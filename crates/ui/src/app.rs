@@ -56,12 +56,13 @@ impl FlexInputApp {
 impl eframe::App for FlexInputApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(backend) = &mut self.device_backend {
-            self.devices = backend.enumerate();
+            // Poll first so gilrs processes hotplug events before enumerate reads the device list.
             let signals = backend.poll();
             self.last_signals = signals
                 .into_iter()
                 .map(|(dev, pin, sig)| ((dev, pin), sig))
                 .collect();
+            self.devices = backend.enumerate();
         }
 
         self.engine.tick();
