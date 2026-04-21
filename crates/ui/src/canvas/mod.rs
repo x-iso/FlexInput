@@ -19,7 +19,9 @@ pub struct Canvas {
 
 impl Canvas {
     pub fn new() -> Self {
-        Canvas { snarl: Snarl::new(), style: SnarlStyle::default() }
+        let mut style = SnarlStyle::default();
+        style.collapsible = Some(true);
+        Canvas { snarl: Snarl::new(), style }
     }
 
     pub fn show(&mut self, descriptors: &[ModuleDescriptor], ui: &mut egui::Ui) {
@@ -51,6 +53,12 @@ impl Canvas {
 
         let mut params = HashMap::new();
         params.insert("device_id".to_string(), Value::String(device.id.clone()));
+        params.insert("output_pin_ids".to_string(), Value::Array(
+            device.outputs.iter().map(|p| Value::String(p.id.clone())).collect(),
+        ));
+        params.insert("input_pin_ids".to_string(), Value::Array(
+            device.inputs.iter().map(|p| Value::String(p.id.clone())).collect(),
+        ));
 
         let node = NodeData {
             module_id: "device.source".to_string(),
@@ -84,6 +92,9 @@ impl Canvas {
         let mut params = HashMap::new();
         params.insert("device_id".to_string(), Value::String(device.id().to_string()));
         params.insert("fixed_input_count".to_string(), Value::Number(fixed_count.into()));
+        params.insert("input_pin_ids".to_string(), Value::Array(
+            device.sink_pins().iter().map(|p| Value::String(p.id.to_string())).collect(),
+        ));
 
         let node = NodeData {
             module_id: "device.sink".to_string(),
