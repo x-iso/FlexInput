@@ -1,0 +1,16 @@
+[package]
+name    = "flexinput-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flexinput-core    = { workspace = true }
+flexinput-engine  = { workspace = true }
+flexinput-devices = { workspace = true }
+glam              = { workspace = true }
+flexinput-virtual = { workspace = true }
+flexinput-modules = { workspace = true }
+egui              = { workspace = true }
+eframe            = { workspace = true }
+serde_json        = { workspace = true }
+egui-snarl = { workspace = true }

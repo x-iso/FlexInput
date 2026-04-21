@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/engine",
+    "crates/devices",
+    "crates/virtual",
+    "crates/modules",
+    "crates/ui",
+    "app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+flexinput-core    = { path = "crates/core" }
+flexinput-engine  = { path = "crates/engine" }
+flexinput-devices = { path = "crates/devices" }
+flexinput-virtual = { path = "crates/virtual" }
+flexinput-modules = { path = "crates/modules" }
+flexinput-ui      = { path = "crates/ui" }
+
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+glam       = { version = "0.27", features = ["serde"] }
+uuid       = { version = "1", features = ["v4", "serde"] }
+smallvec   = { version = "1", features = ["serde"] }
+egui       = "0.33"
+eframe     = { version = "0.33", features = ["default"] }
+egui-snarl = "0.9"

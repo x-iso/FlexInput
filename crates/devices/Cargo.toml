@@ -1,0 +1,9 @@
+[package]
+name    = "flexinput-devices"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flexinput-core = { workspace = true }
+glam           = { workspace = true }
+gilrs          = "0.10"

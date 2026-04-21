@@ -1,0 +1,8 @@
+[package]
+name    = "flexinput"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flexinput-ui = { workspace = true }
+eframe       = { workspace = true }

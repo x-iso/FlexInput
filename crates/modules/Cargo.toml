@@ -1,0 +1,8 @@
+[package]
+name    = "flexinput-modules"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flexinput-core = { workspace = true }
+smallvec       = { workspace = true }

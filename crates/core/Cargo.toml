@@ -1,0 +1,11 @@
+[package]
+name    = "flexinput-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+glam       = { workspace = true }
+uuid       = { workspace = true }
+smallvec   = { workspace = true }

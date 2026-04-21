@@ -1,0 +1,8 @@
+[package]
+name    = "flexinput-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flexinput-core = { workspace = true }
+uuid           = { workspace = true }
