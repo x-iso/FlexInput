@@ -26,6 +26,9 @@ pub trait VirtualDevice: Send {
     fn send(&mut self, pin: &str, value: Signal);
     /// Commit the current state to the system (e.g. submit a HID report).
     fn flush(&mut self);
+    /// Returns false if the underlying system resource is unavailable
+    /// (e.g. ViGEmBus not installed, enigo init failed).
+    fn is_connected(&self) -> bool { true }
 }
 
 #[cfg(windows)]

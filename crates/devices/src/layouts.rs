@@ -4,11 +4,13 @@ use crate::{identification::ControllerKind, DevicePin};
 
 pub fn outputs_for(kind: ControllerKind) -> Vec<DevicePin> {
     match kind {
-        ControllerKind::XInput    => xinput_outputs(),
+        ControllerKind::XInput     => xinput_outputs(),
         ControllerKind::DualShock4 => ds4_outputs(),
-        ControllerKind::DualSense => dualsense_outputs(),
-        ControllerKind::SwitchPro => switch_pro_outputs(),
-        ControllerKind::Generic   => generic_outputs(),
+        ControllerKind::DualSense  => dualsense_outputs(),
+        ControllerKind::SwitchPro  => switch_pro_outputs(),
+        ControllerKind::Generic    => generic_outputs(),
+        // MIDI devices build their own pin lists; layouts not used.
+        ControllerKind::MidiIn | ControllerKind::MidiOut => vec![],
     }
 }
 

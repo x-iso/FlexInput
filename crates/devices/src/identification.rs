@@ -5,6 +5,8 @@ pub enum ControllerKind {
     DualSense,
     SwitchPro,
     Generic,
+    MidiIn,
+    MidiOut,
 }
 
 impl ControllerKind {
@@ -51,11 +53,13 @@ impl ControllerKind {
 
     pub fn display_name(self) -> &'static str {
         match self {
-            Self::XInput    => "Xbox / XInput",
+            Self::XInput     => "Xbox / XInput",
             Self::DualShock4 => "DualShock 4",
-            Self::DualSense => "DualSense",
-            Self::SwitchPro => "Switch Pro Controller",
-            Self::Generic   => "Generic Gamepad",
+            Self::DualSense  => "DualSense",
+            Self::SwitchPro  => "Switch Pro Controller",
+            Self::Generic    => "Generic Gamepad",
+            Self::MidiIn     => "MIDI Input Port",
+            Self::MidiOut    => "MIDI Output Port",
         }
     }
 }

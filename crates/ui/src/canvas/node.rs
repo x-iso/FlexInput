@@ -1,9 +1,24 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
-use flexinput_core::{ModuleDescriptor, PinDescriptor};
+use flexinput_core::{ModuleDescriptor, PinDescriptor, Signal};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
+/// Runtime-only per-node state (not serialized).  Used by display modules.
+#[derive(Debug, Clone, Default)]
+pub struct NodeExtra {
+    /// Rolling signal history for oscilloscope / vectorscope nodes.
+    /// Each entry is [ch0, ch1, ch2, ch3]; None when the channel is unconnected.
+    pub history: VecDeque<[Option<f32>; 4]>,
+    /// Most recent evaluated signal per input (for readout / body display).
+    pub last_signals: Vec<Option<Signal>>,
+    /// Ring buffer of (timestamp, value) pairs for the delay module.
+    pub delay_buf: VecDeque<(std::time::Instant, f32)>,
+    /// Biquad direct-form-II state [x₋₁, x₋₂, y₋₁, y₋₂] for the lowpass module.
+    pub filter_state: [f64; 4],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeData {
     pub module_id: String,
     pub display_name: String,
@@ -11,6 +26,8 @@ pub struct NodeData {
     pub inputs: Vec<PinDescriptor>,
     pub outputs: Vec<PinDescriptor>,
     pub params: HashMap<String, Value>,
+    #[serde(skip)]
+    pub extra: NodeExtra,
 }
 
 impl From<&ModuleDescriptor> for NodeData {
@@ -22,6 +39,7 @@ impl From<&ModuleDescriptor> for NodeData {
             inputs: d.inputs.clone(),
             outputs: d.outputs.clone(),
             params: HashMap::new(),
+            extra: NodeExtra::default(),
         }
     }
 }

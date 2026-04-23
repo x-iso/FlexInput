@@ -7,3 +7,5 @@ edition.workspace = true
 flexinput-core = { workspace = true }
 glam           = { workspace = true }
 gilrs          = "0.10"
+hidapi         = "2"
+midir          = "0.10"

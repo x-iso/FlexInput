@@ -8,4 +8,4 @@ flexinput-core = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 vigem-client = { version = "0.1", features = ["unstable_ds4"] }
-# enigo = "0.2"   # uncomment for virtual keyboard + mouse
+enigo = "0.2"

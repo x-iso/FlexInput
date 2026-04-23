@@ -1,0 +1,90 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.9.0] - 26.10.2025
+
+### Changed
+
+- Upgraded to egui 0.33
+- Changed MSRV to 1.88
+
+## [0.8.0] - 14.07.2025
+
+### Added
+
+- `SnarlViewer::current_transform` method to receive and possibly modify the current transform of the snarl's UI layer.
+
+### Changed
+
+- Snarl is now scaled using egui's layer scaling mechanism.
+  Removes layout twitching when zooming in and out.
+  Simplifies interface of `SnarlViewer`.
+
+## [0.7.1] - 19.02.2025
+
+### Added
+
+- `SnarlPin::pin_rect` method allows custom type to override default pin position and size.
+
+## [0.7.0] - 19.02.2025
+
+### Changed
+
+- `SnarlViewer::show_input` and `SnarlViewer::show_output` now returns `impl SnarlPin`
+  that allows fully custom pin drawing.
+  This replaces `SnarlViewer::draw_input_pin` and `SnarlViewer::draw_output_pin`.
+
+### Removed
+
+- `SnarlViewer::draw_input_pin` and `SnarlViewer::draw_output_pin` are removed.
+  Return custom type from `SnarlViewer::show_input` and `SnarlViewer::show_output` instead.
+
+## [0.6.0] - 20.12.2024
+
+### Changed
+
+- Zooming now uses egui's zoom_delta from Input.
+  This means that zooming is now performed by ctrl+scroll (cmd+scroll on mac) or pinching.
+  Previously it was performed by scrolling alone, which collided with scrolling through content in the node's widgets and didn't work for touch controls.
+
+### Added
+
+- NodeLayout enum
+  To control layout of nodes in the graph
+  Can be set globally in SnarlStyle and overridden per node with SnarlViewer::node_layout
+  Defaults to NodeLayout::Basic which is the previous layout
+  NodeLayout::Sandwich is a new layout that places inputs, body and outputs vertically with inputs on top and outputs on bottom
+  NodeLayout::FlippedSandwich is the same as Sandwich but with outputs on top and inputs on bottom
+
+- SnarlViewer::draw_input_pin/draw_output_pin can be used to override how pins are drawn.
+  Default implementation matches old behavior.
+  This mechanism is meant to replace PinShape::Custom that was removed.
+
+- SnarlViewer::draw_node_background can be used to override how node background is drawn.
+  Default implementation matches old behavior.
+  This mechanism is meant to replace BackgroundPattern::Custom that was removed.
+
+- PinPlacement style option in SnarlStyle
+  This option controls how pins are placed in the node
+  Inside - pins are placed inside the node frame - default, old behavior
+  Edge - pin centers are placed on the edge of the node frame
+  Outside - pins are placed outside the node frame with specified margin
+
+### Removed
+
+- BackgroundPattern::Custom is removed.
+  It contained opaque function to draw custom background pattern
+  and permitted !Send and !Sync captures which made SnarlStyle !Send and !Sync as well
+
+- PinShape::Custom is removed.
+  It is replaced by SnarlViewer::draw_input_pin/draw_output_pin which is more flexible.
+
+- BasicPinShape is removed. SnarlStyle::pin_shape has PinShape type now.
+
+### Fixed
+
+- Crash after centering graph when no nodes are present and adding a node afterwards
