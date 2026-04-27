@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use vigem_client::{Client, DS4Report, DualShock4Wired, XButtons, XGamepad, Xbox360Wired};
+use std::os::windows::io::AsRawHandle;
+use vigem_client::{Client, XButtons, XGamepad, Xbox360Wired};
 
 use flexinput_core::Signal;
 use crate::{layouts, DeviceKind, SinkPin, VirtualDevice};
@@ -129,48 +130,167 @@ impl VirtualDevice for VirtualXInput {
     }
 }
 
-// ── DS4 ───────────────────────────────────────────────────────────────────────
+// ── DS4 (custom implementation with gyro support via DS4ReportEx IOCTL) ────────
 
-pub struct VirtualDS4 {
-    id: String,
-    display_name: String,
-    /// None when ViGEmBus driver is not installed.
-    target: Option<DualShock4Wired<Client>>,
-    thumb_lx: u8,
-    thumb_ly: u8,
-    thumb_rx: u8,
-    thumb_ry: u8,
-    trigger_l: u8,
-    trigger_r: u8,
-    /// Face/shoulder button bits (bits 4-15; dpad nibble handled separately).
-    buttons: u16,
-    /// PS button (bit 0) and touchpad click (bit 1).
-    special: u8,
-    /// DPad state: [up, right, down, left]
-    dpad: [bool; 4],
-}
+/// Win32 types and functions for synchronous overlapped IOCTL calls.
+mod vigem_ioctl {
+    use std::ffi::c_void;
 
-impl VirtualDS4 {
-    pub fn new(instance: usize) -> Self {
-        let (id, display_name) = instance_label("virtual.ds4", "Virtual DualShock 4", instance);
-        let target = Client::connect().ok().and_then(|client| {
-            let mut t = DualShock4Wired::new(client, vigem_client::TargetId::DUALSHOCK4_WIRED);
-            t.plugin().ok()?;
-            t.wait_ready().ok()?;
-            Some(t)
-        });
-        Self {
-            id, display_name,
-            target,
-            thumb_lx: 0x80, thumb_ly: 0x80,
-            thumb_rx: 0x80, thumb_ry: 0x80,
-            trigger_l: 0, trigger_r: 0,
-            buttons: 0, special: 0,
-            dpad: [false; 4],
+    // CTL_CODE(0x2A, fn, METHOD_BUFFERED=0, FILE_WRITE_DATA=2)
+    // = (0x2A << 16) | (2 << 14) | (fn << 2) | 0
+    pub const IOCTL_PLUGIN_TARGET: u32        = 0x2AA004; // fn=0x801
+    pub const IOCTL_UNPLUG_TARGET: u32        = 0x2AA008; // fn=0x802
+    pub const IOCTL_WAIT_DEVICE_READY: u32    = 0x2AA010; // fn=0x804
+    pub const IOCTL_DS4_SUBMIT_REPORT: u32    = 0x2AA80C; // fn=0xA03
+    // Extended report (ViGEmBus ≥ 1.17) — fn=0xA08
+    pub const IOCTL_DS4_SUBMIT_REPORT_EX: u32 = 0x2AA820;
+
+    pub const DS4_TARGET_KIND: i32 = 2;
+    pub const DS4_VID: u16         = 0x054C;
+    pub const DS4_PID: u16         = 0x05C4;
+
+    /// Minimal OVERLAPPED for synchronous overlapped I/O (Offset fields zeroed).
+    #[repr(C)]
+    pub struct Overlapped {
+        pub internal:      usize,
+        pub internal_high: usize,
+        pub offset:        u32,
+        pub offset_high:   u32,
+        pub event:         *mut c_void,
+    }
+
+    // ── ViGEm lifecycle structures ─────────────────────────────────────────────
+
+    #[repr(C)]
+    pub struct PluginTarget {
+        pub size:   u32,
+        pub serial: u32,
+        pub kind:   i32,
+        pub vid:    u16,
+        pub pid:    u16,
+    }
+
+    /// Shared layout for Unplug and WaitDeviceReady (just size + serial).
+    #[repr(C)]
+    pub struct LifecycleTarget {
+        pub size:   u32,
+        pub serial: u32,
+    }
+
+    // ── DS4 basic report (same layout as vigem_client's DS4Report) ─────────────
+
+    #[repr(C)]
+    pub struct DS4Report {
+        pub lx: u8, pub ly: u8, pub rx: u8, pub ry: u8,
+        pub buttons: u16,
+        pub special: u8,
+        pub lt: u8, pub rt: u8,
+    }
+
+    #[repr(C)]
+    pub struct DS4Submit {
+        pub size:   u32,
+        pub serial: u32,
+        pub report: DS4Report,
+    }
+
+    // ── DS4 extended report (with gyro/accel) ─────────────────────────────────
+    // Layout matches the C DS4_TOUCH / DS4_REPORT_EX structs in ViGEmBus,
+    // using natural #[repr(C)] alignment (no packing pragma).
+
+    #[repr(C)]
+    pub struct DS4Touch {
+        pub counter: u8,
+        /// bit 7 = finger-up (inactive), bits 6:0 = tracking ID
+        pub track1:  u8,
+        pub pos1:    [u8; 3],
+        pub track2:  u8,
+        pub pos2:    [u8; 3],
+    }
+    impl Default for DS4Touch {
+        fn default() -> Self {
+            Self { counter: 0, track1: 0x80, pos1: [0; 3], track2: 0x80, pos2: [0; 3] }
         }
+    }
+
+    #[repr(C)]
+    pub struct DS4ReportEx {
+        pub lx: u8, pub ly: u8, pub rx: u8, pub ry: u8,
+        pub buttons:  u16,
+        pub special:  u8,
+        pub lt: u8, pub rt: u8,
+        // Natural alignment inserts 1 pad byte before timestamp (u16).
+        pub timestamp:       u16,
+        pub battery:         u8,
+        // Natural alignment inserts 1 pad byte before gyro_x (i16).
+        pub gyro_x:  i16, pub gyro_y:  i16, pub gyro_z:  i16,
+        pub accel_x: i16, pub accel_y: i16, pub accel_z: i16,
+        pub _unk1:           [u8; 5],
+        pub battery_special: u8,
+        pub _unk2:           [u8; 2],
+        pub touch_n:         u8,
+        pub touch_cur:       DS4Touch,
+        pub touch_prev:      [DS4Touch; 2],
+    }
+
+    #[repr(C)]
+    pub struct DS4ExSubmit {
+        pub size:   u32,
+        pub serial: u32,
+        pub report: DS4ReportEx,
+    }
+
+    // ── Win32 kernel32 imports ─────────────────────────────────────────────────
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn CreateEventW(
+            attrs:         *mut c_void,
+            manual_reset:  i32,
+            initial_state: i32,
+            name:          *const u16,
+        ) -> *mut c_void;
+
+        pub fn CloseHandle(handle: *mut c_void) -> i32;
+
+        pub fn DeviceIoControl(
+            device:      *mut c_void,
+            code:        u32,
+            in_buf:      *const c_void,
+            in_size:     u32,
+            out_buf:     *mut c_void,
+            out_size:    u32,
+            returned:    *mut u32,
+            overlapped:  *mut Overlapped,
+        ) -> i32;
+
+        pub fn GetOverlappedResult(
+            file:       *mut c_void,
+            overlapped: *mut Overlapped,
+            transferred: *mut u32,
+            wait:        i32,
+        ) -> i32;
+    }
+
+    /// Submit a synchronous IOCTL on an overlapped device handle.
+    /// Returns true on success.
+    pub unsafe fn ioctl(
+        device: *mut c_void,
+        event:  *mut c_void,
+        code:   u32,
+        buf:    *const c_void,
+        size:   u32,
+    ) -> bool {
+        let mut ovl = Overlapped {
+            internal: 0, internal_high: 0, offset: 0, offset_high: 0, event,
+        };
+        let mut n = 0u32;
+        DeviceIoControl(device, code, buf, size, std::ptr::null_mut(), 0, &mut n, &mut ovl);
+        GetOverlappedResult(device, &mut ovl, &mut n, 1 /* bWait=TRUE */) != 0
     }
 }
 
+// ── DS4 button bit masks ───────────────────────────────────────────────────────
 mod ds4_btn {
     pub const SQUARE:   u16 = 0x0010;
     pub const CROSS:    u16 = 0x0020;
@@ -188,34 +308,144 @@ mod ds4_btn {
     pub const TOUCHPAD: u8  = 0x02;
 }
 
+pub struct VirtualDS4 {
+    id:           String,
+    display_name: String,
+    /// Keeps the ViGEm bus connection alive; raw handle borrowed via `dev`.
+    _client:      Option<Client>,
+    /// Raw handle from `_client`; null when ViGEmBus is unavailable.
+    dev:          *mut std::ffi::c_void,
+    serial:       u32,
+    /// Windows event for overlapped I/O; null when not connected.
+    event:        *mut std::ffi::c_void,
+    /// Whether `IOCTL_DS4_SUBMIT_REPORT_EX` is supported by installed ViGEmBus.
+    has_extended: bool,
+    // Report state
+    lx: u8, ly: u8, rx: u8, ry: u8,
+    lt: u8, rt: u8,
+    buttons:  u16,
+    special:  u8,
+    dpad:     [bool; 4],
+    // Gyro / accelerometer (float in [-1, 1], converted to i16 in flush)
+    gyro_x:  f32, gyro_y:  f32, gyro_z:  f32,
+    accel_x: f32, accel_y: f32, accel_z: f32,
+}
+
+// Raw pointer fields are not Send by default; declare it safe because the
+// handles are owned exclusively by this struct and accessed on one thread.
+unsafe impl Send for VirtualDS4 {}
+
+impl VirtualDS4 {
+    pub fn new(instance: usize) -> Self {
+        let (id, display_name) = instance_label("virtual.ds4", "Virtual DualShock 4", instance);
+        let mut out = VirtualDS4 {
+            id, display_name,
+            _client: None, dev: std::ptr::null_mut(),
+            serial: 0, event: std::ptr::null_mut(), has_extended: false,
+            lx: 0x80, ly: 0x80, rx: 0x80, ry: 0x80,
+            lt: 0, rt: 0, buttons: 0, special: 0, dpad: [false; 4],
+            gyro_x: 0.0, gyro_y: 0.0, gyro_z: 0.0,
+            accel_x: 0.0, accel_y: 0.0, accel_z: 0.0,
+        };
+
+        let client = match Client::connect() {
+            Ok(c) => c,
+            Err(_) => return out,
+        };
+        let dev = client.as_raw_handle() as *mut std::ffi::c_void;
+        let event = unsafe {
+            vigem_ioctl::CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null())
+        };
+        if event.is_null() { return out; }
+
+        // Find a free serial number and plug in the DS4 target.
+        let mut serial = 1u32;
+        loop {
+            let plug = vigem_ioctl::PluginTarget {
+                size:   std::mem::size_of::<vigem_ioctl::PluginTarget>() as u32,
+                serial,
+                kind:   vigem_ioctl::DS4_TARGET_KIND,
+                vid:    vigem_ioctl::DS4_VID,
+                pid:    vigem_ioctl::DS4_PID,
+            };
+            if unsafe { vigem_ioctl::ioctl(
+                dev, event, vigem_ioctl::IOCTL_PLUGIN_TARGET,
+                &plug as *const _ as _, std::mem::size_of_val(&plug) as u32,
+            ) } { break; }
+            serial += 1;
+            if serial > 65535 {
+                unsafe { vigem_ioctl::CloseHandle(event); }
+                return out;
+            }
+        }
+
+        // Wait until the virtual controller is enumerated and ready.
+        let wait = vigem_ioctl::LifecycleTarget {
+            size: std::mem::size_of::<vigem_ioctl::LifecycleTarget>() as u32,
+            serial,
+        };
+        unsafe { vigem_ioctl::ioctl(
+            dev, event, vigem_ioctl::IOCTL_WAIT_DEVICE_READY,
+            &wait as *const _ as _, std::mem::size_of_val(&wait) as u32,
+        ); }
+
+        // Assume extended IOCTL is available; flush() will fall back to basic if not.
+        // Starting optimistic avoids a probe-timing race where the device isn't ready yet.
+        let has_extended = true;
+
+        #[cfg(debug_assertions)]
+        eprintln!("[VirtualDS4] plugged in serial={serial}, will try extended IOCTL");
+
+        out._client      = Some(client);
+        out.dev          = dev;
+        out.serial       = serial;
+        out.event        = event;
+        out.has_extended = has_extended;
+        out
+    }
+}
+
+impl Drop for VirtualDS4 {
+    fn drop(&mut self) {
+        if self.dev.is_null() { return; }
+        let unplug = vigem_ioctl::LifecycleTarget {
+            size:   std::mem::size_of::<vigem_ioctl::LifecycleTarget>() as u32,
+            serial: self.serial,
+        };
+        unsafe {
+            vigem_ioctl::ioctl(
+                self.dev, self.event, vigem_ioctl::IOCTL_UNPLUG_TARGET,
+                &unplug as *const _ as _, std::mem::size_of_val(&unplug) as u32,
+            );
+            vigem_ioctl::CloseHandle(self.event);
+        }
+    }
+}
+
 impl VirtualDevice for VirtualDS4 {
-    fn id(&self) -> &str { &self.id }
+    fn id(&self)           -> &str { &self.id }
     fn display_name(&self) -> &str { &self.display_name }
-    fn sink_pins(&self) -> &'static [SinkPin] { layouts::DS4_SINK_PINS }
-    fn is_connected(&self) -> bool { self.target.is_some() }
+    fn sink_pins(&self)    -> &'static [SinkPin] { layouts::DS4_SINK_PINS }
+    fn is_connected(&self) -> bool { !self.dev.is_null() }
 
     fn send(&mut self, pin: &str, value: Signal) {
         match pin {
             "left_stick" => if let Signal::Vec2(v) = value {
-                self.thumb_lx = ds4_axis_x(v.x);
-                self.thumb_ly = ds4_axis_y(v.y);
+                self.lx = ds4_axis_x(v.x); self.ly = ds4_axis_y(v.y);
             },
             "right_stick" => if let Signal::Vec2(v) = value {
-                self.thumb_rx = ds4_axis_x(v.x);
-                self.thumb_ry = ds4_axis_y(v.y);
+                self.rx = ds4_axis_x(v.x); self.ry = ds4_axis_y(v.y);
             },
             "dpad" => if let Signal::Vec2(v) = value {
-                self.dpad[0] = v.y >  0.5;
-                self.dpad[1] = v.x >  0.5;
-                self.dpad[2] = v.y < -0.5;
-                self.dpad[3] = v.x < -0.5;
+                self.dpad[0] = v.y >  0.5; self.dpad[1] = v.x >  0.5;
+                self.dpad[2] = v.y < -0.5; self.dpad[3] = v.x < -0.5;
             },
-            "left_stick_x"  => if let Signal::Float(f) = value { self.thumb_lx = ds4_axis_x(f); },
-            "left_stick_y"  => if let Signal::Float(f) = value { self.thumb_ly = ds4_axis_y(f); },
-            "right_stick_x" => if let Signal::Float(f) = value { self.thumb_rx = ds4_axis_x(f); },
-            "right_stick_y" => if let Signal::Float(f) = value { self.thumb_ry = ds4_axis_y(f); },
-            "l2"        => if let Signal::Float(f) = value { self.trigger_l = float_to_u8(f); },
-            "r2"        => if let Signal::Float(f) = value { self.trigger_r = float_to_u8(f); },
+            "left_stick_x"  => if let Signal::Float(f) = value { self.lx = ds4_axis_x(f); },
+            "left_stick_y"  => if let Signal::Float(f) = value { self.ly = ds4_axis_y(f); },
+            "right_stick_x" => if let Signal::Float(f) = value { self.rx = ds4_axis_x(f); },
+            "right_stick_y" => if let Signal::Float(f) = value { self.ry = ds4_axis_y(f); },
+            "l2"            => if let Signal::Float(f) = value { self.lt = float_to_u8(f); },
+            "r2"            => if let Signal::Float(f) = value { self.rt = float_to_u8(f); },
             "btn_cross"    => set_bool_bit(&mut self.buttons, ds4_btn::CROSS,    &value),
             "btn_circle"   => set_bool_bit(&mut self.buttons, ds4_btn::CIRCLE,   &value),
             "btn_square"   => set_bool_bit(&mut self.buttons, ds4_btn::SQUARE,   &value),
@@ -234,24 +464,84 @@ impl VirtualDevice for VirtualDS4 {
             "dpad_right" => { self.dpad[1] = matches!(value, Signal::Bool(true)); },
             "dpad_down"  => { self.dpad[2] = matches!(value, Signal::Bool(true)); },
             "dpad_left"  => { self.dpad[3] = matches!(value, Signal::Bool(true)); },
+            "gyro_x"  => if let Signal::Float(f) = value { self.gyro_x  = f; },
+            "gyro_y"  => if let Signal::Float(f) = value { self.gyro_y  = f; },
+            "gyro_z"  => if let Signal::Float(f) = value { self.gyro_z  = f; },
+            "accel_x" => if let Signal::Float(f) = value { self.accel_x = f; },
+            "accel_y" => if let Signal::Float(f) = value { self.accel_y = f; },
+            "accel_z" => if let Signal::Float(f) = value { self.accel_z = f; },
             _ => {}
         }
     }
 
     fn flush(&mut self) {
-        let Some(target) = &mut self.target else { return; };
-        let dpad_nibble = encode_dpad(self.dpad[0], self.dpad[1], self.dpad[2], self.dpad[3]);
-        let report = DS4Report {
-            thumb_lx: self.thumb_lx,
-            thumb_ly: self.thumb_ly,
-            thumb_rx: self.thumb_rx,
-            thumb_ry: self.thumb_ry,
-            buttons: (self.buttons & !0xF) | dpad_nibble,
-            special: self.special,
-            trigger_l: self.trigger_l,
-            trigger_r: self.trigger_r,
+        if self.dev.is_null() { return; }
+        let dpad    = encode_dpad(self.dpad[0], self.dpad[1], self.dpad[2], self.dpad[3]);
+        let buttons = (self.buttons & !0xF) | dpad;
+        let tp_pressed = self.special & ds4_btn::TOUCHPAD != 0;
+
+        if self.has_extended {
+            let ok = unsafe {
+                let mut sub: vigem_ioctl::DS4ExSubmit = std::mem::zeroed();
+                sub.size   = std::mem::size_of::<vigem_ioctl::DS4ExSubmit>() as u32;
+                sub.serial = self.serial;
+                sub.report.lx      = self.lx;  sub.report.ly = self.ly;
+                sub.report.rx      = self.rx;  sub.report.ry = self.ry;
+                sub.report.buttons = buttons;
+                sub.report.special = self.special;
+                sub.report.lt      = self.lt;  sub.report.rt = self.rt;
+                sub.report.battery = 0xFF;
+                sub.report.gyro_x  = float_to_i16(self.gyro_x);
+                sub.report.gyro_y  = float_to_i16(self.gyro_y);
+                sub.report.gyro_z  = float_to_i16(self.gyro_z);
+                sub.report.accel_x = float_to_i16(self.accel_x);
+                sub.report.accel_y = float_to_i16(self.accel_y);
+                sub.report.accel_z = float_to_i16(self.accel_z);
+                // When the touchpad button is pressed, report a single center touch.
+                // Some software requires at least one active touch point alongside
+                // the touchpad-click bit in the special byte.
+                if tp_pressed {
+                    sub.report.touch_n = 1;
+                    sub.report.touch_cur = vigem_ioctl::DS4Touch {
+                        counter: 0,
+                        track1: 0x00,             // active, tracking ID 0
+                        pos1: [0xC0, 0x63, 0x1D], // X=960, Y=470 (DS4 touchpad centre)
+                        track2: 0x80,             // second slot inactive
+                        pos2: [0; 3],
+                    };
+                } else {
+                    sub.report.touch_cur     = vigem_ioctl::DS4Touch::default();
+                }
+                sub.report.touch_prev[0] = vigem_ioctl::DS4Touch::default();
+                sub.report.touch_prev[1] = vigem_ioctl::DS4Touch::default();
+                vigem_ioctl::ioctl(
+                    self.dev, self.event, vigem_ioctl::IOCTL_DS4_SUBMIT_REPORT_EX,
+                    &sub as *const _ as _, std::mem::size_of_val(&sub) as u32,
+                )
+            };
+            if ok { return; }
+            // Extended IOCTL failed — fall through to basic this frame but keep
+            // has_extended = true so we retry next frame. Transient failures
+            // (device not yet ready) would otherwise permanently kill gyro/touchpad.
+            #[cfg(debug_assertions)]
+            eprintln!("[VirtualDS4] extended IOCTL failed, falling back to basic this frame");
+        }
+
+        // Basic report path (also fallback when extended fails).
+        let sub = vigem_ioctl::DS4Submit {
+            size:   std::mem::size_of::<vigem_ioctl::DS4Submit>() as u32,
+            serial: self.serial,
+            report: vigem_ioctl::DS4Report {
+                lx: self.lx, ly: self.ly, rx: self.rx, ry: self.ry,
+                buttons, special: self.special, lt: self.lt, rt: self.rt,
+            },
         };
-        let _ = target.update(&report);
+        unsafe {
+            vigem_ioctl::ioctl(
+                self.dev, self.event, vigem_ioctl::IOCTL_DS4_SUBMIT_REPORT,
+                &sub as *const _ as _, std::mem::size_of_val(&sub) as u32,
+            );
+        }
     }
 }
 

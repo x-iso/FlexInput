@@ -8,8 +8,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, Default)]
 pub struct NodeExtra {
     /// Rolling signal history for oscilloscope / vectorscope nodes.
-    /// Each entry is [ch0, ch1, ch2, ch3]; None when the channel is unconnected.
-    pub history: VecDeque<[Option<f32>; 4]>,
+    /// Each entry is one sample per input channel; None when the channel is unconnected.
+    pub history: VecDeque<Vec<Option<f32>>>,
     /// Most recent evaluated signal per input (for readout / body display).
     pub last_signals: Vec<Option<Signal>>,
     /// Ring buffer of (timestamp, value) pairs for the delay module.

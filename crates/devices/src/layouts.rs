@@ -100,6 +100,9 @@ fn ds4_outputs() -> Vec<DevicePin> {
         fl("touch1_x",     "Touch 1 X"),
         fl("touch1_y",     "Touch 1 Y"),
         bo("touch1_active","Touch 1 Active"),
+        fl("touch2_x",     "Touch 2 X"),
+        fl("touch2_y",     "Touch 2 Y"),
+        bo("touch2_active","Touch 2 Active"),
         fl("battery",      "Battery (0–1)"),
     ]);
     pins

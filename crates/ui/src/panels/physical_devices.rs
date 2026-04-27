@@ -85,28 +85,44 @@ fn device_card(
                         }
                     }
 
-                    if let Some(hh) = hidhide {
-                        if device.instance_path.is_some() {
-                            let (icon, hover) = if is_hidden {
-                                (RichText::new("👁").small().color(ui.visuals().weak_text_color()),
-                                 "Hidden from system (click to show)")
+                    // HidHide only operates on HID devices — skip MIDI entirely.
+                    let hid_eligible = !matches!(
+                        device.kind,
+                        ControllerKind::MidiIn | ControllerKind::MidiOut
+                    );
+                    if let (Some(hh), true) = (hidhide, hid_eligible) {
+                        if let Some(ip) = device.instance_path.as_deref() {
+                            let (btn_text, action_text) = if is_hidden {
+                                ("🔒 Hidden", "Click to show to all apps")
                             } else {
-                                (RichText::new("👁").small(),
-                                 "Visible to system (click to hide from other apps)")
+                                ("👁 Visible", "Click to hide from other apps")
                             };
-                            if ui.add(egui::Button::new(icon).frame(false))
-                                .on_hover_text(hover)
-                                .clicked()
-                            {
-                                if let Some(ip) = &device.instance_path {
-                                    hh.set_hidden(ip, !is_hidden);
-                                    if !is_hidden { hh.set_active(true); }
-                                }
+                            let hover = format!("{action_text}\n\nInstance: {ip}");
+                            // Use selectable_label — robust click area, visible
+                            // selected/unselected state, no frame ambiguity.
+                            let resp = ui.selectable_label(is_hidden, btn_text)
+                                .on_hover_text(hover);
+                            if resp.clicked() {
+                                eprintln!("[hidhide] eye-button clicked: ip={:?} → hidden={}",
+                                    ip, !is_hidden);
+                                let status = hh.set_hidden(ip, !is_hidden);
+                                if !is_hidden { hh.set_active(true); }
+                                // Surface the status in egui memory so the UI
+                                // (HidHide window + inline) can show it.
+                                ui.ctx().memory_mut(|m| {
+                                    m.data.insert_temp(
+                                        egui::Id::new("hidhide_last_status"),
+                                        status,
+                                    );
+                                });
                             }
                         } else {
-                            ui.add_enabled(false,
-                                egui::Button::new(RichText::new("👁").small().weak()).frame(false),
-                            ).on_hover_text("Device path unavailable — cannot control HidHide");
+                            ui.label(
+                                RichText::new("⚠ no path").small().weak()
+                            ).on_hover_text(
+                                "Could not resolve a HID device-instance path for this controller — \
+                                 HidHide cannot hide it. Check stderr for [hidhide] logs."
+                            );
                         }
                     }
                 });

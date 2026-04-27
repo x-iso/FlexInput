@@ -83,4 +83,10 @@ pub static DS4_SINK_PINS: &[SinkPin] = &[
     sp!("dpad_down",     "D-Pad Down",        SignalType::Bool),
     sp!("dpad_left",     "D-Pad Left",        SignalType::Bool),
     sp!("dpad_right",    "D-Pad Right",       SignalType::Bool),
+    sp!("gyro_x",        "Gyro X",            SignalType::Float),
+    sp!("gyro_y",        "Gyro Y",            SignalType::Float),
+    sp!("gyro_z",        "Gyro Z",            SignalType::Float),
+    sp!("accel_x",       "Accel X",           SignalType::Float),
+    sp!("accel_y",       "Accel Y",           SignalType::Float),
+    sp!("accel_z",       "Accel Z",           SignalType::Float),
 ];

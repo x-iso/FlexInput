@@ -129,6 +129,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "device.sink" | "module.constant" | "module.switch" | "module.knob"
                 | "display.readout" | "display.oscilloscope" | "display.vectorscope"
                 | "module.delay" | "module.lowpass" | "module.response_curve"
+                | "math.add" | "math.subtract" | "math.multiply" | "math.divide"
+                | "module.selector" | "module.split"
         )
     }
 
@@ -136,7 +138,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         &mut self,
         node_id: NodeId,
         inputs: &[InPin],
-        _outputs: &[OutPin],
+        outputs: &[OutPin],
         ui: &mut egui::Ui,
         snarl: &mut Snarl<NodeData>,
     ) {
@@ -151,7 +153,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             .to_string();
 
         if module_id == "device.source" && device_id.starts_with("midi_in:") {
-            show_midi_in_body(node_id, _outputs, ui, snarl);
+            show_midi_in_body(node_id, outputs, ui, snarl);
             return;
         }
         if module_id == "device.sink" && device_id.starts_with("midi_out:") {
@@ -165,11 +167,16 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.switch"        => show_switch_body(node_id, ui, snarl),
             "module.knob"          => show_knob_body(node_id, ui, snarl),
             "display.readout"       => show_readout_body(node_id, ui, snarl),
-            "display.oscilloscope"  => show_oscilloscope_body(node_id, ui, snarl),
+            "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl),
             "display.vectorscope"   => show_vectorscope_body(node_id, ui, snarl),
             "module.delay"          => show_delay_body(node_id, ui, snarl),
             "module.lowpass"        => show_lowpass_body(node_id, ui, snarl),
-            "module.response_curve" => show_response_curve_body(node_id, ui, snarl),
+            "module.response_curve" => show_response_curve_body(node_id, inputs, outputs, ui, snarl),
+            "math.add" | "math.subtract" | "math.multiply" | "math.divide" => {
+                show_math_variadic_body(node_id, inputs, ui, snarl);
+            }
+            "module.selector" => show_selector_body(node_id, inputs, ui, snarl),
+            "module.split"    => show_split_body(node_id, outputs, ui, snarl),
             _ => {}
         }
     }
@@ -494,6 +501,140 @@ fn clear_unused_midi_inputs(node_id: NodeId, inputs: &[InPin], snarl: &mut Snarl
     }
 }
 
+// ── Generic pin removal helpers ───────────────────────────────────────────────
+
+fn remove_input_pin(node_id: NodeId, rm_idx: usize, inputs: &[InPin], snarl: &mut Snarl<NodeData>) {
+    let tail: Vec<Vec<OutPinId>> = inputs[rm_idx..].iter().map(|p| p.remotes.clone()).collect();
+    for i in 0..tail.len() {
+        snarl.drop_inputs(InPinId { node: node_id, input: rm_idx + i });
+    }
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.inputs.remove(rm_idx);
+    }
+    for (shift, remotes) in tail.into_iter().enumerate().skip(1) {
+        let new_in = InPinId { node: node_id, input: rm_idx + shift - 1 };
+        for remote in remotes {
+            snarl.connect(remote, new_in);
+        }
+    }
+}
+
+fn remove_output_pin(node_id: NodeId, rm_idx: usize, outputs: &[OutPin], snarl: &mut Snarl<NodeData>) {
+    let tail: Vec<Vec<egui_snarl::InPinId>> = outputs[rm_idx..].iter().map(|o| o.remotes.clone()).collect();
+    for i in 0..tail.len() {
+        snarl.drop_outputs(OutPinId { node: node_id, output: rm_idx + i });
+    }
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.outputs.remove(rm_idx);
+    }
+    for (shift, remotes) in tail.into_iter().enumerate().skip(1) {
+        let new_out = OutPinId { node: node_id, output: rm_idx + shift - 1 };
+        for remote in remotes {
+            snarl.connect(new_out, remote);
+        }
+    }
+}
+
+// ── Math variadic body ────────────────────────────────────────────────────────
+
+fn pin_letter(idx: usize) -> String {
+    if idx < 26 { format!("{}", (b'a' + idx as u8) as char) }
+    else { format!("in_{}", idx) }
+}
+
+fn show_math_variadic_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+) {
+    let n = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(2);
+    ui.horizontal(|ui| {
+        if ui.small_button("+").on_hover_text("Add input").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let name = pin_letter(node.inputs.len());
+                node.inputs.push(PinDescriptor::new(name, SignalType::Float));
+            }
+        }
+        if n > 2 && ui.small_button("−").on_hover_text("Remove last input").clicked() {
+            remove_input_pin(node_id, n - 1, inputs, snarl);
+        }
+    });
+}
+
+// ── Selector body ─────────────────────────────────────────────────────────────
+
+fn show_selector_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+) {
+    // inputs[0] = select (fixed); inputs[1..] = in_0, in_1, ... (dynamic)
+    let n_value = snarl.get_node(node_id).map(|n| n.inputs.len().saturating_sub(1)).unwrap_or(2);
+
+    ui.vertical(|ui| {
+        ui.set_min_width(80.0);
+        let mut to_remove: Option<usize> = None;
+        for i in 0..n_value {
+            ui.horizontal(|ui| {
+                if n_value > 2 {
+                    if ui.small_button("×").clicked() { to_remove = Some(i + 1); }
+                } else {
+                    ui.add_space(18.0);
+                }
+                ui.label(egui::RichText::new(format!("in_{i}")).small());
+            });
+        }
+        if let Some(rm) = to_remove {
+            remove_input_pin(node_id, rm, inputs, snarl);
+        }
+        ui.add_space(2.0);
+        if ui.small_button("+ input").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let next = node.inputs.len() - 1;
+                node.inputs.push(PinDescriptor::new(format!("in_{next}"), SignalType::Float));
+            }
+        }
+    });
+}
+
+// ── Split body ────────────────────────────────────────────────────────────────
+
+fn show_split_body(
+    node_id: NodeId,
+    outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+) {
+    let n_out = snarl.get_node(node_id).map(|n| n.outputs.len()).unwrap_or(2);
+
+    ui.vertical(|ui| {
+        ui.set_min_width(80.0);
+        let mut to_remove: Option<usize> = None;
+        for i in 0..n_out {
+            ui.horizontal(|ui| {
+                if n_out > 2 {
+                    if ui.small_button("×").clicked() { to_remove = Some(i); }
+                } else {
+                    ui.add_space(18.0);
+                }
+                ui.label(egui::RichText::new(format!("out_{i}")).small());
+            });
+        }
+        if let Some(rm) = to_remove {
+            remove_output_pin(node_id, rm, outputs, snarl);
+        }
+        ui.add_space(2.0);
+        if ui.small_button("+ output").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let next = node.outputs.len();
+                node.outputs.push(PinDescriptor::new(format!("out_{next}"), SignalType::Float));
+            }
+        }
+    });
+}
+
 fn show_sink_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let device_id = snarl
         .get_node(node_id)
@@ -746,9 +887,14 @@ fn show_module_menu(
 
 fn channel_label_color(module_id: &str, ch: usize) -> Option<Color32> {
     match module_id {
-        "module.response_curve" | "display.oscilloscope" | "display.vectorscope" => {
-            SCOPE_COLORS.get(ch).copied()
+        "display.vectorscope" => SCOPE_COLORS.get(ch).copied(),
+        "display.oscilloscope" | "module.response_curve" => {
+            Some(MULTI_COLORS[ch % MULTI_COLORS.len()])
         }
+        // selector: ch 0 is "select" (no color), ch 1+ are the value inputs
+        "module.selector" => if ch == 0 { None } else { Some(MULTI_COLORS[(ch - 1) % MULTI_COLORS.len()]) },
+        // split: all outputs are colored
+        "module.split" => Some(MULTI_COLORS[ch % MULTI_COLORS.len()]),
         _ => None,
     }
 }
@@ -760,6 +906,23 @@ const SCOPE_COLORS: [Color32; 4] = [
     Color32::from_rgb(80,  220, 80),   // green
     Color32::from_rgb(80,  140, 255),  // blue
     Color32::from_rgb(255, 220, 50),   // yellow
+];
+
+// 12 perceptually-spread colors for multi-pin modules (selector inputs, split outputs, etc.).
+// The first four match SCOPE_COLORS so oscilloscope channels stay consistent.
+const MULTI_COLORS: [Color32; 12] = [
+    Color32::from_rgb(255, 80,  80),   //  0 red
+    Color32::from_rgb(80,  220, 80),   //  1 green
+    Color32::from_rgb(80,  140, 255),  //  2 blue
+    Color32::from_rgb(255, 220, 50),   //  3 yellow
+    Color32::from_rgb(80,  220, 220),  //  4 cyan
+    Color32::from_rgb(220, 80,  220),  //  5 magenta
+    Color32::from_rgb(255, 140, 40),   //  6 orange
+    Color32::from_rgb(140, 255, 80),   //  7 lime
+    Color32::from_rgb(180, 100, 255),  //  8 violet
+    Color32::from_rgb(255, 120, 160),  //  9 pink
+    Color32::from_rgb(40,  200, 160),  // 10 teal
+    Color32::from_rgb(200, 200, 80),   // 11 olive
 ];
 
 fn show_readout_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
@@ -781,7 +944,7 @@ fn show_readout_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
     );
 }
 
-fn show_oscilloscope_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     // ── Init params on first use ──────────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("osc_win")).unwrap_or(false);
     if needs_init {
@@ -803,9 +966,10 @@ fn show_oscilloscope_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
     }).unwrap_or((256, 1.0, false, false));
 
     let history = snarl.get_node(node_id).map(|n| n.extra.history.clone()).unwrap_or_default();
+    let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
     let n_total = history.len();
     let start   = n_total.saturating_sub(osc_win);
-    let visible: Vec<[Option<f32>; 4]> = history.iter().skip(start).cloned().collect();
+    let visible: Vec<Vec<Option<f32>>> = history.iter().skip(start).cloned().collect();
     let n       = visible.len();
 
     // Auto-scale: max absolute value across all visible channels.
@@ -855,9 +1019,9 @@ fn show_oscilloscope_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
 
                 // Signal lines.
                 if n >= 2 {
-                    for ch in 0..4 {
+                    for ch in 0..n_channels {
                         let pts: Vec<egui::Pos2> = visible.iter().enumerate().filter_map(|(i, s)| {
-                            s[ch].map(|v| {
+                            s.get(ch).copied().flatten().map(|v| {
                                 let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
                                 let norm = v / eff_scale;
                                 let y = if osc_uni {
@@ -869,7 +1033,7 @@ fn show_oscilloscope_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
                             })
                         }).collect();
                         for w in pts.windows(2) {
-                            painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, SCOPE_COLORS[ch]));
+                            painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, MULTI_COLORS[ch % MULTI_COLORS.len()]));
                         }
                     }
                 }
@@ -914,6 +1078,19 @@ fn show_oscilloscope_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
                 }
             }
         }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Ch").small().weak());
+            if ui.small_button("+").on_hover_text("Add channel").clicked() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    let next = node.inputs.len() + 1;
+                    node.inputs.push(PinDescriptor::new(format!("ch{}", next), SignalType::Float));
+                }
+            }
+            if n_channels > 1 && ui.small_button("−").on_hover_text("Remove channel").clicked() {
+                remove_input_pin(node_id, n_channels - 1, inputs, snarl);
+            }
+        });
     });
 }
 
@@ -1031,13 +1208,7 @@ fn show_lowpass_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
     }
 }
 
-const CURVE_CH_COLORS: [Color32; 3] = [
-    Color32::from_rgb(255, 80,  80),  // red   — channel 1
-    Color32::from_rgb(80,  220, 80),  // green — channel 2
-    Color32::from_rgb(80,  140, 255), // blue  — channel 3
-];
-
-fn show_response_curve_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     // ── Initialise params on first use ────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
@@ -1086,7 +1257,11 @@ fn show_response_curve_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
         })
         .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0, 300));
 
-    let live_inputs: Vec<Option<f32>> = (0..3)
+    let n_channels = snarl.get_node(node_id)
+        .map(|n| n.inputs.len().min(n.outputs.len()))
+        .unwrap_or(1)
+        .max(1);
+    let live_inputs: Vec<Option<f32>> = (0..n_channels)
         .map(|ch| snarl.get_node(node_id)
             .and_then(|n| n.extra.last_signals.get(ch)?.as_ref())
             .map(sig_f32))
@@ -1260,7 +1435,7 @@ fn show_response_curve_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
                     }
                     let trail_pts: Vec<(f32, std::time::Instant)> = trail.iter().cloned().collect();
                     ui.data_mut(|d| d.insert_temp(trail_id, trail));
-                    let ch_col = CURVE_CH_COLORS[ch];
+                    let ch_col = MULTI_COLORS[ch % MULTI_COLORS.len()];
                     for w in trail_pts.windows(2) {
                         let (x0, _)  = w[0];
                         let (x1, t1) = w[1];
@@ -1380,6 +1555,21 @@ fn show_response_curve_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
                 node.params.insert("trail_ms".into(), serde_json::json!(tm));
             }
         }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Ch").small().weak());
+            if ui.small_button("+").on_hover_text("Add parallel channel").clicked() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    let next = node.inputs.len() + 1;
+                    node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Float));
+                    node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Float));
+                }
+            }
+            if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
+                remove_input_pin(node_id, n_channels - 1, inputs, snarl);
+                remove_output_pin(node_id, n_channels - 1, outputs, snarl);
+            }
+        });
     });
 }
 

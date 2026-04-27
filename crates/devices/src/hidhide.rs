@@ -3,14 +3,18 @@
 // can hold Option<HidHideClient> without cfg noise at every use-site.
 
 // ── IOCTL codes (CTL_CODE results for HidHide driver) ────────────────────────
-// CTL_CODE(FILE_DEVICE_UNKNOWN=0x22, fn, METHOD_BUFFERED=0, access)
-// = (0x22<<16)|(access<<14)|(fn<<2)|0
-const IOCTL_GET_WHITELIST: u32 = 0x0022_6000; // access=FILE_READ_DATA(1),  fn=0x800
-const IOCTL_SET_WHITELIST: u32 = 0x0022_6004; // fn=0x801
-const IOCTL_GET_BLACKLIST: u32 = 0x0022_6008; // fn=0x802
-const IOCTL_SET_BLACKLIST: u32 = 0x0022_600C; // fn=0x803
-const IOCTL_GET_ACTIVE:    u32 = 0x0022_6010; // fn=0x804
-const IOCTL_SET_ACTIVE:    u32 = 0x0022_A014; // access=FILE_WRITE_DATA(2), fn=0x805
+// HidHide uses a custom device type (0x8001), NOT FILE_DEVICE_UNKNOWN (0x22).
+// All IOCTLs (both GET and SET) declare FILE_READ_DATA access — the driver
+// performs its own privilege checks internally rather than relying on the
+// I/O manager's handle-access validation.
+// CTL_CODE(0x8001, fn, METHOD_BUFFERED=0, FILE_READ_DATA=1)
+// = (0x8001<<16) | (1<<14) | (fn<<2) | 0
+const IOCTL_GET_WHITELIST: u32 = 0x8001_6000; // fn=0x800
+const IOCTL_SET_WHITELIST: u32 = 0x8001_6004; // fn=0x801
+const IOCTL_GET_BLACKLIST: u32 = 0x8001_6008; // fn=0x802
+const IOCTL_SET_BLACKLIST: u32 = 0x8001_600C; // fn=0x803
+const IOCTL_GET_ACTIVE:    u32 = 0x8001_6010; // fn=0x804
+const IOCTL_SET_ACTIVE:    u32 = 0x8001_6014; // fn=0x805
 
 // ── Windows-only Win32 declarations ──────────────────────────────────────────
 #[cfg(windows)]
@@ -65,6 +69,8 @@ mod win32 {
         ) -> i32;
 
         pub fn GetCurrentProcess() -> *mut c_void;
+
+        pub fn GetLastError() -> u32;
 
         pub fn QueryFullProcessImageNameW(
             h_process:  *mut c_void,
@@ -161,13 +167,12 @@ impl Drop for HidHideClient {
 
 impl HidHideClient {
     /// Returns `None` if HidHide is not installed or the control device cannot be opened.
+    /// Tries to open with read+write access first (needed by the driver's
+    /// internal access check on SET operations); falls back to read-only.
     pub fn try_open() -> Option<Self> {
         #[cfg(windows)] {
             use win32::*;
             let path = to_wide(r"\\.\HidHide");
-            // Try read+write first (needed for set_active/set_blacklist/set_whitelist).
-            // Fall back to read-only so the eye icon and blacklist queries still work
-            // when the process lacks write access (no admin, restricted group).
             for access in [GENERIC_READ | GENERIC_WRITE, GENERIC_READ] {
                 let handle = unsafe {
                     CreateFileW(
@@ -181,8 +186,16 @@ impl HidHideClient {
                     )
                 };
                 if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+                    let access_str = if access == (GENERIC_READ | GENERIC_WRITE) {
+                        "GENERIC_READ | GENERIC_WRITE"
+                    } else {
+                        "GENERIC_READ only"
+                    };
+                    eprintln!("[hidhide] try_open: succeeded with {}", access_str);
                     return Some(HidHideClient { handle });
                 }
+                let err = unsafe { GetLastError() };
+                eprintln!("[hidhide] try_open: access={:#010X} failed GetLastError={}", access, err);
             }
             None
         }
@@ -191,26 +204,54 @@ impl HidHideClient {
 
     #[cfg(windows)]
     fn ioctl_get(&self, code: u32) -> Vec<u16> {
-        let mut buf = vec![0u16; 32_768]; // 64 KB — plenty for any realistic list
+        // Phase 1: outputBufferLength=0 triggers the driver's size-query path,
+        // returning the number of bytes needed via lpBytesReturned.
+        let mut needed = 0u32;
+        let ok = unsafe {
+            win32::DeviceIoControl(
+                self.handle, code,
+                std::ptr::null(), 0,
+                std::ptr::null_mut(), 0,
+                &mut needed,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { win32::GetLastError() };
+            eprintln!("[hidhide] ioctl_get size-query(code={:#010X}) FAILED: GetLastError={}", code, err);
+            return vec![];
+        }
+        if needed == 0 {
+            return vec![]; // empty list
+        }
+        // Phase 2: fetch data using the exact byte count the driver reported.
+        let n_u16 = ((needed as usize) + 1) / 2; // bytes → u16, round up
+        let mut buf = vec![0u16; n_u16];
         let mut returned = 0u32;
         let ok = unsafe {
             win32::DeviceIoControl(
                 self.handle, code,
                 std::ptr::null(), 0,
                 buf.as_mut_ptr() as *mut std::ffi::c_void,
-                (buf.len() * 2) as u32,
+                needed,
                 &mut returned,
                 std::ptr::null_mut(),
             )
         };
-        if ok != 0 { buf.truncate(returned as usize / 2); } else { buf.clear(); }
+        if ok != 0 {
+            buf.truncate(returned as usize / 2);
+        } else {
+            let err = unsafe { win32::GetLastError() };
+            eprintln!("[hidhide] ioctl_get fetch(code={:#010X}) FAILED: GetLastError={}", code, err);
+            buf.clear();
+        }
         buf
     }
 
     #[cfg(windows)]
-    fn ioctl_set(&self, code: u32, data: &[u16]) {
+    fn ioctl_set(&self, code: u32, data: &[u16]) -> bool {
         let mut returned = 0u32;
-        unsafe {
+        let ok = unsafe {
             win32::DeviceIoControl(
                 self.handle, code,
                 data.as_ptr() as *const std::ffi::c_void,
@@ -218,8 +259,14 @@ impl HidHideClient {
                 std::ptr::null_mut(), 0,
                 &mut returned,
                 std::ptr::null_mut(),
-            );
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { win32::GetLastError() };
+            eprintln!("[hidhide] ioctl_set(code={:#X}, bytes={}) failed: GetLastError={}",
+                code, data.len() * 2, err);
         }
+        ok != 0
     }
 
     pub fn blacklist(&self) -> Vec<String> {
@@ -227,9 +274,9 @@ impl HidHideClient {
         #[cfg(not(windows))] { vec![] }
     }
 
-    pub fn set_blacklist(&self, list: &[String]) {
-        #[cfg(windows)] { self.ioctl_set(IOCTL_SET_BLACKLIST, &to_wide_multi(list)); }
-        let _ = list;
+    pub fn set_blacklist(&self, list: &[String]) -> bool {
+        #[cfg(windows)] { return self.ioctl_set(IOCTL_SET_BLACKLIST, &to_wide_multi(list)); }
+        #[cfg(not(windows))] { let _ = list; true }
     }
 
     pub fn whitelist(&self) -> Vec<String> {
@@ -263,13 +310,17 @@ impl HidHideClient {
         #[cfg(windows)] {
             let val = active as u8;
             let mut returned = 0u32;
-            unsafe {
+            let ok = unsafe {
                 win32::DeviceIoControl(
                     self.handle, IOCTL_SET_ACTIVE,
                     &val as *const u8 as *const std::ffi::c_void, 1,
                     std::ptr::null_mut(), 0,
                     &mut returned, std::ptr::null_mut(),
-                );
+                )
+            };
+            if ok == 0 {
+                let err = unsafe { win32::GetLastError() };
+                eprintln!("[hidhide] set_active({}) failed: GetLastError={}", active, err);
             }
         }
         let _ = active;
@@ -282,16 +333,53 @@ impl HidHideClient {
     }
 
     /// Adds or removes `instance_id` from the blacklist.
-    pub fn set_hidden(&self, instance_id: &str, hidden: bool) {
-        let mut list = self.blacklist();
+    /// Returns a human-readable status string describing the outcome.
+    pub fn set_hidden(&self, instance_id: &str, hidden: bool) -> String {
+        let before = self.blacklist();
+        let mut list = before.clone();
         let upper = instance_id.to_uppercase();
         let present = list.iter().any(|s| s.to_uppercase() == upper);
-        if hidden && !present {
-            list.push(instance_id.to_uppercase());
-            self.set_blacklist(&list);
+        let did_change = if hidden && !present {
+            list.push(instance_id.to_string());
+            true
         } else if !hidden && present {
             list.retain(|s| s.to_uppercase() != upper);
-            self.set_blacklist(&list);
+            true
+        } else {
+            return format!("no change (already {})", if hidden { "hidden" } else { "visible" });
+        };
+        let _ = did_change;
+        eprintln!("[hidhide] set_hidden: writing id={:?} hidden={}", instance_id, hidden);
+        let ok = self.set_blacklist(&list);
+        let after = self.blacklist();
+        eprintln!(
+            "[hidhide] set_hidden — before={} wrote={} after={} ioctl_ok={}",
+            before.len(), list.len(), after.len(), ok
+        );
+        eprintln!("[hidhide] after contents: {:?}", after);
+        let now_present = after.iter().any(|s| s.to_uppercase() == upper);
+        if !ok {
+            return "IOCTL failed (see stderr)".to_string();
+        }
+        // Always include before/after counts and any obviously-different stored
+        // path so we can see what the driver actually persisted.
+        let before_n = before.len();
+        let after_n = after.len();
+        let summary = format!("before={before_n} wrote={} after={after_n}", list.len());
+        if hidden && !now_present {
+            // Did the driver perhaps store a normalized variant?
+            let near = after.iter().find(|s| {
+                let u = s.to_uppercase();
+                u.contains(&upper[..upper.len().min(20)]) || upper.contains(&u[..u.len().min(20)])
+            });
+            match near {
+                Some(p) => format!("DRIVER NORMALIZED PATH ({summary}) — stored as: {p}"),
+                None => format!("WRITE DROPPED ({summary}) — registry write was silently rejected by driver"),
+            }
+        } else if !hidden && now_present {
+            format!("REMOVE DROPPED ({summary}) — path still present after write")
+        } else {
+            format!("OK ({summary})")
         }
     }
 
@@ -312,7 +400,7 @@ impl HidHideClient {
             let mut size = buf.len() as u32;
             let ok = unsafe {
                 win32::QueryFullProcessImageNameW(
-                    win32::GetCurrentProcess(), 0,
+                    win32::GetCurrentProcess(), 1,
                     buf.as_mut_ptr(), &mut size,
                 )
             };
@@ -438,8 +526,10 @@ pub fn physical_count_for_vid_pid(vid: u16, pid: u16) -> usize {
 }
 
 /// Finds the Windows device instance ID (e.g. `HID\VID_054C&PID_09CC\5&...`)
-/// for the first NON-ViGEmBus device matching the given VID and PID.
-/// Returns `None` when only virtual (IG_) instances exist.
+/// for the first NON-ViGEmBus HID device matching the given VID and PID.
+/// HidHide operates on HID-class devices, so paths starting with `HID\` are
+/// preferred over USB composite parents (`USB\…`) which HidHide cannot hide.
+/// Falls back to a non-HID match only when no HID instance exists.
 pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
     #[cfg(windows)] {
         use win32::*;
@@ -461,7 +551,8 @@ pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
         // Bluetooth HID: BTHENUM\{GUID}_VID&02057E_PID&2009_REV&...
         let needle_usb = format!("VID_{:04X}&PID_{:04X}", vid, pid);
         let needle_bt  = format!("VID&02{:04X}_PID&{:04X}", vid, pid);
-        let mut result = None;
+        let mut hid_result: Option<String> = None;
+        let mut other_result: Option<String> = None;
         let mut idx = 0u32;
 
         loop {
@@ -508,17 +599,28 @@ pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
             } != 0 {
                 let len = (id_size as usize).saturating_sub(1);
                 let s = String::from_utf16_lossy(&id_buf[..len]);
-                if !s.to_uppercase().contains("IG_") {
-                    // Prefer the first physical (non-ViGEmBus) device.
-                    result = Some(s);
-                    break;
+                let upper = s.to_uppercase();
+                if upper.contains("IG_") { continue; } // ViGEmBus virtual
+
+                // Prefer HID-class devices since HidHide only hides those.
+                // BTHHID covers Bluetooth HID; some Windows builds expose the
+                // HID device directly under HID\{class-guid}_… as well.
+                let is_hid = upper.starts_with("HID\\")
+                    || upper.starts_with("BTHHID\\");
+                if is_hid {
+                    if hid_result.is_none() { hid_result = Some(s); }
+                } else if other_result.is_none() {
+                    other_result = Some(s);
                 }
-                // IG_ device: skip (it's a ViGEmBus virtual controller).
             }
         }
 
         unsafe { SetupDiDestroyDeviceInfoList(hdevinfo); }
-        result
+        let chosen = hid_result.or(other_result);
+        #[cfg(debug_assertions)]
+        eprintln!("[hidhide] instance_id_for_vid_pid({:04X},{:04X}) = {:?}",
+            vid, pid, chosen);
+        chosen
     }
     #[cfg(not(windows))] { let _ = (vid, pid); None }
 }

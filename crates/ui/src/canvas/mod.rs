@@ -20,6 +20,9 @@ struct UiPatch {
     snarl: Snarl<NodeData>,
     /// IDs of virtual output devices that were active (e.g. `"virtual.xinput.0"`).
     virtual_device_ids: Vec<String>,
+    /// Exe filenames that auto-switch to this tab (e.g. `["game.exe"]`).
+    #[serde(default)]
+    bound_exes: Vec<String>,
 }
 
 pub struct Canvas {
@@ -320,7 +323,7 @@ impl Canvas {
 
 impl Canvas {
     /// Serialize the canvas + virtual device list to a `.fxp` file chosen by the user.
-    pub fn save_patch(&self, virtual_device_ids: Vec<String>) {
+    pub fn save_patch(&self, virtual_device_ids: Vec<String>, bound_exes: Vec<String>) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("FlexInput Patch", &["fxp"])
             .set_file_name("patch.fxp")
@@ -331,25 +334,26 @@ impl Canvas {
             version: 1,
             snarl: self.snarl.clone(),
             virtual_device_ids,
+            bound_exes,
         };
         if let Ok(json) = serde_json::to_string_pretty(&patch) {
             let _ = std::fs::write(path, json);
         }
     }
 
-    /// Open a `.fxp` file and return the loaded Canvas plus saved virtual device IDs.
+    /// Open a `.fxp` file and return the loaded Canvas, virtual device IDs, bound exes, and path.
     /// Returns `None` if the user cancels or the file is invalid.
-    pub fn load_patch() -> Option<(Canvas, Vec<String>)> {
+    pub fn load_patch() -> Option<(Canvas, Vec<String>, Vec<String>, std::path::PathBuf)> {
         let path = rfd::FileDialog::new()
             .add_filter("FlexInput Patch", &["fxp"])
             .pick_file()?;
 
-        let json = std::fs::read_to_string(path).ok()?;
+        let json = std::fs::read_to_string(&path).ok()?;
         let patch: UiPatch = serde_json::from_str(&json).ok()?;
 
         let mut canvas = Canvas::new();
         canvas.snarl = patch.snarl;
-        Some((canvas, patch.virtual_device_ids))
+        Some((canvas, patch.virtual_device_ids, patch.bound_exes, path))
     }
 }
 

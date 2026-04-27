@@ -1,12 +1,18 @@
 use flexinput_core::{Module, ModuleDescriptor, ModuleRegistration, PinDescriptor, Signal, SignalType};
 use smallvec::SmallVec;
 
+use crate::util::get_float;
+
 pub fn registrations() -> Vec<ModuleRegistration> {
     vec![
         reg::<ConstantModule>(),
         reg::<SwitchModule>(),
         reg::<KnobModule>(),
         reg::<SelectorModule>(),
+        ModuleRegistration {
+            descriptor: SplitModule::descriptor(),
+            factory: || Box::new(SplitModule::default()),
+        },
     ]
 }
 
@@ -80,8 +86,7 @@ impl Module for KnobModule {
 
 // ── Selector ──────────────────────────────────────────────────────────────────
 
-/// Routes `in_0` or `in_1` to `out` depending on the Bool `select` input.
-/// select=false → in_0, select=true → in_1.
+/// Routes one of N value inputs to `out` based on `select` (Float 0..1, quantized to N slots).
 #[derive(Default)]
 pub struct SelectorModule;
 
@@ -92,7 +97,7 @@ impl Module for SelectorModule {
             display_name: "Selector",
             category: "Utility",
             inputs: vec![
-                PinDescriptor::new("select", SignalType::Bool),
+                PinDescriptor::new("select", SignalType::Float),
                 PinDescriptor::new("in_0",   SignalType::Float),
                 PinDescriptor::new("in_1",   SignalType::Float),
             ],
@@ -100,13 +105,55 @@ impl Module for SelectorModule {
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
-        let sel = inputs.first().and_then(|s| *s)
-            .and_then(|s| if let Signal::Bool(b) = s { Some(b) } else { None })
-            .unwrap_or(false);
-        let v = if sel { inputs.get(2) } else { inputs.get(1) };
-        match v.and_then(|s| *s) {
+        if inputs.len() < 2 { return SmallVec::new(); }
+        let n = (inputs.len() - 1) as f32;
+        let sel = get_float(inputs, 0, 0.0);
+        let idx = (sel.clamp(0.0, 1.0) * n).floor() as usize;
+        let idx = idx.min(inputs.len() - 2);
+        match inputs.get(idx + 1).and_then(|s| *s) {
             Some(sig) => { let mut r = SmallVec::new(); r.push(sig); r }
             None => SmallVec::new(),
         }
+    }
+}
+
+// ── Split ─────────────────────────────────────────────────────────────────────
+
+/// Routes `in` to one of N outputs based on `select` (Float 0..1); unselected outputs emit 0.0.
+pub struct SplitModule {
+    pub n_outputs: usize,
+}
+
+impl Default for SplitModule {
+    fn default() -> Self { Self { n_outputs: 2 } }
+}
+
+impl Module for SplitModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.split",
+            display_name: "Split",
+            category: "Utility",
+            inputs: vec![
+                PinDescriptor::new("select", SignalType::Float),
+                PinDescriptor::new("in",     SignalType::Float),
+            ],
+            outputs: vec![
+                PinDescriptor::new("out_0", SignalType::Float),
+                PinDescriptor::new("out_1", SignalType::Float),
+            ],
+        }
+    }
+    fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        let n = self.n_outputs.max(1);
+        let sel = get_float(inputs, 0, 0.0);
+        let val = get_float(inputs, 1, 0.0);
+        let idx = (sel.clamp(0.0, 1.0) * n as f32).floor() as usize;
+        let idx = idx.min(n - 1);
+        let mut r = SmallVec::new();
+        for i in 0..n {
+            r.push(Signal::Float(if i == idx { val } else { 0.0 }));
+        }
+        r
     }
 }

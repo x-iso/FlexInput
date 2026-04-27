@@ -45,7 +45,7 @@ impl Module for Add {
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
-        out_f(get_float(inputs, 0, 0.0) + get_float(inputs, 1, 0.0))
+        out_f((0..inputs.len()).map(|i| get_float(inputs, i, 0.0)).sum())
     }
 }
 
@@ -65,7 +65,9 @@ impl Module for Subtract {
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
-        out_f(get_float(inputs, 0, 0.0) - get_float(inputs, 1, 0.0))
+        let first = get_float(inputs, 0, 0.0);
+        let rest: f32 = (1..inputs.len()).map(|i| get_float(inputs, i, 0.0)).sum();
+        out_f(first - rest)
     }
 }
 
@@ -85,7 +87,9 @@ impl Module for Multiply {
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
-        out_f(get_float(inputs, 0, 0.0) * get_float(inputs, 1, 1.0))
+        let first = get_float(inputs, 0, 0.0);
+        let rest: f32 = (1..inputs.len()).map(|i| get_float(inputs, i, 1.0)).product();
+        out_f(first * rest)
     }
 }
 
@@ -105,8 +109,12 @@ impl Module for Divide {
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
-        let b = get_float(inputs, 1, 1.0);
-        out_f(if b == 0.0 { 0.0 } else { get_float(inputs, 0, 0.0) / b })
+        let mut v = get_float(inputs, 0, 0.0);
+        for i in 1..inputs.len() {
+            let d = get_float(inputs, i, 1.0);
+            v = if d == 0.0 { 0.0 } else { v / d };
+        }
+        out_f(v)
     }
 }
 

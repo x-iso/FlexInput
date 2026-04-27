@@ -4,3 +4,7 @@
 *.fxm
 .vs/
 .claude/
+.qwen/
+.opencode/
+.agent/
+.github

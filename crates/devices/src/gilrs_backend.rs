@@ -82,9 +82,8 @@ impl DeviceBackend for GilrsBackend {
                     }
                 }
 
-                let vid_pid = pad.vendor_id().zip(pad.product_id());
-                let instance_path = vid_pid
-                    .and_then(|(vid, pid)| crate::hidhide::instance_id_for_vid_pid(vid, pid));
+                // instance_path is only needed for HidHide; skip the SetupAPI scan for now.
+                let instance_path: Option<String> = None;
 
                 let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
                 let display_name = if kind == ControllerKind::Generic {
@@ -106,6 +105,10 @@ impl DeviceBackend for GilrsBackend {
 
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
         while self.gilrs.next_event().is_some() {}
+
+        // Flush staged rumble / lightbar outputs *before* reading inputs so any
+        // device.sink writes from the previous frame land on the controller.
+        self.gyro.flush_outputs();
 
         let mut out = Vec::new();
         // Track per-(VID,PID) instance index for gyro correlation.
@@ -139,6 +142,19 @@ impl DeviceBackend for GilrsBackend {
                 out.push((dev.clone(), "dpad".into(), Signal::Vec2(Vec2::new(dx, dy))));
             }
 
+            // Analog triggers: ButtonData::value() works for both XInput and native HID.
+            // Switch Pro ZL/ZR are digital-only and handled by button_map already.
+            if !matches!(kind, ControllerKind::SwitchPro) {
+                let lt = pad.button_data(Button::LeftTrigger2).map_or(0.0, |d| d.value());
+                let rt = pad.button_data(Button::RightTrigger2).map_or(0.0, |d| d.value());
+                let (l_pin, r_pin) = match kind {
+                    ControllerKind::DualShock4 | ControllerKind::DualSense => ("l2", "r2"),
+                    _ => ("left_trigger", "right_trigger"),
+                };
+                out.push((dev.clone(), l_pin.into(), Signal::Float(lt)));
+                out.push((dev.clone(), r_pin.into(), Signal::Float(rt)));
+            }
+
             // Gyro via raw HID for DS4 / DualSense.
             if let Some((vid, pid)) = pad.vendor_id().zip(pad.product_id()) {
                 let vp = (vid, pid);
@@ -152,11 +168,65 @@ impl DeviceBackend for GilrsBackend {
                     out.push((dev.clone(), "accel_x".into(), Signal::Float(g.accel_x)));
                     out.push((dev.clone(), "accel_y".into(), Signal::Float(g.accel_y)));
                     out.push((dev.clone(), "accel_z".into(), Signal::Float(g.accel_z)));
+                    if g.has_touchpad {
+                        out.push((dev.clone(), "touch1_x".into(),      Signal::Float(g.touch1.x)));
+                        out.push((dev.clone(), "touch1_y".into(),      Signal::Float(g.touch1.y)));
+                        out.push((dev.clone(), "touch1_active".into(), Signal::Bool(g.touch1.active)));
+                        out.push((dev.clone(), "touch2_x".into(),      Signal::Float(g.touch2.x)));
+                        out.push((dev.clone(), "touch2_y".into(),      Signal::Float(g.touch2.y)));
+                        out.push((dev.clone(), "touch2_active".into(), Signal::Bool(g.touch2.active)));
+                        // gilrs's Windows backend doesn't fire Button::C for the touchpad
+                        // click on DS4/DualSense, and DualSense's mute button isn't mapped
+                        // at all — so we override with the values parsed from the raw HID
+                        // report. Pushed last so the per-frame HashMap lookup wins.
+                        out.push((dev.clone(), "btn_touchpad".into(),  Signal::Bool(g.touchpad_click)));
+                    }
+                    if matches!(kind, ControllerKind::DualSense) {
+                        out.push((dev.clone(), "btn_mute".into(),      Signal::Bool(g.mic_button)));
+                    }
                 }
             }
         }
 
         out
+    }
+
+    fn send(&mut self, device_id: &str, pin_id: &str, signal: Signal) {
+        // Currently only physical PlayStation controllers (DS4/DualSense) are
+        // wired up via the raw-HID path in GyroManager. XInput rumble would
+        // need a separate gilrs ff_handle path.
+        let (vid, pid, idx) = match self.lookup_phys(device_id) {
+            Some(t) => t,
+            None => return,
+        };
+        let byte = match signal {
+            Signal::Float(f) => (f.clamp(0.0, 1.0) * 255.0) as u8,
+            Signal::Bool(b)  => if b { 255 } else { 0 },
+            _ => return,
+        };
+        self.gyro.set_output_byte(vid, pid, idx, pin_id, byte);
+    }
+}
+
+impl GilrsBackend {
+    /// Resolve a `gilrs:N` device id to the (vid, pid, instance index) tuple
+    /// that GyroManager keys its open HID handles by. Walks gilrs.gamepads()
+    /// in the same order as `poll()` to keep the per-(vid,pid) index aligned.
+    fn lookup_phys(&self, device_id: &str) -> Option<(u16, u16, usize)> {
+        let mut idx_per: HashMap<(u16, u16), usize> = HashMap::new();
+        for (id, pad) in self.gilrs.gamepads() {
+            let dev = format!("gilrs:{}", usize::from(id));
+            let vp = pad.vendor_id().zip(pad.product_id());
+            if dev == device_id {
+                let (v, p) = vp?;
+                let idx = *idx_per.get(&(v, p)).unwrap_or(&0);
+                return Some((v, p, idx));
+            }
+            if let Some((v, p)) = vp {
+                *idx_per.entry((v, p)).or_insert(0) += 1;
+            }
+        }
+        None
     }
 }
 
@@ -177,8 +247,8 @@ const AXIS_MAP_STANDARD: &[(Axis, &str)] = &[
     (Axis::LeftStickY,  "left_stick_y"),
     (Axis::RightStickX, "right_stick_x"),
     (Axis::RightStickY, "right_stick_y"),
-    (Axis::LeftZ,       "left_trigger"),
-    (Axis::RightZ,      "right_trigger"),
+    // Triggers emitted separately via ButtonData::value() — Axis::LeftZ/RightZ
+    // is not reliably populated on all Windows gilrs backends.
     (Axis::DPadX,       "dpad_x"),
     (Axis::DPadY,       "dpad_y"),
 ];
@@ -188,8 +258,7 @@ const AXIS_MAP_DS4: &[(Axis, &str)] = &[
     (Axis::LeftStickY,  "left_stick_y"),
     (Axis::RightStickX, "right_stick_x"),
     (Axis::RightStickY, "right_stick_y"),
-    (Axis::LeftZ,       "l2"),
-    (Axis::RightZ,      "r2"),
+    // Triggers emitted separately via ButtonData::value().
     (Axis::DPadX,       "dpad_x"),
     (Axis::DPadY,       "dpad_y"),
 ];
