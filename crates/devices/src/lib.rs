@@ -13,12 +13,14 @@ pub use hidhide::HidHideClient;
 pub use identification::ControllerKind;
 pub use midi::MidiBackend;
 
+#[derive(Clone)]
 pub struct DevicePin {
     pub id: String,
     pub display_name: String,
     pub signal_type: SignalType,
 }
 
+#[derive(Clone)]
 pub struct PhysicalDevice {
     pub id: String,
     pub display_name: String,

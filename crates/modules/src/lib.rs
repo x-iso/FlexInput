@@ -1,6 +1,7 @@
 mod util;
 pub mod controls;
 pub mod display;
+pub mod generator;
 pub mod logic;
 pub mod math;
 pub mod processing;
@@ -15,5 +16,6 @@ pub fn all_modules() -> Vec<ModuleRegistration> {
     modules.extend(logic::registrations());
     modules.extend(display::registrations());
     modules.extend(processing::registrations());
+    modules.extend(generator::registrations());
     modules
 }

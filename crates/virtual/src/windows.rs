@@ -128,6 +128,17 @@ impl VirtualDevice for VirtualXInput {
         };
         let _ = target.update(&report);
     }
+
+    fn reset_outputs(&mut self) {
+        self.buttons = 0;
+        self.left_trigger = 0;
+        self.right_trigger = 0;
+        self.thumb_lx = 0;
+        self.thumb_ly = 0;
+        self.thumb_rx = 0;
+        self.thumb_ry = 0;
+        self.flush();
+    }
 }
 
 // ── DS4 (custom implementation with gyro support via DS4ReportEx IOCTL) ────────
@@ -543,6 +554,19 @@ impl VirtualDevice for VirtualDS4 {
             );
         }
     }
+
+    fn reset_outputs(&mut self) {
+        let center = ds4_axis_x(0.0); // 127 — neutral stick position
+        self.lx = center; self.ly = center;
+        self.rx = center; self.ry = center;
+        self.lt = 0; self.rt = 0;
+        self.buttons = 0;
+        self.special = 0;
+        self.dpad = [false; 4];
+        self.gyro_x = 0.0; self.gyro_y = 0.0; self.gyro_z = 0.0;
+        self.accel_x = 0.0; self.accel_y = 0.0; self.accel_z = 0.0;
+        self.flush();
+    }
 }
 
 // ── Keyboard & Mouse ──────────────────────────────────────────────────────────
@@ -837,6 +861,21 @@ impl VirtualDevice for VirtualKeyMouse {
                 self.os_learned_keys.insert(pin_name, false);
             }
         }
+    }
+
+    fn reset_outputs(&mut self) {
+        self.mouse_vel_x = 0.0;
+        self.mouse_vel_y = 0.0;
+        self.scroll_delta = 0;
+        self.buttons = MouseButtons::default();
+        self.keys = KeysHeld::default();
+        for v in self.learned_keys.values_mut() { *v = false; }
+        // Flush with muted=true so the mouse thread gets zero velocity and all
+        // keys/buttons are released via the existing muted-release path.
+        let prev_muted = self.muted;
+        self.muted = true;
+        self.flush();
+        self.muted = prev_muted;
     }
 }
 

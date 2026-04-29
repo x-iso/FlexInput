@@ -5,6 +5,7 @@ use egui_snarl::{
 };
 use flexinput_core::{ModuleDescriptor, PinDescriptor, Signal, SignalType};
 use flexinput_devices::midi::cc_display_name;
+use flexinput_engine::SAMPLE_RATE;
 use serde_json::{Number, Value};
 
 use super::{curve::sample_curve, node::NodeData};
@@ -128,9 +129,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             node.module_id.as_str(),
             "device.sink" | "module.constant" | "module.switch" | "module.knob"
                 | "display.readout" | "display.oscilloscope" | "display.vectorscope"
-                | "module.delay" | "module.lowpass" | "module.response_curve"
+                | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve"
                 | "math.add" | "math.subtract" | "math.multiply" | "math.divide"
                 | "module.selector" | "module.split"
+                | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
+                | "generator.oscillator" | "processing.gyro_3dof"
         )
     }
 
@@ -168,15 +171,22 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.knob"          => show_knob_body(node_id, ui, snarl),
             "display.readout"       => show_readout_body(node_id, ui, snarl),
             "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl),
-            "display.vectorscope"   => show_vectorscope_body(node_id, ui, snarl),
-            "module.delay"          => show_delay_body(node_id, ui, snarl),
-            "module.lowpass"        => show_lowpass_body(node_id, ui, snarl),
-            "module.response_curve" => show_response_curve_body(node_id, inputs, outputs, ui, snarl),
+            "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl),
+            "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl),
+            "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl),
+            "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl),
+            "module.response_curve"     => show_response_curve_body(node_id, inputs, outputs, ui, snarl),
+            "module.vec_response_curve" => show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl),
             "math.add" | "math.subtract" | "math.multiply" | "math.divide" => {
                 show_math_variadic_body(node_id, inputs, ui, snarl);
             }
             "module.selector" => show_selector_body(node_id, inputs, ui, snarl),
             "module.split"    => show_split_body(node_id, outputs, ui, snarl),
+            "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl),
+            "logic.delay"   => show_logic_delay_body(node_id, ui, snarl),
+            "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl),
+            "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl),
+            "processing.gyro_3dof"  => show_gyro_3dof_body(node_id, ui, snarl),
             _ => {}
         }
     }
@@ -572,6 +582,9 @@ fn show_selector_body(
 ) {
     // inputs[0] = select (fixed); inputs[1..] = in_0, in_1, ... (dynamic)
     let n_value = snarl.get_node(node_id).map(|n| n.inputs.len().saturating_sub(1)).unwrap_or(2);
+    let mut interp = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("interpolate").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
 
     ui.vertical(|ui| {
         ui.set_min_width(80.0);
@@ -596,6 +609,13 @@ fn show_selector_body(
                 node.inputs.push(PinDescriptor::new(format!("in_{next}"), SignalType::Float));
             }
         }
+        let interp_before = interp;
+        ui.checkbox(&mut interp, egui::RichText::new("Interp").small());
+        if interp != interp_before {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("interpolate".to_string(), Value::Bool(interp));
+            }
+        }
     });
 }
 
@@ -608,6 +628,9 @@ fn show_split_body(
     snarl: &mut Snarl<NodeData>,
 ) {
     let n_out = snarl.get_node(node_id).map(|n| n.outputs.len()).unwrap_or(2);
+    let mut interp = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("interpolate").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
 
     ui.vertical(|ui| {
         ui.set_min_width(80.0);
@@ -630,6 +653,13 @@ fn show_split_body(
             if let Some(node) = snarl.get_node_mut(node_id) {
                 let next = node.outputs.len();
                 node.outputs.push(PinDescriptor::new(format!("out_{next}"), SignalType::Float));
+            }
+        }
+        let interp_before = interp;
+        ui.checkbox(&mut interp, egui::RichText::new("Interp").small());
+        if interp != interp_before {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("interpolate".to_string(), Value::Bool(interp));
             }
         }
     });
@@ -736,6 +766,299 @@ fn show_switch_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDa
     }
 }
 
+fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (shape, freq_unit, freq_p, phase_p, bipolar) = snarl.get_node(node_id).map(|n| {
+        let shape      = n.params.get("shape")     .and_then(|v| v.as_str()) .unwrap_or("sine").to_string();
+        let freq_unit  = n.params.get("freq_unit") .and_then(|v| v.as_str()) .unwrap_or("hz").to_string();
+        let freq_p     = n.params.get("freq_param") .and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
+        let phase_p    = n.params.get("phase_param").and_then(|v| v.as_f64()).unwrap_or(0.0)  as f32;
+        let bipolar    = n.params.get("bipolar")   .and_then(|v| v.as_bool()).unwrap_or(true);
+        (shape, freq_unit, freq_p, phase_p, bipolar)
+    }).unwrap_or_default();
+
+    let freq_wired  = inputs.get(0).map(|p| !p.remotes.is_empty()).unwrap_or(false);
+    let phase_wired = inputs.get(1).map(|p| !p.remotes.is_empty()).unwrap_or(false);
+
+    let mut shape     = shape;
+    let mut freq_unit = freq_unit;
+    let mut freq_p    = freq_p;
+    let mut phase_p   = phase_p;
+    let mut bipolar   = bipolar;
+    let mut changed   = false;
+
+    ui.vertical(|ui| {
+        // Row 1: shape selector
+        ui.horizontal(|ui| {
+            changed |= ui.selectable_value(&mut shape, "sine".into(),     egui::RichText::new("Sine").small()).changed();
+            changed |= ui.selectable_value(&mut shape, "triangle".into(), egui::RichText::new("Tri").small()).changed();
+            changed |= ui.selectable_value(&mut shape, "saw".into(),      egui::RichText::new("Saw").small()).changed();
+            changed |= ui.selectable_value(&mut shape, "square".into(),   egui::RichText::new("Sqr").small()).changed();
+        });
+
+        // Row 2: frequency unit toggle + value
+        ui.horizontal(|ui| {
+            changed |= ui.selectable_value(&mut freq_unit, "hz".into(), egui::RichText::new("Hz").small()).changed();
+            changed |= ui.selectable_value(&mut freq_unit, "ms".into(), egui::RichText::new("ms").small()).changed();
+            let (lo, hi, spd) = if freq_unit == "hz" { (0.01, 200.0, 0.1) } else { (1.0, 60_000.0, 10.0) };
+            changed |= ui.add_enabled(!freq_wired, egui::DragValue::new(&mut freq_p).speed(spd).range(lo..=hi)).changed();
+        });
+
+        // Row 3: phase offset
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Phase").small().weak());
+            changed |= ui.add_enabled(!phase_wired, egui::DragValue::new(&mut phase_p).speed(0.01).range(0.0..=1.0)).changed();
+            // Bi/Uni toggle
+            ui.separator();
+            changed |= ui.selectable_value(&mut bipolar, true,  egui::RichText::new("Bi").small()).changed();
+            changed |= ui.selectable_value(&mut bipolar, false, egui::RichText::new("Uni").small()).changed();
+        });
+
+        // Row 4: waveform preview
+        let preview_size = egui::vec2(ui.available_width().max(80.0), 36.0);
+        let (rect, _) = ui.allocate_exact_size(preview_size, egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, egui::Color32::from_gray(18));
+
+            // Zero / baseline grid line
+            let zero_y = if bipolar {
+                rect.center().y
+            } else {
+                rect.bottom()
+            };
+            painter.line_segment(
+                [egui::pos2(rect.left(), zero_y), egui::pos2(rect.right(), zero_y)],
+                egui::Stroke::new(0.5, egui::Color32::from_gray(55)),
+            );
+
+            // Waveform
+            let n = 128usize;
+            let pts: Vec<egui::Pos2> = (0..=n).map(|i| {
+                let t = i as f32 / n as f32;
+                let phase = (t + phase_p).rem_euclid(1.0);
+                let v = {
+                    let raw = flexinput_engine::osc_sample(&shape, phase);
+                    if bipolar { raw } else { (raw + 1.0) * 0.5 }
+                };
+                let x = rect.left() + t * rect.width();
+                let y = if bipolar {
+                    rect.center().y - v * rect.height() * 0.45
+                } else {
+                    rect.bottom() - v * rect.height() * 0.9
+                };
+                egui::pos2(x, y.clamp(rect.top(), rect.bottom()))
+            }).collect();
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 180, 255))));
+        }
+    });
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("shape".into(),      Value::String(shape));
+            node.params.insert("freq_unit".into(),  Value::String(freq_unit));
+            node.params.insert("bipolar".into(),    Value::Bool(bipolar));
+            if let Some(n) = Number::from_f64(freq_p  as f64) { node.params.insert("freq_param".into(),  Value::Number(n)); }
+            if let Some(n) = Number::from_f64(phase_p as f64) { node.params.insert("phase_param".into(), Value::Number(n)); }
+        }
+    }
+}
+
+fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (mode, inv_yaw, inv_pitch, inv_roll, inv_ax, inv_ay, inv_az, out_x, out_y) =
+        snarl.get_node(node_id).map(|n| {
+            let mode      = n.params.get("mode")      .and_then(|v| v.as_str()) .unwrap_or("local").to_string();
+            let inv_yaw   = n.params.get("inv_yaw")   .and_then(|v| v.as_bool()).unwrap_or(false);
+            let inv_pitch = n.params.get("inv_pitch")  .and_then(|v| v.as_bool()).unwrap_or(false);
+            let inv_roll  = n.params.get("inv_roll")   .and_then(|v| v.as_bool()).unwrap_or(false);
+            let inv_ax    = n.params.get("inv_accel_x").and_then(|v| v.as_bool()).unwrap_or(false);
+            let inv_ay    = n.params.get("inv_accel_y").and_then(|v| v.as_bool()).unwrap_or(false);
+            let inv_az    = n.params.get("inv_accel_z").and_then(|v| v.as_bool()).unwrap_or(false);
+            let out_x = if let Some(Some(Signal::Float(f))) = n.extra.last_signals.get(1) { *f } else { 0.0_f32 };
+            let out_y = if let Some(Some(Signal::Float(f))) = n.extra.last_signals.get(2) { *f } else { 0.0_f32 };
+            (mode, inv_yaw, inv_pitch, inv_roll, inv_ax, inv_ay, inv_az, out_x, out_y)
+        }).unwrap_or_default();
+
+    let mut mode      = mode;
+    let mut inv_gyro  = [inv_yaw, inv_pitch, inv_roll];
+    let mut inv_accel = [inv_ax, inv_ay, inv_az];
+    let mut changed   = false;
+
+    const GYR_LABELS: [(&str, &str); 3] = [
+        ("yaw",   "gyro_z — invert if rotating right gives negative X\n(expected: right = positive X)"),
+        ("pitch", "gyro_y — invert if tilting up gives negative Y\n(expected: up = positive Y)"),
+        ("roll",  "gyro_x — only affects Player/World space gravity correction"),
+    ];
+    const ACC_LABELS: [(&str, &str); 3] = [
+        ("X",  "accel_x — invert if Player/World horizontal correction is backwards"),
+        ("Y",  "accel_y — invert if Player/World vertical correction is backwards"),
+        ("+Z", "accel_z — expected POSITIVE when controller is held flat face-up (≈ +1 G).\nInvert if your device reports negative when flat."),
+    ];
+
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (label, id) in [("Local", "local"), ("Player", "player"), ("World", "world"), ("Laser", "laser")] {
+                changed |= ui.selectable_value(&mut mode, id.to_string(), egui::RichText::new(label).small()).changed();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.label(egui::RichText::new("Gyr:").small().weak());
+            for i in 0..3 {
+                let (label, tip) = GYR_LABELS[i];
+                changed |= ui.checkbox(&mut inv_gyro[i], egui::RichText::new(label).small())
+                    .on_hover_text(tip).changed();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.label(egui::RichText::new("Acc:").small().weak());
+            for i in 0..3 {
+                let (label, tip) = ACC_LABELS[i];
+                changed |= ui.checkbox(&mut inv_accel[i], egui::RichText::new(label).small())
+                    .on_hover_text(tip).changed();
+            }
+        });
+
+        ui.label(egui::RichText::new(format!("X:{:+.3}  Y:{:+.3}", out_x, out_y)).small().weak());
+    });
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("mode".into(),       Value::String(mode));
+            node.params.insert("inv_yaw".into(),    Value::Bool(inv_gyro[0]));
+            node.params.insert("inv_pitch".into(),  Value::Bool(inv_gyro[1]));
+            node.params.insert("inv_roll".into(),   Value::Bool(inv_gyro[2]));
+            node.params.insert("inv_accel_x".into(),Value::Bool(inv_accel[0]));
+            node.params.insert("inv_accel_y".into(),Value::Bool(inv_accel[1]));
+            node.params.insert("inv_accel_z".into(),Value::Bool(inv_accel[2]));
+        }
+    }
+}
+
+fn show_counter_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (mode, normalized, step_p, min_p, max_p) = snarl.get_node(node_id).map(|n| {
+        let mode       = n.params.get("mode")      .and_then(|v| v.as_str()) .unwrap_or("loop").to_string();
+        let normalized = n.params.get("normalized").and_then(|v| v.as_bool()).unwrap_or(false);
+        let step_p     = n.params.get("step_param").and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
+        let min_p      = n.params.get("min_param") .and_then(|v| v.as_f64()).unwrap_or(0.0)  as f32;
+        let max_p      = n.params.get("max_param") .and_then(|v| v.as_f64()).unwrap_or(10.0) as f32;
+        (mode, normalized, step_p, min_p, max_p)
+    }).unwrap_or_default();
+
+    let step_wired  = inputs.get(3).map(|p| !p.remotes.is_empty()).unwrap_or(false);
+    let min_wired   = inputs.get(4).map(|p| !p.remotes.is_empty()).unwrap_or(false);
+    let max_wired   = inputs.get(5).map(|p| !p.remotes.is_empty()).unwrap_or(false);
+
+    let mut mode       = mode;
+    let mut normalized = normalized;
+    let mut step_p     = step_p;
+    let mut min_p      = min_p;
+    let mut max_p      = max_p;
+    let mut changed    = false;
+
+    ui.vertical(|ui| {
+        // Row 1: counting mode
+        ui.horizontal(|ui| {
+            changed |= ui.selectable_value(&mut mode, "loop".into(),      egui::RichText::new("Loop").small()).changed();
+            changed |= ui.selectable_value(&mut mode, "limit".into(),     egui::RichText::new("Limit").small()).changed();
+            changed |= ui.selectable_value(&mut mode, "bounce".into(),    egui::RichText::new("Bounce").small()).changed();
+            changed |= ui.selectable_value(&mut mode, "unlimited".into(), egui::RichText::new("Unlimited").small()).changed();
+        });
+
+        // Row 2: output range + reset button
+        ui.horizontal(|ui| {
+            changed |= ui.selectable_value(&mut normalized, false, egui::RichText::new("Raw").small()).changed();
+            changed |= ui.selectable_value(&mut normalized, true,  egui::RichText::new("0..1").small()).changed();
+            if ui.small_button("↺").on_hover_text("Reset counter").clicked() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    while node.extra.aux_f32.len() < 2 { node.extra.aux_f32.push(0.0); }
+                    node.extra.aux_f32[0] = 0.0;
+                    node.extra.aux_f32[1] = 1.0;
+                    node.extra.aux_f32_dirty = true;
+                }
+            }
+        });
+
+        // Row 3: Step
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Step").small().weak());
+            changed |= ui.add_enabled(!step_wired, egui::DragValue::new(&mut step_p).speed(0.1).range(0.001..=10000.0)).changed();
+        });
+
+        // Row 4: Min / Max
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Min").small().weak());
+            changed |= ui.add_enabled(!min_wired, egui::DragValue::new(&mut min_p).speed(0.1)).changed();
+            ui.label(egui::RichText::new("Max").small().weak());
+            let max_active = !max_wired && mode != "unlimited";
+            changed |= ui.add_enabled(max_active, egui::DragValue::new(&mut max_p).speed(0.1)).changed();
+        });
+    });
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("mode".into(),       Value::String(mode));
+            node.params.insert("normalized".into(), Value::Bool(normalized));
+            if let Some(n) = Number::from_f64(step_p as f64) { node.params.insert("step_param".into(), Value::Number(n)); }
+            if let Some(n) = Number::from_f64(min_p  as f64) { node.params.insert("min_param".into(),  Value::Number(n)); }
+            if let Some(n) = Number::from_f64(max_p  as f64) { node.params.insert("max_param".into(),  Value::Number(n)); }
+        }
+    }
+}
+
+fn show_logic_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (mode, time, unit) = snarl.get_node(node_id).map(|n| {
+        let mode = n.params.get("mode").and_then(|v| v.as_str()).unwrap_or("delay_false").to_string();
+        let time = n.params.get("time").and_then(|v| v.as_f64()).unwrap_or(100.0);
+        let unit = n.params.get("unit").and_then(|v| v.as_str()).unwrap_or("ms").to_string();
+        (mode, time, unit)
+    }).unwrap_or_default();
+
+    let mut mode = mode;
+    let mut time = time as f32;
+    let mut unit = unit;
+    let mut changed = false;
+
+    ui.horizontal(|ui| {
+        changed |= ui.selectable_value(&mut mode, "delay_true".into(),  egui::RichText::new("Delay ON").small()).changed();
+        changed |= ui.selectable_value(&mut mode, "delay_false".into(), egui::RichText::new("Delay OFF").small()).changed();
+    });
+    ui.horizontal(|ui| {
+        let limit = if unit == "ms" { 60_000.0 } else { 10_000.0 };
+        changed |= ui.add(egui::DragValue::new(&mut time).speed(1.0).range(0.0..=limit)).changed();
+        changed |= ui.selectable_value(&mut unit, "ms".into(),      egui::RichText::new("ms").small()).changed();
+        changed |= ui.selectable_value(&mut unit, "samples".into(), egui::RichText::new("frames").small()).changed();
+    });
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("mode".into(), Value::String(mode));
+            node.params.insert("unit".into(), Value::String(unit));
+            if let Some(n) = Number::from_f64(time as f64) {
+                node.params.insert("time".into(), Value::Number(n));
+            }
+        }
+    }
+}
+
+fn show_or_equal_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let or_equal = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("or_equal").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let mut v = or_equal;
+    if ui.checkbox(&mut v, egui::RichText::new("or equal").small()).changed() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("or_equal".to_string(), Value::Bool(v));
+        }
+    }
+}
+
 fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let value = snarl
         .get_node(node_id)
@@ -806,7 +1129,14 @@ fn clear_unused_inputs(
 
 fn pin_info(t: SignalType) -> PinInfo {
     let [r, g, b] = t.color_rgb();
-    PinInfo::circle().with_fill(Color32::from_rgb(r, g, b))
+    let color = Color32::from_rgb(r, g, b);
+    if t == SignalType::AutoMap {
+        PinInfo::square()
+            .with_fill(color)
+            .with_wire_width_factor(4.0)
+    } else {
+        PinInfo::circle().with_fill(color)
+    }
 }
 
 enum WireDir {
@@ -887,14 +1217,14 @@ fn show_module_menu(
 
 fn channel_label_color(module_id: &str, ch: usize) -> Option<Color32> {
     match module_id {
-        "display.vectorscope" => SCOPE_COLORS.get(ch).copied(),
-        "display.oscilloscope" | "module.response_curve" => {
+        "display.vectorscope" | "display.oscilloscope" | "module.response_curve" | "module.vec_response_curve" => {
             Some(MULTI_COLORS[ch % MULTI_COLORS.len()])
         }
         // selector: ch 0 is "select" (no color), ch 1+ are the value inputs
         "module.selector" => if ch == 0 { None } else { Some(MULTI_COLORS[(ch - 1) % MULTI_COLORS.len()]) },
-        // split: all outputs are colored
-        "module.split" => Some(MULTI_COLORS[ch % MULTI_COLORS.len()]),
+        "module.split" | "module.delay" | "module.average" | "module.dc_filter" => {
+            Some(MULTI_COLORS[ch % MULTI_COLORS.len()])
+        }
         _ => None,
     }
 }
@@ -946,10 +1276,10 @@ fn show_readout_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
 
 fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     // ── Init params on first use ──────────────────────────────────────────────
-    let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("osc_win")).unwrap_or(false);
+    let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("osc_win_ms")).unwrap_or(false);
     if needs_init {
         if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("osc_win".into(),   serde_json::json!(256i64));
+            node.params.insert("osc_win_ms".into(), serde_json::json!(200.0f64));
             node.params.insert("osc_scale".into(), serde_json::json!(1.0));
             node.params.insert("osc_auto".into(),  Value::Bool(false));
             node.params.insert("osc_uni".into(),   Value::Bool(false));
@@ -957,13 +1287,14 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
     }
 
     // ── Read params ───────────────────────────────────────────────────────────
-    let (osc_win, osc_scale, osc_auto, osc_uni) = snarl.get_node(node_id).map(|n| {
-        let win = n.params.get("osc_win")  .and_then(|v| v.as_i64()).unwrap_or(256).clamp(16, 512) as usize;
-        let sc  = n.params.get("osc_scale").and_then(|v| v.as_f64()).unwrap_or(1.0).max(0.001) as f32;
-        let au  = n.params.get("osc_auto") .and_then(|v| v.as_bool()).unwrap_or(false);
-        let uni = n.params.get("osc_uni")  .and_then(|v| v.as_bool()).unwrap_or(false);
+    let (win_ms, osc_scale, osc_auto, osc_uni) = snarl.get_node(node_id).map(|n| {
+        let win = n.params.get("osc_win_ms").and_then(|v| v.as_f64()).unwrap_or(200.0).clamp(10.0, 10000.0) as f32;
+        let sc  = n.params.get("osc_scale") .and_then(|v| v.as_f64()).unwrap_or(1.0).max(0.001) as f32;
+        let au  = n.params.get("osc_auto")  .and_then(|v| v.as_bool()).unwrap_or(false);
+        let uni = n.params.get("osc_uni")   .and_then(|v| v.as_bool()).unwrap_or(false);
         (win, sc, au, uni)
-    }).unwrap_or((256, 1.0, false, false));
+    }).unwrap_or((200.0, 1.0, false, false));
+    let osc_win = (win_ms / 1000.0 * SAMPLE_RATE as f32) as usize;
 
     let history = snarl.get_node(node_id).map(|n| n.extra.history.clone()).unwrap_or_default();
     let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
@@ -1017,12 +1348,31 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
                     );
                 }
 
+                // Downsample to pixel budget so line count never exceeds display width.
+                let pixel_budget = (rect.width().ceil() as usize).max(2);
+                let n_ch_inner = if n > 0 { visible[0].len() } else { 0 };
+                let display: Vec<Vec<Option<f32>>> = if n <= pixel_budget {
+                    visible.clone()
+                } else {
+                    (0..pixel_budget).map(|i| {
+                        let lo = i * n / pixel_budget;
+                        let hi = ((i + 1) * n / pixel_budget).min(n);
+                        (0..n_ch_inner).map(|ch| {
+                            let vals: Vec<f32> = visible[lo..hi].iter()
+                                .filter_map(|s| s.get(ch).copied().flatten())
+                                .collect();
+                            if vals.is_empty() { None } else { Some(vals.iter().sum::<f32>() / vals.len() as f32) }
+                        }).collect()
+                    }).collect()
+                };
+                let nd = display.len();
+
                 // Signal lines.
-                if n >= 2 {
+                if nd >= 2 {
                     for ch in 0..n_channels {
-                        let pts: Vec<egui::Pos2> = visible.iter().enumerate().filter_map(|(i, s)| {
+                        let pts: Vec<egui::Pos2> = display.iter().enumerate().filter_map(|(i, s)| {
                             s.get(ch).copied().flatten().map(|v| {
-                                let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
+                                let x = rect.left() + (i as f32 / (nd - 1) as f32) * rect.width();
                                 let norm = v / eff_scale;
                                 let y = if osc_uni {
                                     rect.bottom() - norm.clamp(0.0, 1.0) * rect.height() * 0.92
@@ -1040,7 +1390,7 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
             });
 
         // ── Controls ─────────────────────────────────────────────────────────
-        let mut win     = osc_win as i64;
+        let mut win_ms_ctrl = win_ms;
         let mut sc      = osc_scale;
         let mut au      = osc_auto;
         let mut uni     = osc_uni;
@@ -1048,8 +1398,14 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Win").small().weak());
-            changed |= ui.add(egui::DragValue::new(&mut win).speed(4.0)
-                .range(16i64..=512).suffix("pt")).changed();
+            changed |= ui.add(egui::Slider::new(&mut win_ms_ctrl, 10.0f32..=10000.0)
+                .logarithmic(true).show_value(false)).changed();
+            let lbl = if win_ms_ctrl >= 1000.0 {
+                format!("{:.1}s", win_ms_ctrl / 1000.0)
+            } else {
+                format!("{:.0}ms", win_ms_ctrl)
+            };
+            ui.label(egui::RichText::new(lbl).small().weak());
             ui.separator();
             ui.label(egui::RichText::new("Scale").small().weak());
             if au {
@@ -1070,7 +1426,7 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
 
         if changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("osc_win".into(),   serde_json::json!(win));
+                if let Some(n) = Number::from_f64(win_ms_ctrl as f64) { node.params.insert("osc_win_ms".into(), Value::Number(n)); }
                 node.params.insert("osc_auto".into(),  Value::Bool(au));
                 node.params.insert("osc_uni".into(),   Value::Bool(uni));
                 if let Some(n) = Number::from_f64(sc as f64) {
@@ -1094,60 +1450,82 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
     });
 }
 
-fn show_vectorscope_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let history = snarl
+fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (history, n_channels, last_signals) = snarl
         .get_node(node_id)
-        .map(|n| n.extra.history.clone())
+        .map(|n| (n.extra.history.clone(), n.inputs.len().max(1), n.extra.last_signals.clone()))
         .unwrap_or_default();
 
-    egui::Resize::default()
-        .id_salt(("vs", node_id))
-        .default_size([140.0, 140.0])
-        .min_size([40.0, 40.0])
-        .show(ui, |ui| {
-            let side = ui.available_size().min_elem();
-            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 2.0, Color32::from_gray(16));
-            painter.line_segment(
-                [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
-                egui::Stroke::new(0.5, Color32::from_gray(50)),
-            );
-            painter.line_segment(
-                [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
-                egui::Stroke::new(0.5, Color32::from_gray(50)),
-            );
-            painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
-                egui::Stroke::new(0.5, Color32::from_gray(40)));
+    ui.vertical(|ui| {
+        egui::Resize::default()
+            .id_salt(("vs", node_id))
+            .default_size([140.0, 140.0])
+            .min_size([40.0, 40.0])
+            .show(ui, |ui| {
+                let side = ui.available_size().min_elem();
+                let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+                painter.line_segment(
+                    [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
+                    egui::Stroke::new(0.5, Color32::from_gray(50)),
+                );
+                painter.line_segment(
+                    [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
+                    egui::Stroke::new(0.5, Color32::from_gray(50)),
+                );
+                painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
+                    egui::Stroke::new(0.5, Color32::from_gray(40)));
 
-            let n = history.len();
-            for (idx, sample) in history.iter().enumerate() {
-                let (Some(x), Some(y)) = (sample[0], sample[1]) else { continue; };
-                let px = rect.center().x + x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
-                let py = rect.center().y - y.clamp(-1.0, 1.0) * rect.height() * 0.45;
-                let alpha = ((idx as f32 / n as f32) * 220.0) as u8 + 35;
-                painter.circle_filled(egui::pos2(px, py), 1.5,
-                    Color32::from_rgba_unmultiplied(80, 200, 255, alpha));
-            }
-            // Current-position dot: read from last_signals (freshest, set by update_display_nodes).
-            let cur = snarl.get_node(node_id).and_then(|n| {
-                let x = sig_f32(n.extra.last_signals.get(0)?.as_ref()?);
-                let y = sig_f32(n.extra.last_signals.get(1)?.as_ref()?);
-                Some((x, y))
+                const MAX_VS_TRAIL: usize = 2000;
+                let skip = history.len().saturating_sub(MAX_VS_TRAIL);
+                let trail: Vec<_> = history.iter().skip(skip).collect();
+                let nt = trail.len();
+                for ch in 0..n_channels {
+                    let col = MULTI_COLORS[ch % MULTI_COLORS.len()];
+                    let xi = ch * 2;
+                    let yi = ch * 2 + 1;
+                    // Trail
+                    for (idx, sample) in trail.iter().enumerate() {
+                        let (Some(x), Some(y)) = (
+                            sample.get(xi).copied().flatten(),
+                            sample.get(yi).copied().flatten(),
+                        ) else { continue; };
+                        let px = rect.center().x + x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
+                        let py = rect.center().y - y.clamp(-1.0, 1.0) * rect.height() * 0.45;
+                        let alpha = ((idx as f32 / nt as f32) * 200.0) as u8 + 35;
+                        painter.circle_filled(egui::pos2(px, py), 1.5,
+                            Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha));
+                    }
+                    // Current-position dot
+                    if let Some(Some(Signal::Vec2(v))) = last_signals.get(ch) {
+                        let px = rect.center().x + v.x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
+                        let py = rect.center().y - v.y.clamp(-1.0, 1.0) * rect.height() * 0.45;
+                        painter.circle_filled(egui::pos2(px, py), 4.0, col);
+                        painter.circle_stroke(egui::pos2(px, py), 4.0,
+                            egui::Stroke::new(1.0, Color32::from_gray(100)));
+                    }
+                }
             });
-            if let Some((x, y)) = cur {
-                let px = rect.center().x + x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
-                let py = rect.center().y - y.clamp(-1.0, 1.0) * rect.height() * 0.45;
-                painter.circle_filled(egui::pos2(px, py), 4.0, Color32::WHITE);
-                painter.circle_stroke(egui::pos2(px, py), 4.0,
-                    egui::Stroke::new(1.0, Color32::from_gray(100)));
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Ch").small().weak());
+            if ui.small_button("+").on_hover_text("Add channel").clicked() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    let next = node.inputs.len() + 1;
+                    node.inputs.push(PinDescriptor::new(format!("ch{}", next), SignalType::Vec2));
+                }
+            }
+            if n_channels > 1 && ui.small_button("−").on_hover_text("Remove channel").clicked() {
+                remove_input_pin(node_id, n_channels - 1, inputs, snarl);
             }
         });
+    });
 }
 
 // ── Processing module body renderers ──────────────────────────────────────────
 
-fn show_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+fn show_delay_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let delay_ms = snarl
         .get_node(node_id)
         .and_then(|n| n.params.get("delay_ms").and_then(|v| v.as_f64()))
@@ -1167,45 +1545,116 @@ fn show_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
             }
         }
     });
+    let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Ch").small().weak());
+        if ui.small_button("+").on_hover_text("Add channel").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let next = node.inputs.len() + 1;
+                node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Float));
+                node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Float));
+            }
+        }
+        if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
+            remove_input_pin(node_id, n_channels - 1, inputs, snarl);
+            remove_output_pin(node_id, n_channels - 1, outputs, snarl);
+        }
+    });
 }
 
-fn show_lowpass_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (cutoff, q) = snarl
+fn show_average_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (buf_size, spike_mad) = snarl
         .get_node(node_id)
         .map(|n| {
-            let c = n.params.get("cutoff_hz").and_then(|v| v.as_f64()).unwrap_or(10.0) as f32;
-            let q = n.params.get("q").and_then(|v| v.as_f64()).unwrap_or(0.707) as f32;
-            (c, q)
+            let bs = n.params.get("buf_size").and_then(|v| v.as_f64()).unwrap_or(10.0) as f32;
+            let sm = n.params.get("spike_mad").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            (bs, sm)
         })
-        .unwrap_or((10.0, 0.707));
+        .unwrap_or((10.0, 0.0));
 
-    let mut c = cutoff;
-    let mut q = q;
-
+    let mut bs = buf_size;
+    let mut sm = spike_mad;
     let mut changed = false;
-    egui::Grid::new(("lp_grid", node_id)).num_columns(2).show(ui, |ui| {
-        ui.label(egui::RichText::new("Hz").small());
-        changed |= ui
-            .add(egui::DragValue::new(&mut c).speed(0.5).range(0.1..=1000.0))
-            .changed();
+
+    egui::Grid::new(("avg_grid", node_id)).num_columns(2).show(ui, |ui| {
+        ui.label(egui::RichText::new("Samples").small());
+        changed |= ui.add(egui::DragValue::new(&mut bs).speed(1.0).range(1.0..=10_000.0)).changed();
         ui.end_row();
-        ui.label(egui::RichText::new("Q").small());
-        changed |= ui
-            .add(egui::DragValue::new(&mut q).speed(0.01).range(0.1..=0.707))
-            .changed();
+        ui.label(egui::RichText::new("Spike MAD").small())
+            .on_hover_text("Outlier threshold in median absolute deviations. 0 = off. Try 3.0 to start.");
+        changed |= ui.add(egui::DragValue::new(&mut sm).speed(0.1).range(0.0..=20.0).max_decimals(1)).changed();
         ui.end_row();
     });
 
     if changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
-            if let Some(n) = Number::from_f64(c as f64) {
-                node.params.insert("cutoff_hz".into(), Value::Number(n));
-            }
-            if let Some(n) = Number::from_f64(q as f64) {
-                node.params.insert("q".into(), Value::Number(n));
-            }
+            if let Some(n) = Number::from_f64(bs as f64) { node.params.insert("buf_size".into(),  Value::Number(n)); }
+            if let Some(n) = Number::from_f64(sm as f64) { node.params.insert("spike_mad".into(), Value::Number(n)); }
         }
     }
+
+    let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Ch").small().weak());
+        if ui.small_button("+").on_hover_text("Add channel").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let next = node.inputs.len() + 1;
+                node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Float));
+                node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Float));
+            }
+        }
+        if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
+            remove_input_pin(node_id, n_channels - 1, inputs, snarl);
+            remove_output_pin(node_id, n_channels - 1, outputs, snarl);
+        }
+    });
+}
+
+fn show_dc_filter_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (window_ms, decay_ms) = snarl
+        .get_node(node_id)
+        .map(|n| {
+            let w = n.params.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(500.0) as f32;
+            let d = n.params.get("decay_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+            (w, d)
+        })
+        .unwrap_or((500.0, 200.0));
+
+    let mut w = window_ms;
+    let mut d = decay_ms;
+    let mut changed = false;
+
+    egui::Grid::new(("dcf_grid", node_id)).num_columns(2).show(ui, |ui| {
+        ui.label(egui::RichText::new("Window ms").small());
+        changed |= ui.add(egui::DragValue::new(&mut w).speed(10.0).range(10.0..=60_000.0)).changed();
+        ui.end_row();
+        ui.label(egui::RichText::new("Decay ms").small());
+        changed |= ui.add(egui::DragValue::new(&mut d).speed(10.0).range(10.0..=60_000.0)).changed();
+        ui.end_row();
+    });
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            if let Some(n) = Number::from_f64(w as f64) { node.params.insert("window_ms".into(), Value::Number(n)); }
+            if let Some(n) = Number::from_f64(d as f64) { node.params.insert("decay_ms".into(),  Value::Number(n)); }
+        }
+    }
+
+    let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Ch").small().weak());
+        if ui.small_button("+").on_hover_text("Add channel").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let next = node.inputs.len() + 1;
+                node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Float));
+                node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Float));
+            }
+        }
+        if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
+            remove_input_pin(node_id, n_channels - 1, inputs, snarl);
+            remove_output_pin(node_id, n_channels - 1, outputs, snarl);
+        }
+    });
 }
 
 fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
@@ -1223,13 +1672,13 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
             node.params.insert("grid_x".into(),   serde_json::json!(4i64));
             node.params.insert("grid_y".into(),   serde_json::json!(4i64));
             node.params.insert("snap".into(),     Value::Bool(false));
-            node.params.insert("in_scale".into(), serde_json::json!(0i64));
+            node.params.insert("scale_t".into(),  serde_json::json!(0.0f64));
             node.params.insert("trail_ms".into(), serde_json::json!(300i64));
         }
     }
 
     // ── Read params ───────────────────────────────────────────────────────────
-    let (points, biases, absolute, in_min, in_max, out_min, out_max, grid_x, grid_y, snap, in_scale, trail_ms) = snarl
+    let (points, biases, absolute, in_min, in_max, out_min, out_max, grid_x, grid_y, snap, scale_t, trail_ms) = snarl
         .get_node(node_id)
         .map(|n| {
             let pts: Vec<[f32; 2]> = n.params.get("points")
@@ -1251,11 +1700,14 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
             let gx   = n.params.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
             let gy   = n.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
             let sn   = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
-            let sc   = n.params.get("in_scale").and_then(|v| v.as_i64()).unwrap_or(0);
+            let sc   = n.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32)
+                .unwrap_or_else(|| match n.params.get("in_scale").and_then(|v| v.as_i64()).unwrap_or(0) {
+                    1 => -0.5, 2 => 0.5, _ => 0.0,
+                });
             let tm   = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
             (pts, bss, abs, i0, i1, o0, o1, gx, gy, sn, sc, tm)
         })
-        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0, 300));
+        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300));
 
     let n_channels = snarl.get_node(node_id)
         .map(|n| n.inputs.len().min(n.outputs.len()))
@@ -1414,12 +1866,12 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     let Some(raw) = raw_opt else { continue; };
                     has_active = true;
                     let graph_x = if absolute {
-                        curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), in_scale)
+                        curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), scale_t)
                     } else {
                         let in_range = (in_max - in_min).abs().max(f32::EPSILON);
                         let norm     = ((raw - in_min) / in_range * 2.0 - 1.0).clamp(-1.0, 1.0);
                         let sign     = if norm < 0.0 { -1.0f32 } else { 1.0 };
-                        sign * curve_scale(norm.abs(), in_scale)
+                        sign * curve_scale(norm.abs(), scale_t)
                     };
                     // Store only graph_x; y is recomputed at draw time from the current curve.
                     type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
@@ -1487,20 +1939,36 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
         let mut gy_f     = grid_y as f64;
         let mut abs      = absolute;
         let mut snap_on  = snap;
-        let mut sc       = in_scale;
+        let mut sc_t     = scale_t;
         let mut tm       = trail_ms;
         let mut changed  = false;
 
-        // Row 1: Input scale mode + Absolute + Snap
+        // Row 1: Scale slider (Log←──●──→Exp, double-click resets) + Absolute + Snap
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Scale").small().weak());
-            for (label, val) in [("Lin", 0i64), ("Log", 1), ("Exp", 2)] {
-                let selected = sc == val;
-                if ui.selectable_label(selected, egui::RichText::new(label).small()).clicked() && !selected {
-                    sc = val;
-                    changed = true;
-                }
+            ui.label(egui::RichText::new("Log").small().weak());
+            let (slider_rect, slider_resp) = ui.allocate_exact_size(
+                egui::vec2(80.0, 14.0), egui::Sense::click_and_drag(),
+            );
+            if slider_resp.double_clicked() {
+                sc_t = 0.0;
+                changed = true;
+            } else if slider_resp.dragged() {
+                sc_t = (sc_t + slider_resp.drag_delta().x / slider_rect.width() * 2.0).clamp(-1.0, 1.0);
+                changed = true;
             }
+            let painter = ui.painter_at(slider_rect);
+            painter.rect_filled(slider_rect, 3.0, Color32::from_gray(35));
+            let cx = slider_rect.center().x;
+            painter.line_segment(
+                [egui::pos2(cx, slider_rect.top() + 2.0), egui::pos2(cx, slider_rect.bottom() - 2.0)],
+                egui::Stroke::new(1.0, Color32::from_gray(70)),
+            );
+            let knob_x = slider_rect.left() + (sc_t + 1.0) * 0.5 * slider_rect.width();
+            painter.circle_filled(
+                egui::pos2(knob_x, slider_rect.center().y), 5.0,
+                if slider_resp.hovered() || slider_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) },
+            );
+            ui.label(egui::RichText::new("Exp").small().weak());
             ui.separator();
             let abs_before = abs;
             ui.checkbox(&mut abs, egui::RichText::new("Abs").small());
@@ -1551,7 +2019,7 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                 node.params.insert("grid_x".into(),   serde_json::json!(gx_f as i64));
                 node.params.insert("grid_y".into(),   serde_json::json!(gy_f as i64));
                 node.params.insert("snap".into(),     Value::Bool(snap_on));
-                node.params.insert("in_scale".into(), serde_json::json!(sc));
+                if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
                 node.params.insert("trail_ms".into(), serde_json::json!(tm));
             }
         }
@@ -1573,15 +2041,353 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
     });
 }
 
-/// Maps x ∈ [0,1] → [0,1] with the chosen scale mode.
-/// Lin (0): identity. Log (1): high resolution for small x. Exp (2): high resolution for large x.
-fn curve_scale(x: f32, mode: i64) -> f32 {
-    use std::f32::consts::E;
-    match mode {
-        1 => (1.0 + x * (E - 1.0)).ln(),           // ln(1 + x*(e-1)): f(0)=0, f(1)=1
-        2 => (x.exp() - 1.0) / (E - 1.0),          // (e^x - 1)/(e-1): f(0)=0, f(1)=1
-        _ => x,
+fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    // ── Initialise params on first use ────────────────────────────────────────
+    let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
+    if needs_init {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("points".into(),   serde_json::json!([[0.0, 0.0], [1.0, 1.0]]));
+            node.params.insert("biases".into(),   serde_json::json!([0.0]));
+            node.params.insert("in_max".into(),   serde_json::json!(1.0f64));
+            node.params.insert("out_max".into(),  serde_json::json!(1.0f64));
+            node.params.insert("grid_x".into(),   serde_json::json!(4i64));
+            node.params.insert("grid_y".into(),   serde_json::json!(4i64));
+            node.params.insert("snap".into(),     Value::Bool(false));
+            node.params.insert("scale_t".into(),  serde_json::json!(0.0f64));
+            node.params.insert("trail_ms".into(), serde_json::json!(300i64));
+        }
     }
+
+    // ── Read params ───────────────────────────────────────────────────────────
+    let (points, biases, in_max, out_max, grid_x, grid_y, snap, scale_t, trail_ms) = snarl
+        .get_node(node_id)
+        .map(|n| {
+            let pts: Vec<[f32; 2]> = n.params.get("points")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|p| {
+                    let a = p.as_array()?;
+                    Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+                }).collect())
+                .unwrap_or_else(|| vec![[0.0, 0.0], [1.0, 1.0]]);
+            let bss: Vec<f32> = n.params.get("biases")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+                .unwrap_or_default();
+            let i1  = n.params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let o1  = n.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let gx  = n.params.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
+            let gy  = n.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
+            let sn  = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sc  = n.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.0);
+            let tm  = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
+            (pts, bss, i1, o1, gx, gy, sn, sc, tm)
+        })
+        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], 1.0, 1.0, 4, 4, false, 0.0f32, 300));
+
+    let n_channels = snarl.get_node(node_id)
+        .map(|n| n.inputs.len().min(n.outputs.len()))
+        .unwrap_or(1).max(1);
+    // sig_f32 returns v.length() for Vec2, giving deflection magnitude
+    let live_inputs: Vec<Option<f32>> = (0..n_channels)
+        .map(|ch| snarl.get_node(node_id)
+            .and_then(|n| n.extra.last_signals.get(ch)?.as_ref())
+            .map(sig_f32))
+        .collect();
+
+    // Vec curve always operates in [0,1] × [0,1] (magnitude space)
+    let (x_lo, x_hi) = (0.0f32, 1.0f32);
+    let (y_lo, y_hi) = (0.0f32, 1.0f32);
+    let x_range = x_hi - x_lo;
+    let y_range = y_hi - y_lo;
+
+    let mut new_points  = points.clone();
+    let mut new_biases  = biases.clone();
+    let mut pts_changed  = false;
+    let mut bias_changed = false;
+
+    ui.vertical(|ui| {
+        // ── Graph ─────────────────────────────────────────────────────────────
+        egui::Resize::default()
+            .id_salt(("vcrv", node_id))
+            .default_size([180.0, 180.0])
+            .min_size([80.0, 80.0])
+            .show(ui, |ui| {
+                let (rect, bg_resp) =
+                    ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+                let painter = ui.painter_at(rect);
+
+                let c2s = |x: f32, y: f32| egui::pos2(
+                    rect.left() + (x - x_lo) / x_range * rect.width(),
+                    rect.bottom() - (y - y_lo) / y_range * rect.height(),
+                );
+                let s2c = |pos: egui::Pos2| -> [f32; 2] {[
+                    x_lo + (pos.x - rect.left()) / rect.width() * x_range,
+                    y_lo + (rect.bottom() - pos.y) / rect.height() * y_range,
+                ]};
+                let do_snap = |x: f32, y: f32| -> (f32, f32) {
+                    if snap {
+                        let nx = ((x - x_lo) / x_range * grid_x as f32).round() / grid_x as f32;
+                        let ny = ((y - y_lo) / y_range * grid_y as f32).round() / grid_y as f32;
+                        (x_lo + nx * x_range, y_lo + ny * y_range)
+                    } else { (x, y) }
+                };
+
+                painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+
+                let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
+                for i in 1..grid_x {
+                    let x = x_lo + x_range * i as f32 / grid_x as f32;
+                    painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
+                }
+                for i in 1..grid_y {
+                    let y = y_lo + y_range * i as f32 / grid_y as f32;
+                    painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
+                }
+                painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
+                    egui::Stroke::new(0.5, Color32::from_gray(55)));
+
+                if new_points.len() >= 2 {
+                    let steps = 120usize;
+                    let curve_pts: Vec<egui::Pos2> = (0..=steps)
+                        .map(|i| {
+                            let x = x_lo + x_range * i as f32 / steps as f32;
+                            let y = sample_curve(&new_points, x, &new_biases).clamp(y_lo, y_hi);
+                            c2s(x, y)
+                        })
+                        .collect();
+                    for w in curve_pts.windows(2) {
+                        painter.line_segment([w[0], w[1]],
+                            egui::Stroke::new(1.5, Color32::from_gray(200)));
+                    }
+                }
+
+                let alt_held = ui.input(|i| i.modifiers.alt);
+                if alt_held && new_points.len() >= 2 {
+                    while new_biases.len() < new_points.len() - 1 { new_biases.push(0.0); }
+                    for seg in 0..(new_points.len() - 1) {
+                        let mid_x = (new_points[seg][0] + new_points[seg + 1][0]) * 0.5;
+                        let mid_y = sample_curve(&new_points, mid_x, &new_biases).clamp(y_lo, y_hi);
+                        let hpos  = c2s(mid_x, mid_y);
+                        let hid   = ui.id().with(("vbias_h", node_id, seg));
+                        let hresp = ui.interact(
+                            egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)),
+                            hid, egui::Sense::click_and_drag());
+                        if hresp.double_clicked() {
+                            new_biases[seg] = 0.0;
+                            bias_changed = true;
+                        } else if hresp.dragged() {
+                            let dy = -hresp.drag_delta().y / rect.height() * y_range;
+                            new_biases[seg] = (new_biases[seg] + dy).clamp(-2.0, 2.0);
+                            bias_changed = true;
+                        }
+                        let hcol = if hresp.hovered() || hresp.dragged() {
+                            Color32::from_rgb(255, 220, 50)
+                        } else { Color32::from_rgb(180, 140, 20) };
+                        painter.circle_filled(hpos, 4.0, hcol);
+                        painter.circle_stroke(hpos, 4.0,
+                            egui::Stroke::new(1.0, Color32::from_gray(100)));
+                    }
+                }
+
+                let mut remove_idx: Option<usize> = None;
+                for i in 0..new_points.len() {
+                    let [px, py] = new_points[i];
+                    let screen   = c2s(px, py);
+                    let pt_id    = ui.id().with(("vcpt", node_id, i));
+                    let pt_resp  = ui.interact(
+                        egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)),
+                        pt_id, egui::Sense::click_and_drag());
+                    if pt_resp.dragged() && !alt_held {
+                        let d      = pt_resp.drag_delta();
+                        let nx_raw = px + d.x * x_range / rect.width();
+                        let ny_raw = py - d.y * y_range / rect.height();
+                        let lo_x   = new_points.get(i.wrapping_sub(1)).map(|p| p[0] + 0.001).unwrap_or(x_lo);
+                        let hi_x   = new_points.get(i + 1).map(|p| p[0] - 0.001).unwrap_or(x_hi);
+                        let (sx, sy) = do_snap(nx_raw, ny_raw);
+                        new_points[i] = [sx.clamp(lo_x, hi_x), sy.clamp(y_lo, y_hi)];
+                        pts_changed = true;
+                    }
+                    if pt_resp.secondary_clicked() && new_points.len() > 2 {
+                        remove_idx = Some(i);
+                        pts_changed = true;
+                    }
+                    let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
+                    painter.circle_filled(screen, 5.0, col);
+                    painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+                }
+
+                if bg_resp.double_clicked() {
+                    if let Some(pos) = bg_resp.interact_pointer_pos() {
+                        let [gx_raw, gy_raw] = s2c(pos);
+                        let (gx_sn, gy_sn)   = do_snap(gx_raw, gy_raw);
+                        let gx = gx_sn.clamp(x_lo, x_hi);
+                        let gy = gy_sn.clamp(y_lo, y_hi);
+                        let idx = new_points.partition_point(|p| p[0] < gx);
+                        new_points.insert(idx, [gx, gy]);
+                        pts_changed = true;
+                    }
+                }
+                if let Some(idx) = remove_idx { new_points.remove(idx); }
+
+                // Live-position trails (magnitude of Vec2 input → position on curve)
+                let abs_max   = in_max.abs().max(f32::EPSILON);
+                let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
+                let now       = std::time::Instant::now();
+                let mut has_active = false;
+                for (ch, raw_opt) in live_inputs.iter().enumerate() {
+                    let Some(raw) = raw_opt else { continue; };
+                    has_active = true;
+                    let graph_x = curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), scale_t);
+                    type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
+                    let trail_id = ui.id().with(("vtrail", node_id, ch as u32));
+                    let mut trail: Trail = ui.data(|d| d.get_temp::<Trail>(trail_id).clone().unwrap_or_default());
+                    if trail_ms > 0 {
+                        trail.push_back((graph_x, now));
+                        while trail.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) {
+                            trail.pop_front();
+                        }
+                    } else { trail.clear(); }
+                    let trail_pts: Vec<(f32, std::time::Instant)> = trail.iter().cloned().collect();
+                    ui.data_mut(|d| d.insert_temp(trail_id, trail));
+                    let ch_col = MULTI_COLORS[ch % MULTI_COLORS.len()];
+                    for w in trail_pts.windows(2) {
+                        let (x0, _)  = w[0];
+                        let (x1, t1) = w[1];
+                        let age   = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32();
+                        let alpha = ((1.0 - age.clamp(0.0, 1.0)) * 220.0) as u8;
+                        let col   = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), alpha);
+                        let steps = (((x1 - x0).abs() / x_range * 80.0) as usize).max(1);
+                        let x0_y  = sample_curve(&new_points, x0, &new_biases).clamp(y_lo, y_hi);
+                        let mut prev = c2s(x0, x0_y);
+                        for s in 1..=steps {
+                            let t  = s as f32 / steps as f32;
+                            let ix = x0 + (x1 - x0) * t;
+                            let iy = sample_curve(&new_points, ix, &new_biases).clamp(y_lo, y_hi);
+                            let next = c2s(ix, iy);
+                            painter.line_segment([prev, next], egui::Stroke::new(1.5, col));
+                            prev = next;
+                        }
+                    }
+                    let graph_y = sample_curve(&new_points, graph_x, &new_biases).clamp(y_lo, y_hi);
+                    let head_col = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 220);
+                    painter.circle_filled(c2s(graph_x, graph_y), 3.5, head_col);
+                }
+                if has_active { ui.ctx().request_repaint(); }
+            });
+
+        // ── Write back curve points / biases ──────────────────────────────────
+        if pts_changed || bias_changed {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                if pts_changed {
+                    new_biases.resize(new_points.len().saturating_sub(1), 0.0);
+                    let json: Vec<Value> = new_points.iter().map(|p| serde_json::json!([p[0], p[1]])).collect();
+                    node.params.insert("points".into(), Value::Array(json));
+                }
+                let bj: Vec<Value> = new_biases.iter()
+                    .filter_map(|&b| Number::from_f64(b as f64).map(Value::Number))
+                    .collect();
+                node.params.insert("biases".into(), Value::Array(bj));
+            }
+        }
+
+        // ── Controls below graph ──────────────────────────────────────────────
+        let mut i1      = in_max;
+        let mut o1      = out_max;
+        let mut gx_f    = grid_x as f64;
+        let mut gy_f    = grid_y as f64;
+        let mut snap_on = snap;
+        let mut sc_t    = scale_t;
+        let mut tm      = trail_ms;
+        let mut changed = false;
+
+        // Row 1: Scale slider (Log←──●──→Exp, double-click resets) + Snap
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Log").small().weak());
+            let (slider_rect, slider_resp) = ui.allocate_exact_size(
+                egui::vec2(80.0, 14.0), egui::Sense::click_and_drag(),
+            );
+            if slider_resp.double_clicked() {
+                sc_t = 0.0;
+                changed = true;
+            } else if slider_resp.dragged() {
+                sc_t = (sc_t + slider_resp.drag_delta().x / slider_rect.width() * 2.0).clamp(-1.0, 1.0);
+                changed = true;
+            }
+            let painter = ui.painter_at(slider_rect);
+            painter.rect_filled(slider_rect, 3.0, Color32::from_gray(35));
+            let cx = slider_rect.center().x;
+            painter.line_segment(
+                [egui::pos2(cx, slider_rect.top() + 2.0), egui::pos2(cx, slider_rect.bottom() - 2.0)],
+                egui::Stroke::new(1.0, Color32::from_gray(70)),
+            );
+            let knob_x = slider_rect.left() + (sc_t + 1.0) * 0.5 * slider_rect.width();
+            painter.circle_filled(
+                egui::pos2(knob_x, slider_rect.center().y), 5.0,
+                if slider_resp.hovered() || slider_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) },
+            );
+            ui.label(egui::RichText::new("Exp").small().weak());
+            ui.separator();
+            let snap_before = snap_on;
+            ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small());
+            changed |= snap_on != snap_before;
+        });
+
+        // Row 2: In/Out max
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("In max").small().weak());
+            changed |= ui.add(egui::DragValue::new(&mut i1).speed(0.01).max_decimals(2)).changed();
+            ui.separator();
+            ui.label(egui::RichText::new("Out max").small().weak());
+            changed |= ui.add(egui::DragValue::new(&mut o1).speed(0.01).max_decimals(2)).changed();
+        });
+
+        // Row 3: Grid + Trail
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Grid").small().weak());
+            changed |= ui.add(egui::DragValue::new(&mut gx_f).speed(0.25)
+                .range(1.0..=20.0).max_decimals(0).prefix("H ")).changed();
+            changed |= ui.add(egui::DragValue::new(&mut gy_f).speed(0.25)
+                .range(1.0..=20.0).max_decimals(0).prefix("V ")).changed();
+            ui.separator();
+            ui.label(egui::RichText::new("Trail").small().weak());
+            changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0)
+                .range(0i64..=1000).suffix("ms")).changed();
+        });
+
+        if changed {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                if let Some(n) = Number::from_f64(i1 as f64)  { node.params.insert("in_max".into(),  Value::Number(n)); }
+                if let Some(n) = Number::from_f64(o1 as f64)  { node.params.insert("out_max".into(), Value::Number(n)); }
+                if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
+                node.params.insert("grid_x".into(),   serde_json::json!(gx_f as i64));
+                node.params.insert("grid_y".into(),   serde_json::json!(gy_f as i64));
+                node.params.insert("snap".into(),     Value::Bool(snap_on));
+                node.params.insert("trail_ms".into(), serde_json::json!(tm));
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Ch").small().weak());
+            if ui.small_button("+").on_hover_text("Add Vec2 channel").clicked() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    let next = node.inputs.len() + 1;
+                    node.inputs.push(PinDescriptor::new(format!("In {}", next), SignalType::Vec2));
+                    node.outputs.push(PinDescriptor::new(format!("Out {}", next), SignalType::Vec2));
+                }
+            }
+            if n_channels > 1 && ui.small_button("−").on_hover_text("Remove last channel").clicked() {
+                remove_input_pin(node_id, n_channels - 1, inputs, snarl);
+                remove_output_pin(node_id, n_channels - 1, outputs, snarl);
+            }
+        });
+    });
+}
+
+/// Maps x ∈ [0,1] → [0,1] continuously. t=0 → linear; t<0 → log-like; t>0 → exp-like.
+/// Power law p = 2^(t*3): at t=±1, p=8 or 1/8 — far more extreme than the old log/exp modes.
+fn curve_scale(x: f32, t: f32) -> f32 {
+    if t.abs() < 1e-4 { return x; }
+    x.clamp(0.0, 1.0).powf(2.0f32.powf(t * 3.0))
 }
 
 // ── Signal helpers ────────────────────────────────────────────────────────────

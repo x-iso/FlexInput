@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "flexinput-ui",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam",
  "serde",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-devices"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flexinput-core",
  "gilrs",
@@ -1250,15 +1250,18 @@ dependencies = [
 
 [[package]]
 name = "flexinput-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flexinput-core",
+ "glam",
+ "serde_json",
+ "smallvec",
  "uuid",
 ]
 
 [[package]]
 name = "flexinput-modules"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flexinput-core",
  "smallvec",
@@ -1266,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1285,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-virtual"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "enigo",
  "flexinput-core",

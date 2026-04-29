@@ -65,10 +65,7 @@ impl Module for VectorscopeModule {
             id: "display.vectorscope",
             display_name: "Vectorscope",
             category: "Display",
-            inputs: vec![
-                PinDescriptor::new("x", SignalType::Float),
-                PinDescriptor::new("y", SignalType::Float),
-            ],
+            inputs: vec![PinDescriptor::new("ch1", SignalType::Vec2)],
             outputs: vec![],
         }
     }

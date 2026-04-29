@@ -463,8 +463,8 @@ fn parse_switch_pro(buf: &[u8]) -> Option<HidReading> {
     let as_ = SWITCH_ACCEL_G_PER_LSB / ACCEL_REF_G;
     Some(HidReading {
         gyro_x:  (gx / 3) as f32 * gs,
-        gyro_y:  (gy / 3) as f32 * gs,
-        gyro_z:  (gz / 3) as f32 * gs,
+        gyro_y: -(gy / 3) as f32 * gs,   // negated: pitch-up=positive, matching DualSense convention
+        gyro_z: -(gz / 3) as f32 * gs,   // negated: yaw-right=positive, matching DualSense convention
         accel_x: (ax / 3) as f32 * as_,
         accel_y: (ay / 3) as f32 * as_,
         accel_z: (az / 3) as f32 * as_,
@@ -475,13 +475,17 @@ fn parse_switch_pro(buf: &[u8]) -> Option<HidReading> {
 fn build(buf: &[u8], gyro_off: usize, accel_off: usize, gyro_dps_per_lsb: f32, accel_g_per_lsb: f32) -> HidReading {
     let gs  = gyro_dps_per_lsb  / GYRO_REF_DPS;
     let as_ = accel_g_per_lsb   / ACCEL_REF_G;
+    // DS4/DualSense raw byte order is (pitch, yaw, roll) — remap to standard (roll, pitch, yaw)
+    // so that gyro_x=roll, gyro_y=pitch, gyro_z=yaw matches Switch Pro and the 3DOF module.
+    // Accel raw order is (side, vertical, fwd-tilt) — move vertical to z so that accel_z is
+    // the gravity axis (≈ +1 when flat face-up), matching Switch Pro's accel_z orientation.
     HidReading {
-        gyro_x:  ri16(buf, gyro_off)      as f32 * gs,
-        gyro_y:  ri16(buf, gyro_off + 2)  as f32 * gs,
-        gyro_z:  ri16(buf, gyro_off + 4)  as f32 * gs,
-        accel_x: ri16(buf, accel_off)     as f32 * as_,
-        accel_y: ri16(buf, accel_off + 2) as f32 * as_,
-        accel_z: ri16(buf, accel_off + 4) as f32 * as_,
+        gyro_x:  ri16(buf, gyro_off + 4)  as f32 * gs,   // raw[2] roll
+        gyro_y:  ri16(buf, gyro_off)      as f32 * gs,   // raw[0] pitch
+        gyro_z: -ri16(buf, gyro_off + 2)  as f32 * gs,   // raw[1] yaw, negated: right=positive
+        accel_x: ri16(buf, accel_off)     as f32 * as_,  // raw[0] side
+        accel_y: ri16(buf, accel_off + 4) as f32 * as_,  // raw[2] fwd-tilt
+        accel_z: ri16(buf, accel_off + 2) as f32 * as_,  // raw[1] vertical → z (+1 when flat)
         ..HidReading::default()
     }
 }

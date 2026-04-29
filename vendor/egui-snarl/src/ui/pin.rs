@@ -31,6 +31,10 @@ pub struct PinWireInfo {
     /// Desired style of the wire.
     /// Zoomed with current scale.
     pub style: WireStyle,
+
+    /// Width multiplier for the wire (1.0 = default). The larger of the two
+    /// connected pins' multipliers is used when drawing.
+    pub width_factor: f32,
 }
 
 /// Uses `Painter` to draw a pin.
@@ -101,6 +105,10 @@ pub struct PinInfo {
     /// Style of the wire connected to the pin.
     pub wire_style: Option<WireStyle>,
 
+    /// Width multiplier for the wire (1.0 = default). The larger of the two
+    /// connected pins' multipliers is used when drawing.
+    pub wire_width_factor: Option<f32>,
+
     /// Custom vertical position of a pin
     pub position: Option<f32>,
 }
@@ -138,6 +146,14 @@ impl PinInfo {
     #[must_use]
     pub const fn with_wire_color(mut self, wire_color: Color32) -> Self {
         self.wire_color = Some(wire_color);
+        self
+    }
+
+    /// Sets a width multiplier for wires connected to this pin.
+    /// The larger of the two endpoints' multipliers is used when drawing.
+    #[must_use]
+    pub const fn with_wire_width_factor(mut self, factor: f32) -> Self {
+        self.wire_width_factor = Some(factor);
         self
     }
 
@@ -217,6 +233,7 @@ impl PinInfo {
             style: self
                 .wire_style
                 .unwrap_or_else(|| snarl_style.get_wire_style()),
+            width_factor: self.wire_width_factor.unwrap_or(1.0),
         }
     }
 }

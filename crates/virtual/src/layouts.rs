@@ -53,6 +53,8 @@ pub static XINPUT_SINK_PINS: &[SinkPin] = &[
     sp!("dpad_down",     "D-Pad Down",        SignalType::Bool),
     sp!("dpad_left",     "D-Pad Left",        SignalType::Bool),
     sp!("dpad_right",    "D-Pad Right",       SignalType::Bool),
+    // Auto-map bus port — always last to avoid shifting existing pin indices.
+    sp!("automap_in",    "Auto-Map",          SignalType::AutoMap),
 ];
 
 pub static DS4_SINK_PINS: &[SinkPin] = &[
@@ -89,4 +91,6 @@ pub static DS4_SINK_PINS: &[SinkPin] = &[
     sp!("accel_x",       "Accel X",           SignalType::Float),
     sp!("accel_y",       "Accel Y",           SignalType::Float),
     sp!("accel_z",       "Accel Z",           SignalType::Float),
+    // Auto-map bus port — always last to avoid shifting existing pin indices.
+    sp!("automap_in",    "Auto-Map",          SignalType::AutoMap),
 ];

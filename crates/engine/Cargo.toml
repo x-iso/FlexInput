@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 flexinput-core = { workspace = true }
 uuid           = { workspace = true }
+serde_json     = { workspace = true }
+glam           = { workspace = true }
+smallvec       = { workspace = true }

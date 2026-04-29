@@ -4,18 +4,21 @@ use flexinput_core::{ModuleDescriptor, PinDescriptor, Signal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Runtime-only per-node state (not serialized).  Used by display modules.
+/// Runtime-only per-node UI state (not serialized).
+/// Computation state has moved to `NodeState` in the engine crate.
 #[derive(Debug, Clone, Default)]
 pub struct NodeExtra {
     /// Rolling signal history for oscilloscope / vectorscope nodes.
-    /// Each entry is one sample per input channel; None when the channel is unconnected.
+    /// Populated each frame by draining the processing thread's scope_pending buffer.
     pub history: VecDeque<Vec<Option<f32>>>,
     /// Most recent evaluated signal per input (for readout / body display).
+    /// Populated each frame from the processing thread's last_inputs map.
     pub last_signals: Vec<Option<Signal>>,
-    /// Ring buffer of (timestamp, value) pairs for the delay module.
-    pub delay_buf: VecDeque<(std::time::Instant, f32)>,
-    /// Biquad direct-form-II state [x₋₁, x₋₂, y₋₁, y₋₂] for the lowpass module.
-    pub filter_state: [f64; 4],
+    /// UI-side aux scratch used by the counter reset button.
+    /// Set by the viewer; read once during graph snapshot building then cleared.
+    pub aux_f32: Vec<f32>,
+    /// True when the counter reset button was clicked; cleared after snapshot build.
+    pub aux_f32_dirty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

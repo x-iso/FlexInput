@@ -3,15 +3,18 @@ use flexinput_core::SignalType;
 use crate::{identification::ControllerKind, DevicePin};
 
 pub fn outputs_for(kind: ControllerKind) -> Vec<DevicePin> {
-    match kind {
+    let mut pins = match kind {
         ControllerKind::XInput     => xinput_outputs(),
         ControllerKind::DualShock4 => ds4_outputs(),
         ControllerKind::DualSense  => dualsense_outputs(),
         ControllerKind::SwitchPro  => switch_pro_outputs(),
         ControllerKind::Generic    => generic_outputs(),
         // MIDI devices build their own pin lists; layouts not used.
-        ControllerKind::MidiIn | ControllerKind::MidiOut => vec![],
-    }
+        ControllerKind::MidiIn | ControllerKind::MidiOut => return vec![],
+    };
+    // Auto-map bus port — always last so it never shifts existing pin indices.
+    pins.push(am("automap_out", "Auto-Map"));
+    pins
 }
 
 pub fn inputs_for(kind: ControllerKind) -> Vec<DevicePin> {
@@ -228,4 +231,7 @@ fn fl(id: &str, name: &str) -> DevicePin {
 }
 fn bo(id: &str, name: &str) -> DevicePin {
     f2(id, name, SignalType::Bool)
+}
+fn am(id: &str, name: &str) -> DevicePin {
+    f2(id, name, SignalType::AutoMap)
 }

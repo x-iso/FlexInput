@@ -817,6 +817,7 @@ struct PinResponse {
     pos: Pos2,
     wire_color: Color32,
     wire_style: WireStyle,
+    wire_width_factor: f32,
 }
 
 /// Widget to display [`Snarl`] graph in [`Ui`].
@@ -1161,7 +1162,8 @@ where
 
         let color = mix_colors(from_r.wire_color, to_r.wire_color);
 
-        let mut draw_width = wire_width;
+        let width_factor = from_r.wire_width_factor.max(to_r.wire_width_factor);
+        let mut draw_width = wire_width * width_factor;
         if hovered_wire == Some(wire) {
             draw_width *= 1.5;
         }
@@ -1545,6 +1547,7 @@ where
                     pos: r.rect.center(),
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
+                    wire_width_factor: wire_info.width_factor,
                 },
             );
 
@@ -1711,6 +1714,7 @@ where
                     pos: r.rect.center(),
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
+                    wire_width_factor: wire_info.width_factor,
                 },
             );
 

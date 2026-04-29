@@ -25,7 +25,7 @@ impl Signal {
         match (self, target) {
             (s, t) if s.signal_type() == t => Some(s),
             (Signal::Bool(b), SignalType::Float) => Some(Signal::Float(if b { 1.0 } else { 0.0 })),
-            (Signal::Float(f), SignalType::Bool) => Some(Signal::Bool(f != 0.0)),
+            (Signal::Float(f), SignalType::Bool) => Some(Signal::Bool(f >= 0.5)),
             (Signal::Int(i), SignalType::Float) => Some(Signal::Float(i as f32)),
             (Signal::Float(f), SignalType::Int) => Some(Signal::Int(f as i32)),
             _ => None,
@@ -55,39 +55,46 @@ pub enum SignalType {
     Int,
     /// Accepts any incoming type — used for pass-through, selector, and switch modules.
     Any,
+    /// Auto-mapping bus port: connects two devices and relays all name-matched signals
+    /// automatically. Direct wires to individual pins on the destination take priority.
+    AutoMap,
 }
 
 impl SignalType {
     pub fn accepts(self, incoming: SignalType) -> bool {
-        self == SignalType::Any
-            || self == incoming
-            || matches!(
-                (self, incoming),
-                (SignalType::Float, SignalType::Bool)
-                    | (SignalType::Bool, SignalType::Float)
-                    | (SignalType::Float, SignalType::Int)
-                    | (SignalType::Int, SignalType::Float)
-            )
+        match (self, incoming) {
+            (SignalType::AutoMap, SignalType::AutoMap) => true,
+            (SignalType::AutoMap, _) | (_, SignalType::AutoMap) => false,
+            (SignalType::Any, _) => true,
+            (a, b) if a == b => true,
+            (SignalType::Float, SignalType::Bool)
+            | (SignalType::Bool, SignalType::Float)
+            | (SignalType::Float, SignalType::Int)
+            | (SignalType::Int, SignalType::Float) => true,
+            _ => false,
+        }
     }
 
     pub fn display_name(self) -> &'static str {
         match self {
-            SignalType::Float => "Float",
-            SignalType::Bool  => "Bool",
-            SignalType::Vec2  => "Vec2",
-            SignalType::Int   => "Int",
-            SignalType::Any   => "Any",
+            SignalType::Float   => "Float",
+            SignalType::Bool    => "Bool",
+            SignalType::Vec2    => "Vec2",
+            SignalType::Int     => "Int",
+            SignalType::Any     => "Any",
+            SignalType::AutoMap => "AutoMap",
         }
     }
 
-    /// Suggested wire color for the UI.
+    /// Suggested wire / pin color for the UI.
     pub fn color_rgb(self) -> [u8; 3] {
         match self {
-            SignalType::Float => [100, 180, 255],
-            SignalType::Bool  => [255, 120, 80],
-            SignalType::Vec2  => [120, 220, 140],
-            SignalType::Int   => [200, 160, 255],
-            SignalType::Any   => [180, 180, 180],
+            SignalType::Float   => [100, 180, 255],
+            SignalType::Bool    => [255, 220, 60],  // yellow (was orange)
+            SignalType::Vec2    => [120, 220, 140],
+            SignalType::Int     => [200, 160, 255],
+            SignalType::Any     => [180, 180, 180],
+            SignalType::AutoMap => [255, 140, 40],  // orange
         }
     }
 }
