@@ -1,6 +1,6 @@
 mod curve;
 pub mod node;
-mod viewer;
+pub mod viewer;
 
 pub use curve::sample_curve;
 pub use node::NodeData;
@@ -49,6 +49,18 @@ pub struct Canvas {
     undo_stack: Vec<Snarl<NodeData>>,
     redo_stack: Vec<Snarl<NodeData>>,
     clipboard: Option<ClipboardData>,
+    /// Set this frame when the user requests to open a subpatch editor window.
+    pub pending_edit_subpatch: Option<egui_snarl::NodeId>,
+    /// Set this frame when the user picks "Pin element …" on an inner canvas
+    /// node. (NodeId, element_id, source_size). `source_size = [0,0]` means
+    /// "no measured size" — the receiver should fall back to a default.
+    pub pending_expose_module: Option<(egui_snarl::NodeId, String, [f32; 2])>,
+    /// True when this canvas is the inner graph of a sub-patch editor window.
+    /// Hides inlet/outlet nodes from the outer context menu.
+    pub is_inner: bool,
+    /// NodeId.0 values of inner nodes currently pinned to the outer body.
+    /// Populated by show_subpatch_editors before rendering the inner canvas.
+    pub pinned_inner_ids: std::collections::HashSet<usize>,
 }
 
 impl Canvas {
@@ -64,6 +76,10 @@ impl Canvas {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: None,
+            pending_edit_subpatch: None,
+            pending_expose_module: None,
+            is_inner: false,
+            pinned_inner_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -189,6 +205,7 @@ impl Canvas {
         &mut self,
         descriptors: &[ModuleDescriptor],
         live_device_ids: &HashSet<String>,
+        physical_devices: &[PhysicalDevice],
         ui: &mut egui::Ui,
     ) {
         let ctx = ui.ctx().clone();
@@ -204,8 +221,14 @@ impl Canvas {
             descriptors,
             ctx: ctx.clone(),
             live_device_ids,
+            physical_devices,
             pending_wire_menu: None,
             rename_request: None,
+            replace_request: None,
+            edit_subpatch_request: None,
+            is_inner_canvas: self.is_inner,
+            expose_module_request: None,
+            pinned_inner_ids: self.pinned_inner_ids.clone(),
         };
         self.snarl.show(&mut viewer, &self.style, "flexinput_canvas", ui);
 
@@ -223,6 +246,14 @@ impl Canvas {
             self.wire_ctx_just_opened = true;
         }
 
+        // ── Hot-swap: replace device node ─────────────────────────────────────
+        if let Some((node_id, dev_idx)) = viewer.replace_request {
+            if let Some(new_device) = physical_devices.get(dev_idx) {
+                self.push_undo();
+                replace_device_node(&mut self.snarl, node_id, new_device);
+            }
+        }
+
         // ── Rename popup ──────────────────────────────────────────────────────
         if let Some(node_id) = viewer.rename_request {
             let current = self.snarl.get_node(node_id)
@@ -231,6 +262,9 @@ impl Canvas {
             let pos = ui.ctx().input(|i| i.pointer.latest_pos().unwrap_or_default());
             self.rename_state = Some((node_id, current, pos));
         }
+
+        self.pending_edit_subpatch  = viewer.edit_subpatch_request;
+        self.pending_expose_module  = viewer.expose_module_request;
 
         let mut commit_name: Option<(egui_snarl::NodeId, String)> = None;
         let mut close_rename = false;
@@ -478,6 +512,7 @@ impl Canvas {
 
         let mut params = HashMap::new();
         params.insert("device_id".to_string(), Value::String(device.id.clone()));
+        params.insert("deadzone".to_string(), Value::from(0.1_f64));
         params.insert("output_pin_ids".to_string(), Value::Array(
             device.outputs.iter().map(|p| Value::String(p.id.clone())).collect(),
         ));
@@ -492,6 +527,7 @@ impl Canvas {
             inputs,
             outputs,
             params,
+            subpatch: None,
             extra: Default::default(),
         };
 
@@ -528,6 +564,7 @@ impl Canvas {
             inputs,
             outputs: vec![],
             params,
+            subpatch: None,
             extra: Default::default(),
         };
 
@@ -565,6 +602,7 @@ impl Canvas {
             inputs,
             outputs: vec![],
             params,
+            subpatch: None,
             extra: Default::default(),
         };
 
@@ -614,6 +652,142 @@ impl Default for Canvas {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Swap a device.source or device.sink node to a different physical device, preserving
+/// wire connections by matching pin IDs between the old and new device.
+fn replace_device_node(
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    new_device: &PhysicalDevice,
+) {
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let module_id = node.module_id.clone();
+    let is_source = module_id == "device.source";
+    let is_sink   = module_id == "device.sink";
+    if !is_source && !is_sink { return; }
+
+    // Capture old pin ID lists for name-based reconnection.
+    let old_out_ids: Vec<String> = node.params
+        .get("output_pin_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| Value::as_str(v).unwrap_or("").to_string()).collect())
+        .unwrap_or_default();
+    let old_in_ids: Vec<String> = node.params
+        .get("input_pin_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| Value::as_str(v).unwrap_or("").to_string()).collect())
+        .unwrap_or_default();
+
+    // Snapshot all wires touching this node before modifying anything.
+    let all_wires: Vec<(OutPinId, InPinId)> = snarl.wires().collect();
+    let out_conns: Vec<(usize, InPinId)> = all_wires.iter()
+        .filter_map(|(o, i)| if o.node == node_id { Some((o.output, *i)) } else { None })
+        .collect();
+    let in_conns: Vec<(usize, OutPinId)> = all_wires.iter()
+        .filter_map(|(o, i)| if i.node == node_id { Some((i.input, *o)) } else { None })
+        .collect();
+
+    // Disconnect everything first.
+    for &(out_idx, inp) in &out_conns {
+        snarl.disconnect(OutPinId { node: node_id, output: out_idx }, inp);
+    }
+    for &(in_idx, out) in &in_conns {
+        snarl.disconnect(out, InPinId { node: node_id, input: in_idx });
+    }
+
+    // Update node data.
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.display_name = new_device.display_name.clone();
+        node.params.insert("device_id".to_string(), Value::String(new_device.id.clone()));
+        if is_source {
+            node.outputs = new_device.outputs.iter()
+                .map(|p| PinDescriptor::new(&p.display_name, p.signal_type))
+                .collect();
+            node.inputs = new_device.inputs.iter()
+                .map(|p| PinDescriptor::new(&p.display_name, p.signal_type))
+                .collect();
+            node.params.insert("output_pin_ids".to_string(), Value::Array(
+                new_device.outputs.iter().map(|p| Value::String(p.id.clone())).collect(),
+            ));
+            node.params.insert("input_pin_ids".to_string(), Value::Array(
+                new_device.inputs.iter().map(|p| Value::String(p.id.clone())).collect(),
+            ));
+        } else {
+            node.inputs = new_device.inputs.iter()
+                .map(|p| PinDescriptor::new(&p.display_name, p.signal_type))
+                .collect();
+            node.outputs = vec![];
+            node.params.insert("fixed_input_count".to_string(),
+                Value::Number((new_device.inputs.len() as u64).into()));
+            node.params.insert("input_pin_ids".to_string(), Value::Array(
+                new_device.inputs.iter().map(|p| Value::String(p.id.clone())).collect(),
+            ));
+        }
+    }
+
+    // Reconnect wires by matching old pin IDs to new pin positions.
+    // Falls back to cross-controller aliases when an exact match is absent.
+    let new_out_ids: Vec<&str> = new_device.outputs.iter().map(|p| p.id.as_str()).collect();
+    let new_in_ids:  Vec<&str> = new_device.inputs.iter().map(|p| p.id.as_str()).collect();
+
+    for (old_idx, target) in out_conns {
+        if let Some(pin_id) = old_out_ids.get(old_idx) {
+            if let Some(new_idx) = resolve_pin(pin_id, &new_out_ids) {
+                snarl.connect(OutPinId { node: node_id, output: new_idx }, target);
+            }
+        }
+    }
+    for (old_idx, source) in in_conns {
+        if let Some(pin_id) = old_in_ids.get(old_idx) {
+            if let Some(new_idx) = resolve_pin(pin_id, &new_in_ids) {
+                snarl.connect(source, InPinId { node: node_id, input: new_idx });
+            }
+        }
+    }
+}
+
+/// Cross-controller pin equivalence groups (positional / functional equivalents).
+const COMPAT_GROUPS: &[&[&str]] = &[
+    // Face buttons by position
+    &["btn_cross",    "btn_b",      "btn_south"],   // South
+    &["btn_circle",   "btn_a",      "btn_east"],    // East
+    &["btn_square",   "btn_y",      "btn_west"],    // West
+    &["btn_triangle", "btn_x",      "btn_north"],   // North
+    // Shoulder bumpers
+    &["btn_l1",       "btn_l",      "btn_lb"],
+    &["btn_r1",       "btn_r",      "btn_rb"],
+    // Triggers: analog float ↔ digital bool
+    &["l2",           "left_trigger",  "btn_zl"],
+    &["r2",           "right_trigger", "btn_zr"],
+    // Stick clicks
+    &["btn_l3",       "btn_ls"],
+    &["btn_r3",       "btn_rs"],
+    // Menu buttons
+    &["btn_options",  "btn_plus",   "btn_start"],
+    &["btn_share",    "btn_minus",  "btn_back"],
+    &["btn_ps",       "btn_home",   "btn_guide"],
+    // Extra action buttons (mic mute ↔ capture/screenshot)
+    &["btn_mute",     "btn_capture"],
+];
+
+/// Find the position of `old_id` in `candidates`, with alias fallback.
+fn resolve_pin(old_id: &str, candidates: &[&str]) -> Option<usize> {
+    if let Some(i) = candidates.iter().position(|&id| id == old_id) {
+        return Some(i);
+    }
+    for group in COMPAT_GROUPS {
+        if group.contains(&old_id) {
+            for &alias in *group {
+                if alias != old_id {
+                    if let Some(i) = candidates.iter().position(|&id| id == alias) {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Disconnect a wire and insert `desc` between its endpoints, auto-connecting compatible pins.

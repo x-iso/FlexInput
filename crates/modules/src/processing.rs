@@ -11,6 +11,8 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<VecToAxisModule>(),
         reg::<AxisToVecModule>(),
         reg::<Gyro3DOFModule>(),
+        reg::<AutoMapSplitModule>(),
+        reg::<AutoMapCollectModule>(),
     ]
 }
 
@@ -47,8 +49,8 @@ impl Module for AverageModule {
             id: "module.average",
             display_name: "Average",
             category: "Processing",
-            inputs: vec![PinDescriptor::new("In", SignalType::Float)],
-            outputs: vec![PinDescriptor::new("Out", SignalType::Float)],
+            inputs: vec![PinDescriptor::new("In", SignalType::Any)],
+            outputs: vec![PinDescriptor::new("Out", SignalType::Any)],
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
@@ -156,6 +158,55 @@ impl Module for AxisToVecModule {
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── AutoMap Splitter ──────────────────────────────────────────────────────────
+
+/// Accepts an AutoMap input and exposes individual device signals as typed outputs,
+/// plus an AutoMap passthrough output for downstream routing.
+/// User adds outputs via the node body UI; `output_pin_ids[0]` = "automap_pass" (passthrough),
+/// `output_pin_ids[1..]` = selected device pin IDs.
+#[derive(Default)]
+pub struct AutoMapSplitModule;
+
+impl Module for AutoMapSplitModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.automap_split",
+            display_name: "AutoMap Splitter",
+            category: "AutoMap",
+            inputs: vec![PinDescriptor::new("Device", SignalType::AutoMap)],
+            outputs: vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        // Signals injected by compute_node in eval.rs via dev_sigs lookup.
+        SmallVec::new()
+    }
+}
+
+// ── AutoMap Collector ─────────────────────────────────────────────────────────
+
+/// Accepts an AutoMap input and individual signal inlets (user-added from canonical list),
+/// then merges them into an AutoMap output. Individual inlets override specific signals;
+/// non-overridden signals pass through from the upstream source device.
+#[derive(Default)]
+pub struct AutoMapCollectModule;
+
+impl Module for AutoMapCollectModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.automap_collect",
+            display_name: "AutoMap Collector",
+            category: "AutoMap",
+            inputs: vec![PinDescriptor::new("Device", SignalType::AutoMap)],
+            outputs: vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        // Signals injected into collector_sigs by eval_graph_tick in eval.rs.
+        SmallVec::new()
+    }
 }
 
 // ── Gyro 3DOF to 2D ───────────────────────────────────────────────────────────

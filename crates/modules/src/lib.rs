@@ -5,6 +5,7 @@ pub mod generator;
 pub mod logic;
 pub mod math;
 pub mod processing;
+pub mod subpatch;
 
 use flexinput_core::ModuleRegistration;
 
@@ -17,5 +18,6 @@ pub fn all_modules() -> Vec<ModuleRegistration> {
     modules.extend(display::registrations());
     modules.extend(processing::registrations());
     modules.extend(generator::registrations());
+    modules.extend(subpatch::registrations());
     modules
 }

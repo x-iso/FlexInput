@@ -65,7 +65,7 @@ impl SignalType {
         match (self, incoming) {
             (SignalType::AutoMap, SignalType::AutoMap) => true,
             (SignalType::AutoMap, _) | (_, SignalType::AutoMap) => false,
-            (SignalType::Any, _) => true,
+            (SignalType::Any, _) | (_, SignalType::Any) => true,
             (a, b) if a == b => true,
             (SignalType::Float, SignalType::Bool)
             | (SignalType::Bool, SignalType::Float)

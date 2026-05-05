@@ -90,12 +90,12 @@ impl VirtualDevice for VirtualXInput {
                 set_bit(&mut self.buttons, XButtons::UP,    v.y >  0.5);
                 set_bit(&mut self.buttons, XButtons::DOWN,  v.y < -0.5);
             },
-            "left_stick_x"  => if let Signal::Float(f) = value { self.thumb_lx = float_to_i16(f); },
-            "left_stick_y"  => if let Signal::Float(f) = value { self.thumb_ly = float_to_i16(f); },
-            "right_stick_x" => if let Signal::Float(f) = value { self.thumb_rx = float_to_i16(f); },
-            "right_stick_y" => if let Signal::Float(f) = value { self.thumb_ry = float_to_i16(f); },
-            "left_trigger"  => if let Signal::Float(f) = value { self.left_trigger  = float_to_u8(f); },
-            "right_trigger" => if let Signal::Float(f) = value { self.right_trigger = float_to_u8(f); },
+            "left_stick_x"  => self.thumb_lx = float_to_i16(value.as_float()),
+            "left_stick_y"  => self.thumb_ly = float_to_i16(value.as_float()),
+            "right_stick_x" => self.thumb_rx = float_to_i16(value.as_float()),
+            "right_stick_y" => self.thumb_ry = float_to_i16(value.as_float()),
+            "left_trigger"  => self.left_trigger  = float_to_u8(value.as_float()),
+            "right_trigger" => self.right_trigger = float_to_u8(value.as_float()),
             "btn_south"  => set_bool_bit(&mut self.buttons, XButtons::A,      &value),
             "btn_east"   => set_bool_bit(&mut self.buttons, XButtons::B,      &value),
             "btn_west"   => set_bool_bit(&mut self.buttons, XButtons::X,      &value),
@@ -451,36 +451,36 @@ impl VirtualDevice for VirtualDS4 {
                 self.dpad[0] = v.y >  0.5; self.dpad[1] = v.x >  0.5;
                 self.dpad[2] = v.y < -0.5; self.dpad[3] = v.x < -0.5;
             },
-            "left_stick_x"  => if let Signal::Float(f) = value { self.lx = ds4_axis_x(f); },
-            "left_stick_y"  => if let Signal::Float(f) = value { self.ly = ds4_axis_y(f); },
-            "right_stick_x" => if let Signal::Float(f) = value { self.rx = ds4_axis_x(f); },
-            "right_stick_y" => if let Signal::Float(f) = value { self.ry = ds4_axis_y(f); },
-            "l2"            => if let Signal::Float(f) = value { self.lt = float_to_u8(f); },
-            "r2"            => if let Signal::Float(f) = value { self.rt = float_to_u8(f); },
-            "btn_cross"    => set_bool_bit(&mut self.buttons, ds4_btn::CROSS,    &value),
-            "btn_circle"   => set_bool_bit(&mut self.buttons, ds4_btn::CIRCLE,   &value),
-            "btn_square"   => set_bool_bit(&mut self.buttons, ds4_btn::SQUARE,   &value),
-            "btn_triangle" => set_bool_bit(&mut self.buttons, ds4_btn::TRIANGLE, &value),
-            "btn_l1"       => set_bool_bit(&mut self.buttons, ds4_btn::L1,       &value),
-            "btn_r1"       => set_bool_bit(&mut self.buttons, ds4_btn::R1,       &value),
-            "btn_l2_dig"   => set_bool_bit(&mut self.buttons, ds4_btn::L2_DIG,   &value),
-            "btn_r2_dig"   => set_bool_bit(&mut self.buttons, ds4_btn::R2_DIG,   &value),
-            "btn_l3"       => set_bool_bit(&mut self.buttons, ds4_btn::L3,       &value),
-            "btn_r3"       => set_bool_bit(&mut self.buttons, ds4_btn::R3,       &value),
-            "btn_options"  => set_bool_bit(&mut self.buttons, ds4_btn::OPTIONS,  &value),
-            "btn_share"    => set_bool_bit(&mut self.buttons, ds4_btn::SHARE,    &value),
-            "btn_ps"       => set_bool_u8(&mut self.special, ds4_btn::PS,       &value),
-            "btn_touchpad" => set_bool_u8(&mut self.special, ds4_btn::TOUCHPAD, &value),
-            "dpad_up"    => { self.dpad[0] = matches!(value, Signal::Bool(true)); },
-            "dpad_right" => { self.dpad[1] = matches!(value, Signal::Bool(true)); },
-            "dpad_down"  => { self.dpad[2] = matches!(value, Signal::Bool(true)); },
-            "dpad_left"  => { self.dpad[3] = matches!(value, Signal::Bool(true)); },
-            "gyro_x"  => if let Signal::Float(f) = value { self.gyro_x  = f; },
-            "gyro_y"  => if let Signal::Float(f) = value { self.gyro_y  = f; },
-            "gyro_z"  => if let Signal::Float(f) = value { self.gyro_z  = f; },
-            "accel_x" => if let Signal::Float(f) = value { self.accel_x = f; },
-            "accel_y" => if let Signal::Float(f) = value { self.accel_y = f; },
-            "accel_z" => if let Signal::Float(f) = value { self.accel_z = f; },
+            "left_stick_x"  => self.lx = ds4_axis_x(value.as_float()),
+            "left_stick_y"  => self.ly = ds4_axis_y(value.as_float()),
+            "right_stick_x" => self.rx = ds4_axis_x(value.as_float()),
+            "right_stick_y" => self.ry = ds4_axis_y(value.as_float()),
+            "left_trigger"  => self.lt = float_to_u8(value.as_float()),
+            "right_trigger" => self.rt = float_to_u8(value.as_float()),
+            "btn_south"    => set_bool_bit(&mut self.buttons, ds4_btn::CROSS,    &value),
+            "btn_east"     => set_bool_bit(&mut self.buttons, ds4_btn::CIRCLE,   &value),
+            "btn_west"     => set_bool_bit(&mut self.buttons, ds4_btn::SQUARE,   &value),
+            "btn_north"    => set_bool_bit(&mut self.buttons, ds4_btn::TRIANGLE, &value),
+            "btn_lb"       => set_bool_bit(&mut self.buttons, ds4_btn::L1,       &value),
+            "btn_rb"       => set_bool_bit(&mut self.buttons, ds4_btn::R1,       &value),
+            "btn_lt_dig"   => set_bool_bit(&mut self.buttons, ds4_btn::L2_DIG,   &value),
+            "btn_rt_dig"   => set_bool_bit(&mut self.buttons, ds4_btn::R2_DIG,   &value),
+            "btn_ls"       => set_bool_bit(&mut self.buttons, ds4_btn::L3,       &value),
+            "btn_rs"       => set_bool_bit(&mut self.buttons, ds4_btn::R3,       &value),
+            "btn_start"    => set_bool_bit(&mut self.buttons, ds4_btn::OPTIONS,  &value),
+            "btn_back"     => set_bool_bit(&mut self.buttons, ds4_btn::SHARE,    &value),
+            "btn_guide"    => set_bool_u8(&mut self.special, ds4_btn::PS,        &value),
+            "btn_touchpad" => set_bool_u8(&mut self.special, ds4_btn::TOUCHPAD,  &value),
+            "dpad_up"    => self.dpad[0] = value.as_bool(),
+            "dpad_right" => self.dpad[1] = value.as_bool(),
+            "dpad_down"  => self.dpad[2] = value.as_bool(),
+            "dpad_left"  => self.dpad[3] = value.as_bool(),
+            "gyro_x"  => self.gyro_x  = value.as_float(),
+            "gyro_y"  => self.gyro_y  = value.as_float(),
+            "gyro_z"  => self.gyro_z  = value.as_float(),
+            "accel_x" => self.accel_x = value.as_float(),
+            "accel_y" => self.accel_y = value.as_float(),
+            "accel_z" => self.accel_z = value.as_float(),
             _ => {}
         }
     }
@@ -534,8 +534,6 @@ impl VirtualDevice for VirtualDS4 {
             // Extended IOCTL failed — fall through to basic this frame but keep
             // has_extended = true so we retry next frame. Transient failures
             // (device not yet ready) would otherwise permanently kill gyro/touchpad.
-            #[cfg(debug_assertions)]
-            eprintln!("[VirtualDS4] extended IOCTL failed, falling back to basic this frame");
         }
 
         // Basic report path (also fallback when extended fails).
@@ -916,13 +914,12 @@ fn set_bit(bits: &mut u16, mask: u16, on: bool) {
 }
 
 fn set_bool_bit(bits: &mut u16, mask: u16, value: &Signal) {
-    if let Signal::Bool(b) = value { set_bit(bits, mask, *b); }
+    // Universal coercion: any Float >= 0.5 → true, any Bool → its value, etc.
+    set_bit(bits, mask, value.as_bool());
 }
 
 fn set_bool_u8(bits: &mut u8, mask: u8, value: &Signal) {
-    if let Signal::Bool(b) = *value {
-        if b { *bits |= mask; } else { *bits &= !mask; }
-    }
+    if value.as_bool() { *bits |= mask; } else { *bits &= !mask; }
 }
 
 /// Maps an egui Key debug name (format!("{key:?}")) to an enigo Key.

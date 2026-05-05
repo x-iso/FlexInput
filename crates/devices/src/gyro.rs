@@ -43,6 +43,25 @@ pub struct TouchPoint {
     pub y: f32,
 }
 
+/// Switch Pro button state read directly from input report 0x30 bytes 3/4/5.
+/// Used to bypass gilrs's WGI backend which loses diagonal D-Pad positions and
+/// has unreliable Home/Capture/Plus/Minus mapping in BT mode.
+/// Naming uses Nintendo's physical labels (A=east, B=south, X=north, Y=west).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SwitchProButtons {
+    pub btn_a: bool, pub btn_b: bool, pub btn_x: bool, pub btn_y: bool,
+    pub btn_l: bool, pub btn_r: bool, pub btn_zl: bool, pub btn_zr: bool,
+    pub btn_lstick: bool, pub btn_rstick: bool,
+    pub btn_minus: bool, pub btn_plus: bool,
+    pub btn_home: bool, pub btn_capture: bool,
+    pub dpad_up: bool, pub dpad_down: bool, pub dpad_left: bool, pub dpad_right: bool,
+    /// L-Stick analog X normalized to [-1, 1] (raw 12-bit calibrated value).
+    pub lstick_x: f32,
+    pub lstick_y: f32,
+    pub rstick_x: f32,
+    pub rstick_y: f32,
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct HidReading {
     pub gyro_x: f32,
@@ -61,6 +80,8 @@ pub struct HidReading {
     pub touchpad_click: bool,
     /// Microphone mute button (DualSense only).
     pub mic_button: bool,
+    /// Switch Pro full button state, parsed from raw HID. None for non-Switch devices.
+    pub switch_buttons: Option<SwitchProButtons>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -444,9 +465,44 @@ fn parse_dualsense_touch(buf: &[u8], off: usize) -> TouchPoint {
 }
 
 fn parse_switch_pro(buf: &[u8]) -> Option<HidReading> {
-    // Report 0x30: 3 IMU samples at bytes 13, 25, 37.
-    // Each sample: [accel X, accel Y, accel Z, gyro X, gyro Y, gyro Z] as i16 LE.
+    // Report 0x30: standard input report with full button state and 3 IMU samples.
+    // Layout (per dekuNukem/Nintendo_Switch_Reverse_Engineering bluetooth_hid_notes.md):
+    //   byte 3 = right buttons:  bit0=Y, bit1=X, bit2=B, bit3=A, bit6=R, bit7=ZR
+    //   byte 4 = shared:         bit0=Minus, bit1=Plus, bit2=RStick, bit3=LStick,
+    //                            bit4=Home, bit5=Capture
+    //   byte 5 = left buttons:   bit0=Down, bit1=Up, bit2=Right, bit3=Left, bit6=L, bit7=ZL
+    //   bytes 6..9   = left analog stick  (3 bytes packed 12-bit X / 12-bit Y)
+    //   bytes 9..12  = right analog stick (same packing)
+    //   bytes 13/25/37 = three IMU samples [ax, ay, az, gx, gy, gz] i16 LE each.
     if buf[0] != 0x30 || buf.len() < 49 { return None; }
+
+    let right  = buf[3];
+    let shared = buf[4];
+    let left   = buf[5];
+
+    let switch_buttons = SwitchProButtons {
+        btn_y:       right  & 0x01 != 0,
+        btn_x:       right  & 0x02 != 0,
+        btn_b:       right  & 0x04 != 0,
+        btn_a:       right  & 0x08 != 0,
+        btn_r:       right  & 0x40 != 0,
+        btn_zr:      right  & 0x80 != 0,
+        btn_minus:   shared & 0x01 != 0,
+        btn_plus:    shared & 0x02 != 0,
+        btn_rstick:  shared & 0x04 != 0,
+        btn_lstick:  shared & 0x08 != 0,
+        btn_home:    shared & 0x10 != 0,
+        btn_capture: shared & 0x20 != 0,
+        dpad_down:   left   & 0x01 != 0,
+        dpad_up:     left   & 0x02 != 0,
+        dpad_right:  left   & 0x04 != 0,
+        dpad_left:   left   & 0x08 != 0,
+        btn_l:       left   & 0x40 != 0,
+        btn_zl:      left   & 0x80 != 0,
+        // Stick analog values are calibrated 12-bit; without per-controller calibration we
+        // leave these at zero — gilrs's stick path remains the source for stick axes.
+        lstick_x: 0.0, lstick_y: 0.0, rstick_x: 0.0, rstick_y: 0.0,
+    };
 
     let (mut ax, mut ay, mut az) = (0i32, 0i32, 0i32);
     let (mut gx, mut gy, mut gz) = (0i32, 0i32, 0i32);
@@ -463,11 +519,12 @@ fn parse_switch_pro(buf: &[u8]) -> Option<HidReading> {
     let as_ = SWITCH_ACCEL_G_PER_LSB / ACCEL_REF_G;
     Some(HidReading {
         gyro_x:  (gx / 3) as f32 * gs,
-        gyro_y: -(gy / 3) as f32 * gs,   // negated: pitch-up=positive, matching DualSense convention
-        gyro_z: -(gz / 3) as f32 * gs,   // negated: yaw-right=positive, matching DualSense convention
+        gyro_y: -(gy / 3) as f32 * gs,
+        gyro_z: -(gz / 3) as f32 * gs,
         accel_x: (ax / 3) as f32 * as_,
         accel_y: (ay / 3) as f32 * as_,
         accel_z: (az / 3) as f32 * as_,
+        switch_buttons: Some(switch_buttons),
         ..HidReading::default()
     })
 }

@@ -8,6 +8,14 @@ pub struct ProcessingGraph {
     pub nodes: Vec<NodeSnap>,
 }
 
+/// Inner graph for a sub-patch node, produced by recursively building the inner snarl.
+#[derive(Clone, Default)]
+pub struct InlineSubgraph {
+    pub graph: ProcessingGraph,
+    /// For each outer output pin k: (inner flat node index, output pin 0) of the outlet node.
+    pub outlet_locs: Vec<Option<(usize, usize)>>,
+}
+
 /// Routing metadata for device.sink nodes: how to dispatch computed signals to a device.
 #[derive(Clone)]
 pub struct SinkTarget {
@@ -18,7 +26,11 @@ pub struct SinkTarget {
     /// For each input slot: ALL upstream sources (multi-source; combined additively).
     pub multi_sources: Vec<Vec<(usize, usize)>>,
     /// If an AutoMap pin is wired: (source_device_id, source_output_pin_ids).
+    /// source_device_id may be "collector:{uid}" for AutoMap Collector nodes.
     pub automap_source: Option<(String, Vec<String>)>,
+    /// When automap_source is a collector, this holds the upstream real device ID
+    /// used as fallback for pins the collector does not override.
+    pub automap_fallback_dev: Option<String>,
 }
 
 #[derive(Clone)]
@@ -38,4 +50,6 @@ pub struct NodeSnap {
     pub aux_f32_override: Option<Vec<f32>>,
     /// Populated only for device.sink nodes; None for all others.
     pub sink_target: Option<SinkTarget>,
+    /// Populated for subpatch nodes; contains the recursively-built inner graph.
+    pub inline_subgraph: Option<Box<InlineSubgraph>>,
 }

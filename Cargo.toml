@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 
@@ -32,6 +32,7 @@ rfd        = "0.15"
 egui       = "0.33"
 eframe     = { version = "0.33", features = ["default"] }
 egui-snarl = "0.9"
+egui_extras = { version = "0.33", features = ["svg"] }
 
 [patch.crates-io]
 egui-snarl = { path = "vendor/egui-snarl" }

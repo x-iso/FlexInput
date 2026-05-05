@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use glam::Vec2;
-use gilrs::{Axis, Button, Gilrs};
+use gilrs::{Axis, Button, Gilrs, GilrsBuilder};
 
 use flexinput_core::Signal;
 
@@ -27,7 +27,7 @@ pub struct GilrsBackend {
 
 impl GilrsBackend {
     pub fn try_new() -> Option<Self> {
-        Gilrs::new().ok().map(|gilrs| Self {
+        GilrsBuilder::new().with_default_filters(false).build().ok().map(|gilrs| Self {
             gilrs,
             phys_counts: HashMap::new(),
             vigem_present: HashMap::new(),
@@ -64,68 +64,135 @@ impl DeviceBackend for GilrsBackend {
         }
 
         let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
+        let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
+        let mut result = Vec::new();
 
-        self.gilrs
-            .gamepads()
-            .filter_map(|(id, pad)| {
-                if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
-                    // Only dedup when ViGEmBus is confirmed to have a virtual for this
-                    // VID/PID. Without that, SetupAPI's USB-format HW-ID search would
-                    // return 0 for Bluetooth devices and incorrectly drop them.
-                    if *self.vigem_present.get(&vp).unwrap_or(&false) {
-                        let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
-                        let seen = gilrs_seen.entry(vp).or_insert(0);
-                        if *seen >= phys {
-                            return None; // extra beyond physical count → ViGEmBus virtual
-                        }
-                        *seen += 1;
+        for (_id, pad) in self.gilrs.gamepads() {
+            if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
+                // Only dedup when ViGEmBus is confirmed to have a virtual for this
+                // VID/PID. Without that, SetupAPI's USB-format HW-ID search would
+                // return 0 for Bluetooth devices and incorrectly drop them.
+                if *self.vigem_present.get(&vp).unwrap_or(&false) {
+                    let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
+                    let seen = gilrs_seen.entry(vp).or_insert(0);
+                    if *seen >= phys {
+                        continue; // extra beyond physical count → ViGEmBus virtual
                     }
+                    *seen += 1;
                 }
+            }
 
-                // instance_path is only needed for HidHide; skip the SetupAPI scan for now.
-                let instance_path: Option<String> = None;
+            let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
+            let inst = *kind_seen.get(&kind).unwrap_or(&0);
+            kind_seen.insert(kind, inst + 1);
 
-                let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
-                let display_name = if kind == ControllerKind::Generic {
-                    pad.name().to_string()
-                } else {
-                    kind.display_name().to_string()
-                };
-                Some(PhysicalDevice {
-                    id: format!("gilrs:{}", usize::from(id)),
-                    display_name,
-                    kind,
-                    outputs: layouts::outputs_for(kind),
-                    inputs: layouts::inputs_for(kind),
-                    instance_path,
-                })
-            })
-            .collect()
+            let display_name = if kind == ControllerKind::Generic {
+                pad.name().to_string()
+            } else {
+                kind.display_name().to_string()
+            };
+
+            result.push(PhysicalDevice {
+                id: format!("gilrs:{}:{}", kind.id_slug(), inst),
+                display_name,
+                kind,
+                outputs: layouts::outputs_for(kind),
+                inputs: layouts::inputs_for(kind),
+                instance_path: None,
+            });
+        }
+        result
     }
 
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
-        while self.gilrs.next_event().is_some() {}
+        // Drain events. Raw events auto-update axis and button state.
+        // axis_dpad_to_button is intentionally NOT applied: on BT Switch Pro it creates
+        // conflicting synthetic button releases that fight the native WGI DPad button events,
+        // causing flicker and broken diagonals. DPad discrete outputs are derived manually
+        // below from both axis_data (HAT/USB path) and button_data (BT/WGI path).
+        while let Some(ev) = self.gilrs.next_event() {
+            self.gilrs.update(&ev);
+        }
 
         // Flush staged rumble / lightbar outputs *before* reading inputs so any
         // device.sink writes from the previous frame land on the controller.
         self.gyro.flush_outputs();
 
         let mut out = Vec::new();
+        let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
+        let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
         // Track per-(VID,PID) instance index for gyro correlation.
         let mut gyro_idx: HashMap<(u16, u16), usize> = HashMap::new();
 
-        for (id, pad) in self.gilrs.gamepads() {
-            let dev = format!("gilrs:{}", usize::from(id));
+        for (_id, pad) in self.gilrs.gamepads() {
+            // Apply the same ViGEmBus filter as enumerate() so IDs stay in sync.
+            if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
+                if *self.vigem_present.get(&vp).unwrap_or(&false) {
+                    let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
+                    let seen = gilrs_seen.entry(vp).or_insert(0);
+                    if *seen >= phys {
+                        continue;
+                    }
+                    *seen += 1;
+                }
+            }
+
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
+            let inst = *kind_seen.get(&kind).unwrap_or(&0);
+            kind_seen.insert(kind, inst + 1);
+            let dev = format!("gilrs:{}:{}", kind.id_slug(), inst);
 
             for (axis, pin_id) in axis_map(kind) {
                 let v = pad.axis_data(*axis).map_or(0.0, |d| d.value());
                 out.push((dev.clone(), pin_id.to_string(), Signal::Float(v)));
             }
 
-            for (button, pin_id) in button_map(kind) {
+            // In BT mode gilrs maps Switch Pro buttons by WGI label order (Nintendo's A/B/X/Y
+            // labels → gilrs South/East/West/North), reversing physical positions. Use a
+            // corrective map when the pad name doesn't say "Pro Controller" (USB mode).
+            let is_switch_bt = kind == ControllerKind::SwitchPro
+                && !pad.name().to_ascii_lowercase().contains("pro controller");
+            let btn_map: &[(Button, &str)] = if is_switch_bt {
+                BUTTON_MAP_SWITCH_BT
+            } else {
+                button_map(kind)
+            };
+            for (button, pin_id) in btn_map {
                 let pressed = pad.button_data(*button).map_or(false, |d| d.is_pressed());
                 out.push((dev.clone(), pin_id.to_string(), Signal::Bool(pressed)));
+            }
+
+            // Universal DPad discrete outputs: combine axis_data (HAT/USB path) and
+            // button_data (WGI/BT path).  Since axis_dpad_to_button is no longer applied,
+            // button_data only reflects native button events (WGI flags etc.) while
+            // axis_data reflects HAT-switch events.  OR-combining both handles all paths:
+            //   • USB HAT (DS4, Switch Pro USB): axis_data non-zero, button_data zero.
+            //   • BT WGI (Switch Pro BT): axis_data zero, button_data non-zero.
+            //   • XInput / WGI gamepad: button_data set by WGI DPad flags.
+            {
+                let dx = axis_val(&pad, Axis::DPadX);
+                let dy = axis_val(&pad, Axis::DPadY);
+                let du = dy >  0.5 || pad.button_data(Button::DPadUp).map_or(false,    |d| d.is_pressed());
+                let dd = dy < -0.5 || pad.button_data(Button::DPadDown).map_or(false,  |d| d.is_pressed());
+                let dr = dx >  0.5 || pad.button_data(Button::DPadRight).map_or(false, |d| d.is_pressed());
+                let dl = dx < -0.5 || pad.button_data(Button::DPadLeft).map_or(false,  |d| d.is_pressed());
+                out.push((dev.clone(), "dpad_up".into(),    Signal::Bool(du)));
+                out.push((dev.clone(), "dpad_down".into(),  Signal::Bool(dd)));
+                out.push((dev.clone(), "dpad_right".into(), Signal::Bool(dr)));
+                out.push((dev.clone(), "dpad_left".into(),  Signal::Bool(dl)));
+
+                // Reconstruct dpad Vec2 and axis pins from button states when axis_data is zero
+                // (BT WGI path has no HAT axis events).  Diagonal magnitude is normalised.
+                if dx == 0.0 && dy == 0.0 && (du || dd || dr || dl) {
+                    let bx = if dr { 1.0f32 } else if dl { -1.0 } else { 0.0 };
+                    let by = if du { 1.0f32 } else if dd { -1.0 } else { 0.0 };
+                    let (nx, ny) = if bx != 0.0 && by != 0.0 {
+                        (bx * std::f32::consts::FRAC_1_SQRT_2, by * std::f32::consts::FRAC_1_SQRT_2)
+                    } else { (bx, by) };
+                    out.push((dev.clone(), "dpad_x".into(), Signal::Float(nx)));
+                    out.push((dev.clone(), "dpad_y".into(), Signal::Float(ny)));
+                    out.push((dev.clone(), "dpad".into(), Signal::Vec2(glam::Vec2::new(nx, ny))));
+                }
             }
 
             let lx = axis_val(&pad, Axis::LeftStickX);
@@ -140,6 +207,12 @@ impl DeviceBackend for GilrsBackend {
                 let dx = axis_val(&pad, Axis::DPadX);
                 let dy = axis_val(&pad, Axis::DPadY);
                 out.push((dev.clone(), "dpad".into(), Signal::Vec2(Vec2::new(dx, dy))));
+            } else if kind == ControllerKind::SwitchPro {
+                // DPad comes as Axis::DPadX/Y (HAT switch) — already emitted by axis_map;
+                // just build the bundled Vec2 from the same values.
+                let dx = axis_val(&pad, Axis::DPadX);
+                let dy = axis_val(&pad, Axis::DPadY);
+                out.push((dev.clone(), "dpad".into(), Signal::Vec2(Vec2::new(dx, dy))));
             }
 
             // Analog triggers: ButtonData::value() works for both XInput and native HID.
@@ -147,10 +220,7 @@ impl DeviceBackend for GilrsBackend {
             if !matches!(kind, ControllerKind::SwitchPro) {
                 let lt = pad.button_data(Button::LeftTrigger2).map_or(0.0, |d| d.value());
                 let rt = pad.button_data(Button::RightTrigger2).map_or(0.0, |d| d.value());
-                let (l_pin, r_pin) = match kind {
-                    ControllerKind::DualShock4 | ControllerKind::DualSense => ("l2", "r2"),
-                    _ => ("left_trigger", "right_trigger"),
-                };
+                let (l_pin, r_pin) = ("left_trigger", "right_trigger");
                 out.push((dev.clone(), l_pin.into(), Signal::Float(lt)));
                 out.push((dev.clone(), r_pin.into(), Signal::Float(rt)));
             }
@@ -184,6 +254,42 @@ impl DeviceBackend for GilrsBackend {
                     if matches!(kind, ControllerKind::DualSense) {
                         out.push((dev.clone(), "btn_mute".into(),      Signal::Bool(g.mic_button)));
                     }
+                    // Switch Pro: override gilrs button output with raw-HID button data.
+                    // This bypasses gilrs's WGI backend which loses D-Pad diagonals (8-position
+                    // switch only emits cardinal events), garbles A/B/X/Y vs South/East/West/North
+                    // by Nintendo label vs physical position, and mis-routes Plus/Minus/Home/Capture.
+                    // Pushing last makes these the authoritative values in the IO-thread HashMap.
+                    if let Some(sb) = g.switch_buttons {
+                        // Face buttons by physical position (Nintendo's labels are weird):
+                        out.push((dev.clone(), "btn_south".into(), Signal::Bool(sb.btn_b))); // B = south
+                        out.push((dev.clone(), "btn_east".into(),  Signal::Bool(sb.btn_a))); // A = east
+                        out.push((dev.clone(), "btn_west".into(),  Signal::Bool(sb.btn_y))); // Y = west
+                        out.push((dev.clone(), "btn_north".into(), Signal::Bool(sb.btn_x))); // X = north
+                        out.push((dev.clone(), "btn_lb".into(),    Signal::Bool(sb.btn_l)));
+                        out.push((dev.clone(), "btn_rb".into(),    Signal::Bool(sb.btn_r)));
+                        out.push((dev.clone(), "btn_lt_dig".into(),Signal::Bool(sb.btn_zl)));
+                        out.push((dev.clone(), "btn_rt_dig".into(),Signal::Bool(sb.btn_zr)));
+                        out.push((dev.clone(), "btn_ls".into(),    Signal::Bool(sb.btn_lstick)));
+                        out.push((dev.clone(), "btn_rs".into(),    Signal::Bool(sb.btn_rstick)));
+                        out.push((dev.clone(), "btn_start".into(), Signal::Bool(sb.btn_plus)));
+                        out.push((dev.clone(), "btn_back".into(),  Signal::Bool(sb.btn_minus)));
+                        out.push((dev.clone(), "btn_guide".into(), Signal::Bool(sb.btn_home)));
+                        out.push((dev.clone(), "btn_capture".into(),Signal::Bool(sb.btn_capture)));
+                        out.push((dev.clone(), "dpad_up".into(),   Signal::Bool(sb.dpad_up)));
+                        out.push((dev.clone(), "dpad_down".into(), Signal::Bool(sb.dpad_down)));
+                        out.push((dev.clone(), "dpad_left".into(), Signal::Bool(sb.dpad_left)));
+                        out.push((dev.clone(), "dpad_right".into(),Signal::Bool(sb.dpad_right)));
+                        // Reconstruct DPad axis/Vec2 from authoritative button bits (BT path
+                        // sends no axis events at all; diagonals get √2/2 magnitude).
+                        let bx = if sb.dpad_right { 1.0f32 } else if sb.dpad_left { -1.0 } else { 0.0 };
+                        let by = if sb.dpad_up    { 1.0f32 } else if sb.dpad_down { -1.0 } else { 0.0 };
+                        let (nx, ny) = if bx != 0.0 && by != 0.0 {
+                            (bx * std::f32::consts::FRAC_1_SQRT_2, by * std::f32::consts::FRAC_1_SQRT_2)
+                        } else { (bx, by) };
+                        out.push((dev.clone(), "dpad_x".into(), Signal::Float(nx)));
+                        out.push((dev.clone(), "dpad_y".into(), Signal::Float(ny)));
+                        out.push((dev.clone(), "dpad".into(),   Signal::Vec2(Vec2::new(nx, ny))));
+                    }
                 }
             }
         }
@@ -209,21 +315,36 @@ impl DeviceBackend for GilrsBackend {
 }
 
 impl GilrsBackend {
-    /// Resolve a `gilrs:N` device id to the (vid, pid, instance index) tuple
-    /// that GyroManager keys its open HID handles by. Walks gilrs.gamepads()
-    /// in the same order as `poll()` to keep the per-(vid,pid) index aligned.
+    /// Resolve a `gilrs:<kind>:<inst>` device id to the (vid, pid, instance index) tuple
+    /// that GyroManager keys its open HID handles by. Applies the same ViGEmBus filter
+    /// and kind-based instance counting as `enumerate()` / `poll()`.
     fn lookup_phys(&self, device_id: &str) -> Option<(u16, u16, usize)> {
-        let mut idx_per: HashMap<(u16, u16), usize> = HashMap::new();
-        for (id, pad) in self.gilrs.gamepads() {
-            let dev = format!("gilrs:{}", usize::from(id));
+        let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
+        let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
+        let mut vp_seen: HashMap<(u16, u16), usize> = HashMap::new();
+        for (_id, pad) in self.gilrs.gamepads() {
+            if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
+                if *self.vigem_present.get(&vp).unwrap_or(&false) {
+                    let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
+                    let seen = gilrs_seen.entry(vp).or_insert(0);
+                    if *seen >= phys {
+                        continue;
+                    }
+                    *seen += 1;
+                }
+            }
+            let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
+            let inst = *kind_seen.get(&kind).unwrap_or(&0);
+            kind_seen.insert(kind, inst + 1);
+            let dev = format!("gilrs:{}:{}", kind.id_slug(), inst);
             let vp = pad.vendor_id().zip(pad.product_id());
             if dev == device_id {
                 let (v, p) = vp?;
-                let idx = *idx_per.get(&(v, p)).unwrap_or(&0);
+                let idx = *vp_seen.get(&(v, p)).unwrap_or(&0);
                 return Some((v, p, idx));
             }
             if let Some((v, p)) = vp {
-                *idx_per.entry((v, p)).or_insert(0) += 1;
+                *vp_seen.entry((v, p)).or_insert(0) += 1;
             }
         }
         None
@@ -268,6 +389,9 @@ const AXIS_MAP_SWITCH: &[(Axis, &str)] = &[
     (Axis::LeftStickY,  "left_stick_y"),
     (Axis::RightStickX, "right_stick_x"),
     (Axis::RightStickY, "right_stick_y"),
+    // DPad is a HAT switch reported as axes on Windows; read directly.
+    (Axis::DPadX,       "dpad_x"),
+    (Axis::DPadY,       "dpad_y"),
 ];
 
 fn button_map(kind: ControllerKind) -> &'static [(Button, &'static str)] {
@@ -278,6 +402,7 @@ fn button_map(kind: ControllerKind) -> &'static [(Button, &'static str)] {
     }
 }
 
+// DPad discrete outputs are emitted via the unified axis+button path in poll(); omitted here.
 const BUTTON_MAP_XINPUT: &[(Button, &str)] = &[
     (Button::South,         "btn_south"),
     (Button::East,          "btn_east"),
@@ -292,50 +417,62 @@ const BUTTON_MAP_XINPUT: &[(Button, &str)] = &[
     (Button::Start,         "btn_start"),
     (Button::Select,        "btn_back"),
     (Button::Mode,          "btn_guide"),
-    (Button::DPadUp,        "dpad_up"),
-    (Button::DPadDown,      "dpad_down"),
-    (Button::DPadLeft,      "dpad_left"),
-    (Button::DPadRight,     "dpad_right"),
 ];
 
 const BUTTON_MAP_PLAYSTATION: &[(Button, &str)] = &[
-    (Button::South,         "btn_cross"),
-    (Button::East,          "btn_circle"),
-    (Button::West,          "btn_square"),
-    (Button::North,         "btn_triangle"),
-    (Button::LeftTrigger,   "btn_l1"),
-    (Button::RightTrigger,  "btn_r1"),
-    (Button::LeftTrigger2,  "btn_l2_dig"),
-    (Button::RightTrigger2, "btn_r2_dig"),
-    (Button::LeftThumb,     "btn_l3"),
-    (Button::RightThumb,    "btn_r3"),
-    (Button::Start,         "btn_options"),
-    (Button::Select,        "btn_share"),
-    (Button::Mode,          "btn_ps"),
-    (Button::C,             "btn_touchpad"),
-    (Button::DPadUp,        "dpad_up"),
-    (Button::DPadDown,      "dpad_down"),
-    (Button::DPadLeft,      "dpad_left"),
-    (Button::DPadRight,     "dpad_right"),
-];
-
-const BUTTON_MAP_SWITCH: &[(Button, &str)] = &[
-    (Button::South,         "btn_b"),
-    (Button::East,          "btn_a"),
-    (Button::West,          "btn_y"),
-    (Button::North,         "btn_x"),
-    (Button::LeftTrigger,   "btn_l"),
-    (Button::RightTrigger,  "btn_r"),
-    (Button::LeftTrigger2,  "btn_zl"),
-    (Button::RightTrigger2, "btn_zr"),
+    (Button::South,         "btn_south"),
+    (Button::East,          "btn_east"),
+    (Button::West,          "btn_west"),
+    (Button::North,         "btn_north"),
+    (Button::LeftTrigger,   "btn_lb"),
+    (Button::RightTrigger,  "btn_rb"),
+    (Button::LeftTrigger2,  "btn_lt_dig"),
+    (Button::RightTrigger2, "btn_rt_dig"),
     (Button::LeftThumb,     "btn_ls"),
     (Button::RightThumb,    "btn_rs"),
-    (Button::Start,         "btn_plus"),
-    (Button::Select,        "btn_minus"),
-    (Button::Mode,          "btn_home"),
-    (Button::C,             "btn_capture"),
-    (Button::DPadUp,        "dpad_up"),
-    (Button::DPadDown,      "dpad_down"),
-    (Button::DPadLeft,      "dpad_left"),
-    (Button::DPadRight,     "dpad_right"),
+    (Button::Start,         "btn_start"),
+    (Button::Select,        "btn_back"),
+    (Button::Mode,          "btn_guide"),
+    (Button::C,             "btn_touchpad"),
+];
+
+// USB / wired Switch Pro: gilrs Button::South = physical south (B), East = A, West = Y, North = X.
+const BUTTON_MAP_SWITCH: &[(Button, &str)] = &[
+    (Button::South,         "btn_south"),
+    (Button::East,          "btn_east"),
+    (Button::West,          "btn_west"),
+    (Button::North,         "btn_north"),
+    (Button::LeftTrigger,   "btn_lb"),
+    (Button::RightTrigger,  "btn_rb"),
+    (Button::LeftTrigger2,  "btn_lt_dig"),
+    (Button::RightTrigger2, "btn_rt_dig"),
+    (Button::LeftThumb,     "btn_ls"),
+    (Button::RightThumb,    "btn_rs"),
+    (Button::Start,         "btn_start"),   // Plus
+    (Button::Select,        "btn_back"),    // Minus
+    (Button::Mode,          "btn_guide"),   // Home
+    (Button::C,             "btn_capture"), // Capture
+    // DPad omitted: emitted separately via axis+button combo in poll() to avoid BT flicker.
+];
+
+// Bluetooth Switch Pro: gilrs is driven by Windows Gaming Input which maps Nintendo labels
+// rather than physical positions (Nintendo's A label → WGI A → gilrs South).
+// Additionally Home/Capture appear at gilrs Select/Start in BT mode.
+const BUTTON_MAP_SWITCH_BT: &[(Button, &str)] = &[
+    (Button::South, "btn_east"),    // WGI A = Nintendo A (east physical position)
+    (Button::East,  "btn_south"),   // WGI B = Nintendo B (south physical position)
+    (Button::West,  "btn_north"),   // WGI X = Nintendo X (north physical position)
+    (Button::North, "btn_west"),    // WGI Y = Nintendo Y (west physical position)
+    (Button::LeftTrigger,   "btn_lb"),
+    (Button::RightTrigger,  "btn_rb"),
+    (Button::LeftTrigger2,  "btn_lt_dig"),
+    (Button::RightTrigger2, "btn_rt_dig"),
+    (Button::LeftThumb,     "btn_ls"),
+    (Button::RightThumb,    "btn_rs"),
+    // In BT mode: Start fires for Home, Select fires for Capture (opposite of USB).
+    (Button::Start,  "btn_guide"),   // Home → gilrs Start in BT
+    (Button::Select, "btn_capture"), // Capture → gilrs Select in BT
+    (Button::Mode,   "btn_start"),   // Plus (if it fires Mode in BT)
+    (Button::C,      "btn_back"),    // Minus (if it fires C in BT)
+    // DPad omitted: emitted separately via axis+button combo in poll().
 ];

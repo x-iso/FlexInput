@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use flexinput_core::{Signal, SignalType};
+use glam::Vec2;
+use flexinput_core::{Signal, SignalType, automap};
 use serde_json::Value;
 
 use crate::graph::{NodeSnap, ProcessingGraph};
@@ -20,6 +21,23 @@ pub struct TickOutput {
     pub sink_outputs: HashMap<(String, String), Signal>,
 }
 
+fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
+    if dz <= 0.0 { return sig; }
+    match sig {
+        Signal::Float(v) => {
+            let av = v.abs();
+            if av < dz { Signal::Float(0.0) }
+            else { Signal::Float(v.signum() * (av - dz) / (1.0 - dz).max(f32::EPSILON)) }
+        }
+        Signal::Vec2(v) => {
+            let len = v.length();
+            if len < dz { Signal::Vec2(Vec2::ZERO) }
+            else { Signal::Vec2(v / len * (len - dz) / (1.0 - dz).max(f32::EPSILON)) }
+        }
+        other => other,
+    }
+}
+
 fn combine_signals(a: Signal, b: Signal) -> Signal {
     match (a, b) {
         (Signal::Float(x), Signal::Float(y)) => Signal::Float(x + y),
@@ -28,6 +46,133 @@ fn combine_signals(a: Signal, b: Signal) -> Signal {
         (Signal::Int(x),   Signal::Int(y))   => Signal::Int(x + y),
         (_, b) => b,
     }
+}
+
+// ── Sub-patch inner evaluation ────────────────────────────────────────────────
+
+/// Namespaces inner node UIDs under their containing subpatch's UID to avoid
+/// collisions in the shared `state` map when multiple subpatches share inner node indices.
+#[inline]
+pub fn namespaced_uid(outer: usize, inner: usize) -> usize {
+    outer.wrapping_shl(20).wrapping_add(inner.wrapping_add(1))
+}
+
+/// Evaluates the inner graph of a sub-patch node.
+/// Returns the per-node computed signal vectors in inner flat-graph order.
+/// `outer_uid` is the UID of the containing meta-module node, used for state namespacing.
+/// Inner display nodes (oscilloscope, response_curve, etc.) push samples into
+/// `scope_samples`/`last_inputs` keyed by `namespaced_uid` so the UI can render
+/// live feedback on inner module bodies (and their pinned mirrors on the outer body).
+/// AutoMap collectors inside the subpatch inject into `collector_sigs` using a
+/// namespaced key so downstream sinks can pick them up via the same routing path.
+fn eval_subgraph(
+    graph: &ProcessingGraph,
+    outer_inputs: &[Option<Signal>],
+    state: &mut HashMap<usize, NodeState>,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+    scope_samples: &mut Vec<(usize, Vec<Option<f32>>)>,
+    last_inputs: &mut HashMap<usize, Vec<Option<Signal>>>,
+    outer_uid: usize,
+    dt: f32,
+) -> Vec<Vec<Option<Signal>>> {
+    let n = graph.nodes.len();
+    let mut computed: Vec<Vec<Option<Signal>>> = vec![vec![]; n];
+
+    for (idx, snap) in graph.nodes.iter().enumerate() {
+        // Inlet: produce the corresponding outer input signal.
+        if snap.module_id == "subpatch.inlet" {
+            let pin_idx = snap.params.get("pin_index")
+                .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            computed[idx] = vec![outer_inputs.get(pin_idx).copied().flatten()];
+            continue;
+        }
+
+        // Nested subpatch within this subpatch.
+        if let Some(ref sg) = snap.inline_subgraph {
+            let inner_inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+                .map(|src| src.and_then(|(si, op)| {
+                    computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+                }))
+                .collect();
+            let nested_uid = namespaced_uid(outer_uid, snap.node_uid);
+            let inner_computed = eval_subgraph(
+                &sg.graph, &inner_inputs, state, dev_sigs, collector_sigs,
+                scope_samples, last_inputs, nested_uid, dt,
+            );
+            computed[idx] = sg.outlet_locs.iter()
+                .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
+                .collect();
+            continue;
+        }
+
+        // AutoMap collector inside a subpatch: inject signals into collector_sigs
+        // using a namespaced key so it matches what find_automap_device produced.
+        if snap.module_id == "module.automap_collect" {
+            let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+                .map(|src| src.and_then(|(si, op)| {
+                    computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+                }))
+                .collect();
+            let collect_ids = snap.params.get("_collect_pin_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let ns_uid = namespaced_uid(outer_uid, snap.node_uid);
+            let uid_key = format!("collector:{}", ns_uid);
+            for (i, pin_id) in collect_ids.iter().enumerate() {
+                if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
+                    if !pin_id.is_empty() {
+                        collector_sigs.insert((uid_key.clone(), pin_id.clone()), sig);
+                    }
+                }
+            }
+            computed[idx] = vec![None];
+            continue;
+        }
+
+        let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+            .map(|src| src.and_then(|(si, op)| {
+                computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+            }))
+            .collect();
+
+        let ns_uid = namespaced_uid(outer_uid, snap.node_uid);
+        let node_state = state.entry(ns_uid).or_insert_with(NodeState::default);
+        if let Some(ref vals) = snap.aux_f32_override {
+            node_state.aux_f32 = vals.clone();
+        }
+        let node_outputs = compute_node(snap, &inputs, node_state, dev_sigs, collector_sigs, dt);
+
+        // Display state for inner nodes — keyed by namespaced UID so the UI walk
+        // can find them when populating `node.extra.last_signals` / `history`.
+        match snap.module_id.as_str() {
+            "display.oscilloscope" | "display.readout" => {
+                let sample = inputs.iter().map(|s| sig_to_f32(*s)).collect();
+                scope_samples.push((ns_uid, sample));
+                last_inputs.insert(ns_uid, inputs.clone());
+            }
+            "display.vectorscope" => {
+                let sample = inputs.iter().flat_map(|sig| match sig {
+                    Some(Signal::Vec2(v)) => [Some(v.x), Some(v.y)],
+                    _ => [None, None],
+                }).collect();
+                scope_samples.push((ns_uid, sample));
+                last_inputs.insert(ns_uid, inputs.clone());
+            }
+            "module.response_curve" | "module.vec_response_curve" => {
+                last_inputs.insert(ns_uid, inputs.clone());
+            }
+            "processing.gyro_3dof" => {
+                last_inputs.insert(ns_uid, node_outputs.clone());
+            }
+            _ => {}
+        }
+
+        computed[idx] = node_outputs;
+    }
+
+    computed
 }
 
 // ── Main graph tick ───────────────────────────────────────────────────────────
@@ -45,10 +190,42 @@ pub fn eval_graph_tick(
     let mut scope_samples: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
     let mut last_inputs: HashMap<usize, Vec<Option<Signal>>> = HashMap::new();
     let mut sink_outputs: HashMap<(String, String), Signal> = HashMap::new();
+    // Signals injected by AutoMap Collector nodes, keyed by ("collector:{uid}", pin_id).
+    let mut collector_sigs: HashMap<(String, String), Signal> = HashMap::new();
 
     for (idx, snap) in graph.nodes.iter().enumerate() {
+        // ── module.automap_collect: inject individual inputs into collector_sigs ──
+        if snap.module_id == "module.automap_collect" {
+            let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+                .map(|src| src.and_then(|(si, op)| {
+                    computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+                }))
+                .collect();
+            let collect_ids = snap.params.get("_collect_pin_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let uid_key = format!("collector:{}", snap.node_uid);
+            for (i, pin_id) in collect_ids.iter().enumerate() {
+                if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
+                    if !pin_id.is_empty() {
+                        collector_sigs.insert((uid_key.clone(), pin_id.clone()), sig);
+                    }
+                }
+            }
+            computed[idx] = vec![None]; // AutoMap passthrough: no signal value
+            continue;
+        }
+
         // ── device.sink: collect combined inputs, populate sink_outputs ──────
         if let Some(ref st) = snap.sink_target {
+            // Pins that have at least one actual direct wire (non-empty multi_sources).
+            // These take priority over auto-mapped signals for the same pin.
+            let directly_wired: HashSet<&str> = st.pin_ids.iter().enumerate()
+                .filter(|(i, pid)| !pid.is_empty() && st.multi_sources.get(*i).map_or(false, |s| !s.is_empty()))
+                .map(|(_, pid)| pid.as_str())
+                .collect();
+
             // Direct-wire inputs (possibly multi-source per pin, combined additively).
             for (in_idx, pin_id) in st.pin_ids.iter().enumerate() {
                 if pin_id.is_empty() { continue; }
@@ -67,22 +244,98 @@ pub fn eval_graph_tick(
                     sink_outputs.insert((st.device_id.clone(), pin_id.clone()), sig);
                 }
             }
-            // AutoMap: name-match source device pins → sink device pins.
+
+            // AutoMap: semantic-map source device pins → sink device pins.
+            // Uses resolve_mapping() for cross-family translation (e.g. btn_cross → btn_south).
             if let Some((ref src_dev, ref src_pins)) = st.automap_source {
-                let direct: HashSet<&str> = st.pin_ids.iter().map(|s| s.as_str()).collect();
-                for src_pin in src_pins {
-                    if src_pin == "automap_out" { continue; }
-                    // Direct-wire connection already covers this pin — skip.
-                    if direct.contains(src_pin.as_str()) { continue; }
-                    if let Some(&sig) = dev_sigs.get(&(src_dev.clone(), src_pin.clone())) {
+                let dst_ids: Vec<&str> = st.pin_ids.iter()
+                    .filter(|pid| !pid.is_empty())
+                    .map(|pid| pid.as_str())
+                    .collect();
+                let src_ids: Vec<&str> = src_pins.iter()
+                    .filter(|p| !p.is_empty() && p.as_str() != "automap_out")
+                    .map(|p| p.as_str())
+                    .collect();
+                let is_collector = src_dev.starts_with("collector:");
+                for (mapped_src, mapped_dst) in automap::resolve_mapping(&src_ids, &dst_ids) {
+                    if directly_wired.contains(mapped_dst) { continue; }
+                    // For collectors: check collector_sigs first, then fall back to upstream device.
+                    let sig_opt = if is_collector {
+                        collector_sigs.get(&(src_dev.clone(), mapped_src.to_string())).copied()
+                            .or_else(|| {
+                                st.automap_fallback_dev.as_ref().and_then(|fb| {
+                                    dev_sigs.get(&(fb.clone(), mapped_src.to_string())).copied()
+                                })
+                            })
+                    } else {
+                        dev_sigs.get(&(src_dev.clone(), mapped_src.to_string())).copied()
+                    };
+                    if let Some(sig) = sig_opt {
+                        // Type coercion (Bool↔Float) is performed by the virtual device's
+                        // send() via Signal::as_float / as_bool, so we just hand the raw
+                        // signal off — semantic groups already routed it to the right pin.
                         sink_outputs
-                            .entry((st.device_id.clone(), src_pin.clone()))
+                            .entry((st.device_id.clone(), mapped_dst.to_string()))
+                            .or_insert(sig);
+                    }
+                }
+                // Wildcard pass-through for virtual keyboard/mouse sinks: forward EVERY
+                // collector-injected signal to the sink as-is (using the source pin name
+                // verbatim).  The sink's send() handles arbitrary key names through its
+                // learned_keys fallback, so users can drive any custom key (F1, Space,
+                // letters, …) by adding it to the Collector via the Learn-key UI.
+                if is_collector && st.device_id.starts_with("virtual.keymouse") {
+                    for ((dev, pin), &sig) in collector_sigs.iter() {
+                        if dev != src_dev { continue; }
+                        if directly_wired.contains(pin.as_str()) { continue; }
+                        sink_outputs
+                            .entry((st.device_id.clone(), pin.clone()))
                             .or_insert(sig);
                     }
                 }
             }
+
+            // Resolve Vec2 vs individual axis conflicts (they write the same hardware registers).
+            // Priority: directly-wired axes beat auto-mapped Vec2; Vec2 wins in all other cases.
+            const STICK_GROUPS: &[(&str, &[&str])] = &[
+                ("left_stick",  &["left_stick_x", "left_stick_y"]),
+                ("right_stick", &["right_stick_x", "right_stick_y"]),
+                ("dpad",        &["dpad_x", "dpad_y"]),
+            ];
+            for &(vec2_pin, axis_pins) in STICK_GROUPS {
+                let has_vec2     = sink_outputs.contains_key(&(st.device_id.clone(), vec2_pin.to_string()));
+                let has_any_axis = axis_pins.iter().any(|p| sink_outputs.contains_key(&(st.device_id.clone(), p.to_string())));
+                if !has_vec2 || !has_any_axis { continue; }
+                let vec2_direct     = directly_wired.contains(vec2_pin);
+                let any_axis_direct = axis_pins.iter().any(|p| directly_wired.contains(*p));
+                if any_axis_direct && !vec2_direct {
+                    sink_outputs.remove(&(st.device_id.clone(), vec2_pin.to_string()));
+                } else {
+                    for &axis_pin in axis_pins {
+                        sink_outputs.remove(&(st.device_id.clone(), axis_pin.to_string()));
+                    }
+                }
+            }
+
             computed[idx] = vec![];
             continue; // no further processing for sink nodes
+        }
+
+        // ── inline sub-patch: run inner graph and map outlet outputs ──────────
+        if let Some(ref sg) = snap.inline_subgraph {
+            let outer_inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+                .map(|src| src.and_then(|(si, op)| {
+                    computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+                }))
+                .collect();
+            let inner_computed = eval_subgraph(
+                &sg.graph, &outer_inputs, state, dev_sigs, &mut collector_sigs,
+                &mut scope_samples, &mut last_inputs, snap.node_uid, dt,
+            );
+            computed[idx] = sg.outlet_locs.iter()
+                .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
+                .collect();
+            continue;
         }
 
         let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
@@ -98,7 +351,7 @@ pub fn eval_graph_tick(
             node_state.aux_f32 = vals.clone();
         }
 
-        let node_outputs = compute_node(snap, &inputs, node_state, dev_sigs, dt);
+        let node_outputs = compute_node(snap, &inputs, node_state, dev_sigs, &collector_sigs, dt);
 
         match snap.module_id.as_str() {
             "display.oscilloscope" | "display.readout" => {
@@ -144,14 +397,36 @@ fn compute_node(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
     dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &HashMap<(String, String), Signal>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
     match snap.module_id.as_str() {
         "device.source" => {
             let dev_id = snap.device_id.as_deref().unwrap_or("");
+            let dz = snap.params.get("deadzone").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
             (0..snap.n_outputs).map(|i| {
                 let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
                 if pin_id.is_empty() { return None; }
+                let sig = dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()?;
+                Some(apply_deadzone(sig, dz))
+            }).collect()
+        }
+        "module.automap_split" => {
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            // The collector_id (set by build_processing_graph) is the closest
+            // upstream collector in the AutoMap wire chain. Splitter prefers its
+            // injected/overridden signals over the raw device samples so the
+            // probe reflects the most recent state along the chain.
+            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            (0..snap.n_outputs).map(|i| {
+                let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
+                // "automap_pass" or empty = the AutoMap passthrough slot — no signal value.
+                if pin_id.is_empty() || pin_id == "automap_pass" { return None; }
+                if !collector_id.is_empty() {
+                    if let Some(&sig) = collector_sigs.get(&(collector_id.to_string(), pin_id.to_string())) {
+                        return Some(sig);
+                    }
+                }
                 dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
             }).collect()
         }
@@ -210,6 +485,8 @@ fn compute_node(
             }).collect()
         }
         "display.oscilloscope" | "display.vectorscope" | "display.readout" | "device.sink" => vec![],
+        "subpatch.inlet" => vec![],
+        "subpatch.outlet" => vec![inputs.first().copied().flatten()],
         id => {
             (0..snap.n_outputs).map(|out_idx| {
                 eval_pure(id, out_idx, inputs, &snap.params, snap.n_outputs)
@@ -232,42 +509,88 @@ pub fn eval_pure(
     };
 
     match id {
-        "math.add" => Some(Signal::Float((0..inputs.len()).map(|i| get_f(inputs, i, 0.0)).sum())),
+        "math.add" => {
+            if inputs.iter().any(|s| matches!(s, Some(Signal::Vec2(_)))) {
+                let sum = (0..inputs.len())
+                    .map(|i| get_v2(inputs, i, 0.0))
+                    .fold(Vec2::ZERO, |acc, v| acc + v);
+                Some(Signal::Vec2(sum))
+            } else {
+                Some(Signal::Float((0..inputs.len()).map(|i| get_f(inputs, i, 0.0)).sum()))
+            }
+        }
         "math.subtract" => {
-            let first = get_f(inputs, 0, 0.0);
-            let rest: f32 = (1..inputs.len()).map(|i| get_f(inputs, i, 0.0)).sum();
-            Some(Signal::Float(first - rest))
+            if inputs.iter().any(|s| matches!(s, Some(Signal::Vec2(_)))) {
+                let first = get_v2(inputs, 0, 0.0);
+                let rest = (1..inputs.len()).map(|i| get_v2(inputs, i, 0.0)).fold(Vec2::ZERO, |acc, v| acc + v);
+                Some(Signal::Vec2(first - rest))
+            } else {
+                let first = get_f(inputs, 0, 0.0);
+                let rest: f32 = (1..inputs.len()).map(|i| get_f(inputs, i, 0.0)).sum();
+                Some(Signal::Float(first - rest))
+            }
         }
         "math.multiply" => {
-            let first = get_f(inputs, 0, 0.0);
-            let rest: f32 = (1..inputs.len()).map(|i| get_f(inputs, i, 1.0)).product();
-            Some(Signal::Float(first * rest))
+            if inputs.iter().any(|s| matches!(s, Some(Signal::Vec2(_)))) {
+                let first = get_v2(inputs, 0, 0.0);
+                let scale = (1..inputs.len()).map(|i| get_v2(inputs, i, 1.0)).fold(Vec2::ONE, |acc, v| acc * v);
+                Some(Signal::Vec2(first * scale))
+            } else {
+                let first = get_f(inputs, 0, 0.0);
+                let rest: f32 = (1..inputs.len()).map(|i| get_f(inputs, i, 1.0)).product();
+                Some(Signal::Float(first * rest))
+            }
         }
         "math.divide" => {
-            let mut v = get_f(inputs, 0, 0.0);
-            for i in 1..inputs.len() {
-                let d = get_f(inputs, i, 1.0);
-                v = if d == 0.0 { 0.0 } else { v / d };
+            if inputs.iter().any(|s| matches!(s, Some(Signal::Vec2(_)))) {
+                let mut v = get_v2(inputs, 0, 0.0);
+                for i in 1..inputs.len() {
+                    let d = get_v2(inputs, i, 1.0);
+                    v = Vec2::new(
+                        if d.x == 0.0 { 0.0 } else { v.x / d.x },
+                        if d.y == 0.0 { 0.0 } else { v.y / d.y },
+                    );
+                }
+                Some(Signal::Vec2(v))
+            } else {
+                let mut v = get_f(inputs, 0, 0.0);
+                for i in 1..inputs.len() {
+                    let d = get_f(inputs, i, 1.0);
+                    v = if d == 0.0 { 0.0 } else { v / d };
+                }
+                Some(Signal::Float(v))
             }
-            Some(Signal::Float(v))
         }
-        "math.abs"    => Some(Signal::Float(get_f(inputs, 0, 0.0).abs())),
-        "math.negate" => Some(Signal::Float(-get_f(inputs, 0, 0.0))),
+        "math.abs" => match inputs.get(0).and_then(|s| *s) {
+            Some(Signal::Vec2(v)) => Some(Signal::Vec2(v.abs())),
+            other => Some(Signal::Float(other.map(|s| s.as_float()).unwrap_or(0.0).abs())),
+        },
+        "math.negate" => match inputs.get(0).and_then(|s| *s) {
+            Some(Signal::Vec2(v)) => Some(Signal::Vec2(-v)),
+            other => Some(Signal::Float(-other.map(|s| s.as_float()).unwrap_or(0.0))),
+        },
         "math.clamp"  => {
-            let v   = get_f(inputs, 0, 0.0);
             let min = if inputs.get(1).and_then(|s| *s).is_some() { get_f(inputs, 1, -1.0) } else { param_f("min", -1.0) };
             let max = if inputs.get(2).and_then(|s| *s).is_some() { get_f(inputs, 2,  1.0) } else { param_f("max",  1.0) };
-            Some(Signal::Float(v.clamp(min, max)))
+            match inputs.get(0).and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => Some(Signal::Vec2(v.clamp(Vec2::splat(min), Vec2::splat(max)))),
+                other => Some(Signal::Float(other.map(|s| s.as_float()).unwrap_or(0.0).clamp(min, max))),
+            }
         }
         "math.map_range" => {
-            let v       = get_f(inputs, 0, 0.0);
             let in_min  = if inputs.get(1).and_then(|s| *s).is_some() { get_f(inputs, 1, -1.0) } else { param_f("in_min",  -1.0) };
             let in_max  = if inputs.get(2).and_then(|s| *s).is_some() { get_f(inputs, 2,  1.0) } else { param_f("in_max",   1.0) };
             let out_min = if inputs.get(3).and_then(|s| *s).is_some() { get_f(inputs, 3, -1.0) } else { param_f("out_min", -1.0) };
             let out_max = if inputs.get(4).and_then(|s| *s).is_some() { get_f(inputs, 4,  1.0) } else { param_f("out_max",  1.0) };
-            let t = if (in_max - in_min).abs() < f32::EPSILON { 0.0 }
-                    else { (v - in_min) / (in_max - in_min) };
-            Some(Signal::Float(out_min + t * (out_max - out_min)))
+            let map = |v: f32| -> f32 {
+                let t = if (in_max - in_min).abs() < f32::EPSILON { 0.0 }
+                        else { (v - in_min) / (in_max - in_min) };
+                out_min + t * (out_max - out_min)
+            };
+            match inputs.get(0).and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => Some(Signal::Vec2(Vec2::new(map(v.x), map(v.y)))),
+                other => Some(Signal::Float(map(other.map(|s| s.as_float()).unwrap_or(0.0)))),
+            }
         }
         "logic.and"       => Some(Signal::Bool(get_b(inputs, 0, false) && get_b(inputs, 1, false))),
         "logic.or"        => Some(Signal::Bool(get_b(inputs, 0, false) || get_b(inputs, 1, false))),
@@ -461,35 +784,60 @@ fn compute_average(
         .map(|f| f as u64).unwrap_or(10).clamp(1, 10_000) as usize;
     let spike_mad = params.get("spike_mad").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
 
-    while state.avg_bufs.len() < inputs.len() { state.avg_bufs.push(VecDeque::new()); }
+    while state.avg_bufs.len()    < inputs.len() { state.avg_bufs.push(VecDeque::new()); }
+    while state.avg_bufs_v2.len() < inputs.len() { state.avg_bufs_v2.push(VecDeque::new()); }
 
     let mut results = Vec::with_capacity(inputs.len());
     for (ch, inp) in inputs.iter().enumerate() {
-        let Some(v) = sig_to_f32(*inp) else { results.push(None); continue; };
-        let buf = &mut state.avg_bufs[ch];
-        buf.push_back(v);
-        while buf.len() > buf_size { buf.pop_front(); }
+        match inp {
+            Some(Signal::Vec2(v)) => {
+                let buf = &mut state.avg_bufs_v2[ch];
+                buf.push_back(*v);
+                while buf.len() > buf_size { buf.pop_front(); }
 
-        let avg = if spike_mad > 0.0 && buf.len() >= 3 {
-            let mut sorted: Vec<f32> = buf.iter().cloned().collect();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            let median = sorted_median(&sorted);
-            let mut devs: Vec<f32> = sorted.iter().map(|&x| (x - median).abs()).collect();
-            devs.sort_by(|a, b| a.total_cmp(b));
-            let mad = sorted_median(&devs);
-            if mad < 1e-9 { buf.iter().sum::<f32>() / buf.len() as f32 }
-            else {
-                let thresh = spike_mad as f32 * mad;
-                let kept: Vec<f32> = buf.iter().cloned().filter(|&x| (x - median).abs() <= thresh).collect();
-                if kept.is_empty() { buf.iter().sum::<f32>() / buf.len() as f32 }
-                else { kept.iter().sum::<f32>() / kept.len() as f32 }
+                let avg = if spike_mad > 0.0 && buf.len() >= 3 {
+                    Vec2::new(
+                        mad_average(buf.iter().map(|v| v.x), spike_mad as f32),
+                        mad_average(buf.iter().map(|v| v.y), spike_mad as f32),
+                    )
+                } else {
+                    buf.iter().copied().sum::<Vec2>() / buf.len() as f32
+                };
+                results.push(Some(Signal::Vec2(avg)));
             }
-        } else {
-            buf.iter().sum::<f32>() / buf.len() as f32
-        };
-        results.push(Some(Signal::Float(avg)));
+            inp => {
+                let Some(v) = sig_to_f32(*inp) else { results.push(None); continue; };
+                let buf = &mut state.avg_bufs[ch];
+                buf.push_back(v);
+                while buf.len() > buf_size { buf.pop_front(); }
+
+                let avg = if spike_mad > 0.0 && buf.len() >= 3 {
+                    mad_average(buf.iter().copied(), spike_mad as f32)
+                } else {
+                    buf.iter().sum::<f32>() / buf.len() as f32
+                };
+                results.push(Some(Signal::Float(avg)));
+            }
+        }
     }
     results
+}
+
+fn mad_average(values: impl Iterator<Item = f32> + Clone, spike_mad: f32) -> f32 {
+    let mut sorted: Vec<f32> = values.collect();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let median = sorted_median(&sorted);
+    let mut devs: Vec<f32> = sorted.iter().map(|&x| (x - median).abs()).collect();
+    devs.sort_by(|a, b| a.total_cmp(b));
+    let mad = sorted_median(&devs);
+    if mad < 1e-9 {
+        sorted.iter().sum::<f32>() / sorted.len() as f32
+    } else {
+        let thresh = spike_mad * mad;
+        let kept: Vec<f32> = sorted.iter().cloned().filter(|&x| (x - median).abs() <= thresh).collect();
+        if kept.is_empty() { sorted.iter().sum::<f32>() / sorted.len() as f32 }
+        else { kept.iter().sum::<f32>() / kept.len() as f32 }
+    }
 }
 
 fn sorted_median(sorted: &[f32]) -> f32 {
@@ -889,6 +1237,15 @@ pub fn get_f(inputs: &[Option<Signal>], i: usize, default: f32) -> f32 {
 
 pub fn get_b(inputs: &[Option<Signal>], i: usize, default: bool) -> bool {
     inputs.get(i).and_then(|s| *s).map(|s| s.as_bool()).unwrap_or(default)
+}
+
+/// Lift input slot to Vec2: Vec2 passes through, scalars are splatted, None → splat(default).
+fn get_v2(inputs: &[Option<Signal>], i: usize, default: f32) -> Vec2 {
+    match inputs.get(i).and_then(|s| *s) {
+        Some(Signal::Vec2(v)) => v,
+        Some(other) => Vec2::splat(other.as_float()),
+        None => Vec2::splat(default),
+    }
 }
 
 fn sig_scalar(s: Signal) -> f32 {

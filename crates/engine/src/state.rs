@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use glam::Vec2;
 use flexinput_core::Signal;
 
 /// Per-node computation state owned by the processing thread.
@@ -11,8 +12,10 @@ pub struct NodeState {
     pub last_signals: Vec<Option<Signal>>,
     /// Per-channel ring buffers of (timestamp, value) pairs for the delay module.
     pub delay_bufs: Vec<VecDeque<(Instant, f32)>>,
-    /// Per-channel sample ring buffers for the moving-average module.
+    /// Per-channel sample ring buffers for the moving-average module (float inputs).
     pub avg_bufs: Vec<VecDeque<f32>>,
+    /// Per-channel sample ring buffers for the moving-average module (Vec2 inputs).
+    pub avg_bufs_v2: Vec<VecDeque<Vec2>>,
     /// Per-channel fast EMA for the DC filter.
     pub dc_fast: Vec<f64>,
     /// Per-channel slow EMA for the DC filter — estimates DC level.

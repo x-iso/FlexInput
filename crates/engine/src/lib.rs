@@ -11,9 +11,10 @@ pub mod thread;
 
 pub use eval::{
     apply_curve, biases_from_params, curve_points_from_params, curve_scale, curve_scale_inv,
-    eval_graph_tick, eval_pure, get_b, get_f, osc_sample, read_scale_t, sample_curve, sig_to_f32,
+    eval_graph_tick, eval_pure, get_b, get_f, namespaced_uid, osc_sample, read_scale_t,
+    sample_curve, sig_to_f32,
 };
-pub use graph::{NodeSnap, ProcessingGraph};
+pub use graph::{InlineSubgraph, NodeSnap, ProcessingGraph};
 pub use router::InputRouter;
 pub use state::NodeState;
 pub use thread::{spawn_processing_thread, ProcessingOutput, SinkBus, SAMPLE_RATE};

@@ -9,6 +9,8 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<SwitchModule>(),
         reg::<KnobModule>(),
         reg::<SelectorModule>(),
+        reg::<LabelModule>(),
+        reg::<SvgModule>(),
         ModuleRegistration {
             descriptor: SplitModule::descriptor(),
             factory: || Box::new(SplitModule::default()),
@@ -56,6 +58,54 @@ impl Module for SwitchModule {
             category: "Utility",
             inputs: vec![],
             outputs: vec![PinDescriptor::new("out", SignalType::Bool)],
+        }
+    }
+    fn process(&mut self, _inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        SmallVec::new()
+    }
+}
+
+// ── Label / Text ──────────────────────────────────────────────────────────────
+
+/// Static text label for the canvas. No inputs, no outputs — purely visual,
+/// used as documentation/annotation on top-level canvases or sub-patch bodies.
+/// Body UI exposes a multiline text edit and a font-size slider.
+#[derive(Default)]
+pub struct LabelModule;
+
+impl Module for LabelModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.label",
+            display_name: "Text",
+            category: "Utility",
+            inputs: vec![],
+            outputs: vec![],
+        }
+    }
+    fn process(&mut self, _inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        SmallVec::new()
+    }
+}
+
+// ── SVG ───────────────────────────────────────────────────────────────────────
+
+/// Static SVG image for the canvas. No inputs, no outputs — purely visual.
+/// SVG source is stored verbatim in the patch (`svg_data` param) so patches
+/// stay self-contained without external icon files. The body shows the image
+/// scaled to a resizable area; an optional RGBA tint blends a color over the
+/// glyph (alpha = blend amount, 0 = no tint).
+#[derive(Default)]
+pub struct SvgModule;
+
+impl Module for SvgModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.svg",
+            display_name: "SVG",
+            category: "Utility",
+            inputs: vec![],
+            outputs: vec![],
         }
     }
     fn process(&mut self, _inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {

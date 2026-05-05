@@ -11,7 +11,13 @@ glam              = { workspace = true }
 flexinput-virtual = { workspace = true }
 flexinput-modules = { workspace = true }
 egui              = { workspace = true }
+egui_extras       = { workspace = true }
 eframe            = { workspace = true }
+# Direct SVG rasterization so we can recolor the pixmap before uploading as a
+# texture — egui_extras' built-in SVG loader only supports multiplicative tint.
+resvg             = "0.45"
+usvg              = "0.45"
+tiny-skia         = "0.11"
 serde             = { workspace = true }
 serde_json        = { workspace = true }
 rfd               = { workspace = true }
