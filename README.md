@@ -31,7 +31,6 @@ A node-based HID/MIDI input routing and mapping application for Windows (Linux s
 ### MIDI
 - MIDI IN nodes with per-CC output pins — use CC Learn to map by wiggling a knob or actively changing target CC value
 - MIDI OUT nodes accept Float/Bool signals and send CC messages
-- Pitch bend output pin on MIDI IN nodes
 
 ### Patch system
 - Save and load `.fxp` patch files from **File → Save Patch / Load Patch**
