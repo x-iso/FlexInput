@@ -145,6 +145,10 @@ impl Canvas {
     }
 
     /// Paste clipboard nodes offset by a fixed amount, restoring internal wires.
+    ///
+    /// Wire indices are validated against the copied node pin counts before
+    /// connecting; stale or malformed entries are silently dropped so that a
+    /// tampered clipboard cannot cause a panic or corrupt the graph.
     fn paste(&mut self) {
         let clipboard = match self.clipboard.clone() { Some(c) => c, None => return };
         self.push_undo();
@@ -153,12 +157,20 @@ impl Canvas {
             .map(|(pos, data)| self.snarl.insert_node(*pos + offset, data.clone()))
             .collect();
         for (from_idx, from_pin, to_idx, to_pin) in clipboard.internal_wires {
-            if from_idx < new_ids.len() && to_idx < new_ids.len() {
-                self.snarl.connect(
-                    OutPinId { node: new_ids[from_idx], output: from_pin },
-                    InPinId  { node: new_ids[to_idx],   input:  to_pin  },
-                );
-            }
+            // Bounds-check node indices first.
+            if from_idx >= new_ids.len() || to_idx >= new_ids.len() { continue; }
+            // Bounds-check pin indices against the node's declared pin counts.
+            // This guards against stale ClipboardData whose wire indices no longer
+            // match the (possibly edited) node pin lists (T-04-01).
+            let from_pin_ok = clipboard.nodes.get(from_idx)
+                .map_or(false, |(_, d)| from_pin < d.outputs.len());
+            let to_pin_ok   = clipboard.nodes.get(to_idx)
+                .map_or(false, |(_, d)| to_pin   < d.inputs.len());
+            if !from_pin_ok || !to_pin_ok { continue; }
+            self.snarl.connect(
+                OutPinId { node: new_ids[from_idx], output: from_pin },
+                InPinId  { node: new_ids[to_idx],   input:  to_pin  },
+            );
         }
     }
 
