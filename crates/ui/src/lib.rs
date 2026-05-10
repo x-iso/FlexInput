@@ -4,3 +4,4 @@ mod panels;
 mod process_list;
 
 pub use app::FlexInputApp;
+pub use canvas::UiPatch;
