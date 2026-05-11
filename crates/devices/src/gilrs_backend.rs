@@ -13,6 +13,25 @@ use crate::{
     DeviceBackend, PhysicalDevice,
 };
 
+// ── XInput force-feedback FFI (no windows-sys dependency) ────────────────────
+// Pattern mirrors crates/devices/src/hidhide.rs win32 module.
+#[cfg(windows)]
+mod xinput_ffi {
+    #[repr(C)]
+    pub struct XINPUT_VIBRATION {
+        pub w_left_motor_speed:  u16,
+        pub w_right_motor_speed: u16,
+    }
+
+    #[link(name = "xinput")]
+    extern "system" {
+        /// Sets vibration state for an XInput controller slot (0-3).
+        /// Returns 0 on success, ERROR_DEVICE_NOT_CONNECTED (1167) if the
+        /// controller is disconnected.
+        pub fn XInputSetState(dw_user_index: u32, p_vibration: *const XINPUT_VIBRATION) -> u32;
+    }
+}
+
 pub struct GilrsBackend {
     gilrs: Gilrs,
     /// Cached count of non-ViGEmBus physical instances per (VID, PID).
@@ -23,6 +42,13 @@ pub struct GilrsBackend {
     vigem_present: HashMap<(u16, u16), bool>,
     phys_counts_at: Instant,
     gyro: GyroManager,
+    /// XInput user index (0-3) for each `gilrs:<kind>:<inst>` device_id string.
+    /// Rebuilt at the start of each poll() call from the same kind_seen counter
+    /// used for the dev-string, so indices never drift on reconnect.
+    xinput_idx: HashMap<String, u32>,
+    /// Last-written rumble state per XInput slot to avoid redundant XInputSetState calls.
+    /// (left_motor_byte, right_motor_byte) in 0-255 range.
+    xinput_rumble: HashMap<u32, (u8, u8)>,
 }
 
 impl GilrsBackend {
@@ -34,6 +60,8 @@ impl GilrsBackend {
             // force refresh on first enumerate()
             phys_counts_at: Instant::now() - Duration::from_secs(10),
             gyro: GyroManager::new(),
+            xinput_idx: HashMap::new(),
+            xinput_rumble: HashMap::new(),
         })
     }
 
