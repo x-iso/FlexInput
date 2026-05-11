@@ -13,6 +13,8 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<Gyro3DOFModule>(),
         reg::<AutoMapSplitModule>(),
         reg::<AutoMapCollectModule>(),
+        reg::<AutoMapFork>(),
+        reg::<AutoMapSelector>(),
     ]
 }
 
@@ -206,6 +208,89 @@ impl Module for AutoMapCollectModule {
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
         // Signals injected into collector_sigs by eval_graph_tick in eval.rs.
         SmallVec::new()
+    }
+}
+
+// ── AutoMap Fork ─────────────────────────────────────────────────────────────
+
+/// Routes one AutoMap bus to one of two AutoMap outputs based on a Bool/Float select pin.
+/// select = false/0.0 → out_0 receives the bus, out_1 is disconnected.
+/// select = true/1.0  → out_1 receives the bus, out_0 is disconnected.
+/// Named "Fork" to distinguish from the existing Split (scalar) module.
+#[derive(Default)]
+pub struct AutoMapFork;
+
+impl Module for AutoMapFork {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.automap_fork",
+            display_name: "AutoMap Fork",
+            category: "AutoMap",
+            inputs: vec![
+                PinDescriptor::new("in", SignalType::AutoMap),
+                PinDescriptor::new("select", SignalType::Float),
+            ],
+            outputs: vec![
+                PinDescriptor::new("out_0", SignalType::AutoMap),
+                PinDescriptor::new("out_1", SignalType::AutoMap),
+            ],
+        }
+    }
+    fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        // AutoMap bus routing: the eval graph follows wires to the upstream AutoMap source.
+        // The select pin controls which output wire is "active" at the UI level.
+        let bus = inputs.get(0).and_then(|s| *s).unwrap_or(Signal::Float(0.0));
+        let select = match inputs.get(1).and_then(|s| *s) {
+            Some(Signal::Float(f)) => f > 0.5,
+            Some(Signal::Bool(b)) => b,
+            _ => false,
+        };
+        let mut r = SmallVec::new();
+        r.push(if !select { bus } else { Signal::Float(0.0) });
+        r.push(if select { bus } else { Signal::Float(0.0) });
+        r
+    }
+}
+
+// ── AutoMap Selector ──────────────────────────────────────────────────────────
+
+/// Selects one of N AutoMap bus inputs and routes it to a single AutoMap output.
+/// select pin (Float 0..1) is quantized to N slots, same as the scalar Selector module.
+/// Default: 2 inputs (in_0, in_1); additional inputs added via params["n_inputs"].
+#[derive(Default)]
+pub struct AutoMapSelector;
+
+impl Module for AutoMapSelector {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.automap_selector",
+            display_name: "AutoMap Selector",
+            category: "AutoMap",
+            inputs: vec![
+                PinDescriptor::new("select", SignalType::Float),
+                PinDescriptor::new("in_0", SignalType::AutoMap),
+                PinDescriptor::new("in_1", SignalType::AutoMap),
+            ],
+            outputs: vec![
+                PinDescriptor::new("out", SignalType::AutoMap),
+            ],
+        }
+    }
+    fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        // inputs[0] = select (Float 0..1), inputs[1..] = AutoMap buses
+        let n = inputs.len().saturating_sub(1).max(1);
+        let select = match inputs.get(0).and_then(|s| *s) {
+            Some(Signal::Float(f)) => {
+                let slot = (f.clamp(0.0, 1.0) * (n as f32 - 1.0 + 0.5)).floor() as usize;
+                slot.min(n - 1)
+            }
+            Some(Signal::Bool(b)) => if b { 1 } else { 0 },
+            _ => 0,
+        };
+        let selected_bus = inputs.get(select + 1).and_then(|s| *s).unwrap_or(Signal::Float(0.0));
+        let mut r = SmallVec::new();
+        r.push(selected_bus);
+        r
     }
 }
 
