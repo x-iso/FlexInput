@@ -44,6 +44,8 @@ pub struct Canvas {
     wire_ctx_menu: Option<(OutPinId, InPinId, egui::Pos2)>,
     /// True on the frame the wire menu was first opened; suppresses the outside-click close check.
     wire_ctx_just_opened: bool,
+    /// Pending selection right-click context menu: (selected node ids, screen position).
+    selection_ctx_menu: Option<(Vec<NodeId>, egui::Pos2)>,
     /// Active inline rename: (node id, edit buffer, popup position).
     rename_state: Option<(egui_snarl::NodeId, String, egui::Pos2)>,
     undo_stack: Vec<Snarl<NodeData>>,
@@ -72,6 +74,7 @@ impl Canvas {
             style,
             wire_ctx_menu: None,
             wire_ctx_just_opened: false,
+            selection_ctx_menu: None,
             rename_state: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -481,6 +484,41 @@ impl Canvas {
             }
         }
 
+        // ── Selection right-click context menu ────────────────────────────────
+        if let Some((ref sel_ids, pos)) = self.selection_ctx_menu.clone() {
+            let mut close = false;
+            let mut do_group = false;
+            let area_resp = egui::Area::new(egui::Id::new("selection_ctx_menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(180.0);
+                        let group_label = format!("⬡ Group into sub-patch ({})", sel_ids.len());
+                        if ui.add_enabled(sel_ids.len() >= 2, egui::Button::new(group_label)).clicked() {
+                            do_group = true;
+                            close = true;
+                        }
+                        ui.separator();
+                        if ui.button("✖ Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            let ptr = ui.input(|i| i.pointer.latest_pos().unwrap_or_default());
+            let clicked_outside = ui.input(|i| i.pointer.any_click())
+                && !area_resp.response.rect.contains(ptr);
+            if clicked_outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close = true;
+            }
+            if do_group {
+                self.group_selected_into_subpatch(sel_ids);
+            }
+            if close {
+                self.selection_ctx_menu = None;
+            }
+        }
+
         // ── Keyboard shortcuts and modifier tooltip ────────────────────────────
         // Get selected nodes from snarl's egui state.
         let snarl_id = ui.make_persistent_id("flexinput_canvas");
@@ -489,7 +527,9 @@ impl Canvas {
         // Only process shortcuts when no overlay is open.
         // Use direct event matching with modifiers — more robust than key_pressed() + separate
         // modifier check, because Ctrl+V may arrive as Event::Paste on some platforms.
-        let overlay_open = self.rename_state.is_some() || self.wire_ctx_menu.is_some();
+        let overlay_open = self.rename_state.is_some()
+            || self.wire_ctx_menu.is_some()
+            || self.selection_ctx_menu.is_some();
         if !overlay_open {
             let del      = ui.input(|i| i.key_pressed(egui::Key::Delete));
             // Ctrl+C may arrive as Event::Copy on Windows instead of Event::Key.
@@ -510,6 +550,24 @@ impl Canvas {
                 egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. }
                 if modifiers.ctrl && modifiers.shift
             )));
+            let ctrl_g   = ui.input(|i| i.events.iter().any(|e| matches!(e,
+                egui::Event::Key { key: egui::Key::G, pressed: true, modifiers, .. }
+                if modifiers.ctrl && !modifiers.shift
+            )));
+
+            // Right-click on canvas with a non-empty selection opens the selection menu.
+            let right_click_pos = ui.input(|i| {
+                if i.pointer.secondary_pressed() {
+                    i.pointer.latest_pos()
+                } else {
+                    None
+                }
+            });
+            if let Some(pos) = right_click_pos {
+                if !selected.is_empty() {
+                    self.selection_ctx_menu = Some((selected.to_vec(), pos));
+                }
+            }
 
             if del && !selected.is_empty() {
                 self.push_undo();
@@ -527,6 +585,9 @@ impl Canvas {
             if ctrl_sz {
                 self.redo();
             }
+            if ctrl_g && selected.len() >= 2 {
+                self.group_selected_into_subpatch(&selected);
+            }
         }
 
         // ── Modifier key tooltip ───────────────────────────────────────────────
@@ -543,6 +604,7 @@ impl Canvas {
             lines.push("Ctrl+Z        Undo");
             if has_sel { lines.push("Ctrl+C        Copy selected"); }
             if has_clip { lines.push("Ctrl+V        Paste"); }
+            if has_sel { lines.push("Ctrl+G        Group into sub-patch"); }
         } else if shift {
             lines.push("Shift+Drag    Multi-select region");
             lines.push("Shift+Click   Toggle node selection");
