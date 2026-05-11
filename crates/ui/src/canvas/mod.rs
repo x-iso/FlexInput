@@ -1393,6 +1393,51 @@ mod clipboard_tests {
         assert_eq!(wire_count, 0, "malformed wire should be dropped; no wires expected");
     }
 
+    // ── Tests required by plan 01-07 (cross-boundary clipboard contract) ─────
+
+    #[test]
+    fn fresh_canvas_has_no_clipboard() {
+        let canvas = Canvas::new();
+        assert!(canvas.clipboard().is_none(), "fresh canvas clipboard should be None");
+    }
+
+    #[test]
+    fn set_clipboard_makes_clipboard_accessible() {
+        let mut canvas = Canvas::new();
+        let data = ClipboardData {
+            nodes: vec![(egui::pos2(0.0, 0.0), make_node(1, 0))],
+            internal_wires: vec![],
+        };
+        canvas.set_clipboard(data);
+        assert!(canvas.clipboard().is_some(), "clipboard() should return Some after set_clipboard()");
+    }
+
+    #[test]
+    fn paste_after_set_clipboard_inserts_node() {
+        let mut src = Canvas::new();
+        let src_id = add_node(&mut src, egui::pos2(10.0, 20.0), make_node(1, 0));
+        src.copy_selected(&[src_id]);
+        let cb = src.clipboard().unwrap();
+
+        // Simulate cross-boundary paste: target canvas starts empty, receives clipboard from app.
+        let mut target = Canvas::new();
+        target.set_clipboard(cb);
+        target.paste();
+
+        let count = target.snarl.nodes_ids_data().count();
+        assert_eq!(count, 1, "paste should insert exactly one node into the target canvas");
+    }
+
+    #[test]
+    fn paste_calls_push_undo() {
+        let mut canvas = Canvas::new();
+        let id = add_node(&mut canvas, egui::pos2(10.0, 20.0), make_node(1, 0));
+        canvas.copy_selected(&[id]);
+        let before = canvas.undo_stack.len();
+        canvas.paste();
+        assert_eq!(canvas.undo_stack.len(), before + 1, "paste() must push undo before inserting nodes");
+    }
+
     // ── Tests required by plan 01-08 (named interface contract) ──────────────
 
     #[test]
