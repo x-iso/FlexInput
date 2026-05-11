@@ -133,6 +133,10 @@ impl DeviceBackend for GilrsBackend {
     }
 
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
+        // Rebuild XInput slot map at the start of each poll so it stays in sync
+        // with kind_seen even after device reconnects.
+        self.xinput_idx.clear();
+
         // Drain events. Raw events auto-update axis and button state.
         // axis_dpad_to_button is intentionally NOT applied: on BT Switch Pro it creates
         // conflicting synthetic button releases that fight the native WGI DPad button events,
@@ -169,6 +173,13 @@ impl DeviceBackend for GilrsBackend {
             let inst = *kind_seen.get(&kind).unwrap_or(&0);
             kind_seen.insert(kind, inst + 1);
             let dev = format!("gilrs:{}:{}", kind.id_slug(), inst);
+
+            // Record XInput slot: inst is the 0-based kind_seen index, which matches
+            // the XInput user index on Windows (gilrs enumerates XInput controllers
+            // in slot order 0-3).
+            if kind == ControllerKind::XInput {
+                self.xinput_idx.insert(dev.clone(), inst as u32);
+            }
 
             for (axis, pin_id) in axis_map(kind) {
                 let v = pad.axis_data(*axis).map_or(0.0, |d| d.value());
@@ -326,9 +337,33 @@ impl DeviceBackend for GilrsBackend {
     }
 
     fn send(&mut self, device_id: &str, pin_id: &str, signal: Signal) {
-        // Currently only physical PlayStation controllers (DS4/DualSense) are
-        // wired up via the raw-HID path in GyroManager. XInput rumble would
-        // need a separate gilrs ff_handle path.
+        // ── XInput path: dispatch via XInputSetState ──────────────────────────
+        if let Some(&xinput_slot) = self.xinput_idx.get(device_id) {
+            let byte = match signal {
+                Signal::Float(f) => (f.clamp(0.0, 1.0) * 255.0) as u8,
+                Signal::Bool(b)  => if b { 255 } else { 0 },
+                _ => return,
+            };
+            let entry = self.xinput_rumble.entry(xinput_slot).or_insert((0, 0));
+            match pin_id {
+                "rumble_strong" => entry.0 = byte,
+                "rumble_weak"   => entry.1 = byte,
+                _ => return, // other pin names are not XInput rumble
+            }
+            #[cfg(windows)]
+            unsafe {
+                use xinput_ffi::*;
+                let vib = XINPUT_VIBRATION {
+                    // 0-255 byte mapped to 0-65535 motor speed: multiply by 257 (= 0xFFFF / 0xFF).
+                    w_left_motor_speed:  (entry.0 as u16).saturating_mul(257),
+                    w_right_motor_speed: (entry.1 as u16).saturating_mul(257),
+                };
+                XInputSetState(xinput_slot, &vib);
+            }
+            return;
+        }
+
+        // ── PS/Switch HID path via GyroManager (unchanged) ───────────────────
         let (vid, pid, idx) = match self.lookup_phys(device_id) {
             Some(t) => t,
             None => return,
