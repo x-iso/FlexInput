@@ -191,22 +191,27 @@ fn ds4_inputs() -> Vec<DevicePin> {
 fn dualsense_inputs() -> Vec<DevicePin> {
     let mut pins = ds4_inputs();
     pins.extend(vec![
-        // Player indicator and mic mute LED
-        fl("player_led", "Player LED (1–4)"),
-        fl("mic_led",    "Mic Mute LED"),
-        // Right adaptive trigger — mode selects effect type:
-        //   0.0=Off  0.33=Feedback(constant)  0.66=Weapon(click)  1.0=Vibration
-        fl("trigger_r_mode",     "R.Trigger Mode"),
-        fl("trigger_r_start",    "R.Trigger Start"),    // 0–1 → zone 0–9
-        fl("trigger_r_end",      "R.Trigger End"),      // 0–1 → zone 0–9 (Weapon only)
-        fl("trigger_r_strength", "R.Trigger Strength"), // 0–1 → force 0–7
-        fl("trigger_r_freq",     "R.Trigger Freq"),     // 0–1 → 0–255 (Vibration only)
-        // Left adaptive trigger
-        fl("trigger_l_mode",     "L.Trigger Mode"),
-        fl("trigger_l_start",    "L.Trigger Start"),
-        fl("trigger_l_end",      "L.Trigger End"),
-        fl("trigger_l_strength", "L.Trigger Strength"),
-        fl("trigger_l_freq",     "L.Trigger Freq"),
+        // LEDs. All accept Float 0–1.
+        // player_led: 0=off, 0.25=P1, 0.5=P2, 0.75=P3, 1.0=P4
+        fl("player_led", "Player LED (0=off 0.25=P1 0.5=P2 0.75=P3 1=P4)"),
+        // mic_led: 0=off, 0.5=on(orange), 1.0=pulsing
+        fl("mic_led",    "Mic LED (0=off 0.5=on 1=pulse)"),
+        // Adaptive triggers. All accept Float 0–1, scaled per pin.
+        // Mode: 0=off, 0.33=Feedback(constant resist), 0.66=Weapon(click), 1=Vibration
+        fl("trigger_r_mode",     "R.Trigger Mode (0=off 0.33=resist 0.66=click 1=vib)"),
+        // Start/End: trigger travel position, 0=rest 1=fully pressed
+        fl("trigger_r_start",    "R.Trigger Start (0=rest 1=full)"),
+        // End only used in Weapon(click) mode
+        fl("trigger_r_end",      "R.Trigger End (Weapon mode only)"),
+        // Strength: 0=none 1=max
+        fl("trigger_r_strength", "R.Trigger Strength (0–1)"),
+        // Freq: vibration speed, only used in Vibration mode
+        fl("trigger_r_freq",     "R.Trigger Freq (Vibration mode only)"),
+        fl("trigger_l_mode",     "L.Trigger Mode (0=off 0.33=resist 0.66=click 1=vib)"),
+        fl("trigger_l_start",    "L.Trigger Start (0=rest 1=full)"),
+        fl("trigger_l_end",      "L.Trigger End (Weapon mode only)"),
+        fl("trigger_l_strength", "L.Trigger Strength (0–1)"),
+        fl("trigger_l_freq",     "L.Trigger Freq (Vibration mode only)"),
     ]);
     pins
 }
