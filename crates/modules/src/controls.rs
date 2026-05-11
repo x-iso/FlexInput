@@ -151,10 +151,10 @@ impl Module for SelectorModule {
             category: "Utility",
             inputs: vec![
                 PinDescriptor::new("select", SignalType::Float),
-                PinDescriptor::new("in_0",   SignalType::Float),
-                PinDescriptor::new("in_1",   SignalType::Float),
+                PinDescriptor::new("in_0",   SignalType::Any),
+                PinDescriptor::new("in_1",   SignalType::Any),
             ],
-            outputs: vec![PinDescriptor::new("out", SignalType::Float)],
+            outputs: vec![PinDescriptor::new("out", SignalType::Any)],
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
@@ -275,23 +275,23 @@ impl Module for SplitModule {
             category: "Utility",
             inputs: vec![
                 PinDescriptor::new("select", SignalType::Float),
-                PinDescriptor::new("in",     SignalType::Float),
+                PinDescriptor::new("in",     SignalType::Any),
             ],
             outputs: vec![
-                PinDescriptor::new("out_0", SignalType::Float),
-                PinDescriptor::new("out_1", SignalType::Float),
+                PinDescriptor::new("out_0", SignalType::Any),
+                PinDescriptor::new("out_1", SignalType::Any),
             ],
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
         let n = self.n_outputs.max(1);
         let sel = get_float(inputs, 0, 0.0);
-        let val = get_float(inputs, 1, 0.0);
+        let val = inputs.get(1).and_then(|s| *s);
         let idx = (sel.clamp(0.0, 1.0) * n as f32).floor() as usize;
         let idx = idx.min(n - 1);
         let mut r = SmallVec::new();
         for i in 0..n {
-            r.push(Signal::Float(if i == idx { val } else { 0.0 }));
+            r.push(if i == idx { val.unwrap_or(Signal::Float(0.0)) } else { Signal::Float(0.0) });
         }
         r
     }
