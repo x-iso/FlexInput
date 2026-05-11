@@ -113,6 +113,24 @@ struct OutputState {
     lightbar_r: u8,
     lightbar_g: u8,
     lightbar_b: u8,
+    // DualSense adaptive trigger — right
+    // mode: 0=Off, 1=Feedback, 2=Weapon, 3=Vibration
+    trigger_r_mode:     u8,
+    trigger_r_start:    u8, // zone 0–9 (stored as raw zone; caller passes 0–9 already scaled)
+    trigger_r_end:      u8, // zone 0–9 (Weapon mode only)
+    trigger_r_strength: u8, // force 0–7
+    trigger_r_freq:     u8, // 0–255 (Vibration mode only)
+    // DualSense adaptive trigger — left
+    trigger_l_mode:     u8,
+    trigger_l_start:    u8,
+    trigger_l_end:      u8,
+    trigger_l_strength: u8,
+    trigger_l_freq:     u8,
+    // DualSense LEDs
+    // player_led: 0=off, 1=P1(0x04), 2=P2(0x0A), 3=P3(0x15), 4=P4(0x1B)
+    player_led: u8,
+    // mic_led: 0=off, 1=on(orange), 2=pulsing
+    mic_led:    u8,
 }
 
 pub struct GyroManager {
@@ -246,6 +264,27 @@ impl GyroManager {
             "lightbar_r"    => { entry.out.lightbar_r = byte; true }
             "lightbar_g"    => { entry.out.lightbar_g = byte; true }
             "lightbar_b"    => { entry.out.lightbar_b = byte; true }
+            // Adaptive trigger pins — caller passes Float 0–1 already scaled to
+            // the appropriate range before calling set_output_byte:
+            //   mode:     0–3  (0=Off,1=Feedback,2=Weapon,3=Vibration)
+            //   start/end: 0–9 (zone index along trigger travel)
+            //   strength:  0–7 (force level)
+            //   freq:      0–255 (vibration frequency, Vibration mode only)
+            "trigger_r_mode"     => { entry.out.trigger_r_mode     = byte; true }
+            "trigger_r_start"    => { entry.out.trigger_r_start    = byte; true }
+            "trigger_r_end"      => { entry.out.trigger_r_end      = byte; true }
+            "trigger_r_strength" => { entry.out.trigger_r_strength = byte; true }
+            "trigger_r_freq"     => { entry.out.trigger_r_freq     = byte; true }
+            "trigger_l_mode"     => { entry.out.trigger_l_mode     = byte; true }
+            "trigger_l_start"    => { entry.out.trigger_l_start    = byte; true }
+            "trigger_l_end"      => { entry.out.trigger_l_end      = byte; true }
+            "trigger_l_strength" => { entry.out.trigger_l_strength = byte; true }
+            "trigger_l_freq"     => { entry.out.trigger_l_freq     = byte; true }
+            // DualSense LEDs — caller passes scaled byte
+            // player_led: 0=off, 1=P1, 2=P2, 3=P3, 4=P4
+            // mic_led:    0=off, 1=on(orange), 2=pulsing
+            "player_led" => { entry.out.player_led = byte; true }
+            "mic_led"    => { entry.out.mic_led    = byte; true }
             _ => false,
         };
         if updated { entry.output_active = true; }
@@ -604,6 +643,81 @@ fn switch_rumble_encode(amp: f32) -> [u8; 4] {
     ]
 }
 
+/// Encode one DualSense adaptive trigger effect into 11 bytes:
+/// byte[0] = mode byte, bytes[1..10] = effect params.
+///
+/// mode: 0=Off(0x05), 1=Feedback(0x21), 2=Weapon(0x25), 3=Vibration(0x26)
+/// start/end: zone 0–9 along trigger travel (0=rest, 9=fully pressed)
+/// strength: force 0–7
+/// freq: oscillation 0–255 (Vibration mode only)
+///
+/// Bit-packing derived from MysteriousJ/Joystick-Input-Examples and confirmed
+/// against Linux hid-playstation.c trigger effect structs.
+fn encode_trigger_effect(mode: u8, start: u8, end: u8, strength: u8, freq: u8) -> [u8; 11] {
+    let mut p = [0u8; 11];
+    match mode {
+        1 => {
+            // Feedback (0x21): constant resistance from start zone onwards.
+            p[0] = 0x21;
+            let s = (start.min(9)) as u16;
+            let f = (strength.min(7)) as u32;
+            // active_zones: bits s..9 set (10-bit field, LSB-first across 2 bytes)
+            let active: u16 = if s < 10 { ((1u16 << (10 - s)) - 1) << s } else { 0 };
+            // force_zones: 3-bit force value repeated for each active zone (10 zones × 3 bits)
+            let mut force = 0u32;
+            for z in s..10 { force |= f << (z * 3); }
+            p[1] = (active & 0xFF) as u8;
+            p[2] = ((active >> 8) & 0xFF) as u8;
+            p[3] = (force & 0xFF) as u8;
+            p[4] = ((force >> 8) & 0xFF) as u8;
+            p[5] = ((force >> 16) & 0xFF) as u8;
+            p[6] = ((force >> 24) & 0xFF) as u8;
+        }
+        2 => {
+            // Weapon (0x25): hard resistance between start and end, then releases.
+            p[0] = 0x25;
+            let s = (start.clamp(2, 7)) as u16;
+            let e = (end.max(start.saturating_add(1)).clamp(3, 8)) as u16;
+            let start_end: u16 = (1u16 << s) | (1u16 << e);
+            p[1] = (start_end & 0xFF) as u8;
+            p[2] = ((start_end >> 8) & 0xFF) as u8;
+            p[3] = strength.min(7);
+        }
+        3 => {
+            // Vibration (0x26): oscillating resistance in a zone range.
+            p[0] = 0x26;
+            let s = (start.min(9)) as u16;
+            let f = (strength.min(7)) as u32;
+            let active: u16 = if s < 10 { ((1u16 << (10 - s)) - 1) << s } else { 0 };
+            let mut force = 0u32;
+            for z in s..10 { force |= f << (z * 3); }
+            p[1] = (active & 0xFF) as u8;
+            p[2] = ((active >> 8) & 0xFF) as u8;
+            p[3] = (force & 0xFF) as u8;
+            p[4] = ((force >> 8) & 0xFF) as u8;
+            p[5] = ((force >> 16) & 0xFF) as u8;
+            p[6] = ((force >> 24) & 0xFF) as u8;
+            p[9] = freq;
+        }
+        _ => {
+            // Off (0x05) — deactivate any effect.
+            p[0] = 0x05;
+        }
+    }
+    p
+}
+
+/// Map player_led index (0–4) to the DualSense 5-bit LED bitmask.
+fn player_led_mask(idx: u8) -> u8 {
+    match idx {
+        1 => 0x04,
+        2 => 0x0A,
+        3 => 0x15,
+        4 => 0x1B,
+        _ => 0x00, // off
+    }
+}
+
 /// DualSense USB output report 0x02 (63 bytes incl. report ID).
 /// Layout reference: Linux drivers/hid/hid-playstation.c, struct
 /// `dualsense_output_report_common` (47 bytes) sits at buffer offset 1.
@@ -613,15 +727,30 @@ fn switch_rumble_encode(amp: f32) -> [u8; 4] {
 fn build_dualsense_usb_out(out: &OutputState) -> [u8; 63] {
     let mut r = [0u8; 63];
     r[0] = 0x02;                // Report ID
-    r[1] = 0xFF;                // valid_flag0: all rumble + audio paths enabled
-    r[2] = 0xF7;                // valid_flag1: all LED paths except release_leds (bit 3)
-    r[3] = out.rumble_weak;     // motor_right — high-freq emulation
-    r[4] = out.rumble_strong;   // motor_left  — low-freq  emulation
+    r[1] = 0xFF;                // valid_flag0: rumble + trigger motors + audio enabled
+    r[2] = 0xF7;                // valid_flag1: LED paths enabled, bit 3 (release_leds) = 0
+    r[3] = out.rumble_weak;     // motor_right — high-freq
+    r[4] = out.rumble_strong;   // motor_left  — low-freq
+    // Adaptive trigger effects: right at r[11..22], left at r[22..33]
+    let rt = encode_trigger_effect(
+        out.trigger_r_mode, out.trigger_r_start,
+        out.trigger_r_end,  out.trigger_r_strength, out.trigger_r_freq,
+    );
+    let lt = encode_trigger_effect(
+        out.trigger_l_mode, out.trigger_l_start,
+        out.trigger_l_end,  out.trigger_l_strength, out.trigger_l_freq,
+    );
+    r[11..22].copy_from_slice(&rt);
+    r[22..33].copy_from_slice(&lt);
     r[39] = 0x07;               // valid_flag2: lightbar setup + compat vibration v2
-    r[42] = 0x02;               // led_brightness byte (0x00=off,0x01=mid,0x02=bright)
+    r[42] = 0x02;               // lightbar_setup: 0x02 = lightbar_on
+    r[43] = 0x02;               // led_brightness: 0x02 = bright
+    r[44] = player_led_mask(out.player_led); // player indicator LEDs
     r[45] = out.lightbar_r;     // lightbar_red
     r[46] = out.lightbar_g;     // lightbar_green
     r[47] = out.lightbar_b;     // lightbar_blue
+    // Mic mute LED: r[9] = mute_button_led (0=off, 1=on/orange, 2=pulsing)
+    r[9]  = out.mic_led.min(2);
     r
 }
 
