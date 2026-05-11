@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "module_id": "math.add",
+      "position": [100.0, 200.0],
+      "params": {
+        "operand_b": 0.5
+      }
+    },
+    {
+      "id": "b2c3d4e5-f6a7-8901-bcde-f01234567891",
+      "module_id": "input.xinput_axis",
+      "position": [50.0, 200.0]
+    }
+  ],
+  "wires": [
+    {
+      "from_node": "b2c3d4e5-f6a7-8901-bcde-f01234567891",
+      "from_pin": "axis_x",
+      "to_node": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "to_pin": "a"
+    }
+  ]
+}
