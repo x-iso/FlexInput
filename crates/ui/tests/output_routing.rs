@@ -137,7 +137,7 @@ fn non_gilrs_sink_outputs_do_not_reach_backend() {
 }
 
 #[test]
-fn rgb_and_adaptive_trigger_pins_route_via_gilrs_path() {
+fn rgb_and_dualsense_pins_route_via_gilrs_path() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut backends: Vec<Box<dyn DeviceBackend>> =
         vec![Box::new(MockBackend::new(Arc::clone(&calls)))];
@@ -156,13 +156,13 @@ fn rgb_and_adaptive_trigger_pins_route_via_gilrs_path() {
         ("gilrs:1".to_string(), "lightbar_b".to_string()),
         Signal::Float(0.5),
     );
-    // Adaptive trigger pins (DualSense USB).
+    // DualSense adaptive trigger pins (new pin names).
     sink_outputs.insert(
-        ("gilrs:1".to_string(), "adaptive_trigger_l".to_string()),
+        ("gilrs:1".to_string(), "trigger_r_strength".to_string()),
         Signal::Float(0.8),
     );
     sink_outputs.insert(
-        ("gilrs:1".to_string(), "adaptive_trigger_r".to_string()),
+        ("gilrs:1".to_string(), "trigger_l_strength".to_string()),
         Signal::Float(0.6),
     );
 
@@ -172,7 +172,7 @@ fn rgb_and_adaptive_trigger_pins_route_via_gilrs_path() {
     assert_eq!(
         recorded.len(),
         5,
-        "All 5 physical output pins (RGB + adaptive triggers) should reach backend; got {:?}",
+        "All 5 physical output pins (RGB + trigger strength) should reach backend; got {:?}",
         *recorded
     );
 }
