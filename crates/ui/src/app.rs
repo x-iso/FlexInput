@@ -115,6 +115,10 @@ pub struct FlexInputApp {
     /// inner canvases). Written whenever a copy action fires in any canvas.
     /// Read when the target canvas has no local clipboard (cross-boundary paste).
     app_clipboard: Option<ClipboardData>,
+    /// True when app_clipboard was last written by an inner SubPatchEditor canvas.
+    /// Used to force-seed the outer canvas clipboard so inner→outer paste works
+    /// even when the outer canvas already has its own stale clipboard.
+    app_clipboard_from_inner: bool,
     // ── Processing thread shared state ────────────────────────────────────────
     proc_graph: Arc<RwLock<ProcessingGraph>>,
     proc_device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
@@ -201,6 +205,7 @@ impl FlexInputApp {
             hidhide_whitelist: vec![],
             sub_patch_editors: vec![],
             app_clipboard: None,
+            app_clipboard_from_inner: false,
             proc_graph,
             proc_device_signals,
             proc_outputs,
@@ -961,11 +966,13 @@ impl eframe::App for FlexInputApp {
             if modifiers.ctrl && !modifiers.shift
         ) || matches!(e, egui::Event::Paste(_))));
 
-        // Seed cross-boundary clipboard: if the outer canvas has no local clipboard
-        // but the app has one, make it available so Ctrl+V works across boundaries.
-        // When Ctrl+V is pressed on a cross-boundary paste, also insert AutoMap
-        // Splitter/Collector bridge nodes at the boundary (D-04 item 3).
-        if canvas.clipboard().is_none() {
+        // Seed cross-boundary clipboard so Ctrl+V in the outer canvas works when
+        // the copy came from an inner SubPatchEditor canvas (inner→outer direction).
+        // Also seeds when the outer canvas has no local clipboard at all.
+        // app_clipboard_from_inner is true when the last copy came from an inner canvas,
+        // which forces seeding even if the outer canvas has a stale local clipboard.
+        let should_seed = self.app_clipboard_from_inner || canvas.clipboard().is_none();
+        if should_seed {
             if let Some(ref cb) = self.app_clipboard {
                 canvas.set_clipboard(cb.clone());
                 if ctrl_v_pressed {
@@ -982,10 +989,12 @@ impl eframe::App for FlexInputApp {
             crate::panels::canvas::show(canvas, &self.descriptors, &live_device_ids, devices, ui);
         });
 
-        // Sync app-level clipboard from the outer canvas after show() so cross-boundary
-        // paste picks up the latest copy from any canvas.
+        // Sync app-level clipboard from the outer canvas after show().
+        // Clear the from_inner flag — the outer canvas just ran, so any pending
+        // inner→outer seed has been consumed (or Ctrl+V wasn't pressed this frame).
         if let Some(cb) = canvas.clipboard() {
             self.app_clipboard = Some(cb);
+            self.app_clipboard_from_inner = false;
         }
 
         // ── Sub-patch editor windows ──────────────────────────────────────────
@@ -2727,8 +2736,11 @@ fn show_subpatch_editors(
 
         // Sync app-level clipboard from this inner canvas after show() so a copy
         // action inside a SubPatchEditor is visible for cross-boundary paste.
+        // Set from_inner=true so the outer canvas seeding logic knows to force-seed
+        // even if the outer canvas already has a stale local clipboard (inner→outer fix).
         if let Some(cb) = inner_canvas.clipboard() {
             app.app_clipboard = Some(cb);
+            app.app_clipboard_from_inner = true;
         }
 
         if save_clicked {
