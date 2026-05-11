@@ -191,10 +191,22 @@ fn ds4_inputs() -> Vec<DevicePin> {
 fn dualsense_inputs() -> Vec<DevicePin> {
     let mut pins = ds4_inputs();
     pins.extend(vec![
-        fl("haptic_l",             "Haptic L"),
-        fl("haptic_r",             "Haptic R"),
-        fl("adaptive_trigger_l",   "Adaptive Trigger L"),
-        fl("adaptive_trigger_r",   "Adaptive Trigger R"),
+        // Player indicator and mic mute LED
+        fl("player_led", "Player LED (1–4)"),
+        fl("mic_led",    "Mic Mute LED"),
+        // Right adaptive trigger — mode selects effect type:
+        //   0.0=Off  0.33=Feedback(constant)  0.66=Weapon(click)  1.0=Vibration
+        fl("trigger_r_mode",     "R.Trigger Mode"),
+        fl("trigger_r_start",    "R.Trigger Start"),    // 0–1 → zone 0–9
+        fl("trigger_r_end",      "R.Trigger End"),      // 0–1 → zone 0–9 (Weapon only)
+        fl("trigger_r_strength", "R.Trigger Strength"), // 0–1 → force 0–7
+        fl("trigger_r_freq",     "R.Trigger Freq"),     // 0–1 → 0–255 (Vibration only)
+        // Left adaptive trigger
+        fl("trigger_l_mode",     "L.Trigger Mode"),
+        fl("trigger_l_start",    "L.Trigger Start"),
+        fl("trigger_l_end",      "L.Trigger End"),
+        fl("trigger_l_strength", "L.Trigger Strength"),
+        fl("trigger_l_freq",     "L.Trigger Freq"),
     ]);
     pins
 }

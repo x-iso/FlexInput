@@ -65,21 +65,24 @@ fn dualsense_inputs_include_rumble_and_lightbar() {
 }
 
 #[test]
-fn dualsense_inputs_include_haptic_pins() {
+fn dualsense_inputs_include_adaptive_trigger_pins() {
     let inputs = layouts::inputs_for(ControllerKind::DualSense);
-    assert!(inputs.iter().any(|p| p.id == "haptic_l"),
-        "DualSense must expose haptic_l");
-    assert!(inputs.iter().any(|p| p.id == "haptic_r"),
-        "DualSense must expose haptic_r");
+    for pin in [
+        "trigger_r_mode", "trigger_r_start", "trigger_r_end", "trigger_r_strength", "trigger_r_freq",
+        "trigger_l_mode", "trigger_l_start", "trigger_l_end", "trigger_l_strength", "trigger_l_freq",
+    ] {
+        assert!(inputs.iter().any(|p| p.id == pin),
+            "DualSense must expose {pin}");
+    }
 }
 
 #[test]
-fn dualsense_inputs_include_adaptive_trigger_pins() {
+fn dualsense_inputs_include_led_pins() {
     let inputs = layouts::inputs_for(ControllerKind::DualSense);
-    assert!(inputs.iter().any(|p| p.id == "adaptive_trigger_l"),
-        "DualSense must expose adaptive_trigger_l");
-    assert!(inputs.iter().any(|p| p.id == "adaptive_trigger_r"),
-        "DualSense must expose adaptive_trigger_r");
+    assert!(inputs.iter().any(|p| p.id == "player_led"),
+        "DualSense must expose player_led");
+    assert!(inputs.iter().any(|p| p.id == "mic_led"),
+        "DualSense must expose mic_led");
 }
 
 // ── XInput ────────────────────────────────────────────────────────────────────
@@ -94,14 +97,14 @@ fn xinput_inputs_include_rumble_pins() {
 }
 
 #[test]
-fn xinput_inputs_have_no_lightbar_or_haptic() {
+fn xinput_inputs_have_no_lightbar_or_trigger_pins() {
     let inputs = layouts::inputs_for(ControllerKind::XInput);
     assert!(!inputs.iter().any(|p| p.id.starts_with("lightbar_")),
         "XInput must not expose lightbar pins (no RGB hardware)");
-    assert!(!inputs.iter().any(|p| p.id.starts_with("haptic_")),
-        "XInput must not expose haptic pins");
-    assert!(!inputs.iter().any(|p| p.id.starts_with("adaptive_trigger")),
-        "XInput must not expose adaptive trigger pins");
+    assert!(!inputs.iter().any(|p| p.id.starts_with("trigger_r_") || p.id.starts_with("trigger_l_")),
+        "XInput must not expose DualSense adaptive trigger pins");
+    assert!(!inputs.iter().any(|p| p.id == "player_led" || p.id == "mic_led"),
+        "XInput must not expose DualSense LED pins");
 }
 
 // ── Switch Pro ────────────────────────────────────────────────────────────────
