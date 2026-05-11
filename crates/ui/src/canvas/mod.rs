@@ -9,7 +9,7 @@ pub use viewer::FlexViewer;
 use std::collections::{HashMap, HashSet};
 
 use egui_snarl::{ui::{get_selected_nodes, SnarlStyle}, InPinId, NodeId, OutPinId, Snarl};
-use flexinput_core::{PinDescriptor, ModuleDescriptor};
+use flexinput_core::{PinDescriptor, ModuleDescriptor, SignalType};
 use flexinput_devices::PhysicalDevice;
 use flexinput_virtual::{SinkPin, VirtualDevice};
 use serde_json::Value;
@@ -985,6 +985,597 @@ mod clipboard_tests {
         // Only the pasted node should exist (original + pasted = 2 nodes, 0 wires).
         let wire_count = canvas.snarl.wires().count();
         assert_eq!(wire_count, 0, "malformed wire should be dropped; no wires expected");
+    }
+}
+
+// ── Selected-node grouping into a subpatch ────────────────────────────────────
+
+/// Result of attempting to group selected nodes into a subpatch.
+#[derive(Debug)]
+pub enum GroupResult {
+    /// Grouping succeeded; the new subpatch `NodeId` is returned.
+    Ok(NodeId),
+    /// Grouping was rejected because a boundary wire crosses a non-canonical AutoMap
+    /// pin. The offending pin name is included for diagnostics.
+    NonCanonicalBoundaryPin(String),
+    /// Nothing to group — the selection was empty.
+    EmptySelection,
+}
+
+/// Classification of a wire relative to the selected node set.
+#[derive(Debug)]
+struct BoundaryWire {
+    /// Source pin in the outer canvas.
+    out_id: OutPinId,
+    /// Destination pin in the outer canvas.
+    in_id: InPinId,
+    /// Signal type carried by the wire (from the output-side pin).
+    signal_type: SignalType,
+    /// True if data flows FROM outside into the selected set (incoming).
+    /// False if data flows FROM inside the selected set to outside (outgoing).
+    incoming: bool,
+    /// Pin name on the boundary (used as subpatch inlet/outlet display name).
+    pin_name: String,
+}
+
+/// Attempt to group `selected` nodes into a new `subpatch` node.
+///
+/// Phase-1 constraint: only wires whose signal type is `AutoMap` or whose
+/// output-side pin name is a canonical `ALL_PINS` ID are allowed to cross
+/// the subpatch boundary. Non-conforming boundary wires cause the operation
+/// to return `GroupResult::NonCanonicalBoundaryPin`.
+///
+/// On success, selected nodes are removed from the outer canvas, their
+/// internal wires are preserved inside the inner snarl, and one
+/// `subpatch.inlet` / `subpatch.outlet` node is inserted per boundary wire.
+/// The outer canvas receives a single `subpatch` node wired to all former
+/// boundary connections. An undo snapshot is taken before any mutations.
+pub fn group_into_subpatch(
+    snarl: &mut Snarl<NodeData>,
+    undo_stack: &mut Vec<Snarl<NodeData>>,
+    selected: &[NodeId],
+) -> GroupResult {
+    if selected.is_empty() {
+        return GroupResult::EmptySelection;
+    }
+
+    let selected_set: HashSet<NodeId> = selected.iter().copied().collect();
+
+    // ── Classify all wires in the outer canvas ────────────────────────────────
+
+    let all_wires: Vec<(OutPinId, InPinId)> = snarl.wires().collect();
+
+    let mut boundary_wires: Vec<BoundaryWire> = Vec::new();
+
+    for &(out_id, in_id) in &all_wires {
+        let from_inside = selected_set.contains(&out_id.node);
+        let to_inside   = selected_set.contains(&in_id.node);
+
+        if from_inside == to_inside {
+            // Both inside or both outside — internal or fully external; skip.
+            continue;
+        }
+
+        // Determine signal type from the output-side pin.
+        let (sig_type, pin_name) = if from_inside {
+            // Outgoing: from selected node's output pin to outside.
+            let t = snarl.get_node(out_id.node)
+                .and_then(|n| n.outputs.get(out_id.output))
+                .map(|p| (p.signal_type, p.name.clone()))
+                .unwrap_or((SignalType::Any, String::new()));
+            t
+        } else {
+            // Incoming: from outside into selected node's input pin.
+            // Use the output-side type (the signal being produced).
+            let t = snarl.get_node(out_id.node)
+                .and_then(|n| n.outputs.get(out_id.output))
+                .map(|p| (p.signal_type, p.name.clone()))
+                .unwrap_or((SignalType::Any, String::new()));
+            t
+        };
+
+        // ── Phase-1 validation (T-05-01) ─────────────────────────────────────
+        // Only AutoMap-typed signals OR canonical AutoMap pin names are allowed
+        // at the boundary. Reject anything else to prevent broken routing.
+        let is_canonical = sig_type == SignalType::AutoMap
+            || flexinput_core::automap::ALL_PINS.iter().any(|ap| ap.id == pin_name);
+
+        if !is_canonical {
+            return GroupResult::NonCanonicalBoundaryPin(pin_name);
+        }
+
+        boundary_wires.push(BoundaryWire {
+            out_id,
+            in_id,
+            signal_type: sig_type,
+            incoming: !from_inside,
+            pin_name,
+        });
+    }
+
+    // ── Snapshot undo state before mutating ───────────────────────────────────
+
+    undo_stack.push(snarl.clone());
+    if undo_stack.len() > MAX_UNDO {
+        undo_stack.remove(0);
+    }
+
+    // ── Build inner snarl: copy selected nodes ────────────────────────────────
+
+    let mut inner_snarl: Snarl<NodeData> = Snarl::new();
+
+    // Map from outer NodeId to inner NodeId so we can reconnect internal wires.
+    let mut outer_to_inner: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for &outer_id in selected {
+        if let Some(info) = snarl.get_node_info(outer_id) {
+            let inner_id = inner_snarl.insert_node(info.pos, info.value.clone());
+            outer_to_inner.insert(outer_id, inner_id);
+        }
+    }
+
+    // Restore internal wires inside the inner snarl.
+    for &(out_id, in_id) in &all_wires {
+        if selected_set.contains(&out_id.node) && selected_set.contains(&in_id.node) {
+            if let (Some(&inner_out_node), Some(&inner_in_node)) = (
+                outer_to_inner.get(&out_id.node),
+                outer_to_inner.get(&in_id.node),
+            ) {
+                inner_snarl.connect(
+                    OutPinId { node: inner_out_node, output: out_id.output },
+                    InPinId  { node: inner_in_node,  input:  in_id.input  },
+                );
+            }
+        }
+    }
+
+    // ── Insert inlet / outlet nodes for boundary wires ────────────────────────
+    // Each boundary wire gets its own inlet or outlet node.
+    // pin_index is assigned in order (0, 1, 2, …) separately for inlets and outlets.
+
+    let mut inlet_idx: usize = 0;
+    let mut outlet_idx: usize = 0;
+
+    // Map: (outer OutPinId, outer InPinId) → inner inlet NodeId
+    let mut inlet_map:  HashMap<(OutPinId, InPinId), NodeId> = HashMap::new();
+    // Map: (outer OutPinId, outer InPinId) → inner outlet NodeId
+    let mut outlet_map: HashMap<(OutPinId, InPinId), NodeId> = HashMap::new();
+
+    // Centroid of selected nodes for inlet/outlet placement.
+    let centroid = {
+        let positions: Vec<egui::Pos2> = selected.iter()
+            .filter_map(|&id| snarl.get_node_info(id).map(|n| n.pos))
+            .collect();
+        let n = positions.len() as f32;
+        if n > 0.0 {
+            egui::pos2(
+                positions.iter().map(|p| p.x).sum::<f32>() / n,
+                positions.iter().map(|p| p.y).sum::<f32>() / n,
+            )
+        } else {
+            egui::pos2(0.0, 0.0)
+        }
+    };
+
+    for bw in &boundary_wires {
+        if bw.incoming {
+            // Insert a subpatch.inlet node in the inner snarl.
+            let mut params = HashMap::new();
+            params.insert("pin_index".to_string(),
+                Value::Number(inlet_idx.into()));
+            params.insert("signal_type".to_string(),
+                serde_json::to_value(bw.signal_type).unwrap_or(Value::Null));
+
+            let inlet_node = NodeData {
+                module_id: "subpatch.inlet".to_string(),
+                display_name: bw.pin_name.clone(),
+                category: "SubPatch".to_string(),
+                inputs: vec![],
+                outputs: vec![PinDescriptor::new("out", bw.signal_type)],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            };
+
+            // Position inlets to the left of the centroid.
+            let pos = egui::pos2(
+                centroid.x - 220.0,
+                centroid.y + (inlet_idx as f32 * 60.0),
+            );
+            let inner_inlet_id = inner_snarl.insert_node(pos, inlet_node);
+            inlet_map.insert((bw.out_id, bw.in_id), inner_inlet_id);
+
+            // Wire: inlet.out → inner destination node's input.
+            if let Some(&inner_dst) = outer_to_inner.get(&bw.in_id.node) {
+                inner_snarl.connect(
+                    OutPinId { node: inner_inlet_id, output: 0 },
+                    InPinId  { node: inner_dst,       input:  bw.in_id.input },
+                );
+            }
+
+            inlet_idx += 1;
+        } else {
+            // Insert a subpatch.outlet node in the inner snarl.
+            let mut params = HashMap::new();
+            params.insert("pin_index".to_string(),
+                Value::Number(outlet_idx.into()));
+            params.insert("signal_type".to_string(),
+                serde_json::to_value(bw.signal_type).unwrap_or(Value::Null));
+
+            let outlet_node = NodeData {
+                module_id: "subpatch.outlet".to_string(),
+                display_name: bw.pin_name.clone(),
+                category: "SubPatch".to_string(),
+                inputs: vec![PinDescriptor::new("in", bw.signal_type)],
+                outputs: vec![],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            };
+
+            // Position outlets to the right of the centroid.
+            let pos = egui::pos2(
+                centroid.x + 220.0,
+                centroid.y + (outlet_idx as f32 * 60.0),
+            );
+            let inner_outlet_id = inner_snarl.insert_node(pos, outlet_node);
+            outlet_map.insert((bw.out_id, bw.in_id), inner_outlet_id);
+
+            // Wire: inner source node's output → outlet.in
+            if let Some(&inner_src) = outer_to_inner.get(&bw.out_id.node) {
+                inner_snarl.connect(
+                    OutPinId { node: inner_src,        output: bw.out_id.output },
+                    InPinId  { node: inner_outlet_id,  input:  0               },
+                );
+            }
+
+            outlet_idx += 1;
+        }
+    }
+
+    // ── Build the outer subpatch node ─────────────────────────────────────────
+
+    use crate::canvas::node::UiSubPatch;
+    use flexinput_core::SubPatchPin;
+
+    let pins_in: Vec<SubPatchPin> = boundary_wires.iter()
+        .filter(|bw| bw.incoming)
+        .map(|bw| SubPatchPin { name: bw.pin_name.clone(), signal_type: bw.signal_type })
+        .collect();
+    let pins_out: Vec<SubPatchPin> = boundary_wires.iter()
+        .filter(|bw| !bw.incoming)
+        .map(|bw| SubPatchPin { name: bw.pin_name.clone(), signal_type: bw.signal_type })
+        .collect();
+
+    let outer_inputs: Vec<PinDescriptor> = pins_in.iter()
+        .map(|p| PinDescriptor::new(p.name.as_str(), p.signal_type))
+        .collect();
+    let outer_outputs: Vec<PinDescriptor> = pins_out.iter()
+        .map(|p| PinDescriptor::new(p.name.as_str(), p.signal_type))
+        .collect();
+
+    let subpatch_data = UiSubPatch {
+        display_name: "Sub-patch".to_string(),
+        pins_in,
+        pins_out,
+        snarl: Box::new(inner_snarl),
+        exposed_modules: vec![],
+        snap_enabled: false,
+        snap_grid_px: 8,
+    };
+
+    let subpatch_node = NodeData {
+        module_id: "subpatch".to_string(),
+        display_name: "Sub-patch".to_string(),
+        category: "Utility".to_string(),
+        inputs: outer_inputs,
+        outputs: outer_outputs,
+        params: HashMap::new(),
+        subpatch: Some(Box::new(subpatch_data)),
+        extra: Default::default(),
+    };
+
+    // Insert the subpatch at the centroid position.
+    let subpatch_id = snarl.insert_node(centroid, subpatch_node);
+
+    // ── Reconnect outer boundary wires to the new subpatch node ───────────────
+
+    let mut inlet_port: usize = 0;
+    let mut outlet_port: usize = 0;
+
+    for bw in &boundary_wires {
+        if bw.incoming {
+            // The external source → subpatch input port.
+            snarl.connect(
+                bw.out_id,
+                InPinId { node: subpatch_id, input: inlet_port },
+            );
+            inlet_port += 1;
+        } else {
+            // The subpatch output port → external destination.
+            snarl.connect(
+                OutPinId { node: subpatch_id, output: outlet_port },
+                bw.in_id,
+            );
+            outlet_port += 1;
+        }
+    }
+
+    // ── Remove selected nodes from outer canvas ───────────────────────────────
+    // Disconnection happens automatically when the node is removed.
+
+    for &outer_id in selected {
+        if snarl.get_node(outer_id).is_some() {
+            snarl.remove_node(outer_id);
+        }
+    }
+
+    GroupResult::Ok(subpatch_id)
+}
+
+/// Public wrapper that calls `group_into_subpatch` through a `Canvas`.
+impl Canvas {
+    /// Attempt to group `selected` nodes into a `subpatch` node.
+    ///
+    /// Returns `GroupResult::Ok(id)` on success. On
+    /// `GroupResult::NonCanonicalBoundaryPin`, no mutation has occurred — the
+    /// caller should surface the error to the user before retrying.
+    pub fn group_selected_into_subpatch(&mut self, selected: &[NodeId]) -> GroupResult {
+        group_into_subpatch(&mut self.snarl, &mut self.undo_stack, selected)
+    }
+}
+
+// ── Grouping tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use flexinput_core::{PinDescriptor, SignalType};
+    use std::collections::HashMap;
+
+    /// Build a node with one AutoMap output.
+    fn make_automap_source() -> NodeData {
+        NodeData {
+            module_id: "module.automap_split".to_string(),
+            display_name: "AutoMap Source".to_string(),
+            category: "AutoMap".to_string(),
+            outputs: vec![PinDescriptor::new("automap_out", SignalType::AutoMap)],
+            inputs: vec![],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// Build a node with one AutoMap input.
+    fn make_automap_sink() -> NodeData {
+        NodeData {
+            module_id: "module.automap_collect".to_string(),
+            display_name: "AutoMap Sink".to_string(),
+            category: "AutoMap".to_string(),
+            inputs: vec![PinDescriptor::new("automap_in", SignalType::AutoMap)],
+            outputs: vec![],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// Build a generic node with one Float output and one Float input.
+    fn make_float_node() -> NodeData {
+        NodeData {
+            module_id: "test.float_node".to_string(),
+            display_name: "Float Node".to_string(),
+            category: "Test".to_string(),
+            outputs: vec![PinDescriptor::new("out", SignalType::Float)],
+            inputs: vec![PinDescriptor::new("in", SignalType::Float)],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    // ── Test: empty selection returns EmptySelection ──────────────────────────
+
+    #[test]
+    fn group_empty_selection_is_noop() {
+        let mut canvas = Canvas::new();
+        let result = canvas.group_selected_into_subpatch(&[]);
+        assert!(
+            matches!(result, GroupResult::EmptySelection),
+            "empty selection should return EmptySelection"
+        );
+        // Canvas should be unmodified.
+        assert_eq!(canvas.snarl.nodes_ids_data().count(), 0);
+    }
+
+    // ── Test: selected nodes are moved into the subpatch's inner snarl ────────
+
+    #[test]
+    fn group_moves_selected_nodes_into_inner_snarl() {
+        let mut canvas = Canvas::new();
+        // Insert two AutoMap nodes to be grouped.
+        let id_a = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), make_automap_source());
+        let id_b = canvas.snarl.insert_node(egui::pos2(200.0, 0.0), make_automap_sink());
+        // Wire them internally.
+        canvas.snarl.connect(
+            OutPinId { node: id_a, output: 0 },
+            InPinId  { node: id_b, input:  0 },
+        );
+
+        let result = canvas.group_selected_into_subpatch(&[id_a, id_b]);
+        let sp_id = match result {
+            GroupResult::Ok(id) => id,
+            other => panic!("expected Ok, got {:?}", other),
+        };
+
+        // Original nodes should be gone from outer canvas.
+        assert!(canvas.snarl.get_node(id_a).is_none(), "id_a should be removed from outer canvas");
+        assert!(canvas.snarl.get_node(id_b).is_none(), "id_b should be removed from outer canvas");
+
+        // Only the subpatch node should remain.
+        let outer_nodes: Vec<NodeId> = canvas.snarl.nodes_ids_data().map(|(id, _)| id).collect();
+        assert_eq!(outer_nodes.len(), 1, "only subpatch node should remain in outer canvas");
+        assert_eq!(outer_nodes[0], sp_id);
+
+        // The subpatch's inner snarl should hold two nodes (the original pair).
+        let sp_node = canvas.snarl.get_node(sp_id).expect("subpatch node must exist");
+        let inner = sp_node.subpatch.as_ref().expect("subpatch field must be populated");
+        let inner_count = inner.snarl.nodes_ids_data().count();
+        assert_eq!(
+            inner_count, 2,
+            "inner snarl should contain exactly the two grouped nodes; got {inner_count}"
+        );
+    }
+
+    // ── Test: internal wires are preserved inside the inner snarl ─────────────
+
+    #[test]
+    fn group_preserves_internal_wires() {
+        let mut canvas = Canvas::new();
+        let id_a = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), make_automap_source());
+        let id_b = canvas.snarl.insert_node(egui::pos2(200.0, 0.0), make_automap_sink());
+        canvas.snarl.connect(
+            OutPinId { node: id_a, output: 0 },
+            InPinId  { node: id_b, input:  0 },
+        );
+
+        let result = canvas.group_selected_into_subpatch(&[id_a, id_b]);
+        let sp_id = match result {
+            GroupResult::Ok(id) => id,
+            other => panic!("expected Ok, got {:?}", other),
+        };
+
+        let sp_node = canvas.snarl.get_node(sp_id).expect("subpatch node must exist");
+        let inner = sp_node.subpatch.as_ref().expect("subpatch field must be populated");
+        // Internal wire (a.out[0] → b.in[0]) must be preserved.
+        let inner_wire_count = inner.snarl.wires().count();
+        assert_eq!(
+            inner_wire_count, 1,
+            "internal wire should be preserved inside inner snarl; got {inner_wire_count}"
+        );
+    }
+
+    // ── Test: incoming boundary wire → inlet node created ─────────────────────
+
+    #[test]
+    fn group_creates_inlet_for_incoming_boundary_wire() {
+        let mut canvas = Canvas::new();
+        // External upstream node (NOT grouped).
+        let id_upstream = canvas.snarl.insert_node(
+            egui::pos2(-200.0, 0.0), make_automap_source(),
+        );
+        // Internal node (grouped).
+        let id_inner = canvas.snarl.insert_node(
+            egui::pos2(0.0, 0.0), make_automap_sink(),
+        );
+        // Boundary incoming wire.
+        canvas.snarl.connect(
+            OutPinId { node: id_upstream, output: 0 },
+            InPinId  { node: id_inner,    input:  0 },
+        );
+
+        let result = canvas.group_selected_into_subpatch(&[id_inner]);
+        let sp_id = match result {
+            GroupResult::Ok(id) => id,
+            other => panic!("expected Ok, got {:?}", other),
+        };
+
+        // Outer subpatch node should have one input (the inlet port).
+        let sp_node = canvas.snarl.get_node(sp_id).expect("subpatch node must exist");
+        assert_eq!(
+            sp_node.inputs.len(), 1,
+            "subpatch node should have one input pin for the incoming boundary wire"
+        );
+
+        // Inner snarl should contain the grouped node + one inlet node.
+        let inner = sp_node.subpatch.as_ref().expect("subpatch field must be populated");
+        let has_inlet = inner.snarl.nodes_ids_data()
+            .any(|(_, n)| n.value.module_id == "subpatch.inlet");
+        assert!(has_inlet, "inner snarl must contain a subpatch.inlet node");
+    }
+
+    // ── Test: outgoing boundary wire → outlet node created ────────────────────
+
+    #[test]
+    fn group_creates_outlet_for_outgoing_boundary_wire() {
+        let mut canvas = Canvas::new();
+        // Internal node (grouped) with one AutoMap output.
+        let id_inner = canvas.snarl.insert_node(
+            egui::pos2(0.0, 0.0), make_automap_source(),
+        );
+        // External downstream node (NOT grouped).
+        let id_downstream = canvas.snarl.insert_node(
+            egui::pos2(200.0, 0.0), make_automap_sink(),
+        );
+        // Boundary outgoing wire.
+        canvas.snarl.connect(
+            OutPinId { node: id_inner,      output: 0 },
+            InPinId  { node: id_downstream, input:  0 },
+        );
+
+        let result = canvas.group_selected_into_subpatch(&[id_inner]);
+        let sp_id = match result {
+            GroupResult::Ok(id) => id,
+            other => panic!("expected Ok, got {:?}", other),
+        };
+
+        // Outer subpatch node should have one output (the outlet port).
+        let sp_node = canvas.snarl.get_node(sp_id).expect("subpatch node must exist");
+        assert_eq!(
+            sp_node.outputs.len(), 1,
+            "subpatch node should have one output pin for the outgoing boundary wire"
+        );
+
+        // Inner snarl should contain the grouped node + one outlet node.
+        let inner = sp_node.subpatch.as_ref().expect("subpatch field must be populated");
+        let has_outlet = inner.snarl.nodes_ids_data()
+            .any(|(_, n)| n.value.module_id == "subpatch.outlet");
+        assert!(has_outlet, "inner snarl must contain a subpatch.outlet node");
+    }
+
+    // ── Test: non-canonical boundary pin rejects grouping (T-05-01) ───────────
+
+    #[test]
+    fn group_rejects_non_canonical_boundary_pin() {
+        let mut canvas = Canvas::new();
+        // External upstream node emitting a Float signal (not AutoMap, not canonical AutoMap pin ID).
+        let id_upstream = canvas.snarl.insert_node(
+            egui::pos2(-200.0, 0.0), make_float_node(),
+        );
+        // Internal node accepting a Float.
+        let id_inner = canvas.snarl.insert_node(
+            egui::pos2(0.0, 0.0), make_float_node(),
+        );
+        // Boundary incoming wire with non-AutoMap, non-canonical pin name.
+        canvas.snarl.connect(
+            OutPinId { node: id_upstream, output: 0 },
+            InPinId  { node: id_inner,    input:  0 },
+        );
+
+        let result = canvas.group_selected_into_subpatch(&[id_inner]);
+        assert!(
+            matches!(result, GroupResult::NonCanonicalBoundaryPin(_)),
+            "grouping with a non-canonical Float boundary wire should be rejected"
+        );
+
+        // No mutation should have occurred.
+        assert!(canvas.snarl.get_node(id_inner).is_some(), "id_inner must not have been removed");
+    }
+
+    // ── Test: undo snapshot is pushed before mutation ─────────────────────────
+
+    #[test]
+    fn group_pushes_undo_snapshot() {
+        let mut canvas = Canvas::new();
+        let id_a = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), make_automap_source());
+        let id_b = canvas.snarl.insert_node(egui::pos2(200.0, 0.0), make_automap_sink());
+
+        assert!(!canvas.can_undo(), "undo stack should be empty before grouping");
+
+        let _ = canvas.group_selected_into_subpatch(&[id_a, id_b]);
+
+        assert!(canvas.can_undo(), "undo snapshot should be pushed after grouping");
     }
 }
 
