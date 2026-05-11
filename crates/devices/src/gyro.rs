@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use hidapi::{HidApi, HidDevice};
 
-const SONY_VID: u16       = 0x054C;
-const DS4_PIDS: &[u16]   = &[0x05C4, 0x09CC];
-const DUALSENSE_PID: u16  = 0x0CE6;
+const SONY_VID: u16           = 0x054C;
+const DS4_PIDS: &[u16]       = &[0x05C4, 0x09CC];
+const DUALSENSE_PIDS: &[u16] = &[0x0CE6, 0x0DF2]; // standard + DualSense Edge
 const SWITCH_VID: u16     = 0x057E;
 const SWITCH_PRO_PID: u16 = 0x2009;
 
@@ -228,8 +228,19 @@ impl GyroManager {
                 .collect();
         }
 
+        #[cfg(debug_assertions)]
+        eprintln!("[gyro] open_device vid={:04X} pid={:04X} idx={} paths_found={}",
+            vid, pid, idx, paths.len());
+
         let info = paths.get(idx)?;
-        let device = api.open_path(info.path()).ok()?;
+        let device = match api.open_path(info.path()) {
+            Ok(d) => d,
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                eprintln!("[gyro] open_path failed: {e}");
+                return None;
+            }
+        };
         device.set_blocking_mode(false).ok()?;
 
         let kind = match kind_tag {
@@ -760,8 +771,8 @@ enum KindTag { Ds4, DualSense, SwitchPro }
 
 fn classify(vid: u16, pid: u16) -> Option<KindTag> {
     match vid {
-        SONY_VID   if DS4_PIDS.contains(&pid)   => Some(KindTag::Ds4),
-        SONY_VID   if pid == DUALSENSE_PID       => Some(KindTag::DualSense),
+        SONY_VID   if DS4_PIDS.contains(&pid)      => Some(KindTag::Ds4),
+        SONY_VID   if DUALSENSE_PIDS.contains(&pid) => Some(KindTag::DualSense),
         SWITCH_VID if pid == SWITCH_PRO_PID      => Some(KindTag::SwitchPro),
         _ => None,
     }

@@ -960,28 +960,15 @@ impl eframe::App for FlexInputApp {
             });
         self.bottom_panel_height = bottom_resp.response.rect.height();
 
-        // Detect Ctrl+V before show() so we can act on cross-boundary paste.
-        let ctrl_v_pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e,
-            egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
-            if modifiers.ctrl && !modifiers.shift
-        ) || matches!(e, egui::Event::Paste(_))));
-
         // Seed cross-boundary clipboard so Ctrl+V in the outer canvas works when
         // the copy came from an inner SubPatchEditor canvas (inner→outer direction).
-        // Also seeds when the outer canvas has no local clipboard at all.
-        // app_clipboard_from_inner is true when the last copy came from an inner canvas,
-        // which forces seeding even if the outer canvas has a stale local clipboard.
+        // app_clipboard_from_inner is set by show_subpatch_editors on the previous frame
+        // when a copy happened inside a sub-patch editor.  Seeding here (before canvas.show)
+        // ensures the outer canvas has the clipboard ready when Ctrl+V is processed.
         let should_seed = self.app_clipboard_from_inner || canvas.clipboard().is_none();
         if should_seed {
             if let Some(ref cb) = self.app_clipboard {
                 canvas.set_clipboard(cb.clone());
-                if ctrl_v_pressed {
-                    use flexinput_core::automap::ALL_PINS;
-                    let boundary_pins: Vec<String> = ALL_PINS.iter()
-                        .map(|p| p.id.to_string())
-                        .collect();
-                    canvas.insert_automap_bridge(&boundary_pins, egui::pos2(200.0, 200.0));
-                }
             }
         }
 
@@ -2687,23 +2674,6 @@ fn show_subpatch_editors(
                 }
                 // Mark layout mode for body renderers in this viewport's frame.
                 crate::canvas::viewer::set_layout_mode_active(vctx, outer_layout_mode);
-
-                // Cross-boundary paste bridge: if this is a cross-boundary seed and the
-                // user is pressing Ctrl+V in this viewport, insert AutoMap bridge nodes
-                // in the inner canvas before paste() fires inside show() (D-04 item 3).
-                if inner_needs_clipboard_seed {
-                    let inner_ctrl_v = vctx.input(|i| i.events.iter().any(|e| matches!(e,
-                        egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
-                        if modifiers.ctrl && !modifiers.shift
-                    ) || matches!(e, egui::Event::Paste(_))));
-                    if inner_ctrl_v {
-                        use flexinput_core::automap::ALL_PINS;
-                        let boundary_pins: Vec<String> = ALL_PINS.iter()
-                            .map(|p| p.id.to_string())
-                            .collect();
-                        inner_canvas.insert_automap_bridge(&boundary_pins, egui::pos2(200.0, 200.0));
-                    }
-                }
 
                 egui::TopBottomPanel::top("subpatch_editor_header").show(vctx, |ui| {
                     ui.horizontal(|ui| {
