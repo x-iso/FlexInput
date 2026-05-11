@@ -15,6 +15,9 @@ pub fn registrations() -> Vec<ModuleRegistration> {
             descriptor: SplitModule::descriptor(),
             factory: || Box::new(SplitModule::default()),
         },
+        reg::<RumbleOutput>(),
+        reg::<RgbOutput>(),
+        reg::<AdaptiveTriggerOutput>(),
     ]
 }
 
@@ -148,10 +151,10 @@ impl Module for SelectorModule {
             category: "Utility",
             inputs: vec![
                 PinDescriptor::new("select", SignalType::Float),
-                PinDescriptor::new("in_0",   SignalType::Float),
-                PinDescriptor::new("in_1",   SignalType::Float),
+                PinDescriptor::new("in_0",   SignalType::Any),
+                PinDescriptor::new("in_1",   SignalType::Any),
             ],
-            outputs: vec![PinDescriptor::new("out", SignalType::Float)],
+            outputs: vec![PinDescriptor::new("out", SignalType::Any)],
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
@@ -164,6 +167,92 @@ impl Module for SelectorModule {
             Some(sig) => { let mut r = SmallVec::new(); r.push(sig); r }
             None => SmallVec::new(),
         }
+    }
+}
+
+// ── RumbleOutput ──────────────────────────────────────────────────────────────
+
+/// Routes Float signals to a physical device's rumble motors.
+/// Pin ids match the device layout: "rumble_strong", "rumble_weak".
+/// No outputs — this is a pure sink; actual dispatch happens through the
+/// device's SinkTarget routing in the engine and UI output loop.
+#[derive(Default)]
+pub struct RumbleOutput;
+
+impl Module for RumbleOutput {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.rumble_output",
+            display_name: "Rumble Output",
+            category: "Controls",
+            inputs: vec![
+                PinDescriptor::new("rumble_strong", SignalType::Float),
+                PinDescriptor::new("rumble_weak",   SignalType::Float),
+            ],
+            outputs: vec![],
+        }
+    }
+    fn process(&mut self, _inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        // Values flow through the SinkTarget routing path in the engine,
+        // not through Module::process. Return empty.
+        SmallVec::new()
+    }
+}
+
+// ── RgbOutput ─────────────────────────────────────────────────────────────────
+
+/// Routes Float signals to a physical device's RGB lightbar.
+/// Pin ids match the device layout: "lightbar_r", "lightbar_g", "lightbar_b".
+/// Supported on DualShock 4 and DualSense; silently ignored on unsupported devices.
+/// No outputs — pure sink.
+#[derive(Default)]
+pub struct RgbOutput;
+
+impl Module for RgbOutput {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.rgb_output",
+            display_name: "RGB Output",
+            category: "Controls",
+            inputs: vec![
+                PinDescriptor::new("lightbar_r", SignalType::Float),
+                PinDescriptor::new("lightbar_g", SignalType::Float),
+                PinDescriptor::new("lightbar_b", SignalType::Float),
+            ],
+            outputs: vec![],
+        }
+    }
+    fn process(&mut self, _inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        SmallVec::new()
+    }
+}
+
+// ── AdaptiveTriggerOutput ─────────────────────────────────────────────────────
+
+/// Routes Float signals to a DualSense adaptive trigger actuators.
+/// Pin ids: "adaptive_trigger_l", "adaptive_trigger_r".
+/// Only supported on DualSense via USB; silently ignored on other devices or
+/// when connected over Bluetooth (USB-only limitation of the adaptive trigger
+/// HID report).
+/// No outputs — pure sink.
+#[derive(Default)]
+pub struct AdaptiveTriggerOutput;
+
+impl Module for AdaptiveTriggerOutput {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.adaptive_trigger_output",
+            display_name: "Adaptive Trigger Output",
+            category: "Controls",
+            inputs: vec![
+                PinDescriptor::new("adaptive_trigger_l", SignalType::Float),
+                PinDescriptor::new("adaptive_trigger_r", SignalType::Float),
+            ],
+            outputs: vec![],
+        }
+    }
+    fn process(&mut self, _inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        SmallVec::new()
     }
 }
 
@@ -186,23 +275,23 @@ impl Module for SplitModule {
             category: "Utility",
             inputs: vec![
                 PinDescriptor::new("select", SignalType::Float),
-                PinDescriptor::new("in",     SignalType::Float),
+                PinDescriptor::new("in",     SignalType::Any),
             ],
             outputs: vec![
-                PinDescriptor::new("out_0", SignalType::Float),
-                PinDescriptor::new("out_1", SignalType::Float),
+                PinDescriptor::new("out_0", SignalType::Any),
+                PinDescriptor::new("out_1", SignalType::Any),
             ],
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
         let n = self.n_outputs.max(1);
         let sel = get_float(inputs, 0, 0.0);
-        let val = get_float(inputs, 1, 0.0);
+        let val = inputs.get(1).and_then(|s| *s);
         let idx = (sel.clamp(0.0, 1.0) * n as f32).floor() as usize;
         let idx = idx.min(n - 1);
         let mut r = SmallVec::new();
         for i in 0..n {
-            r.push(Signal::Float(if i == idx { val } else { 0.0 }));
+            r.push(if i == idx { val.unwrap_or(Signal::Float(0.0)) } else { Signal::Float(0.0) });
         }
         r
     }

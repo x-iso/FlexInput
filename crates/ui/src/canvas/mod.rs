@@ -17,21 +17,21 @@ use serde_json::Value;
 const MAX_UNDO: usize = 50;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct UiPatch {
-    version: u32,
-    snarl: Snarl<NodeData>,
+pub struct UiPatch {
+    pub version: u32,
+    pub snarl: Snarl<NodeData>,
     /// IDs of virtual output devices that were active (e.g. `"virtual.xinput.0"`).
-    virtual_device_ids: Vec<String>,
+    pub virtual_device_ids: Vec<String>,
     /// Exe filenames that auto-switch to this tab (e.g. `["game.exe"]`).
     #[serde(default)]
-    bound_exes: Vec<String>,
+    pub bound_exes: Vec<String>,
     /// Bypass output when the bound process is not in focus.
     #[serde(default)]
-    auto_bypass: bool,
+    pub auto_bypass: bool,
 }
 
 #[derive(Clone)]
-struct ClipboardData {
+pub(crate) struct ClipboardData {
     nodes: Vec<(egui::Pos2, NodeData)>,
     /// Internal wires encoded as (from_node_idx, from_pin, to_node_idx, to_pin).
     internal_wires: Vec<(usize, usize, usize, usize)>,
@@ -116,6 +116,75 @@ impl Canvas {
             self.undo_stack.push(self.snarl.clone());
             self.snarl = next;
         }
+    }
+
+    /// Return a clone of the current clipboard for app-level cross-boundary paste.
+    pub(crate) fn clipboard(&self) -> Option<ClipboardData> {
+        self.clipboard.clone()
+    }
+
+    /// Seed the canvas clipboard from an external source before calling paste().
+    /// Used by FlexInputApp to implement cross-boundary paste: the app writes
+    /// app_clipboard into the target canvas, then calls paste() via the normal
+    /// Ctrl+V path.
+    pub(crate) fn set_clipboard(&mut self, data: ClipboardData) {
+        self.clipboard = Some(data);
+    }
+
+    /// Insert AutoMap Splitter and Collector bridge nodes at the boundary when
+    /// pasting across a patch/sub-patch boundary (D-04 item 3).
+    ///
+    /// For each pin name in `boundary_pins`, this inserts one AutoMap Splitter
+    /// node (module_id = "module.automap_split") and one AutoMap Collector node
+    /// (module_id = "module.automap_collect") in the target canvas, positioned
+    /// near `base_pos`. Non-AutoMap boundary wires should be dropped by the caller.
+    ///
+    /// Returns the NodeIds of inserted bridge nodes so the caller can connect them.
+    pub(crate) fn insert_automap_bridge(
+        &mut self,
+        boundary_pins: &[String],
+        base_pos: egui::Pos2,
+    ) -> Vec<NodeId> {
+        self.push_undo();
+        let mut bridge_ids = Vec::new();
+        for (i, pin_name) in boundary_pins.iter().enumerate() {
+            let offset = egui::vec2(0.0, i as f32 * 60.0);
+            // Insert AutoMap Splitter (source side of boundary)
+            let mut splitter_params = HashMap::new();
+            splitter_params.insert("pin".into(), serde_json::Value::String(pin_name.clone()));
+            let splitter_id = self.snarl.insert_node(
+                base_pos + offset,
+                NodeData {
+                    module_id: "module.automap_split".into(),
+                    display_name: format!("AutoMap Split: {pin_name}"),
+                    category: "AutoMap".into(),
+                    inputs: vec![],
+                    outputs: vec![],
+                    params: splitter_params,
+                    subpatch: None,
+                    extra: crate::canvas::node::NodeExtra::default(),
+                },
+            );
+            // Insert AutoMap Collector (destination side of boundary)
+            let mut collector_params = HashMap::new();
+            collector_params.insert("pin".into(), serde_json::Value::String(pin_name.clone()));
+            let collector_id = self.snarl.insert_node(
+                base_pos + offset + egui::vec2(160.0, 0.0),
+                NodeData {
+                    module_id: "module.automap_collect".into(),
+                    display_name: format!("AutoMap Collect: {pin_name}"),
+                    category: "AutoMap".into(),
+                    inputs: vec![],
+                    outputs: vec![],
+                    params: collector_params,
+                    subpatch: None,
+                    extra: crate::canvas::node::NodeExtra::default(),
+                },
+            );
+            bridge_ids.push(splitter_id);
+            bridge_ids.push(collector_id);
+        }
+        bridge_ids
     }
 
     /// Copy selected nodes (and internal wires) to the clipboard.
@@ -802,192 +871,6 @@ fn resolve_pin(old_id: &str, candidates: &[&str]) -> Option<usize> {
     None
 }
 
-// ── Regression tests for canvas clipboard semantics ──────────────────────────
-
-#[cfg(test)]
-mod clipboard_tests {
-    use super::*;
-    use egui_snarl::{InPinId, NodeId, OutPinId};
-    use flexinput_core::{PinDescriptor, SignalType};
-    use std::collections::HashMap;
-
-    /// Build a minimal `NodeData` with the given number of outputs and inputs.
-    fn make_node(n_out: usize, n_in: usize) -> NodeData {
-        NodeData {
-            module_id: "test.node".to_string(),
-            display_name: "Test".to_string(),
-            category: "Test".to_string(),
-            outputs: (0..n_out)
-                .map(|i| PinDescriptor::new(format!("out{i}"), SignalType::Float))
-                .collect(),
-            inputs: (0..n_in)
-                .map(|i| PinDescriptor::new(format!("in{i}"), SignalType::Float))
-                .collect(),
-            params: HashMap::new(),
-            subpatch: None,
-            extra: Default::default(),
-        }
-    }
-
-    /// Insert `node` into a fresh Canvas and return its NodeId.
-    fn add_node(canvas: &mut Canvas, pos: egui::Pos2, node: NodeData) -> NodeId {
-        canvas.snarl.insert_node(pos, node)
-    }
-
-    // ── Test: copy populates clipboard ────────────────────────────────────────
-
-    #[test]
-    fn copy_selected_populates_clipboard() {
-        let mut canvas = Canvas::new();
-        let id = add_node(&mut canvas, egui::pos2(10.0, 20.0), make_node(1, 1));
-
-        assert!(canvas.clipboard.is_none(), "clipboard should start empty");
-        canvas.copy_selected(&[id]);
-        assert!(canvas.clipboard.is_some(), "clipboard should be set after copy");
-
-        let cb = canvas.clipboard.as_ref().unwrap();
-        assert_eq!(cb.nodes.len(), 1, "one node should be in clipboard");
-        let (pos, _data) = &cb.nodes[0];
-        assert!(
-            (pos.x - 10.0).abs() < 0.001 && (pos.y - 20.0).abs() < 0.001,
-            "clipboard position should match original node position"
-        );
-    }
-
-    // ── Test: empty selection leaves clipboard unchanged ──────────────────────
-
-    #[test]
-    fn copy_empty_selection_leaves_clipboard_unchanged() {
-        let mut canvas = Canvas::new();
-        canvas.copy_selected(&[]);
-        assert!(canvas.clipboard.is_none());
-    }
-
-    // ── Test: paste produces fresh NodeIds ────────────────────────────────────
-
-    #[test]
-    fn paste_produces_fresh_node_ids() {
-        let mut canvas = Canvas::new();
-        let orig_id = add_node(&mut canvas, egui::pos2(0.0, 0.0), make_node(1, 0));
-        canvas.copy_selected(&[orig_id]);
-
-        let before: Vec<NodeId> = canvas.snarl.nodes_ids_data().map(|(id, _)| id).collect();
-        canvas.paste();
-        let after: Vec<NodeId> = canvas.snarl.nodes_ids_data().map(|(id, _)| id).collect();
-
-        assert_eq!(after.len(), before.len() + 1, "paste should add exactly one new node");
-
-        let new_ids: Vec<NodeId> = after.into_iter().filter(|id| !before.contains(id)).collect();
-        assert!(!new_ids.contains(&orig_id), "pasted node must have a different NodeId from the original");
-    }
-
-    // ── Test: pasted nodes are offset from original positions ─────────────────
-
-    #[test]
-    fn paste_offsets_node_positions() {
-        let mut canvas = Canvas::new();
-        let orig_id = add_node(&mut canvas, egui::pos2(100.0, 50.0), make_node(1, 0));
-        canvas.copy_selected(&[orig_id]);
-        canvas.paste();
-
-        // Find nodes other than the original.
-        let pasted: Vec<egui::Pos2> = canvas.snarl
-            .nodes_ids_data()
-            .filter(|(id, _)| *id != orig_id)
-            .filter_map(|(id, _)| canvas.snarl.get_node_info(id).map(|n| n.pos))
-            .collect();
-
-        assert_eq!(pasted.len(), 1, "exactly one pasted node expected");
-        let p = pasted[0];
-        assert!(
-            (p.x - 140.0).abs() < 0.001 && (p.y - 90.0).abs() < 0.001,
-            "pasted node should be offset by (40, 40); got ({}, {})",
-            p.x, p.y
-        );
-    }
-
-    // ── Test: internal wires are reconstructed after paste ────────────────────
-
-    #[test]
-    fn paste_reconstructs_internal_wires() {
-        let mut canvas = Canvas::new();
-        // Node A has one output; Node B has one input.
-        let id_a = add_node(&mut canvas, egui::pos2(0.0, 0.0), make_node(1, 0));
-        let id_b = add_node(&mut canvas, egui::pos2(200.0, 0.0), make_node(0, 1));
-
-        // Connect A.out[0] → B.in[0]
-        canvas.snarl.connect(
-            OutPinId { node: id_a, output: 0 },
-            InPinId  { node: id_b, input:  0 },
-        );
-
-        canvas.copy_selected(&[id_a, id_b]);
-        canvas.paste();
-
-        // Count total wires: original + pasted should each have one wire.
-        let wire_count = canvas.snarl.wires().count();
-        assert_eq!(wire_count, 2, "expected 2 wires (original + reconstructed internal); got {wire_count}");
-    }
-
-    // ── Test: boundary (external) wires are NOT reconnected ───────────────────
-
-    #[test]
-    fn paste_drops_boundary_wires() {
-        let mut canvas = Canvas::new();
-        // id_upstream: one output — NOT copied.
-        let id_upstream = add_node(&mut canvas, egui::pos2(-200.0, 0.0), make_node(1, 0));
-        // id_b: one input, one output — the node we will copy.
-        let id_b = add_node(&mut canvas, egui::pos2(0.0, 0.0), make_node(1, 1));
-        // id_downstream: one input — NOT copied.
-        let id_downstream = add_node(&mut canvas, egui::pos2(200.0, 0.0), make_node(0, 1));
-
-        // Boundary wire in: upstream → b
-        canvas.snarl.connect(
-            OutPinId { node: id_upstream, output: 0 },
-            InPinId  { node: id_b,        input:  0 },
-        );
-        // Boundary wire out: b → downstream
-        canvas.snarl.connect(
-            OutPinId { node: id_b,          output: 0 },
-            InPinId  { node: id_downstream, input:  0 },
-        );
-
-        // Copy only id_b (not upstream or downstream).
-        canvas.copy_selected(&[id_b]);
-        canvas.paste();
-
-        // The pasted node (id_b copy) should have zero wires.
-        // Original wires (upstream→b, b→downstream) remain: 2 total.
-        let wire_count = canvas.snarl.wires().count();
-        assert_eq!(
-            wire_count, 2,
-            "only original boundary wires should exist; pasted node must not be rewired; got {wire_count}"
-        );
-    }
-
-    // ── Test: malformed wire indices in clipboard are silently dropped ─────────
-
-    #[test]
-    fn paste_ignores_out_of_bounds_wire_indices() {
-        let mut canvas = Canvas::new();
-        let id = add_node(&mut canvas, egui::pos2(0.0, 0.0), make_node(1, 1));
-        canvas.copy_selected(&[id]);
-
-        // Inject malformed wire: both indices in range (only one node) but pin
-        // indices deliberately out of bounds.
-        if let Some(ref mut cb) = canvas.clipboard {
-            cb.internal_wires.push((0, 99, 0, 99)); // pin 99 does not exist
-        }
-
-        // Paste must not panic.
-        canvas.paste();
-
-        // Only the pasted node should exist (original + pasted = 2 nodes, 0 wires).
-        let wire_count = canvas.snarl.wires().count();
-        assert_eq!(wire_count, 0, "malformed wire should be dropped; no wires expected");
-    }
-}
-
 // ── Selected-node grouping into a subpatch ────────────────────────────────────
 
 /// Result of attempting to group selected nodes into a subpatch.
@@ -1021,26 +904,15 @@ struct BoundaryWire {
 /// Attempt to group `selected` nodes into a new `subpatch` node.
 ///
 /// Phase-1 constraint: only wires whose signal type is `AutoMap` or whose
-/// output-side pin name is a canonical `ALL_PINS` ID (from
-/// `flexinput_core::automap::ALL_PINS`) are allowed to cross the subpatch
-/// boundary. Non-conforming boundary wires cause the operation to return
-/// `GroupResult::NonCanonicalBoundaryPin`.
+/// output-side pin name is a canonical `ALL_PINS` ID are allowed to cross
+/// the subpatch boundary. Non-conforming boundary wires cause the operation
+/// to return `GroupResult::NonCanonicalBoundaryPin`.
 ///
 /// On success, selected nodes are removed from the outer canvas, their
 /// internal wires are preserved inside the inner snarl, and one
 /// `subpatch.inlet` / `subpatch.outlet` node is inserted per boundary wire.
 /// The outer canvas receives a single `subpatch` node wired to all former
 /// boundary connections. An undo snapshot is taken before any mutations.
-///
-/// # AutoMap Splitter/Collector preservation
-///
-/// `module.automap_split` and `module.automap_collect` are already fully
-/// implemented in `crates/modules/src/processing.rs`. Grouping uses their
-/// existing `AutoMap` signal-type semantics at boundaries rather than
-/// introducing any new processing modules. When an AutoMap Splitter or
-/// Collector is part of the selected set, its `AutoMap`-typed wire is
-/// accepted at the boundary unchanged — the inner graph retains the full
-/// device bus for downstream splitting or collection inside the sub-patch.
 pub fn group_into_subpatch(
     snarl: &mut Snarl<NodeData>,
     undo_stack: &mut Vec<Snarl<NodeData>>,
@@ -1336,6 +1208,300 @@ impl Canvas {
     }
 }
 
+// ── Regression tests for canvas clipboard semantics ──────────────────────────
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use egui_snarl::{InPinId, NodeId, OutPinId};
+    use flexinput_core::{PinDescriptor, SignalType};
+    use std::collections::HashMap;
+
+    /// Build a minimal `NodeData` with the given number of outputs and inputs.
+    fn make_node(n_out: usize, n_in: usize) -> NodeData {
+        NodeData {
+            module_id: "test.node".to_string(),
+            display_name: "Test".to_string(),
+            category: "Test".to_string(),
+            outputs: (0..n_out)
+                .map(|i| PinDescriptor::new(format!("out{i}"), SignalType::Float))
+                .collect(),
+            inputs: (0..n_in)
+                .map(|i| PinDescriptor::new(format!("in{i}"), SignalType::Float))
+                .collect(),
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// Insert `node` into a fresh Canvas and return its NodeId.
+    fn add_node(canvas: &mut Canvas, pos: egui::Pos2, node: NodeData) -> NodeId {
+        canvas.snarl.insert_node(pos, node)
+    }
+
+    // ── Test: copy populates clipboard ────────────────────────────────────────
+
+    #[test]
+    fn copy_selected_populates_clipboard() {
+        let mut canvas = Canvas::new();
+        let id = add_node(&mut canvas, egui::pos2(10.0, 20.0), make_node(1, 1));
+
+        assert!(canvas.clipboard.is_none(), "clipboard should start empty");
+        canvas.copy_selected(&[id]);
+        assert!(canvas.clipboard.is_some(), "clipboard should be set after copy");
+
+        let cb = canvas.clipboard.as_ref().unwrap();
+        assert_eq!(cb.nodes.len(), 1, "one node should be in clipboard");
+        let (pos, _data) = &cb.nodes[0];
+        assert!(
+            (pos.x - 10.0).abs() < 0.001 && (pos.y - 20.0).abs() < 0.001,
+            "clipboard position should match original node position"
+        );
+    }
+
+    // ── Test: empty selection leaves clipboard unchanged ──────────────────────
+
+    #[test]
+    fn copy_empty_selection_leaves_clipboard_unchanged() {
+        let mut canvas = Canvas::new();
+        canvas.copy_selected(&[]);
+        assert!(canvas.clipboard.is_none());
+    }
+
+    // ── Test: paste produces fresh NodeIds ────────────────────────────────────
+
+    #[test]
+    fn paste_produces_fresh_node_ids() {
+        let mut canvas = Canvas::new();
+        let orig_id = add_node(&mut canvas, egui::pos2(0.0, 0.0), make_node(1, 0));
+        canvas.copy_selected(&[orig_id]);
+
+        let before: Vec<NodeId> = canvas.snarl.nodes_ids_data().map(|(id, _)| id).collect();
+        canvas.paste();
+        let after: Vec<NodeId> = canvas.snarl.nodes_ids_data().map(|(id, _)| id).collect();
+
+        assert_eq!(after.len(), before.len() + 1, "paste should add exactly one new node");
+
+        let new_ids: Vec<NodeId> = after.into_iter().filter(|id| !before.contains(id)).collect();
+        assert!(!new_ids.contains(&orig_id), "pasted node must have a different NodeId from the original");
+    }
+
+    // ── Test: pasted nodes are offset from original positions ─────────────────
+
+    #[test]
+    fn paste_offsets_node_positions() {
+        let mut canvas = Canvas::new();
+        let orig_id = add_node(&mut canvas, egui::pos2(100.0, 50.0), make_node(1, 0));
+        canvas.copy_selected(&[orig_id]);
+        canvas.paste();
+
+        // Find nodes other than the original.
+        let pasted: Vec<egui::Pos2> = canvas.snarl
+            .nodes_ids_data()
+            .filter(|(id, _)| *id != orig_id)
+            .filter_map(|(id, _)| canvas.snarl.get_node_info(id).map(|n| n.pos))
+            .collect();
+
+        assert_eq!(pasted.len(), 1, "exactly one pasted node expected");
+        let p = pasted[0];
+        assert!(
+            (p.x - 140.0).abs() < 0.001 && (p.y - 90.0).abs() < 0.001,
+            "pasted node should be offset by (40, 40); got ({}, {})",
+            p.x, p.y
+        );
+    }
+
+    // ── Test: internal wires are reconstructed after paste ────────────────────
+
+    #[test]
+    fn paste_reconstructs_internal_wires() {
+        let mut canvas = Canvas::new();
+        // Node A has one output; Node B has one input.
+        let id_a = add_node(&mut canvas, egui::pos2(0.0, 0.0), make_node(1, 0));
+        let id_b = add_node(&mut canvas, egui::pos2(200.0, 0.0), make_node(0, 1));
+
+        // Connect A.out[0] → B.in[0]
+        canvas.snarl.connect(
+            OutPinId { node: id_a, output: 0 },
+            InPinId  { node: id_b, input:  0 },
+        );
+
+        canvas.copy_selected(&[id_a, id_b]);
+        canvas.paste();
+
+        // Count total wires: original + pasted should each have one wire.
+        let wire_count = canvas.snarl.wires().count();
+        assert_eq!(wire_count, 2, "expected 2 wires (original + reconstructed internal); got {wire_count}");
+    }
+
+    // ── Test: boundary (external) wires are NOT reconnected ───────────────────
+
+    #[test]
+    fn paste_drops_boundary_wires() {
+        let mut canvas = Canvas::new();
+        // id_a: one output — it's the "upstream" node NOT copied.
+        let id_upstream = add_node(&mut canvas, egui::pos2(-200.0, 0.0), make_node(1, 0));
+        // id_b: one input, one output — the node we will copy.
+        let id_b = add_node(&mut canvas, egui::pos2(0.0, 0.0), make_node(1, 1));
+        // id_downstream: one input — NOT copied.
+        let id_downstream = add_node(&mut canvas, egui::pos2(200.0, 0.0), make_node(0, 1));
+
+        // Boundary wire in: upstream → b
+        canvas.snarl.connect(
+            OutPinId { node: id_upstream, output: 0 },
+            InPinId  { node: id_b,        input:  0 },
+        );
+        // Boundary wire out: b → downstream
+        canvas.snarl.connect(
+            OutPinId { node: id_b,          output: 0 },
+            InPinId  { node: id_downstream, input:  0 },
+        );
+
+        // Copy only id_b (not upstream or downstream).
+        canvas.copy_selected(&[id_b]);
+        canvas.paste();
+
+        // The pasted node (id_b copy) should have zero wires.
+        // Original wires (upstream→b, b→downstream) remain: 2 total.
+        let wire_count = canvas.snarl.wires().count();
+        assert_eq!(
+            wire_count, 2,
+            "only original boundary wires should exist; pasted node must not be rewired; got {wire_count}"
+        );
+    }
+
+    // ── Test: malformed wire indices in clipboard are silently dropped ─────────
+
+    #[test]
+    fn paste_ignores_out_of_bounds_wire_indices() {
+        let mut canvas = Canvas::new();
+        let id = add_node(&mut canvas, egui::pos2(0.0, 0.0), make_node(1, 1));
+        canvas.copy_selected(&[id]);
+
+        // Inject malformed wire: both indices in range (only one node) but pin
+        // indices deliberately out of bounds.
+        if let Some(ref mut cb) = canvas.clipboard {
+            cb.internal_wires.push((0, 99, 0, 99)); // pin 99 does not exist
+        }
+
+        // Paste must not panic.
+        canvas.paste();
+
+        // Only the pasted node should exist (original + pasted = 2 nodes, 0 wires).
+        let wire_count = canvas.snarl.wires().count();
+        assert_eq!(wire_count, 0, "malformed wire should be dropped; no wires expected");
+    }
+
+    // ── Tests required by plan 01-07 (cross-boundary clipboard contract) ─────
+
+    #[test]
+    fn fresh_canvas_has_no_clipboard() {
+        let canvas = Canvas::new();
+        assert!(canvas.clipboard().is_none(), "fresh canvas clipboard should be None");
+    }
+
+    #[test]
+    fn set_clipboard_makes_clipboard_accessible() {
+        let mut canvas = Canvas::new();
+        let data = ClipboardData {
+            nodes: vec![(egui::pos2(0.0, 0.0), make_node(1, 0))],
+            internal_wires: vec![],
+        };
+        canvas.set_clipboard(data);
+        assert!(canvas.clipboard().is_some(), "clipboard() should return Some after set_clipboard()");
+    }
+
+    #[test]
+    fn paste_after_set_clipboard_inserts_node() {
+        let mut src = Canvas::new();
+        let src_id = add_node(&mut src, egui::pos2(10.0, 20.0), make_node(1, 0));
+        src.copy_selected(&[src_id]);
+        let cb = src.clipboard().unwrap();
+
+        // Simulate cross-boundary paste: target canvas starts empty, receives clipboard from app.
+        let mut target = Canvas::new();
+        target.set_clipboard(cb);
+        target.paste();
+
+        let count = target.snarl.nodes_ids_data().count();
+        assert_eq!(count, 1, "paste should insert exactly one node into the target canvas");
+    }
+
+    #[test]
+    fn paste_calls_push_undo() {
+        let mut canvas = Canvas::new();
+        let id = add_node(&mut canvas, egui::pos2(10.0, 20.0), make_node(1, 0));
+        canvas.copy_selected(&[id]);
+        let before = canvas.undo_stack.len();
+        canvas.paste();
+        assert_eq!(canvas.undo_stack.len(), before + 1, "paste() must push undo before inserting nodes");
+    }
+
+    // ── Tests required by plan 01-08 (named interface contract) ──────────────
+
+    #[test]
+    fn copy_selected_captures_nodes() {
+        let mut canvas = Canvas::new();
+        let id = add_node(&mut canvas, egui::pos2(10.0, 20.0), make_node(1, 0));
+        canvas.copy_selected(&[id]);
+        let cb = canvas.clipboard.clone().expect("clipboard should be set after copy_selected");
+        assert_eq!(cb.nodes.len(), 1, "clipboard should contain exactly one node");
+    }
+
+    #[test]
+    fn paste_inserts_at_offset() {
+        let mut canvas = Canvas::new();
+        let pos = egui::pos2(10.0, 20.0);
+        let id = add_node(&mut canvas, pos, make_node(1, 0));
+        canvas.copy_selected(&[id]);
+        canvas.paste();
+        let count = canvas.snarl.nodes_ids_data().count();
+        assert_eq!(count, 2, "paste should insert one additional node (original + copy)");
+    }
+
+    #[test]
+    fn paste_with_empty_clipboard_is_noop() {
+        let mut canvas = Canvas::new();
+        let before = canvas.snarl.nodes_ids_data().count();
+        canvas.paste(); // clipboard is None — should be a no-op
+        let after = canvas.snarl.nodes_ids_data().count();
+        assert_eq!(before, after, "paste with no clipboard should not change node count");
+    }
+}
+
+/// Disconnect a wire and insert `desc` between its endpoints, auto-connecting compatible pins.
+fn insert_between(
+    snarl: &mut Snarl<NodeData>,
+    desc: &ModuleDescriptor,
+    out_id: OutPinId,
+    in_id: InPinId,
+) {
+    let from_pos = snarl.get_node_info(out_id.node).map(|n| n.pos).unwrap_or_default();
+    let to_pos   = snarl.get_node_info(in_id.node) .map(|n| n.pos).unwrap_or_default();
+    let insert_pos = egui::pos2(
+        (from_pos.x + to_pos.x) * 0.5,
+        (from_pos.y + to_pos.y) * 0.5,
+    );
+
+    let out_type = snarl.get_node(out_id.node)
+        .and_then(|n| n.outputs.get(out_id.output))
+        .map(|p| p.signal_type);
+    let in_type = snarl.get_node(in_id.node)
+        .and_then(|n| n.inputs.get(in_id.input))
+        .map(|p| p.signal_type);
+
+    snarl.disconnect(out_id, in_id);
+    let new_id = snarl.insert_node(insert_pos, NodeData::from(desc));
+
+    if let Some(idx) = desc.inputs.iter().position(|p| out_type.map_or(true, |t| p.signal_type.accepts(t))) {
+        snarl.connect(out_id, InPinId { node: new_id, input: idx });
+    }
+    if let Some(idx) = desc.outputs.iter().position(|p| in_type.map_or(true, |t| t.accepts(p.signal_type))) {
+        snarl.connect(OutPinId { node: new_id, output: idx }, in_id);
+    }
+}
+
 // ── Grouping tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1587,37 +1753,5 @@ mod group_tests {
         let _ = canvas.group_selected_into_subpatch(&[id_a, id_b]);
 
         assert!(canvas.can_undo(), "undo snapshot should be pushed after grouping");
-    }
-}
-
-/// Disconnect a wire and insert `desc` between its endpoints, auto-connecting compatible pins.
-fn insert_between(
-    snarl: &mut Snarl<NodeData>,
-    desc: &ModuleDescriptor,
-    out_id: OutPinId,
-    in_id: InPinId,
-) {
-    let from_pos = snarl.get_node_info(out_id.node).map(|n| n.pos).unwrap_or_default();
-    let to_pos   = snarl.get_node_info(in_id.node) .map(|n| n.pos).unwrap_or_default();
-    let insert_pos = egui::pos2(
-        (from_pos.x + to_pos.x) * 0.5,
-        (from_pos.y + to_pos.y) * 0.5,
-    );
-
-    let out_type = snarl.get_node(out_id.node)
-        .and_then(|n| n.outputs.get(out_id.output))
-        .map(|p| p.signal_type);
-    let in_type = snarl.get_node(in_id.node)
-        .and_then(|n| n.inputs.get(in_id.input))
-        .map(|p| p.signal_type);
-
-    snarl.disconnect(out_id, in_id);
-    let new_id = snarl.insert_node(insert_pos, NodeData::from(desc));
-
-    if let Some(idx) = desc.inputs.iter().position(|p| out_type.map_or(true, |t| p.signal_type.accepts(t))) {
-        snarl.connect(out_id, InPinId { node: new_id, input: idx });
-    }
-    if let Some(idx) = desc.outputs.iter().position(|p| in_type.map_or(true, |t| t.accepts(p.signal_type))) {
-        snarl.connect(OutPinId { node: new_id, output: idx }, in_id);
     }
 }

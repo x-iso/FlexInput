@@ -13,6 +13,7 @@ use flexinput_virtual::VirtualDevice;
 use crate::{
     canvas::{sample_curve, Canvas, NodeData},
     canvas::node::{ExposedModule, UiSubPatch},
+    canvas::ClipboardData,
     panels::{physical_devices, virtual_devices::VirtualDevicePanel},
 };
 
@@ -110,6 +111,10 @@ pub struct FlexInputApp {
     /// Cached whitelist read from the HidHide driver; refreshed on window open and after edits.
     hidhide_whitelist: Vec<String>,
     sub_patch_editors: Vec<SubPatchEditor>,
+    /// App-level clipboard shared across all Canvas instances (outer tabs and SubPatchEditor
+    /// inner canvases). Written whenever a copy action fires in any canvas.
+    /// Read when the target canvas has no local clipboard (cross-boundary paste).
+    app_clipboard: Option<ClipboardData>,
     // ── Processing thread shared state ────────────────────────────────────────
     proc_graph: Arc<RwLock<ProcessingGraph>>,
     proc_device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
@@ -195,6 +200,7 @@ impl FlexInputApp {
             hidhide_proc_list: vec![],
             hidhide_whitelist: vec![],
             sub_patch_editors: vec![],
+            app_clipboard: None,
             proc_graph,
             proc_device_signals,
             proc_outputs,
@@ -949,9 +955,38 @@ impl eframe::App for FlexInputApp {
             });
         self.bottom_panel_height = bottom_resp.response.rect.height();
 
+        // Detect Ctrl+V before show() so we can act on cross-boundary paste.
+        let ctrl_v_pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e,
+            egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
+            if modifiers.ctrl && !modifiers.shift
+        ) || matches!(e, egui::Event::Paste(_))));
+
+        // Seed cross-boundary clipboard: if the outer canvas has no local clipboard
+        // but the app has one, make it available so Ctrl+V works across boundaries.
+        // When Ctrl+V is pressed on a cross-boundary paste, also insert AutoMap
+        // Splitter/Collector bridge nodes at the boundary (D-04 item 3).
+        if canvas.clipboard().is_none() {
+            if let Some(ref cb) = self.app_clipboard {
+                canvas.set_clipboard(cb.clone());
+                if ctrl_v_pressed {
+                    use flexinput_core::automap::ALL_PINS;
+                    let boundary_pins: Vec<String> = ALL_PINS.iter()
+                        .map(|p| p.id.to_string())
+                        .collect();
+                    canvas.insert_automap_bridge(&boundary_pins, egui::pos2(200.0, 200.0));
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             crate::panels::canvas::show(canvas, &self.descriptors, &live_device_ids, devices, ui);
         });
+
+        // Sync app-level clipboard from the outer canvas after show() so cross-boundary
+        // paste picks up the latest copy from any canvas.
+        if let Some(cb) = canvas.clipboard() {
+            self.app_clipboard = Some(cb);
+        }
 
         // ── Sub-patch editor windows ──────────────────────────────────────────
         show_subpatch_editors(self, ctx, &live_device_ids);
@@ -2614,6 +2649,18 @@ fn show_subpatch_editors(
             .get_node(node_id)
             .map(|n| n.extra.layout_unlocked)
             .unwrap_or(false);
+        // Snapshot app_clipboard for use inside the viewport closure below.
+        let app_clipboard_snap = app.app_clipboard.clone();
+        // Whether this inner canvas currently has no local clipboard (cross-boundary candidate).
+        let inner_needs_clipboard_seed = inner_canvas.clipboard().is_none() && app_clipboard_snap.is_some();
+        // Seed cross-boundary clipboard: if this inner canvas has no local clipboard
+        // but the app has one (set by a copy in another canvas), seed it so Ctrl+V works.
+        if inner_needs_clipboard_seed {
+            if let Some(ref cb) = app_clipboard_snap {
+                inner_canvas.set_clipboard(cb.clone());
+            }
+        }
+
         // Render the editor in its own native viewport (separate OS window) so it
         // can be moved freely outside the main window. Falls back to nothing when
         // the user closes it via the OS close button — that triggers close_requested.
@@ -2631,6 +2678,23 @@ fn show_subpatch_editors(
                 }
                 // Mark layout mode for body renderers in this viewport's frame.
                 crate::canvas::viewer::set_layout_mode_active(vctx, outer_layout_mode);
+
+                // Cross-boundary paste bridge: if this is a cross-boundary seed and the
+                // user is pressing Ctrl+V in this viewport, insert AutoMap bridge nodes
+                // in the inner canvas before paste() fires inside show() (D-04 item 3).
+                if inner_needs_clipboard_seed {
+                    let inner_ctrl_v = vctx.input(|i| i.events.iter().any(|e| matches!(e,
+                        egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
+                        if modifiers.ctrl && !modifiers.shift
+                    ) || matches!(e, egui::Event::Paste(_))));
+                    if inner_ctrl_v {
+                        use flexinput_core::automap::ALL_PINS;
+                        let boundary_pins: Vec<String> = ALL_PINS.iter()
+                            .map(|p| p.id.to_string())
+                            .collect();
+                        inner_canvas.insert_automap_bridge(&boundary_pins, egui::pos2(200.0, 200.0));
+                    }
+                }
 
                 egui::TopBottomPanel::top("subpatch_editor_header").show(vctx, |ui| {
                     ui.horizontal(|ui| {
@@ -2660,6 +2724,12 @@ fn show_subpatch_editors(
                 crate::canvas::viewer::set_layout_mode_active(vctx, false);
             },
         );
+
+        // Sync app-level clipboard from this inner canvas after show() so a copy
+        // action inside a SubPatchEditor is visible for cross-boundary paste.
+        if let Some(cb) = inner_canvas.clipboard() {
+            app.app_clipboard = Some(cb);
+        }
 
         if save_clicked {
             if let Some(sp) = app.tabs[active].canvas.snarl.get_node(node_id)

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "snarl": {
+    "nodes": {},
+    "wires": []
+  },
+  "virtual_device_ids": [],
+  "bound_exes": [],
+  "auto_bypass": false
+}
