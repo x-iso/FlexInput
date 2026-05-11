@@ -363,15 +363,32 @@ impl DeviceBackend for GilrsBackend {
             return;
         }
 
-        // ── PS/Switch HID path via GyroManager (unchanged) ───────────────────
+        // ── PS/Switch HID path via GyroManager ───────────────────────────────
         let (vid, pid, idx) = match self.lookup_phys(device_id) {
             Some(t) => t,
             None => return,
         };
-        let byte = match signal {
-            Signal::Float(f) => (f.clamp(0.0, 1.0) * 255.0) as u8,
-            Signal::Bool(b)  => if b { 255 } else { 0 },
+        // Scale Float 0–1 to the semantic range for each pin.
+        // Pins with custom ranges are listed explicitly; everything else uses 0–255.
+        let f = match signal {
+            Signal::Float(f) => f.clamp(0.0, 1.0),
+            Signal::Bool(b)  => if b { 1.0 } else { 0.0 },
             _ => return,
+        };
+        let byte = match pin_id {
+            // Trigger mode: 0=Off, 1=Feedback, 2=Weapon, 3=Vibration → scale to 0–3
+            "trigger_r_mode" | "trigger_l_mode" => (f * 3.0).round() as u8,
+            // Trigger zones: 0–9 along trigger travel → scale to 0–9
+            "trigger_r_start" | "trigger_r_end" |
+            "trigger_l_start" | "trigger_l_end" => (f * 9.0).round() as u8,
+            // Trigger force: 0–7 → scale to 0–7
+            "trigger_r_strength" | "trigger_l_strength" => (f * 7.0).round() as u8,
+            // Player LED: 0=off, 1=P1, 2=P2, 3=P3, 4=P4 → scale to 0–4
+            "player_led" => (f * 4.0).round() as u8,
+            // Mic LED: 0=off, 1=on, 2=pulsing → scale to 0–2
+            "mic_led" => (f * 2.0).round() as u8,
+            // Everything else (rumble 0–255, lightbar 0–255, trigger freq 0–255): linear
+            _ => (f * 255.0) as u8,
         };
         self.gyro.set_output_byte(vid, pid, idx, pin_id, byte);
     }

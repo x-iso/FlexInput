@@ -494,21 +494,22 @@ impl Canvas {
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.set_min_width(180.0);
-                        let group_label = format!("⬡ Group into sub-patch ({})", sel_ids.len());
+                        let group_label = format!("Group into sub-patch ({})", sel_ids.len());
                         if ui.add_enabled(sel_ids.len() >= 2, egui::Button::new(group_label)).clicked() {
                             do_group = true;
                             close = true;
                         }
                         ui.separator();
-                        if ui.button("✖ Cancel").clicked() {
+                        if ui.button("Cancel").clicked() {
                             close = true;
                         }
                     });
                 });
             let ptr = ui.input(|i| i.pointer.latest_pos().unwrap_or_default());
-            let clicked_outside = ui.input(|i| i.pointer.any_click())
+            // Close on primary click outside the menu rect, or Escape.
+            let primary_clicked_outside = ui.input(|i| i.pointer.primary_clicked())
                 && !area_resp.response.rect.contains(ptr);
-            if clicked_outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if primary_clicked_outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 close = true;
             }
             if do_group {
@@ -939,10 +940,8 @@ fn resolve_pin(old_id: &str, candidates: &[&str]) -> Option<usize> {
 #[derive(Debug)]
 pub enum GroupResult {
     /// Grouping succeeded; the new subpatch `NodeId` is returned.
+    /// Non-AutoMap boundary wires were dropped; AutoMap boundary wires got inlet/outlet ports.
     Ok(NodeId),
-    /// Grouping was rejected because a boundary wire crosses a non-canonical AutoMap
-    /// pin. The offending pin name is included for diagnostics.
-    NonCanonicalBoundaryPin(String),
     /// Nothing to group — the selection was empty.
     EmptySelection,
 }
@@ -1019,14 +1018,19 @@ pub fn group_into_subpatch(
             t
         };
 
-        // ── Phase-1 validation (T-05-01) ─────────────────────────────────────
-        // Only AutoMap-typed signals OR canonical AutoMap pin names are allowed
-        // at the boundary. Reject anything else to prevent broken routing.
-        let is_canonical = sig_type == SignalType::AutoMap
+        // ── Boundary wire policy ──────────────────────────────────────────────
+        // AutoMap-typed signals or canonical AutoMap pin names get an inlet/outlet
+        // port and are reconnected through the subpatch boundary.
+        // All other signal types (Float, Bool, Vec2, etc.) are dropped — the
+        // external wire is removed and not reconnected. This matches the intent:
+        // grouping disconnects non-AutoMap boundary wires; the user can rewire
+        // manually or use AutoMap routing for inter-patch signal flow.
+        let is_automap_boundary = sig_type == SignalType::AutoMap
             || flexinput_core::automap::ALL_PINS.iter().any(|ap| ap.id == pin_name);
 
-        if !is_canonical {
-            return GroupResult::NonCanonicalBoundaryPin(pin_name);
+        if !is_automap_boundary {
+            // Drop this boundary wire — don't reconnect, don't block grouping.
+            continue;
         }
 
         boundary_wires.push(BoundaryWire {
@@ -1776,9 +1780,9 @@ mod group_tests {
     // ── Test: non-canonical boundary pin rejects grouping (T-05-01) ───────────
 
     #[test]
-    fn group_rejects_non_canonical_boundary_pin() {
+    fn group_drops_non_automap_boundary_wire() {
         let mut canvas = Canvas::new();
-        // External upstream node emitting a Float signal (not AutoMap, not canonical AutoMap pin ID).
+        // External upstream node emitting a Float signal (not AutoMap).
         let id_upstream = canvas.snarl.insert_node(
             egui::pos2(-200.0, 0.0), make_float_node(),
         );
@@ -1786,20 +1790,22 @@ mod group_tests {
         let id_inner = canvas.snarl.insert_node(
             egui::pos2(0.0, 0.0), make_float_node(),
         );
-        // Boundary incoming wire with non-AutoMap, non-canonical pin name.
+        // Boundary incoming wire with non-AutoMap signal — should be dropped, not block grouping.
         canvas.snarl.connect(
             OutPinId { node: id_upstream, output: 0 },
             InPinId  { node: id_inner,    input:  0 },
         );
 
         let result = canvas.group_selected_into_subpatch(&[id_inner]);
+        // Grouping succeeds — non-AutoMap boundary wire is dropped.
         assert!(
-            matches!(result, GroupResult::NonCanonicalBoundaryPin(_)),
-            "grouping with a non-canonical Float boundary wire should be rejected"
+            matches!(result, GroupResult::Ok(_)),
+            "grouping with a non-AutoMap boundary wire should succeed (wire dropped): got {:?}", result
         );
-
-        // No mutation should have occurred.
-        assert!(canvas.snarl.get_node(id_inner).is_some(), "id_inner must not have been removed");
+        // The inner node moved into the subpatch — it no longer exists in the outer canvas.
+        assert!(canvas.snarl.get_node(id_inner).is_none(), "id_inner should have moved into subpatch");
+        // The upstream node stays in the outer canvas.
+        assert!(canvas.snarl.get_node(id_upstream).is_some(), "id_upstream must remain in outer canvas");
     }
 
     // ── Test: undo snapshot is pushed before mutation ─────────────────────────
