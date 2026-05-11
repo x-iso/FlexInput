@@ -1021,15 +1021,26 @@ struct BoundaryWire {
 /// Attempt to group `selected` nodes into a new `subpatch` node.
 ///
 /// Phase-1 constraint: only wires whose signal type is `AutoMap` or whose
-/// output-side pin name is a canonical `ALL_PINS` ID are allowed to cross
-/// the subpatch boundary. Non-conforming boundary wires cause the operation
-/// to return `GroupResult::NonCanonicalBoundaryPin`.
+/// output-side pin name is a canonical `ALL_PINS` ID (from
+/// `flexinput_core::automap::ALL_PINS`) are allowed to cross the subpatch
+/// boundary. Non-conforming boundary wires cause the operation to return
+/// `GroupResult::NonCanonicalBoundaryPin`.
 ///
 /// On success, selected nodes are removed from the outer canvas, their
 /// internal wires are preserved inside the inner snarl, and one
 /// `subpatch.inlet` / `subpatch.outlet` node is inserted per boundary wire.
 /// The outer canvas receives a single `subpatch` node wired to all former
 /// boundary connections. An undo snapshot is taken before any mutations.
+///
+/// # AutoMap Splitter/Collector preservation
+///
+/// `module.automap_split` and `module.automap_collect` are already fully
+/// implemented in `crates/modules/src/processing.rs`. Grouping uses their
+/// existing `AutoMap` signal-type semantics at boundaries rather than
+/// introducing any new processing modules. When an AutoMap Splitter or
+/// Collector is part of the selected set, its `AutoMap`-typed wire is
+/// accepted at the boundary unchanged — the inner graph retains the full
+/// device bus for downstream splitting or collection inside the sub-patch.
 pub fn group_into_subpatch(
     snarl: &mut Snarl<NodeData>,
     undo_stack: &mut Vec<Snarl<NodeData>>,
