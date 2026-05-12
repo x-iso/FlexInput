@@ -49,6 +49,10 @@ pub struct Canvas {
     undo_stack: Vec<Snarl<NodeData>>,
     redo_stack: Vec<Snarl<NodeData>>,
     clipboard: Option<ClipboardData>,
+    /// Incremented every time copy_selected() is called. Used by app.rs to detect
+    /// whether the user actually copied something in an inner canvas this frame,
+    /// without relying on clipboard content comparison (which breaks for same-count copies).
+    pub(crate) clipboard_gen: u64,
     /// Set this frame when the user requests to open a subpatch editor window.
     pub pending_edit_subpatch: Option<egui_snarl::NodeId>,
     /// Set this frame when the user picks "Pin element …" on an inner canvas
@@ -76,6 +80,7 @@ impl Canvas {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: None,
+            clipboard_gen: 0,
             pending_edit_subpatch: None,
             pending_expose_module: None,
             is_inner: false,
@@ -211,6 +216,7 @@ impl Canvas {
             .collect();
 
         self.clipboard = Some(ClipboardData { nodes, internal_wires });
+        self.clipboard_gen = self.clipboard_gen.wrapping_add(1);
     }
 
     /// Paste clipboard nodes offset by a fixed amount, restoring internal wires.

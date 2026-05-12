@@ -75,6 +75,8 @@ struct SubPatchEditor {
     parent_editor_idx: Option<usize>,
     canvas: Canvas,
     open: bool,
+    /// Last canvas.clipboard_gen seen; used to detect a genuine user copy inside this editor.
+    last_clipboard_gen: u64,
 }
 
 pub struct FlexInputApp {
@@ -122,6 +124,9 @@ pub struct FlexInputApp {
     /// Used to force-seed the outer canvas clipboard so inner→outer paste works
     /// even when the outer canvas already has its own stale clipboard.
     app_clipboard_from_inner: bool,
+    /// Last clipboard_gen seen from the active tab's outer canvas.
+    /// Used to detect genuine user copies without comparing clipboard contents.
+    last_outer_clipboard_gen: u64,
     // ── Processing thread shared state ────────────────────────────────────────
     proc_graph: Arc<RwLock<ProcessingGraph>>,
     proc_device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
@@ -209,6 +214,7 @@ impl FlexInputApp {
             sub_patch_editors: vec![],
             app_clipboard: None,
             app_clipboard_from_inner: false,
+            last_outer_clipboard_gen: 0,
             proc_graph,
             proc_device_signals,
             proc_outputs,
@@ -963,29 +969,28 @@ impl eframe::App for FlexInputApp {
             });
         self.bottom_panel_height = bottom_resp.response.rect.height();
 
-        // Seed cross-boundary clipboard so Ctrl+V in the outer canvas works when
-        // the copy came from an inner SubPatchEditor canvas (inner→outer direction).
-        // app_clipboard_from_inner is set by show_subpatch_editors on the previous frame
-        // when a copy happened inside a sub-patch editor.  Seeding here (before canvas.show)
-        // ensures the outer canvas has the clipboard ready when Ctrl+V is processed.
-        let should_seed = self.app_clipboard_from_inner || canvas.clipboard().is_none();
-        if should_seed {
+        // Seed outer canvas clipboard from inner when app_clipboard_from_inner is set
+        // (user copied inside a sub-patch editor last frame) or on first use.
+        if self.app_clipboard_from_inner || canvas.clipboard().is_none() {
             if let Some(ref cb) = self.app_clipboard {
                 canvas.set_clipboard(cb.clone());
             }
         }
+        let outer_gen_before = canvas.clipboard_gen;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             crate::panels::canvas::show(canvas, &self.descriptors, &live_device_ids, devices, ui);
         });
 
-        // Sync app-level clipboard from the outer canvas after show().
-        // Clear the from_inner flag — the outer canvas just ran, so any pending
-        // inner→outer seed has been consumed (or Ctrl+V wasn't pressed this frame).
-        if let Some(cb) = canvas.clipboard() {
-            self.app_clipboard = Some(cb);
-            self.app_clipboard_from_inner = false;
+        // Only update app_clipboard from outer canvas when the user actually copied
+        // (gen advanced). Clear from_inner flag regardless so seeding doesn't repeat.
+        if canvas.clipboard_gen != outer_gen_before {
+            self.last_outer_clipboard_gen = canvas.clipboard_gen;
+            if let Some(cb) = canvas.clipboard() {
+                self.app_clipboard = Some(cb);
+            }
         }
+        self.app_clipboard_from_inner = false;
 
         // ── Sub-patch editor windows ──────────────────────────────────────────
         show_subpatch_editors(self, ctx, &live_device_ids);
@@ -2579,6 +2584,7 @@ fn show_subpatch_editors(
                 parent_editor_idx: None,
                 canvas: editor_canvas,
                 open: true,
+                last_clipboard_gen: 0,
             });
         }
     }
@@ -2629,10 +2635,21 @@ fn show_subpatch_editors(
         let descriptors: &[ModuleDescriptor] = &app.descriptors;
         let devices: &[flexinput_devices::PhysicalDevice] = &app.devices;
 
-        // No pre-sync: the editor canvas is the source of truth for inner snarl state.
-        // Write-back at end of each iteration propagates changes upward (child → parent
-        // editor → tab canvas). Pre-sync in either direction would clobber pin/unpin
-        // changes made in the same frame before the parent's write-back runs.
+        // Pre-sync: pull pinned-body param changes from the parent snarl so that
+        // sliders/knobs on the sub-patch body remain interactive.
+        // Skip when a child editor is open: the child will write-back into this
+        // editor's canvas this same frame (reverse loop order), and pre-sync would
+        // overwrite those changes with the stale parent state.
+        let has_active_child = app.sub_patch_editors.iter().enumerate().any(|(j, e)| {
+            j != i && e.tab_idx == active && e.parent_editor_idx == Some(i)
+        });
+        if !has_active_child {
+            let outer_inner = match parent_editor_idx {
+                None    => app.tabs[active].canvas.snarl.get_node(node_id),
+                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+            }.and_then(|n| n.subpatch.as_ref()).map(|sp| *sp.snarl.clone());
+            if let Some(snarl) = outer_inner { inner_canvas.snarl = snarl; }
+        }
 
         // Pinned IDs from parent.
         inner_canvas.pinned_inner_ids = {
@@ -2654,12 +2671,17 @@ fn show_subpatch_editors(
             Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
         }.map(|n| n.extra.layout_unlocked).unwrap_or(false);
 
-        // Seed cross-boundary clipboard.
+        // Seed cross-boundary clipboard (outer→inner direction) so the user can
+        // paste nodes copied from the outer canvas into this editor.
+        // Only seed when the canvas has no clipboard yet (first frame after open).
+        // Subsequent frames: the canvas retains its clipboard across mem::replace.
         if inner_canvas.clipboard().is_none() {
             if let Some(ref cb) = app.app_clipboard.clone() {
                 inner_canvas.set_clipboard(cb.clone());
             }
         }
+        // Snapshot gen before show() so we can detect a real user copy after.
+        let gen_before = inner_canvas.clipboard_gen;
 
         let viewport_id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
         // Build breadcrumb: "Parent Name > This Name" for nested editors.
@@ -2725,10 +2747,16 @@ fn show_subpatch_editors(
             pending_nested.push((i, child_id));
         }
 
-        // Sync clipboard upward.
-        if let Some(cb) = inner_canvas.clipboard() {
-            app.app_clipboard = Some(cb);
-            app.app_clipboard_from_inner = true;
+        // Sync clipboard upward only when the user actually copied inside this editor.
+        // clipboard_gen is incremented by copy_selected(); comparing before/after show()
+        // is exact regardless of node count, content, or number of copies in a row.
+        let user_copied = inner_canvas.clipboard_gen != gen_before;
+        if user_copied {
+            app.sub_patch_editors[i].last_clipboard_gen = inner_canvas.clipboard_gen;
+            if let Some(cb) = inner_canvas.clipboard() {
+                app.app_clipboard = Some(cb);
+                app.app_clipboard_from_inner = true;
+            }
         }
 
         if save_clicked {
@@ -2855,6 +2883,7 @@ fn show_subpatch_editors(
                 parent_editor_idx: Some(parent_idx),
                 canvas: editor_canvas,
                 open: true,
+                last_clipboard_gen: 0,
             });
         }
     }
