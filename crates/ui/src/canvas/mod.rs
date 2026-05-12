@@ -646,7 +646,10 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        self.snarl.insert_node(egui::pos2(80.0, 80.0), node);
+        let existing = self.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.source")
+            .count();
+        self.snarl.insert_node(egui::pos2(80.0, 80.0 + existing as f32 * 220.0), node);
     }
 
     /// Add a physical device's input pins as a sink node (e.g. MIDI OUT port).
@@ -683,7 +686,10 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        self.snarl.insert_node(egui::pos2(400.0, 80.0), node);
+        let existing = self.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.sink")
+            .count();
+        self.snarl.insert_node(egui::pos2(400.0, 80.0 + existing as f32 * 220.0), node);
     }
 
     /// Add a virtual device as a sink node. No-op if already present (keyed by device id).
@@ -721,7 +727,10 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        self.snarl.insert_node(egui::pos2(400.0, 80.0), node);
+        let existing = self.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.sink")
+            .count();
+        self.snarl.insert_node(egui::pos2(400.0, 80.0 + existing as f32 * 220.0), node);
     }
 }
 

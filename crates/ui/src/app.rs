@@ -852,6 +852,8 @@ impl eframe::App for FlexInputApp {
             self.tabs.remove(idx);
             let new_idx = self.active_tab.saturating_sub(if self.active_tab > idx { 1 } else { 0 })
                 .min(self.tabs.len() - 1);
+            // Clamp active_tab before set_active_tab reads self.tabs[self.active_tab].
+            self.active_tab = self.active_tab.min(self.tabs.len() - 1);
             self.set_active_tab(new_idx);
         }
 
