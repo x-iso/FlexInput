@@ -530,6 +530,10 @@ impl Canvas {
             }
             if ctrl_c && !selected.is_empty() {
                 self.copy_selected(&selected);
+                // Write a sentinel to the OS clipboard so egui-winit fires Event::Paste
+                // on the next Ctrl+V (it only does so when the OS clipboard is non-empty).
+                // We ignore the text content on paste and use our internal ClipboardData.
+                ctx.copy_text("__flexinput_nodes__".to_string());
             }
             if ctrl_v {
                 self.paste();

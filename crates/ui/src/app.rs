@@ -69,7 +69,10 @@ impl PatchTab {
 
 struct SubPatchEditor {
     tab_idx: usize,
+    /// NodeId of the sub-patch node in the *parent* snarl (tab canvas or a parent editor).
     node_id: NodeId,
+    /// Index into sub_patch_editors of the parent editor, or None if parented to the tab canvas.
+    parent_editor_idx: Option<usize>,
     canvas: Canvas,
     open: bool,
 }
@@ -2573,6 +2576,7 @@ fn show_subpatch_editors(
             app.sub_patch_editors.push(SubPatchEditor {
                 tab_idx: active,
                 node_id,
+                parent_editor_idx: None,
                 canvas: editor_canvas,
                 open: true,
             });
@@ -2581,102 +2585,115 @@ fn show_subpatch_editors(
 
     // Render each open editor window.
     let mut to_close: Vec<usize> = Vec::new();
+    // Collect nested-open requests outside the loop to avoid borrow issues.
+    let mut pending_nested: Vec<(usize, NodeId)> = Vec::new(); // (parent_editor_idx, child_node_id)
+
     for i in 0..app.sub_patch_editors.len() {
         if app.sub_patch_editors[i].tab_idx != active { continue; }
         let node_id = app.sub_patch_editors[i].node_id;
+        let parent_editor_idx = app.sub_patch_editors[i].parent_editor_idx;
 
-        // Close editor if the sub-patch node was deleted from the canvas.
-        let node_exists = app.tabs[active].canvas.snarl
-            .get_node(node_id)
-            .map(|n| n.module_id == "subpatch")
-            .unwrap_or(false);
+        // Close editor if the sub-patch node was deleted.
+        // For nested editors, check the parent editor's canvas; for top-level, check tab canvas.
+        let node_exists = match parent_editor_idx {
+            None => app.tabs[active].canvas.snarl
+                .get_node(node_id).map(|n| n.module_id == "subpatch").unwrap_or(false),
+            Some(p) => app.sub_patch_editors[p].canvas.snarl
+                .get_node(node_id).map(|n| n.module_id == "subpatch").unwrap_or(false),
+        };
         if !node_exists {
             to_close.push(i);
             continue;
         }
 
-        // Window title follows the outer node's display_name so renames done
-        // via the rename popup show up here. Falls back to the inner subpatch
-        // display_name (legacy patches) and finally to "Sub-patch".
-        let display_name = app.tabs[active].canvas.snarl
-            .get_node(node_id)
-            .map(|n| {
+        // Window title: resolve from parent snarl.
+        let display_name = {
+            let node_opt = match parent_editor_idx {
+                None    => app.tabs[active].canvas.snarl.get_node(node_id),
+                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+            };
+            node_opt.map(|n| {
                 if !n.display_name.is_empty() { n.display_name.clone() }
                 else { n.subpatch.as_ref().map(|sp| sp.display_name.clone()).unwrap_or_else(|| "Sub-patch".to_string()) }
-            })
-            .unwrap_or_else(|| "Sub-patch".to_string());
+            }).unwrap_or_else(|| "Sub-patch".to_string())
+        };
 
-        // Extract inner canvas to avoid simultaneous borrow of tabs and sub_patch_editors.
-        let mut inner_canvas = std::mem::replace(
-            &mut app.sub_patch_editors[i].canvas,
-            Canvas::new(),
-        );
+        // Extract inner canvas.
+        let mut inner_canvas = std::mem::replace(&mut app.sub_patch_editors[i].canvas, Canvas::new());
         let mut open = app.sub_patch_editors[i].open;
 
         let descriptors: &[ModuleDescriptor] = &app.descriptors;
         let devices: &[flexinput_devices::PhysicalDevice] = &app.devices;
-        let win_id = egui::Id::new(("subpatch_editor", active, node_id.0));
 
-        // Pre-sync: copy the outer node's inner snarl into the editor canvas before
-        // rendering, so any param changes made via pinned modules in the outer body
-        // (which run before show_subpatch_editors each frame) are not lost.
-        if let Some(outer_inner) = app.tabs[active].canvas.snarl
-            .get_node(node_id)
-            .and_then(|n| n.subpatch.as_ref())
-            .map(|sp| *sp.snarl.clone())
+        // Pre-sync: pull current inner snarl from parent.
         {
-            inner_canvas.snarl = outer_inner;
+            let outer_inner = match parent_editor_idx {
+                None    => app.tabs[active].canvas.snarl.get_node(node_id),
+                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+            }.and_then(|n| n.subpatch.as_ref()).map(|sp| *sp.snarl.clone());
+            if let Some(snarl) = outer_inner { inner_canvas.snarl = snarl; }
         }
 
-        // Tell the inner canvas which nodes are already pinned so the context
-        // menu can show the correct "Pin / Unpin" label.
-        inner_canvas.pinned_inner_ids = app.tabs[active].canvas.snarl
-            .get_node(node_id)
-            .and_then(|n| n.subpatch.as_ref())
-            .map(|sp| sp.exposed_modules.iter().map(|m| m.inner_node_id).collect())
-            .unwrap_or_default();
+        // Pinned IDs from parent.
+        inner_canvas.pinned_inner_ids = {
+            let node_opt = match parent_editor_idx {
+                None    => app.tabs[active].canvas.snarl.get_node(node_id),
+                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+            };
+            node_opt.and_then(|n| n.subpatch.as_ref())
+                .map(|sp| sp.exposed_modules.iter().map(|m| m.inner_node_id).collect())
+                .unwrap_or_default()
+        };
 
         let mut save_clicked = false;
         let mut load_clicked = false;
-        // Layout mode is driven by the outer subpatch's layout_unlocked flag.
-        // While active, the editor's body renderers register hit-rects on each
-        // exposable UI element so users can click to pin them onto the body.
-        let outer_layout_mode = app.tabs[active].canvas.snarl
-            .get_node(node_id)
-            .map(|n| n.extra.layout_unlocked)
-            .unwrap_or(false);
-        // Snapshot app_clipboard for use inside the viewport closure below.
-        let app_clipboard_snap = app.app_clipboard.clone();
-        // Whether this inner canvas currently has no local clipboard (cross-boundary candidate).
-        let inner_needs_clipboard_seed = inner_canvas.clipboard().is_none() && app_clipboard_snap.is_some();
-        // Seed cross-boundary clipboard: if this inner canvas has no local clipboard
-        // but the app has one (set by a copy in another canvas), seed it so Ctrl+V works.
-        if inner_needs_clipboard_seed {
-            if let Some(ref cb) = app_clipboard_snap {
+        let mut close_self = false; // for "← Back" button on nested editors
+
+        let outer_layout_mode = match parent_editor_idx {
+            None    => app.tabs[active].canvas.snarl.get_node(node_id),
+            Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+        }.map(|n| n.extra.layout_unlocked).unwrap_or(false);
+
+        // Seed cross-boundary clipboard.
+        if inner_canvas.clipboard().is_none() {
+            if let Some(ref cb) = app.app_clipboard.clone() {
                 inner_canvas.set_clipboard(cb.clone());
             }
         }
 
-        // Render the editor in its own native viewport (separate OS window) so it
-        // can be moved freely outside the main window. Falls back to nothing when
-        // the user closes it via the OS close button — that triggers close_requested.
         let viewport_id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
-        let _ = win_id; // legacy id retained above only for hashing context; window uses viewport_id now.
+        // Build breadcrumb: "Parent Name > This Name" for nested editors.
+        let window_title = if let Some(p) = parent_editor_idx {
+            let parent_name = app.sub_patch_editors[p].canvas.snarl
+                .get_node(app.sub_patch_editors[p].node_id)
+                .map(|n| n.display_name.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Sub-patch".to_string());
+            format!("✦ {} › {}", parent_name, display_name)
+        } else {
+            format!("✦ {}", display_name)
+        };
+
         ctx.show_viewport_immediate(
             viewport_id,
             egui::ViewportBuilder::default()
-                .with_title(format!("✦ {}", display_name))
+                .with_title(window_title)
                 .with_inner_size([720.0, 540.0])
                 .with_min_inner_size([400.0, 300.0]),
             |vctx, _class| {
                 if vctx.input(|i| i.viewport().close_requested()) {
                     open = false;
                 }
-                // Mark layout mode for body renderers in this viewport's frame.
                 crate::canvas::viewer::set_layout_mode_active(vctx, outer_layout_mode);
 
                 egui::TopBottomPanel::top("subpatch_editor_header").show(vctx, |ui| {
                     ui.horizontal(|ui| {
+                        // "← Back" for nested editors — closes this level.
+                        if parent_editor_idx.is_some()
+                            && ui.small_button("← Back").on_hover_text("Close this sub-patch and return to parent").clicked()
+                        {
+                            close_self = true;
+                        }
                         if ui.small_button("💾 Save…")
                             .on_hover_text("Save this sub-patch to a .fxsp file")
                             .clicked() { save_clicked = true; }
@@ -2694,62 +2711,65 @@ fn show_subpatch_editors(
                     inner_canvas.show(descriptors, live_device_ids, devices, ui);
                 });
 
-                // After rendering, harvest any element pin request that the
-                // body renderers wrote into egui memory.
                 if let Some((inner_uid, eid, size)) = crate::canvas::viewer::take_layout_pending(vctx) {
                     inner_canvas.pending_expose_module = Some((NodeId(inner_uid), eid, size));
                 }
-                // Reset layout flag at end so other viewports / next frame are clean.
                 crate::canvas::viewer::set_layout_mode_active(vctx, false);
             },
         );
 
-        // Sync app-level clipboard from this inner canvas after show() so a copy
-        // action inside a SubPatchEditor is visible for cross-boundary paste.
-        // Set from_inner=true so the outer canvas seeding logic knows to force-seed
-        // even if the outer canvas already has a stale local clipboard (inner→outer fix).
+        if close_self { open = false; }
+
+        // Collect nested edit request before putting inner_canvas back.
+        if let Some(child_id) = inner_canvas.pending_edit_subpatch.take() {
+            pending_nested.push((i, child_id));
+        }
+
+        // Sync clipboard upward.
         if let Some(cb) = inner_canvas.clipboard() {
             app.app_clipboard = Some(cb);
             app.app_clipboard_from_inner = true;
         }
 
         if save_clicked {
-            if let Some(sp) = app.tabs[active].canvas.snarl.get_node(node_id)
-                .and_then(|n| n.subpatch.as_ref()) {
-                let _ = save_subpatch_file(sp);
-            }
+            let sp_opt = match parent_editor_idx {
+                None    => app.tabs[active].canvas.snarl.get_node(node_id),
+                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+            }.and_then(|n| n.subpatch.as_ref());
+            if let Some(sp) = sp_opt { let _ = save_subpatch_file(sp); }
         }
         if load_clicked {
             if let Some(loaded) = load_subpatch_file() {
-                if let Some(node) = app.tabs[active].canvas.snarl.get_node_mut(node_id) {
-                    // Replace inner snarl + pin metadata + exposed modules.
-                    // Outer node.inputs/outputs get rebuilt next frame by sync_inner_canvas_ports.
+                let node_opt = match parent_editor_idx {
+                    None    => app.tabs[active].canvas.snarl.get_node_mut(node_id),
+                    Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node_mut(node_id),
+                };
+                if let Some(node) = node_opt {
                     if node.subpatch.is_some() {
                         node.display_name = loaded.display_name.clone();
                         node.subpatch = Some(Box::new(loaded.clone()));
                         node.extra.layout_unlocked = false;
                     }
                 }
-                // Mirror into the editor canvas immediately so the window reflects the load.
                 inner_canvas.snarl = *loaded.snarl;
             }
         }
 
-        // Handle pin/unpin requests from the inner canvas context menu. When
-        // "Unpin from body" is selected we strip ALL exposed elements for that
-        // inner node; otherwise we add a single element with the chosen id
-        // (duplicates are allowed: the same element_id can be pinned multiple
-        // times so the user can place several copies on the body).
+        // Handle pin/unpin.
         if let Some((inner_id, element_id, src_size)) = inner_canvas.pending_expose_module.take() {
-            let any_existing = app.tabs[active].canvas.snarl
-                .get_node(node_id)
-                .and_then(|n| n.subpatch.as_ref())
-                .map(|sp| sp.exposed_modules.iter().any(|m| m.inner_node_id == inner_id.0))
-                .unwrap_or(false);
+            let any_existing = match parent_editor_idx {
+                None    => app.tabs[active].canvas.snarl.get_node(node_id),
+                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+            }.and_then(|n| n.subpatch.as_ref())
+             .map(|sp| sp.exposed_modules.iter().any(|m| m.inner_node_id == inner_id.0))
+             .unwrap_or(false);
             let unpin = any_existing && element_id == "default";
-
             if unpin {
-                if let Some(node) = app.tabs[active].canvas.snarl.get_node_mut(node_id) {
+                let node_opt = match parent_editor_idx {
+                    None    => app.tabs[active].canvas.snarl.get_node_mut(node_id),
+                    Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node_mut(node_id),
+                };
+                if let Some(node) = node_opt {
                     if let Some(sp) = node.subpatch.as_mut() {
                         sp.exposed_modules.retain(|m| m.inner_node_id != inner_id.0);
                     }
@@ -2758,25 +2778,18 @@ fn show_subpatch_editors(
                     }
                 }
             } else {
-                // Item 1: prefer the source-element size captured at pin time;
-                // fall back to a sensible default for unknown elements.
-                let init_size = if src_size[0] >= 1.0 && src_size[1] >= 1.0 {
-                    src_size
-                } else {
-                    [220.0, 100.0]
+                let init_size = if src_size[0] >= 1.0 && src_size[1] >= 1.0 { src_size } else { [220.0, 100.0] };
+                let next_y = match parent_editor_idx {
+                    None    => app.tabs[active].canvas.snarl.get_node(node_id),
+                    Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+                }.and_then(|n| n.subpatch.as_ref())
+                 .map(|sp| sp.exposed_modules.iter().map(|m| m.pos[1] + m.size[1]).fold(0.0f32, f32::max))
+                 .unwrap_or(0.0);
+                let node_opt = match parent_editor_idx {
+                    None    => app.tabs[active].canvas.snarl.get_node_mut(node_id),
+                    Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node_mut(node_id),
                 };
-                // Item 3: place new pin just below the lowest existing pin
-                // (max y + height + pad), not stacked by index. Lets the user
-                // free up space at the top by moving things and have new pins
-                // tuck against the existing layout.
-                let next_y = app.tabs[active].canvas.snarl
-                    .get_node(node_id)
-                    .and_then(|n| n.subpatch.as_ref())
-                    .map(|sp| sp.exposed_modules.iter()
-                        .map(|m| m.pos[1] + m.size[1])
-                        .fold(0.0f32, f32::max))
-                    .unwrap_or(0.0);
-                if let Some(node) = app.tabs[active].canvas.snarl.get_node_mut(node_id) {
+                if let Some(node) = node_opt {
                     if let Some(sp) = node.subpatch.as_mut() {
                         sp.exposed_modules.push(ExposedModule {
                             inner_node_id: inner_id.0,
@@ -2790,23 +2803,60 @@ fn show_subpatch_editors(
         }
 
         app.sub_patch_editors[i].open = open;
-
-        // Put inner canvas back and run per-frame port sync.
         app.sub_patch_editors[i].canvas = inner_canvas;
-        {
-            let (editors, tabs) = (&mut app.sub_patch_editors, &mut app.tabs);
-            sync_inner_canvas_ports(&mut tabs[active].canvas.snarl, node_id, &mut editors[i].canvas);
-        }
 
-        // Sync the inner snarl to NodeData so build_processing_graph sees updates.
-        let inner_snarl = app.sub_patch_editors[i].canvas.snarl.clone();
-        if let Some(node) = app.tabs[active].canvas.snarl.get_node_mut(node_id) {
-            if let Some(sp) = node.subpatch.as_mut() {
-                *sp.snarl = inner_snarl;
+        // Port sync: always against parent snarl.
+        match parent_editor_idx {
+            None => {
+                let (editors, tabs) = (&mut app.sub_patch_editors, &mut app.tabs);
+                sync_inner_canvas_ports(&mut tabs[active].canvas.snarl, node_id, &mut editors[i].canvas);
+            }
+            Some(p) => {
+                // Split borrow: editors[p] and editors[i] are different indices.
+                let (left, right) = app.sub_patch_editors.split_at_mut(p.max(i));
+                let (parent_ed, child_ed) = if p < i {
+                    (&mut left[p], &mut right[i - p - 1])
+                } else {
+                    (&mut right[p - i - 1], &mut left[i])
+                };
+                sync_inner_canvas_ports(&mut parent_ed.canvas.snarl, node_id, &mut child_ed.canvas);
             }
         }
 
+        // Write-back inner snarl to parent node.
+        let inner_snarl = app.sub_patch_editors[i].canvas.snarl.clone();
+        let node_opt = match parent_editor_idx {
+            None    => app.tabs[active].canvas.snarl.get_node_mut(node_id),
+            Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node_mut(node_id),
+        };
+        if let Some(node) = node_opt {
+            if let Some(sp) = node.subpatch.as_mut() { *sp.snarl = inner_snarl; }
+        }
+
         if !open { to_close.push(i); }
+    }
+
+    // Open any nested editors collected during rendering.
+    for (parent_idx, child_node_id) in pending_nested {
+        let already_open = app.sub_patch_editors.iter()
+            .any(|e| e.tab_idx == active && e.node_id == child_node_id && e.parent_editor_idx == Some(parent_idx));
+        if !already_open {
+            let inner_snarl = app.sub_patch_editors[parent_idx].canvas.snarl
+                .get_node(child_node_id)
+                .and_then(|n| n.subpatch.as_ref())
+                .map(|sp| *sp.snarl.clone())
+                .unwrap_or_else(egui_snarl::Snarl::new);
+            let mut editor_canvas = Canvas::new();
+            editor_canvas.snarl = inner_snarl;
+            editor_canvas.is_inner = true;
+            app.sub_patch_editors.push(SubPatchEditor {
+                tab_idx: active,
+                node_id: child_node_id,
+                parent_editor_idx: Some(parent_idx),
+                canvas: editor_canvas,
+                open: true,
+            });
+        }
     }
 
     for i in to_close.into_iter().rev() {
