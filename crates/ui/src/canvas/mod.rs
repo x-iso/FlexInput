@@ -534,8 +534,15 @@ impl Canvas {
                 // on the next Ctrl+V (it only does so when the OS clipboard is non-empty).
                 // We ignore the text content on paste and use our internal ClipboardData.
                 ctx.copy_text("__flexinput_nodes__".to_string());
+                #[cfg(debug_assertions)]
+                eprintln!("[canvas] ctrl_c: copied {} nodes, inner_wires={}",
+                    self.clipboard.as_ref().map(|c| c.nodes.len()).unwrap_or(0),
+                    self.clipboard.as_ref().map(|c| c.internal_wires.len()).unwrap_or(0));
             }
             if ctrl_v {
+                #[cfg(debug_assertions)]
+                eprintln!("[canvas] ctrl_v: clipboard has {} nodes",
+                    self.clipboard.as_ref().map(|c| c.nodes.len()).unwrap_or(0));
                 self.paste();
             }
             if ctrl_z {

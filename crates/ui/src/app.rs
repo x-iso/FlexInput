@@ -2629,22 +2629,10 @@ fn show_subpatch_editors(
         let descriptors: &[ModuleDescriptor] = &app.descriptors;
         let devices: &[flexinput_devices::PhysicalDevice] = &app.devices;
 
-        // Pre-sync: copy the canonical inner snarl into the editor canvas so that
-        // param changes made via pinned widgets on the outer body (rendered before
-        // this editor each frame) are not lost.
-        // Only for top-level editors (parent = tab canvas): pinned-body widgets run
-        // in the tab's CentralPanel and write to tab.snarl, so we need to pull those
-        // changes in.  For nested editors the editor canvas IS the source of truth;
-        // overwriting it from the parent would clobber pin changes made this frame.
-        if parent_editor_idx.is_none() {
-            if let Some(outer_inner) = app.tabs[active].canvas.snarl
-                .get_node(node_id)
-                .and_then(|n| n.subpatch.as_ref())
-                .map(|sp| *sp.snarl.clone())
-            {
-                inner_canvas.snarl = outer_inner;
-            }
-        }
+        // No pre-sync: the editor canvas is the source of truth for inner snarl state.
+        // Write-back at end of each iteration propagates changes upward (child → parent
+        // editor → tab canvas). Pre-sync in either direction would clobber pin/unpin
+        // changes made in the same frame before the parent's write-back runs.
 
         // Pinned IDs from parent.
         inner_canvas.pinned_inner_ids = {
