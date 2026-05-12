@@ -2588,7 +2588,11 @@ fn show_subpatch_editors(
     // Collect nested-open requests outside the loop to avoid borrow issues.
     let mut pending_nested: Vec<(usize, NodeId)> = Vec::new(); // (parent_editor_idx, child_node_id)
 
-    for i in 0..app.sub_patch_editors.len() {
+    // Process in reverse index order so nested (child) editors write-back their
+    // inner snarl into the parent editor's canvas BEFORE the parent's iteration
+    // reads and propagates it upward. Without this, a child's changes (e.g. pin)
+    // would be clobbered by the parent's earlier write-back to the tab canvas.
+    for i in (0..app.sub_patch_editors.len()).rev() {
         if app.sub_patch_editors[i].tab_idx != active { continue; }
         let node_id = app.sub_patch_editors[i].node_id;
         let parent_editor_idx = app.sub_patch_editors[i].parent_editor_idx;
@@ -2625,13 +2629,21 @@ fn show_subpatch_editors(
         let descriptors: &[ModuleDescriptor] = &app.descriptors;
         let devices: &[flexinput_devices::PhysicalDevice] = &app.devices;
 
-        // Pre-sync: pull current inner snarl from parent.
-        {
-            let outer_inner = match parent_editor_idx {
-                None    => app.tabs[active].canvas.snarl.get_node(node_id),
-                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
-            }.and_then(|n| n.subpatch.as_ref()).map(|sp| *sp.snarl.clone());
-            if let Some(snarl) = outer_inner { inner_canvas.snarl = snarl; }
+        // Pre-sync: copy the canonical inner snarl into the editor canvas so that
+        // param changes made via pinned widgets on the outer body (rendered before
+        // this editor each frame) are not lost.
+        // Only for top-level editors (parent = tab canvas): pinned-body widgets run
+        // in the tab's CentralPanel and write to tab.snarl, so we need to pull those
+        // changes in.  For nested editors the editor canvas IS the source of truth;
+        // overwriting it from the parent would clobber pin changes made this frame.
+        if parent_editor_idx.is_none() {
+            if let Some(outer_inner) = app.tabs[active].canvas.snarl
+                .get_node(node_id)
+                .and_then(|n| n.subpatch.as_ref())
+                .map(|sp| *sp.snarl.clone())
+            {
+                inner_canvas.snarl = outer_inner;
+            }
         }
 
         // Pinned IDs from parent.
