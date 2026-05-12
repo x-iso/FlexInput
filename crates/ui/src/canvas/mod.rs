@@ -49,6 +49,10 @@ pub struct Canvas {
     undo_stack: Vec<Snarl<NodeData>>,
     redo_stack: Vec<Snarl<NodeData>>,
     clipboard: Option<ClipboardData>,
+    /// Incremented every time copy_selected() is called. Used by app.rs to detect
+    /// whether the user actually copied something in an inner canvas this frame,
+    /// without relying on clipboard content comparison (which breaks for same-count copies).
+    pub(crate) clipboard_gen: u64,
     /// Set this frame when the user requests to open a subpatch editor window.
     pub pending_edit_subpatch: Option<egui_snarl::NodeId>,
     /// Set this frame when the user picks "Pin element …" on an inner canvas
@@ -76,6 +80,7 @@ impl Canvas {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: None,
+            clipboard_gen: 0,
             pending_edit_subpatch: None,
             pending_expose_module: None,
             is_inner: false,
@@ -211,6 +216,7 @@ impl Canvas {
             .collect();
 
         self.clipboard = Some(ClipboardData { nodes, internal_wires });
+        self.clipboard_gen = self.clipboard_gen.wrapping_add(1);
     }
 
     /// Paste clipboard nodes offset by a fixed amount, restoring internal wires.
@@ -310,6 +316,7 @@ impl Canvas {
             is_inner_canvas: self.is_inner,
             expose_module_request: None,
             pinned_inner_ids: self.pinned_inner_ids.clone(),
+            group_request: false,
         };
         self.snarl.show(&mut viewer, &self.style, "flexinput_canvas", ui);
 
@@ -346,6 +353,8 @@ impl Canvas {
 
         self.pending_edit_subpatch  = viewer.edit_subpatch_request;
         self.pending_expose_module  = viewer.expose_module_request;
+        // Stash group_request flag; acted on after `selected` is fetched below.
+        let group_from_menu = viewer.group_request;
 
         let mut commit_name: Option<(egui_snarl::NodeId, String)> = None;
         let mut close_rename = false;
@@ -486,10 +495,16 @@ impl Canvas {
         let snarl_id = ui.make_persistent_id("flexinput_canvas");
         let selected = get_selected_nodes(snarl_id, ui.ctx());
 
+        // Group triggered via node right-click menu (viewer sets group_from_menu).
+        if group_from_menu && !selected.is_empty() {
+            self.group_selected_into_subpatch(&selected);
+        }
+
         // Only process shortcuts when no overlay is open.
         // Use direct event matching with modifiers — more robust than key_pressed() + separate
         // modifier check, because Ctrl+V may arrive as Event::Paste on some platforms.
-        let overlay_open = self.rename_state.is_some() || self.wire_ctx_menu.is_some();
+        let overlay_open = self.rename_state.is_some()
+            || self.wire_ctx_menu.is_some();
         if !overlay_open {
             let del      = ui.input(|i| i.key_pressed(egui::Key::Delete));
             // Ctrl+C may arrive as Event::Copy on Windows instead of Event::Key.
@@ -510,6 +525,10 @@ impl Canvas {
                 egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. }
                 if modifiers.ctrl && modifiers.shift
             )));
+            let ctrl_g   = ui.input(|i| i.events.iter().any(|e| matches!(e,
+                egui::Event::Key { key: egui::Key::G, pressed: true, modifiers, .. }
+                if modifiers.ctrl && !modifiers.shift
+            )));
 
             if del && !selected.is_empty() {
                 self.push_undo();
@@ -517,8 +536,19 @@ impl Canvas {
             }
             if ctrl_c && !selected.is_empty() {
                 self.copy_selected(&selected);
+                // Write a sentinel to the OS clipboard so egui-winit fires Event::Paste
+                // on the next Ctrl+V (it only does so when the OS clipboard is non-empty).
+                // We ignore the text content on paste and use our internal ClipboardData.
+                ctx.copy_text("__flexinput_nodes__".to_string());
+                #[cfg(debug_assertions)]
+                eprintln!("[canvas] ctrl_c: copied {} nodes, inner_wires={}",
+                    self.clipboard.as_ref().map(|c| c.nodes.len()).unwrap_or(0),
+                    self.clipboard.as_ref().map(|c| c.internal_wires.len()).unwrap_or(0));
             }
             if ctrl_v {
+                #[cfg(debug_assertions)]
+                eprintln!("[canvas] ctrl_v: clipboard has {} nodes",
+                    self.clipboard.as_ref().map(|c| c.nodes.len()).unwrap_or(0));
                 self.paste();
             }
             if ctrl_z {
@@ -526,6 +556,9 @@ impl Canvas {
             }
             if ctrl_sz {
                 self.redo();
+            }
+            if ctrl_g && selected.len() >= 2 {
+                self.group_selected_into_subpatch(&selected);
             }
         }
 
@@ -543,6 +576,7 @@ impl Canvas {
             lines.push("Ctrl+Z        Undo");
             if has_sel { lines.push("Ctrl+C        Copy selected"); }
             if has_clip { lines.push("Ctrl+V        Paste"); }
+            if has_sel { lines.push("Ctrl+G        Group into sub-patch"); }
         } else if shift {
             lines.push("Shift+Drag    Multi-select region");
             lines.push("Shift+Click   Toggle node selection");
@@ -612,7 +646,10 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        self.snarl.insert_node(egui::pos2(80.0, 80.0), node);
+        let existing = self.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.source")
+            .count();
+        self.snarl.insert_node(egui::pos2(80.0, 80.0 + existing as f32 * 220.0), node);
     }
 
     /// Add a physical device's input pins as a sink node (e.g. MIDI OUT port).
@@ -649,7 +686,10 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        self.snarl.insert_node(egui::pos2(400.0, 80.0), node);
+        let existing = self.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.sink")
+            .count();
+        self.snarl.insert_node(egui::pos2(400.0, 80.0 + existing as f32 * 220.0), node);
     }
 
     /// Add a virtual device as a sink node. No-op if already present (keyed by device id).
@@ -687,7 +727,10 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        self.snarl.insert_node(egui::pos2(400.0, 80.0), node);
+        let existing = self.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.sink")
+            .count();
+        self.snarl.insert_node(egui::pos2(400.0, 80.0 + existing as f32 * 220.0), node);
     }
 }
 
@@ -877,10 +920,8 @@ fn resolve_pin(old_id: &str, candidates: &[&str]) -> Option<usize> {
 #[derive(Debug)]
 pub enum GroupResult {
     /// Grouping succeeded; the new subpatch `NodeId` is returned.
+    /// Non-AutoMap boundary wires were dropped; AutoMap boundary wires got inlet/outlet ports.
     Ok(NodeId),
-    /// Grouping was rejected because a boundary wire crosses a non-canonical AutoMap
-    /// pin. The offending pin name is included for diagnostics.
-    NonCanonicalBoundaryPin(String),
     /// Nothing to group — the selection was empty.
     EmptySelection,
 }
@@ -957,14 +998,19 @@ pub fn group_into_subpatch(
             t
         };
 
-        // ── Phase-1 validation (T-05-01) ─────────────────────────────────────
-        // Only AutoMap-typed signals OR canonical AutoMap pin names are allowed
-        // at the boundary. Reject anything else to prevent broken routing.
-        let is_canonical = sig_type == SignalType::AutoMap
+        // ── Boundary wire policy ──────────────────────────────────────────────
+        // AutoMap-typed signals or canonical AutoMap pin names get an inlet/outlet
+        // port and are reconnected through the subpatch boundary.
+        // All other signal types (Float, Bool, Vec2, etc.) are dropped — the
+        // external wire is removed and not reconnected. This matches the intent:
+        // grouping disconnects non-AutoMap boundary wires; the user can rewire
+        // manually or use AutoMap routing for inter-patch signal flow.
+        let is_automap_boundary = sig_type == SignalType::AutoMap
             || flexinput_core::automap::ALL_PINS.iter().any(|ap| ap.id == pin_name);
 
-        if !is_canonical {
-            return GroupResult::NonCanonicalBoundaryPin(pin_name);
+        if !is_automap_boundary {
+            // Drop this boundary wire — don't reconnect, don't block grouping.
+            continue;
         }
 
         boundary_wires.push(BoundaryWire {
@@ -1714,9 +1760,9 @@ mod group_tests {
     // ── Test: non-canonical boundary pin rejects grouping (T-05-01) ───────────
 
     #[test]
-    fn group_rejects_non_canonical_boundary_pin() {
+    fn group_drops_non_automap_boundary_wire() {
         let mut canvas = Canvas::new();
-        // External upstream node emitting a Float signal (not AutoMap, not canonical AutoMap pin ID).
+        // External upstream node emitting a Float signal (not AutoMap).
         let id_upstream = canvas.snarl.insert_node(
             egui::pos2(-200.0, 0.0), make_float_node(),
         );
@@ -1724,20 +1770,22 @@ mod group_tests {
         let id_inner = canvas.snarl.insert_node(
             egui::pos2(0.0, 0.0), make_float_node(),
         );
-        // Boundary incoming wire with non-AutoMap, non-canonical pin name.
+        // Boundary incoming wire with non-AutoMap signal — should be dropped, not block grouping.
         canvas.snarl.connect(
             OutPinId { node: id_upstream, output: 0 },
             InPinId  { node: id_inner,    input:  0 },
         );
 
         let result = canvas.group_selected_into_subpatch(&[id_inner]);
+        // Grouping succeeds — non-AutoMap boundary wire is dropped.
         assert!(
-            matches!(result, GroupResult::NonCanonicalBoundaryPin(_)),
-            "grouping with a non-canonical Float boundary wire should be rejected"
+            matches!(result, GroupResult::Ok(_)),
+            "grouping with a non-AutoMap boundary wire should succeed (wire dropped): got {:?}", result
         );
-
-        // No mutation should have occurred.
-        assert!(canvas.snarl.get_node(id_inner).is_some(), "id_inner must not have been removed");
+        // The inner node moved into the subpatch — it no longer exists in the outer canvas.
+        assert!(canvas.snarl.get_node(id_inner).is_none(), "id_inner should have moved into subpatch");
+        // The upstream node stays in the outer canvas.
+        assert!(canvas.snarl.get_node(id_upstream).is_some(), "id_upstream must remain in outer canvas");
     }
 
     // ── Test: undo snapshot is pushed before mutation ─────────────────────────

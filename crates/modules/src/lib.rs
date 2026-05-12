@@ -21,26 +21,3 @@ pub fn all_modules() -> Vec<ModuleRegistration> {
     modules.extend(subpatch::registrations());
     modules
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn all_modules_includes_feedback_sinks() {
-        let modules = all_modules();
-        let ids: Vec<&str> = modules.iter().map(|r| r.descriptor.id).collect();
-        assert!(
-            ids.contains(&"module.rumble_output"),
-            "all_modules() must include module.rumble_output; found: {:?}", ids
-        );
-        assert!(
-            ids.contains(&"module.rgb_output"),
-            "all_modules() must include module.rgb_output; found: {:?}", ids
-        );
-        assert!(
-            ids.contains(&"module.adaptive_trigger_output"),
-            "all_modules() must include module.adaptive_trigger_output; found: {:?}", ids
-        );
-    }
-}

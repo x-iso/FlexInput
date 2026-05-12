@@ -36,6 +36,9 @@ pub struct FlexViewer<'a> {
     pub expose_module_request: Option<(NodeId, String, [f32; 2])>,
     /// NodeId.0 values currently pinned to the outer body (used to toggle menu label).
     pub pinned_inner_ids: std::collections::HashSet<usize>,
+    /// Set by show_node_menu when the user clicks "Group into sub-patch…".
+    /// Canvas::show() reads this, looks up the snarl selection, and calls group_selected_into_subpatch.
+    pub group_request: bool,
 }
 
 impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
@@ -616,6 +619,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         }
 
         ui.separator();
+        if ui.button("Group into sub-patch…").clicked() {
+            self.group_request = true;
+            ui.close();
+        }
         if ui.button("Remove node").clicked() {
             snarl.remove_node(node);
             ui.close();

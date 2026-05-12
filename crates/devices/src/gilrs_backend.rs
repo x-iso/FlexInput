@@ -13,6 +13,25 @@ use crate::{
     DeviceBackend, PhysicalDevice,
 };
 
+// ── XInput force-feedback FFI (no windows-sys dependency) ────────────────────
+// Pattern mirrors crates/devices/src/hidhide.rs win32 module.
+#[cfg(windows)]
+mod xinput_ffi {
+    #[repr(C)]
+    pub struct XINPUT_VIBRATION {
+        pub w_left_motor_speed:  u16,
+        pub w_right_motor_speed: u16,
+    }
+
+    #[link(name = "xinput")]
+    extern "system" {
+        /// Sets vibration state for an XInput controller slot (0-3).
+        /// Returns 0 on success, ERROR_DEVICE_NOT_CONNECTED (1167) if the
+        /// controller is disconnected.
+        pub fn XInputSetState(dw_user_index: u32, p_vibration: *const XINPUT_VIBRATION) -> u32;
+    }
+}
+
 pub struct GilrsBackend {
     gilrs: Gilrs,
     /// Cached count of non-ViGEmBus physical instances per (VID, PID).
@@ -23,6 +42,13 @@ pub struct GilrsBackend {
     vigem_present: HashMap<(u16, u16), bool>,
     phys_counts_at: Instant,
     gyro: GyroManager,
+    /// XInput user index (0-3) for each `gilrs:<kind>:<inst>` device_id string.
+    /// Rebuilt at the start of each poll() call from the same kind_seen counter
+    /// used for the dev-string, so indices never drift on reconnect.
+    xinput_idx: HashMap<String, u32>,
+    /// Last-written rumble state per XInput slot to avoid redundant XInputSetState calls.
+    /// (left_motor_byte, right_motor_byte) in 0-255 range.
+    xinput_rumble: HashMap<u32, (u8, u8)>,
 }
 
 impl GilrsBackend {
@@ -34,6 +60,8 @@ impl GilrsBackend {
             // force refresh on first enumerate()
             phys_counts_at: Instant::now() - Duration::from_secs(10),
             gyro: GyroManager::new(),
+            xinput_idx: HashMap::new(),
+            xinput_rumble: HashMap::new(),
         })
     }
 
@@ -105,6 +133,10 @@ impl DeviceBackend for GilrsBackend {
     }
 
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
+        // Rebuild XInput slot map at the start of each poll so it stays in sync
+        // with kind_seen even after device reconnects.
+        self.xinput_idx.clear();
+
         // Drain events. Raw events auto-update axis and button state.
         // axis_dpad_to_button is intentionally NOT applied: on BT Switch Pro it creates
         // conflicting synthetic button releases that fight the native WGI DPad button events,
@@ -141,6 +173,13 @@ impl DeviceBackend for GilrsBackend {
             let inst = *kind_seen.get(&kind).unwrap_or(&0);
             kind_seen.insert(kind, inst + 1);
             let dev = format!("gilrs:{}:{}", kind.id_slug(), inst);
+
+            // Record XInput slot: inst is the 0-based kind_seen index, which matches
+            // the XInput user index on Windows (gilrs enumerates XInput controllers
+            // in slot order 0-3).
+            if kind == ControllerKind::XInput {
+                self.xinput_idx.insert(dev.clone(), inst as u32);
+            }
 
             for (axis, pin_id) in axis_map(kind) {
                 let v = pad.axis_data(*axis).map_or(0.0, |d| d.value());
@@ -298,17 +337,58 @@ impl DeviceBackend for GilrsBackend {
     }
 
     fn send(&mut self, device_id: &str, pin_id: &str, signal: Signal) {
-        // Currently only physical PlayStation controllers (DS4/DualSense) are
-        // wired up via the raw-HID path in GyroManager. XInput rumble would
-        // need a separate gilrs ff_handle path.
+        // ── XInput path: dispatch via XInputSetState ──────────────────────────
+        if let Some(&xinput_slot) = self.xinput_idx.get(device_id) {
+            let byte = match signal {
+                Signal::Float(f) => (f.clamp(0.0, 1.0) * 255.0) as u8,
+                Signal::Bool(b)  => if b { 255 } else { 0 },
+                _ => return,
+            };
+            let entry = self.xinput_rumble.entry(xinput_slot).or_insert((0, 0));
+            match pin_id {
+                "rumble_strong" => entry.0 = byte,
+                "rumble_weak"   => entry.1 = byte,
+                _ => return, // other pin names are not XInput rumble
+            }
+            #[cfg(windows)]
+            unsafe {
+                use xinput_ffi::*;
+                let vib = XINPUT_VIBRATION {
+                    // 0-255 byte mapped to 0-65535 motor speed: multiply by 257 (= 0xFFFF / 0xFF).
+                    w_left_motor_speed:  (entry.0 as u16).saturating_mul(257),
+                    w_right_motor_speed: (entry.1 as u16).saturating_mul(257),
+                };
+                XInputSetState(xinput_slot, &vib);
+            }
+            return;
+        }
+
+        // ── PS/Switch HID path via GyroManager ───────────────────────────────
         let (vid, pid, idx) = match self.lookup_phys(device_id) {
             Some(t) => t,
             None => return,
         };
-        let byte = match signal {
-            Signal::Float(f) => (f.clamp(0.0, 1.0) * 255.0) as u8,
-            Signal::Bool(b)  => if b { 255 } else { 0 },
+        // Scale Float 0–1 to the semantic range for each pin.
+        // Pins with custom ranges are listed explicitly; everything else uses 0–255.
+        let f = match signal {
+            Signal::Float(f) => f.clamp(0.0, 1.0),
+            Signal::Bool(b)  => if b { 1.0 } else { 0.0 },
             _ => return,
+        };
+        let byte = match pin_id {
+            // Trigger mode: 0=Off, 1=Feedback, 2=Weapon, 3=Vibration → scale to 0–3
+            "trigger_r_mode" | "trigger_l_mode" => (f * 3.0).round() as u8,
+            // Trigger zones: 0–9 along trigger travel → scale to 0–9
+            "trigger_r_start" | "trigger_r_end" |
+            "trigger_l_start" | "trigger_l_end" => (f * 9.0).round() as u8,
+            // Trigger force: 0–7 → scale to 0–7
+            "trigger_r_strength" | "trigger_l_strength" => (f * 7.0).round() as u8,
+            // Player LED: 0=off, 1=P1, 2=P2, 3=P3, 4=P4 → scale to 0–4
+            "player_led" => (f * 4.0).round() as u8,
+            // Mic LED: 0=off, 1=on, 2=pulsing → scale to 0–2
+            "mic_led" => (f * 2.0).round() as u8,
+            // Everything else (rumble 0–255, lightbar 0–255, trigger freq 0–255): linear
+            _ => (f * 255.0) as u8,
         };
         self.gyro.set_output_byte(vid, pid, idx, pin_id, byte);
     }
