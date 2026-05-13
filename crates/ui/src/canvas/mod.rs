@@ -318,6 +318,7 @@ impl Canvas {
             expose_module_request: None,
             pinned_inner_ids: self.pinned_inner_ids.clone(),
             group_request: false,
+            push_undo_request: false,
         };
         self.snarl.show(&mut viewer, &self.style, "flexinput_canvas", ui);
 
@@ -326,7 +327,7 @@ impl Canvas {
             self.snarl.nodes_ids_data().count(),
             self.snarl.wires().count(),
         );
-        if pre_counts != post_counts {
+        if pre_counts != post_counts || viewer.push_undo_request {
             self.push_snapshot(pre_snapshot);
         }
 

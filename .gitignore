@@ -9,3 +9,5 @@
 .agent/
 .github
 .planning
+/memory/
+.notes

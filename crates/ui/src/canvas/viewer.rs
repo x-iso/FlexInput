@@ -39,6 +39,9 @@ pub struct FlexViewer<'a> {
     /// Set by show_node_menu when the user clicks "Group into sub-patch…".
     /// Canvas::show() reads this, looks up the snarl selection, and calls group_selected_into_subpatch.
     pub group_request: bool,
+    /// Set by response-curve body when the user clicks Reset. Canvas::show() pushes the
+    /// pre_snapshot (captured before snarl.show()) onto the undo stack so Reset is reversible.
+    pub push_undo_request: bool,
 }
 
 impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
@@ -93,8 +96,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         } else {
             (0, false, false)
         };
-        let is_label = snarl.get_node(node).map(|n| n.module_id == "module.label").unwrap_or(false);
-        let is_svg   = snarl.get_node(node).map(|n| n.module_id == "module.svg").unwrap_or(false);
+        let is_label          = snarl.get_node(node).map(|n| n.module_id == "module.label").unwrap_or(false);
+        let is_svg            = snarl.get_node(node).map(|n| n.module_id == "module.svg").unwrap_or(false);
+        let is_response_curve = snarl.get_node(node).map(|n| {
+            n.module_id == "module.response_curve" || n.module_id == "module.vec_response_curve"
+        }).unwrap_or(false);
+        let curve_is_float    = snarl.get_node(node).map(|n| n.module_id == "module.response_curve").unwrap_or(false);
 
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -119,6 +126,20 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         if let Some(n) = snarl.get_node_mut(node) {
                             n.extra.layout_unlocked = !is_unlocked;
                         }
+                    }
+                }
+
+                // Response Curve: Save / Load / Reset in the header.
+                if is_response_curve {
+                    if ui.small_button("Save…").on_hover_text("Save curve to a .fxc file").clicked() {
+                        curve_header_save(node, snarl);
+                    }
+                    if ui.small_button("Load…").on_hover_text("Load curve from a .fxc file").clicked() {
+                        curve_header_load(node, curve_is_float, snarl);
+                    }
+                    if ui.small_button("Reset").on_hover_text("Reset to default (undoable)").clicked() {
+                        curve_header_reset(node, curve_is_float, snarl);
+                        self.push_undo_request = true;
                     }
                 }
 
@@ -426,8 +447,16 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl),
             "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl),
             "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl),
-            "module.response_curve"     => show_response_curve_body(node_id, inputs, outputs, ui, snarl),
-            "module.vec_response_curve" => show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl),
+            "module.response_curve" => {
+                if show_response_curve_body(node_id, inputs, outputs, ui, snarl) {
+                    self.push_undo_request = true;
+                }
+            }
+            "module.vec_response_curve" => {
+                if show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl) {
+                    self.push_undo_request = true;
+                }
+            }
             "math.add" | "math.subtract" | "math.multiply" | "math.divide" => {
                 show_math_variadic_body(node_id, inputs, ui, snarl);
             }
@@ -2727,6 +2756,10 @@ fn render_pinned_element(
             render_response_curve_grid_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        ("module.response_curve", "grid_options_row") => {
+            render_response_curve_grid_options_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         ("module.vec_response_curve", "scale_row") => {
             render_response_curve_scale_row(inner_id, ui, inner_snarl, container_size, true);
             return;
@@ -2737,6 +2770,10 @@ fn render_pinned_element(
         }
         ("module.vec_response_curve", "grid_row") => {
             render_response_curve_grid_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.vec_response_curve", "grid_options_row") => {
+            render_response_curve_grid_options_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
         // Average / Delay / DC Filter — bare DragValue rows.
@@ -2833,8 +2870,8 @@ fn dispatch_pinned_body(
         "module.label"      => show_label_body(inner_id, ui, inner_snarl),
         "generator.oscillator" => show_oscillator_body(inner_id, &[], ui, inner_snarl),
         "module.selector"   => show_selector_body(inner_id, &[], ui, inner_snarl),
-        "module.response_curve"     => show_response_curve_body(inner_id, &[], &[], ui, inner_snarl),
-        "module.vec_response_curve" => show_vec_response_curve_body(inner_id, &[], &[], ui, inner_snarl),
+        "module.response_curve"     => { show_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
+        "module.vec_response_curve" => { show_vec_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
         "processing.gyro_3dof"      => show_gyro_3dof_body(inner_id, ui, inner_snarl),
         "logic.greater_than" | "logic.less_than" => show_or_equal_body(inner_id, ui, inner_snarl),
         "logic.delay"       => show_logic_delay_body(inner_id, ui, inner_snarl),
@@ -3760,6 +3797,39 @@ fn render_response_curve_grid_row(
     }
 }
 
+/// Bare Scale grid + Labels checkboxes row.
+fn render_response_curve_grid_options_row(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let (mut ssg, mut sgl) = snarl.get_node(inner_id).map(|n| {
+        let ssg = n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
+        let sgl = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+        (ssg, sgl)
+    }).unwrap_or((false, false));
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let was = ssg;
+        ui.checkbox(&mut ssg, egui::RichText::new("Scale grid"))
+            .on_hover_text("Adapt grid lines to the current Log/Exp scaling");
+        changed |= ssg != was;
+        let was = sgl;
+        ui.checkbox(&mut sgl, egui::RichText::new("Labels"))
+            .on_hover_text("Show value labels on grid lines");
+        changed |= sgl != was;
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("show_scaled_grid".into(), Value::Bool(ssg));
+            node.params.insert("show_grid_labels".into(), Value::Bool(sgl));
+        }
+    }
+}
+
 /// Paints just the response-curve graph (background + grid + curve + control
 /// points + bias handles + live-input trails) into `rect`, and writes back any
 /// param changes made via interaction. Shared between the in-editor body
@@ -3794,7 +3864,7 @@ fn paint_response_curve_graph(
     }
 
     // Read params.
-    let (points, biases, absolute, in_min, in_max, grid_x, grid_y, snap, scale_t, trail_ms) = snarl
+    let (points, biases, absolute, in_min, in_max, out_min, out_max, grid_x, grid_y, snap, scale_t, trail_ms, show_scaled_grid, show_grid_labels) = snarl
         .get_node(node_id)
         .map(|n| {
             let pts: Vec<[f32; 2]> = n.params.get("points")
@@ -3811,14 +3881,18 @@ fn paint_response_curve_graph(
             let abs  = if is_vec { true } else { n.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true) };
             let i0   = if is_vec { 0.0 } else { n.params.get("in_min") .and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32 };
             let i1   = n.params.get("in_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let o0   = if is_vec { 0.0 } else { n.params.get("out_min").and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32 };
+            let o1   = n.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             let gx   = n.params.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
             let gy   = n.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize;
             let sn   = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
             let sc   = n.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.0);
             let tm   = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
-            (pts, bss, abs, i0, i1, gx, gy, sn, sc, tm)
+            let ssg  = n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+            (pts, bss, abs, i0, i1, o0, o1, gx, gy, sn, sc, tm, ssg, sgl)
         })
-        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, 4, 4, false, 0.0f32, 300));
+        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
 
     let n_channels = snarl.get_node(node_id)
         .map(|n| n.inputs.len().min(n.outputs.len()))
@@ -3849,27 +3923,142 @@ fn paint_response_curve_graph(
         x_lo + (pos.x - rect.left()) / rect.width() * x_range,
         y_lo + (rect.bottom() - pos.y) / rect.height() * y_range,
     ]};
+    // Shared grid-position builder — same logic as the body renderers.
+    let redist = |mut nodes: Vec<f32>, n: usize| -> Vec<f32> {
+        let min_gap = 1.0f32 / n as f32 * 0.5;
+        for _ in 0..n {
+            nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let crowded = (1..nodes.len().saturating_sub(1))
+                .filter(|&i| (nodes[i]-nodes[i-1]).min(nodes[i+1]-nodes[i]) < min_gap)
+                .min_by(|&a, &b| {
+                    let ga = (nodes[a]-nodes[a-1]).min(nodes[a+1]-nodes[a]);
+                    let gb = (nodes[b]-nodes[b-1]).min(nodes[b+1]-nodes[b]);
+                    ga.partial_cmp(&gb).unwrap()
+                });
+            let Some(ci) = crowded else { break; };
+            nodes.remove(ci);
+            let (li, _) = nodes.windows(2).enumerate()
+                .max_by(|(_, a), (_, b)| (a[1]-a[0]).partial_cmp(&(b[1]-b[0])).unwrap())
+                .unwrap();
+            nodes.insert(li+1, (nodes[li]+nodes[li+1])*0.5);
+        }
+        nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        nodes
+    };
+    let build_grid_nodes = |n: usize| -> Vec<f32> {
+        if n == 0 { return vec![0.0, 1.0]; }
+        if !show_scaled_grid {
+            return (0..=n).map(|i| i as f32 / n as f32).collect();
+        }
+        if absolute || is_vec {
+            let nodes = (0..=n).map(|i| {
+                let t = i as f32 / n as f32;
+                1.0 - curve_scale_inv(1.0 - t, scale_t)
+            }).collect();
+            redist(nodes, n)
+        } else {
+            // Bidirectional: both halves expand outward from centre.
+            // t=0 is centre, t=1 is edge; same scale formula as abs case.
+            let half_lo = n / 2;
+            let half_hi = n - half_lo;
+            let lo: Vec<f32> = (0..=half_lo).map(|i| {
+                let t = i as f32 / half_lo as f32;
+                let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
+                0.5 - s * 0.5
+            }).collect();
+            let hi: Vec<f32> = (0..=half_hi).map(|i| {
+                let t = i as f32 / half_hi as f32;
+                let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
+                0.5 + s * 0.5
+            }).collect();
+            let mut merged = redist(lo, half_lo);
+            for v in redist(hi, half_hi).iter().skip(1) { merged.push(*v); }
+            merged.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            merged
+        }
+    };
+    let snap_nodes_x = build_grid_nodes(grid_x);
+    let snap_nodes_y = build_grid_nodes(grid_y);
+    let grid_x_positions: Vec<f32> = (1..grid_x).map(|i| x_lo + snap_nodes_x[i] * x_range).collect();
+    let grid_y_positions: Vec<f32> = (1..grid_y).map(|i| y_lo + snap_nodes_y[i] * y_range).collect();
+
     let do_snap = |x: f32, y: f32| -> (f32, f32) {
-        if snap {
-            let nx = ((x - x_lo) / x_range * grid_x as f32).round() / grid_x as f32;
-            let ny = ((y - y_lo) / y_range * grid_y as f32).round() / grid_y as f32;
-            (x_lo + nx * x_range, y_lo + ny * y_range)
-        } else { (x, y) }
+        if !snap { return (x, y); }
+        let u = ((x - x_lo) / x_range).clamp(0.0, 1.0);
+        let v = ((y - y_lo) / y_range).clamp(0.0, 1.0);
+        let su = snap_nodes_x.iter().copied()
+            .min_by(|a, b| (a-u).abs().partial_cmp(&(b-u).abs()).unwrap()).unwrap_or(u);
+        let sv = snap_nodes_y.iter().copied()
+            .min_by(|a, b| (a-v).abs().partial_cmp(&(b-v).abs()).unwrap()).unwrap_or(v);
+        (x_lo + su * x_range, y_lo + sv * y_range)
     };
 
     painter.rect_filled(rect, 2.0, Color32::from_gray(16));
 
     let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
-    for i in 1..grid_x {
-        let x = x_lo + x_range * i as f32 / grid_x as f32;
-        painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
-    }
-    for i in 1..grid_y {
-        let y = y_lo + y_range * i as f32 / grid_y as f32;
-        painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
-    }
+    for &x in &grid_x_positions { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
+    for &y in &grid_y_positions { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
     painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
         egui::Stroke::new(0.5, Color32::from_gray(55)));
+
+    if show_grid_labels {
+        const MIN_LABEL_PX: f32 = 20.0;
+        let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
+        let font = egui::FontId::proportional(9.0);
+        let abs_max_in  = in_max.abs().max(in_min.abs());
+        let abs_max_out = out_max.abs().max(out_min.abs());
+        // real_in(u): u∈[0,1] graph pos → actual input value.
+        // Graph x = curve_scale(|real|/abs_max), so real = curve_scale_inv(u)*abs_max.
+        // Bipolar: centre u=0.5 is value 0; each half scales outward.
+        let real_in = |u: f32| -> f32 {
+            if absolute || is_vec {
+                curve_scale_inv(u, scale_t) * abs_max_in
+            } else {
+                let c = u * 2.0 - 1.0; // [-1,1], 0 = centre
+                let sign = if c < 0.0 { -1.0f32 } else { 1.0 };
+                sign * curve_scale_inv(c.abs(), scale_t) * abs_max_in
+            }
+        };
+        let real_out = |v: f32| -> f32 {
+            if absolute || is_vec {
+                curve_scale_inv(v, scale_t) * abs_max_out
+            } else {
+                let c = v * 2.0 - 1.0;
+                let sign = if c < 0.0 { -1.0f32 } else { 1.0 };
+                sign * curve_scale_inv(c.abs(), scale_t) * abs_max_out
+            }
+        };
+        let mut last_sx = f32::NEG_INFINITY;
+        for &x in &grid_x_positions {
+            let sx = c2s(x, y_hi).x;
+            if sx - last_sx < MIN_LABEL_PX { continue; }
+            last_sx = sx;
+            let u = (x - x_lo) / x_range;
+            let val = real_in(u);
+            let label = if abs_max_in <= 1.01 {
+                format!("{:.0}%", val * 100.0)
+            } else {
+                format!("{:.2}", val)
+            };
+            painter.text(egui::pos2(sx + 1.0, rect.top() + 1.0),
+                egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
+        }
+        let mut last_sy = f32::INFINITY;
+        for &y in &grid_y_positions {
+            let sy = c2s(x_lo, y).y;
+            if last_sy - sy < MIN_LABEL_PX { continue; }
+            last_sy = sy;
+            let v = (y - y_lo) / y_range;
+            let val = real_out(v);
+            let label = if abs_max_out <= 1.01 {
+                format!("{:.0}%", val * 100.0)
+            } else {
+                format!("{:.2}", val)
+            };
+            painter.text(egui::pos2(rect.left() + 1.0, sy - 9.0),
+                egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
+        }
+    }
 
     if new_points.len() >= 2 {
         let steps = 120usize;
@@ -4659,7 +4848,148 @@ fn show_dc_filter_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui
     });
 }
 
-fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+// ── Curve save/load/reset file format ────────────────────────────────────────
+// .fxc is a JSON object. Float and Vec curves share the same fields; the Vec
+// variant simply never stores "absolute", "in_min", "out_min".  Loading into
+// either type ignores fields it doesn't use, so files are cross-compatible.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CurveFile {
+    #[serde(default)]
+    points:          Vec<[f64; 2]>,
+    #[serde(default)]
+    biases:          Vec<f64>,
+    #[serde(default = "default_true")]
+    absolute:        bool,
+    #[serde(default = "default_neg1")]
+    in_min:          f64,
+    #[serde(default = "default_1")]
+    in_max:          f64,
+    #[serde(default = "default_neg1")]
+    out_min:         f64,
+    #[serde(default = "default_1")]
+    out_max:         f64,
+    #[serde(default = "default_4")]
+    grid_x:          i64,
+    #[serde(default = "default_4")]
+    grid_y:          i64,
+    #[serde(default)]
+    snap:            bool,
+    #[serde(default)]
+    scale_t:         f64,
+    #[serde(default = "default_300")]
+    trail_ms:        i64,
+    #[serde(default)]
+    show_scaled_grid: bool,
+    #[serde(default)]
+    show_grid_labels: bool,
+}
+fn default_true()  -> bool { true  }
+fn default_neg1()  -> f64  { -1.0  }
+fn default_1()     -> f64  {  1.0  }
+fn default_4()     -> i64  {  4    }
+fn default_300()   -> i64  { 300   }
+
+fn curve_header_save(node_id: NodeId, snarl: &Snarl<NodeData>) {
+    let Some(n) = snarl.get_node(node_id) else { return };
+    let pts: Vec<[f64; 2]> = n.params.get("points")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|p| {
+            let a = p.as_array()?;
+            Some([a.get(0)?.as_f64()?, a.get(1)?.as_f64()?])
+        }).collect())
+        .unwrap_or_default();
+    let bss: Vec<f64> = n.params.get("biases")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|b| b.as_f64()).collect())
+        .unwrap_or_default();
+    let cf = CurveFile {
+        points:           pts,
+        biases:           bss,
+        absolute:         n.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true),
+        in_min:           n.params.get("in_min") .and_then(|v| v.as_f64()).unwrap_or(-1.0),
+        in_max:           n.params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or( 1.0),
+        out_min:          n.params.get("out_min").and_then(|v| v.as_f64()).unwrap_or(-1.0),
+        out_max:          n.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or( 1.0),
+        grid_x:           n.params.get("grid_x") .and_then(|v| v.as_i64()).unwrap_or(4),
+        grid_y:           n.params.get("grid_y") .and_then(|v| v.as_i64()).unwrap_or(4),
+        snap:             n.params.get("snap")   .and_then(|v| v.as_bool()).unwrap_or(false),
+        scale_t:          n.params.get("scale_t").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        trail_ms:         n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300),
+        show_scaled_grid: n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false),
+        show_grid_labels: n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false),
+    };
+    if let Some(path) = rfd::FileDialog::new()
+        .add_filter("FlexInput Curve", &["fxc"])
+        .set_file_name("curve.fxc")
+        .save_file()
+    {
+        if let Ok(json) = serde_json::to_string_pretty(&cf) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+fn curve_header_load(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData>) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("FlexInput Curve", &["fxc"])
+        .pick_file()
+    else { return };
+    let Ok(json) = std::fs::read_to_string(path) else { return };
+    let Ok(cf)   = serde_json::from_str::<CurveFile>(&json) else { return };
+    let Some(node) = snarl.get_node_mut(node_id) else { return };
+    let pts_json: Vec<Value> = cf.points.iter()
+        .map(|p| serde_json::json!([p[0], p[1]]))
+        .collect();
+    let bss_json: Vec<Value> = cf.biases.iter()
+        .filter_map(|&b| Number::from_f64(b).map(Value::Number))
+        .collect();
+    node.params.insert("points".into(),  Value::Array(pts_json));
+    node.params.insert("biases".into(),  Value::Array(bss_json));
+    node.params.insert("grid_x".into(),  serde_json::json!(cf.grid_x));
+    node.params.insert("grid_y".into(),  serde_json::json!(cf.grid_y));
+    node.params.insert("snap".into(),    Value::Bool(cf.snap));
+    if let Some(n) = Number::from_f64(cf.scale_t) {
+        node.params.insert("scale_t".into(), Value::Number(n));
+    }
+    node.params.insert("trail_ms".into(), serde_json::json!(cf.trail_ms));
+    node.params.insert("show_scaled_grid".into(), Value::Bool(cf.show_scaled_grid));
+    node.params.insert("show_grid_labels".into(), Value::Bool(cf.show_grid_labels));
+    if is_float {
+        node.params.insert("absolute".into(), Value::Bool(cf.absolute));
+        if let Some(n) = Number::from_f64(cf.in_min)  { node.params.insert("in_min".into(),  Value::Number(n)); }
+        if let Some(n) = Number::from_f64(cf.in_max)  { node.params.insert("in_max".into(),  Value::Number(n)); }
+        if let Some(n) = Number::from_f64(cf.out_min) { node.params.insert("out_min".into(), Value::Number(n)); }
+        if let Some(n) = Number::from_f64(cf.out_max) { node.params.insert("out_max".into(), Value::Number(n)); }
+    } else {
+        if let Some(n) = Number::from_f64(cf.in_max)  { node.params.insert("in_max".into(),  Value::Number(n)); }
+        if let Some(n) = Number::from_f64(cf.out_max) { node.params.insert("out_max".into(), Value::Number(n)); }
+    }
+}
+
+fn curve_header_reset(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData>) {
+    let Some(node) = snarl.get_node_mut(node_id) else { return };
+    node.params.insert("points".into(),           serde_json::json!([[0.0, 0.0], [1.0, 1.0]]));
+    node.params.insert("biases".into(),            serde_json::json!([0.0]));
+    node.params.insert("grid_x".into(),            serde_json::json!(4i64));
+    node.params.insert("grid_y".into(),            serde_json::json!(4i64));
+    node.params.insert("snap".into(),              Value::Bool(false));
+    node.params.insert("scale_t".into(),           serde_json::json!(0.0f64));
+    node.params.insert("trail_ms".into(),          serde_json::json!(300i64));
+    node.params.insert("show_scaled_grid".into(),  Value::Bool(false));
+    node.params.insert("show_grid_labels".into(),  Value::Bool(false));
+    if is_float {
+        node.params.insert("absolute".into(),  Value::Bool(true));
+        node.params.insert("in_min".into(),    serde_json::json!(-1.0f64));
+        node.params.insert("in_max".into(),    serde_json::json!( 1.0f64));
+        node.params.insert("out_min".into(),   serde_json::json!(-1.0f64));
+        node.params.insert("out_max".into(),   serde_json::json!( 1.0f64));
+    } else {
+        node.params.insert("in_max".into(),    serde_json::json!(1.0f64));
+        node.params.insert("out_max".into(),   serde_json::json!(1.0f64));
+    }
+}
+
+fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
     // ── Initialise params on first use ────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
@@ -4680,7 +5010,7 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
     }
 
     // ── Read params ───────────────────────────────────────────────────────────
-    let (points, biases, absolute, in_min, in_max, out_min, out_max, grid_x, grid_y, snap, scale_t, trail_ms) = snarl
+    let (points, biases, absolute, in_min, in_max, out_min, out_max, grid_x, grid_y, snap, scale_t, trail_ms, show_scaled_grid, show_grid_labels) = snarl
         .get_node(node_id)
         .map(|n| {
             let pts: Vec<[f32; 2]> = n.params.get("points")
@@ -4707,9 +5037,11 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     1 => -0.5, 2 => 0.5, _ => 0.0,
                 });
             let tm   = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
-            (pts, bss, abs, i0, i1, o0, o1, gx, gy, sn, sc, tm)
+            let ssg  = n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+            (pts, bss, abs, i0, i1, o0, o1, gx, gy, sn, sc, tm, ssg, sgl)
         })
-        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300));
+        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], true, -1.0, 1.0, -1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
 
     let n_channels = snarl.get_node(node_id)
         .map(|n| n.inputs.len().min(n.outputs.len()))
@@ -4752,27 +5084,164 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     x_lo + (pos.x - rect.left()) / rect.width() * x_range,
                     y_lo + (rect.bottom() - pos.y) / rect.height() * y_range,
                 ]};
+                // Compute grid node positions (including 0 and 1 endpoints) in
+                // normalized [0,1] graph space, with redistribution of crowded lines.
+                // In bidirectional mode (not absolute) scaling is applied symmetrically
+                // from the centre (u=0.5 = value 0) outward, so each half is scaled
+                // independently then merged.
+                let redistribute = |mut nodes: Vec<f32>, n: usize| -> Vec<f32> {
+                    let min_gap = 1.0f32 / n as f32 * 0.5;
+                    for _ in 0..n {
+                        nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let crowded = (1..nodes.len().saturating_sub(1))
+                            .filter(|&i| (nodes[i]-nodes[i-1]).min(nodes[i+1]-nodes[i]) < min_gap)
+                            .min_by(|&a, &b| {
+                                let ga = (nodes[a]-nodes[a-1]).min(nodes[a+1]-nodes[a]);
+                                let gb = (nodes[b]-nodes[b-1]).min(nodes[b+1]-nodes[b]);
+                                ga.partial_cmp(&gb).unwrap()
+                            });
+                        let Some(ci) = crowded else { break; };
+                        nodes.remove(ci);
+                        let (li, _) = nodes.windows(2).enumerate()
+                            .max_by(|(_, a), (_, b)| (a[1]-a[0]).partial_cmp(&(b[1]-b[0])).unwrap())
+                            .unwrap();
+                        nodes.insert(li + 1, (nodes[li] + nodes[li+1]) * 0.5);
+                    }
+                    nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    nodes
+                };
+                let scaled_grid_positions = |n: usize| -> Vec<f32> {
+                    if n == 0 { return vec![0.0, 1.0]; }
+                    if !show_scaled_grid {
+                        return (0..=n).map(|i| i as f32 / n as f32).collect();
+                    }
+                    if absolute {
+                        // One-sided: scale the full [0,1] range (Log→dense near max).
+                        let nodes = (0..=n).map(|i| {
+                            let t = i as f32 / n as f32;
+                            1.0 - curve_scale_inv(1.0 - t, scale_t)
+                        }).collect();
+                        redistribute(nodes, n)
+                    } else {
+                        // Bidirectional: each half is an independent abs-style scale
+                        // expanding outward from the centre (u=0.5, value=0).
+                        // Log→dense near ±max edges; Exp→dense near 0.
+                        let half_lo = n / 2;
+                        let half_hi = n - half_lo;
+                        // lo half: t=0 is centre (u=0.5), t=1 is left edge (u=0).
+                        let lo_nodes: Vec<f32> = (0..=half_lo).map(|i| {
+                            let t = i as f32 / half_lo as f32;
+                            let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
+                            0.5 - s * 0.5
+                        }).collect();
+                        // hi half: t=0 is centre (u=0.5), t=1 is right edge (u=1).
+                        let hi_nodes: Vec<f32> = (0..=half_hi).map(|i| {
+                            let t = i as f32 / half_hi as f32;
+                            let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
+                            0.5 + s * 0.5
+                        }).collect();
+                        let mut merged = redistribute(lo_nodes, half_lo);
+                        for v in redistribute(hi_nodes, half_hi).iter().skip(1) { merged.push(*v); }
+                        merged.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        merged
+                    }
+                };
+                let snap_nodes_x = scaled_grid_positions(grid_x);
+                let snap_nodes_y = scaled_grid_positions(grid_y);
+
                 let do_snap = |x: f32, y: f32| -> (f32, f32) {
-                    if snap {
-                        let nx = ((x - x_lo) / x_range * grid_x as f32).round() / grid_x as f32;
-                        let ny = ((y - y_lo) / y_range * grid_y as f32).round() / grid_y as f32;
-                        (x_lo + nx * x_range, y_lo + ny * y_range)
-                    } else { (x, y) }
+                    if !snap { return (x, y); }
+                    let u = ((x - x_lo) / x_range).clamp(0.0, 1.0);
+                    let v = ((y - y_lo) / y_range).clamp(0.0, 1.0);
+                    let snap_u = snap_nodes_x.iter().copied()
+                        .min_by(|a, b| (a - u).abs().partial_cmp(&(b - u).abs()).unwrap())
+                        .unwrap_or(u);
+                    let snap_v = snap_nodes_y.iter().copied()
+                        .min_by(|a, b| (a - v).abs().partial_cmp(&(b - v).abs()).unwrap())
+                        .unwrap_or(v);
+                    (x_lo + snap_u * x_range, y_lo + snap_v * y_range)
                 };
 
                 painter.rect_filled(rect, 2.0, Color32::from_gray(16));
 
+                let grid_x_positions: Vec<f32> = (1..grid_x)
+                    .map(|i| x_lo + snap_nodes_x[i] * x_range)
+                    .collect();
+                let grid_y_positions: Vec<f32> = (1..grid_y)
+                    .map(|i| y_lo + snap_nodes_y[i] * y_range)
+                    .collect();
+
                 let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
-                for i in 1..grid_x {
-                    let x = x_lo + x_range * i as f32 / grid_x as f32;
+                for &x in &grid_x_positions {
                     painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
                 }
-                for i in 1..grid_y {
-                    let y = y_lo + y_range * i as f32 / grid_y as f32;
+                for &y in &grid_y_positions {
                     painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
                 }
                 painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
                     egui::Stroke::new(0.5, Color32::from_gray(55)));
+
+                // Labels: show the real input/output value at each grid line.
+                // Graph x is the SCALED domain (curve_scale maps real→graph), so
+                // the real value at graph position x is curve_scale_inv(x) * abs_max
+                // for abs mode, or sign*curve_scale_inv(|x|)*abs_max for bipolar.
+                if show_grid_labels {
+                    const MIN_LABEL_PX: f32 = 20.0;
+                    let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
+                    let font = egui::FontId::proportional(9.0);
+                    let abs_max_in  = in_max.abs().max(in_min.abs());
+                    let abs_max_out = out_max.abs().max(out_min.abs());
+                    // Convert a normalized graph position u∈[0,1] to the real input value.
+                    let graph_to_real_in = |u: f32| -> f32 {
+                        if absolute {
+                            curve_scale_inv(u, scale_t) * abs_max_in
+                        } else {
+                            // u=0.5 is value 0; each half scaled independently
+                            let centered = u * 2.0 - 1.0; // [-1,1]
+                            let sign = if centered < 0.0 { -1.0f32 } else { 1.0 };
+                            sign * curve_scale_inv(centered.abs(), scale_t) * abs_max_in
+                        }
+                    };
+                    let graph_to_real_out = |v: f32| -> f32 {
+                        if absolute {
+                            curve_scale_inv(v, scale_t) * abs_max_out
+                        } else {
+                            let centered = v * 2.0 - 1.0;
+                            let sign = if centered < 0.0 { -1.0f32 } else { 1.0 };
+                            sign * curve_scale_inv(centered.abs(), scale_t) * abs_max_out
+                        }
+                    };
+                    let mut last_sx = f32::NEG_INFINITY;
+                    for &x in &grid_x_positions {
+                        let sx = c2s(x, y_hi).x;
+                        if sx - last_sx < MIN_LABEL_PX { continue; }
+                        last_sx = sx;
+                        let u = (x - x_lo) / x_range;
+                        let val = graph_to_real_in(u);
+                        let label = if abs_max_in <= 1.01 {
+                            format!("{:.0}%", val * 100.0)
+                        } else {
+                            format!("{:.2}", val)
+                        };
+                        painter.text(egui::pos2(sx + 1.0, rect.top() + 1.0),
+                            egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
+                    }
+                    let mut last_sy = f32::INFINITY;
+                    for &y in &grid_y_positions {
+                        let sy = c2s(x_lo, y).y;
+                        if last_sy - sy < MIN_LABEL_PX { continue; }
+                        last_sy = sy;
+                        let v = (y - y_lo) / y_range;
+                        let val = graph_to_real_out(v);
+                        let label = if abs_max_out <= 1.01 {
+                            format!("{:.0}%", val * 100.0)
+                        } else {
+                            format!("{:.2}", val)
+                        };
+                        painter.text(egui::pos2(rect.left() + 1.0, sy - 9.0),
+                            egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
+                    }
+                }
 
                 if new_points.len() >= 2 {
                     let steps = 120usize;
@@ -4957,6 +5426,8 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
         let mut snap_on  = snap;
         let mut sc_t     = scale_t;
         let mut tm       = trail_ms;
+        let mut ssg      = show_scaled_grid;
+        let mut sgl      = show_grid_labels;
         let mut changed  = false;
 
         // Row 1: Scale slider (Log←──●──→Exp, double-click resets) + Absolute + Snap
@@ -5028,6 +5499,19 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
         });
         register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
 
+        // Row 4: Grid display options
+        let grid_opts_resp = ui.horizontal(|ui| {
+            let ssg_before = ssg;
+            ui.checkbox(&mut ssg, egui::RichText::new("Scale grid").small())
+                .on_hover_text("Adapt grid lines to the current Log/Exp scaling (Log compresses toward max, Exp toward min)");
+            changed |= ssg != ssg_before;
+            let sgl_before = sgl;
+            ui.checkbox(&mut sgl, egui::RichText::new("Labels").small())
+                .on_hover_text("Show value labels on grid lines");
+            changed |= sgl != sgl_before;
+        });
+        register_exposable_element(ui, node_id, "grid_options_row", grid_opts_resp.response.rect);
+
         if changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 for (k, v) in [
@@ -5041,7 +5525,9 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                 node.params.insert("grid_y".into(),   serde_json::json!(gy_f as i64));
                 node.params.insert("snap".into(),     Value::Bool(snap_on));
                 if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
-                node.params.insert("trail_ms".into(), serde_json::json!(tm));
+                node.params.insert("trail_ms".into(),          serde_json::json!(tm));
+                node.params.insert("show_scaled_grid".into(),  Value::Bool(ssg));
+                node.params.insert("show_grid_labels".into(),  Value::Bool(sgl));
             }
         }
 
@@ -5063,9 +5549,10 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
     if let Some(rect) = curve_graph_rect {
         register_exposable_element(ui, node_id, "curve", rect);
     }
+    false
 }
 
-fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
     // ── Initialise params on first use ────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
@@ -5083,7 +5570,7 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
     }
 
     // ── Read params ───────────────────────────────────────────────────────────
-    let (points, biases, in_max, out_max, grid_x, grid_y, snap, scale_t, trail_ms) = snarl
+    let (points, biases, in_max, out_max, grid_x, grid_y, snap, scale_t, trail_ms, show_scaled_grid, show_grid_labels) = snarl
         .get_node(node_id)
         .map(|n| {
             let pts: Vec<[f32; 2]> = n.params.get("points")
@@ -5104,9 +5591,11 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
             let sn  = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
             let sc  = n.params.get("scale_t").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.0);
             let tm  = n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
-            (pts, bss, i1, o1, gx, gy, sn, sc, tm)
+            let ssg = n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sgl = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
+            (pts, bss, i1, o1, gx, gy, sn, sc, tm, ssg, sgl)
         })
-        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], 1.0, 1.0, 4, 4, false, 0.0f32, 300));
+        .unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 1.0]], vec![], 1.0, 1.0, 4, 4, false, 0.0f32, 300, false, false));
 
     let n_channels = snarl.get_node(node_id)
         .map(|n| n.inputs.len().min(n.outputs.len()))
@@ -5150,27 +5639,104 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                     x_lo + (pos.x - rect.left()) / rect.width() * x_range,
                     y_lo + (rect.bottom() - pos.y) / rect.height() * y_range,
                 ]};
+                // Vec curve is always one-sided [0,1] magnitude space; no bidirectional case.
+                let redistribute_v = |mut nodes: Vec<f32>, n: usize| -> Vec<f32> {
+                    let min_gap = 1.0f32 / n as f32 * 0.5;
+                    for _ in 0..n {
+                        nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let crowded = (1..nodes.len().saturating_sub(1))
+                            .filter(|&i| (nodes[i]-nodes[i-1]).min(nodes[i+1]-nodes[i]) < min_gap)
+                            .min_by(|&a, &b| {
+                                let ga = (nodes[a]-nodes[a-1]).min(nodes[a+1]-nodes[a]);
+                                let gb = (nodes[b]-nodes[b-1]).min(nodes[b+1]-nodes[b]);
+                                ga.partial_cmp(&gb).unwrap()
+                            });
+                        let Some(ci) = crowded else { break; };
+                        nodes.remove(ci);
+                        let (li, _) = nodes.windows(2).enumerate()
+                            .max_by(|(_, a), (_, b)| (a[1]-a[0]).partial_cmp(&(b[1]-b[0])).unwrap())
+                            .unwrap();
+                        nodes.insert(li + 1, (nodes[li] + nodes[li+1]) * 0.5);
+                    }
+                    nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    nodes
+                };
+                let scaled_grid_positions_v = |n: usize| -> Vec<f32> {
+                    if n == 0 { return vec![0.0, 1.0]; }
+                    if !show_scaled_grid {
+                        return (0..=n).map(|i| i as f32 / n as f32).collect();
+                    }
+                    let nodes = (0..=n).map(|i| {
+                        let t = i as f32 / n as f32;
+                        1.0 - curve_scale_inv(1.0 - t, scale_t)
+                    }).collect();
+                    redistribute_v(nodes, n)
+                };
+                let snap_nodes_x = scaled_grid_positions_v(grid_x);
+                let snap_nodes_y = scaled_grid_positions_v(grid_y);
+
                 let do_snap = |x: f32, y: f32| -> (f32, f32) {
-                    if snap {
-                        let nx = ((x - x_lo) / x_range * grid_x as f32).round() / grid_x as f32;
-                        let ny = ((y - y_lo) / y_range * grid_y as f32).round() / grid_y as f32;
-                        (x_lo + nx * x_range, y_lo + ny * y_range)
-                    } else { (x, y) }
+                    if !snap { return (x, y); }
+                    let u = ((x - x_lo) / x_range).clamp(0.0, 1.0);
+                    let v = ((y - y_lo) / y_range).clamp(0.0, 1.0);
+                    let snap_u = snap_nodes_x.iter().copied()
+                        .min_by(|a, b| (a - u).abs().partial_cmp(&(b - u).abs()).unwrap())
+                        .unwrap_or(u);
+                    let snap_v = snap_nodes_y.iter().copied()
+                        .min_by(|a, b| (a - v).abs().partial_cmp(&(b - v).abs()).unwrap())
+                        .unwrap_or(v);
+                    (x_lo + snap_u * x_range, y_lo + snap_v * y_range)
                 };
 
                 painter.rect_filled(rect, 2.0, Color32::from_gray(16));
 
+                let grid_x_positions: Vec<f32> = (1..grid_x).map(|i| x_lo + snap_nodes_x[i] * x_range).collect();
+                let grid_y_positions: Vec<f32> = (1..grid_y).map(|i| y_lo + snap_nodes_y[i] * y_range).collect();
+
                 let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
-                for i in 1..grid_x {
-                    let x = x_lo + x_range * i as f32 / grid_x as f32;
+                for &x in &grid_x_positions {
                     painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
                 }
-                for i in 1..grid_y {
-                    let y = y_lo + y_range * i as f32 / grid_y as f32;
+                for &y in &grid_y_positions {
                     painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
                 }
                 painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
                     egui::Stroke::new(0.5, Color32::from_gray(55)));
+
+                // Vec curve: graph axis is [0,1]; label shows x * in_max / y * out_max.
+                if show_grid_labels {
+                    const MIN_LABEL_PX: f32 = 20.0;
+                    let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
+                    let font = egui::FontId::proportional(9.0);
+                    let mut last_sx = f32::NEG_INFINITY;
+                    for &x in &grid_x_positions {
+                        let sx = c2s(x, y_hi).x;
+                        if sx - last_sx < MIN_LABEL_PX { continue; }
+                        last_sx = sx;
+                        let val = x * in_max;
+                        let label = if in_max <= 1.01 {
+                            format!("{:.0}%", x * 100.0)
+                        } else {
+                            format!("{:.2}", val)
+                        };
+                        painter.text(egui::pos2(sx + 1.0, rect.top() + 1.0),
+                            egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
+                    }
+                    let mut last_sy = f32::INFINITY;
+                    for &y in &grid_y_positions {
+                        let sy = c2s(x_lo, y).y;
+                        if last_sy - sy < MIN_LABEL_PX { continue; }
+                        last_sy = sy;
+                        let val = y * out_max;
+                        let label = if out_max <= 1.01 {
+                            format!("{:.0}%", y * 100.0)
+                        } else {
+                            format!("{:.2}", val)
+                        };
+                        painter.text(egui::pos2(rect.left() + 1.0, sy - 9.0),
+                            egui::Align2::LEFT_TOP, &label, font.clone(), label_col);
+                    }
+                }
 
                 if new_points.len() >= 2 {
                     let steps = 120usize;
@@ -5337,6 +5903,8 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
         let mut snap_on = snap;
         let mut sc_t    = scale_t;
         let mut tm      = trail_ms;
+        let mut ssg     = show_scaled_grid;
+        let mut sgl     = show_grid_labels;
         let mut changed = false;
 
         // Row 1: Scale slider (Log←──●──→Exp, double-click resets) + Snap
@@ -5396,15 +5964,30 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
         });
         register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
 
+        // Row 4: Grid display options
+        let grid_opts_resp = ui.horizontal(|ui| {
+            let ssg_before = ssg;
+            ui.checkbox(&mut ssg, egui::RichText::new("Scale grid").small())
+                .on_hover_text("Adapt grid lines to the current Log/Exp scaling (Log compresses toward max, Exp toward min)");
+            changed |= ssg != ssg_before;
+            let sgl_before = sgl;
+            ui.checkbox(&mut sgl, egui::RichText::new("Labels").small())
+                .on_hover_text("Show value labels on grid lines");
+            changed |= sgl != sgl_before;
+        });
+        register_exposable_element(ui, node_id, "grid_options_row", grid_opts_resp.response.rect);
+
         if changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
-                if let Some(n) = Number::from_f64(i1 as f64)  { node.params.insert("in_max".into(),  Value::Number(n)); }
-                if let Some(n) = Number::from_f64(o1 as f64)  { node.params.insert("out_max".into(), Value::Number(n)); }
+                if let Some(n) = Number::from_f64(i1 as f64)   { node.params.insert("in_max".into(),  Value::Number(n)); }
+                if let Some(n) = Number::from_f64(o1 as f64)   { node.params.insert("out_max".into(), Value::Number(n)); }
                 if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
-                node.params.insert("grid_x".into(),   serde_json::json!(gx_f as i64));
-                node.params.insert("grid_y".into(),   serde_json::json!(gy_f as i64));
-                node.params.insert("snap".into(),     Value::Bool(snap_on));
-                node.params.insert("trail_ms".into(), serde_json::json!(tm));
+                node.params.insert("grid_x".into(),            serde_json::json!(gx_f as i64));
+                node.params.insert("grid_y".into(),            serde_json::json!(gy_f as i64));
+                node.params.insert("snap".into(),              Value::Bool(snap_on));
+                node.params.insert("trail_ms".into(),          serde_json::json!(tm));
+                node.params.insert("show_scaled_grid".into(),  Value::Bool(ssg));
+                node.params.insert("show_grid_labels".into(),  Value::Bool(sgl));
             }
         }
 
@@ -5426,6 +6009,7 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
     if let Some(rect) = curve_graph_rect {
         register_exposable_element(ui, node_id, "curve", rect);
     }
+    false
 }
 
 /// Maps x ∈ [0,1] → [0,1] continuously. t=0 → linear; t<0 → log-like; t>0 → exp-like.
@@ -5433,6 +6017,14 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
 fn curve_scale(x: f32, t: f32) -> f32 {
     if t.abs() < 1e-4 { return x; }
     x.clamp(0.0, 1.0).powf(2.0f32.powf(t * 3.0))
+}
+
+/// Inverse of curve_scale: given a scaled output y ∈ [0,1], find x such that curve_scale(x,t)=y.
+/// Used to place grid lines at perceptually even intervals under the current scaling.
+fn curve_scale_inv(y: f32, t: f32) -> f32 {
+    if t.abs() < 1e-4 { return y; }
+    let p = 2.0f32.powf(t * 3.0);
+    y.clamp(0.0, 1.0).powf(1.0 / p)
 }
 
 // ── Signal helpers ────────────────────────────────────────────────────────────
