@@ -383,6 +383,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
                 | "generator.oscillator" | "processing.gyro_3dof"
                 | "module.automap_split" | "module.automap_collect"
+                | "module.automap_fork" | "module.automap_selector"
                 | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
         )
     }
@@ -439,8 +440,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl),
             "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl),
             "processing.gyro_3dof"  => show_gyro_3dof_body(node_id, ui, snarl),
-            "module.automap_split"   => show_automap_split_body(node_id, outputs, ui, snarl),
-            "module.automap_collect" => show_automap_collect_body(node_id, inputs, ui, snarl),
+            "module.automap_split"     => show_automap_split_body(node_id, outputs, ui, snarl),
+            "module.automap_collect"   => show_automap_collect_body(node_id, inputs, ui, snarl),
+            "module.automap_fork"      => show_automap_fork_body(node_id, outputs, ui, snarl),
+            "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
             "subpatch" => {
                 if show_subpatch_body(node_id, ui, snarl) {
                     self.edit_subpatch_request = Some(node_id);
@@ -995,6 +998,77 @@ fn remove_automap_collect_input(node_id: NodeId, rm_idx: usize, inputs: &[InPin]
     }
 }
 
+// ── AutoMap Fork body ─────────────────────────────────────────────────────────
+
+fn show_automap_fork_body(
+    node_id: NodeId,
+    outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+) {
+    let n_out = snarl.get_node(node_id).map(|n| n.outputs.len()).unwrap_or(2);
+    ui.vertical(|ui| {
+        ui.set_min_width(80.0);
+        let mut to_remove: Option<usize> = None;
+        for i in 0..n_out {
+            ui.horizontal(|ui| {
+                if n_out > 2 {
+                    if ui.small_button("×").clicked() { to_remove = Some(i); }
+                } else {
+                    ui.add_space(18.0);
+                }
+                ui.label(egui::RichText::new(format!("out_{i}")).small());
+            });
+        }
+        if let Some(rm) = to_remove {
+            remove_output_pin(node_id, rm, outputs, snarl);
+        }
+        ui.add_space(2.0);
+        if ui.small_button("+ output").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let next = node.outputs.len();
+                node.outputs.push(PinDescriptor::new(format!("out_{next}"), SignalType::AutoMap));
+            }
+        }
+    });
+}
+
+// ── AutoMap Selector body ─────────────────────────────────────────────────────
+
+fn show_automap_selector_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+) {
+    // inputs[0] = select (fixed); inputs[1..] = in_0, in_1, ... (dynamic AutoMap)
+    let n_value = snarl.get_node(node_id).map(|n| n.inputs.len().saturating_sub(1)).unwrap_or(2);
+    ui.vertical(|ui| {
+        ui.set_min_width(80.0);
+        let mut to_remove: Option<usize> = None;
+        for i in 0..n_value {
+            ui.horizontal(|ui| {
+                if n_value > 2 {
+                    if ui.small_button("×").clicked() { to_remove = Some(i + 1); }
+                } else {
+                    ui.add_space(18.0);
+                }
+                ui.label(egui::RichText::new(format!("in_{i}")).small());
+            });
+        }
+        if let Some(rm) = to_remove {
+            remove_input_pin(node_id, rm, inputs, snarl);
+        }
+        ui.add_space(2.0);
+        if ui.small_button("+ input").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let next = node.inputs.len() - 1;
+                node.inputs.push(PinDescriptor::new(format!("in_{next}"), SignalType::AutoMap));
+            }
+        }
+    });
+}
+
 // ── MIDI pin removal helpers ──────────────────────────────────────────────────
 
 fn remove_midi_output(node_id: NodeId, rm_idx: usize, outputs: &[OutPin], snarl: &mut Snarl<NodeData>) {
@@ -1162,7 +1236,7 @@ fn show_math_variadic_body(
         if ui.small_button("+").on_hover_text("Add input").clicked() {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 let name = pin_letter(node.inputs.len());
-                node.inputs.push(PinDescriptor::new(name, SignalType::Float));
+                node.inputs.push(PinDescriptor::new(name, SignalType::Any));
             }
         }
         if n > 2 && ui.small_button("−").on_hover_text("Remove last input").clicked() {
@@ -1205,7 +1279,7 @@ fn show_selector_body(
         if ui.small_button("+ input").clicked() {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 let next = node.inputs.len() - 1;
-                node.inputs.push(PinDescriptor::new(format!("in_{next}"), SignalType::Float));
+                node.inputs.push(PinDescriptor::new(format!("in_{next}"), SignalType::Any));
             }
         }
         let interp_before = interp;
@@ -1251,7 +1325,7 @@ fn show_split_body(
         if ui.small_button("+ output").clicked() {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 let next = node.outputs.len();
-                node.outputs.push(PinDescriptor::new(format!("out_{next}"), SignalType::Float));
+                node.outputs.push(PinDescriptor::new(format!("out_{next}"), SignalType::Any));
             }
         }
         let interp_before = interp;

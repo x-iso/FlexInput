@@ -120,8 +120,11 @@ impl DeviceBackend for GilrsBackend {
                 kind.display_name().to_string()
             };
 
+            let dev_id = format!("gilrs:{}:{}", kind.id_slug(), inst);
+            eprintln!("[enumerate] pad: name={:?} vid={:04X?} pid={:04X?} -> id={dev_id}",
+                pad.name(), pad.vendor_id(), pad.product_id());
             result.push(PhysicalDevice {
-                id: format!("gilrs:{}:{}", kind.id_slug(), inst),
+                id: dev_id,
                 display_name,
                 kind,
                 outputs: layouts::outputs_for(kind),
@@ -163,6 +166,8 @@ impl DeviceBackend for GilrsBackend {
                     let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
                     let seen = gilrs_seen.entry(vp).or_insert(0);
                     if *seen >= phys {
+                        eprintln!("[poll] FILTER skip: name={:?} vid={:04X?} pid={:04X?} seen={} phys={}",
+                            pad.name(), pad.vendor_id(), pad.product_id(), seen, phys);
                         continue;
                     }
                     *seen += 1;

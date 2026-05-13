@@ -217,6 +217,71 @@ pub fn eval_graph_tick(
             continue;
         }
 
+        // ── module.automap_fork: gate AutoMap bus to selected output ─────────
+        if snap.module_id == "module.automap_fork" {
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let collector_id_upstream = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            // inputs[0] = AutoMap (ignored as value), inputs[1] = select
+            let select = match snap.input_sources.get(1)
+                .and_then(|src| src.and_then(|(si, op)| computed.get(si).and_then(|v| v.get(op)).copied().flatten()))
+            {
+                Some(Signal::Float(f)) => {
+                    let n = snap.n_outputs.max(1);
+                    ((f.clamp(0.0, 1.0) * (n as f32 - 1.0 + 0.5)).floor() as usize).min(n - 1)
+                }
+                Some(Signal::Bool(b)) => if b { 1 } else { 0 },
+                _ => 0,
+            };
+            for out_idx in 0..snap.n_outputs {
+                if out_idx != select { continue; }
+                let key = format!("forksel:{}:{}", snap.node_uid, out_idx);
+                for pin in flexinput_core::automap::ALL_PINS {
+                    let sig = if !collector_id_upstream.is_empty() {
+                        collector_sigs.get(&(collector_id_upstream.to_string(), pin.id.to_string())).copied()
+                            .or_else(|| dev_sigs.get(&(dev_id.to_string(), pin.id.to_string())).copied())
+                    } else {
+                        dev_sigs.get(&(dev_id.to_string(), pin.id.to_string())).copied()
+                    };
+                    if let Some(sig) = sig {
+                        collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+                    }
+                }
+            }
+            computed[idx] = vec![None; snap.n_outputs];
+            continue;
+        }
+
+        // ── module.automap_selector: gate selected AutoMap input to output ────
+        if snap.module_id == "module.automap_selector" {
+            // inputs[0] = select, inputs[1..] = AutoMap buses
+            let n_inputs = snap.input_sources.len().saturating_sub(1).max(1);
+            let select = match snap.input_sources.get(0)
+                .and_then(|src| src.and_then(|(si, op)| computed.get(si).and_then(|v| v.get(op)).copied().flatten()))
+            {
+                Some(Signal::Float(f)) => {
+                    let n = n_inputs as f32;
+                    ((f.clamp(0.0, 1.0) * n).floor() as usize).min(n_inputs - 1)
+                }
+                Some(Signal::Bool(b)) => if b { 1 } else { 0 },
+                _ => 0,
+            };
+            let input_devs = snap.params.get("_automap_input_devs")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let selected_dev = input_devs.get(select).map(|s| s.as_str()).unwrap_or("");
+            let key = format!("forksel:{}:0", snap.node_uid);
+            if !selected_dev.is_empty() {
+                for pin in flexinput_core::automap::ALL_PINS {
+                    if let Some(sig) = dev_sigs.get(&(selected_dev.to_string(), pin.id.to_string())).copied() {
+                        collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+                    }
+                }
+            }
+            computed[idx] = vec![None];
+            continue;
+        }
+
         // ── device.sink: collect combined inputs, populate sink_outputs ──────
         if let Some(ref st) = snap.sink_target {
             // Pins that have at least one actual direct wire (non-empty multi_sources).
@@ -256,10 +321,11 @@ pub fn eval_graph_tick(
                     .filter(|p| !p.is_empty() && p.as_str() != "automap_out")
                     .map(|p| p.as_str())
                     .collect();
-                let is_collector = src_dev.starts_with("collector:");
+                let is_collector = src_dev.starts_with("collector:") || src_dev.starts_with("forksel:");
                 for (mapped_src, mapped_dst) in automap::resolve_mapping(&src_ids, &dst_ids) {
                     if directly_wired.contains(mapped_dst) { continue; }
-                    // For collectors: check collector_sigs first, then fall back to upstream device.
+                    // For collectors (including fork/selector gates): check collector_sigs first,
+                    // then fall back to upstream device.
                     let sig_opt = if is_collector {
                         collector_sigs.get(&(src_dev.clone(), mapped_src.to_string())).copied()
                             .or_else(|| {
@@ -474,7 +540,7 @@ fn compute_node(
             out
         }
         "processing.gyro_3dof" => {
-            let out = compute_gyro_3dof(inputs, state, &snap.params, dev_sigs, dt);
+            let out = compute_gyro_3dof(inputs, state, &snap.params, dev_sigs, collector_sigs, dt);
             state.last_signals = out.clone();
             out
         }
@@ -629,23 +695,42 @@ pub fn eval_pure(
             }
         }
         "module.split" => {
-            let sel  = get_f(inputs, 0, 0.0);
-            let val  = get_f(inputs, 1, 0.0);
-            let n    = n_outputs;
+            let sel = get_f(inputs, 0, 0.0);
+            let raw = inputs.get(1).and_then(|s| *s);
+            let n   = n_outputs;
             let interp = params.get("interpolate").and_then(|v| v.as_bool()).unwrap_or(false);
+            let zero_like = |sig: Option<Signal>| -> Signal {
+                match sig {
+                    Some(Signal::Vec2(_)) => Signal::Vec2(glam::Vec2::ZERO),
+                    Some(Signal::Bool(_)) => Signal::Bool(false),
+                    Some(Signal::Int(_))  => Signal::Int(0),
+                    _                     => Signal::Float(0.0),
+                }
+            };
             if interp && n >= 2 {
                 let pos = sel.clamp(0.0, 1.0) * (n - 1) as f32;
                 let lo  = pos.floor() as usize;
                 let hi  = (lo + 1).min(n - 1);
                 let t   = pos.fract();
-                if out_idx == lo && lo == hi { Some(Signal::Float(val)) }
-                else if out_idx == lo        { Some(Signal::Float(val * (1.0 - t))) }
-                else if out_idx == hi        { Some(Signal::Float(val * t)) }
-                else                         { Some(Signal::Float(0.0)) }
+                match raw {
+                    Some(Signal::Vec2(v)) => {
+                        if out_idx == lo && lo == hi { Some(Signal::Vec2(v)) }
+                        else if out_idx == lo        { Some(Signal::Vec2(v * (1.0 - t))) }
+                        else if out_idx == hi        { Some(Signal::Vec2(v * t)) }
+                        else                         { Some(Signal::Vec2(glam::Vec2::ZERO)) }
+                    }
+                    _ => {
+                        let val = raw.map(|s| s.as_float()).unwrap_or(0.0);
+                        if out_idx == lo && lo == hi { Some(Signal::Float(val)) }
+                        else if out_idx == lo        { Some(Signal::Float(val * (1.0 - t))) }
+                        else if out_idx == hi        { Some(Signal::Float(val * t)) }
+                        else                         { Some(Signal::Float(0.0)) }
+                    }
+                }
             } else {
                 let idx = (sel.clamp(0.0, 1.0) * n as f32).floor() as usize;
                 let idx = idx.min(n.saturating_sub(1));
-                if out_idx == idx { Some(Signal::Float(val)) } else { Some(Signal::Float(0.0)) }
+                if out_idx == idx { Some(raw.unwrap_or(Signal::Float(0.0))) } else { Some(zero_like(raw)) }
             }
         }
         "module.response_curve" => {
@@ -1043,6 +1128,7 @@ fn compute_gyro_3dof(
     state: &mut NodeState,
     params: &HashMap<String, Value>,
     dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &HashMap<(String, String), Signal>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
     let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("local");
@@ -1052,17 +1138,38 @@ fn compute_gyro_3dof(
     };
 
     // Auto-map path: read all six axes from the connected device.
+    // If upstream is a fork/selector/collector, read from collector_sigs first.
     let (gx_am, gy_am, gz_am, ax_am, ay_am, az_am) =
         if let Some(dev_id) = params.get("_automap_device_id").and_then(|v| v.as_str()) {
+            let collector_id = params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
             let get = |pin: &str| -> f32 {
+                if !collector_id.is_empty() {
+                    if let Some(Signal::Float(f)) = collector_sigs.get(&(collector_id.to_string(), pin.to_string())) {
+                        return *f;
+                    }
+                }
                 match dev_sigs.get(&(dev_id.to_string(), pin.to_string())) {
                     Some(Signal::Float(f)) => *f,
                     _ => 0.0,
                 }
             };
-            let az_raw = match dev_sigs.get(&(dev_id.to_string(), "accel_z".to_string())) {
-                Some(Signal::Float(f)) => *f,
-                _ => 1.0,
+            let az_raw = {
+                let pin = "accel_z";
+                if !collector_id.is_empty() {
+                    if let Some(Signal::Float(f)) = collector_sigs.get(&(collector_id.to_string(), pin.to_string())) {
+                        *f
+                    } else {
+                        match dev_sigs.get(&(dev_id.to_string(), pin.to_string())) {
+                            Some(Signal::Float(f)) => *f,
+                            _ => 1.0,
+                        }
+                    }
+                } else {
+                    match dev_sigs.get(&(dev_id.to_string(), pin.to_string())) {
+                        Some(Signal::Float(f)) => *f,
+                        _ => 1.0,
+                    }
+                }
             };
             (get("gyro_x"), get("gyro_y"), get("gyro_z"), get("accel_x"), get("accel_y"), az_raw)
         } else {

@@ -1716,6 +1716,22 @@ fn find_automap_device_rec(
         let upstream = *in_pin.remotes.first()?;
         return find_automap_device_rec(snarl, upstream, parents);
     }
+    // Fork and Selector act as gating collectors: they inject signals into collector_sigs
+    // only on the active output/input, so non-active paths produce silence.
+    // No fallback device — the collector key alone controls what the sink sees.
+    if node.module_id == "module.automap_fork"
+        || node.module_id == "module.automap_selector"
+    {
+        let node_uid = match parents {
+            None => src.node.0,
+            Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
+        };
+        // Encode which output pin the sink is downstream of so eval can gate per-output.
+        let collector_id = format!("forksel:{}:{}", node_uid, src.output);
+        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+            .iter().map(|p| p.id.to_string()).collect();
+        return Some((collector_id, canonical_pins, None));
+    }
     if node.module_id == "module.automap_collect" {
         let upstream_dev_id = node.inputs.iter()
             .position(|p| p.signal_type == SignalType::AutoMap)
@@ -1862,25 +1878,39 @@ fn build_processing_graph_rec(
 
         // For modules that read device signals by name, inject the originating device_id.
         let mut params = node.params.clone();
-        if matches!(node.module_id.as_str(), "processing.gyro_3dof" | "module.automap_split") {
+        if matches!(node.module_id.as_str(),
+            "processing.gyro_3dof" | "module.automap_split"
+            | "module.automap_fork" | "module.automap_selector")
+        {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {
                 let pin = snarl.in_pin(InPinId { node: *node_id, input: idx });
                 if let Some(&src) = pin.remotes.first() {
                     if let Some((dev_id, _, fallback)) = find_automap_device_rec(snarl, src, parents) {
-                        // Always use the real device ID (fallback when chain passes through a Collector).
-                        let real_id = fallback.clone().unwrap_or_else(|| dev_id.clone());
+                        // _automap_device_id = real physical device (fallback when upstream is a collector/forksel).
+                        let real_id = fallback.unwrap_or_else(|| dev_id.clone());
                         params.insert("_automap_device_id".to_string(), serde_json::Value::String(real_id));
-                        // For Splitters: also remember the closest upstream collector ID so
-                        // splitter eval can read collector_sigs first (showing the most recent
-                        // injected/overridden values along the chain) before falling back to
-                        // the raw device samples.
-                        if node.module_id == "module.automap_split" && dev_id.starts_with("collector:") {
+                        // _automap_collector_id = virtual collector key to read from collector_sigs first.
+                        // Covers both automap_collect ("collector:") and fork/selector ("forksel:").
+                        if dev_id.starts_with("collector:") || dev_id.starts_with("forksel:") {
                             params.insert("_automap_collector_id".to_string(),
                                 serde_json::Value::String(dev_id));
                         }
                     }
                 }
+            }
+            // Selector: also inject device_id for each additional AutoMap input (in_1, in_2, ...).
+            if node.module_id == "module.automap_selector" {
+                let mut extra_devs: Vec<serde_json::Value> = Vec::new();
+                for i in 1..node.inputs.len() {
+                    let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
+                    let dev_str = pin.remotes.first()
+                        .and_then(|&src| find_automap_device_rec(snarl, src, parents))
+                        .map(|(dev_id, _, fallback)| fallback.unwrap_or(dev_id))
+                        .unwrap_or_default();
+                    extra_devs.push(serde_json::Value::String(dev_str));
+                }
+                params.insert("_automap_input_devs".to_string(), serde_json::Value::Array(extra_devs));
             }
         }
         // For automap_collect: forward the stable pin-ID list so eval.rs can key collector_sigs.
@@ -1951,10 +1981,14 @@ fn build_processing_graph_rec(
                     }
                 }
             }
-            // If the AutoMap source is a Collector, add it as a dependency so it is
-            // evaluated before this sink (ensuring collector_sigs is populated in time).
+            // If the AutoMap source is a Collector or Fork/Selector, add it as a dependency
+            // so it is evaluated before this sink (ensuring collector_sigs is populated).
             if let Some((ref am_dev_id, _)) = st.automap_source {
-                if let Some(uid_str) = am_dev_id.strip_prefix("collector:") {
+                // "collector:{uid}" → automap_collect node
+                // "forksel:{uid}:{out}" → automap_fork or automap_selector node
+                let uid_str = am_dev_id.strip_prefix("collector:")
+                    .or_else(|| am_dev_id.strip_prefix("forksel:").and_then(|s| s.split(':').next()));
+                if let Some(uid_str) = uid_str {
                     if let Ok(uid) = uid_str.parse::<usize>() {
                         if let Some(am_idx) = snaps.iter().position(|s| s.node_uid == uid) {
                             if seen.insert(am_idx) {
