@@ -400,7 +400,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             node.module_id.as_str(),
             "device.sink" | "module.constant" | "module.switch" | "module.knob" | "module.label" | "module.svg"
                 | "display.readout" | "display.oscilloscope" | "display.vectorscope"
-                | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve"
+                | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
                 | "math.add" | "math.subtract" | "math.multiply" | "math.divide"
                 | "module.selector" | "module.split"
                 | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
