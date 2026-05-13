@@ -198,6 +198,7 @@ impl Canvas {
 
         let nodes: Vec<(egui::Pos2, NodeData)> = selected.iter()
             .filter_map(|&id| self.snarl.get_node_info(id).map(|n| (n.pos, n.value.clone())))
+            .filter(|(_, d)| !matches!(d.module_id.as_str(), "device.source" | "device.sink"))
             .collect();
 
         let selected_set: HashSet<NodeId> = selected.iter().copied().collect();
@@ -497,7 +498,11 @@ impl Canvas {
 
         // Group triggered via node right-click menu (viewer sets group_from_menu).
         if group_from_menu && !selected.is_empty() {
-            self.group_selected_into_subpatch(&selected);
+            let groupable: Vec<NodeId> = selected.iter().copied()
+                .filter(|&id| self.snarl.get_node(id)
+                    .map_or(true, |n| !matches!(n.module_id.as_str(), "device.source" | "device.sink")))
+                .collect();
+            self.group_selected_into_subpatch(&groupable);
         }
 
         // Only process shortcuts when no overlay is open.
@@ -558,7 +563,11 @@ impl Canvas {
                 self.redo();
             }
             if ctrl_g && selected.len() >= 2 {
-                self.group_selected_into_subpatch(&selected);
+                let groupable: Vec<NodeId> = selected.iter().copied()
+                    .filter(|&id| self.snarl.get_node(id)
+                        .map_or(true, |n| !matches!(n.module_id.as_str(), "device.source" | "device.sink")))
+                    .collect();
+                self.group_selected_into_subpatch(&groupable);
             }
         }
 
@@ -635,9 +644,33 @@ impl Canvas {
             device.inputs.iter().map(|p| Value::String(p.id.clone())).collect(),
         ));
 
+        // Count existing source nodes with the same base display name.
+        let base = &device.display_name;
+        let same_name_ids: Vec<NodeId> = self.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.source"
+                && device_base_name(&n.value.display_name) == base.as_str())
+            .map(|(id, _)| id)
+            .collect();
+        let inst = same_name_ids.len(); // 0-based index for the new node
+
+        // When the second device of this name is added, retroactively number the first one.
+        if inst == 1 {
+            if let Some(first_id) = same_name_ids.into_iter().next() {
+                if let Some(n) = self.snarl.get_node_mut(first_id) {
+                    n.display_name = format!("{} #1", base);
+                }
+            }
+        }
+
+        let display_name = if inst == 0 {
+            base.clone()
+        } else {
+            format!("{} #{}", base, inst + 1)
+        };
+
         let node = NodeData {
             module_id: "device.source".to_string(),
-            display_name: device.display_name.clone(),
+            display_name,
             category: "Device".to_string(),
             inputs,
             outputs,
@@ -675,9 +708,31 @@ impl Canvas {
             device.inputs.iter().map(|p| Value::String(p.id.clone())).collect(),
         ));
 
+        let base = &device.display_name;
+        let same_name_ids: Vec<NodeId> = self.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.sink"
+                && device_base_name(&n.value.display_name) == base.as_str())
+            .map(|(id, _)| id)
+            .collect();
+        let inst = same_name_ids.len();
+
+        if inst == 1 {
+            if let Some(first_id) = same_name_ids.into_iter().next() {
+                if let Some(n) = self.snarl.get_node_mut(first_id) {
+                    n.display_name = format!("{} #1", base);
+                }
+            }
+        }
+
+        let display_name = if inst == 0 {
+            base.clone()
+        } else {
+            format!("{} #{}", base, inst + 1)
+        };
+
         let node = NodeData {
             module_id: "device.sink".to_string(),
-            display_name: device.display_name.clone(),
+            display_name,
             category: "Device".to_string(),
             inputs,
             outputs: vec![],
@@ -776,6 +831,17 @@ impl Default for Canvas {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Strip a trailing " #N" suffix from a device display name, returning the base name.
+fn device_base_name(name: &str) -> &str {
+    if let Some(pos) = name.rfind(" #") {
+        let suffix = &name[pos + 2..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return &name[..pos];
+        }
+    }
+    name
 }
 
 /// Swap a device.source or device.sink node to a different physical device, preserving

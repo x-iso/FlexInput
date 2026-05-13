@@ -25,6 +25,14 @@ pub fn show(
     let blacklist: Vec<String> = hidhide.map_or_else(Vec::new, |hh| hh.blacklist());
     let card_max_h = ui.available_height();
 
+    // Count how many devices share each display name so we know when to show #N.
+    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for d in devices {
+        *name_counts.entry(d.display_name.as_str()).or_insert(0) += 1;
+    }
+    // Per-name running index so each duplicate gets its own number.
+    let mut name_seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+
     egui::ScrollArea::horizontal()
         .id_salt("physical_scroll")
         .max_height(card_max_h)
@@ -36,7 +44,15 @@ pub fn show(
                             let up = ip.to_uppercase();
                             blacklist.iter().any(|b| b.to_uppercase() == up)
                         });
-                    device_card(ui, device, canvas, hidhide, is_hidden, card_max_h);
+                    let total = *name_counts.get(device.display_name.as_str()).unwrap_or(&1);
+                    let idx   = *name_seen.get(device.display_name.as_str()).unwrap_or(&0);
+                    *name_seen.entry(device.display_name.as_str()).or_insert(0) += 1;
+                    let label = if total > 1 {
+                        std::borrow::Cow::Owned(format!("{} #{}", device.display_name, idx + 1))
+                    } else {
+                        std::borrow::Cow::Borrowed(device.display_name.as_str())
+                    };
+                    device_card(ui, device, &label, canvas, hidhide, is_hidden, card_max_h);
                 }
             });
         });
@@ -47,6 +63,7 @@ pub fn show(
 fn device_card(
     ui: &mut egui::Ui,
     device: &PhysicalDevice,
+    label: &str,
     canvas: &mut Canvas,
     hidhide: Option<&HidHideClient>,
     is_hidden: bool,
@@ -73,7 +90,7 @@ fn device_card(
 
             ui.horizontal(|ui| {
                 ui.label(controller_icon(device.kind));
-                ui.label(RichText::new(&device.display_name).strong().small());
+                ui.label(RichText::new(label).strong().small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if already_on_canvas {
                         ui.label(RichText::new("On canvas").weak().small());
