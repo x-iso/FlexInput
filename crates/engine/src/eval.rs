@@ -433,7 +433,7 @@ pub fn eval_graph_tick(
                 scope_samples.push((snap.node_uid, sample));
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
-            "module.response_curve" | "module.vec_response_curve" => {
+            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve" => {
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
             // Export outputs (not inputs) so the UI body can show a live readout.
@@ -521,6 +521,11 @@ fn compute_node(
         }
         "module.dc_filter" => {
             let out = compute_dc_filter(inputs, state, &snap.params, dt);
+            state.last_signals = out.clone();
+            out
+        }
+        "module.twoway_response_curve" => {
+            let out = compute_twoway_response_curve(inputs, state, &snap.params, dt);
             state.last_signals = out.clone();
             out
         }
@@ -992,6 +997,138 @@ fn compute_dc_filter(
         };
         results.push(Some(Signal::Float(output as f32)));
     }
+    results
+}
+
+fn compute_twoway_response_curve(
+    inputs: &[Option<Signal>],
+    state: &mut NodeState,
+    params: &HashMap<String, Value>,
+    dt: f32,
+) -> Vec<Option<Signal>> {
+    let n_ch = inputs.len();
+
+    // Grow per-channel state vectors lazily.
+    while state.twoway_lane.len()       < n_ch { state.twoway_lane.push(1); }
+    while state.twoway_dir_buf.len()    < n_ch { state.twoway_dir_buf.push(VecDeque::new()); }
+    while state.twoway_blend.len()      < n_ch { state.twoway_blend.push(1.0); }
+    while state.twoway_prev_input.len() < n_ch { state.twoway_prev_input.push(0.0); }
+    while state.twoway_old_output.len() < n_ch { state.twoway_old_output.push(0.0); }
+
+    // Shared params (applied to both curves).
+    let abs     = params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true);
+    let in_max  = params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
+    let in_min  = params.get("in_min") .and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
+    let out_max = params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
+    let out_min = params.get("out_min").and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
+    let scale_t = read_scale_t(params);
+
+    let vec_mode = params.get("vec_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Up-lane (rising) curve params.
+    let pts_up   = curve_points_from_params(params);
+    let biases_up = biases_from_params(params);
+
+    // Down-lane (falling) curve uses "_dn"-suffixed params, falling back to up-lane.
+    let pts_dn: Vec<[f32; 2]> = params.get("points_dn")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|p| {
+            let a = p.as_array()?;
+            Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+        }).collect())
+        .unwrap_or_else(|| pts_up.clone());
+    let biases_dn: Vec<f32> = params.get("biases_dn")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+        .unwrap_or_else(|| biases_up.clone());
+
+    // Hysteresis params.
+    let hyst_pct = params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+    let hyst_ms  = params.get("hysteresis_ms") .and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
+    let interp_ms = params.get("interp_ms")    .and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
+
+    // How many ticks to fill the hysteresis window.
+    let hyst_ticks = ((hyst_ms / 1000.0) / dt).ceil() as usize;
+    let hyst_ticks = hyst_ticks.max(1);
+
+    let abs_max = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+    let threshold = hyst_pct / 100.0 * abs_max;
+
+    let interp_step = if interp_ms > 0.0 { dt / (interp_ms / 1000.0) } else { 1.0 };
+
+    let mut results = Vec::with_capacity(n_ch);
+
+    for ch in 0..n_ch {
+        let raw_input = if vec_mode {
+            match inputs.get(ch).and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => v.length(),
+                Some(Signal::Float(f)) => f,
+                _ => { results.push(None); continue; }
+            }
+        } else {
+            match inputs.get(ch).and_then(|s| *s) {
+                Some(Signal::Float(f)) => f,
+                _ => { results.push(None); continue; }
+            }
+        };
+
+        let prev = state.twoway_prev_input[ch];
+        let delta = raw_input - prev;
+        state.twoway_prev_input[ch] = raw_input;
+
+        // Push delta into ring buffer, capped to hyst_ticks length.
+        let buf = &mut state.twoway_dir_buf[ch];
+        buf.push_back(delta);
+        while buf.len() > hyst_ticks { buf.pop_front(); }
+
+        // Lane switch decision: all buffered deltas must exceed threshold in same direction.
+        let all_up   = buf.len() >= hyst_ticks && buf.iter().all(|&d| d >  threshold);
+        let all_down = buf.len() >= hyst_ticks && buf.iter().all(|&d| d < -threshold);
+
+        let prev_lane = state.twoway_lane[ch];
+        if all_up   && prev_lane != 1  {
+            state.twoway_old_output[ch] = state.twoway_blend[ch]
+                .mul_add(apply_curve(raw_input, &pts_up, &biases_up, abs, in_min, in_max, out_min, out_max, scale_t),
+                    (1.0 - state.twoway_blend[ch]) * state.twoway_old_output[ch]);
+            state.twoway_lane[ch]  =  1;
+            state.twoway_blend[ch] = 0.0;
+        } else if all_down && prev_lane != -1 {
+            state.twoway_old_output[ch] = state.twoway_blend[ch]
+                .mul_add(apply_curve(raw_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t),
+                    (1.0 - state.twoway_blend[ch]) * state.twoway_old_output[ch]);
+            state.twoway_lane[ch]  = -1;
+            state.twoway_blend[ch] = 0.0;
+        }
+
+        // Advance blend.
+        state.twoway_blend[ch] = (state.twoway_blend[ch] + interp_step).min(1.0);
+        let blend = state.twoway_blend[ch];
+
+        // Evaluate active-lane curve.
+        let new_output = if state.twoway_lane[ch] >= 0 {
+            apply_curve(raw_input, &pts_up, &biases_up, abs, in_min, in_max, out_min, out_max, scale_t)
+        } else {
+            apply_curve(raw_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t)
+        };
+
+        let output = blend * new_output + (1.0 - blend) * state.twoway_old_output[ch];
+
+        let sig = if vec_mode {
+            match inputs.get(ch).and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => {
+                    let mag = v.length();
+                    if mag < f32::EPSILON { Signal::Vec2(glam::Vec2::ZERO) }
+                    else { Signal::Vec2(v / mag * output) }
+                }
+                _ => Signal::Float(output),
+            }
+        } else {
+            Signal::Float(output)
+        };
+
+        results.push(Some(sig));
+    }
+
     results
 }
 

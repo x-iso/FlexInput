@@ -8,6 +8,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<DcFilterModule>(),
         reg::<ResponseCurveModule>(),
         reg::<VecResponseCurveModule>(),
+        reg::<TwowayResponseCurveModule>(),
         reg::<VecToAxisModule>(),
         reg::<AxisToVecModule>(),
         reg::<Gyro3DOFModule>(),
@@ -115,6 +116,32 @@ impl Module for VecResponseCurveModule {
             category: "Processing",
             inputs: vec![PinDescriptor::new("In", SignalType::Vec2)],
             outputs: vec![PinDescriptor::new("Out", SignalType::Vec2)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Two-way Response Curve ────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub struct TwowayResponseCurveModule;
+
+impl Module for TwowayResponseCurveModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.twoway_response_curve",
+            display_name: "Two-way Response Curve",
+            category: "Processing",
+            inputs: vec![
+                PinDescriptor::new("In 1", SignalType::Float),
+                PinDescriptor::new("In 2", SignalType::Float),
+                PinDescriptor::new("In 3", SignalType::Float),
+            ],
+            outputs: vec![
+                PinDescriptor::new("Out 1", SignalType::Float),
+                PinDescriptor::new("Out 2", SignalType::Float),
+                PinDescriptor::new("Out 3", SignalType::Float),
+            ],
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }

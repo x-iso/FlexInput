@@ -32,4 +32,15 @@ pub struct NodeState {
     pub prev_signals: Vec<Option<Signal>>,
     /// Generic f32 scratch space for stateful modules (timers, accumulators).
     pub aux_f32: Vec<f32>,
+    // ── Two-way Response Curve ────────────────────────────────────────────────
+    /// Per-channel current lane: +1 = rising, -1 = falling.
+    pub twoway_lane: Vec<i8>,
+    /// Per-channel ring buffer of recent per-tick input deltas for hysteresis.
+    pub twoway_dir_buf: Vec<VecDeque<f32>>,
+    /// Per-channel interpolation blend factor [0, 1] (0 = fully on old lane output).
+    pub twoway_blend: Vec<f32>,
+    /// Per-channel previous tick input value for delta computation.
+    pub twoway_prev_input: Vec<f32>,
+    /// Per-channel blended output frozen at the moment a lane switch begins.
+    pub twoway_old_output: Vec<f32>,
 }
