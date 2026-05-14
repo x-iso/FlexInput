@@ -2783,6 +2783,35 @@ fn render_pinned_element(
             render_response_curve_grid_options_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        // Two-way Response Curve
+        ("module.twoway_response_curve", "curve") => {
+            render_twoway_curve_only(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.twoway_response_curve", "scale_row") => {
+            render_response_curve_scale_row(inner_id, ui, inner_snarl, container_size, false);
+            return;
+        }
+        ("module.twoway_response_curve", "range_row") => {
+            render_response_curve_range_row(inner_id, ui, inner_snarl, container_size, false);
+            return;
+        }
+        ("module.twoway_response_curve", "grid_row") => {
+            render_response_curve_grid_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.twoway_response_curve", "grid_options_row") => {
+            render_response_curve_grid_options_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.twoway_response_curve", "hyst_row") => {
+            render_twoway_hyst_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.twoway_response_curve", "interp_row") => {
+            render_twoway_interp_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Average / Delay / DC Filter — bare DragValue rows.
         ("module.average", "samples") => {
             render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
@@ -6379,10 +6408,10 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
             }
         }
 
-        // Controls
+        // Controls — each row wrapped so it can be registered as a pinnable element
         let mut changed = false;
         // Scale slider with center notch (double-click resets)
-        ui.horizontal(|ui| {
+        let scale_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Log").small().weak());
             let (sr, sresp) = ui.allocate_exact_size(egui::vec2(80.0, 14.0), egui::Sense::click_and_drag());
             if sresp.double_clicked() { sc_t = 0.0; changed = true; }
@@ -6415,30 +6444,41 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                 }
             }
         });
-        ui.horizontal(|ui| {
+        register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
+
+        let range_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).clamp_range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
             ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).clamp_range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
             ui.label(egui::RichText::new("Grid").small().weak());
             let (gxb,gyb)=(gx_f,gy_f); ui.add(egui::DragValue::new(&mut gx_f).speed(0.1).clamp_range(1usize..=32usize)); ui.label(egui::RichText::new("×").small()); ui.add(egui::DragValue::new(&mut gy_f).speed(0.1).clamp_range(1usize..=32usize)); if gx_f!=gxb||gy_f!=gyb{changed=true;}
         });
-        ui.horizontal(|ui| {
+        register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
+
+        let grid_resp = ui.horizontal(|ui| {
             let snb=snap_on; ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small()); if snap_on!=snb{changed=true;}
             ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).clamp_range(0i64..=1000i64).suffix("ms")); if tm!=tmb{changed=true;}
         });
-        ui.horizontal(|ui| {
+        register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
+
+        let grid_opts_resp = ui.horizontal(|ui| {
             let ssgb=ssg; ui.checkbox(&mut ssg, egui::RichText::new("Scale grid").small()).on_hover_text("Adapt grid lines to Log/Exp scaling"); if ssg!=ssgb{changed=true;}
             let sglb=sgl; ui.checkbox(&mut sgl, egui::RichText::new("Labels").small()).on_hover_text("Show value labels on grid lines"); if sgl!=sglb{changed=true;}
         });
-        ui.horizontal(|ui| {
+        register_exposable_element(ui, node_id, "grid_options_row", grid_opts_resp.response.rect);
+
+        let hyst_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Hyst").small().weak());
             let (hpb,hmb)=(h_pct,h_ms);
             ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%"));
             ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms"));
             if (h_pct-hpb).abs()>1e-5||(h_ms-hmb).abs()>1e-5{changed=true;}
         });
-        ui.horizontal(|ui| {
+        register_exposable_element(ui, node_id, "hyst_row", hyst_resp.response.rect);
+
+        let interp_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Interp").small().weak()); let imb=i_ms; ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).clamp_range(0.0f32..=500.0f32).suffix("ms")); if (i_ms-imb).abs()>1e-5{changed=true;}
         });
+        register_exposable_element(ui, node_id, "interp_row", interp_resp.response.rect);
 
         if changed || params_changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
@@ -6482,6 +6522,65 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
     }
 
     undo_requested || pts_up_changed || pts_dn_changed
+}
+
+fn render_twoway_curve_only(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let avail = egui::vec2(container.x.max(20.0), container.y.max(20.0));
+    let (rect, bg_resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+    paint_response_curve_graph(inner_id, ui, snarl, rect, bg_resp, false);
+}
+
+fn render_twoway_hyst_row(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let (mut h_pct, mut h_ms) = snarl.get_node(inner_id).map(|n| {
+        let p = n.params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+        let m = n.params.get("hysteresis_ms") .and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
+        (p, m)
+    }).unwrap_or((0.5, 20.0));
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Hyst").weak());
+        changed |= ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%")).changed();
+        changed |= ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms")).changed();
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            if let Some(n) = Number::from_f64(h_pct as f64) { node.params.insert("hysteresis_pct".into(), Value::Number(n)); }
+            if let Some(n) = Number::from_f64(h_ms  as f64) { node.params.insert("hysteresis_ms".into(),  Value::Number(n)); }
+        }
+    }
+}
+
+fn render_twoway_interp_row(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let mut i_ms = snarl.get_node(inner_id)
+        .and_then(|n| n.params.get("interp_ms").and_then(|v| v.as_f64()))
+        .unwrap_or(50.0) as f32;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Interp").weak());
+        if ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).clamp_range(0.0f32..=500.0f32).suffix("ms")).changed() {
+            if let Some(node) = snarl.get_node_mut(inner_id) {
+                if let Some(n) = Number::from_f64(i_ms as f64) { node.params.insert("interp_ms".into(), Value::Number(n)); }
+            }
+        }
+    });
 }
 
 /// Maps x ∈ [0,1] → [0,1] continuously. t=0 → linear; t<0 → log-like; t>0 → exp-like.
