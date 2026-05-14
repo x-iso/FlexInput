@@ -6021,8 +6021,8 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
 
 // ── Two-way Response Curve body ───────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
-    // ── Init params on first use ──────────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -6048,32 +6048,26 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
         }
     }
 
-    // ── Read params ───────────────────────────────────────────────────────────
-    let node_data = snarl.get_node(node_id).cloned();
-    let node_data = match node_data { Some(n) => n, None => return false };
+    let node_data = match snarl.get_node(node_id).cloned() { Some(n) => n, None => return false };
 
-    let pts_up: Vec<[f32; 2]> = node_data.params.get("points")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|p| {
-            let a = p.as_array()?;
-            Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
-        }).collect())
-        .unwrap_or_else(|| vec![[0.0, 0.0], [1.0, 1.0]]);
-    let biases_up: Vec<f32> = node_data.params.get("biases")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
-        .unwrap_or_default();
-    let pts_dn: Vec<[f32; 2]> = node_data.params.get("points_dn")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|p| {
-            let a = p.as_array()?;
-            Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
-        }).collect())
-        .unwrap_or_else(|| vec![[0.0, 0.0], [1.0, 1.0]]);
-    let biases_dn: Vec<f32> = node_data.params.get("biases_dn")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
-        .unwrap_or_default();
+    let read_pts = |key: &str| -> Vec<[f32; 2]> {
+        node_data.params.get(key).and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|p| {
+                let a = p.as_array()?;
+                Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+            }).collect())
+            .unwrap_or_else(|| vec![[0.0, 0.0], [1.0, 1.0]])
+    };
+    let read_biases = |key: &str| -> Vec<f32> {
+        node_data.params.get(key).and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default()
+    };
+
+    let pts_up    = read_pts("points");
+    let biases_up = read_biases("biases");
+    let pts_dn    = read_pts("points_dn");
+    let biases_dn = read_biases("biases_dn");
 
     let absolute  = node_data.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true);
     let in_min    = node_data.params.get("in_min") .and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
@@ -6095,612 +6089,363 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
 
     let n_channels = node_data.inputs.len().min(node_data.outputs.len()).max(1);
     let live_inputs: Vec<Option<f32>> = (0..n_channels)
-        .map(|ch| snarl.get_node(node_id)
-            .and_then(|n| n.extra.last_signals.get(ch)?.as_ref())
-            .map(sig_f32))
+        .map(|ch| snarl.get_node(node_id).and_then(|n| n.extra.last_signals.get(ch)?.as_ref()).map(sig_f32))
         .collect();
 
-    // For two-way we always use absolute/vec domain [0,1] internally.
-    // If vec_mode is on, absolute is forced true.
     let absolute_eff = absolute || vec_mode;
     let (x_lo, x_hi): (f32, f32) = if absolute_eff { (0.0, 1.0) } else { (-1.0, 1.0) };
     let (y_lo, y_hi): (f32, f32) = if absolute_eff { (0.0, 1.0) } else { (-1.0, 1.0) };
     let x_range = x_hi - x_lo;
     let y_range = y_hi - y_lo;
+    let lane_up  = active_lane == "up";
 
-    let lane_up = active_lane == "up";
-    let mut new_pts_up   = pts_up.clone();
+    let mut new_pts_up    = pts_up.clone();
     let mut new_biases_up = biases_up.clone();
-    let mut new_pts_dn   = pts_dn.clone();
+    let mut new_pts_dn    = pts_dn.clone();
     let mut new_biases_dn = biases_dn.clone();
-    let mut pts_up_changed   = false;
-    let mut bias_up_changed  = false;
-    let mut pts_dn_changed   = false;
-    let mut bias_dn_changed  = false;
-    let mut params_changed   = false;
-    let mut undo_requested   = false;
+    let mut pts_up_changed  = false;
+    let mut bias_up_changed = false;
+    let mut pts_dn_changed  = false;
+    let mut bias_dn_changed = false;
+    let mut params_changed  = false;
+    let mut undo_requested  = false;
 
-    let mut gx_f     = grid_x;
-    let mut gy_f     = grid_y;
-    let mut snap_on  = snap;
-    let mut sc_t     = scale_t;
-    let mut i1       = in_max;
-    let mut o1       = out_max;
-    let mut abs_on   = absolute;
-    let mut vm       = vec_mode;
-    let mut h_pct    = hyst_pct;
-    let mut h_ms     = hyst_ms;
-    let mut i_ms     = interp_ms;
-    let mut tm       = trail_ms;
-    let mut ssg      = show_scaled_grid;
-    let mut sgl      = show_grid_labels;
+    let mut gx_f    = grid_x;
+    let mut gy_f    = grid_y;
+    let mut snap_on = snap;
+    let mut sc_t    = scale_t;
+    let mut i1      = in_max;
+    let mut o1      = out_max;
+    let mut abs_on  = absolute;
+    let mut vm      = vec_mode;
+    let mut h_pct   = hyst_pct;
+    let mut h_ms    = hyst_ms;
+    let mut i_ms    = interp_ms;
+    let mut tm      = trail_ms;
+    let mut ssg     = show_scaled_grid;
+    let mut sgl     = show_grid_labels;
     let mut lane_sel = active_lane.clone();
-
     let mut curve_graph_rect: Option<egui::Rect> = None;
 
     ui.vertical(|ui| {
-        // ── Lane toggle ───────────────────────────────────────────────────────
+        // Lane toggle
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Edit:").small().weak());
-            let up_active   = lane_sel == "up";
-            let dn_active   = lane_sel == "dn";
-            if ui.selectable_label(up_active,   egui::RichText::new("↑ Up").small())
-                .on_hover_text("Edit the rising-input curve").clicked() && !up_active {
-                lane_sel = "up".into();
-                params_changed = true;
-            }
-            if ui.selectable_label(dn_active, egui::RichText::new("↓ Down").small())
-                .on_hover_text("Edit the falling-input curve").clicked() && !dn_active {
-                lane_sel = "dn".into();
-                params_changed = true;
-            }
+            let up_sel = lane_sel == "up";
+            let dn_sel = lane_sel == "dn";
+            if ui.selectable_label(up_sel, egui::RichText::new("↑ Up").small()).on_hover_text("Edit the rising-input curve").clicked() && !up_sel { lane_sel = "up".into(); params_changed = true; }
+            if ui.selectable_label(dn_sel, egui::RichText::new("↓ Down").small()).on_hover_text("Edit the falling-input curve").clicked() && !dn_sel { lane_sel = "dn".into(); params_changed = true; }
         });
 
-        // ── Graph ─────────────────────────────────────────────────────────────
         egui::Resize::default()
             .id_salt(("twcrv", node_id))
             .default_size([180.0, 180.0])
             .min_size([80.0, 80.0])
             .show(ui, |ui| {
-                let (rect, bg_resp) =
-                    ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+                // bg uses Sense::click only so child interact() calls can capture drags
+                let (rect, bg_resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
                 curve_graph_rect = Some(rect);
 
-                let c2s = |cx: f32, cy: f32| -> egui::Pos2 {
-                    egui::pos2(
-                        rect.left() + (cx - x_lo) / x_range * rect.width(),
-                        rect.bottom() - (cy - y_lo) / y_range * rect.height(),
-                    )
-                };
-                let s2c = |sx: f32, sy: f32| -> (f32, f32) {
-                    (
-                        x_lo + (sx - rect.left()) / rect.width() * x_range,
-                        y_lo + (rect.bottom() - sy) / rect.height() * y_range,
-                    )
-                };
+                let c2s = |x: f32, y: f32| egui::pos2(
+                    rect.left() + (x - x_lo) / x_range * rect.width(),
+                    rect.bottom() - (y - y_lo) / y_range * rect.height(),
+                );
+                let s2c = |pos: egui::Pos2| -> [f32; 2] {[
+                    x_lo + (pos.x - rect.left()) / rect.width() * x_range,
+                    y_lo + (rect.bottom() - pos.y) / rect.height() * y_range,
+                ]};
 
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 0.0, Color32::from_rgb(28, 28, 28));
+                painter.rect_filled(rect, 2.0, Color32::from_gray(16));
 
-                // ── Grid ─────────────────────────────────────────────────────
-                let abs_max_in = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
-                let build_grid_nodes = |n: usize| -> Vec<f32> {
-                    if !ssg || scale_t.abs() < 1e-4 {
-                        (0..=n).map(|i| x_lo + i as f32 / n as f32 * x_range).collect()
-                    } else if absolute_eff {
-                        let raw: Vec<f32> = (0..=n).map(|i| {
-                            let t = i as f32 / n as f32;
-                            1.0 - curve_scale_inv(1.0 - t, scale_t)
-                        }).collect();
-                        let min_gap = 1.0f32 / n as f32 * 0.5;
-                        let mut nodes = raw;
-                        for _ in 0..n {
-                            nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                            let crowded = (1..nodes.len().saturating_sub(1)).filter(|&i| {
-                                (nodes[i] - nodes[i-1]).min(nodes[i+1] - nodes[i]) < min_gap
-                            }).min_by(|&a, &b| {
-                                let ga = (nodes[a] - nodes[a-1]).min(nodes[a+1] - nodes[a]);
-                                let gb = (nodes[b] - nodes[b-1]).min(nodes[b+1] - nodes[b]);
+                let abs_max_in  = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+                let abs_max_out = out_max.abs().max(out_min.abs()).max(f32::EPSILON);
+
+                // Grid positions (same redistribute algorithm as float body)
+                let redistribute = |mut nodes: Vec<f32>, n: usize| -> Vec<f32> {
+                    let min_gap = 1.0f32 / n as f32 * 0.5;
+                    for _ in 0..n {
+                        nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let crowded = (1..nodes.len().saturating_sub(1))
+                            .filter(|&i| (nodes[i]-nodes[i-1]).min(nodes[i+1]-nodes[i]) < min_gap)
+                            .min_by(|&a, &b| {
+                                let ga = (nodes[a]-nodes[a-1]).min(nodes[a+1]-nodes[a]);
+                                let gb = (nodes[b]-nodes[b-1]).min(nodes[b+1]-nodes[b]);
                                 ga.partial_cmp(&gb).unwrap()
                             });
-                            let Some(ci) = crowded else { break; };
-                            nodes.remove(ci);
-                            let (li, _) = nodes.windows(2).enumerate()
-                                .max_by(|(_, w1), (_, w2)| (w1[1]-w1[0]).partial_cmp(&(w2[1]-w2[0])).unwrap())
-                                .unwrap();
-                            nodes.insert(li + 1, (nodes[li] + nodes[li+1]) * 0.5);
-                        }
-                        nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        nodes
+                        let Some(ci) = crowded else { break; };
+                        nodes.remove(ci);
+                        let (li, _) = nodes.windows(2).enumerate()
+                            .max_by(|(_, a), (_, b)| (a[1]-a[0]).partial_cmp(&(b[1]-b[0])).unwrap()).unwrap();
+                        nodes.insert(li + 1, (nodes[li] + nodes[li+1]) * 0.5);
+                    }
+                    nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    nodes
+                };
+                let scaled_grid = |n: usize| -> Vec<f32> {
+                    if n == 0 { return vec![0.0, 1.0]; }
+                    if !ssg { return (0..=n).map(|i| i as f32 / n as f32).collect(); }
+                    if absolute_eff {
+                        redistribute((0..=n).map(|i| 1.0 - curve_scale_inv(1.0 - i as f32 / n as f32, sc_t)).collect(), n)
                     } else {
-                        let half = n / 2;
-                        let half_lo = n - half;
-                        let hi: Vec<f32> = (0..=half).map(|i| {
-                            let t = i as f32 / half as f32;
-                            let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
-                            0.5 + s * 0.5
-                        }).collect();
-                        let lo: Vec<f32> = (0..=half_lo).map(|i| {
-                            let t = i as f32 / half_lo as f32;
-                            let s = 1.0 - curve_scale_inv(1.0 - t, scale_t);
-                            0.5 - s * 0.5
-                        }).collect();
-                        let mut nodes: Vec<f32> = lo.into_iter().chain(hi).collect();
-                        nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        nodes.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
-                        nodes
+                        let hlo = n / 2; let hhi = n - hlo;
+                        let lo: Vec<f32> = (0..=hlo).map(|i| 0.5 - (1.0 - curve_scale_inv(1.0 - i as f32 / hlo as f32, sc_t)) * 0.5).collect();
+                        let hi: Vec<f32> = (0..=hhi).map(|i| 0.5 + (1.0 - curve_scale_inv(1.0 - i as f32 / hhi as f32, sc_t)) * 0.5).collect();
+                        let mut m = redistribute(lo, hlo);
+                        for v in redistribute(hi, hhi).iter().skip(1) { m.push(*v); }
+                        m.sort_by(|a, b| a.partial_cmp(b).unwrap()); m
                     }
                 };
-                let grid_x_nodes = build_grid_nodes(gx_f);
-                let grid_y_nodes = build_grid_nodes(gy_f);
+                let sx = scaled_grid(gx_f);
+                let sy = scaled_grid(gy_f);
+                let do_snap = |x: f32, y: f32| -> (f32, f32) {
+                    if !snap_on { return (x, y); }
+                    let u = ((x-x_lo)/x_range).clamp(0.0, 1.0);
+                    let v = ((y-y_lo)/y_range).clamp(0.0, 1.0);
+                    let su = sx.iter().copied().min_by(|a, b| (a-u).abs().partial_cmp(&(b-u).abs()).unwrap()).unwrap_or(u);
+                    let sv = sy.iter().copied().min_by(|a, b| (a-v).abs().partial_cmp(&(b-v).abs()).unwrap()).unwrap_or(v);
+                    (x_lo + su * x_range, y_lo + sv * y_range)
+                };
+                let gxp: Vec<f32> = (1..gx_f).map(|i| x_lo + sx[i] * x_range).collect();
+                let gyp: Vec<f32> = (1..gy_f).map(|i| y_lo + sy[i] * y_range).collect();
+                let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
+                for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
+                for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
+                painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, Color32::from_gray(55)));
 
-                let grid_col = Color32::from_rgb(55, 55, 55);
-                let axis_col = Color32::from_rgb(80, 80, 80);
-                for &gx in &grid_x_nodes {
-                    let col = if (gx - 0.5).abs() < 1e-4 || (gx - x_lo).abs() < 1e-4 || (gx - x_hi).abs() < 1e-4 { axis_col } else { grid_col };
-                    painter.line_segment([c2s(gx, y_lo), c2s(gx, y_hi)], egui::Stroke::new(1.0, col));
-                }
-                for &gy in &grid_y_nodes {
-                    let col = if (gy - 0.5).abs() < 1e-4 || (gy - y_lo).abs() < 1e-4 || (gy - y_hi).abs() < 1e-4 { axis_col } else { grid_col };
-                    painter.line_segment([c2s(x_lo, gy), c2s(x_hi, gy)], egui::Stroke::new(1.0, col));
-                }
-
-                // ── Grid labels ───────────────────────────────────────────────
                 if sgl {
-                    let min_px_gap = 28.0f32;
-                    let label_col  = Color32::from_rgba_unmultiplied(180, 180, 180, 180);
-                    let font_id    = egui::FontId::proportional(9.0);
-
-                    let real_in = |u: f32| -> f32 {
-                        if absolute_eff {
-                            curve_scale_inv(u, scale_t) * abs_max_in
-                        } else {
-                            let c = u * 2.0 - 1.0;
-                            let sign = if c < 0.0 { -1.0f32 } else { 1.0 };
-                            sign * curve_scale_inv(c.abs(), scale_t) * abs_max_in
-                        }
-                    };
-
-                    // X-axis labels (bottom, staggered).
-                    let mut last_px_x: Option<f32> = None;
-                    let mut stagger = false;
-                    for &gx in &grid_x_nodes {
-                        let px = rect.left() + (gx - x_lo) / x_range * rect.width();
-                        if let Some(lpx) = last_px_x {
-                            if (px - lpx).abs() < min_px_gap { stagger = !stagger; } else { stagger = false; }
-                        }
-                        last_px_x = Some(px);
-                        let val = real_in(if absolute_eff { gx } else { gx });
-                        let label = format!("{:.2}", val * (in_max.abs().max(in_min.abs())).signum());
-                        let offset_y = if stagger { -10.0f32 } else { -2.0f32 };
-                        painter.text(
-                            egui::pos2(px, rect.bottom() + offset_y),
-                            egui::Align2::CENTER_TOP,
-                            label,
-                            font_id.clone(),
-                            label_col,
-                        );
-                    }
-                    // Y-axis labels (left side).
-                    let mut last_px_y: Option<f32> = None;
-                    stagger = false;
-                    for &gy in &grid_y_nodes {
-                        let py = rect.bottom() - (gy - y_lo) / y_range * rect.height();
-                        if let Some(lpy) = last_px_y {
-                            if (py - lpy).abs() < min_px_gap { stagger = !stagger; } else { stagger = false; }
-                        }
-                        last_px_y = Some(py);
-                        let val = real_in(if absolute_eff { gy } else { gy });
-                        let label = format!("{:.2}", val * (out_max.abs().max(out_min.abs())).signum());
-                        let offset_x = if stagger { 10.0f32 } else { 2.0f32 };
-                        painter.text(
-                            egui::pos2(rect.left() + offset_x, py),
-                            egui::Align2::LEFT_CENTER,
-                            label,
-                            font_id.clone(),
-                            label_col,
-                        );
-                    }
+                    const MPX: f32 = 20.0;
+                    let lc = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
+                    let fnt = egui::FontId::proportional(9.0);
+                    let gri = |u: f32| -> f32 { if absolute_eff { curve_scale_inv(u, sc_t) * abs_max_in } else { let c = u*2.0-1.0; (if c<0.0{-1.0f32}else{1.0}) * curve_scale_inv(c.abs(), sc_t) * abs_max_in } };
+                    let gro = |v: f32| -> f32 { if absolute_eff { curve_scale_inv(v, sc_t) * abs_max_out } else { let c = v*2.0-1.0; (if c<0.0{-1.0f32}else{1.0}) * curve_scale_inv(c.abs(), sc_t) * abs_max_out } };
+                    let mut lsx = f32::NEG_INFINITY;
+                    for &x in &gxp { let sx2 = c2s(x, y_hi).x; if sx2-lsx < MPX { continue; } lsx = sx2; let val = gri((x-x_lo)/x_range); let lbl = if abs_max_in<=1.01{format!("{:.0}%",val*100.0)}else{format!("{:.2}",val)}; painter.text(egui::pos2(sx2+1.0, rect.top()+1.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc); }
+                    let mut lsy = f32::INFINITY;
+                    for &y in &gyp { let sy2 = c2s(x_lo, y).y; if lsy-sy2 < MPX { continue; } lsy = sy2; let val = gro((y-y_lo)/y_range); let lbl = if abs_max_out<=1.01{format!("{:.0}%",val*100.0)}else{format!("{:.2}",val)}; painter.text(egui::pos2(rect.left()+1.0, sy2-9.0), egui::Align2::LEFT_TOP, &lbl, fnt.clone(), lc); }
                 }
 
-                // ── Draw inactive lane (dimmed) ────────────────────────────────
-                let inactive_pts  = if lane_up { &pts_dn }    else { &pts_up };
-                let inactive_bias = if lane_up { &biases_dn }  else { &biases_up };
-                let inactive_col  = Color32::from_rgba_unmultiplied(180, 140, 60, 80);
-                {
-                    let steps = 80usize;
-                    let mut prev = c2s(x_lo, sample_curve(inactive_pts, x_lo, inactive_bias).clamp(y_lo, y_hi));
-                    for s in 1..=steps {
-                        let t  = s as f32 / steps as f32;
-                        let ix = x_lo + t * x_range;
-                        let iy = sample_curve(inactive_pts, ix, inactive_bias).clamp(y_lo, y_hi);
-                        let next = c2s(ix, iy);
-                        painter.line_segment([prev, next], egui::Stroke::new(1.5, inactive_col));
-                        prev = next;
-                    }
+                // Inactive lane (dimmed)
+                let (inact_pts, inact_bias) = if lane_up { (&pts_dn, &biases_dn) } else { (&pts_up, &biases_up) };
+                if inact_pts.len() >= 2 {
+                    let ic = Color32::from_rgba_unmultiplied(130, 130, 130, 70);
+                    let mut pp = c2s(x_lo, sample_curve(inact_pts, x_lo, inact_bias).clamp(y_lo, y_hi));
+                    for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0, ic)); pp = np; }
                 }
 
-                // ── Draw active lane curve (solid) ────────────────────────────
-                let active_pts      = if lane_up { &pts_up }   else { &pts_dn };
-                let active_bias     = if lane_up { &biases_up } else { &biases_dn };
-                let active_col      = Color32::from_rgb(220, 180, 60);
-                {
-                    let steps = 80usize;
-                    let mut prev = c2s(x_lo, sample_curve(active_pts, x_lo, active_bias).clamp(y_lo, y_hi));
-                    for s in 1..=steps {
-                        let t  = s as f32 / steps as f32;
-                        let ix = x_lo + t * x_range;
-                        let iy = sample_curve(active_pts, ix, active_bias).clamp(y_lo, y_hi);
-                        let next = c2s(ix, iy);
-                        painter.line_segment([prev, next], egui::Stroke::new(2.0, active_col));
-                        prev = next;
-                    }
-                }
-
-                // ── Control point handles for the active lane ─────────────────
-                let (edit_pts, edit_biases, pts_changed_ref, bias_changed_ref, new_pts_ref, new_biases_ref) =
-                    if lane_up {
-                        (&pts_up, &biases_up, &mut pts_up_changed, &mut bias_up_changed,
-                         &mut new_pts_up, &mut new_biases_up)
-                    } else {
-                        (&pts_dn, &biases_dn, &mut pts_dn_changed, &mut bias_dn_changed,
-                         &mut new_pts_dn, &mut new_biases_dn)
-                    };
-
-                let pt_radius = 5.0f32;
-                let pt_col    = active_col;
-
-                // Snap helper — same as float body.
-                let snap_x = |cx: f32| -> f32 {
-                    if !snap_on { return cx; }
-                    let nodes = if ssg { build_grid_nodes(gx_f) } else {
-                        (0..=gx_f).map(|i| x_lo + i as f32 / gx_f as f32 * x_range).collect()
-                    };
-                    nodes.iter().copied().min_by(|a, b| {
-                        (a - cx).abs().partial_cmp(&(b - cx).abs()).unwrap()
-                    }).unwrap_or(cx)
+                // Active lane (solid gray, same as float body)
+                let (edit_pts_r, edit_biases_r) = if lane_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
+                let (new_edit_pts, new_edit_biases, pts_changed_ref, bias_changed_ref) = if lane_up {
+                    (&mut new_pts_up, &mut new_biases_up, &mut pts_up_changed, &mut bias_up_changed)
+                } else {
+                    (&mut new_pts_dn, &mut new_biases_dn, &mut pts_dn_changed, &mut bias_dn_changed)
                 };
-                let snap_y = |cy: f32| -> f32 {
-                    if !snap_on { return cy; }
-                    let nodes = if ssg { build_grid_nodes(gy_f) } else {
-                        (0..=gy_f).map(|i| y_lo + i as f32 / gy_f as f32 * y_range).collect()
-                    };
-                    nodes.iter().copied().min_by(|a, b| {
-                        (a - cy).abs().partial_cmp(&(b - cy).abs()).unwrap()
-                    }).unwrap_or(cy)
-                };
+                if new_edit_pts.len() >= 2 {
+                    let cp: Vec<egui::Pos2> = (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(new_edit_pts, x, new_edit_biases).clamp(y_lo, y_hi)) }).collect();
+                    for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, Color32::from_gray(200))); }
+                }
 
-                for (i, &[px, py]) in edit_pts.iter().enumerate() {
-                    let scr = c2s(px, py);
-                    let pt_id = ui.id().with(("twpt", node_id, lane_up, i as u32));
-                    let pt_resp = ui.interact(
-                        egui::Rect::from_center_size(scr, egui::Vec2::splat(pt_radius * 2.5)),
-                        pt_id,
-                        egui::Sense::click_and_drag(),
-                    );
-                    if pt_resp.dragged() {
-                        let delta = pt_resp.drag_delta();
-                        let (mut nx, mut ny) = s2c(scr.x + delta.x, scr.y + delta.y);
-                        nx = snap_x(nx.clamp(x_lo, x_hi));
-                        ny = snap_y(ny.clamp(y_lo, y_hi));
-                        // Keep x ordering.
-                        let x_lo_bound = if i > 0 { edit_pts[i-1][0] + 0.001 } else { x_lo };
-                        let x_hi_bound = if i < edit_pts.len()-1 { edit_pts[i+1][0] - 0.001 } else { x_hi };
-                        nx = nx.clamp(x_lo_bound, x_hi_bound);
-                        new_pts_ref[i] = [nx, ny];
+                // Alt-drag bias handles
+                let alt_held = ui.input(|i| i.modifiers.alt);
+                if alt_held && new_edit_pts.len() >= 2 {
+                    while new_edit_biases.len() < new_edit_pts.len() - 1 { new_edit_biases.push(0.0); }
+                    for seg in 0..(new_edit_pts.len() - 1) {
+                        let mid_x = (new_edit_pts[seg][0] + new_edit_pts[seg+1][0]) * 0.5;
+                        let mid_y = sample_curve(new_edit_pts, mid_x, new_edit_biases).clamp(y_lo, y_hi);
+                        let hpos  = c2s(mid_x, mid_y);
+                        let hresp = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), ui.id().with(("twbh", node_id, lane_up, seg as u32)), egui::Sense::click_and_drag());
+                        if hresp.double_clicked() { new_edit_biases[seg] = 0.0; *bias_changed_ref = true; }
+                        else if hresp.dragged() { let dy = -hresp.drag_delta().y / rect.height() * y_range; new_edit_biases[seg] = (new_edit_biases[seg] + dy).clamp(-2.0, 2.0); *bias_changed_ref = true; }
+                        let hcol = if hresp.hovered() || hresp.dragged() { Color32::from_rgb(255,220,50) } else { Color32::from_rgb(180,140,20) };
+                        painter.circle_filled(hpos, 4.0, hcol);
+                        painter.circle_stroke(hpos, 4.0, egui::Stroke::new(1.0, Color32::from_gray(100)));
+                    }
+                }
+
+                // Control point handles
+                let mut remove_idx: Option<usize> = None;
+                for i in 0..edit_pts_r.len() {
+                    let [px, py] = edit_pts_r[i];
+                    let screen   = c2s(px, py);
+                    let pt_id    = ui.id().with(("twpt", node_id, lane_up, i as u32));
+                    let pt_resp  = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pt_id, egui::Sense::click_and_drag());
+                    let oid      = ui.id().with(("twpt_orig", node_id, lane_up, i as u32));
+                    if pt_resp.drag_started() && !alt_held { ui.ctx().data_mut(|d| d.insert_temp(oid, [px, py, 0.0f32, 0.0f32])); }
+                    if pt_resp.dragged() && !alt_held {
+                        let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(oid)).unwrap_or([px, py, 0.0, 0.0]);
+                        let dd = pt_resp.drag_delta();
+                        let (ax, ay) = (prev[2]+dd.x, prev[3]+dd.y);
+                        ui.ctx().data_mut(|d| d.insert_temp(oid, [prev[0], prev[1], ax, ay]));
+                        let nx = prev[0] + ax * x_range / rect.width();
+                        let ny = prev[1] - ay * y_range / rect.height();
+                        let lox = new_edit_pts.get(i.wrapping_sub(1)).map(|p| p[0]+0.001).unwrap_or(x_lo);
+                        let hix = new_edit_pts.get(i+1).map(|p| p[0]-0.001).unwrap_or(x_hi);
+                        let (sx2, sy2) = do_snap(nx, ny);
+                        new_edit_pts[i] = [sx2.clamp(lox, hix), sy2.clamp(y_lo, y_hi)];
                         *pts_changed_ref = true;
                     }
-                    if pt_resp.double_clicked() && edit_pts.len() > 2 {
-                        new_pts_ref.remove(i);
-                        new_biases_ref.resize(new_pts_ref.len().saturating_sub(1), 0.0);
-                        *pts_changed_ref = true;
+                    if pt_resp.drag_stopped() { ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(oid)); }
+                    if pt_resp.secondary_clicked() && edit_pts_r.len() > 2 { remove_idx = Some(i); *pts_changed_ref = true; }
+                    let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
+                    painter.circle_filled(screen, 5.0, col);
+                    painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+                }
+
+                if bg_resp.double_clicked() {
+                    if let Some(pos) = bg_resp.interact_pointer_pos() {
+                        let [gx_raw, gy_raw] = s2c(pos);
+                        let (gxs, gys) = do_snap(gx_raw, gy_raw);
+                        let gx = gxs.clamp(x_lo, x_hi); let gy = gys.clamp(y_lo, y_hi);
+                        let idx = new_edit_pts.partition_point(|p| p[0] < gx);
+                        new_edit_pts.insert(idx, [gx, gy]);
+                        *pts_changed_ref = true; undo_requested = true;
                     }
-                    let col = if pt_resp.hovered() || pt_resp.dragged() {
-                        Color32::WHITE
-                    } else {
-                        pt_col
-                    };
-                    painter.circle_filled(scr, pt_radius, col);
                 }
+                if let Some(idx) = remove_idx { new_edit_pts.remove(idx); }
 
-                // Add point on background click.
-                if bg_resp.clicked() {
-                    let pos = bg_resp.interact_pointer_pos().unwrap_or_default();
-                    let (mut cx, mut cy) = s2c(pos.x, pos.y);
-                    cx = snap_x(cx.clamp(x_lo, x_hi));
-                    cy = snap_y(cy.clamp(y_lo, y_hi));
-                    // Insert in sorted x order.
-                    let ins = new_pts_ref.iter().position(|p| p[0] > cx).unwrap_or(new_pts_ref.len());
-                    new_pts_ref.insert(ins, [cx, cy]);
-                    new_biases_ref.resize(new_pts_ref.len().saturating_sub(1), 0.0);
-                    *pts_changed_ref = true;
-                    undo_requested = true;
-                }
-
-                // Bias handles (midpoint drag between each pair).
-                for i in 0..edit_pts.len().saturating_sub(1) {
-                    let mx = (edit_pts[i][0] + edit_pts[i+1][0]) * 0.5;
-                    let my_curve = sample_curve(edit_pts, mx, edit_biases).clamp(y_lo, y_hi);
-                    let bh_scr = c2s(mx, my_curve);
-                    let bh_id  = ui.id().with(("twbh", node_id, lane_up, i as u32));
-                    let bh_resp = ui.interact(
-                        egui::Rect::from_center_size(bh_scr, egui::Vec2::splat(8.0)),
-                        bh_id,
-                        egui::Sense::click_and_drag(),
-                    );
-                    if bh_resp.dragged() {
-                        let delta_y = -bh_resp.drag_delta().y / rect.height() * y_range;
-                        let b = new_biases_ref.get_mut(i).map(|b| { *b = (*b + delta_y * 2.0).clamp(-1.0, 1.0); *b });
-                        let _ = b;
-                        *bias_changed_ref = true;
-                    }
-                    let bh_col = if bh_resp.hovered() || bh_resp.dragged() {
-                        Color32::from_rgb(255, 255, 120)
-                    } else {
-                        Color32::from_rgba_unmultiplied(180, 180, 50, 140)
-                    };
-                    painter.circle_filled(bh_scr, 3.0, bh_col);
-                }
-
-                // ── Live-position markers (triangle arrows) ───────────────────
-                let abs_max = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
-                let trail_dur  = std::time::Duration::from_millis(trail_ms as u64);
-                let now        = std::time::Instant::now();
+                // Live arrow marker on active lane only
+                let abs_max   = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+                let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
+                let now       = std::time::Instant::now();
                 let mut has_active = false;
-
                 for (ch, raw_opt) in live_inputs.iter().enumerate() {
                     let Some(raw) = raw_opt else { continue; };
                     has_active = true;
-
                     let graph_x = if absolute_eff {
-                        curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), scale_t)
+                        curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), sc_t)
                     } else {
-                        let in_range = (in_max - in_min).abs().max(f32::EPSILON);
-                        let norm     = ((raw - in_min) / in_range * 2.0 - 1.0).clamp(-1.0, 1.0);
-                        let sign     = if norm < 0.0 { -1.0f32 } else { 1.0 };
-                        sign * curve_scale(norm.abs(), scale_t)
+                        let inr = (in_max-in_min).abs().max(f32::EPSILON);
+                        let norm = ((raw-in_min)/inr*2.0-1.0).clamp(-1.0, 1.0);
+                        let sign = if norm < 0.0 { -1.0f32 } else { 1.0 };
+                        sign * curve_scale(norm.abs(), sc_t)
                     };
-
                     type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
-                    let trail_id = ui.id().with(("twtrail", node_id, ch as u32));
-                    let mut trail: Trail = ui.data(|d| d.get_temp::<Trail>(trail_id).clone().unwrap_or_default());
+                    let tid = ui.id().with(("twtrail", node_id, ch as u32));
+                    let mut tbuf: Trail = ui.data(|d| d.get_temp::<Trail>(tid).clone().unwrap_or_default());
                     if trail_ms > 0 {
-                        trail.push_back((graph_x, now));
-                        while trail.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) {
-                            trail.pop_front();
-                        }
-                    } else { trail.clear(); }
-                    let trail_pts_list: Vec<(f32, std::time::Instant)> = trail.iter().cloned().collect();
-                    ui.data_mut(|d| d.insert_temp(trail_id, trail));
-
+                        tbuf.push_back((graph_x, now));
+                        while tbuf.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) { tbuf.pop_front(); }
+                    } else { tbuf.clear(); }
+                    let tlist: Vec<(f32, std::time::Instant)> = tbuf.iter().cloned().collect();
+                    ui.data_mut(|d| d.insert_temp(tid, tbuf));
                     let ch_col = MULTI_COLORS[ch % MULTI_COLORS.len()];
-                    // Draw trail on the UP curve.
-                    for w in trail_pts_list.windows(2) {
-                        let (x0, _)  = w[0];
-                        let (x1, t1) = w[1];
-                        let age   = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32().max(0.001);
-                        let alpha = ((1.0 - age.clamp(0.0, 1.0)) * 180.0) as u8;
-                        let col   = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), alpha);
-                        let steps = (((x1 - x0).abs() / x_range * 60.0) as usize).max(1);
-                        let x0_y  = sample_curve(&pts_up, x0, &biases_up).clamp(y_lo, y_hi);
-                        let mut prev = c2s(x0, x0_y);
-                        for s in 1..=steps {
-                            let t  = s as f32 / steps as f32;
-                            let ix = x0 + (x1 - x0) * t;
-                            let iy = sample_curve(&pts_up, ix, &biases_up).clamp(y_lo, y_hi);
-                            let next = c2s(ix, iy);
-                            painter.line_segment([prev, next], egui::Stroke::new(1.0, col));
-                            prev = next;
-                        }
+                    let dir_up = if tlist.len() >= 2 { tlist.last().map(|(x,_)| *x).unwrap_or(graph_x) >= tlist.first().map(|(x,_)| *x).unwrap_or(graph_x) } else { true };
+                    let (trpts, trbias) = if dir_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
+                    for w in tlist.windows(2) {
+                        let (x0, _) = w[0]; let (x1, t1) = w[1];
+                        let age = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32().max(0.001);
+                        let alpha = ((1.0-age.clamp(0.0,1.0))*220.0) as u8;
+                        let tc = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), alpha);
+                        let steps = (((x1-x0).abs()/x_range*80.0) as usize).max(1);
+                        let mut pp = c2s(x0, sample_curve(trpts, x0, trbias).clamp(y_lo, y_hi));
+                        for s in 1..=steps { let t = s as f32/steps as f32; let ix = x0+(x1-x0)*t; let np = c2s(ix, sample_curve(trpts, ix, trbias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.5, tc)); pp = np; }
                     }
-
-                    // Determine direction from trail: positive delta = up lane, negative = down lane.
-                    let direction_up = if trail_pts_list.len() >= 2 {
-                        let first = trail_pts_list.first().map(|(x, _)| *x).unwrap_or(graph_x);
-                        let last  = trail_pts_list.last() .map(|(x, _)| *x).unwrap_or(graph_x);
-                        last >= first
-                    } else { true };
-
-                    // Draw dot on UP curve and DOWN curve.
-                    let y_up = sample_curve(&pts_up, graph_x, &biases_up).clamp(y_lo, y_hi);
-                    let y_dn = sample_curve(&pts_dn, graph_x, &biases_dn).clamp(y_lo, y_hi);
-                    painter.circle_filled(c2s(graph_x, y_up), 3.0,
-                        Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 200));
-                    painter.circle_filled(c2s(graph_x, y_dn), 3.0,
-                        Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 100));
-
-                    // Triangle arrow at the active lane position pointing in travel direction.
-                    let active_y = if direction_up { y_up } else { y_dn };
-                    let head     = c2s(graph_x, active_y);
-                    let r        = 6.0f32;
-                    let (tip, l, r_pt) = if direction_up {
-                        // Arrow points up.
-                        (head + egui::vec2(0.0, -r),
-                         head + egui::vec2(-r * 0.7, r * 0.6),
-                         head + egui::vec2( r * 0.7, r * 0.6))
-                    } else {
-                        // Arrow points down.
-                        (head + egui::vec2(0.0,  r),
-                         head + egui::vec2(-r * 0.7, -r * 0.6),
-                         head + egui::vec2( r * 0.7, -r * 0.6))
-                    };
-                    let arrow_col = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230);
-                    painter.add(egui::Shape::convex_polygon(
-                        vec![tip, l, r_pt],
-                        arrow_col,
-                        egui::Stroke::NONE,
-                    ));
+                    let (apts, abias) = if dir_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
+                    let ay = sample_curve(apts, graph_x, abias).clamp(y_lo, y_hi);
+                    let head = c2s(graph_x, ay);
+                    let r = 6.0f32;
+                    let (tip, l, rp) = if dir_up { (head+egui::vec2(0.0,-r), head+egui::vec2(-r*0.7,r*0.6), head+egui::vec2(r*0.7,r*0.6)) }
+                                       else       { (head+egui::vec2(0.0, r), head+egui::vec2(-r*0.7,-r*0.6), head+egui::vec2(r*0.7,-r*0.6)) };
+                    painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
                 }
                 if has_active { ui.ctx().request_repaint(); }
             });
 
-        // ── Row 1: Scale / Abs / Vec mode ────────────────────────────────────
+        // Write back curve changes
+        if pts_up_changed || bias_up_changed {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                if pts_up_changed { new_biases_up.resize(new_pts_up.len().saturating_sub(1), 0.0); let j: Vec<Value> = new_pts_up.iter().map(|p| serde_json::json!([p[0],p[1]])).collect(); node.params.insert("points".into(), Value::Array(j)); }
+                let bj: Vec<Value> = new_biases_up.iter().filter_map(|&b| Number::from_f64(b as f64).map(Value::Number)).collect(); node.params.insert("biases".into(), Value::Array(bj));
+            }
+        }
+        if pts_dn_changed || bias_dn_changed {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                if pts_dn_changed { new_biases_dn.resize(new_pts_dn.len().saturating_sub(1), 0.0); let j: Vec<Value> = new_pts_dn.iter().map(|p| serde_json::json!([p[0],p[1]])).collect(); node.params.insert("points_dn".into(), Value::Array(j)); }
+                let bj: Vec<Value> = new_biases_dn.iter().filter_map(|&b| Number::from_f64(b as f64).map(Value::Number)).collect(); node.params.insert("biases_dn".into(), Value::Array(bj));
+            }
+        }
+
+        // Controls
+        let mut changed = false;
+        // Scale slider with center notch (double-click resets)
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Scale").small().weak());
-            let sc_before = sc_t;
-            ui.add(egui::Slider::new(&mut sc_t, -1.0f32..=1.0f32)
-                .show_value(false)
-                .text("Log←→Exp"));
-            if (sc_t - sc_before).abs() > 1e-5 { params_changed = true; }
-
-            let abs_before = abs_on;
-            let abs_enabled = !vm;
-            ui.add_enabled_ui(abs_enabled, |ui| {
-                ui.checkbox(&mut abs_on, egui::RichText::new("Abs").small())
-                    .on_hover_text("Absolute mode: ignore sign of input");
-            });
-            if abs_on != abs_before { params_changed = true; }
-
-            // Vec mode toggle — switches pin types and forces Abs.
-            let vm_before = vm;
-            ui.checkbox(&mut vm, egui::RichText::new("Vec").small())
-                .on_hover_text("Vec2 mode: process vector magnitude. Forces Abs on, disconnects Float wires.");
-            if vm != vm_before {
-                params_changed = true;
-                // Disconnect wires with wrong type when mode changes.
-                let target_type = if vm { SignalType::Vec2 } else { SignalType::Float };
-                let wrong_type  = if vm { SignalType::Float } else { SignalType::Vec2 };
-                let all_wires: Vec<(OutPinId, InPinId)> = snarl.wires().collect();
-                for (out_id, in_id) in all_wires {
-                    if in_id.node == node_id {
-                        let out_type = snarl.get_node(out_id.node)
-                            .and_then(|n| n.outputs.get(out_id.output))
-                            .map(|p| p.signal_type);
-                        if out_type == Some(wrong_type) {
-                            snarl.disconnect(out_id, in_id);
-                        }
-                    }
-                    if out_id.node == node_id {
-                        let in_type = snarl.get_node(in_id.node)
-                            .and_then(|n| n.inputs.get(in_id.input))
-                            .map(|p| p.signal_type);
-                        if in_type == Some(wrong_type) {
-                            snarl.disconnect(out_id, in_id);
-                        }
-                    }
+            ui.label(egui::RichText::new("Log").small().weak());
+            let (sr, sresp) = ui.allocate_exact_size(egui::vec2(80.0, 14.0), egui::Sense::click_and_drag());
+            if sresp.double_clicked() { sc_t = 0.0; changed = true; }
+            else if sresp.dragged() { sc_t = (sc_t + sresp.drag_delta().x / sr.width() * 2.0).clamp(-1.0, 1.0); changed = true; }
+            let slp = ui.painter_at(sr);
+            slp.rect_filled(sr, 3.0, Color32::from_gray(35));
+            slp.line_segment([egui::pos2(sr.center().x, sr.top()+2.0), egui::pos2(sr.center().x, sr.bottom()-2.0)], egui::Stroke::new(1.0, Color32::from_gray(70)));
+            let kx = sr.left() + (sc_t+1.0)*0.5*sr.width();
+            slp.circle_filled(egui::pos2(kx, sr.center().y), 5.0, if sresp.hovered() || sresp.dragged() { Color32::WHITE } else { Color32::from_gray(190) });
+            ui.label(egui::RichText::new("Exp").small().weak());
+            ui.separator();
+            let ab = abs_on;
+            ui.add_enabled_ui(!vm, |ui| { ui.checkbox(&mut abs_on, egui::RichText::new("Abs").small()).on_hover_text("Absolute mode: ignore sign of input"); });
+            if abs_on != ab { changed = true; }
+            let vmb = vm;
+            ui.checkbox(&mut vm, egui::RichText::new("Vec").small()).on_hover_text("Vec2 mode: process magnitude. Forces Abs on.");
+            if vm != vmb {
+                changed = true;
+                let tgt = if vm { SignalType::Vec2 } else { SignalType::Float };
+                let wrg = if vm { SignalType::Float } else { SignalType::Vec2 };
+                let aw: Vec<(OutPinId, InPinId)> = snarl.wires().collect();
+                for (oid, iid) in aw {
+                    if iid.node == node_id && snarl.get_node(oid.node).and_then(|n| n.outputs.get(oid.output)).map(|p| p.signal_type) == Some(wrg) { snarl.disconnect(oid, iid); }
+                    if oid.node == node_id && snarl.get_node(iid.node).and_then(|n| n.inputs.get(iid.input)).map(|p| p.signal_type) == Some(wrg) { snarl.disconnect(oid, iid); }
                 }
-                // Update pin types.
                 if let Some(node) = snarl.get_node_mut(node_id) {
-                    for pin in node.inputs.iter_mut() {
-                        pin.signal_type = target_type;
-                    }
-                    for pin in node.outputs.iter_mut() {
-                        pin.signal_type = target_type;
-                    }
+                    for p in node.inputs.iter_mut()  { p.signal_type = tgt; }
+                    for p in node.outputs.iter_mut() { p.signal_type = tgt; }
                     if vm { node.params.insert("absolute".into(), Value::Bool(true)); }
                 }
             }
         });
-
-        // ── Row 2: In/Out range + Grid ────────────────────────────────────────
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("In").small().weak());
-            let i1_before = i1;
-            ui.add(egui::DragValue::new(&mut i1).speed(0.01).clamp_range(0.001f32..=1000.0f32));
-            if (i1 - i1_before).abs() > 1e-5 { params_changed = true; }
-
-            ui.label(egui::RichText::new("Out").small().weak());
-            let o1_before = o1;
-            ui.add(egui::DragValue::new(&mut o1).speed(0.01).clamp_range(0.001f32..=1000.0f32));
-            if (o1 - o1_before).abs() > 1e-5 { params_changed = true; }
-
+            ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).clamp_range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
+            ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).clamp_range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
             ui.label(egui::RichText::new("Grid").small().weak());
-            let gx_before = gx_f;
-            let gy_before = gy_f;
-            ui.add(egui::DragValue::new(&mut gx_f).speed(0.1).clamp_range(1usize..=32usize));
-            ui.label(egui::RichText::new("×").small());
-            ui.add(egui::DragValue::new(&mut gy_f).speed(0.1).clamp_range(1usize..=32usize));
-            if gx_f != gx_before || gy_f != gy_before { params_changed = true; }
+            let (gxb,gyb)=(gx_f,gy_f); ui.add(egui::DragValue::new(&mut gx_f).speed(0.1).clamp_range(1usize..=32usize)); ui.label(egui::RichText::new("×").small()); ui.add(egui::DragValue::new(&mut gy_f).speed(0.1).clamp_range(1usize..=32usize)); if gx_f!=gxb||gy_f!=gyb{changed=true;}
         });
-
-        // ── Row 3: Snap / Trail ───────────────────────────────────────────────
         ui.horizontal(|ui| {
-            let snap_before = snap_on;
-            ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small());
-            if snap_on != snap_before { params_changed = true; }
-
-            ui.label(egui::RichText::new("Trail").small().weak());
-            let tm_before = tm;
-            ui.add(egui::DragValue::new(&mut tm).speed(5).clamp_range(0i64..=1000i64).suffix("ms"));
-            if tm != tm_before { params_changed = true; }
+            let snb=snap_on; ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small()); if snap_on!=snb{changed=true;}
+            ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).clamp_range(0i64..=1000i64).suffix("ms")); if tm!=tmb{changed=true;}
         });
-
-        // ── Row 4: Grid options ───────────────────────────────────────────────
         ui.horizontal(|ui| {
-            let ssg_before = ssg;
-            ui.checkbox(&mut ssg, egui::RichText::new("Scale grid").small())
-                .on_hover_text("Adapt grid lines to the current Log/Exp scaling");
-            if ssg != ssg_before { params_changed = true; }
-            let sgl_before = sgl;
-            ui.checkbox(&mut sgl, egui::RichText::new("Labels").small())
-                .on_hover_text("Show value labels on grid lines");
-            if sgl != sgl_before { params_changed = true; }
+            let ssgb=ssg; ui.checkbox(&mut ssg, egui::RichText::new("Scale grid").small()).on_hover_text("Adapt grid lines to Log/Exp scaling"); if ssg!=ssgb{changed=true;}
+            let sglb=sgl; ui.checkbox(&mut sgl, egui::RichText::new("Labels").small()).on_hover_text("Show value labels on grid lines"); if sgl!=sglb{changed=true;}
         });
-
-        // ── Row 5: Hysteresis ─────────────────────────────────────────────────
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Hyst").small().weak());
-            let hp_before = h_pct;
+            let (hpb,hmb)=(h_pct,h_ms);
             ui.add(egui::DragValue::new(&mut h_pct).speed(0.001).clamp_range(0.001f32..=5.0f32).suffix("%"));
-            if (h_pct - hp_before).abs() > 1e-5 { params_changed = true; }
-            let hm_before = h_ms;
             ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms"));
-            if (h_ms - hm_before).abs() > 1e-5 { params_changed = true; }
+            if (h_pct-hpb).abs()>1e-5||(h_ms-hmb).abs()>1e-5{changed=true;}
         });
-
-        // ── Row 6: Interpolation ──────────────────────────────────────────────
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Interp").small().weak());
-            let im_before = i_ms;
-            ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).clamp_range(0.0f32..=500.0f32).suffix("ms"));
-            if (i_ms - im_before).abs() > 1e-5 { params_changed = true; }
+            ui.label(egui::RichText::new("Interp").small().weak()); let imb=i_ms; ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).clamp_range(0.0f32..=500.0f32).suffix("ms")); if (i_ms-imb).abs()>1e-5{changed=true;}
         });
 
-        // ── Write back params ─────────────────────────────────────────────────
-        if params_changed || pts_up_changed || bias_up_changed || pts_dn_changed || bias_dn_changed {
+        if changed || params_changed {
             if let Some(node) = snarl.get_node_mut(node_id) {
-                if let Some(n) = Number::from_f64(i1 as f64)   { node.params.insert("in_max".into(),  Value::Number(n)); }
-                if let Some(n) = Number::from_f64(o1 as f64)   { node.params.insert("out_max".into(), Value::Number(n)); }
-                if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
-                node.params.insert("grid_x".into(),             serde_json::json!(gx_f as i64));
-                node.params.insert("grid_y".into(),             serde_json::json!(gy_f as i64));
-                node.params.insert("snap".into(),               Value::Bool(snap_on));
-                node.params.insert("trail_ms".into(),           serde_json::json!(tm));
-                node.params.insert("absolute".into(),           Value::Bool(abs_on));
-                node.params.insert("vec_mode".into(),           Value::Bool(vm));
-                node.params.insert("active_lane".into(),        Value::String(lane_sel.clone()));
-                node.params.insert("show_scaled_grid".into(),   Value::Bool(ssg));
-                node.params.insert("show_grid_labels".into(),   Value::Bool(sgl));
-                if let Some(n) = Number::from_f64(h_pct as f64) { node.params.insert("hysteresis_pct".into(), Value::Number(n)); }
-                if let Some(n) = Number::from_f64(h_ms  as f64) { node.params.insert("hysteresis_ms".into(),  Value::Number(n)); }
-                if let Some(n) = Number::from_f64(i_ms  as f64) { node.params.insert("interp_ms".into(),      Value::Number(n)); }
-
-                if pts_up_changed {
-                    new_biases_up.resize(new_pts_up.len().saturating_sub(1), 0.0);
-                    let json: Vec<Value> = new_pts_up.iter().map(|p| serde_json::json!([p[0], p[1]])).collect();
-                    node.params.insert("points".into(), Value::Array(json));
-                }
-                if bias_up_changed {
-                    let bj: Vec<Value> = new_biases_up.iter()
-                        .filter_map(|&b| Number::from_f64(b as f64).map(Value::Number))
-                        .collect();
-                    node.params.insert("biases".into(), Value::Array(bj));
-                }
-                if pts_dn_changed {
-                    new_biases_dn.resize(new_pts_dn.len().saturating_sub(1), 0.0);
-                    let json: Vec<Value> = new_pts_dn.iter().map(|p| serde_json::json!([p[0], p[1]])).collect();
-                    node.params.insert("points_dn".into(), Value::Array(json));
-                }
-                if bias_dn_changed {
-                    let bj: Vec<Value> = new_biases_dn.iter()
-                        .filter_map(|&b| Number::from_f64(b as f64).map(Value::Number))
-                        .collect();
-                    node.params.insert("biases_dn".into(), Value::Array(bj));
-                }
+                if let Some(n)=Number::from_f64(i1 as f64){node.params.insert("in_max".into(),Value::Number(n));}
+                if let Some(n)=Number::from_f64(o1 as f64){node.params.insert("out_max".into(),Value::Number(n));}
+                if let Some(n)=Number::from_f64(sc_t as f64){node.params.insert("scale_t".into(),Value::Number(n));}
+                if let Some(n)=Number::from_f64(h_pct as f64){node.params.insert("hysteresis_pct".into(),Value::Number(n));}
+                if let Some(n)=Number::from_f64(h_ms as f64){node.params.insert("hysteresis_ms".into(),Value::Number(n));}
+                if let Some(n)=Number::from_f64(i_ms as f64){node.params.insert("interp_ms".into(),Value::Number(n));}
+                node.params.insert("grid_x".into(),serde_json::json!(gx_f as i64));
+                node.params.insert("grid_y".into(),serde_json::json!(gy_f as i64));
+                node.params.insert("snap".into(),Value::Bool(snap_on));
+                node.params.insert("trail_ms".into(),serde_json::json!(tm));
+                node.params.insert("absolute".into(),Value::Bool(abs_on));
+                node.params.insert("vec_mode".into(),Value::Bool(vm));
+                node.params.insert("active_lane".into(),Value::String(lane_sel.clone()));
+                node.params.insert("show_scaled_grid".into(),Value::Bool(ssg));
+                node.params.insert("show_grid_labels".into(),Value::Bool(sgl));
             }
         }
 
-        // ── Channel count row ─────────────────────────────────────────────────
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Ch").small().weak());
             if ui.small_button("+").on_hover_text("Add channel").clicked() {
