@@ -2812,6 +2812,10 @@ fn render_pinned_element(
             render_twoway_interp_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        ("module.twoway_response_curve", "lane_toggle") => {
+            render_twoway_lane_toggle(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Average / Delay / DC Filter — bare DragValue rows.
         ("module.average", "samples") => {
             render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
@@ -6158,13 +6162,14 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
 
     ui.vertical(|ui| {
         // Lane toggle
-        ui.horizontal(|ui| {
+        let lane_toggle_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Edit:").small().weak());
             let up_sel = lane_sel == "up";
             let dn_sel = lane_sel == "dn";
             if ui.selectable_label(up_sel, egui::RichText::new("↑ Up").small()).on_hover_text("Edit the rising-input curve").clicked() && !up_sel { lane_sel = "up".into(); params_changed = true; }
             if ui.selectable_label(dn_sel, egui::RichText::new("↓ Down").small()).on_hover_text("Edit the falling-input curve").clicked() && !dn_sel { lane_sel = "dn".into(); params_changed = true; }
         });
+        register_exposable_element(ui, node_id, "lane_toggle", lane_toggle_resp.response.rect);
 
         egui::Resize::default()
             .id_salt(("twcrv", node_id))
@@ -6522,6 +6527,32 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
     }
 
     undo_requested || pts_up_changed || pts_dn_changed
+}
+
+fn render_twoway_lane_toggle(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let mut lane = snarl.get_node(inner_id)
+        .and_then(|n| n.params.get("active_lane").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "up".to_string());
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(120.0, 22.0));
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Edit:").weak());
+        let up = lane == "up";
+        let dn = lane == "dn";
+        if ui.selectable_label(up, egui::RichText::new("↑ Up")).clicked() && !up { lane = "up".into(); changed = true; }
+        if ui.selectable_label(dn, egui::RichText::new("↓ Down")).clicked() && !dn { lane = "dn".into(); changed = true; }
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("active_lane".into(), Value::String(lane));
+        }
+    }
 }
 
 fn render_twoway_curve_only(

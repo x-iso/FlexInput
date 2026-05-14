@@ -160,7 +160,7 @@ fn eval_subgraph(
                 scope_samples.push((ns_uid, sample));
                 last_inputs.insert(ns_uid, inputs.clone());
             }
-            "module.response_curve" | "module.vec_response_curve" => {
+            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve" => {
                 last_inputs.insert(ns_uid, inputs.clone());
             }
             "processing.gyro_3dof" => {
@@ -1043,15 +1043,14 @@ fn compute_twoway_response_curve(
         .unwrap_or_else(|| biases_up.clone());
 
     // Hysteresis params.
-    let hyst_pct = params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-    let hyst_ms  = params.get("hysteresis_ms") .and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
-    let interp_ms = params.get("interp_ms")    .and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
+    let hyst_pct  = params.get("hysteresis_pct").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+    let hyst_ms   = params.get("hysteresis_ms") .and_then(|v| v.as_f64()).unwrap_or(20.0) as f32;
+    let interp_ms = params.get("interp_ms")     .and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
 
-    // How many ticks to fill the hysteresis window.
     let hyst_ticks = ((hyst_ms / 1000.0) / dt).ceil() as usize;
     let hyst_ticks = hyst_ticks.max(1);
 
-    let abs_max = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+    let abs_max   = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
     let threshold = hyst_pct / 100.0 * abs_max;
 
     let interp_step = if interp_ms > 0.0 { dt / (interp_ms / 1000.0) } else { 1.0 };
@@ -1072,21 +1071,45 @@ fn compute_twoway_response_curve(
             }
         };
 
-        let prev = state.twoway_prev_input[ch];
-        let delta = raw_input - prev;
-        state.twoway_prev_input[ch] = raw_input;
+        // Hysteresis: track displacement from a reference point.
+        // twoway_prev_input = reference position (reset when direction reverses or lane commits).
+        // twoway_dir_buf    = consistent-direction tick counter (push one item per tick; clear on reversal).
+        //
+        // A lane switch fires when:
+        //   1. displacement from reference exceeds threshold, AND
+        //   2. that displacement has been sustained for hyst_ticks consecutive ticks.
+        //
+        // This correctly handles slow movements (displacement accumulates across many ticks)
+        // and filters jitter (jitter reverses direction and resets the tick counter).
+        let reference = state.twoway_prev_input[ch];
+        let displacement = raw_input - reference;
+        let dir_buf = &mut state.twoway_dir_buf[ch];
 
-        // Push delta into ring buffer, capped to hyst_ticks length.
-        let buf = &mut state.twoway_dir_buf[ch];
-        buf.push_back(delta);
-        while buf.len() > hyst_ticks { buf.pop_front(); }
+        if displacement > threshold {
+            dir_buf.push_back(1.0);
+            // Direction reversed: start counting from now, update reference if needed
+            if dir_buf.front().copied().unwrap_or(1.0) < 0.0 {
+                dir_buf.clear();
+                dir_buf.push_back(1.0);
+                state.twoway_prev_input[ch] = raw_input;
+            }
+        } else if displacement < -threshold {
+            dir_buf.push_back(-1.0);
+            if dir_buf.front().copied().unwrap_or(-1.0) > 0.0 {
+                dir_buf.clear();
+                dir_buf.push_back(-1.0);
+                state.twoway_prev_input[ch] = raw_input;
+            }
+        } else {
+            // Within deadband: reset counter, update reference to current position
+            dir_buf.clear();
+            state.twoway_prev_input[ch] = raw_input;
+        }
+        // Cap counter length to hyst_ticks
+        while dir_buf.len() > hyst_ticks { dir_buf.pop_front(); }
 
-        // Lane switch: net cumulative movement over the window must exceed threshold,
-        // AND the net direction must be consistent (no reversal beyond threshold).
-        // This tolerates per-tick jitter while requiring sustained directional movement.
-        let net: f32 = buf.iter().sum();
-        let all_up   = buf.len() >= hyst_ticks &&  net >  threshold;
-        let all_down = buf.len() >= hyst_ticks &&  net < -threshold;
+        let all_up   = dir_buf.len() >= hyst_ticks && dir_buf.iter().all(|&d| d > 0.0);
+        let all_down = dir_buf.len() >= hyst_ticks && dir_buf.iter().all(|&d| d < 0.0);
 
         let prev_lane = state.twoway_lane[ch];
         if all_up   && prev_lane != 1  {
@@ -1095,12 +1118,17 @@ fn compute_twoway_response_curve(
                     (1.0 - state.twoway_blend[ch]) * state.twoway_old_output[ch]);
             state.twoway_lane[ch]  =  1;
             state.twoway_blend[ch] = 0.0;
+            // Reset reference so hysteresis measures from the new committed position
+            state.twoway_dir_buf[ch].clear();
+            state.twoway_prev_input[ch] = raw_input;
         } else if all_down && prev_lane != -1 {
             state.twoway_old_output[ch] = state.twoway_blend[ch]
                 .mul_add(apply_curve(raw_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t),
                     (1.0 - state.twoway_blend[ch]) * state.twoway_old_output[ch]);
             state.twoway_lane[ch]  = -1;
             state.twoway_blend[ch] = 0.0;
+            state.twoway_dir_buf[ch].clear();
+            state.twoway_prev_input[ch] = raw_input;
         }
 
         // Advance blend.
