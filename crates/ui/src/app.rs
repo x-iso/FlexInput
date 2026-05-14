@@ -327,14 +327,15 @@ impl eframe::App for FlexInputApp {
         // Pull outputs from the processing thread: pre-populate eval_cache, sync display state.
         self.eval_cache.clear();
         if canvas_has_nodes {
-            let (last_inputs_snap, scope_batch) = {
+            let (last_inputs_snap, last_outputs_snap, scope_batch) = {
                 let mut out = self.proc_outputs.lock().unwrap();
                 for (&(uid, pin), &sig) in &out.node_outputs {
                     self.eval_cache.insert((NodeId(uid), pin), sig);
                 }
                 let last = out.last_inputs.clone();
+                let last_out = out.last_outputs.clone();
                 let scopes = std::mem::take(&mut out.scope_pending);
-                (last, scopes)
+                (last, last_out, scopes)
             };
             // Group scope samples by uid so each node receives its full batch.
             let mut scope_lookup: HashMap<usize, Vec<Vec<Option<f32>>>> = HashMap::new();
@@ -349,6 +350,7 @@ impl eframe::App for FlexInputApp {
                 &mut self.tabs[self.active_tab].canvas.snarl,
                 None,
                 &last_inputs_snap,
+                &last_outputs_snap,
                 &scope_lookup,
             );
         }
@@ -1654,6 +1656,7 @@ fn apply_display_state(
     snarl: &mut Snarl<NodeData>,
     parent_uid: Option<usize>,
     last_inputs: &HashMap<usize, Vec<Option<Signal>>>,
+    last_outputs: &HashMap<usize, Vec<Option<Signal>>>,
     scope_lookup: &HashMap<usize, Vec<Vec<Option<f32>>>>,
 ) {
     let ids: Vec<NodeId> = snarl.nodes_ids_data().map(|(id, _)| id).collect();
@@ -1665,6 +1668,9 @@ fn apply_display_state(
         if let Some(node) = snarl.get_node_mut(id) {
             if let Some(sigs) = last_inputs.get(&uid) {
                 node.extra.last_signals = sigs.clone();
+            }
+            if let Some(outs) = last_outputs.get(&uid) {
+                node.extra.last_out = outs.clone();
             }
             if let Some(samples) = scope_lookup.get(&uid) {
                 let h = &mut node.extra.history;
@@ -1680,7 +1686,7 @@ fn apply_display_state(
         if is_subpatch {
             if let Some(node) = snarl.get_node_mut(id) {
                 if let Some(sp) = node.subpatch.as_mut() {
-                    apply_display_state(&mut sp.snarl, Some(child_uid), last_inputs, scope_lookup);
+                    apply_display_state(&mut sp.snarl, Some(child_uid), last_inputs, last_outputs, scope_lookup);
                 }
             }
         }

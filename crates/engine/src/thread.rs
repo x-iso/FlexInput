@@ -22,6 +22,8 @@ pub struct ProcessingOutput {
     pub node_outputs: HashMap<(usize, usize), Option<Signal>>,
     /// Latest input signals per display/response_curve node for readout rendering.
     pub last_inputs: HashMap<usize, Vec<Option<Signal>>>,
+    /// Latest output signals per twoway_response_curve node (blended engine output for UI).
+    pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,
     /// Accumulated scope samples not yet drained by the UI thread.
     pub scope_pending: Vec<(usize, Vec<Option<f32>>)>,
 }
@@ -85,8 +87,9 @@ pub fn spawn_processing_thread(
                             out.scope_pending.push(sample);
                         }
                     }
-                    out.node_outputs = tick_out.outputs;
-                    out.last_inputs  = tick_out.last_inputs;
+                    out.node_outputs  = tick_out.outputs;
+                    out.last_inputs   = tick_out.last_inputs;
+                    out.last_outputs  = tick_out.last_outputs;
                 }
             }
 

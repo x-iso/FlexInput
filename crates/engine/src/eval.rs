@@ -17,6 +17,8 @@ pub struct TickOutput {
     pub scope_samples: Vec<(usize, Vec<Option<f32>>)>,
     /// Latest inputs per display/response_curve node for UI readout rendering.
     pub last_inputs: HashMap<usize, Vec<Option<Signal>>>,
+    /// Latest outputs per twoway_response_curve node (blended engine output for UI arrow).
+    pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,
     /// Latest signals destined for each (device_id, pin_id) sink slot.
     pub sink_outputs: HashMap<(String, String), Signal>,
 }
@@ -73,6 +75,7 @@ fn eval_subgraph(
     collector_sigs: &mut HashMap<(String, String), Signal>,
     scope_samples: &mut Vec<(usize, Vec<Option<f32>>)>,
     last_inputs: &mut HashMap<usize, Vec<Option<Signal>>>,
+    last_outputs: &mut HashMap<usize, Vec<Option<Signal>>>,
     outer_uid: usize,
     dt: f32,
 ) -> Vec<Vec<Option<Signal>>> {
@@ -98,7 +101,7 @@ fn eval_subgraph(
             let nested_uid = namespaced_uid(outer_uid, snap.node_uid);
             let inner_computed = eval_subgraph(
                 &sg.graph, &inner_inputs, state, dev_sigs, collector_sigs,
-                scope_samples, last_inputs, nested_uid, dt,
+                scope_samples, last_inputs, last_outputs, nested_uid, dt,
             );
             computed[idx] = sg.outlet_locs.iter()
                 .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
@@ -160,8 +163,12 @@ fn eval_subgraph(
                 scope_samples.push((ns_uid, sample));
                 last_inputs.insert(ns_uid, inputs.clone());
             }
-            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve" => {
+            "module.response_curve" | "module.vec_response_curve" => {
                 last_inputs.insert(ns_uid, inputs.clone());
+            }
+            "module.twoway_response_curve" => {
+                last_inputs.insert(ns_uid, inputs.clone());
+                last_outputs.insert(ns_uid, node_outputs.clone());
             }
             "processing.gyro_3dof" => {
                 last_inputs.insert(ns_uid, node_outputs.clone());
@@ -189,6 +196,7 @@ pub fn eval_graph_tick(
     let mut outputs: HashMap<(usize, usize), Option<Signal>> = HashMap::new();
     let mut scope_samples: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
     let mut last_inputs: HashMap<usize, Vec<Option<Signal>>> = HashMap::new();
+    let mut last_outputs: HashMap<usize, Vec<Option<Signal>>> = HashMap::new();
     let mut sink_outputs: HashMap<(String, String), Signal> = HashMap::new();
     // Signals injected by AutoMap Collector nodes, keyed by ("collector:{uid}", pin_id).
     let mut collector_sigs: HashMap<(String, String), Signal> = HashMap::new();
@@ -396,7 +404,7 @@ pub fn eval_graph_tick(
                 .collect();
             let inner_computed = eval_subgraph(
                 &sg.graph, &outer_inputs, state, dev_sigs, &mut collector_sigs,
-                &mut scope_samples, &mut last_inputs, snap.node_uid, dt,
+                &mut scope_samples, &mut last_inputs, &mut last_outputs, snap.node_uid, dt,
             );
             computed[idx] = sg.outlet_locs.iter()
                 .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
@@ -433,8 +441,12 @@ pub fn eval_graph_tick(
                 scope_samples.push((snap.node_uid, sample));
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
-            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve" => {
+            "module.response_curve" | "module.vec_response_curve" => {
                 last_inputs.insert(snap.node_uid, inputs.clone());
+            }
+            "module.twoway_response_curve" => {
+                last_inputs.insert(snap.node_uid, inputs.clone());
+                last_outputs.insert(snap.node_uid, node_outputs.clone());
             }
             // Export outputs (not inputs) so the UI body can show a live readout.
             "processing.gyro_3dof" => {
@@ -453,7 +465,7 @@ pub fn eval_graph_tick(
         computed[idx] = node_outputs;
     }
 
-    TickOutput { outputs, scope_samples, last_inputs, sink_outputs }
+    TickOutput { outputs, scope_samples, last_inputs, last_outputs, sink_outputs }
 }
 
 // ── Per-node dispatch ─────────────────────────────────────────────────────────
@@ -1071,77 +1083,53 @@ fn compute_twoway_response_curve(
             }
         };
 
-        // Hysteresis: track displacement from a reference point.
-        // twoway_prev_input = reference position (reset when direction reverses or lane commits).
-        // twoway_dir_buf    = consistent-direction tick counter (push one item per tick; clear on reversal).
-        //
-        // A lane switch fires when:
-        //   1. displacement from reference exceeds threshold, AND
-        //   2. that displacement has been sustained for hyst_ticks consecutive ticks.
-        //
-        // This correctly handles slow movements (displacement accumulates across many ticks)
-        // and filters jitter (jitter reverses direction and resets the tick counter).
-        let reference = state.twoway_prev_input[ch];
-        let displacement = raw_input - reference;
-        let dir_buf = &mut state.twoway_dir_buf[ch];
+        // Use magnitude in abs/vec mode; signed value in bipolar mode.
+        let hyst_input = if abs || vec_mode { raw_input.abs() } else { raw_input };
 
-        if displacement > threshold {
-            dir_buf.push_back(1.0);
-            // Direction reversed: start counting from now, update reference if needed
-            if dir_buf.front().copied().unwrap_or(1.0) < 0.0 {
-                dir_buf.clear();
-                dir_buf.push_back(1.0);
-                state.twoway_prev_input[ch] = raw_input;
-            }
-        } else if displacement < -threshold {
-            dir_buf.push_back(-1.0);
-            if dir_buf.front().copied().unwrap_or(-1.0) > 0.0 {
-                dir_buf.clear();
-                dir_buf.push_back(-1.0);
-                state.twoway_prev_input[ch] = raw_input;
-            }
-        } else {
-            // Within deadband: reset counter, update reference to current position
-            dir_buf.clear();
-            state.twoway_prev_input[ch] = raw_input;
-        }
-        // Cap counter length to hyst_ticks
-        while dir_buf.len() > hyst_ticks { dir_buf.pop_front(); }
+        // Hysteresis: sliding-window peak/trough detector.
+        // twoway_dir_buf stores the last hyst_ticks samples of hyst_input.
+        // running_max = highest value in window → if current falls threshold below it → Down.
+        // running_min = lowest  value in window → if current rises threshold above it → Up.
+        // Works at any speed: a fast release immediately shows a large gap from the window max.
+        let win = &mut state.twoway_dir_buf[ch];
+        win.push_back(hyst_input);
+        while win.len() > hyst_ticks { win.pop_front(); }
 
-        let all_up   = dir_buf.len() >= hyst_ticks && dir_buf.iter().all(|&d| d > 0.0);
-        let all_down = dir_buf.len() >= hyst_ticks && dir_buf.iter().all(|&d| d < 0.0);
+        let running_max = win.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let running_min = win.iter().copied().fold(f32::INFINITY,     f32::min);
+
+        // Use a minimum window of 1 tick so single-tick reversals are detected immediately.
+        let fell_from_peak = hyst_input < running_max - threshold;
+        let rose_from_trough = hyst_input > running_min + threshold;
 
         let prev_lane = state.twoway_lane[ch];
-        if all_up   && prev_lane != 1  {
-            state.twoway_old_output[ch] = state.twoway_blend[ch]
-                .mul_add(apply_curve(raw_input, &pts_up, &biases_up, abs, in_min, in_max, out_min, out_max, scale_t),
-                    (1.0 - state.twoway_blend[ch]) * state.twoway_old_output[ch]);
+        if rose_from_trough && prev_lane != 1 {
+            state.twoway_old_output[ch] = apply_curve(raw_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t);
             state.twoway_lane[ch]  =  1;
             state.twoway_blend[ch] = 0.0;
-            // Reset reference so hysteresis measures from the new committed position
             state.twoway_dir_buf[ch].clear();
-            state.twoway_prev_input[ch] = raw_input;
-        } else if all_down && prev_lane != -1 {
-            state.twoway_old_output[ch] = state.twoway_blend[ch]
-                .mul_add(apply_curve(raw_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t),
-                    (1.0 - state.twoway_blend[ch]) * state.twoway_old_output[ch]);
+            state.twoway_dir_buf[ch].push_back(hyst_input);
+        } else if fell_from_peak && prev_lane != -1 {
+            state.twoway_old_output[ch] = apply_curve(raw_input, &pts_up, &biases_up, abs, in_min, in_max, out_min, out_max, scale_t);
             state.twoway_lane[ch]  = -1;
             state.twoway_blend[ch] = 0.0;
             state.twoway_dir_buf[ch].clear();
-            state.twoway_prev_input[ch] = raw_input;
+            state.twoway_dir_buf[ch].push_back(hyst_input);
         }
 
         // Advance blend.
         state.twoway_blend[ch] = (state.twoway_blend[ch] + interp_step).min(1.0);
         let blend = state.twoway_blend[ch];
 
-        // Evaluate active-lane curve.
+        // Evaluate active-lane curve at current input.
         let new_output = if state.twoway_lane[ch] >= 0 {
             apply_curve(raw_input, &pts_up, &biases_up, abs, in_min, in_max, out_min, out_max, scale_t)
         } else {
             apply_curve(raw_input, &pts_dn, &biases_dn, abs, in_min, in_max, out_min, out_max, scale_t)
         };
 
+        // Blend from old-lane-output-at-switch-point toward new-lane-output-at-current-input.
+        // When both curves are identical, old_output == new_output so blend has no effect.
         let output = blend * new_output + (1.0 - blend) * state.twoway_old_output[ch];
 
         let sig = if vec_mode {
