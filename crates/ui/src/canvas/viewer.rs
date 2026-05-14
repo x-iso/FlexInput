@@ -6337,14 +6337,16 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                 }
                 if let Some(idx) = remove_idx { new_edit_pts.remove(idx); }
 
-                // Live arrow marker on active lane only
+                // Live arrow marker — X from input, Y from actual engine output (last_signals)
                 let abs_max   = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
+                let abs_max_out = out_max.abs().max(out_min.abs()).max(f32::EPSILON);
                 let trail_dur = std::time::Duration::from_millis(trail_ms as u64);
                 let now       = std::time::Instant::now();
                 let mut has_active = false;
                 for (ch, raw_opt) in live_inputs.iter().enumerate() {
                     let Some(raw) = raw_opt else { continue; };
                     has_active = true;
+                    // X position: scaled input
                     let graph_x = if absolute_eff {
                         curve_scale((raw.abs() / abs_max).clamp(0.0, 1.0), sc_t)
                     } else {
@@ -6353,43 +6355,57 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                         let sign = if norm < 0.0 { -1.0f32 } else { 1.0 };
                         sign * curve_scale(norm.abs(), sc_t)
                     };
-                    type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
+                    // Y position: actual blended engine output, mapped to graph space
+                    let actual_out_raw = snarl.get_node(node_id)
+                        .and_then(|n| n.extra.last_signals.get(ch)?.as_ref()).map(sig_f32);
+                    let graph_y = if let Some(out_val) = actual_out_raw {
+                        if absolute_eff {
+                            (out_val.abs() / abs_max_out).clamp(0.0, 1.0)
+                        } else {
+                            let out_range = (out_max - out_min).abs().max(f32::EPSILON);
+                            ((out_val - out_min) / out_range * 2.0 - 1.0).clamp(-1.0, 1.0)
+                        }
+                    } else {
+                        sample_curve(&pts_up, graph_x, &biases_up).clamp(y_lo, y_hi)
+                    };
+
+                    type Trail = std::collections::VecDeque<(f32, f32, std::time::Instant)>;
                     let tid = ui.id().with(("twtrail", node_id, ch as u32));
                     let mut tbuf: Trail = ui.data(|d| d.get_temp::<Trail>(tid).clone().unwrap_or_default());
                     if trail_ms > 0 {
-                        tbuf.push_back((graph_x, now));
-                        while tbuf.front().map(|&(_, t)| now.duration_since(t) > trail_dur).unwrap_or(false) { tbuf.pop_front(); }
+                        tbuf.push_back((graph_x, graph_y, now));
+                        while tbuf.front().map(|&(_, _, t)| now.duration_since(t) > trail_dur).unwrap_or(false) { tbuf.pop_front(); }
                     } else { tbuf.clear(); }
-                    let tlist: Vec<(f32, std::time::Instant)> = tbuf.iter().cloned().collect();
+                    let tlist: Vec<(f32, f32, std::time::Instant)> = tbuf.iter().cloned().collect();
                     ui.data_mut(|d| d.insert_temp(tid, tbuf));
                     let ch_col = MULTI_COLORS[ch % MULTI_COLORS.len()];
-                    let dir_up = if tlist.len() >= 2 { tlist.last().map(|(x,_)| *x).unwrap_or(graph_x) >= tlist.first().map(|(x,_)| *x).unwrap_or(graph_x) } else { true };
-                    let (trpts, trbias) = if dir_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
+
+                    // Trail follows actual output path
                     for w in tlist.windows(2) {
-                        let (x0, _) = w[0]; let (x1, t1) = w[1];
+                        let (x0, y0, _)  = w[0]; let (x1, y1, t1) = w[1];
                         let age = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32().max(0.001);
                         let alpha = ((1.0-age.clamp(0.0,1.0))*220.0) as u8;
                         let tc = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), alpha);
-                        let steps = (((x1-x0).abs()/x_range*80.0) as usize).max(1);
-                        let mut pp = c2s(x0, sample_curve(trpts, x0, trbias).clamp(y_lo, y_hi));
-                        for s in 1..=steps { let t = s as f32/steps as f32; let ix = x0+(x1-x0)*t; let np = c2s(ix, sample_curve(trpts, ix, trbias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.5, tc)); pp = np; }
+                        painter.line_segment([c2s(x0, y0.clamp(y_lo, y_hi)), c2s(x1, y1.clamp(y_lo, y_hi))], egui::Stroke::new(1.5, tc));
                     }
-                    // Tangent-aligned arrow: sample curve ±epsilon to get slope direction.
-                    let (apts, abias) = if dir_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
-                    let ay = sample_curve(apts, graph_x, abias).clamp(y_lo, y_hi);
-                    let head = c2s(graph_x, ay);
-                    let eps = x_range * 0.015; // small step in curve space
-                    let (x_a, x_b) = if dir_up {
-                        ((graph_x - eps).clamp(x_lo, x_hi), (graph_x + eps).clamp(x_lo, x_hi))
+
+                    // Arrow at actual output position, direction from x-trail
+                    let dir_up = if tlist.len() >= 2 { tlist.last().map(|(x,_,_)| *x).unwrap_or(graph_x) >= tlist.first().map(|(x,_,_)| *x).unwrap_or(graph_x) } else { true };
+                    let head = c2s(graph_x, graph_y.clamp(y_lo, y_hi));
+                    // Use tangent along the actual output trail for orientation
+                    let (fwd, perp) = if tlist.len() >= 2 {
+                        let n = tlist.len();
+                        let (x0, y0, _) = tlist[n.saturating_sub(2)];
+                        let (x1, y1, _) = tlist[n-1];
+                        let dp = c2s(x1, y1.clamp(y_lo,y_hi)) - c2s(x0, y0.clamp(y_lo,y_hi));
+                        let fwd_raw = if dir_up { dp } else { -dp };
+                        let len = fwd_raw.length().max(0.001);
+                        let f = fwd_raw / len;
+                        (f, egui::vec2(-f.y, f.x))
                     } else {
-                        ((graph_x + eps).clamp(x_lo, x_hi), (graph_x - eps).clamp(x_lo, x_hi))
+                        let f = if dir_up { egui::vec2(0.5, -0.866) } else { egui::vec2(0.5, 0.866) };
+                        (f, egui::vec2(-f.y, f.x))
                     };
-                    let p_a = c2s(x_a, sample_curve(apts, x_a, abias).clamp(y_lo, y_hi));
-                    let p_b = c2s(x_b, sample_curve(apts, x_b, abias).clamp(y_lo, y_hi));
-                    let tangent = p_b - p_a;
-                    let tang_len = tangent.length().max(0.001);
-                    let fwd  = tangent / tang_len;           // unit vector along travel direction
-                    let perp = egui::vec2(-fwd.y, fwd.x);   // perpendicular
                     let r = 6.0f32;
                     let tip = head + fwd * r;
                     let l   = head - fwd * (r * 0.5) + perp * (r * 0.7);
