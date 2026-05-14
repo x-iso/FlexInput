@@ -1081,9 +1081,12 @@ fn compute_twoway_response_curve(
         buf.push_back(delta);
         while buf.len() > hyst_ticks { buf.pop_front(); }
 
-        // Lane switch decision: all buffered deltas must exceed threshold in same direction.
-        let all_up   = buf.len() >= hyst_ticks && buf.iter().all(|&d| d >  threshold);
-        let all_down = buf.len() >= hyst_ticks && buf.iter().all(|&d| d < -threshold);
+        // Lane switch: net cumulative movement over the window must exceed threshold,
+        // AND the net direction must be consistent (no reversal beyond threshold).
+        // This tolerates per-tick jitter while requiring sustained directional movement.
+        let net: f32 = buf.iter().sum();
+        let all_up   = buf.len() >= hyst_ticks &&  net >  threshold;
+        let all_down = buf.len() >= hyst_ticks &&  net < -threshold;
 
         let prev_lane = state.twoway_lane[ch];
         if all_up   && prev_lane != 1  {

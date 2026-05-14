@@ -6340,12 +6340,26 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                         let mut pp = c2s(x0, sample_curve(trpts, x0, trbias).clamp(y_lo, y_hi));
                         for s in 1..=steps { let t = s as f32/steps as f32; let ix = x0+(x1-x0)*t; let np = c2s(ix, sample_curve(trpts, ix, trbias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.5, tc)); pp = np; }
                     }
+                    // Tangent-aligned arrow: sample curve ±epsilon to get slope direction.
                     let (apts, abias) = if dir_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
                     let ay = sample_curve(apts, graph_x, abias).clamp(y_lo, y_hi);
                     let head = c2s(graph_x, ay);
+                    let eps = x_range * 0.015; // small step in curve space
+                    let (x_a, x_b) = if dir_up {
+                        ((graph_x - eps).clamp(x_lo, x_hi), (graph_x + eps).clamp(x_lo, x_hi))
+                    } else {
+                        ((graph_x + eps).clamp(x_lo, x_hi), (graph_x - eps).clamp(x_lo, x_hi))
+                    };
+                    let p_a = c2s(x_a, sample_curve(apts, x_a, abias).clamp(y_lo, y_hi));
+                    let p_b = c2s(x_b, sample_curve(apts, x_b, abias).clamp(y_lo, y_hi));
+                    let tangent = p_b - p_a;
+                    let tang_len = tangent.length().max(0.001);
+                    let fwd  = tangent / tang_len;           // unit vector along travel direction
+                    let perp = egui::vec2(-fwd.y, fwd.x);   // perpendicular
                     let r = 6.0f32;
-                    let (tip, l, rp) = if dir_up { (head+egui::vec2(0.0,-r), head+egui::vec2(-r*0.7,r*0.6), head+egui::vec2(r*0.7,r*0.6)) }
-                                       else       { (head+egui::vec2(0.0, r), head+egui::vec2(-r*0.7,-r*0.6), head+egui::vec2(r*0.7,-r*0.6)) };
+                    let tip = head + fwd * r;
+                    let l   = head - fwd * (r * 0.5) + perp * (r * 0.7);
+                    let rp  = head - fwd * (r * 0.5) - perp * (r * 0.7);
                     painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
                 }
                 if has_active { ui.ctx().request_repaint(); }
@@ -6418,7 +6432,7 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Hyst").small().weak());
             let (hpb,hmb)=(h_pct,h_ms);
-            ui.add(egui::DragValue::new(&mut h_pct).speed(0.001).clamp_range(0.001f32..=5.0f32).suffix("%"));
+            ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%"));
             ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms"));
             if (h_pct-hpb).abs()>1e-5||(h_ms-hmb).abs()>1e-5{changed=true;}
         });
