@@ -391,8 +391,12 @@ pub fn eval_graph_tick(
                 }
             }
 
-            computed[idx] = vec![];
-            continue; // no further processing for sink nodes
+            // device.source nodes with haptic inputs need sink routing but still
+            // must compute their output signals — don't skip them.
+            if snap.module_id != "device.source" {
+                computed[idx] = vec![];
+                continue;
+            }
         }
 
         // ── inline sub-patch: run inner graph and map outlet outputs ──────────
@@ -809,7 +813,11 @@ fn compute_oscillator(
     let freq_wired  = inputs.get(0).and_then(|s| *s).is_some();
     let phase_wired = inputs.get(1).and_then(|s| *s).is_some();
 
-    let freq_val  = if freq_wired  { get_f(inputs, 0, 1.0) } else { params.get("freq_param") .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32 };
+    let base_freq = params.get("freq_param").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    // When freq is wired the input is a normalized multiplier [0,1] (or bipolar) applied
+    // to the base frequency set in the node. This lets you sweep 0→base_freq with a
+    // unipolar source or modulate depth with another oscillator.
+    let freq_val  = if freq_wired  { get_f(inputs, 0, 1.0).max(0.0) * base_freq } else { base_freq };
     let phase_off = if phase_wired { get_f(inputs, 1, 0.0) } else { params.get("phase_param").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 };
     let retrig    = get_b(inputs, 2, false);
 

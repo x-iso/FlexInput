@@ -10,9 +10,9 @@ use flexinput_core::Signal;
 use crate::{layouts, DeviceKind, SinkPin, VirtualDevice};
 
 pub static DEVICE_KINDS: &[DeviceKind] = &[
-    DeviceKind { kind_id: "virtual.xinput",   display_name: "Virtual XInput Controller", allows_multiple: true },
-    DeviceKind { kind_id: "virtual.ds4",      display_name: "Virtual DualShock 4",       allows_multiple: true },
-    DeviceKind { kind_id: "virtual.keymouse", display_name: "Virtual Keyboard & Mouse",  allows_multiple: false },
+    DeviceKind { kind_id: "virtual.xinput",    display_name: "Virtual XInput Controller",       allows_multiple: true },
+    DeviceKind { kind_id: "virtual.ds4",       display_name: "Virtual DualShock 4 (ViGEmBus)", allows_multiple: true },
+    DeviceKind { kind_id: "virtual.keymouse",  display_name: "Virtual Keyboard & Mouse",        allows_multiple: false },
 ];
 
 pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
@@ -206,10 +206,12 @@ mod vigem_ioctl {
     }
 
     // ── DS4 extended report (with gyro/accel) ─────────────────────────────────
-    // Layout matches the C DS4_TOUCH / DS4_REPORT_EX structs in ViGEmBus,
-    // using natural #[repr(C)] alignment (no packing pragma).
+    // ViGEmBus defines these structs with #pragma pack(1) (pshpack1.h).
+    // DS4_SUBMIT_REPORT_EX = 72 bytes, DS4_REPORT_EX = 63 bytes, DS4_TOUCH = 9 bytes.
+    // Must use #[repr(C, packed)] to match — natural alignment adds padding and the
+    // driver rejects the IOCTL when Size != sizeof(DS4_SUBMIT_REPORT_EX).
 
-    #[repr(C)]
+    #[repr(C, packed)]
     pub struct DS4Touch {
         pub counter: u8,
         /// bit 7 = finger-up (inactive), bits 6:0 = tracking ID
@@ -224,32 +226,75 @@ mod vigem_ioctl {
         }
     }
 
-    #[repr(C)]
+    // DS4_REPORT_EX in C is a union { struct { ... }; UCHAR ReportBuffer[63]; }.
+    // The named fields sum to 60 bytes; the union size is 63 (the array arm wins).
+    // We model this as a flat 63-byte array and project field accessors via methods.
+    #[repr(C, packed)]
     pub struct DS4ReportEx {
-        pub lx: u8, pub ly: u8, pub rx: u8, pub ry: u8,
-        pub buttons:  u16,
-        pub special:  u8,
-        pub lt: u8, pub rt: u8,
-        // Natural alignment inserts 1 pad byte before timestamp (u16).
-        pub timestamp:       u16,
-        pub battery:         u8,
-        // Natural alignment inserts 1 pad byte before gyro_x (i16).
-        pub gyro_x:  i16, pub gyro_y:  i16, pub gyro_z:  i16,
-        pub accel_x: i16, pub accel_y: i16, pub accel_z: i16,
-        pub _unk1:           [u8; 5],
-        pub battery_special: u8,
-        pub _unk2:           [u8; 2],
-        pub touch_n:         u8,
-        pub touch_cur:       DS4Touch,
-        pub touch_prev:      [DS4Touch; 2],
+        pub buf: [u8; 63],
     }
 
-    #[repr(C)]
+    impl DS4ReportEx {
+        pub fn set_lx(&mut self, v: u8) { self.buf[0] = v; }
+        pub fn set_ly(&mut self, v: u8) { self.buf[1] = v; }
+        pub fn set_rx(&mut self, v: u8) { self.buf[2] = v; }
+        pub fn set_ry(&mut self, v: u8) { self.buf[3] = v; }
+        pub fn set_buttons(&mut self, v: u16) {
+            self.buf[4] = v as u8; self.buf[5] = (v >> 8) as u8;
+        }
+        pub fn set_special(&mut self, v: u8) { self.buf[6] = v; }
+        pub fn set_lt(&mut self, v: u8) { self.buf[7] = v; }
+        pub fn set_rt(&mut self, v: u8) { self.buf[8] = v; }
+        // buf[9..10] = wTimestamp (leave 0)
+        pub fn set_battery(&mut self, v: u8) { self.buf[11] = v; }
+        pub fn set_gyro_x(&mut self, v: i16) {
+            let b = v.to_le_bytes(); self.buf[12] = b[0]; self.buf[13] = b[1];
+        }
+        pub fn set_gyro_y(&mut self, v: i16) {
+            let b = v.to_le_bytes(); self.buf[14] = b[0]; self.buf[15] = b[1];
+        }
+        pub fn set_gyro_z(&mut self, v: i16) {
+            let b = v.to_le_bytes(); self.buf[16] = b[0]; self.buf[17] = b[1];
+        }
+        pub fn set_accel_x(&mut self, v: i16) {
+            let b = v.to_le_bytes(); self.buf[18] = b[0]; self.buf[19] = b[1];
+        }
+        pub fn set_accel_y(&mut self, v: i16) {
+            let b = v.to_le_bytes(); self.buf[20] = b[0]; self.buf[21] = b[1];
+        }
+        pub fn set_accel_z(&mut self, v: i16) {
+            let b = v.to_le_bytes(); self.buf[22] = b[0]; self.buf[23] = b[1];
+        }
+        // buf[24..28] = _bUnknown1[5], buf[29] = bBatteryLvlSpecial, buf[30..31] = _bUnknown2
+        pub fn set_touch_n(&mut self, v: u8) { self.buf[32] = v; }
+        // DS4_TOUCH at offset 33 (current) and 42/51 (previous[0/1])
+        // DS4_TOUCH layout: counter(1) track1(1) pos1[3] track2(1) pos2[3] = 9 bytes
+        pub fn set_touch_cur(&mut self, counter: u8, track1: u8, pos1: [u8;3], track2: u8, pos2: [u8;3]) {
+            let b = &mut self.buf[33..42];
+            b[0]=counter; b[1]=track1; b[2]=pos1[0]; b[3]=pos1[1]; b[4]=pos1[2];
+            b[5]=track2;  b[6]=pos2[0]; b[7]=pos2[1]; b[8]=pos2[2];
+        }
+        pub fn clear_touch_prev(&mut self) {
+            // track bits 7 = finger-up (inactive)
+            self.buf[42] = 0; self.buf[43] = 0x80; self.buf[44..47].fill(0);
+            self.buf[47] = 0x80; self.buf[48..51].fill(0);
+            self.buf[51] = 0; self.buf[52] = 0x80; self.buf[53..56].fill(0);
+            self.buf[56] = 0x80; self.buf[57..60].fill(0);
+        }
+    }
+
+    #[repr(C, packed)]
     pub struct DS4ExSubmit {
         pub size:   u32,
         pub serial: u32,
         pub report: DS4ReportEx,
     }
+
+    const _: () = {
+        assert!(std::mem::size_of::<DS4Touch>()    ==  9);
+        assert!(std::mem::size_of::<DS4ReportEx>() == 63);
+        assert!(std::mem::size_of::<DS4ExSubmit>() == 71);
+    };
 
     // ── Win32 kernel32 imports ─────────────────────────────────────────────────
 
@@ -281,6 +326,8 @@ mod vigem_ioctl {
             transferred: *mut u32,
             wait:        i32,
         ) -> i32;
+
+        pub fn GetLastError() -> u32;
     }
 
     /// Submit a synchronous IOCTL on an overlapped device handle.
@@ -496,44 +543,62 @@ impl VirtualDevice for VirtualDS4 {
                 let mut sub: vigem_ioctl::DS4ExSubmit = std::mem::zeroed();
                 sub.size   = std::mem::size_of::<vigem_ioctl::DS4ExSubmit>() as u32;
                 sub.serial = self.serial;
-                sub.report.lx      = self.lx;  sub.report.ly = self.ly;
-                sub.report.rx      = self.rx;  sub.report.ry = self.ry;
-                sub.report.buttons = buttons;
-                sub.report.special = self.special;
-                sub.report.lt      = self.lt;  sub.report.rt = self.rt;
-                sub.report.battery = 0xFF;
-                sub.report.gyro_x  = float_to_i16(self.gyro_x);
-                sub.report.gyro_y  = float_to_i16(self.gyro_y);
-                sub.report.gyro_z  = float_to_i16(self.gyro_z);
-                sub.report.accel_x = float_to_i16(self.accel_x);
-                sub.report.accel_y = float_to_i16(self.accel_y);
-                sub.report.accel_z = float_to_i16(self.accel_z);
+                sub.report.set_lx(self.lx);
+                sub.report.set_ly(self.ly);
+                sub.report.set_rx(self.rx);
+                sub.report.set_ry(self.ry);
+                sub.report.set_buttons(buttons);
+                sub.report.set_special(self.special);
+                sub.report.set_lt(self.lt);
+                sub.report.set_rt(self.rt);
+                sub.report.set_battery(0xFF);
+                sub.report.set_gyro_x(float_to_i16(self.gyro_x));
+                sub.report.set_gyro_y(float_to_i16(self.gyro_y));
+                sub.report.set_gyro_z(float_to_i16(self.gyro_z));
+                sub.report.set_accel_x(float_to_i16(self.accel_x));
+                sub.report.set_accel_y(float_to_i16(self.accel_y));
+                sub.report.set_accel_z(float_to_i16(self.accel_z));
                 // When the touchpad button is pressed, report a single center touch.
                 // Some software requires at least one active touch point alongside
                 // the touchpad-click bit in the special byte.
                 if tp_pressed {
-                    sub.report.touch_n = 1;
-                    sub.report.touch_cur = vigem_ioctl::DS4Touch {
-                        counter: 0,
-                        track1: 0x00,             // active, tracking ID 0
-                        pos1: [0xC0, 0x63, 0x1D], // X=960, Y=470 (DS4 touchpad centre)
-                        track2: 0x80,             // second slot inactive
-                        pos2: [0; 3],
-                    };
+                    sub.report.set_touch_n(1);
+                    sub.report.set_touch_cur(
+                        0,
+                        0x00,                    // active, tracking ID 0
+                        [0xC0, 0x63, 0x1D],      // X=960, Y=470 (DS4 touchpad centre)
+                        0x80,                    // second slot inactive
+                        [0; 3],
+                    );
                 } else {
-                    sub.report.touch_cur     = vigem_ioctl::DS4Touch::default();
+                    sub.report.set_touch_n(0);
+                    sub.report.set_touch_cur(0, 0x80, [0;3], 0x80, [0;3]);
                 }
-                sub.report.touch_prev[0] = vigem_ioctl::DS4Touch::default();
-                sub.report.touch_prev[1] = vigem_ioctl::DS4Touch::default();
-                vigem_ioctl::ioctl(
+                sub.report.clear_touch_prev();
+                let result = vigem_ioctl::ioctl(
                     self.dev, self.event, vigem_ioctl::IOCTL_DS4_SUBMIT_REPORT_EX,
                     &sub as *const _ as _, std::mem::size_of_val(&sub) as u32,
-                )
+                );
+                #[cfg(debug_assertions)]
+                {
+                    let err = vigem_ioctl::GetLastError();
+                    let sz = sub.size; let sn = sub.serial;
+                    eprintln!(
+                        "[VirtualDS4 EX] size={} serial={} ok={} winerr={:#010x} gyro=({},{},{}) accel=({},{},{})",
+                        sz, sn, result, err,
+                        i16::from_le_bytes([sub.report.buf[12], sub.report.buf[13]]),
+                        i16::from_le_bytes([sub.report.buf[14], sub.report.buf[15]]),
+                        i16::from_le_bytes([sub.report.buf[16], sub.report.buf[17]]),
+                        i16::from_le_bytes([sub.report.buf[18], sub.report.buf[19]]),
+                        i16::from_le_bytes([sub.report.buf[20], sub.report.buf[21]]),
+                        i16::from_le_bytes([sub.report.buf[22], sub.report.buf[23]]),
+                    );
+                }
+                result
             };
             if ok { return; }
             // Extended IOCTL failed — fall through to basic this frame but keep
-            // has_extended = true so we retry next frame. Transient failures
-            // (device not yet ready) would otherwise permanently kill gyro/touchpad.
+            // has_extended = true so we retry next frame.
         }
 
         // Basic report path (also fallback when extended fails).
@@ -783,8 +848,9 @@ impl VirtualDevice for VirtualKeyMouse {
         match pin {
             // Velocity pins — the mouse thread spreads these at 500 Hz.
             // Semantics: value = pixels per 60 Hz reference frame (unchanged from before).
+            "mouse" => { if let Signal::Vec2(v) = value { self.mouse_vel_x += v.x; self.mouse_vel_y += -v.y; } }
             "mouse_x"       => { if let Signal::Float(f) = value { self.mouse_vel_x += f; } }
-            "mouse_y"       => { if let Signal::Float(f) = value { self.mouse_vel_y += f; } }
+            "mouse_y"       => { if let Signal::Float(f) = value { self.mouse_vel_y += -f; } }
             "scroll_up"     => { if matches!(value, Signal::Bool(true)) { self.scroll_delta += 1; } }
             "scroll_down"   => { if matches!(value, Signal::Bool(true)) { self.scroll_delta -= 1; } }
             "mouse_left"    => { if let Signal::Bool(b) = value { self.buttons.lmb = b; } }

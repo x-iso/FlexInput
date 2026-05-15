@@ -69,12 +69,10 @@ fn device_card(
     is_hidden: bool,
     max_h: f32,
 ) {
-    // MIDI OUT is a sink even though enumerate() returns it with empty inputs.
-    let is_sink = match device.kind {
-        ControllerKind::MidiOut => true,
-        ControllerKind::MidiIn  => false,
-        _ => device.outputs.is_empty() && !device.inputs.is_empty(),
-    };
+    // MIDI OUT is a pure sink; all other gamepad devices are sources (haptic inputs live
+    // on the same device.source node and are routed by the engine via its input pins).
+    let is_sink = device.kind == ControllerKind::MidiOut;
+    let has_source = !is_sink;
     let canvas_module = if is_sink { "device.sink" } else { "device.source" };
     let already_on_canvas = canvas.snarl.nodes_ids_data().any(|(_, n)| {
         n.value.module_id == canvas_module
@@ -146,7 +144,7 @@ fn device_card(
             });
 
             ui.add_space(4.0);
-            let summary_pins = if is_sink { &device.inputs } else { &device.outputs };
+            let summary_pins = if has_source { &device.outputs } else { &device.inputs };
             pin_type_bar(ui, summary_pins);
             ui.add_space(4.0);
 
@@ -166,10 +164,10 @@ fn device_card(
                         });
                     }
                     if !device.inputs.is_empty() {
-                        let label = if is_sink {
-                            format!("{} inputs", device.inputs.len())
-                        } else {
+                        let label = if has_source {
                             format!("{} inputs (haptic)", device.inputs.len())
+                        } else {
+                            format!("{} inputs", device.inputs.len())
                         };
                         egui::CollapsingHeader::new(RichText::new(label).small())
                             .id_salt(format!("{}_inputs", device.id))

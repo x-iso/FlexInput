@@ -218,8 +218,16 @@ fn dualsense_inputs() -> Vec<DevicePin> {
 
 fn switch_pro_inputs() -> Vec<DevicePin> {
     vec![
-        fl("hd_rumble_l", "HD Rumble L"),
-        fl("hd_rumble_r", "HD Rumble R"),
+        // Per-side amplitude + carrier frequency.
+        // hd_l/r_amp:  0=silent → 1=max; perceptual power-law curve (more resolution at low amp).
+        // hd_l/r_freq: 0=82 Hz → 1=626 Hz; linear over safe dual-band range.
+        fl("hd_l_amp",  "HD Rumble L: Amplitude (perceptual 0–1)"),
+        fl("hd_l_freq", "HD Rumble L: Frequency (0=82Hz 0.5=320Hz 1=626Hz)"),
+        fl("hd_r_amp",  "HD Rumble R: Amplitude (perceptual 0–1)"),
+        fl("hd_r_freq", "HD Rumble R: Frequency (0=82Hz 0.5=320Hz 1=626Hz)"),
+        // Legacy single-pin aliases kept for patch backward compatibility.
+        fl("hd_rumble_l", "HD Rumble L (legacy — use hd_l_amp)"),
+        fl("hd_rumble_r", "HD Rumble R (legacy — use hd_r_amp)"),
     ]
 }
 

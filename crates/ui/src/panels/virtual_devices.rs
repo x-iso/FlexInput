@@ -1,7 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, RichText};
-use flexinput_virtual::{available_device_kinds, create_device, VirtualDevice};
+use flexinput_virtual::{
+    available_device_kinds, create_device,
+    driver_availability::vigem_available,
+    VirtualDevice,
+};
 
 use crate::canvas::Canvas;
 
@@ -23,6 +27,17 @@ impl VirtualDevicePanel {
                 (d.id().to_string(), chip_name(&devs, i), d.is_connected())
             }).collect()
         };
+
+        // Driver dependency banner
+        if !vigem_available() {
+            ui.horizontal(|ui| {
+                let warn = RichText::new("⚠ ViGEmBus missing").color(Color32::from_rgb(220, 160, 40));
+                ui.label(warn).on_hover_text("Required for Virtual XInput and Virtual DualShock 4");
+                if ui.small_button("Install").clicked() {
+                    let _ = open::that("https://github.com/nefarius/ViGEmBus/releases/latest");
+                }
+            });
+        }
 
         ui.horizontal(|ui| {
             ui.strong("Virtual Outputs");
@@ -173,10 +188,10 @@ fn chip_name(active: &[Box<dyn VirtualDevice>], i: usize) -> String {
 
 fn kind_base_name(kind_prefix: &str) -> &'static str {
     match kind_prefix {
-        "virtual.xinput"   => "Virtual XInput",
-        "virtual.ds4"      => "Virtual DualShock 4",
-        "virtual.keymouse" => "Virtual Keyboard & Mouse",
-        _                  => "Virtual Device",
+        "virtual.xinput"    => "Virtual XInput",
+        "virtual.ds4"       => "Virtual DualShock 4",
+        "virtual.keymouse"  => "Virtual Keyboard & Mouse",
+        _                   => "Virtual Device",
     }
 }
 

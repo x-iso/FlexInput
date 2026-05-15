@@ -414,9 +414,24 @@ impl HidHideClient {
 
 // ── Device instance path lookup via SetupAPI ─────────────────────────────────
 
-/// Returns true if any Windows device with this VID/PID is a ViGEmBus
-/// virtual controller (instance ID contains "IG_").  Used to filter virtual
-/// gamepads out of the physical-device panel.
+/// Returns true if a device instance ID belongs to a known virtual gamepad
+/// driver rather than a real physical device.
+///
+/// Markers:
+///   "IG_"          — ViGEmBus (Xbox / DS4 virtual targets)
+///   "SWD\HIDMAESTRO" — HIDMaestro software-enumerated devices
+pub fn is_virtual_instance_id(instance_id: &str) -> bool {
+    let upper = instance_id.to_uppercase();
+    upper.contains("IG_") || upper.contains("SWD\\HIDMAESTRO")
+}
+
+/// Returns true if any Windows device with this VID/PID is a virtual
+/// controller (ViGEmBus or HIDMaestro).  Used to trigger the dedup filter
+/// in the physical-device panel.
+///
+/// For ViGEmBus: matches hardware IDs containing VID_xxxx&PID_xxxx + IG_ instance.
+/// For HIDMaestro: any SWD\HIDMAESTRO device present means a virtual controller
+/// exists for the same VID/PID (HIDMaestro uses the registry VID/PID we wrote).
 pub fn has_vigem_for_vid_pid(vid: u16, pid: u16) -> bool {
     #[cfg(windows)] {
         use win32::*;
@@ -427,7 +442,6 @@ pub fn has_vigem_for_vid_pid(vid: u16, pid: u16) -> bool {
         };
         if hdevinfo == INVALID_HANDLE_VALUE || hdevinfo.is_null() { return false; }
         let needle = format!("VID_{:04X}&PID_{:04X}", vid, pid);
-        let ig_marker = "IG_";
         let mut found = false;
         let mut idx = 0u32;
         loop {
@@ -438,6 +452,25 @@ pub fn has_vigem_for_vid_pid(vid: u16, pid: u16) -> bool {
             };
             if unsafe { SetupDiEnumDeviceInfo(hdevinfo, idx, &mut info) } == 0 { break; }
             idx += 1;
+
+            let mut id_buf  = vec![0u16; 512];
+            let mut id_size = 0u32;
+            if unsafe { SetupDiGetDeviceInstanceIdW(
+                hdevinfo, &mut info, id_buf.as_mut_ptr(), id_buf.len() as u32, &mut id_size) } == 0
+            { continue; }
+            let len = (id_size as usize).saturating_sub(1);
+            let instance_id = String::from_utf16_lossy(&id_buf[..len]);
+
+            // HIDMaestro: any active SWD\HIDMAESTRO device means we have a virtual
+            // controller with this VID/PID (we wrote it to the registry slot).
+            if instance_id.to_uppercase().contains("SWD\\HIDMAESTRO") {
+                #[cfg(debug_assertions)]
+                eprintln!("[hidhide] has_vigem: found HIDMaestro device: {}", instance_id);
+                found = true; break;
+            }
+
+            // ViGEmBus: hardware ID must match VID/PID and instance ID must have IG_.
+            if !instance_id.to_uppercase().contains("IG_") { continue; }
             let mut hw_buf  = vec![0u8; 1024];
             let mut hw_type = 0u32;
             let mut hw_size = 0u32;
@@ -449,16 +482,8 @@ pub fn has_vigem_for_vid_pid(vid: u16, pid: u16) -> bool {
             if ok == 0 { continue; }
             let hw_words: Vec<u16> = hw_buf[..hw_size as usize]
                 .chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-            let hw_ids = from_wide_multi(&hw_words);
-            if !hw_ids.iter().any(|id| id.to_uppercase().contains(&needle)) { continue; }
-            let mut id_buf  = vec![0u16; 512];
-            let mut id_size = 0u32;
-            if unsafe { SetupDiGetDeviceInstanceIdW(
-                hdevinfo, &mut info, id_buf.as_mut_ptr(), id_buf.len() as u32, &mut id_size) } != 0
-            {
-                let len = (id_size as usize).saturating_sub(1);
-                let s = String::from_utf16_lossy(&id_buf[..len]);
-                if s.to_uppercase().contains(ig_marker) { found = true; break; }
+            if from_wide_multi(&hw_words).iter().any(|id| id.to_uppercase().contains(&needle)) {
+                found = true; break;
             }
         }
         unsafe { SetupDiDestroyDeviceInfoList(hdevinfo); }
@@ -514,7 +539,7 @@ pub fn physical_count_for_vid_pid(vid: u16, pid: u16) -> usize {
                 hdevinfo, &mut info, id_buf.as_mut_ptr(), id_buf.len() as u32, &mut id_size) } != 0
             {
                 let len = (id_size as usize).saturating_sub(1);
-                if !String::from_utf16_lossy(&id_buf[..len]).to_uppercase().contains("IG_") {
+                if !is_virtual_instance_id(&String::from_utf16_lossy(&id_buf[..len])) {
                     count += 1;
                 }
             }
@@ -600,7 +625,7 @@ pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
                 let len = (id_size as usize).saturating_sub(1);
                 let s = String::from_utf16_lossy(&id_buf[..len]);
                 let upper = s.to_uppercase();
-                if upper.contains("IG_") { continue; } // ViGEmBus virtual
+                if is_virtual_instance_id(&s) { continue; } // virtual (ViGEmBus or HIDMaestro)
 
                 // Prefer HID-class devices since HidHide only hides those.
                 // BTHHID covers Bluetooth HID; some Windows builds expose the

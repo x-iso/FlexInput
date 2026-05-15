@@ -824,6 +824,7 @@ impl Canvas {
 
         let mut canvas = Canvas::new();
         canvas.snarl = patch.snarl;
+        migrate_ds4_pin_ids(&mut canvas);
         Some((canvas, patch.virtual_device_ids, patch.bound_exes, patch.auto_bypass, path))
     }
 }
@@ -831,6 +832,40 @@ impl Canvas {
 impl Default for Canvas {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Rename DS4 pin IDs that were changed between v0.3 and v0.4 so that old
+/// patches continue to route correctly.
+fn migrate_ds4_pin_ids(canvas: &mut Canvas) {
+    const RENAMES: &[(&str, &str)] = &[
+        ("l2",           "left_trigger"),
+        ("r2",           "right_trigger"),
+        ("btn_cross",    "btn_south"),
+        ("btn_circle",   "btn_east"),
+        ("btn_square",   "btn_west"),
+        ("btn_triangle", "btn_north"),
+        ("btn_l1",       "btn_lb"),
+        ("btn_r1",       "btn_rb"),
+        ("btn_l2_dig",   "btn_lt_dig"),
+        ("btn_r2_dig",   "btn_rt_dig"),
+        ("btn_l3",       "btn_ls"),
+        ("btn_r3",       "btn_rs"),
+        ("btn_options",  "btn_start"),
+        ("btn_share",    "btn_back"),
+        ("btn_ps",       "btn_guide"),
+    ];
+    for (_, node) in canvas.snarl.nodes_ids_data_mut() {
+        if node.value.module_id != "device.sink" { continue; }
+        if let Some(Value::Array(ids)) = node.value.params.get_mut("input_pin_ids") {
+            for id in ids.iter_mut() {
+                if let Some(s) = id.as_str() {
+                    if let Some(&(_, new)) = RENAMES.iter().find(|&&(old, _)| old == s) {
+                        *id = Value::String(new.to_string());
+                    }
+                }
+            }
+        }
     }
 }
 

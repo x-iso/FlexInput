@@ -296,7 +296,46 @@ impl DeviceBackend for GilrsBackend {
                         out.push((dev.clone(), "btn_touchpad".into(),  Signal::Bool(g.touchpad_click)));
                     }
                     if matches!(kind, ControllerKind::DualSense) {
-                        out.push((dev.clone(), "btn_mute".into(),      Signal::Bool(g.mic_button)));
+                        out.push((dev.clone(), "btn_mute".into(), Signal::Bool(g.mic_button)));
+                    }
+                    // DualSense: override all axes and buttons with raw HID values.
+                    // gilrs on Windows HID maps the 6 axes by USB Usage ID order rather than
+                    // logical gamepad position, placing L2/R2 where RightStickX/Y should be
+                    // and RX/RY under LeftZ/RightZ. Parsing the report directly avoids this.
+                    if let Some(ds) = g.dualsense {
+                        out.push((dev.clone(), "left_stick_x".into(),  Signal::Float(ds.lx)));
+                        out.push((dev.clone(), "left_stick_y".into(),  Signal::Float(ds.ly)));
+                        out.push((dev.clone(), "right_stick_x".into(), Signal::Float(ds.rx)));
+                        out.push((dev.clone(), "right_stick_y".into(), Signal::Float(ds.ry)));
+                        out.push((dev.clone(), "left_stick".into(),    Signal::Vec2(Vec2::new(ds.lx, ds.ly))));
+                        out.push((dev.clone(), "right_stick".into(),   Signal::Vec2(Vec2::new(ds.rx, ds.ry))));
+                        out.push((dev.clone(), "left_trigger".into(),  Signal::Float(ds.l2)));
+                        out.push((dev.clone(), "right_trigger".into(), Signal::Float(ds.r2)));
+                        out.push((dev.clone(), "btn_south".into(),   Signal::Bool(ds.btn_south)));
+                        out.push((dev.clone(), "btn_east".into(),    Signal::Bool(ds.btn_east)));
+                        out.push((dev.clone(), "btn_west".into(),    Signal::Bool(ds.btn_west)));
+                        out.push((dev.clone(), "btn_north".into(),   Signal::Bool(ds.btn_north)));
+                        out.push((dev.clone(), "btn_lb".into(),      Signal::Bool(ds.btn_l1)));
+                        out.push((dev.clone(), "btn_rb".into(),      Signal::Bool(ds.btn_r1)));
+                        out.push((dev.clone(), "btn_lt_dig".into(),  Signal::Bool(ds.btn_l2)));
+                        out.push((dev.clone(), "btn_rt_dig".into(),  Signal::Bool(ds.btn_r2)));
+                        out.push((dev.clone(), "btn_ls".into(),      Signal::Bool(ds.btn_ls)));
+                        out.push((dev.clone(), "btn_rs".into(),      Signal::Bool(ds.btn_rs)));
+                        out.push((dev.clone(), "btn_start".into(),   Signal::Bool(ds.btn_options)));
+                        out.push((dev.clone(), "btn_back".into(),    Signal::Bool(ds.btn_create)));
+                        out.push((dev.clone(), "btn_guide".into(),   Signal::Bool(ds.btn_ps)));
+                        out.push((dev.clone(), "dpad_up".into(),     Signal::Bool(ds.dpad_up)));
+                        out.push((dev.clone(), "dpad_down".into(),   Signal::Bool(ds.dpad_down)));
+                        out.push((dev.clone(), "dpad_left".into(),   Signal::Bool(ds.dpad_left)));
+                        out.push((dev.clone(), "dpad_right".into(),  Signal::Bool(ds.dpad_right)));
+                        let dx = if ds.dpad_right { 1.0f32 } else if ds.dpad_left { -1.0 } else { 0.0 };
+                        let dy = if ds.dpad_up    { 1.0f32 } else if ds.dpad_down { -1.0 } else { 0.0 };
+                        let (ndx, ndy) = if dx != 0.0 && dy != 0.0 {
+                            (dx * std::f32::consts::FRAC_1_SQRT_2, dy * std::f32::consts::FRAC_1_SQRT_2)
+                        } else { (dx, dy) };
+                        out.push((dev.clone(), "dpad_x".into(),  Signal::Float(ndx)));
+                        out.push((dev.clone(), "dpad_y".into(),  Signal::Float(ndy)));
+                        out.push((dev.clone(), "dpad".into(),    Signal::Vec2(Vec2::new(ndx, ndy))));
                     }
                     // Switch Pro: override gilrs button output with raw-HID button data.
                     // This bypasses gilrs's WGI backend which loses D-Pad diagonals (8-position
@@ -371,7 +410,10 @@ impl DeviceBackend for GilrsBackend {
         // ── PS/Switch HID path via GyroManager ───────────────────────────────
         let (vid, pid, idx) = match self.lookup_phys(device_id) {
             Some(t) => t,
-            None => return,
+            None => {
+                eprintln!("[send] lookup_phys failed for device_id={device_id:?} pin={pin_id:?}");
+                return;
+            }
         };
         // Scale Float 0–1 to the semantic range for each pin.
         // Pins with custom ranges are listed explicitly; everything else uses 0–255.

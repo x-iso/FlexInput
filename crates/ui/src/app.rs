@@ -1811,7 +1811,8 @@ fn build_processing_graph_rec(
     let mut dirty_uids: Vec<usize> = Vec::new();
 
     let snaps: Vec<NodeSnap> = node_list.iter().map(|(node_id, node)| {
-        let is_sink = node.module_id == "device.sink";
+        let is_sink = node.module_id == "device.sink"
+            || (node.module_id == "device.source" && !node.inputs.is_empty());
 
         // Non-sink: single (first) source per input pin, for the existing eval path.
         let input_sources = if !is_sink {

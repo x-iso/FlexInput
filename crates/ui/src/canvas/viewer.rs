@@ -5743,7 +5743,6 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                 painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
                     egui::Stroke::new(0.5, Color32::from_gray(55)));
 
-                // Vec curve: graph axis is [0,1]; label shows x * in_max / y * out_max.
                 if show_grid_labels {
                     const MIN_LABEL_PX: f32 = 20.0;
                     let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
@@ -5753,9 +5752,9 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                         let sx = c2s(x, y_hi).x;
                         if sx - last_sx < MIN_LABEL_PX { continue; }
                         last_sx = sx;
-                        let val = x * in_max;
+                        let val = curve_scale_inv(x, scale_t) * in_max;
                         let label = if in_max <= 1.01 {
-                            format!("{:.0}%", x * 100.0)
+                            format!("{:.0}%", val * 100.0)
                         } else {
                             format!("{:.2}", val)
                         };
@@ -5767,9 +5766,9 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                         let sy = c2s(x_lo, y).y;
                         if last_sy - sy < MIN_LABEL_PX { continue; }
                         last_sy = sy;
-                        let val = y * out_max;
+                        let val = curve_scale_inv(y, scale_t) * out_max;
                         let label = if out_max <= 1.01 {
-                            format!("{:.0}%", y * 100.0)
+                            format!("{:.0}%", val * 100.0)
                         } else {
                             format!("{:.2}", val)
                         };

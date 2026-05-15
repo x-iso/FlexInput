@@ -1,4 +1,5 @@
 pub mod layouts;
+pub mod driver_availability;
 
 use flexinput_core::{Signal, SignalType};
 

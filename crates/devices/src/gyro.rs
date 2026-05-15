@@ -43,6 +43,28 @@ pub struct TouchPoint {
     pub y: f32,
 }
 
+/// Full DualSense input state parsed directly from the raw HID input report.
+/// Used to override gilrs, which mis-maps axes on the Windows HID path.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DualSenseState {
+    // Sticks: normalized [-1, 1]
+    pub lx: f32, pub ly: f32,
+    pub rx: f32, pub ry: f32,
+    // Triggers: normalized [0, 1]
+    pub l2: f32, pub r2: f32,
+    // Face buttons
+    pub btn_south: bool, pub btn_east: bool, pub btn_west: bool, pub btn_north: bool,
+    // Shoulder / trigger digital
+    pub btn_l1: bool, pub btn_r1: bool,
+    pub btn_l2: bool, pub btn_r2: bool,
+    // Stick clicks
+    pub btn_ls: bool, pub btn_rs: bool,
+    // Menu / special
+    pub btn_options: bool, pub btn_create: bool, pub btn_ps: bool,
+    // DPad
+    pub dpad_up: bool, pub dpad_down: bool, pub dpad_left: bool, pub dpad_right: bool,
+}
+
 /// Switch Pro button state read directly from input report 0x30 bytes 3/4/5.
 /// Used to bypass gilrs's WGI backend which loses diagonal D-Pad positions and
 /// has unreliable Home/Capture/Plus/Minus mapping in BT mode.
@@ -82,6 +104,8 @@ pub struct HidReading {
     pub mic_button: bool,
     /// Switch Pro full button state, parsed from raw HID. None for non-Switch devices.
     pub switch_buttons: Option<SwitchProButtons>,
+    /// DualSense full input state, parsed from raw HID. None for non-DualSense devices.
+    pub dualsense: Option<DualSenseState>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,9 +122,6 @@ struct HidEntry {
     kind: DeviceKind,
     last: HidReading,
     out: OutputState,
-    /// Becomes true after the first `set_output_byte` call. We keep refreshing
-    /// the output report every frame from then on so that rumble/lightbar stay
-    /// in sync (especially over BT) without needing a dirty flag per pin.
     output_active: bool,
 }
 
@@ -131,6 +152,13 @@ struct OutputState {
     player_led: u8,
     // mic_led: 0=off, 1=on(orange), 2=pulsing
     mic_led:    u8,
+    // Switch Pro HD Rumble — per-side amplitude + frequency (0–255 each, mapped at encode).
+    // hd_l/r_amp:  0=silent, 255=max safe; perceptual power-law curve applied at encode.
+    // hd_l/r_freq: 0–255 mapped logarithmically over safe range 82–1253 Hz (indices 32–159).
+    hd_l_amp:  u8,
+    hd_l_freq: u8,
+    hd_r_amp:  u8,
+    hd_r_freq: u8,
 }
 
 pub struct GyroManager {
@@ -229,8 +257,10 @@ impl GyroManager {
         }
 
         #[cfg(debug_assertions)]
-        eprintln!("[gyro] open_device vid={:04X} pid={:04X} idx={} paths_found={}",
-            vid, pid, idx, paths.len());
+        eprintln!("[gyro] open_device vid={:04X} pid={:04X} idx={} iface={} path={:?}",
+            vid, pid, idx,
+            paths.get(idx).map_or(-1, |p| p.interface_number()),
+            paths.get(idx).map(|p| p.path()));
 
         let info = paths.get(idx)?;
         let device = match api.open_path(info.path()) {
@@ -243,6 +273,13 @@ impl GyroManager {
         };
         device.set_blocking_mode(false).ok()?;
 
+        // On Windows, DualSense/DS4 LED output (report 0x02) is only processed by
+        // the firmware when sent to interface 0 — but that interface is owned
+        // exclusively by the Windows HID class driver and cannot be opened from
+        // userspace. All LED/lightbar control is therefore unavailable on Windows
+        // unless a WinRT (Windows.Gaming.Input) path is implemented in the future.
+        // Trigger effects and rumble go to interface 3 (the accessible IMU interface)
+        // and the firmware processes those fields on that interface.
         let kind = match kind_tag {
             KindTag::Ds4       => DeviceKind::Ds4,
             KindTag::DualSense => DeviceKind::DualSense { connection: None },
@@ -260,18 +297,22 @@ impl GyroManager {
     /// Stage one byte of an output report (rumble/lightbar) for the Nth physical
     /// device with this VID/PID. Has no effect if the device isn't open. Call
     /// `flush_outputs()` once per frame to actually transmit.
-    ///
-    /// Pin name conventions: DS4/DualSense use `rumble_strong`/`rumble_weak`,
-    /// Switch Pro uses `hd_rumble_l`/`hd_rumble_r`. Both pairs map to the same
-    /// internal storage (left side = strong = big motor; right = weak = small).
     pub fn set_output_byte(&mut self, vid: u16, pid: u16, idx: usize, pin_id: &str, byte: u8) {
         let entry = match self.devices.get_mut(&(vid, pid, idx)) {
             Some(e) => e,
             None => return,
         };
         let updated = match pin_id {
-            "rumble_strong" | "hd_rumble_l" => { entry.out.rumble_strong = byte; true }
-            "rumble_weak"   | "hd_rumble_r" => { entry.out.rumble_weak   = byte; true }
+            "rumble_strong" => { entry.out.rumble_strong = byte; true }
+            "rumble_weak"   => { entry.out.rumble_weak   = byte; true }
+            // Legacy amplitude-only HD rumble pins — route to per-side amp field.
+            "hd_rumble_l" => { entry.out.hd_l_amp = byte; true }
+            "hd_rumble_r" => { entry.out.hd_r_amp = byte; true }
+            // Switch Pro HD rumble — amplitude + frequency per side
+            "hd_l_amp"  => { entry.out.hd_l_amp  = byte; true }
+            "hd_l_freq" => { entry.out.hd_l_freq  = byte; true }
+            "hd_r_amp"  => { entry.out.hd_r_amp   = byte; true }
+            "hd_r_freq" => { entry.out.hd_r_freq  = byte; true }
             "lightbar_r"    => { entry.out.lightbar_r = byte; true }
             "lightbar_g"    => { entry.out.lightbar_g = byte; true }
             "lightbar_b"    => { entry.out.lightbar_b = byte; true }
@@ -292,8 +333,6 @@ impl GyroManager {
             "trigger_l_strength" => { entry.out.trigger_l_strength = byte; true }
             "trigger_l_freq"     => { entry.out.trigger_l_freq     = byte; true }
             // DualSense LEDs — caller passes scaled byte
-            // player_led: 0=off, 1=P1, 2=P2, 3=P3, 4=P4
-            // mic_led:    0=off, 1=on(orange), 2=pulsing
             "player_led" => { entry.out.player_led = byte; true }
             "mic_led"    => { entry.out.mic_led    = byte; true }
             _ => false,
@@ -301,48 +340,40 @@ impl GyroManager {
         if updated { entry.output_active = true; }
     }
 
+    /// Stage a signed float output value for AC rumble pins (hd_l_ac / hd_r_ac).
     /// Send pending output reports for every device that has been driven at
     /// least once. Call once per frame.
     pub fn flush_outputs(&mut self) {
         for entry in self.devices.values_mut() {
             if !entry.output_active { continue; }
-            // Destructure so we can borrow device + out + kind disjointly.
             let HidEntry { device, kind, out, .. } = entry;
             match kind {
                 DeviceKind::Ds4 => {
-                    hid_write(device, &build_ds4_usb_out(out), "ds4");
+                    hid_write(device, &build_ds4_usb_out(out));
                 }
                 DeviceKind::DualSense { connection } => {
-                    // BT path needs a 78-byte report 0x31 with seq_tag, padding
-                    // and a CRC32 trailer — not implemented yet, so skip.
-                    if !matches!(connection, Some(Connection::Bt)) {
-                        hid_write(device, &build_dualsense_usb_out(out), "dualsense");
-                    }
+                    if matches!(connection, Some(Connection::Bt)) { continue; }
+                    hid_write(device, &build_dualsense_usb_out(out));
                 }
                 DeviceKind::SwitchPro { initialized, packet_counter } => {
-                    // Rumble subcommand 0x48 must have completed first.
                     if !*initialized { continue; }
-                    let left  = switch_rumble_encode(out.rumble_strong as f32 / 255.0);
-                    let right = switch_rumble_encode(out.rumble_weak   as f32 / 255.0);
+                    let left  = switch_rumble_encode(out.hd_l_amp as f32 / 255.0, out.hd_l_freq as f32 / 255.0);
+                    let right = switch_rumble_encode(out.hd_r_amp as f32 / 255.0, out.hd_r_freq as f32 / 255.0);
                     let pkt = build_switch_rumble_only(*packet_counter, left, right);
                     *packet_counter = packet_counter.wrapping_add(1);
-                    hid_write(device, &pkt, "switch_pro");
+                    hid_write(device, &pkt);
                 }
             }
         }
     }
 }
 
-/// Send an output report and surface failures in debug builds. HID writes can
-/// fail if HidHide hasn't whitelisted FlexInput, if the controller dropped, or
-/// if another process holds an exclusive handle.
-fn hid_write(device: &HidDevice, data: &[u8], _tag: &str) {
+fn hid_write(device: &HidDevice, data: &[u8]) {
     let res = device.write(data);
     #[cfg(debug_assertions)]
-    if let Err(e) = res {
-        eprintln!("[hid-out:{}] write failed ({} bytes): {:?}", _tag, data.len(), e);
+    if let Err(e) = &res {
+        eprintln!("[hid-write] failed ({} bytes): {:?}", data.len(), e);
     }
-    #[cfg(not(debug_assertions))]
     let _ = res;
 }
 
@@ -467,28 +498,61 @@ fn parse_ds4(buf: &[u8]) -> Option<HidReading> {
 
 fn parse_dualsense(buf: &[u8], connection: &mut Option<Connection>) -> Option<HidReading> {
     // Layout reference: Linux drivers/hid/hid-playstation.c, struct dualsense_input_report.
-    //   payload offsets: x,y(0,1) rx,ry(2,3) z,rz(4,5) seq(6) buttons[4](7-10)
-    //                    reserved[4](11-14) gyro[3](15-20) accel[3](21-26)
-    //                    timestamp(27-30) reserved2(31) touch[2](32-39)
-    // USB: report 0x01, payload starts at byte 1 → gyro 16, accel 22, touch 33/37.
-    // BT:  report 0x31, payload starts at byte 2 (1-byte BT preamble) → gyro 17, accel 23, touch 34/38.
-    // buttons[2] (payload offset 9): bit 0 = PS, bit 1 = Touchpad click, bit 2 = Mute.
-    let (conn, go, ao, t1, t2, btn2) = match buf[0] {
-        // USB needs ≥41 bytes to cover touch2 (37+8 ish, but 41 covers touch2's 4 bytes at 37-40).
-        // For just gyro/accel reading without touch, ≥28 is enough; we pick the larger so we get touch.
-        0x01 if buf.len() >= 41 => (Connection::Usb, 16, 22, 33, 37, 10),
-        // BT report 0x31 is 78 bytes including 4-byte CRC; touch fits comfortably.
-        0x31 if buf.len() >= 79 => (Connection::Bt,  17, 23, 34, 38, 11),
+    // Payload offsets (relative to payload base po):
+    //   lx(0) ly(1) rx(2) ry(3) l2(4) r2(5) seq(6)
+    //   buttons[0](7): dpad(3:0) square(4) cross(5) circle(6) triangle(7)
+    //   buttons[1](8): l1(0) r1(1) l2_dig(2) r2_dig(3) create(4) options(5) l3(6) r3(7)
+    //   buttons[2](9): ps(0) touchpad(1) mute(2)
+    //   reserved[4](11-14) gyro[3](15-20) accel[3](21-26)
+    //   timestamp(27-30) reserved2(31) touch[2](32-39)
+    // USB: report 0x01, payload base po=1. BT: report 0x31, payload base po=2.
+    let (conn, po, go, ao, t1, t2) = match buf[0] {
+        0x01 if buf.len() >= 41 => (Connection::Usb, 1usize, 16, 22, 33, 37),
+        0x31 if buf.len() >= 79 => (Connection::Bt,  2usize, 17, 23, 34, 38),
         _ => return None,
     };
     *connection = Some(conn);
 
+    let btn0 = buf[po + 7];
+    let btn1 = buf[po + 8];
+    let btn2 = buf[po + 9];
+
+    // D-Pad: low nibble of buttons[0], 0-7 clockwise from north, 8=neutral.
+    let dpad = btn0 & 0x0F;
+
+    let ds = DualSenseState {
+        lx:  (buf[po]     as f32 - 128.0) / 128.0,
+        ly: -(buf[po + 1] as f32 - 128.0) / 128.0, // HID Y increases downward; invert to +Y=up
+        rx:  (buf[po + 2] as f32 - 128.0) / 128.0,
+        ry: -(buf[po + 3] as f32 - 128.0) / 128.0, // same
+        l2: buf[po + 4] as f32 / 255.0,
+        r2: buf[po + 5] as f32 / 255.0,
+        btn_west:    btn0 & 0x10 != 0, // Square
+        btn_south:   btn0 & 0x20 != 0, // Cross
+        btn_east:    btn0 & 0x40 != 0, // Circle
+        btn_north:   btn0 & 0x80 != 0, // Triangle
+        btn_l1:      btn1 & 0x01 != 0,
+        btn_r1:      btn1 & 0x02 != 0,
+        btn_l2:      btn1 & 0x04 != 0,
+        btn_r2:      btn1 & 0x08 != 0,
+        btn_create:  btn1 & 0x10 != 0,
+        btn_options: btn1 & 0x20 != 0,
+        btn_ls:      btn1 & 0x40 != 0,
+        btn_rs:      btn1 & 0x80 != 0,
+        btn_ps:      btn2 & 0x01 != 0,
+        dpad_up:    matches!(dpad, 0 | 1 | 7),
+        dpad_right: matches!(dpad, 1 | 2 | 3),
+        dpad_down:  matches!(dpad, 3 | 4 | 5),
+        dpad_left:  matches!(dpad, 5 | 6 | 7),
+    };
+
     let mut r = build(buf, go, ao, DS4_GYRO_DPS_PER_LSB, DS4_ACCEL_G_PER_LSB);
-    r.has_touchpad = true;
-    r.touch1 = parse_dualsense_touch(buf, t1);
-    r.touch2 = parse_dualsense_touch(buf, t2);
-    r.touchpad_click = buf[btn2] & 0x02 != 0;
-    r.mic_button     = buf[btn2] & 0x04 != 0;
+    r.has_touchpad    = true;
+    r.touch1          = parse_dualsense_touch(buf, t1);
+    r.touch2          = parse_dualsense_touch(buf, t2);
+    r.touchpad_click  = btn2 & 0x02 != 0;
+    r.mic_button      = btn2 & 0x04 != 0;
+    r.dualsense       = Some(ds);
     Some(r)
 }
 
@@ -509,8 +573,8 @@ fn parse_dualsense_touch(buf: &[u8], off: usize) -> TouchPoint {
     const HALF_H: f32 = 1080.0 / 2.0;
     TouchPoint {
         active,
-        x: (raw_x as f32 - HALF_W) / HALF_W,
-        y: (raw_y as f32 - HALF_H) / HALF_H,
+        x:  (raw_x as f32 - HALF_W) / HALF_W,
+        y: -(raw_y as f32 - HALF_H) / HALF_H, // touchpad Y increases downward; invert to +Y=up
     }
 }
 
@@ -630,27 +694,121 @@ fn build_switch_rumble_only(counter: u8, left: [u8; 4], right: [u8; 4]) -> [u8; 
     r
 }
 
-/// Encode 0..1 amplitude into a 4-byte Switch Pro rumble sample at default
-/// frequencies (LF 160 Hz, HF 320 Hz). The neutral / off packet is
-/// `[0x00, 0x01, 0x40, 0x40]` — sending that stops vibration on that side.
+/// Encode amplitude + frequency into a 4-byte Switch Pro HD rumble packet.
 ///
-/// This is an *approximate* linear scale. Real firmware uses a 100-entry
-/// non-linear lookup table (drivers/hid/nintendo.c `JC_RUMBLE_AMP_LOOKUP`);
-/// the closed-form here trades fidelity for code size and produces a usable,
-/// monotonic amplitude curve. If the rumble feels uncalibrated we can swap in
-/// the real table later.
-fn switch_rumble_encode(amp: f32) -> [u8; 4] {
-    let amp = amp.clamp(0.0, 1.0);
-    if amp < 0.005 {
-        return [0x00, 0x01, 0x40, 0x40];
-    }
-    // Map 0..1 → 7-bit encoded amp 0..0x7C (kernel's max LUT entry).
-    let enc = (amp * 0x7C as f32).round() as u8;
+///   amp  — vibration intensity 0.0–1.0 (0 = silent, 1 = max safe ~1003 units)
+///   freq — normalized 0.0–1.0 mapping to 41–1253 Hz
+///          (0.0=41 Hz, ~0.6=320 Hz default, 1.0=1253 Hz)
+///
+/// The kernel uses one shared frequency table (joycon_rumble_frequencies[]) for
+/// both the HF field (bytes 0–1, u16 `high`) and the LF field (byte 2, u8 `low`).
+/// A single freq input drives both bands simultaneously, which is how the Switch
+/// OS and kernel driver work by default.
+///
+/// Encoding from Linux drivers/hid/nintendo.c joycon_encode_rumble():
+///   data[0] = (freq.high >> 8) & 0xFF
+///   data[1] = (freq.high & 0xFF) + amp.high
+///   data[2] =  freq.low          + ((amp.low >> 8) & 0xFF)
+///   data[3] =  amp.low & 0xFF
+fn switch_rumble_encode(amp: f32, freq: f32) -> [u8; 4] {
+    // joycon_rumble_frequencies[] from drivers/hid/hid-nintendo.c.
+    // Each entry: (high: u16, low: u8) for the given Hz.
+    // 160 entries, 41 Hz (index 0) → 1253 Hz (index 159).
+    // Index 96 = 320 Hz (firmware default).
+    #[rustfmt::skip]
+    const FREQ_TABLE: &[(u16, u8)] = &[
+        (0x0000,0x01),(0x0000,0x02),(0x0000,0x03),(0x0000,0x04),(0x0000,0x05),
+        (0x0000,0x06),(0x0000,0x07),(0x0000,0x08),(0x0000,0x09),(0x0000,0x0a),
+        (0x0000,0x0b),(0x0000,0x0c),(0x0000,0x0d),(0x0000,0x0e),(0x0000,0x0f),
+        (0x0000,0x10),(0x0000,0x11),(0x0000,0x12),(0x0000,0x13),(0x0000,0x14),
+        (0x0000,0x15),(0x0000,0x16),(0x0000,0x17),(0x0000,0x18),(0x0000,0x19),
+        (0x0000,0x1a),(0x0000,0x1b),(0x0000,0x1c),(0x0000,0x1d),(0x0000,0x1e),
+        (0x0000,0x1f),(0x0000,0x20),(0x0400,0x21),(0x0800,0x22),(0x0c00,0x23),
+        (0x1000,0x24),(0x1400,0x25),(0x1800,0x26),(0x1c00,0x27),(0x2000,0x28),
+        (0x2400,0x29),(0x2800,0x2a),(0x2c00,0x2b),(0x3000,0x2c),(0x3400,0x2d),
+        (0x3800,0x2e),(0x3c00,0x2f),(0x4000,0x30),(0x4400,0x31),(0x4800,0x32),
+        (0x4c00,0x33),(0x5000,0x34),(0x5400,0x35),(0x5800,0x36),(0x5c00,0x37),
+        (0x6000,0x38),(0x6400,0x39),(0x6800,0x3a),(0x6c00,0x3b),(0x7000,0x3c),
+        (0x7400,0x3d),(0x7800,0x3e),(0x7c00,0x3f),(0x8000,0x40),(0x8400,0x41),
+        (0x8800,0x42),(0x8c00,0x43),(0x9000,0x44),(0x9400,0x45),(0x9800,0x46),
+        (0x9c00,0x47),(0xa000,0x48),(0xa400,0x49),(0xa800,0x4a),(0xac00,0x4b),
+        (0xb000,0x4c),(0xb400,0x4d),(0xb800,0x4e),(0xbc00,0x4f),(0xc000,0x50),
+        (0xc400,0x51),(0xc800,0x52),(0xcc00,0x53),(0xd000,0x54),(0xd400,0x55),
+        (0xd800,0x56),(0xdc00,0x57),(0xe000,0x58),(0xe400,0x59),(0xe800,0x5a),
+        (0xec00,0x5b),(0xf000,0x5c),(0xf400,0x5d),(0xf800,0x5e),(0xfc00,0x5f),
+        // index 96 = 320 Hz
+        (0x0001,0x60),(0x0401,0x61),(0x0801,0x62),(0x0c01,0x63),(0x1001,0x64),
+        (0x1401,0x65),(0x1801,0x66),(0x1c01,0x67),(0x2001,0x68),(0x2401,0x69),
+        (0x2801,0x6a),(0x2c01,0x6b),(0x3001,0x6c),(0x3401,0x6d),(0x3801,0x6e),
+        (0x3c01,0x6f),(0x4001,0x70),(0x4401,0x71),(0x4801,0x72),(0x4c01,0x73),
+        (0x5001,0x74),(0x5401,0x75),(0x5801,0x76),(0x5c01,0x77),(0x6001,0x78),
+        (0x6401,0x79),(0x6801,0x7a),(0x6c01,0x7b),(0x7001,0x7c),(0x7401,0x7d),
+        (0x7801,0x7e),(0x7c01,0x7f),
+        // index 128 = 640 Hz, low = 0x00 for these (above LF range)
+        (0x8001,0x00),(0x8401,0x00),(0x8801,0x00),(0x8c01,0x00),(0x9001,0x00),
+        (0x9401,0x00),(0x9801,0x00),(0x9c01,0x00),(0xa001,0x00),(0xa401,0x00),
+        (0xa801,0x00),(0xac01,0x00),(0xb001,0x00),(0xb401,0x00),(0xb801,0x00),
+        (0xbc01,0x00),(0xc001,0x00),(0xc401,0x00),(0xc801,0x00),(0xcc01,0x00),
+        (0xd001,0x00),(0xd401,0x00),(0xd801,0x00),(0xdc01,0x00),(0xe001,0x00),
+        (0xe401,0x00),(0xe801,0x00),(0xec01,0x00),(0xf001,0x00),(0xf401,0x00),
+        (0xf801,0x00),(0xfc01,0x00), // index 159 = 1253 Hz
+    ];
+    // joycon_rumble_amplitudes[] safe range (0–1003 units) from drivers/hid/hid-nintendo.c.
+    // (high: u8, low: u16) — added into frequency bytes per joycon_encode_rumble().
+    // 101 entries: index 0 = silent (0 units), index 100 = max safe (1003 units).
+    #[rustfmt::skip]
+    const AMP_TABLE: &[(u8, u16)] = &[
+        (0x00,0x0040),
+        (0x02,0x8040),(0x04,0x0041),(0x06,0x8041),(0x08,0x0042),(0x0a,0x8042),
+        (0x0c,0x0043),(0x0e,0x8043),(0x10,0x0044),(0x12,0x8044),(0x14,0x0045),
+        (0x16,0x8045),(0x18,0x0046),(0x1a,0x8046),(0x1c,0x0047),(0x1e,0x8047),
+        (0x20,0x0048),(0x22,0x8048),(0x24,0x0049),(0x26,0x8049),(0x28,0x004a),
+        (0x2a,0x804a),(0x2c,0x004b),(0x2e,0x804b),(0x30,0x004c),(0x32,0x804c),
+        (0x34,0x004d),(0x36,0x804d),(0x38,0x004e),(0x3a,0x804e),(0x3c,0x004f),
+        (0x3e,0x804f),(0x40,0x0050),(0x42,0x8050),(0x44,0x0051),(0x46,0x8051),
+        (0x48,0x0052),(0x4a,0x8052),(0x4c,0x0053),(0x4e,0x8053),(0x50,0x0054),
+        (0x52,0x8054),(0x54,0x0055),(0x56,0x8055),(0x58,0x0056),(0x5a,0x8056),
+        (0x5c,0x0057),(0x5e,0x8057),(0x60,0x0058),(0x62,0x8058),(0x64,0x0059),
+        (0x66,0x8059),(0x68,0x005a),(0x6a,0x805a),(0x6c,0x005b),(0x6e,0x805b),
+        (0x70,0x005c),(0x72,0x805c),(0x74,0x005d),(0x76,0x805d),(0x78,0x005e),
+        (0x7a,0x805e),(0x7c,0x005f),(0x7e,0x805f),(0x80,0x0060),(0x82,0x8060),
+        (0x84,0x0061),(0x86,0x8061),(0x88,0x0062),(0x8a,0x8062),(0x8c,0x0063),
+        (0x8e,0x8063),(0x90,0x0064),(0x92,0x8064),(0x94,0x0065),(0x96,0x8065),
+        (0x98,0x0066),(0x9a,0x8066),(0x9c,0x0067),(0x9e,0x8067),(0xa0,0x0068),
+        (0xa2,0x8068),(0xa4,0x0069),(0xa6,0x8069),(0xa8,0x006a),(0xaa,0x806a),
+        (0xac,0x006b),(0xae,0x806b),(0xb0,0x006c),(0xb2,0x806c),(0xb4,0x006d),
+        (0xb6,0x806d),(0xb8,0x006e),(0xba,0x806e),(0xbc,0x006f),(0xbe,0x806f),
+        (0xc0,0x0070),(0xc2,0x8070),(0xc4,0x0071),(0xc6,0x8071),(0xc8,0x0072),
+    ];
+
+    // FREQ_TABLE has 159 entries (valid indices 0–158).
+    // Safe range: indices 32–127 (~82–626 Hz) — these have both HF and LF fields non-zero.
+    // Indices 128–158 have fl=0x00 (above LF range); capped at 127 to avoid firmware glitches.
+    // The fh field is NOT a linear numeric encoding — it wraps at index 95→96 — so we must
+    // use it as an opaque lookup key and never interpolate between entries.
+    const FREQ_LO: usize = 32;  // ~82 Hz
+    const FREQ_HI: usize = 127; // ~626 Hz
+    let f_idx = ((FREQ_LO as f32 + freq.clamp(0.0, 1.0) * (FREQ_HI - FREQ_LO) as f32)
+        .round() as usize)
+        .clamp(FREQ_LO, FREQ_HI);
+    let (fh, fl) = FREQ_TABLE[f_idx];
+
+    // Perceptual amplitude: input 0–1 → power-law curve (exponent 1.8).
+    // Skips index 0 (silence) for any non-zero input so amp responds from the very start.
+    let amp_c = amp.clamp(0.0, 1.0);
+    let a_idx = if amp_c == 0.0 {
+        0
+    } else {
+        let linear = amp_c.powf(1.8);
+        (1 + (linear * (AMP_TABLE.len() - 2) as f32).round() as usize).min(AMP_TABLE.len() - 1)
+    };
+
+    let (ah, al) = AMP_TABLE[a_idx];
     [
-        0x00,                                  // HF freq high (320 Hz default)
-        0x01 | (enc & 0x7E),                   // HF freq low | HF amp (6-bit slot)
-        0x40 | (enc >> 1),                     // LF freq high | LF amp upper
-        0x40 | ((enc & 0x01) << 6),            // LF freq low  | LF amp lsb
+        ((fh >> 8) & 0xFF) as u8,
+        ((fh & 0xFF) as u8).wrapping_add(ah),
+        fl.wrapping_add(((al >> 8) & 0xFF) as u8),
+        (al & 0xFF) as u8,
     ]
 }
 
@@ -734,15 +892,41 @@ fn player_led_mask(idx: u8) -> u8 {
 /// `dualsense_output_report_common` (47 bytes) sits at buffer offset 1.
 ///
 /// Valid-flag values mirror pydualsense / DS4Windows: enable everything except
-/// `release LEDs` (which would hand the lightbar back to the system).
+/// One-shot lightbar init report: sends LIGHTBAR_SETUP=LIGHT_ON so the firmware
+/// DualSense USB output report 0x02.
 fn build_dualsense_usb_out(out: &OutputState) -> [u8; 63] {
+    // Layout: Linux hid-playstation.c dualsense_output_report_common (47 bytes, __packed).
+    // Report ID 0x02 at buf[0]; common struct starts at buf[1] (struct offset + 1).
+    //
+    // buf[ 0] = 0x02  report_id
+    // buf[ 1] = valid_flag0  bit0=compatible_vibration, bit1=haptics_select
+    // buf[ 2] = valid_flag1  bit0=mic_mute_led, bit1=power_save, bit2=lightbar,
+    //                        bit3=RELEASE_LEDS (must be 0!), bit4=player_indicator
+    // buf[ 3] = motor_right  (rumble weak)
+    // buf[ 4] = motor_left   (rumble strong)
+    // buf[ 5-8]  audio (leave 0)
+    // buf[ 9] = mute_button_led
+    // buf[10] = power_save_control
+    // buf[11-37] = reserved2[27] — trigger effects placed here (non-kernel extension)
+    // buf[38] = audio_control2
+    // buf[39] = valid_flag2   bit1=lightbar_setup_control_enable, bit2=compat_vibration2
+    // buf[40-41] = reserved3[2]
+    // buf[42] = lightbar_setup  (0x02 = lightbar_on)
+    // buf[43] = led_brightness  (0x02 = bright)
+    // buf[44] = player_leds bitmask
+    // buf[45] = lightbar_red
+    // buf[46] = lightbar_green
+    // buf[47] = lightbar_blue
+    // buf[48-62] = padding
+    // Offsets match DualSense-Windows DS5_Output.cpp (their buffer has no report ID,
+    // so their 0x00 = our r[1], their 0x2C = our r[45], etc.)
     let mut r = [0u8; 63];
-    r[0] = 0x02;                // Report ID
-    r[1] = 0xFF;                // valid_flag0: rumble + trigger motors + audio enabled
-    r[2] = 0xF7;                // valid_flag1: LED paths enabled, bit 3 (release_leds) = 0
-    r[3] = out.rumble_weak;     // motor_right — high-freq
-    r[4] = out.rumble_strong;   // motor_left  — low-freq
-    // Adaptive trigger effects: right at r[11..22], left at r[22..33]
+    r[0] = 0x02;
+    r[1] = 0xFF;  // valid_flag0
+    r[2] = 0xF7;  // valid_flag1 (matches DualSense-Windows exactly)
+    r[3] = out.rumble_weak;
+    r[4] = out.rumble_strong;
+    r[9] = out.mic_led.min(2);
     let rt = encode_trigger_effect(
         out.trigger_r_mode, out.trigger_r_start,
         out.trigger_r_end,  out.trigger_r_strength, out.trigger_r_freq,
@@ -753,15 +937,13 @@ fn build_dualsense_usb_out(out: &OutputState) -> [u8; 63] {
     );
     r[11..22].copy_from_slice(&rt);
     r[22..33].copy_from_slice(&lt);
-    r[39] = 0x07;               // valid_flag2: lightbar setup + compat vibration v2
-    r[42] = 0x02;               // lightbar_setup: 0x02 = lightbar_on
-    r[43] = 0x02;               // led_brightness: 0x02 = bright
-    r[44] = player_led_mask(out.player_led); // player indicator LEDs
-    r[45] = out.lightbar_r;     // lightbar_red
-    r[46] = out.lightbar_g;     // lightbar_green
-    r[47] = out.lightbar_b;     // lightbar_blue
-    // Mic mute LED: r[9] = mute_button_led (0=off, 1=on/orange, 2=pulsing)
-    r[9]  = out.mic_led.min(2);
+    r[39] = 0x03; // valid_flag2: matches DualSense-Windows exactly (their 0x26=0x03)
+    r[42] = 0x02; // lightbar_setup (their 0x29)
+    r[43] = 0x00; // led_brightness: 0 = firmware default
+    r[44] = player_led_mask(out.player_led);
+    r[45] = out.lightbar_r;
+    r[46] = out.lightbar_g;
+    r[47] = out.lightbar_b;
     r
 }
 

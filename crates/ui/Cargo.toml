@@ -22,6 +22,7 @@ serde             = { workspace = true }
 serde_json        = { workspace = true }
 rfd               = { workspace = true }
 egui-snarl        = { workspace = true, features = ["serde"] }
+open              = "5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
