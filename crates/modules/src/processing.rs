@@ -16,6 +16,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<AutoMapCollectModule>(),
         reg::<AutoMapFork>(),
         reg::<AutoMapSelector>(),
+        reg::<AutoMapCombiner>(),
         reg::<RemapperModule>(),
     ]
 }
@@ -310,6 +311,40 @@ impl Module for AutoMapSelector {
         let selected_bus = inputs.get(select + 1).and_then(|s| *s).unwrap_or(Signal::Float(0.0));
         let mut r = SmallVec::new();
         r.push(selected_bus);
+        r
+    }
+}
+
+// ── AutoMap Combiner ──────────────────────────────────────────────────────────
+
+/// Merges multiple AutoMap bus inputs into one. Priority by port order: the
+/// uppermost input that has a pin "asserted" (Bool true, non-zero Float) wins
+/// that pin for this tick. Other inputs contribute pins they alone assert.
+/// Default: 2 inputs (in_0, in_1); additional inputs added by extending the
+/// node's input vec from the canvas body.
+#[derive(Default)]
+pub struct AutoMapCombiner;
+
+impl Module for AutoMapCombiner {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.automap_combiner",
+            display_name: "AutoMap Combiner",
+            category: "AutoMap",
+            inputs: vec![
+                PinDescriptor::new("in_0", SignalType::AutoMap),
+                PinDescriptor::new("in_1", SignalType::AutoMap),
+            ],
+            outputs: vec![
+                PinDescriptor::new("out", SignalType::AutoMap),
+            ],
+        }
+    }
+    fn process(&mut self, _inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        // Bus value is irrelevant — eval reads `combiner:{uid}` collector_sigs
+        // entries written by the dedicated branch in `eval::tick`.
+        let mut r = SmallVec::new();
+        r.push(Signal::Float(0.0));
         r
     }
 }

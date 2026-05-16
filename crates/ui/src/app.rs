@@ -138,6 +138,16 @@ pub struct FlexInputApp {
     io_device_list: Arc<RwLock<Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>>>,
     /// Bypass flag: when true the I/O thread calls reset_outputs() instead of flush().
     io_bypass: Arc<AtomicBool>,
+    // ── MIDI watch thread shared state ────────────────────────────────────────
+    /// MIDI device IDs (`midi_in:N` / `midi_out:N`) referenced by canvas
+    /// device.source / device.sink nodes across all tabs. The MIDI watch
+    /// thread reads this to decide which OS handles to keep open vs release.
+    /// UI rebuilds it each frame from the current canvas state.
+    pinned_midi_ids: Arc<RwLock<HashSet<String>>>,
+    /// MIDI device list maintained by the MIDI watch thread. Appended into
+    /// the I/O thread's shared_devices each enum cycle so the UI sees a
+    /// unified gilrs + MIDI list without ever touching the MIDI lock.
+    shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     // ── Panic mode ────────────────────────────────────────────────────────────
     /// User-configurable global shortcut to toggle all virtual output off.
     panic_shortcut: PanicShortcut,
@@ -224,6 +234,8 @@ impl FlexInputApp {
 
         let tabs = vec![PatchTab::new_untitled(1)];
         let shared_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
+        let shared_midi_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
+        let pinned_midi_ids = Arc::new(RwLock::new(HashSet::<String>::new()));
         let io_bypass      = Arc::new(AtomicBool::new(false));
         // Point io_device_list at the first (active) tab's device Arc.
         let io_device_list = Arc::new(RwLock::new(
@@ -238,6 +250,13 @@ impl FlexInputApp {
             Arc::clone(&io_device_list),
             Arc::clone(&io_bypass),
             Arc::clone(&shared_devices),
+            Arc::clone(&shared_midi_devices),
+        );
+
+        spawn_midi_watch_thread(
+            Arc::clone(&midi_backend),
+            Arc::clone(&pinned_midi_ids),
+            Arc::clone(&shared_midi_devices),
         );
 
         // ── Panic-mode state ──────────────────────────────────────────────
@@ -282,6 +301,8 @@ impl FlexInputApp {
             proc_outputs,
             io_device_list,
             io_bypass,
+            pinned_midi_ids,
+            shared_midi_devices,
             panic_shortcut: panic_shortcut.clone(),
             panic_active: false,
             panic_learning: false,
@@ -298,12 +319,42 @@ impl eframe::App for FlexInputApp {
 
         // Read the latest device signals written by the I/O thread (500 Hz).
         self.last_signals = self.proc_device_signals.read().unwrap().clone();
-        // Refresh device list from I/O thread and append live MIDI devices.
+        // Refresh device list from I/O thread. Both gilrs and MIDI device
+        // listings are populated there, so the UI never contends with the
+        // 500 Hz MIDI poll lock (which used to cause MIDI cards to flicker
+        // in/out whenever the lock was held during a paint).
         self.devices = self.shared_devices.read().unwrap().clone();
-        if let Ok(mut midi_g) = self.midi_backend.try_lock() {
-            if let Some(m) = midi_g.as_mut() {
-                self.devices.extend(m.enumerate());
+
+        // Publish the set of `midi_in:N` / `midi_out:N` IDs referenced by
+        // canvas device.source / device.sink nodes (across all tabs and
+        // sub-patch editors). The MIDI watch thread reads this to decide
+        // which OS handles to keep open vs release: unpinned handles are
+        // closed so loopMIDI can actually remove ports the user deletes.
+        {
+            let mut pinned: HashSet<String> = HashSet::new();
+            for tab in &self.tabs {
+                for (_, n) in tab.canvas.snarl.nodes_ids_data() {
+                    if n.value.module_id == "device.source" || n.value.module_id == "device.sink" {
+                        if let Some(id) = n.value.params.get("device_id").and_then(|v| v.as_str()) {
+                            if id.starts_with("midi_in:") || id.starts_with("midi_out:") {
+                                pinned.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
             }
+            for ed in &self.sub_patch_editors {
+                for (_, n) in ed.canvas.snarl.nodes_ids_data() {
+                    if n.value.module_id == "device.source" || n.value.module_id == "device.sink" {
+                        if let Some(id) = n.value.params.get("device_id").and_then(|v| v.as_str()) {
+                            if id.starts_with("midi_in:") || id.starts_with("midi_out:") {
+                                pinned.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            *self.pinned_midi_ids.write().unwrap() = pinned;
         }
 
         // Feed learned CCs into the active tab's canvas nodes.
@@ -1080,16 +1131,26 @@ impl eframe::App for FlexInputApp {
         // ── Sub-patch editor windows ──────────────────────────────────────────
         show_subpatch_editors(self, ctx, &live_device_ids);
 
+        // When the patch is live (has nodes or virtual devices), paint every
+        // vsync — `request_repaint()` with no delay tells eframe to paint
+        // next frame; the swap-chain throttles to the monitor refresh rate,
+        // so no beating with arbitrary monitor refresh rates.
+        //
+        // When idle (empty patch and no virtual devices), fall back to a
+        // slow 100 ms tick. Always-repainting on the desktop PC produces
+        // worse strobing than the conditional path on some GPU/driver
+        // combos (likely a glow + DWM swap-chain interaction). Empty patch
+        // is a transient state; once a node is dropped the live path kicks
+        // in and rendering is smooth.
         let has_virtual = {
             let devs = self.tabs[self.active_tab].virtual_panel.active.lock().unwrap();
             !devs.is_empty()
         };
-        let repaint_after = if canvas_has_nodes || has_virtual {
-            std::time::Duration::from_millis(8)
+        if canvas_has_nodes || has_virtual {
+            ctx.request_repaint();
         } else {
-            std::time::Duration::from_millis(100)
-        };
-        ctx.request_repaint_after(repaint_after);
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         handle_window_resize(ctx);
     }
@@ -1121,6 +1182,7 @@ fn spawn_io_thread(
     io_device_list: Arc<RwLock<Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>>>,
     io_bypass: Arc<AtomicBool>,
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
+    shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
 ) {
     use std::time::{Duration, Instant};
 
@@ -1150,12 +1212,17 @@ fn spawn_io_thread(
                 }
                 *proc_device_signals.write().unwrap() = signals;
 
-                // ── Enumerate devices periodically ────────────────────────────
+                // ── Enumerate gilrs devices periodically ──────────────────────
+                // MIDI enumeration is handled by spawn_midi_watch_thread() so
+                // the slow Win32 MIDI calls (60–70 ms with loopMIDI loaded)
+                // don't stall this 500 Hz I/O loop.
                 if last_enum.elapsed() > Duration::from_secs(2) {
                     let mut devs: Vec<PhysicalDevice> = Vec::new();
                     for backend in &mut backends {
                         devs.extend(backend.enumerate());
                     }
+                    // Append MIDI device list maintained by the MIDI watch thread.
+                    devs.extend(shared_midi_devices.read().unwrap().iter().cloned());
                     *shared_devices.write().unwrap() = devs;
                     last_enum = Instant::now();
                 }
@@ -1228,6 +1295,58 @@ fn spawn_io_thread(
             }
         })
         .expect("failed to spawn device I/O thread");
+}
+
+// ── MIDI watch thread ────────────────────────────────────────────────────────
+//
+// Runs the (slow, Windows-blocking) MIDI port enumeration off the 500 Hz I/O
+// loop so it never stalls device polling. Cycle every 2 s:
+//
+//  1. Read pinned_midi_ids (set of midi_in:N / midi_out:N the canvas uses).
+//  2. Lock MidiBackend briefly to drop any open OS handles that aren't
+//     pinned — this lets the Windows MIDI subsystem report removed ports as
+//     gone (otherwise an open handle keeps loopMIDI ports alive even after
+//     the user deletes them in loopMIDI's UI).
+//  3. Without the lock, call list_live_ports() — the slow Win32 call.
+//  4. Lock MidiBackend again briefly to apply the diff (open connections for
+//     pinned ports that came back, drop entries for vanished ports) and
+//     rebuild the shared MIDI device list for the UI panel.
+fn spawn_midi_watch_thread(
+    midi: Arc<Mutex<Option<MidiBackend>>>,
+    pinned_midi_ids: Arc<RwLock<HashSet<String>>>,
+    shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
+) {
+    use std::time::Duration;
+    std::thread::Builder::new()
+        .name("midi-watch".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+
+                // 1+2: release non-canvas-pinned handles so the OS can free them.
+                {
+                    let pinned = pinned_midi_ids.read().unwrap().clone();
+                    if let Ok(mut mg) = midi.lock() {
+                        if let Some(m) = mg.as_mut() {
+                            m.release_unpinned(&pinned);
+                        }
+                    }
+                }
+
+                // 3: slow enum without the lock.
+                let (live_in, live_out) = MidiBackend::list_live_ports();
+
+                // 4: apply diff + publish device list for the UI.
+                if let Ok(mut mg) = midi.lock() {
+                    if let Some(m) = mg.as_mut() {
+                        m.apply_port_diff(&live_in, &live_out);
+                        let devs = m.enumerate();
+                        *shared_midi_devices.write().unwrap() = devs;
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn MIDI watch thread");
 }
 
 /// Recreate a virtual device from its saved ID string.
@@ -1853,6 +1972,31 @@ fn find_automap_device_rec(
             .iter().map(|p| p.id.to_string()).collect();
         return Some((collector_id, canonical_pins, upstream_dev_id));
     }
+    if node.module_id == "module.automap_combiner" {
+        // Combiner is a virtual bus: per-pin priority merge of its N AutoMap
+        // inputs, written into collector_sigs under "combiner:{uid}". Downstream
+        // consumers read it the same way they read any other collector.
+        let combiner_uid = match parents {
+            None => src.node.0,
+            Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
+        };
+        let combiner_id = format!("combiner:{}", combiner_uid);
+        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+            .iter().map(|p| p.id.to_string()).collect();
+        // Use the first connected input's underlying physical device as the
+        // fallback so haptic-feedback reverse-routing has something to bind
+        // (matches Collector's behaviour).
+        let upstream_dev_id = (0..node.inputs.len())
+            .find_map(|i| {
+                if node.inputs[i].signal_type != SignalType::AutoMap { return None; }
+                let in_pin = snarl.in_pin(InPinId { node: src.node, input: i });
+                let &s = in_pin.remotes.first()?;
+                find_automap_device_rec(snarl, s, parents).map(|(id, _, fallback)| {
+                    fallback.unwrap_or(id)
+                })
+            });
+        return Some((combiner_id, canonical_pins, upstream_dev_id));
+    }
     if node.module_id == "module.remapper" {
         // Acts as a collector: publishes per-pin signals (pass-through + mapping
         // overrides) into collector_sigs under a `remap:{uid}` key. Downstream
@@ -1950,7 +2094,7 @@ fn build_processing_graph_rec(
         }
     }
 
-    let snaps: Vec<NodeSnap> = node_list.iter().map(|(node_id, node)| {
+    let mut snaps: Vec<NodeSnap> = node_list.iter().map(|(node_id, node)| {
         let is_sink = node.module_id == "device.sink"
             || (node.module_id == "device.source" && !node.inputs.is_empty());
 
@@ -2022,7 +2166,7 @@ fn build_processing_graph_rec(
             // Their output signals (rumble, lightbar) flow back to this sink's haptic inputs.
             let feedback_sources = feedback_map.get(&sink_dev_id).cloned().unwrap_or_default();
 
-            Some(SinkTarget { device_id: sink_dev_id, pin_ids, multi_sources, automap_source, automap_fallback_dev, feedback_sources })
+            Some(SinkTarget { device_id: sink_dev_id, pin_ids, multi_sources, automap_source, automap_fallback_dev, feedback_sources, is_self_sink: false })
         } else {
             None
         };
@@ -2043,8 +2187,13 @@ fn build_processing_graph_rec(
                         let real_id = fallback.unwrap_or_else(|| dev_id.clone());
                         params.insert("_automap_device_id".to_string(), serde_json::Value::String(real_id));
                         // _automap_collector_id = virtual collector key to read from collector_sigs first.
-                        // Covers both automap_collect ("collector:") and fork/selector ("forksel:").
-                        if dev_id.starts_with("collector:") || dev_id.starts_with("forksel:") {
+                        // Covers automap_collect ("collector:"), fork/selector ("forksel:"),
+                        // combiner ("combiner:"), and remapper ("remap:").
+                        if dev_id.starts_with("collector:")
+                            || dev_id.starts_with("forksel:")
+                            || dev_id.starts_with("combiner:")
+                            || dev_id.starts_with("remap:")
+                        {
                             params.insert("_automap_collector_id".to_string(),
                                 serde_json::Value::String(dev_id));
                         }
@@ -2064,6 +2213,35 @@ fn build_processing_graph_rec(
                 }
                 params.insert("_automap_input_devs".to_string(), serde_json::Value::Array(extra_devs));
             }
+        }
+        // Combiner: all inputs are equal AutoMap buses (no select pin). Record
+        // dev_id AND collector_id for each port so eval can read collector
+        // overrides (Remapper / Collector / Selector / Fork) before falling
+        // back to raw device samples. Parallel arrays indexed by port.
+        if node.module_id == "module.automap_combiner" {
+            let mut devs: Vec<serde_json::Value> = Vec::new();
+            let mut collectors: Vec<serde_json::Value> = Vec::new();
+            for i in 0..node.inputs.len() {
+                let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
+                let resolved = pin.remotes.first()
+                    .and_then(|&src| find_automap_device_rec(snarl, src, parents));
+                let (dev_str, coll_str) = match resolved {
+                    Some((dev_id, _, fallback)) => {
+                        let is_collector = dev_id.starts_with("collector:")
+                            || dev_id.starts_with("forksel:")
+                            || dev_id.starts_with("remap:")
+                            || dev_id.starts_with("combiner:");
+                        let dev = fallback.unwrap_or_else(|| if is_collector { String::new() } else { dev_id.clone() });
+                        let coll = if is_collector { dev_id } else { String::new() };
+                        (dev, coll)
+                    }
+                    None => (String::new(), String::new()),
+                };
+                devs.push(serde_json::Value::String(dev_str));
+                collectors.push(serde_json::Value::String(coll_str));
+            }
+            params.insert("_automap_input_devs".to_string(), serde_json::Value::Array(devs));
+            params.insert("_automap_input_collectors".to_string(), serde_json::Value::Array(collectors));
         }
         // For automap_collect: forward the stable pin-ID list so eval.rs can key collector_sigs.
         // IDs are stored separately in collect_input_pin_ids (parallel to inputs[1..]).
@@ -2113,7 +2291,54 @@ fn build_processing_graph_rec(
 
     // Topological sort (Kahn's algorithm).
     // Sink nodes are leaves (no node depends on them), so they naturally end up last.
+    //
+    // A device.source node with feedback inputs is both source and sink in one
+    // physical node. Its sink-half (multi_sources) can legitimately receive a
+    // wire that traces back to its own source-half — directly, or through a
+    // Splitter/Math chain. That looks like a graph cycle but isn't a real
+    // data-flow cycle: hardware reads happen at frame start (dev_sigs) and
+    // hardware writes happen at frame end (sink_outputs), with no within-frame
+    // dependency between them. We solve this by suppressing the sink-half's
+    // incoming edges in the topo sort (so the source-half sorts early as a
+    // pure leaf, releasing downstream consumers in Kahn), and eval runs a
+    // second pass over self-sinks' multi_sources after the main loop, by which
+    // time every upstream `computed[idx]` slot is filled.
     let n = snaps.len();
+    let is_source_self_sink: Vec<bool> = snaps.iter().enumerate().map(|(idx, snap)| {
+        if snap.module_id != "device.source" { return false; }
+        let Some(ref st) = snap.sink_target else { return false; };
+        // Direct self-wire: any multi_source pointing back to this node.
+        if st.multi_sources.iter().any(|srcs| srcs.iter().any(|&(s, _)| s == idx)) {
+            return true;
+        }
+        // Indirect self-wire: BFS over input_sources of upstream nodes — does any
+        // path through the regular signal graph loop back to this node?
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut stack: Vec<usize> = st.multi_sources.iter()
+            .flat_map(|srcs| srcs.iter().map(|&(s, _)| s))
+            .collect();
+        while let Some(cur) = stack.pop() {
+            if cur == idx { return true; }
+            if !visited.insert(cur) { continue; }
+            if let Some(up) = snaps.get(cur) {
+                for &(s, _) in up.input_sources.iter().flatten() {
+                    stack.push(s);
+                }
+            }
+        }
+        false
+    }).collect();
+
+    // Propagate the detection back into each SinkTarget so eval can drive its
+    // post-pass for these nodes.
+    for (i, snap) in snaps.iter_mut().enumerate() {
+        if is_source_self_sink[i] {
+            if let Some(ref mut st) = snap.sink_target {
+                st.is_self_sink = true;
+            }
+        }
+    }
+
     let mut in_degree = vec![0usize; n];
     let mut dependents: Vec<Vec<usize>> = vec![vec![]; n];
     for (idx, snap) in snaps.iter().enumerate() {
@@ -2123,6 +2348,9 @@ fn build_processing_graph_rec(
             in_degree[idx] += 1;
         }
         // Sink nodes: multi-source inputs (deduplicated per source node to avoid double-counting).
+        // Skip for device.source self-sinks: their sink-half is handled in a
+        // post-pass during eval, so we don't add the cycle-inducing incoming edges here.
+        if !is_source_self_sink[idx] {
         if let Some(ref st) = snap.sink_target {
             let mut seen: HashSet<usize> = HashSet::new();
             for sources in &st.multi_sources {
@@ -2133,12 +2361,17 @@ fn build_processing_graph_rec(
                     }
                 }
             }
-            // If the AutoMap source is a Collector or Fork/Selector, add it as a dependency
-            // so it is evaluated before this sink (ensuring collector_sigs is populated).
+            // If the AutoMap source is a Collector / Fork / Selector / Combiner / Remapper,
+            // add it as a dependency so it is evaluated before this sink (ensuring
+            // collector_sigs is populated).
             if let Some((ref am_dev_id, _)) = st.automap_source {
                 // "collector:{uid}" → automap_collect node
                 // "forksel:{uid}:{out}" → automap_fork or automap_selector node
+                // "combiner:{uid}" → automap_combiner node
+                // "remap:{uid}" → remapper node
                 let uid_str = am_dev_id.strip_prefix("collector:")
+                    .or_else(|| am_dev_id.strip_prefix("combiner:"))
+                    .or_else(|| am_dev_id.strip_prefix("remap:"))
                     .or_else(|| am_dev_id.strip_prefix("forksel:").and_then(|s| s.split(':').next()));
                 if let Some(uid_str) = uid_str {
                     if let Ok(uid) = uid_str.parse::<usize>() {
@@ -2172,6 +2405,7 @@ fn build_processing_graph_rec(
                 }
             }
         }
+        } // end !is_source_self_sink guard
     }
     let mut queue: VecDeque<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
     let mut sorted: Vec<usize> = Vec::with_capacity(n);

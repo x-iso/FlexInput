@@ -78,19 +78,19 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "accel_x",       display_name: "Accel X",              signal_type: SignalType::Float },
     AutoMapPin { id: "accel_y",       display_name: "Accel Y",              signal_type: SignalType::Float },
     AutoMapPin { id: "accel_z",       display_name: "Accel Z",              signal_type: SignalType::Float },
-    AutoMapPin { id: "btn_south",     display_name: "South (B/Cross/X)",    signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_east",      display_name: "East (A/Circle/O)",    signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_west",      display_name: "West (X/Square/Y)",    signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_north",     display_name: "North (Y/Triangle/X)", signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_lb",        display_name: "LB / L1 / L",          signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_rb",        display_name: "RB / R1 / R",          signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_lt_dig",    display_name: "LT dig / L2 / ZL",     signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_rt_dig",    display_name: "RT dig / R2 / ZR",     signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_south",     display_name: "South",                signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_east",      display_name: "East",                 signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_west",      display_name: "West",                 signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_north",     display_name: "North",                signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_lb",        display_name: "LB",                   signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_rb",        display_name: "RB",                   signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_lt_dig",    display_name: "LT (dig)",             signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_rt_dig",    display_name: "RT (dig)",             signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_ls",        display_name: "L.Stick Click",        signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_rs",        display_name: "R.Stick Click",        signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_start",     display_name: "Start / + / Options",  signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_back",      display_name: "Back / − / Share",     signal_type: SignalType::Bool },
-    AutoMapPin { id: "btn_guide",     display_name: "Guide / Home / PS",    signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_start",     display_name: "Start",                signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_back",      display_name: "Back",                 signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_guide",     display_name: "Guide",                signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_capture",   display_name: "Capture",              signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_mute",      display_name: "Mute",                 signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_touchpad",  display_name: "Touchpad Click",       signal_type: SignalType::Bool },
@@ -117,6 +117,37 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "mouse_x",       display_name: "Mouse: X (delta)",     signal_type: SignalType::Float },
     AutoMapPin { id: "mouse_y",       display_name: "Mouse: Y (delta)",     signal_type: SignalType::Float },
 ];
+
+/// Family-specific button glyph for a cross-family pin, or `None` if the pin
+/// is family-neutral. `family_slug` is the middle segment of a gilrs device ID
+/// (e.g. `"dualsense"` from `"gilrs:dualsense:0"`). Pass `None` / unknown to get
+/// the neutral positional label embedded in [`ALL_PINS`] (e.g. "South").
+///
+/// Used by the AutoMap Splitter body to swap "South (B/Cross/X)" for the single
+/// label that matches the actually-connected upstream device.
+pub fn family_label(pin_id: &str, family_slug: Option<&str>) -> Option<&'static str> {
+    let fam = family_slug?;
+    let (xi, ps, sw) = match pin_id {
+        "btn_south"  => ("A", "Cross", "B"),
+        "btn_east"   => ("B", "Circle", "A"),
+        "btn_west"   => ("X", "Square", "Y"),
+        "btn_north"  => ("Y", "Triangle", "X"),
+        "btn_lb"     => ("LB", "L1", "L"),
+        "btn_rb"     => ("RB", "R1", "R"),
+        "btn_lt_dig" => ("LT", "L2", "ZL"),
+        "btn_rt_dig" => ("RT", "R2", "ZR"),
+        "btn_start"  => ("Start", "Options", "+"),
+        "btn_back"   => ("Back", "Share", "−"),
+        "btn_guide"  => ("Guide", "PS", "Home"),
+        _ => return None,
+    };
+    Some(match fam {
+        "xinput"                  => xi,
+        "ds4" | "dualsense"       => ps,
+        "switch_pro"              => sw,
+        _                         => return None,
+    })
+}
 
 /// Given lists of source and destination pin IDs, returns `(src_id, dst_id)` pairs
 /// for every auto-mappable signal. A single source pin can map to multiple destination

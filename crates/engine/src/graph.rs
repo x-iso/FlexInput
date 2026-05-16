@@ -36,6 +36,11 @@ pub struct SinkTarget {
     /// When this device is itself a sink (has haptic inputs), the engine looks up
     /// matching feedback signals (per FEEDBACK_PAIRS) from these virtual devices.
     pub feedback_sources: Vec<String>,
+    /// True for device.source nodes whose feedback-input wires loop back to
+    /// their own source-half (directly or through Splitter/Math chain). Eval
+    /// defers the multi_sources read to a post-pass so the chain has produced
+    /// values by the time we read them.
+    pub is_self_sink: bool,
 }
 
 #[derive(Clone)]

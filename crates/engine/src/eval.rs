@@ -399,6 +399,262 @@ pub fn eval_graph_tick(
             continue;
         }
 
+        // ── module.automap_combiner: merge N AutoMap inputs per per-pin policy ──
+        // Default policy SORT: walk inputs top-down (lowest port = highest priority);
+        // first asserted value wins. Per-pin overrides in `combiner_pin_policy`:
+        //   - OR  : Bool = logical OR;  Float = max(|x|) preserving sign of max
+        //   - AND : Bool = logical AND; Float = min(|x|) preserving sign of min
+        //   - XOR : Bool = parity;      Float = |a - b| (folded across all inputs)
+        //   - ADD : sum, clamped per pin (triggers [0,1], sticks/axes [-1,1])
+        //   - MULT: product, clamped per pin
+        // Writes into collector_sigs under "combiner:{uid}".
+        if snap.module_id == "module.automap_combiner" {
+            let input_devs = snap.params.get("_automap_input_devs")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let input_collectors = snap.params.get("_automap_input_collectors")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let policy_map = snap.params.get("combiner_pin_policy")
+                .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            // Per-pin port pinning: if present, this pin reads ONLY from the
+            // specified port (clamped to last connected port). Bypasses policy.
+            let port_map = snap.params.get("combiner_pin_port")
+                .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            let key = format!("combiner:{}", snap.node_uid);
+
+            // Pin-type-aware clamping. Triggers are [0,1]; stick axes / dpad axes
+            // / left-right sticks are [-1,1]. Gyro/accel/mouse remain unclamped.
+            fn clamp_for_pin(pin_id: &str, v: f32) -> f32 {
+                match pin_id {
+                    "left_trigger" | "right_trigger" => v.clamp(0.0, 1.0),
+                    "left_stick_x" | "left_stick_y"
+                    | "right_stick_x" | "right_stick_y"
+                    | "dpad_x" | "dpad_y" => v.clamp(-1.0, 1.0),
+                    _ => v,
+                }
+            }
+            fn clamp_vec2_for_pin(pin_id: &str, v: glam::Vec2) -> glam::Vec2 {
+                if matches!(pin_id, "left_stick" | "right_stick" | "dpad") {
+                    glam::Vec2::new(v.x.clamp(-1.0, 1.0), v.y.clamp(-1.0, 1.0))
+                } else { v }
+            }
+
+            // Read per-port pin signal at a given index, preferring collector
+            // override over raw device samples (matches Splitter's behaviour).
+            fn read_pin_at(
+                i: usize, pin_id: &str,
+                input_devs: &[String], input_collectors: &[String],
+                collector_sigs: &HashMap<(String, String), Signal>,
+                dev_sigs: &HashMap<(String, String), Signal>,
+            ) -> Option<Signal> {
+                let collector_id = input_collectors.get(i).map(|s| s.as_str()).unwrap_or("");
+                let dev_id       = input_devs.get(i).map(|s| s.as_str()).unwrap_or("");
+                if !collector_id.is_empty() {
+                    collector_sigs.get(&(collector_id.to_string(), pin_id.to_string())).copied()
+                        .or_else(|| {
+                            if !dev_id.is_empty() {
+                                dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+                            } else { None }
+                        })
+                } else if !dev_id.is_empty() {
+                    dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+                } else {
+                    None
+                }
+            }
+
+            for pin in flexinput_core::automap::ALL_PINS {
+                // Per-pin port pin: if set, route exclusively from that port
+                // (clamped to the last connected port). Skip the rest of the
+                // policy machinery entirely.
+                if let Some(port_v) = port_map.get(pin.id) {
+                    if let Some(port_u) = port_v.as_u64() {
+                        let n_inputs = input_devs.len();
+                        if n_inputs == 0 { continue; }
+                        let port = (port_u as usize).min(n_inputs - 1);
+                        if let Some(sig) = read_pin_at(port, pin.id,
+                            &input_devs, &input_collectors, &collector_sigs, dev_sigs)
+                        {
+                            collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+                        }
+                        continue;
+                    }
+                }
+
+                // Collect raw values from every connected input.
+                let mut raw: Vec<Signal> = Vec::with_capacity(input_devs.len());
+                for i in 0..input_devs.len() {
+                    if let Some(s) = read_pin_at(i, pin.id,
+                        &input_devs, &input_collectors, &collector_sigs, dev_sigs)
+                    {
+                        raw.push(s);
+                    }
+                }
+                if raw.is_empty() { continue; }
+
+                let policy = policy_map.get(pin.id).and_then(|v| v.as_str()).unwrap_or("SORT");
+                let resolved: Option<Signal> = match policy {
+                    "SORT" => {
+                        // Connection-priority: highest port that *offers* the
+                        // pin wins, even when its current value is idle. Lower
+                        // ports are completely shadowed for this pin. Since
+                        // `raw` is built by walking ports top-down and pushing
+                        // only when read_pin_at returns Some, the first entry
+                        // is exactly the highest-priority port that has it.
+                        raw.into_iter().next()
+                    }
+                    "OR" => match pin.signal_type {
+                        flexinput_core::SignalType::Bool => {
+                            let any = raw.iter().any(|s| matches!(s, Signal::Bool(true)));
+                            Some(Signal::Bool(any))
+                        }
+                        flexinput_core::SignalType::Vec2 => {
+                            // Per-component max-abs, preserving sign of the contributing component.
+                            let pick = |sel: fn(&glam::Vec2) -> f32| {
+                                raw.iter().filter_map(|s| match s {
+                                    Signal::Vec2(v) => Some(sel(v)), _ => None
+                                }).fold(0.0_f32, |acc, x|
+                                    if x.abs() > acc.abs() { x } else { acc })
+                            };
+                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
+                                glam::Vec2::new(pick(|v| v.x), pick(|v| v.y)))))
+                        }
+                        _ => {
+                            // Float / Int: max(|x|) preserving sign.
+                            let f = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).fold(0.0_f32, |acc, x|
+                                if x.abs() > acc.abs() { x } else { acc });
+                            Some(Signal::Float(clamp_for_pin(pin.id, f)))
+                        }
+                    },
+                    "AND" => match pin.signal_type {
+                        flexinput_core::SignalType::Bool => {
+                            let all = raw.iter().all(|s| matches!(s, Signal::Bool(true)));
+                            Some(Signal::Bool(all))
+                        }
+                        flexinput_core::SignalType::Vec2 => {
+                            let pick = |sel: fn(&glam::Vec2) -> f32| {
+                                let mut it = raw.iter().filter_map(|s| match s {
+                                    Signal::Vec2(v) => Some(sel(v)), _ => None
+                                });
+                                let mut best = it.next().unwrap_or(0.0);
+                                for x in it {
+                                    if x.abs() < best.abs() { best = x; }
+                                }
+                                best
+                            };
+                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
+                                glam::Vec2::new(pick(|v| v.x), pick(|v| v.y)))))
+                        }
+                        _ => {
+                            let mut it = raw.iter().filter_map(|s| sig_to_f32(Some(*s)));
+                            let mut best = it.next().unwrap_or(0.0);
+                            for x in it {
+                                if x.abs() < best.abs() { best = x; }
+                            }
+                            Some(Signal::Float(clamp_for_pin(pin.id, best)))
+                        }
+                    },
+                    "XOR" => match pin.signal_type {
+                        flexinput_core::SignalType::Bool => {
+                            let parity = raw.iter()
+                                .filter(|s| matches!(s, Signal::Bool(true))).count() % 2 == 1;
+                            Some(Signal::Bool(parity))
+                        }
+                        flexinput_core::SignalType::Vec2 => {
+                            // |a - b| folded across all inputs, per component.
+                            let fold = |sel: fn(&glam::Vec2) -> f32| -> f32 {
+                                let xs: Vec<f32> = raw.iter().filter_map(|s| match s {
+                                    Signal::Vec2(v) => Some(sel(v)), _ => None
+                                }).collect();
+                                if xs.is_empty() { return 0.0; }
+                                xs.iter().skip(1).fold(xs[0], |acc, &x| (acc - x).abs())
+                            };
+                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
+                                glam::Vec2::new(fold(|v| v.x), fold(|v| v.y)))))
+                        }
+                        _ => {
+                            let xs: Vec<f32> = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).collect();
+                            let v = if xs.is_empty() { 0.0 }
+                                else { xs.iter().skip(1).fold(xs[0], |acc, &x| (acc - x).abs()) };
+                            Some(Signal::Float(clamp_for_pin(pin.id, v)))
+                        }
+                    },
+                    "ADD" => match pin.signal_type {
+                        flexinput_core::SignalType::Bool => {
+                            let any = raw.iter().any(|s| matches!(s, Signal::Bool(true)));
+                            Some(Signal::Bool(any))
+                        }
+                        flexinput_core::SignalType::Vec2 => {
+                            let sum = raw.iter().fold(glam::Vec2::ZERO, |acc, s| match s {
+                                Signal::Vec2(v) => acc + *v, _ => acc
+                            });
+                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id, sum)))
+                        }
+                        _ => {
+                            let s: f32 = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).sum();
+                            Some(Signal::Float(clamp_for_pin(pin.id, s)))
+                        }
+                    },
+                    "MULT" => match pin.signal_type {
+                        flexinput_core::SignalType::Bool => {
+                            let all = raw.iter().all(|s| matches!(s, Signal::Bool(true)));
+                            Some(Signal::Bool(all))
+                        }
+                        flexinput_core::SignalType::Vec2 => {
+                            // Polar MULT: multiply input *lengths*, keep
+                            // port-0's *direction*. With circular sticks a
+                            // full diagonal is length 1, so two full diagonal
+                            // deflections both yield length 1 instead of the
+                            // per-component product collapsing to (0.5, 0.5).
+                            // Direction comes from port 0 because SORT means
+                            // "port 0 owns this pin" everywhere else too.
+                            let first = match raw.first() {
+                                Some(Signal::Vec2(v)) => *v,
+                                _ => glam::Vec2::ZERO,
+                            };
+                            let mag_product = raw.iter().fold(1.0_f32, |acc, s| match s {
+                                Signal::Vec2(v) => acc * v.length(),
+                                _ => acc,
+                            });
+                            let dir = if first.length() > 0.0 {
+                                first.normalize()
+                            } else {
+                                glam::Vec2::ZERO
+                            };
+                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id, dir * mag_product)))
+                        }
+                        _ => {
+                            // For unsigned pins (triggers [0,1]) plain product
+                            // is correct. For signed pins, take port-0 sign ×
+                            // product of magnitudes so two negative inputs
+                            // don't flip into a positive output.
+                            let is_signed = !matches!(pin.id,
+                                "left_trigger" | "right_trigger");
+                            let nums: Vec<f32> = raw.iter()
+                                .filter_map(|s| sig_to_f32(Some(*s))).collect();
+                            let v = if is_signed {
+                                let sign = nums.first().copied().unwrap_or(0.0);
+                                let mag = nums.iter().fold(1.0_f32, |a, b| a * b.abs());
+                                if sign < 0.0 { -mag } else { mag }
+                            } else {
+                                nums.iter().fold(1.0_f32, |a, b| a * b)
+                            };
+                            Some(Signal::Float(clamp_for_pin(pin.id, v)))
+                        }
+                    },
+                    _ => None, // unknown policy → silent
+                };
+                if let Some(s) = resolved {
+                    collector_sigs.insert((key.clone(), pin.id.to_string()), s);
+                }
+            }
+            computed[idx] = vec![None];
+            continue;
+        }
+
         // ── module.automap_selector: gate selected AutoMap input to output ────
         if snap.module_id == "module.automap_selector" {
             // inputs[0] = select, inputs[1..] = AutoMap buses
@@ -440,21 +696,29 @@ pub fn eval_graph_tick(
                 .collect();
 
             // Direct-wire inputs (possibly multi-source per pin, combined additively).
-            for (in_idx, pin_id) in st.pin_ids.iter().enumerate() {
-                if pin_id.is_empty() { continue; }
-                let mut combined: Option<Signal> = None;
-                if let Some(sources) = st.multi_sources.get(in_idx) {
-                    for &(src_idx, out_pin) in sources {
-                        if let Some(Some(sig)) = computed.get(src_idx).and_then(|v| v.get(out_pin)) {
-                            combined = Some(match combined {
-                                None => *sig,
-                                Some(prev) => combine_signals(prev, *sig),
-                            });
+            //
+            // Self-sink nodes (device.source whose feedback inputs loop back to
+            // their own outputs, directly or via a Splitter/Math chain) are
+            // deferred to a post-pass below: their upstream chain only fills
+            // `computed[]` after this iteration runs, so we wait until the main
+            // loop completes before reading.
+            if !st.is_self_sink {
+                for (in_idx, pin_id) in st.pin_ids.iter().enumerate() {
+                    if pin_id.is_empty() { continue; }
+                    let mut combined: Option<Signal> = None;
+                    if let Some(sources) = st.multi_sources.get(in_idx) {
+                        for &(src_idx, out_pin) in sources {
+                            if let Some(Some(sig)) = computed.get(src_idx).and_then(|v| v.get(out_pin)) {
+                                combined = Some(match combined {
+                                    None => *sig,
+                                    Some(prev) => combine_signals(prev, *sig),
+                                });
+                            }
                         }
                     }
-                }
-                if let Some(sig) = combined {
-                    sink_outputs.insert((st.device_id.clone(), pin_id.clone()), sig);
+                    if let Some(sig) = combined {
+                        sink_outputs.insert((st.device_id.clone(), pin_id.clone()), sig);
+                    }
                 }
             }
 
@@ -471,7 +735,8 @@ pub fn eval_graph_tick(
                     .collect();
                 let is_collector = src_dev.starts_with("collector:")
                     || src_dev.starts_with("forksel:")
-                    || src_dev.starts_with("remap:");
+                    || src_dev.starts_with("remap:")
+                    || src_dev.starts_with("combiner:");
                 for (mapped_src, mapped_dst) in automap::resolve_mapping(&src_ids, &dst_ids) {
                     if directly_wired.contains(mapped_dst) { continue; }
                     // For collectors (including fork/selector gates): check collector_sigs first,
@@ -635,6 +900,46 @@ pub fn eval_graph_tick(
         }
 
         computed[idx] = node_outputs;
+    }
+
+    // Post-pass: device.source self-sinks (feedback inputs wired back to their
+    // own outputs, possibly through Splitter/Math chains). Their multi_sources
+    // can only be read after the main loop has filled `computed[]` for the
+    // whole graph — by then any chain that loops through this node has its
+    // value, and we can route it into sink_outputs like any other sink.
+    for (idx, snap) in graph.nodes.iter().enumerate() {
+        let Some(ref st) = snap.sink_target else { continue; };
+        if !st.is_self_sink { continue; }
+        for (in_idx, pin_id) in st.pin_ids.iter().enumerate() {
+            if pin_id.is_empty() { continue; }
+            let mut combined: Option<Signal> = None;
+            if let Some(sources) = st.multi_sources.get(in_idx) {
+                for &(src_idx, out_pin) in sources {
+                    let sig_opt: Option<Signal> = computed.get(src_idx)
+                        .and_then(|v| v.get(out_pin))
+                        .copied()
+                        .flatten()
+                        .or_else(|| {
+                            // Direct self-wire: source's own `computed[idx]` is
+                            // the result of this same tick's compute_node, which
+                            // for device.source mirrors dev_sigs anyway.
+                            if src_idx != idx { return None; }
+                            let src_pin = snap.output_pin_ids.get(out_pin)?;
+                            if src_pin.is_empty() { return None; }
+                            dev_sigs.get(&(st.device_id.clone(), src_pin.clone())).copied()
+                        });
+                    if let Some(sig) = sig_opt {
+                        combined = Some(match combined {
+                            None => sig,
+                            Some(prev) => combine_signals(prev, sig),
+                        });
+                    }
+                }
+            }
+            if let Some(sig) = combined {
+                sink_outputs.insert((st.device_id.clone(), pin_id.clone()), sig);
+            }
+        }
     }
 
     TickOutput { outputs, scope_samples, last_inputs, last_outputs, sink_outputs }
