@@ -202,6 +202,146 @@ pub fn eval_graph_tick(
     let mut collector_sigs: HashMap<(String, String), Signal> = HashMap::new();
 
     for (idx, snap) in graph.nodes.iter().enumerate() {
+        // ── module.remapper: pass-through + per-mapping override + consume ────
+        if snap.module_id == "module.remapper" {
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let key = format!("remap:{}", snap.node_uid);
+
+            // Snapshot upstream values for every canonical pin once, so we can
+            // freely mutate collector_sigs below without aliasing the read side.
+            let mut upstream: HashMap<String, Signal> = HashMap::new();
+            for ap in automap::ALL_PINS {
+                let sig = if !collector_id.is_empty() {
+                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
+                } else { None }
+                .or_else(|| {
+                    if !dev_id.is_empty() {
+                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
+                    } else { None }
+                });
+                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+            }
+            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
+
+            // Determine which mappings are currently triggered (all input pins true).
+            // Sort by descending input-set size so longer combos win conflicts.
+            let mut sorted = mappings.clone();
+            sorted.sort_by(|a, b| {
+                let la = a.get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let lb = b.get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                lb.cmp(&la)
+            });
+
+            // Trigger pass 1: identify triggered mappings and the pins they consume.
+            // claimed_inputs tracks pins suppressed by a longer triggered combo, so
+            // a shorter combo that overlaps cannot also fire from the same press.
+            let mut triggered: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+            let mut claimed_inputs: HashSet<String> = HashSet::new();
+            for m in &sorted {
+                let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if in_pins.is_empty() { continue; }
+                if in_pins.iter().any(|p| claimed_inputs.contains(p)) { continue; }
+                let all_held = in_pins.iter().all(|p| {
+                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                });
+                if !all_held { continue; }
+                for p in &in_pins { claimed_inputs.insert(p.clone()); }
+                triggered.push((in_pins, out_pins));
+            }
+
+            // Pass-through every canonical pin first, suppressing claimed inputs.
+            // Bool pins suppress to false; Float/Vec2 suppress to zero so downstream
+            // virtual sinks see no analog leakage from a consumed trigger.
+            for ap in automap::ALL_PINS {
+                let suppressed = claimed_inputs.contains(ap.id);
+                let sig = if suppressed {
+                    match ap.signal_type {
+                        SignalType::Bool  => Signal::Bool(false),
+                        SignalType::Float => Signal::Float(0.0),
+                        SignalType::Vec2  => Signal::Vec2(Vec2::ZERO),
+                        SignalType::Int   => Signal::Int(0),
+                        _ => continue,
+                    }
+                } else {
+                    match read_upstream(ap.id) {
+                        Some(s) => s,
+                        None => continue,
+                    }
+                };
+                collector_sigs.insert((key.clone(), ap.id.to_string()), sig);
+            }
+
+            // Collect every output pin mentioned in ANY mapping (triggered or
+            // not). Released mappings must explicitly publish "false" so the
+            // downstream sink sees the transition — otherwise sinks with sticky
+            // state (e.g. virtual KB/M's learned_keys → enigo) latch the OS
+            // key as held until the patch is reloaded.
+            let mut all_out_pins: HashSet<String> = HashSet::new();
+            for m in &mappings {
+                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            all_out_pins.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+            // Determine which output pins are currently asserted (any triggered
+            // mapping listing them in its `out`).
+            let mut asserted: HashSet<String> = HashSet::new();
+            for (_, out_pins) in &triggered {
+                for p in out_pins { asserted.insert(p.clone()); }
+            }
+            // Overlay rule per output pin:
+            //   - If the mapping fires this tick, write the asserted value.
+            //   - If the mapping is released:
+            //       * Output pin that the upstream device naturally emits
+            //         (e.g. btn_east on a gamepad) — leave the pass-through
+            //         value alone so the button still works natively when not
+            //         being driven by a mapping.
+            //       * Output pin the upstream doesn't emit (e.g. key_q,
+            //         mouse_left) — write false/zero so downstream sinks with
+            //         sticky state (virtual KB/M) see the release transition.
+            for out_pin in &all_out_pins {
+                let sig_type = automap::ALL_PINS.iter()
+                    .find(|p| p.id == out_pin.as_str())
+                    .map(|p| p.signal_type)
+                    .unwrap_or(SignalType::Bool);
+                let on = asserted.contains(out_pin);
+                if on {
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(1.0),
+                        SignalType::Vec2  => continue, // not driven by chord mappings
+                        SignalType::Int   => Signal::Int(1),
+                        _                 => Signal::Bool(true),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                } else {
+                    // Released. Only force a zero/false write if the upstream
+                    // wouldn't have produced anything for this pin (i.e. KB/M
+                    // output pins not present on the upstream gamepad).
+                    if upstream.contains_key(out_pin.as_str()) { continue; }
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(0.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(0),
+                        _                 => Signal::Bool(false),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                }
+            }
+
+            computed[idx] = vec![None];
+            continue;
+        }
+
         // ── module.automap_collect: inject individual inputs into collector_sigs ──
         if snap.module_id == "module.automap_collect" {
             let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
@@ -329,7 +469,9 @@ pub fn eval_graph_tick(
                     .filter(|p| !p.is_empty() && p.as_str() != "automap_out")
                     .map(|p| p.as_str())
                     .collect();
-                let is_collector = src_dev.starts_with("collector:") || src_dev.starts_with("forksel:");
+                let is_collector = src_dev.starts_with("collector:")
+                    || src_dev.starts_with("forksel:")
+                    || src_dev.starts_with("remap:");
                 for (mapped_src, mapped_dst) in automap::resolve_mapping(&src_ids, &dst_ids) {
                     if directly_wired.contains(mapped_dst) { continue; }
                     // For collectors (including fork/selector gates): check collector_sigs first,

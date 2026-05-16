@@ -16,6 +16,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<AutoMapCollectModule>(),
         reg::<AutoMapFork>(),
         reg::<AutoMapSelector>(),
+        reg::<RemapperModule>(),
     ]
 }
 
@@ -339,6 +340,38 @@ impl Module for Gyro3DOFModule {
                 PinDescriptor::new("X",   SignalType::Float),
                 PinDescriptor::new("Y",   SignalType::Float),
             ],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Remapper ─────────────────────────────────────────────────────────────────
+//
+// Single AutoMap in, single AutoMap out. Captures button presses live from the
+// input wire, lets the user define mappings via a Learn UI, and (in a future
+// phase) injects per-pin overrides at eval time.
+//
+// All state lives in `node.params` so it persists with the patch:
+//   ui_phase:      "idle" | "capturing" | "ready_to_learn" | "learning"
+//   draft_input:   [pin_id, ...]
+//   draft_output:  [pin_id, ...]
+//   mappings:      [{in: [pin_id, ...], out: [pin_id, ...]}, ...]
+//   skin:          "auto" | "xbox" | "playstation" | "switchpro" | "kbm"
+//
+// The process() body returns empty — the engine will inject Remapper output
+// signals in eval.rs (future phase), matching the AutoMap Splitter/Collector
+// pattern.
+#[derive(Default)]
+pub struct RemapperModule;
+
+impl Module for RemapperModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.remapper",
+            display_name: "Remapper",
+            category: "AutoMap",
+            inputs:  vec![PinDescriptor::new("in",  SignalType::AutoMap)],
+            outputs: vec![PinDescriptor::new("out", SignalType::AutoMap)],
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }

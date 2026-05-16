@@ -15,6 +15,7 @@ use crate::{
     canvas::node::{ExposedModule, UiSubPatch},
     canvas::ClipboardData,
     panels::{physical_devices, virtual_devices::VirtualDevicePanel},
+    panic_hotkey::{load_panic_shortcut, save_panic_shortcut, spawn_panic_hotkey_listener},
 };
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -137,6 +138,58 @@ pub struct FlexInputApp {
     io_device_list: Arc<RwLock<Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>>>,
     /// Bypass flag: when true the I/O thread calls reset_outputs() instead of flush().
     io_bypass: Arc<AtomicBool>,
+    // ── Panic mode ────────────────────────────────────────────────────────────
+    /// User-configurable global shortcut to toggle all virtual output off.
+    panic_shortcut: PanicShortcut,
+    /// True while the panic shortcut is engaged. Forces io_bypass for the
+    /// active tab regardless of normal bypass state, until the user toggles off.
+    panic_active: bool,
+    /// True when the shortcut button is in Learn mode (next chord captures).
+    panic_learning: bool,
+    /// Set by the global hotkey listener when the configured chord fires.
+    /// UI consumes this each frame and toggles `panic_active`.
+    panic_toggle_requested: Arc<AtomicBool>,
+    /// Live snapshot of the shortcut for the global hotkey listener thread.
+    /// Updated whenever the user changes the binding.
+    panic_shortcut_shared: Arc<RwLock<PanicShortcut>>,
+}
+
+/// Keyboard-only shortcut for panic mode. Modifiers + non-modifier key.
+/// Stored as serializable strings so it can be persisted to disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PanicShortcut {
+    pub ctrl:  bool,
+    pub shift: bool,
+    pub alt:   bool,
+    pub win:   bool,
+    /// egui::Key as Debug string (e.g. "Escape", "F8"). None means "unassigned".
+    pub key:   Option<String>,
+}
+
+impl Default for PanicShortcut {
+    fn default() -> Self {
+        // Ctrl+Backtick — `Backtick` is the egui Debug name for the
+        // tilde / backtick key (US layout), unlikely to collide with shell or
+        // game bindings while still being easy to mash blind.
+        Self { ctrl: true, shift: false, alt: false, win: false, key: Some("Backtick".to_string()) }
+    }
+}
+
+impl PanicShortcut {
+    /// Human-readable label for the button face.
+    pub fn label(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.ctrl  { parts.push("Ctrl"); }
+        if self.shift { parts.push("Shift"); }
+        if self.alt   { parts.push("Alt"); }
+        if self.win   { parts.push("Win"); }
+        let key = self.key.as_deref().unwrap_or("…");
+        if parts.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}+{}", parts.join("+"), key)
+        }
+    }
 }
 
 impl FlexInputApp {
@@ -187,6 +240,15 @@ impl FlexInputApp {
             Arc::clone(&shared_devices),
         );
 
+        // ── Panic-mode state ──────────────────────────────────────────────
+        let panic_shortcut = load_panic_shortcut().unwrap_or_default();
+        let panic_toggle_requested = Arc::new(AtomicBool::new(false));
+        let panic_shortcut_shared  = Arc::new(RwLock::new(panic_shortcut.clone()));
+        spawn_panic_hotkey_listener(
+            Arc::clone(&panic_shortcut_shared),
+            Arc::clone(&panic_toggle_requested),
+        );
+
         Self {
             engine: Engine::new(),
             tabs,
@@ -220,6 +282,11 @@ impl FlexInputApp {
             proc_outputs,
             io_device_list,
             io_bypass,
+            panic_shortcut: panic_shortcut.clone(),
+            panic_active: false,
+            panic_learning: false,
+            panic_toggle_requested,
+            panic_shortcut_shared,
         }
     }
 }
@@ -295,14 +362,23 @@ impl eframe::App for FlexInputApp {
             }
         }
 
+        // Consume any global-hotkey toggle requests from the hook thread BEFORE
+        // computing effective_bypass, so the visible tab-dot flips this frame.
+        if self.panic_toggle_requested.swap(false, Ordering::Relaxed) {
+            self.panic_active = !self.panic_active;
+        }
         // Effective bypass: manual toggle OR (auto mode on AND auto-bypass AND bound process not in focus).
-        let effective_bypass: Vec<bool> = self.tabs.iter().map(|tab| {
-            tab.bypassed || (
-                self.auto_switch
-                    && tab.auto_bypass
-                    && !tab.bound_exes.is_empty()
-                    && !tab.bound_exes.iter().any(|b| b.eq_ignore_ascii_case(&self.last_fg_exe))
-            )
+        // Panic mode forces bypass on the active tab so its bypass indicator
+        // flips green→orange the moment the shortcut fires.
+        let active_idx = self.active_tab;
+        let panic_active_now = self.panic_active;
+        let effective_bypass: Vec<bool> = self.tabs.iter().enumerate().map(|(i, tab)| {
+            let auto = self.auto_switch
+                && tab.auto_bypass
+                && !tab.bound_exes.is_empty()
+                && !tab.bound_exes.iter().any(|b| b.eq_ignore_ascii_case(&self.last_fg_exe));
+            let panic = panic_active_now && i == active_idx;
+            tab.bypassed || auto || panic
         }).collect();
 
         let canvas_has_nodes = self.tabs[self.active_tab].canvas.snarl.nodes_ids_data().next().is_some();
@@ -356,7 +432,8 @@ impl eframe::App for FlexInputApp {
         }
 
         // Signal routing and device flushing are handled by the 500 Hz I/O thread.
-        // Just keep the bypass flag in sync so the I/O thread knows whether to reset outputs.
+        // panic_active is already folded into effective_bypass above so the
+        // tab-bar indicator and the I/O thread stay in sync from the same source.
         self.io_bypass.store(effective_bypass[self.active_tab], Ordering::Relaxed);
 
         // ── Custom title bar ──────────────────────────────────────────────────────
@@ -383,6 +460,10 @@ impl eframe::App for FlexInputApp {
                     &mut do_undo, &mut do_redo,
                     can_undo, can_redo,
                     &self.logo_texture,
+                    &mut self.panic_shortcut,
+                    &mut self.panic_active,
+                    &mut self.panic_learning,
+                    &self.panic_shortcut_shared,
                 );
             });
 
@@ -983,7 +1064,7 @@ impl eframe::App for FlexInputApp {
         let outer_gen_before = canvas.clipboard_gen;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            crate::panels::canvas::show(canvas, &self.descriptors, &live_device_ids, devices, ui);
+            crate::panels::canvas::show(canvas, &self.descriptors, &live_device_ids, &self.last_signals, &self.panic_shortcut, devices, ui);
         });
 
         // Only update app_clipboard from outer canvas when the user actually copied
@@ -1772,6 +1853,26 @@ fn find_automap_device_rec(
             .iter().map(|p| p.id.to_string()).collect();
         return Some((collector_id, canonical_pins, upstream_dev_id));
     }
+    if node.module_id == "module.remapper" {
+        // Acts as a collector: publishes per-pin signals (pass-through + mapping
+        // overrides) into collector_sigs under a `remap:{uid}` key. Downstream
+        // sinks find these the same way they find collector / forksel signals.
+        let upstream_dev_id = node.inputs.iter()
+            .position(|p| p.signal_type == SignalType::AutoMap)
+            .and_then(|am_idx| {
+                let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
+                in_pin.remotes.first().copied()
+            })
+            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, _)| id));
+        let remap_uid = match parents {
+            None => src.node.0,
+            Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
+        };
+        let remap_id = format!("remap:{}", remap_uid);
+        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+            .iter().map(|p| p.id.to_string()).collect();
+        return Some((remap_id, canonical_pins, upstream_dev_id));
+    }
     if node.module_id == "subpatch" {
         // Wire enters the subpatch via output pin `src.output`. Find the outlet
         // inside whose pin_index matches, and continue tracing from its input.
@@ -1930,7 +2031,8 @@ fn build_processing_graph_rec(
         let mut params = node.params.clone();
         if matches!(node.module_id.as_str(),
             "processing.gyro_3dof" | "module.automap_split"
-            | "module.automap_fork" | "module.automap_selector")
+            | "module.automap_fork" | "module.automap_selector"
+            | "module.remapper")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {
@@ -2449,6 +2551,10 @@ fn show_title_bar(
     can_undo: bool,
     can_redo: bool,
     logo: &Option<egui::TextureHandle>,
+    panic_shortcut: &mut PanicShortcut,
+    panic_active: &mut bool,
+    panic_learning: &mut bool,
+    panic_shortcut_shared: &Arc<RwLock<PanicShortcut>>,
 ) {
     let bar = ui.max_rect();
     let h = bar.height();
@@ -2572,6 +2678,85 @@ fn show_title_bar(
         });
     });
 
+    // ── Panic-mode strip (anchored to the left of the window controls) ─────
+    {
+        // Reserve a generous slice immediately left of the window-controls.
+        // The strip lays out right-to-left so the rightmost edge is always
+        // pinned to ctrl_rect.left() regardless of shortcut-label length.
+        const PANIC_STRIP_W: f32 = 260.0;
+        let panic_rect = egui::Rect::from_min_size(
+            egui::pos2(ctrl_rect.left() - PANIC_STRIP_W, bar.top()),
+            egui::vec2(PANIC_STRIP_W, h),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(panic_rect), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+
+                // Shortcut button. While learning, label is "Press chord…".
+                let btn_text = if *panic_learning {
+                    "Press chord…".to_string()
+                } else {
+                    panic_shortcut.label()
+                };
+                let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+                if *panic_active {
+                    btn = btn.fill(egui::Color32::from_rgb(196, 43, 28))
+                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 80, 60)));
+                } else if *panic_learning {
+                    btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
+                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                }
+                let resp = ui.add(btn).on_hover_text(
+                    if *panic_active {
+                        "Panic mode ENGAGED — virtual output is suppressed.\nPress the shortcut again to release."
+                    } else if *panic_learning {
+                        "Press the new shortcut (modifier + key).\nClick again to cancel."
+                    } else {
+                        "Click to re-bind the shortcut.\nPress the shortcut anywhere on the system to toggle Panic mode."
+                    }
+                );
+
+                // Click toggles Learn mode (start re-binding, or cancel). To
+                // engage / disengage Panic mode, the user presses the shortcut
+                // — the title-bar button itself is purely a re-bind control.
+                if resp.clicked() {
+                    *panic_learning = !*panic_learning;
+                }
+
+                // While in learn mode, watch every input event for the next chord.
+                if *panic_learning {
+                    let pressed: Option<egui::Key> = ctx.input(|i| {
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                            _ => None,
+                        })
+                    });
+                    if let Some(key) = pressed {
+                        // Skip pure-modifier-only events (egui doesn't emit Shift/Ctrl/Alt/Win
+                        // as Key here; modifiers come through i.modifiers on the next key).
+                        let m = ctx.input(|i| i.modifiers);
+                        let key_name = format!("{:?}", key);
+                        *panic_shortcut = PanicShortcut {
+                            ctrl:  m.ctrl,
+                            shift: m.shift,
+                            alt:   m.alt,
+                            win:   m.command && !m.ctrl,
+                            key:   Some(key_name),
+                        };
+                        save_panic_shortcut(panic_shortcut);
+                        if let Ok(mut s) = panic_shortcut_shared.write() {
+                            *s = panic_shortcut.clone();
+                        }
+                        *panic_learning = false;
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Panic mode:").size(12.0).weak());
+            });
+        });
+    }
+
     // ── Center: logo + app name ────────────────────────────────────────────
     let mid = bar.center();
     let text_color = ui.visuals().text_color();
@@ -2648,6 +2833,10 @@ fn show_subpatch_editors(
     ctx: &egui::Context,
     live_device_ids: &std::collections::HashSet<String>,
 ) {
+    // Snapshot once so the inner-canvas show call can borrow this immutably while
+    // `app` is borrowed mutably for sub-patch editor state.
+    let live_signals = app.last_signals.clone();
+    let panic_shortcut = app.panic_shortcut.clone();
     let active = app.active_tab;
 
     // Open new editors requested this frame by the canvas viewer.
@@ -2816,7 +3005,7 @@ fn show_subpatch_editors(
                     });
                 });
                 egui::CentralPanel::default().show(vctx, |ui| {
-                    inner_canvas.show(descriptors, live_device_ids, devices, ui);
+                    inner_canvas.show(descriptors, live_device_ids, &live_signals, &panic_shortcut, devices, ui);
                 });
 
                 if let Some((inner_uid, eid, size)) = crate::canvas::viewer::take_layout_pending(vctx) {

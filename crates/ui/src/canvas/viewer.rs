@@ -15,6 +15,14 @@ pub struct FlexViewer<'a> {
     pub ctx: egui::Context,
     /// IDs of currently-live physical and virtual devices.  Used to render status dots.
     pub live_device_ids: &'a std::collections::HashSet<String>,
+    /// Latest raw device signals, keyed by (device_id, pin_id). Refreshed each frame
+    /// from the processing thread. Read by module bodies that need to observe live
+    /// canonical pin values (e.g. Remapper's capture state machine).
+    pub live_signals: &'a std::collections::HashMap<(String, String), Signal>,
+    /// Snapshot of the user-configurable Panic-mode shortcut. Read by the
+    /// Remapper body so that learning a mapping cannot accidentally rebind the
+    /// emergency-stop chord onto a controller button.
+    pub panic_shortcut: &'a crate::app::PanicShortcut,
     /// Physical devices available as hot-swap candidates in the node context menu.
     pub physical_devices: &'a [PhysicalDevice],
     /// Set by the `disconnect` override when the user right-clicks a wire.
@@ -98,6 +106,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         };
         let is_label          = snarl.get_node(node).map(|n| n.module_id == "module.label").unwrap_or(false);
         let is_svg            = snarl.get_node(node).map(|n| n.module_id == "module.svg").unwrap_or(false);
+        let is_remapper       = snarl.get_node(node).map(|n| n.module_id == "module.remapper").unwrap_or(false);
         let is_response_curve = snarl.get_node(node).map(|n| {
             n.module_id == "module.response_curve"
                 || n.module_id == "module.vec_response_curve"
@@ -238,6 +247,48 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         if let Some(n) = snarl.get_node_mut(node) {
                             n.params.insert("tint".into(), serde_json::json!([tint.r() as u64, tint.g() as u64, tint.b() as u64, tint.a() as u64]));
                             n.params.insert("color_mode".into(), Value::String(mode));
+                        }
+                    }
+                }
+
+                // Remapper module: skin selector lives in the header so the
+                // body stays compact and the label/dropdown can sit next to the title.
+                if is_remapper {
+                    use super::remapper_icons::Skin;
+                    let current_str = snarl.get_node(node)
+                        .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_else(|| "auto".to_string());
+                    let current = Skin::from_str(&current_str);
+                    let resolved = remapper_resolve_skin(snarl, node, &current_str);
+                    let selected_text = if current == Skin::Auto {
+                        format!("auto · {}", resolved.label())
+                    } else {
+                        current.label().to_string()
+                    };
+                    let mut new_skin = current;
+                    // Right-align: build the chip+label as a right-to-left layout
+                    // so it pins to the far edge of the header row regardless of
+                    // node width.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt((node, "remapper_skin_hdr"))
+                            .selected_text(egui::RichText::new(selected_text).small())
+                            .width(140.0)
+                            .show_ui(ui, |ui| {
+                                // Skin governs only gamepad chip rendering; KBM has
+                                // no controller equivalent so it isn't offered here.
+                                for opt in [Skin::Auto, Skin::Xbox, Skin::Playstation, Skin::SwitchPro] {
+                                    if ui.selectable_label(current == opt,
+                                        egui::RichText::new(opt.label()).small()).clicked()
+                                    {
+                                        new_skin = opt;
+                                    }
+                                }
+                            });
+                        ui.label(egui::RichText::new("Labels").small().weak());
+                    });
+                    if new_skin != current {
+                        if let Some(n) = snarl.get_node_mut(node) {
+                            n.params.insert("skin".to_string(), Value::String(new_skin.as_str().to_string()));
                         }
                     }
                 }
@@ -407,6 +458,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "generator.oscillator" | "processing.gyro_3dof"
                 | "module.automap_split" | "module.automap_collect"
                 | "module.automap_fork" | "module.automap_selector"
+                | "module.remapper"
                 | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
         )
     }
@@ -480,6 +532,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.automap_collect"   => show_automap_collect_body(node_id, inputs, ui, snarl),
             "module.automap_fork"      => show_automap_fork_body(node_id, outputs, ui, snarl),
             "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
+            "module.remapper"          => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut),
             "subpatch" => {
                 if show_subpatch_body(node_id, ui, snarl) {
                     self.edit_subpatch_request = Some(node_id);
@@ -6956,5 +7009,534 @@ fn sig_f32(s: &Signal) -> f32 {
         Signal::Bool(b)  => if *b { 1.0 } else { 0.0 },
         Signal::Int(i)   => *i as f32,
         Signal::Vec2(v)  => v.length(),
+    }
+}
+
+// ── Remapper body ────────────────────────────────────────────────────────────
+//
+// State (persisted in node.params, all serde_json values):
+//
+//   ui_phase       : "idle" | "capturing" | "ready_to_learn" | "learning"
+//   draft_input    : Array<String> (canonical AutoMap pin IDs)
+//   draft_output   : Array<String>
+//   mappings       : Array<{ in: Array<String>, out: Array<String> }>
+//   skin           : "auto" | "xbox" | "playstation" | "switchpro" | "kbm"
+//   _pressed_prev  : Array<String> (internal: last frame's pressed set)
+//
+// Capture algorithm (max-simultaneous-set, latched on full release):
+//   1. Build pressed_now from live_signals filtered by the upstream device id.
+//   2. While pressed_prev was empty, a new press starts a fresh burst:
+//        - If draft was already latched from a previous burst, replace it.
+//        - Otherwise begin accumulating into draft.
+//   3. Within a burst, draft |= pressed_now (so we capture the peak combo).
+//   4. On full release (pressed_now empty, draft non-empty), latch: advance
+//      phase to ready_to_learn for input or capture-done for output.
+
+/// Resolve the device id at the other end of an AutoMap input pin. Returns the
+/// `device_id` param string of the directly-upstream `device.source` node, or
+/// None if the pin is unwired / upstream is not a device source.
+///
+/// Walks at most one hop. Cross-subpatch and collector/fork chains are not
+/// followed here — for the Remapper's capture UX the common case is
+/// `Device → Remapper`. More complex topologies can be added later by reusing
+/// the engine-side `find_automap_device_rec` from app.rs.
+fn remapper_upstream_device_id(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    input_idx: usize,
+) -> Option<String> {
+    let pin = snarl.in_pin(InPinId { node: node_id, input: input_idx });
+    let src = *pin.remotes.first()?;
+    let upstream = snarl.get_node(src.node)?;
+    if upstream.module_id != "device.source" { return None; }
+    upstream.params.get("device_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Read which canonical AutoMap pins are currently asserted (Bool == true)
+/// for the given upstream device id.
+fn remapper_pressed_now(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev_id: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for ap in am_canon::ALL_PINS {
+        if ap.signal_type != SignalType::Bool { continue; }
+        if let Some(sig) = live_signals.get(&(dev_id.to_string(), ap.id.to_string())) {
+            if sig.as_bool() {
+                out.push(ap.id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Read live OS keyboard + mouse state as canonical AutoMap pin IDs. Used in
+/// the Remapper's `learning` phase so the user can map to keys/mouse buttons
+/// that are otherwise only present on the bus when a virtual KB/M sink is wired.
+fn remapper_kbm_pressed_now(
+    ui: &egui::Ui,
+    panic_shortcut: &crate::app::PanicShortcut,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    ui.input(|i| {
+        let m = i.modifiers;
+        if m.shift { out.push("key_shift".to_string()); }
+        if m.ctrl  { out.push("key_ctrl".to_string()); }
+        if m.alt   { out.push("key_alt".to_string()); }
+        // egui maps Cmd (Mac) and Win/Super into `command` — surface as key_win
+        // on Windows, key_ctrl is already covered above.
+        if m.command && !m.ctrl { out.push("key_win".to_string()); }
+
+        // Every other egui key. Shift/Ctrl/Alt/Cmd are not in Key::ALL — they
+        // are reported through i.modifiers above, so no risk of double-adding.
+        for &key in egui::Key::ALL {
+            if i.key_down(key) {
+                let id = remapper_key_to_pin_id(key);
+                if !out.iter().any(|p| p == &id) {
+                    out.push(id);
+                }
+            }
+        }
+
+        // Mouse buttons and scroll are intentionally NOT captured here.
+        // They cannot be live-learned because the user must click Add (LMB) to
+        // confirm a mapping — that very click would otherwise latch as part of
+        // the captured combo. They are added via the Special dropdown instead.
+
+        // Block the panic-mode chord from being captured. If the currently
+        // held set matches the configured Panic shortcut, drop it so the user
+        // cannot accidentally rebind the emergency-stop onto a Remapper output.
+        // We check exact equality (same modifiers + same key) so adjacent
+        // chords still work — only the exact panic combo is filtered.
+        if let Some(ref panic_key_name) = panic_shortcut.key {
+            let panic_id = if matches!(panic_key_name.as_str(), "Escape") {
+                "key_escape".to_string()
+            } else {
+                format!("key_{}", panic_key_name.to_ascii_lowercase())
+            };
+            let modifiers_match =
+                m.shift   == panic_shortcut.shift
+                && m.ctrl == panic_shortcut.ctrl
+                && m.alt  == panic_shortcut.alt
+                && (m.command && !m.ctrl) == panic_shortcut.win;
+            if modifiers_match && out.iter().any(|p| p == &panic_id) {
+                out.retain(|p| p != &panic_id
+                    && p != "key_shift" && p != "key_ctrl"
+                    && p != "key_alt"   && p != "key_win");
+            }
+        }
+    });
+    out
+}
+
+/// Render a chip for one canonical pin: SVG icon if mapped under `skin`,
+/// otherwise the textual display name. Chip height is fixed at 22 logical px
+/// to align with surrounding text. The SVG is rasterized + cached in egui
+/// memory keyed on (pin_id, skin, size, tint).
+fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_icons::Skin) {
+    use super::remapper_icons;
+    const CHIP_H: f32 = 28.0; // ~+27% over the original 22px
+    if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
+        let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
+        // Alpha 0 → rasterizer leaves the SVG's own colors intact (the recolor
+        // block in rasterize_svg_recolored is gated on blend > 0).
+        let tint = egui::Color32::TRANSPARENT;
+        let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
+        let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
+            .or_else(|| {
+                let text = std::str::from_utf8(bytes).ok()?;
+                let img = rasterize_svg_recolored(text, size_px, size_px, "override", tint)?;
+                let handle = ui.ctx().load_texture(
+                    format!("remapper_icon_{:p}", bytes.as_ptr()),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+                Some(handle)
+            });
+        if let Some(tex) = tex {
+            ui.add(egui::Image::new(&tex)
+                .fit_to_exact_size(egui::vec2(CHIP_H, CHIP_H))
+                .tint(Color32::WHITE));
+            return;
+        }
+    }
+    ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong());
+}
+
+/// Render the long-arrow SVG glyph between a mapping's input chips and its
+/// output chips. Rasterized once via the existing SVG path and cached in egui
+/// memory keyed on target size. Alpha-0 tint preserves the SVG's own color.
+fn remapper_render_arrow(ui: &mut egui::Ui) {
+    use super::remapper_icons;
+    const H: f32 = 22.0;
+    let size_px = (H * ui.ctx().pixels_per_point()).round() as u32;
+    let cache_key = egui::Id::new(("remapper_arrow_svg", size_px));
+    let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
+        .or_else(|| {
+            let text = std::str::from_utf8(remapper_icons::ARROW_LONG_SVG).ok()?;
+            let img = rasterize_svg_recolored(text, size_px, size_px, "override", Color32::TRANSPARENT)?;
+            let handle = ui.ctx().load_texture(
+                "remapper_arrow_long",
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+            Some(handle)
+        });
+    if let Some(tex) = tex {
+        ui.add(egui::Image::new(&tex)
+            .fit_to_exact_size(egui::vec2(H, H))
+            .tint(Color32::WHITE));
+    } else {
+        ui.label(egui::RichText::new("→").size(14.0).weak());
+    }
+}
+
+/// Detect the upstream device family for a Remapper's AutoMap input, falling
+/// back to Xbox when no device is wired or auto detection fails. The user's
+/// manual override in `node.params["skin"]` takes precedence.
+fn remapper_resolve_skin(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    override_param: &str,
+) -> super::remapper_icons::Skin {
+    use super::remapper_icons::Skin;
+    let chosen = Skin::from_str(override_param);
+    if chosen != Skin::Auto { return chosen; }
+    let dev = remapper_upstream_device_id(snarl, node_id, 0);
+    match dev {
+        Some(d) => super::remapper_icons::skin_from_device_id(&d),
+        None => Skin::Xbox,
+    }
+}
+
+/// Pins offered in the Special… dropdown during Learn. These can't be
+/// press-captured (mouse buttons would trigger on the Add click; scroll fires
+/// once per wheel tick, never as a held combo), so the user picks them by
+/// name. Labels are shown to the user; ids are the canonical AutoMap pin ids.
+const REMAPPER_SPECIAL_PINS: &[(&str, &str)] = &[
+    ("Mouse: LMB",         "mouse_left"),
+    ("Mouse: RMB",         "mouse_right"),
+    ("Mouse: MMB",         "mouse_middle"),
+    ("Mouse: Back",        "mouse_back"),
+    ("Mouse: Forward",     "mouse_forward"),
+    ("Mouse: Scroll Up",   "scroll_up"),
+    ("Mouse: Scroll Down", "scroll_down"),
+];
+
+/// Canonical pin id for an arbitrary egui Key. Modifiers and Escape get their
+/// canonical short names so they round-trip with am_canon::ALL_PINS. Anything
+/// else becomes `key_<lowercase debug>` (e.g. `key_a`, `key_space`, `key_f5`).
+fn remapper_key_to_pin_id(key: egui::Key) -> String {
+    match key {
+        egui::Key::Escape => "key_escape".to_string(),
+        _ => format!("key_{}", format!("{:?}", key).to_lowercase()),
+    }
+}
+
+fn remapper_pin_display(pin_id: &str) -> String {
+    if let Some(p) = am_canon::ALL_PINS.iter().find(|p| p.id == pin_id) {
+        return p.display_name.to_string();
+    }
+    // Fall back to a humanised form of the raw id. `key_space` → "Space",
+    // `key_a` → "A", `key_f5` → "F5". Unknown prefix → return id as-is.
+    if let Some(rest) = pin_id.strip_prefix("key_") {
+        let mut chars = rest.chars();
+        let first = chars.next().unwrap_or('?').to_ascii_uppercase();
+        return format!("{}{}", first, chars.as_str());
+    }
+    pin_id.to_string()
+}
+
+fn remapper_read_str_array(node: &NodeData, key: &str) -> Vec<String> {
+    node.params.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default()
+}
+
+fn remapper_write_str_array(node: &mut NodeData, key: &str, vals: &[String]) {
+    let arr: Vec<Value> = vals.iter().map(|s| Value::String(s.clone())).collect();
+    node.params.insert(key.to_string(), Value::Array(arr));
+}
+
+fn show_remapper_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+) {
+    // ── Read current state ─────────────────────────────────────────────────
+    let wired = inputs.first().map(|p| !p.remotes.is_empty()).unwrap_or(false);
+    let upstream_dev_id = if wired {
+        remapper_upstream_device_id(snarl, node_id, 0)
+    } else { None };
+
+    let (phase, draft_input, draft_output, mappings, pressed_prev) = snarl.get_node(node_id)
+        .map(|n| (
+            n.params.get("ui_phase").and_then(|v| v.as_str()).unwrap_or("idle").to_string(),
+            remapper_read_str_array(n, "draft_input"),
+            remapper_read_str_array(n, "draft_output"),
+            n.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+            remapper_read_str_array(n, "_pressed_prev"),
+        ))
+        .unwrap_or_else(|| ("idle".into(), vec![], vec![], vec![], vec![]));
+
+    // ── Capture state machine ──────────────────────────────────────────────
+    // Runs whenever a wire is connected. The phase transition idle→capturing
+    // happens on connect; ready_to_learn / capture-done on release.
+    let mut pressed_now: Vec<String> = match (&upstream_dev_id, wired) {
+        (Some(dev), true) => remapper_pressed_now(live_signals, dev),
+        _ => Vec::new(),
+    };
+    // During Learn, merge in live OS keyboard/mouse so the user can map to
+    // keys/mouse buttons even when no virtual KB/M sink is in the graph.
+    if phase == "learning" {
+        for p in remapper_kbm_pressed_now(ui, panic_shortcut) {
+            if !pressed_now.iter().any(|q| q == &p) {
+                pressed_now.push(p);
+            }
+        }
+    }
+
+    let mut new_phase = phase.clone();
+    let mut new_draft_input = draft_input.clone();
+    let mut new_draft_output = draft_output.clone();
+
+    // Auto-enter capturing when a wire is connected and we were idle.
+    if wired && new_phase == "idle" {
+        new_phase = "capturing".to_string();
+    }
+    // Drop back to idle when wire is disconnected.
+    if !wired && new_phase != "idle" {
+        new_phase = "idle".to_string();
+        new_draft_input.clear();
+        new_draft_output.clear();
+    }
+
+    // The set rising from pressed_prev to pressed_now (new presses this frame).
+    let rising: Vec<&String> = pressed_now.iter()
+        .filter(|p| !pressed_prev.iter().any(|q| q == *p))
+        .collect();
+    let prev_was_empty = pressed_prev.is_empty();
+    let now_empty = pressed_now.is_empty();
+
+    match new_phase.as_str() {
+        "capturing" => {
+            if !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
+                // New burst after a previous latched combo → replace.
+                new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
+            } else if !pressed_now.is_empty() {
+                // Accumulate the peak set.
+                for p in &pressed_now {
+                    if !new_draft_input.iter().any(|q| q == p) {
+                        new_draft_input.push(p.clone());
+                    }
+                }
+            }
+            if now_empty && !new_draft_input.is_empty() {
+                new_phase = "ready_to_learn".to_string();
+            }
+        }
+        "ready_to_learn" => {
+            // A new press from idle (prev empty) re-captures.
+            if !rising.is_empty() && prev_was_empty {
+                new_phase = "capturing".to_string();
+                new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
+            }
+        }
+        "learning" => {
+            if !rising.is_empty() && prev_was_empty && !new_draft_output.is_empty() {
+                new_draft_output = rising.iter().map(|s| (*s).clone()).collect();
+            } else if !pressed_now.is_empty() {
+                for p in &pressed_now {
+                    if !new_draft_output.iter().any(|q| q == p) {
+                        new_draft_output.push(p.clone());
+                    }
+                }
+            }
+            // Learning has no auto-latch; user clicks Add or Stop.
+        }
+        _ => {}
+    }
+
+    // Persist state machine results before rendering controls.
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.params.insert("ui_phase".to_string(), Value::String(new_phase.clone()));
+        remapper_write_str_array(node, "draft_input", &new_draft_input);
+        remapper_write_str_array(node, "draft_output", &new_draft_output);
+        remapper_write_str_array(node, "_pressed_prev", &pressed_now);
+    }
+
+    // ── Render ─────────────────────────────────────────────────────────────
+    let skin_param = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "auto".to_string());
+    let skin = remapper_resolve_skin(snarl, node_id, &skin_param);
+
+    ui.vertical(|ui| {
+        ui.set_min_width(260.0);
+
+        // Status line.
+        let status = if !wired {
+            ("Connect Auto-Map wire to start mapping", Color32::from_rgb(232, 180, 65))
+        } else {
+            match new_phase.as_str() {
+                "capturing" if new_draft_input.is_empty() =>
+                    ("Press a button or combination", Color32::from_rgb(106, 167, 255)),
+                "ready_to_learn" =>
+                    ("Captured — click Learn (press again to re-capture)", Color32::from_rgb(127, 201, 127)),
+                "learning" if new_draft_output.is_empty() =>
+                    ("Press target key or button", Color32::from_rgb(106, 167, 255)),
+                "learning" =>
+                    ("Captured output — click Add", Color32::from_rgb(127, 201, 127)),
+                _ => ("", Color32::TRANSPARENT),
+            }
+        };
+        if !status.0.is_empty() {
+            ui.label(egui::RichText::new(status.0).size(13.0).color(status.1));
+        }
+
+        // Draft input chips (only if non-empty).
+        if !new_draft_input.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (i, pin) in new_draft_input.iter().enumerate() {
+                    if i > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
+                    remapper_render_chip(ui, pin, skin);
+                }
+            });
+        }
+
+        // Draft output row (during learn).
+        if new_phase == "learning" {
+            ui.horizontal_wrapped(|ui| {
+                remapper_render_arrow(ui);
+                if new_draft_output.is_empty() {
+                    ui.label(egui::RichText::new("…").size(13.0).weak().italics());
+                } else {
+                    for (i, pin) in new_draft_output.iter().enumerate() {
+                        if i > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
+                        remapper_render_chip(ui, pin, skin);
+                    }
+                }
+            });
+        }
+
+        ui.add_space(2.0);
+
+        // Action row.
+        let in_learning = new_phase == "learning";
+        let learn_enabled = new_phase == "ready_to_learn";
+        let add_enabled = in_learning && !new_draft_output.is_empty();
+        ui.horizontal(|ui| {
+            let learn_label = if in_learning { "Stop" } else { "Learn" };
+            let learn_btn = ui.add_enabled(
+                learn_enabled || in_learning,
+                egui::Button::new(egui::RichText::new(learn_label).size(13.0)),
+            );
+            if learn_btn.clicked() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    if in_learning {
+                        // Stop → keep latched input, drop output draft.
+                        node.params.insert("ui_phase".to_string(), Value::String("ready_to_learn".to_string()));
+                        remapper_write_str_array(node, "draft_output", &[]);
+                    } else {
+                        node.params.insert("ui_phase".to_string(), Value::String("learning".to_string()));
+                        remapper_write_str_array(node, "draft_output", &[]);
+                    }
+                }
+            }
+
+            // Special dropdown — appends pins that can't be press-captured (mouse
+            // buttons / scroll / explicit modifiers) directly to draft_output.
+            // Only meaningful during learning.
+            if in_learning {
+                let mut to_append: Option<&'static str> = None;
+                egui::ComboBox::from_id_salt((node_id, "remapper_special"))
+                    .selected_text(egui::RichText::new("Special…").size(13.0))
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for (label, id) in REMAPPER_SPECIAL_PINS {
+                            if new_draft_output.iter().any(|p| p == id) { continue; }
+                            if ui.selectable_label(false, egui::RichText::new(*label).size(13.0)).clicked() {
+                                to_append = Some(id);
+                            }
+                        }
+                    });
+                if let Some(id) = to_append {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        let mut arr = new_draft_output.clone();
+                        arr.push(id.to_string());
+                        remapper_write_str_array(node, "draft_output", &arr);
+                    }
+                }
+            }
+
+            // Add button — appends mapping and resets drafts.
+            if ui.add_enabled(add_enabled, egui::Button::new(egui::RichText::new("Add").size(13.0)))
+                .clicked()
+            {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    let in_arr: Vec<Value> = new_draft_input.iter()
+                        .map(|s| Value::String(s.clone())).collect();
+                    let out_arr: Vec<Value> = new_draft_output.iter()
+                        .map(|s| Value::String(s.clone())).collect();
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("in".to_string(), Value::Array(in_arr));
+                    entry.insert("out".to_string(), Value::Array(out_arr));
+                    let mut all = mappings.clone();
+                    all.push(Value::Object(entry));
+                    node.params.insert("mappings".to_string(), Value::Array(all));
+                    node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
+                    remapper_write_str_array(node, "draft_input", &[]);
+                    remapper_write_str_array(node, "draft_output", &[]);
+                }
+            }
+        });
+
+        // Mapping list.
+        if !mappings.is_empty() {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.label(egui::RichText::new(format!("Mappings ({})", mappings.len())).size(13.0).weak());
+            let mut to_remove: Option<usize> = None;
+            for (i, m) in mappings.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.button(egui::RichText::new("×").size(13.0)).clicked() { to_remove = Some(i); }
+                    let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+                    let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+                    for (j, p) in in_pins.iter().enumerate() {
+                        if j > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
+                        remapper_render_chip(ui, p, skin);
+                    }
+                    remapper_render_arrow(ui);
+                    for (j, p) in out_pins.iter().enumerate() {
+                        if j > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
+                        remapper_render_chip(ui, p, skin);
+                    }
+                });
+            }
+            if let Some(idx) = to_remove {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    if let Some(Value::Array(arr)) = node.params.get_mut("mappings") {
+                        if idx < arr.len() { arr.remove(idx); }
+                    }
+                }
+            }
+        }
+    });
+
+    // Request repaint so the state machine ticks each frame — both for
+    // gamepad-driven capture (when wired) and OS-key learning (when in
+    // learning phase regardless of wire state).
+    if wired || new_phase == "learning" {
+        ui.ctx().request_repaint();
     }
 }

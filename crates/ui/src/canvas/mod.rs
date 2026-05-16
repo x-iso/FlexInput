@@ -1,5 +1,6 @@
 mod curve;
 pub mod node;
+pub mod remapper_icons;
 pub mod viewer;
 
 pub use curve::sample_curve;
@@ -9,7 +10,7 @@ pub use viewer::FlexViewer;
 use std::collections::{HashMap, HashSet};
 
 use egui_snarl::{ui::{get_selected_nodes, SnarlStyle}, InPinId, NodeId, OutPinId, Snarl};
-use flexinput_core::{PinDescriptor, ModuleDescriptor, SignalType};
+use flexinput_core::{PinDescriptor, ModuleDescriptor, Signal, SignalType};
 use flexinput_devices::PhysicalDevice;
 use flexinput_virtual::{SinkPin, SourcePin, VirtualDevice};
 use serde_json::Value;
@@ -293,6 +294,8 @@ impl Canvas {
         &mut self,
         descriptors: &[ModuleDescriptor],
         live_device_ids: &HashSet<String>,
+        live_signals: &HashMap<(String, String), Signal>,
+        panic_shortcut: &crate::app::PanicShortcut,
         physical_devices: &[PhysicalDevice],
         ui: &mut egui::Ui,
     ) {
@@ -309,6 +312,8 @@ impl Canvas {
             descriptors,
             ctx: ctx.clone(),
             live_device_ids,
+            live_signals,
+            panic_shortcut,
             physical_devices,
             pending_wire_menu: None,
             rename_request: None,

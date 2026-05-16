@@ -957,6 +957,12 @@ pub struct VirtualKeyMouse {
     enigo_keys: Option<Enigo>,
     os_keys: KeysHeld,
     os_learned_keys: HashMap<String, bool>,
+    // Per-key auto-repeat timing for learned keys. We re-send Direction::Press
+    // at OS-typical rates (initial ~500ms delay, then ~30 Hz) so apps that
+    // listen for WM_KEYDOWN repeats (text fields, games using typematic) feel
+    // a held synthetic key the same as a real one.
+    key_press_at:  HashMap<String, std::time::Instant>,
+    key_repeat_at: HashMap<String, std::time::Instant>,
 
     // Shared with the mouse thread
     mouse_shared: Arc<Mutex<MouseShared>>,
@@ -991,6 +997,8 @@ impl VirtualKeyMouse {
             enigo_keys,
             os_keys: KeysHeld::default(),
             os_learned_keys: HashMap::new(),
+            key_press_at:  HashMap::new(),
+            key_repeat_at: HashMap::new(),
             mouse_shared: shared,
             _mouse_thread: thread,
             enigo_ok: ok,
@@ -1077,6 +1085,9 @@ impl VirtualDevice for VirtualKeyMouse {
             key_release!(self.os_keys.win,    Key::Meta);
         }
 
+        let now = std::time::Instant::now();
+        const REPEAT_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33); // ~30 Hz
         let learned: Vec<(String, bool)> = self.learned_keys.iter()
             .map(|(k, &v)| (k.clone(), v))
             .collect();
@@ -1086,11 +1097,31 @@ impl VirtualDevice for VirtualKeyMouse {
             if !self.muted {
                 if want != os {
                     let _ = enigo.key(key, if want { Direction::Press } else { Direction::Release });
-                    self.os_learned_keys.insert(pin_name, want);
+                    self.os_learned_keys.insert(pin_name.clone(), want);
+                    if want {
+                        self.key_press_at.insert(pin_name.clone(), now);
+                        self.key_repeat_at.insert(pin_name.clone(), now);
+                    } else {
+                        self.key_press_at.remove(&pin_name);
+                        self.key_repeat_at.remove(&pin_name);
+                    }
+                } else if want {
+                    // Held — re-send Press to drive OS-level typematic repeat.
+                    let press_at = self.key_press_at.entry(pin_name.clone()).or_insert(now);
+                    let elapsed_since_press = now.saturating_duration_since(*press_at);
+                    if elapsed_since_press >= REPEAT_INITIAL {
+                        let last = self.key_repeat_at.entry(pin_name.clone()).or_insert(now);
+                        if now.saturating_duration_since(*last) >= REPEAT_INTERVAL {
+                            let _ = enigo.key(key, Direction::Press);
+                            *last = now;
+                        }
+                    }
                 }
             } else if os {
                 let _ = enigo.key(key, Direction::Release);
-                self.os_learned_keys.insert(pin_name, false);
+                self.os_learned_keys.insert(pin_name.clone(), false);
+                self.key_press_at.remove(&pin_name);
+                self.key_repeat_at.remove(&pin_name);
             }
         }
     }
@@ -1102,6 +1133,8 @@ impl VirtualDevice for VirtualKeyMouse {
         self.buttons = MouseButtons::default();
         self.keys = KeysHeld::default();
         for v in self.learned_keys.values_mut() { *v = false; }
+        self.key_press_at.clear();
+        self.key_repeat_at.clear();
         // Flush with muted=true so the mouse thread gets zero velocity and all
         // keys/buttons are released via the existing muted-release path.
         let prev_muted = self.muted;
@@ -1158,35 +1191,46 @@ fn set_bool_u8(bits: &mut u8, mask: u8, value: &Signal) {
 
 /// Maps an egui Key debug name (format!("{key:?}")) to an enigo Key.
 fn egui_key_name_to_enigo(name: &str) -> Option<Key> {
-    Some(match name {
-        "Enter"      => Key::Return,
-        "Space"      => Key::Space,
-        "Tab"        => Key::Tab,
-        "Backspace"  => Key::Backspace,
-        "Delete"     => Key::Delete,
-        "Home"       => Key::Home,
-        "End"        => Key::End,
-        "PageUp"     => Key::PageUp,
-        "PageDown"   => Key::PageDown,
-        "ArrowUp"    => Key::UpArrow,
-        "ArrowDown"  => Key::DownArrow,
-        "ArrowLeft"  => Key::LeftArrow,
-        "ArrowRight" => Key::RightArrow,
-        "CapsLock"   => Key::CapsLock,
-        "F1"  => Key::F1,  "F2"  => Key::F2,  "F3"  => Key::F3,  "F4"  => Key::F4,
-        "F5"  => Key::F5,  "F6"  => Key::F6,  "F7"  => Key::F7,  "F8"  => Key::F8,
-        "F9"  => Key::F9,  "F10" => Key::F10, "F11" => Key::F11, "F12" => Key::F12,
-        "F13" => Key::F13, "F14" => Key::F14, "F15" => Key::F15, "F16" => Key::F16,
-        "F17" => Key::F17, "F18" => Key::F18, "F19" => Key::F19, "F20" => Key::F20,
-        // Single uppercase letter → VK code (VK_A=0x41 … VK_Z=0x5A).
-        // Key::Other sends the actual virtual-key scancode, which works in games
-        // that use WM_KEYDOWN; Key::Unicode would only work in text-input fields.
+    // Accept both the legacy AutoMap Collector form ("A", "Space", "Num0",
+    // raw `{egui::Key:?}`) and the Remapper form ("key_a", "key_space",
+    // "key_num0", lowercased with a "key_" prefix).
+    let rest = name.strip_prefix("key_").unwrap_or(name);
+    let raw_lower = rest.eq_ignore_ascii_case(rest);
+    let _ = raw_lower;
+    Some(match rest.to_ascii_lowercase().as_str() {
+        "enter" | "return" => Key::Return,
+        "space"            => Key::Space,
+        "tab"              => Key::Tab,
+        "backspace"        => Key::Backspace,
+        "delete"           => Key::Delete,
+        "home"             => Key::Home,
+        "end"              => Key::End,
+        "pageup"           => Key::PageUp,
+        "pagedown"         => Key::PageDown,
+        "arrowup"          => Key::UpArrow,
+        "arrowdown"        => Key::DownArrow,
+        "arrowleft"        => Key::LeftArrow,
+        "arrowright"       => Key::RightArrow,
+        "capslock"         => Key::CapsLock,
+        "f1"  => Key::F1,  "f2"  => Key::F2,  "f3"  => Key::F3,  "f4"  => Key::F4,
+        "f5"  => Key::F5,  "f6"  => Key::F6,  "f7"  => Key::F7,  "f8"  => Key::F8,
+        "f9"  => Key::F9,  "f10" => Key::F10, "f11" => Key::F11, "f12" => Key::F12,
+        "f13" => Key::F13, "f14" => Key::F14, "f15" => Key::F15, "f16" => Key::F16,
+        "f17" => Key::F17, "f18" => Key::F18, "f19" => Key::F19, "f20" => Key::F20,
+        // Single letter → VK code (VK_A=0x41 … VK_Z=0x5A). Match on the
+        // lowercased form then send the uppercase VK scancode.
         n if n.len() == 1 => {
             let c = n.chars().next()?;
-            if c.is_ascii_uppercase() { Key::Other(c as u32) } else { return None; }
+            if c.is_ascii_alphabetic() {
+                Key::Other(c.to_ascii_uppercase() as u32)
+            } else { return None; }
         }
-        // Num0–Num9 → VK_0=0x30 … VK_9=0x39
-        n if n.starts_with("Num") && n.len() == 4 => {
+        // Digits: bare "0".."9" or "num0".."num9".
+        n if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) => {
+            let c = n.chars().next()?;
+            Key::Other(c as u32)
+        }
+        n if n.starts_with("num") && n.len() == 4 => {
             let c = n.chars().nth(3)?;
             if c.is_ascii_digit() { Key::Other(c as u32) } else { return None; }
         }

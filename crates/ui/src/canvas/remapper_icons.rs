@@ -1,0 +1,388 @@
+//! Asset map for the Remapper module. SVGs are embedded at compile time so the
+//! binary is self-contained and chip rendering is fast (no disk I/O per frame).
+//!
+//! KBM coverage: every standalone letter / digit / F-key, modifiers, common
+//! punctuation, navigation, and the named mouse + scroll glyphs.
+//! Gamepad coverage: face buttons, bumpers, triggers, start/back/guide, D-pad
+//! arrows, and stick clicks for Xbox / PlayStation / Switch Pro families.
+//! Anything not mapped falls back to the textual pin display.
+
+/// Controller skin family. `Auto` means "detect from upstream device". `Kbm` is
+/// internal-only; it is never offered in the skin dropdown because skin governs
+/// only gamepad chip rendering — keyboard/mouse pins have no controller
+/// equivalent and resolve from the KBM folder regardless of the chosen skin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skin {
+    Auto,
+    Xbox,
+    Playstation,
+    SwitchPro,
+    Kbm,
+}
+
+impl Skin {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "xbox"        => Skin::Xbox,
+            "playstation" => Skin::Playstation,
+            "switchpro"   => Skin::SwitchPro,
+            "kbm"         => Skin::Kbm,
+            _             => Skin::Auto,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Skin::Auto        => "auto",
+            Skin::Xbox        => "xbox",
+            Skin::Playstation => "playstation",
+            Skin::SwitchPro   => "switchpro",
+            Skin::Kbm         => "kbm",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Skin::Auto        => "auto",
+            Skin::Xbox        => "Xbox",
+            Skin::Playstation => "PlayStation",
+            Skin::SwitchPro   => "Switch Pro",
+            Skin::Kbm         => "Keyboard",
+        }
+    }
+}
+
+/// Best-effort skin inference from a `device_id` string. Skin governs only
+/// gamepad chip rendering — KBM has no controller equivalent, so a keyboard
+/// upstream falls back to Xbox icons (which are the visual default).
+pub fn skin_from_device_id(dev_id: &str) -> Skin {
+    let d = dev_id.to_ascii_lowercase();
+    if d.contains("switch")               { return Skin::SwitchPro; }
+    if d.contains("dualshock") || d.contains("dualsense")
+        || d.contains("playstation") || d.contains("ps4") || d.contains("ps5") {
+        return Skin::Playstation;
+    }
+    Skin::Xbox
+}
+
+// ── Embedded SVG bytes ────────────────────────────────────────────────────────
+
+macro_rules! a { ($p:literal) => { include_bytes!(concat!("../../../../app/assets/", $p)) }; }
+
+// Xbox face + shoulder + sticks + start/back/guide + dpad
+const XB_A:       &[u8] = a!("Xbox/xbox_button_a.svg");
+const XB_B:       &[u8] = a!("Xbox/xbox_button_b.svg");
+const XB_X:       &[u8] = a!("Xbox/xbox_button_x.svg");
+const XB_Y:       &[u8] = a!("Xbox/xbox_button_y.svg");
+const XB_LB:      &[u8] = a!("Xbox/xbox_lb.svg");
+const XB_RB:      &[u8] = a!("Xbox/xbox_rb.svg");
+const XB_LT:      &[u8] = a!("Xbox/xbox_lt.svg");
+const XB_RT:      &[u8] = a!("Xbox/xbox_rt.svg");
+const XB_START:   &[u8] = a!("Xbox/xbox_button_start.svg");
+const XB_BACK:    &[u8] = a!("Xbox/xbox_button_back.svg");
+const XB_GUIDE:   &[u8] = a!("Xbox/xbox_guide.svg");
+const XB_DPAD_U:  &[u8] = a!("Xbox/xbox_dpad_up.svg");
+const XB_DPAD_D:  &[u8] = a!("Xbox/xbox_dpad_down.svg");
+const XB_DPAD_L:  &[u8] = a!("Xbox/xbox_dpad_left.svg");
+const XB_DPAD_R:  &[u8] = a!("Xbox/xbox_dpad_right.svg");
+const XB_LS:      &[u8] = a!("Xbox/xbox_stick_l_press.svg");
+const XB_RS:      &[u8] = a!("Xbox/xbox_stick_r_press.svg");
+const XB_LSTICK:  &[u8] = a!("Xbox/xbox_stick_l.svg");
+const XB_RSTICK:  &[u8] = a!("Xbox/xbox_stick_r.svg");
+
+// PlayStation
+const PS_CROSS:    &[u8] = a!("Playstation/playstation_button_cross.svg");
+const PS_CIRCLE:   &[u8] = a!("Playstation/playstation_button_circle.svg");
+const PS_SQUARE:   &[u8] = a!("Playstation/playstation_button_square.svg");
+const PS_TRIANGLE: &[u8] = a!("Playstation/playstation_button_triangle.svg");
+const PS_L1:       &[u8] = a!("Playstation/playstation_trigger_l1.svg");
+const PS_R1:       &[u8] = a!("Playstation/playstation_trigger_r1.svg");
+const PS_L2:       &[u8] = a!("Playstation/playstation_trigger_l2.svg");
+const PS_R2:       &[u8] = a!("Playstation/playstation_trigger_r2.svg");
+const PS_L3:       &[u8] = a!("Playstation/playstation_button_l3.svg");
+const PS_R3:       &[u8] = a!("Playstation/playstation_button_r3.svg");
+const PS_OPTIONS:  &[u8] = a!("Playstation/playstation4_button_options.svg");
+const PS_SHARE:    &[u8] = a!("Playstation/playstation4_button_share.svg");
+const PS_DPAD_U:   &[u8] = a!("Playstation/playstation_dpad_up.svg");
+const PS_DPAD_D:   &[u8] = a!("Playstation/playstation_dpad_down.svg");
+const PS_DPAD_L:   &[u8] = a!("Playstation/playstation_dpad_left.svg");
+const PS_DPAD_R:   &[u8] = a!("Playstation/playstation_dpad_right.svg");
+const PS_LSTICK:   &[u8] = a!("Playstation/playstation_stick_l.svg");
+const PS_RSTICK:   &[u8] = a!("Playstation/playstation_stick_r.svg");
+
+// Switch Pro
+const SW_A:       &[u8] = a!("SwitchPro/switch_button_a.svg");
+const SW_B:       &[u8] = a!("SwitchPro/switch_button_b.svg");
+const SW_X:       &[u8] = a!("SwitchPro/switch_button_x.svg");
+const SW_Y:       &[u8] = a!("SwitchPro/switch_button_y.svg");
+const SW_L:       &[u8] = a!("SwitchPro/switch_button_l.svg");
+const SW_R:       &[u8] = a!("SwitchPro/switch_button_r.svg");
+const SW_ZL:      &[u8] = a!("SwitchPro/switch_button_zl.svg");
+const SW_ZR:      &[u8] = a!("SwitchPro/switch_button_zr.svg");
+const SW_PLUS:    &[u8] = a!("SwitchPro/switch_button_plus.svg");
+const SW_MINUS:   &[u8] = a!("SwitchPro/switch_button_minus.svg");
+const SW_HOME:    &[u8] = a!("SwitchPro/switch_button_home.svg");
+const SW_DPAD_U:  &[u8] = a!("SwitchPro/switch_dpad_up.svg");
+const SW_DPAD_D:  &[u8] = a!("SwitchPro/switch_dpad_down.svg");
+const SW_DPAD_L:  &[u8] = a!("SwitchPro/switch_dpad_left.svg");
+const SW_DPAD_R:  &[u8] = a!("SwitchPro/switch_dpad_right.svg");
+const SW_LSTICK:  &[u8] = a!("SwitchPro/switch_stick_l.svg");
+const SW_RSTICK:  &[u8] = a!("SwitchPro/switch_stick_r.svg");
+const SW_LS:      &[u8] = a!("SwitchPro/switch_stick_l_press.svg");
+const SW_RS:      &[u8] = a!("SwitchPro/switch_stick_r_press.svg");
+
+// KB/M — modifiers + special keys
+const KB_SHIFT:    &[u8] = a!("KBM/keyboard_shift.svg");
+const KB_CTRL:     &[u8] = a!("KBM/keyboard_ctrl.svg");
+const KB_ALT:      &[u8] = a!("KBM/keyboard_alt.svg");
+const KB_WIN:      &[u8] = a!("KBM/keyboard_win.svg");
+const KB_ESCAPE:   &[u8] = a!("KBM/keyboard_escape.svg");
+const KB_SPACE:    &[u8] = a!("KBM/keyboard_space.svg");
+const KB_ENTER:    &[u8] = a!("KBM/keyboard_enter.svg");
+const KB_TAB:      &[u8] = a!("KBM/keyboard_tab.svg");
+const KB_BACKSPACE:&[u8] = a!("KBM/keyboard_backspace.svg");
+const KB_DELETE:   &[u8] = a!("KBM/keyboard_delete.svg");
+const KB_INSERT:   &[u8] = a!("KBM/keyboard_insert.svg");
+const KB_HOME:     &[u8] = a!("KBM/keyboard_home.svg");
+const KB_END:      &[u8] = a!("KBM/keyboard_end.svg");
+const KB_CAPS:     &[u8] = a!("KBM/keyboard_capslock.svg");
+const KB_NUMLOCK:  &[u8] = a!("KBM/keyboard_numlock.svg");
+const KB_SCROLL_LK:&[u8] = a!("KBM/keyboard_scroll_lock.svg");
+const KB_ARROW_U:  &[u8] = a!("KBM/keyboard_arrow_up.svg");
+const KB_ARROW_D:  &[u8] = a!("KBM/keyboard_arrow_down.svg");
+const KB_ARROW_L:  &[u8] = a!("KBM/keyboard_arrow_left.svg");
+const KB_ARROW_R:  &[u8] = a!("KBM/keyboard_arrow_right.svg");
+
+// KB/M — letters
+const KB_A: &[u8] = a!("KBM/keyboard_a.svg");
+const KB_B: &[u8] = a!("KBM/keyboard_b.svg");
+const KB_C: &[u8] = a!("KBM/keyboard_c.svg");
+const KB_D: &[u8] = a!("KBM/keyboard_d.svg");
+const KB_E: &[u8] = a!("KBM/keyboard_e.svg");
+const KB_F: &[u8] = a!("KBM/keyboard_f.svg");
+const KB_G: &[u8] = a!("KBM/keyboard_g.svg");
+const KB_H: &[u8] = a!("KBM/keyboard_h.svg");
+const KB_I: &[u8] = a!("KBM/keyboard_i.svg");
+const KB_J: &[u8] = a!("KBM/keyboard_j.svg");
+const KB_K: &[u8] = a!("KBM/keyboard_k.svg");
+const KB_L: &[u8] = a!("KBM/keyboard_l.svg");
+const KB_M: &[u8] = a!("KBM/keyboard_m.svg");
+const KB_N: &[u8] = a!("KBM/keyboard_n.svg");
+const KB_O: &[u8] = a!("KBM/keyboard_o.svg");
+const KB_P: &[u8] = a!("KBM/keyboard_p.svg");
+const KB_Q: &[u8] = a!("KBM/keyboard_q.svg");
+const KB_R: &[u8] = a!("KBM/keyboard_r.svg");
+const KB_S: &[u8] = a!("KBM/keyboard_s.svg");
+const KB_T: &[u8] = a!("KBM/keyboard_t.svg");
+const KB_U: &[u8] = a!("KBM/keyboard_u.svg");
+const KB_V: &[u8] = a!("KBM/keyboard_v.svg");
+const KB_W: &[u8] = a!("KBM/keyboard_w.svg");
+const KB_X: &[u8] = a!("KBM/keyboard_x.svg");
+const KB_Y: &[u8] = a!("KBM/keyboard_y.svg");
+const KB_Z: &[u8] = a!("KBM/keyboard_z.svg");
+
+// KB/M — digits
+const KB_0: &[u8] = a!("KBM/keyboard_0.svg");
+const KB_1: &[u8] = a!("KBM/keyboard_1.svg");
+const KB_2: &[u8] = a!("KBM/keyboard_2.svg");
+const KB_3: &[u8] = a!("KBM/keyboard_3.svg");
+const KB_4: &[u8] = a!("KBM/keyboard_4.svg");
+const KB_5: &[u8] = a!("KBM/keyboard_5.svg");
+const KB_6: &[u8] = a!("KBM/keyboard_6.svg");
+const KB_7: &[u8] = a!("KBM/keyboard_7.svg");
+const KB_8: &[u8] = a!("KBM/keyboard_8.svg");
+const KB_9: &[u8] = a!("KBM/keyboard_9.svg");
+
+// KB/M — F-keys
+const KB_F1:  &[u8] = a!("KBM/keyboard_f1.svg");
+const KB_F2:  &[u8] = a!("KBM/keyboard_f2.svg");
+const KB_F3:  &[u8] = a!("KBM/keyboard_f3.svg");
+const KB_F4:  &[u8] = a!("KBM/keyboard_f4.svg");
+const KB_F5:  &[u8] = a!("KBM/keyboard_f5.svg");
+const KB_F6:  &[u8] = a!("KBM/keyboard_f6.svg");
+const KB_F7:  &[u8] = a!("KBM/keyboard_f7.svg");
+const KB_F8:  &[u8] = a!("KBM/keyboard_f8.svg");
+const KB_F9:  &[u8] = a!("KBM/keyboard_f9.svg");
+const KB_F10: &[u8] = a!("KBM/keyboard_f10.svg");
+const KB_F11: &[u8] = a!("KBM/keyboard_f11.svg");
+const KB_F12: &[u8] = a!("KBM/keyboard_f12.svg");
+
+// KB/M — punctuation
+const KB_COMMA:      &[u8] = a!("KBM/keyboard_comma.svg");
+const KB_PERIOD:     &[u8] = a!("KBM/keyboard_period.svg");
+const KB_SEMICOLON:  &[u8] = a!("KBM/keyboard_semicolon.svg");
+const KB_QUOTE:      &[u8] = a!("KBM/keyboard_quote.svg");
+const KB_APOSTROPHE: &[u8] = a!("KBM/keyboard_apostrophe.svg");
+const KB_MINUS:      &[u8] = a!("KBM/keyboard_minus.svg");
+const KB_PLUS:       &[u8] = a!("KBM/keyboard_plus.svg");
+const KB_EQUALS:     &[u8] = a!("KBM/keyboard_equals.svg");
+const KB_SLASH_F:    &[u8] = a!("KBM/keyboard_slash_forward.svg");
+const KB_SLASH_B:    &[u8] = a!("KBM/keyboard_slash_back.svg");
+const KB_BRK_OPEN:   &[u8] = a!("KBM/keyboard_bracket_open.svg");
+const KB_BRK_CLOSE:  &[u8] = a!("KBM/keyboard_bracket_close.svg");
+const KB_TILDE:      &[u8] = a!("KBM/keyboard_tilde.svg");
+const KB_COLON:      &[u8] = a!("KBM/keyboard_colon.svg");
+const KB_QUESTION:   &[u8] = a!("KBM/keyboard_question.svg");
+const KB_EXCLAIM:    &[u8] = a!("KBM/keyboard_exclamation.svg");
+
+// Mouse
+const M_LEFT:     &[u8] = a!("KBM/mouse_left.svg");
+const M_RIGHT:    &[u8] = a!("KBM/mouse_right.svg");
+const M_SCROLL_U: &[u8] = a!("KBM/mouse_scroll_up.svg");
+const M_SCROLL_D: &[u8] = a!("KBM/mouse_scroll_down.svg");
+
+/// Long-arrow glyph used in place of the textual "→" between a mapping's
+/// input and output chips. Rasterized once and cached as an egui texture.
+pub const ARROW_LONG_SVG: &[u8] = a!("flair_arrow_long.svg");
+
+/// Resolve the SVG bytes for a canonical AutoMap pin under a given skin.
+/// Returns None when no icon is mapped (caller renders the text label).
+/// KBM-family pins (`key_*`, `mouse_*`, `scroll_*`) always resolve from the
+/// KBM folder regardless of the requested skin.
+pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
+    // KBM pins are family-agnostic.
+    match pin_id {
+        // Modifiers + named special keys
+        "key_shift"       => return Some(KB_SHIFT),
+        "key_ctrl"        => return Some(KB_CTRL),
+        "key_alt"         => return Some(KB_ALT),
+        "key_win"         => return Some(KB_WIN),
+        "key_escape"      => return Some(KB_ESCAPE),
+        "key_space"       => return Some(KB_SPACE),
+        "key_enter"       => return Some(KB_ENTER),
+        "key_tab"         => return Some(KB_TAB),
+        "key_backspace"   => return Some(KB_BACKSPACE),
+        "key_delete"      => return Some(KB_DELETE),
+        "key_insert"      => return Some(KB_INSERT),
+        "key_home"        => return Some(KB_HOME),
+        "key_end"         => return Some(KB_END),
+        "key_capslock"    => return Some(KB_CAPS),
+        "key_numlock"     => return Some(KB_NUMLOCK),
+        "key_scrolllock"  => return Some(KB_SCROLL_LK),
+        "key_arrowup"     => return Some(KB_ARROW_U),
+        "key_arrowdown"   => return Some(KB_ARROW_D),
+        "key_arrowleft"   => return Some(KB_ARROW_L),
+        "key_arrowright"  => return Some(KB_ARROW_R),
+
+        // Letters (single-letter ids match Key::A..Key::Z Debug lower-cased).
+        "key_a" => return Some(KB_A), "key_b" => return Some(KB_B), "key_c" => return Some(KB_C),
+        "key_d" => return Some(KB_D), "key_e" => return Some(KB_E), "key_f" => return Some(KB_F),
+        "key_g" => return Some(KB_G), "key_h" => return Some(KB_H), "key_i" => return Some(KB_I),
+        "key_j" => return Some(KB_J), "key_k" => return Some(KB_K), "key_l" => return Some(KB_L),
+        "key_m" => return Some(KB_M), "key_n" => return Some(KB_N), "key_o" => return Some(KB_O),
+        "key_p" => return Some(KB_P), "key_q" => return Some(KB_Q), "key_r" => return Some(KB_R),
+        "key_s" => return Some(KB_S), "key_t" => return Some(KB_T), "key_u" => return Some(KB_U),
+        "key_v" => return Some(KB_V), "key_w" => return Some(KB_W), "key_x" => return Some(KB_X),
+        "key_y" => return Some(KB_Y), "key_z" => return Some(KB_Z),
+
+        // Digits: egui::Key::Num0 → Debug "Num0" → our id `key_num0`.
+        "key_num0" => return Some(KB_0), "key_num1" => return Some(KB_1),
+        "key_num2" => return Some(KB_2), "key_num3" => return Some(KB_3),
+        "key_num4" => return Some(KB_4), "key_num5" => return Some(KB_5),
+        "key_num6" => return Some(KB_6), "key_num7" => return Some(KB_7),
+        "key_num8" => return Some(KB_8), "key_num9" => return Some(KB_9),
+
+        // F-keys
+        "key_f1" => return Some(KB_F1),   "key_f2" => return Some(KB_F2),
+        "key_f3" => return Some(KB_F3),   "key_f4" => return Some(KB_F4),
+        "key_f5" => return Some(KB_F5),   "key_f6" => return Some(KB_F6),
+        "key_f7" => return Some(KB_F7),   "key_f8" => return Some(KB_F8),
+        "key_f9" => return Some(KB_F9),   "key_f10" => return Some(KB_F10),
+        "key_f11" => return Some(KB_F11), "key_f12" => return Some(KB_F12),
+
+        // Punctuation (egui Debug names round-tripped to lowercase).
+        "key_comma"           => return Some(KB_COMMA),
+        "key_period"          => return Some(KB_PERIOD),
+        "key_semicolon"       => return Some(KB_SEMICOLON),
+        "key_quote"           => return Some(KB_QUOTE),
+        "key_apostrophe"      => return Some(KB_APOSTROPHE),
+        "key_minus"           => return Some(KB_MINUS),
+        "key_plus"            => return Some(KB_PLUS),
+        "key_equals"          => return Some(KB_EQUALS),
+        "key_slash"           => return Some(KB_SLASH_F),
+        "key_backslash"       => return Some(KB_SLASH_B),
+        "key_openbracket"     => return Some(KB_BRK_OPEN),
+        "key_closebracket"    => return Some(KB_BRK_CLOSE),
+        "key_backtick"        => return Some(KB_TILDE),
+        "key_colon"           => return Some(KB_COLON),
+        "key_questionmark"    => return Some(KB_QUESTION),
+        "key_exclamationmark" => return Some(KB_EXCLAIM),
+
+        "mouse_left"   => return Some(M_LEFT),
+        "mouse_right"  => return Some(M_RIGHT),
+        "scroll_up"    => return Some(M_SCROLL_U),
+        "scroll_down"  => return Some(M_SCROLL_D),
+        _ => {}
+    }
+    // Gamepad pins. Auto falls back to Xbox; Kbm has no gamepad equivalents.
+    let skin = match skin {
+        Skin::Auto | Skin::Kbm => Skin::Xbox,
+        s => s,
+    };
+    match (skin, pin_id) {
+        // Xbox
+        (Skin::Xbox, "btn_south")     => Some(XB_A),
+        (Skin::Xbox, "btn_east")      => Some(XB_B),
+        (Skin::Xbox, "btn_west")      => Some(XB_X),
+        (Skin::Xbox, "btn_north")     => Some(XB_Y),
+        (Skin::Xbox, "btn_lb")        => Some(XB_LB),
+        (Skin::Xbox, "btn_rb")        => Some(XB_RB),
+        (Skin::Xbox, "btn_lt_dig")    => Some(XB_LT),
+        (Skin::Xbox, "btn_rt_dig")    => Some(XB_RT),
+        (Skin::Xbox, "left_trigger")  => Some(XB_LT),
+        (Skin::Xbox, "right_trigger") => Some(XB_RT),
+        (Skin::Xbox, "btn_start")     => Some(XB_START),
+        (Skin::Xbox, "btn_back")      => Some(XB_BACK),
+        (Skin::Xbox, "btn_guide")     => Some(XB_GUIDE),
+        (Skin::Xbox, "dpad_up")       => Some(XB_DPAD_U),
+        (Skin::Xbox, "dpad_down")     => Some(XB_DPAD_D),
+        (Skin::Xbox, "dpad_left")     => Some(XB_DPAD_L),
+        (Skin::Xbox, "dpad_right")    => Some(XB_DPAD_R),
+        (Skin::Xbox, "btn_ls")        => Some(XB_LS),
+        (Skin::Xbox, "btn_rs")        => Some(XB_RS),
+        (Skin::Xbox, "left_stick")    => Some(XB_LSTICK),
+        (Skin::Xbox, "right_stick")   => Some(XB_RSTICK),
+        // PlayStation
+        (Skin::Playstation, "btn_south")     => Some(PS_CROSS),
+        (Skin::Playstation, "btn_east")      => Some(PS_CIRCLE),
+        (Skin::Playstation, "btn_west")      => Some(PS_SQUARE),
+        (Skin::Playstation, "btn_north")     => Some(PS_TRIANGLE),
+        (Skin::Playstation, "btn_lb")        => Some(PS_L1),
+        (Skin::Playstation, "btn_rb")        => Some(PS_R1),
+        (Skin::Playstation, "btn_lt_dig")    => Some(PS_L2),
+        (Skin::Playstation, "btn_rt_dig")    => Some(PS_R2),
+        (Skin::Playstation, "left_trigger")  => Some(PS_L2),
+        (Skin::Playstation, "right_trigger") => Some(PS_R2),
+        (Skin::Playstation, "btn_ls")        => Some(PS_L3),
+        (Skin::Playstation, "btn_rs")        => Some(PS_R3),
+        (Skin::Playstation, "btn_start")     => Some(PS_OPTIONS),
+        (Skin::Playstation, "btn_back")      => Some(PS_SHARE),
+        (Skin::Playstation, "dpad_up")       => Some(PS_DPAD_U),
+        (Skin::Playstation, "dpad_down")     => Some(PS_DPAD_D),
+        (Skin::Playstation, "dpad_left")     => Some(PS_DPAD_L),
+        (Skin::Playstation, "dpad_right")    => Some(PS_DPAD_R),
+        (Skin::Playstation, "left_stick")    => Some(PS_LSTICK),
+        (Skin::Playstation, "right_stick")   => Some(PS_RSTICK),
+        // Switch Pro (Nintendo layout: south position = B, east = A).
+        (Skin::SwitchPro, "btn_south")     => Some(SW_B),
+        (Skin::SwitchPro, "btn_east")      => Some(SW_A),
+        (Skin::SwitchPro, "btn_west")      => Some(SW_Y),
+        (Skin::SwitchPro, "btn_north")     => Some(SW_X),
+        (Skin::SwitchPro, "btn_lb")        => Some(SW_L),
+        (Skin::SwitchPro, "btn_rb")        => Some(SW_R),
+        (Skin::SwitchPro, "btn_lt_dig")    => Some(SW_ZL),
+        (Skin::SwitchPro, "btn_rt_dig")    => Some(SW_ZR),
+        (Skin::SwitchPro, "left_trigger")  => Some(SW_ZL),
+        (Skin::SwitchPro, "right_trigger") => Some(SW_ZR),
+        (Skin::SwitchPro, "btn_start")     => Some(SW_PLUS),
+        (Skin::SwitchPro, "btn_back")      => Some(SW_MINUS),
+        (Skin::SwitchPro, "btn_guide")     => Some(SW_HOME),
+        (Skin::SwitchPro, "dpad_up")       => Some(SW_DPAD_U),
+        (Skin::SwitchPro, "dpad_down")     => Some(SW_DPAD_D),
+        (Skin::SwitchPro, "dpad_left")     => Some(SW_DPAD_L),
+        (Skin::SwitchPro, "dpad_right")    => Some(SW_DPAD_R),
+        (Skin::SwitchPro, "btn_ls")        => Some(SW_LS),
+        (Skin::SwitchPro, "btn_rs")        => Some(SW_RS),
+        (Skin::SwitchPro, "left_stick")    => Some(SW_LSTICK),
+        (Skin::SwitchPro, "right_stick")   => Some(SW_RSTICK),
+        _ => None,
+    }
+}
