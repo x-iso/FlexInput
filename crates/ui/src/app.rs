@@ -1098,6 +1098,20 @@ fn spawn_io_thread(
                             }
                         }
                         for dev in devs.iter_mut() { dev.flush(); }
+
+                        // Poll rumble/feedback signals back from virtual devices and
+                        // merge them into proc_device_signals for graph routing.
+                        let mut virt_sigs: Vec<((String, String), Signal)> = Vec::new();
+                        for dev in devs.iter_mut() {
+                            let id = dev.id().to_string();
+                            for (pin_id, sig) in dev.poll_outputs() {
+                                virt_sigs.push(((id.clone(), pin_id.to_string()), sig));
+                            }
+                        }
+                        if !virt_sigs.is_empty() {
+                            let mut map = proc_device_signals.write().unwrap();
+                            for (k, v) in virt_sigs { map.insert(k, v); }
+                        }
                     }
                 }
 
@@ -1810,6 +1824,31 @@ fn build_processing_graph_rec(
 
     let mut dirty_uids: Vec<usize> = Vec::new();
 
+    // Pre-pass: collect, for each physical device_id used as an AutoMap source,
+    // the list of virtual sink device_ids that auto-map from it. Used to wire
+    // feedback signals (rumble, lightbar) backward along AutoMap connections.
+    let mut feedback_map: HashMap<String, Vec<String>> = HashMap::new();
+    for (node_id, node) in &node_list {
+        let is_sink = node.module_id == "device.sink"
+            || (node.module_id == "device.source" && !node.inputs.is_empty());
+        if !is_sink { continue; }
+        // Find this sink's AutoMap source device_id (if wired).
+        let automap_src_dev = (0..node.inputs.len()).find_map(|i| {
+            if node.inputs.get(i).map(|p| p.signal_type) != Some(SignalType::AutoMap) {
+                return None;
+            }
+            let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
+            let &src = pin.remotes.first()?;
+            find_automap_device_rec(snarl, src, parents).map(|(d, _, _)| d)
+        });
+        let Some(src_dev) = automap_src_dev else { continue; };
+        let sink_dev = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+        // Only track virtual sinks (their feedback flows back to physical sources).
+        if sink_dev.starts_with("virtual.") {
+            feedback_map.entry(src_dev).or_default().push(sink_dev.to_string());
+        }
+    }
+
     let snaps: Vec<NodeSnap> = node_list.iter().map(|(node_id, node)| {
         let is_sink = node.module_id == "device.sink"
             || (node.module_id == "device.source" && !node.inputs.is_empty());
@@ -1878,7 +1917,11 @@ fn build_processing_graph_rec(
                 None => (None, None),
             };
 
-            Some(SinkTarget { device_id: sink_dev_id, pin_ids, multi_sources, automap_source, automap_fallback_dev })
+            // Feedback sources: virtual sinks that auto-map FROM this physical device.
+            // Their output signals (rumble, lightbar) flow back to this sink's haptic inputs.
+            let feedback_sources = feedback_map.get(&sink_dev_id).cloned().unwrap_or_default();
+
+            Some(SinkTarget { device_id: sink_dev_id, pin_ids, multi_sources, automap_source, automap_fallback_dev, feedback_sources })
         } else {
             None
         };

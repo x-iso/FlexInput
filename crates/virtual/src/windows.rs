@@ -7,7 +7,7 @@ use std::os::windows::io::AsRawHandle;
 use vigem_client::{Client, XButtons, XGamepad, Xbox360Wired};
 
 use flexinput_core::Signal;
-use crate::{layouts, DeviceKind, SinkPin, VirtualDevice};
+use crate::{layouts, DeviceKind, SinkPin, SourcePin, VirtualDevice};
 
 pub static DEVICE_KINDS: &[DeviceKind] = &[
     DeviceKind { kind_id: "virtual.xinput",    display_name: "Virtual XInput Controller",       allows_multiple: true },
@@ -34,6 +34,10 @@ fn instance_label(base_id: &str, base_name: &str, instance: usize) -> (String, S
 
 // ── XInput ────────────────────────────────────────────────────────────────────
 
+/// Rumble state written by the ViGEm notification thread, read by poll_outputs().
+#[derive(Default, Clone, Copy)]
+struct XRumble { large: u8, small: u8 }
+
 pub struct VirtualXInput {
     id: String,
     display_name: String,
@@ -46,17 +50,40 @@ pub struct VirtualXInput {
     left_trigger: u8,
     right_trigger: u8,
     buttons: u16,
+    /// Latest rumble values received from the game via ViGEm notifications.
+    rumble: Arc<Mutex<XRumble>>,
+    /// Join handle kept alive so the thread lives as long as this struct.
+    _notif_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl VirtualXInput {
     pub fn new(instance: usize) -> Self {
         let (id, display_name) = instance_label("virtual.xinput", "Virtual XInput Controller", instance);
+        let rumble = Arc::new(Mutex::new(XRumble::default()));
+        let mut notif_thread = None;
+
         let target = Client::connect().ok().and_then(|client| {
             let mut t = Xbox360Wired::new(client, vigem_client::TargetId::XBOX360_WIRED);
             t.plugin().ok()?;
             t.wait_ready().ok()?;
+
+            // request_notification() must be called before t is moved.
+            // spawn_thread() takes ownership of the request and loops internally,
+            // calling the callback each time the game sends XInputSetState.
+            let rumble2 = Arc::clone(&rumble);
+            if let Ok(req) = t.request_notification() {
+                notif_thread = Some(req.spawn_thread(move |_, data| {
+                    eprintln!("[xinput-notif] large={} small={}", data.large_motor, data.small_motor);
+                    if let Ok(mut r) = rumble2.lock() {
+                        r.large = data.large_motor;
+                        r.small = data.small_motor;
+                    }
+                }));
+            }
+
             Some(t)
         });
+
         Self {
             id, display_name,
             target,
@@ -64,6 +91,8 @@ impl VirtualXInput {
             thumb_rx: 0, thumb_ry: 0,
             left_trigger: 0, right_trigger: 0,
             buttons: 0,
+            rumble,
+            _notif_thread: notif_thread,
         }
     }
 }
@@ -139,6 +168,16 @@ impl VirtualDevice for VirtualXInput {
         self.thumb_ry = 0;
         self.flush();
     }
+
+    fn source_pins(&self) -> &'static [SourcePin] { layouts::XINPUT_SOURCE_PINS }
+
+    fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> {
+        let r = self.rumble.lock().map(|r| *r).unwrap_or_default();
+        vec![
+            ("rumble_strong", Signal::Float(r.large as f32 / 255.0)),
+            ("rumble_weak",   Signal::Float(r.small as f32 / 255.0)),
+        ]
+    }
 }
 
 // ── DS4 (custom implementation with gyro support via DS4ReportEx IOCTL) ────────
@@ -152,9 +191,9 @@ mod vigem_ioctl {
     pub const IOCTL_PLUGIN_TARGET: u32        = 0x2AA004; // fn=0x801
     pub const IOCTL_UNPLUG_TARGET: u32        = 0x2AA008; // fn=0x802
     pub const IOCTL_WAIT_DEVICE_READY: u32    = 0x2AA010; // fn=0x804
-    pub const IOCTL_DS4_SUBMIT_REPORT: u32    = 0x2AA80C; // fn=0xA03
-    // Extended report (ViGEmBus ≥ 1.17) — fn=0xA08
-    pub const IOCTL_DS4_SUBMIT_REPORT_EX: u32 = 0x2AA820;
+    pub const IOCTL_DS4_SUBMIT_REPORT: u32        = 0x002AA80C; // BUSENUM_W_IOCTL(0x801+0x202)
+    // DS4 rumble/lightbar notification from game — BUSENUM_W_IOCTL(0x801+0x203)
+    pub const IOCTL_DS4_REQUEST_NOTIFICATION: u32 = 0x002AA810;
 
     pub const DS4_TARGET_KIND: i32 = 2;
     pub const DS4_VID: u16         = 0x054C;
@@ -296,6 +335,51 @@ mod vigem_ioctl {
         assert!(std::mem::size_of::<DS4ExSubmit>() == 71);
     };
 
+    // ── DS4 notification (rumble + lightbar from game) ────────────────────────
+    // Real DS4_REQUEST_NOTIFICATION layout (16 bytes, observed from raw driver output):
+    //   Size(4) + SerialNo(4) + SmallMotor(1) + LargeMotor(1) + R(1) + G(1) + B(1) + pad[3]
+    // No padding between SerialNo and DS4_OUTPUT_REPORT — driver writes motors at offset 8.
+    #[repr(C)]
+    pub struct DS4NotificationBuffer {
+        pub size:        u32,
+        pub serial:      u32,
+        pub small_motor: u8,
+        pub large_motor: u8,
+        pub lightbar_r:  u8,
+        pub lightbar_g:  u8,
+        pub lightbar_b:  u8,
+        pub _tail:       [u8; 3], // pad to 16 bytes (matches driver-reported Size)
+    }
+
+    /// Submit a non-blocking overlapped IOCTL (does not wait for completion).
+    /// The caller must keep `overlapped` pinned until polled.
+    pub unsafe fn ioctl_async(
+        device:     *mut c_void,
+        overlapped: *mut Overlapped,
+        code:       u32,
+        buf:        *mut c_void,
+        size:       u32,
+    ) {
+        let mut n = 0u32;
+        DeviceIoControl(device, code, buf, size, buf, size, &mut n, overlapped);
+    }
+
+    /// Non-blocking poll of a pending overlapped operation.
+    /// Returns Some(()) if completed, None if still pending, Err(code) on error/abort.
+    pub unsafe fn poll_overlapped(
+        device:     *mut c_void,
+        overlapped: *mut Overlapped,
+    ) -> Result<Option<()>, u32> {
+        let mut n = 0u32;
+        if GetOverlappedResult(device, overlapped, &mut n, 0 /* bWait=FALSE */) != 0 {
+            Ok(Some(()))
+        } else {
+            let err = GetLastError();
+            const ERROR_IO_INCOMPLETE: u32 = 996;
+            if err == ERROR_IO_INCOMPLETE { Ok(None) } else { Err(err) }
+        }
+    }
+
     // ── Win32 kernel32 imports ─────────────────────────────────────────────────
 
     #[link(name = "kernel32")]
@@ -366,6 +450,19 @@ mod ds4_btn {
     pub const TOUCHPAD: u8  = 0x02;
 }
 
+/// Rumble + lightbar values received from a game via DS4 notification IOCTL.
+#[derive(Default, Clone, Copy)]
+struct DS4Rumble {
+    large: u8, small: u8,
+    r: u8, g: u8, b: u8,
+}
+
+/// Shared state between the DS4 notification thread and poll_outputs() reader.
+struct DS4NotifShared {
+    rumble: DS4Rumble,
+    stop:   bool,
+}
+
 pub struct VirtualDS4 {
     id:           String,
     display_name: String,
@@ -374,7 +471,7 @@ pub struct VirtualDS4 {
     /// Raw handle from `_client`; null when ViGEmBus is unavailable.
     dev:          *mut std::ffi::c_void,
     serial:       u32,
-    /// Windows event for overlapped I/O; null when not connected.
+    /// Windows event for overlapped I/O (submit); null when not connected.
     event:        *mut std::ffi::c_void,
     /// Whether `IOCTL_DS4_SUBMIT_REPORT_EX` is supported by installed ViGEmBus.
     has_extended: bool,
@@ -387,6 +484,9 @@ pub struct VirtualDS4 {
     // Gyro / accelerometer (float in [-1, 1], converted to i16 in flush)
     gyro_x:  f32, gyro_y:  f32, gyro_z:  f32,
     accel_x: f32, accel_y: f32, accel_z: f32,
+    /// Rumble/lightbar feedback from game — updated by background notification thread.
+    notif_shared: Arc<Mutex<DS4NotifShared>>,
+    _notif_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 // Raw pointer fields are not Send by default; declare it safe because the
@@ -394,8 +494,29 @@ pub struct VirtualDS4 {
 unsafe impl Send for VirtualDS4 {}
 
 impl VirtualDS4 {
+    fn make_notif_buf(serial: u32) -> Box<vigem_ioctl::DS4NotificationBuffer> {
+        Box::new(vigem_ioctl::DS4NotificationBuffer {
+            size:        16,
+            serial,
+            small_motor: 0, large_motor: 0,
+            lightbar_r:  0, lightbar_g:  0, lightbar_b: 0,
+            _tail:       [0; 3],
+        })
+    }
+
+    fn make_notif_ovl() -> Box<vigem_ioctl::Overlapped> {
+        Box::new(vigem_ioctl::Overlapped {
+            internal: 0, internal_high: 0, offset: 0, offset_high: 0,
+            event: unsafe { vigem_ioctl::CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) },
+        })
+    }
+
     pub fn new(instance: usize) -> Self {
         let (id, display_name) = instance_label("virtual.ds4", "Virtual DualShock 4", instance);
+        let notif_shared = Arc::new(Mutex::new(DS4NotifShared {
+            rumble: DS4Rumble::default(),
+            stop:   false,
+        }));
         let mut out = VirtualDS4 {
             id, display_name,
             _client: None, dev: std::ptr::null_mut(),
@@ -404,6 +525,8 @@ impl VirtualDS4 {
             lt: 0, rt: 0, buttons: 0, special: 0, dpad: [false; 4],
             gyro_x: 0.0, gyro_y: 0.0, gyro_z: 0.0,
             accel_x: 0.0, accel_y: 0.0, accel_z: 0.0,
+            notif_shared,
+            _notif_thread: None,
         };
 
         let client = match Client::connect() {
@@ -447,30 +570,124 @@ impl VirtualDS4 {
             &wait as *const _ as _, std::mem::size_of_val(&wait) as u32,
         ); }
 
-        // Assume extended IOCTL is available; flush() will fall back to basic if not.
-        // Starting optimistic avoids a probe-timing race where the device isn't ready yet.
-        let has_extended = true;
-
-        #[cfg(debug_assertions)]
-        eprintln!("[VirtualDS4] plugged in serial={serial}, will try extended IOCTL");
-
         out._client      = Some(client);
         out.dev          = dev;
         out.serial       = serial;
         out.event        = event;
-        out.has_extended = has_extended;
+        out.has_extended = false;
+
+        eprintln!("[VirtualDS4] plugged in serial={serial}");
+
+        // Spawn a notification thread with its OWN duplicated ViGEm handle.
+        // Sharing the main handle blocks all subsequent submit IOCTLs behind the
+        // long-pending notification IOCTL, throttling DS4 polling to a crawl and
+        // also stalling physical-device HID writes on the same I/O thread.
+        if let Some(client_ref) = out._client.as_ref() {
+            if let Ok(notif_client) = client_ref.try_clone() {
+                let notif_dev = notif_client.as_raw_handle() as *mut std::ffi::c_void;
+                let shared = Arc::clone(&out.notif_shared);
+                let dev_ptr = SendPtr(notif_dev);
+                let handle = std::thread::Builder::new()
+                    .name(format!("ds4-notif-{instance}"))
+                    .spawn(move || {
+                        // Move the duplicated client into the thread so its handle
+                        // stays open for the lifetime of the notification loop.
+                        let _hold = notif_client;
+                        ds4_notif_thread(dev_ptr, serial, shared);
+                    })
+                    .ok();
+                out._notif_thread = handle;
+            } else {
+                eprintln!("[VirtualDS4] failed to duplicate ViGEm handle — feedback disabled");
+            }
+        }
+
         out
     }
+
+}
+
+/// Raw-pointer wrapper marked Send so it can cross to the notification thread.
+/// SAFETY: the ViGEm device handle is shared between the main I/O thread (issuing
+/// DS4_SUBMIT_REPORT) and the notification thread (waiting on DS4_REQUEST_NOTIFICATION).
+/// Windows kernel I/O on a HANDLE is thread-safe for distinct overlapped operations.
+struct SendPtr(*mut std::ffi::c_void);
+unsafe impl Send for SendPtr {}
+
+/// Dedicated thread that blocks on DS4 notification IOCTLs. Sleeps in the kernel
+/// until the game sends rumble/lightbar, then updates `shared.rumble` and loops.
+fn ds4_notif_thread(dev_ptr: SendPtr, serial: u32, shared: Arc<Mutex<DS4NotifShared>>) {
+    let dev = dev_ptr.0;
+    let mut buf = VirtualDS4::make_notif_buf(serial);
+    let event = unsafe {
+        vigem_ioctl::CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null())
+    };
+    if event.is_null() { return; }
+    let mut ovl = vigem_ioctl::Overlapped {
+        internal: 0, internal_high: 0, offset: 0, offset_high: 0, event,
+    };
+    loop {
+        // Check stop flag before each blocking call.
+        if shared.lock().map(|s| s.stop).unwrap_or(true) { break; }
+
+        // Reset overlapped state and reissue the request.
+        ovl.internal = 0;
+        ovl.internal_high = 0;
+        unsafe {
+            vigem_ioctl::ioctl_async(
+                dev, &mut ovl as *mut _,
+                vigem_ioctl::IOCTL_DS4_REQUEST_NOTIFICATION,
+                buf.as_mut() as *mut _ as _,
+                16,
+            );
+        }
+        // Block until completion (bWait=TRUE) — kernel parks this thread, no CPU spin.
+        let mut n = 0u32;
+        let ok = unsafe {
+            vigem_ioctl::GetOverlappedResult(dev, &mut ovl as *mut _, &mut n, 1)
+        };
+        if ok == 0 {
+            let err = unsafe { vigem_ioctl::GetLastError() };
+            // ERROR_OPERATION_ABORTED (995) fires when the target is unplugged.
+            if err != 995 {
+                eprintln!("[VirtualDS4 notif-thread] error winerr={err:#010x}, exiting");
+            }
+            break;
+        }
+
+        let new_rumble = DS4Rumble {
+            large: buf.large_motor,
+            small: buf.small_motor,
+            r:     buf.lightbar_r,
+            g:     buf.lightbar_g,
+            b:     buf.lightbar_b,
+        };
+        if let Ok(mut s) = shared.lock() {
+            if s.stop { break; }
+            let changed = (new_rumble.large, new_rumble.small, new_rumble.r, new_rumble.g, new_rumble.b)
+                != (s.rumble.large, s.rumble.small, s.rumble.r, s.rumble.g, s.rumble.b);
+            if changed {
+                eprintln!("[VirtualDS4] notification: large={} small={} rgb=({},{},{})",
+                    new_rumble.large, new_rumble.small, new_rumble.r, new_rumble.g, new_rumble.b);
+            }
+            s.rumble = new_rumble;
+        }
+    }
+    unsafe { vigem_ioctl::CloseHandle(event); }
 }
 
 impl Drop for VirtualDS4 {
     fn drop(&mut self) {
+        // Signal the notification thread to exit on its next wake-up.
+        if let Ok(mut s) = self.notif_shared.lock() { s.stop = true; }
         if self.dev.is_null() { return; }
         let unplug = vigem_ioctl::LifecycleTarget {
             size:   std::mem::size_of::<vigem_ioctl::LifecycleTarget>() as u32,
             serial: self.serial,
         };
         unsafe {
+            // Unplugging aborts any pending notification IOCTL with ERROR_OPERATION_ABORTED,
+            // unblocking the notification thread so it can observe `stop` and exit.
             vigem_ioctl::ioctl(
                 self.dev, self.event, vigem_ioctl::IOCTL_UNPLUG_TARGET,
                 &unplug as *const _ as _, std::mem::size_of_val(&unplug) as u32,
@@ -538,70 +755,6 @@ impl VirtualDevice for VirtualDS4 {
         let buttons = (self.buttons & !0xF) | dpad;
         let tp_pressed = self.special & ds4_btn::TOUCHPAD != 0;
 
-        if self.has_extended {
-            let ok = unsafe {
-                let mut sub: vigem_ioctl::DS4ExSubmit = std::mem::zeroed();
-                sub.size   = std::mem::size_of::<vigem_ioctl::DS4ExSubmit>() as u32;
-                sub.serial = self.serial;
-                sub.report.set_lx(self.lx);
-                sub.report.set_ly(self.ly);
-                sub.report.set_rx(self.rx);
-                sub.report.set_ry(self.ry);
-                sub.report.set_buttons(buttons);
-                sub.report.set_special(self.special);
-                sub.report.set_lt(self.lt);
-                sub.report.set_rt(self.rt);
-                sub.report.set_battery(0xFF);
-                sub.report.set_gyro_x(float_to_i16(self.gyro_x));
-                sub.report.set_gyro_y(float_to_i16(self.gyro_y));
-                sub.report.set_gyro_z(float_to_i16(self.gyro_z));
-                sub.report.set_accel_x(float_to_i16(self.accel_x));
-                sub.report.set_accel_y(float_to_i16(self.accel_y));
-                sub.report.set_accel_z(float_to_i16(self.accel_z));
-                // When the touchpad button is pressed, report a single center touch.
-                // Some software requires at least one active touch point alongside
-                // the touchpad-click bit in the special byte.
-                if tp_pressed {
-                    sub.report.set_touch_n(1);
-                    sub.report.set_touch_cur(
-                        0,
-                        0x00,                    // active, tracking ID 0
-                        [0xC0, 0x63, 0x1D],      // X=960, Y=470 (DS4 touchpad centre)
-                        0x80,                    // second slot inactive
-                        [0; 3],
-                    );
-                } else {
-                    sub.report.set_touch_n(0);
-                    sub.report.set_touch_cur(0, 0x80, [0;3], 0x80, [0;3]);
-                }
-                sub.report.clear_touch_prev();
-                let result = vigem_ioctl::ioctl(
-                    self.dev, self.event, vigem_ioctl::IOCTL_DS4_SUBMIT_REPORT_EX,
-                    &sub as *const _ as _, std::mem::size_of_val(&sub) as u32,
-                );
-                #[cfg(debug_assertions)]
-                {
-                    let err = vigem_ioctl::GetLastError();
-                    let sz = sub.size; let sn = sub.serial;
-                    eprintln!(
-                        "[VirtualDS4 EX] size={} serial={} ok={} winerr={:#010x} gyro=({},{},{}) accel=({},{},{})",
-                        sz, sn, result, err,
-                        i16::from_le_bytes([sub.report.buf[12], sub.report.buf[13]]),
-                        i16::from_le_bytes([sub.report.buf[14], sub.report.buf[15]]),
-                        i16::from_le_bytes([sub.report.buf[16], sub.report.buf[17]]),
-                        i16::from_le_bytes([sub.report.buf[18], sub.report.buf[19]]),
-                        i16::from_le_bytes([sub.report.buf[20], sub.report.buf[21]]),
-                        i16::from_le_bytes([sub.report.buf[22], sub.report.buf[23]]),
-                    );
-                }
-                result
-            };
-            if ok { return; }
-            // Extended IOCTL failed — fall through to basic this frame but keep
-            // has_extended = true so we retry next frame.
-        }
-
-        // Basic report path (also fallback when extended fails).
         let sub = vigem_ioctl::DS4Submit {
             size:   std::mem::size_of::<vigem_ioctl::DS4Submit>() as u32,
             serial: self.serial,
@@ -629,6 +782,21 @@ impl VirtualDevice for VirtualDS4 {
         self.gyro_x = 0.0; self.gyro_y = 0.0; self.gyro_z = 0.0;
         self.accel_x = 0.0; self.accel_y = 0.0; self.accel_z = 0.0;
         self.flush();
+    }
+
+    fn source_pins(&self) -> &'static [SourcePin] { layouts::DS4_SOURCE_PINS }
+
+    fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> {
+        if self.dev.is_null() { return vec![]; }
+        // Cheap read of values populated by the notification thread.
+        let r = self.notif_shared.lock().map(|s| s.rumble).unwrap_or_default();
+        vec![
+            ("rumble_strong", Signal::Float(r.large as f32 / 255.0)),
+            ("rumble_weak",   Signal::Float(r.small as f32 / 255.0)),
+            ("lightbar_r",    Signal::Float(r.r     as f32 / 255.0)),
+            ("lightbar_g",    Signal::Float(r.g     as f32 / 255.0)),
+            ("lightbar_b",    Signal::Float(r.b     as f32 / 255.0)),
+        ]
     }
 }
 

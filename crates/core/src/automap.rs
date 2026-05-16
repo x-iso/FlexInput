@@ -10,6 +10,44 @@ const SEMANTIC_GROUPS: &[&[&str]] = &[
     &["btn_rt_dig", "right_trigger"],
 ];
 
+/// Feedback pin pairs that flow BACKWARD along an AutoMap wire.
+///
+/// When an AutoMap wire connects a physical device.source → virtual device.sink (carrying
+/// forward gamepad signals: sticks, buttons, etc.), feedback signals (rumble, lightbar,
+/// LEDs) flow back along the same wire in the reverse direction. This is silent and
+/// automatic — no separate wires required, no UI changes.
+///
+/// Each entry: (virtual_output_pin_id, &[matching_physical_input_pin_ids]).
+/// The engine looks up the virtual sink's output signal under `virtual_output_pin_id`
+/// and, if a matching physical haptic input pin exists, routes the value there.
+///
+/// To extend: add a new entry for any new device-specific haptic input pin alias.
+/// Example: when a new controller adopts pin "trigger_l_rumble", add it to the
+/// rumble_strong entry alongside "hd_l_amp" / "hd_rumble_l".
+pub const FEEDBACK_PAIRS: &[(&str, &[&str])] = &[
+    ("rumble_strong", &["rumble_strong", "hd_l_amp", "hd_rumble_l"]),
+    ("rumble_weak",   &["rumble_weak",   "hd_r_amp", "hd_rumble_r"]),
+    ("lightbar_r",    &["lightbar_r"]),
+    ("lightbar_g",    &["lightbar_g"]),
+    ("lightbar_b",    &["lightbar_b"]),
+];
+
+/// Resolve feedback pin-id mapping for the AutoMap reverse-flow channel.
+/// Given a virtual sink's output pin id (e.g. "rumble_strong"), returns the
+/// first matching pin from `physical_input_pins` (e.g. "hd_l_amp" on Switch Pro).
+pub fn resolve_feedback_pin<'a>(
+    virtual_out_pin: &str,
+    physical_input_pins: &[&'a str],
+) -> Option<&'a str> {
+    let entry = FEEDBACK_PAIRS.iter().find(|(src, _)| *src == virtual_out_pin)?;
+    for &candidate in entry.1 {
+        if let Some(&p) = physical_input_pins.iter().find(|&&p| p == candidate) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// A single auto-mappable signal in the canonical gamepad bus.
 pub struct AutoMapPin {
     pub id: &'static str,

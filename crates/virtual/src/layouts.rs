@@ -1,11 +1,30 @@
 use flexinput_core::SignalType;
-use crate::SinkPin;
+use crate::{SinkPin, SourcePin};
 
 macro_rules! sp {
     ($id:expr, $name:expr, $t:expr) => {
         SinkPin { id: $id, display_name: $name, signal_type: $t }
     };
 }
+
+macro_rules! op {
+    ($id:expr, $name:expr, $t:expr) => {
+        SourcePin { id: $id, display_name: $name, signal_type: $t }
+    };
+}
+
+pub static XINPUT_SOURCE_PINS: &[SourcePin] = &[
+    op!("rumble_strong", "Rumble Strong (large motor)", SignalType::Float),
+    op!("rumble_weak",   "Rumble Weak (small motor)",   SignalType::Float),
+];
+
+pub static DS4_SOURCE_PINS: &[SourcePin] = &[
+    op!("rumble_strong", "Rumble Strong",  SignalType::Float),
+    op!("rumble_weak",   "Rumble Weak",    SignalType::Float),
+    op!("lightbar_r",    "Lightbar R",     SignalType::Float),
+    op!("lightbar_g",    "Lightbar G",     SignalType::Float),
+    op!("lightbar_b",    "Lightbar B",     SignalType::Float),
+];
 
 pub static KEYMOUSE_DEFAULT_PINS: &[SinkPin] = &[
     // Modifier / special keys — always present, non-removable

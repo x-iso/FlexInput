@@ -391,9 +391,35 @@ pub fn eval_graph_tick(
                 }
             }
 
-            // device.source nodes with haptic inputs need sink routing but still
-            // must compute their output signals — don't skip them.
-            if snap.module_id != "device.source" {
+            // AutoMap feedback channel: signals flow BACKWARD along AutoMap wires
+            // from virtual sinks to physical haptic inputs. Each virtual sink that
+            // auto-maps FROM this device contributes its rumble/lightbar outputs
+            // to matching haptic input pins on this device, silently and without
+            // explicit user wiring. Direct wires (in `directly_wired`) take priority.
+            if !st.feedback_sources.is_empty() {
+                let dst_pins: Vec<&str> = st.pin_ids.iter()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.as_str())
+                    .collect();
+                for virt_dev in &st.feedback_sources {
+                    for (virt_out_pin, _) in flexinput_core::automap::FEEDBACK_PAIRS.iter() {
+                        let Some(&sig) = dev_sigs.get(&(virt_dev.clone(), virt_out_pin.to_string())) else {
+                            continue;
+                        };
+                        let Some(dst_pin) = flexinput_core::automap::resolve_feedback_pin(
+                            virt_out_pin, &dst_pins
+                        ) else { continue; };
+                        if directly_wired.contains(dst_pin) { continue; }
+                        sink_outputs
+                            .entry((st.device_id.clone(), dst_pin.to_string()))
+                            .or_insert(sig);
+                    }
+                }
+            }
+
+            // device.source nodes with haptic inputs, and device.sink nodes with
+            // feedback output pins, still need output computation — don't skip them.
+            if snap.module_id != "device.source" && snap.n_outputs == 0 {
                 computed[idx] = vec![];
                 continue;
             }
@@ -571,7 +597,18 @@ fn compute_node(
                 eval_pure(&snap.module_id, out_idx, inputs, &snap.params, snap.n_outputs)
             }).collect()
         }
-        "display.oscilloscope" | "display.vectorscope" | "display.readout" | "device.sink" => vec![],
+        "display.oscilloscope" | "display.vectorscope" | "display.readout" => vec![],
+        "device.sink" => {
+            if snap.n_outputs == 0 { return vec![]; }
+            let dev_id = snap.device_id.as_deref().unwrap_or("");
+            let dz = snap.params.get("deadzone").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            (0..snap.n_outputs).map(|i| {
+                let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
+                if pin_id.is_empty() { return None; }
+                let sig = dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()?;
+                Some(if dz > 0.0 { apply_deadzone(sig, dz) } else { sig })
+            }).collect()
+        }
         "subpatch.inlet" => vec![],
         "subpatch.outlet" => vec![inputs.first().copied().flatten()],
         id => {

@@ -9,6 +9,12 @@ pub struct SinkPin {
     pub signal_type: SignalType,
 }
 
+pub struct SourcePin {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub signal_type: SignalType,
+}
+
 /// Static metadata about an available virtual device type (no connections made).
 pub struct DeviceKind {
     pub kind_id: &'static str,
@@ -33,6 +39,12 @@ pub trait VirtualDevice: Send {
     /// Returns false if the underlying system resource is unavailable
     /// (e.g. ViGEmBus not installed, enigo init failed).
     fn is_connected(&self) -> bool { true }
+    /// Output pins this device exposes back into the graph (e.g. rumble from games).
+    /// Empty by default — only devices with feedback signals implement this.
+    fn source_pins(&self) -> &'static [SourcePin] { &[] }
+    /// Poll latest output values from the OS/game (e.g. rumble motor speeds).
+    /// Returns (pin_id, signal) pairs; called each I/O frame after flush().
+    fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> { vec![] }
 }
 
 #[cfg(windows)]

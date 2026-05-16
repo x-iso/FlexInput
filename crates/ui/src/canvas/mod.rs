@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use egui_snarl::{ui::{get_selected_nodes, SnarlStyle}, InPinId, NodeId, OutPinId, Snarl};
 use flexinput_core::{PinDescriptor, ModuleDescriptor, SignalType};
 use flexinput_devices::PhysicalDevice;
-use flexinput_virtual::{SinkPin, VirtualDevice};
+use flexinput_virtual::{SinkPin, SourcePin, VirtualDevice};
 use serde_json::Value;
 
 const MAX_UNDO: usize = 50;
@@ -748,21 +748,21 @@ impl Canvas {
         self.snarl.insert_node(egui::pos2(400.0, 80.0 + existing as f32 * 220.0), node);
     }
 
-    /// Add a virtual device as a sink node. No-op if already present (keyed by device id).
+    /// Add a virtual device as a single sink node with optional feedback output pins.
+    /// No-op if already present (keyed by device id).
     pub fn add_virtual_sink(&mut self, device: &dyn VirtualDevice) {
         let already_present = self.snarl.nodes_ids_data().any(|(_, n)| {
             n.value.module_id == "device.sink"
                 && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(device.id())
         });
-        if already_present {
-            return;
-        }
+        if already_present { return; }
 
         let fixed_count = device.sink_pins().len();
-        let inputs = device
-            .sink_pins()
-            .iter()
+        let inputs = device.sink_pins().iter()
             .map(|p: &SinkPin| PinDescriptor::new(p.display_name, p.signal_type))
+            .collect();
+        let outputs = device.source_pins().iter()
+            .map(|p: &SourcePin| PinDescriptor::new(p.display_name, p.signal_type))
             .collect();
 
         let mut params = HashMap::new();
@@ -771,13 +771,16 @@ impl Canvas {
         params.insert("input_pin_ids".to_string(), Value::Array(
             device.sink_pins().iter().map(|p| Value::String(p.id.to_string())).collect(),
         ));
+        params.insert("output_pin_ids".to_string(), Value::Array(
+            device.source_pins().iter().map(|p| Value::String(p.id.to_string())).collect(),
+        ));
 
         let node = NodeData {
             module_id: "device.sink".to_string(),
             display_name: device.display_name().to_string(),
             category: "Device".to_string(),
             inputs,
-            outputs: vec![],
+            outputs,
             params,
             subpatch: None,
             extra: Default::default(),

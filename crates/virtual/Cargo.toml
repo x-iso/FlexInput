@@ -7,5 +7,5 @@ edition.workspace = true
 flexinput-core = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-vigem-client = { version = "0.1", features = ["unstable_ds4"] }
+vigem-client = { version = "0.1", features = ["unstable_ds4", "unstable_xtarget_notification"] }
 enigo = "0.2"

@@ -31,6 +31,11 @@ pub struct SinkTarget {
     /// When automap_source is a collector, this holds the upstream real device ID
     /// used as fallback for pins the collector does not override.
     pub automap_fallback_dev: Option<String>,
+    /// Virtual sink device IDs that auto-map FROM this physical device, used to pull
+    /// feedback signals (rumble, lightbar) backward along the AutoMap wire.
+    /// When this device is itself a sink (has haptic inputs), the engine looks up
+    /// matching feedback signals (per FEEDBACK_PAIRS) from these virtual devices.
+    pub feedback_sources: Vec<String>,
 }
 
 #[derive(Clone)]
