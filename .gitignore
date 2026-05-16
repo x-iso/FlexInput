@@ -7,7 +7,7 @@
 .qwen/
 .opencode/
 .agent/
-.github
-.planning
+.planning/
+.github/
 /memory/
 .notes
