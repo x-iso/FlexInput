@@ -17,7 +17,7 @@ pub use eval::{
 pub use graph::{InlineSubgraph, NodeSnap, ProcessingGraph};
 pub use router::InputRouter;
 pub use state::NodeState;
-pub use thread::{spawn_processing_thread, ProcessingOutput, SinkBus, SAMPLE_RATE};
+pub use thread::{spawn_processing_thread, current_sample_rate, ProcessingOutput, SinkBus, DEFAULT_SAMPLE_RATE};
 
 pub struct Engine {
     modules: HashMap<Uuid, Box<dyn Module>>,

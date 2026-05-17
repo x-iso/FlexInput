@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,7 +10,21 @@ use crate::eval::{eval_graph_tick, TickOutput};
 use crate::graph::ProcessingGraph;
 use crate::state::NodeState;
 
-pub const SAMPLE_RATE: u32 = 2000;
+/// Default processing rate (Hz). Runtime-tunable via the `sample_rate` atomic
+/// passed to `spawn_processing_thread`.
+pub const DEFAULT_SAMPLE_RATE: u32 = 2000;
+
+/// Process-global live sample rate. Mirrors the atomic handed to
+/// `spawn_processing_thread`, so read-only consumers (oscilloscope window
+/// sizing, etc.) don't have to thread the `Arc<AtomicU32>` through every
+/// rendering layer. Updated atomically inside the processing loop.
+static LIVE_SAMPLE_RATE: AtomicU32 = AtomicU32::new(DEFAULT_SAMPLE_RATE);
+
+/// Read the currently-active processing rate. Cheap relaxed load — safe to
+/// call from per-frame UI code.
+pub fn current_sample_rate() -> u32 {
+    LIVE_SAMPLE_RATE.load(Ordering::Relaxed)
+}
 /// How many scope samples to buffer before the UI drains them.
 const MAX_SCOPE_PENDING: usize = 8192;
 
@@ -35,24 +50,33 @@ pub type SinkBus = Arc<RwLock<HashMap<(String, String), Signal>>>;
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
-/// Spawns the 2 kHz processing thread and returns the shared state handles.
+/// Spawns the processing thread and returns the shared state handles.
 /// The caller keeps the `Arc` references; the thread holds clones.
+///
+/// `sample_rate` is read at the top of each wakeup so the user can retune
+/// the processing rate live without restarting the thread.
 pub fn spawn_processing_thread(
     graph: Arc<RwLock<ProcessingGraph>>,
     device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
     output: Arc<Mutex<ProcessingOutput>>,
     sink_bus: SinkBus,
+    sample_rate: Arc<AtomicU32>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        const DT: f32 = 1.0 / SAMPLE_RATE as f32;
-        let interval  = Duration::from_nanos(1_000_000_000 / SAMPLE_RATE as u64);
         let mut next_tick = Instant::now();
         let mut state: HashMap<usize, NodeState> = HashMap::new();
 
         loop {
             let now = Instant::now();
 
-            // How many 500 µs ticks have elapsed since we last processed?
+            // Re-read sample rate each wakeup so live retunes apply immediately.
+            // Clamp defensively in case settings.json holds a garbage value.
+            let sr = sample_rate.load(Ordering::Relaxed).clamp(100, 16_000);
+            LIVE_SAMPLE_RATE.store(sr, Ordering::Relaxed);
+            let dt: f32 = 1.0 / sr as f32;
+            let interval = Duration::from_nanos(1_000_000_000 / sr as u64);
+
+            // How many ticks have elapsed since we last processed?
             let mut ticks = 0u32;
             while next_tick <= now {
                 next_tick += interval;
@@ -71,7 +95,7 @@ pub fn spawn_processing_thread(
                 let mut scope_acc: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
                 let mut last_out: Option<TickOutput> = None;
                 for _ in 0..ticks {
-                    let tick_out = eval_graph_tick(&graph_snap, &mut state, &dev_sigs, DT);
+                    let tick_out = eval_graph_tick(&graph_snap, &mut state, &dev_sigs, dt);
                     scope_acc.extend(tick_out.scope_samples.iter().cloned());
                     last_out = Some(tick_out);
                 }

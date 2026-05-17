@@ -1,6 +1,6 @@
 ﻿use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use eframe::egui;
 use egui_snarl::{InPinId, NodeId, OutPinId, Snarl};
@@ -16,6 +16,7 @@ use crate::{
     canvas::ClipboardData,
     panels::{physical_devices, virtual_devices::VirtualDevicePanel},
     panic_hotkey::{load_panic_shortcut, save_panic_shortcut, spawn_panic_hotkey_listener},
+    settings::{self, AppSettings, PersistedTab, PersistedWorkspace},
 };
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -162,6 +163,18 @@ pub struct FlexInputApp {
     /// Live snapshot of the shortcut for the global hotkey listener thread.
     /// Updated whenever the user changes the binding.
     panic_shortcut_shared: Arc<RwLock<PanicShortcut>>,
+    // ── Settings ──────────────────────────────────────────────────────────────
+    /// User-configurable preferences persisted to settings.json. Mutated by the
+    /// Settings window UI; persistence happens on change (debounced).
+    settings: AppSettings,
+    /// True while the Settings window is shown.
+    settings_open: bool,
+    /// Set when settings have changed and need to be written out at end of frame.
+    settings_dirty: bool,
+    /// Live processing rate handed to the engine thread.
+    sample_rate_hz: Arc<AtomicU32>,
+    /// Live device polling rate handed to the I/O thread.
+    polling_hz: Arc<AtomicU32>,
 }
 
 /// Keyboard-only shortcut for panic mode. Modifiers + non-modifier key.
@@ -214,12 +227,36 @@ impl FlexInputApp {
         // HidHide integration disabled pending a proper rewrite.
         let hidhide: Option<HidHideClient> = None;
         let logo_texture = eframe::icon_data::from_png_bytes(icon_bytes).ok().map(|icon| {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
+            // Pre-multiply alpha so blending at small render sizes doesn't
+            // produce dark fringes around the logo's edges.
+            let mut premul = Vec::with_capacity(icon.rgba.len());
+            for px in icon.rgba.chunks_exact(4) {
+                let a = px[3] as u32;
+                premul.push((px[0] as u32 * a / 255) as u8);
+                premul.push((px[1] as u32 * a / 255) as u8);
+                premul.push((px[2] as u32 * a / 255) as u8);
+                premul.push(px[3]);
+            }
+            let image = egui::ColorImage::from_rgba_premultiplied(
                 [icon.width as usize, icon.height as usize],
-                &icon.rgba,
+                &premul,
             );
-            cc.egui_ctx.load_texture("app_logo", image, egui::TextureOptions::LINEAR)
+            // Mipmaps + linear min/mag give a clean downscale from the source
+            // PNG (large) to the ~20px render size in the title bar.
+            let opts = egui::TextureOptions {
+                magnification: egui::TextureFilter::Linear,
+                minification:  egui::TextureFilter::Linear,
+                wrap_mode:     egui::TextureWrapMode::ClampToEdge,
+                mipmap_mode:   Some(egui::TextureFilter::Linear),
+            };
+            cc.egui_ctx.load_texture("app_logo", image, opts)
         });
+
+        // ── Settings ──────────────────────────────────────────────────────
+        // Loaded before threads spawn so the engine starts at the user's rate.
+        let app_settings = settings::load_settings();
+        let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
+        let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
 
         let proc_graph          = Arc::new(RwLock::new(ProcessingGraph::default()));
         let proc_device_signals = Arc::new(RwLock::new(HashMap::<(String, String), Signal>::new()));
@@ -230,9 +267,30 @@ impl FlexInputApp {
             Arc::clone(&proc_device_signals),
             Arc::clone(&proc_outputs),
             Arc::clone(&sink_bus),
+            Arc::clone(&sample_rate_hz),
         );
 
-        let tabs = vec![PatchTab::new_untitled(1)];
+        // Restore workspace if the user opted in; otherwise start with one empty tab.
+        let tabs = if app_settings.keep_workspace {
+            match settings::load_workspace() {
+                Some(ws) if !ws.tabs.is_empty() => ws.tabs.into_iter().map(|pt| {
+                    let mut canvas = Canvas::new();
+                    canvas.snarl = pt.snarl;
+                    PatchTab {
+                        title: pt.title,
+                        file_path: pt.file_path,
+                        bound_exes: pt.bound_exes,
+                        canvas,
+                        virtual_panel: VirtualDevicePanel::new(),
+                        bypassed: false,
+                        auto_bypass: pt.auto_bypass,
+                    }
+                }).collect(),
+                _ => vec![PatchTab::new_untitled(1)],
+            }
+        } else {
+            vec![PatchTab::new_untitled(1)]
+        };
         let shared_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
         let shared_midi_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
         let pinned_midi_ids = Arc::new(RwLock::new(HashSet::<String>::new()));
@@ -251,6 +309,7 @@ impl FlexInputApp {
             Arc::clone(&io_bypass),
             Arc::clone(&shared_devices),
             Arc::clone(&shared_midi_devices),
+            Arc::clone(&polling_hz),
         );
 
         spawn_midi_watch_thread(
@@ -268,11 +327,21 @@ impl FlexInputApp {
             Arc::clone(&panic_toggle_requested),
         );
 
+        // Pick `next_untitled` high enough that any restored "Untitled N" tab
+        // doesn't collide with a freshly-created one.
+        let next_untitled = tabs.iter()
+            .filter_map(|t| t.title.strip_prefix("Untitled")
+                .and_then(|rest| rest.trim().parse::<u32>().ok()
+                    .or_else(|| if rest.is_empty() { Some(1) } else { None })))
+            .max()
+            .map(|n| n + 1)
+            .unwrap_or(2);
+
         Self {
             engine: Engine::new(),
             tabs,
             active_tab: 0,
-            next_untitled: 2,
+            next_untitled,
             descriptors,
             midi_backend,
             devices: vec![],
@@ -308,6 +377,11 @@ impl FlexInputApp {
             panic_learning: false,
             panic_toggle_requested,
             panic_shortcut_shared,
+            settings: app_settings,
+            settings_open: false,
+            settings_dirty: false,
+            sample_rate_hz,
+            polling_hz,
         }
     }
 }
@@ -496,6 +570,7 @@ impl eframe::App for FlexInputApp {
         let mut do_hidhide = false;
         let mut do_undo = false;
         let mut do_redo = false;
+        let mut toggle_settings = false;
         let can_undo = self.tabs[self.active_tab].canvas.can_undo();
         let can_redo = self.tabs[self.active_tab].canvas.can_redo();
         let title_frame = egui::Frame::NONE.fill(ctx.style().visuals.panel_fill);
@@ -515,8 +590,12 @@ impl eframe::App for FlexInputApp {
                     &mut self.panic_active,
                     &mut self.panic_learning,
                     &self.panic_shortcut_shared,
+                    &mut toggle_settings,
                 );
             });
+        if toggle_settings {
+            self.settings_open = !self.settings_open;
+        }
 
         // ── Tab bar ───────────────────────────────────────────────────────────────
         let tab_bar_frame = egui::Frame::NONE.fill(ctx.style().visuals.widgets.noninteractive.bg_fill);
@@ -976,6 +1055,13 @@ impl eframe::App for FlexInputApp {
             }
         }
 
+        // ── Settings window ───────────────────────────────────────────────────
+        self.draw_settings_window(ctx);
+        if self.settings_dirty {
+            settings::save_settings(&self.settings);
+            self.settings_dirty = false;
+        }
+
         // Close a specific tab from the tab bar X button.
         let close_idx = tab_close_idx.or(if do_close { Some(self.active_tab) } else { None });
         if let Some(idx) = close_idx {
@@ -1154,6 +1240,13 @@ impl eframe::App for FlexInputApp {
 
         handle_window_resize(ctx);
     }
+
+    /// Called by eframe just before the application exits. Persist workspace
+    /// (if opted in) and settings here.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        settings::save_settings(&self.settings);
+        self.save_workspace_now();
+    }
 }
 
 impl FlexInputApp {
@@ -1170,6 +1263,144 @@ impl FlexInputApp {
         *self.io_device_list.write().unwrap() =
             Arc::clone(&self.tabs[idx].virtual_panel.active);
     }
+
+    /// Render the Settings modal. Reads/writes `self.settings`, mirrors live
+    /// values into the engine/I-O atomics, and flips `settings_dirty` so the
+    /// outer update loop persists settings.json at end of frame.
+    fn draw_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open { return; }
+        let mut open = true;
+        let mut dirty = false;
+        let mut save_workspace = false;
+
+        egui::Window::new("Settings")
+            .id(egui::Id::new("settings_window"))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([460.0, 520.0])
+            .max_size(egui::vec2(560.0, 720.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading("FlexInput");
+                    ui.label(egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .small().color(egui::Color32::from_gray(170)));
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Performance ─────────────────────────────────────────
+                ui.label(egui::RichText::new("Performance").strong());
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Device polling rate");
+                    let resp = ui.add(egui::Slider::new(
+                        &mut self.settings.polling_hz,
+                        settings::POLLING_HZ_MIN..=settings::POLLING_HZ_MAX,
+                    ).suffix(" Hz"));
+                    if resp.changed() {
+                        self.polling_hz.store(self.settings.polling_hz, Ordering::Relaxed);
+                        dirty = true;
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "How often the I/O thread polls gamepads and MIDI devices."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Processing sample rate");
+                    let resp = ui.add(egui::Slider::new(
+                        &mut self.settings.sample_rate_hz,
+                        settings::SAMPLE_RATE_HZ_MIN..=settings::SAMPLE_RATE_HZ_MAX,
+                    ).suffix(" Hz"));
+                    if resp.changed() {
+                        self.sample_rate_hz.store(self.settings.sample_rate_hz, Ordering::Relaxed);
+                        dirty = true;
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "Engine tick rate. Higher = lower latency, more CPU."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Workspace ───────────────────────────────────────────
+                ui.label(egui::RichText::new("Workspace").strong());
+                ui.add_space(4.0);
+                let resp = ui.checkbox(&mut self.settings.keep_workspace,
+                    "Keep open tabs on next launch");
+                if resp.changed() {
+                    dirty = true;
+                    if self.settings.keep_workspace {
+                        save_workspace = true;
+                    } else {
+                        settings::delete_workspace();
+                    }
+                }
+                ui.label(egui::RichText::new(
+                    "When enabled, the current tabs (including unsaved patches) are restored on the next launch."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Links ───────────────────────────────────────────────
+                ui.label(egui::RichText::new("Links").strong());
+                ui.add_space(4.0);
+                ui.hyperlink_to("FlexInput repository",      "https://github.com/x-iso/FlexInput");
+                ui.hyperlink_to("ViGEm Bus — latest release","https://github.com/nefarius/ViGEmBus/releases/latest");
+                ui.hyperlink_to("HidHide — latest release",  "https://github.com/nefarius/HidHide/releases/latest");
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Credits ─────────────────────────────────────────────
+                ui.label(egui::RichText::new("Credits").strong());
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(
+                    "Built with egui, eframe, egui-snarl, egui_extras, gilrs, midir, rfd, serde, ViGEmBus, HidHide."
+                ).small());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Input prompt SVG icons by Kenney —").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("kenney.nl/assets/input-prompts").small(),
+                        "https://kenney.nl/assets/input-prompts",
+                    );
+                    ui.label(egui::RichText::new("(CC0).").small());
+                });
+            });
+
+        if dirty { self.settings_dirty = true; }
+        if save_workspace { self.save_workspace_now(); }
+        if !open { self.settings_open = false; }
+    }
+
+    /// Serialize the current tab set to workspace.json. No-op if the user
+    /// has not opted in to workspace persistence.
+    fn save_workspace_now(&self) {
+        if !self.settings.keep_workspace { return; }
+        let tabs: Vec<PersistedTab> = self.tabs.iter().map(|t| PersistedTab {
+            title: t.title.clone(),
+            file_path: t.file_path.clone(),
+            bound_exes: t.bound_exes.clone(),
+            auto_bypass: t.auto_bypass,
+            snarl: t.canvas.snarl.clone(),
+        }).collect();
+        let ws = PersistedWorkspace {
+            version: 1,
+            active_tab: self.active_tab,
+            tabs,
+        };
+        settings::save_workspace(&ws);
+    }
 }
 
 // ── 500 Hz device I/O thread ──────────────────────────────────────────────────
@@ -1183,18 +1414,21 @@ fn spawn_io_thread(
     io_bypass: Arc<AtomicBool>,
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
+    polling_hz: Arc<AtomicU32>,
 ) {
     use std::time::{Duration, Instant};
 
     std::thread::Builder::new()
-        .name("device-io-500hz".into())
+        .name("device-io".into())
         .spawn(move || {
-            let interval = Duration::from_nanos(1_000_000_000 / 500);
             let mut last_enum = Instant::now() - Duration::from_secs(10);
             let mut last_midi_out: HashMap<(String, String), Signal> = HashMap::new();
 
             loop {
                 let t0 = Instant::now();
+                // Re-read polling rate each iteration so live retunes apply.
+                let hz = polling_hz.load(Ordering::Relaxed).clamp(60, 4000);
+                let interval = Duration::from_nanos(1_000_000_000 / hz as u64);
 
                 // ── Poll physical inputs ──────────────────────────────────────
                 let mut signals: HashMap<(String, String), Signal> = HashMap::new();
@@ -2789,6 +3023,7 @@ fn show_title_bar(
     panic_active: &mut bool,
     panic_learning: &mut bool,
     panic_shortcut_shared: &Arc<RwLock<PanicShortcut>>,
+    toggle_settings: &mut bool,
 ) {
     let bar = ui.max_rect();
     let h = bar.height();
@@ -2991,22 +3226,59 @@ fn show_title_bar(
         });
     }
 
-    // ── Center: logo + app name ────────────────────────────────────────────
+    // ── Center: logo + app name (clickable → Settings) ────────────────────
     let mid = bar.center();
-    let text_color = ui.visuals().text_color();
+    let base_color = ui.visuals().text_color();
     let font_id = egui::FontId::proportional(14.0);
-    let galley = ui.painter().layout_no_wrap("FlexInput".to_string(), font_id, text_color);
+    let galley = ui.painter().layout_no_wrap("FlexInput".to_string(), font_id, base_color);
     let text_size = galley.size();
 
     let logo_w = if logo.is_some() { 20.0 + 6.0 } else { 0.0 };
     let total_w = logo_w + text_size.x;
     let start_x = mid.x - total_w / 2.0;
 
+    // Allocate the hit rect BEFORE painting so it wins over the title-bar
+    // drag interaction allocated at the top of this function.
+    let hit_rect = egui::Rect::from_center_size(
+        egui::pos2(mid.x, mid.y),
+        egui::vec2(total_w + 16.0, h - 6.0),
+    );
+    let logo_resp = ui.interact(hit_rect, ui.id().with("logo_settings"), egui::Sense::click());
+    if logo_resp.clicked() {
+        *toggle_settings = true;
+    }
+    if logo_resp.hovered() {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    // Subtle lighter fill always (reads against the dark title bar where a
+    // dark overlay would be invisible); outline reveals on hover.
+    let bg_fill = egui::Color32::from_white_alpha(if logo_resp.hovered() { 28 } else { 14 });
+    let bg_stroke = if logo_resp.hovered() {
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90))
+    } else {
+        egui::Stroke::NONE
+    };
+    ui.painter().rect(
+        hit_rect,
+        egui::CornerRadius::same(6),
+        bg_fill,
+        bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    let text_color = if logo_resp.hovered() { egui::Color32::WHITE } else { base_color };
+    let logo_tint  = if logo_resp.hovered() {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgba_premultiplied(220, 220, 220, 220)
+    };
+
     let painter = ui.painter();
     if let Some(tex) = logo {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let logo_rect = egui::Rect::from_center_size(egui::pos2(start_x + 10.0, mid.y), egui::vec2(20.0, 20.0));
-        painter.image(tex.id(), logo_rect, uv, egui::Color32::WHITE);
+        painter.image(tex.id(), logo_rect, uv, logo_tint);
         painter.galley(egui::pos2(start_x + 20.0 + 6.0, mid.y - text_size.y / 2.0), galley, text_color);
     } else {
         painter.galley(egui::pos2(start_x, mid.y - text_size.y / 2.0), galley, text_color);

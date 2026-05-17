@@ -1291,15 +1291,16 @@ dependencies = [
 
 [[package]]
 name = "flexinput"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "eframe",
  "flexinput-ui",
+ "winresource",
 ]
 
 [[package]]
 name = "flexinput-core"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "glam",
  "serde",
@@ -1310,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-devices"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "flexinput-core",
  "gilrs",
@@ -1321,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-engine"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "flexinput-core",
  "glam",
@@ -1332,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-modules"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "flexinput-core",
  "glam",
@@ -1341,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-ui"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1365,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "flexinput-virtual"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "enigo",
  "flexinput-core",
@@ -1726,7 +1727,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 1.0.69",
- "windows 0.56.0",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -3426,6 +3427,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3767,6 +3777,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
+name = "toml"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.1",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3795,6 +3820,12 @@ checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow 1.0.1",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "tracing"
@@ -4951,6 +4982,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "toml",
+ "version_check",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use egui_snarl::{
 };
 use flexinput_core::{ModuleDescriptor, PinDescriptor, Signal, SignalType, automap as am_canon};
 use flexinput_devices::{ControllerKind, PhysicalDevice, midi::cc_display_name};
-use flexinput_engine::SAMPLE_RATE;
+use flexinput_engine::current_sample_rate;
 use serde_json::{Number, Value};
 
 use super::{curve::sample_curve, node::{ExposedModule, NodeData}};
@@ -4057,7 +4057,7 @@ fn render_oscilloscope_display(
         (n.extra.history.clone(), n.inputs.len().max(1), win, sc, au, uni)
     }).unwrap_or_default();
 
-    let osc_win = (win_ms / 1000.0 * SAMPLE_RATE as f32) as usize;
+    let osc_win = (win_ms / 1000.0 * current_sample_rate() as f32) as usize;
     let n_total = history.len();
     let start   = n_total.saturating_sub(osc_win);
     let visible: Vec<Vec<Option<f32>>> = history.iter().skip(start).cloned().collect();
@@ -5098,7 +5098,7 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
         let uni = n.params.get("osc_uni")   .and_then(|v| v.as_bool()).unwrap_or(false);
         (win, sc, au, uni)
     }).unwrap_or((200.0, 1.0, false, false));
-    let osc_win = (win_ms / 1000.0 * SAMPLE_RATE as f32) as usize;
+    let osc_win = (win_ms / 1000.0 * current_sample_rate() as f32) as usize;
 
     let history = snarl.get_node(node_id).map(|n| n.extra.history.clone()).unwrap_or_default();
     let n_channels = snarl.get_node(node_id).map(|n| n.inputs.len()).unwrap_or(1).max(1);
@@ -7851,6 +7851,20 @@ const REMAPPER_SPECIAL_PINS: &[(&str, &str)] = &[
 fn remapper_key_to_pin_id(key: egui::Key) -> String {
     match key {
         egui::Key::Escape => "key_escape".to_string(),
+        // egui has no CapsLock variant; on Windows winit reports the Caps
+        // Lock physical key as F18 through egui. Treat F18 as Caps Lock so
+        // it captures correctly and uses the existing capslock SVG/enigo.
+        egui::Key::F18 => "key_capslock".to_string(),
+        // Egui exposes shifted-character variants for several keys; fold
+        // them back to the physical key so they pick up the right icon
+        // and map to the unshifted canonical pin.
+        egui::Key::OpenCurlyBracket  => "key_openbracket".to_string(),
+        egui::Key::CloseCurlyBracket => "key_closebracket".to_string(),
+        egui::Key::Colon             => "key_semicolon".to_string(),
+        egui::Key::Pipe              => "key_backslash".to_string(),
+        egui::Key::Questionmark      => "key_slash".to_string(),
+        egui::Key::Exclamationmark   => "key_1".to_string(),
+        egui::Key::Plus              => "key_equals".to_string(),
         _ => format!("key_{}", format!("{:?}", key).to_lowercase()),
     }
 }
@@ -8173,8 +8187,21 @@ fn show_remapper_body(
         .unwrap_or_else(|| "auto".to_string());
     let skin = remapper_resolve_skin(snarl, node_id, &skin_param);
 
-    ui.vertical(|ui| {
-        ui.set_min_width(260.0);
+    // Allocate a fixed-width sub-UI so the body's measured min_rect is
+    // bounded — egui-snarl reports body width as body_ui.min_rect, and a
+    // bare `ui.vertical` with set_min_width fills the parent's available
+    // width, making the node permanently stuck wide once it grows. Pinning
+    // the width here means the node tracks this width exactly.
+    const BODY_W: f32 = 260.0;
+    // available_height can be infinite when snarl gives the body a tall
+    // payload_rect; clamp to a sane upper bound so wrap layouts don't get
+    // NaN from infinity arithmetic.
+    let body_h = ui.available_height().min(2000.0).max(28.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(BODY_W, body_h),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+        ui.set_min_width(BODY_W);
 
         // Status line.
         let status = if !wired {
@@ -8296,11 +8323,12 @@ fn show_remapper_body(
             ui.separator();
             ui.label(egui::RichText::new(format!("Mappings ({})", mappings.len())).size(13.0).weak());
             let mut to_remove: Option<usize> = None;
-            // Use a fixed-height row so the × button, chips, and arrow all
-            // vertically center on the icon height (28px). Without this,
-            // baseline-aligned widgets (button, label) end up offset above
-            // the image chips on rows that have icons.
-            const ROW_H: f32 = 28.0;
+            // Two-column layout: × button on the left in its own narrow
+            // column, chord chips in a wrapping right column. This keeps
+            // the × aligned with the first chord row and lets long chords
+            // wrap to additional lines without the X button overlapping.
+            const X_COL_W: f32 = 28.0;
+            const CHORD_COL_W: f32 = BODY_W - X_COL_W - 8.0; // leave inner spacing
             for (i, m) in mappings.iter().enumerate() {
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
@@ -8308,14 +8336,59 @@ fn show_remapper_body(
                 let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), ROW_H),
-                    egui::Layout::left_to_right(egui::Align::Center),
+                // Estimate whether everything fits on one line. Chip ~28px,
+                // "+" separator ~12px, arrow ~26px. If estimate exceeds the
+                // chord column width, force a break: input chord wraps on
+                // its own row(s), then arrow + output on a new row.
+                let chip_w = 28.0_f32;
+                let sep_w = 12.0_f32;
+                let arrow_w = 26.0_f32;
+                let estimate = |pins: &[String]| -> f32 {
+                    if pins.is_empty() { return 0.0; }
+                    (pins.len() as f32) * chip_w
+                        + ((pins.len() as f32) - 1.0).max(0.0) * sep_w
+                };
+                let single_line_w = estimate(&in_pins) + arrow_w + estimate(&out_pins);
+                let force_break = single_line_w > CHORD_COL_W;
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::TOP),
                     |ui| {
-                        if ui.button(egui::RichText::new("×").size(13.0)).clicked() { to_remove = Some(i); }
-                        remapper_render_chord(ui, &in_pins, skin);
-                        remapper_render_arrow(ui);
-                        remapper_render_chord(ui, &out_pins, skin);
+                    // x button in a fixed 28x28 slot at the top of the row.
+                    // Align::TOP on the outer layout keeps it aligned with
+                    // the first chord line when the chord wraps to multiple
+                    // lines.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(X_COL_W, 28.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if ui.button(egui::RichText::new("×").size(13.0)).clicked() {
+                                to_remove = Some(i);
+                            }
+                        },
+                    );
+                    if force_break {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(CHORD_COL_W);
+                            ui.set_max_width(CHORD_COL_W);
+                            ui.horizontal_wrapped(|ui| {
+                                remapper_render_chord(ui, &in_pins, skin);
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                remapper_render_arrow(ui);
+                                remapper_render_chord(ui, &out_pins, skin);
+                            });
+                        });
+                    } else {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(CHORD_COL_W, 28.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                remapper_render_chord(ui, &in_pins, skin);
+                                remapper_render_arrow(ui);
+                                remapper_render_chord(ui, &out_pins, skin);
+                            },
+                        );
+                    }
                     },
                 );
             }
