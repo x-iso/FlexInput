@@ -7593,11 +7593,58 @@ fn remapper_pressed_now(
     let mut out = Vec::new();
     for ap in am_canon::ALL_PINS {
         if ap.signal_type != SignalType::Bool { continue; }
+        // Touch-active pins are canonical (Splitter/Collector use them) but
+        // suppressed in Remapper Learn — the zone synthesis below already
+        // expresses the same information as touch_left/center/right.
+        if ap.id == "touch1_active" || ap.id == "touch2_active" { continue; }
+        // btn_touchpad is conditionally suppressed below: when a finger is
+        // on the pad during a click, the specific-zone pin is the right
+        // capture target; when there is no finger, the bare click stands as
+        // a "click anywhere" mapping.
+        if ap.id == "btn_touchpad" { continue; }
         if let Some(sig) = live_signals.get(&(dev_id.to_string(), ap.id.to_string())) {
             if sig.as_bool() {
                 out.push(ap.id.to_string());
             }
         }
+    }
+    // Synthetic stick-cardinal pins. Mirror of the rule in
+    // `flexinput_engine::eval::derive_stick_cardinals` so what Learn captures
+    // matches what the eval engine will trigger on.
+    const T_CARDINAL: f32 = 0.5;
+    const T_DIAGONAL: f32 = 0.4;
+    const DOM: f32 = 1.5;
+    for (xpin, ypin, up, down, left, right) in [
+        ("left_stick_x",  "left_stick_y",
+         "left_stick_up",  "left_stick_down",
+         "left_stick_left", "left_stick_right"),
+        ("right_stick_x", "right_stick_y",
+         "right_stick_up", "right_stick_down",
+         "right_stick_left", "right_stick_right"),
+    ] {
+        let read = |pin: &str| -> f32 {
+            live_signals
+                .get(&(dev_id.to_string(), pin.to_string()))
+                .map(|s| match s {
+                    Signal::Float(v) => *v,
+                    Signal::Vec2(v) => v.x,
+                    _ => 0.0,
+                })
+                .unwrap_or(0.0)
+        };
+        let x = read(xpin);
+        let y = read(ypin);
+        let ax = x.abs();
+        let ay = y.abs();
+        let diagonal = ax > T_DIAGONAL && ay > T_DIAGONAL;
+        if diagonal && x >  T_DIAGONAL
+            || x >  T_CARDINAL && (ay < T_CARDINAL ||  x >  DOM * ay) { out.push(right.to_string()); }
+        if diagonal && x < -T_DIAGONAL
+            || x < -T_CARDINAL && (ay < T_CARDINAL || -x >  DOM * ay) { out.push(left.to_string()); }
+        if diagonal && y >  T_DIAGONAL
+            || y >  T_CARDINAL && (ax < T_CARDINAL ||  y >  DOM * ax) { out.push(up.to_string()); }
+        if diagonal && y < -T_DIAGONAL
+            || y < -T_CARDINAL && (ax < T_CARDINAL || -y >  DOM * ax) { out.push(down.to_string()); }
     }
     out
 }
@@ -7667,11 +7714,9 @@ fn remapper_kbm_pressed_now(
 /// memory keyed on (pin_id, skin, size, tint).
 fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_icons::Skin) {
     use super::remapper_icons;
-    const CHIP_H: f32 = 28.0; // ~+27% over the original 22px
+    const CHIP_H: f32 = 28.0;
     if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
         let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
-        // Alpha 0 → rasterizer leaves the SVG's own colors intact (the recolor
-        // block in rasterize_svg_recolored is gated on blend > 0).
         let tint = egui::Color32::TRANSPARENT;
         let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
         let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
@@ -7694,6 +7739,45 @@ fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_i
         }
     }
     ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong());
+}
+
+/// Render a chord (list of pin ids) as chips separated by "+". When any
+/// pin is a click-zone variant, the chord is rewritten so the touchpad
+/// click icon appears once at the front, then plain zone chips follow:
+///   ["touchpad_left", "touchpad_center"]  →  click + zone_L + zone_C
+/// rather than the visually heavier zone+overlay-per-chip form.
+fn remapper_render_chord(ui: &mut egui::Ui, pins: &[String], skin: super::remapper_icons::Skin) {
+    use super::remapper_icons::Skin;
+    let click_zone = |p: &str| matches!(p,
+        "touchpad_left" | "touchpad_center" | "touchpad_right" | "touchpad_any");
+    let has_click = pins.iter().any(|p| click_zone(p));
+    // Synthetic "click" chip rendered from the click-overlay SVG. Only
+    // emitted when the chord actually contains click-zone pins.
+    let mut first = true;
+    let mut emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
+        if !*first {
+            ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE));
+        }
+        *first = false;
+    };
+    if has_click && skin == Skin::Playstation {
+        emit_sep(ui, &mut first);
+        // Render touchpad_any's icon (the swipe-down SVG) as the click chip.
+        remapper_render_chip(ui, "touchpad_any", skin);
+    }
+    for p in pins {
+        // Substitute click-zone pins with their plain-zone equivalents so
+        // the click indicator isn't duplicated on every zone chip.
+        let render_id: &str = match p.as_str() {
+            "touchpad_left"   => "touch_left",
+            "touchpad_center" => "touch_center",
+            "touchpad_right"  => "touch_right",
+            "touchpad_any"    => continue, // already shown as the click chip
+            other => other,
+        };
+        emit_sep(ui, &mut first);
+        remapper_render_chip(ui, render_id, skin);
+    }
 }
 
 /// Render the long-arrow SVG glyph between a mapping's input chips and its
@@ -7755,6 +7839,10 @@ const REMAPPER_SPECIAL_PINS: &[(&str, &str)] = &[
     ("Mouse: Forward",     "mouse_forward"),
     ("Mouse: Scroll Up",   "scroll_up"),
     ("Mouse: Scroll Down", "scroll_down"),
+    // Auto-captured zone variants would otherwise auto-chord with every
+    // specific-zone click. Opt-in here for users who want a "click anywhere"
+    // mapping that fires alongside their specific-zone mappings.
+    ("Touchpad: Click (Any)", "touchpad_any"),
 ];
 
 /// Canonical pin id for an arbitrary egui Key. Modifiers and Escape get their
@@ -7770,6 +7858,25 @@ fn remapper_key_to_pin_id(key: egui::Key) -> String {
 fn remapper_pin_display(pin_id: &str) -> String {
     if let Some(p) = am_canon::ALL_PINS.iter().find(|p| p.id == pin_id) {
         return p.display_name.to_string();
+    }
+    // Synthetic stick-cardinal pins (derived inside Remapper, not canonical).
+    match pin_id {
+        "left_stick_up"     => return "L.Stick Up".into(),
+        "left_stick_down"   => return "L.Stick Down".into(),
+        "left_stick_left"   => return "L.Stick Left".into(),
+        "left_stick_right"  => return "L.Stick Right".into(),
+        "right_stick_up"    => return "R.Stick Up".into(),
+        "right_stick_down"  => return "R.Stick Down".into(),
+        "right_stick_left"  => return "R.Stick Left".into(),
+        "right_stick_right" => return "R.Stick Right".into(),
+        "touchpad_left"     => return "Touchpad Left (Click)".into(),
+        "touchpad_center"   => return "Touchpad Center (Click)".into(),
+        "touchpad_right"    => return "Touchpad Right (Click)".into(),
+        "touchpad_any"      => return "Touchpad Click (Any)".into(),
+        "touch_left"        => return "Touchpad Left (Touch)".into(),
+        "touch_center"      => return "Touchpad Center (Touch)".into(),
+        "touch_right"       => return "Touchpad Right (Touch)".into(),
+        _ => {}
     }
     // Fall back to a humanised form of the raw id. `key_space` → "Space",
     // `key_a` → "A", `key_f5` → "F5". Unknown prefix → return id as-is.
@@ -7834,9 +7941,129 @@ fn show_remapper_body(
         }
     }
 
+    // Touchpad zones. Mirror of the rule in `flexinput_engine::eval`
+    // (Remapper arm). Two parallel pin variants:
+    //   touch_*    — transient: fires whenever a finger is in that zone.
+    //                No state. Up to 2 zones at once.
+    //   touchpad_* — accumulated: only while btn_touchpad is held; every
+    //                zone any finger has visited stays asserted until the
+    //                click is released. State held in node params (3-bit
+    //                mask `_tp_zones`) so it survives across frames.
+    // Per-zone override: touchpad_N firing forces touch_N false, so the
+    // click-variant mapping takes over from a touch-only mapping cleanly.
+    {
+        let prev_mask: u8 = snarl.get_node(node_id)
+            .and_then(|n| n.params.get("_tp_zones"))
+            .and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        // Read btn_touchpad directly from live_signals — the canonical-pin
+        // sweep above filters it out of pressed_now so its presence here
+        // wouldn't reflect device state.
+        let touch_click = upstream_dev_id.as_deref()
+            .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        let mut click_mask = if touch_click { prev_mask } else { 0 };
+        let mut touch_mask: u8 = 0;
+        if let Some(dev) = upstream_dev_id.as_deref() {
+            let read_f = |pin: &str| -> Option<f32> {
+                live_signals.get(&(dev.to_string(), pin.to_string()))
+                    .map(|s| match s {
+                        Signal::Float(v) => *v,
+                        Signal::Vec2(v) => v.x,
+                        _ => 0.0,
+                    })
+            };
+            let read_b = |pin: &str| -> bool {
+                live_signals.get(&(dev.to_string(), pin.to_string()))
+                    .map(|s| s.as_bool()).unwrap_or(false)
+            };
+            for (xpin, apin) in [("touch1_x","touch1_active"),
+                                 ("touch2_x","touch2_active")] {
+                if !read_b(apin) { continue; }
+                let x = match read_f(xpin) { Some(v) => v, None => continue };
+                let idx = if x < -1.0/3.0 { 0 }
+                          else if x >  1.0/3.0 { 2 }
+                          else { 1 };
+                touch_mask |= 1u8 << idx;
+                if touch_click { click_mask |= 1u8 << idx; }
+            }
+        }
+        if click_mask != prev_mask {
+            if let Some(n) = snarl.get_node_mut(node_id) {
+                n.params.insert("_tp_zones".to_string(), Value::from(click_mask as u64));
+            }
+        }
+        // Click suppresses touch-only — see derive in eval.rs.
+        let touch_mask = if touch_click { 0 } else { touch_mask };
+        let push = |pn: &mut Vec<String>, pin: &str| {
+            if !pn.iter().any(|p| p == pin) { pn.push(pin.to_string()); }
+        };
+        if click_mask & 1 != 0 { push(&mut pressed_now, "touchpad_left"); }
+        if click_mask & 2 != 0 { push(&mut pressed_now, "touchpad_center"); }
+        if click_mask & 4 != 0 { push(&mut pressed_now, "touchpad_right"); }
+        // Click without a detected touch point (e.g. dielectric press, or
+        // click registered before the finger contacts the surface) → fall
+        // back to the bare btn_touchpad pin so the click still captures.
+        // touchpad_any is NOT auto-captured here — it's the Special-dropdown
+        // pin used when the user wants a "click anywhere" mapping that
+        // additively fires alongside a specific-zone click mapping.
+        if touch_click && click_mask == 0 { push(&mut pressed_now, "btn_touchpad"); }
+        if touch_mask & 1 != 0 { push(&mut pressed_now, "touch_left"); }
+        if touch_mask & 2 != 0 { push(&mut pressed_now, "touch_center"); }
+        if touch_mask & 4 != 0 { push(&mut pressed_now, "touch_right"); }
+    }
+
     let mut new_phase = phase.clone();
     let mut new_draft_input = draft_input.clone();
     let mut new_draft_output = draft_output.clone();
+
+    // On the touchpad-click rising edge, evict every touch-only zone pin
+    // (touch_left/center/right) from the draft. Rationale: clicking
+    // promotes the touchpad interaction from "touch" to "click"; the
+    // touch-only captures that landed before the click should be replaced
+    // by click-variant captures. Anything else in the draft (gamepad
+    // buttons, modifiers, etc.) is preserved so chords with click+zone
+    // can still include them.
+    let click_prev = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("_tp_click_prev"))
+        .and_then(|v| v.as_bool()).unwrap_or(false);
+    let touch_click_now = upstream_dev_id.as_deref()
+        .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
+        .map(|s| s.as_bool()).unwrap_or(false);
+    // Click latches the capture into "click mode" for the rest of the session.
+    //
+    // Rule: once btn_touchpad has been pressed during this capture, the
+    // capture is about clicking — any prior touch_* pins are wiped, and
+    // touch_* pins are blocked from accumulating for the remainder of the
+    // capture (so releasing the click while the finger still rests on the
+    // pad doesn't tack a touch_* onto the click chord).
+    //
+    // The mode-flag is cleared whenever the capture restarts (capturing
+    // re-enter from idle / ready_to_learn).
+    let click_mode_before = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("_tp_click_mode"))
+        .and_then(|v| v.as_bool()).unwrap_or(false);
+    let touch_click_now = upstream_dev_id.as_deref()
+        .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
+        .map(|s| s.as_bool()).unwrap_or(false);
+    let entering_click_mode = touch_click_now && !click_mode_before;
+    if entering_click_mode {
+        new_draft_input.retain(|p|
+            p != "touch_left" && p != "touch_center" && p != "touch_right"
+        );
+    }
+    let click_mode = click_mode_before || touch_click_now;
+    if click_mode != click_mode_before {
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            n.params.insert("_tp_click_mode".to_string(), Value::from(click_mode));
+        }
+    }
+    // While in click mode, drop touch_* from pressed_now so they don't
+    // accumulate into the draft during the click+release tail.
+    if click_mode {
+        pressed_now.retain(|p|
+            p != "touch_left" && p != "touch_center" && p != "touch_right"
+        );
+    }
 
     // Auto-enter capturing when a wire is connected and we were idle.
     if wired && new_phase == "idle" {
@@ -7847,6 +8074,9 @@ fn show_remapper_body(
         new_phase = "idle".to_string();
         new_draft_input.clear();
         new_draft_output.clear();
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            n.params.insert("_tp_click_mode".to_string(), Value::from(false));
+        }
     }
 
     // The set rising from pressed_prev to pressed_now (new presses this frame).
@@ -7856,21 +8086,51 @@ fn show_remapper_body(
     let prev_was_empty = pressed_prev.is_empty();
     let now_empty = pressed_now.is_empty();
 
+    // touch_* pins are transient (a finger occupies one zone at a time),
+    // unlike buttons/sticks which are held. Capture must reflect the
+    // current touch zones, not the union across the swipe — otherwise
+    // sweeping a finger across all three zones latches all three.
+    let is_transient = |p: &str| p == "touch_left" || p == "touch_center" || p == "touch_right";
+    let mut reset_click_mode = false;
     match new_phase.as_str() {
         "capturing" => {
             if !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
                 // New burst after a previous latched combo → replace.
                 new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
+                reset_click_mode = true;
             } else if !pressed_now.is_empty() {
-                // Accumulate the peak set.
+                // Drop any transient pins that are no longer asserted —
+                // moving a finger between zones must replace, not accumulate.
+                new_draft_input.retain(|p| {
+                    !is_transient(p) || pressed_now.iter().any(|q| q == p)
+                });
+                // Accumulate the peak set (sticky for non-transient pins).
                 for p in &pressed_now {
                     if !new_draft_input.iter().any(|q| q == p) {
                         new_draft_input.push(p.clone());
                     }
                 }
             }
-            if now_empty && !new_draft_input.is_empty() {
+            // Latching: capture completes when nothing is pressed AND nothing
+            // is on the touchpad. While click_mode is set, touch_* are
+            // stripped from pressed_now, so a click-release with finger still
+            // resting would otherwise look "empty" and latch prematurely —
+            // wiping the click chord on the next finger movement. Hold the
+            // latch until the touchpad is genuinely idle.
+            let touchpad_idle = !touch_click_now
+                && upstream_dev_id.as_deref().map(|dev| {
+                    let a1 = live_signals.get(&(dev.to_string(), "touch1_active".into()))
+                        .map(|s| s.as_bool()).unwrap_or(false);
+                    let a2 = live_signals.get(&(dev.to_string(), "touch2_active".into()))
+                        .map(|s| s.as_bool()).unwrap_or(false);
+                    !a1 && !a2
+                }).unwrap_or(true);
+            if now_empty && touchpad_idle && !new_draft_input.is_empty() {
                 new_phase = "ready_to_learn".to_string();
+                // Capture is complete and latched — clear click_mode so a
+                // fresh touch (with no click) on a new capture can be
+                // captured as touch_*.
+                reset_click_mode = true;
             }
         }
         "ready_to_learn" => {
@@ -7878,6 +8138,7 @@ fn show_remapper_body(
             if !rising.is_empty() && prev_was_empty {
                 new_phase = "capturing".to_string();
                 new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
+                reset_click_mode = true;
             }
         }
         "learning" => {
@@ -7901,6 +8162,9 @@ fn show_remapper_body(
         remapper_write_str_array(node, "draft_input", &new_draft_input);
         remapper_write_str_array(node, "draft_output", &new_draft_output);
         remapper_write_str_array(node, "_pressed_prev", &pressed_now);
+        if reset_click_mode {
+            node.params.insert("_tp_click_mode".to_string(), Value::from(false));
+        }
     }
 
     // ── Render ─────────────────────────────────────────────────────────────
@@ -7935,10 +8199,7 @@ fn show_remapper_body(
         // Draft input chips (only if non-empty).
         if !new_draft_input.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                for (i, pin) in new_draft_input.iter().enumerate() {
-                    if i > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
-                    remapper_render_chip(ui, pin, skin);
-                }
+                remapper_render_chord(ui, &new_draft_input, skin);
             });
         }
 
@@ -8044,15 +8305,9 @@ fn show_remapper_body(
                     let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
                         .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                         .unwrap_or_default();
-                    for (j, p) in in_pins.iter().enumerate() {
-                        if j > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
-                        remapper_render_chip(ui, p, skin);
-                    }
+                    remapper_render_chord(ui, &in_pins, skin);
                     remapper_render_arrow(ui);
-                    for (j, p) in out_pins.iter().enumerate() {
-                        if j > 0 { ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE)); }
-                        remapper_render_chip(ui, p, skin);
-                    }
+                    remapper_render_chord(ui, &out_pins, skin);
                 });
             }
             if let Some(idx) = to_remove {

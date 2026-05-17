@@ -40,6 +40,53 @@ fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
     }
 }
 
+/// Derive synthetic cardinal-direction Bool pins from the analog stick axes
+/// in `upstream`, in place. Used by the Remapper so a user can map e.g.
+/// "L.Stick Up" → "key_w". A cardinal fires when its axis crosses 0.5 and
+/// dominates the perpendicular axis by 1.5× — so pushing slightly off-axis
+/// still captures a single direction, but a genuine diagonal fires both
+/// cardinals as a chord.
+fn derive_stick_cardinals(upstream: &mut HashMap<String, Signal>) {
+    // Tuned for round-gate sticks where 45° physically caps at ~0.707.
+    //   T_CARDINAL — minimum push for a single cardinal to fire when
+    //     the perpendicular axis is quiet.
+    //   T_DIAGONAL — when BOTH axes exceed this, fire both cardinals as
+    //     a chord. Lower than T_CARDINAL so a 45° push at ~0.5/0.5 still
+    //     registers as a diagonal (avoid the narrow band that the
+    //     dominance rule alone couldn't cover on a circular gate).
+    //   DOM — perpendicular-dominance ratio so a slight off-axis push
+    //     still counts as a single cardinal.
+    const T_CARDINAL: f32 = 0.5;
+    const T_DIAGONAL: f32 = 0.4;
+    const DOM: f32 = 1.5;
+    for (xpin, ypin, up, down, left, right) in [
+        ("left_stick_x",  "left_stick_y",
+         "left_stick_up",  "left_stick_down",
+         "left_stick_left", "left_stick_right"),
+        ("right_stick_x", "right_stick_y",
+         "right_stick_up", "right_stick_down",
+         "right_stick_left", "right_stick_right"),
+    ] {
+        let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+        let y = upstream.get(ypin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+        let ax = x.abs();
+        let ay = y.abs();
+        let diagonal = ax > T_DIAGONAL && ay > T_DIAGONAL;
+        let right_on = diagonal && x >  T_DIAGONAL
+            || x >  T_CARDINAL && (ay < T_CARDINAL ||  x >  DOM * ay);
+        let left_on  = diagonal && x < -T_DIAGONAL
+            || x < -T_CARDINAL && (ay < T_CARDINAL || -x >  DOM * ay);
+        let up_on    = diagonal && y >  T_DIAGONAL
+            || y >  T_CARDINAL && (ax < T_CARDINAL ||  y >  DOM * ax);
+        let down_on  = diagonal && y < -T_DIAGONAL
+            || y < -T_CARDINAL && (ax < T_CARDINAL || -y >  DOM * ax);
+        upstream.insert(up.to_string(),    Signal::Bool(up_on));
+        upstream.insert(down.to_string(),  Signal::Bool(down_on));
+        upstream.insert(left.to_string(),  Signal::Bool(left_on));
+        upstream.insert(right.to_string(), Signal::Bool(right_on));
+    }
+}
+
 fn combine_signals(a: Signal, b: Signal) -> Signal {
     match (a, b) {
         (Signal::Float(x), Signal::Float(y)) => Signal::Float(x + y),
@@ -223,6 +270,81 @@ pub fn eval_graph_tick(
                 });
                 if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
             }
+            // Derive synthetic cardinal-direction Bool pins from each stick's
+            // (x, y) so they can participate in mapping triggers just like
+            // buttons. See `derive_stick_cardinals` for the dominant-axis rule.
+            derive_stick_cardinals(&mut upstream);
+
+            // Derive touchpad zone pins. Two parallel variants:
+            //   touch_*       — fire whenever a finger is in that zone, click
+            //                   or not. Up to 2 zones at once (one per finger).
+            //                   No accumulation; transient, instantaneous.
+            //   touchpad_*    — fire only while btn_touchpad is held. While
+            //                   held, every zone any finger has visited stays
+            //                   asserted (swipe accumulation) so a drag
+            //                   across all three zones produces a 3-pin chord.
+            //                   Release of btn_touchpad clears the accumulator.
+            // Per-zone override: if touchpad_N (click variant) fires, touch_N
+            // (touch-only) is forced false so a click-mapped zone takes over
+            // from a touch-mapped one rather than firing both.
+            let touch_click = upstream.get("btn_touchpad")
+                .map(|s| s.as_bool()).unwrap_or(false);
+            let zone_of_x = |x: f32| -> usize {
+                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
+            };
+            // Touch-only zones — each active finger asserts exactly one zone
+            // (the one its X currently sits in). Moving a finger from zone A
+            // to zone B drops A and asserts B for that finger. With two
+            // fingers active, two zones can fire simultaneously. No swipe
+            // accumulation here — that's reserved for the click variant.
+            let mut touch_only = [false; 3];
+            for (xpin, apin) in [("touch1_x","touch1_active"),
+                                 ("touch2_x","touch2_active")] {
+                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                if !active { continue; }
+                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                touch_only[zone_of_x(x)] = true;
+            }
+            // Click-variant zones — accumulated in per-node aux_f32.
+            let ns = state.entry(snap.node_uid).or_insert_with(NodeState::default);
+            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
+            if !touch_click {
+                ns.aux_f32[0] = 0.0;
+                ns.aux_f32[1] = 0.0;
+                ns.aux_f32[2] = 0.0;
+            } else {
+                for (xpin, apin) in [("touch1_x","touch1_active"),
+                                     ("touch2_x","touch2_active")] {
+                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                    if !active { continue; }
+                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                    ns.aux_f32[zone_of_x(x)] = 1.0;
+                }
+            }
+            let click_zone = [
+                ns.aux_f32[0] > 0.5,
+                ns.aux_f32[1] > 0.5,
+                ns.aux_f32[2] > 0.5,
+            ];
+            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
+            // Click suppresses all touch-only zones — once btn_touchpad
+            // fires, the click variants own the touchpad.
+            if touch_click {
+                touch_only[0] = false;
+                touch_only[1] = false;
+                touch_only[2] = false;
+            }
+            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
+            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
+            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
+            // touchpad_any — "click anywhere on the pad". Available via the
+            // Special… dropdown only (not auto-captured) so users opt in.
+            // Fires together with the specific-zone pin additively.
+            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
+            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
+            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
+            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
+
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
             // Determine which mappings are currently triggered (all input pins true).

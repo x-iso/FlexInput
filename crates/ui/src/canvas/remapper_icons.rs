@@ -79,6 +79,8 @@ const XB_RT:      &[u8] = a!("Xbox/xbox_rt.svg");
 const XB_START:   &[u8] = a!("Xbox/xbox_button_start.svg");
 const XB_BACK:    &[u8] = a!("Xbox/xbox_button_back.svg");
 const XB_GUIDE:   &[u8] = a!("Xbox/xbox_guide.svg");
+const XB_SHARE:   &[u8] = a!("Xbox/xbox_button_share.svg");
+const XB_LOGO:    &[u8] = a!("Xbox/xbox_button_logo.svg");
 const XB_DPAD_U:  &[u8] = a!("Xbox/xbox_dpad_up.svg");
 const XB_DPAD_D:  &[u8] = a!("Xbox/xbox_dpad_down.svg");
 const XB_DPAD_L:  &[u8] = a!("Xbox/xbox_dpad_left.svg");
@@ -87,6 +89,14 @@ const XB_LS:      &[u8] = a!("Xbox/xbox_stick_l_press.svg");
 const XB_RS:      &[u8] = a!("Xbox/xbox_stick_r_press.svg");
 const XB_LSTICK:  &[u8] = a!("Xbox/xbox_stick_l.svg");
 const XB_RSTICK:  &[u8] = a!("Xbox/xbox_stick_r.svg");
+const XB_LSTICK_U: &[u8] = a!("Xbox/xbox_stick_l_up.svg");
+const XB_LSTICK_D: &[u8] = a!("Xbox/xbox_stick_l_down.svg");
+const XB_LSTICK_L: &[u8] = a!("Xbox/xbox_stick_l_left.svg");
+const XB_LSTICK_R: &[u8] = a!("Xbox/xbox_stick_l_right.svg");
+const XB_RSTICK_U: &[u8] = a!("Xbox/xbox_stick_r_up.svg");
+const XB_RSTICK_D: &[u8] = a!("Xbox/xbox_stick_r_down.svg");
+const XB_RSTICK_L: &[u8] = a!("Xbox/xbox_stick_r_left.svg");
+const XB_RSTICK_R: &[u8] = a!("Xbox/xbox_stick_r_right.svg");
 
 // PlayStation
 const PS_CROSS:    &[u8] = a!("Playstation/playstation_button_cross.svg");
@@ -101,12 +111,29 @@ const PS_L3:       &[u8] = a!("Playstation/playstation_button_l3.svg");
 const PS_R3:       &[u8] = a!("Playstation/playstation_button_r3.svg");
 const PS_OPTIONS:  &[u8] = a!("Playstation/playstation4_button_options.svg");
 const PS_SHARE:    &[u8] = a!("Playstation/playstation4_button_share.svg");
+const PS_MUTE:     &[u8] = a!("Playstation/playstation5_button_mute.svg");
+const PS_LOGO:        &[u8] = a!("Playstation/ps4_button_logo.svg");
+// Touchpad icons (PS5 set). The plain "click" pin uses the swipe_down asset
+// because it carries the clearest tap affordance among the available
+// touchpad SVGs.
+const PS_TP_CLICK:    &[u8] = a!("Playstation/playstation5_touchpad_swipe_down.svg");
+const PS_TP_LEFT:     &[u8] = a!("Playstation/playstation5_touchpad_press_left.svg");
+const PS_TP_CENTER:   &[u8] = a!("Playstation/playstation5_touchpad_press_center.svg");
+const PS_TP_RIGHT:    &[u8] = a!("Playstation/playstation5_touchpad_press_right.svg");
 const PS_DPAD_U:   &[u8] = a!("Playstation/playstation_dpad_up.svg");
 const PS_DPAD_D:   &[u8] = a!("Playstation/playstation_dpad_down.svg");
 const PS_DPAD_L:   &[u8] = a!("Playstation/playstation_dpad_left.svg");
 const PS_DPAD_R:   &[u8] = a!("Playstation/playstation_dpad_right.svg");
 const PS_LSTICK:   &[u8] = a!("Playstation/playstation_stick_l.svg");
 const PS_RSTICK:   &[u8] = a!("Playstation/playstation_stick_r.svg");
+const PS_LSTICK_U: &[u8] = a!("Playstation/playstation_stick_l_up.svg");
+const PS_LSTICK_D: &[u8] = a!("Playstation/playstation_stick_l_down.svg");
+const PS_LSTICK_L: &[u8] = a!("Playstation/playstation_stick_l_left.svg");
+const PS_LSTICK_R: &[u8] = a!("Playstation/playstation_stick_l_right.svg");
+const PS_RSTICK_U: &[u8] = a!("Playstation/playstation_stick_r_up.svg");
+const PS_RSTICK_D: &[u8] = a!("Playstation/playstation_stick_r_down.svg");
+const PS_RSTICK_L: &[u8] = a!("Playstation/playstation_stick_r_left.svg");
+const PS_RSTICK_R: &[u8] = a!("Playstation/playstation_stick_r_right.svg");
 
 // Switch Pro
 const SW_A:       &[u8] = a!("SwitchPro/switch_button_a.svg");
@@ -119,13 +146,22 @@ const SW_ZL:      &[u8] = a!("SwitchPro/switch_button_zl.svg");
 const SW_ZR:      &[u8] = a!("SwitchPro/switch_button_zr.svg");
 const SW_PLUS:    &[u8] = a!("SwitchPro/switch_button_plus.svg");
 const SW_MINUS:   &[u8] = a!("SwitchPro/switch_button_minus.svg");
-const SW_HOME:    &[u8] = a!("SwitchPro/switch_button_home.svg");
+const SW_HOME:    &[u8] = a!("SwitchPro/switchpro_button_home.svg");
+const SW_SYNC:    &[u8] = a!("SwitchPro/switch_button_sync.svg");
 const SW_DPAD_U:  &[u8] = a!("SwitchPro/switch_dpad_up.svg");
 const SW_DPAD_D:  &[u8] = a!("SwitchPro/switch_dpad_down.svg");
 const SW_DPAD_L:  &[u8] = a!("SwitchPro/switch_dpad_left.svg");
 const SW_DPAD_R:  &[u8] = a!("SwitchPro/switch_dpad_right.svg");
 const SW_LSTICK:  &[u8] = a!("SwitchPro/switch_stick_l.svg");
 const SW_RSTICK:  &[u8] = a!("SwitchPro/switch_stick_r.svg");
+const SW_LSTICK_U: &[u8] = a!("SwitchPro/switch_stick_l_up.svg");
+const SW_LSTICK_D: &[u8] = a!("SwitchPro/switch_stick_l_down.svg");
+const SW_LSTICK_L: &[u8] = a!("SwitchPro/switch_stick_l_left.svg");
+const SW_LSTICK_R: &[u8] = a!("SwitchPro/switch_stick_l_right.svg");
+const SW_RSTICK_U: &[u8] = a!("SwitchPro/switch_stick_r_up.svg");
+const SW_RSTICK_D: &[u8] = a!("SwitchPro/switch_stick_r_down.svg");
+const SW_RSTICK_L: &[u8] = a!("SwitchPro/switch_stick_r_left.svg");
+const SW_RSTICK_R: &[u8] = a!("SwitchPro/switch_stick_r_right.svg");
 const SW_LS:      &[u8] = a!("SwitchPro/switch_stick_l_press.svg");
 const SW_RS:      &[u8] = a!("SwitchPro/switch_stick_r_press.svg");
 
@@ -331,7 +367,8 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::Xbox, "right_trigger") => Some(XB_RT),
         (Skin::Xbox, "btn_start")     => Some(XB_START),
         (Skin::Xbox, "btn_back")      => Some(XB_BACK),
-        (Skin::Xbox, "btn_guide")     => Some(XB_GUIDE),
+        (Skin::Xbox, "btn_guide")     => Some(XB_LOGO),
+        (Skin::Xbox, "btn_capture")   => Some(XB_SHARE),
         (Skin::Xbox, "dpad_up")       => Some(XB_DPAD_U),
         (Skin::Xbox, "dpad_down")     => Some(XB_DPAD_D),
         (Skin::Xbox, "dpad_left")     => Some(XB_DPAD_L),
@@ -340,6 +377,14 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::Xbox, "btn_rs")        => Some(XB_RS),
         (Skin::Xbox, "left_stick")    => Some(XB_LSTICK),
         (Skin::Xbox, "right_stick")   => Some(XB_RSTICK),
+        (Skin::Xbox, "left_stick_up")     => Some(XB_LSTICK_U),
+        (Skin::Xbox, "left_stick_down")   => Some(XB_LSTICK_D),
+        (Skin::Xbox, "left_stick_left")   => Some(XB_LSTICK_L),
+        (Skin::Xbox, "left_stick_right")  => Some(XB_LSTICK_R),
+        (Skin::Xbox, "right_stick_up")    => Some(XB_RSTICK_U),
+        (Skin::Xbox, "right_stick_down")  => Some(XB_RSTICK_D),
+        (Skin::Xbox, "right_stick_left")  => Some(XB_RSTICK_L),
+        (Skin::Xbox, "right_stick_right") => Some(XB_RSTICK_R),
         // PlayStation
         (Skin::Playstation, "btn_south")     => Some(PS_CROSS),
         (Skin::Playstation, "btn_east")      => Some(PS_CIRCLE),
@@ -355,12 +400,36 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::Playstation, "btn_rs")        => Some(PS_R3),
         (Skin::Playstation, "btn_start")     => Some(PS_OPTIONS),
         (Skin::Playstation, "btn_back")      => Some(PS_SHARE),
+        (Skin::Playstation, "btn_mute")      => Some(PS_MUTE),
+        (Skin::Playstation, "btn_guide")     => Some(PS_LOGO),
+        // The plain "touchpad click" pin shows the swipe_down icon — it has
+        // the clearest "tap" affordance among the available touchpad assets.
+        (Skin::Playstation, "btn_touchpad")  => Some(PS_TP_CLICK),
+        (Skin::Playstation, "touchpad_any")  => Some(PS_TP_CLICK),
+        // touchpad_swipe_down is rendered separately as a click overlay
+        // via click_overlay_svg, not via pin_svg.
+        // Touch-zone synthetic pins. Click required for any of these to fire
+        // (see derive_touchpad_zones in eval.rs).
+        (Skin::Playstation, "touchpad_left")   => Some(PS_TP_LEFT),
+        (Skin::Playstation, "touchpad_center") => Some(PS_TP_CENTER),
+        (Skin::Playstation, "touchpad_right")  => Some(PS_TP_RIGHT),
+        (Skin::Playstation, "touch_left")      => Some(PS_TP_LEFT),
+        (Skin::Playstation, "touch_center")    => Some(PS_TP_CENTER),
+        (Skin::Playstation, "touch_right")     => Some(PS_TP_RIGHT),
         (Skin::Playstation, "dpad_up")       => Some(PS_DPAD_U),
         (Skin::Playstation, "dpad_down")     => Some(PS_DPAD_D),
         (Skin::Playstation, "dpad_left")     => Some(PS_DPAD_L),
         (Skin::Playstation, "dpad_right")    => Some(PS_DPAD_R),
         (Skin::Playstation, "left_stick")    => Some(PS_LSTICK),
         (Skin::Playstation, "right_stick")   => Some(PS_RSTICK),
+        (Skin::Playstation, "left_stick_up")     => Some(PS_LSTICK_U),
+        (Skin::Playstation, "left_stick_down")   => Some(PS_LSTICK_D),
+        (Skin::Playstation, "left_stick_left")   => Some(PS_LSTICK_L),
+        (Skin::Playstation, "left_stick_right")  => Some(PS_LSTICK_R),
+        (Skin::Playstation, "right_stick_up")    => Some(PS_RSTICK_U),
+        (Skin::Playstation, "right_stick_down")  => Some(PS_RSTICK_D),
+        (Skin::Playstation, "right_stick_left")  => Some(PS_RSTICK_L),
+        (Skin::Playstation, "right_stick_right") => Some(PS_RSTICK_R),
         // Switch Pro (Nintendo layout: south position = B, east = A).
         (Skin::SwitchPro, "btn_south")     => Some(SW_B),
         (Skin::SwitchPro, "btn_east")      => Some(SW_A),
@@ -375,6 +444,7 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::SwitchPro, "btn_start")     => Some(SW_PLUS),
         (Skin::SwitchPro, "btn_back")      => Some(SW_MINUS),
         (Skin::SwitchPro, "btn_guide")     => Some(SW_HOME),
+        (Skin::SwitchPro, "btn_capture")   => Some(SW_SYNC),
         (Skin::SwitchPro, "dpad_up")       => Some(SW_DPAD_U),
         (Skin::SwitchPro, "dpad_down")     => Some(SW_DPAD_D),
         (Skin::SwitchPro, "dpad_left")     => Some(SW_DPAD_L),
@@ -383,6 +453,15 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::SwitchPro, "btn_rs")        => Some(SW_RS),
         (Skin::SwitchPro, "left_stick")    => Some(SW_LSTICK),
         (Skin::SwitchPro, "right_stick")   => Some(SW_RSTICK),
+        (Skin::SwitchPro, "left_stick_up")     => Some(SW_LSTICK_U),
+        (Skin::SwitchPro, "left_stick_down")   => Some(SW_LSTICK_D),
+        (Skin::SwitchPro, "left_stick_left")   => Some(SW_LSTICK_L),
+        (Skin::SwitchPro, "left_stick_right")  => Some(SW_LSTICK_R),
+        (Skin::SwitchPro, "right_stick_up")    => Some(SW_RSTICK_U),
+        (Skin::SwitchPro, "right_stick_down")  => Some(SW_RSTICK_D),
+        (Skin::SwitchPro, "right_stick_left")  => Some(SW_RSTICK_L),
+        (Skin::SwitchPro, "right_stick_right") => Some(SW_RSTICK_R),
         _ => None,
     }
 }
+
