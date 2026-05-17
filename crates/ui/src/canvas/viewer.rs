@@ -8296,19 +8296,28 @@ fn show_remapper_body(
             ui.separator();
             ui.label(egui::RichText::new(format!("Mappings ({})", mappings.len())).size(13.0).weak());
             let mut to_remove: Option<usize> = None;
+            // Use a fixed-height row so the × button, chips, and arrow all
+            // vertically center on the icon height (28px). Without this,
+            // baseline-aligned widgets (button, label) end up offset above
+            // the image chips on rows that have icons.
+            const ROW_H: f32 = 28.0;
             for (i, m) in mappings.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui.button(egui::RichText::new("×").size(13.0)).clicked() { to_remove = Some(i); }
-                    let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                        .unwrap_or_default();
-                    let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                        .unwrap_or_default();
-                    remapper_render_chord(ui, &in_pins, skin);
-                    remapper_render_arrow(ui);
-                    remapper_render_chord(ui, &out_pins, skin);
-                });
+                let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), ROW_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if ui.button(egui::RichText::new("×").size(13.0)).clicked() { to_remove = Some(i); }
+                        remapper_render_chord(ui, &in_pins, skin);
+                        remapper_render_arrow(ui);
+                        remapper_render_chord(ui, &out_pins, skin);
+                    },
+                );
             }
             if let Some(idx) = to_remove {
                 if let Some(node) = snarl.get_node_mut(node_id) {
