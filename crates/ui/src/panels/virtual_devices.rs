@@ -8,6 +8,16 @@ use flexinput_virtual::{
 };
 
 use crate::canvas::Canvas;
+use crate::canvas::remapper_icons;
+use crate::panels::device_icon::{render_device_icon, svg_icon_button};
+use crate::panels::physical_devices::canvas_status_button;
+
+const CHIP_ICON_H: f32 = 24.0;
+const CHIP_H: f32 = 28.0;
+
+fn kind_prefix_of(dev_id: &str) -> String {
+    dev_id.split('.').take(2).collect::<Vec<_>>().join(".")
+}
 
 pub struct VirtualDevicePanel {
     /// Devices for this tab. Shared with the I/O thread when this tab is active.
@@ -39,36 +49,51 @@ impl VirtualDevicePanel {
             });
         }
 
-        ui.horizontal(|ui| {
-            ui.strong("Virtual Outputs");
-            ui.separator();
-
+        let scroll_out = egui::ScrollArea::horizontal()
+            .id_salt("virtual_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+        ui.horizontal_top(|ui| {
             let mut to_remove: Option<usize> = None;
             for (i, (dev_id, chip_label, connected)) in chips.iter().enumerate() {
                 let chip = egui::Frame::default()
-                    .inner_margin(egui::Margin::symmetric(6, 2))
-                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 0 })
+                    .corner_radius(10.0)
                     .fill(ui.visuals().widgets.inactive.bg_fill)
                     .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
 
                 chip.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (dot, hover) = if *connected {
-                            (RichText::new("●").small().color(Color32::from_rgb(80, 200, 100)),
-                             "Connected")
-                        } else {
-                            (RichText::new("●").small().color(Color32::from_rgb(220, 80, 60)),
-                             "Not connected — driver unavailable (ViGEmBus / enigo)")
-                        };
-                        ui.label(dot).on_hover_text(hover);
-                        ui.label(chip_label.as_str());
+                    ui.set_height(CHIP_H);
+                    ui.with_layout(
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            let kind_prefix = kind_prefix_of(dev_id);
+                            if kind_prefix == "virtual.keymouse" {
+                                let (kb, ms) = remapper_icons::keymouse_pair_svgs();
+                                render_device_icon(ui, kb, CHIP_ICON_H);
+                                render_device_icon(ui, ms, CHIP_ICON_H);
+                            } else {
+                                render_device_icon(
+                                    ui,
+                                    remapper_icons::virtual_device_card_svg(&kind_prefix),
+                                    CHIP_ICON_H,
+                                );
+                            }
+                            let (dot, hover) = if *connected {
+                                (RichText::new("●").small().color(Color32::from_rgb(80, 200, 100)),
+                                 "Connected")
+                            } else {
+                                (RichText::new("●").small().color(Color32::from_rgb(220, 80, 60)),
+                                 "Not connected — driver unavailable (ViGEmBus / enigo)")
+                            };
+                            ui.label(dot).on_hover_text(hover);
+                            ui.label(RichText::new(chip_label.as_str()).strong());
 
-                        let on_canvas = canvas.snarl.nodes_ids_data().any(|(_, n)| {
-                            n.value.module_id == "device.sink"
-                                && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(dev_id.as_str())
-                        });
-                        if !on_canvas {
-                            if ui.small_button("+canvas").on_hover_text("Add to canvas").clicked() {
+                            let on_canvas = canvas.snarl.nodes_ids_data().any(|(_, n)| {
+                                n.value.module_id == "device.sink"
+                                    && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(dev_id.as_str())
+                            });
+                            canvas_status_button(ui, on_canvas, || {
                                 // Re-lock briefly to get the device reference for canvas registration.
                                 let devs = self.active.lock().unwrap();
                                 if let Some(dev) = devs.get(i) {
@@ -85,13 +110,17 @@ impl VirtualDevicePanel {
                                         }
                                     }
                                 }
-                            }
-                        }
+                            });
 
-                        if ui.small_button("x").on_hover_text("Remove").clicked() {
-                            to_remove = Some(i);
-                        }
-                    });
+                            // Close button — placed last so it's far-right.
+                            if svg_icon_button(ui, remapper_icons::CLOSE_SVG, 18.0)
+                                .on_hover_text("Remove")
+                                .clicked()
+                            {
+                                to_remove = Some(i);
+                            }
+                        },
+                    );
                 });
             }
 
@@ -132,8 +161,8 @@ impl VirtualDevicePanel {
                 }
             }
 
-            // Add button
-            ui.menu_button("+", |ui| {
+            // Inline "+" SVG button — sits immediately after the last chip.
+            add_svg_button(ui, |ui, ctl| {
                 ui.label(RichText::new("Add virtual output").strong());
                 ui.separator();
 
@@ -169,12 +198,82 @@ impl VirtualDevicePanel {
                                 node.display_name = new_name;
                             }
                         }
-                        ui.close();
+                        ctl.close = true;
                     }
                 }
             });
+
+            // Trailing space so the last chip + button never sit under the
+            // right-edge fade shadow.
+            ui.add_space(40.0);
         });
+            });
+        crate::panels::physical_devices::paint_scroll_edge_fades(ui.ctx(), &scroll_out, ui.clip_rect());
     }
+}
+
+/// Chip-styled menu button for adding a new virtual device. Matches the
+/// device-chip frame visually so it reads as part of the row.
+pub(crate) struct MenuCtl {
+    pub close: bool,
+}
+
+/// Inline "+" SVG icon-button that opens the "add virtual device" menu.
+/// The body receives a `&mut MenuCtl`; set `ctl.close = true` to dismiss
+/// the menu (used after a device is selected).
+fn add_svg_button(ui: &mut egui::Ui, menu_body: impl FnOnce(&mut egui::Ui, &mut MenuCtl)) {
+    let menu_id = egui::Id::new("add_virtual_menu_open");
+    // Wrap in a vertically-centered sub-ui so the button aligns with the
+    // chip row instead of sitting top-aligned against the panel's top edge.
+    let resp = ui
+        .with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_height(CHIP_H);
+            svg_icon_button(ui, remapper_icons::ADD_SVG, CHIP_H)
+        })
+        .inner;
+    let resp = resp.on_hover_text("Add virtual output");
+    if resp.clicked() {
+        let open = ui.memory(|m| m.data.get_temp::<bool>(menu_id).unwrap_or(false));
+        ui.memory_mut(|m| m.data.insert_temp(menu_id, !open));
+    }
+    let open = ui.memory(|m| m.data.get_temp::<bool>(menu_id).unwrap_or(false));
+    if open {
+        let mut ctl = MenuCtl { close: false };
+        let area_resp = egui::Area::new(egui::Id::new("add_virtual_menu_area"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(resp.rect.left_bottom() + egui::vec2(0.0, 4.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(160.0);
+                    menu_body(ui, &mut ctl);
+                });
+            });
+        if ctl.close {
+            ui.memory_mut(|m| m.data.insert_temp(menu_id, false));
+            return;
+        }
+        // Close on outside click.
+        if ui.input(|i| i.pointer.any_click())
+            && !area_resp.response.rect.contains(
+                ui.input(|i| i.pointer.interact_pos()).unwrap_or(egui::Pos2::ZERO),
+            )
+            && !resp.rect.contains(
+                ui.input(|i| i.pointer.interact_pos()).unwrap_or(egui::Pos2::ZERO),
+            )
+        {
+            ui.memory_mut(|m| m.data.insert_temp(menu_id, false));
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn circular_ghost_button(ui: &mut egui::Ui, glyph: &str, size: f32) -> egui::Response {
+    let btn = egui::Button::new(RichText::new(glyph).size(size * 0.65))
+        .corner_radius(size * 0.5)
+        .min_size(egui::vec2(size, size))
+        .fill(Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE);
+    ui.add(btn)
 }
 
 fn chip_name(active: &[Box<dyn VirtualDevice>], i: usize) -> String {

@@ -24,15 +24,16 @@ jobs:
         run: cargo build --release
 
       - name: Package
+        id: package
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           $archive = "FlexInput-$tag-windows-x64.zip"
           Compress-Archive -Path "target/release/flexinput.exe" -DestinationPath $archive
-          echo "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ARCHIVE }}
+          files: ${{ steps.package.outputs.archive }}
           generate_release_notes: true

@@ -99,6 +99,10 @@ pub struct FlexInputApp {
     hidhide: Option<HidHideClient>,
     last_update: std::time::Instant,
     bottom_panel_height: f32,
+    /// Whether the Virtual Devices (top) panel is collapsed (only its heading tab visible).
+    virtual_panel_collapsed: bool,
+    /// Whether the Physical Devices (bottom) panel is collapsed.
+    physical_panel_collapsed: bool,
     /// Whether to automatically switch to the tab whose bound_exe matches the foreground process.
     auto_switch: bool,
     /// Last foreground exe seen, used to avoid redundant switches.
@@ -352,6 +356,8 @@ impl FlexInputApp {
             hidhide,
             last_update: std::time::Instant::now(),
             bottom_panel_height: 220.0,
+            virtual_panel_collapsed: false,
+            physical_panel_collapsed: false,
             auto_switch: false,
             last_fg_exe: String::new(),
             bind_window_open: false,
@@ -1170,26 +1176,107 @@ impl eframe::App for FlexInputApp {
         };
 
         let devices = &self.devices;
-        let hidhide = self.hidhide.as_ref();
         let bottom_panel_height = self.bottom_panel_height;
         let tab = &mut self.tabs[self.active_tab];
         let (virtual_panel, canvas) = (&mut tab.virtual_panel, &mut tab.canvas);
 
-        egui::TopBottomPanel::top("virtual_devices_panel")
-            .min_height(48.0)
-            .resizable(true)
+        // Device panels use a darker fill so they read as separate from the
+        // canvas surface and the floating heading tabs visually integrate.
+        let panel_frame = {
+            let bg = ctx.style().visuals.panel_fill;
+            let dark = crate::panels::physical_devices::darken_color(bg, 0.35);
+            egui::Frame::default()
+                .fill(dark)
+                .inner_margin(egui::Margin::symmetric(8, 2))
+        };
+        let collapsed_frame = egui::Frame::default().inner_margin(egui::Margin::ZERO);
+
+        // Animation progress: 0.0 = fully collapsed, 1.0 = fully expanded.
+        // ctx.animate_bool_with_time eases between targets smoothly.
+        let virt_open = ctx.animate_bool_with_time(
+            egui::Id::new("virt_panel_open_anim"),
+            !self.virtual_panel_collapsed,
+            0.18,
+        );
+        let phys_open = ctx.animate_bool_with_time(
+            egui::Id::new("phys_panel_open_anim"),
+            !self.physical_panel_collapsed,
+            0.18,
+        );
+
+        const VIRT_NATURAL_H: f32 = 36.0;
+        const PHYS_NATURAL_H: f32 = 44.0;
+        const COLLAPSED_H:    f32 = 1.0;
+        let virt_h = COLLAPSED_H.max(VIRT_NATURAL_H * virt_open);
+        let phys_h = COLLAPSED_H.max(PHYS_NATURAL_H * phys_open);
+
+        // Build a frame that scales its vertical margins with the animation
+        // progress so the panel can actually shrink to ~0 height. Once fully
+        // open we use the regular frame so margins are stable for layout.
+        let scaled_frame = |progress: f32| -> egui::Frame {
+            let bg = ctx.style().visuals.panel_fill;
+            let dark = crate::panels::physical_devices::darken_color(bg, 0.35);
+            let vpad = (2.0 * progress).round() as i8;
+            egui::Frame::default()
+                .fill(dark)
+                .inner_margin(egui::Margin { left: 8, right: 8, top: vpad, bottom: vpad })
+        };
+        let top_frame = if virt_open < 0.001 { collapsed_frame }
+                        else if virt_open > 0.999 { panel_frame }
+                        else { scaled_frame(virt_open) };
+        let bot_frame = if phys_open < 0.001 { collapsed_frame }
+                        else if phys_open > 0.999 { panel_frame }
+                        else { scaled_frame(phys_open) };
+
+        let top_resp = egui::TopBottomPanel::top("virtual_devices_panel")
+            .resizable(false)
+            .exact_height(virt_h)
+            .frame(top_frame)
             .show(ctx, |ui| {
-                virtual_panel.show(ui, canvas);
+                if virt_open > 0.01 {
+                    virtual_panel.show(ui, canvas);
+                }
             });
 
         let bottom_resp = egui::TopBottomPanel::bottom("physical_devices_panel")
-            .min_height(80.0)
-            .default_height(bottom_panel_height)
-            .resizable(true)
+            .resizable(false)
+            .exact_height(phys_h)
+            .frame(bot_frame)
             .show(ctx, |ui| {
-                physical_devices::show(ui, devices, canvas, hidhide);
+                if phys_open > 0.01 {
+                    physical_devices::show(ui, devices, canvas);
+                }
             });
-        self.bottom_panel_height = bottom_resp.response.rect.height();
+        // Only record the natural height when fully expanded so the snapshot
+        // isn't poisoned by the in-flight animation values.
+        if phys_open > 0.99 {
+            self.bottom_panel_height = bottom_resp.response.rect.height();
+        }
+
+        // Floating heading tabs hang off each panel's canvas-facing edge.
+        // Clicking a tab toggles its panel's collapsed state.
+        let top_rect = top_resp.response.rect;
+        let bottom_rect = bottom_resp.response.rect;
+        let top_tab = crate::panels::physical_devices::draw_floating_heading(
+            ctx,
+            "heading_virtual_devices",
+            "Virtual Devices",
+            egui::pos2(top_rect.left() + 12.0, top_rect.bottom()),
+            crate::panels::physical_devices::TabDirection::Down,
+        );
+        if top_tab.clicked() {
+            self.virtual_panel_collapsed = !self.virtual_panel_collapsed;
+        }
+        let bottom_tab = crate::panels::physical_devices::draw_floating_heading(
+            ctx,
+            "heading_physical_devices",
+            "Physical Devices",
+            egui::pos2(bottom_rect.left() + 12.0, bottom_rect.top()),
+            crate::panels::physical_devices::TabDirection::Up,
+        );
+        if bottom_tab.clicked() {
+            self.physical_panel_collapsed = !self.physical_panel_collapsed;
+        }
 
         // Seed outer canvas clipboard from inner when app_clipboard_from_inner is set
         // (user copied inside a sub-patch editor last frame) or on first use.

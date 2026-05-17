@@ -2236,7 +2236,7 @@ fn show_svg_body_sized(
 ///   - "additive": `tint.rgb * (tint.a / 255)` is added to each pixel's RGB
 ///     (clamped), again preserving the SVG's alpha.
 /// Returns None if the SVG can't be parsed.
-fn rasterize_svg_recolored(
+pub(crate) fn rasterize_svg_recolored(
     svg_text: &str,
     w: u32,
     h: u32,

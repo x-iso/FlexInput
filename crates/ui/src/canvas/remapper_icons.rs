@@ -269,6 +269,53 @@ const M_SCROLL_D: &[u8] = a!("KBM/mouse_scroll_down.svg");
 /// input and output chips. Rasterized once and cached as an egui texture.
 pub const ARROW_LONG_SVG: &[u8] = a!("flair_arrow_long.svg");
 
+// ── Device-card icons ─────────────────────────────────────────────────────────
+// Larger per-device images shown in the Physical/Virtual device panels —
+// separate from the per-pin chip glyphs above.
+
+const DEV_XBOX:     &[u8] = a!("Xbox/controller_xboxone.svg");
+const DEV_PS4:      &[u8] = a!("Playstation/controller_playstation4.svg");
+const DEV_PS5:      &[u8] = a!("Playstation/controller_playstation5.svg");
+const DEV_SWITCH:   &[u8] = a!("SwitchPro/controller_switch_pro.svg");
+const DEV_MIDI_IN:  &[u8] = a!("MIDI_in.svg");
+const DEV_MIDI_OUT: &[u8] = a!("MIDI_out.svg");
+const DEV_KBM_KEYBOARD: &[u8] = a!("KBM/keyboard.svg");
+const DEV_KBM_MOUSE:    &[u8] = a!("KBM/mouse.svg");
+
+/// Generic action icons used by panel chrome (add button, close button, …).
+pub const ADD_SVG:   &[u8] = a!("add.svg");
+pub const CLOSE_SVG: &[u8] = a!("close.svg");
+
+/// Resolve a device-card icon from a `ControllerKind`.
+pub fn device_card_svg(kind: flexinput_devices::ControllerKind) -> &'static [u8] {
+    use flexinput_devices::ControllerKind as K;
+    match kind {
+        K::XInput     => DEV_XBOX,
+        K::DualShock4 => DEV_PS4,
+        K::DualSense  => DEV_PS5,
+        K::SwitchPro  => DEV_SWITCH,
+        K::Generic    => DEV_XBOX,
+        K::MidiIn     => DEV_MIDI_IN,
+        K::MidiOut    => DEV_MIDI_OUT,
+    }
+}
+
+/// Resolve a virtual-device card icon by `kind_prefix` (e.g. `"virtual.xinput"`).
+/// `virtual.keymouse` is rendered as two icons side-by-side by the panel — see
+/// `keymouse_pair_svgs`.
+pub fn virtual_device_card_svg(kind_prefix: &str) -> &'static [u8] {
+    match kind_prefix {
+        "virtual.xinput" => DEV_XBOX,
+        "virtual.ds4"    => DEV_PS4,
+        _                => DEV_XBOX,
+    }
+}
+
+/// Keyboard + mouse glyph pair used for the Virtual Keyboard & Mouse card.
+pub fn keymouse_pair_svgs() -> (&'static [u8], &'static [u8]) {
+    (DEV_KBM_KEYBOARD, DEV_KBM_MOUSE)
+}
+
 /// Resolve the SVG bytes for a canonical AutoMap pin under a given skin.
 /// Returns None when no icon is mapped (caller renders the text label).
 /// KBM-family pins (`key_*`, `mouse_*`, `scroll_*`) always resolve from the
