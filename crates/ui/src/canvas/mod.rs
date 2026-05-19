@@ -88,8 +88,42 @@ impl Canvas {
     pub fn new() -> Self {
         let mut style = SnarlStyle::default();
         style.collapsible = Some(true);
-        // Tighten the gap between the collapse chevron and the header content.
+        // Place input/output pins just outside the node frame so they
+        // don't collide with header content (notably the collapse
+        // chevron, which egui-snarl always anchors at the node's left
+        // edge regardless of header_frame margin).
+        style.pin_placement = Some(egui_snarl::ui::PinPlacement::Outside { margin: 2.0 });
         style.header_drag_space = Some(egui::vec2(0.0, 0.0));
+        // Translucent, slightly-darkened node/header fills so wires routed
+        // behind a node (Auto-Map feedback loops in particular) remain
+        // visibly continuous with their target port. egui-snarl paints the
+        // header frame ON TOP of the body frame, so the header's alpha
+        // composites against the body — to keep its *effective* opacity
+        // close to the body's we use a low alpha on the header itself.
+        let body_fill   = egui::Color32::from_rgba_unmultiplied(22, 24, 28, 160);
+        let header_fill = egui::Color32::from_rgba_unmultiplied(0,  0,  0,  38);
+        let border      = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 70, 76, 200));
+        style.node_frame = Some(
+            egui::Frame::default()
+                .fill(body_fill)
+                .stroke(border)
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(6))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 2],
+                    blur: 8,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(120),
+                }),
+        );
+        style.header_frame = Some(
+            egui::Frame::default()
+                .fill(header_fill)
+                .corner_radius(egui::CornerRadius {
+                    nw: 6, ne: 6, sw: 0, se: 0,
+                })
+                .inner_margin(egui::Margin::symmetric(6, 4)),
+        );
         Canvas {
             snarl: Snarl::new(),
             style,

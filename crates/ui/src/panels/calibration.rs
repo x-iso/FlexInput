@@ -165,7 +165,7 @@ fn read_invert3(canvas: &Canvas, node: NodeId, key: &str) -> [bool; 3] {
 /// bottom regardless of UI repaint rate. Set to 1 s so a quick controller
 /// motion (~0.5–1 s) fits in-frame with room to read its shape.
 const SCOPE_WIN_MS: f32 = 1000.0;
-const GYRO_SAMPLE_FRAMES: u32 = 500; // ~1 s of stable data at 500 Hz polling
+const GYRO_SAMPLE_FRAMES: u32 = 250; // ~0.5 s of stable data at 500 Hz polling
 
 #[derive(Clone)]
 struct ScopeBuffer {
@@ -206,6 +206,33 @@ struct GyroSession {
     m2:    [f64; 5],
     scope: ScopeBuffer,
 }
+
+/// Per-axis orientation-calibration sample buffer. Each Vec collects raw
+/// gyro vectors observed during a single-axis rotation. Mean accel during
+/// each pass is averaged across captures and used as a gravity reference
+/// to refine the PCA-derived rotation.
+#[derive(Clone, Default)]
+struct OrientSession {
+    /// Which axis is currently being sampled (0=Roll, 1=Pitch, 2=Yaw),
+    /// or None if idle.
+    sampling_axis: Option<usize>,
+    /// Frame counter for the active sampling pass.
+    sampling_n: u32,
+    /// Per-body-axis raw gyro samples (3-vectors).
+    samples: [Vec<[f32; 3]>; 3],
+    /// Per-body-axis "captured" flag.
+    captured: [bool; 3],
+    /// Running mean accel vector recorded during each axis pass (chip
+    /// frame). Averaged together to give a clean gravity reference.
+    /// `accel_sum[axis] / accel_n[axis]` = mean accel for that pass.
+    accel_sum: [[f64; 3]; 3],
+    accel_n:   [u32; 3],
+}
+
+/// Frames to collect for one orientation-axis sampling pass. ~0.5 s at
+/// 500 Hz polling — fewer is plenty given PCA only needs ~30 samples
+/// in different directions to recover an axis confidently.
+const ORIENT_SAMPLE_FRAMES: u32 = 250;
 
 const STICK_BUCKETS: usize = 72; // 5° per bucket
 const STICK_MIN_BUCKETS: usize = 64;
@@ -259,7 +286,7 @@ struct TriggerSession {
     seen: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct WindowState {
     /// L/R fading dot trail for the stick vectorscopes (unit-circle coords).
     l_trail: VecDeque<[f32; 2]>,
@@ -267,6 +294,23 @@ struct WindowState {
     gyro: GyroSession,
     stick: StickSession,
     trig: TriggerSession,
+    orient: OrientSession,
+    /// User-selected gyro-scope time window in ms (500 / 1000 / 5000).
+    scope_win_ms: f32,
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            l_trail: VecDeque::new(),
+            r_trail: VecDeque::new(),
+            gyro: GyroSession::default(),
+            stick: StickSession::default(),
+            trig: TriggerSession::default(),
+            orient: OrientSession::default(),
+            scope_win_ms: 1000.0,
+        }
+    }
 }
 
 fn state_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_state", node)) }
@@ -301,8 +345,12 @@ pub fn show_windows(
         // Default size capped to ~85% of the host window so the cal window
         // always fits inside the main app frame even on smaller monitors.
         let screen = ctx.screen_rect();
-        let default_w = (screen.width()  * 0.85).clamp(640.0, 1000.0);
-        let default_h = (screen.height() * 0.85).clamp(420.0, 720.0);
+        // Default to a compact size matching the min, so the window opens
+        // as small as it can go and the user can grow it if needed.
+        let min_w = (screen.width()  * 0.50).clamp(560.0, 760.0);
+        let min_h = (screen.height() * 0.55).clamp(320.0, 560.0);
+        let default_w = min_w;
+        let default_h = min_h;
         egui::Window::new(title)
             .id(egui::Id::new(("cal_window", node_id)))
             .open(&mut is_open)
@@ -310,8 +358,8 @@ pub fn show_windows(
             .collapsible(true)
             .default_width(default_w)
             .default_height(default_h)
-            .min_width(640.0)
-            .min_height(360.0)
+            .min_width(min_w)
+            .min_height(min_h)
             .show(ctx, |ui| {
                 draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps);
             });
@@ -585,6 +633,151 @@ fn gyro_section(
         });
         gyro_scope(ui, node_id, dev_id, lo, skip_accel_initial, canvas, scope_taps);
     });
+
+    // ── Axis Alignment row (full-width, beneath the scope) ─────────────────
+    //
+    // Some controllers (modded units, or factories with looser mount
+    // tolerances) have their IMU chip soldered at a small angle. Pure
+    // body-frame rotations then bleed into multiple axes. The matrix
+    // compensates by remapping the chip's frame back to the controller's
+    // body frame. Three short single-axis rotations + PCA → an
+    // orthonormal rotation matrix.
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Axis Alignment").size(INSTRUCT_SIZE).strong());
+        // "Calibrated" indicator if a non-identity matrix exists.
+        let has_m = canvas.snarl.get_node(node_id)
+            .and_then(|n| n.params.get("gyro_orient_matrix"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len() == 9)
+            .unwrap_or(false);
+        if has_m {
+            ui.label(egui::RichText::new("✓ matrix set")
+                .color(Color32::from_rgb(80, 200, 100)).size(INSTRUCT_SIZE - 1.0));
+        }
+        ui.label(egui::RichText::new(
+            "  ·  pure single-axis rotation per button, then Solve")
+            .color(Color32::from_gray(140)).size(INSTRUCT_SIZE - 2.0));
+    });
+    ui.add_space(2.0);
+    let (or_sampling_axis, or_n, or_captured) = ui.ctx().data(|d| {
+        d.get_temp::<WindowState>(state_id(node_id))
+            .map(|s| (s.orient.sampling_axis, s.orient.sampling_n, s.orient.captured))
+            .unwrap_or((None, 0, [false; 3]))
+    });
+    let axis_names = ["Roll", "Pitch", "Yaw"];
+    let axis_hints = ["tilt side-to-side", "rock front-to-back", "rotate like a wheel"];
+    ui.horizontal(|ui| {
+        for ai in 0..3 {
+            let active = or_sampling_axis == Some(ai);
+            let core = if active {
+                format!("{}  {}/{}", axis_names[ai], or_n, ORIENT_SAMPLE_FRAMES)
+            } else if or_captured[ai] {
+                format!("{} ✓", axis_names[ai])
+            } else {
+                axis_names[ai].to_string()
+            };
+            let label = format!("{}\n{}", core, axis_hints[ai]);
+            if ui.add_enabled(or_sampling_axis.is_none() || active,
+                egui::Button::new(egui::RichText::new(label).size(INSTRUCT_SIZE - 1.0))).clicked()
+            {
+                ui.ctx().data_mut(|d| {
+                    let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                    if active {
+                        st.orient.sampling_axis = None;
+                        st.orient.sampling_n = 0;
+                    } else {
+                        st.orient.sampling_axis = Some(ai);
+                        st.orient.sampling_n = 0;
+                        st.orient.samples[ai].clear();
+                        st.orient.captured[ai] = false;
+                    }
+                });
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(egui::RichText::new("Clear").size(INSTRUCT_SIZE - 1.0)).clicked() {
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    n.params.remove("gyro_orient_matrix");
+                }
+                ui.ctx().data_mut(|d| {
+                    let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                    st.orient = OrientSession::default();
+                });
+            }
+            let all = or_captured.iter().all(|c| *c);
+            if ui.add_enabled(all && or_sampling_axis.is_none(),
+                egui::Button::new(egui::RichText::new("Solve & Apply").size(INSTRUCT_SIZE - 1.0))).clicked()
+            {
+                let (samples, accel_mean) = ui.ctx().data(|d| {
+                    let st = d.get_temp::<WindowState>(state_id(node_id));
+                    let samples = st.as_ref().map(|s| s.orient.samples.clone()).unwrap_or_default();
+                    // Average the three captured accel passes into one
+                    // chip-frame gravity vector. Each pass already
+                    // contains the running sum + count.
+                    let accel_mean = st.as_ref().and_then(|s| {
+                        let mut sum = [0.0_f64; 3];
+                        let mut n   = 0_u64;
+                        for ai in 0..3 {
+                            if !s.orient.captured[ai] || s.orient.accel_n[ai] == 0 { continue; }
+                            // Per-pass mean, then sum the means so each
+                            // pass contributes equally regardless of
+                            // sample count.
+                            let inv = 1.0 / s.orient.accel_n[ai] as f64;
+                            sum[0] += s.orient.accel_sum[ai][0] * inv;
+                            sum[1] += s.orient.accel_sum[ai][1] * inv;
+                            sum[2] += s.orient.accel_sum[ai][2] * inv;
+                            n += 1;
+                        }
+                        if n == 0 { return None; }
+                        let k = 1.0 / n as f64;
+                        Some([(sum[0] * k) as f32, (sum[1] * k) as f32, (sum[2] * k) as f32])
+                    });
+                    (samples, accel_mean)
+                });
+                if let Some(m) = solve_orient_matrix(&samples, accel_mean) {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.insert("gyro_orient_matrix".into(), serde_json::json!(m.to_vec()));
+                    }
+                }
+            }
+        });
+    });
+    // Collect samples for the active axis (UI-frame rate is fine — PCA
+    // only needs a handful of well-separated vectors). Also accumulate
+    // a running mean accel vector so the solver can use gravity as an
+    // absolute reference and refine PCA's wobbly axis estimate.
+    if let Some(ai) = or_sampling_axis {
+        let gx = read_float(live, dev_id, "gyro_x");
+        let gy = read_float(live, dev_id, "gyro_y");
+        let gz = read_float(live, dev_id, "gyro_z");
+        let ax = read_float(live, dev_id, "accel_x");
+        let ay = read_float(live, dev_id, "accel_y");
+        let az = read_float(live, dev_id, "accel_z");
+        let done = ui.ctx().data_mut(|d| {
+            let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+            let mag = (gx * gx + gy * gy + gz * gz).sqrt();
+            if mag > 0.01 {
+                st.orient.samples[ai].push([gx, gy, gz]);
+            }
+            // Accumulate accel UNCONDITIONALLY — even at rest it reads
+            // gravity, which is exactly the signal we want for the
+            // gravity-alignment refinement.
+            st.orient.accel_sum[ai][0] += ax as f64;
+            st.orient.accel_sum[ai][1] += ay as f64;
+            st.orient.accel_sum[ai][2] += az as f64;
+            st.orient.accel_n[ai]      += 1;
+            st.orient.sampling_n += 1;
+            if st.orient.sampling_n >= ORIENT_SAMPLE_FRAMES {
+                let enough = st.orient.samples[ai].len() >= 16;
+                st.orient.captured[ai] = enough;
+                st.orient.sampling_axis = None;
+                st.orient.sampling_n = 0;
+                true
+            } else { false }
+        });
+        if !done { ui.ctx().request_repaint(); }
+    }
 }
 
 fn gyro_scope(
@@ -598,14 +791,35 @@ fn gyro_scope(
 ) {
     // Width = right column extent; height = shortened gyro height per spec.
     let (rect, _) = ui.allocate_exact_size(egui::vec2(lo.right_w, lo.gyro_h), Sense::hover());
+
+    // Read the per-window scope-window setting (default 1000 ms).
+    let scope_win_ms = ui.ctx().data(|d| {
+        d.get_temp::<WindowState>(state_id(_node_id))
+            .map(|s| s.scope_win_ms)
+            .unwrap_or(1000.0)
+    });
+
+    // Bottom strip reserved for legend + clickable time-window indicator.
+    const LEGEND_STRIP_H: f32 = 22.0;
+    let scope_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.max.x, rect.max.y - LEGEND_STRIP_H),
+    );
+    let legend_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x, scope_rect.max.y),
+        rect.max,
+    );
+
     let painter = ui.painter();
     painter.rect_filled(rect, 4.0, Color32::from_gray(15));
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
     // Read raw poll-rate samples directly from the I/O thread's scope-tap rings.
-    // Apply the same calibration math the engine uses (offset + sign) so the
-    // trace visibly converges toward 0 as offsets are written during sampling.
+    // Apply the same calibration math the engine uses (offset → matrix → sign)
+    // so the trace visibly converges toward 0 as offsets are written during
+    // sampling, AND the orientation-matrix solve takes visible effect on the
+    // scope right away.
     let g_off = read_param_arr::<3>(canvas, _node_id, "gyro_offset", [0.0; 3]);
     let a_off = read_param_arr::<3>(canvas, _node_id, "accel_offset", [0.0; 3]);
     let g_inv = read_invert3(canvas, _node_id, "gyro_invert");
@@ -621,21 +835,81 @@ fn gyro_scope(
         if a_inv[2] { -1.0_f32 } else { 1.0 },
     ];
 
-    // Per-channel sample lists pulled from rings. `samples_ch[ch] = Vec<(Instant, f32)>`,
-    // already calibrated for display.
+    // Read the 3×3 orientation matrix (row-major). Identity = no-op.
+    let mut orient_m: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let mut orient_active = false;
+    if let Some(arr) = canvas.snarl.get_node(_node_id)
+        .and_then(|n| n.params.get("gyro_orient_matrix"))
+        .and_then(|v| v.as_array())
+    {
+        if arr.len() == 9 {
+            for i in 0..9 {
+                if let Some(v) = arr[i].as_f64() { orient_m[i] = v as f32; }
+            }
+            for i in 0..9 {
+                let id = if i == 0 || i == 4 || i == 8 { 1.0 } else { 0.0 };
+                if (orient_m[i] - id).abs() > 0.01 { orient_active = true; break; }
+            }
+        }
+    }
+    let apply_m = |v: [f32; 3]| -> [f32; 3] {
+        [
+            orient_m[0] * v[0] + orient_m[1] * v[1] + orient_m[2] * v[2],
+            orient_m[3] * v[0] + orient_m[4] * v[1] + orient_m[5] * v[2],
+            orient_m[6] * v[0] + orient_m[7] * v[1] + orient_m[8] * v[2],
+        ]
+    };
+
+    // The gyro/accel samples need to be matrix-transformed as a TRIPLE,
+    // not per-axis. So we pull all 3 gyro pin rings, time-align by index,
+    // run them through the matrix, then split back into per-channel lists.
     let pin_for_ch = ["gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y"];
     let off_for_ch = [g_off[0], g_off[1], g_off[2], a_off[0], a_off[1]];
     let sgn_for_ch = [g_sign[0], g_sign[1], g_sign[2], a_sign[0], a_sign[1]];
     let mut samples_ch: [Vec<(Instant, f32)>; 5] = Default::default();
     {
         let taps = scope_taps.read().unwrap();
-        for ch in 0..5 {
-            if let Some(ring) = taps.get(&(dev_id.to_string(), pin_for_ch[ch].to_string())) {
-                let off = off_for_ch[ch];
-                let sgn = sgn_for_ch[ch];
-                samples_ch[ch] = ring.iter()
-                    .map(|&(t, v)| (t, (v - off) * sgn))
-                    .collect();
+        if orient_active {
+            // Pull gyro_{x,y,z} as parallel rings; matrix-transform per
+            // index. Ring lengths should match because they're written
+            // in lockstep from the same I/O loop iteration.
+            let gx_ring = taps.get(&(dev_id.to_string(), "gyro_x".into())).cloned().unwrap_or_default();
+            let gy_ring = taps.get(&(dev_id.to_string(), "gyro_y".into())).cloned().unwrap_or_default();
+            let gz_ring = taps.get(&(dev_id.to_string(), "gyro_z".into())).cloned().unwrap_or_default();
+            let n = gx_ring.len().min(gy_ring.len()).min(gz_ring.len());
+            for i in 0..n {
+                let (t, gx) = gx_ring[i];
+                let (_, gy) = gy_ring[i];
+                let (_, gz) = gz_ring[i];
+                let v = [gx - g_off[0], gy - g_off[1], gz - g_off[2]];
+                let v = apply_m(v);
+                samples_ch[0].push((t, v[0] * g_sign[0]));
+                samples_ch[1].push((t, v[1] * g_sign[1]));
+                samples_ch[2].push((t, v[2] * g_sign[2]));
+            }
+            // Accel: same dance but only X/Y are shown.
+            let ax_ring = taps.get(&(dev_id.to_string(), "accel_x".into())).cloned().unwrap_or_default();
+            let ay_ring = taps.get(&(dev_id.to_string(), "accel_y".into())).cloned().unwrap_or_default();
+            let az_ring = taps.get(&(dev_id.to_string(), "accel_z".into())).cloned().unwrap_or_default();
+            let n = ax_ring.len().min(ay_ring.len()).min(az_ring.len());
+            for i in 0..n {
+                let (t, ax) = ax_ring[i];
+                let (_, ay) = ay_ring[i];
+                let (_, az) = az_ring[i];
+                let v = [ax - a_off[0], ay - a_off[1], az - a_off[2]];
+                let v = apply_m(v);
+                samples_ch[3].push((t, v[0] * a_sign[0]));
+                samples_ch[4].push((t, v[1] * a_sign[1]));
+            }
+        } else {
+            for ch in 0..5 {
+                if let Some(ring) = taps.get(&(dev_id.to_string(), pin_for_ch[ch].to_string())) {
+                    let off = off_for_ch[ch];
+                    let sgn = sgn_for_ch[ch];
+                    samples_ch[ch] = ring.iter()
+                        .map(|&(t, v)| (t, (v - off) * sgn))
+                        .collect();
+                }
             }
         }
     }
@@ -643,31 +917,31 @@ fn gyro_scope(
     ui.ctx().request_repaint();
 
     // Vertical waterfall: newest sample at top (age=0), time flows down.
-    // y_position is computed from sample age in ms vs. SCOPE_WIN_MS so the
+    // y_position is computed from sample age in ms vs. scope_win_ms so the
     // visual horizon is real-time regardless of UI repaint rate.
-    let center_x = rect.center().x;
-    let half_w = (rect.width() * 0.5) - 8.0;
+    let center_x = scope_rect.center().x;
+    let half_w = (scope_rect.width() * 0.5) - 8.0;
 
     // Gray crosshair guidelines: vertical zero line + two side rails at the
     // dynamic peak (1.0 magnitude) and a horizontal midline at half-window.
     let guide = Color32::from_gray(55);
     painter.line_segment(
-        [egui::pos2(center_x, rect.top() + 4.0), egui::pos2(center_x, rect.bottom() - 4.0)],
+        [egui::pos2(center_x, scope_rect.top() + 4.0), egui::pos2(center_x, scope_rect.bottom() - 4.0)],
         Stroke::new(1.0, guide),
     );
     painter.line_segment(
-        [egui::pos2(center_x - half_w * 0.5, rect.top() + 4.0),
-         egui::pos2(center_x - half_w * 0.5, rect.bottom() - 4.0)],
+        [egui::pos2(center_x - half_w * 0.5, scope_rect.top() + 4.0),
+         egui::pos2(center_x - half_w * 0.5, scope_rect.bottom() - 4.0)],
         Stroke::new(1.0, Color32::from_gray(38)),
     );
     painter.line_segment(
-        [egui::pos2(center_x + half_w * 0.5, rect.top() + 4.0),
-         egui::pos2(center_x + half_w * 0.5, rect.bottom() - 4.0)],
+        [egui::pos2(center_x + half_w * 0.5, scope_rect.top() + 4.0),
+         egui::pos2(center_x + half_w * 0.5, scope_rect.bottom() - 4.0)],
         Stroke::new(1.0, Color32::from_gray(38)),
     );
-    let mid_y = rect.top() + rect.height() * 0.5;
+    let mid_y = scope_rect.top() + scope_rect.height() * 0.5;
     painter.line_segment(
-        [egui::pos2(rect.left() + 8.0, mid_y), egui::pos2(rect.right() - 8.0, mid_y)],
+        [egui::pos2(scope_rect.left() + 8.0, mid_y), egui::pos2(scope_rect.right() - 8.0, mid_y)],
         Stroke::new(1.0, Color32::from_gray(38)),
     );
     // Active channel set. When the user skips accelerometer calibration the
@@ -678,7 +952,11 @@ fn gyro_scope(
     let peak = active.iter()
         .flat_map(|&ch| samples_ch[ch].iter().map(|(_, v)| v.abs()))
         .fold(0.0_f32, f32::max);
-    let scale = if peak > 1e-4 { half_w / peak } else { half_w / 0.02 };
+    // Auto-zoom with 50% padding margin so the visible peak never touches
+    // the rails. peak=0.001 → scale fills ±0.0015; floor at ±0.005 so an
+    // idle stick still shows some background noise rather than collapsing.
+    let display_peak = (peak * 1.5).max(0.005);
+    let scale = half_w / display_peak;
 
     let colors = [
         Color32::from_rgb(230, 70, 70),    // Roll  (gx)
@@ -691,8 +969,8 @@ fn gyro_scope(
 
     let now = Instant::now();
     let age_to_y = |age_ms: f32| -> f32 {
-        let t = (age_ms / SCOPE_WIN_MS).clamp(0.0, 1.0);
-        rect.top() + t * rect.height()
+        let t = (age_ms / scope_win_ms).clamp(0.0, 1.0);
+        scope_rect.top() + t * scope_rect.height()
     };
     // Helper: scale a color toward black by `mul` (0..1), preserving alpha.
     // Floor alpha at 25% so the oldest trace (bottom of the waterfall) is
@@ -715,7 +993,7 @@ fn gyro_scope(
         let mut pts: Vec<(Pos2, f32)> = Vec::with_capacity(ring.len());
         for (t, v) in ring.iter().rev() {
             let age_ms = now.duration_since(*t).as_secs_f32() * 1000.0;
-            if age_ms > SCOPE_WIN_MS { break; }
+            if age_ms > scope_win_ms { break; }
             let y = age_to_y(age_ms);
             let x = center_x + (v * scale).clamp(-half_w, half_w);
             pts.push((egui::pos2(x, y), age_ms));
@@ -727,7 +1005,7 @@ fn gyro_scope(
             let (pp, ap) = pts[i - 1];
             let (p,  a ) = pts[i];
             let age = 0.5 * (ap + a);
-            let fade = 1.0 - (age / SCOPE_WIN_MS).clamp(0.0, 1.0);
+            let fade = 1.0 - (age / scope_win_ms).clamp(0.0, 1.0);
             // sqrt → faster early decay, longer mid/late visibility.
             let alpha = fade.sqrt();
             let glow = scale_color(colors[ch], alpha * 0.55);
@@ -744,28 +1022,97 @@ fn gyro_scope(
         }
     }
 
-    // Legend top-left, larger font as mockup suggests. Hide accel rows when
-    // they're skipped so the legend matches the visible traces.
-    let font = egui::FontId::proportional(15.0);
-    let mut ly = rect.top() + 8.0;
+    // ── Bottom legend strip ──────────────────────────────────────────────
+    //
+    // Channel chips inline on the left, peak readout in the middle, and a
+    // clickable time-window indicator on the right that cycles 500 → 1000
+    // → 5000 ms.
+    let legend_font  = egui::FontId::proportional(13.0);
+    let legend_y     = legend_rect.center().y;
+
+    // Channel chips: small filled circle + label, packed left-to-right.
+    let mut chip_x = legend_rect.left() + 8.0;
     for &i in active {
-        painter.text(
-            egui::pos2(rect.left() + 12.0, ly),
-            egui::Align2::LEFT_TOP,
-            labels[i],
-            font.clone(),
+        let dot_c = egui::pos2(chip_x + 5.0, legend_y);
+        painter.circle_filled(dot_c, 4.0, colors[i]);
+        let text_pos = egui::pos2(dot_c.x + 8.0, legend_y);
+        let galley = painter.layout_no_wrap(
+            labels[i].to_string(),
+            legend_font.clone(),
             colors[i],
         );
-        ly += 20.0;
+        painter.galley(
+            egui::pos2(text_pos.x, text_pos.y - galley.size().y * 0.5),
+            galley.clone(),
+            colors[i],
+        );
+        chip_x = text_pos.x + galley.size().x + 12.0;
     }
+
+    // Peak / point-count readout. Anchored just above the scope's bottom-
+    // right corner so it never collides with the channel chips on the
+    // legend strip — important on the smallest window size where the
+    // chips already span most of the legend width.
     painter.text(
-        egui::pos2(rect.right() - 12.0, rect.top() + 8.0),
-        egui::Align2::RIGHT_TOP,
-        format!("peak ±{:.3}  ·  {} ms  ·  {} pts",
-            peak, SCOPE_WIN_MS as i32, total_pts),
-        egui::FontId::proportional(13.0),
+        egui::pos2(scope_rect.right() - 10.0, scope_rect.bottom() - 6.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("peak ±{:.3}  ·  {} pts", peak, total_pts),
+        legend_font.clone(),
         Color32::from_gray(170),
     );
+
+    // Clickable time-window indicator on the right.
+    let win_text   = format!("{} ms", scope_win_ms as i32);
+    let win_galley = painter.layout_no_wrap(
+        win_text,
+        legend_font.clone(),
+        Color32::from_gray(220),
+    );
+    let win_size = win_galley.size();
+    let pad_x = 8.0;
+    let pad_y = 3.0;
+    let win_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            legend_rect.right() - 8.0 - win_size.x - 2.0 * pad_x,
+            legend_y - win_size.y * 0.5 - pad_y,
+        ),
+        egui::vec2(win_size.x + 2.0 * pad_x, win_size.y + 2.0 * pad_y),
+    );
+    let win_resp = ui.interact(
+        win_rect,
+        ui.id().with(("scope_win_btn", _node_id)),
+        Sense::click(),
+    );
+    let bg = if win_resp.hovered() {
+        Color32::from_gray(45)
+    } else {
+        Color32::from_gray(28)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(win_rect, 3.0, bg);
+    painter.rect_stroke(
+        win_rect, 3.0,
+        Stroke::new(1.0, Color32::from_gray(70)),
+        egui::epaint::StrokeKind::Inside,
+    );
+    let text_color = if win_resp.hovered() { Color32::WHITE } else { Color32::from_gray(220) };
+    painter.galley(
+        egui::pos2(win_rect.center().x - win_size.x * 0.5,
+                   win_rect.center().y - win_size.y * 0.5),
+        win_galley,
+        text_color,
+    );
+    if win_resp.clicked() {
+        let next = match scope_win_ms as i32 {
+            x if x <= 500 => 1000.0,
+            x if x <= 1000 => 5000.0,
+            _ => 500.0,
+        };
+        ui.ctx().data_mut(|d| {
+            let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(_node_id), WindowState::default);
+            st.scope_win_ms = next;
+        });
+    }
 }
 
 // ── Sticks section ───────────────────────────────────────────────────────────
@@ -792,6 +1139,23 @@ fn sticks_section(
     let rs = read_param_arr::<RADIAL_N>(canvas, node_id, "rstick_radial", [1.0; RADIAL_N]);
     let (lx, ly) = apply_stick_view(raw_lx, raw_ly, lc, ls);
     let (rx, ry) = apply_stick_view(raw_rx, raw_ry, rc, rs);
+    // Deadzone applied to the displayed dot only (same math the engine uses
+    // on the live signal). Lets the user see exactly where their selected
+    // deadzone collapses the dot to center.
+    let deadzone = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("deadzone").and_then(|v| v.as_f64()))
+        .map(|v| v as f32).unwrap_or(0.1).clamp(0.0, 0.5);
+    let apply_dz = |x: f32, y: f32, dz: f32| -> (f32, f32) {
+        if dz <= 0.0 { return (x, y); }
+        let len = (x * x + y * y).sqrt();
+        if len < dz { (0.0, 0.0) }
+        else {
+            let s = (len - dz) / (1.0 - dz).max(f32::EPSILON) / len;
+            (x * s, y * s)
+        }
+    };
+    let (lx, ly) = apply_dz(lx, ly, deadzone);
+    let (rx, ry) = apply_dz(rx, ry, deadzone);
 
     // Step session.
     let (sampling, l_filled, r_filled, l_cn, r_cn, commit) = ui.ctx().data_mut(|d| {
@@ -908,18 +1272,43 @@ fn sticks_section(
                 )).size(INSTRUCT_SIZE).color(ORANGE));
             }
         });
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = lo.scope_gap;
-            let l_edge_snap = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
-                .map(|s| s.stick.l_edge).unwrap_or([0.0; STICK_BUCKETS]));
-            let r_edge_snap = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
-                .map(|s| s.stick.r_edge).unwrap_or([0.0; STICK_BUCKETS]));
-            let l_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
-                .map(|s| s.l_trail.clone()).unwrap_or_default());
-            let r_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
-                .map(|s| s.r_trail.clone()).unwrap_or_default());
-            stick_scope(ui, lx, ly, &l_trail, &l_edge_snap, lc, ls, lo);
-            stick_scope(ui, rx, ry, &r_trail, &r_edge_snap, rc, rs, lo);
+        ui.vertical(|ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = lo.scope_gap;
+                let l_edge_snap = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
+                    .map(|s| s.stick.l_edge).unwrap_or([0.0; STICK_BUCKETS]));
+                let r_edge_snap = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
+                    .map(|s| s.stick.r_edge).unwrap_or([0.0; STICK_BUCKETS]));
+                let l_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
+                    .map(|s| s.l_trail.clone()).unwrap_or_default());
+                let r_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
+                    .map(|s| s.r_trail.clone()).unwrap_or_default());
+                stick_scope(ui, lx, ly, &l_trail, &l_edge_snap, lc, ls, lo);
+                stick_scope(ui, rx, ry, &r_trail, &r_edge_snap, rc, rs, lo);
+            });
+            // Deadzone slider — directly linked to the device.source's
+            // `deadzone` param (same one the header slider edits). Lets
+            // the user tune deadzone down until the displayed dot stops
+            // drifting at rest.
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Deadzone")
+                    .size(INSTRUCT_SIZE).color(ORANGE));
+                let mut dz = deadzone;
+                let resp = ui.add(egui::Slider::new(&mut dz, 0.0_f32..=0.5)
+                    .show_value(false)
+                    .clamping(egui::SliderClamping::Always));
+                ui.add(egui::DragValue::new(&mut dz)
+                    .speed(0.005)
+                    .range(0.0_f32..=0.5)
+                    .fixed_decimals(3));
+                if (dz - deadzone).abs() > f32::EPSILON || resp.changed() {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.insert("deadzone".into(),
+                            Value::from(dz.clamp(0.0, 0.5) as f64));
+                    }
+                }
+            });
         });
     });
 }
@@ -1028,6 +1417,185 @@ fn derive_radial_profile(edges: &[f32; STICK_BUCKETS], center: [f32; 2]) -> [f32
         if smooth[i] > 0.1 { scale[i] = (1.0 / smooth[i]).clamp(0.5, 2.5); }
     }
     scale
+}
+
+// ── Orientation-matrix solver ─────────────────────────────────────────────────
+//
+// Workflow:
+//   1. User performs three single-axis rotations (Pitch, Yaw, Roll) and we
+//      collect the raw gyro 3-vectors for each.
+//   2. `principal_axis()` runs PCA via power-iteration on each sample cloud
+//      to recover the dominant chip-frame axis. Sign is picked so the axis
+//      points the same way as the mean motion vector (otherwise PCA returns
+//      either +v or -v arbitrarily).
+//   3. The three recovered axes form the columns of M⁻¹ (chip-frame
+//      directions that correspond to body Pitch/Yaw/Roll). We invert to get
+//      M (chip → body).
+//   4. M is not perfectly orthonormal because the user's rotations weren't
+//      pure single-axis motions. `orthonormalize_mat3()` runs modified
+//      Gram-Schmidt to snap M to the closest rotation matrix, eliminating
+//      shear/scale distortion.
+
+/// Run 3D PCA on a sample cloud via power iteration on the covariance
+/// matrix. Returns the unit eigenvector with the largest eigenvalue —
+/// i.e. the direction of greatest variance, which corresponds to the
+/// physical rotation axis the user actually rotated around.
+fn principal_axis(samples: &[[f32; 3]]) -> Option<[f32; 3]> {
+    if samples.len() < 16 { return None; }
+    // Subtract mean (we're after axis-of-variance, not direction-of-mean).
+    let n = samples.len() as f32;
+    let mut mean = [0.0_f32; 3];
+    for s in samples { for i in 0..3 { mean[i] += s[i]; } }
+    for i in 0..3 { mean[i] /= n; }
+    // 3×3 covariance, row-major.
+    let mut c = [0.0_f32; 9];
+    for s in samples {
+        let dx = s[0] - mean[0];
+        let dy = s[1] - mean[1];
+        let dz = s[2] - mean[2];
+        c[0] += dx * dx; c[1] += dx * dy; c[2] += dx * dz;
+        c[3] += dy * dx; c[4] += dy * dy; c[5] += dy * dz;
+        c[6] += dz * dx; c[7] += dz * dy; c[8] += dz * dz;
+    }
+    for v in c.iter_mut() { *v /= n; }
+    // Power iteration: 32 multiplies are plenty for a 3×3 spread case.
+    let mut v = [1.0_f32, 1.0, 1.0];
+    for _ in 0..48 {
+        let nv = [
+            c[0] * v[0] + c[1] * v[1] + c[2] * v[2],
+            c[3] * v[0] + c[4] * v[1] + c[5] * v[2],
+            c[6] * v[0] + c[7] * v[1] + c[8] * v[2],
+        ];
+        let m = (nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]).sqrt();
+        if m < 1e-9 { return None; }
+        v = [nv[0] / m, nv[1] / m, nv[2] / m];
+    }
+    // Sign convention: pick the orientation matching the overall mean
+    // direction so independent solves don't flip signs randomly.
+    let dot = mean[0] * v[0] + mean[1] * v[1] + mean[2] * v[2];
+    if dot < 0.0 { v = [-v[0], -v[1], -v[2]]; }
+    Some(v)
+}
+
+/// Modified Gram-Schmidt orthonormalisation of a row-major 3×3 matrix
+/// whose ROWS are the three near-orthogonal body axes recovered from
+/// PCA. Returns the cleaned matrix (rows orthonormal, determinant +1).
+fn orthonormalize_mat3(m: [f32; 9]) -> [f32; 9] {
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 { a[0]*b[0]+a[1]*b[1]+a[2]*b[2] }
+    fn sub(a: [f32; 3], b: [f32; 3], k: f32) -> [f32; 3] { [a[0]-k*b[0], a[1]-k*b[1], a[2]-k*b[2]] }
+    fn norm(a: [f32; 3]) -> [f32; 3] {
+        let n = (a[0]*a[0]+a[1]*a[1]+a[2]*a[2]).sqrt().max(1e-9);
+        [a[0]/n, a[1]/n, a[2]/n]
+    }
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
+    }
+    let r0 = norm([m[0], m[1], m[2]]);
+    let r1 = sub([m[3], m[4], m[5]], r0, dot([m[3], m[4], m[5]], r0));
+    let r1 = norm(r1);
+    // Force r2 = r0 × r1 so the matrix has determinant +1.
+    let r2 = cross(r0, r1);
+    [
+        r0[0], r0[1], r0[2],
+        r1[0], r1[1], r1[2],
+        r2[0], r2[1], r2[2],
+    ]
+}
+
+/// Solve a chip-frame → body-frame rotation matrix from three sample
+/// clouds + a mean accel (gravity) reference. Returns None if any cloud
+/// is too small or degenerate.
+///
+/// Two-stage solve:
+///   1. PCA on the three gyro clouds recovers the chip-frame direction
+///      of each body axis. This is the same as the gyro-only solver, but
+///      we get a rough answer that may be off by a few degrees due to
+///      hand wobble.
+///   2. If we have a usable gravity reference, refine by computing the
+///      pre-rotation `R_g` that maps the gyro-derived "down" vector to
+///      the canonical body-down (`-Y`). Apply `R_g` to every PCA axis.
+///      Gravity gives an absolute reference frame the gyro motions
+///      can't, so this reduces tilt error substantially.
+///
+/// Sample-index convention matches the pin order used elsewhere
+/// (Roll=gyro_x, Pitch=gyro_y, Yaw=gyro_z):
+///   samples[0] = Roll  cloud → body +X
+///   samples[1] = Pitch cloud → body +Y
+///   samples[2] = Yaw   cloud → body +Z
+fn solve_orient_matrix(
+    samples: &[Vec<[f32; 3]>; 3],
+    accel_mean: Option<[f32; 3]>,
+) -> Option<[f32; 9]> {
+    let mut a_roll  = principal_axis(&samples[0])?;
+    let mut a_pitch = principal_axis(&samples[1])?;
+    let mut a_yaw   = principal_axis(&samples[2])?;
+
+    // Stage 2: gravity refinement.
+    //
+    // Body convention (matches crates/devices/src/gyro.rs and
+    // engine 3DOF math): gravity is +Z when the controller is held
+    // face-up. The chip-frame mean accel IS the body-frame +Z axis
+    // expressed in chip coordinates — exactly what we want for the
+    // Yaw row of M (Yaw is rotation about +Z).
+    //
+    // Strategy:
+    //   - Override the noisy PCA Yaw axis with the chip-frame gravity
+    //     direction (absolute, hand-wobble-immune).
+    //   - Sign-align PCA Roll and Pitch against the gyro-mean direction
+    //     so they at least face a consistent way.
+    //   - Project PCA Roll perpendicular to the new Yaw via Gram-Schmidt
+    //     so the basis is orthogonal even if hand motion wasn't.
+    //   - Pitch = Yaw × Roll, giving a right-handed orthonormal basis.
+    if let Some(g) = accel_mean {
+        let g_mag = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        if g_mag > 0.1 {
+            let g_chip = [g[0] / g_mag, g[1] / g_mag, g[2] / g_mag];
+
+            // Yaw row of M maps chip-frame g_chip → body +Z. For an
+            // orthonormal M, the Yaw ROW equals g_chip itself (since
+            // M · g_chip = [0, 0, 1] ⇒ row2 · g_chip = 1 ⇒ row2 = g_chip).
+            a_yaw = g_chip;
+
+            // Sign-align PCA Roll/Pitch using the mean of their sample
+            // clouds — this is more reliable than relying on PCA's
+            // arbitrary sign for back-and-forth motion.
+            let mean_of = |s: &[[f32; 3]]| -> [f32; 3] {
+                if s.is_empty() { return [0.0; 3]; }
+                let n = s.len() as f32;
+                let mut m = [0.0_f32; 3];
+                for v in s { m[0] += v[0]; m[1] += v[1]; m[2] += v[2]; }
+                [m[0]/n, m[1]/n, m[2]/n]
+            };
+            let m_roll  = mean_of(&samples[0]);
+            let m_pitch = mean_of(&samples[1]);
+            let dot3 = |a: [f32;3], b: [f32;3]| a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+            if dot3(a_roll,  m_roll)  < 0.0 { a_roll  = [-a_roll[0],  -a_roll[1],  -a_roll[2]];  }
+            if dot3(a_pitch, m_pitch) < 0.0 { a_pitch = [-a_pitch[0], -a_pitch[1], -a_pitch[2]]; }
+
+            // Gram-Schmidt: make Roll perpendicular to Yaw.
+            let d = dot3(a_roll, a_yaw);
+            a_roll = [a_roll[0] - d * a_yaw[0], a_roll[1] - d * a_yaw[1], a_roll[2] - d * a_yaw[2]];
+            let rn = (a_roll[0]*a_roll[0] + a_roll[1]*a_roll[1] + a_roll[2]*a_roll[2]).sqrt().max(1e-9);
+            a_roll = [a_roll[0]/rn, a_roll[1]/rn, a_roll[2]/rn];
+
+            // Pitch = Yaw × Roll, ensuring right-handed orthonormal basis.
+            // (For body axes Roll=+X, Pitch=+Y, Yaw=+Z, we want
+            //  Pitch = Yaw × Roll = +Z × +X = +Y. ✓)
+            a_pitch = [
+                a_yaw[1] * a_roll[2] - a_yaw[2] * a_roll[1],
+                a_yaw[2] * a_roll[0] - a_yaw[0] * a_roll[2],
+                a_yaw[0] * a_roll[1] - a_yaw[1] * a_roll[0],
+            ];
+        }
+    }
+
+    // Build M with chip directions as ROWS: M·chip = body.
+    let m_chip_to_body = [
+        a_roll[0],  a_roll[1],  a_roll[2],
+        a_pitch[0], a_pitch[1], a_pitch[2],
+        a_yaw[0],   a_yaw[1],   a_yaw[2],
+    ];
+    Some(orthonormalize_mat3(m_chip_to_body))
 }
 
 fn stick_scope(

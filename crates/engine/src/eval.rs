@@ -57,6 +57,13 @@ struct DeviceCal {
     gyro_sign:     [f32; 3],
     /// Per-axis output sign for accel_{x,y,z}.
     accel_sign:    [f32; 3],
+    /// 3×3 orientation matrix (row-major) applied to the (offset-removed)
+    /// gyro and accel vectors before per-axis sign flip. Compensates for
+    /// IMU chips that aren't perfectly aligned with the controller's body
+    /// axes (modded controllers, factory mount tilt). Identity = no-op.
+    orient_matrix: [f32; 9],
+    /// True if `orient_matrix` is non-identity and should be applied.
+    orient_active: bool,
     lstick_center: [f32; 2], // subtracted from left_stick_{x,y}
     rstick_center: [f32; 2],
     /// Per-bucket radial scale: lstick_radial[i] = 1.0 / (mean stick radius
@@ -71,6 +78,12 @@ struct DeviceCal {
     rtrig_range:   (f32, f32),
 }
 
+const IDENTITY_M3: [f32; 9] = [
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    0.0, 0.0, 1.0,
+];
+
 impl Default for DeviceCal {
     fn default() -> Self {
         Self {
@@ -78,6 +91,8 @@ impl Default for DeviceCal {
             accel_offset:  [0.0; 3],
             gyro_sign:     [1.0; 3],
             accel_sign:    [1.0; 3],
+            orient_matrix: IDENTITY_M3,
+            orient_active: false,
             lstick_center: [0.0; 2],
             rstick_center: [0.0; 2],
             lstick_radial: [1.0; STICK_RADIAL_BUCKETS],
@@ -129,12 +144,46 @@ fn read_sign3(params: &HashMap<String, Value>, key: &str) -> [f32; 3] {
     out
 }
 
+/// Read a 9-element float array (row-major Mat3) from params. Returns
+/// (matrix, active) where `active` is true if the matrix differs
+/// meaningfully from identity.
+fn read_orient_matrix(params: &HashMap<String, Value>, key: &str) -> ([f32; 9], bool) {
+    let Some(arr) = params.get(key).and_then(|v| v.as_array()) else {
+        return (IDENTITY_M3, false);
+    };
+    if arr.len() < 9 { return (IDENTITY_M3, false); }
+    let mut m = IDENTITY_M3;
+    for i in 0..9 {
+        if let Some(v) = arr[i].as_f64() { m[i] = v as f32; }
+    }
+    // Active if any element differs from identity by more than ~0.5°
+    // worth of rotation (≈ 0.01).
+    let mut active = false;
+    for i in 0..9 {
+        if (m[i] - IDENTITY_M3[i]).abs() > 0.01 { active = true; break; }
+    }
+    (m, active)
+}
+
+/// Apply a row-major 3×3 matrix to a 3-vector: `out = M · v`.
+#[inline]
+fn mat3_apply(m: &[f32; 9], v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+        m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+        m[6] * v[0] + m[7] * v[1] + m[8] * v[2],
+    ]
+}
+
 fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
+    let (orient_matrix, orient_active) = read_orient_matrix(params, "gyro_orient_matrix");
     DeviceCal {
         gyro_offset:   read_arr3(params, "gyro_offset"),
         accel_offset:  read_arr3(params, "accel_offset"),
         gyro_sign:     read_sign3(params, "gyro_invert"),
         accel_sign:    read_sign3(params, "accel_invert"),
+        orient_matrix,
+        orient_active,
         lstick_center: read_arr2(params, "lstick_center"),
         rstick_center: read_arr2(params, "rstick_center"),
         lstick_radial: read_radial(params, "lstick_radial"),
@@ -170,15 +219,26 @@ fn apply_trigger_range(v: f32, (mn, mx): (f32, f32)) -> f32 {
 ///   1. Calibration offsets / scales / ranges (from the node's params)
 ///   2. Gyro multiplier (gyro pins only)
 ///   3. Stick deadzone (stick pins only)
-fn post_process_device_pin(pin_id: &str, sig: Signal, dz: f32, gm: f32, cal: &DeviceCal) -> Signal {
+///
+/// `imu_pre_applied` = true skips the per-pin offset+sign step for
+/// gyro/accel pins because `preprocess_dev_sigs` already did them
+/// together with the orientation-matrix transform.
+fn post_process_device_pin(
+    pin_id: &str,
+    sig: Signal,
+    dz: f32,
+    gm: f32,
+    cal: &DeviceCal,
+    imu_pre_applied: bool,
+) -> Signal {
     // 1. Calibration. Offsets first, then optional axis sign flip.
     let sig = match (pin_id, sig) {
-        ("gyro_x",  Signal::Float(v)) => Signal::Float((v - cal.gyro_offset[0])  * cal.gyro_sign[0]),
-        ("gyro_y",  Signal::Float(v)) => Signal::Float((v - cal.gyro_offset[1])  * cal.gyro_sign[1]),
-        ("gyro_z",  Signal::Float(v)) => Signal::Float((v - cal.gyro_offset[2])  * cal.gyro_sign[2]),
-        ("accel_x", Signal::Float(v)) => Signal::Float((v - cal.accel_offset[0]) * cal.accel_sign[0]),
-        ("accel_y", Signal::Float(v)) => Signal::Float((v - cal.accel_offset[1]) * cal.accel_sign[1]),
-        ("accel_z", Signal::Float(v)) => Signal::Float((v - cal.accel_offset[2]) * cal.accel_sign[2]),
+        ("gyro_x",  Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.gyro_offset[0])  * cal.gyro_sign[0]),
+        ("gyro_y",  Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.gyro_offset[1])  * cal.gyro_sign[1]),
+        ("gyro_z",  Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.gyro_offset[2])  * cal.gyro_sign[2]),
+        ("accel_x", Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.accel_offset[0]) * cal.accel_sign[0]),
+        ("accel_y", Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.accel_offset[1]) * cal.accel_sign[1]),
+        ("accel_z", Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.accel_offset[2]) * cal.accel_sign[2]),
         ("left_stick_x", Signal::Float(v))  => Signal::Float(v - cal.lstick_center[0]),
         ("left_stick_y", Signal::Float(v))  => Signal::Float(v - cal.lstick_center[1]),
         ("right_stick_x", Signal::Float(v)) => Signal::Float(v - cal.rstick_center[0]),
@@ -231,10 +291,71 @@ fn preprocess_dev_sigs(
         params.insert(dev_id.to_string(), (dz, gm, cal));
     }
     let default_entry = (0.0_f32, 1.0_f32, DeviceCal::default());
+
+    // ── Pass 1: 3-axis matrix transform for gyro/accel triples ──────────────
+    //
+    // The orientation matrix needs all 3 axes at once, which the per-pin
+    // pipeline can't see. We collect each device's gyro/accel triples,
+    // apply offset → matrix → sign, and pre-write the corrected values
+    // into a side map that pass 2 reads from instead of the raw signal.
+    let mut imu_override: HashMap<(String, String), Signal> = HashMap::new();
+    for (dev_id, (_, _, cal)) in &params {
+        let read_f = |pin: &str| -> Option<f32> {
+            dev_sigs.get(&(dev_id.clone(), pin.to_string())).and_then(|s| {
+                if let Signal::Float(v) = s { Some(*v) } else { None }
+            })
+        };
+        let gxyz = (read_f("gyro_x"), read_f("gyro_y"), read_f("gyro_z"));
+        if let (Some(gx), Some(gy), Some(gz)) = gxyz {
+            let v = [
+                gx - cal.gyro_offset[0],
+                gy - cal.gyro_offset[1],
+                gz - cal.gyro_offset[2],
+            ];
+            let v = if cal.orient_active { mat3_apply(&cal.orient_matrix, v) } else { v };
+            let out = [
+                v[0] * cal.gyro_sign[0],
+                v[1] * cal.gyro_sign[1],
+                v[2] * cal.gyro_sign[2],
+            ];
+            imu_override.insert((dev_id.clone(), "gyro_x".into()), Signal::Float(out[0]));
+            imu_override.insert((dev_id.clone(), "gyro_y".into()), Signal::Float(out[1]));
+            imu_override.insert((dev_id.clone(), "gyro_z".into()), Signal::Float(out[2]));
+        }
+        let axyz = (read_f("accel_x"), read_f("accel_y"), read_f("accel_z"));
+        if let (Some(ax), Some(ay), Some(az)) = axyz {
+            let v = [
+                ax - cal.accel_offset[0],
+                ay - cal.accel_offset[1],
+                az - cal.accel_offset[2],
+            ];
+            let v = if cal.orient_active { mat3_apply(&cal.orient_matrix, v) } else { v };
+            let out = [
+                v[0] * cal.accel_sign[0],
+                v[1] * cal.accel_sign[1],
+                v[2] * cal.accel_sign[2],
+            ];
+            imu_override.insert((dev_id.clone(), "accel_x".into()), Signal::Float(out[0]));
+            imu_override.insert((dev_id.clone(), "accel_y".into()), Signal::Float(out[1]));
+            imu_override.insert((dev_id.clone(), "accel_z".into()), Signal::Float(out[2]));
+        }
+    }
+
+    // ── Pass 2: per-pin pipeline ──────────────────────────────────────────────
     let mut out = HashMap::with_capacity(dev_sigs.len());
     for (key, sig) in dev_sigs.iter() {
         let entry = params.get(&key.0).cloned().unwrap_or_else(|| default_entry.clone());
-        out.insert(key.clone(), post_process_device_pin(&key.1, *sig, entry.0, entry.1, &entry.2));
+        // Use the matrix-transformed value when this is a gyro/accel pin
+        // that we pre-processed; the per-pin function will still apply
+        // gyro_multiplier (gyro only) but skip its own offset + sign.
+        let src = imu_override.get(key).copied().unwrap_or(*sig);
+        let is_imu = matches!(key.1.as_str(),
+            "gyro_x" | "gyro_y" | "gyro_z" |
+            "accel_x" | "accel_y" | "accel_z");
+        out.insert(
+            key.clone(),
+            post_process_device_pin(&key.1, src, entry.0, entry.1, &entry.2, is_imu),
+        );
     }
     out
 }

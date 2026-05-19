@@ -517,6 +517,22 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // us recognise double-click on the slider track alone (reset to
             // global default), while a double-click on the DragValue keeps
             // egui's built-in inline edit behaviour.
+            // Pad the header for device.source nodes that have fewer than
+            // two slider rows so every device.source ends up the same
+            // height. Without this, a collapsed short-header node (e.g.
+            // XInput, which has no gyro) is so short that pin rows
+            // protrude past the header bottom and remain visible
+            // through the translucent body when collapsed. Each slider
+            // row is ~22 px tall.
+            if is_device_source {
+                const SLIDER_ROW_H: f32 = 22.0;
+                let present_rows = (has_deadzone as u8) + (has_gyro as u8);
+                let missing_rows = 2 - present_rows.min(2);
+                if missing_rows > 0 {
+                    ui.add_space(SLIDER_ROW_H * missing_rows as f32);
+                }
+            }
+
             if is_device_source && (has_deadzone || has_gyro) {
                 const LABEL_CELL_W: f32 = 60.0;
                 let mut dz_edit = deadzone_initial;
@@ -639,7 +655,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         };
         let glow = input_pin_glow(self.live_signals, snarl, node, pin.id.node, pin.id.input)
             .map(|(col, t)| (col, pin_glow_smoothed(ui.ctx(), pin.id.node, pin.id.input, true, t)));
-        MaybeHeaderPin { inner: pin_info(desc.signal_type), rect, glow }
+        // Half-circle (flat right edge against the node) for normal column
+        // pins; the AutoMap chip stays a square.
+        let half = if rect.is_none() && desc.signal_type != SignalType::AutoMap {
+            Some(HalfSide::Right)
+        } else { None };
+        MaybeHeaderPin { inner: pin_info(desc.signal_type), rect, glow, half }
     }
 
     fn show_output(
@@ -669,7 +690,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         };
         let glow = output_pin_glow(self.live_signals, node, pin.id.output)
             .map(|(col, t)| (col, pin_glow_smoothed(ui.ctx(), pin.id.node, pin.id.output, false, t)));
-        MaybeHeaderPin { inner: pin_info(desc.signal_type), rect, glow }
+        // Half-circle with flat LEFT edge for output column pins.
+        let half = if rect.is_none() && desc.signal_type != SignalType::AutoMap {
+            Some(HalfSide::Left)
+        } else { None };
+        MaybeHeaderPin { inner: pin_info(desc.signal_type), rect, glow, half }
     }
 
     fn connect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<NodeData>) {
@@ -5226,27 +5251,47 @@ fn pin_info(t: SignalType) -> PinInfo {
     }
 }
 
+/// Which side of a half-circle pin is FLAT (i.e. faces the node body).
+#[derive(Clone, Copy)]
+enum HalfSide { Left, Right }
+
 /// SnarlPin wrapper. When `rect` is `Some`, `pin_rect` returns it verbatim —
 /// used to lift the device.source `automap_out` pin into the header so it
 /// stays reachable when the node is collapsed. When `rect` is `None`, falls
 /// through to the default snarl pin geometry. When `glow` is `Some`, paints
 /// a radial halo behind the pin scaled by intensity (0..1) — used to make
-/// device pins light up when live signal is flowing.
+/// device pins light up when live signal is flowing. When `half` is `Some`,
+/// renders as a half-circle (flat side toward the node) instead of a full
+/// circle — used so pins sit flush against the node body even though
+/// PinPlacement::Outside puts them outside the frame.
 struct MaybeHeaderPin {
     inner: PinInfo,
     rect: Option<egui::Rect>,
     glow: Option<(Color32, f32)>,
+    half: Option<HalfSide>,
 }
 
 impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
     fn pin_rect(&self, x: f32, y0: f32, y1: f32, size: f32) -> egui::Rect {
         if let Some(r) = self.rect {
-            r
-        } else {
-            // Mirror the default impl from SnarlPin (vendored pin.rs:43-48).
-            let y = (y0 + y1) * 0.5;
-            egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(size, size))
+            return r;
         }
+        // Mirror the default impl from SnarlPin (vendored pin.rs:43-48).
+        let y = (y0 + y1) * 0.5;
+        // For half-circle pins, shift the center inward so the flat edge
+        // (which lives at `center.x`) sits flush with the node body edge
+        // — i.e. counteract PinPlacement::Outside's outward offset and
+        // align with where snarl's default pin's outer edge would have
+        // been. snarl gives us `x` = pin center under Outside; the pin's
+        // outermost extent sits at x ± size/2. We want the flat edge
+        // (center.x) to coincide with that outermost extent, so shift
+        // the center inward by size/2.
+        let cx = match self.half {
+            Some(HalfSide::Right) => x + size * 0.5, // input → shift right (toward node)
+            Some(HalfSide::Left)  => x - size * 0.5, // output → shift left  (toward node)
+            None                  => x,
+        };
+        egui::Rect::from_center_size(egui::pos2(cx, y), egui::vec2(size, size))
     }
     fn draw(
         self,
@@ -5289,12 +5334,27 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
         }
         // Paint the radial-glow halo *behind* the pin so the colored outline
         // remains crisp on top. Halo extends to 2.2× the pin radius.
+        //
+        // For half-circle pins we use a half-disc glow shaped to the same
+        // outward sweep, so the halo doesn't bleed into the node body.
         if let Some((hot, intensity)) = self.glow {
             if intensity > 0.01 {
                 let center = rect.center();
                 let pin_r = (rect.width().min(rect.height())) * 0.5;
                 let halo_r = pin_r * 2.2;
-                paint_radial_glow(painter, center, halo_r, hot, intensity);
+                match self.half {
+                    None => paint_radial_glow(painter, center, halo_r, hot, intensity),
+                    Some(HalfSide::Right) => paint_radial_glow_half(
+                        painter, center, halo_r, hot, intensity,
+                        std::f32::consts::FRAC_PI_2,
+                        std::f32::consts::FRAC_PI_2 * 3.0,
+                    ),
+                    Some(HalfSide::Left) => paint_radial_glow_half(
+                        painter, center, halo_r, hot, intensity,
+                        -std::f32::consts::FRAC_PI_2,
+                        std::f32::consts::FRAC_PI_2,
+                    ),
+                }
             }
         }
         // Lerp the inner fill from the default dark toward the hot type-color
@@ -5318,6 +5378,58 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
         } else {
             self.inner
         };
+
+        // Half-circle path. Paint a filled semicircle with the flat side
+        // facing the node body. We draw the fill as a triangle fan around
+        // the flat-edge midpoint, then stroke the curved edge.
+        if let Some(side) = self.half {
+            use egui::epaint::{PathShape, PathStroke};
+            let fill = inner.fill.unwrap_or(Color32::from_gray(20));
+            let stroke = inner.stroke.unwrap_or(egui::Stroke::new(1.5, Color32::WHITE));
+            let center = rect.center();
+            let r = (rect.width().min(rect.height())) * 0.5;
+            // Flat edge is vertical: x = center.x for inputs (flat on right,
+            // curve sweeps to the left, i.e. outward) and for outputs (flat
+            // on left, curve sweeps right, i.e. outward).
+            //
+            // Angle convention: 0 = +X (right), π/2 = +Y (down).
+            // Input pin (flat right): sweep from +π/2 (down) → 3π/2 (up)
+            //   through π (left). The convex side faces LEFT (away from node).
+            // Output pin (flat left): sweep from -π/2 → +π/2 through 0
+            //   (right). Convex side faces RIGHT (away from node).
+            let (a0, a1) = match side {
+                HalfSide::Right => (std::f32::consts::FRAC_PI_2,  std::f32::consts::FRAC_PI_2 * 3.0), // input
+                HalfSide::Left  => (-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2),       // output
+            };
+            const N: usize = 12;
+            let mut pts: Vec<egui::Pos2> = Vec::with_capacity(N + 1);
+            for i in 0..=N {
+                let t = i as f32 / N as f32;
+                let a = a0 + (a1 - a0) * t;
+                pts.push(center + r * egui::vec2(a.cos(), a.sin()));
+            }
+            // Close the path with the flat edge endpoints. The endpoints
+            // of the arc already sit at (center.x, center.y ± r), so
+            // appending nothing closes the half-disc when `closed=true`.
+            painter.add(egui::Shape::Path(PathShape {
+                points: pts,
+                closed: true,
+                fill,
+                stroke: PathStroke::from(stroke),
+            }));
+
+            // Wire info: same defaults PinInfo::draw computes.
+            let mut wire_info = egui_snarl::ui::PinWireInfo {
+                color: inner.wire_color.unwrap_or(fill),
+                style: inner.wire_style.unwrap_or(egui_snarl::ui::WireStyle::Bezier5),
+                width_factor: inner.wire_width_factor.unwrap_or(1.0),
+            };
+            if let Some((_hot, intensity)) = self.glow {
+                wire_info.color = brighten_wire_color(wire_info.color, intensity);
+            }
+            return wire_info;
+        }
+
         let mut wire_info = PinInfo::draw(&inner, snarl_style, style, rect, painter);
         if let Some((_hot, intensity)) = self.glow {
             wire_info.color = brighten_wire_color(wire_info.color, intensity);
@@ -5467,6 +5579,46 @@ fn paint_radial_glow(painter: &egui::Painter, center: egui::Pos2, radius: f32, h
     for k in 0..SEGMENTS {
         let a = (k + 1) as u32;
         let b = ((k + 1) % SEGMENTS + 1) as u32;
+        mesh.indices.extend_from_slice(&[0, a, b]);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Half-disc radial glow. `a0..a1` defines the angular sweep (radians);
+/// the fan is built as a triangle fan around `center` with vertices on
+/// the arc, so the glow stays on the convex (outward) side of the pin
+/// and doesn't bleed into the node body.
+fn paint_radial_glow_half(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    hot: Color32,
+    intensity: f32,
+    a0: f32,
+    a1: f32,
+) {
+    use egui::epaint::{Mesh, Vertex};
+    const SEGMENTS: usize = 16;
+    let mut mesh = Mesh::default();
+    let i = intensity.clamp(0.0, 1.0);
+    let center_color = Color32::from_rgba_premultiplied(
+        (hot.r() as f32 * i) as u8,
+        (hot.g() as f32 * i) as u8,
+        (hot.b() as f32 * i) as u8,
+        (255.0 * i) as u8,
+    );
+    let edge_color = Color32::TRANSPARENT;
+    let uv = egui::Pos2::ZERO;
+    mesh.vertices.push(Vertex { pos: center, uv, color: center_color });
+    for k in 0..=SEGMENTS {
+        let t = (k as f32) / (SEGMENTS as f32);
+        let theta = a0 + (a1 - a0) * t;
+        let p = center + egui::vec2(theta.cos(), theta.sin()) * radius;
+        mesh.vertices.push(Vertex { pos: p, uv, color: edge_color });
+    }
+    for k in 0..SEGMENTS {
+        let a = (k + 1) as u32;
+        let b = (k + 2) as u32;
         mesh.indices.extend_from_slice(&[0, a, b]);
     }
     painter.add(egui::Shape::mesh(mesh));

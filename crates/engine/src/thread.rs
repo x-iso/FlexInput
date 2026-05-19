@@ -65,12 +65,14 @@ pub type ScopeTapRing = std::collections::VecDeque<(Instant, f32)>;
 /// Map of (device_id, pin_id) → ring of recent samples.
 pub type ScopeTaps = Arc<RwLock<HashMap<(String, String), ScopeTapRing>>>;
 
-/// Time window the I/O thread retains samples for (ms). The UI window is
-/// shorter; the extra slack covers UI repaint jitter.
-pub const SCOPE_TAP_RETAIN_MS: u64 = 1500;
+/// Time window the I/O thread retains samples for (ms). Sized to cover
+/// the longest scope window the UI offers (5 s) with a small overhang
+/// so the scope can render the full window even if a frame is slow.
+pub const SCOPE_TAP_RETAIN_MS: u64 = 5500;
 
-/// Hard cap on per-pin ring length (defensive, in case Hz is very high).
-pub const SCOPE_TAP_MAX_LEN: usize = 8192;
+/// Hard cap on per-pin ring length (defensive). Sized to comfortably hold
+/// 5 s at ~4 kHz polling with headroom.
+pub const SCOPE_TAP_MAX_LEN: usize = 32768;
 
 /// Build a fresh `ScopeTaps` handle. The I/O thread writes; the UI reads.
 pub fn new_scope_taps() -> ScopeTaps {
