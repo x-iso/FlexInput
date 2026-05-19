@@ -25,6 +25,64 @@ static LIVE_SAMPLE_RATE: AtomicU32 = AtomicU32::new(DEFAULT_SAMPLE_RATE);
 pub fn current_sample_rate() -> u32 {
     LIVE_SAMPLE_RATE.load(Ordering::Relaxed)
 }
+
+/// Measured I/O thread loop rate (Hz). Updated by the device-io loop after
+/// each iteration as a rolling EMA. Used as a fallback/global indicator.
+static LIVE_IO_RATE: AtomicU32 = AtomicU32::new(0);
+
+/// Read the currently-measured device I/O polling rate (Hz).
+pub fn current_io_rate() -> u32 {
+    LIVE_IO_RATE.load(Ordering::Relaxed)
+}
+
+/// Update the live I/O rate. Called by the device-io thread.
+pub fn set_io_rate(hz: u32) {
+    LIVE_IO_RATE.store(hz, Ordering::Relaxed);
+}
+
+/// Per-device measured event rate (Hz). Populated by the device-io thread
+/// from raw event counts per device. UI reads it to display each device's
+/// real polling rate in the canvas header.
+pub type DeviceRates = std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, u32>>>;
+
+/// Build a fresh `DeviceRates` handle. Hand to both the device-io thread
+/// (writes) and the UI (reads).
+pub fn new_device_rates() -> DeviceRates {
+    std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+// ── Per-pin scope tap ────────────────────────────────────────────────────────
+//
+// Bounded, time-windowed ring of raw samples per (device_id, pin_id). Used by
+// the calibration window's oscilloscope so the trace density matches the
+// device's actual polling Hz rather than UI repaint Hz. Populated on the I/O
+// thread; read at UI repaint rate.
+
+/// One taped sample: timestamp + scalar value (Vec2/Bool/etc. are
+/// pre-projected to f32 by the writer to keep the ring compact).
+pub type ScopeTapRing = std::collections::VecDeque<(Instant, f32)>;
+
+/// Map of (device_id, pin_id) → ring of recent samples.
+pub type ScopeTaps = Arc<RwLock<HashMap<(String, String), ScopeTapRing>>>;
+
+/// Time window the I/O thread retains samples for (ms). The UI window is
+/// shorter; the extra slack covers UI repaint jitter.
+pub const SCOPE_TAP_RETAIN_MS: u64 = 1500;
+
+/// Hard cap on per-pin ring length (defensive, in case Hz is very high).
+pub const SCOPE_TAP_MAX_LEN: usize = 8192;
+
+/// Build a fresh `ScopeTaps` handle. The I/O thread writes; the UI reads.
+pub fn new_scope_taps() -> ScopeTaps {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Pin names the I/O loop should tap. Kept narrow on purpose — calibration
+/// only needs gyro + accel today.
+pub const SCOPE_TAP_PINS: &[&str] = &[
+    "gyro_x", "gyro_y", "gyro_z",
+    "accel_x", "accel_y", "accel_z",
+];
 /// How many scope samples to buffer before the UI drains them.
 const MAX_SCOPE_PENDING: usize = 8192;
 

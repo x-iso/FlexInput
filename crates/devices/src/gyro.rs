@@ -123,6 +123,10 @@ struct HidEntry {
     last: HidReading,
     out: OutputState,
     output_active: bool,
+    /// Number of HID input reports successfully parsed since the last drain
+    /// of `take_event_count`. Used to feed the per-device polling-rate readout
+    /// so gyro-only devices (and IMU activity in general) show real Hz.
+    event_count: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -217,6 +221,15 @@ impl GyroManager {
         self.devices.remove(&(vid, pid, idx));
     }
 
+    /// Drains the count of parsed HID reports for `(vid, pid, idx)` since the
+    /// previous call. Used by the I/O thread to attribute IMU activity to the
+    /// per-device polling-rate readout.
+    pub fn take_event_count(&mut self, vid: u16, pid: u16, idx: usize) -> u32 {
+        self.devices.get_mut(&(vid, pid, idx))
+            .map(|e| std::mem::take(&mut e.event_count))
+            .unwrap_or(0)
+    }
+
     fn open_device(&self, vid: u16, pid: u16, idx: usize) -> Option<HidEntry> {
         let api = self.api.as_ref()?;
         let kind_tag = classify(vid, pid)?;
@@ -291,6 +304,7 @@ impl GyroManager {
             last: HidReading::default(),
             out: OutputState::default(),
             output_active: false,
+            event_count: 0,
         })
     }
 
@@ -463,6 +477,7 @@ fn drain_reports(entry: &mut HidEntry) -> bool {
             Ok(n) => {
                 if let Some(r) = parse_report(&buf[..n], &mut entry.kind) {
                     entry.last = r;
+                    entry.event_count = entry.event_count.saturating_add(1);
                 }
             }
         }

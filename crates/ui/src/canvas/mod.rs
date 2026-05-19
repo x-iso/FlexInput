@@ -17,6 +17,22 @@ use serde_json::Value;
 
 const MAX_UNDO: usize = 50;
 
+/// Per-device param seeds applied when a device node is first added to the
+/// canvas. Sourced from `AppSettings` so users can set workspace-wide defaults
+/// in Settings → Device defaults.
+#[derive(Clone, Copy)]
+pub struct DeviceParamDefaults {
+    pub stick_deadzone: f32,
+    pub gyro_mult: f32,
+    pub mouse_sensitivity: f32,
+}
+
+impl Default for DeviceParamDefaults {
+    fn default() -> Self {
+        Self { stick_deadzone: 0.1, gyro_mult: 1.0, mouse_sensitivity: 1.0 }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct UiPatch {
     pub version: u32,
@@ -72,6 +88,8 @@ impl Canvas {
     pub fn new() -> Self {
         let mut style = SnarlStyle::default();
         style.collapsible = Some(true);
+        // Tighten the gap between the collapse chevron and the header content.
+        style.header_drag_space = Some(egui::vec2(0.0, 0.0));
         Canvas {
             snarl: Snarl::new(),
             style,
@@ -297,8 +315,10 @@ impl Canvas {
         live_signals: &HashMap<(String, String), Signal>,
         panic_shortcut: &crate::app::PanicShortcut,
         physical_devices: &[PhysicalDevice],
+        device_rates: &HashMap<String, u32>,
+        param_defaults: DeviceParamDefaults,
         ui: &mut egui::Ui,
-    ) {
+    ) -> Option<NodeId> {
         let ctx = ui.ctx().clone();
 
         // ── Pre-show snapshot for viewer-driven mutations ─────────────────────
@@ -313,6 +333,7 @@ impl Canvas {
             ctx: ctx.clone(),
             live_device_ids,
             live_signals,
+            device_rates,
             panic_shortcut,
             physical_devices,
             pending_wire_menu: None,
@@ -324,8 +345,11 @@ impl Canvas {
             pinned_inner_ids: self.pinned_inner_ids.clone(),
             group_request: false,
             push_undo_request: false,
+            param_defaults,
+            calibrate_request: None,
         };
         self.snarl.show(&mut viewer, &self.style, "flexinput_canvas", ui);
+        let calibrate_request = viewer.calibrate_request;
 
         // ── Detect structural mutations from viewer callbacks ─────────────────
         let post_counts = (
@@ -616,10 +640,17 @@ impl Canvas {
                         });
                 });
         }
+
+        calibrate_request
     }
 
     /// Add a physical device as a source node. No-op if already present.
-    pub fn add_device_source(&mut self, device: &PhysicalDevice) {
+    pub fn add_device_source(
+        &mut self,
+        device: &PhysicalDevice,
+        default_collapsed: bool,
+        defaults: DeviceParamDefaults,
+    ) {
         let already_present = self.snarl.nodes_ids_data().any(|(_, n)| {
             n.value.module_id == "device.source"
                 && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(&device.id)
@@ -642,7 +673,8 @@ impl Canvas {
 
         let mut params = HashMap::new();
         params.insert("device_id".to_string(), Value::String(device.id.clone()));
-        params.insert("deadzone".to_string(), Value::from(0.1_f64));
+        params.insert("deadzone".to_string(), Value::from(defaults.stick_deadzone as f64));
+        params.insert("gyro_multiplier".to_string(), Value::from(defaults.gyro_mult as f64));
         params.insert("output_pin_ids".to_string(), Value::Array(
             device.outputs.iter().map(|p| Value::String(p.id.clone())).collect(),
         ));
@@ -688,12 +720,22 @@ impl Canvas {
         let existing = self.snarl.nodes_ids_data()
             .filter(|(_, n)| n.value.module_id == "device.source")
             .count();
-        self.snarl.insert_node(egui::pos2(80.0, 80.0 + existing as f32 * 220.0), node);
+        let pos = egui::pos2(80.0, 80.0 + existing as f32 * 220.0);
+        if default_collapsed {
+            self.snarl.insert_node_collapsed(pos, node);
+        } else {
+            self.snarl.insert_node(pos, node);
+        }
     }
 
     /// Add a physical device's input pins as a sink node (e.g. MIDI OUT port).
     /// No-op if already present (keyed by device id).
-    pub fn add_physical_sink(&mut self, device: &PhysicalDevice) {
+    pub fn add_physical_sink(
+        &mut self,
+        device: &PhysicalDevice,
+        default_collapsed: bool,
+        _defaults: DeviceParamDefaults,
+    ) {
         let already_present = self.snarl.nodes_ids_data().any(|(_, n)| {
             n.value.module_id == "device.sink"
                 && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(&device.id)
@@ -750,12 +792,22 @@ impl Canvas {
         let existing = self.snarl.nodes_ids_data()
             .filter(|(_, n)| n.value.module_id == "device.sink")
             .count();
-        self.snarl.insert_node(egui::pos2(400.0, 80.0 + existing as f32 * 220.0), node);
+        let pos = egui::pos2(400.0, 80.0 + existing as f32 * 220.0);
+        if default_collapsed {
+            self.snarl.insert_node_collapsed(pos, node);
+        } else {
+            self.snarl.insert_node(pos, node);
+        }
     }
 
     /// Add a virtual device as a single sink node with optional feedback output pins.
     /// No-op if already present (keyed by device id).
-    pub fn add_virtual_sink(&mut self, device: &dyn VirtualDevice) {
+    pub fn add_virtual_sink(
+        &mut self,
+        device: &dyn VirtualDevice,
+        default_collapsed: bool,
+        defaults: DeviceParamDefaults,
+    ) {
         let already_present = self.snarl.nodes_ids_data().any(|(_, n)| {
             n.value.module_id == "device.sink"
                 && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(device.id())
@@ -779,6 +831,12 @@ impl Canvas {
         params.insert("output_pin_ids".to_string(), Value::Array(
             device.source_pins().iter().map(|p| Value::String(p.id.to_string())).collect(),
         ));
+        // Mouse sensitivity is keymouse-only; harmless on other virtual sinks
+        // since their header doesn't surface a slider for it.
+        if device.id().starts_with("virtual.keymouse") {
+            params.insert("mouse_sensitivity".to_string(),
+                Value::from(defaults.mouse_sensitivity as f64));
+        }
 
         let node = NodeData {
             module_id: "device.sink".to_string(),
@@ -794,7 +852,12 @@ impl Canvas {
         let existing = self.snarl.nodes_ids_data()
             .filter(|(_, n)| n.value.module_id == "device.sink")
             .count();
-        self.snarl.insert_node(egui::pos2(400.0, 80.0 + existing as f32 * 220.0), node);
+        let pos = egui::pos2(400.0, 80.0 + existing as f32 * 220.0);
+        if default_collapsed {
+            self.snarl.insert_node_collapsed(pos, node);
+        } else {
+            self.snarl.insert_node(pos, node);
+        }
     }
 }
 

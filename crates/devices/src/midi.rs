@@ -14,11 +14,14 @@ struct InPortState {
     pitch_bend: f32,
     /// Most recently received CC number; consumed by take_learned_cc().
     last_cc: Option<u8>,
+    /// Raw MIDI message count since the last `take_event_counts` drain.
+    /// Drained by the I/O thread to compute live per-device polling rates.
+    event_count: u32,
 }
 
 impl Default for InPortState {
     fn default() -> Self {
-        Self { cc: [0.0; 128], pitch_bend: 0.0, last_cc: None }
+        Self { cc: [0.0; 128], pitch_bend: 0.0, last_cc: None, event_count: 0 }
     }
 }
 
@@ -249,6 +252,19 @@ impl DeviceBackend for MidiBackend {
         }
         out
     }
+
+    fn take_event_counts(&mut self) -> Vec<(String, u32)> {
+        let mut out = Vec::new();
+        for entry in &self.in_entries {
+            if let Ok(mut state) = entry.state.lock() {
+                let n = std::mem::take(&mut state.event_count);
+                if n > 0 {
+                    out.push((entry.device_id.clone(), n));
+                }
+            }
+        }
+        out
+    }
 }
 
 // ── Slot allocation ───────────────────────────────────────────────────────────
@@ -264,6 +280,7 @@ fn next_free_slot(slots: &std::collections::HashMap<String, usize>) -> usize {
 fn midi_in_callback(msg: &[u8], state: &Arc<Mutex<InPortState>>) {
     if msg.is_empty() { return; }
     let Ok(mut s) = state.lock() else { return };
+    s.event_count = s.event_count.saturating_add(1);
     match msg[0] & 0xF0 {
         0xB0 if msg.len() >= 3 => {
             let cc = msg[1] as usize;

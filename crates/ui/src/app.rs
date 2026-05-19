@@ -122,6 +122,8 @@ pub struct FlexInputApp {
     /// Cached whitelist read from the HidHide driver; refreshed on window open and after edits.
     hidhide_whitelist: Vec<String>,
     sub_patch_editors: Vec<SubPatchEditor>,
+    /// NodeIds of device.source nodes whose Device Calibration window is open.
+    calibration_open: std::collections::HashSet<egui_snarl::NodeId>,
     /// App-level clipboard shared across all Canvas instances (outer tabs and SubPatchEditor
     /// inner canvases). Written whenever a copy action fires in any canvas.
     /// Read when the target canvas has no local clipboard (cross-boundary paste).
@@ -179,6 +181,12 @@ pub struct FlexInputApp {
     sample_rate_hz: Arc<AtomicU32>,
     /// Live device polling rate handed to the I/O thread.
     polling_hz: Arc<AtomicU32>,
+    /// Per-device measured polling rates (device_id → Hz). Written by the
+    /// I/O thread, read by the canvas viewer to show live per-device Hz.
+    pub device_rates: flexinput_engine::DeviceRates,
+    /// Per-pin time-windowed scope rings (raw values + timestamps) for the
+    /// calibration window. Populated by the I/O thread at polling Hz.
+    pub scope_taps: flexinput_engine::ScopeTaps,
 }
 
 /// Keyboard-only shortcut for panic mode. Modifiers + non-modifier key.
@@ -304,6 +312,8 @@ impl FlexInputApp {
             Arc::clone(&tabs[0].virtual_panel.active),
         ));
 
+        let device_rates = flexinput_engine::new_device_rates();
+        let scope_taps   = flexinput_engine::new_scope_taps();
         spawn_io_thread(
             backends,
             Arc::clone(&midi_backend),
@@ -314,6 +324,8 @@ impl FlexInputApp {
             Arc::clone(&shared_devices),
             Arc::clone(&shared_midi_devices),
             Arc::clone(&polling_hz),
+            Arc::clone(&device_rates),
+            Arc::clone(&scope_taps),
         );
 
         spawn_midi_watch_thread(
@@ -368,6 +380,7 @@ impl FlexInputApp {
             hidhide_proc_list: vec![],
             hidhide_whitelist: vec![],
             sub_patch_editors: vec![],
+            calibration_open: std::collections::HashSet::new(),
             app_clipboard: None,
             app_clipboard_from_inner: false,
             last_outer_clipboard_gen: 0,
@@ -388,6 +401,8 @@ impl FlexInputApp {
             settings_dirty: false,
             sample_rate_hz,
             polling_hz,
+            device_rates,
+            scope_taps,
         }
     }
 }
@@ -1228,13 +1243,20 @@ impl eframe::App for FlexInputApp {
                         else if phys_open > 0.999 { panel_frame }
                         else { scaled_frame(phys_open) };
 
+        let default_collapsed = self.settings.device_nodes_default_collapsed;
+        let device_defaults = crate::canvas::DeviceParamDefaults {
+            stick_deadzone: self.settings.default_stick_deadzone,
+            gyro_mult: self.settings.default_gyro_mult,
+            mouse_sensitivity: self.settings.default_mouse_sensitivity,
+        };
+
         let top_resp = egui::TopBottomPanel::top("virtual_devices_panel")
             .resizable(false)
             .exact_height(virt_h)
             .frame(top_frame)
             .show(ctx, |ui| {
                 if virt_open > 0.01 {
-                    virtual_panel.show(ui, canvas);
+                    virtual_panel.show(ui, canvas, default_collapsed, device_defaults);
                 }
             });
 
@@ -1244,7 +1266,7 @@ impl eframe::App for FlexInputApp {
             .frame(bot_frame)
             .show(ctx, |ui| {
                 if phys_open > 0.01 {
-                    physical_devices::show(ui, devices, canvas);
+                    physical_devices::show(ui, devices, canvas, default_collapsed, device_defaults);
                 }
             });
         // Only record the natural height when fully expanded so the snapshot
@@ -1287,9 +1309,19 @@ impl eframe::App for FlexInputApp {
         }
         let outer_gen_before = canvas.clipboard_gen;
 
+        let device_rates_snap = self.device_rates.read().map(|r| r.clone()).unwrap_or_default();
+        let mut calibrate_request: Option<egui_snarl::NodeId> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
-            crate::panels::canvas::show(canvas, &self.descriptors, &live_device_ids, &self.last_signals, &self.panic_shortcut, devices, ui);
+            calibrate_request = crate::panels::canvas::show(
+                canvas, &self.descriptors, &live_device_ids, &self.last_signals,
+                &self.panic_shortcut, devices, &device_rates_snap,
+                device_defaults, ui,
+            );
         });
+        if let Some(node) = calibrate_request {
+            self.calibration_open.insert(node);
+        }
+        crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps);
 
         // Only update app_clipboard from outer canvas when the user actually copied
         // (gen advanced). Clear from_inner flag regardless so seeding doesn't repeat.
@@ -1382,7 +1414,8 @@ impl FlexInputApp {
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("Device polling rate");
+                    ui.label("Max polling rate")
+                        .on_hover_text("Upper bound for the I/O loop. Actual per-device rate depends on the device — see the live Hz on each device's header in the canvas.");
                     let resp = ui.add(egui::Slider::new(
                         &mut self.settings.polling_hz,
                         settings::POLLING_HZ_MIN..=settings::POLLING_HZ_MAX,
@@ -1433,6 +1466,99 @@ impl FlexInputApp {
                 ui.label(egui::RichText::new(
                     "When enabled, the current tabs (including unsaved patches) are restored on the next launch."
                 ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(6.0);
+                if ui.checkbox(&mut self.settings.device_nodes_default_collapsed,
+                    "Collapse new device nodes by default").changed()
+                {
+                    dirty = true;
+                }
+                ui.label(egui::RichText::new(
+                    "New physical / virtual device nodes spawn collapsed. The header (icon, status, Auto-Map) stays visible."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Device defaults ─────────────────────────────────────
+                // Per-device sliders in the node header are seeded from these
+                // when a node is first added. Editing them later updates only
+                // the affected node, not these defaults.
+                ui.label(egui::RichText::new("Device defaults").strong());
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(
+                    "Applied to newly-added device nodes. Existing nodes keep their own values."
+                ).small().color(egui::Color32::from_gray(140)));
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("Double-click the slider track to reset to factory default. Double-click the value to type a number.")
+                    .small().italics().color(egui::Color32::from_gray(120)));
+                ui.add_space(4.0);
+
+                // egui Slider widgets only sense drag, so Response::double_clicked()
+                // never fires on the track. Overlay a click-sense interact on the
+                // same rect with a derived id and read the double-click from there.
+                fn track_dbl(ui: &egui::Ui, r: &egui::Response) -> bool {
+                    let id = r.id.with("__dblclick_overlay");
+                    ui.interact(r.rect, id, egui::Sense::click()).double_clicked()
+                }
+
+                egui::Grid::new("device-defaults-grid")
+                    .num_columns(3)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Default Stick deadzone");
+                        let r = ui.add(egui::Slider::new(&mut self.settings.default_stick_deadzone, 0.0_f32..=0.5)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always));
+                        if r.changed() { dirty = true; }
+                        if track_dbl(ui, &r) {
+                            self.settings.default_stick_deadzone = 0.1;
+                            dirty = true;
+                        }
+                        if ui.add(egui::DragValue::new(&mut self.settings.default_stick_deadzone)
+                            .speed(0.005)
+                            .range(0.0_f32..=0.5)
+                            .fixed_decimals(2))
+                            .changed() { dirty = true; }
+                        ui.end_row();
+
+                        ui.label("Default Gyro ×");
+                        let r = ui.add(egui::Slider::new(&mut self.settings.default_gyro_mult, 0.1_f32..=50.0)
+                            .logarithmic(true)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always));
+                        if r.changed() { dirty = true; }
+                        if track_dbl(ui, &r) {
+                            self.settings.default_gyro_mult = 1.0;
+                            dirty = true;
+                        }
+                        if ui.add(egui::DragValue::new(&mut self.settings.default_gyro_mult)
+                            .speed(0.05)
+                            .range(0.1_f32..=50.0)
+                            .fixed_decimals(2))
+                            .changed() { dirty = true; }
+                        ui.end_row();
+
+                        ui.label("Default Mouse ×");
+                        let r = ui.add(egui::Slider::new(&mut self.settings.default_mouse_sensitivity, 0.0_f32..=3000.0)
+                            .logarithmic(true)
+                            .smallest_positive(0.01)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always));
+                        if r.changed() { dirty = true; }
+                        if track_dbl(ui, &r) {
+                            self.settings.default_mouse_sensitivity = 1.0;
+                            dirty = true;
+                        }
+                        if ui.add(egui::DragValue::new(&mut self.settings.default_mouse_sensitivity)
+                            .speed(0.5)
+                            .range(0.0_f32..=3000.0)
+                            .fixed_decimals(2))
+                            .changed() { dirty = true; }
+                        ui.end_row();
+                    });
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -1502,14 +1628,38 @@ fn spawn_io_thread(
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     polling_hz: Arc<AtomicU32>,
+    device_rates: flexinput_engine::DeviceRates,
+    scope_taps: flexinput_engine::ScopeTaps,
 ) {
     use std::time::{Duration, Instant};
 
     std::thread::Builder::new()
         .name("device-io".into())
         .spawn(move || {
+            // Bump the Windows system timer resolution to 1 ms so
+            // `thread::sleep(Duration::from_millis(1))` actually sleeps
+            // ~1 ms instead of the default ~15.6 ms. Without this, the
+            // requested polling rate is capped at ~64 Hz regardless of
+            // setting. Process-wide effect; matches what game-input
+            // libraries do internally.
+            #[cfg(windows)]
+            unsafe {
+                let r = windows_sys::Win32::Media::timeBeginPeriod(1);
+                eprintln!("[device-io] timeBeginPeriod(1) -> {} (0 == TIMERR_NOERROR)", r);
+            }
             let mut last_enum = Instant::now() - Duration::from_secs(10);
             let mut last_midi_out: HashMap<(String, String), Signal> = HashMap::new();
+            // Measured I/O rate EMA. Updated each iteration; published via
+            // `flexinput_engine::set_io_rate` so the UI can show the actual
+            // poll rate (separate from the engine's sample rate).
+            let mut last_loop_t = Instant::now();
+            let mut measured_hz_ema: f32 = 0.0;
+            // Per-device event accumulator. We sample the device backends'
+            // raw event counts and convert to Hz on a fixed 500 ms cadence
+            // (smooths short-term spikes while still feeling "live").
+            let mut dev_event_acc: HashMap<String, u32> = HashMap::new();
+            let mut dev_rate_ema: HashMap<String, f32> = HashMap::new();
+            let mut last_rate_publish = Instant::now();
 
             loop {
                 let t0 = Instant::now();
@@ -1523,14 +1673,53 @@ fn spawn_io_thread(
                     for (dev, pin, sig) in backend.poll() {
                         signals.insert((dev, pin), sig);
                     }
+                    // Drain per-device raw-event counts for live-rate tracking.
+                    for (dev, n) in backend.take_event_counts() {
+                        *dev_event_acc.entry(dev).or_insert(0) += n;
+                    }
                 }
                 if let Ok(mut mg) = midi.try_lock() {
                     if let Some(m) = mg.as_mut() {
                         for (dev, pin, sig) in m.poll() {
                             signals.insert((dev, pin), sig);
                         }
+                        for (dev, n) in m.take_event_counts() {
+                            *dev_event_acc.entry(dev).or_insert(0) += n;
+                        }
                     }
                 }
+                // Tap gyro/accel samples into the per-pin scope rings so the
+                // calibration window can render at true polling Hz rather than
+                // UI repaint Hz. We do this BEFORE moving `signals` into the
+                // shared map.
+                {
+                    let now = Instant::now();
+                    let mut taps = scope_taps.write().unwrap();
+                    let retain = Duration::from_millis(flexinput_engine::SCOPE_TAP_RETAIN_MS);
+                    for ((dev, pin), sig) in &signals {
+                        if !flexinput_engine::SCOPE_TAP_PINS.iter().any(|p| *p == pin.as_str()) {
+                            continue;
+                        }
+                        let v = match sig {
+                            Signal::Float(f) => *f,
+                            Signal::Bool(b)  => if *b { 1.0 } else { 0.0 },
+                            _ => continue,
+                        };
+                        let ring = taps.entry((dev.clone(), pin.clone()))
+                            .or_insert_with(flexinput_engine::ScopeTapRing::new);
+                        ring.push_back((now, v));
+                        while let Some(&(t, _)) = ring.front() {
+                            if now.duration_since(t) > retain
+                                || ring.len() > flexinput_engine::SCOPE_TAP_MAX_LEN
+                            {
+                                ring.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 *proc_device_signals.write().unwrap() = signals;
 
                 // ── Enumerate gilrs devices periodically ──────────────────────
@@ -1612,6 +1801,62 @@ fn spawn_io_thread(
                 let elapsed = t0.elapsed();
                 if elapsed < interval {
                     std::thread::sleep(interval - elapsed);
+                }
+
+                // Measured per-loop Hz via inter-iteration interval. EMA
+                // smooths it so the UI label doesn't strobe at frame rate.
+                let now = Instant::now();
+                let dt = now.duration_since(last_loop_t).as_secs_f32().max(1e-4);
+                last_loop_t = now;
+                let inst_hz = 1.0 / dt;
+                // ~1 s time constant at 500 Hz loop = alpha ≈ 0.002
+                let alpha = 0.02_f32;
+                if measured_hz_ema == 0.0 {
+                    measured_hz_ema = inst_hz;
+                } else {
+                    measured_hz_ema = measured_hz_ema * (1.0 - alpha) + inst_hz * alpha;
+                }
+                flexinput_engine::set_io_rate(measured_hz_ema.round() as u32);
+
+                // Publish per-device rates every ~150 ms. Hz is computed from
+                // raw event counts accumulated since the last publish, EMA-
+                // smoothed across publishes for stability.
+                let rate_dt = last_rate_publish.elapsed();
+                if rate_dt >= Duration::from_millis(150) {
+                    let rate_dt_s = rate_dt.as_secs_f32().max(1e-3);
+                    // Compute new per-device instantaneous Hz, lerp into EMA.
+                    let alpha = 0.6_f32;
+                    let seen_devs: Vec<String> = dev_event_acc.keys().cloned().collect();
+                    for dev in &seen_devs {
+                        let count = dev_event_acc.get(dev).copied().unwrap_or(0) as f32;
+                        let inst = count / rate_dt_s;
+                        let prev = dev_rate_ema.get(dev).copied().unwrap_or(0.0);
+                        let new = prev * (1.0 - alpha) + inst * alpha;
+                        dev_rate_ema.insert(dev.clone(), new);
+                    }
+                    // Devices without recent events decay toward zero.
+                    let known: Vec<String> = dev_rate_ema.keys().cloned().collect();
+                    for dev in known {
+                        if !dev_event_acc.contains_key(&dev) {
+                            let prev = dev_rate_ema.get(&dev).copied().unwrap_or(0.0);
+                            let new = prev * (1.0 - alpha);
+                            if new < 0.5 {
+                                dev_rate_ema.remove(&dev);
+                            } else {
+                                dev_rate_ema.insert(dev, new);
+                            }
+                        }
+                    }
+                    dev_event_acc.clear();
+                    last_rate_publish = Instant::now();
+
+                    // Publish to shared map.
+                    if let Ok(mut rates) = device_rates.write() {
+                        rates.clear();
+                        for (dev, hz) in &dev_rate_ema {
+                            rates.insert(dev.clone(), hz.round() as u32);
+                        }
+                    }
                 }
             }
         })
@@ -3430,6 +3675,12 @@ fn show_subpatch_editors(
     // `app` is borrowed mutably for sub-patch editor state.
     let live_signals = app.last_signals.clone();
     let panic_shortcut = app.panic_shortcut.clone();
+    let device_rates_inner = app.device_rates.read().map(|r| r.clone()).unwrap_or_default();
+    let device_defaults_inner = crate::canvas::DeviceParamDefaults {
+        stick_deadzone: app.settings.default_stick_deadzone,
+        gyro_mult: app.settings.default_gyro_mult,
+        mouse_sensitivity: app.settings.default_mouse_sensitivity,
+    };
     let active = app.active_tab;
 
     // Open new editors requested this frame by the canvas viewer.
@@ -3598,7 +3849,11 @@ fn show_subpatch_editors(
                     });
                 });
                 egui::CentralPanel::default().show(vctx, |ui| {
-                    inner_canvas.show(descriptors, live_device_ids, &live_signals, &panic_shortcut, devices, ui);
+                    let _ = inner_canvas.show(
+                        descriptors, live_device_ids, &live_signals,
+                        &panic_shortcut, devices, &device_rates_inner,
+                        device_defaults_inner, ui,
+                    );
                 });
 
                 if let Some((inner_uid, eid, size)) = crate::canvas::viewer::take_layout_pending(vctx) {

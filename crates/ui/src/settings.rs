@@ -21,6 +21,10 @@ pub const SAMPLE_RATE_HZ_DEFAULT: u32 = 2000;
 
 fn default_polling_hz() -> u32 { POLLING_HZ_DEFAULT }
 fn default_sample_rate_hz() -> u32 { SAMPLE_RATE_HZ_DEFAULT }
+fn default_true() -> bool { true }
+fn default_deadzone() -> f32 { 0.1 }
+fn default_gyro_mult() -> f32 { 1.0 }
+fn default_mouse_sens() -> f32 { 1.0 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -30,6 +34,17 @@ pub struct AppSettings {
     pub sample_rate_hz: u32,
     #[serde(default)]
     pub keep_workspace: bool,
+    #[serde(default = "default_true")]
+    pub device_nodes_default_collapsed: bool,
+    /// Default `deadzone` param applied to newly-added device.source nodes.
+    #[serde(default = "default_deadzone")]
+    pub default_stick_deadzone: f32,
+    /// Default `gyro_multiplier` param applied to newly-added device.source nodes.
+    #[serde(default = "default_gyro_mult")]
+    pub default_gyro_mult: f32,
+    /// Default `mouse_sensitivity` param applied to newly-added keymouse sinks.
+    #[serde(default = "default_mouse_sens")]
+    pub default_mouse_sensitivity: f32,
 }
 
 impl Default for AppSettings {
@@ -38,6 +53,10 @@ impl Default for AppSettings {
             polling_hz: POLLING_HZ_DEFAULT,
             sample_rate_hz: SAMPLE_RATE_HZ_DEFAULT,
             keep_workspace: false,
+            device_nodes_default_collapsed: true,
+            default_stick_deadzone: 0.1,
+            default_gyro_mult: 1.0,
+            default_mouse_sensitivity: 1.0,
         }
     }
 }

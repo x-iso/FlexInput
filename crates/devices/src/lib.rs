@@ -38,6 +38,10 @@ pub trait DeviceBackend: Send {
     /// Route a signal to a physical output pin (e.g. MIDI CC send).
     /// Backends that don't support output can ignore this.
     fn send(&mut self, _device_id: &str, _pin_id: &str, _signal: Signal) {}
+    /// Drain accumulated raw-event counts per device id. Used by the I/O
+    /// thread to compute live per-device polling rates. Default: empty
+    /// (backends that don't track events are reported as 0 Hz).
+    fn take_event_counts(&mut self) -> Vec<(String, u32)> { Vec::new() }
 }
 
 pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {

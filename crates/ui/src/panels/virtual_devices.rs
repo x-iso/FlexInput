@@ -7,7 +7,7 @@ use flexinput_virtual::{
     VirtualDevice,
 };
 
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, DeviceParamDefaults};
 use crate::canvas::remapper_icons;
 use crate::panels::device_icon::{render_device_icon, svg_icon_button};
 use crate::panels::physical_devices::canvas_status_button;
@@ -29,7 +29,13 @@ impl VirtualDevicePanel {
         Self { active: Arc::new(Mutex::new(vec![])) }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, canvas: &mut Canvas) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        canvas: &mut Canvas,
+        default_collapsed: bool,
+        defaults: DeviceParamDefaults,
+    ) {
         // Snapshot device state briefly so we can render without holding the lock.
         let chips: Vec<(String, String, bool)> = {
             let devs = self.active.lock().unwrap();
@@ -97,7 +103,7 @@ impl VirtualDevicePanel {
                                 // Re-lock briefly to get the device reference for canvas registration.
                                 let devs = self.active.lock().unwrap();
                                 if let Some(dev) = devs.get(i) {
-                                    canvas.add_virtual_sink(dev.as_ref());
+                                    canvas.add_virtual_sink(dev.as_ref(), default_collapsed, defaults);
                                     let new_name = chip_name(&devs, i);
                                     let did = dev.id().to_string();
                                     drop(devs);
@@ -183,7 +189,7 @@ impl VirtualDevicePanel {
                         };
 
                         let dev = create_device(kind.kind_id, instance);
-                        canvas.add_virtual_sink(dev.as_ref());
+                        canvas.add_virtual_sink(dev.as_ref(), default_collapsed, defaults);
                         let mut devs = self.active.lock().unwrap();
                         devs.push(dev);
                         let j = devs.len() - 1;

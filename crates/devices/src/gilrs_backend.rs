@@ -49,6 +49,13 @@ pub struct GilrsBackend {
     /// Last-written rumble state per XInput slot to avoid redundant XInputSetState calls.
     /// (left_motor_byte, right_motor_byte) in 0-255 range.
     xinput_rumble: HashMap<u32, (u8, u8)>,
+    /// Per-gilrs-gamepad-id raw event count since the last `take_event_counts`.
+    /// Used by the I/O thread to compute live per-device polling rates.
+    event_counts: HashMap<usize, u32>,
+    /// Maps gilrs-internal gamepad id → device_id string. Refreshed each
+    /// `poll()` so the I/O thread can convert event counts to per-device
+    /// rates.
+    id_to_dev: HashMap<usize, String>,
 }
 
 impl GilrsBackend {
@@ -62,6 +69,8 @@ impl GilrsBackend {
             gyro: GyroManager::new(),
             xinput_idx: HashMap::new(),
             xinput_rumble: HashMap::new(),
+            event_counts: HashMap::new(),
+            id_to_dev: HashMap::new(),
         })
     }
 
@@ -146,6 +155,12 @@ impl DeviceBackend for GilrsBackend {
         // causing flicker and broken diagonals. DPad discrete outputs are derived manually
         // below from both axis_data (HAT/USB path) and button_data (BT/WGI path).
         while let Some(ev) = self.gilrs.next_event() {
+            // Count raw events per gilrs gamepad id so the I/O thread can
+            // compute live per-device polling rates. We bump on every event
+            // (Axis/Button/Connected/Disconnected/Dropped) — a single iter of
+            // device data typically produces several events together, which
+            // matches what users see as "device polled this frame".
+            *self.event_counts.entry(usize::from(ev.id)).or_insert(0) += 1;
             self.gilrs.update(&ev);
         }
 
@@ -158,8 +173,11 @@ impl DeviceBackend for GilrsBackend {
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
         // Track per-(VID,PID) instance index for gyro correlation.
         let mut gyro_idx: HashMap<(u16, u16), usize> = HashMap::new();
+        // Rebuild the gilrs-id → device-id map this frame so event counts
+        // can be resolved to per-device polling rates.
+        self.id_to_dev.clear();
 
-        for (_id, pad) in self.gilrs.gamepads() {
+        for (gilrs_id, pad) in self.gilrs.gamepads() {
             // Apply the same ViGEmBus filter as enumerate() so IDs stay in sync.
             if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
                 if *self.vigem_present.get(&vp).unwrap_or(&false) {
@@ -178,6 +196,7 @@ impl DeviceBackend for GilrsBackend {
             let inst = *kind_seen.get(&kind).unwrap_or(&0);
             kind_seen.insert(kind, inst + 1);
             let dev = format!("gilrs:{}:{}", kind.id_slug(), inst);
+            self.id_to_dev.insert(usize::from(gilrs_id), dev.clone());
 
             // Record XInput slot: inst is the 0-based kind_seen index, which matches
             // the XInput user index on Windows (gilrs enumerates XInput controllers
@@ -276,6 +295,13 @@ impl DeviceBackend for GilrsBackend {
                 gyro_idx.insert(vp, idx + 1);
 
                 if let Some(g) = self.gyro.read(vid, pid, idx) {
+                    // Attribute HID IMU/state reports to the per-device polling
+                    // rate. gilrs's event stream only fires on axis/button state
+                    // changes, so a still gyro-only device would otherwise read 0 Hz.
+                    let hid_n = self.gyro.take_event_count(vid, pid, idx);
+                    if hid_n > 0 {
+                        *self.event_counts.entry(usize::from(gilrs_id)).or_insert(0) += hid_n;
+                    }
                     out.push((dev.clone(), "gyro_x".into(),  Signal::Float(g.gyro_x)));
                     out.push((dev.clone(), "gyro_y".into(),  Signal::Float(g.gyro_y)));
                     out.push((dev.clone(), "gyro_z".into(),  Signal::Float(g.gyro_z)));
@@ -438,6 +464,22 @@ impl DeviceBackend for GilrsBackend {
             _ => (f * 255.0) as u8,
         };
         self.gyro.set_output_byte(vid, pid, idx, pin_id, byte);
+    }
+
+    fn take_event_counts(&mut self) -> Vec<(String, u32)> {
+        let mut out = Vec::new();
+        // Map gilrs-id counts to device-id, summing in case multiple gilrs ids
+        // somehow resolved to the same device id (shouldn't happen, but safe).
+        let mut acc: HashMap<String, u32> = HashMap::new();
+        for (gilrs_id, count) in self.event_counts.drain() {
+            if let Some(dev) = self.id_to_dev.get(&gilrs_id) {
+                *acc.entry(dev.clone()).or_insert(0) += count;
+            }
+        }
+        for (dev, count) in acc {
+            out.push((dev, count));
+        }
+        out
     }
 }
 

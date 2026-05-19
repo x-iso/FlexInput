@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, RichText};
 use flexinput_devices::{ControllerKind, PhysicalDevice};
 
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, DeviceParamDefaults};
 use crate::canvas::remapper_icons;
 use crate::panels::device_icon::render_device_icon;
 
@@ -10,7 +10,13 @@ const ICON_H: f32 = 32.0;
 const PILL_W: f32 = 110.0;
 const CARD_H: f32 = 36.0;
 
-pub fn show(ui: &mut egui::Ui, devices: &[PhysicalDevice], canvas: &mut Canvas) {
+pub fn show(
+    ui: &mut egui::Ui,
+    devices: &[PhysicalDevice],
+    canvas: &mut Canvas,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
+) {
     if devices.is_empty() {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -40,7 +46,7 @@ pub fn show(ui: &mut egui::Ui, devices: &[PhysicalDevice], canvas: &mut Canvas) 
                     } else {
                         std::borrow::Cow::Borrowed(device.display_name.as_str())
                     };
-                    device_card(ui, device, &label, canvas);
+                    device_card(ui, device, &label, canvas, default_collapsed, defaults);
                 }
                 // Trailing breathing room so the last card never sits buried
                 // under the right-edge fade.
@@ -81,7 +87,7 @@ pub fn draw_floating_heading(
     let was_hovered = ctx.memory(|m| m.data.get_temp::<bool>(interact_id).unwrap_or(false));
 
     let area = egui::Area::new(egui::Id::new(id_source))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .fixed_pos(tl)
         .interactable(true)
         .show(ctx, |ui| {
@@ -214,7 +220,7 @@ pub fn paint_scroll_edge_fades<R>(
     let can_scroll_right = offset_x < max_scroll - 0.5;
 
     let layer = egui::LayerId::new(
-        egui::Order::Foreground,
+        egui::Order::Middle,
         egui::Id::new(("edge_fade", out.id)),
     );
     let mut painter = ctx.layer_painter(layer);
@@ -282,6 +288,8 @@ fn device_card(
     device: &PhysicalDevice,
     label: &str,
     canvas: &mut Canvas,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
 ) {
     // MIDI OUT is a pure sink; all other gamepad devices are sources.
     let is_sink = device.kind == ControllerKind::MidiOut;
@@ -324,9 +332,9 @@ fn device_card(
                         |ui| {
                             canvas_status_button(ui, already_on_canvas, || {
                                 if is_sink {
-                                    canvas.add_physical_sink(device);
+                                    canvas.add_physical_sink(device, default_collapsed, defaults);
                                 } else {
-                                    canvas.add_device_source(device);
+                                    canvas.add_device_source(device, default_collapsed, defaults);
                                 }
                             });
                         },

@@ -316,6 +316,44 @@ pub fn keymouse_pair_svgs() -> (&'static [u8], &'static [u8]) {
     (DEV_KBM_KEYBOARD, DEV_KBM_MOUSE)
 }
 
+/// One or two SVGs to render in a canvas device-node header.
+/// `Pair` is used only for `virtual.keymouse` (keyboard + mouse glyphs).
+pub enum NodeIconSpec {
+    Single(&'static [u8]),
+    Pair(&'static [u8], &'static [u8]),
+}
+
+/// Resolve the canvas-node icon for any device id used by `device.source`
+/// or `device.sink` nodes. Recognised id shapes:
+/// - `gilrs:<slug>:<inst>` physical gamepad
+/// - `midi_in:<N>` / `midi_out:<N>` physical MIDI port
+/// - `virtual.xinput:<inst>` / `virtual.ds4:<inst>` virtual gamepad
+/// - `virtual.keymouse[:<inst>]` virtual keyboard + mouse (pair)
+pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
+    if let Some(rest) = dev_id.strip_prefix("gilrs:") {
+        let slug = rest.split(':').next()?;
+        return Some(NodeIconSpec::Single(match slug {
+            "xinput"     => DEV_XBOX,
+            "ds4"        => DEV_PS4,
+            "dualsense"  => DEV_PS5,
+            "switch_pro" => DEV_SWITCH,
+            _            => DEV_XBOX,
+        }));
+    }
+    if dev_id.starts_with("midi_in")  { return Some(NodeIconSpec::Single(DEV_MIDI_IN));  }
+    if dev_id.starts_with("midi_out") { return Some(NodeIconSpec::Single(DEV_MIDI_OUT)); }
+    if let Some(rest) = dev_id.strip_prefix("virtual.") {
+        let kind = rest.split(':').next()?;
+        return match kind {
+            "xinput"   => Some(NodeIconSpec::Single(DEV_XBOX)),
+            "ds4"      => Some(NodeIconSpec::Single(DEV_PS4)),
+            "keymouse" => Some(NodeIconSpec::Pair(DEV_KBM_KEYBOARD, DEV_KBM_MOUSE)),
+            _          => None,
+        };
+    }
+    None
+}
+
 /// Resolve the SVG bytes for a canonical AutoMap pin under a given skin.
 /// Returns None when no icon is mapped (caller renders the text label).
 /// KBM-family pins (`key_*`, `mouse_*`, `scroll_*`) always resolve from the

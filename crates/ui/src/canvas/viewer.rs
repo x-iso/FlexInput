@@ -19,6 +19,9 @@ pub struct FlexViewer<'a> {
     /// from the processing thread. Read by module bodies that need to observe live
     /// canonical pin values (e.g. Remapper's capture state machine).
     pub live_signals: &'a std::collections::HashMap<(String, String), Signal>,
+    /// Per-device measured polling rate (device_id → Hz). Populated by the
+    /// device-io thread.
+    pub device_rates: &'a std::collections::HashMap<String, u32>,
     /// Snapshot of the user-configurable Panic-mode shortcut. Read by the
     /// Remapper body so that learning a mapping cannot accidentally rebind the
     /// emergency-stop chord onto a controller button.
@@ -50,6 +53,12 @@ pub struct FlexViewer<'a> {
     /// Set by response-curve body when the user clicks Reset. Canvas::show() pushes the
     /// pre_snapshot (captured before snarl.show()) onto the undo stack so Reset is reversible.
     pub push_undo_request: bool,
+    /// Per-device-type seeds the user picked in Settings → Device defaults.
+    /// Double-clicking a header slider resets that node's param to the value here.
+    pub param_defaults: crate::canvas::DeviceParamDefaults,
+    /// Set by a device.source header when the user clicks "Calibrate".
+    /// Canvas::show() reads it and the app surfaces a calibration window for that node.
+    pub calibrate_request: Option<NodeId>,
 }
 
 impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
@@ -92,6 +101,58 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         } else {
             None
         };
+        let icon_spec = if matches!(data.module_id.as_str(), "device.source" | "device.sink") {
+            data.params.get("device_id")
+                .and_then(|v| v.as_str())
+                .and_then(crate::canvas::remapper_icons::device_node_icon_for_id)
+        } else {
+            None
+        };
+        let is_device_source = data.module_id == "device.source";
+        let is_device_sink   = data.module_id == "device.sink";
+        // Index of the AutoMap input pin on a device.sink (always last per
+        // crates/virtual/src/layouts.rs, but locate it by type so we don't
+        // hard-code the position).
+        let sink_automap_in_idx: Option<usize> = if is_device_sink {
+            data.inputs.iter().position(|p|
+                p.signal_type == SignalType::AutoMap && p.name == "Auto-Map")
+        } else { None };
+        // Pre-compute the AutoMap chip glow intensity so the manual paint in
+        // the header reacts to live activity (matches the column-pin glow).
+        let source_automap_out_idx: Option<usize> = if is_device_source {
+            data.outputs.iter().position(|p|
+                p.signal_type == SignalType::AutoMap && p.name == "Auto-Map")
+        } else { None };
+        let source_automap_glow: f32 = source_automap_out_idx
+            .and_then(|i| output_pin_glow(self.live_signals, data, i).map(|(_, t)| (i, t)))
+            .map(|(i, t)| pin_glow_smoothed(&self.ctx, node, i, false, t))
+            .unwrap_or(0.0);
+        let sink_automap_glow: f32 = sink_automap_in_idx
+            .and_then(|i| input_pin_glow(self.live_signals, snarl, data, node, i).map(|(_, t)| (i, t)))
+            .map(|(i, t)| pin_glow_smoothed(&self.ctx, node, i, true, t))
+            .unwrap_or(0.0);
+        let deadzone_initial = data.params.get("deadzone")
+            .and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
+        let gyro_mult_initial = data.params.get("gyro_multiplier")
+            .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let mouse_sens_initial = data.params.get("mouse_sensitivity")
+            .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        // Mouse-sensitivity slider applies to virtual.keymouse sinks only.
+        let is_keymouse_sink = is_device_sink && data.params.get("device_id")
+            .and_then(|v| v.as_str()).map(|s| s.starts_with("virtual.keymouse")).unwrap_or(false);
+        // Capability flags driven by the physical device family. MIDI ports
+        // get no per-device sliders; XInput (Xbox) has no gyro/sticks
+        // calibration support; gyro/sticks-capable controllers get both.
+        let dev_id_owned: String = data.params.get("device_id")
+            .and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
+        let dev_id_str: &str = &dev_id_owned;
+        let (has_deadzone, has_gyro, has_sticks_cal) = device_source_caps(dev_id_str, is_device_source);
+        // Estimate the body width so the AutoMap chip can right-align to it.
+        // Computed up-front (outside the closure that mutates the snarl) so
+        // the `data` borrow doesn't outlive the snarl.get_node_mut calls.
+        let device_body_w: f32 = if is_device_source {
+            estimate_device_body_width(ui, data)
+        } else { 0.0 };
 
         let is_subpatch = snarl.get_node(node).map(|n| n.module_id == "subpatch").unwrap_or(false);
         let (inner_count, has_pinned, is_unlocked) = if is_subpatch {
@@ -114,13 +175,60 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         }).unwrap_or(false);
         let curve_is_float    = snarl.get_node(node).map(|n| n.module_id == "module.response_curve").unwrap_or(false);
 
-        ui.vertical(|ui| {
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
-                if let Some(live) = status_dot {
-                    let color = if live { Color32::from_rgb(80, 200, 100) } else { Color32::from_rgb(220, 80, 60) };
-                    ui.label(egui::RichText::new("●").color(color).small());
+                if let Some(spec) = &icon_spec {
+                    use crate::canvas::remapper_icons::NodeIconSpec;
+                    use crate::panels::device_icon::render_device_icon;
+                    const ICON_H: f32 = 40.0;
+                    match spec {
+                        NodeIconSpec::Single(bytes) => render_device_icon(ui, bytes, ICON_H),
+                        NodeIconSpec::Pair(a, b) => {
+                            render_device_icon(ui, a, ICON_H);
+                            render_device_icon(ui, b, ICON_H);
+                        }
+                    }
                 }
-                ui.label(&title);
+                // Device source: dot + [title / (Calibrate + Hz)] stack,
+                // vertically centered next to the icon. The Calibrate button +
+                // measured polling rate occupy the row directly under the title.
+                if is_device_source {
+                    if let Some(live) = status_dot {
+                        let color = if live { Color32::from_rgb(80, 200, 100) } else { Color32::from_rgb(220, 80, 60) };
+                        ui.label(egui::RichText::new("●").color(color).small());
+                    }
+                    let (has_dz_c, has_gy_c, has_st_c) = device_source_caps(dev_id_str, is_device_source);
+                    let has_cal_here = has_gy_c || has_st_c || has_dz_c;
+                    ui.vertical(|ui| {
+                        ui.label(&title);
+                        if has_cal_here {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Calibrate")
+                                    .on_hover_text("Open the Device Calibration window")
+                                    .clicked()
+                                {
+                                    self.calibrate_request = Some(node);
+                                }
+                                let hz = self.device_rates.get(&dev_id_owned).copied().unwrap_or(0);
+                                ui.label(egui::RichText::new(format!("{} Hz", hz))
+                                    .color(Color32::from_rgb(220, 160, 40)).small())
+                                    .on_hover_text("Measured per-device polling rate (raw events/sec)");
+                            });
+                        }
+                    });
+                } else if is_device_sink {
+                    if let Some(live) = status_dot {
+                        let color = if live { Color32::from_rgb(80, 200, 100) } else { Color32::from_rgb(220, 80, 60) };
+                        ui.label(egui::RichText::new("●").color(color).small());
+                    }
+                    ui.label(&title);
+                } else {
+                    if let Some(live) = status_dot {
+                        let color = if live { Color32::from_rgb(80, 200, 100) } else { Color32::from_rgb(220, 80, 60) };
+                        ui.label(egui::RichText::new("●").color(color).small());
+                    }
+                    ui.label(&title);
+                }
 
                 if is_subpatch {
                     let _ = has_pinned;
@@ -333,7 +441,129 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         }
                     }
                 }
+
+                // device.source: AutoMap chip. We paint the orange square
+                // manually here (above the header frame, in the header
+                // painter) AND stash the rect so `show_output` returns it as
+                // the pin rect — snarl uses the rect for hit-testing and
+                // for the wire endpoint, but its own pin-draw paints to the
+                // right-column painter which is clipped to the body so the
+                // header rect lands outside its clip and isn't visible.
+                if is_device_source && source_automap_out_idx.is_some() {
+                    let label_w = ui.painter().layout_no_wrap(
+                        "Auto-Map".to_string(),
+                        egui::TextStyle::Small.resolve(ui.style()),
+                        Color32::WHITE,
+                    ).size().x;
+                    let chip_w = 16.0_f32;
+                    let row_left = ui.min_rect().left();
+                    let target_chip_right = row_left + device_body_w;
+                    let target_x = target_chip_right - chip_w - 4.0 - label_w;
+                    let spacer = (target_x - ui.cursor().min.x).max(16.0);
+                    ui.add_space(spacer);
+                    ui.label(egui::RichText::new("Auto-Map").small().weak());
+                    let chip_size = egui::vec2(chip_w, chip_w);
+                    let (rect, _resp) = ui.allocate_exact_size(chip_size, egui::Sense::hover());
+                    paint_automap_chip(ui, rect, source_automap_glow);
+                    ui.ctx().data_mut(|d| d.insert_temp(header_automap_rect_key(node), rect));
+                }
             });
+
+            // device.sink: AutoMap chip on its own row BELOW the title row,
+            // chip on the left. Painted manually here (header painter) and
+            // rect stashed for show_input's pin-rect override.
+            if is_device_sink && sink_automap_in_idx.is_some() {
+                ui.horizontal(|ui| {
+                    let chip_size = egui::vec2(16.0, 16.0);
+                    let (rect, _resp) = ui.allocate_exact_size(chip_size, egui::Sense::hover());
+                    paint_automap_chip(ui, rect, sink_automap_glow);
+                    ui.ctx().data_mut(|d| d.insert_temp(header_automap_in_rect_key(node), rect));
+                    ui.label(egui::RichText::new("Auto-Map").small().weak());
+                });
+            }
+
+            // Mouse-sensitivity slider for the virtual keyboard+mouse sink.
+            // Logarithmic 0..3000; double-click on the slider track resets
+            // to the global default (Settings → Device defaults).
+            // Double-click on the value box keeps egui's inline-edit behavior.
+            if is_keymouse_sink {
+                const LABEL_CELL_W: f32 = 60.0;
+                let mut ms_edit = mouse_sens_initial;
+                let ms_initial = ms_edit;
+                ui.horizontal(|ui| {
+                    slider_label(ui, "Mouse ×", LABEL_CELL_W);
+                    let resp = ui.add(egui::Slider::new(&mut ms_edit, 0.0_f32..=3000.0)
+                        .logarithmic(true)
+                        .smallest_positive(0.01)
+                        .show_value(false)
+                        .clamping(egui::SliderClamping::Always));
+                    if slider_track_double_clicked(ui, &resp) { ms_edit = self.param_defaults.mouse_sensitivity; }
+                    ui.add(egui::DragValue::new(&mut ms_edit)
+                        .speed(0.5)
+                        .range(0.0_f32..=3000.0)
+                        .fixed_decimals(2));
+                });
+                if (ms_edit - ms_initial).abs() > f32::EPSILON {
+                    if let Some(n) = snarl.get_node_mut(node) {
+                        n.params.insert("mouse_sensitivity".into(), Value::from(ms_edit as f64));
+                    }
+                }
+            }
+
+            // Deadzone / Gyro × slider rows.
+            //
+            // Each row is rendered as a fixed-width label cell + a Slider with
+            // its value box suppressed + a separate DragValue. This split lets
+            // us recognise double-click on the slider track alone (reset to
+            // global default), while a double-click on the DragValue keeps
+            // egui's built-in inline edit behaviour.
+            if is_device_source && (has_deadzone || has_gyro) {
+                const LABEL_CELL_W: f32 = 60.0;
+                let mut dz_edit = deadzone_initial;
+                let dz_initial  = dz_edit;
+                if has_deadzone {
+                    ui.horizontal(|ui| {
+                        slider_label(ui, "Deadzone", LABEL_CELL_W);
+                        let resp = ui.add(egui::Slider::new(&mut dz_edit, 0.0_f32..=0.5)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always));
+                        if slider_track_double_clicked(ui, &resp) { dz_edit = self.param_defaults.stick_deadzone; }
+                        ui.add(egui::DragValue::new(&mut dz_edit)
+                            .speed(0.005)
+                            .range(0.0_f32..=0.5)
+                            .fixed_decimals(2));
+                    });
+                }
+                let mut gm_edit = gyro_mult_initial;
+                let gm_initial  = gm_edit;
+                if has_gyro {
+                    ui.horizontal(|ui| {
+                        slider_label(ui, "Gyro ×", LABEL_CELL_W);
+                        let resp = ui.add(egui::Slider::new(&mut gm_edit, 0.1_f32..=50.0)
+                            .logarithmic(true)
+                            .show_value(false)
+                            .clamping(egui::SliderClamping::Always));
+                        if slider_track_double_clicked(ui, &resp) { gm_edit = self.param_defaults.gyro_mult; }
+                        ui.add(egui::DragValue::new(&mut gm_edit)
+                            .speed(0.05)
+                            .range(0.1_f32..=50.0)
+                            .fixed_decimals(2));
+                    });
+                }
+
+                if (dz_edit - dz_initial).abs() > f32::EPSILON
+                   || (gm_edit - gm_initial).abs() > f32::EPSILON
+                {
+                    if let Some(n) = snarl.get_node_mut(node) {
+                        if (dz_edit - dz_initial).abs() > f32::EPSILON {
+                            n.params.insert("deadzone".into(), Value::from(dz_edit as f64));
+                        }
+                        if (gm_edit - gm_initial).abs() > f32::EPSILON {
+                            n.params.insert("gyro_multiplier".into(), Value::from(gm_edit as f64));
+                        }
+                    }
+                }
+            }
 
             // Second header row — only visible while in Layout mode for this
             // sub-patch. Snap settings live on the sub-patch itself (they
@@ -390,14 +620,26 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     ) -> impl egui_snarl::ui::SnarlPin + 'static {
         let node = &snarl[pin.id.node];
         let desc = &node.inputs[pin.id.input];
+        let is_relocated_automap = node.module_id == "device.sink"
+            && desc.signal_type == SignalType::AutoMap
+            && desc.name == "Auto-Map";
         ui.spacing_mut().item_spacing.y = 0.0;
-        let text = egui::RichText::new(&desc.name).small();
-        let text = match channel_label_color(&node.module_id, pin.id.input) {
-            Some(col) => text.color(col),
-            None      => text,
+        if !is_relocated_automap {
+            let text = egui::RichText::new(&desc.name).small();
+            let text = match channel_label_color(&node.module_id, pin.id.input) {
+                Some(col) => text.color(col),
+                None      => text,
+            };
+            ui.label(text);
+        }
+        let rect = if is_relocated_automap {
+            ui.ctx().data(|d| d.get_temp::<egui::Rect>(header_automap_in_rect_key(pin.id.node)))
+        } else {
+            None
         };
-        ui.label(text);
-        pin_info(desc.signal_type)
+        let glow = input_pin_glow(self.live_signals, snarl, node, pin.id.node, pin.id.input)
+            .map(|(col, t)| (col, pin_glow_smoothed(ui.ctx(), pin.id.node, pin.id.input, true, t)));
+        MaybeHeaderPin { inner: pin_info(desc.signal_type), rect, glow }
     }
 
     fn show_output(
@@ -408,14 +650,26 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     ) -> impl egui_snarl::ui::SnarlPin + 'static {
         let node = &snarl[pin.id.node];
         let desc = &node.outputs[pin.id.output];
+        let is_relocated_automap = node.module_id == "device.source"
+            && desc.signal_type == SignalType::AutoMap
+            && desc.name == "Auto-Map";
         ui.spacing_mut().item_spacing.y = 0.0;
-        let text = egui::RichText::new(&desc.name).small();
-        let text = match channel_label_color(&node.module_id, pin.id.output) {
-            Some(col) => text.color(col),
-            None      => text,
+        if !is_relocated_automap {
+            let text = egui::RichText::new(&desc.name).small();
+            let text = match channel_label_color(&node.module_id, pin.id.output) {
+                Some(col) => text.color(col),
+                None      => text,
+            };
+            ui.label(text);
+        }
+        let rect = if is_relocated_automap {
+            ui.ctx().data(|d| d.get_temp::<egui::Rect>(header_automap_rect_key(pin.id.node)))
+        } else {
+            None
         };
-        ui.label(text);
-        pin_info(desc.signal_type)
+        let glow = output_pin_glow(self.live_signals, node, pin.id.output)
+            .map(|(col, t)| (col, pin_glow_smoothed(ui.ctx(), pin.id.node, pin.id.output, false, t)));
+        MaybeHeaderPin { inner: pin_info(desc.signal_type), rect, glow }
     }
 
     fn connect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<NodeData>) {
@@ -547,33 +801,20 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
 
     // ── Node footer (below all pins) ─────────────────────────────────────────
 
-    fn has_footer(&mut self, node: &NodeData) -> bool {
-        let dev_id = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
-        node.module_id == "device.source" && !dev_id.starts_with("midi_in:")
+    fn has_footer(&mut self, _node: &NodeData) -> bool {
+        // The Deadzone slider was relocated into the device.source header so
+        // it survives node collapse. No other node currently needs a footer.
+        false
     }
 
     fn show_footer(
         &mut self,
-        node_id: NodeId,
+        _node_id: NodeId,
         _inputs: &[InPin],
         _outputs: &[OutPin],
-        ui: &mut egui::Ui,
-        snarl: &mut Snarl<NodeData>,
-    ) {
-        let dz = snarl.get_node(node_id)
-            .and_then(|n| n.params.get("deadzone").and_then(|v| v.as_f64()))
-            .unwrap_or(0.1) as f32;
-        let mut dz_edit = dz;
-        ui.horizontal(|ui| {
-            ui.label("Deadzone");
-            ui.add(egui::Slider::new(&mut dz_edit, 0.0_f32..=0.5).fixed_decimals(2));
-        });
-        if (dz_edit - dz).abs() > f32::EPSILON {
-            if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("deadzone".to_string(), serde_json::Value::from(dz_edit as f64));
-            }
-        }
-    }
+        _ui: &mut egui::Ui,
+        _snarl: &mut Snarl<NodeData>,
+    ) {}
 
     // ── Graph context menu ───────────────────────────────────────────────────
 
@@ -857,6 +1098,28 @@ fn show_midi_out_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
 // ── AutoMap Splitter body ─────────────────────────────────────────────────────
 
 /// Parse the family slug from a gilrs source ID (`"gilrs:<slug>:<inst>"`) or
+/// Per-device-source capability flags for the header control rows.
+/// Returns `(has_deadzone, has_gyro_mult, has_sticks_cal)`.
+/// - MIDI ports: nothing
+/// - XInput (Xbox): deadzone + sticks calibration, no gyro
+/// - DualShock4 / DualSense / Switch Pro: deadzone + gyro + sticks
+/// - Generic HID / unknown: deadzone + sticks (conservative)
+fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {
+    if !is_device_source { return (false, false, false); }
+    if dev_id.starts_with("midi_in") || dev_id.starts_with("midi_out") {
+        return (false, false, false);
+    }
+    if let Some(rest) = dev_id.strip_prefix("gilrs:") {
+        let slug = rest.split(':').next().unwrap_or("");
+        return match slug {
+            "xinput"                          => (true, false, true),
+            "ds4" | "dualsense" | "switch_pro" => (true, true,  true),
+            _                                 => (true, false, true),
+        };
+    }
+    (false, false, false)
+}
+
 /// virtual sink ID (`"virtual.<slug>:<inst>"` / `"virtual.keymouse"`). Returns
 /// the canonical slug accepted by `am_canon::family_label` ("dualsense", "ds4",
 /// "switch_pro", "xinput") or None if the device family is irrelevant for
@@ -4929,14 +5192,407 @@ fn register_exposable_element(
 
 fn pin_info(t: SignalType) -> PinInfo {
     let [r, g, b] = t.color_rgb();
-    let color = Color32::from_rgb(r, g, b);
+    let outline = Color32::from_rgb(r, g, b);
+    // Wire at rest is desaturated/dim (~45% of outline); the per-frame
+    // brighten_wire_color() pumps it toward full + a small white lerp under
+    // signal so flowing wires visibly stand out without idle wires shouting.
+    let wire_rest = Color32::from_rgb(
+        (r as u16 * 9 / 20) as u8,
+        (g as u16 * 9 / 20) as u8,
+        (b as u16 * 9 / 20) as u8,
+    );
+    let stroke = egui::Stroke::new(1.5, outline);
     if t == SignalType::AutoMap {
+        // AutoMap chip needs more presence at rest — bump the dark interior
+        // from ~20% to ~40% of the type color so the square reads clearly
+        // even before any signal lights it up.
+        let dark = Color32::from_rgb(
+            (r as u16 * 2 / 5) as u8,
+            (g as u16 * 2 / 5) as u8,
+            (b as u16 * 2 / 5) as u8,
+        );
         PinInfo::square()
-            .with_fill(color)
+            .with_fill(dark)
+            .with_stroke(stroke)
             .with_wire_width_factor(4.0)
+            .with_wire_color(wire_rest)
     } else {
-        PinInfo::circle().with_fill(color)
+        // Dark fill ~20% of the type color so the pin reads as an outlined ring.
+        let dark = Color32::from_rgb(r / 5, g / 5, b / 5);
+        PinInfo::circle()
+            .with_fill(dark)
+            .with_stroke(stroke)
+            .with_wire_color(wire_rest)
     }
+}
+
+/// SnarlPin wrapper. When `rect` is `Some`, `pin_rect` returns it verbatim —
+/// used to lift the device.source `automap_out` pin into the header so it
+/// stays reachable when the node is collapsed. When `rect` is `None`, falls
+/// through to the default snarl pin geometry. When `glow` is `Some`, paints
+/// a radial halo behind the pin scaled by intensity (0..1) — used to make
+/// device pins light up when live signal is flowing.
+struct MaybeHeaderPin {
+    inner: PinInfo,
+    rect: Option<egui::Rect>,
+    glow: Option<(Color32, f32)>,
+}
+
+impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
+    fn pin_rect(&self, x: f32, y0: f32, y1: f32, size: f32) -> egui::Rect {
+        if let Some(r) = self.rect {
+            r
+        } else {
+            // Mirror the default impl from SnarlPin (vendored pin.rs:43-48).
+            let y = (y0 + y1) * 0.5;
+            egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(size, size))
+        }
+    }
+    fn draw(
+        self,
+        snarl_style: &egui_snarl::ui::SnarlStyle,
+        style: &egui::Style,
+        rect: egui::Rect,
+        painter: &egui::Painter,
+    ) -> egui_snarl::ui::PinWireInfo {
+        // Header-relocated pins: snarl paints the chip via PinInfo::draw at
+        // our stashed rect, ensuring the visual is perfectly in sync with
+        // the interaction rect and wire endpoint (no drag-lag).
+        if self.rect.is_some() {
+            // Halo first (behind the chip).
+            if let Some((hot, intensity)) = self.glow {
+                if intensity > 0.01 {
+                    let center = rect.center();
+                    let r_pin  = (rect.width().min(rect.height())) * 0.5;
+                    paint_radial_glow(painter, center, r_pin * 2.2, hot, intensity);
+                }
+            }
+            // Lerp fill brighter under signal.
+            let inner = if let Some((hot, intensity)) = self.glow {
+                let base = self.inner.fill.unwrap_or(Color32::from_gray(20));
+                let t = intensity.clamp(0.0, 1.0);
+                let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+                let mixed = Color32::from_rgb(
+                    lerp(base.r(), hot.r()),
+                    lerp(base.g(), hot.g()),
+                    lerp(base.b(), hot.b()),
+                );
+                PinInfo { fill: Some(mixed), ..self.inner }
+            } else {
+                self.inner
+            };
+            let mut wire_info = PinInfo::draw(&inner, snarl_style, style, rect, painter);
+            if let Some((_hot, intensity)) = self.glow {
+                wire_info.color = brighten_wire_color(wire_info.color, intensity);
+            }
+            return wire_info;
+        }
+        // Paint the radial-glow halo *behind* the pin so the colored outline
+        // remains crisp on top. Halo extends to 2.2× the pin radius.
+        if let Some((hot, intensity)) = self.glow {
+            if intensity > 0.01 {
+                let center = rect.center();
+                let pin_r = (rect.width().min(rect.height())) * 0.5;
+                let halo_r = pin_r * 2.2;
+                paint_radial_glow(painter, center, halo_r, hot, intensity);
+            }
+        }
+        // Lerp the inner fill from the default dark toward the hot type-color
+        // by the glow intensity, so the inside of the pin gets visibly brighter
+        // as signal flows (not just the halo outside it).
+        let inner = if let Some((hot, intensity)) = self.glow {
+            // `pin_info` always sets `fill`, so the unwrap is the live path;
+            // the fallback only matters if some other callsite forgets it.
+            let base = self.inner.fill.unwrap_or(Color32::from_gray(20));
+            let t = intensity.clamp(0.0, 1.0);
+            let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+            let mixed = Color32::from_rgb(
+                lerp(base.r(), hot.r()),
+                lerp(base.g(), hot.g()),
+                lerp(base.b(), hot.b()),
+            );
+            PinInfo {
+                fill: Some(mixed),
+                ..self.inner
+            }
+        } else {
+            self.inner
+        };
+        let mut wire_info = PinInfo::draw(&inner, snarl_style, style, rect, painter);
+        if let Some((_hot, intensity)) = self.glow {
+            wire_info.color = brighten_wire_color(wire_info.color, intensity);
+        }
+        wire_info
+    }
+}
+
+/// Brighten a wire color based on signal intensity. The `base` is the dim
+/// rest color from `pin_info`; under signal we lerp toward the type-color
+/// outline (recovered as `base * 20/9`) and then add a small ~20% lerp
+/// toward white at peak so flowing wires read as actively lit.
+fn brighten_wire_color(base: Color32, intensity: f32) -> Color32 {
+    let t = intensity.clamp(0.0, 1.0);
+    // Reconstruct the full-saturation outline color from the dimmed base.
+    let undim = |c: u8| ((c as u16 * 20 / 9).min(255)) as u8;
+    let outline = Color32::from_rgb(undim(base.r()), undim(base.g()), undim(base.b()));
+    // Lerp base → outline by t, then outline → white by t*0.2.
+    let lerp = |a: u8, b: u8, k: f32| (a as f32 + (b as f32 - a as f32) * k) as u8;
+    let bright = Color32::from_rgb(
+        lerp(base.r(), outline.r(), t),
+        lerp(base.g(), outline.g(), t),
+        lerp(base.b(), outline.b(), t),
+    );
+    let white_t = t * 0.2;
+    Color32::from_rgb(
+        lerp(bright.r(), 255, white_t),
+        lerp(bright.g(), 255, white_t),
+        lerp(bright.b(), 255, white_t),
+    )
+}
+
+/// Estimate the device-source body width using small-text label measurement,
+/// matching the styling that `show_input` / `show_output` use. Padding
+/// constants are intentionally **small** so the header chip lands just
+/// inside the body's right edge rather than pushing the body wider.
+fn estimate_device_body_width(ui: &egui::Ui, node: &NodeData) -> f32 {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let measure = |s: &str| ui.painter()
+        .layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE)
+        .size().x;
+    let in_w  = node.inputs.iter().map(|p| measure(&p.name)).fold(0.0_f32, f32::max);
+    let out_w = node.outputs.iter()
+        .filter(|p| p.name != "Auto-Map")
+        .map(|p| measure(&p.name)).fold(0.0_f32, f32::max);
+    // snarl: pin_size = interact_size.y * 0.6 (~11 px), so each side reserves
+    // pin_size + label. Inner gap ≈ item_spacing.x. Underestimate by a few
+    // pixels so we never push the body wider than it naturally wants.
+    let pin_size = ui.spacing().interact_size.y * 0.6;
+    let gap      = ui.spacing().item_spacing.x;
+    in_w + out_w + pin_size * 2.0 + gap
+}
+
+/// True if the slider track (covered by `slider_resp`) was double-clicked
+/// this frame. egui's Slider widget senses drag only, so `.double_clicked()`
+/// on its Response is always false — we overlay a click-sense interact on
+/// the same rect using a distinct id and read the double-click from there.
+/// Call AFTER rendering the slider so the overlay sits on top.
+fn slider_track_double_clicked(ui: &egui::Ui, slider_resp: &egui::Response) -> bool {
+    let id = slider_resp.id.with("__dblclick_overlay");
+    ui.interact(slider_resp.rect, id, egui::Sense::click()).double_clicked()
+}
+
+/// Fixed-width label cell used to align the leading column across the
+/// Deadzone / Gyro × / Mouse × slider rows in a device-node header.
+fn slider_label(ui: &mut egui::Ui, label: &str, cell_w: f32) {
+    let (cell, _) = ui.allocate_exact_size(
+        egui::vec2(cell_w, 18.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().text(
+        egui::pos2(cell.left(), cell.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.style().visuals.weak_text_color(),
+    );
+}
+
+/// Small calibration button. `calibrated == true` flips the button's fill to
+/// a calm green so the visual state is conveyed without a separate ✓ label.
+fn cal_button(ui: &mut egui::Ui, label: &str, calibrated: bool) -> egui::Response {
+    let mut btn = egui::Button::new(egui::RichText::new(label).small());
+    if calibrated {
+        btn = btn
+            .fill(Color32::from_rgb(50, 130, 70))
+            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(80, 200, 100)));
+    }
+    ui.add(btn)
+}
+
+/// Paint the AutoMap header chip with optional glow. Mirrors the dark-fill +
+/// colored-outline + radial-halo treatment that the column-pin draw applies.
+fn paint_automap_chip(ui: &mut egui::Ui, rect: egui::Rect, intensity: f32) {
+    let [r, g, b] = SignalType::AutoMap.color_rgb();
+    let hot = Color32::from_rgb(r, g, b);
+    let dark = Color32::from_rgb(
+        (r as u16 * 2 / 5) as u8,
+        (g as u16 * 2 / 5) as u8,
+        (b as u16 * 2 / 5) as u8,
+    );
+    let painter = ui.painter();
+    let t = intensity.clamp(0.0, 1.0);
+    // Halo first so the chip sits on top of it.
+    if t > 0.01 {
+        let center = rect.center();
+        let pin_r = (rect.width().min(rect.height())) * 0.5;
+        paint_radial_glow(painter, center, pin_r * 2.2, hot, t);
+    }
+    // Lerp the fill from dark toward hot by intensity.
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+    let fill = Color32::from_rgb(
+        lerp(dark.r(), hot.r()),
+        lerp(dark.g(), hot.g()),
+        lerp(dark.b(), hot.b()),
+    );
+    painter.rect_filled(rect, 2.0, fill);
+    painter.rect_stroke(rect, 2.0,
+        egui::Stroke::new(1.5, hot),
+        egui::StrokeKind::Inside);
+}
+
+/// Paint a soft circular halo via a triangle fan with per-vertex colors.
+/// Center color = `hot` premultiplied by intensity; edge color = transparent.
+/// Uses `Color32::TRANSPARENT` for the edge so the gradient is premultiplied-
+/// correct (no white-fringe artifacts when interpolating).
+fn paint_radial_glow(painter: &egui::Painter, center: egui::Pos2, radius: f32, hot: Color32, intensity: f32) {
+    use egui::epaint::{Mesh, Vertex};
+    const SEGMENTS: usize = 24;
+    let mut mesh = Mesh::default();
+    let i = intensity.clamp(0.0, 1.0);
+    // Premultiplied: scale all channels by alpha = intensity.
+    let center_color = Color32::from_rgba_premultiplied(
+        (hot.r() as f32 * i) as u8,
+        (hot.g() as f32 * i) as u8,
+        (hot.b() as f32 * i) as u8,
+        (255.0 * i) as u8,
+    );
+    let edge_color = Color32::TRANSPARENT;
+    let uv = egui::Pos2::ZERO;
+    mesh.vertices.push(Vertex { pos: center, uv, color: center_color });
+    for k in 0..SEGMENTS {
+        let theta = (k as f32) / (SEGMENTS as f32) * std::f32::consts::TAU;
+        let p = center + egui::vec2(theta.cos(), theta.sin()) * radius;
+        mesh.vertices.push(Vertex { pos: p, uv, color: edge_color });
+    }
+    for k in 0..SEGMENTS {
+        let a = (k + 1) as u32;
+        let b = ((k + 1) % SEGMENTS + 1) as u32;
+        mesh.indices.extend_from_slice(&[0, a, b]);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Convert a `Signal` to a 0..1 glow intensity. Bool→on/off, Float→|v|,
+/// Vec2→length, Int→nonzero.
+fn signal_intensity(sig: &Signal) -> f32 {
+    match sig {
+        Signal::Float(f) => f.abs().min(1.0),
+        Signal::Bool(b)  => if *b { 1.0 } else { 0.0 },
+        Signal::Vec2(v)  => v.length().min(1.0),
+        Signal::Int(i)   => if *i != 0 { 1.0 } else { 0.0 },
+    }
+}
+
+/// Read prior glow intensity for this pin (memory-cached), lerp toward `target`
+/// at a fixed rate, store back, and return the smoothed value. Smoothing
+/// prevents the 500 Hz raw signal from strobing the visual.
+fn pin_glow_smoothed(ctx: &egui::Context, node: egui_snarl::NodeId, pin_idx: usize, is_input: bool, target: f32) -> f32 {
+    let key = egui::Id::new(("pin_glow", node.0, pin_idx, is_input));
+    let prev = ctx.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
+    let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+    // Up-fast / down-slow: jumps to bright instantly, decays over ~250 ms.
+    let rate = if target > prev { 30.0 } else { 6.0 };
+    let smoothed = prev + (target - prev) * (1.0 - (-rate * dt).exp());
+    ctx.data_mut(|d| d.insert_temp(key, smoothed));
+    smoothed
+}
+
+/// Look up live activity for any output pin: device sources read from
+/// `live_signals`; other modules read from `NodeExtra.last_out`.
+/// Returns `None` when no value is available yet.
+fn output_pin_glow(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    node: &NodeData,
+    out_idx: usize,
+) -> Option<(Color32, f32)> {
+    let desc = node.outputs.get(out_idx)?;
+    // AutoMap pins: no scalar value, but the bus is "active" when the source
+    // device has any signal. For device.source, max-pool over its other pins.
+    if desc.signal_type == SignalType::AutoMap {
+        if node.module_id == "device.source" {
+            let dev_id = node.params.get("device_id").and_then(|v| v.as_str())?;
+            let pin_ids = node.params.get("output_pin_ids")
+                .and_then(|v| v.as_array())?;
+            let mut max_i = 0.0_f32;
+            for pid in pin_ids.iter().filter_map(|v| v.as_str()) {
+                if let Some(sig) = live_signals.get(&(dev_id.to_string(), pid.to_string())) {
+                    max_i = max_i.max(signal_intensity(sig));
+                }
+            }
+            let [r, g, b] = SignalType::AutoMap.color_rgb();
+            return Some((Color32::from_rgb(r, g, b), max_i));
+        }
+        // For automap_* / virtual sink feedback, fall through to last_out lookup.
+    }
+    // Device source's other outputs: read from live_signals.
+    if node.module_id == "device.source" {
+        let dev_id = node.params.get("device_id").and_then(|v| v.as_str())?;
+        let pin_id = node.params.get("output_pin_ids")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.get(out_idx))
+            .and_then(|v| v.as_str())?;
+        let sig = live_signals.get(&(dev_id.to_string(), pin_id.to_string()))?;
+        let intensity = signal_intensity(sig);
+        let [r, g, b] = sig.signal_type().color_rgb();
+        return Some((Color32::from_rgb(r, g, b), intensity));
+    }
+    // Module nodes: latest evaluated output from NodeExtra.last_out.
+    let sig = node.extra.last_out.get(out_idx).and_then(|s| s.as_ref())?;
+    let intensity = signal_intensity(sig);
+    let [r, g, b] = sig.signal_type().color_rgb();
+    Some((Color32::from_rgb(r, g, b), intensity))
+}
+
+/// Look up live activity for any input pin by walking back to the upstream
+/// output's value. Falls back to `NodeExtra.last_signals` when the wire
+/// source can't be resolved (rare; legacy nodes).
+fn input_pin_glow(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    snarl: &Snarl<NodeData>,
+    node: &NodeData,
+    node_id: egui_snarl::NodeId,
+    in_idx: usize,
+) -> Option<(Color32, f32)> {
+    let desc = node.inputs.get(in_idx)?;
+    // AutoMap inputs: light up when the upstream device has any signal.
+    if desc.signal_type == SignalType::AutoMap {
+        let pin_id = egui_snarl::InPinId { node: node_id, input: in_idx };
+        let src = snarl.in_pin(pin_id).remotes.first().copied()?;
+        let src_node = snarl.get_node(src.node)?;
+        if let Some((_, i)) = output_pin_glow(live_signals, src_node, src.output) {
+            let [r, g, b] = SignalType::AutoMap.color_rgb();
+            return Some((Color32::from_rgb(r, g, b), i));
+        }
+        return None;
+    }
+    // Walk upstream: take the live value from whatever feeds this input.
+    let pin_id = egui_snarl::InPinId { node: node_id, input: in_idx };
+    let pin = snarl.in_pin(pin_id);
+    if let Some(src) = pin.remotes.first().copied() {
+        if let Some(src_node) = snarl.get_node(src.node) {
+            if let Some(glow) = output_pin_glow(live_signals, src_node, src.output) {
+                return Some(glow);
+            }
+        }
+    }
+    // Fallback: most-recently evaluated input value stashed on the node itself.
+    let sig = node.extra.last_signals.get(in_idx).and_then(|s| s.as_ref())?;
+    let intensity = signal_intensity(sig);
+    let [r, g, b] = sig.signal_type().color_rgb();
+    Some((Color32::from_rgb(r, g, b), intensity))
+}
+
+/// Memory key for stashing the header-rect of the relocated automap_out pin so
+/// `show_output` can read it back. Per-node, frame-fresh — snarl calls
+/// `show_header` before `show_output` each frame, so the rect is current.
+fn header_automap_rect_key(node: egui_snarl::NodeId) -> egui::Id {
+    egui::Id::new(("device_source_header_automap_rect", node.0))
+}
+
+/// Same as `header_automap_rect_key` but for the device.sink input-side
+/// AutoMap pin (relocated to the left edge of the header).
+fn header_automap_in_rect_key(node: egui_snarl::NodeId) -> egui::Id {
+    egui::Id::new(("device_sink_header_automap_in_rect", node.0))
 }
 
 enum WireDir {

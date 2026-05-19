@@ -23,6 +23,222 @@ pub struct TickOutput {
     pub sink_outputs: HashMap<(String, String), Signal>,
 }
 
+/// Stick pin IDs — deadzone applies only here, not to triggers/gyro/accel/buttons.
+fn is_stick_pin(pin_id: &str) -> bool {
+    matches!(pin_id,
+        "left_stick" | "right_stick"
+        | "left_stick_x" | "left_stick_y"
+        | "right_stick_x" | "right_stick_y"
+    )
+}
+
+/// IMU pin IDs — gyro multiplier scales these.
+fn is_gyro_pin(pin_id: &str) -> bool {
+    matches!(pin_id, "gyro_x" | "gyro_y" | "gyro_z")
+}
+
+/// Mouse-delta pin IDs — mouse_sensitivity scales these.
+fn is_mouse_pin(pin_id: &str) -> bool {
+    matches!(pin_id, "mouse" | "mouse_x" | "mouse_y")
+}
+
+/// Number of angular buckets in the per-stick radial correction profile.
+/// 72 buckets = 5° each — matches the calibration UI's edge-tracking
+/// resolution so we never lose detail through resampling.
+pub const STICK_RADIAL_BUCKETS: usize = 72;
+
+/// Per-device-source calibration applied before deadzone / gyro_multiplier.
+/// All fields are no-ops when uncalibrated (centers=0, scales=1, ranges=identity).
+#[derive(Clone, Debug)]
+struct DeviceCal {
+    gyro_offset:   [f32; 3], // [x, y, z] — subtracted from gyro_x/y/z
+    accel_offset:  [f32; 3], // [x, y, z] — subtracted from accel_x/y/z
+    /// Per-axis output sign for gyro_{x,y,z}. +1.0 = pass-through, -1.0 = inverted.
+    gyro_sign:     [f32; 3],
+    /// Per-axis output sign for accel_{x,y,z}.
+    accel_sign:    [f32; 3],
+    lstick_center: [f32; 2], // subtracted from left_stick_{x,y}
+    rstick_center: [f32; 2],
+    /// Per-bucket radial scale: lstick_radial[i] = 1.0 / (mean stick radius
+    /// at angle bucket i). Applied to the centered (x, y) so the corrected
+    /// magnitude reaches 1.0 along every direction. STICK_RADIAL_BUCKETS
+    /// entries, indexed by `floor(angle / TAU * N)`.
+    lstick_radial: [f32; STICK_RADIAL_BUCKETS],
+    rstick_radial: [f32; STICK_RADIAL_BUCKETS],
+    // Trigger calibration: raw_min/raw_max define the usable range; output
+    // is renormalised to 0..1 across it. Defaults (0.0, 1.0) = no-op.
+    ltrig_range:   (f32, f32),
+    rtrig_range:   (f32, f32),
+}
+
+impl Default for DeviceCal {
+    fn default() -> Self {
+        Self {
+            gyro_offset:   [0.0; 3],
+            accel_offset:  [0.0; 3],
+            gyro_sign:     [1.0; 3],
+            accel_sign:    [1.0; 3],
+            lstick_center: [0.0; 2],
+            rstick_center: [0.0; 2],
+            lstick_radial: [1.0; STICK_RADIAL_BUCKETS],
+            rstick_radial: [1.0; STICK_RADIAL_BUCKETS],
+            ltrig_range:   (0.0, 1.0),
+            rtrig_range:   (0.0, 1.0),
+        }
+    }
+}
+
+fn read_arr3(params: &HashMap<String, Value>, key: &str) -> [f32; 3] {
+    params.get(key).and_then(|v| v.as_array()).and_then(|a| {
+        if a.len() < 3 { return None; }
+        Some([
+            a[0].as_f64()? as f32,
+            a[1].as_f64()? as f32,
+            a[2].as_f64()? as f32,
+        ])
+    }).unwrap_or([0.0; 3])
+}
+fn read_arr2(params: &HashMap<String, Value>, key: &str) -> [f32; 2] {
+    params.get(key).and_then(|v| v.as_array()).and_then(|a| {
+        if a.len() < 2 { return None; }
+        Some([a[0].as_f64()? as f32, a[1].as_f64()? as f32])
+    }).unwrap_or([0.0; 2])
+}
+fn read_radial(params: &HashMap<String, Value>, key: &str) -> [f32; STICK_RADIAL_BUCKETS] {
+    let mut out = [1.0_f32; STICK_RADIAL_BUCKETS];
+    let Some(arr) = params.get(key).and_then(|v| v.as_array()) else { return out; };
+    for i in 0..STICK_RADIAL_BUCKETS.min(arr.len()) {
+        if let Some(v) = arr[i].as_f64() { out[i] = v as f32; }
+    }
+    out
+}
+fn read_range(params: &HashMap<String, Value>, key_min: &str, key_max: &str) -> (f32, f32) {
+    let mn = params.get(key_min).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let mx = params.get(key_max).and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    (mn, mx)
+}
+
+fn read_sign3(params: &HashMap<String, Value>, key: &str) -> [f32; 3] {
+    let mut out = [1.0_f32; 3];
+    let Some(arr) = params.get(key).and_then(|v| v.as_array()) else { return out; };
+    for i in 0..3.min(arr.len()) {
+        if let Some(b) = arr[i].as_bool() {
+            out[i] = if b { -1.0 } else { 1.0 };
+        }
+    }
+    out
+}
+
+fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
+    DeviceCal {
+        gyro_offset:   read_arr3(params, "gyro_offset"),
+        accel_offset:  read_arr3(params, "accel_offset"),
+        gyro_sign:     read_sign3(params, "gyro_invert"),
+        accel_sign:    read_sign3(params, "accel_invert"),
+        lstick_center: read_arr2(params, "lstick_center"),
+        rstick_center: read_arr2(params, "rstick_center"),
+        lstick_radial: read_radial(params, "lstick_radial"),
+        rstick_radial: read_radial(params, "rstick_radial"),
+        ltrig_range:   read_range(params, "ltrig_min", "ltrig_max"),
+        rtrig_range:   read_range(params, "rtrig_min", "rtrig_max"),
+    }
+}
+
+/// Scale a centered stick reading (x, y) so that the magnitude reaches 1.0
+/// along every direction, using a per-bucket radial scale profile. Buckets
+/// linearly-interpolate so the correction is smooth between sample angles.
+fn apply_stick_scale(x: f32, y: f32, profile: &[f32; STICK_RADIAL_BUCKETS]) -> (f32, f32) {
+    let r = (x * x + y * y).sqrt();
+    if r < 1e-5 { return (x, y); }
+    let theta = y.atan2(x); // -π..π
+    let norm = (theta / std::f32::consts::TAU + 1.0) % 1.0; // 0..1
+    let fpos = norm * STICK_RADIAL_BUCKETS as f32;
+    let i0 = fpos.floor() as usize % STICK_RADIAL_BUCKETS;
+    let i1 = (i0 + 1) % STICK_RADIAL_BUCKETS;
+    let t  = fpos - fpos.floor();
+    let s  = profile[i0] * (1.0 - t) + profile[i1] * t;
+    (x * s, y * s)
+}
+
+/// Renormalise a trigger reading from [raw_min, raw_max] to [0, 1] clamped.
+fn apply_trigger_range(v: f32, (mn, mx): (f32, f32)) -> f32 {
+    if (mx - mn).abs() < 1e-4 { return v; }
+    ((v - mn) / (mx - mn)).clamp(0.0, 1.0)
+}
+
+/// device.source per-pin post-processing pipeline:
+///   1. Calibration offsets / scales / ranges (from the node's params)
+///   2. Gyro multiplier (gyro pins only)
+///   3. Stick deadzone (stick pins only)
+fn post_process_device_pin(pin_id: &str, sig: Signal, dz: f32, gm: f32, cal: &DeviceCal) -> Signal {
+    // 1. Calibration. Offsets first, then optional axis sign flip.
+    let sig = match (pin_id, sig) {
+        ("gyro_x",  Signal::Float(v)) => Signal::Float((v - cal.gyro_offset[0])  * cal.gyro_sign[0]),
+        ("gyro_y",  Signal::Float(v)) => Signal::Float((v - cal.gyro_offset[1])  * cal.gyro_sign[1]),
+        ("gyro_z",  Signal::Float(v)) => Signal::Float((v - cal.gyro_offset[2])  * cal.gyro_sign[2]),
+        ("accel_x", Signal::Float(v)) => Signal::Float((v - cal.accel_offset[0]) * cal.accel_sign[0]),
+        ("accel_y", Signal::Float(v)) => Signal::Float((v - cal.accel_offset[1]) * cal.accel_sign[1]),
+        ("accel_z", Signal::Float(v)) => Signal::Float((v - cal.accel_offset[2]) * cal.accel_sign[2]),
+        ("left_stick_x", Signal::Float(v))  => Signal::Float(v - cal.lstick_center[0]),
+        ("left_stick_y", Signal::Float(v))  => Signal::Float(v - cal.lstick_center[1]),
+        ("right_stick_x", Signal::Float(v)) => Signal::Float(v - cal.rstick_center[0]),
+        ("right_stick_y", Signal::Float(v)) => Signal::Float(v - cal.rstick_center[1]),
+        ("left_stick",  Signal::Vec2(v)) => {
+            let cx = v.x - cal.lstick_center[0];
+            let cy = v.y - cal.lstick_center[1];
+            let (sx, sy) = apply_stick_scale(cx, cy, &cal.lstick_radial);
+            Signal::Vec2(Vec2::new(sx, sy))
+        }
+        ("right_stick", Signal::Vec2(v)) => {
+            let cx = v.x - cal.rstick_center[0];
+            let cy = v.y - cal.rstick_center[1];
+            let (sx, sy) = apply_stick_scale(cx, cy, &cal.rstick_radial);
+            Signal::Vec2(Vec2::new(sx, sy))
+        }
+        ("left_trigger",  Signal::Float(v)) => Signal::Float(apply_trigger_range(v, cal.ltrig_range)),
+        ("right_trigger", Signal::Float(v)) => Signal::Float(apply_trigger_range(v, cal.rtrig_range)),
+        (_, s) => s,
+    };
+
+    // 2 + 3. Gyro × multiplier, then stick deadzone.
+    if is_stick_pin(pin_id) {
+        apply_deadzone(sig, dz)
+    } else if is_gyro_pin(pin_id) && (gm - 1.0).abs() > f32::EPSILON {
+        match sig {
+            Signal::Float(v) => Signal::Float(v * gm),
+            other => other,
+        }
+    } else {
+        sig
+    }
+}
+
+/// Build a copy of `dev_sigs` with each device.source node's calibration,
+/// deadzone and gyro_multiplier applied to its own device's pins. Called once
+/// at the top of `eval_graph_tick` so AutoMap (which reads dev_sigs directly)
+/// sees the same processed values as direct wires.
+fn preprocess_dev_sigs(
+    graph: &ProcessingGraph,
+    dev_sigs: &HashMap<(String, String), Signal>,
+) -> HashMap<(String, String), Signal> {
+    let mut params: HashMap<String, (f32, f32, DeviceCal)> = HashMap::new();
+    for snap in &graph.nodes {
+        if snap.module_id != "device.source" { continue; }
+        let Some(dev_id) = snap.device_id.as_deref() else { continue; };
+        let dz = snap.params.get("deadzone").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
+        let gm = snap.params.get("gyro_multiplier").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let cal = load_device_cal(&snap.params);
+        params.insert(dev_id.to_string(), (dz, gm, cal));
+    }
+    let default_entry = (0.0_f32, 1.0_f32, DeviceCal::default());
+    let mut out = HashMap::with_capacity(dev_sigs.len());
+    for (key, sig) in dev_sigs.iter() {
+        let entry = params.get(&key.0).cloned().unwrap_or_else(|| default_entry.clone());
+        out.insert(key.clone(), post_process_device_pin(&key.1, *sig, entry.0, entry.1, &entry.2));
+    }
+    out
+}
+
 fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
     if dz <= 0.0 { return sig; }
     match sig {
@@ -215,13 +431,15 @@ fn eval_subgraph(
             }
             "module.twoway_response_curve" => {
                 last_inputs.insert(ns_uid, inputs.clone());
-                last_outputs.insert(ns_uid, node_outputs.clone());
             }
             "processing.gyro_3dof" => {
                 last_inputs.insert(ns_uid, node_outputs.clone());
             }
             _ => {}
         }
+        // Populate last_outputs for every node — used by the UI to drive the
+        // per-pin signal glow on downstream device-sink inputs.
+        last_outputs.insert(ns_uid, node_outputs.clone());
 
         computed[idx] = node_outputs;
     }
@@ -239,6 +457,15 @@ pub fn eval_graph_tick(
 ) -> TickOutput {
     let n = graph.nodes.len();
     let mut computed: Vec<Vec<Option<Signal>>> = vec![vec![]; n];
+
+    // Apply per-device source-side post-processing (stick deadzone + gyro
+    // multiplier) ONCE up front so every downstream consumer — direct wires,
+    // AutoMap split/collector, sink AutoMap, remapper — sees the processed
+    // values. Avoids the prior leak where AutoMap pulled raw dev_sigs and
+    // bypassed the source node's params.
+    let dev_sigs_owned: HashMap<(String, String), Signal> =
+        preprocess_dev_sigs(graph, dev_sigs);
+    let dev_sigs = &dev_sigs_owned;
 
     let mut outputs: HashMap<(usize, usize), Option<Signal>> = HashMap::new();
     let mut scope_samples: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
@@ -817,6 +1044,22 @@ pub fn eval_graph_tick(
                 .map(|(_, pid)| pid.as_str())
                 .collect();
 
+            // Per-sink scaling params. Currently: mouse sensitivity on
+            // virtual.keymouse — applied to mouse_x / mouse_y / mouse pins.
+            let mouse_sens = snap.params.get("mouse_sensitivity")
+                .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let scale_for_sink = |pin_id: &str, sig: Signal| -> Signal {
+                if st.device_id.starts_with("virtual.keymouse") && is_mouse_pin(pin_id)
+                    && (mouse_sens - 1.0).abs() > f32::EPSILON
+                {
+                    match sig {
+                        Signal::Float(v) => Signal::Float(v * mouse_sens),
+                        Signal::Vec2(v)  => Signal::Vec2(v * mouse_sens),
+                        other => other,
+                    }
+                } else { sig }
+            };
+
             // Direct-wire inputs (possibly multi-source per pin, combined additively).
             //
             // Self-sink nodes (device.source whose feedback inputs loop back to
@@ -839,7 +1082,7 @@ pub fn eval_graph_tick(
                         }
                     }
                     if let Some(sig) = combined {
-                        sink_outputs.insert((st.device_id.clone(), pin_id.clone()), sig);
+                        sink_outputs.insert((st.device_id.clone(), pin_id.clone()), scale_for_sink(pin_id, sig));
                     }
                 }
             }
@@ -879,7 +1122,7 @@ pub fn eval_graph_tick(
                         // signal off — semantic groups already routed it to the right pin.
                         sink_outputs
                             .entry((st.device_id.clone(), mapped_dst.to_string()))
-                            .or_insert(sig);
+                            .or_insert(scale_for_sink(mapped_dst, sig));
                     }
                 }
                 // Wildcard pass-through for virtual keyboard/mouse sinks: forward EVERY
@@ -893,7 +1136,7 @@ pub fn eval_graph_tick(
                         if directly_wired.contains(pin.as_str()) { continue; }
                         sink_outputs
                             .entry((st.device_id.clone(), pin.clone()))
-                            .or_insert(sig);
+                            .or_insert(scale_for_sink(pin, sig));
                     }
                 }
             }
@@ -1005,7 +1248,6 @@ pub fn eval_graph_tick(
             }
             "module.twoway_response_curve" => {
                 last_inputs.insert(snap.node_uid, inputs.clone());
-                last_outputs.insert(snap.node_uid, node_outputs.clone());
             }
             // Export outputs (not inputs) so the UI body can show a live readout.
             "processing.gyro_3dof" => {
@@ -1013,6 +1255,9 @@ pub fn eval_graph_tick(
             }
             _ => {}
         }
+        // Populate last_outputs for every node — used by the UI to drive the
+        // per-pin signal glow on downstream device-sink inputs.
+        last_outputs.insert(snap.node_uid, node_outputs.clone());
 
         // Exclude device.source from the exported outputs; UI evaluates those fresh.
         if snap.module_id != "device.source" {
@@ -1079,13 +1324,14 @@ fn compute_node(
 ) -> Vec<Option<Signal>> {
     match snap.module_id.as_str() {
         "device.source" => {
+            // Deadzone + gyro multiplier already applied in `preprocess_dev_sigs`
+            // at the top of `eval_graph_tick` so AutoMap/splitter/collector see
+            // the same processed values via raw dev_sigs reads.
             let dev_id = snap.device_id.as_deref().unwrap_or("");
-            let dz = snap.params.get("deadzone").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
             (0..snap.n_outputs).map(|i| {
                 let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
                 if pin_id.is_empty() { return None; }
-                let sig = dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()?;
-                Some(apply_deadzone(sig, dz))
+                dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
             }).collect()
         }
         "module.automap_split" => {
@@ -1175,7 +1421,7 @@ fn compute_node(
                 let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
                 if pin_id.is_empty() { return None; }
                 let sig = dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()?;
-                Some(if dz > 0.0 { apply_deadzone(sig, dz) } else { sig })
+                Some(if dz > 0.0 && is_stick_pin(pin_id) { apply_deadzone(sig, dz) } else { sig })
             }).collect()
         }
         "subpatch.inlet" => vec![],
