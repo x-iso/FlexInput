@@ -5408,13 +5408,20 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
                 let a = a0 + (a1 - a0) * t;
                 pts.push(center + r * egui::vec2(a.cos(), a.sin()));
             }
-            // Close the path with the flat edge endpoints. The endpoints
-            // of the arc already sit at (center.x, center.y ± r), so
-            // appending nothing closes the half-disc when `closed=true`.
+            // Two-pass paint so the outline traces ONLY the curved edge,
+            // not the flat side that meets the node body. First a closed
+            // filled half-disc (no stroke), then an OPEN polyline over
+            // just the arc points so the stroke skips the flat closing.
             painter.add(egui::Shape::Path(PathShape {
-                points: pts,
+                points: pts.clone(),
                 closed: true,
                 fill,
+                stroke: PathStroke::NONE,
+            }));
+            painter.add(egui::Shape::Path(PathShape {
+                points: pts,
+                closed: false,
+                fill: Color32::TRANSPARENT,
                 stroke: PathStroke::from(stroke),
             }));
 
@@ -6074,57 +6081,99 @@ fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, s
 
     let mut display_rect: Option<egui::Rect> = None;
     ui.vertical(|ui| {
-        egui::Resize::default()
-            .id_salt(("vs", node_id))
-            .default_size([140.0, 140.0])
-            .min_size([40.0, 40.0])
-            .show(ui, |ui| {
-                let side = ui.available_size().min_elem();
-                let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
-                display_rect = Some(rect);
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 2.0, Color32::from_gray(16));
-                painter.line_segment(
-                    [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
-                    egui::Stroke::new(0.5, Color32::from_gray(50)),
-                );
-                painter.line_segment(
-                    [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
-                    egui::Stroke::new(0.5, Color32::from_gray(50)),
-                );
-                painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
-                    egui::Stroke::new(0.5, Color32::from_gray(40)));
+        // Aspect-locked square resize. Stores `side` as persisted egui memory so
+        // it survives app restarts (same id scheme as the prior egui::Resize).
+        let size_id = egui::Id::new(("vs_side", node_id));
+        let mut side = ui
+            .ctx()
+            .data_mut(|d| d.get_persisted::<f32>(size_id))
+            .unwrap_or(140.0)
+            .max(40.0);
 
-                const MAX_VS_TRAIL: usize = 2000;
-                let skip = history.len().saturating_sub(MAX_VS_TRAIL);
-                let trail: Vec<_> = history.iter().skip(skip).collect();
-                let nt = trail.len();
-                for ch in 0..n_channels {
-                    let col = MULTI_COLORS[ch % MULTI_COLORS.len()];
-                    let xi = ch * 2;
-                    let yi = ch * 2 + 1;
-                    // Trail
-                    for (idx, sample) in trail.iter().enumerate() {
-                        let (Some(x), Some(y)) = (
-                            sample.get(xi).copied().flatten(),
-                            sample.get(yi).copied().flatten(),
-                        ) else { continue; };
-                        let px = rect.center().x + x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
-                        let py = rect.center().y - y.clamp(-1.0, 1.0) * rect.height() * 0.45;
-                        let alpha = ((idx as f32 / nt as f32) * 200.0) as u8 + 35;
-                        painter.circle_filled(egui::pos2(px, py), 1.5,
-                            Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha));
-                    }
-                    // Current-position dot
-                    if let Some(Some(Signal::Vec2(v))) = last_signals.get(ch) {
-                        let px = rect.center().x + v.x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
-                        let py = rect.center().y - v.y.clamp(-1.0, 1.0) * rect.height() * 0.45;
-                        painter.circle_filled(egui::pos2(px, py), 4.0, col);
-                        painter.circle_stroke(egui::pos2(px, py), 4.0,
-                            egui::Stroke::new(1.0, Color32::from_gray(100)));
-                    }
-                }
-            });
+        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+        display_rect = Some(rect);
+
+        // Drag handle in the bottom-right corner. Drives both axes from a single
+        // delta so the area stays square.
+        let handle_sz = 12.0;
+        let handle_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - handle_sz, rect.bottom() - handle_sz),
+            egui::Vec2::splat(handle_sz),
+        );
+        let handle_resp = ui.interact(
+            handle_rect,
+            size_id.with("handle"),
+            egui::Sense::click_and_drag(),
+        );
+        if handle_resp.hovered() || handle_resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+        }
+        if handle_resp.dragged() {
+            let d = handle_resp.drag_delta();
+            // Use the dominant axis so diagonal drags feel natural.
+            let delta = if d.x.abs() >= d.y.abs() { d.x } else { d.y };
+            side = (side + delta).max(40.0);
+            ui.ctx().data_mut(|d| d.insert_persisted(size_id, side));
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+        painter.line_segment(
+            [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
+            egui::Stroke::new(0.5, Color32::from_gray(50)),
+        );
+        painter.line_segment(
+            [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
+            egui::Stroke::new(0.5, Color32::from_gray(50)),
+        );
+        painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
+            egui::Stroke::new(0.5, Color32::from_gray(40)));
+
+        const MAX_VS_TRAIL: usize = 2000;
+        let skip = history.len().saturating_sub(MAX_VS_TRAIL);
+        let trail: Vec<_> = history.iter().skip(skip).collect();
+        let nt = trail.len();
+        for ch in 0..n_channels {
+            let col = MULTI_COLORS[ch % MULTI_COLORS.len()];
+            let xi = ch * 2;
+            let yi = ch * 2 + 1;
+            // Trail
+            for (idx, sample) in trail.iter().enumerate() {
+                let (Some(x), Some(y)) = (
+                    sample.get(xi).copied().flatten(),
+                    sample.get(yi).copied().flatten(),
+                ) else { continue; };
+                let px = rect.center().x + x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
+                let py = rect.center().y - y.clamp(-1.0, 1.0) * rect.height() * 0.45;
+                let alpha = ((idx as f32 / nt as f32) * 200.0) as u8 + 35;
+                painter.circle_filled(egui::pos2(px, py), 1.5,
+                    Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha));
+            }
+            // Current-position dot
+            if let Some(Some(Signal::Vec2(v))) = last_signals.get(ch) {
+                let px = rect.center().x + v.x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
+                let py = rect.center().y - v.y.clamp(-1.0, 1.0) * rect.height() * 0.45;
+                painter.circle_filled(egui::pos2(px, py), 4.0, col);
+                painter.circle_stroke(egui::pos2(px, py), 4.0,
+                    egui::Stroke::new(1.0, Color32::from_gray(100)));
+            }
+        }
+
+        // Paint a small diagonal-line resize grip in the bottom-right corner
+        // (mirrors egui's internal `paint_resize_corner_with_style`).
+        {
+            let grip_color = ui.style().interact(&handle_resp).fg_stroke.color;
+            let grip_stroke = egui::Stroke::new(1.0, grip_color);
+            let cp = handle_rect.right_bottom();
+            let mut w = 2.0;
+            while w <= handle_rect.width() && w <= handle_rect.height() {
+                painter.line_segment(
+                    [egui::pos2(cp.x - w, cp.y), egui::pos2(cp.x, cp.y - w)],
+                    grip_stroke,
+                );
+                w += 4.0;
+            }
+        }
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Ch").small().weak());

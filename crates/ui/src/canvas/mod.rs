@@ -82,6 +82,13 @@ pub struct Canvas {
     /// NodeId.0 values of inner nodes currently pinned to the outer body.
     /// Populated by show_subpatch_editors before rendering the inner canvas.
     pub pinned_inner_ids: std::collections::HashSet<usize>,
+    /// Updated each frame from the snarl view transform. Used to spawn
+    /// new device nodes at the center of the current viewport.
+    last_view_center_canvas: Option<egui::Pos2>,
+    /// Nodes scheduled for a one-shot spawn-glow flash, with the Instant
+    /// they were inserted. The viewer paints a fading outline halo around
+    /// these nodes for ~400 ms.
+    spawn_glow: std::collections::HashMap<egui_snarl::NodeId, std::time::Instant>,
 }
 
 impl Canvas {
@@ -138,6 +145,8 @@ impl Canvas {
             pending_expose_module: None,
             is_inner: false,
             pinned_inner_ids: std::collections::HashSet::new(),
+            last_view_center_canvas: None,
+            spawn_glow: std::collections::HashMap::new(),
         }
     }
 
@@ -355,6 +364,70 @@ impl Canvas {
     ) -> Option<NodeId> {
         let ctx = ui.ctx().clone();
 
+        // Clear any stale AutoMap-chip header-rect stash for nodes that
+        // were ADDED THIS FRAME. Slab reuses freed NodeId slots, so a
+        // newly-spawned device.source / device.sink can inherit the
+        // previous occupant's stashed rect — which snarl's show_output
+        // then reads on frame 1 before the new node's header gets to
+        // refresh it, producing a one-frame chip flash at the old
+        // location. We track this via spawn_glow which is populated by
+        // the add_* methods at insertion time.
+        {
+            let now = std::time::Instant::now();
+            for (&node_id, &spawn_t) in self.spawn_glow.iter() {
+                // Only clear within the first ~50 ms; after that the
+                // node has redrawn its header at least once and the
+                // stash is current.
+                if now.duration_since(spawn_t).as_millis() > 50 { continue; }
+                ctx.data_mut(|d| {
+                    d.remove::<egui::Rect>(egui::Id::new((
+                        "device_source_header_automap_rect", node_id.0,
+                    )));
+                    d.remove::<egui::Rect>(egui::Id::new((
+                        "device_sink_header_automap_in_rect", node_id.0,
+                    )));
+                });
+            }
+        }
+
+        // Refresh node/header frame fills from the current egui visuals so
+        // theme changes apply to the canvas immediately. We rebuild only
+        // the fill colors; the rest of `self.style` (collapsible, pins,
+        // shadow, etc.) was set in `Canvas::new` and stays put.
+        {
+            let v = &ui.visuals().clone();
+            let panel = v.panel_fill;
+            let darken = |c: egui::Color32, n: i16| {
+                let f = |x: u8| (x as i16 - n).clamp(0, 255) as u8;
+                egui::Color32::from_rgba_unmultiplied(f(c.r()), f(c.g()), f(c.b()), c.a())
+            };
+            let lighten = |c: egui::Color32, n: i16| darken(c, -n);
+            // Pick a body fill that's slightly different from the panel
+            // so nodes pop against the canvas; light theme wants a darker
+            // node, dark theme wants a slightly brighter node.
+            let is_dark = v.dark_mode;
+            let body_rgb = if is_dark { lighten(panel, 6) } else { darken(panel, 14) };
+            let body_fill = egui::Color32::from_rgba_unmultiplied(
+                body_rgb.r(), body_rgb.g(), body_rgb.b(), 200);
+            let header_fill = if is_dark {
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 38)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18)
+            };
+            let border_color = if is_dark {
+                egui::Color32::from_rgba_unmultiplied(70, 70, 76, 200)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(150, 150, 158, 200)
+            };
+            if let Some(f) = self.style.node_frame.as_mut() {
+                f.fill = body_fill;
+                f.stroke = egui::Stroke::new(1.0, border_color);
+            }
+            if let Some(f) = self.style.header_frame.as_mut() {
+                f.fill = header_fill;
+            }
+        }
+
         // ── Pre-show snapshot for viewer-driven mutations ─────────────────────
         let pre_snapshot = self.snarl.clone();
         let pre_counts = (
@@ -382,8 +455,32 @@ impl Canvas {
             param_defaults,
             calibrate_request: None,
         };
+        // Capture the snarl_id BEFORE show so we can manipulate SnarlState
+        // (zoom / pan) from the zoom-control overlay below.
+        let snarl_id = ui.make_persistent_id("flexinput_canvas");
+        let snarl_rect = ui.available_rect_before_wrap();
         self.snarl.show(&mut viewer, &self.style, "flexinput_canvas", ui);
         let calibrate_request = viewer.calibrate_request;
+
+        // Snapshot the current viewport-center in canvas space so new-node
+        // spawns can land at the user's current view rather than (0,0).
+        {
+            use egui_snarl::ui::SnarlState;
+            let st = SnarlState::load(ui.ctx(), snarl_id, &self.snarl, snarl_rect, 0.2, 2.0);
+            let t = st.to_global();
+            let center = snarl_rect.center();
+            let canvas_center = (center - t.translation) / t.scaling;
+            self.last_view_center_canvas = Some(egui::pos2(canvas_center.x, canvas_center.y));
+        }
+
+        // ── Spawn-glow overlay ────────────────────────────────────────────────
+        // Paint a fading outline pulse around recently-added nodes so the
+        // user sees where they landed (especially handy when they spawn
+        // off-screen after a pan, before we centred them).
+        draw_spawn_glow(ui, snarl_id, snarl_rect, &self.snarl, &mut self.spawn_glow);
+
+        // ── Zoom-control overlay (lower-right corner) ────────────────────────
+        draw_zoom_controls(ui, snarl_id, snarl_rect, &self.snarl);
 
         // ── Detect structural mutations from viewer callbacks ─────────────────
         let post_counts = (
@@ -678,6 +775,18 @@ impl Canvas {
         calibrate_request
     }
 
+    /// Return a sensible canvas-space spawn position for a new node:
+    /// the center of the current viewport if known, else a fallback.
+    /// Populated each frame from the snarl show; if `show` hasn't been
+    /// called yet this returns a stacked default.
+    pub fn spawn_position(&self) -> egui::Pos2 {
+        if let Some(p) = self.last_view_center_canvas {
+            return p;
+        }
+        let n = self.snarl.nodes_ids_data().count();
+        egui::pos2(80.0, 80.0 + n as f32 * 220.0)
+    }
+
     /// Add a physical device as a source node. No-op if already present.
     pub fn add_device_source(
         &mut self,
@@ -751,15 +860,13 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        let existing = self.snarl.nodes_ids_data()
-            .filter(|(_, n)| n.value.module_id == "device.source")
-            .count();
-        let pos = egui::pos2(80.0, 80.0 + existing as f32 * 220.0);
-        if default_collapsed {
-            self.snarl.insert_node_collapsed(pos, node);
+        let pos = self.spawn_position();
+        let new_id = if default_collapsed {
+            self.snarl.insert_node_collapsed(pos, node)
         } else {
-            self.snarl.insert_node(pos, node);
-        }
+            self.snarl.insert_node(pos, node)
+        };
+        self.spawn_glow.insert(new_id, std::time::Instant::now());
     }
 
     /// Add a physical device's input pins as a sink node (e.g. MIDI OUT port).
@@ -823,15 +930,13 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        let existing = self.snarl.nodes_ids_data()
-            .filter(|(_, n)| n.value.module_id == "device.sink")
-            .count();
-        let pos = egui::pos2(400.0, 80.0 + existing as f32 * 220.0);
-        if default_collapsed {
-            self.snarl.insert_node_collapsed(pos, node);
+        let pos = self.spawn_position();
+        let new_id = if default_collapsed {
+            self.snarl.insert_node_collapsed(pos, node)
         } else {
-            self.snarl.insert_node(pos, node);
-        }
+            self.snarl.insert_node(pos, node)
+        };
+        self.spawn_glow.insert(new_id, std::time::Instant::now());
     }
 
     /// Add a virtual device as a single sink node with optional feedback output pins.
@@ -883,15 +988,13 @@ impl Canvas {
             extra: Default::default(),
         };
 
-        let existing = self.snarl.nodes_ids_data()
-            .filter(|(_, n)| n.value.module_id == "device.sink")
-            .count();
-        let pos = egui::pos2(400.0, 80.0 + existing as f32 * 220.0);
-        if default_collapsed {
-            self.snarl.insert_node_collapsed(pos, node);
+        let pos = self.spawn_position();
+        let new_id = if default_collapsed {
+            self.snarl.insert_node_collapsed(pos, node)
         } else {
-            self.snarl.insert_node(pos, node);
-        }
+            self.snarl.insert_node(pos, node)
+        };
+        self.spawn_glow.insert(new_id, std::time::Instant::now());
     }
 }
 
@@ -1101,6 +1204,210 @@ const COMPAT_GROUPS: &[&[&str]] = &[
     // Extra action buttons (mic mute ↔ capture/screenshot)
     &["btn_mute",     "btn_capture"],
 ];
+
+/// Subtle outline pulse around recently-added nodes. Queries the real
+/// per-node `NodeState` from snarl's egui memory so the halo matches the
+/// node's actual screen rect — including after collapse and after snarl's
+/// first-frame size measurement. Painted in a foreground layer so the
+/// glow sits above the node frame, not behind it.
+///
+/// Skips the very first frame after spawn because snarl hasn't measured
+/// the node yet on that frame; drawing then would produce a halo of the
+/// wrong size (and snarl will request a discard / re-paint anyway).
+fn draw_spawn_glow(
+    ui: &mut egui::Ui,
+    snarl_id: egui::Id,
+    snarl_rect: egui::Rect,
+    snarl: &Snarl<NodeData>,
+    glow: &mut std::collections::HashMap<egui_snarl::NodeId, std::time::Instant>,
+) {
+    use egui_snarl::ui::{NodeState, SnarlState};
+    const DURATION_MS: f32 = 600.0;
+    const FRAME_SKIP_MS: f32 = 16.0; // skip the first ~one frame
+    if glow.is_empty() { return; }
+    let now = std::time::Instant::now();
+    glow.retain(|_, t| now.duration_since(*t).as_secs_f32() * 1000.0 < DURATION_MS);
+    if glow.is_empty() { return; }
+    ui.ctx().request_repaint();
+
+    // Canvas → screen transform.
+    let st = SnarlState::load(ui.ctx(), snarl_id, snarl, snarl_rect, 0.2, 2.0);
+    let t = st.to_global();
+
+    // Foreground painter — above snarl's node and wire layers.
+    let layer = egui::LayerId::new(egui::Order::Foreground, snarl_id.with("spawn_glow"));
+    let mut painter = ui.ctx().layer_painter(layer);
+    painter.set_clip_rect(snarl_rect);
+
+    let style = ui.ctx().style();
+    for (&node_id, &spawn_t) in glow.iter() {
+        let age_ms = now.duration_since(spawn_t).as_secs_f32() * 1000.0;
+        if age_ms < FRAME_SKIP_MS { continue; }
+        let Some(info) = snarl.get_node_info(node_id) else { continue; };
+
+        // Pull the snarl-measured node size for this node.
+        let ns_id = snarl_id.with(("snarl-node", node_id));
+        let ns = NodeState::load(ui.ctx(), ns_id, &style.spacing);
+        // openness 1.0 if open, 0.0 if collapsed (snarl interpolates but
+        // we don't need the in-between for a brief flash).
+        let openness = if info.open { 1.0 } else { 0.0 };
+        let canvas_rect = ns.node_rect(info.pos, openness);
+        // Transform to screen space.
+        let top_left = canvas_rect.min.to_vec2() * t.scaling + t.translation;
+        let size     = canvas_rect.size() * t.scaling;
+        let rect     = egui::Rect::from_min_size(top_left.to_pos2(), size);
+
+        let p = (age_ms / DURATION_MS).clamp(0.0, 1.0);
+        let alpha = (1.0 - p).powf(1.5);
+        let halo  = egui::Color32::from_rgba_unmultiplied(120, 180, 255, (180.0 * alpha) as u8);
+        let bloom = egui::Color32::from_rgba_unmultiplied(120, 180, 255, (45.0 * alpha) as u8);
+
+        painter.rect_stroke(
+            rect.expand(7.0),
+            egui::CornerRadius::same(10),
+            egui::Stroke::new(8.0, bloom),
+            egui::epaint::StrokeKind::Outside,
+        );
+        painter.rect_stroke(
+            rect.expand(3.0),
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(2.5, halo),
+            egui::epaint::StrokeKind::Outside,
+        );
+    }
+}
+
+/// Lower-right overlay with canvas zoom controls.
+/// Layout (left → right): [−] [100%] [zoom %] [+] [fit].
+/// Painted in a foreground egui Area so the strip sits visually above
+/// and interactively above the snarl node layer.
+fn draw_zoom_controls(
+    ui: &mut egui::Ui,
+    snarl_id: egui::Id,
+    snarl_rect: egui::Rect,
+    snarl: &Snarl<NodeData>,
+) {
+    use egui_snarl::ui::SnarlState;
+
+    const MIN_SCALE: f32 = 0.2;
+    const MAX_SCALE: f32 = 2.0;
+
+    let mut state = SnarlState::load(ui.ctx(), snarl_id, snarl, snarl_rect, MIN_SCALE, MAX_SCALE);
+    let cur_scale = state.to_global().scaling;
+    let pct = (cur_scale * 100.0).round() as i32;
+
+    // Pre-measure the strip so we can compute a bottom-right placement.
+    // Layout: [-]  [zoom%]  [+]  [fit]  ≈ 24 + 48 + 24 + 24 + paddings
+    let margin = 10.0_f32;
+    let est_w  = 156.0_f32;
+    let est_h  = 36.0_f32;
+    let anchor = egui::pos2(
+        snarl_rect.right()  - est_w - margin,
+        snarl_rect.bottom() - est_h - margin,
+    );
+
+    // Foreground area placed at an absolute screen-space position inside
+    // the snarl rect, so it stays anchored to the canvas (not the
+    // viewport / side panels).
+    let area = egui::Area::new(snarl_id.with("zoom_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .interactable(true);
+
+    let mut clicked_minus  = false;
+    let mut clicked_reset  = false;
+    let mut clicked_plus   = false;
+    let mut clicked_fit    = false;
+
+    area.show(ui.ctx(), |ui| {
+        let bg = ui.visuals().window_fill();
+        let frame = egui::Frame::default()
+            .fill(egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 230))
+            .stroke(egui::Stroke::new(
+                1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(6, 4));
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                clicked_minus = ui.add(egui::Button::new(
+                    egui::RichText::new("−").monospace())
+                    .min_size(egui::vec2(24.0, 22.0)))
+                    .on_hover_text("Zoom out")
+                    .clicked();
+                // Current-zoom display doubles as the "reset to 100%"
+                // button — visually it looks like a button, so the
+                // affordance is obvious without a dedicated 100% label.
+                clicked_reset = ui.add(egui::Button::new(
+                    egui::RichText::new(format!("{}%", pct)).monospace())
+                    .min_size(egui::vec2(48.0, 22.0)))
+                    .on_hover_text("Reset to 100%")
+                    .clicked();
+                clicked_plus = ui.add(egui::Button::new(
+                    egui::RichText::new("+").monospace())
+                    .min_size(egui::vec2(24.0, 22.0)))
+                    .on_hover_text("Zoom in")
+                    .clicked();
+                clicked_fit = ui.add(egui::Button::new(
+                    egui::RichText::new("⛶").monospace())
+                    .min_size(egui::vec2(24.0, 22.0)))
+                    .on_hover_text("Fit all nodes")
+                    .clicked();
+            });
+        });
+    });
+
+    if clicked_minus {
+        let new_scale = (cur_scale / 1.25).clamp(MIN_SCALE, MAX_SCALE);
+        zoom_about(&mut state, snarl_rect.center(), new_scale);
+    }
+    if clicked_reset {
+        zoom_about(&mut state, snarl_rect.center(), 1.0);
+    }
+    if clicked_plus {
+        let new_scale = (cur_scale * 1.25).clamp(MIN_SCALE, MAX_SCALE);
+        zoom_about(&mut state, snarl_rect.center(), new_scale);
+    }
+    if clicked_fit {
+        // Match snarl's own double-click "fit-to-view" behavior: union
+        // of each node's full RECT (top-left + measured size), not just
+        // its top-left position. Without the size, large nodes would
+        // poke off the right/bottom of the framed view.
+        use egui_snarl::ui::NodeState;
+        let style = ui.ctx().style();
+        let mut bb = egui::Rect::NOTHING;
+        for (node_id, info) in snarl.nodes_ids_data() {
+            let ns_id = snarl_id.with(("snarl-node", node_id));
+            let ns = NodeState::load(ui.ctx(), ns_id, &style.spacing);
+            let openness = if info.open { 1.0 } else { 0.0 };
+            let r = ns.node_rect(info.pos, openness);
+            bb = bb.union(r);
+        }
+        if bb.is_finite() {
+            bb = bb.expand(100.0);
+            state.look_at(bb, snarl_rect, MIN_SCALE, MAX_SCALE);
+        }
+    }
+
+    state.store(snarl, ui.ctx());
+}
+
+/// Apply a new zoom level while keeping `pivot` (screen-space point) fixed.
+fn zoom_about(state: &mut egui_snarl::ui::SnarlState, pivot: egui::Pos2, new_scale: f32) {
+    let t = state.to_global();
+    let cur_scale = t.scaling;
+    if (new_scale - cur_scale).abs() < 1e-4 { return; }
+    // Solve: new translation such that new_to_global maps the same canvas
+    // point under `pivot` to `pivot` again.
+    //   pivot_canvas = (pivot - t.translation) / cur_scale
+    //   pivot = pivot_canvas * new_scale + new_translation
+    let pivot_canvas = (pivot - t.translation) / cur_scale;
+    let new_translation = pivot - pivot_canvas * new_scale;
+    state.set_to_global(egui::emath::TSTransform {
+        translation: new_translation,
+        scaling: new_scale,
+    });
+}
 
 /// Find the position of `old_id` in `candidates`, with alias fallback.
 fn resolve_pin(old_id: &str, candidates: &[&str]) -> Option<usize> {

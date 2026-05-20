@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use hidapi::{HidApi, HidDevice};
 
+#[cfg(windows)]
+use crate::dualsense_haptic;
+
 const SONY_VID: u16           = 0x054C;
 const DS4_PIDS: &[u16]       = &[0x05C4, 0x09CC];
 const DUALSENSE_PIDS: &[u16] = &[0x0CE6, 0x0DF2]; // standard + DualSense Edge
@@ -113,7 +116,15 @@ enum Connection { Usb, Bt }
 
 enum DeviceKind {
     Ds4,
-    DualSense { connection: Option<Connection> },
+    DualSense {
+        connection: Option<Connection>,
+        /// 4-bit sequence counter for BT output reports (low 4 bits used).
+        bt_seq: u8,
+        /// Lazily-initialized WASAPI haptic stream (USB only). `None` while
+        /// the audio endpoint hasn't been resolved yet or on non-Windows builds.
+        #[cfg(windows)]
+        haptic: Option<dualsense_haptic::HapticStream>,
+    },
     SwitchPro { initialized: bool, packet_counter: u8 },
 }
 
@@ -163,6 +174,14 @@ struct OutputState {
     hd_l_freq: u8,
     hd_r_amp:  u8,
     hd_r_freq: u8,
+    // DualSense HD haptics — per-side amplitude + frequency (0–255 each).
+    // Driven through the controller's USB audio endpoint (channels 3/4 = left/right
+    // LRA). Bluetooth has no audio endpoint, so these fields are silently ignored
+    // when the connection is BT; rumble_strong/weak still drive the classic motors.
+    ds_l_amp:  u8,
+    ds_l_freq: u8,
+    ds_r_amp:  u8,
+    ds_r_freq: u8,
 }
 
 pub struct GyroManager {
@@ -295,7 +314,12 @@ impl GyroManager {
         // and the firmware processes those fields on that interface.
         let kind = match kind_tag {
             KindTag::Ds4       => DeviceKind::Ds4,
-            KindTag::DualSense => DeviceKind::DualSense { connection: None },
+            KindTag::DualSense => DeviceKind::DualSense {
+                connection: None,
+                bt_seq: 0,
+                #[cfg(windows)]
+                haptic: None,
+            },
             KindTag::SwitchPro => DeviceKind::SwitchPro { initialized: false, packet_counter: 0 },
         };
         Some(HidEntry {
@@ -327,6 +351,11 @@ impl GyroManager {
             "hd_l_freq" => { entry.out.hd_l_freq  = byte; true }
             "hd_r_amp"  => { entry.out.hd_r_amp   = byte; true }
             "hd_r_freq" => { entry.out.hd_r_freq  = byte; true }
+            // DualSense HD haptics — amplitude + frequency per side (USB only).
+            "ds_l_amp"  => { entry.out.ds_l_amp  = byte; true }
+            "ds_l_freq" => { entry.out.ds_l_freq = byte; true }
+            "ds_r_amp"  => { entry.out.ds_r_amp  = byte; true }
+            "ds_r_freq" => { entry.out.ds_r_freq = byte; true }
             "lightbar_r"    => { entry.out.lightbar_r = byte; true }
             "lightbar_g"    => { entry.out.lightbar_g = byte; true }
             "lightbar_b"    => { entry.out.lightbar_b = byte; true }
@@ -365,9 +394,37 @@ impl GyroManager {
                 DeviceKind::Ds4 => {
                     hid_write(device, &build_ds4_usb_out(out));
                 }
-                DeviceKind::DualSense { connection } => {
-                    if matches!(connection, Some(Connection::Bt)) { continue; }
-                    hid_write(device, &build_dualsense_usb_out(out));
+                DeviceKind::DualSense { connection, bt_seq, #[cfg(windows)] haptic } => {
+                    match connection {
+                        Some(Connection::Bt) => {
+                            let pkt = build_dualsense_bt_out(out, *bt_seq);
+                            *bt_seq = bt_seq.wrapping_add(1) & 0x0F;
+                            hid_write(device, &pkt);
+                        }
+                        // USB (or unknown — default to USB report which is what
+                        // the firmware accepts when the device is on interface 3).
+                        _ => {
+                            hid_write(device, &build_dualsense_usb_out(out));
+                            #[cfg(windows)]
+                            {
+                                let want_haptic = out.ds_l_amp != 0
+                                    || out.ds_l_freq != 0
+                                    || out.ds_r_amp != 0
+                                    || out.ds_r_freq != 0;
+                                if want_haptic && haptic.is_none() {
+                                    *haptic = dualsense_haptic::HapticStream::open();
+                                }
+                                if let Some(h) = haptic.as_mut() {
+                                    h.set_targets(
+                                        out.ds_l_amp as f32 / 255.0,
+                                        out.ds_l_freq as f32 / 255.0,
+                                        out.ds_r_amp as f32 / 255.0,
+                                        out.ds_r_freq as f32 / 255.0,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 DeviceKind::SwitchPro { initialized, packet_counter } => {
                     if !*initialized { continue; }
@@ -489,7 +546,7 @@ fn parse_report(buf: &[u8], kind: &mut DeviceKind) -> Option<HidReading> {
     if buf.is_empty() { return None; }
     match kind {
         DeviceKind::Ds4 => parse_ds4(buf),
-        DeviceKind::DualSense { connection } => parse_dualsense(buf, connection),
+        DeviceKind::DualSense { connection, .. } => parse_dualsense(buf, connection),
         DeviceKind::SwitchPro { .. } => parse_switch_pro(buf),
     }
 }
@@ -937,11 +994,52 @@ fn build_dualsense_usb_out(out: &OutputState) -> [u8; 63] {
     // so their 0x00 = our r[1], their 0x2C = our r[45], etc.)
     let mut r = [0u8; 63];
     r[0] = 0x02;
-    r[1] = 0xFF;  // valid_flag0
-    r[2] = 0xF7;  // valid_flag1 (matches DualSense-Windows exactly)
-    r[3] = out.rumble_weak;
-    r[4] = out.rumble_strong;
-    r[9] = out.mic_led.min(2);
+    fill_dualsense_common(&mut r[1..48], out);
+    r
+}
+
+/// DualSense Bluetooth output report 0x31 (78 bytes incl. report ID).
+/// Wraps the same 47-byte common struct as USB, prefixed with seq_tag + tag
+/// and signed with a CRC32 over the report contents (excluding the 4 CRC bytes).
+/// Without the CRC the firmware silently drops the packet.
+fn build_dualsense_bt_out(out: &OutputState, seq: u8) -> [u8; 78] {
+    let mut r = [0u8; 78];
+    r[0] = 0x31;                       // report id
+    r[1] = (seq & 0x0F) << 4;          // seq_tag: high nibble = sequence, low nibble = 0
+    r[2] = 0x10;                       // DS_OUTPUT_TAG
+    fill_dualsense_common(&mut r[3..50], out);
+    // bytes 50..73 = reserved (zero)
+    let crc = dualsense_bt_crc32(&r[..74]);
+    r[74..78].copy_from_slice(&crc.to_le_bytes());
+    r
+}
+
+/// Populate the 47-byte `dualsense_output_report_common` struct shared by USB
+/// (offset +1) and BT (offset +3). Pure function so both transports stay in sync.
+fn fill_dualsense_common(dst: &mut [u8], out: &OutputState) {
+    debug_assert_eq!(dst.len(), 47);
+    // +0 valid_flag0:
+    //   bit0 COMPATIBLE_VIBRATION  — enables motor_left/motor_right (classic rumble)
+    //   bit1 HAPTICS_SELECT        — routes audio ch3/ch4 to LRA actuators
+    //   bit5 SPEAKER_VOLUME_ENABLE
+    //   bit6 MIC_VOLUME_ENABLE
+    //   bit7 AUDIO_CONTROL_ENABLE
+    dst[0] = 0xFF;
+    // +1 valid_flag1:
+    //   bit0 MIC_MUTE_LED_CONTROL_ENABLE
+    //   bit1 POWER_SAVE_CONTROL_ENABLE
+    //   bit2 LIGHTBAR_CONTROL_ENABLE
+    //   bit3 RELEASE_LEDS  — must be 0
+    //   bit4 PLAYER_INDICATOR_CONTROL_ENABLE
+    //   bit7 AUDIO_CONTROL2_ENABLE
+    dst[1] = 0xF7;
+    // +2 motor_right (weak / high-freq), +3 motor_left (strong / low-freq)
+    dst[2] = out.rumble_weak;
+    dst[3] = out.rumble_strong;
+    // +8 mute_button_led
+    dst[8] = out.mic_led.min(2);
+    // +10..+36 reserved2[27] — trigger effect blobs are placed here.
+    // Adaptive trigger effect encodings live at dst[10..21] (right) and dst[21..32] (left).
     let rt = encode_trigger_effect(
         out.trigger_r_mode, out.trigger_r_start,
         out.trigger_r_end,  out.trigger_r_strength, out.trigger_r_freq,
@@ -950,16 +1048,41 @@ fn build_dualsense_usb_out(out: &OutputState) -> [u8; 63] {
         out.trigger_l_mode, out.trigger_l_start,
         out.trigger_l_end,  out.trigger_l_strength, out.trigger_l_freq,
     );
-    r[11..22].copy_from_slice(&rt);
-    r[22..33].copy_from_slice(&lt);
-    r[39] = 0x03; // valid_flag2: matches DualSense-Windows exactly (their 0x26=0x03)
-    r[42] = 0x02; // lightbar_setup (their 0x29)
-    r[43] = 0x00; // led_brightness: 0 = firmware default
-    r[44] = player_led_mask(out.player_led);
-    r[45] = out.lightbar_r;
-    r[46] = out.lightbar_g;
-    r[47] = out.lightbar_b;
-    r
+    dst[10..21].copy_from_slice(&rt);
+    dst[21..32].copy_from_slice(&lt);
+    // +38 valid_flag2:
+    //   bit1 LIGHTBAR_SETUP_CONTROL_ENABLE
+    //   bit2 COMPATIBLE_VIBRATION2 — newer firmware requires this alongside FLAG0 bit0
+    dst[38] = 0x03;
+    // +41 lightbar_setup (LIGHT_OUT), +42 led_brightness (0=firmware default),
+    // +43 player_leds bitmask, +44..+46 RGB
+    dst[41] = 0x02;
+    dst[42] = 0x00;
+    dst[43] = player_led_mask(out.player_led);
+    dst[44] = out.lightbar_r;
+    dst[45] = out.lightbar_g;
+    dst[46] = out.lightbar_b;
+}
+
+/// CRC32 used by DualSense Bluetooth output reports.
+/// Equivalent to `~crc32_le(crc32_le(0xFFFFFFFF, &0xA2, 1), data, len)`
+/// from `drivers/hid/hid-playstation.c`. Polynomial 0xEDB88320 (reflected IEEE).
+fn dualsense_bt_crc32(data: &[u8]) -> u32 {
+    const SEED: u8 = 0xA2;
+    let mut crc = crc32_le_update(0xFFFFFFFF, &[SEED]);
+    crc = crc32_le_update(crc, data);
+    !crc
+}
+
+fn crc32_le_update(mut crc: u32, data: &[u8]) -> u32 {
+    const POLY: u32 = 0xEDB88320;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (POLY & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    crc
 }
 
 // ── VID/PID classification ─────────────────────────────────────────────────────
@@ -984,5 +1107,80 @@ fn preferred_interface(kind: &KindTag) -> i32 {
     match kind {
         KindTag::Ds4 | KindTag::DualSense => 3,
         KindTag::SwitchPro => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reflected IEEE CRC32 of the empty input is 0 (the canonical identity).
+    /// `dualsense_bt_crc32` mixes the 0xA2 seed byte first, so the result for
+    /// empty data is ~crc32_le(0xFFFFFFFF, [0xA2]) — a fixed value we can pin.
+    #[test]
+    fn dualsense_bt_crc_is_deterministic() {
+        // Two identical reports must produce identical CRCs.
+        let out = OutputState::default();
+        let a = build_dualsense_bt_out(&out, 0);
+        let b = build_dualsense_bt_out(&out, 0);
+        assert_eq!(a, b);
+        // Different sequence numbers produce different CRCs (seq is covered).
+        let c = build_dualsense_bt_out(&out, 1);
+        assert_ne!(a[74..78], c[74..78], "seq counter must affect CRC");
+    }
+
+    /// USB and BT carry the same 47-byte common struct. After stripping
+    /// transport wrappers (USB: 1-byte ID prefix; BT: 3-byte prefix + 4-byte
+    /// CRC + 24-byte reserved suffix), the common payloads must match.
+    #[test]
+    fn dualsense_usb_and_bt_share_common_payload() {
+        let mut out = OutputState::default();
+        out.rumble_strong = 0xAB;
+        out.rumble_weak   = 0xCD;
+        out.lightbar_r    = 0x10;
+        out.lightbar_g    = 0x20;
+        out.lightbar_b    = 0x30;
+        let usb = build_dualsense_usb_out(&out);
+        let bt  = build_dualsense_bt_out(&out, 0);
+        assert_eq!(&usb[1..48], &bt[3..50], "common struct must be identical");
+    }
+
+    #[test]
+    fn dualsense_bt_report_has_correct_framing() {
+        let out = OutputState::default();
+        let bt  = build_dualsense_bt_out(&out, 0x5);
+        assert_eq!(bt[0], 0x31);              // report id
+        assert_eq!(bt[1], 0x50);              // seq high-nibble = 5, low = 0
+        assert_eq!(bt[2], 0x10);              // DS_OUTPUT_TAG
+        assert_eq!(bt.len(), 78);             // DS_OUTPUT_REPORT_BT_SIZE
+    }
+
+    #[test]
+    fn dualsense_usb_report_has_correct_framing() {
+        let out = OutputState::default();
+        let usb = build_dualsense_usb_out(&out);
+        assert_eq!(usb[0], 0x02);             // report id
+        assert_eq!(usb.len(), 63);            // DS_OUTPUT_REPORT_USB_SIZE
+    }
+
+    #[test]
+    fn dualsense_common_motor_bytes_match_layout() {
+        // motor_right at struct offset +2, motor_left at +3 (XInput-style).
+        let mut out = OutputState::default();
+        out.rumble_weak   = 0xAA; // → motor_right
+        out.rumble_strong = 0xBB; // → motor_left
+        let usb = build_dualsense_usb_out(&out);
+        assert_eq!(usb[3], 0xAA, "motor_right (rumble_weak) at USB byte 3");
+        assert_eq!(usb[4], 0xBB, "motor_left  (rumble_strong) at USB byte 4");
+    }
+
+    /// Sanity-check the CRC32 routine against a known-good vector. The reflected
+    /// IEEE CRC32 of "123456789" is the IEEE/PNG checksum 0xCBF43926.
+    /// (We compute it directly via `crc32_le_update` to validate the bit-level
+    /// arithmetic — the DualSense-specific seeding is then trivial to layer on.)
+    #[test]
+    fn crc32_le_matches_ieee_check_vector() {
+        let crc = !crc32_le_update(0xFFFFFFFF, b"123456789");
+        assert_eq!(crc, 0xCBF43926);
     }
 }

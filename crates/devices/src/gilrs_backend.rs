@@ -78,9 +78,6 @@ impl GilrsBackend {
         self.phys_counts.clear();
         self.vigem_present.clear();
         for (_, pad) in self.gilrs.gamepads() {
-            #[cfg(debug_assertions)]
-            eprintln!("[gilrs] name={:?} vid={:04X?} pid={:04X?}",
-                pad.name(), pad.vendor_id(), pad.product_id());
             if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
                 self.vigem_present.entry(vp).or_insert_with(|| {
                     crate::hidhide::has_vigem_for_vid_pid(vp.0, vp.1)
@@ -130,8 +127,6 @@ impl DeviceBackend for GilrsBackend {
             };
 
             let dev_id = format!("gilrs:{}:{}", kind.id_slug(), inst);
-            eprintln!("[enumerate] pad: name={:?} vid={:04X?} pid={:04X?} -> id={dev_id}",
-                pad.name(), pad.vendor_id(), pad.product_id());
             result.push(PhysicalDevice {
                 id: dev_id,
                 display_name,
@@ -184,8 +179,6 @@ impl DeviceBackend for GilrsBackend {
                     let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
                     let seen = gilrs_seen.entry(vp).or_insert(0);
                     if *seen >= phys {
-                        eprintln!("[poll] FILTER skip: name={:?} vid={:04X?} pid={:04X?} seen={} phys={}",
-                            pad.name(), pad.vendor_id(), pad.product_id(), seen, phys);
                         continue;
                     }
                     *seen += 1;
@@ -436,10 +429,7 @@ impl DeviceBackend for GilrsBackend {
         // ── PS/Switch HID path via GyroManager ───────────────────────────────
         let (vid, pid, idx) = match self.lookup_phys(device_id) {
             Some(t) => t,
-            None => {
-                eprintln!("[send] lookup_phys failed for device_id={device_id:?} pin={pin_id:?}");
-                return;
-            }
+            None => return,
         };
         // Scale Float 0–1 to the semantic range for each pin.
         // Pins with custom ranges are listed explicitly; everything else uses 0–255.

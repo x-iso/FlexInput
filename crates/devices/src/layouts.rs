@@ -191,6 +191,16 @@ fn ds4_inputs() -> Vec<DevicePin> {
 fn dualsense_inputs() -> Vec<DevicePin> {
     let mut pins = ds4_inputs();
     pins.extend(vec![
+        // ── HD haptics (USB only — driven through the controller's 4-ch audio
+        // endpoint, channels 3/4 = left/right LRA). Bluetooth has no audio
+        // endpoint so these pins are silently no-op on BT; rumble_strong/weak
+        // remain as the XInput-compatible fallback the user wires explicitly.
+        // ds_l/r_amp:  0=silent → 1=max
+        // ds_l/r_freq: 0=80Hz  → 1=500Hz (covers LRA usable band; ~160Hz resonance)
+        fl("ds_l_amp",  "DS Haptic L: Amplitude (USB only, 0–1)"),
+        fl("ds_l_freq", "DS Haptic L: Frequency (USB only, 0=80Hz 1=500Hz)"),
+        fl("ds_r_amp",  "DS Haptic R: Amplitude (USB only, 0–1)"),
+        fl("ds_r_freq", "DS Haptic R: Frequency (USB only, 0=80Hz 1=500Hz)"),
         // LEDs. All accept Float 0–1.
         // player_led: 0=off, 0.25=P1, 0.5=P2, 0.75=P3, 1.0=P4
         fl("player_led", "Player LED (0=off 0.25=P1 0.5=P2 0.75=P3 1=P4)"),

@@ -25,6 +25,13 @@ fn default_true() -> bool { true }
 fn default_deadzone() -> f32 { 0.1 }
 fn default_gyro_mult() -> f32 { 1.0 }
 fn default_mouse_sens() -> f32 { 1.0 }
+fn default_theme() -> Theme { Theme::Dark }
+fn default_contrast() -> f32 { 0.0 }
+
+/// App-wide visual theme. Controls the egui Visuals base + the canvas
+/// node/header fill colors picked by `Canvas::new`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Theme { Dark, Light }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -45,6 +52,14 @@ pub struct AppSettings {
     /// Default `mouse_sensitivity` param applied to newly-added keymouse sinks.
     #[serde(default = "default_mouse_sens")]
     pub default_mouse_sensitivity: f32,
+    /// Selected app theme. Defaults to Dark to match existing visuals.
+    #[serde(default = "default_theme")]
+    pub theme: Theme,
+    /// Contrast adjustment in -1..1 range. Positive lightens panel/node
+    /// backgrounds (more contrast against text), negative darkens. 0 is
+    /// neutral — current default.
+    #[serde(default = "default_contrast")]
+    pub contrast: f32,
 }
 
 impl Default for AppSettings {
@@ -57,8 +72,44 @@ impl Default for AppSettings {
             default_stick_deadzone: 0.1,
             default_gyro_mult: 1.0,
             default_mouse_sensitivity: 1.0,
+            theme: Theme::Dark,
+            contrast: 0.0,
         }
     }
+}
+
+/// Apply `settings.theme` + `settings.contrast` to the egui style. Called
+/// each frame from the app loop so changes take effect immediately.
+///
+/// Note: theme is currently forced to Dark regardless of the persisted
+/// value, because light mode isn't fully plumbed through every custom-
+/// painted element. The setting is preserved on disk for a future
+/// proper light-mode pass.
+pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
+    let _ = settings.theme; // theme picker hidden in UI; dark-only for now
+    let mut style: egui::Style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::dark();
+    let c = settings.contrast.clamp(-1.0, 1.0);
+    if c.abs() > 1e-3 {
+        // Contrast pushes panel/widget fills lighter (c > 0) or darker
+        // (c < 0) by up to ~30 levels of brightness. We work directly on
+        // the visuals fields the panel/widget chrome reads from.
+        let shift = (c * 30.0).round() as i16;
+        let adjust = |col: egui::Color32| -> egui::Color32 {
+            let f = |v: u8| (v as i16 + shift).clamp(0, 255) as u8;
+            egui::Color32::from_rgba_unmultiplied(f(col.r()), f(col.g()), f(col.b()), col.a())
+        };
+        style.visuals.panel_fill            = adjust(style.visuals.panel_fill);
+        style.visuals.window_fill           = adjust(style.visuals.window_fill);
+        style.visuals.extreme_bg_color      = adjust(style.visuals.extreme_bg_color);
+        style.visuals.faint_bg_color        = adjust(style.visuals.faint_bg_color);
+        style.visuals.code_bg_color         = adjust(style.visuals.code_bg_color);
+        style.visuals.widgets.noninteractive.bg_fill = adjust(style.visuals.widgets.noninteractive.bg_fill);
+        style.visuals.widgets.noninteractive.weak_bg_fill = adjust(style.visuals.widgets.noninteractive.weak_bg_fill);
+        style.visuals.widgets.inactive.bg_fill = adjust(style.visuals.widgets.inactive.bg_fill);
+        style.visuals.widgets.inactive.weak_bg_fill = adjust(style.visuals.widgets.inactive.weak_bg_fill);
+    }
+    ctx.set_style(style);
 }
 
 fn appdata_dir() -> Option<std::path::PathBuf> {

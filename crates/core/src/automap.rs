@@ -24,6 +24,12 @@ const SEMANTIC_GROUPS: &[&[&str]] = &[
 /// To extend: add a new entry for any new device-specific haptic input pin alias.
 /// Example: when a new controller adopts pin "trigger_l_rumble", add it to the
 /// rumble_strong entry alongside "hd_l_amp" / "hd_rumble_l".
+///
+/// DualSense note: `ds_l_amp`/`ds_r_amp` are NOT listed here. DualSense already
+/// exposes `rumble_strong`/`rumble_weak` (classic motors, XInput-compatible),
+/// which is the right fallback when a generic patch wires `rumble_strong`.
+/// To drive HD haptics, the user explicitly wires `ds_l_amp` + `ds_l_freq`
+/// (and the R pair) in their patch — same shape as Switch Pro's HD rumble.
 pub const FEEDBACK_PAIRS: &[(&str, &[&str])] = &[
     ("rumble_strong", &["rumble_strong", "hd_l_amp", "hd_rumble_l"]),
     ("rumble_weak",   &["rumble_weak",   "hd_r_amp", "hd_rumble_r"]),

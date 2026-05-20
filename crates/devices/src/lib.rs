@@ -6,6 +6,9 @@ pub mod identification;
 pub mod layouts;
 pub mod midi;
 
+#[cfg(windows)]
+mod dualsense_haptic;
+
 use flexinput_core::{Signal, SignalType};
 
 pub use gilrs_backend::GilrsBackend;

@@ -9,3 +9,18 @@ glam           = { workspace = true }
 gilrs          = "0.10"
 hidapi         = "2"
 midir          = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# WASAPI access for DualSense HD haptics (channels 3/4 of the controller's
+# 4-channel USB audio endpoint drive the left/right LRA actuators).
+# The `wasapi` crate is a thin safe wrapper around the Windows COM interfaces;
+# windows-sys would force us to hand-roll COM vtables, which is not worth it
+# for a single audio render path.
+#
+# Pinned to 0.18: this is the last wasapi release that targets the `windows`
+# crate at major 0.61 — the same major `accesskit_windows` 0.29 (pulled in by
+# eframe 0.33) uses. Newer wasapi (0.20+) pulls in `windows 0.62`, which
+# causes two parallel `windows` crate runtimes in the same process — both
+# install COM apartment hooks, and the result is that accesskit's
+# `SetPropW` calls in subclass.rs panic on startup with ERROR_NOT_ENOUGH_MEMORY.
+wasapi = "=0.18"

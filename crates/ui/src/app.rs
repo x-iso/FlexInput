@@ -412,6 +412,10 @@ impl eframe::App for FlexInputApp {
         let dt = self.last_update.elapsed().as_secs_f32().clamp(0.001, 0.1);
         self.last_update = std::time::Instant::now();
 
+        // Apply selected theme + contrast every frame so changes take
+        // effect immediately when the user moves the slider in Settings.
+        crate::settings::apply_theme_and_contrast(ctx, &self.settings);
+
         // Read the latest device signals written by the I/O thread (500 Hz).
         self.last_signals = self.proc_device_signals.read().unwrap().clone();
         // Refresh device list from I/O thread. Both gilrs and MIDI device
@@ -598,6 +602,7 @@ impl eframe::App for FlexInputApp {
         egui::TopBottomPanel::top("title_bar")
             .exact_height(32.0)
             .frame(title_frame)
+            .show_separator_line(false)
             .show(ctx, |ui| {
                 show_title_bar(
                     ui, ctx,
@@ -623,6 +628,7 @@ impl eframe::App for FlexInputApp {
         let (tab_switch, tab_close_idx, tab_new, bypass_toggle_idx) = egui::TopBottomPanel::top("tab_bar")
             .exact_height(28.0)
             .frame(tab_bar_frame)
+            .show_separator_line(false)
             .show(ctx, |ui| show_tab_bar(ui, &self.tabs, self.active_tab, &effective_bypass))
             .inner;
         do_new = do_new || tab_new;
@@ -1275,15 +1281,17 @@ impl eframe::App for FlexInputApp {
             self.bottom_panel_height = bottom_resp.response.rect.height();
         }
 
-        // Floating heading tabs hang off each panel's canvas-facing edge.
-        // Clicking a tab toggles its panel's collapsed state.
+        // Floating heading tabs hang off each panel's canvas-facing edge,
+        // nudged 1px down to sit on the canvas inner border.
         let top_rect = top_resp.response.rect;
         let bottom_rect = bottom_resp.response.rect;
+        let top_anchor_y = top_rect.bottom() + 5.0;
+        let bottom_anchor_y = bottom_rect.top() - 1.0;
         let top_tab = crate::panels::physical_devices::draw_floating_heading(
             ctx,
             "heading_virtual_devices",
             "Virtual Devices",
-            egui::pos2(top_rect.left() + 12.0, top_rect.bottom()),
+            egui::pos2(top_rect.left() + 12.0, top_anchor_y),
             crate::panels::physical_devices::TabDirection::Down,
         );
         if top_tab.clicked() {
@@ -1293,7 +1301,7 @@ impl eframe::App for FlexInputApp {
             ctx,
             "heading_physical_devices",
             "Physical Devices",
-            egui::pos2(bottom_rect.left() + 12.0, bottom_rect.top()),
+            egui::pos2(bottom_rect.left() + 12.0, bottom_anchor_y),
             crate::panels::physical_devices::TabDirection::Up,
         );
         if bottom_tab.clicked() {
@@ -1444,6 +1452,38 @@ impl FlexInputApp {
                 });
                 ui.label(egui::RichText::new(
                     "Engine tick rate. Higher = lower latency, more CPU."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Appearance ──────────────────────────────────────────
+                ui.label(egui::RichText::new("Appearance").strong());
+                ui.add_space(4.0);
+                // Theme switching is not yet plumbed through every custom-
+                // painted UI element (canvas viewer overlays, calibration
+                // scope backgrounds, response-curve grid, etc.), so the
+                // app is dark-only for now. The contrast slider still
+                // works on the dark theme.
+                ui.horizontal(|ui| {
+                    ui.label("Contrast:");
+                    let mut c = self.settings.contrast;
+                    let resp = ui.add(egui::Slider::new(&mut c, -1.0_f32..=1.0)
+                        .show_value(false)
+                        .clamping(egui::SliderClamping::Always));
+                    if resp.double_clicked() { c = 0.0; }
+                    ui.add(egui::DragValue::new(&mut c)
+                        .speed(0.01)
+                        .range(-1.0_f32..=1.0)
+                        .fixed_decimals(2));
+                    if (c - self.settings.contrast).abs() > f32::EPSILON {
+                        self.settings.contrast = c.clamp(-1.0, 1.0);
+                        dirty = true;
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "Adjusts panel/widget background lightness. Negative = darker, positive = lighter. Double-click the slider to reset."
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(10.0);
@@ -3160,11 +3200,16 @@ fn show_tab_bar(
     let mut bypass_toggle: Option<usize> = None;
 
     let h = ui.available_height();
-    let accent      = ui.visuals().selection.bg_fill;
     let text_color  = ui.visuals().text_color();
     let hover_fill  = ui.visuals().widgets.hovered.bg_fill;
     let sep_color   = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let active_fill = ui.visuals().window_fill();
+    // Darker than the panel background so the selected tab visibly recedes.
+    let panel_fill  = ui.visuals().window_fill();
+    let darken = |c: egui::Color32, n: i16| {
+        let f = |v: u8| (v as i16 - n).clamp(0, 255) as u8;
+        egui::Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+    };
+    let active_fill = darken(panel_fill, 22);
     let font_id     = egui::FontId::proportional(13.0);
 
     egui::ScrollArea::horizontal()
@@ -3189,21 +3234,18 @@ fn show_tab_bar(
                         egui::Sense::click(),
                     );
 
-                    // Background
+                    // Background. Active tab is darker than the tab-bar
+                    // panel and has rounded top corners so it visually
+                    // sits forward from the bar like a file-folder tab.
                     if is_active {
-                        ui.painter().rect_filled(tab_rect, egui::CornerRadius::ZERO, active_fill);
-                        // Bottom accent line
-                        ui.painter().line_segment(
-                            [tab_rect.left_bottom(), tab_rect.right_bottom()],
-                            egui::Stroke::new(2.0, accent),
-                        );
-                        // Side borders to frame the active tab
-                        let border = egui::Stroke::new(1.0, sep_color);
-                        ui.painter().line_segment([tab_rect.left_top(), tab_rect.left_bottom()], border);
-                        ui.painter().line_segment([tab_rect.right_top(), tab_rect.right_bottom()], border);
+                        let radius = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+                        ui.painter().rect_filled(tab_rect, radius, active_fill);
                     } else if tab_resp.hovered() {
-                        ui.painter().rect_filled(tab_rect, egui::CornerRadius::ZERO, hover_fill);
+                        let radius = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+                        ui.painter().rect_filled(tab_rect, radius, hover_fill);
                     }
+                    let _ = sep_color; // kept for the close-X hover bg
+                    let _ = panel_fill;
 
                     // Label (left-padded, vertically centered)
                     let label_x = tab_rect.left() + 8.0;
@@ -3398,7 +3440,16 @@ fn show_title_bar(
             }
 
             ui.add_space(6.0);
-            ui.separator();
+            // Short vertical divider that doesn't extend to the panel edges.
+            let (sep_rect, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
+            let inset = 8.0_f32;
+            let top = sep_rect.top() + inset;
+            let bottom = sep_rect.bottom() - inset;
+            let x = sep_rect.center().x;
+            ui.painter().line_segment(
+                [egui::pos2(x, top), egui::pos2(x, bottom)],
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            );
             ui.add_space(4.0);
 
             // Undo / Redo buttons

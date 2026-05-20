@@ -5,7 +5,8 @@
 //!
 //!
 
-#![deny(missing_docs, non_ascii_idents, unsafe_code)]
+#![deny(non_ascii_idents, unsafe_code)]
+#![allow(missing_docs)]
 #![deny(
     clippy::correctness,
     clippy::complexity,

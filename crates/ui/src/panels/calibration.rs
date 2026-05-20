@@ -106,7 +106,9 @@ impl Layout {
         let cell_w = ((right_w - scope_gap) * 0.5).max(120.0);
         let cell_h = cell_w; // vectorscope is square
         let gyro_h = (right_w / SCOPE_ASPECT).clamp(120.0, 220.0);
-        let trig_w = cell_w * 0.55;
+        // Trigger widget gains an outer range-clamp arc, so reserve more
+        // box around the inner threshold arc + silhouette.
+        let trig_w = cell_w * 0.72;
         let trig_h = trig_w;
         Self { left_w, right_w, scope_gap, cell_w, cell_h, gyro_h, trig_w, trig_h }
     }
@@ -1821,18 +1823,16 @@ fn triggers_section(
             // vectorscopes above.
             let pad = ((lo.cell_w - lo.trig_w) * 0.5).max(0.0);
             ui.add_space(pad);
-            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, lo);
+            let new_l = trigger_widget(ui, "L", l_norm, lt_thr, lt_min, lt_max, lo);
             ui.add_space(pad + lo.scope_gap + pad);
-            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, lo);
-            if let Some(t) = new_l {
-                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                    n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(t));
-                }
-            }
-            if let Some(t) = new_r {
-                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                    n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(t));
-                }
+            let new_r = trigger_widget(ui, "R", r_norm, rt_thr, rt_min, rt_max, lo);
+            if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                if let Some(t) = new_l.threshold { n.params.insert("ltrig_digital_threshold".into(), serde_json::json!(t)); }
+                if let Some(v) = new_l.range_min { n.params.insert("ltrig_min".into(), serde_json::json!(v)); }
+                if let Some(v) = new_l.range_max { n.params.insert("ltrig_max".into(), serde_json::json!(v)); }
+                if let Some(t) = new_r.threshold { n.params.insert("rtrig_digital_threshold".into(), serde_json::json!(t)); }
+                if let Some(v) = new_r.range_min { n.params.insert("rtrig_min".into(), serde_json::json!(v)); }
+                if let Some(v) = new_r.range_max { n.params.insert("rtrig_max".into(), serde_json::json!(v)); }
             }
         });
     });
@@ -1866,12 +1866,32 @@ fn debias_range(
     (mn_q.clamp(0.0, 1.0), mx_q.clamp(0.0, 1.0))
 }
 
-/// Trigger arc with live fill + draggable yellow threshold pin + Atrig SVG
-/// silhouette inside the cup. Half-circle on the right side, opening to the
-/// left so the silhouette nests inside the cup with the arc wrapping around
-/// the back of the trigger. Returns Some(new threshold 0..1) when the user
-/// drags the pin or clicks anywhere on the arc.
-fn trigger_widget(ui: &mut egui::Ui, label: &str, norm: f32, threshold: f32, lo: Layout) -> Option<f32> {
+/// Updates returned by `trigger_widget` for the current frame. Any field
+/// may be `Some` if the user dragged/clicked that pin.
+#[derive(Default)]
+struct TriggerWidgetEdit {
+    threshold: Option<f32>,
+    range_min: Option<f32>,
+    range_max: Option<f32>,
+}
+
+/// Trigger arc with live fill + draggable threshold pin (inner ring) +
+/// draggable range min/max pins (outer ring) + Atrig SVG silhouette.
+///
+/// Geometry: two concentric half-circles on the right side, cup opening
+/// leftward.
+///   * Inner radius `r_in`   — threshold pin (yellow).
+///   * Outer radius `r_out`  — range pins (green min, red max).
+/// Clicks within ±r_hit pixels of each ring are dispatched to that ring.
+fn trigger_widget(
+    ui: &mut egui::Ui,
+    label: &str,
+    norm: f32,
+    threshold: f32,
+    range_min: f32,
+    range_max: f32,
+    lo: Layout,
+) -> TriggerWidgetEdit {
     let size = egui::vec2(lo.trig_w, lo.trig_h);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let painter = ui.painter();
@@ -1879,21 +1899,20 @@ fn trigger_widget(ui: &mut egui::Ui, label: &str, norm: f32, threshold: f32, lo:
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(50)),
         egui::epaint::StrokeKind::Inside);
 
-    // Half-circle on the right half (cup opens leftward): arc spans the
-    // upper-right through bottom-right, i.e. -π/2 → +π/2.
     let cx = rect.center().x - rect.width() * 0.06;
     let cy = rect.center().y;
-    let r  = (rect.width().min(rect.height()) * 0.5) - 10.0;
-    let start = -std::f32::consts::FRAC_PI_2;     // -90° (top)
-    let end   =  std::f32::consts::FRAC_PI_2;     // +90° (bottom) — sweep 180°
+    // Two concentric arcs: outer for range-clamp pins, inner for threshold.
+    let r_out = (rect.width().min(rect.height()) * 0.5) - 10.0;
+    let r_in  = r_out * 0.74;
+    let start = -std::f32::consts::FRAC_PI_2;
+    let end   =  std::f32::consts::FRAC_PI_2;
 
-    // Trigger silhouette inside the cup, scaled smaller than before so the
-    // SVG doesn't dominate the box and the arc reads as the primary element.
-    if let Some(tex) = load_atrig_texture(ui, (r * 2.0) as u32) {
-        let img_h = r * 1.35;
-        let img_w = img_h * (69.0 / 82.0); // native SVG aspect
+    // Trigger silhouette — sized to fit inside the inner arc.
+    if let Some(tex) = load_atrig_texture(ui, (r_in * 2.0) as u32) {
+        let img_h = r_in * 1.30;
+        let img_w = img_h * (69.0 / 82.0);
         let img_rect = egui::Rect::from_center_size(
-            egui::pos2(cx, cy + r * 0.05),
+            egui::pos2(cx, cy + r_in * 0.05),
             egui::vec2(img_w, img_h),
         );
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -1902,39 +1921,90 @@ fn trigger_widget(ui: &mut egui::Ui, label: &str, norm: f32, threshold: f32, lo:
         painter.add(egui::Shape::mesh(mesh));
     }
 
-    // "L"/"R" glyph centred on the silhouette, slightly smaller too.
-    let glyph_size = (r * 0.80).clamp(24.0, 68.0);
+    // L/R glyph.
+    let glyph_size = (r_in * 0.78).clamp(22.0, 62.0);
     painter.text(
-        egui::pos2(cx, cy + r * 0.05),
+        egui::pos2(cx, cy + r_in * 0.05),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(glyph_size),
         Color32::from_gray(80),
     );
 
-    // Background arc — dim gray.
-    arc_segment(painter, egui::pos2(cx, cy), r, start, end, 5.0, Color32::from_gray(50));
-
-    // Calibrated live fill — blue, sweeps from start as the trigger is pressed.
+    // Inner background arc.
+    arc_segment(painter, egui::pos2(cx, cy), r_in, start, end, 5.0, Color32::from_gray(50));
+    // Inner live fill (post-calibration) — blue.
     let fill_end = start + (end - start) * norm.clamp(0.0, 1.0);
     if fill_end > start {
-        arc_segment(painter, egui::pos2(cx, cy), r, start, fill_end, 5.0,
+        arc_segment(painter, egui::pos2(cx, cy), r_in, start, fill_end, 5.0,
             Color32::from_rgb(100, 180, 240));
     }
 
-    // Yellow draggable threshold pin sitting on the arc.
+    // Outer background arc — dim, full sweep.
+    arc_segment(painter, egui::pos2(cx, cy), r_out, start, end, 3.5,
+        Color32::from_gray(45));
+    // Outer active range — orange band between min and max pins.
+    let rmin_t = range_min.clamp(0.0, 1.0);
+    let rmax_t = range_max.clamp(rmin_t, 1.0);
+    let a_min = start + (end - start) * rmin_t;
+    let a_max = start + (end - start) * rmax_t;
+    if a_max > a_min {
+        arc_segment(painter, egui::pos2(cx, cy), r_out, a_min, a_max, 3.5,
+            Color32::from_rgb(220, 160, 40));
+    }
+
+    // Threshold pin on inner ring (yellow).
     let thr_t = threshold.clamp(0.0, 1.0);
     let thr_a = start + (end - start) * thr_t;
-    let pin = polar(egui::pos2(cx, cy), r, thr_a);
-    painter.circle_filled(pin, 5.0, Color32::from_rgb(240, 220, 60));
-    painter.circle_stroke(pin, 5.0, Stroke::new(1.0, Color32::from_gray(30)));
+    let thr_pin = polar(egui::pos2(cx, cy), r_in, thr_a);
+    painter.circle_filled(thr_pin, 5.0, Color32::from_rgb(240, 220, 60));
+    painter.circle_stroke(thr_pin, 5.0, Stroke::new(1.0, Color32::from_gray(30)));
 
-    // Drag interaction: convert pointer (x, y) → arc parameter t along the
-    // right semicircle (start = -π/2 at the top, end = +π/2 at the bottom).
-    // Pointer angles in [-π/2, π/2] map directly; anything in the left
-    // half-plane (dx < 0) snaps to the nearer endpoint.
-    let mut new_thr: Option<f32> = None;
+    // Range pins on outer ring.
+    let min_pin = polar(egui::pos2(cx, cy), r_out, a_min);
+    let max_pin = polar(egui::pos2(cx, cy), r_out, a_max);
+    painter.circle_filled(min_pin, 5.0, Color32::from_rgb(80, 200, 110));
+    painter.circle_stroke(min_pin, 5.0, Stroke::new(1.0, Color32::from_gray(30)));
+    painter.circle_filled(max_pin, 5.0, Color32::from_rgb(230, 90, 90));
+    painter.circle_stroke(max_pin, 5.0, Stroke::new(1.0, Color32::from_gray(30)));
+
+    let mut out = TriggerWidgetEdit::default();
+
+    // Pointer routing: figure out which ring (inner/outer) the user is
+    // interacting with. We pick whichever ring's radius is CLOSER to the
+    // pointer's current distance from the arc center. Clicks at very
+    // different radii (silhouette area or far outside) snap to whichever
+    // is nearest, which feels natural.
     if resp.dragged() || resp.clicked() {
+        // Sticky-target: once a drag starts on a ring, keep editing that
+        // ring even if the pointer wanders into the other ring's
+        // capture zone mid-drag. Stash the target on drag start.
+        let target_key = egui::Id::new(("trig_drag_target", label, resp.id));
+        let target_now = if resp.drag_started() || resp.clicked() {
+            let pos = resp.interact_pointer_pos().unwrap_or(egui::pos2(cx, cy));
+            let d = ((pos.x - cx).powi(2) + (pos.y - cy).powi(2)).sqrt();
+            // Decide based on which radius is closer.
+            let to_in = (d - r_in).abs();
+            let to_out = (d - r_out).abs();
+            // For the outer ring, decide which pin (min vs max) is closer
+            // in angle so a single click can grab the right handle.
+            let target: u8 = if to_in <= to_out {
+                0 // threshold
+            } else {
+                let dx = pos.x - cx;
+                let dy = pos.y - cy;
+                let a = if dx < 0.0 {
+                    if dy < 0.0 { start } else { end }
+                } else {
+                    dy.atan2(dx).clamp(start, end)
+                };
+                if (a - a_min).abs() <= (a - a_max).abs() { 1 } else { 2 }
+            };
+            ui.ctx().data_mut(|d| d.insert_temp(target_key, target));
+            target
+        } else {
+            ui.ctx().data(|d| d.get_temp::<u8>(target_key)).unwrap_or(0)
+        };
         if let Some(pos) = resp.interact_pointer_pos() {
             let dx = pos.x - cx;
             let dy = pos.y - cy;
@@ -1945,10 +2015,15 @@ fn trigger_widget(ui: &mut egui::Ui, label: &str, norm: f32, threshold: f32, lo:
             };
             let span = end - start;
             let t = ((a - start) / span).clamp(0.0, 1.0);
-            new_thr = Some(t);
+            match target_now {
+                0 => out.threshold = Some(t),
+                1 => out.range_min = Some(t.min(rmax_t - 0.01).max(0.0)),
+                2 => out.range_max = Some(t.max(rmin_t + 0.01).min(1.0)),
+                _ => {}
+            }
         }
     }
-    new_thr
+    out
 }
 
 fn polar(c: Pos2, r: f32, a: f32) -> Pos2 {

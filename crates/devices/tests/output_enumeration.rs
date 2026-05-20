@@ -85,6 +85,24 @@ fn dualsense_inputs_include_led_pins() {
         "DualSense must expose mic_led");
 }
 
+#[test]
+fn dualsense_inputs_include_hd_haptic_pins() {
+    let inputs = layouts::inputs_for(ControllerKind::DualSense);
+    for pin in ["ds_l_amp", "ds_l_freq", "ds_r_amp", "ds_r_freq"] {
+        assert!(inputs.iter().any(|p| p.id == pin),
+            "DualSense must expose {pin} for HD haptic feedback");
+    }
+}
+
+#[test]
+fn dualsense_keeps_xinput_compatible_rumble_alongside_hd_haptics() {
+    // HD haptics are USB-only; rumble_strong/weak must remain so that BT
+    // connections still get a feedback path that works.
+    let inputs = layouts::inputs_for(ControllerKind::DualSense);
+    assert!(inputs.iter().any(|p| p.id == "rumble_strong"));
+    assert!(inputs.iter().any(|p| p.id == "rumble_weak"));
+}
+
 // ── XInput ────────────────────────────────────────────────────────────────────
 
 #[test]
