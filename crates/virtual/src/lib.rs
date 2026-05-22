@@ -66,3 +66,10 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
     #[cfg(not(windows))]
     panic!("No virtual devices on this platform: {kind_id} #{instance}")
 }
+
+/// Best-effort: extract the kind prefix (e.g. "virtual.xinput") from a
+/// full device id like "virtual.xinput.2". Used by the UI to identify
+/// FlexInput's own virtuals when filtering the physical-devices list.
+pub fn kind_prefix(dev_id: &str) -> String {
+    dev_id.split('.').take(2).collect::<Vec<_>>().join(".")
+}

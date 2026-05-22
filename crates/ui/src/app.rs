@@ -425,11 +425,20 @@ impl FlexInputApp {
         );
 
         // Restore workspace if the user opted in; otherwise start with one empty tab.
+        let on_load_view = match app_settings.on_patch_load {
+            settings::OnPatchLoad::Off       => None,
+            settings::OnPatchLoad::Center    => Some(crate::canvas::PendingViewAction::Center),
+            settings::OnPatchLoad::ZoomToFit => Some(crate::canvas::PendingViewAction::ZoomToFit),
+        };
         let tabs = if app_settings.keep_workspace {
             match settings::load_workspace() {
                 Some(ws) if !ws.tabs.is_empty() => ws.tabs.into_iter().map(|pt| {
                     let mut canvas = Canvas::new();
                     canvas.snarl = pt.snarl;
+                    // Restored patches are conceptually "loaded" — honor the
+                    // on-patch-load camera setting so the saved view's
+                    // arbitrary pan/zoom doesn't strand the user off-canvas.
+                    canvas.pending_view_action = on_load_view;
                     PatchTab {
                         title: pt.title,
                         file_path: pt.file_path,
@@ -1443,6 +1452,16 @@ impl eframe::App for FlexInputApp {
                 tab.file_path = Some(path);
                 tab.bound_exes = bound;
                 tab.auto_bypass = auto_bypass;
+                // Queue the configured on-load camera action. The canvas
+                // consumes this on its next render — it can't apply now
+                // because SnarlState / snarl_rect aren't in scope here.
+                tab.canvas.pending_view_action = match self.settings.on_patch_load {
+                    settings::OnPatchLoad::Off       => None,
+                    settings::OnPatchLoad::Center    =>
+                        Some(crate::canvas::PendingViewAction::Center),
+                    settings::OnPatchLoad::ZoomToFit =>
+                        Some(crate::canvas::PendingViewAction::ZoomToFit),
+                };
                 // Reconcile the shared pool: union of the saved id list
                 // and the canvas-referenced ids (canvas wins on disagreement
                 // because that's what the user will see). Reuses existing
@@ -1486,7 +1505,51 @@ impl eframe::App for FlexInputApp {
                 .collect()
         };
 
-        let devices = &self.devices;
+        // Optionally hide FlexInput's own ViGEm virtuals from the
+        // physical-devices panel. The gilrs backend already dedups based
+        // on SetupAPI counts, but its `phys_counts` cache is refreshed
+        // every ~2s — a freshly-created virtual can therefore leak into
+        // the displayed list for up to that window. Filter by kind here
+        // using the shared pool as authoritative for "ours": one
+        // virtual.xinput → drop one ControllerKind::XInput entry, etc.
+        let devices_owned;
+        let devices: &[PhysicalDevice] = if self.settings.show_own_virtuals_as_physical {
+            &self.devices
+        } else {
+            let mut to_skip: HashMap<flexinput_devices::ControllerKind, usize> = HashMap::new();
+            {
+                let pool = self.shared_virtual_devices.lock().unwrap();
+                for d in pool.iter() {
+                    let prefix = flexinput_virtual::kind_prefix(d.id());
+                    let kind = match prefix.as_str() {
+                        "virtual.xinput" => Some(flexinput_devices::ControllerKind::XInput),
+                        "virtual.ds4"    => Some(flexinput_devices::ControllerKind::DualShock4),
+                        _ => None,
+                    };
+                    if let Some(k) = kind {
+                        *to_skip.entry(k).or_insert(0) += 1;
+                    }
+                }
+            }
+            // Walk in reverse so we drop the *last* N entries of each
+            // matching kind — gilrs lists in plug order so a real
+            // controller plugged before our virtual stays visible.
+            let mut keep: Vec<bool> = vec![true; self.devices.len()];
+            for (k, n) in to_skip.iter() {
+                let mut remaining = *n;
+                for i in (0..self.devices.len()).rev() {
+                    if remaining == 0 { break; }
+                    if keep[i] && self.devices[i].kind == *k {
+                        keep[i] = false;
+                        remaining -= 1;
+                    }
+                }
+            }
+            devices_owned = self.devices.iter().enumerate()
+                .filter_map(|(i, d)| if keep[i] { Some(d.clone()) } else { None })
+                .collect::<Vec<_>>();
+            &devices_owned
+        };
         let bottom_panel_height = self.bottom_panel_height;
         // Pre-compute the set of device ids referenced by *non-active* tab
         // canvases so the panel can grey out the close (X) button on any
@@ -2203,6 +2266,46 @@ impl FlexInputApp {
                 }
                 ui.label(egui::RichText::new(
                     "New physical / virtual device nodes spawn collapsed. The header (icon, status, Auto-Map) stays visible."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(6.0);
+                if ui.checkbox(
+                    &mut self.settings.show_own_virtuals_as_physical,
+                    "Show FlexInput's own virtual controllers in the physical-devices panel",
+                ).changed() {
+                    dirty = true;
+                }
+                ui.label(egui::RichText::new(
+                    "Off by default. Turn on to test patches against your own virtual output (loopback).",
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("On patch load:");
+                    let cur = self.settings.on_patch_load;
+                    let label = match cur {
+                        settings::OnPatchLoad::Off         => "Do nothing",
+                        settings::OnPatchLoad::Center      => "Center on patch",
+                        settings::OnPatchLoad::ZoomToFit   => "Zoom to fit",
+                    };
+                    egui::ComboBox::from_id_salt("on_patch_load_combo")
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            let mut sel = cur;
+                            ui.selectable_value(&mut sel, settings::OnPatchLoad::Off,
+                                "Do nothing");
+                            ui.selectable_value(&mut sel, settings::OnPatchLoad::Center,
+                                "Center on patch");
+                            ui.selectable_value(&mut sel, settings::OnPatchLoad::ZoomToFit,
+                                "Zoom to fit");
+                            if sel != cur {
+                                self.settings.on_patch_load = sel;
+                                dirty = true;
+                            }
+                        });
+                });
+                ui.label(egui::RichText::new(
+                    "Behavior when a .fxp is loaded into a tab. 'Off' preserves the current view."
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(10.0);

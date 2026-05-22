@@ -54,6 +54,16 @@ pub(crate) struct ClipboardData {
     internal_wires: Vec<(usize, usize, usize, usize)>,
 }
 
+/// One-shot view manipulation requested by an external action (e.g.
+/// loading a patch). Applied on the canvas's next render and then cleared.
+#[derive(Clone, Copy, Debug)]
+pub enum PendingViewAction {
+    /// Pan to the centroid of all nodes, keeping current zoom.
+    Center,
+    /// Pan + zoom so every node fits in the viewport with margin.
+    ZoomToFit,
+}
+
 pub struct Canvas {
     pub snarl: Snarl<NodeData>,
     style: SnarlStyle,
@@ -85,6 +95,11 @@ pub struct Canvas {
     /// Updated each frame from the snarl view transform. Used to spawn
     /// new device nodes at the center of the current viewport.
     last_view_center_canvas: Option<egui::Pos2>,
+    /// One-shot view action to apply on the next render. Set by app.rs
+    /// after loading a patch when the `on_patch_load` setting is not Off.
+    /// Consumed during `draw_zoom_controls` (which already has the
+    /// `SnarlState` + snarl_rect needed).
+    pub pending_view_action: Option<PendingViewAction>,
     /// Nodes scheduled for a one-shot spawn-glow flash, with the Instant
     /// they were inserted. The viewer paints a fading outline halo around
     /// these nodes for ~400 ms.
@@ -146,6 +161,7 @@ impl Canvas {
             is_inner: false,
             pinned_inner_ids: std::collections::HashSet::new(),
             last_view_center_canvas: None,
+            pending_view_action: None,
             spawn_glow: std::collections::HashMap::new(),
         }
     }
@@ -510,6 +526,53 @@ impl Canvas {
             let center = snarl_rect.center();
             let canvas_center = (center - t.translation) / t.scaling;
             self.last_view_center_canvas = Some(egui::pos2(canvas_center.x, canvas_center.y));
+        }
+
+        // ── One-shot view action (e.g. center / zoom-to-fit after patch load) ─
+        if let Some(action) = self.pending_view_action.take() {
+            use egui_snarl::ui::{NodeState, SnarlState};
+            const MIN_SCALE: f32 = 0.2;
+            const MAX_SCALE: f32 = 2.0;
+            // Build bounding box of all nodes — uses each node's measured
+            // rect (top-left + size) so wide nodes aren't clipped on the
+            // right edge of the framed view.
+            let style = ui.ctx().style();
+            let mut bb = egui::Rect::NOTHING;
+            for (node_id, info) in self.snarl.nodes_ids_data() {
+                let ns_id = snarl_id.with(("snarl-node", node_id));
+                let ns = NodeState::load(ui.ctx(), ns_id, &style.spacing);
+                let openness = if info.open { 1.0 } else { 0.0 };
+                bb = bb.union(ns.node_rect(info.pos, openness));
+            }
+            if bb.is_finite() {
+                let mut state = SnarlState::load(
+                    ui.ctx(), snarl_id, &self.snarl, snarl_rect, MIN_SCALE, MAX_SCALE,
+                );
+                match action {
+                    PendingViewAction::Center => {
+                        // Keep current zoom; pan so the bb centroid lands
+                        // on the viewport center.
+                        let t = state.to_global();
+                        let target_canvas = bb.center();
+                        let viewport_center = snarl_rect.center();
+                        let new_translation = viewport_center.to_vec2()
+                            - target_canvas.to_vec2() * t.scaling;
+                        state.set_to_global(egui::emath::TSTransform {
+                            translation: new_translation,
+                            scaling: t.scaling,
+                        });
+                    }
+                    PendingViewAction::ZoomToFit => {
+                        bb = bb.expand(100.0);
+                        state.look_at(bb, snarl_rect, MIN_SCALE, MAX_SCALE);
+                    }
+                }
+                state.store(&self.snarl, ui.ctx());
+                // We modified the view after the snarl already rendered
+                // this frame; request another paint so the user sees the
+                // new framing immediately.
+                ui.ctx().request_repaint();
+            }
         }
 
         // ── Spawn-glow overlay ────────────────────────────────────────────────

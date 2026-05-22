@@ -133,6 +133,28 @@ pub struct AppSettings {
     /// Settings. None = no chord (Guide alone fires).
     #[serde(default)]
     pub pin_guide_chord: Option<String>,
+    /// When true, FlexInput's own virtual ViGEm controllers are also
+    /// listed in the bottom (physical) devices panel — useful for
+    /// closing the loop and testing your patch against itself. Off by
+    /// default; the virtual is normally already represented by its
+    /// chip in the top panel.
+    #[serde(default)]
+    pub show_own_virtuals_as_physical: bool,
+    /// What to do with the camera when a patch is loaded into a tab.
+    #[serde(default)]
+    pub on_patch_load: OnPatchLoad,
+}
+
+/// Camera behavior immediately after a patch is loaded into a tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum OnPatchLoad {
+    /// Leave the canvas view exactly as it was — no auto-pan, no auto-zoom.
+    #[default]
+    Off,
+    /// Pan the camera to the centroid of the loaded nodes (zoom unchanged).
+    Center,
+    /// Pan + scale so every node is visible with a small margin.
+    ZoomToFit,
 }
 
 impl Default for AppSettings {
@@ -155,6 +177,8 @@ impl Default for AppSettings {
             pin_guide_double_tap: true,
             focus_flip_flop: true,
             pin_guide_chord: None,
+            show_own_virtuals_as_physical: false,
+            on_patch_load: OnPatchLoad::Off,
         }
     }
 }
