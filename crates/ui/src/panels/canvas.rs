@@ -20,6 +20,6 @@ pub fn show(
     canvas.show(
         descriptors, live_device_ids, live_signals,
         panic_shortcut, physical_devices, device_rates,
-        param_defaults, ui,
+        param_defaults, ui, None,
     )
 }

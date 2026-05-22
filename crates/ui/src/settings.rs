@@ -27,6 +27,44 @@ fn default_gyro_mult() -> f32 { 1.0 }
 fn default_mouse_sens() -> f32 { 1.0 }
 fn default_theme() -> Theme { Theme::Dark }
 fn default_contrast() -> f32 { 0.0 }
+fn default_see_through_alpha() -> f32 { 0.55 }
+fn default_pin_shortcut() -> PinShortcut { PinShortcut::default() }
+fn default_pin_guide_double_tap() -> bool { true }
+fn default_focus_flip_flop() -> bool { true }
+
+/// Keyboard shortcut for the always-on-top pin toggle. Mirrors
+/// `PanicShortcut` in shape — kept in `settings.rs` so the full settings
+/// blob round-trips through one serde struct. Empty `key` means "unassigned"
+/// and disables the global hotkey.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PinShortcut {
+    #[serde(default)] pub ctrl:  bool,
+    #[serde(default)] pub shift: bool,
+    #[serde(default)] pub alt:   bool,
+    #[serde(default)] pub win:   bool,
+    /// egui::Key Debug name. `None` = unassigned.
+    #[serde(default)] pub key:   Option<String>,
+}
+
+impl Default for PinShortcut {
+    fn default() -> Self {
+        // Ctrl+Shift+P — "pin". Unlikely to collide with the panic chord
+        // (Ctrl+Backtick) or common game bindings.
+        Self { ctrl: true, shift: true, alt: false, win: false, key: Some("P".to_string()) }
+    }
+}
+
+impl PinShortcut {
+    pub fn label(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.ctrl  { parts.push("Ctrl"); }
+        if self.shift { parts.push("Shift"); }
+        if self.alt   { parts.push("Alt"); }
+        if self.win   { parts.push("Win"); }
+        let key = self.key.as_deref().unwrap_or("…");
+        if parts.is_empty() { key.to_string() } else { format!("{}+{}", parts.join("+"), key) }
+    }
+}
 
 /// App-wide visual theme. Controls the egui Visuals base + the canvas
 /// node/header fill colors picked by `Canvas::new`.
@@ -60,6 +98,41 @@ pub struct AppSettings {
     /// neutral — current default.
     #[serde(default = "default_contrast")]
     pub contrast: f32,
+    /// Background opacity when "see-through" mode is active. 0.0 = fully
+    /// transparent, 1.0 = fully opaque. The translucent fill only affects
+    /// panel/window backgrounds; nodes and connectors stay opaque.
+    #[serde(default = "default_see_through_alpha")]
+    pub see_through_alpha: f32,
+    /// Persists the last see-through state so the app reopens in the same
+    /// visual mode.
+    #[serde(default)]
+    pub see_through_active: bool,
+    /// Persists the last always-on-top pin state.
+    #[serde(default)]
+    pub pin_active: bool,
+    /// Keyboard chord that toggles the pin globally. Mirrors panic_shortcut
+    /// — uses RegisterHotKey under the hood (see `pin_hotkey.rs`).
+    #[serde(default = "default_pin_shortcut")]
+    pub pin_shortcut: PinShortcut,
+    /// If true, the controller Guide/PS button also toggles the pin.
+    #[serde(default)]
+    pub pin_via_guide: bool,
+    /// If true, Guide-button activation requires a double-tap (within ~300ms);
+    /// otherwise a single tap fires. Default true to avoid colliding with
+    /// the Game Bar / Steam overlay's own Guide-button handling.
+    #[serde(default = "default_pin_guide_double_tap")]
+    pub pin_guide_double_tap: bool,
+    /// When true, activating the pin remembers the previous foreground
+    /// window and brings it back to the front; deactivating returns focus
+    /// to FlexInput. Lets the user flip-flop between tweak and test.
+    #[serde(default = "default_focus_flip_flop")]
+    pub focus_flip_flop: bool,
+    /// Optional chord button required IN ADDITION to the Guide button
+    /// for pin activation via controller. Signal name like `"btn_lb"`
+    /// or `"btn_back"`. Captured via AutoMap-style learn mode in
+    /// Settings. None = no chord (Guide alone fires).
+    #[serde(default)]
+    pub pin_guide_chord: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -74,6 +147,14 @@ impl Default for AppSettings {
             default_mouse_sensitivity: 1.0,
             theme: Theme::Dark,
             contrast: 0.0,
+            see_through_alpha: 0.55,
+            see_through_active: false,
+            pin_active: false,
+            pin_shortcut: PinShortcut::default(),
+            pin_via_guide: false,
+            pin_guide_double_tap: true,
+            focus_flip_flop: true,
+            pin_guide_chord: None,
         }
     }
 }
@@ -109,8 +190,16 @@ pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
         style.visuals.widgets.inactive.bg_fill = adjust(style.visuals.widgets.inactive.bg_fill);
         style.visuals.widgets.inactive.weak_bg_fill = adjust(style.visuals.widgets.inactive.weak_bg_fill);
     }
+
+    // See-through mode is NOT applied here on the global style — that
+    // would tint sub-windows (Settings, Calibration, Subpatch editors)
+    // and bleed into node bodies via `widgets.*` and `extreme_bg_color`.
+    // Instead the canvas CentralPanel applies the alpha directly on its
+    // own `egui::Frame` (see `app.rs` central-panel block), so only the
+    // backdrop behind the snarl nodes goes translucent. Nothing else.
     ctx.set_style(style);
 }
+
 
 fn appdata_dir() -> Option<std::path::PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;

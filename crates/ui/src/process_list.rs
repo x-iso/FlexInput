@@ -155,10 +155,112 @@ mod imp {
             exe_name_for_pid(pid)
         }
     }
+
+    /// Returns the current foreground HWND as an opaque `isize` token, or
+    /// `None` if it belongs to FlexInput's own process (we don't want to
+    /// flip-flop to our own subwindows). Used by the pin flip-flop feature.
+    pub fn foreground_hwnd() -> Option<isize> {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() { return None; }
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == GetCurrentProcessId() { return None; }
+            Some(hwnd as isize)
+        }
+    }
+
+    /// Best-effort bring `hwnd` to the foreground. Windows blocks foreground
+    /// changes from a process that is not itself foreground (the "focus
+    /// stealing prevention" rule); we sidestep it by briefly attaching our
+    /// thread input to the target's GUI thread so Windows treats the call
+    /// as same-process. Returns true if SetForegroundWindow reported success.
+    /// Best-effort bring `hwnd` to both the *top* of the z-order AND give
+    /// it input focus. Windows treats "foreground" and "z-order top" as
+    /// separate concerns:
+    ///   * `SetForegroundWindow` is what gives keyboard focus, but it's
+    ///     gated by the focus-stealing-prevention rule and may silently
+    ///     fail (flashing the taskbar button instead of raising).
+    ///   * `SetWindowPos` with `HWND_TOP` reorders the window stack but
+    ///     does NOT change focus.
+    /// To consistently flip-flop FlexInput off-top AND surface the target
+    /// app, we do BOTH. The `AttachThreadInput` dance temporarily merges
+    /// our input queue with the target's so the focus rule passes.
+    pub fn bring_hwnd_to_front(hwnd_isize: isize) -> bool {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IsWindow, IsIconic, ShowWindow, SetForegroundWindow, SetWindowPos,
+            SW_RESTORE, GetWindowThreadProcessId as GetWinThreadPid,
+            HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SWP_NOACTIVATE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            AttachThreadInput, GetCurrentThreadId,
+        };
+        unsafe {
+            let hwnd = hwnd_isize as HWND;
+            if hwnd.is_null() || IsWindow(hwnd) == 0 { return false; }
+            if IsIconic(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
+
+            // Synthesize an ALT keystroke to reset Windows' focus
+            // stealing prevention timer for our process. Without this,
+            // SetForegroundWindow can silently fail and only flash the
+            // taskbar button.
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                keybd_event, KEYEVENTF_KEYUP, VK_MENU,
+            };
+            keybd_event(VK_MENU as u8, 0, 0, 0);
+            keybd_event(VK_MENU as u8, 0, KEYEVENTF_KEYUP, 0);
+
+            // Raise z-order first (no activation yet). This dislodges
+            // FlexInput from the visual top even if the subsequent
+            // foreground call is denied.
+            SetWindowPos(
+                hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
+
+            let target_tid = GetWinThreadPid(hwnd, std::ptr::null_mut());
+            let our_tid    = GetCurrentThreadId();
+            let attached   = target_tid != 0
+                && target_tid != our_tid
+                && AttachThreadInput(our_tid, target_tid, 1) != 0;
+            let ok = SetForegroundWindow(hwnd) != 0;
+            if attached {
+                AttachThreadInput(our_tid, target_tid, 0);
+            }
+            ok
+        }
+    }
+
+    /// Drop `hwnd` out of the topmost z-order band synchronously, without
+    /// changing focus. We need this on pin-off because `eframe` defers
+    /// the `WindowLevel::Normal` viewport command into winit's event
+    /// loop — by the time the target-app raise call runs, our window is
+    /// still in the topmost band and refuses to give up the top slot.
+    pub fn drop_topmost(hwnd_isize: isize) {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_NOTOPMOST,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE,
+        };
+        unsafe {
+            let hwnd = hwnd_isize as HWND;
+            if hwnd.is_null() { return; }
+            SetWindowPos(
+                hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
 }
 
 #[cfg(windows)]
-pub use imp::{enumerate_windows, enumerate_processes_full, foreground_exe};
+pub use imp::{
+    enumerate_windows, enumerate_processes_full, foreground_exe,
+    foreground_hwnd, bring_hwnd_to_front,
+    drop_topmost,
+};
 
 #[cfg(not(windows))]
 pub fn enumerate_windows() -> Vec<(String, String)> {
@@ -174,3 +276,13 @@ pub fn enumerate_processes_full() -> Vec<(String, String, String)> {
 pub fn foreground_exe() -> Option<String> {
     None
 }
+
+#[cfg(not(windows))]
+pub fn foreground_hwnd() -> Option<isize> { None }
+
+#[cfg(not(windows))]
+pub fn bring_hwnd_to_front(_hwnd: isize) -> bool { false }
+
+#[cfg(not(windows))]
+pub fn drop_topmost(_hwnd: isize) {}
+

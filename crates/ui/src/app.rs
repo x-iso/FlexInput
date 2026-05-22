@@ -14,10 +14,35 @@ use crate::{
     canvas::{sample_curve, Canvas, NodeData},
     canvas::node::{ExposedModule, UiSubPatch},
     canvas::ClipboardData,
+    guide_watcher::{spawn_guide_watcher, GuideWatchConfig},
     panels::{physical_devices, virtual_devices::VirtualDevicePanel},
     panic_hotkey::{load_panic_shortcut, save_panic_shortcut, spawn_panic_hotkey_listener},
-    settings::{self, AppSettings, PersistedTab, PersistedWorkspace},
+    pin_hotkey::spawn_pin_hotkey_listener,
+    settings::{self, AppSettings, PersistedTab, PersistedWorkspace, PinShortcut},
 };
+
+/// Human-readable name for a chord button signal (e.g. `"btn_lb"` →
+/// `"LB"`). Falls back to the raw signal name for anything we don't
+/// recognise.
+fn pretty_chord_name(sig: &str) -> String {
+    match sig {
+        "btn_south"     => "South / A".to_string(),
+        "btn_east"      => "East / B".to_string(),
+        "btn_west"      => "West / X".to_string(),
+        "btn_north"     => "North / Y".to_string(),
+        "btn_lb"        => "LB / L1".to_string(),
+        "btn_rb"        => "RB / R1".to_string(),
+        "btn_lt_dig"    => "LT (digital)".to_string(),
+        "btn_rt_dig"    => "RT (digital)".to_string(),
+        "btn_ls"        => "L-Stick click".to_string(),
+        "btn_rs"        => "R-Stick click".to_string(),
+        "btn_start"     => "Start / Options".to_string(),
+        "btn_back"      => "Back / Share / Create".to_string(),
+        "btn_touchpad"  => "Touchpad click".to_string(),
+        "btn_mute"      => "Mute".to_string(),
+        other           => other.to_string(),
+    }
+}
 
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -187,6 +212,48 @@ pub struct FlexInputApp {
     /// Per-pin time-windowed scope rings (raw values + timestamps) for the
     /// calibration window. Populated by the I/O thread at polling Hz.
     pub scope_taps: flexinput_engine::ScopeTaps,
+    // ── Always-on-top pin ────────────────────────────────────────────────
+    /// Set by both the global keyboard hotkey thread and the Guide-button
+    /// watcher thread when the user fires their configured pin toggle. The
+    /// UI loop consumes it, flips `settings.pin_active`, and sends the
+    /// matching `ViewportCommand::WindowLevel` so the change takes effect
+    /// without waiting for the next mouse interaction.
+    pin_toggle_requested: Arc<AtomicBool>,
+    /// Live snapshot of the pin keyboard chord shared with the hotkey
+    /// listener thread. Updated whenever the user re-binds in Settings.
+    pin_shortcut_shared: Arc<RwLock<PinShortcut>>,
+    /// Live snapshot of the Guide-button watcher config (enabled +
+    /// double-tap mode + chord). The watcher reads this each poll
+    /// iteration.
+    pin_guide_cfg: Arc<RwLock<GuideWatchConfig>>,
+    /// AutoMap-style chord learn: set true to ask the watcher to
+    /// capture the next pressed button on any device. Watcher clears
+    /// it when a capture lands.
+    pin_learn_chord: Arc<AtomicBool>,
+    /// Result slot for `pin_learn_chord`. Watcher writes the captured
+    /// signal name here; UI consumes it on the next frame.
+    pin_learned_chord: Arc<Mutex<Option<String>>>,
+    /// True while the pin shortcut button is in Learn mode in Settings.
+    pin_learning: bool,
+    /// HWND of whatever foreground window we left when the pin was last
+    /// engaged. Used by the focus flip-flop feature to restore focus to
+    /// that window so the user can immediately test their changes.
+    /// Stored as `isize` because `HWND` is `!Send`.
+    pin_prev_foreground_hwnd: Option<isize>,
+    /// Continuously-tracked HWND of the most recent non-FlexInput
+    /// foreground window. Sampled each frame from
+    /// `process_list::foreground_hwnd()`. Used as the flip-flop target
+    /// when the user toggles the pin — by the time they click our pin
+    /// button, FlexInput itself is foreground, so we need a remembered
+    /// pointer to the window that was foreground *before* that.
+    pin_last_external_hwnd: Option<isize>,
+    /// FlexInput's own HWND (set on first `update()` call by reading
+    /// `eframe::Frame::window_handle()`). Used for direct Win32
+    /// operations that can't be routed through eframe — dropping
+    /// topmost synchronously on pin-off, applying the click-through
+    /// layered-window style, and toggling `WS_EX_TRANSPARENT`. Stored
+    /// as `isize` for `Send`-ness.
+    self_hwnd: Option<isize>,
 }
 
 /// Keyboard-only shortcut for panic mode. Modifiers + non-modifier key.
@@ -343,6 +410,39 @@ impl FlexInputApp {
             Arc::clone(&panic_toggle_requested),
         );
 
+        // ── Always-on-top pin state ──────────────────────────────────────
+        // Both the keyboard hotkey thread and the Guide-button watcher
+        // raise the same `pin_toggle_requested` flag so the UI loop has a
+        // single edge to consume each frame.
+        let pin_toggle_requested = Arc::new(AtomicBool::new(false));
+        let pin_shortcut_shared  = Arc::new(RwLock::new(app_settings.pin_shortcut.clone()));
+        let pin_guide_cfg        = Arc::new(RwLock::new(GuideWatchConfig {
+            enabled: app_settings.pin_via_guide,
+            require_double_tap: app_settings.pin_guide_double_tap,
+            chord_signal: app_settings.pin_guide_chord.clone(),
+        }));
+        let pin_learn_chord      = Arc::new(AtomicBool::new(false));
+        let pin_learned_chord    = Arc::new(Mutex::new(None));
+        spawn_pin_hotkey_listener(
+            Arc::clone(&pin_shortcut_shared),
+            Arc::clone(&pin_toggle_requested),
+        );
+        spawn_guide_watcher(
+            Arc::clone(&pin_guide_cfg),
+            Arc::clone(&pin_toggle_requested),
+            Arc::clone(&proc_device_signals),
+            Arc::clone(&pin_learn_chord),
+            Arc::clone(&pin_learned_chord),
+        );
+        // Seed the see-through data slot so the eye button reflects the
+        // persisted value on first frame.
+        cc.egui_ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY),
+                app_settings.see_through_active,
+            );
+        });
+
         // Pick `next_untitled` high enough that any restored "Untitled N" tab
         // doesn't collide with a freshly-created one.
         let next_untitled = tabs.iter()
@@ -403,6 +503,15 @@ impl FlexInputApp {
             polling_hz,
             device_rates,
             scope_taps,
+            pin_toggle_requested,
+            pin_shortcut_shared,
+            pin_guide_cfg,
+            pin_learn_chord,
+            pin_learned_chord,
+            pin_learning: false,
+            pin_prev_foreground_hwnd: None,
+            pin_last_external_hwnd: None,
+            self_hwnd: None,
         }
     }
 }
@@ -412,9 +521,37 @@ impl eframe::App for FlexInputApp {
         let dt = self.last_update.elapsed().as_secs_f32().clamp(0.001, 0.1);
         self.last_update = std::time::Instant::now();
 
+        // Cache our own HWND on the first frame we have one. We need it
+        // for direct Win32 work that can't go through eframe: dropping
+        // our topmost synchronously, applying click-through, etc.
+        #[cfg(windows)]
+        if self.self_hwnd.is_none() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = _frame.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    self.self_hwnd = Some(w.hwnd.get() as isize);
+                }
+            }
+        }
+
         // Apply selected theme + contrast every frame so changes take
         // effect immediately when the user moves the slider in Settings.
+        // Also folds in the see-through alpha when active.
         crate::settings::apply_theme_and_contrast(ctx, &self.settings);
+
+        // Restore persisted always-on-top pin state on the first frame
+        // after launch. eframe only honours the runtime WindowLevel
+        // command, not a builder hint, so the persisted bool needs to be
+        // re-applied here. We piggy-back on `last_fg_exe.is_empty()` —
+        // true exactly once at startup — to avoid storing a separate
+        // "first frame" flag.
+        if self.settings.pin_active && self.last_fg_exe.is_empty()
+            && self.pin_prev_foreground_hwnd.is_none()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
+        }
 
         // Read the latest device signals written by the I/O thread (500 Hz).
         self.last_signals = self.proc_device_signals.read().unwrap().clone();
@@ -512,11 +649,52 @@ impl eframe::App for FlexInputApp {
             }
         }
 
+        // Track the most recent external (non-FlexInput) foreground HWND
+        // so the pin flip-flop has a target when the user toggles via the
+        // in-app button (at which point FlexInput is foreground and a
+        // fresh `foreground_hwnd()` call returns None). Cheap on Windows
+        // — one user32 call per frame. Skipped while the pin is engaged
+        // because FlexInput sits on top and any "external" window the
+        // user clicks would itself be a flip target we don't want to
+        // overwrite.
+        if !self.settings.pin_active {
+            if let Some(hwnd) = crate::process_list::foreground_hwnd() {
+                self.pin_last_external_hwnd = Some(hwnd);
+            }
+        }
+
         // Consume any global-hotkey toggle requests from the hook thread BEFORE
         // computing effective_bypass, so the visible tab-dot flips this frame.
         if self.panic_toggle_requested.swap(false, Ordering::Relaxed) {
             self.panic_active = !self.panic_active;
         }
+
+        // ── See-through: mirror the eye-toggle data slot into settings ────
+        // The zoom-overlay button writes the new state into a temp data
+        // slot (so it doesn't need a mutable reference to settings); we
+        // pull that here. Writing back the slot every frame is harmless —
+        // it's a `Cell`-style store, not a queue.
+        {
+            let key = egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY);
+            let from_slot: bool = ctx.data(|d| d.get_temp::<bool>(key))
+                .unwrap_or(self.settings.see_through_active);
+            if from_slot != self.settings.see_through_active {
+                self.settings.see_through_active = from_slot;
+                self.settings_dirty = true;
+            }
+        }
+
+        // ── Pin / always-on-top toggle ────────────────────────────────────
+        // The keyboard listener thread AND the Guide-button watcher share
+        // the same `pin_toggle_requested` flag — we consume it once per
+        // frame and re-apply the WindowLevel command so the change takes
+        // effect immediately. We also handle the optional focus flip-flop
+        // (capture HWND on pin-on, restore on pin-off) here, on the UI
+        // thread, where the Win32 calls are safe to make.
+        if self.pin_toggle_requested.swap(false, Ordering::Relaxed) {
+            self.toggle_pin(ctx);
+        }
+
         // Effective bypass: manual toggle OR (auto mode on AND auto-bypass AND bound process not in focus).
         // Panic mode forces bypass on the active tab so its bypass indicator
         // flips green→orange the moment the shortcut fires.
@@ -596,6 +774,8 @@ impl eframe::App for FlexInputApp {
         let mut do_undo = false;
         let mut do_redo = false;
         let mut toggle_settings = false;
+        let mut do_pin_toggle = false;
+        let pin_active_now = self.settings.pin_active;
         let can_undo = self.tabs[self.active_tab].canvas.can_undo();
         let can_redo = self.tabs[self.active_tab].canvas.can_redo();
         let title_frame = egui::Frame::NONE.fill(ctx.style().visuals.panel_fill);
@@ -617,10 +797,15 @@ impl eframe::App for FlexInputApp {
                     &mut self.panic_learning,
                     &self.panic_shortcut_shared,
                     &mut toggle_settings,
+                    pin_active_now,
+                    &mut do_pin_toggle,
                 );
             });
         if toggle_settings {
             self.settings_open = !self.settings_open;
+        }
+        if do_pin_toggle {
+            self.toggle_pin(ctx);
         }
 
         // ── Tab bar ───────────────────────────────────────────────────────────────
@@ -1319,7 +1504,83 @@ impl eframe::App for FlexInputApp {
 
         let device_rates_snap = self.device_rates.read().map(|r| r.clone()).unwrap_or_default();
         let mut calibrate_request: Option<egui_snarl::NodeId> = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Two-way bridge between settings.see_through_alpha and the
+        // temp data slot that the eye-button popover slider edits.
+        // If the slot value differs from settings (popover user moved
+        // the slider), pull the new value into settings and mark
+        // dirty. Then publish settings back to the slot so any other
+        // reader (canvas bg_frame fill) sees the up-to-date value.
+        {
+            let alpha_id = egui::Id::new(crate::canvas::SEE_THROUGH_ALPHA_KEY);
+            let from_slot: Option<f32> = ctx.data(|d| d.get_temp::<f32>(alpha_id));
+            if let Some(a) = from_slot {
+                if (a - self.settings.see_through_alpha).abs() > f32::EPSILON {
+                    self.settings.see_through_alpha = a.clamp(0.0, 1.0);
+                    self.settings_dirty = true;
+                }
+            }
+            ctx.data_mut(|d| {
+                d.insert_temp(alpha_id, self.settings.see_through_alpha);
+            });
+        }
+        // CentralPanel handling has two modes:
+        //  * Opaque: default `Frame::central_panel(&style)` — its
+        //    `panel_fill` paints the whole area, and the 8 px
+        //    inner_margin gives the implicit "frame surround" band
+        //    around the snarl rect.
+        //  * See-through: we need the inner area to actually be
+        //    transparent so the snarl `bg_frame` alpha can show the
+        //    desktop. We use a TRANSPARENT frame fill (so the inner
+        //    area doesn't paint), but keep `inner_margin(8)` so the
+        //    snarl rect lands in the same place as opaque mode. Then
+        //    we explicitly paint 4 opaque bands in the 8 px surround
+        //    region — this is the FRAME, promoted from
+        //    accidental-byproduct of the central panel fill to a
+        //    deliberate UI element.
+        let style_snapshot = ctx.style();
+        let see_through_on = self.settings.see_through_active;
+        let central_frame = if see_through_on {
+            egui::Frame::central_panel(&style_snapshot)
+                .fill(egui::Color32::TRANSPARENT)
+        } else {
+            egui::Frame::central_panel(&style_snapshot)
+        };
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
+            if see_through_on {
+                // `ui.max_rect()` here is the central panel's content
+                // area AFTER the 8 px inner_margin has been applied,
+                // so the visible "frame" surround band sits in the
+                // 8 px ring OUTSIDE this rect. Paint that ring on the
+                // ctx's background layer painter (which spans the
+                // whole window) using the panel_fill color.
+                let inner = ui.max_rect();
+                let outer = inner.expand(8.0);
+                let p = ctx.layer_painter(egui::LayerId::background());
+                let frame_color = style_snapshot.visuals.panel_fill;
+                // Top
+                p.rect_filled(
+                    egui::Rect::from_min_max(outer.left_top(),
+                        egui::pos2(outer.right(), inner.top())),
+                    egui::CornerRadius::ZERO, frame_color);
+                // Bottom
+                p.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(outer.left(), inner.bottom()),
+                        outer.right_bottom()),
+                    egui::CornerRadius::ZERO, frame_color);
+                // Left (between top and bottom bands)
+                p.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(outer.left(), inner.top()),
+                        egui::pos2(inner.left(), inner.bottom())),
+                    egui::CornerRadius::ZERO, frame_color);
+                // Right
+                p.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(inner.right(), inner.top()),
+                        egui::pos2(outer.right(), inner.bottom())),
+                    egui::CornerRadius::ZERO, frame_color);
+            }
             calibrate_request = crate::panels::canvas::show(
                 canvas, &self.descriptors, &live_device_ids, &self.last_signals,
                 &self.panic_shortcut, devices, &device_rates_snap,
@@ -1365,14 +1626,55 @@ impl eframe::App for FlexInputApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
+        // ── Window border ────────────────────────────────────────────────
+        // We turned off OS decorations (`with_decorations(false)`) so
+        // paint a 1 px subtle border ourselves. Skipped while
+        // maximized so the window snaps cleanly to monitor edges.
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if !maximized {
+            let rect = ctx.input(|i| i.screen_rect());
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("app_window_border"),
+            ));
+            // Inset by half a pixel so the 1px stroke sits inside the
+            // window bounds and isn't cropped by the corner region.
+            let border_rect = rect.shrink(0.5);
+            let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40);
+            painter.rect_stroke(
+                border_rect,
+                egui::CornerRadius::ZERO,
+                egui::Stroke::new(1.0, stroke_color),
+                egui::StrokeKind::Inside,
+            );
+        }
+
         handle_window_resize(ctx);
     }
 
     /// Called by eframe just before the application exits. Persist workspace
     /// (if opted in) and settings here.
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         settings::save_settings(&self.settings);
         self.save_workspace_now();
+    }
+
+    /// Override of the default eframe clear color (which is a 70%-opaque
+    /// dark gray — meant to look reasonable in non-transparent mode and to
+    /// give a hint of the desktop in transparent mode). For our see-through
+    /// toggle to actually go fully transparent we have to clear to RGBA 0;
+    /// otherwise that opaque-by-default gray sits behind the canvas's
+    /// alpha-faded `bg_frame` and you get a "more gray" effect at low alpha
+    /// instead of full transparency.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.settings.see_through_active {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            // Mirror the eframe default — dark gray, ~70% alpha — so the
+            // non-transparent mode looks identical to before.
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180)
+                .to_normalized_gamma_f32()
+        }
     }
 }
 
@@ -1390,6 +1692,63 @@ impl FlexInputApp {
         *self.io_device_list.write().unwrap() =
             Arc::clone(&self.tabs[idx].virtual_panel.active);
     }
+
+    /// Flip the always-on-top pin state. Sends the matching `WindowLevel`
+    /// viewport command, persists to settings, and runs the optional focus
+    /// flip-flop:
+    ///   * On pin-on: capture the previous foreground HWND (if any) so we
+    ///     can restore it on pin-off. After applying always-on-top the
+    ///     window itself is now foreground — but it took a frame to get
+    ///     there, so we read the foreground BEFORE the command lands.
+    ///   * On pin-off: bring the previously-captured HWND back to the
+    ///     front (best-effort — Windows may block this if too much time
+    ///     has passed; see `process_list::bring_hwnd_to_front`).
+    fn toggle_pin(&mut self, ctx: &egui::Context) {
+        let new_state = !self.settings.pin_active;
+        if new_state && self.settings.focus_flip_flop {
+            // Use the continuously-tracked last-external HWND rather than
+            // a fresh `foreground_hwnd()` call: by the time the user
+            // clicks the pin button (or the hotkey thread sets the toggle
+            // flag and we get scheduled), FlexInput itself is usually
+            // foreground, so a fresh read would return None.
+            self.pin_prev_foreground_hwnd = self.pin_last_external_hwnd;
+        }
+        self.settings.pin_active = new_state;
+        self.settings_dirty = true;
+        let level = if new_state {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        // Pin-off: drop our topmost synchronously via Win32. eframe
+        // defers the `WindowLevel::Normal` command into winit's event
+        // loop, so if we relied on it alone we'd still be in the
+        // topmost band when bring_hwnd_to_front runs. Direct
+        // SetWindowPos(self, HWND_NOTOPMOST) takes effect immediately.
+        if !new_state {
+            if let Some(hwnd) = self.self_hwnd {
+                crate::process_list::drop_topmost(hwnd);
+            }
+            if self.settings.focus_flip_flop {
+                if let Some(hwnd) = self.pin_prev_foreground_hwnd.take() {
+                    let _ = crate::process_list::bring_hwnd_to_front(hwnd);
+                }
+            }
+        }
+    }
+
+    /// Toggle our pseudo-maximize state. Avoids the WS_POPUP overshoot
+    /// (~7-8 px gap on the taskbar edge of vertical-taskbar setups) by
+    /// fitting the outer rect to the monitor work area directly instead
+    /// of calling `ViewportCommand::Maximized`. The OS therefore never
+    /// thinks we're maximized; we manage the toggle ourselves.
+    // (Removed: pseudo_maximize. We now use the OS `Maximized` viewport
+    // command, which gives correct native behavior — Aero Snap, drag-
+    // from-top, restore on drag-from-titlebar — at the cost of a 7-8 px
+    // overshoot on the taskbar edge for borderless windows. That can
+    // be fixed properly later by subclassing the window proc and
+    // handling WM_GETMINMAXINFO to clamp to work area.)
 
     /// Render the Settings modal. Reads/writes `self.settings`, mirrors live
     /// values into the engine/I-O atomics, and flips `settings_dirty` so the
@@ -1414,6 +1773,12 @@ impl FlexInputApp {
                         .small().color(egui::Color32::from_gray(170)));
                 });
                 ui.add_space(8.0);
+                // Settings content grew tall enough to fall off screen on
+                // common 1080p / smaller displays — wrap in a scroll area
+                // so users can reach the bottom sections (Workspace,
+                // Device defaults, Links, Credits) without resizing the
+                // window manually.
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.separator();
                 ui.add_space(6.0);
 
@@ -1485,6 +1850,170 @@ impl FlexInputApp {
                 ui.label(egui::RichText::new(
                     "Adjusts panel/widget background lightness. Negative = darker, positive = lighter. Double-click the slider to reset."
                 ).small().color(egui::Color32::from_gray(140)));
+
+                // See-through opacity is set via the popover slider that
+                // appears when you hover the eye icon next to the zoom
+                // controls — no longer surfaced here to keep Settings
+                // focused on durable preferences.
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Always-on-top pin ──────────────────────────────────
+                ui.label(egui::RichText::new("Always-on-top pin").strong());
+                ui.add_space(4.0);
+
+                // Shortcut binder (mirrors the panic-mode binder pattern).
+                ui.horizontal(|ui| {
+                    ui.label("Pin shortcut:");
+                    let btn_text = if self.pin_learning {
+                        "Press chord…".to_string()
+                    } else {
+                        self.settings.pin_shortcut.label()
+                    };
+                    let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+                    if self.pin_learning {
+                        btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
+                                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                    }
+                    let resp = ui.add(btn).on_hover_text(
+                        if self.pin_learning {
+                            "Press the new shortcut (modifier + key).\nClick again to cancel."
+                        } else {
+                            "Click to re-bind. Press the shortcut anywhere on the system to toggle the pin."
+                        }
+                    );
+                    if resp.clicked() {
+                        self.pin_learning = !self.pin_learning;
+                    }
+                });
+                if self.pin_learning {
+                    let pressed: Option<egui::Key> = ctx.input(|i| {
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                            _ => None,
+                        })
+                    });
+                    if let Some(key) = pressed {
+                        let m = ctx.input(|i| i.modifiers);
+                        let key_name = format!("{:?}", key);
+                        self.settings.pin_shortcut = settings::PinShortcut {
+                            ctrl:  m.ctrl,
+                            shift: m.shift,
+                            alt:   m.alt,
+                            win:   m.command && !m.ctrl,
+                            key:   Some(key_name),
+                        };
+                        if let Ok(mut s) = self.pin_shortcut_shared.write() {
+                            *s = self.settings.pin_shortcut.clone();
+                        }
+                        self.pin_learning = false;
+                        dirty = true;
+                    }
+                }
+
+                ui.add_space(4.0);
+                if ui.checkbox(&mut self.settings.pin_via_guide,
+                    "Also toggle pin with controller Guide / PS / Home button")
+                    .on_hover_text(
+                        "Watches every connected gamepad for a Guide-button press.\n\
+                         Standard XInput on Windows does NOT expose the Guide bit on Xbox \
+                         controllers — it works for DualSense via HID, virtual ViGEm pads, \
+                         and most non-Microsoft controllers."
+                    )
+                    .changed()
+                {
+                    dirty = true;
+                }
+                ui.add_enabled_ui(self.settings.pin_via_guide, |ui| {
+                    if ui.checkbox(&mut self.settings.pin_guide_double_tap,
+                        "    Require double-tap")
+                        .on_hover_text(
+                            "Recommended: dodges collisions with Steam / Game Bar's own \
+                             single-press Guide-button handling.\nTwo taps within ~300 ms."
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+
+                    // ── Chord button (AutoMap-style learn) ──────────
+                    // Optional additional button that must be held with
+                    // Guide for the activation to fire. Click "Learn"
+                    // and press any button on the controller to bind.
+                    ui.horizontal(|ui| {
+                        ui.label("    Chord button:");
+                        let learning = self.pin_learn_chord.load(Ordering::Relaxed);
+                        let face = if learning {
+                            "Press a button…".to_string()
+                        } else {
+                            self.settings.pin_guide_chord
+                                .as_deref()
+                                .map(pretty_chord_name)
+                                .unwrap_or_else(|| "(none)".to_string())
+                        };
+                        let mut btn = egui::Button::new(
+                            egui::RichText::new(face).size(12.0));
+                        if learning {
+                            btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
+                                .stroke(egui::Stroke::new(1.0,
+                                    egui::Color32::from_rgb(200, 160, 80)));
+                        }
+                        let resp = ui.add(btn).on_hover_text(
+                            "Optional button that must be held WITH the Guide press\n\
+                             for the pin to toggle. Useful to dodge Steam / Game Bar.\n\
+                             Click to (re)bind; press any controller button to capture.");
+                        if resp.clicked() {
+                            // Toggle learn mode. Clear any prior result.
+                            let new_state = !learning;
+                            self.pin_learn_chord.store(new_state, Ordering::Relaxed);
+                            if let Ok(mut g) = self.pin_learned_chord.lock() {
+                                *g = None;
+                            }
+                        }
+                        // Clear button to drop the chord requirement.
+                        if self.settings.pin_guide_chord.is_some()
+                            && ui.small_button("✕")
+                                .on_hover_text("Clear chord — Guide alone fires")
+                                .clicked()
+                        {
+                            self.settings.pin_guide_chord = None;
+                            dirty = true;
+                        }
+                    });
+
+                    // Consume any newly-learned chord this frame.
+                    let learned: Option<String> = self.pin_learned_chord
+                        .lock().ok().and_then(|mut g| g.take());
+                    if let Some(name) = learned {
+                        self.settings.pin_guide_chord = Some(name);
+                        dirty = true;
+                    }
+                });
+
+                ui.add_space(6.0);
+                if ui.checkbox(&mut self.settings.focus_flip_flop,
+                    "Flip-flop focus on pin toggle")
+                    .on_hover_text(
+                        "Pin ON: remember the previously-focused window.\n\
+                         Pin OFF: return focus to it.\n\
+                         Lets you press the shortcut, tweak, press again, and instantly \
+                         resume testing the target app."
+                    )
+                    .changed()
+                {
+                    dirty = true;
+                }
+
+
+                // Push live state changes to the watcher thread whenever
+                // the user toggles the Guide options.
+                if let Ok(mut cfg) = self.pin_guide_cfg.write() {
+                    cfg.enabled = self.settings.pin_via_guide;
+                    cfg.require_double_tap = self.settings.pin_guide_double_tap;
+                    cfg.chord_signal = self.settings.pin_guide_chord.clone();
+                }
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -1629,6 +2158,7 @@ impl FlexInputApp {
                     );
                     ui.label(egui::RichText::new("(CC0).").small());
                 });
+                }); // ScrollArea
             });
 
         if dirty { self.settings_dirty = true; }
@@ -3321,9 +3851,15 @@ fn show_tab_bar(
     (switch_to, close_idx, new_tab, bypass_toggle)
 }
 
+// (Removed: rounded-corner HRGN logic. SetWindowRgn interacted badly
+// with WS_EX_LAYERED + pseudo-maximize, producing NC chrome strobing.
+// Window stays rectangular; the painted 1 px border delineates the
+// edge.)
+
 // ── Custom title bar ──────────────────────────────────────────────────────────
 
 fn handle_window_resize(ctx: &egui::Context) {
+    // Skip edge-resize hit-testing when OS-maximized.
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     if maximized { return; }
 
@@ -3398,6 +3934,8 @@ fn show_title_bar(
     panic_learning: &mut bool,
     panic_shortcut_shared: &Arc<RwLock<PanicShortcut>>,
     toggle_settings: &mut bool,
+    pin_active: bool,
+    do_pin_toggle: &mut bool,
 ) {
     let bar = ui.max_rect();
     let h = bar.height();
@@ -3465,6 +4003,32 @@ fn show_title_bar(
             {
                 *do_redo = true;
             }
+
+            // ── Divider before pin ─────────────────────────────────────
+            ui.add_space(6.0);
+            let (sep_rect, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
+            let inset = 8.0_f32;
+            let x = sep_rect.center().x;
+            ui.painter().line_segment(
+                [egui::pos2(x, sep_rect.top() + inset),
+                 egui::pos2(x, sep_rect.bottom() - inset)],
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            );
+            ui.add_space(4.0);
+
+            // ── Pin (always-on-top) ───────────────────────────────────
+            // SelectableLabel so the active state gets the standard egui
+            // highlight, matching the see-through eye toggle's look.
+            let pin_label = egui::RichText::new("📌").size(13.0);
+            let pin_resp = ui.add(egui::SelectableLabel::new(pin_active, pin_label));
+            let hover = if pin_active {
+                "Pinned: window stays on top of all others.\nClick to unpin."
+            } else {
+                "Pin window to stay on top of all others.\nConfigure global hotkey / Guide-button trigger in Settings."
+            };
+            if pin_resp.on_hover_text(hover).clicked() {
+                *do_pin_toggle = true;
+            }
         });
     });
 
@@ -3501,10 +4065,8 @@ fn show_title_bar(
             let c = rect.center();
             let s = egui::Stroke::new(1.5, icon_color);
             if maximized {
-                // Restore: two overlapping squares
                 let back  = egui::Rect::from_min_size(egui::pos2(c.x - 1.5, c.y - 5.5), egui::vec2(9.0, 8.0));
                 let front = egui::Rect::from_min_size(egui::pos2(c.x - 5.0, c.y - 2.0), egui::vec2(9.0, 8.0));
-                // Erase the portion of back behind front's top-left so it looks layered.
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(front.min, egui::vec2(3.0, 2.0)),
                     egui::CornerRadius::ZERO,
@@ -3513,10 +4075,11 @@ fn show_title_bar(
                 draw_rect_stroke(ui.painter(), back, s);
                 draw_rect_stroke(ui.painter(), front, s);
             } else {
-                // Maximize: single square
                 draw_rect_stroke(ui.painter(), egui::Rect::from_center_size(c, egui::vec2(11.0, 9.0)), s);
             }
-            if resp.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)); }
+            if resp.clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
 
             // ── Minimize ───────────────────────────────────────────────────
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(btn_w, h), egui::Sense::click());
@@ -3667,13 +4230,19 @@ fn show_title_bar(
         painter.galley(egui::pos2(start_x, mid.y - text_size.y / 2.0), galley, text_color);
     }
 
-    // Process drag / double-click after interactive widgets.
-    if drag.drag_started() {
+    // Fire StartDrag on mouse-press (not drag_started) to avoid the
+    // egui ~6 px threshold lag before the OS drag-move loop takes
+    // over. Win32 itself decides click vs drag based on actual cursor
+    // travel, so this is safe — single clicks still register, and
+    // double-clicks still fire on the second press.
+    if drag.is_pointer_button_down_on()
+        && ctx.input(|i| i.pointer.primary_pressed())
+    {
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
     if drag.double_clicked() {
-        let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
     }
 }
 
@@ -3899,11 +4468,27 @@ fn show_subpatch_editors(
                         }
                     });
                 });
+                // Build a one-level AutoMap glow parent frame so the inner
+                // canvas can resolve inlet AutoMap activity through the
+                // sub-patch boundary. Deeper chains (grandparents) degrade
+                // gracefully — the walk just bottoms out one frame earlier.
+                let automap_parent = match parent_editor_idx {
+                    None => Some(crate::canvas::viewer::AutomapGlowParent {
+                        snarl: &app.tabs[active].canvas.snarl,
+                        subpatch_node_id: node_id,
+                        prev: None,
+                    }),
+                    Some(p) => Some(crate::canvas::viewer::AutomapGlowParent {
+                        snarl: &app.sub_patch_editors[p].canvas.snarl,
+                        subpatch_node_id: node_id,
+                        prev: None,
+                    }),
+                };
                 egui::CentralPanel::default().show(vctx, |ui| {
                     let _ = inner_canvas.show(
                         descriptors, live_device_ids, &live_signals,
                         &panic_shortcut, devices, &device_rates_inner,
-                        device_defaults_inner, ui,
+                        device_defaults_inner, ui, automap_parent,
                     );
                 });
 

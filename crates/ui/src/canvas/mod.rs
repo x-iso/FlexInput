@@ -361,6 +361,7 @@ impl Canvas {
         device_rates: &HashMap<String, u32>,
         param_defaults: DeviceParamDefaults,
         ui: &mut egui::Ui,
+        automap_parent: Option<crate::canvas::viewer::AutomapGlowParent<'_>>,
     ) -> Option<NodeId> {
         let ctx = ui.ctx().clone();
 
@@ -379,14 +380,10 @@ impl Canvas {
                 // node has redrawn its header at least once and the
                 // stash is current.
                 if now.duration_since(spawn_t).as_millis() > 50 { continue; }
-                ctx.data_mut(|d| {
-                    d.remove::<egui::Rect>(egui::Id::new((
-                        "device_source_header_automap_rect", node_id.0,
-                    )));
-                    d.remove::<egui::Rect>(egui::Id::new((
-                        "device_sink_header_automap_in_rect", node_id.0,
-                    )));
-                });
+                // AutoMap pin Y is now derived directly from snarl's per-frame
+                // `pin_ui.clip_rect()` via `automap_chevron_y` — no cross-frame
+                // cache to invalidate on node spawn.
+                let _ = node_id;
             }
         }
 
@@ -426,6 +423,47 @@ impl Canvas {
             if let Some(f) = self.style.header_frame.as_mut() {
                 f.fill = header_fill;
             }
+
+            // See-through mode: thin the snarl canvas backdrop ONLY
+            // (nodes/headers above keep their opaque fills). We build a
+            // bg_frame that's byte-identical to snarl's default
+            // `Frame::canvas(style)` except the fill alpha is reduced —
+            // same inner_margin, corner_radius, stroke, and stroke
+            // color. This preserves the rect layout the Virtual
+            // Devices / Physical Devices tab labels anchor against.
+            //
+            // In opaque mode we set `bg_frame = None` so snarl uses
+            // its default — anything else risks subtle drift from
+            // Frame::canvas's actual values across egui versions.
+            let see_through_on: bool = ui.ctx().data(|d|
+                d.get_temp::<bool>(egui::Id::new(SEE_THROUGH_DATA_KEY))
+            ).unwrap_or(false);
+            let see_through_alpha: f32 = ui.ctx().data(|d|
+                d.get_temp::<f32>(egui::Id::new(SEE_THROUGH_ALPHA_KEY))
+            ).unwrap_or(1.0);
+            if see_through_on {
+                // See-through mode: the snarl backdrop fill (between
+                // modules) gets the user-chosen alpha so the desktop
+                // bleeds through. Stroke / inner_margin / corner all
+                // stay byte-identical to `Frame::canvas(style)` — only
+                // the FILL alpha differs from opaque mode. Module
+                // bodies, headers, wires, and frame outline keep
+                // their normal appearance.
+                let base = v.extreme_bg_color;
+                let a = (see_through_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let fill = egui::Color32::from_rgba_unmultiplied(
+                    base.r(), base.g(), base.b(), a,
+                );
+                self.style.bg_frame = Some(
+                    egui::Frame::new()
+                        .inner_margin(2)
+                        .corner_radius(v.widgets.noninteractive.corner_radius)
+                        .fill(fill)
+                        .stroke(v.window_stroke())
+                );
+            } else {
+                self.style.bg_frame = None;
+            }
         }
 
         // ── Pre-show snapshot for viewer-driven mutations ─────────────────────
@@ -454,6 +492,7 @@ impl Canvas {
             push_undo_request: false,
             param_defaults,
             calibrate_request: None,
+            automap_parent,
         };
         // Capture the snarl_id BEFORE show so we can manipulate SnarlState
         // (zoom / pan) from the zoom-control overlay below.
@@ -1277,8 +1316,20 @@ fn draw_spawn_glow(
     }
 }
 
+/// Shared egui data key for the see-through toggle. The zoom overlay writes
+/// here when the eye icon is clicked; `FlexInputApp::update` reads it each
+/// frame and reflects the value into `settings.see_through_active` so the
+/// panel/window-fill alpha override takes effect.
+///
+/// Lives in a `Cell`-style data slot so neither the canvas nor the app need
+/// to thread a mutable reference through `Canvas::show`. Default value
+/// `false` means the very first frame after launch matches the persisted
+/// setting once the app writes it back.
+pub const SEE_THROUGH_DATA_KEY: &str = "flexinput::see_through_active";
+pub const SEE_THROUGH_ALPHA_KEY: &str = "flexinput::see_through_alpha";
+
 /// Lower-right overlay with canvas zoom controls.
-/// Layout (left → right): [−] [100%] [zoom %] [+] [fit].
+/// Layout (left → right): [👁] [−] [100%] [+] [fit].
 /// Painted in a foreground egui Area so the strip sits visually above
 /// and interactively above the snarl node layer.
 fn draw_zoom_controls(
@@ -1297,9 +1348,9 @@ fn draw_zoom_controls(
     let pct = (cur_scale * 100.0).round() as i32;
 
     // Pre-measure the strip so we can compute a bottom-right placement.
-    // Layout: [-]  [zoom%]  [+]  [fit]  ≈ 24 + 48 + 24 + 24 + paddings
+    // Layout: [eye] [sep] [-] [zoom%] [+] [fit] ≈ 24 + 8 + 24 + 48 + 24 + 24 + paddings
     let margin = 10.0_f32;
-    let est_w  = 156.0_f32;
+    let est_w  = 196.0_f32;
     let est_h  = 36.0_f32;
     let anchor = egui::pos2(
         snarl_rect.right()  - est_w - margin,
@@ -1318,6 +1369,13 @@ fn draw_zoom_controls(
     let mut clicked_reset  = false;
     let mut clicked_plus   = false;
     let mut clicked_fit    = false;
+    let mut clicked_eye    = false;
+
+    // Read the current see-through state so the eye button can render in
+    // its active style without the caller having to plumb it through.
+    let see_through_id = egui::Id::new(SEE_THROUGH_DATA_KEY);
+    let see_through_on: bool = ui.ctx().data(|d| d.get_temp::<bool>(see_through_id))
+        .unwrap_or(false);
 
     area.show(ui.ctx(), |ui| {
         let bg = ui.visuals().window_fill();
@@ -1330,6 +1388,108 @@ fn draw_zoom_controls(
         frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
+
+                // ── See-through toggle (eye icon) ─────────────────────────
+                // Click toggles see-through; hover pops out a vertical
+                // opacity slider so the user can adjust without diving
+                // into the Settings window.
+                let eye_label = egui::RichText::new("👁").monospace().size(14.0);
+                let eye_btn = egui::SelectableLabel::new(see_through_on, eye_label);
+                let eye_resp = ui.add_sized(egui::vec2(24.0, 22.0), eye_btn);
+                let hover = if see_through_on {
+                    "See-through: ON — click to make app fully opaque.\nHover to adjust opacity."
+                } else {
+                    "See-through: OFF — click to make app translucent.\nHover to adjust opacity."
+                };
+                let eye_resp = eye_resp.on_hover_text(hover);
+                clicked_eye = eye_resp.clicked();
+
+                // Opacity popover: anchored above the eye button.
+                // Stays open while either the eye OR the popup is
+                // hovered, plus a 3-second grace window after the
+                // last hover so the user can travel from the eye
+                // across the gap to the slider without it closing
+                // mid-traversal. Without the grace timer, the popup
+                // hides for one frame between leaving the eye and
+                // entering the slider rect, and never recovers.
+                let popup_id = snarl_id.with("see_through_popup");
+                let last_hover_id = popup_id.with("last_hover");
+                const POPUP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+                let now = std::time::Instant::now();
+                let last_hover: Option<std::time::Instant> = ui.ctx().data(|d|
+                    d.get_temp::<std::time::Instant>(last_hover_id)
+                );
+                if eye_resp.hovered() {
+                    ui.ctx().data_mut(|d| d.insert_temp(last_hover_id, now));
+                }
+                let popup_visible = eye_resp.hovered()
+                    || last_hover.map(|t| now.duration_since(t) < POPUP_GRACE)
+                        .unwrap_or(false);
+                if popup_visible {
+                    let alpha_id = egui::Id::new(SEE_THROUGH_ALPHA_KEY);
+                    let mut alpha: f32 = ui.ctx().data(|d|
+                        d.get_temp::<f32>(alpha_id)
+                    ).unwrap_or(0.55);
+                    let popup_area = egui::Area::new(popup_id)
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(egui::pos2(
+                            eye_resp.rect.center().x - 28.0,
+                            eye_resp.rect.top() - 130.0,
+                        ))
+                        .interactable(true);
+                    // We need continuous repaints during the grace
+                    // window so the timer-driven hide actually fires
+                    // — without this the UI would freeze open until
+                    // the next external event.
+                    ui.ctx().request_repaint_after(
+                        std::time::Duration::from_millis(100));
+                    let popup_resp = popup_area.show(ui.ctx(), |ui| {
+                        let bg = ui.visuals().window_fill();
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                bg.r(), bg.g(), bg.b(), 240))
+                            .stroke(egui::Stroke::new(1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(6))
+                            .show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.label(egui::RichText::new(
+                                        format!("{:.0}%", alpha * 100.0))
+                                        .small());
+                                    let resp = ui.add_sized(
+                                        egui::vec2(40.0, 96.0),
+                                        egui::Slider::new(&mut alpha, 0.0_f32..=1.0)
+                                            .vertical()
+                                            .show_value(false),
+                                    );
+                                    if resp.changed() {
+                                        ui.ctx().data_mut(|d| d.insert_temp(
+                                            alpha_id, alpha.clamp(0.0, 1.0),
+                                        ));
+                                    }
+                                });
+                            }).response
+                    }).response;
+                    // Refresh the grace timer any time either widget
+                    // is hovered, so the popup stays open as long as
+                    // the cursor lives on the slider.
+                    if eye_resp.hovered() || popup_resp.hovered() {
+                        ui.ctx().data_mut(|d|
+                            d.insert_temp(last_hover_id, now));
+                    }
+                }
+
+                // Short separator between the visual toggle and the
+                // numeric zoom group.
+                let (sep_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(1.0, 18.0), egui::Sense::hover());
+                ui.painter().line_segment(
+                    [sep_rect.center_top(), sep_rect.center_bottom()],
+                    egui::Stroke::new(1.0,
+                        ui.visuals().widgets.noninteractive.bg_stroke.color),
+                );
+
                 clicked_minus = ui.add(egui::Button::new(
                     egui::RichText::new("−").monospace())
                     .min_size(egui::vec2(24.0, 22.0)))
@@ -1357,6 +1517,12 @@ fn draw_zoom_controls(
         });
     });
 
+    if clicked_eye {
+        // Flip and persist into the temp data slot. The app polls this
+        // each frame in `update` and mirrors it into `settings.see_through_active`
+        // (which the theme applier uses to thin panel/window alpha).
+        ui.ctx().data_mut(|d| d.insert_temp(see_through_id, !see_through_on));
+    }
     if clicked_minus {
         let new_scale = (cur_scale / 1.25).clamp(MIN_SCALE, MAX_SCALE);
         zoom_about(&mut state, snarl_rect.center(), new_scale);

@@ -1329,9 +1329,11 @@ pub fn eval_graph_tick(
                 &sg.graph, &outer_inputs, state, dev_sigs, &mut collector_sigs,
                 &mut scope_samples, &mut last_inputs, &mut last_outputs, snap.node_uid, dt,
             );
-            computed[idx] = sg.outlet_locs.iter()
+            let out: Vec<Option<Signal>> = sg.outlet_locs.iter()
                 .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
                 .collect();
+            last_outputs.insert(snap.node_uid, out.clone());
+            computed[idx] = out;
             continue;
         }
 

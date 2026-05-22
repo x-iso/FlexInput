@@ -30,9 +30,39 @@ uuid       = { version = "1", features = ["v4", "serde"] }
 smallvec   = { version = "1", features = ["serde"] }
 rfd        = "0.15"
 egui       = "0.33"
-eframe     = { version = "0.33", features = ["default"] }
+# Default eframe features minus `accesskit`, with the renderer
+# switched from `glow` (OpenGL) to `wgpu`. accesskit_windows
+# crashes with `Result::unwrap on Err(ERROR_NOT_ENOUGH_MEMORY)`
+# when Windows' global atom table is full — disabling the feature
+# drops the screen-reader bridge but keeps everything else.
+# wgpu lets the OS pick the best backend (D3D12 on Windows, Metal
+# on macOS, Vulkan on Linux). The OpenGL path was failing to honor
+# the transparent surface on at least one Windows/NVIDIA combo
+# (RTX 4070) — wgpu's D3D12 path renders the alpha correctly and
+# also unblocks first-class Linux/Vulkan support.
+eframe     = { version = "0.33", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "web_screen_reader",
+    "x11",
+] }
 egui-snarl = "0.9"
 egui_extras = { version = "0.33", features = ["svg"] }
+# eframe's `wgpu` feature only wires the egui-wgpu glue; the wgpu
+# crate itself defaults to NO backends, which panics at runtime with
+# "No wgpu backend feature that is implemented for the target
+# platform was enabled". We add wgpu as a direct dep and explicitly
+# enable Vulkan (works on Windows + Linux; NVIDIA/AMD/Intel all ship
+# good drivers) and Metal (macOS). DX12 is intentionally omitted —
+# wgpu-hal 27.0.4's dx12 backend has a windows-crate version conflict
+# (gpu-allocator 0.27 pulls windows 0.56 but wgpu-hal targets 0.58).
+# Vulkan is sufficient and gives us Linux parity without a second
+# backend to maintain.
+wgpu       = { version = "27", default-features = false, features = [
+    "metal",
+    "vulkan",
+] }
 
 [patch.crates-io]
 egui-snarl = { path = "vendor/egui-snarl" }
