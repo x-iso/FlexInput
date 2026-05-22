@@ -15,30 +15,46 @@ use crate::panels::physical_devices::canvas_status_button;
 const CHIP_ICON_H: f32 = 24.0;
 const CHIP_H: f32 = 28.0;
 
+/// Shared, app-level pool of virtual output devices. Tabs no longer own
+/// devices — the pool is shared across all open tabs so the same
+/// `virtual.xinput.0` instance is reused if multiple patches reference it.
+pub type SharedDevicePool = Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>;
+
 fn kind_prefix_of(dev_id: &str) -> String {
     dev_id.split('.').take(2).collect::<Vec<_>>().join(".")
 }
 
-pub struct VirtualDevicePanel {
-    /// Devices for this tab. Shared with the I/O thread when this tab is active.
-    pub active: Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>,
-}
+/// Stateless renderer for the top virtual-devices panel. The actual device
+/// list lives in `FlexInputApp::shared_virtual_devices`; the panel reads it
+/// every frame and shows the entire pool (the user's spec: top panel
+/// reflects the whole shared pool, not just devices referenced by the
+/// active tab).
+pub struct VirtualDevicePanel;
 
 impl VirtualDevicePanel {
-    pub fn new() -> Self {
-        Self { active: Arc::new(Mutex::new(vec![])) }
-    }
+    pub fn new() -> Self { Self }
 
+    /// Render the panel.
+    ///
+    /// * `pool` — shared device pool (app-level Arc).
+    /// * `canvas` — current tab's canvas; "+" adds a sink node here, and
+    ///   the close (X) button uses canvas membership to decide whether the
+    ///   device can be safely removed (only when no other tab references it).
+    /// * `referenced_elsewhere` — for each device id, whether *some other
+    ///   open tab's canvas* also references it. When true the close (X)
+    ///   button on the chip is disabled with an explanatory tooltip.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
+        pool: &SharedDevicePool,
         canvas: &mut Canvas,
         default_collapsed: bool,
         defaults: DeviceParamDefaults,
+        referenced_elsewhere: &dyn Fn(&str) -> bool,
     ) {
         // Snapshot device state briefly so we can render without holding the lock.
         let chips: Vec<(String, String, bool)> = {
-            let devs = self.active.lock().unwrap();
+            let devs = pool.lock().unwrap();
             devs.iter().enumerate().map(|(i, d)| {
                 (d.id().to_string(), chip_name(&devs, i), d.is_connected())
             }).collect()
@@ -101,7 +117,7 @@ impl VirtualDevicePanel {
                             });
                             canvas_status_button(ui, on_canvas, || {
                                 // Re-lock briefly to get the device reference for canvas registration.
-                                let devs = self.active.lock().unwrap();
+                                let devs = pool.lock().unwrap();
                                 if let Some(dev) = devs.get(i) {
                                     canvas.add_virtual_sink(dev.as_ref(), default_collapsed, defaults);
                                     let new_name = chip_name(&devs, i);
@@ -119,10 +135,23 @@ impl VirtualDevicePanel {
                             });
 
                             // Close button — placed last so it's far-right.
-                            if svg_icon_button(ui, remapper_icons::CLOSE_SVG, 18.0)
-                                .on_hover_text("Remove")
-                                .clicked()
-                            {
+                            // Disabled when another open tab still references this
+                            // device; the user must close that tab (or delete the
+                            // sink node there) first.
+                            let other_tab_uses_it = referenced_elsewhere(dev_id);
+                            let resp = ui
+                                .add_enabled_ui(!other_tab_uses_it, |ui| {
+                                    svg_icon_button(ui, remapper_icons::CLOSE_SVG, 18.0)
+                                })
+                                .inner;
+                            let resp = if other_tab_uses_it {
+                                resp.on_hover_text(
+                                    "Used by another open tab — close that tab first to remove this device",
+                                )
+                            } else {
+                                resp.on_hover_text("Remove")
+                            };
+                            if !other_tab_uses_it && resp.clicked() {
                                 to_remove = Some(i);
                             }
                         },
@@ -132,7 +161,7 @@ impl VirtualDevicePanel {
 
             if let Some(i) = to_remove {
                 let (removed_id, kind_prefix) = {
-                    let mut devs = self.active.lock().unwrap();
+                    let mut devs = pool.lock().unwrap();
                     let removed = devs.remove(i);
                     let id = removed.id().to_string();
                     let prefix = id.split('.').take(2).collect::<Vec<_>>().join(".");
@@ -149,7 +178,7 @@ impl VirtualDevicePanel {
 
                 // Re-sync canvas node display names for remaining same-kind devices.
                 let renames: Vec<(String, String)> = {
-                    let devs = self.active.lock().unwrap();
+                    let devs = pool.lock().unwrap();
                     devs.iter().enumerate()
                         .filter(|(_, d)| d.id().starts_with(&kind_prefix))
                         .map(|(j, d)| (d.id().to_string(), chip_name(&devs, j)))
@@ -176,7 +205,7 @@ impl VirtualDevicePanel {
                     let already = if kind.allows_multiple {
                         false
                     } else {
-                        let devs = self.active.lock().unwrap();
+                        let devs = pool.lock().unwrap();
                         devs.iter().any(|a| a.id().starts_with(kind.kind_id))
                     };
 
@@ -184,13 +213,13 @@ impl VirtualDevicePanel {
                         ui.add_enabled(false, egui::Button::new(kind.display_name));
                     } else if ui.button(kind.display_name).clicked() {
                         let instance = {
-                            let devs = self.active.lock().unwrap();
+                            let devs = pool.lock().unwrap();
                             devs.iter().filter(|d| d.id().starts_with(kind.kind_id)).count()
                         };
 
                         let dev = create_device(kind.kind_id, instance);
                         canvas.add_virtual_sink(dev.as_ref(), default_collapsed, defaults);
-                        let mut devs = self.active.lock().unwrap();
+                        let mut devs = pool.lock().unwrap();
                         devs.push(dev);
                         let j = devs.len() - 1;
                         let new_name = chip_name(&devs, j);

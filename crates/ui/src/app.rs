@@ -15,7 +15,7 @@ use crate::{
     canvas::node::{ExposedModule, UiSubPatch},
     canvas::ClipboardData,
     guide_watcher::{spawn_guide_watcher, GuideWatchConfig},
-    panels::{physical_devices, virtual_devices::VirtualDevicePanel},
+    panels::{physical_devices, virtual_devices::{SharedDevicePool, VirtualDevicePanel}},
     panic_hotkey::{load_panic_shortcut, save_panic_shortcut, spawn_panic_hotkey_listener},
     pin_hotkey::spawn_pin_hotkey_listener,
     settings::{self, AppSettings, PersistedTab, PersistedWorkspace, PinShortcut},
@@ -71,6 +71,8 @@ pub struct PatchTab {
     /// Exe filenames that auto-switch to this tab (e.g. `["game.exe", "launcher.exe"]`).
     pub bound_exes: Vec<String>,
     pub canvas: Canvas,
+    /// Stateless panel renderer. Devices themselves live in the app-level
+    /// `shared_virtual_devices` pool, not on the tab.
     pub virtual_panel: VirtualDevicePanel,
     /// Manual bypass: stop sending output from this tab's virtual/physical sinks.
     pub bypassed: bool,
@@ -90,6 +92,71 @@ impl PatchTab {
             auto_bypass: false,
         }
     }
+}
+
+/// Collect every `device_id` string referenced by a `device.sink` node in
+/// the given snarl that targets a virtual device (id starts with
+/// `"virtual."`). Used to drive shared-pool reconciliation and the
+/// active-tab id filter.
+fn snarl_virtual_device_ids(snarl: &Snarl<NodeData>) -> Vec<String> {
+    snarl
+        .nodes_ids_data()
+        .filter_map(|(_, n)| {
+            let node = &n.value;
+            if node.module_id == "device.sink" {
+                node.params
+                    .get("device_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|id| id.starts_with("virtual."))
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Insert virtual devices into the shared pool for every id in
+/// `needed_ids` that doesn't already exist. Pre-existing devices are
+/// reused — never duplicated. Devices the pool has but `needed_ids`
+/// doesn't list are left alone (pruning is a separate operation).
+fn reconcile_shared_devices(
+    pool: &mut Vec<Box<dyn VirtualDevice>>,
+    needed_ids: &[String],
+) {
+    for id in needed_ids {
+        if !pool.iter().any(|d| d.id() == id.as_str()) {
+            if let Some(dev) = try_create_virtual_device(id) {
+                pool.push(dev);
+            }
+        }
+    }
+}
+
+/// Drop devices from the shared pool whose id is not referenced by any
+/// open tab's canvas. Called after closing a tab. Returns the dropped ids
+/// (informational).
+fn prune_shared_devices(
+    pool: &mut Vec<Box<dyn VirtualDevice>>,
+    tabs: &[PatchTab],
+) -> Vec<String> {
+    let mut keep: HashSet<String> = HashSet::new();
+    for tab in tabs {
+        for id in snarl_virtual_device_ids(&tab.canvas.snarl) {
+            keep.insert(id);
+        }
+    }
+    let mut dropped = Vec::new();
+    pool.retain(|d| {
+        let id = d.id().to_string();
+        if keep.contains(&id) {
+            true
+        } else {
+            dropped.push(id);
+            false
+        }
+    });
+    dropped
 }
 
 // ── Sub-patch editor windows ──────────────────────────────────────────────────
@@ -165,9 +232,17 @@ pub struct FlexInputApp {
     proc_device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
     proc_outputs: Arc<Mutex<ProcessingOutput>>,
     // ── I/O thread shared state ───────────────────────────────────────────────
-    /// Points to the active tab's device list Arc so the I/O thread always dispatches
-    /// to the right set of virtual devices without needing to know the active tab index.
-    io_device_list: Arc<RwLock<Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>>>,
+    /// App-level shared pool of virtual output devices. Same instance of
+    /// `virtual.xinput.0` is reused across every tab that references it.
+    /// Membership is reconciled on workspace restore, patch load, and tab
+    /// close (pruning).
+    shared_virtual_devices: SharedDevicePool,
+    /// Set of virtual device IDs referenced by the *active tab's* canvas.
+    /// The I/O thread routes signals only to devices whose id is in this
+    /// set; devices owned by background tabs receive `reset_outputs()` each
+    /// tick so they don't drive output. Rebuilt by `set_active_tab` and
+    /// whenever the active tab's canvas changes.
+    active_tab_device_ids: Arc<RwLock<HashSet<String>>>,
     /// Bypass flag: when true the I/O thread calls reset_outputs() instead of flush().
     io_bypass: Arc<AtomicBool>,
     // ── MIDI watch thread shared state ────────────────────────────────────────
@@ -374,9 +449,25 @@ impl FlexInputApp {
         let shared_midi_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
         let pinned_midi_ids = Arc::new(RwLock::new(HashSet::<String>::new()));
         let io_bypass      = Arc::new(AtomicBool::new(false));
-        // Point io_device_list at the first (active) tab's device Arc.
-        let io_device_list = Arc::new(RwLock::new(
-            Arc::clone(&tabs[0].virtual_panel.active),
+
+        // App-level shared virtual-device pool. Reconciled from every
+        // restored tab's canvas so re-opening the app brings back the
+        // devices each patch requires (no duplicates: a single shared
+        // instance per device id).
+        let shared_virtual_devices: SharedDevicePool =
+            Arc::new(Mutex::new(Vec::<Box<dyn VirtualDevice>>::new()));
+        {
+            let mut pool = shared_virtual_devices.lock().unwrap();
+            for tab in &tabs {
+                let ids = snarl_virtual_device_ids(&tab.canvas.snarl);
+                reconcile_shared_devices(&mut pool, &ids);
+            }
+        }
+
+        // Active-tab device id filter — I/O thread only ticks devices
+        // whose id is in this set. Seeded from tab 0's canvas.
+        let active_tab_device_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(
+            snarl_virtual_device_ids(&tabs[0].canvas.snarl).into_iter().collect(),
         ));
 
         let device_rates = flexinput_engine::new_device_rates();
@@ -386,7 +477,8 @@ impl FlexInputApp {
             Arc::clone(&midi_backend),
             Arc::clone(&proc_device_signals),
             Arc::clone(&sink_bus),
-            Arc::clone(&io_device_list),
+            Arc::clone(&shared_virtual_devices),
+            Arc::clone(&active_tab_device_ids),
             Arc::clone(&io_bypass),
             Arc::clone(&shared_devices),
             Arc::clone(&shared_midi_devices),
@@ -487,7 +579,8 @@ impl FlexInputApp {
             proc_graph,
             proc_device_signals,
             proc_outputs,
-            io_device_list,
+            shared_virtual_devices,
+            active_tab_device_ids,
             io_bypass,
             pinned_midi_ids,
             shared_midi_devices,
@@ -1286,7 +1379,19 @@ impl eframe::App for FlexInputApp {
                 .min(self.tabs.len() - 1);
             // Clamp active_tab before set_active_tab reads self.tabs[self.active_tab].
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+            // Force the active-id set + I/O filter refresh even when
+            // new_idx == active_tab (set_active_tab early-returns on no-op);
+            // the closing tab may have referenced devices that are now
+            // orphaned and we want to silence them before pruning.
+            self.refresh_active_tab_device_ids();
             self.set_active_tab(new_idx);
+            // Prune the shared pool: drop any device no remaining tab
+            // references. The Drop impl on each VirtualDevice releases
+            // the underlying OS resource (ViGEm target, enigo handles).
+            {
+                let mut pool = self.shared_virtual_devices.lock().unwrap();
+                let _ = prune_shared_devices(&mut pool, &self.tabs);
+            }
         }
 
         // Switch active tab — manual tab click disengages auto mode.
@@ -1312,10 +1417,12 @@ impl eframe::App for FlexInputApp {
 
         // Save / Load operate on the active tab.
         if do_save {
-            let vids = {
-                let devs = self.tabs[self.active_tab].virtual_panel.active.lock().unwrap();
-                devs.iter().map(|d| d.id().to_string()).collect()
-            };
+            // Saved patches record the device ids referenced by the active
+            // tab's canvas — that's the contract `.fxp` consumers expect.
+            // The shared pool may hold devices owned by other tabs that
+            // shouldn't end up in this file.
+            let vids: Vec<String> =
+                snarl_virtual_device_ids(&self.tabs[self.active_tab].canvas.snarl);
             let bound = self.tabs[self.active_tab].bound_exes.clone();
             let auto_bypass = self.tabs[self.active_tab].auto_bypass;
             if let Some(saved_path) = self.tabs[self.active_tab].canvas.save_patch(vids, bound, auto_bypass) {
@@ -1336,45 +1443,43 @@ impl eframe::App for FlexInputApp {
                 tab.file_path = Some(path);
                 tab.bound_exes = bound;
                 tab.auto_bypass = auto_bypass;
-                // Collect virtual device IDs referenced by canvas nodes (covers older saves
-                // that may not have populated virtual_device_ids).
-                let canvas_vids: Vec<String> = tab.canvas.snarl.nodes_ids_data()
-                    .filter_map(|(_, n)| {
-                        let node = &n.value;
-                        if node.module_id == "device.sink" {
-                            node.params.get("device_id")
-                                .and_then(|v| v.as_str())
-                                .filter(|id| id.starts_with("virtual."))
-                                .map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                // Reconcile the shared pool: union of the saved id list
+                // and the canvas-referenced ids (canvas wins on disagreement
+                // because that's what the user will see). Reuses existing
+                // pool entries — no duplicate instances.
+                let canvas_vids = snarl_virtual_device_ids(&tab.canvas.snarl);
+                let mut needed: Vec<String> = vids;
+                for cv in canvas_vids {
+                    if !needed.iter().any(|v| v == &cv) {
+                        needed.push(cv);
+                    }
+                }
                 {
-                    let mut devs = tab.virtual_panel.active.lock().unwrap();
-                    devs.clear();
-                    for vid in &vids {
-                        if let Some(dev) = try_create_virtual_device(vid) {
-                            devs.push(dev);
-                        }
-                    }
-                    for vid in &canvas_vids {
-                        if !devs.iter().any(|d| d.id() == vid.as_str()) {
-                            if let Some(dev) = try_create_virtual_device(vid) {
-                                devs.push(dev);
-                            }
-                        }
-                    }
+                    let mut pool = self.shared_virtual_devices.lock().unwrap();
+                    reconcile_shared_devices(&mut pool, &needed);
+                }
+                // Active-tab canvas changed — refresh the I/O filter so the
+                // new tab's devices start receiving signals this frame.
+                self.refresh_active_tab_device_ids();
+                // Prune any devices the previous canvas needed but the new
+                // one (and no other tab) does.
+                {
+                    let mut pool = self.shared_virtual_devices.lock().unwrap();
+                    prune_shared_devices(&mut pool, &self.tabs);
                 }
             }
         }
 
         // Build live device IDs for the active tab's canvas status dots.
         let live_device_ids: std::collections::HashSet<String> = {
+            let active_ids: std::collections::HashSet<String> =
+                self.active_tab_device_ids.read().unwrap().clone();
             let virtual_live: Vec<String> = {
-                let devs = self.tabs[self.active_tab].virtual_panel.active.lock().unwrap();
-                devs.iter().filter(|d| d.is_connected()).map(|d| d.id().to_string()).collect()
+                let devs = self.shared_virtual_devices.lock().unwrap();
+                devs.iter()
+                    .filter(|d| d.is_connected() && active_ids.contains(d.id()))
+                    .map(|d| d.id().to_string())
+                    .collect()
             };
             self.devices.iter().map(|d| d.id.clone())
                 .chain(virtual_live)
@@ -1383,6 +1488,20 @@ impl eframe::App for FlexInputApp {
 
         let devices = &self.devices;
         let bottom_panel_height = self.bottom_panel_height;
+        // Pre-compute the set of device ids referenced by *non-active* tab
+        // canvases so the panel can grey out the close (X) button on any
+        // chip another tab still needs.
+        let referenced_by_other_tabs: std::collections::HashSet<String> = {
+            let mut s = std::collections::HashSet::new();
+            for (i, t) in self.tabs.iter().enumerate() {
+                if i == self.active_tab { continue; }
+                for id in snarl_virtual_device_ids(&t.canvas.snarl) {
+                    s.insert(id);
+                }
+            }
+            s
+        };
+        let shared_pool_for_panel = Arc::clone(&self.shared_virtual_devices);
         let tab = &mut self.tabs[self.active_tab];
         let (virtual_panel, canvas) = (&mut tab.virtual_panel, &mut tab.canvas);
 
@@ -1447,7 +1566,14 @@ impl eframe::App for FlexInputApp {
             .frame(top_frame)
             .show(ctx, |ui| {
                 if virt_open > 0.01 {
-                    virtual_panel.show(ui, canvas, default_collapsed, device_defaults);
+                    virtual_panel.show(
+                        ui,
+                        &shared_pool_for_panel,
+                        canvas,
+                        default_collapsed,
+                        device_defaults,
+                        &|id| referenced_by_other_tabs.contains(id),
+                    );
                 }
             });
 
@@ -1616,10 +1742,10 @@ impl eframe::App for FlexInputApp {
         // combos (likely a glow + DWM swap-chain interaction). Empty patch
         // is a transient state; once a node is dropped the live path kicks
         // in and rendering is smooth.
-        let has_virtual = {
-            let devs = self.tabs[self.active_tab].virtual_panel.active.lock().unwrap();
-            !devs.is_empty()
-        };
+        // Repaint heuristic: live path runs whenever a virtual device is
+        // referenced by the active tab's canvas. Background-tab devices
+        // don't need vsync repaints here — their UI is hidden.
+        let has_virtual = !self.active_tab_device_ids.read().unwrap().is_empty();
         if canvas_has_nodes || has_virtual {
             ctx.request_repaint();
         } else {
@@ -1650,6 +1776,22 @@ impl eframe::App for FlexInputApp {
         }
 
         handle_window_resize(ctx);
+
+        // ── Reconcile shared virtual-device pool against canvas state ────
+        // Cheap; catches sink-node adds/removes that happened anywhere
+        // this frame (panel "+", panel "X", canvas drop, right-click
+        // delete, undo/redo, paste). Runs once per frame at the end so
+        // every edit path converges on a consistent pool.
+        {
+            let needed: Vec<String> = self.tabs.iter()
+                .flat_map(|t| snarl_virtual_device_ids(&t.canvas.snarl))
+                .collect();
+            let mut pool = self.shared_virtual_devices.lock().unwrap();
+            reconcile_shared_devices(&mut pool, &needed);
+            let _ = prune_shared_devices(&mut pool, &self.tabs);
+        }
+        // Refresh the I/O thread's active-tab device id filter.
+        self.refresh_active_tab_device_ids();
     }
 
     /// Called by eframe just before the application exits. Persist workspace
@@ -1679,18 +1821,35 @@ impl eframe::App for FlexInputApp {
 }
 
 impl FlexInputApp {
-    /// Switch the active tab and update the I/O thread's device list pointer.
+    /// Switch the active tab and refresh the I/O thread's device id filter.
+    /// Devices in the shared pool that the new tab doesn't reference are
+    /// silenced (`reset_outputs()`) immediately so a drifting axis from
+    /// the old tab doesn't leak into the new tab's idle frame.
     fn set_active_tab(&mut self, idx: usize) {
         if idx == self.active_tab { return; }
-        // Zero the outgoing tab's virtual devices so they don't hold their last
-        // signal state (e.g. a drifting mouse axis) after we stop updating them.
-        {
-            let mut devs = self.tabs[self.active_tab].virtual_panel.active.lock().unwrap();
-            for dev in devs.iter_mut() { dev.reset_outputs(); }
-        }
         self.active_tab = idx;
-        *self.io_device_list.write().unwrap() =
-            Arc::clone(&self.tabs[idx].virtual_panel.active);
+        self.refresh_active_tab_device_ids();
+        // Silence everything not referenced by the new active tab. The I/O
+        // thread will keep silencing them each tick; this immediate pass
+        // matters because the I/O thread runs at 500 Hz and the UI thread
+        // controls flush ordering on tab switch.
+        let active_ids = self.active_tab_device_ids.read().unwrap().clone();
+        let mut devs = self.shared_virtual_devices.lock().unwrap();
+        for dev in devs.iter_mut() {
+            if !active_ids.contains(dev.id()) {
+                dev.reset_outputs();
+            }
+        }
+    }
+
+    /// Rebuild `active_tab_device_ids` from the current active tab's
+    /// canvas. Cheap; call whenever the canvas content changes in a way
+    /// that adds/removes a device.sink node.
+    fn refresh_active_tab_device_ids(&self) {
+        let ids: HashSet<String> = snarl_virtual_device_ids(
+            &self.tabs[self.active_tab].canvas.snarl,
+        ).into_iter().collect();
+        *self.active_tab_device_ids.write().unwrap() = ids;
     }
 
     /// Flip the always-on-top pin state. Sends the matching `WindowLevel`
@@ -2193,7 +2352,14 @@ fn spawn_io_thread(
     midi: Arc<Mutex<Option<MidiBackend>>>,
     proc_device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
     sink_bus: SinkBus,
-    io_device_list: Arc<RwLock<Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>>>,
+    // App-level shared pool of virtual output devices. Membership is
+    // managed by the UI thread (reconcile on patch load, prune on tab
+    // close); the I/O thread only reads it.
+    shared_virtual_devices: SharedDevicePool,
+    // IDs referenced by the active tab's canvas. Devices in the pool
+    // whose id is NOT in this set are silenced (`reset_outputs()`)
+    // every tick — background tabs don't drive output.
+    active_tab_device_ids: Arc<RwLock<HashSet<String>>>,
     io_bypass: Arc<AtomicBool>,
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
@@ -2313,25 +2479,42 @@ fn spawn_io_thread(
                     sink_bus.read().unwrap().clone();
 
                 // ── Drive virtual & physical devices ──────────────────────────
+                // Shared pool holds ALL virtual devices across every open
+                // tab. The active-tab id filter decides which devices
+                // actually route signals this tick; devices outside the
+                // filter receive `reset_outputs()` so a background tab's
+                // device idles instead of holding its last state.
                 let bypass = io_bypass.load(Ordering::Relaxed);
-                let device_arc = io_device_list.read().unwrap().clone();
+                let active_ids = active_tab_device_ids.read().unwrap().clone();
                 {
-                    let mut devs = device_arc.lock().unwrap();
+                    let mut devs = shared_virtual_devices.lock().unwrap();
                     if bypass {
                         for dev in devs.iter_mut() { dev.reset_outputs(); }
                     } else {
+                        // Silence devices not referenced by the active tab.
+                        for dev in devs.iter_mut() {
+                            if !active_ids.contains(dev.id()) {
+                                dev.reset_outputs();
+                            }
+                        }
+                        // Route signals to active-tab devices only.
                         for ((device_id, pin_id), &signal) in &sink_outputs {
+                            if !active_ids.contains(device_id) { continue; }
                             if let Some(dev) = devs.iter_mut().find(|d| d.id() == device_id) {
                                 dev.send(pin_id, signal);
                             }
                         }
+                        // Flush every device (silenced ones still need a
+                        // flush to commit their zeroed state to the OS).
                         for dev in devs.iter_mut() { dev.flush(); }
 
-                        // Poll rumble/feedback signals back from virtual devices and
-                        // merge them into proc_device_signals for graph routing.
+                        // Poll rumble/feedback signals back only from active-tab
+                        // devices — background-tab feedback would route into the
+                        // wrong graph.
                         let mut virt_sigs: Vec<((String, String), Signal)> = Vec::new();
                         for dev in devs.iter_mut() {
                             let id = dev.id().to_string();
+                            if !active_ids.contains(&id) { continue; }
                             for (pin_id, sig) in dev.poll_outputs() {
                                 virt_sigs.push(((id.clone(), pin_id.to_string()), sig));
                             }
