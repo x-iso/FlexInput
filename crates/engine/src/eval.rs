@@ -10,6 +10,7 @@ use crate::state::NodeState;
 
 // ── Public output type ────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct TickOutput {
     /// Latest output per (node_uid, output_pin). Excludes device.source (UI evaluates fresh).
     pub outputs: HashMap<(usize, usize), Option<Signal>>,
@@ -21,6 +22,19 @@ pub struct TickOutput {
     pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,
     /// Latest signals destined for each (device_id, pin_id) sink slot.
     pub sink_outputs: HashMap<(String, String), Signal>,
+}
+
+impl TickOutput {
+    /// Clear all containers in-place. Preserves allocated capacity so the
+    /// proc thread can reuse the same `TickOutput` across ticks instead of
+    /// dropping and reallocating five HashMaps per call (was hot at 2 kHz).
+    pub fn clear(&mut self) {
+        self.outputs.clear();
+        self.scope_samples.clear();
+        self.last_inputs.clear();
+        self.last_outputs.clear();
+        self.sink_outputs.clear();
+    }
 }
 
 /// Stick pin IDs — deadzone applies only here, not to triggers/gyro/accel/buttons.
@@ -570,12 +584,20 @@ fn eval_subgraph(
 
 // ── Main graph tick ───────────────────────────────────────────────────────────
 
+/// Evaluate one tick into `out`. The caller owns `out` and is expected to
+/// reuse the same `TickOutput` across ticks — we `.clear()` at the top so
+/// the HashMaps keep their allocated capacity between calls instead of
+/// being dropped and reallocated. At 2 kHz this was a non-trivial source
+/// of allocator pressure even on empty graphs.
 pub fn eval_graph_tick(
     graph: &ProcessingGraph,
     state: &mut HashMap<usize, NodeState>,
     dev_sigs: &HashMap<(String, String), Signal>,
     dt: f32,
-) -> TickOutput {
+    out: &mut TickOutput,
+) {
+    puffin::profile_function!();
+    out.clear();
     let n = graph.nodes.len();
     let mut computed: Vec<Vec<Option<Signal>>> = vec![vec![]; n];
 
@@ -584,18 +606,28 @@ pub fn eval_graph_tick(
     // AutoMap split/collector, sink AutoMap, remapper — sees the processed
     // values. Avoids the prior leak where AutoMap pulled raw dev_sigs and
     // bypassed the source node's params.
-    let dev_sigs_owned: HashMap<(String, String), Signal> =
-        preprocess_dev_sigs(graph, dev_sigs);
+    let dev_sigs_owned: HashMap<(String, String), Signal> = {
+        puffin::profile_scope!("preprocess_dev_sigs");
+        preprocess_dev_sigs(graph, dev_sigs)
+    };
     let dev_sigs = &dev_sigs_owned;
 
-    let mut outputs: HashMap<(usize, usize), Option<Signal>> = HashMap::new();
-    let mut scope_samples: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
-    let mut last_inputs: HashMap<usize, Vec<Option<Signal>>> = HashMap::new();
-    let mut last_outputs: HashMap<usize, Vec<Option<Signal>>> = HashMap::new();
-    let mut sink_outputs: HashMap<(String, String), Signal> = HashMap::new();
+    // Destructure with `ref mut` so the rest of the function can keep
+    // using bare names (outputs, scope_samples, …) as mutable references.
+    // Borrows live until the end of the function; final
+    // `TickOutput { … }` packing is no longer needed.
+    let TickOutput {
+        ref mut outputs,
+        ref mut scope_samples,
+        ref mut last_inputs,
+        ref mut last_outputs,
+        ref mut sink_outputs,
+    } = *out;
     // Signals injected by AutoMap Collector nodes, keyed by ("collector:{uid}", pin_id).
     let mut collector_sigs: HashMap<(String, String), Signal> = HashMap::new();
 
+    {
+    puffin::profile_scope!("main_node_loop");
     for (idx, snap) in graph.nodes.iter().enumerate() {
         // ── module.remapper: pass-through + per-mapping override + consume ────
         if snap.module_id == "module.remapper" {
@@ -1327,7 +1359,7 @@ pub fn eval_graph_tick(
                 .collect();
             let inner_computed = eval_subgraph(
                 &sg.graph, &outer_inputs, state, dev_sigs, &mut collector_sigs,
-                &mut scope_samples, &mut last_inputs, &mut last_outputs, snap.node_uid, dt,
+                scope_samples, last_inputs, last_outputs, snap.node_uid, dt,
             );
             let out: Vec<Option<Signal>> = sg.outlet_locs.iter()
                 .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
@@ -1391,12 +1423,14 @@ pub fn eval_graph_tick(
 
         computed[idx] = node_outputs;
     }
+    } // end main_node_loop
 
     // Post-pass: device.source self-sinks (feedback inputs wired back to their
     // own outputs, possibly through Splitter/Math chains). Their multi_sources
     // can only be read after the main loop has filled `computed[]` for the
     // whole graph — by then any chain that loops through this node has its
     // value, and we can route it into sink_outputs like any other sink.
+    puffin::profile_scope!("self_sink_post_pass");
     for (idx, snap) in graph.nodes.iter().enumerate() {
         let Some(ref st) = snap.sink_target else { continue; };
         if !st.is_self_sink { continue; }
@@ -1431,8 +1465,6 @@ pub fn eval_graph_tick(
             }
         }
     }
-
-    TickOutput { outputs, scope_samples, last_inputs, last_outputs, sink_outputs }
 }
 
 // ── Per-node dispatch ─────────────────────────────────────────────────────────
@@ -1445,6 +1477,7 @@ fn compute_node(
     collector_sigs: &HashMap<(String, String), Signal>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
+    puffin::profile_function!();
     match snap.module_id.as_str() {
         "device.source" => {
             // Deadzone + gyro multiplier already applied in `preprocess_dev_sigs`

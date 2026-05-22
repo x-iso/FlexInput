@@ -27,6 +27,12 @@ open              = "5"
 # tweaks (window border tint, z-order drop on pin-off flip-flop,
 # click-through layer when see-through + pin are both active).
 raw-window-handle = "0.6"
+# Profiler: macros + HTTP transport. The HTTP server is only spawned
+# when the Settings → Profiler toggle is on; without that the puffin
+# scope-start flag stays false and the macros are near-no-op (single
+# atomic-bool load).
+puffin             = { workspace = true }
+puffin_http        = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

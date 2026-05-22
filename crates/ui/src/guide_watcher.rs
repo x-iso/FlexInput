@@ -54,7 +54,7 @@ fn is_chord_candidate(signal_name: &str) -> bool {
 pub fn spawn_guide_watcher(
     config: Arc<RwLock<GuideWatchConfig>>,
     toggle_requested: Arc<AtomicBool>,
-    proc_device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
+    proc_device_signals: flexinput_engine::ArcSignals,
     learn_chord: Arc<AtomicBool>,
     learned_chord: Arc<Mutex<Option<String>>>,
 ) {
@@ -72,13 +72,13 @@ pub fn spawn_guide_watcher(
                 let cfg = config.read().map(|c| c.clone()).unwrap_or_default();
                 let learning = learn_chord.load(Ordering::Relaxed);
 
-                // Snapshot the signal map. Cheap clone (HashMap of
-                // small enum). Holding the read lock for the duration
-                // of our loop body would block the I/O thread's writer.
-                let snapshot: Vec<((String, String), Signal)> = match proc_device_signals.read() {
-                    Ok(m) => m.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-                    Err(_) => Vec::new(),
-                };
+                // Snapshot the signal map. With the ArcSwap publish
+                // model the load is a refcount bump and the iteration
+                // walks the snapshot without contending the I/O thread.
+                let snap = proc_device_signals.load_full();
+                let snapshot: Vec<((String, String), Signal)> = snap.iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
 
                 if learning {
                     // Look for a rising-edge button press on any device,

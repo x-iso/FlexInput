@@ -143,6 +143,14 @@ pub struct AppSettings {
     /// What to do with the camera when a patch is loaded into a tab.
     #[serde(default)]
     pub on_patch_load: OnPatchLoad,
+    /// Profiler toggle. When true the app spawns a `puffin_http` server on
+    /// 127.0.0.1:8585 and flips `puffin::set_scopes_on(true)` so the macros
+    /// scattered through the hot paths actually emit events. Connect from
+    /// the standalone `puffin_viewer` GUI (`cargo install puffin_viewer`)
+    /// to inspect a live flamegraph. NOT persisted — it's a dev-time tool
+    /// and we don't want users accidentally leaving it on across sessions.
+    #[serde(default, skip)]
+    pub profiler_enabled: bool,
 }
 
 /// Camera behavior immediately after a patch is loaded into a tab.
@@ -179,6 +187,7 @@ impl Default for AppSettings {
             pin_guide_chord: None,
             show_own_virtuals_as_physical: false,
             on_patch_load: OnPatchLoad::Off,
+            profiler_enabled: false,
         }
     }
 }

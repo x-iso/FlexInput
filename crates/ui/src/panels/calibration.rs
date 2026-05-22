@@ -1661,18 +1661,63 @@ fn stick_scope(
         }
     }
 
-    // Fading trail of the dot.
-    let n = trail.len().max(1);
-    for (i, p) in trail.iter().enumerate() {
-        let age = i as f32 / n as f32;
-        let alpha = (40.0 + age * 160.0) as u8;
-        let r_xy = (p[0] * p[0] + p[1] * p[1]).sqrt();
-        let (dx, dy) = if r_xy < 0.10 { (p[0] * 4.0, -p[1] * 4.0) } else { (p[0], -p[1]) };
-        let pt = egui::pos2(
-            center_p.x + dx.clamp(-1.0, 1.0) * r_outer,
-            center_p.y + dy.clamp(-1.0, 1.0) * r_outer,
-        );
-        painter.circle_filled(pt, 1.5, Color32::from_rgba_unmultiplied(220, 80, 80, alpha));
+    // Fading trail rendered as a small number of polyline chunks with
+    // ramped alpha instead of one circle per sample. Matches the
+    // vectorscope module's fading-line look and drops the painter shape
+    // count from O(trail) to O(FADE_CHUNKS) per chunk.
+    //
+    // The display applies a 4× magnification inside the inner deadzone
+    // ring (`r_xy < 0.10`). A point that crosses that boundary visually
+    // jumps, so we split a chunk whenever the inner/outer zone flips —
+    // otherwise the polyline would draw a misleading line connecting
+    // the magnified inner point to the un-magnified outer point.
+    const FADE_CHUNKS: usize = 10;
+    let n = trail.len();
+    if n >= 2 {
+        // Pre-project and tag each point with its zone (inner/outer).
+        let pts: Vec<(egui::Pos2, bool)> = trail.iter().map(|p| {
+            let r_xy = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            let inner = r_xy < 0.10;
+            let (dx, dy) = if inner { (p[0] * 4.0, -p[1] * 4.0) } else { (p[0], -p[1]) };
+            (
+                egui::pos2(
+                    center_p.x + dx.clamp(-1.0, 1.0) * r_outer,
+                    center_p.y + dy.clamp(-1.0, 1.0) * r_outer,
+                ),
+                inner,
+            )
+        }).collect();
+
+        let per_chunk = (n / FADE_CHUNKS).max(1);
+        for c in 0..FADE_CHUNKS {
+            let lo_i = c * per_chunk;
+            let hi_i = ((c + 1) * per_chunk + 1).min(pts.len()); // share boundary
+            if hi_i <= lo_i + 1 { continue; }
+            let age = c as f32 / (FADE_CHUNKS - 1).max(1) as f32;
+            let alpha = (40.0 + age * 160.0) as u8;
+            let stroke_color = Color32::from_rgba_unmultiplied(220, 80, 80, alpha);
+            // Emit sub-polylines within the chunk, splitting whenever the
+            // zone flips so we never draw a line across the inner/outer
+            // magnification boundary.
+            let mut run: Vec<egui::Pos2> = Vec::new();
+            let mut run_zone: Option<bool> = None;
+            for &(p, inner) in &pts[lo_i..hi_i] {
+                match run_zone {
+                    Some(z) if z == inner => run.push(p),
+                    _ => {
+                        if run.len() >= 2 {
+                            painter.line(run.clone(), Stroke::new(1.25, stroke_color));
+                        }
+                        run.clear();
+                        run.push(p);
+                        run_zone = Some(inner);
+                    }
+                }
+            }
+            if run.len() >= 2 {
+                painter.line(run, Stroke::new(1.25, stroke_color));
+            }
+        }
     }
 
     // Current dot (large in magnified region, small outside).

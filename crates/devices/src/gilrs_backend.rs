@@ -93,6 +93,7 @@ impl GilrsBackend {
 
 impl DeviceBackend for GilrsBackend {
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
+        puffin::profile_function!();
         if self.phys_counts_at.elapsed() > Duration::from_secs(2) {
             self.refresh_phys_counts();
         }
@@ -140,6 +141,7 @@ impl DeviceBackend for GilrsBackend {
     }
 
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
+        puffin::profile_function!();
         // Rebuild XInput slot map at the start of each poll so it stays in sync
         // with kind_seen even after device reconnects.
         self.xinput_idx.clear();

@@ -63,6 +63,23 @@ wgpu       = { version = "27", default-features = false, features = [
     "metal",
     "vulkan",
 ] }
+# Lightweight CPU profiler. `puffin` macros compile to near-no-ops when
+# the scope-start global flag is disabled (`puffin::set_scopes_on(false)`),
+# so leaving the instrumentation permanently in place costs ~nothing.
+# Profile data is streamed over TCP via `puffin_http` to the standalone
+# `puffin_viewer` GUI — run `cargo install puffin_viewer`, then
+# `puffin_viewer --url 127.0.0.1:8585` while FlexInput is running and the
+# Settings toggle has profiling enabled. Picking the HTTP transport (vs
+# `puffin_egui`) avoids coupling our egui 0.33 pin to the profiler crate's
+# egui-version cadence.
+puffin       = "0.20"
+puffin_http  = "0.17"
+# Atomically-swappable `Arc<T>`. Lets the UI publish a fresh
+# ProcessingGraph snapshot to the proc thread, and the I/O thread publish
+# a fresh device-signal map to the proc thread, with each consumer paying
+# only a refcount bump per access instead of cloning the whole structure
+# under a RwLock.
+arc-swap     = "1"
 
 [patch.crates-io]
 egui-snarl = { path = "vendor/egui-snarl" }

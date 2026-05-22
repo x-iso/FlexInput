@@ -199,6 +199,7 @@ impl GyroManager {
 
     /// Returns the latest IMU + touchpad reading for the Nth physical device with this VID/PID.
     pub fn read(&mut self, vid: u16, pid: u16, idx: usize) -> Option<HidReading> {
+        puffin::profile_function!();
         if classify(vid, pid).is_none() {
             return None;
         }

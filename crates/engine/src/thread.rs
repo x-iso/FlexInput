@@ -4,11 +4,32 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use flexinput_core::Signal;
 
 use crate::eval::{eval_graph_tick, TickOutput};
 use crate::graph::ProcessingGraph;
 use crate::state::NodeState;
+
+/// Type alias for the atomically-swappable `ProcessingGraph` snapshot.
+/// The UI writes new snapshots via `store(Arc::new(g))`; the proc thread
+/// reads via `load()` which is a cheap refcount bump — no clone needed.
+pub type ArcGraph = Arc<ArcSwap<ProcessingGraph>>;
+
+/// Type alias for the atomically-swappable device-signal map. Same
+/// pattern as `ArcGraph` — the I/O thread publishes a fresh map per poll
+/// cycle; consumers (proc thread, UI) read by refcount bump.
+pub type ArcSignals = Arc<ArcSwap<HashMap<(String, String), Signal>>>;
+
+/// Build a fresh `ArcGraph` initialized with an empty graph.
+pub fn new_arc_graph() -> ArcGraph {
+    Arc::new(ArcSwap::from_pointee(ProcessingGraph::default()))
+}
+
+/// Build a fresh `ArcSignals` initialized with an empty map.
+pub fn new_arc_signals() -> ArcSignals {
+    Arc::new(ArcSwap::from_pointee(HashMap::new()))
+}
 
 /// Default processing rate (Hz). Runtime-tunable via the `sample_rate` atomic
 /// passed to `spawn_processing_thread`.
@@ -116,8 +137,8 @@ pub type SinkBus = Arc<RwLock<HashMap<(String, String), Signal>>>;
 /// `sample_rate` is read at the top of each wakeup so the user can retune
 /// the processing rate live without restarting the thread.
 pub fn spawn_processing_thread(
-    graph: Arc<RwLock<ProcessingGraph>>,
-    device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
+    graph: ArcGraph,
+    device_signals: ArcSignals,
     output: Arc<Mutex<ProcessingOutput>>,
     sink_bus: SinkBus,
     sample_rate: Arc<AtomicU32>,
@@ -125,8 +146,18 @@ pub fn spawn_processing_thread(
     thread::spawn(move || {
         let mut next_tick = Instant::now();
         let mut state: HashMap<usize, NodeState> = HashMap::new();
+        // Persistent scratch reused across ticks (cleared in-place at the
+        // top of every `eval_graph_tick` call). Avoids 5 HashMap reallocs
+        // per tick — significant at 2 kHz with an empty graph.
+        let mut tick_out: TickOutput = TickOutput::default();
+        // Persistent scope-sample accumulator across the catchup loop.
+        // Pre-allocated outside the hot loop so it grows once and is
+        // reused thereafter.
+        let mut scope_acc: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
 
         loop {
+            puffin::GlobalProfiler::lock().new_frame();
+            puffin::profile_scope!("proc_thread_iter");
             let now = Instant::now();
 
             // Re-read sample rate each wakeup so live retunes apply immediately.
@@ -146,34 +177,48 @@ pub fn spawn_processing_thread(
             let ticks = ticks.min(16);
 
             if ticks > 0 {
-                let graph_snap = graph.read().unwrap().clone();
-                let dev_sigs   = device_signals.read().unwrap().clone();
+                // Refcount-bump reads — no cloning of graph or signal map.
+                // The Arc<…> handles point at whatever the publishers most
+                // recently stored. Stable across the catchup loop because
+                // each `load()` returns a snapshot held by this scope.
+                let graph_snap = {
+                    puffin::profile_scope!("graph_load");
+                    graph.load_full()
+                };
+                let dev_sigs = {
+                    puffin::profile_scope!("dev_sigs_load");
+                    device_signals.load_full()
+                };
 
-                // Evaluate all catchup ticks first, accumulating scope samples
-                // and keeping only the last tick's outputs.  This reduces
-                // proc_outputs lock acquisitions from O(ticks) to O(1) per wakeup.
-                let mut scope_acc: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
-                let mut last_out: Option<TickOutput> = None;
-                for _ in 0..ticks {
-                    let tick_out = eval_graph_tick(&graph_snap, &mut state, &dev_sigs, dt);
-                    scope_acc.extend(tick_out.scope_samples.iter().cloned());
-                    last_out = Some(tick_out);
+                scope_acc.clear();
+
+                {
+                    puffin::profile_scope!("eval_ticks");
+                    for _ in 0..ticks {
+                        eval_graph_tick(&graph_snap, &mut state, &dev_sigs, dt, &mut tick_out);
+                        // Drain scope samples each tick — eval_graph_tick
+                        // clears tick_out on entry, so we must move (not
+                        // clone) the samples here before the next call.
+                        scope_acc.append(&mut tick_out.scope_samples);
+                    }
                 }
 
-                if let Some(tick_out) = last_out {
-                    // Write sink outputs on the fast path (separate lock, no UI contention).
-                    *sink_bus.write().unwrap() = tick_out.sink_outputs;
-
-                    // Write display outputs once per wakeup (not once per tick).
+                // tick_out now holds the LAST tick's outputs/inputs/sinks.
+                {
+                    puffin::profile_scope!("write_sink_bus");
+                    *sink_bus.write().unwrap() = tick_out.sink_outputs.clone();
+                }
+                {
+                    puffin::profile_scope!("write_proc_outputs");
                     let mut out = output.lock().unwrap();
-                    for sample in scope_acc {
+                    for sample in scope_acc.drain(..) {
                         if out.scope_pending.len() < MAX_SCOPE_PENDING {
                             out.scope_pending.push(sample);
                         }
                     }
-                    out.node_outputs  = tick_out.outputs;
-                    out.last_inputs   = tick_out.last_inputs;
-                    out.last_outputs  = tick_out.last_outputs;
+                    out.node_outputs  = tick_out.outputs.clone();
+                    out.last_inputs   = tick_out.last_inputs.clone();
+                    out.last_outputs  = tick_out.last_outputs.clone();
                 }
             }
 

@@ -242,6 +242,7 @@ impl DeviceBackend for MidiBackend {
     /// Emit all 128 CC values + pitch bend for every connected IN port.
     /// The canvas node's output_pin_ids selects which subset flows into the graph.
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
+        puffin::profile_function!();
         let mut out = Vec::new();
         for entry in &self.in_entries {
             let Ok(state) = entry.state.lock() else { continue };

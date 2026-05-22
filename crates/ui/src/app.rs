@@ -228,8 +228,8 @@ pub struct FlexInputApp {
     /// Used to detect genuine user copies without comparing clipboard contents.
     last_outer_clipboard_gen: u64,
     // ── Processing thread shared state ────────────────────────────────────────
-    proc_graph: Arc<RwLock<ProcessingGraph>>,
-    proc_device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
+    proc_graph: flexinput_engine::ArcGraph,
+    proc_device_signals: flexinput_engine::ArcSignals,
     proc_outputs: Arc<Mutex<ProcessingOutput>>,
     // ── I/O thread shared state ───────────────────────────────────────────────
     /// App-level shared pool of virtual output devices. Same instance of
@@ -329,6 +329,11 @@ pub struct FlexInputApp {
     /// layered-window style, and toggling `WS_EX_TRANSPARENT`. Stored
     /// as `isize` for `Send`-ness.
     self_hwnd: Option<isize>,
+    /// Running `puffin_http` server. `Some` exactly while the Profiler
+    /// toggle in Settings is on. Dropping the server stops the listener
+    /// thread; we also call `puffin::set_scopes_on(false)` so the macros
+    /// stop emitting events.
+    profiler_server: Option<puffin_http::Server>,
 }
 
 /// Keyboard-only shortcut for panic mode. Modifiers + non-modifier key.
@@ -412,8 +417,8 @@ impl FlexInputApp {
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
 
-        let proc_graph          = Arc::new(RwLock::new(ProcessingGraph::default()));
-        let proc_device_signals = Arc::new(RwLock::new(HashMap::<(String, String), Signal>::new()));
+        let proc_graph          = flexinput_engine::new_arc_graph();
+        let proc_device_signals = flexinput_engine::new_arc_signals();
         let proc_outputs        = Arc::new(Mutex::new(ProcessingOutput::default()));
         let sink_bus: SinkBus   = Arc::new(RwLock::new(HashMap::new()));
         spawn_processing_thread(
@@ -614,12 +619,17 @@ impl FlexInputApp {
             pin_prev_foreground_hwnd: None,
             pin_last_external_hwnd: None,
             self_hwnd: None,
+            profiler_server: None,
         }
     }
 }
 
 impl eframe::App for FlexInputApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Tell puffin a new frame began. Cheap when scopes are off (atomic
+        // check); only does real work while the profiler toggle is on.
+        puffin::GlobalProfiler::lock().new_frame();
+        puffin::profile_function!();
         let dt = self.last_update.elapsed().as_secs_f32().clamp(0.001, 0.1);
         self.last_update = std::time::Instant::now();
 
@@ -639,7 +649,10 @@ impl eframe::App for FlexInputApp {
         // Apply selected theme + contrast every frame so changes take
         // effect immediately when the user moves the slider in Settings.
         // Also folds in the see-through alpha when active.
-        crate::settings::apply_theme_and_contrast(ctx, &self.settings);
+        {
+            puffin::profile_scope!("apply_theme_and_contrast");
+            crate::settings::apply_theme_and_contrast(ctx, &self.settings);
+        }
 
         // Restore persisted always-on-top pin state on the first frame
         // after launch. eframe only honours the runtime WindowLevel
@@ -656,12 +669,22 @@ impl eframe::App for FlexInputApp {
         }
 
         // Read the latest device signals written by the I/O thread (500 Hz).
-        self.last_signals = self.proc_device_signals.read().unwrap().clone();
+        // `load_full()` returns the current `Arc<HashMap>` — a refcount
+        // bump, no map clone. Deref-cloning the map only happens at the
+        // few `.last_signals = …` sites that need an owned map.
+        {
+            puffin::profile_scope!("read_signals_load");
+            let snap = self.proc_device_signals.load_full();
+            self.last_signals = (*snap).clone();
+        }
         // Refresh device list from I/O thread. Both gilrs and MIDI device
         // listings are populated there, so the UI never contends with the
         // 500 Hz MIDI poll lock (which used to cause MIDI cards to flicker
         // in/out whenever the lock was held during a paint).
-        self.devices = self.shared_devices.read().unwrap().clone();
+        {
+            puffin::profile_scope!("read_devices_clone");
+            self.devices = self.shared_devices.read().unwrap().clone();
+        }
 
         // Publish the set of `midi_in:N` / `midi_out:N` IDs referenced by
         // canvas device.source / device.sink nodes (across all tabs and
@@ -669,6 +692,7 @@ impl eframe::App for FlexInputApp {
         // which OS handles to keep open vs release: unpinned handles are
         // closed so loopMIDI can actually remove ports the user deletes.
         {
+            puffin::profile_scope!("rebuild_pinned_midi");
             let mut pinned: HashSet<String> = HashSet::new();
             for tab in &self.tabs {
                 for (_, n) in tab.canvas.snarl.nodes_ids_data() {
@@ -815,11 +839,18 @@ impl eframe::App for FlexInputApp {
 
         // Push a fresh graph snapshot to the processing thread each frame.
         {
+            puffin::profile_scope!("build_and_publish_graph");
             let (graph_snap, dirty_uids) = {
+                puffin::profile_scope!("build_processing_graph");
                 let snarl = &self.tabs[self.active_tab].canvas.snarl;
                 build_processing_graph(snarl)
             };
-            *self.proc_graph.write().unwrap() = graph_snap;
+            {
+                puffin::profile_scope!("write_proc_graph");
+                // ArcSwap publish: proc thread reads via `load()` which
+                // is lock-free and only refcount-bumps the Arc handle.
+                self.proc_graph.store(std::sync::Arc::new(graph_snap));
+            }
             if !dirty_uids.is_empty() {
                 let snarl = &mut self.tabs[self.active_tab].canvas.snarl;
                 for (id, node_ref) in snarl.nodes_ids_data_mut() {
@@ -831,6 +862,7 @@ impl eframe::App for FlexInputApp {
         }
 
         // Pull outputs from the processing thread: pre-populate eval_cache, sync display state.
+        puffin::profile_scope!("pull_outputs_and_display");
         self.eval_cache.clear();
         if canvas_has_nodes {
             let (last_inputs_snap, last_outputs_snap, scope_batch) = {
@@ -1770,6 +1802,7 @@ impl eframe::App for FlexInputApp {
                         egui::pos2(outer.right(), inner.bottom())),
                     egui::CornerRadius::ZERO, frame_color);
             }
+            puffin::profile_scope!("canvas_show");
             calibrate_request = crate::panels::canvas::show(
                 canvas, &self.descriptors, &live_device_ids, &self.last_signals,
                 &self.panic_shortcut, devices, &device_rates_snap,
@@ -1779,7 +1812,10 @@ impl eframe::App for FlexInputApp {
         if let Some(node) = calibrate_request {
             self.calibration_open.insert(node);
         }
-        crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps);
+        {
+            puffin::profile_scope!("calibration_show_windows");
+            crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps);
+        }
 
         // Only update app_clipboard from outer canvas when the user actually copied
         // (gen advanced). Clear from_inner flag regardless so seeding doesn't repeat.
@@ -2395,6 +2431,44 @@ impl FlexInputApp {
                 ui.separator();
                 ui.add_space(6.0);
 
+                // ── Profiler (dev tool) ─────────────────────────────────
+                // Toggle here flips `puffin::set_scopes_on()` and starts/
+                // stops a `puffin_http` server on 127.0.0.1:8585. Connect
+                // from the standalone `puffin_viewer` GUI to see a live
+                // flamegraph of FlexInput's threads. Not persisted —
+                // resets to off on every launch.
+                ui.label(egui::RichText::new("Profiler").strong());
+                ui.add_space(4.0);
+                let mut prof = self.settings.profiler_enabled;
+                if ui.checkbox(&mut prof, "Enable puffin profiler (127.0.0.1:8585)").changed() {
+                    self.settings.profiler_enabled = prof;
+                    if prof {
+                        match puffin_http::Server::new("127.0.0.1:8585") {
+                            Ok(server) => {
+                                puffin::set_scopes_on(true);
+                                self.profiler_server = Some(server);
+                                eprintln!("[profiler] listening on 127.0.0.1:8585 — connect with `puffin_viewer --url 127.0.0.1:8585`");
+                            }
+                            Err(e) => {
+                                eprintln!("[profiler] failed to start server: {e}");
+                                self.settings.profiler_enabled = false;
+                            }
+                        }
+                    } else {
+                        puffin::set_scopes_on(false);
+                        self.profiler_server = None;
+                        eprintln!("[profiler] stopped");
+                    }
+                }
+                ui.label(egui::RichText::new(
+                    "Install once: `cargo install puffin_viewer`.\n\
+                     Then run `puffin_viewer --url 127.0.0.1:8585` with this toggle on."
+                ).small().weak());
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
                 // ── Links ───────────────────────────────────────────────
                 ui.label(egui::RichText::new("Links").strong());
                 ui.add_space(4.0);
@@ -2453,7 +2527,7 @@ impl FlexInputApp {
 fn spawn_io_thread(
     mut backends: Vec<Box<dyn DeviceBackend>>,
     midi: Arc<Mutex<Option<MidiBackend>>>,
-    proc_device_signals: Arc<RwLock<HashMap<(String, String), Signal>>>,
+    proc_device_signals: flexinput_engine::ArcSignals,
     sink_bus: SinkBus,
     // App-level shared pool of virtual output devices. Membership is
     // managed by the UI thread (reconcile on patch load, prune on tab
@@ -2501,6 +2575,8 @@ fn spawn_io_thread(
             let mut last_rate_publish = Instant::now();
 
             loop {
+                puffin::GlobalProfiler::lock().new_frame();
+                puffin::profile_scope!("io_thread_iter");
                 let t0 = Instant::now();
                 // Re-read polling rate each iteration so live retunes apply.
                 let hz = polling_hz.load(Ordering::Relaxed).clamp(60, 4000);
@@ -2508,22 +2584,27 @@ fn spawn_io_thread(
 
                 // ── Poll physical inputs ──────────────────────────────────────
                 let mut signals: HashMap<(String, String), Signal> = HashMap::new();
-                for backend in &mut backends {
-                    for (dev, pin, sig) in backend.poll() {
-                        signals.insert((dev, pin), sig);
-                    }
-                    // Drain per-device raw-event counts for live-rate tracking.
-                    for (dev, n) in backend.take_event_counts() {
-                        *dev_event_acc.entry(dev).or_insert(0) += n;
-                    }
-                }
-                if let Ok(mut mg) = midi.try_lock() {
-                    if let Some(m) = mg.as_mut() {
-                        for (dev, pin, sig) in m.poll() {
+                {
+                    puffin::profile_scope!("backends_poll");
+                    for backend in &mut backends {
+                        for (dev, pin, sig) in backend.poll() {
                             signals.insert((dev, pin), sig);
                         }
-                        for (dev, n) in m.take_event_counts() {
+                        for (dev, n) in backend.take_event_counts() {
                             *dev_event_acc.entry(dev).or_insert(0) += n;
+                        }
+                    }
+                }
+                {
+                    puffin::profile_scope!("midi_poll");
+                    if let Ok(mut mg) = midi.try_lock() {
+                        if let Some(m) = mg.as_mut() {
+                            for (dev, pin, sig) in m.poll() {
+                                signals.insert((dev, pin), sig);
+                            }
+                            for (dev, n) in m.take_event_counts() {
+                                *dev_event_acc.entry(dev).or_insert(0) += n;
+                            }
                         }
                     }
                 }
@@ -2532,6 +2613,7 @@ fn spawn_io_thread(
                 // UI repaint Hz. We do this BEFORE moving `signals` into the
                 // shared map.
                 {
+                    puffin::profile_scope!("scope_taps_write");
                     let now = Instant::now();
                     let mut taps = scope_taps.write().unwrap();
                     let retain = Duration::from_millis(flexinput_engine::SCOPE_TAP_RETAIN_MS);
@@ -2559,13 +2641,20 @@ fn spawn_io_thread(
                     }
                 }
 
-                *proc_device_signals.write().unwrap() = signals;
+                {
+                    puffin::profile_scope!("publish_signals");
+                    // ArcSwap publish — consumers (proc thread, UI) read
+                    // via `load_full()`, a refcount bump rather than a
+                    // map clone under a RwLock.
+                    proc_device_signals.store(std::sync::Arc::new(signals));
+                }
 
                 // ── Enumerate gilrs devices periodically ──────────────────────
                 // MIDI enumeration is handled by spawn_midi_watch_thread() so
                 // the slow Win32 MIDI calls (60–70 ms with loopMIDI loaded)
                 // don't stall this 500 Hz I/O loop.
                 if last_enum.elapsed() > Duration::from_secs(2) {
+                    puffin::profile_scope!("enumerate_devices");
                     let mut devs: Vec<PhysicalDevice> = Vec::new();
                     for backend in &mut backends {
                         devs.extend(backend.enumerate());
@@ -2578,8 +2667,10 @@ fn spawn_io_thread(
 
                 // ── Get latest sink outputs from processing thread ─────────────
                 // Uses a separate RwLock so this read never contends on proc_outputs.
-                let sink_outputs: HashMap<(String, String), Signal> =
-                    sink_bus.read().unwrap().clone();
+                let sink_outputs: HashMap<(String, String), Signal> = {
+                    puffin::profile_scope!("read_sink_bus");
+                    sink_bus.read().unwrap().clone()
+                };
 
                 // ── Drive virtual & physical devices ──────────────────────────
                 // Shared pool holds ALL virtual devices across every open
@@ -2590,6 +2681,7 @@ fn spawn_io_thread(
                 let bypass = io_bypass.load(Ordering::Relaxed);
                 let active_ids = active_tab_device_ids.read().unwrap().clone();
                 {
+                    puffin::profile_scope!("route_virtual_devices");
                     let mut devs = shared_virtual_devices.lock().unwrap();
                     if bypass {
                         for dev in devs.iter_mut() { dev.reset_outputs(); }
@@ -2623,8 +2715,16 @@ fn spawn_io_thread(
                             }
                         }
                         if !virt_sigs.is_empty() {
-                            let mut map = proc_device_signals.write().unwrap();
-                            for (k, v) in virt_sigs { map.insert(k, v); }
+                            // ArcSwap is publish-only — to merge into the
+                            // currently-published map we load it, clone
+                            // into an owned mutable copy, apply the merge,
+                            // and store the result. Cost = one map clone
+                            // (was already paid before by the RwLock
+                            // write path, which serialized vs readers).
+                            let cur = proc_device_signals.load_full();
+                            let mut merged: HashMap<(String, String), Signal> = (*cur).clone();
+                            for (k, v) in virt_sigs { merged.insert(k, v); }
+                            proc_device_signals.store(std::sync::Arc::new(merged));
                         }
                     }
                 }

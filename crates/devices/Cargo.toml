@@ -9,6 +9,9 @@ glam           = { workspace = true }
 gilrs          = "0.10"
 hidapi         = "2"
 midir          = "0.10"
+# See engine/Cargo.toml — instrumentation is unconditional; emission is
+# gated by the runtime puffin::set_scopes_on() flag.
+puffin         = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI access for DualSense HD haptics (channels 3/4 of the controller's

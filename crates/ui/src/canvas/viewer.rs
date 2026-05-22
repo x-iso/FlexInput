@@ -4539,8 +4539,20 @@ fn render_vectorscope_display(
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
 ) {
-    let (history, n_channels, last_signals) = snarl.get_node(inner_id)
-        .map(|n| (n.extra.history.clone(), n.inputs.len().max(1), n.extra.last_signals.clone()))
+    // Visualization tail length — bounded so we don't pay for samples
+    // that won't be drawn. History buffer itself can be much longer
+    // (20k entries by default).
+    const MAX_VS_TRAIL: usize = 600;
+    // Pull only the tail we actually render plus channel/last-signal
+    // metadata. Skipping the full `history.clone()` avoids cloning a
+    // VecDeque of up to 20k Vec<Option<f32>> entries every frame.
+    let (history_tail, n_channels, last_signals) = snarl.get_node(inner_id)
+        .map(|n| {
+            let hist = &n.extra.history;
+            let skip = hist.len().saturating_sub(MAX_VS_TRAIL);
+            let tail: Vec<Vec<Option<f32>>> = hist.iter().skip(skip).cloned().collect();
+            (tail, n.inputs.len().max(1), n.extra.last_signals.clone())
+        })
         .unwrap_or_default();
 
     let side = container.x.min(container.y).max(40.0);
@@ -4558,34 +4570,81 @@ fn render_vectorscope_display(
     painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
         egui::Stroke::new(0.5, Color32::from_gray(40)));
 
-    const MAX_VS_TRAIL: usize = 2000;
-    let skip = history.len().saturating_sub(MAX_VS_TRAIL);
-    let trail: Vec<_> = history.iter().skip(skip).collect();
-    let nt = trail.len();
+    // Trail rendering: instead of one circle per sample (was up to 2000
+    // painter calls per channel per frame), we emit a small number of
+    // contiguous polyline segments with constant alpha per segment. The
+    // alpha steps from low (oldest) to high (newest) so the line looks
+    // like a fading trail — and the polyline shows actual motion rather
+    // than a static dot cloud. Cost drops from O(N) painter shapes to
+    // O(SEGMENTS) regardless of trail length.
+    //
+    // 12 chunks looks smooth at 60 fps with a few hundred samples of
+    // trail — perceivable fade gradient without visible banding.
+    const FADE_CHUNKS: usize = 12;
+    let nt = history_tail.len();
+    let center = rect.center();
+    let hx = rect.width() * 0.45;
+    let hy = rect.height() * 0.45;
     for ch in 0..n_channels {
         let col = MULTI_COLORS[ch % MULTI_COLORS.len()];
         let xi = ch * 2;
         let yi = ch * 2 + 1;
-        for (idx, sample) in trail.iter().enumerate() {
-            let (Some(x), Some(y)) = (
+
+        // Pre-project the trail into screen space, dropping samples where
+        // either x or y is missing. We need an indexed list so we know
+        // each surviving point's "age" within the original trail (which
+        // drives the per-chunk alpha).
+        let mut pts: Vec<(usize, egui::Pos2)> = Vec::with_capacity(nt);
+        for (idx, sample) in history_tail.iter().enumerate() {
+            if let (Some(x), Some(y)) = (
                 sample.get(xi).copied().flatten(),
                 sample.get(yi).copied().flatten(),
-            ) else { continue; };
-            let px = rect.center().x + x.clamp(-1.0, 1.0) * rect.width() * 0.45;
-            let py = rect.center().y - y.clamp(-1.0, 1.0) * rect.height() * 0.45;
-            let alpha = ((idx as f32 / nt.max(1) as f32) * 200.0) as u8 + 35;
-            painter.circle_filled(egui::pos2(px, py), 1.5,
-                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha));
+            ) {
+                let px = center.x + x.clamp(-1.0, 1.0) * hx;
+                let py = center.y - y.clamp(-1.0, 1.0) * hy;
+                pts.push((idx, egui::pos2(px, py)));
+            }
         }
+
+        // Slice the projected polyline into FADE_CHUNKS roughly equal
+        // chunks, each rendered as one painter.line() call with a fixed
+        // alpha derived from the chunk's age. Adjacent chunks share their
+        // boundary point so the visual line is continuous.
+        if pts.len() >= 2 {
+            let per_chunk = (pts.len() / FADE_CHUNKS).max(1);
+            for c in 0..FADE_CHUNKS {
+                let lo = c * per_chunk;
+                let hi = ((c + 1) * per_chunk + 1).min(pts.len()); // +1 to share boundary
+                if hi <= lo + 1 { continue; }
+                // Age 0.0 = oldest chunk, 1.0 = newest. Alpha curve
+                // matches the previous dot-cloud's `(idx/nt)*200 + 35`
+                // intensity ramp so the visual weight feels similar.
+                let age = c as f32 / (FADE_CHUNKS - 1).max(1) as f32;
+                let alpha = (age * 200.0) as u8 + 35;
+                let stroke_color = Color32::from_rgba_unmultiplied(
+                    col.r(), col.g(), col.b(), alpha,
+                );
+                let chunk_pts: Vec<egui::Pos2> = pts[lo..hi].iter().map(|(_, p)| *p).collect();
+                painter.line(chunk_pts, egui::Stroke::new(1.25, stroke_color));
+            }
+        }
+
+        // Current value head — a small filled+stroked circle so the user
+        // can pinpoint the live sample even when the trail dims away.
         if let Some(Some(Signal::Vec2(v))) = last_signals.get(ch) {
-            let px = rect.center().x + v.x.clamp(-1.0, 1.0) * rect.width() * 0.45;
-            let py = rect.center().y - v.y.clamp(-1.0, 1.0) * rect.height() * 0.45;
+            let px = center.x + v.x.clamp(-1.0, 1.0) * hx;
+            let py = center.y - v.y.clamp(-1.0, 1.0) * hy;
             painter.circle_filled(egui::pos2(px, py), 4.0, col);
             painter.circle_stroke(egui::pos2(px, py), 4.0,
                 egui::Stroke::new(1.0, Color32::from_gray(100)));
         }
     }
-    ui.ctx().request_repaint();
+    // Only force a repaint while the trail still has live samples or
+    // the current frame's signals contain a Vec2. Idle vectorscope
+    // (no history, no live input) is static.
+    let has_trail = nt > 0;
+    let has_live = last_signals.iter().any(|s| matches!(s, Some(Signal::Vec2(_))));
+    if has_trail || has_live { ui.ctx().request_repaint(); }
     let _ = inner_id;
 }
 
@@ -6270,9 +6329,19 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
 }
 
 fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (history, n_channels, last_signals) = snarl
+    // Bounded tail clone: we only render the last MAX_VS_TRAIL samples,
+    // so cloning the full 20k-entry history every frame was pure waste.
+    // See `render_vectorscope_display` for the equivalent change on the
+    // bare/sub-patch render path.
+    const MAX_VS_TRAIL: usize = 600;
+    let (history_tail, n_channels, last_signals) = snarl
         .get_node(node_id)
-        .map(|n| (n.extra.history.clone(), n.inputs.len().max(1), n.extra.last_signals.clone()))
+        .map(|n| {
+            let h = &n.extra.history;
+            let skip = h.len().saturating_sub(MAX_VS_TRAIL);
+            let tail: Vec<Vec<Option<f32>>> = h.iter().skip(skip).cloned().collect();
+            (tail, n.inputs.len().max(1), n.extra.last_signals.clone())
+        })
         .unwrap_or_default();
 
     let mut display_rect: Option<egui::Rect> = None;
@@ -6325,30 +6394,55 @@ fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, s
         painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
             egui::Stroke::new(0.5, Color32::from_gray(40)));
 
-        const MAX_VS_TRAIL: usize = 2000;
-        let skip = history.len().saturating_sub(MAX_VS_TRAIL);
-        let trail: Vec<_> = history.iter().skip(skip).collect();
-        let nt = trail.len();
+        // Fading polyline trail. Replaces the per-sample circle dot
+        // cloud — 600 samples ⇒ 12 polyline shapes per channel rather
+        // than 600 circles. See `render_vectorscope_display` for the
+        // matching change on the bare/sub-patch path.
+        const FADE_CHUNKS: usize = 12;
+        let nt = history_tail.len();
+        let center = rect.center();
+        let hx = rect.width()  * 0.45;
+        let hy = rect.height() * 0.45;
         for ch in 0..n_channels {
             let col = MULTI_COLORS[ch % MULTI_COLORS.len()];
             let xi = ch * 2;
             let yi = ch * 2 + 1;
-            // Trail
-            for (idx, sample) in trail.iter().enumerate() {
-                let (Some(x), Some(y)) = (
+
+            // Project surviving samples to screen coords once.
+            let mut pts: Vec<egui::Pos2> = Vec::with_capacity(nt);
+            for sample in history_tail.iter() {
+                if let (Some(x), Some(y)) = (
                     sample.get(xi).copied().flatten(),
                     sample.get(yi).copied().flatten(),
-                ) else { continue; };
-                let px = rect.center().x + x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
-                let py = rect.center().y - y.clamp(-1.0, 1.0) * rect.height() * 0.45;
-                let alpha = ((idx as f32 / nt as f32) * 200.0) as u8 + 35;
-                painter.circle_filled(egui::pos2(px, py), 1.5,
-                    Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha));
+                ) {
+                    pts.push(egui::pos2(
+                        center.x + x.clamp(-1.0, 1.0) * hx,
+                        center.y - y.clamp(-1.0, 1.0) * hy,
+                    ));
+                }
             }
-            // Current-position dot
+
+            if pts.len() >= 2 {
+                let per_chunk = (pts.len() / FADE_CHUNKS).max(1);
+                for c in 0..FADE_CHUNKS {
+                    let lo = c * per_chunk;
+                    let hi = ((c + 1) * per_chunk + 1).min(pts.len()); // share boundary
+                    if hi <= lo + 1 { continue; }
+                    let age = c as f32 / (FADE_CHUNKS - 1).max(1) as f32;
+                    let alpha = (age * 200.0) as u8 + 35;
+                    let stroke_color = Color32::from_rgba_unmultiplied(
+                        col.r(), col.g(), col.b(), alpha,
+                    );
+                    painter.line(pts[lo..hi].to_vec(),
+                        egui::Stroke::new(1.25, stroke_color));
+                }
+            }
+
+            // Current-position dot (filled+stroked) so the live sample
+            // remains visible when the trail dims out.
             if let Some(Some(Signal::Vec2(v))) = last_signals.get(ch) {
-                let px = rect.center().x + v.x.clamp(-1.0, 1.0) * rect.width()  * 0.45;
-                let py = rect.center().y - v.y.clamp(-1.0, 1.0) * rect.height() * 0.45;
+                let px = center.x + v.x.clamp(-1.0, 1.0) * hx;
+                let py = center.y - v.y.clamp(-1.0, 1.0) * hy;
                 painter.circle_filled(egui::pos2(px, py), 4.0, col);
                 painter.circle_stroke(egui::pos2(px, py), 4.0,
                     egui::Stroke::new(1.0, Color32::from_gray(100)));
