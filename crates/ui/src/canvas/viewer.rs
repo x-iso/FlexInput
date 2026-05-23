@@ -5785,6 +5785,22 @@ fn resolve_automap_glow_output(
                 .and_then(|v| v.as_array())?;
             let mut max_i = 0.0_f32;
             for pid in pin_ids.iter().filter_map(|v| v.as_str()) {
+                // Exclude raw touch X/Y axes from AutoMap bus glow unless the
+                // corresponding Touch Active flag is present and true. These
+                // axes are only meaningful when Touch Active is asserted;
+                // individual touch X/Y pins and their wires remain unaffected.
+                if pid == "touch1_x" || pid == "touch1_y" {
+                    match live_signals.get(&(dev_id.to_string(), "touch1_active".to_string())) {
+                        Some(Signal::Bool(b)) if *b => {}
+                        _ => continue,
+                    }
+                }
+                if pid == "touch2_x" || pid == "touch2_y" {
+                    match live_signals.get(&(dev_id.to_string(), "touch2_active".to_string())) {
+                        Some(Signal::Bool(b)) if *b => {}
+                        _ => continue,
+                    }
+                }
                 if let Some(sig) = live_signals.get(&(dev_id.to_string(), pid.to_string())) {
                     max_i = max_i.max(signal_intensity(sig));
                 }
