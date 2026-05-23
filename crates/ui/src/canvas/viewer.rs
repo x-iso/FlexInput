@@ -163,6 +163,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let is_label          = snarl.get_node(node).map(|n| n.module_id == "module.label").unwrap_or(false);
         let is_svg            = snarl.get_node(node).map(|n| n.module_id == "module.svg").unwrap_or(false);
         let is_remapper       = snarl.get_node(node).map(|n| n.module_id == "module.remapper").unwrap_or(false);
+        let is_map_action     = snarl.get_node(node).map(|n| n.module_id == "module.map_action").unwrap_or(false);
         let is_response_curve = snarl.get_node(node).map(|n| {
             n.module_id == "module.response_curve"
                 || n.module_id == "module.vec_response_curve"
@@ -354,9 +355,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     }
                 }
 
-                // Remapper module: skin selector lives in the header so the
-                // body stays compact and the label/dropdown can sit next to the title.
-                if is_remapper {
+                // Remapper / Map Action module: skin selector + Labels live in the
+                // header so the body stays compact and the label/dropdown can sit next to the title.
+                if is_remapper || is_map_action {
                     use super::remapper_icons::Skin;
                     let current_str = snarl.get_node(node)
                         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
@@ -793,7 +794,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "module.automap_split" | "module.automap_collect"
                 | "module.automap_fork" | "module.automap_selector"
                 | "module.automap_combiner"
-                | "module.remapper"
+                | "module.remapper" | "module.map_action"
                 | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
         )
     }
@@ -868,7 +869,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.automap_fork"      => show_automap_fork_body(node_id, outputs, ui, snarl),
             "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
             "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals),
-            "module.remapper"          => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut),
+            "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut),
+            "module.map_action" => show_map_action_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut),
             "subpatch" => {
                 if show_subpatch_body(node_id, ui, snarl) {
                     self.edit_subpatch_request = Some(node_id);
@@ -9410,7 +9412,7 @@ fn show_remapper_body(
 
         ui.add_space(2.0);
 
-        // Action row.
+        // Action row
         let in_learning = new_phase == "learning";
         let learn_enabled = new_phase == "ready_to_learn";
         let add_enabled = in_learning && !new_draft_output.is_empty();
@@ -9571,4 +9573,259 @@ fn show_remapper_body(
     if wired || new_phase == "learning" {
         ui.ctx().request_repaint();
     }
+}
+
+fn show_map_action_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    _panic_shortcut: &crate::app::PanicShortcut,
+) {
+    // Read current state
+    let wired = inputs.first().map(|p| !p.remotes.is_empty()).unwrap_or(false);
+    let upstream_dev_id = if wired {
+        remapper_upstream_device_id(snarl, node_id, 0)
+    } else { None };
+
+    let (phase, draft_input, mappings, pressed_prev) = snarl.get_node(node_id)
+        .map(|n| (
+            n.params.get("ui_phase").and_then(|v| v.as_str()).unwrap_or("idle").to_string(),
+            remapper_read_str_array(n, "draft_input"),
+            n.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+            remapper_read_str_array(n, "_pressed_prev"),
+        ))
+        .unwrap_or_else(|| ("idle".into(), vec![], vec![], vec![]));
+
+    // Capture state machine (input side only)
+    let mut pressed_now: Vec<String> = match (&upstream_dev_id, wired) {
+        (Some(dev), true) => remapper_pressed_now(live_signals, dev),
+        _ => Vec::new(),
+    };
+
+    // Prepare draft state for capture logic.
+    let mut new_phase = phase.clone();
+    let mut new_draft_input = draft_input.clone();
+
+    // Touchpad zones & click accumulation (mirror remapper logic).
+    let mut reset_click_mode = false;
+    {
+        let prev_mask: u8 = snarl.get_node(node_id)
+            .and_then(|n| n.params.get("_tp_zones"))
+            .and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        // Read btn_touchpad directly from live_signals
+        let touch_click_now = upstream_dev_id.as_deref()
+            .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        let mut click_mask = if touch_click_now { prev_mask } else { 0 };
+        let mut touch_mask: u8 = 0;
+        if let Some(dev) = upstream_dev_id.as_deref() {
+            let read_f = |pin: &str| -> Option<f32> {
+                live_signals.get(&(dev.to_string(), pin.to_string()))
+                    .map(|s| match s {
+                        Signal::Float(v) => *v,
+                        Signal::Vec2(v) => v.x,
+                        _ => 0.0,
+                    })
+            };
+            let read_b = |pin: &str| -> bool {
+                live_signals.get(&(dev.to_string(), pin.to_string()))
+                    .map(|s| s.as_bool()).unwrap_or(false)
+            };
+            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                if !read_b(apin) { continue; }
+                let x = match read_f(xpin) { Some(v) => v, None => continue };
+                let idx = if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 };
+                touch_mask |= 1u8 << idx;
+                if touch_click_now { click_mask |= 1u8 << idx; }
+            }
+        }
+        if click_mask != prev_mask {
+            if let Some(n) = snarl.get_node_mut(node_id) {
+                n.params.insert("_tp_zones".to_string(), Value::from(click_mask as u64));
+            }
+        }
+        // Click suppresses touch-only — see derive in eval.rs.
+        let touch_mask = if touch_click_now { 0 } else { touch_mask };
+        let push = |pn: &mut Vec<String>, pin: &str| {
+            if !pn.iter().any(|p| p == pin) { pn.push(pin.to_string()); }
+        };
+        if click_mask & 1 != 0 { push(&mut pressed_now, "touchpad_left"); }
+        if click_mask & 2 != 0 { push(&mut pressed_now, "touchpad_center"); }
+        if click_mask & 4 != 0 { push(&mut pressed_now, "touchpad_right"); }
+        if touch_click_now && click_mask == 0 { push(&mut pressed_now, "btn_touchpad"); }
+        if touch_mask & 1 != 0 { push(&mut pressed_now, "touch_left"); }
+        if touch_mask & 2 != 0 { push(&mut pressed_now, "touch_center"); }
+        if touch_mask & 4 != 0 { push(&mut pressed_now, "touch_right"); }
+
+        // Click-mode handling: if we just entered click mode, evict transient
+        // touch_* pins from the draft so the click-variant mapping takes over.
+        let click_mode_before = snarl.get_node(node_id)
+            .and_then(|n| n.params.get("_tp_click_mode"))
+            .and_then(|v| v.as_bool()).unwrap_or(false);
+        let entering_click_mode = touch_click_now && !click_mode_before;
+        if entering_click_mode {
+            new_draft_input.retain(|p| p != "touch_left" && p != "touch_center" && p != "touch_right");
+        }
+        let click_mode = click_mode_before || touch_click_now;
+        if click_mode != click_mode_before {
+            if let Some(n) = snarl.get_node_mut(node_id) {
+                n.params.insert("_tp_click_mode".to_string(), Value::from(click_mode));
+            }
+        }
+        // While in click mode, drop touch_* from pressed_now so they don't
+        // accumulate into the draft during the click+release tail.
+        if click_mode {
+            pressed_now.retain(|p| p != "touch_left" && p != "touch_center" && p != "touch_right");
+        }
+    }
+
+    // On capture: accumulate peak set; latch on full release
+    let rising: Vec<&String> = pressed_now.iter()
+        .filter(|p| !pressed_prev.iter().any(|q| q == *p))
+        .collect();
+    let prev_was_empty = pressed_prev.is_empty();
+    let now_empty = pressed_now.is_empty();
+
+    let is_transient = |p: &str| p == "touch_left" || p == "touch_center" || p == "touch_right";
+    match new_phase.as_str() {
+        "capturing" => {
+            if !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
+                new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
+            } else if !pressed_now.is_empty() {
+                new_draft_input.retain(|p| { !is_transient(p) || pressed_now.iter().any(|q| q == p) });
+                for p in &pressed_now {
+                    if !new_draft_input.iter().any(|q| q == p) { new_draft_input.push(p.clone()); }
+                }
+            }
+            let touchpad_idle = !upstream_dev_id.as_deref()
+                .and_then(|dev| {
+                    let a1 = live_signals.get(&(dev.to_string(), "touch1_active".to_string())).map(|s| s.as_bool()).unwrap_or(false);
+                    let a2 = live_signals.get(&(dev.to_string(), "touch2_active".to_string())).map(|s| s.as_bool()).unwrap_or(false);
+                    Some(!a1 && !a2)
+                }).unwrap_or(true);
+            if now_empty && touchpad_idle && !new_draft_input.is_empty() {
+                new_phase = "ready_to_add".to_string();
+            }
+        }
+        "ready_to_add" => {
+            if !rising.is_empty() && prev_was_empty {
+                new_phase = "capturing".to_string();
+                new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
+            }
+        }
+        _ => {}
+    }
+
+    // Auto-enter capturing when a wire is connected and we were idle.
+    if wired && new_phase == "idle" {
+        new_phase = "capturing".to_string();
+    }
+    // Drop back to idle when wire is disconnected.
+    if !wired && new_phase != "idle" {
+        new_phase = "idle".to_string();
+        new_draft_input.clear();
+        if let Some(n) = snarl.get_node_mut(node_id) {
+            remapper_write_str_array(n, "draft_input", &[]);
+            remapper_write_str_array(n, "_pressed_prev", &[]);
+        }
+    }
+
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.params.insert("ui_phase".to_string(), Value::String(new_phase.clone()));
+        remapper_write_str_array(node, "draft_input", &new_draft_input);
+        remapper_write_str_array(node, "_pressed_prev", &pressed_now);
+    }
+
+    // Render
+    let skin_param = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "auto".to_string());
+    let skin = remapper_resolve_skin(snarl, node_id, &skin_param);
+
+    const BODY_W: f32 = 260.0;
+    let body_h = ui.available_height().min(2000.0).max(28.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(BODY_W, body_h),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+        ui.set_min_width(BODY_W);
+
+        // Status line
+        let status = if !wired {
+            ("Connect Auto-Map wire to start mapping", Color32::from_rgb(232, 180, 65))
+        } else {
+            match new_phase.as_str() {
+                "capturing" if new_draft_input.is_empty() => ("Press a button or combination", Color32::from_rgb(106, 167, 255)),
+                "ready_to_add" => ("Captured — click Add", Color32::from_rgb(127, 201, 127)),
+                _ => ("", Color32::TRANSPARENT),
+            }
+        };
+        if !status.0.is_empty() { ui.label(egui::RichText::new(status.0).size(13.0).color(status.1)); }
+
+        if !new_draft_input.is_empty() {
+            ui.horizontal_wrapped(|ui| { remapper_render_chord(ui, &new_draft_input, skin); });
+        }
+
+        ui.add_space(2.0);
+
+        // Action row: only Add
+        // For Map Action we allow Add as soon as a capture exists — enable
+        // whenever we're wired and have a non-empty draft input.
+        let add_enabled = wired && !new_draft_input.is_empty();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(add_enabled, egui::Button::new(egui::RichText::new("Add").size(13.0))).clicked() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    let arr: Vec<Value> = new_draft_input.iter().map(|s| Value::String(s.clone())).collect();
+                    let mut all = mappings.clone();
+                    all.push(Value::Array(arr));
+                    node.params.insert("mappings".to_string(), Value::Array(all));
+                    node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
+                    remapper_write_str_array(node, "draft_input", &[]);
+                    remapper_write_str_array(node, "_pressed_prev", &[]);
+                }
+            }
+        });
+
+        // Mapping list: each mapping is Array<String> (input chord)
+        if !mappings.is_empty() {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.label(egui::RichText::new(format!("Mappings ({})", mappings.len())).size(13.0).weak());
+            let mut to_remove: Option<usize> = None;
+            const X_COL_W: f32 = 28.0;
+            const CHORD_COL_W: f32 = BODY_W - X_COL_W - 8.0;
+            for (i, m) in mappings.iter().enumerate() {
+                let in_pins: Vec<String> = m.as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let chip_w = 28.0_f32; let sep_w = 12.0_f32; let estimate = |pins: &[String]| {
+                    if pins.is_empty() { return 0.0; }
+                    (pins.len() as f32) * chip_w + ((pins.len() as f32) - 1.0).max(0.0) * sep_w
+                };
+                let force_break = estimate(&in_pins) > CHORD_COL_W;
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(X_COL_W, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if ui.button(egui::RichText::new("×").size(13.0)).clicked() { to_remove = Some(i); }
+                    });
+                    if force_break {
+                        ui.vertical(|ui| { ui.set_min_width(CHORD_COL_W); ui.set_max_width(CHORD_COL_W); ui.horizontal_wrapped(|ui| { remapper_render_chord(ui, &in_pins, skin); }); });
+                    } else {
+                        ui.allocate_ui_with_layout(egui::vec2(CHORD_COL_W, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            remapper_render_chord(ui, &in_pins, skin);
+                        });
+                    }
+                });
+            }
+            if let Some(idx) = to_remove {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    if let Some(Value::Array(arr)) = node.params.get_mut("mappings") { if idx < arr.len() { arr.remove(idx); } }
+                }
+            }
+        }
+    });
+
+    // Request repaint so capture ticks each frame while wired
+    if wired { ui.ctx().request_repaint(); }
 }

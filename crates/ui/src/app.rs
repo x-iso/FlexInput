@@ -3698,7 +3698,7 @@ fn build_processing_graph_rec(
         if matches!(node.module_id.as_str(),
             "processing.gyro_3dof" | "module.automap_split"
             | "module.automap_fork" | "module.automap_selector"
-            | "module.remapper")
+            | "module.remapper" | "module.map_action")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {

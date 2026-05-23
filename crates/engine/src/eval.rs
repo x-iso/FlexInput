@@ -629,6 +629,88 @@ pub fn eval_graph_tick(
     {
     puffin::profile_scope!("main_node_loop");
     for (idx, snap) in graph.nodes.iter().enumerate() {
+        // ── module.map_action: AutoMap in → Bool out based on stored mappings ──
+        if snap.module_id == "module.map_action" {
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            // Snapshot upstream values for every canonical pin once.
+            let mut upstream: HashMap<String, Signal> = HashMap::new();
+            for ap in automap::ALL_PINS {
+                let sig = if !collector_id.is_empty() {
+                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
+                } else { None }
+                .or_else(|| {
+                    if !dev_id.is_empty() {
+                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
+                    } else { None }
+                });
+                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+            }
+            // Derive synthetic pins (stick cardinals + touchpad variants)
+            derive_stick_cardinals(&mut upstream);
+            // Touchpad handling mirrors Remapper's behaviour (click accumulation)
+            let touch_click = upstream.get("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
+            let zone_of_x = |x: f32| -> usize {
+                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
+            };
+            let mut touch_only = [false; 3];
+            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                if !active { continue; }
+                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                touch_only[zone_of_x(x)] = true;
+            }
+            // Click-variant zones are stored in per-node state; reuse NodeState aux_f32
+            let ns = state.entry(snap.node_uid).or_insert_with(NodeState::default);
+            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
+            if !touch_click {
+                ns.aux_f32[0] = 0.0; ns.aux_f32[1] = 0.0; ns.aux_f32[2] = 0.0;
+            } else {
+                for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                    if !active { continue; }
+                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                    ns.aux_f32[zone_of_x(x)] = 1.0;
+                }
+            }
+            let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
+            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
+            if touch_click { touch_only = [false;3]; }
+            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
+            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
+            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
+            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
+            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
+            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
+            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
+
+            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
+
+            // Each mapping is an Array<String> of input pin ids (AND). If any
+            // mapping's all-pins-held then the module outputs Bool(true).
+            let mut any_trigger = false;
+            for m in &mappings {
+                if let Some(arr) = m.as_array() {
+                    if arr.is_empty() { continue; }
+                    let mut all_held = true;
+                    for v in arr {
+                        if let Some(pin) = v.as_str() {
+                            let held = read_upstream(pin).map(|s| s.as_bool()).unwrap_or(false);
+                            if !held { all_held = false; break; }
+                        }
+                    }
+                    if all_held { any_trigger = true; break; }
+                }
+            }
+
+            computed[idx] = vec![Some(Signal::Bool(any_trigger))];
+            // Populate last_outputs for this node so the UI can display per-pin
+            // signal glow (mirrors the general-path behaviour below).
+            last_outputs.insert(snap.node_uid, computed[idx].clone());
+            continue;
+        }
+
         // ── module.remapper: pass-through + per-mapping override + consume ────
         if snap.module_id == "module.remapper" {
             let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");

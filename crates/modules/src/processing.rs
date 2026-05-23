@@ -18,6 +18,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<AutoMapSelector>(),
         reg::<AutoMapCombiner>(),
         reg::<RemapperModule>(),
+        reg::<MapActionModule>(),
     ]
 }
 
@@ -407,6 +408,28 @@ impl Module for RemapperModule {
             category: "AutoMap",
             inputs:  vec![PinDescriptor::new("in",  SignalType::AutoMap)],
             outputs: vec![PinDescriptor::new("out", SignalType::AutoMap)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Map Action ────────────────────────────────────────────────────────────
+//
+// Simplified Remapper-derived module: accepts an AutoMap input and exposes a
+// single Bool output that is true when any configured mapping (an AND of
+// listed pins) is currently held on the upstream bus. Mappings are stored
+// in `node.params["mappings"]` as `Array<Array<String>>`.
+#[derive(Default)]
+pub struct MapActionModule;
+
+impl Module for MapActionModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.map_action",
+            display_name: "Map Action",
+            category: "AutoMap",
+            inputs:  vec![PinDescriptor::new("in",  SignalType::AutoMap)],
+            outputs: vec![PinDescriptor::new("out", SignalType::Bool)],
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
