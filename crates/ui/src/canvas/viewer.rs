@@ -363,7 +363,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
                         .unwrap_or_else(|| "auto".to_string());
                     let current = Skin::from_str(&current_str);
-                    let resolved = remapper_resolve_skin(snarl, node, &current_str);
+                    let resolved = remapper_resolve_skin(snarl, node, &current_str, None);
                     let selected_text = if current == Skin::Auto {
                         format!("auto · {}", resolved.label())
                     } else {
@@ -869,8 +869,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.automap_fork"      => show_automap_fork_body(node_id, outputs, ui, snarl),
             "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
             "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals),
-            "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut),
-            "module.map_action" => show_map_action_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut),
+            "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
+            "module.map_action" => show_map_action_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
             "subpatch" => {
                 if show_subpatch_body(node_id, ui, snarl) {
                     self.edit_subpatch_request = Some(node_id);
@@ -8741,12 +8741,11 @@ fn remapper_upstream_device_id(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
     input_idx: usize,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
 ) -> Option<String> {
     let pin = snarl.in_pin(InPinId { node: node_id, input: input_idx });
     let src = *pin.remotes.first()?;
-    let upstream = snarl.get_node(src.node)?;
-    if upstream.module_id != "device.source" { return None; }
-    upstream.params.get("device_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+    crate::app::find_automap_device_id_for_viewer(snarl, src, automap_parent)
 }
 
 /// Read which canonical AutoMap pins are currently asserted (Bool == true)
@@ -8981,11 +8980,12 @@ fn remapper_resolve_skin(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
     override_param: &str,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
 ) -> super::remapper_icons::Skin {
     use super::remapper_icons::Skin;
     let chosen = Skin::from_str(override_param);
     if chosen != Skin::Auto { return chosen; }
-    let dev = remapper_upstream_device_id(snarl, node_id, 0);
+    let dev = remapper_upstream_device_id(snarl, node_id, 0, automap_parent);
     match dev {
         Some(d) => super::remapper_icons::skin_from_device_id(&d),
         None => Skin::Xbox,
@@ -9086,11 +9086,12 @@ fn show_remapper_body(
     snarl: &mut Snarl<NodeData>,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
     // ── Read current state ─────────────────────────────────────────────────
     let wired = inputs.first().map(|p| !p.remotes.is_empty()).unwrap_or(false);
     let upstream_dev_id = if wired {
-        remapper_upstream_device_id(snarl, node_id, 0)
+        remapper_upstream_device_id(snarl, node_id, 0, automap_parent)
     } else { None };
 
     let (phase, draft_input, draft_output, mappings, pressed_prev) = snarl.get_node(node_id)
@@ -9350,7 +9351,7 @@ fn show_remapper_body(
     let skin_param = snarl.get_node(node_id)
         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
         .unwrap_or_else(|| "auto".to_string());
-    let skin = remapper_resolve_skin(snarl, node_id, &skin_param);
+    let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
 
     // Allocate a fixed-width sub-UI so the body's measured min_rect is
     // bounded — egui-snarl reports body width as body_ui.min_rect, and a
@@ -9387,12 +9388,22 @@ fn show_remapper_body(
         if !status.0.is_empty() {
             ui.label(egui::RichText::new(status.0).size(13.0).color(status.1));
         }
+        if wired {
+            let dev_txt = upstream_dev_id.clone().unwrap_or_else(|| "(none)".to_string());
+            ui.label(egui::RichText::new(format!("dev: {}  pressed: {:?}", dev_txt, pressed_now)).size(11.0).weak());
+        }
 
         // Draft input chips (only if non-empty).
         if !new_draft_input.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 remapper_render_chord(ui, &new_draft_input, skin);
             });
+            // Register the whole body as exposable for layout-mode pinning.
+            // Capture the min_rect of the body we just painted.
+            {
+                let rect = ui.min_rect();
+                register_exposable_element(ui, node_id, "default", rect);
+            }
         }
 
         // Draft output row (during learn).
@@ -9582,11 +9593,12 @@ fn show_map_action_body(
     snarl: &mut Snarl<NodeData>,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     _panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
     // Read current state
     let wired = inputs.first().map(|p| !p.remotes.is_empty()).unwrap_or(false);
     let upstream_dev_id = if wired {
-        remapper_upstream_device_id(snarl, node_id, 0)
+        remapper_upstream_device_id(snarl, node_id, 0, automap_parent)
     } else { None };
 
     let (phase, draft_input, mappings, pressed_prev) = snarl.get_node(node_id)
@@ -9742,7 +9754,7 @@ fn show_map_action_body(
     let skin_param = snarl.get_node(node_id)
         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
         .unwrap_or_else(|| "auto".to_string());
-    let skin = remapper_resolve_skin(snarl, node_id, &skin_param);
+    let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
 
     const BODY_W: f32 = 260.0;
     let body_h = ui.available_height().min(2000.0).max(28.0);
@@ -9763,6 +9775,10 @@ fn show_map_action_body(
             }
         };
         if !status.0.is_empty() { ui.label(egui::RichText::new(status.0).size(13.0).color(status.1)); }
+        if wired {
+            let dev_txt = upstream_dev_id.clone().unwrap_or_else(|| "(none)".to_string());
+            ui.label(egui::RichText::new(format!("dev: {}  pressed: {:?}", dev_txt, pressed_now)).size(11.0).weak());
+        }
 
         if !new_draft_input.is_empty() {
             ui.horizontal_wrapped(|ui| { remapper_render_chord(ui, &new_draft_input, skin); });
@@ -9815,6 +9831,11 @@ fn show_map_action_body(
                         ui.allocate_ui_with_layout(egui::vec2(CHORD_COL_W, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             remapper_render_chord(ui, &in_pins, skin);
                         });
+                        // Register the whole body as exposable for layout-mode pinning.
+                        {
+                            let rect = ui.min_rect();
+                            register_exposable_element(ui, node_id, "default", rect);
+                        }
                     }
                 });
             }

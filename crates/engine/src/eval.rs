@@ -481,6 +481,10 @@ fn eval_subgraph(
     let mut computed: Vec<Vec<Option<Signal>>> = vec![vec![]; n];
 
     for (idx, snap) in graph.nodes.iter().enumerate() {
+        // Compute a namespaced UID for this inner node early so inner-node
+        // special cases can publish into `collector_sigs` using the same
+        // keying scheme the UI's AutoMap resolver expects.
+        let ns_uid = namespaced_uid(outer_uid, snap.node_uid);
         // Inlet: produce the corresponding outer input signal.
         if snap.module_id == "subpatch.inlet" {
             let pin_idx = snap.params.get("pin_index")
@@ -519,7 +523,6 @@ fn eval_subgraph(
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
                 .unwrap_or_default();
-            let ns_uid = namespaced_uid(outer_uid, snap.node_uid);
             let uid_key = format!("collector:{}", ns_uid);
             for (i, pin_id) in collect_ids.iter().enumerate() {
                 if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
@@ -532,13 +535,225 @@ fn eval_subgraph(
             continue;
         }
 
+        // Handle remapper inside a subpatch the same way the top-level loop
+        // does, but publish under the namespaced remap key so downstream
+        // sinks (or outer graph routing) can pick up the overrides.
+        if snap.module_id == "module.remapper" {
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let key = format!("remap:{}", ns_uid);
+
+            let mut upstream: HashMap<String, Signal> = HashMap::new();
+            for ap in automap::ALL_PINS {
+                let sig = if !collector_id.is_empty() {
+                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
+                } else { None }
+                .or_else(|| {
+                    if !dev_id.is_empty() {
+                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
+                    } else { None }
+                });
+                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+            }
+            derive_stick_cardinals(&mut upstream);
+
+            // Touchpad accumulation (click-mode) — reuse the state's aux_f32
+            let touch_click = upstream.get("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
+            let zone_of_x = |x: f32| -> usize {
+                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
+            };
+            let mut touch_only = [false; 3];
+            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                if !active { continue; }
+                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                touch_only[zone_of_x(x)] = true;
+            }
+            let ns = state.entry(ns_uid).or_insert_with(NodeState::default);
+            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
+            if !touch_click {
+                ns.aux_f32[0] = 0.0; ns.aux_f32[1] = 0.0; ns.aux_f32[2] = 0.0;
+            } else {
+                for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                    if !active { continue; }
+                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                    ns.aux_f32[zone_of_x(x)] = 1.0;
+                }
+            }
+            let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
+            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
+            if touch_click { touch_only = [false;3]; }
+            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
+            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
+            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
+            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
+            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
+            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
+            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
+
+            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
+
+            // Pass-through every canonical pin first, suppressing claimed inputs.
+            let mut sorted = mappings.clone();
+            sorted.sort_by(|a, b| {
+                let la = a.get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let lb = b.get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                lb.cmp(&la)
+            });
+            let mut triggered: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+            let mut claimed_inputs: HashSet<String> = HashSet::new();
+            for m in &sorted {
+                let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if in_pins.is_empty() { continue; }
+                if in_pins.iter().any(|p| claimed_inputs.contains(p)) { continue; }
+                let all_held = in_pins.iter().all(|p| {
+                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                });
+                if !all_held { continue; }
+                for p in &in_pins { claimed_inputs.insert(p.clone()); }
+                triggered.push((in_pins, out_pins));
+            }
+            for ap in automap::ALL_PINS {
+                let suppressed = claimed_inputs.contains(ap.id);
+                let sig = if suppressed {
+                    match ap.signal_type {
+                        SignalType::Bool  => Signal::Bool(false),
+                        SignalType::Float => Signal::Float(0.0),
+                        SignalType::Vec2  => Signal::Vec2(Vec2::ZERO),
+                        SignalType::Int   => Signal::Int(0),
+                        _ => continue,
+                    }
+                } else {
+                    match read_upstream(ap.id) {
+                        Some(s) => s,
+                        None => continue,
+                    }
+                };
+                collector_sigs.insert((key.clone(), ap.id.to_string()), sig);
+            }
+            let mut all_out_pins: HashSet<String> = HashSet::new();
+            for m in &mappings {
+                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+                    for v in arr { if let Some(s) = v.as_str() { all_out_pins.insert(s.to_string()); } }
+                }
+            }
+            let mut asserted: HashSet<String> = HashSet::new();
+            for (_, out_pins) in &triggered { for p in out_pins { asserted.insert(p.clone()); } }
+            for out_pin in &all_out_pins {
+                let sig_type = automap::ALL_PINS.iter()
+                    .find(|p| p.id == out_pin.as_str())
+                    .map(|p| p.signal_type)
+                    .unwrap_or(SignalType::Bool);
+                let on = asserted.contains(out_pin);
+                if on {
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(1.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(1),
+                        _                 => Signal::Bool(true),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                } else {
+                    if upstream.contains_key(out_pin.as_str()) { continue; }
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(0.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(0),
+                        _                 => Signal::Bool(false),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                }
+            }
+
+            computed[idx] = vec![None];
+            continue;
+        }
+
+        // module.map_action inside subpatch: mirror top-level behaviour but
+        // write last_outputs keyed by the namespaced UID so UI/outer bodies
+        // can observe inner output state.
+        if snap.module_id == "module.map_action" {
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let mut upstream: HashMap<String, Signal> = HashMap::new();
+            for ap in automap::ALL_PINS {
+                let sig = if !collector_id.is_empty() {
+                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
+                } else { None }
+                .or_else(|| {
+                    if !dev_id.is_empty() {
+                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
+                    } else { None }
+                });
+                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+            }
+            derive_stick_cardinals(&mut upstream);
+            let touch_click = upstream.get("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
+            let zone_of_x = |x: f32| -> usize {
+                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
+            };
+            let mut touch_only = [false; 3];
+            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                if !active { continue; }
+                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                touch_only[zone_of_x(x)] = true;
+            }
+            let ns = state.entry(ns_uid).or_insert_with(NodeState::default);
+            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
+            if !touch_click { ns.aux_f32[0] = 0.0; ns.aux_f32[1] = 0.0; ns.aux_f32[2] = 0.0; }
+            else {
+                for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                    if !active { continue; }
+                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                    ns.aux_f32[zone_of_x(x)] = 1.0;
+                }
+            }
+            let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
+            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
+            if touch_click { touch_only = [false;3]; }
+            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
+            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
+            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
+            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
+            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
+            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
+            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
+            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
+            let mut any_trigger = false;
+            for m in &mappings {
+                if let Some(arr) = m.as_array() {
+                    if arr.is_empty() { continue; }
+                    let mut all_held = true;
+                    for v in arr {
+                        if let Some(pin) = v.as_str() {
+                            let held = read_upstream(pin).map(|s| s.as_bool()).unwrap_or(false);
+                            if !held { all_held = false; break; }
+                        }
+                    }
+                    if all_held { any_trigger = true; break; }
+                }
+            }
+            computed[idx] = vec![Some(Signal::Bool(any_trigger))];
+            last_outputs.insert(ns_uid, computed[idx].clone());
+            continue;
+        }
+
         let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
             .map(|src| src.and_then(|(si, op)| {
                 computed.get(si).and_then(|v| v.get(op)).copied().flatten()
             }))
             .collect();
 
-        let ns_uid = namespaced_uid(outer_uid, snap.node_uid);
         let node_state = state.entry(ns_uid).or_insert_with(NodeState::default);
         if let Some(ref vals) = snap.aux_f32_override {
             node_state.aux_f32 = vals.clone();

@@ -3440,6 +3440,129 @@ fn find_automap_device(snarl: &Snarl<NodeData>, src: OutPinId) -> Option<(String
     find_automap_device_rec(snarl, src, None)
 }
 
+/// Public helper for the viewer: resolve an AutoMap chain back to the
+/// originating physical device id (or a sensible fallback) for UI capture.
+/// Returns `Some(device_id)` when resolved, or `None` when not wired.
+pub fn find_automap_device_id_for_viewer(
+    snarl: &Snarl<NodeData>,
+    src: OutPinId,
+    parent: Option<&crate::canvas::viewer::AutomapGlowParent<'_>>,
+) -> Option<String> {
+    // Mirror of `find_automap_device_rec` but accepting the viewer's
+    // `AutomapGlowParent` chain so the UI can resolve AutoMap origins when
+    // rendering inner canvases. Returns (dev_id, pins, fallback) and we
+    // surface the fallback or dev_id to the caller.
+    fn rec(
+        snarl: &Snarl<NodeData>,
+        src: OutPinId,
+        parents: Option<&crate::canvas::viewer::AutomapGlowParent<'_>>,
+    ) -> Option<(String, Vec<String>, Option<String>)> {
+        let node = snarl.get_node(src.node)?;
+        if node.module_id == "device.source" {
+            let dev_id = node.params.get("device_id")?.as_str()?.to_string();
+            let pin_ids: Vec<String> = node.params.get("output_pin_ids")?.as_array()?
+                .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
+            return Some((dev_id, pin_ids, None));
+        }
+        if node.module_id == "module.automap_split" {
+            let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
+            let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
+            let upstream = *in_pin.remotes.first()?;
+            return rec(snarl, upstream, parents);
+        }
+        if node.module_id == "module.automap_fork" || node.module_id == "module.automap_selector" {
+            let node_uid = match parents {
+                None => src.node.0,
+                Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
+            };
+            let collector_id = format!("forksel:{}:{}", node_uid, src.output);
+            let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+                .iter().map(|p| p.id.to_string()).collect();
+            return Some((collector_id, canonical_pins, None));
+        }
+        if node.module_id == "module.automap_collect" {
+            let upstream_dev_id = node.inputs.iter()
+                .position(|p| p.signal_type == SignalType::AutoMap)
+                .and_then(|am_idx| {
+                    let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
+                    in_pin.remotes.first().copied()
+                })
+                .and_then(|s| rec(snarl, s, parents).map(|(id, _, _)| id));
+            let collector_uid = match parents {
+                None => src.node.0,
+                Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
+            };
+            let collector_id = format!("collector:{}", collector_uid);
+            let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+                .iter().map(|p| p.id.to_string()).collect();
+            return Some((collector_id, canonical_pins, upstream_dev_id));
+        }
+        if node.module_id == "module.automap_combiner" {
+            let combiner_uid = match parents {
+                None => src.node.0,
+                Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
+            };
+            let combiner_id = format!("combiner:{}", combiner_uid);
+            let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+                .iter().map(|p| p.id.to_string()).collect();
+            let upstream_dev_id = (0..node.inputs.len())
+                .find_map(|i| {
+                    if node.inputs[i].signal_type != SignalType::AutoMap { return None; }
+                    let in_pin = snarl.in_pin(InPinId { node: src.node, input: i });
+                    let &s = in_pin.remotes.first()?;
+                    rec(snarl, s, parents).map(|(id, _, fallback)| fallback.unwrap_or(id))
+                });
+            return Some((combiner_id, canonical_pins, upstream_dev_id));
+        }
+        if node.module_id == "module.remapper" {
+            let upstream_dev_id = node.inputs.iter()
+                .position(|p| p.signal_type == SignalType::AutoMap)
+                .and_then(|am_idx| {
+                    let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
+                    in_pin.remotes.first().copied()
+                })
+                .and_then(|s| rec(snarl, s, parents).map(|(id, _, _)| id));
+            let remap_uid = match parents {
+                None => src.node.0,
+                Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
+            };
+            let remap_id = format!("remap:{}", remap_uid);
+            let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+                .iter().map(|p| p.id.to_string()).collect();
+            return Some((remap_id, canonical_pins, upstream_dev_id));
+        }
+        if node.module_id == "subpatch" {
+            let sp = node.subpatch.as_ref()?;
+            let outlet_id: NodeId = sp.snarl.nodes_ids_data()
+                .find(|(_, n)| n.value.module_id == "subpatch.outlet"
+                    && n.value.params.get("pin_index").and_then(|v| v.as_u64())
+                        == Some(src.output as u64))
+                .map(|(id, _)| id)?;
+            let outlet_in = sp.snarl.in_pin(InPinId { node: outlet_id, input: 0 });
+            let inner_upstream = *outlet_in.remotes.first()?;
+            let frame = crate::canvas::viewer::AutomapGlowParent { snarl, subpatch_node_id: src.node, prev: parents };
+            return rec(&sp.snarl, inner_upstream, Some(&frame));
+        }
+        if node.module_id == "subpatch.inlet" {
+            let pin_idx = node.params.get("pin_index").and_then(|v| v.as_u64())? as usize;
+            let p = parents?;
+            let outer_in = p.snarl.in_pin(InPinId { node: p.subpatch_node_id, input: pin_idx });
+            let upstream = *outer_in.remotes.first()?;
+            return rec(p.snarl, upstream, p.prev);
+        }
+        None
+    }
+    rec(snarl, src, parent).map(|(dev, _pins, fallback)| fallback.unwrap_or(dev))
+}
+
+// Helper to reconstruct the fold_outer_uid value for the viewer parent chain.
+fn fold_outer_uid_app(p: &crate::canvas::viewer::AutomapGlowParent<'_>) -> usize {
+    match p.prev {
+        None => p.subpatch_node_id.0,
+        Some(prev) => flexinput_engine::namespaced_uid(fold_outer_uid_app(prev), p.subpatch_node_id.0),
+    }
+}
+
 fn find_automap_device_rec(
     snarl: &Snarl<NodeData>,
     src: OutPinId,
@@ -3736,6 +3859,11 @@ fn build_processing_graph_rec(
                 params.insert("_automap_input_devs".to_string(), serde_json::Value::Array(extra_devs));
             }
         }
+        // Note: we intentionally do NOT mutate the source `snarl` here.
+        // The injected `_automap_*` values are stored in the local `params`
+        // and carried forward into the returned `NodeSnap.params`, which
+        // the UI body renderers read at runtime. Mutating `snarl` would
+        // require a mutable borrow of `snarl` which is not available here.
         // Combiner: all inputs are equal AutoMap buses (no select pin). Record
         // dev_id AND collector_id for each port so eval can read collector
         // overrides (Remapper / Collector / Selector / Fork) before falling
