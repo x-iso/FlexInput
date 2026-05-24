@@ -306,3 +306,20 @@ pub fn delete_workspace() {
         let _ = std::fs::remove_file(&p);
     }
 }
+
+/// Write a workspace snapshot to an arbitrary path. Used by the File menu's
+/// "Save Workspace…" item so the user can keep named workspace bundles
+/// (e.g. for A/B perf comparisons) separate from the auto-persisted
+/// `workspace.json`.
+pub fn save_workspace_to(ws: &PersistedWorkspace, path: &std::path::Path) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(ws)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, json)
+}
+
+/// Read a workspace snapshot from an arbitrary path. Returns None if the
+/// file is missing or unparseable.
+pub fn load_workspace_from(path: &std::path::Path) -> Option<PersistedWorkspace> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}

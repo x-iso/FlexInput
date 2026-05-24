@@ -216,9 +216,25 @@ pub fn spawn_processing_thread(
                             out.scope_pending.push(sample);
                         }
                     }
-                    out.node_outputs  = tick_out.outputs.clone();
-                    out.last_inputs   = tick_out.last_inputs.clone();
-                    out.last_outputs  = tick_out.last_outputs.clone();
+                    // Swap instead of clone: hand our just-filled maps
+                    // to the UI and take back whatever was there (now
+                    // an empty default since the UI drained it). Saves
+                    // 3 HashMap clones per UI-frame at large patches.
+                    // tick_out is cleared at the top of the next
+                    // eval_graph_tick call so the swapped-in empties
+                    // don't matter — but if the UI was slow this round
+                    // (still holding stale data), we'd overwrite a
+                    // non-empty map. Clear after-swap to guarantee.
+                    std::mem::swap(&mut out.node_outputs,  &mut tick_out.outputs);
+                    std::mem::swap(&mut out.last_inputs,   &mut tick_out.last_inputs);
+                    std::mem::swap(&mut out.last_outputs,  &mut tick_out.last_outputs);
+                    // After the swap, tick_out holds whatever the UI
+                    // hadn't drained yet. Clear so the next eval starts
+                    // from empty (eval_graph_tick also clears, but doing
+                    // it here lets the allocations free sooner).
+                    tick_out.outputs.clear();
+                    tick_out.last_inputs.clear();
+                    tick_out.last_outputs.clear();
                 }
             }
 

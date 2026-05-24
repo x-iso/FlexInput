@@ -80,6 +80,12 @@ pub struct Canvas {
     /// whether the user actually copied something in an inner canvas this frame,
     /// without relying on clipboard content comparison (which breaks for same-count copies).
     pub(crate) clipboard_gen: u64,
+    /// Incremented every time the snarl mutates (any push_undo / push_snapshot
+    /// path, or undo/redo). Used by show_subpatch_editors to skip the
+    /// per-frame `*sp.snarl.clone()` pre-sync when the outer canvas hasn't
+    /// changed since the editor last synced — that clone dominates frame
+    /// time for large inner graphs (50+ nodes) and is wasted on idle frames.
+    pub(crate) mutation_gen: u64,
     /// Set this frame when the user requests to open a subpatch editor window.
     pub pending_edit_subpatch: Option<egui_snarl::NodeId>,
     /// Set this frame when the user picks "Pin element …" on an inner canvas
@@ -156,6 +162,7 @@ impl Canvas {
             redo_stack: Vec::new(),
             clipboard: None,
             clipboard_gen: 0,
+            mutation_gen: 0,
             pending_edit_subpatch: None,
             pending_expose_module: None,
             is_inner: false,
@@ -176,6 +183,7 @@ impl Canvas {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
+        self.mutation_gen = self.mutation_gen.wrapping_add(1);
     }
 
     /// Push an externally-taken pre-mutation snapshot onto the undo stack.
@@ -185,12 +193,14 @@ impl Canvas {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
+        self.mutation_gen = self.mutation_gen.wrapping_add(1);
     }
 
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             self.redo_stack.push(self.snarl.clone());
             self.snarl = prev;
+            self.mutation_gen = self.mutation_gen.wrapping_add(1);
         }
     }
 
@@ -198,6 +208,7 @@ impl Canvas {
         if let Some(next) = self.redo_stack.pop() {
             self.undo_stack.push(self.snarl.clone());
             self.snarl = next;
+            self.mutation_gen = self.mutation_gen.wrapping_add(1);
         }
     }
 
@@ -483,7 +494,29 @@ impl Canvas {
         }
 
         // ── Pre-show snapshot for viewer-driven mutations ─────────────────────
-        let pre_snapshot = self.snarl.clone();
+        // Only clone the snarl when this frame could plausibly mutate it.
+        // Snarl's built-in `show()` mutates on pointer drag (node move),
+        // wire drag/disconnect, etc. — all gated on pointer activity. When
+        // the user is idle, `show()` is read-only, so the clone is pure
+        // waste. At 60 fps with a 50-node graph this clone dominates the
+        // frame; gating it drops the cost to zero on idle frames.
+        //
+        // We snapshot when:
+        //   - any pointer button is currently down (drag in progress), OR
+        //   - the pointer just released this frame (drag completed), OR
+        //   - any keyboard key is pressed this frame.
+        // False positives are fine (we just pay the clone); false negatives
+        // would break undo, so the conditions are intentionally generous.
+        let needs_snapshot = ui.ctx().input(|i| {
+            i.pointer.any_down()
+                || i.pointer.any_released()
+                || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        });
+        let pre_snapshot = if needs_snapshot {
+            Some(self.snarl.clone())
+        } else {
+            None
+        };
         let pre_counts = (
             self.snarl.nodes_ids_data().count(),
             self.snarl.wires().count(),
@@ -590,7 +623,18 @@ impl Canvas {
             self.snarl.wires().count(),
         );
         if pre_counts != post_counts || viewer.push_undo_request {
-            self.push_snapshot(pre_snapshot);
+            if let Some(snap) = pre_snapshot {
+                self.push_snapshot(snap);
+            } else {
+                // Snapshot was skipped (gating thought the frame was idle)
+                // but a mutation slipped through. Fall back to cloning the
+                // current (post-mutation) snarl so the undo history at
+                // least doesn't get out of sync. Worst case: one undo
+                // step replays itself. This branch should be very rare —
+                // if it fires often, the gating heuristic above needs to
+                // be widened.
+                self.push_snapshot(self.snarl.clone());
+            }
         }
 
         if let Some(pending) = viewer.pending_wire_menu {

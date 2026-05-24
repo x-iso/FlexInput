@@ -171,6 +171,11 @@ struct SubPatchEditor {
     open: bool,
     /// Last canvas.clipboard_gen seen; used to detect a genuine user copy inside this editor.
     last_clipboard_gen: u64,
+    /// Last mutation_gen of the parent canvas that this editor synced its
+    /// inner snarl from. Used to skip the per-frame `*sp.snarl.clone()`
+    /// pre-sync when the parent hasn't mutated. `None` means "never synced"
+    /// (force a sync on the next frame).
+    last_synced_parent_gen: Option<u64>,
 }
 
 pub struct FlexInputApp {
@@ -332,8 +337,18 @@ pub struct FlexInputApp {
     /// Running `puffin_http` server. `Some` exactly while the Profiler
     /// toggle in Settings is on. Dropping the server stops the listener
     /// thread; we also call `puffin::set_scopes_on(false)` so the macros
-    /// stop emitting events.
+    /// stop emitting events. Field exists in release too (so the struct
+    /// layout doesn't drift between profiles) but is never assigned —
+    /// `#[allow(dead_code)]` keeps the release warning down.
+    #[allow(dead_code)]
     profiler_server: Option<puffin_http::Server>,
+    /// Last (theme, contrast bits, see_through_active, alpha bits) tuple
+    /// applied to the egui style. The per-frame `apply_theme_and_contrast`
+    /// call short-circuits when the tuple matches the current settings —
+    /// avoids walking the entire egui Visuals on every vsync just to
+    /// rewrite identical values. `None` means "never applied", which
+    /// forces the first frame to push the initial style.
+    theme_applied_for: Option<(crate::settings::Theme, u32, bool, u32)>,
 }
 
 /// Keyboard-only shortcut for panic mode. Modifiers + non-modifier key.
@@ -620,6 +635,7 @@ impl FlexInputApp {
             pin_last_external_hwnd: None,
             self_hwnd: None,
             profiler_server: None,
+            theme_applied_for: None,
         }
     }
 }
@@ -646,12 +662,26 @@ impl eframe::App for FlexInputApp {
             }
         }
 
-        // Apply selected theme + contrast every frame so changes take
-        // effect immediately when the user moves the slider in Settings.
-        // Also folds in the see-through alpha when active.
+        // Apply selected theme + contrast only when the relevant
+        // settings actually changed (plus once at startup before any
+        // user input). The function walks the egui style and replaces
+        // colors/strokes — cheap individually but wasted on every
+        // vsync frame when nothing has moved. `theme_applied_for`
+        // remembers the (theme, contrast, see_through_active, alpha)
+        // tuple we last pushed into the context; matching values skip
+        // the re-apply entirely.
         {
             puffin::profile_scope!("apply_theme_and_contrast");
-            crate::settings::apply_theme_and_contrast(ctx, &self.settings);
+            let key = (
+                self.settings.theme,
+                self.settings.contrast.to_bits(),
+                self.settings.see_through_active,
+                self.settings.see_through_alpha.to_bits(),
+            );
+            if self.theme_applied_for != Some(key) {
+                crate::settings::apply_theme_and_contrast(ctx, &self.settings);
+                self.theme_applied_for = Some(key);
+            }
         }
 
         // Restore persisted always-on-top pin state on the first frame
@@ -862,36 +892,65 @@ impl eframe::App for FlexInputApp {
         }
 
         // Pull outputs from the processing thread: pre-populate eval_cache, sync display state.
+        //
+        // `try_lock` instead of `lock` — the proc thread holds the same
+        // mutex while writing each catchup batch; if we'd block here a
+        // slow paint frame snowballs into mutex-stall amplification.
+        // Skipping the drain costs one frame of display staleness
+        // (≤16 ms, imperceptible) and the data arrives on the next
+        // frame instead.
+        //
+        // IMPORTANT: this profile_scope! is inside an explicit block.
+        // A bare `profile_scope!(...)` at function-body scope binds the
+        // RAII guard to function exit, so the "pull_outputs_and_display"
+        // timing would include canvas_show and everything else below
+        // — a misleading number we had to debug once already.
+        {
         puffin::profile_scope!("pull_outputs_and_display");
         self.eval_cache.clear();
         if canvas_has_nodes {
-            let (last_inputs_snap, last_outputs_snap, scope_batch) = {
-                let mut out = self.proc_outputs.lock().unwrap();
-                for (&(uid, pin), &sig) in &out.node_outputs {
-                    self.eval_cache.insert((NodeId(uid), pin), sig);
+            let drained = {
+                puffin::profile_scope!("drain_proc_outputs");
+                match self.proc_outputs.try_lock() {
+                    Ok(mut out) => {
+                        for (&(uid, pin), &sig) in &out.node_outputs {
+                            self.eval_cache.insert((NodeId(uid), pin), sig);
+                        }
+                        let last     = std::mem::take(&mut out.last_inputs);
+                        let last_out = std::mem::take(&mut out.last_outputs);
+                        let scopes   = std::mem::take(&mut out.scope_pending);
+                        Some((last, last_out, scopes))
+                    }
+                    Err(_) => None,
                 }
-                let last = out.last_inputs.clone();
-                let last_out = out.last_outputs.clone();
-                let scopes = std::mem::take(&mut out.scope_pending);
-                (last, last_out, scopes)
             };
-            // Group scope samples by uid so each node receives its full batch.
-            let mut scope_lookup: HashMap<usize, Vec<Vec<Option<f32>>>> = HashMap::new();
-            for (uid, sample) in scope_batch {
-                scope_lookup.entry(uid).or_default().push(sample);
+            if let Some((last_inputs_snap, last_outputs_snap, scope_batch)) = drained {
+                let scope_count = scope_batch.len();
+                let li_count = last_inputs_snap.len();
+                let lo_count = last_outputs_snap.len();
+                puffin::profile_scope!("display_state_sizes",
+                    format!("scope={} li={} lo={}", scope_count, li_count, lo_count));
+                let mut scope_lookup: HashMap<usize, Vec<Vec<Option<f32>>>> = {
+                    puffin::profile_scope!("scope_lookup_build");
+                    let mut m: HashMap<usize, Vec<Vec<Option<f32>>>> = HashMap::new();
+                    for (uid, sample) in scope_batch {
+                        m.entry(uid).or_default().push(sample);
+                    }
+                    m
+                };
+                {
+                    puffin::profile_scope!("apply_display_state");
+                    apply_display_state(
+                        &mut self.tabs[self.active_tab].canvas.snarl,
+                        None,
+                        &last_inputs_snap,
+                        &last_outputs_snap,
+                        &mut scope_lookup,
+                    );
+                }
             }
-            // Walk root + recurse into subpatch inner snarls so inner display
-            // nodes (oscilloscope, response_curve, gyro_3dof, …) receive their
-            // visual feedback. Inner nodes are keyed by namespaced_uid; matches
-            // what eval_subgraph wrote into last_inputs / scope_samples.
-            apply_display_state(
-                &mut self.tabs[self.active_tab].canvas.snarl,
-                None,
-                &last_inputs_snap,
-                &last_outputs_snap,
-                &scope_lookup,
-            );
         }
+        } // end pull_outputs_and_display scope
 
         // Signal routing and device flushing are handled by the 500 Hz I/O thread.
         // panic_active is already folded into effective_bypass above so the
@@ -901,6 +960,8 @@ impl eframe::App for FlexInputApp {
         // ── Custom title bar ──────────────────────────────────────────────────────
         let mut do_save = false;
         let mut do_load = false;
+        let mut do_save_workspace = false;
+        let mut do_load_workspace = false;
         let mut do_new  = false;
         let mut do_close = false;
         let mut do_bind  = false;
@@ -920,7 +981,9 @@ impl eframe::App for FlexInputApp {
             .show(ctx, |ui| {
                 show_title_bar(
                     ui, ctx,
-                    &mut do_save, &mut do_load, &mut do_new, &mut do_close, &mut do_bind,
+                    &mut do_save, &mut do_load,
+                    &mut do_save_workspace, &mut do_load_workspace,
+                    &mut do_new, &mut do_close, &mut do_bind,
                     &mut do_hidhide,
                     &mut self.auto_switch,
                     &mut do_undo, &mut do_redo,
@@ -1521,6 +1584,85 @@ impl eframe::App for FlexInputApp {
             }
         }
 
+        // ── Save workspace (full tab set) ────────────────────────────────────
+        // Mirrors the auto-persisted `workspace.json` path but lets the user
+        // pick the destination — handy for A/B perf comparisons by quickly
+        // swapping between an empty workspace and a loaded one without
+        // restarting the app.
+        if do_save_workspace {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("FlexInput Workspace", &["fxw", "json"])
+                .set_file_name("workspace.fxw")
+                .save_file()
+            {
+                let tabs: Vec<PersistedTab> = self.tabs.iter().map(|t| PersistedTab {
+                    title: t.title.clone(),
+                    file_path: t.file_path.clone(),
+                    bound_exes: t.bound_exes.clone(),
+                    auto_bypass: t.auto_bypass,
+                    snarl: t.canvas.snarl.clone(),
+                }).collect();
+                let ws = PersistedWorkspace {
+                    version: 1,
+                    active_tab: self.active_tab,
+                    tabs,
+                };
+                if let Err(e) = settings::save_workspace_to(&ws, &path) {
+                    eprintln!("[workspace] save failed: {e}");
+                }
+            }
+        }
+
+        // ── Load workspace (full tab set, replacing current state) ───────────
+        if do_load_workspace {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("FlexInput Workspace", &["fxw", "json"])
+                .pick_file()
+            {
+                if let Some(ws) = settings::load_workspace_from(&path) {
+                    let on_load_view = match self.settings.on_patch_load {
+                        settings::OnPatchLoad::Off       => None,
+                        settings::OnPatchLoad::Center    => Some(crate::canvas::PendingViewAction::Center),
+                        settings::OnPatchLoad::ZoomToFit => Some(crate::canvas::PendingViewAction::ZoomToFit),
+                    };
+                    let new_tabs: Vec<PatchTab> = ws.tabs.into_iter().map(|pt| {
+                        let mut canvas = Canvas::new();
+                        canvas.snarl = pt.snarl;
+                        canvas.pending_view_action = on_load_view;
+                        PatchTab {
+                            title: pt.title,
+                            file_path: pt.file_path,
+                            bound_exes: pt.bound_exes,
+                            canvas,
+                            virtual_panel: VirtualDevicePanel::new(),
+                            bypassed: false,
+                            auto_bypass: pt.auto_bypass,
+                        }
+                    }).collect();
+                    if !new_tabs.is_empty() {
+                        self.tabs = new_tabs;
+                        self.active_tab = ws.active_tab.min(self.tabs.len() - 1);
+                        // Rebuild the shared virtual-device pool from the new
+                        // tab set; prune what's no longer needed.
+                        {
+                            let mut pool = self.shared_virtual_devices.lock().unwrap();
+                            let mut needed: Vec<String> = Vec::new();
+                            for tab in &self.tabs {
+                                for v in snarl_virtual_device_ids(&tab.canvas.snarl) {
+                                    if !needed.iter().any(|x| x == &v) { needed.push(v); }
+                                }
+                            }
+                            reconcile_shared_devices(&mut pool, &needed);
+                            let _ = prune_shared_devices(&mut pool, &self.tabs);
+                        }
+                        self.refresh_active_tab_device_ids();
+                    }
+                } else {
+                    eprintln!("[workspace] load failed: file missing or invalid JSON");
+                }
+            }
+        }
+
         // Build live device IDs for the active tab's canvas status dots.
         let live_device_ids: std::collections::HashSet<String> = {
             let active_ids: std::collections::HashSet<String> =
@@ -1828,7 +1970,10 @@ impl eframe::App for FlexInputApp {
         self.app_clipboard_from_inner = false;
 
         // ── Sub-patch editor windows ──────────────────────────────────────────
-        show_subpatch_editors(self, ctx, &live_device_ids);
+        {
+            puffin::profile_scope!("show_subpatch_editors");
+            show_subpatch_editors(self, ctx, &live_device_ids);
+        }
 
         // When the patch is live (has nodes or virtual devices), paint every
         // vsync — `request_repaint()` with no delay tells eframe to paint
@@ -2427,43 +2572,47 @@ impl FlexInputApp {
                         ui.end_row();
                     });
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
+                // ── Profiler (dev tool, debug builds only) ──────────────
+                // Toggle flips `puffin::set_scopes_on()` and starts/stops
+                // a `puffin_http` server on 127.0.0.1:8585 so the
+                // standalone `puffin_viewer` GUI can connect for a live
+                // flamegraph. Not persisted — resets to off on every
+                // launch. Hidden from release builds entirely so the
+                // shipped UI doesn't expose an internal dev tool.
+                #[cfg(debug_assertions)]
+                {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
 
-                // ── Profiler (dev tool) ─────────────────────────────────
-                // Toggle here flips `puffin::set_scopes_on()` and starts/
-                // stops a `puffin_http` server on 127.0.0.1:8585. Connect
-                // from the standalone `puffin_viewer` GUI to see a live
-                // flamegraph of FlexInput's threads. Not persisted —
-                // resets to off on every launch.
-                ui.label(egui::RichText::new("Profiler").strong());
-                ui.add_space(4.0);
-                let mut prof = self.settings.profiler_enabled;
-                if ui.checkbox(&mut prof, "Enable puffin profiler (127.0.0.1:8585)").changed() {
-                    self.settings.profiler_enabled = prof;
-                    if prof {
-                        match puffin_http::Server::new("127.0.0.1:8585") {
-                            Ok(server) => {
-                                puffin::set_scopes_on(true);
-                                self.profiler_server = Some(server);
-                                eprintln!("[profiler] listening on 127.0.0.1:8585 — connect with `puffin_viewer --url 127.0.0.1:8585`");
+                    ui.label(egui::RichText::new("Profiler").strong());
+                    ui.add_space(4.0);
+                    let mut prof = self.settings.profiler_enabled;
+                    if ui.checkbox(&mut prof, "Enable puffin profiler (127.0.0.1:8585)").changed() {
+                        self.settings.profiler_enabled = prof;
+                        if prof {
+                            match puffin_http::Server::new("127.0.0.1:8585") {
+                                Ok(server) => {
+                                    puffin::set_scopes_on(true);
+                                    self.profiler_server = Some(server);
+                                    eprintln!("[profiler] listening on 127.0.0.1:8585 — connect with `puffin_viewer --url 127.0.0.1:8585`");
+                                }
+                                Err(e) => {
+                                    eprintln!("[profiler] failed to start server: {e}");
+                                    self.settings.profiler_enabled = false;
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("[profiler] failed to start server: {e}");
-                                self.settings.profiler_enabled = false;
-                            }
+                        } else {
+                            puffin::set_scopes_on(false);
+                            self.profiler_server = None;
+                            eprintln!("[profiler] stopped");
                         }
-                    } else {
-                        puffin::set_scopes_on(false);
-                        self.profiler_server = None;
-                        eprintln!("[profiler] stopped");
                     }
+                    ui.label(egui::RichText::new(
+                        "Install once: `cargo install puffin_viewer`.\n\
+                         Then run `puffin_viewer --url 127.0.0.1:8585` with this toggle on."
+                    ).small().weak());
                 }
-                ui.label(egui::RichText::new(
-                    "Install once: `cargo install puffin_viewer`.\n\
-                     Then run `puffin_viewer --url 127.0.0.1:8585` with this toggle on."
-                ).small().weak());
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -2612,7 +2761,14 @@ fn spawn_io_thread(
                 // calibration window can render at true polling Hz rather than
                 // UI repaint Hz. We do this BEFORE moving `signals` into the
                 // shared map.
-                {
+                //
+                // Skip the write-lock acquisition entirely when no taped pin
+                // names appear in this iteration's signals — the common case
+                // when no gyro-capable device is connected. Saves a contended
+                // RwLock write per loop iteration (500 Hz) on idle setups.
+                let has_taped_pin = signals.keys()
+                    .any(|(_, pin)| flexinput_engine::SCOPE_TAP_PINS.iter().any(|p| *p == pin.as_str()));
+                if has_taped_pin {
                     puffin::profile_scope!("scope_taps_write");
                     let now = Instant::now();
                     let mut taps = scope_taps.write().unwrap();
@@ -3393,7 +3549,7 @@ fn apply_display_state(
     parent_uid: Option<usize>,
     last_inputs: &HashMap<usize, Vec<Option<Signal>>>,
     last_outputs: &HashMap<usize, Vec<Option<Signal>>>,
-    scope_lookup: &HashMap<usize, Vec<Vec<Option<f32>>>>,
+    scope_lookup: &mut HashMap<usize, Vec<Vec<Option<f32>>>>,
 ) {
     let ids: Vec<NodeId> = snarl.nodes_ids_data().map(|(id, _)| id).collect();
     for id in ids {
@@ -3408,11 +3564,15 @@ fn apply_display_state(
             if let Some(outs) = last_outputs.get(&uid) {
                 node.extra.last_out = outs.clone();
             }
-            if let Some(samples) = scope_lookup.get(&uid) {
+            // Scope samples: move (drain) the per-uid bucket out of
+            // scope_lookup instead of cloning each `Vec<Option<f32>>`.
+            // Each sample becomes a single push_back into the history
+            // ring with no intermediate copy.
+            if let Some(samples) = scope_lookup.remove(&uid) {
                 let h = &mut node.extra.history;
                 for s in samples {
                     if h.len() >= HISTORY_LEN { h.pop_front(); }
-                    h.push_back(s.clone());
+                    h.push_back(s);
                 }
             }
         }
@@ -4433,6 +4593,8 @@ fn show_title_bar(
     ctx: &egui::Context,
     do_save: &mut bool,
     do_load: &mut bool,
+    do_save_workspace: &mut bool,
+    do_load_workspace: &mut bool,
     do_new: &mut bool,
     do_close: &mut bool,
     do_bind: &mut bool,
@@ -4469,6 +4631,9 @@ fn show_title_bar(
                 if ui.button("New").clicked()                       { *do_new   = true; ui.close(); }
                 if ui.button("Save Patch…").clicked()               { *do_save  = true; ui.close(); }
                 if ui.button("Load Patch…").clicked()               { *do_load  = true; ui.close(); }
+                ui.separator();
+                if ui.button("Save Workspace…").clicked()           { *do_save_workspace = true; ui.close(); }
+                if ui.button("Load Workspace…").clicked()           { *do_load_workspace = true; ui.close(); }
                 ui.separator();
                 if ui.button("Bind Tab to Process…").clicked()      { *do_bind  = true; ui.close(); }
                 ui.separator();
@@ -4838,6 +5003,7 @@ fn show_subpatch_editors(
                 canvas: editor_canvas,
                 open: true,
                 last_clipboard_gen: 0,
+                last_synced_parent_gen: None,
             });
         }
     }
@@ -5157,6 +5323,7 @@ fn show_subpatch_editors(
                 canvas: editor_canvas,
                 open: true,
                 last_clipboard_gen: 0,
+                last_synced_parent_gen: None,
             });
         }
     }
