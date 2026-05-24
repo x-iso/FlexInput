@@ -49,10 +49,104 @@ pub struct ExposedModule {
     /// modules without inherent height limits (e.g. Text) use the full size.
     #[serde(default = "default_exposed_size")]
     pub size: [f32; 2],
+    /// Per-pin Text color override. Populated only for Text-module pins via
+    /// the layout inspector strip; `None` fields fall back to module values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_override: Option<PinTextOverride>,
 }
 
 fn default_exposed_size() -> [f32; 2] { [220.0, 100.0] }
 fn default_element_id() -> String { "default".to_string() }
+
+/// Per-pin color override for pinned Text modules. `None` on a field means
+/// "use the source module's value". Only meaningful when `inner_node_id`
+/// references a `module.label` (Text) node.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PinTextOverride {
+    #[serde(default)] pub fill: Option<[u8; 4]>,
+    #[serde(default)] pub outline: Option<[u8; 4]>,
+    #[serde(default)] pub outline_px: Option<f32>,
+}
+
+/// Text horizontal alignment for layout-decoration Text items.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TextAlign { #[default] Left, Center, Right }
+
+/// Layout-only decorations placed on a sub-patch body. Distinct from
+/// `ExposedModule` (which mirrors an inner module's UI); decorations don't
+/// reference an inner node. Vec order = paint order (first = bottom).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LayoutDecoration {
+    Text {
+        pos: [f32; 2],
+        size: [f32; 2],
+        text: String,
+        font_size: f32,
+        fill: [u8; 4],
+        outline: [u8; 4],
+        outline_px: f32,
+        align: TextAlign,
+    },
+    Svg {
+        pos: [f32; 2],
+        size: [f32; 2],
+        svg_data: String,
+        rev: u64,
+        tint: [u8; 4],
+        tint_mode: String,
+        stroke: [u8; 4],
+        stroke_px: f32,
+    },
+    Rect {
+        pos: [f32; 2],
+        size: [f32; 2],
+        fill: [u8; 4],
+        stroke: [u8; 4],
+        stroke_px: f32,
+        corner_radius: f32,
+    },
+    Ellipse {
+        pos: [f32; 2],
+        size: [f32; 2],
+        fill: [u8; 4],
+        stroke: [u8; 4],
+        stroke_px: f32,
+    },
+    Line {
+        a: [f32; 2],
+        b: [f32; 2],
+        stroke: [u8; 4],
+        stroke_px: f32,
+    },
+}
+
+impl LayoutDecoration {
+    pub fn type_label(&self) -> &'static str {
+        match self {
+            LayoutDecoration::Text { .. }    => "Text",
+            LayoutDecoration::Svg { .. }     => "SVG",
+            LayoutDecoration::Rect { .. }    => "Rectangle",
+            LayoutDecoration::Ellipse { .. } => "Ellipse",
+            LayoutDecoration::Line { .. }    => "Line",
+        }
+    }
+    /// Bounding rect in body-local coordinates. For Line, the bbox spans
+    /// between the two endpoints (with a small inflation for hit testing
+    /// applied at the call site).
+    pub fn bbox(&self) -> ([f32; 2], [f32; 2]) {
+        match self {
+            LayoutDecoration::Text { pos, size, .. }
+            | LayoutDecoration::Svg { pos, size, .. }
+            | LayoutDecoration::Rect { pos, size, .. }
+            | LayoutDecoration::Ellipse { pos, size, .. } => (*pos, *size),
+            LayoutDecoration::Line { a, b, .. } => {
+                let min = [a[0].min(b[0]), a[1].min(b[1])];
+                let max = [a[0].max(b[0]), a[1].max(b[1])];
+                (min, [max[0] - min[0], max[1] - min[1]])
+            }
+        }
+    }
+}
 
 /// Inner graph + declared I/O for a sub-patch (meta-module) node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +165,18 @@ pub struct UiSubPatch {
     /// Grid step in logical pixels. Stepped in increments of 2 to keep things tidy.
     #[serde(default = "default_snap_grid_px")]
     pub snap_grid_px: u32,
+    /// Static layout decorations (text labels, SVGs, shapes) painted under
+    /// `exposed_modules`. Vec order = paint order (first = bottom).
+    #[serde(default)]
+    pub decorations: Vec<LayoutDecoration>,
+    /// Runtime-only: currently selected decoration index for the inspector
+    /// strip. Cleared on layout-mode exit.
+    #[serde(skip)]
+    pub selected_deco: Option<usize>,
+    /// Runtime-only: currently selected exposed-module pin index, used by
+    /// the inspector strip to surface per-pin overrides (e.g. Text color).
+    #[serde(skip)]
+    pub selected_pin: Option<usize>,
 }
 
 fn default_snap_grid_px() -> u32 { 8 }
@@ -89,6 +195,9 @@ impl Default for UiSubPatch {
             exposed_modules: vec![],
             snap_enabled: false,
             snap_grid_px: default_snap_grid_px(),
+            decorations: vec![],
+            selected_deco: None,
+            selected_pin: None,
         }
     }
 }

@@ -5263,6 +5263,7 @@ fn show_subpatch_editors(
                             element_id,
                             pos: [PINNED_PAD, next_y + PINNED_PAD],
                             size: init_size,
+                            text_override: None,
                         });
                     }
                 }

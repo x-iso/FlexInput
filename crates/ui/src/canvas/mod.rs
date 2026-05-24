@@ -1978,6 +1978,9 @@ pub fn group_into_subpatch(
         exposed_modules: vec![],
         snap_enabled: false,
         snap_grid_px: 8,
+        decorations: vec![],
+        selected_deco: None,
+        selected_pin: None,
     };
 
     let subpatch_node = NodeData {

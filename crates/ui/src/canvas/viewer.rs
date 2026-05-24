@@ -8,7 +8,10 @@ use flexinput_devices::{ControllerKind, PhysicalDevice, midi::cc_display_name};
 use flexinput_engine::current_sample_rate;
 use serde_json::{Number, Value};
 
-use super::{curve::sample_curve, node::{ExposedModule, NodeData}};
+use super::{
+    curve::sample_curve,
+    node::{ExposedModule, LayoutDecoration, NodeData, TextAlign},
+};
 
 pub struct FlexViewer<'a> {
     pub descriptors: &'a [ModuleDescriptor],
@@ -154,7 +157,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             let sp = snarl.get_node(node).and_then(|n| n.subpatch.as_ref());
             (
                 sp.map(|s| s.snarl.nodes_ids_data().count()).unwrap_or(0),
-                sp.map(|s| !s.exposed_modules.is_empty()).unwrap_or(false),
+                sp.map(|s| !s.exposed_modules.is_empty() || !s.decorations.is_empty()).unwrap_or(false),
                 snarl.get_node(node).map(|n| n.extra.layout_unlocked).unwrap_or(false),
             )
         } else {
@@ -611,6 +614,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     .map(|sp| (sp.snap_enabled, sp.snap_grid_px))
                     .unwrap_or((false, 8));
                 let mut changed = false;
+                let mut add_kind: Option<&'static str> = None;
                 ui.horizontal(|ui| {
                     let was = snap_enabled;
                     ui.checkbox(&mut snap_enabled, egui::RichText::new("Snap").small())
@@ -630,11 +634,64 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             if g2 != snap_grid_px { snap_grid_px = g2; changed = true; }
                         }
                     });
+                    ui.separator();
+                    ui.label(egui::RichText::new("Add:").small().weak());
+                    if ui.small_button("T").on_hover_text("Add Text label").clicked() {
+                        add_kind = Some("text");
+                    }
+                    if ui.small_button("▢").on_hover_text("Add Rectangle").clicked() {
+                        add_kind = Some("rect");
+                    }
+                    if ui.small_button("◯").on_hover_text("Add Ellipse").clicked() {
+                        add_kind = Some("ellipse");
+                    }
+                    if ui.small_button("╱").on_hover_text("Add Line").clicked() {
+                        add_kind = Some("line");
+                    }
+                    if ui.small_button("SVG").on_hover_text("Add SVG").clicked() {
+                        add_kind = Some("svg");
+                    }
                 });
                 if changed {
                     if let Some(sp) = snarl.get_node_mut(node).and_then(|n| n.subpatch.as_mut()) {
                         sp.snap_enabled = snap_enabled;
                         sp.snap_grid_px = snap_grid_px;
+                    }
+                }
+                if let Some(kind) = add_kind {
+                    if let Some(sp) = snarl.get_node_mut(node).and_then(|n| n.subpatch.as_mut()) {
+                        let deco = make_default_decoration(kind);
+                        sp.decorations.push(deco);
+                        sp.selected_deco = Some(sp.decorations.len() - 1);
+                    }
+                }
+
+                // Inspector strip for the selected decoration.
+                let sel = snarl.get_node(node)
+                    .and_then(|n| n.subpatch.as_ref())
+                    .and_then(|sp| sp.selected_deco);
+                if let Some(idx) = sel {
+                    if let Some(sp) = snarl.get_node_mut(node).and_then(|n| n.subpatch.as_mut()) {
+                        if idx < sp.decorations.len() {
+                            decoration_inspector_strip(ui, &mut sp.decorations, idx);
+                        } else {
+                            sp.selected_deco = None;
+                        }
+                    }
+                }
+
+                // Inspector strip for selected exposed Text-module pin (color override).
+                let text_pin_idx: Option<usize> = snarl.get_node(node)
+                    .and_then(|n| n.subpatch.as_ref())
+                    .and_then(|sp| {
+                        let i = sp.selected_pin?;
+                        let inner_id = sp.exposed_modules.get(i)?.inner_node_id;
+                        let mid = sp.snarl.get_node(egui_snarl::NodeId(inner_id))?.module_id.clone();
+                        if mid == "module.label" { Some(i) } else { None }
+                    });
+                if let Some(i) = text_pin_idx {
+                    if let Some(sp) = snarl.get_node_mut(node).and_then(|n| n.subpatch.as_mut()) {
+                        text_pin_inspector_strip(ui, sp, i);
                     }
                 }
             }
@@ -2415,8 +2472,50 @@ fn show_switch_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDa
 /// Body for the Text/Label module: editable multiline text + font-size slider.
 /// No I/O; purely visual annotation. Persists `text` and `font_size` in params.
 fn show_label_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let outer = ui.allocate_ui(egui::vec2(180.0, 0.0), |ui| {
-        show_label_body_sized(node_id, ui, snarl, 160.0, 0.0);
+    // Module-resident "box_width" — user-resizable width for the wrapped text
+    // body. Default 160.0 for parity with the legacy unresizable layout.
+    let box_width = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("box_width").and_then(|v| v.as_f64()))
+        .map(|v| v as f32)
+        .unwrap_or(160.0)
+        .clamp(60.0, 800.0);
+
+    let outer = ui.allocate_ui(egui::vec2(box_width + 14.0, 0.0), |ui| {
+        // Body (height auto from wrap).
+        show_label_body_sized(node_id, ui, snarl, box_width, 0.0);
+        // Width-only resize handle directly under the text.
+        const HANDLE_W: f32 = 14.0;
+        const HANDLE_H: f32 = 6.0;
+        let (handle_rect, h_resp) = ui.allocate_exact_size(
+            egui::vec2(box_width, HANDLE_H),
+            egui::Sense::click_and_drag(),
+        );
+        let _ = handle_rect;
+        let painter = ui.painter();
+        let col = if h_resp.hovered() || h_resp.dragged() {
+            egui::Color32::from_rgba_unmultiplied(180, 230, 255, 160)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(150, 220, 255, 80)
+        };
+        // Centered grip mark for discoverability.
+        let cx = handle_rect.center().x;
+        let cy = handle_rect.center().y;
+        for k in [-4.0, 0.0, 4.0] {
+            painter.line_segment(
+                [egui::pos2(cx + k - 1.5, cy), egui::pos2(cx + k + 1.5, cy)],
+                egui::Stroke::new(1.5, col),
+            );
+        }
+        if h_resp.dragged_by(egui::PointerButton::Primary) {
+            let dx = h_resp.drag_delta().x;
+            if dx.abs() > f32::EPSILON {
+                let new_w = (box_width + dx).clamp(60.0, 800.0);
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("box_width".into(), Value::from(new_w as f64));
+                }
+            }
+        }
+        let _ = HANDLE_W; // reserved for future corner-handle variant
     });
     register_exposable_element(ui, node_id, "text", outer.response.rect);
 }
@@ -3350,7 +3449,12 @@ fn show_subpatch_body(
         .map(|sp| sp.exposed_modules.clone())
         .unwrap_or_default();
 
-    if exposed.is_empty() {
+    let has_decos = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .map(|sp| !sp.decorations.is_empty())
+        .unwrap_or(false);
+
+    if exposed.is_empty() && !has_decos {
         return false;
     }
 
@@ -3358,12 +3462,25 @@ fn show_subpatch_body(
         .map(|n| n.extra.layout_unlocked)
         .unwrap_or(false);
 
+    // Clear runtime selection state when leaving Layout mode.
+    if !is_unlocked {
+        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+            sp.selected_deco = None;
+            sp.selected_pin = None;
+        }
+    }
+
     // Snapshot the outer snarl so the whole-module pinned renderers can build
     // an `AutomapGlowParent` describing this subpatch's boundary even while
     // they hold a mutable borrow on `sp.snarl`. Cloning the outer snarl is
     // overkill in pure cost but pinned-widget rendering is rare enough that
     // this is fine — and any subpatch with no whole-module pins skips it.
-    let needs_outer_snapshot = !is_unlocked && exposed.iter().any(|e| e.element_id == "whole_module");
+    // Snapshot needed when:
+    //   - any whole_module pin needs to build an AutomapGlowParent chain, OR
+    //   - any Text-module pin may need to read its per-pin color override.
+    let needs_outer_snapshot = !is_unlocked && exposed.iter().any(|e| {
+        e.element_id == "whole_module" || e.element_id == "text"
+    });
     let outer_snapshot: Option<Snarl<NodeData>> = if needs_outer_snapshot {
         Some(snarl.clone())
     } else { None };
@@ -3417,6 +3534,10 @@ fn show_subpatch_body(
             y += snap_grid;
         }
     }
+
+    // ── Decorations pass (paint + interact + selection). Drawn under modules
+    //    so module widgets layer above static graphics by default.
+    show_subpatch_decorations(outer_id, ui, snarl, is_unlocked, snap_enabled, snap_grid);
 
     let mut remove: Option<usize> = None;
     // Live target values each frame. None = no drag/resize active for this idx.
@@ -3582,6 +3703,13 @@ fn show_subpatch_body(
                     [exp.pos[0], exp.pos[1], 0.0f32, 0.0f32],
                 ));
             }
+            // Select this pin for the inspector strip on click or drag-start.
+            if interact_resp.clicked() || (interact_resp.drag_started() && !pointer_in_handle) {
+                if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+                    sp.selected_pin = Some(idx);
+                    sp.selected_deco = None;
+                }
+            }
             if body_dragging {
                 let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(drag_pos_id(idx)))
                     .unwrap_or([exp.pos[0], exp.pos[1], 0.0, 0.0]);
@@ -3730,10 +3858,14 @@ fn render_pinned_element(
             render_switch_toggle(inner_id, ui, inner_snarl, container_size);
             return;
         }
-        // Text label: read-only when pinned (locked or in layout mode), so the
-        // outer body never accepts text edits — those happen inside the editor.
+        // Text label: scaled (width) + cropped (height) with scroll, mirroring
+        // Remapper's pin behavior. Per-pin color override is read inside the
+        // renderer from `outer_snapshot`'s exposed_modules.
         ("module.label", "text") => {
-            render_label_text_readonly(inner_id, ui, inner_snarl, container_size);
+            render_label_text_pinned_scroll(
+                inner_id, ui, inner_snarl, container_size,
+                outer_snapshot, outer_id, is_layout_mode,
+            );
             return;
         }
         ("module.svg", "image") => {
@@ -4436,6 +4568,221 @@ fn render_label_text_readonly(
     }).unwrap_or_else(|| ("Label".to_string(), 14.0, egui::Color32::from_rgb(220, 220, 220)));
     ui.set_max_width(container.x);
     ui.label(egui::RichText::new(text).size(font_size).color(col));
+}
+
+/// Pinned-Text renderer: scale by width, crop by height with scrollbar,
+/// auto-scroll to top when the text content hash changes. Mirrors the
+/// Remapper whole-module pin pattern. Per-pin color override is read by
+/// finding this `inner_id` in `outer_snapshot`'s `exposed_modules` list.
+fn render_label_text_pinned_scroll(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    outer_snapshot: Option<&Snarl<NodeData>>,
+    outer_id: NodeId,
+    is_layout_mode: bool,
+) {
+    use std::hash::{Hash, Hasher};
+
+    // ── 1. Resolve text + module-native styling ─────────────────────────────
+    let (text, base_font, base_col) = inner_snarl.get_node(inner_id).map(|n| {
+        let t = n.params.get("text").and_then(|v| v.as_str()).unwrap_or("Label").to_string();
+        let f = n.params.get("font_size").and_then(|v| v.as_f64()).unwrap_or(14.0) as f32;
+        let c = read_label_color(n);
+        (t, f, c)
+    }).unwrap_or_else(|| ("Label".to_string(), 14.0, egui::Color32::from_rgb(220, 220, 220)));
+
+    // ── 2. Per-pin override lookup ──────────────────────────────────────────
+    let override_ = outer_snapshot
+        .and_then(|outer| outer.get_node(outer_id))
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| sp.exposed_modules.iter().find(|e|
+            e.inner_node_id == inner_id.0 && e.element_id == "text"
+        ))
+        .and_then(|e| e.text_override.clone())
+        .unwrap_or_default();
+    let fill_col = override_.fill
+        .map(rgba_to_color32)
+        .unwrap_or(base_col);
+    let outline_col = override_.outline.map(rgba_to_color32).unwrap_or(egui::Color32::TRANSPARENT);
+    let outline_px = override_.outline_px.unwrap_or(0.0);
+
+    // ── 3. Container reservation + scale ────────────────────────────────────
+    let (container_rect, _) = ui.allocate_exact_size(container_size, egui::Sense::hover());
+    let design_w: f32 = 200.0;
+    let container_w = container_size.x.max(40.0);
+    let container_h = container_size.y.max(16.0);
+    let scale = (container_w / design_w).clamp(0.25, 4.0);
+
+    // ── 4. State key (per layer + inner node) ───────────────────────────────
+    let state_key = egui::Id::new(("fxi_label_pin_state", ui.layer_id().id, inner_id.0));
+    type LabelPinState = (f32, u64); // (scroll_offset_body, text_hash)
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    base_font.to_bits().hash(&mut hasher);
+    let cur_text_hash = hasher.finish();
+    let prev: Option<LabelPinState> = ui.ctx().data(|d| d.get_temp(state_key));
+    let (prev_offset, prev_hash) = prev.unwrap_or((0.0, cur_text_hash));
+    let changed = (cur_text_hash != prev_hash) && !is_layout_mode;
+
+    // ── 5. Pointer-over for wheel scroll ────────────────────────────────────
+    let parent_to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let from_global = parent_to_global.inverse();
+    let pointer_over = ui.ctx().input(|i| i.pointer.hover_pos())
+        .map(|g| container_rect.contains(from_global * g))
+        .unwrap_or(false);
+
+    let mut scroll_offset_body = if changed { 0.0 } else { prev_offset };
+    if pointer_over && !is_layout_mode {
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+        if wheel != 0.0 {
+            scroll_offset_body -= wheel / scale;
+        }
+    }
+
+    // ── 6. Render — visual-transform path (layout) vs layer path (lock) ─────
+    let render_body = |body_ui: &mut egui::Ui, content_w: f32| -> f32 {
+        body_ui.set_max_width(content_w);
+        // Optional 8-direction offset outline (cheap halo) via painter.layout_no_wrap-free wrap.
+        if outline_col.a() > 0 && outline_px > 0.05 {
+            let origin = body_ui.cursor().min;
+            let galley = body_ui.painter().layout(
+                text.clone(),
+                egui::FontId::proportional(base_font),
+                outline_col,
+                content_w,
+            );
+            let painter = body_ui.painter().clone();
+            for (dx, dy) in [(-1.0,0.0),(1.0,0.0),(0.0,-1.0),(0.0,1.0),
+                             (-1.0,-1.0),(1.0,-1.0),(-1.0,1.0),(1.0,1.0)] {
+                painter.galley(
+                    origin + egui::vec2(dx * outline_px, dy * outline_px),
+                    galley.clone(),
+                    outline_col,
+                );
+            }
+        }
+        let resp = body_ui.label(
+            egui::RichText::new(&text).size(base_font).color(fill_col),
+        );
+        resp.rect.height().max(1.0)
+    };
+
+    let body_h: f32;
+    if is_layout_mode {
+        let xform = egui::emath::TSTransform::new(
+            container_rect.min.to_vec2() - egui::vec2(0.0, scroll_offset_body * scale),
+            scale,
+        );
+        let inner = ui.with_visual_transform(xform, |ui| {
+            let body_max_rect = egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(design_w, 100_000.0),
+            );
+            let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body_max_rect));
+            let visible_band = egui::Rect::from_min_size(
+                egui::pos2(0.0, scroll_offset_body),
+                egui::vec2(design_w, container_h / scale),
+            );
+            body_ui.set_clip_rect(visible_band);
+            body_ui.add_enabled_ui(false, |b| render_body(b, design_w))
+                .inner
+        });
+        body_h = inner.inner;
+    } else {
+        let body_layer = egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new(("fxi_label_pin_layer", ui.layer_id().id, inner_id.0)),
+        );
+        let body_max_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(design_w, 100_000.0),
+        );
+        let mut body_ui = ui.new_child(
+            egui::UiBuilder::new().layer_id(body_layer).max_rect(body_max_rect),
+        );
+        let visible_band = egui::Rect::from_min_size(
+            egui::pos2(0.0, scroll_offset_body),
+            egui::vec2(design_w, container_h / scale),
+        );
+        body_ui.set_clip_rect(visible_band);
+        body_h = render_body(&mut body_ui, design_w);
+
+        let max_offset_body = (body_h - container_h / scale).max(0.0);
+        if scroll_offset_body < 0.0 { scroll_offset_body = 0.0; }
+        if scroll_offset_body > max_offset_body { scroll_offset_body = max_offset_body; }
+
+        // Scrollbar painted into body layer with Y offset so it stays on screen.
+        let mut new_scroll = scroll_offset_body;
+        if max_offset_body > 0.5 {
+            let band_top = scroll_offset_body;
+            let band_h_body = container_h / scale;
+            let sb_w_body = 6.0 / scale;
+            let sb_inset_body = 1.0 / scale;
+            let track_x_min = design_w - sb_w_body - sb_inset_body;
+            let track_y_min = band_top + sb_inset_body;
+            let track_y_max = band_top + band_h_body - sb_inset_body;
+            let track_h = (track_y_max - track_y_min).max(1.0);
+            let track_rect = egui::Rect::from_min_max(
+                egui::pos2(track_x_min, track_y_min),
+                egui::pos2(track_x_min + sb_w_body, track_y_max),
+            );
+            let visible_frac = (band_h_body / body_h).clamp(0.05, 1.0);
+            let min_thumb_body = 14.0 / scale;
+            let thumb_h = (track_h * visible_frac).max(min_thumb_body);
+            let scroll_frac = (scroll_offset_body / max_offset_body).clamp(0.0, 1.0);
+            let thumb_y = track_y_min + (track_h - thumb_h) * scroll_frac;
+            let thumb_rect = egui::Rect::from_min_size(
+                egui::pos2(track_x_min, thumb_y),
+                egui::vec2(sb_w_body, thumb_h),
+            );
+            let drag_id = egui::Id::new(("fxi_label_sb_drag", body_layer, inner_id.0));
+            let thumb_resp = body_ui.interact(thumb_rect, drag_id, egui::Sense::click_and_drag());
+            if thumb_resp.drag_started() {
+                body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (scroll_offset_body, 0.0f32)));
+            }
+            if thumb_resp.dragged() {
+                let track_travel = (track_h - thumb_h).max(1.0);
+                let body_per_track_px = max_offset_body / track_travel;
+                let (start, acc) = body_ui.ctx().data(|d| d.get_temp::<(f32, f32)>(drag_id))
+                    .unwrap_or((scroll_offset_body, 0.0));
+                let new_acc = acc + thumb_resp.drag_delta().y;
+                body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (start, new_acc)));
+                new_scroll = (start + new_acc * body_per_track_px).clamp(0.0, max_offset_body);
+            }
+            if thumb_resp.drag_stopped() {
+                body_ui.ctx().data_mut(|d| d.remove_temp::<(f32, f32)>(drag_id));
+            }
+            let painter = body_ui.painter();
+            painter.rect_filled(track_rect, 2.0 / scale,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14));
+            let thumb_col = if thumb_resp.dragged() {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180)
+            } else if thumb_resp.hovered() {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90)
+            };
+            painter.rect_filled(thumb_rect, 2.0 / scale, thumb_col);
+        }
+        scroll_offset_body = new_scroll;
+
+        let local_translation = container_rect.min.to_vec2()
+            - egui::vec2(0.0, scroll_offset_body * scale);
+        let local_xform = egui::emath::TSTransform::new(local_translation, scale);
+        ui.ctx().set_transform_layer(body_layer, parent_to_global * local_xform);
+        ui.ctx().set_sublayer(ui.layer_id(), body_layer);
+    }
+
+    let max_offset_body = (body_h - container_h / scale).max(0.0);
+    if scroll_offset_body < 0.0 { scroll_offset_body = 0.0; }
+    if scroll_offset_body > max_offset_body { scroll_offset_body = max_offset_body; }
+
+    ui.ctx().data_mut(|d| {
+        d.insert_temp::<LabelPinState>(state_key, (scroll_offset_body, cur_text_hash));
+    });
 }
 
 // ── Gyro 3DOF row renderers ──────────────────────────────────────────────────
@@ -10320,4 +10667,631 @@ fn show_map_action_body(
 
     // Request repaint so capture ticks each frame while wired
     if wired { ui.ctx().request_repaint(); }
+}
+
+// ── Layout decorations ──────────────────────────────────────────────────────
+//
+// Decorations are static body items (text labels, SVGs, basic shapes) drawn
+// under exposed-module pins. They live on `UiSubPatch::decorations` and are
+// edited only in Layout mode via the toolbar + inspector strip.
+
+const DECO_DEFAULT_FILL:    [u8; 4] = [200, 200, 200, 220];
+const DECO_DEFAULT_STROKE:  [u8; 4] = [255, 255, 255, 220];
+const DECO_DEFAULT_OUTLINE: [u8; 4] = [0,   0,   0,   200];
+
+fn make_default_decoration(kind: &str) -> LayoutDecoration {
+    match kind {
+        "text" => LayoutDecoration::Text {
+            pos: [16.0, 16.0],
+            size: [160.0, 28.0],
+            text: "Text".to_string(),
+            font_size: 16.0,
+            fill: DECO_DEFAULT_FILL,
+            outline: [0, 0, 0, 0],
+            outline_px: 0.0,
+            align: TextAlign::Left,
+        },
+        "rect" => LayoutDecoration::Rect {
+            pos: [16.0, 16.0],
+            size: [120.0, 80.0],
+            fill: [60, 60, 60, 180],
+            stroke: DECO_DEFAULT_STROKE,
+            stroke_px: 1.0,
+            corner_radius: 4.0,
+        },
+        "ellipse" => LayoutDecoration::Ellipse {
+            pos: [16.0, 16.0],
+            size: [100.0, 100.0],
+            fill: [60, 60, 60, 180],
+            stroke: DECO_DEFAULT_STROKE,
+            stroke_px: 1.0,
+        },
+        "line" => LayoutDecoration::Line {
+            a: [16.0, 16.0],
+            b: [136.0, 16.0],
+            stroke: DECO_DEFAULT_STROKE,
+            stroke_px: 1.5,
+        },
+        "svg" => LayoutDecoration::Svg {
+            pos: [16.0, 16.0],
+            size: [120.0, 120.0],
+            svg_data: String::new(),
+            rev: 0,
+            tint: [255, 255, 255, 0],
+            tint_mode: "override".to_string(),
+            stroke: [0, 0, 0, 0],
+            stroke_px: 0.0,
+        },
+        _ => LayoutDecoration::Rect {
+            pos: [16.0, 16.0],
+            size: [120.0, 80.0],
+            fill: DECO_DEFAULT_FILL,
+            stroke: DECO_DEFAULT_STROKE,
+            stroke_px: 1.0,
+            corner_radius: 4.0,
+        },
+    }
+}
+
+fn rgba_to_color32(c: [u8; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
+}
+fn color32_to_rgba(c: egui::Color32) -> [u8; 4] { [c.r(), c.g(), c.b(), c.a()] }
+
+fn color_button(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4]) -> bool {
+    let mut col = rgba_to_color32(*rgba);
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).small().weak());
+        if ui.color_edit_button_srgba(&mut col).changed() {
+            *rgba = color32_to_rgba(col);
+            changed = true;
+        }
+    });
+    changed
+}
+
+/// Render the contextual inspector strip for the selected decoration. Lives
+/// in the extended layout-mode header. Bails out cleanly if `idx` is stale.
+fn decoration_inspector_strip(
+    ui: &mut egui::Ui,
+    decos: &mut Vec<LayoutDecoration>,
+    idx: usize,
+) {
+    if idx >= decos.len() { return; }
+    let n = decos.len();
+    let mut action: Option<&'static str> = None;
+    let mut delete = false;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(format!("[{}] {}", idx, decos[idx].type_label())).small().strong());
+        ui.separator();
+        match &mut decos[idx] {
+            LayoutDecoration::Text { text, font_size, fill, outline, outline_px, align, .. } => {
+                ui.add(egui::TextEdit::singleline(text).desired_width(140.0).hint_text("text"));
+                ui.add(egui::DragValue::new(font_size).speed(0.25).range(6.0f32..=96.0).suffix("px"))
+                    .on_hover_text("Font size");
+                color_button(ui, "fill", fill);
+                color_button(ui, "outline", outline);
+                ui.add(egui::DragValue::new(outline_px).speed(0.1).range(0.0f32..=8.0).suffix("px"))
+                    .on_hover_text("Outline thickness");
+                egui::ComboBox::from_id_salt(("deco_align", idx))
+                    .width(70.0)
+                    .selected_text(match *align { TextAlign::Left => "Left", TextAlign::Center => "Center", TextAlign::Right => "Right" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(align, TextAlign::Left, "Left");
+                        ui.selectable_value(align, TextAlign::Center, "Center");
+                        ui.selectable_value(align, TextAlign::Right, "Right");
+                    });
+            }
+            LayoutDecoration::Rect { fill, stroke, stroke_px, corner_radius, .. } => {
+                color_button(ui, "fill", fill);
+                color_button(ui, "stroke", stroke);
+                ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.0f32..=12.0).suffix("px"))
+                    .on_hover_text("Stroke thickness");
+                ui.add(egui::DragValue::new(corner_radius).speed(0.25).range(0.0f32..=64.0).suffix("r"))
+                    .on_hover_text("Corner radius");
+            }
+            LayoutDecoration::Ellipse { fill, stroke, stroke_px, .. } => {
+                color_button(ui, "fill", fill);
+                color_button(ui, "stroke", stroke);
+                ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.0f32..=12.0).suffix("px"))
+                    .on_hover_text("Stroke thickness");
+            }
+            LayoutDecoration::Line { stroke, stroke_px, .. } => {
+                color_button(ui, "stroke", stroke);
+                ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.1f32..=12.0).suffix("px"))
+                    .on_hover_text("Line thickness");
+            }
+            LayoutDecoration::Svg { tint, tint_mode, stroke, stroke_px, svg_data, rev, .. } => {
+                if ui.small_button("Load…").on_hover_text("Load SVG file").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("SVG", &["svg"])
+                        .pick_file()
+                    {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            *svg_data = text;
+                            *rev = rev.wrapping_add(1);
+                        }
+                    }
+                }
+                color_button(ui, "tint", tint);
+                egui::ComboBox::from_id_salt(("deco_svg_mode", idx))
+                    .width(80.0)
+                    .selected_text(tint_mode.as_str())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(tint_mode, "override".to_string(), "override");
+                        ui.selectable_value(tint_mode, "additive".to_string(), "additive");
+                    });
+                color_button(ui, "stroke", stroke);
+                ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.0f32..=12.0).suffix("px"))
+                    .on_hover_text("Frame stroke thickness");
+            }
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("Z:").small().weak());
+        if ui.small_button("⏶⏶").on_hover_text("Send to top").clicked()    { action = Some("top"); }
+        if ui.small_button("⏶").on_hover_text("Bring up").clicked()         { action = Some("up"); }
+        if ui.small_button("⏷").on_hover_text("Send down").clicked()        { action = Some("down"); }
+        if ui.small_button("⏷⏷").on_hover_text("Send to bottom").clicked() { action = Some("bottom"); }
+        ui.separator();
+        if ui.small_button("🗑").on_hover_text("Delete").clicked() { delete = true; }
+    });
+
+    if let Some(act) = action {
+        apply_zorder_action(decos, idx, act, n);
+    }
+    if delete && idx < decos.len() {
+        decos.remove(idx);
+    }
+}
+
+fn apply_zorder_action(decos: &mut Vec<LayoutDecoration>, idx: usize, act: &str, n: usize) {
+    match act {
+        "up"     if idx + 1 < n => { decos.swap(idx, idx + 1); }
+        "down"   if idx > 0     => { decos.swap(idx, idx - 1); }
+        "top"    if idx + 1 < n => { let d = decos.remove(idx); decos.push(d); }
+        "bottom" if idx > 0     => { let d = decos.remove(idx); decos.insert(0, d); }
+        _ => {}
+    }
+}
+
+/// Inspector strip for the per-pin Text color override (when the selected
+/// exposed-module pin is a Text module).
+fn text_pin_inspector_strip(
+    ui: &mut egui::Ui,
+    sp: &mut crate::canvas::node::UiSubPatch,
+    idx: usize,
+) {
+    if idx >= sp.exposed_modules.len() { return; }
+    let exp = &mut sp.exposed_modules[idx];
+    // Default the override row to module values when missing.
+    let mut ov = exp.text_override.clone().unwrap_or_default();
+    let mut clear = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(format!("Text pin [{}] override", idx)).small().strong());
+        ui.separator();
+        let mut fill_rgba = ov.fill.unwrap_or([220, 220, 220, 255]);
+        if color_button(ui, "fill", &mut fill_rgba) {
+            ov.fill = Some(fill_rgba);
+        }
+        let mut outline_rgba = ov.outline.unwrap_or([0, 0, 0, 0]);
+        if color_button(ui, "outline", &mut outline_rgba) {
+            ov.outline = Some(outline_rgba);
+        }
+        let mut opx = ov.outline_px.unwrap_or(0.0);
+        if ui.add(egui::DragValue::new(&mut opx).speed(0.1).range(0.0f32..=8.0).suffix("px"))
+            .on_hover_text("Outline thickness")
+            .changed()
+        {
+            ov.outline_px = Some(opx);
+        }
+        if ui.small_button("Reset").on_hover_text("Use Text module's own colors").clicked() {
+            clear = true;
+        }
+    });
+    if clear {
+        exp.text_override = None;
+    } else if ov.fill.is_some() || ov.outline.is_some() || ov.outline_px.is_some() {
+        exp.text_override = Some(ov);
+    }
+}
+
+/// Paint a single decoration into the given body painter. Coordinates are in
+/// body-local space; caller already translated `origin` and provides absolute
+/// `painter` and `offset` to add to local coords.
+fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco: &LayoutDecoration) {
+    match deco {
+        LayoutDecoration::Rect { pos, size, fill, stroke, stroke_px, corner_radius } => {
+            let r = egui::Rect::from_min_size(
+                origin + egui::vec2(pos[0], pos[1]),
+                egui::vec2(size[0].max(1.0), size[1].max(1.0)),
+            );
+            let fcol = rgba_to_color32(*fill);
+            if fcol.a() > 0 {
+                painter.rect_filled(r, *corner_radius, fcol);
+            }
+            let scol = rgba_to_color32(*stroke);
+            if scol.a() > 0 && *stroke_px > 0.05 {
+                painter.rect_stroke(r, *corner_radius,
+                    egui::Stroke::new(*stroke_px, scol),
+                    egui::StrokeKind::Inside);
+            }
+        }
+        LayoutDecoration::Ellipse { pos, size, fill, stroke, stroke_px } => {
+            let r = egui::Rect::from_min_size(
+                origin + egui::vec2(pos[0], pos[1]),
+                egui::vec2(size[0].max(1.0), size[1].max(1.0)),
+            );
+            let center = r.center();
+            let radius = egui::vec2(r.width() * 0.5, r.height() * 0.5);
+            // egui has no ellipse primitive; approximate with a polygon of 64 verts.
+            let mut pts = Vec::with_capacity(64);
+            for i in 0..64 {
+                let t = (i as f32) / 64.0 * std::f32::consts::TAU;
+                pts.push(egui::pos2(center.x + radius.x * t.cos(), center.y + radius.y * t.sin()));
+            }
+            let fcol = rgba_to_color32(*fill);
+            if fcol.a() > 0 {
+                painter.add(egui::Shape::convex_polygon(pts.clone(), fcol, egui::Stroke::NONE));
+            }
+            let scol = rgba_to_color32(*stroke);
+            if scol.a() > 0 && *stroke_px > 0.05 {
+                pts.push(pts[0]);
+                painter.add(egui::Shape::line(pts, egui::Stroke::new(*stroke_px, scol)));
+            }
+        }
+        LayoutDecoration::Line { a, b, stroke, stroke_px } => {
+            let p1 = origin + egui::vec2(a[0], a[1]);
+            let p2 = origin + egui::vec2(b[0], b[1]);
+            painter.line_segment([p1, p2],
+                egui::Stroke::new(*stroke_px, rgba_to_color32(*stroke)));
+        }
+        LayoutDecoration::Text { pos, size, text, font_size, fill, outline, outline_px, align } => {
+            let r = egui::Rect::from_min_size(
+                origin + egui::vec2(pos[0], pos[1]),
+                egui::vec2(size[0].max(1.0), size[1].max(1.0)),
+            );
+            let (anchor, x) = match align {
+                TextAlign::Left   => (egui::Align2::LEFT_TOP,   r.min.x),
+                TextAlign::Center => (egui::Align2::CENTER_TOP, r.center().x),
+                TextAlign::Right  => (egui::Align2::RIGHT_TOP,  r.max.x),
+            };
+            let fcol = rgba_to_color32(*fill);
+            let ocol = rgba_to_color32(*outline);
+            // Cheap text outline: paint 8-direction offset copies first.
+            if ocol.a() > 0 && *outline_px > 0.05 {
+                for (dx, dy) in [(-1.0,0.0),(1.0,0.0),(0.0,-1.0),(0.0,1.0),(-1.0,-1.0),(1.0,-1.0),(-1.0,1.0),(1.0,1.0)] {
+                    painter.text(
+                        egui::pos2(x + dx * *outline_px, r.min.y + dy * *outline_px),
+                        anchor, text,
+                        egui::FontId::proportional(*font_size),
+                        ocol,
+                    );
+                }
+            }
+            painter.text(
+                egui::pos2(x, r.min.y),
+                anchor, text,
+                egui::FontId::proportional(*font_size),
+                fcol,
+            );
+        }
+        LayoutDecoration::Svg { pos, size, svg_data, rev, tint, tint_mode, stroke, stroke_px } => {
+            let r = egui::Rect::from_min_size(
+                origin + egui::vec2(pos[0], pos[1]),
+                egui::vec2(size[0].max(8.0), size[1].max(8.0)),
+            );
+            let scol = rgba_to_color32(*stroke);
+            if scol.a() > 0 && *stroke_px > 0.05 {
+                painter.rect_stroke(r, 0.0,
+                    egui::Stroke::new(*stroke_px, scol),
+                    egui::StrokeKind::Inside);
+            }
+            if svg_data.is_empty() {
+                painter.rect_stroke(r, 2.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                    egui::StrokeKind::Inside);
+                painter.text(r.center(), egui::Align2::CENTER_CENTER, "SVG",
+                    egui::FontId::proportional(11.0), egui::Color32::from_gray(140));
+                return;
+            }
+            let pw = (r.width().round() as u32).max(1);
+            let ph = (r.height().round() as u32).max(1);
+            let ctx = painter.ctx();
+            let cache_key = egui::Id::new((
+                "deco_svg_tex", svg_data.as_ptr() as usize, *rev, pw, ph, tint_mode.as_str(),
+                tint[0], tint[1], tint[2], tint[3],
+            ));
+            let cached = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key));
+            let tex = match cached {
+                Some(t) => Some(t),
+                None => {
+                    rasterize_svg_recolored(svg_data, pw, ph, tint_mode, rgba_to_color32(*tint))
+                        .map(|img| {
+                            let h = ctx.load_texture(
+                                format!("deco-svg-{}-{}", *rev, pw),
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            ctx.data_mut(|d| d.insert_temp(cache_key, h.clone()));
+                            h
+                        })
+                }
+            };
+            if let Some(tex) = tex {
+                painter.image(
+                    tex.id(), r,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+    }
+}
+
+/// Render + interaction for the decorations list. Painted under exposed
+/// modules. In Layout mode each item gets a dashed outline, drag area, and
+/// corner resize handle (Line uses two endpoint handles instead). Click
+/// selects; right-click opens the per-type context menu.
+fn show_subpatch_decorations(
+    outer_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    is_layout_mode: bool,
+    snap_enabled: bool,
+    snap_grid: f32,
+) {
+    let origin = ui.cursor().min;
+    let snap = |v: f32| -> f32 {
+        if snap_enabled && snap_grid > 0.5 { (v / snap_grid).round() * snap_grid } else { v }
+    };
+
+    // Snapshot decorations so we can paint without holding a mutable borrow.
+    let decos: Vec<LayoutDecoration> = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .map(|sp| sp.decorations.clone())
+        .unwrap_or_default();
+
+    // Paint pass (under everything, no interaction).
+    {
+        let painter = ui.painter().with_clip_rect(
+            ui.clip_rect()
+        );
+        for d in decos.iter() {
+            paint_decoration(&painter, origin, d);
+        }
+    }
+
+    if !is_layout_mode { return; }
+
+    let selected = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| sp.selected_deco);
+
+    const RESIZE_HANDLE: f32 = 12.0;
+    let mut new_pos:  Vec<Option<[f32; 2]>> = vec![None; decos.len()];
+    let mut new_size: Vec<Option<[f32; 2]>> = vec![None; decos.len()];
+    let mut new_line: Vec<Option<([f32;2],[f32;2])>> = vec![None; decos.len()];
+    let mut select_idx: Option<usize> = None;
+    let mut deselect = false;
+    let mut zaction: Option<(usize, &'static str)> = None;
+    let mut delete_idx: Option<usize> = None;
+
+    let shift_held = ui.input(|i| i.modifiers.shift);
+
+    let drag_pos_id  = |i: usize| egui::Id::new(("deco_drag_pos",  outer_id.0, i));
+    let drag_size_id = |i: usize| egui::Id::new(("deco_drag_size", outer_id.0, i));
+    let drag_a_id    = |i: usize| egui::Id::new(("deco_drag_a",    outer_id.0, i));
+    let drag_b_id    = |i: usize| egui::Id::new(("deco_drag_b",    outer_id.0, i));
+
+    for (idx, d) in decos.iter().enumerate() {
+        let (lp, ls) = d.bbox();
+        let rect = egui::Rect::from_min_size(
+            origin + egui::vec2(lp[0], lp[1]),
+            egui::vec2(ls[0].max(8.0), ls[1].max(8.0)),
+        );
+
+        // Dashed selection outline.
+        let is_sel = selected == Some(idx);
+        let col = if is_sel {
+            egui::Color32::from_rgba_unmultiplied(255, 220, 120, 220)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(150, 220, 255, 130)
+        };
+        let stroke = egui::Stroke::new(1.0, col);
+        let r = rect;
+        ui.painter().line_segment([r.left_top(),     r.right_top()],    stroke);
+        ui.painter().line_segment([r.right_top(),    r.right_bottom()], stroke);
+        ui.painter().line_segment([r.right_bottom(), r.left_bottom()],  stroke);
+        ui.painter().line_segment([r.left_bottom(),  r.left_top()],     stroke);
+
+        // Body interact (click/drag/right-click).
+        let body_resp = ui.interact(
+            rect,
+            egui::Id::new(("deco_body", outer_id.0, idx)),
+            egui::Sense::click_and_drag(),
+        );
+        if body_resp.clicked() {
+            select_idx = Some(idx);
+        }
+
+        // Line: two endpoint handles instead of corner resize.
+        if matches!(d, LayoutDecoration::Line { .. }) {
+            let (a, b) = if let LayoutDecoration::Line { a, b, .. } = d { (*a, *b) } else { unreachable!() };
+            let pa = origin + egui::vec2(a[0], a[1]);
+            let pb = origin + egui::vec2(b[0], b[1]);
+            let h = 8.0;
+            let ha_rect = egui::Rect::from_center_size(pa, egui::vec2(h, h));
+            let hb_rect = egui::Rect::from_center_size(pb, egui::vec2(h, h));
+            ui.painter().rect_filled(ha_rect, 1.0, col);
+            ui.painter().rect_filled(hb_rect, 1.0, col);
+            let ar = ui.interact(ha_rect, egui::Id::new(("deco_la", outer_id.0, idx)), egui::Sense::click_and_drag());
+            let br = ui.interact(hb_rect, egui::Id::new(("deco_lb", outer_id.0, idx)), egui::Sense::click_and_drag());
+
+            if ar.drag_started() {
+                ui.ctx().data_mut(|d| d.insert_temp(drag_a_id(idx), [a[0], a[1], 0.0f32, 0.0f32]));
+            }
+            if ar.dragged_by(egui::PointerButton::Primary) {
+                let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(drag_a_id(idx))).unwrap_or([a[0],a[1],0.0,0.0]);
+                let dd = ar.drag_delta();
+                ui.ctx().data_mut(|d| d.insert_temp(drag_a_id(idx), [prev[0],prev[1], prev[2]+dd.x, prev[3]+dd.y]));
+                let na = [snap(prev[0] + prev[2] + dd.x), snap(prev[1] + prev[3] + dd.y)];
+                new_line[idx] = Some((na, b));
+            }
+            if br.drag_started() {
+                ui.ctx().data_mut(|d| d.insert_temp(drag_b_id(idx), [b[0], b[1], 0.0f32, 0.0f32]));
+            }
+            if br.dragged_by(egui::PointerButton::Primary) {
+                let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(drag_b_id(idx))).unwrap_or([b[0],b[1],0.0,0.0]);
+                let dd = br.drag_delta();
+                ui.ctx().data_mut(|d| d.insert_temp(drag_b_id(idx), [prev[0],prev[1], prev[2]+dd.x, prev[3]+dd.y]));
+                let nb = [snap(prev[0] + prev[2] + dd.x), snap(prev[1] + prev[3] + dd.y)];
+                let current_a = new_line[idx].map(|p| p.0).unwrap_or(a);
+                new_line[idx] = Some((current_a, nb));
+            }
+        } else {
+            // Resize handle at bottom-right corner.
+            let handle_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.max.x - RESIZE_HANDLE, rect.max.y - RESIZE_HANDLE),
+                egui::vec2(RESIZE_HANDLE, RESIZE_HANDLE),
+            );
+            let h_resp = ui.interact(
+                handle_rect,
+                egui::Id::new(("deco_resize", outer_id.0, idx)),
+                egui::Sense::click_and_drag(),
+            );
+            ui.painter().rect_filled(handle_rect, 2.0,
+                if h_resp.hovered() || h_resp.dragged() { col }
+                else { egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 80) });
+
+            if h_resp.drag_started() {
+                ui.ctx().data_mut(|d| d.insert_temp(drag_size_id(idx), [ls[0], ls[1], 0.0f32, 0.0f32]));
+            }
+            if h_resp.dragged_by(egui::PointerButton::Primary) {
+                let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(drag_size_id(idx))).unwrap_or([ls[0],ls[1],0.0,0.0]);
+                let dd = h_resp.drag_delta();
+                let mut ax = prev[2] + dd.x;
+                let mut ay = prev[3] + dd.y;
+                if shift_held {
+                    let aspect = (prev[0] / prev[1].max(1.0)).max(0.0001);
+                    if ax.abs() * (1.0 / aspect) > ay.abs() { ay = ax / aspect; } else { ax = ay * aspect; }
+                }
+                ui.ctx().data_mut(|d| d.insert_temp(drag_size_id(idx), [prev[0], prev[1], ax, ay]));
+                let tw = snap(prev[0] + ax).max(8.0);
+                let th = snap(prev[1] + ay).max(8.0);
+                new_size[idx] = Some([tw, th]);
+            }
+        }
+
+        // Body drag (move). Suppressed while the resize/endpoint handles claim input.
+        if body_resp.drag_started() && body_resp.dragged_by(egui::PointerButton::Primary) {
+            ui.ctx().data_mut(|d| d.insert_temp(drag_pos_id(idx), [lp[0], lp[1], 0.0f32, 0.0f32]));
+            select_idx = Some(idx);
+        }
+        if body_resp.dragged_by(egui::PointerButton::Primary) {
+            let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(drag_pos_id(idx))).unwrap_or([lp[0],lp[1],0.0,0.0]);
+            let dd = body_resp.drag_delta();
+            ui.ctx().data_mut(|d| d.insert_temp(drag_pos_id(idx), [prev[0], prev[1], prev[2]+dd.x, prev[3]+dd.y]));
+            let tx = snap(prev[0] + prev[2] + dd.x).max(0.0);
+            let ty = snap(prev[1] + prev[3] + dd.y).max(0.0);
+            // For Line, move both endpoints together.
+            if let LayoutDecoration::Line { a, b, .. } = d {
+                let delta = [tx - lp[0], ty - lp[1]];
+                new_line[idx] = Some(([a[0]+delta[0], a[1]+delta[1]], [b[0]+delta[0], b[1]+delta[1]]));
+            } else {
+                new_pos[idx] = Some([tx, ty]);
+            }
+        }
+
+        // Right-click menu: select + z-order + delete + type-specific shortcuts.
+        body_resp.context_menu(|ui| {
+            ui.label(egui::RichText::new(d.type_label()).small().weak());
+            ui.separator();
+            ui.menu_button("Z-order", |ui| {
+                if ui.button("To Top").clicked()    { zaction = Some((idx, "top"));    ui.close_menu(); }
+                if ui.button("Up").clicked()        { zaction = Some((idx, "up"));     ui.close_menu(); }
+                if ui.button("Down").clicked()      { zaction = Some((idx, "down"));   ui.close_menu(); }
+                if ui.button("To Bottom").clicked() { zaction = Some((idx, "bottom")); ui.close_menu(); }
+            });
+            if ui.button("Delete").clicked() { delete_idx = Some(idx); ui.close_menu(); }
+        });
+    }
+
+    // Empty-area context menu = "Add ▶" + deselect.
+    let body_bg = ui.interact(
+        ui.clip_rect(),
+        egui::Id::new(("deco_bg", outer_id.0)),
+        egui::Sense::click(),
+    );
+    if body_bg.clicked() {
+        deselect = true;
+    }
+    let mut bg_add: Option<&'static str> = None;
+    body_bg.context_menu(|ui| {
+        ui.menu_button("Add", |ui| {
+            if ui.button("Text").clicked()      { bg_add = Some("text");    ui.close_menu(); }
+            if ui.button("Rectangle").clicked() { bg_add = Some("rect");    ui.close_menu(); }
+            if ui.button("Ellipse").clicked()   { bg_add = Some("ellipse"); ui.close_menu(); }
+            if ui.button("Line").clicked()      { bg_add = Some("line");    ui.close_menu(); }
+            if ui.button("SVG").clicked()       { bg_add = Some("svg");     ui.close_menu(); }
+        });
+    });
+
+    // Commit all updates.
+    if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+        let n = sp.decorations.len();
+        for (i, d) in sp.decorations.iter_mut().enumerate() {
+            if let Some(p) = new_pos.get(i).copied().flatten() {
+                match d {
+                    LayoutDecoration::Text { pos, .. }
+                    | LayoutDecoration::Rect { pos, .. }
+                    | LayoutDecoration::Ellipse { pos, .. }
+                    | LayoutDecoration::Svg  { pos, .. } => { *pos = p; }
+                    _ => {}
+                }
+            }
+            if let Some(s) = new_size.get(i).copied().flatten() {
+                match d {
+                    LayoutDecoration::Text { size, .. }
+                    | LayoutDecoration::Rect { size, .. }
+                    | LayoutDecoration::Ellipse { size, .. }
+                    | LayoutDecoration::Svg  { size, .. } => { *size = s; }
+                    _ => {}
+                }
+            }
+            if let Some((na, nb)) = new_line.get(i).copied().flatten() {
+                if let LayoutDecoration::Line { a, b, .. } = d {
+                    *a = na; *b = nb;
+                }
+            }
+        }
+        if let Some(i) = select_idx { sp.selected_deco = Some(i); sp.selected_pin = None; }
+        if deselect { sp.selected_deco = None; }
+        if let Some((i, act)) = zaction {
+            apply_zorder_action(&mut sp.decorations, i, act, n);
+            if Some(i) == sp.selected_deco {
+                // Recompute index of the moved item.
+                sp.selected_deco = match act {
+                    "up"     if i + 1 < n => Some(i + 1),
+                    "down"   if i > 0     => Some(i - 1),
+                    "top"    if i + 1 < n => Some(sp.decorations.len() - 1),
+                    "bottom" if i > 0     => Some(0),
+                    _ => sp.selected_deco,
+                };
+            }
+        }
+        if let Some(i) = delete_idx {
+            if i < sp.decorations.len() {
+                sp.decorations.remove(i);
+                if sp.selected_deco == Some(i) { sp.selected_deco = None; }
+                else if let Some(s) = sp.selected_deco { if s > i { sp.selected_deco = Some(s - 1); } }
+            }
+        }
+        if let Some(kind) = bg_add {
+            let d = make_default_decoration(kind);
+            sp.decorations.push(d);
+            sp.selected_deco = Some(sp.decorations.len() - 1);
+        }
+    }
 }
