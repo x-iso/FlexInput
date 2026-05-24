@@ -186,6 +186,8 @@ pub fn exposable_elements(module_id: &str) -> &'static [(&'static str, &'static 
             ("controls", "Win / Scale / Auto / Bi-Uni"),
         ],
         "display.vectorscope"  => &[("display", "Vectorscope display")],
+        "module.remapper"      => &[("whole_module", "Whole module")],
+        "module.map_action"    => &[("whole_module", "Whole module")],
         _ => &[],
     }
 }

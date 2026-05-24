@@ -363,7 +363,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
                         .unwrap_or_else(|| "auto".to_string());
                     let current = Skin::from_str(&current_str);
-                    let resolved = remapper_resolve_skin(snarl, node, &current_str, None);
+                    let resolved = remapper_resolve_skin(snarl, node, &current_str, self.automap_parent.as_ref());
                     let selected_text = if current == Skin::Auto {
                         format!("auto · {}", resolved.label())
                     } else {
@@ -872,7 +872,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
             "module.map_action" => show_map_action_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
             "subpatch" => {
-                if show_subpatch_body(node_id, ui, snarl) {
+                if show_subpatch_body(
+                    node_id, ui, snarl,
+                    self.live_signals, self.panic_shortcut, self.automap_parent.as_ref(),
+                ) {
                     self.edit_subpatch_request = Some(node_id);
                 }
             }
@@ -3313,7 +3316,35 @@ fn show_inlet_outlet_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
 /// dashed selection outline + corner resize handle and the underlying widget
 /// is disabled so the user can drag/resize without accidentally operating it.
 /// In Lock mode the widget is fully interactive and no chrome is drawn.
-fn show_subpatch_body(outer_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+fn show_subpatch_body(
+    outer_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) -> bool {
+    // Migrate legacy pins on Remapper / Map Action: older patches stored
+    // `element_id = "default"` (whole-body crop) which the renderer no
+    // longer supports. Rewrite in place to `"whole_module"` so the new
+    // scaled-and-cropped renderer picks them up automatically.
+    if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+        // Snapshot inner module ids first to avoid holding two borrows.
+        let module_ids: std::collections::HashMap<usize, String> = sp.snarl
+            .nodes_ids_data()
+            .map(|(id, info)| (id.0, info.value.module_id.clone()))
+            .collect();
+        for exp in sp.exposed_modules.iter_mut() {
+            if exp.element_id == "default" {
+                if let Some(mid) = module_ids.get(&exp.inner_node_id) {
+                    if mid == "module.remapper" || mid == "module.map_action" {
+                        exp.element_id = "whole_module".to_string();
+                    }
+                }
+            }
+        }
+    }
+
     let exposed: Vec<ExposedModule> = snarl.get_node(outer_id)
         .and_then(|n| n.subpatch.as_ref())
         .map(|sp| sp.exposed_modules.clone())
@@ -3326,6 +3357,16 @@ fn show_subpatch_body(outer_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
     let is_unlocked = snarl.get_node(outer_id)
         .map(|n| n.extra.layout_unlocked)
         .unwrap_or(false);
+
+    // Snapshot the outer snarl so the whole-module pinned renderers can build
+    // an `AutomapGlowParent` describing this subpatch's boundary even while
+    // they hold a mutable borrow on `sp.snarl`. Cloning the outer snarl is
+    // overkill in pure cost but pinned-widget rendering is rare enough that
+    // this is fine — and any subpatch with no whole-module pins skips it.
+    let needs_outer_snapshot = !is_unlocked && exposed.iter().any(|e| e.element_id == "whole_module");
+    let outer_snapshot: Option<Snarl<NodeData>> = if needs_outer_snapshot {
+        Some(snarl.clone())
+    } else { None };
 
     let (snap_enabled, snap_grid) = snarl.get_node(outer_id)
         .and_then(|n| n.subpatch.as_ref())
@@ -3421,6 +3462,8 @@ fn show_subpatch_body(outer_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
                     render_pinned_element(
                         inner_id_c, module_id, &exp.element_id, ui, &mut sp.snarl,
                         mod_size,
+                        live_signals, panic_shortcut, automap_parent,
+                        outer_snapshot.as_ref(), outer_id, is_unlocked,
                     );
                 }
             });
@@ -3627,12 +3670,51 @@ fn render_pinned_element(
     ui: &mut egui::Ui,
     inner_snarl: &mut Snarl<NodeData>,
     container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    outer_snapshot: Option<&Snarl<NodeData>>,
+    outer_id: NodeId,
+    is_layout_mode: bool,
 ) {
     let cap_w = container_size.x.max(20.0);
-    ui.set_max_width(cap_w);
+    // Whole-module pinned renderers manage their own width/clip; don't cap
+    // ahead of them.
+    let is_whole_module = element_id == "whole_module";
+    if !is_whole_module {
+        ui.set_max_width(cap_w);
+    }
 
     // ── Per-element renderers ────────────────────────────────────────────────
+    // Build a parent frame describing THIS subpatch's boundary so the inner
+    // module body can walk through its inlet → outer wire → device source.
+    // Only meaningful for whole-module pins (other renderers don't read
+    // upstream wiring); built lazily from `outer_snapshot` to avoid carrying
+    // unused references when no whole-module pin is present.
+    let bridged_parent_holder: Option<AutomapGlowParent<'_>> = match outer_snapshot {
+        Some(outer_snarl) => Some(AutomapGlowParent {
+            snarl: outer_snarl,
+            subpatch_node_id: outer_id,
+            prev: automap_parent,
+        }),
+        None => None,
+    };
+    let bridged_parent = bridged_parent_holder.as_ref();
     match (module_id, element_id) {
+        ("module.remapper", "whole_module") => {
+            render_remapper_whole_module(
+                inner_id, ui, inner_snarl, container_size,
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
+            return;
+        }
+        ("module.map_action", "whole_module") => {
+            render_map_action_whole_module(
+                inner_id, ui, inner_snarl, container_size,
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
+            return;
+        }
         // Knob slider: scaled-up slider taking the full container width.
         ("module.knob", "value") => {
             render_knob_value(inner_id, ui, inner_snarl, container_size);
@@ -3852,6 +3934,385 @@ fn dispatch_pinned_body(
         _ => { /* no body for this module type */ }
     }
 }
+
+// ── Whole-module pinned renderers (Remapper / Map Action) ─────────────────────
+//
+// Renders the full module body scaled to the user-chosen container width and
+// vertically cropped to the container height. Content past the crop is reachable
+// by mouse-wheel scrolling. On any change to the capture draft or mappings list
+// the view auto-snaps back to the top so newly-detected input is always visible.
+//
+// Strategy: paint the body unscaled into a fresh layer at body-coords, then
+// install a TSTransform on that layer (scale + translate) to project body-space
+// onto container-space. Using a real layer transform (not `with_visual_transform`)
+// is essential so pointer hits inside the body — Learn/Add/× buttons — map back
+// correctly through the inverse transform.
+//
+// The inner module body reads its first input pin to detect a wired AutoMap
+// source; we construct that InPin from the *inner* snarl so the body sees the
+// same wiring it would when rendered inside the sub-patch editor.
+
+const REMAP_DESIGN_W: f32 = 260.0;
+
+fn remap_body_inputs_for(
+    inner_id: NodeId,
+    inner_snarl: &Snarl<NodeData>,
+) -> Vec<InPin> {
+    let n_in = inner_snarl.get_node(inner_id).map(|n| n.inputs.len()).unwrap_or(0);
+    (0..n_in)
+        .map(|i| inner_snarl.in_pin(InPinId { node: inner_id, input: i }))
+        .collect()
+}
+
+/// Per-pinned-widget runtime state stashed in egui ctx data.
+///   (scroll_offset, last_draft_hash, last_mappings_hash)
+///
+/// Hashes (not lengths) so swapping one captured button for another — same
+/// count, different content — still triggers the auto-scroll-to-top.
+type RemapPinState = (f32, u64, u64);
+
+fn remap_hash_draft(node: &NodeData, with_output: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for s in remapper_read_str_array(node, "draft_input") {
+        s.hash(&mut h);
+        0u8.hash(&mut h); // separator
+    }
+    if with_output {
+        1u8.hash(&mut h);
+        for s in remapper_read_str_array(node, "draft_output") {
+            s.hash(&mut h);
+            0u8.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn remap_hash_mappings(node: &NodeData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(arr) = node.params.get("mappings").and_then(|v| v.as_array()) {
+        for m in arr {
+            // serde_json::Value already implements Hash via its variants for
+            // strings/numbers/bools/null but not for arrays/objects directly.
+            // Stringify for a stable fingerprint — patches are small enough
+            // that the cost is negligible per frame.
+            m.to_string().hash(&mut h);
+            0u8.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn remap_pin_state_id(outer_layer: egui::LayerId, inner_id: NodeId, tag: &'static str) -> egui::Id {
+    egui::Id::new(("fxi_remap_pin_state", outer_layer, inner_id.0, tag))
+}
+
+fn remap_layer_id(outer_layer: egui::LayerId, inner_id: NodeId, tag: &'static str) -> egui::LayerId {
+    egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("fxi_remap_pin_layer", outer_layer, inner_id.0, tag)),
+    )
+}
+
+fn render_remapper_whole_module(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    is_layout_mode: bool,
+) {
+    render_remap_whole_module_impl(
+        "remapper", inner_id, ui, inner_snarl, container_size,
+        live_signals, panic_shortcut, automap_parent, is_layout_mode,
+        "Remapper",
+        |id, ins, ui, sn, sigs, panic, am| {
+            show_remapper_body(id, ins, ui, sn, sigs, panic, am);
+        },
+        remap_hash_mappings,
+        |n| remap_hash_draft(n, true),
+    );
+}
+
+fn render_map_action_whole_module(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    is_layout_mode: bool,
+) {
+    render_remap_whole_module_impl(
+        "map_action", inner_id, ui, inner_snarl, container_size,
+        live_signals, panic_shortcut, automap_parent, is_layout_mode,
+        "Map Action",
+        |id, ins, ui, sn, sigs, panic, am| {
+            show_map_action_body(id, ins, ui, sn, sigs, panic, am);
+        },
+        remap_hash_mappings,
+        |n| remap_hash_draft(n, false),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_remap_whole_module_impl<BodyFn, MapLenFn, DraftLenFn>(
+    tag: &'static str,
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    is_layout_mode: bool,
+    placeholder_label: &'static str,
+    body_fn: BodyFn,
+    map_len_fn: MapLenFn,
+    draft_len_fn: DraftLenFn,
+)
+where
+    BodyFn: FnOnce(
+        NodeId,
+        &[InPin],
+        &mut egui::Ui,
+        &mut Snarl<NodeData>,
+        &std::collections::HashMap<(String, String), Signal>,
+        &crate::app::PanicShortcut,
+        Option<&AutomapGlowParent<'_>>,
+    ),
+    MapLenFn:   Fn(&NodeData) -> u64,
+    DraftLenFn: Fn(&NodeData) -> u64,
+{
+    let _ = placeholder_label; // kept on the call sig for future per-module styling
+
+    // ── 1. Reserve the container area in the outer UI ───────────────────────
+    // Use no sense — in lock mode the body layer handles interactions; in
+    // layout mode the parent UI's drag/resize/right-click handles do.
+    let (container_rect, _container_resp) = ui.allocate_exact_size(
+        container_size,
+        egui::Sense::hover(),
+    );
+
+    // Cap min sizes so the scale math stays sane.
+    let container_w = container_size.x.max(40.0);
+    let container_h = container_size.y.max(20.0);
+    let scale = (container_w / REMAP_DESIGN_W).clamp(0.25, 4.0);
+
+    // ── 2. Detect "new capture" — compare current state vs last frame ───────
+    // (Skip update in layout mode so the user's chosen scroll position is
+    // preserved across layout/lock toggles.)
+    let state_key = remap_pin_state_id(ui.layer_id(), inner_id, tag);
+    let (cur_draft_h, cur_map_h): (u64, u64) = inner_snarl.get_node(inner_id).map(|n| {
+        (draft_len_fn(n), map_len_fn(n))
+    }).unwrap_or((0, 0));
+    let prev: Option<RemapPinState> = ui.ctx().data(|d| d.get_temp(state_key));
+    let (prev_offset, prev_draft, prev_map) = prev.unwrap_or((0.0, cur_draft_h, cur_map_h));
+    let any_capture_change = (cur_draft_h != prev_draft || cur_map_h != prev_map)
+        && !is_layout_mode;
+
+    // ── 3. Compute pointer-over check via raw input (the body layer above
+    //       intercepts the parent's hover Response, so we go to the source).
+    //       Convert global pointer → parent-UI local via inverse layer xform.
+    let parent_to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let from_global = parent_to_global.inverse();
+    let pointer_over = ui.ctx().input(|i| i.pointer.hover_pos())
+        .map(|g| container_rect.contains(from_global * g))
+        .unwrap_or(false);
+
+    // ── 4. Compute scroll offset (in body-space px, before scaling) ─────────
+    let mut scroll_offset_body = if any_capture_change { 0.0 } else { prev_offset };
+    if pointer_over && !is_layout_mode {
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+        if wheel != 0.0 {
+            scroll_offset_body -= wheel / scale;
+        }
+    }
+
+    // ── 5. Render the body — two paths depending on mode ────────────────────
+    //
+    // LOCK mode (live, interactive):
+    //   Paint into a fresh transform layer; install a TSTransform that
+    //   scales + scrolls + composes with the parent layer's transform.
+    //   This is the only way to get true scaled visuals with working
+    //   input routing.
+    //
+    // LAYOUT mode (preview, non-interactive):
+    //   Use `ui.with_visual_transform` to scale visuals only — no layer,
+    //   no input claim. Parent UI's drag / resize / right-click handles
+    //   stay fully responsive because there is no competing layer above.
+    let inputs = remap_body_inputs_for(inner_id, inner_snarl);
+    let body_h: f32;
+
+    if is_layout_mode {
+        // Visual-only transform: scale around (0,0), then translate so
+        // body-origin lands at `container_rect.min`. with_visual_transform
+        // re-bases existing shape coords; we still pre-allocate a child
+        // UI at body-coord origin (0,0) so widgets compute their rects in
+        // a normalized space before the visual transform reapplies them.
+        let xform = egui::emath::TSTransform::new(
+            container_rect.min.to_vec2()
+                - egui::vec2(0.0, scroll_offset_body * scale),
+            scale,
+        );
+        let inner = ui.with_visual_transform(xform, |ui| {
+            let body_max_rect = egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(REMAP_DESIGN_W, 100_000.0),
+            );
+            let mut body_ui = ui.new_child(
+                egui::UiBuilder::new().max_rect(body_max_rect),
+            );
+            // Clip to the visible band in body coords; with_visual_transform
+            // will re-base these shapes into the container_rect on paint.
+            let visible_band = egui::Rect::from_min_size(
+                egui::pos2(0.0, scroll_offset_body),
+                egui::vec2(REMAP_DESIGN_W, container_h / scale),
+            );
+            body_ui.set_clip_rect(visible_band);
+            body_ui.add_enabled_ui(false, |body_ui| {
+                body_fn(
+                    inner_id,
+                    &inputs,
+                    body_ui,
+                    inner_snarl,
+                    live_signals,
+                    panic_shortcut,
+                    automap_parent,
+                );
+            });
+            body_ui.min_rect().height().max(1.0)
+        });
+        body_h = inner.inner;
+    } else {
+        let body_layer = remap_layer_id(ui.layer_id(), inner_id, tag);
+        let body_max_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(REMAP_DESIGN_W, 100_000.0),
+        );
+        let mut body_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .layer_id(body_layer)
+                .max_rect(body_max_rect),
+        );
+        let visible_band = egui::Rect::from_min_size(
+            egui::pos2(0.0, scroll_offset_body),
+            egui::vec2(REMAP_DESIGN_W, container_h / scale),
+        );
+        body_ui.set_clip_rect(visible_band);
+
+        body_fn(
+            inner_id,
+            &inputs,
+            &mut body_ui,
+            inner_snarl,
+            live_signals,
+            panic_shortcut,
+            automap_parent,
+        );
+        body_h = body_ui.min_rect().height().max(1.0);
+
+        // Clamp scroll offset using actual body height before painting chrome.
+        let max_offset_body = (body_h - container_h / scale).max(0.0);
+        if scroll_offset_body < 0.0 { scroll_offset_body = 0.0; }
+        if scroll_offset_body > max_offset_body { scroll_offset_body = max_offset_body; }
+
+        // ── Scrollbar — painted INTO the body layer so it shares the layer's
+        //    z-order (always above the body widgets, never lost behind a
+        //    sublayer). Coordinates are in body-space; we add `scroll_offset_body`
+        //    to the Y so the scrollbar stays stationary on screen as the body
+        //    scrolls (the body layer's translation includes -scroll_offset_body*scale).
+        let mut new_scroll = scroll_offset_body;
+        if max_offset_body > 0.5 {
+            // Visible band in body coords.
+            let band_top = scroll_offset_body;
+            let band_h_body = container_h / scale;
+            // Scrollbar geometry, all in body-coords. Convert pixel sizes to
+            // body-coords by dividing by `scale` so the on-screen size stays
+            // constant regardless of the user's zoom on the widget.
+            let sb_w_body = 6.0 / scale;
+            let sb_inset_body = 1.0 / scale;
+            let track_x_min = REMAP_DESIGN_W - sb_w_body - sb_inset_body;
+            let track_y_min = band_top + sb_inset_body;
+            let track_y_max = band_top + band_h_body - sb_inset_body;
+            let track_h = (track_y_max - track_y_min).max(1.0);
+            let track_rect = egui::Rect::from_min_max(
+                egui::pos2(track_x_min, track_y_min),
+                egui::pos2(track_x_min + sb_w_body, track_y_max),
+            );
+
+            let visible_frac = (band_h_body / body_h).clamp(0.05, 1.0);
+            let min_thumb_body = 14.0 / scale;
+            let thumb_h = (track_h * visible_frac).max(min_thumb_body);
+            let scroll_frac = (scroll_offset_body / max_offset_body).clamp(0.0, 1.0);
+            let thumb_y = track_y_min + (track_h - thumb_h) * scroll_frac;
+            let thumb_rect = egui::Rect::from_min_size(
+                egui::pos2(track_x_min, thumb_y),
+                egui::vec2(sb_w_body, thumb_h),
+            );
+
+            // Interaction on the body layer at thumb_rect (body-coords).
+            let drag_id = egui::Id::new(("fxi_remap_sb_drag", body_layer, inner_id.0));
+            let thumb_resp = body_ui.interact(thumb_rect, drag_id, egui::Sense::click_and_drag());
+            if thumb_resp.drag_started() {
+                body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (scroll_offset_body, 0.0f32)));
+            }
+            if thumb_resp.dragged() {
+                let track_travel = (track_h - thumb_h).max(1.0);
+                // drag_delta is in body layer coords (already scale-adjusted by
+                // the layer's inverse transform). track_travel in same coords.
+                let body_per_track_px = max_offset_body / track_travel;
+                let (start, acc) = body_ui.ctx().data(|d| d.get_temp::<(f32, f32)>(drag_id))
+                    .unwrap_or((scroll_offset_body, 0.0));
+                let new_acc = acc + thumb_resp.drag_delta().y;
+                body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (start, new_acc)));
+                new_scroll = (start + new_acc * body_per_track_px)
+                    .clamp(0.0, max_offset_body);
+            }
+            if thumb_resp.drag_stopped() {
+                body_ui.ctx().data_mut(|d| d.remove_temp::<(f32, f32)>(drag_id));
+            }
+
+            let painter = body_ui.painter();
+            let track_col = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14);
+            painter.rect_filled(track_rect, 2.0 / scale, track_col);
+            let thumb_col = if thumb_resp.dragged() {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180)
+            } else if thumb_resp.hovered() {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90)
+            };
+            painter.rect_filled(thumb_rect, 2.0 / scale, thumb_col);
+        }
+        scroll_offset_body = new_scroll;
+
+        let local_translation = container_rect.min.to_vec2()
+            - egui::vec2(0.0, scroll_offset_body * scale);
+        let local_xform = egui::emath::TSTransform::new(local_translation, scale);
+        ui.ctx().set_transform_layer(body_layer, parent_to_global * local_xform);
+        ui.ctx().set_sublayer(ui.layer_id(), body_layer);
+    }
+
+    // ── 6. Re-clamp scroll offset (in layout-mode path it isn't set above) ──
+    let max_offset_body = (body_h - container_h / scale).max(0.0);
+    if scroll_offset_body < 0.0 { scroll_offset_body = 0.0; }
+    if scroll_offset_body > max_offset_body { scroll_offset_body = max_offset_body; }
+
+    // ── 9. Persist updated state for next frame ─────────────────────────────
+    ui.ctx().data_mut(|d| {
+        d.insert_temp::<RemapPinState>(
+            state_key,
+            (scroll_offset_body, cur_draft_h, cur_map_h),
+        );
+    });
+}
+
 
 // ── Per-element pinned renderers ──────────────────────────────────────────────
 //
@@ -9363,7 +9824,7 @@ fn show_remapper_body(
     // payload_rect; clamp to a sane upper bound so wrap layouts don't get
     // NaN from infinity arithmetic.
     let body_h = ui.available_height().min(2000.0).max(28.0);
-    ui.allocate_ui_with_layout(
+    let body_resp = ui.allocate_ui_with_layout(
         egui::vec2(BODY_W, body_h),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
@@ -9388,22 +9849,14 @@ fn show_remapper_body(
         if !status.0.is_empty() {
             ui.label(egui::RichText::new(status.0).size(13.0).color(status.1));
         }
-        if wired {
-            let dev_txt = upstream_dev_id.clone().unwrap_or_else(|| "(none)".to_string());
-            ui.label(egui::RichText::new(format!("dev: {}  pressed: {:?}", dev_txt, pressed_now)).size(11.0).weak());
-        }
+        let _ = upstream_dev_id;
+        let _ = &pressed_now;
 
         // Draft input chips (only if non-empty).
         if !new_draft_input.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 remapper_render_chord(ui, &new_draft_input, skin);
             });
-            // Register the whole body as exposable for layout-mode pinning.
-            // Capture the min_rect of the body we just painted.
-            {
-                let rect = ui.min_rect();
-                register_exposable_element(ui, node_id, "default", rect);
-            }
         }
 
         // Draft output row (during learn).
@@ -9578,6 +10031,8 @@ fn show_remapper_body(
         }
     });
 
+    register_exposable_element(ui, node_id, "whole_module", body_resp.response.rect);
+
     // Request repaint so the state machine ticks each frame — both for
     // gamepad-driven capture (when wired) and OS-key learning (when in
     // learning phase regardless of wire state).
@@ -9705,26 +10160,41 @@ fn show_map_action_body(
         "capturing" => {
             if !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
                 new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
+                reset_click_mode = true;
             } else if !pressed_now.is_empty() {
                 new_draft_input.retain(|p| { !is_transient(p) || pressed_now.iter().any(|q| q == p) });
                 for p in &pressed_now {
                     if !new_draft_input.iter().any(|q| q == p) { new_draft_input.push(p.clone()); }
                 }
             }
-            let touchpad_idle = !upstream_dev_id.as_deref()
-                .and_then(|dev| {
-                    let a1 = live_signals.get(&(dev.to_string(), "touch1_active".to_string())).map(|s| s.as_bool()).unwrap_or(false);
-                    let a2 = live_signals.get(&(dev.to_string(), "touch2_active".to_string())).map(|s| s.as_bool()).unwrap_or(false);
-                    Some(!a1 && !a2)
+            // Latching: capture completes only when nothing is pressed AND
+            // the touchpad is genuinely idle (no fingers, no click held).
+            // Mirrors Remapper — without the `!touch_click_now` guard, a
+            // click held with no finger would look "empty" and latch early,
+            // wiping the click chord the next time a finger lands.
+            let touch_click_now_latch = upstream_dev_id.as_deref()
+                .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
+                .map(|s| s.as_bool()).unwrap_or(false);
+            let touchpad_idle = !touch_click_now_latch
+                && upstream_dev_id.as_deref().map(|dev| {
+                    let a1 = live_signals.get(&(dev.to_string(), "touch1_active".into()))
+                        .map(|s| s.as_bool()).unwrap_or(false);
+                    let a2 = live_signals.get(&(dev.to_string(), "touch2_active".into()))
+                        .map(|s| s.as_bool()).unwrap_or(false);
+                    !a1 && !a2
                 }).unwrap_or(true);
             if now_empty && touchpad_idle && !new_draft_input.is_empty() {
                 new_phase = "ready_to_add".to_string();
+                // Clear sticky click_mode so the next capture (e.g. a fresh
+                // touch without click) can register touch_* zones again.
+                reset_click_mode = true;
             }
         }
         "ready_to_add" => {
             if !rising.is_empty() && prev_was_empty {
                 new_phase = "capturing".to_string();
                 new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
+                reset_click_mode = true;
             }
         }
         _ => {}
@@ -9741,6 +10211,7 @@ fn show_map_action_body(
         if let Some(n) = snarl.get_node_mut(node_id) {
             remapper_write_str_array(n, "draft_input", &[]);
             remapper_write_str_array(n, "_pressed_prev", &[]);
+            n.params.insert("_tp_click_mode".to_string(), Value::from(false));
         }
     }
 
@@ -9748,6 +10219,9 @@ fn show_map_action_body(
         node.params.insert("ui_phase".to_string(), Value::String(new_phase.clone()));
         remapper_write_str_array(node, "draft_input", &new_draft_input);
         remapper_write_str_array(node, "_pressed_prev", &pressed_now);
+        if reset_click_mode {
+            node.params.insert("_tp_click_mode".to_string(), Value::from(false));
+        }
     }
 
     // Render
@@ -9758,7 +10232,7 @@ fn show_map_action_body(
 
     const BODY_W: f32 = 260.0;
     let body_h = ui.available_height().min(2000.0).max(28.0);
-    ui.allocate_ui_with_layout(
+    let body_resp = ui.allocate_ui_with_layout(
         egui::vec2(BODY_W, body_h),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
@@ -9775,10 +10249,8 @@ fn show_map_action_body(
             }
         };
         if !status.0.is_empty() { ui.label(egui::RichText::new(status.0).size(13.0).color(status.1)); }
-        if wired {
-            let dev_txt = upstream_dev_id.clone().unwrap_or_else(|| "(none)".to_string());
-            ui.label(egui::RichText::new(format!("dev: {}  pressed: {:?}", dev_txt, pressed_now)).size(11.0).weak());
-        }
+        let _ = upstream_dev_id;
+        let _ = &pressed_now;
 
         if !new_draft_input.is_empty() {
             ui.horizontal_wrapped(|ui| { remapper_render_chord(ui, &new_draft_input, skin); });
@@ -9800,6 +10272,8 @@ fn show_map_action_body(
                     node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
                     remapper_write_str_array(node, "draft_input", &[]);
                     remapper_write_str_array(node, "_pressed_prev", &[]);
+                    // Clear sticky click_mode so the next capture starts fresh.
+                    node.params.insert("_tp_click_mode".to_string(), Value::from(false));
                 }
             }
         });
@@ -9831,11 +10305,6 @@ fn show_map_action_body(
                         ui.allocate_ui_with_layout(egui::vec2(CHORD_COL_W, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             remapper_render_chord(ui, &in_pins, skin);
                         });
-                        // Register the whole body as exposable for layout-mode pinning.
-                        {
-                            let rect = ui.min_rect();
-                            register_exposable_element(ui, node_id, "default", rect);
-                        }
                     }
                 });
             }
@@ -9846,6 +10315,8 @@ fn show_map_action_body(
             }
         }
     });
+
+    register_exposable_element(ui, node_id, "whole_module", body_resp.response.rect);
 
     // Request repaint so capture ticks each frame while wired
     if wired { ui.ctx().request_repaint(); }
