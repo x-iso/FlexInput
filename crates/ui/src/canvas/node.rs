@@ -148,6 +148,51 @@ impl LayoutDecoration {
     }
 }
 
+/// Unified layout item: either a module pin (exposed inner-module widget) or
+/// a static decoration. The `items` Vec on `UiSubPatch` is in paint order
+/// (first = bottom, last = top), giving a single Z-order across both kinds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LayoutItem {
+    Module(ExposedModule),
+    Deco(LayoutDecoration),
+}
+
+impl LayoutItem {
+    pub fn bbox(&self) -> ([f32; 2], [f32; 2]) {
+        match self {
+            LayoutItem::Module(m) => (m.pos, m.size),
+            LayoutItem::Deco(d)   => d.bbox(),
+        }
+    }
+    /// Whether the given point (in body-local coords) hits this item. Lines
+    /// use a distance-to-segment test; others use the bbox.
+    pub fn hit_test(&self, p: [f32; 2]) -> bool {
+        if let LayoutItem::Deco(LayoutDecoration::Line { a, b, stroke_px, .. }) = self {
+            let tol = (stroke_px + 4.0).max(6.0);
+            point_line_dist(p, *a, *b) <= tol
+        } else {
+            let (lp, ls) = self.bbox();
+            p[0] >= lp[0] && p[1] >= lp[1] &&
+            p[0] <= lp[0] + ls[0].max(1.0) && p[1] <= lp[1] + ls[1].max(1.0)
+        }
+    }
+}
+
+fn point_line_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let abx = b[0] - a[0];
+    let aby = b[1] - a[1];
+    let len2 = abx * abx + aby * aby;
+    if len2 < 1e-6 {
+        let dx = p[0] - a[0]; let dy = p[1] - a[1];
+        return (dx * dx + dy * dy).sqrt();
+    }
+    let t = (((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / len2).clamp(0.0, 1.0);
+    let qx = a[0] + abx * t;
+    let qy = a[1] + aby * t;
+    let dx = p[0] - qx; let dy = p[1] - qy;
+    (dx * dx + dy * dy).sqrt()
+}
+
 /// Inner graph + declared I/O for a sub-patch (meta-module) node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiSubPatch {
@@ -156,27 +201,101 @@ pub struct UiSubPatch {
     pub pins_out: Vec<SubPatchPin>,
     #[serde(default = "default_inner_snarl")]
     pub snarl: Box<Snarl<NodeData>>,
-    /// Inner modules pinned onto the sub-patch body for direct interaction.
+    /// Unified layout items in paint order (first = bottom). Modules and
+    /// decorations share one Z-order list.
     #[serde(default)]
+    pub items: Vec<LayoutItem>,
+    /// Legacy fields, read only — drained into `items` on first frame, then
+    /// never written back (skip_serializing_if).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exposed_modules: Vec<ExposedModule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decorations: Vec<LayoutDecoration>,
     /// Grid snap on layout-mode drag/resize.
     #[serde(default)]
     pub snap_enabled: bool,
     /// Grid step in logical pixels. Stepped in increments of 2 to keep things tidy.
     #[serde(default = "default_snap_grid_px")]
     pub snap_grid_px: u32,
-    /// Static layout decorations (text labels, SVGs, shapes) painted under
-    /// `exposed_modules`. Vec order = paint order (first = bottom).
-    #[serde(default)]
-    pub decorations: Vec<LayoutDecoration>,
-    /// Runtime-only: currently selected decoration index for the inspector
-    /// strip. Cleared on layout-mode exit.
+    /// Runtime-only: currently selected item index (into `items`). Cleared on
+    /// layout-mode exit.
     #[serde(skip)]
-    pub selected_deco: Option<usize>,
-    /// Runtime-only: currently selected exposed-module pin index, used by
-    /// the inspector strip to surface per-pin overrides (e.g. Text color).
+    pub selected_item: Option<usize>,
+    /// Runtime-only: tracks the last hit position + cursor pos for click-cycle
+    /// behavior (so repeated clicks at the same spot cycle through overlapping
+    /// items rather than always selecting the topmost).
     #[serde(skip)]
-    pub selected_pin: Option<usize>,
+    pub cycle_pos: Option<[f32; 2]>,
+}
+
+impl UiSubPatch {
+    /// Drain any legacy `exposed_modules` / `decorations` into the unified
+    /// `items` Vec. Decorations go to the bottom (preserving their internal
+    /// order), modules on top.
+    pub fn migrate_into_items(&mut self) {
+        if self.exposed_modules.is_empty() && self.decorations.is_empty() {
+            return;
+        }
+        let decos = std::mem::take(&mut self.decorations);
+        let mods  = std::mem::take(&mut self.exposed_modules);
+        let mut migrated: Vec<LayoutItem> = decos.into_iter().map(LayoutItem::Deco).collect();
+        migrated.extend(mods.into_iter().map(LayoutItem::Module));
+        // Prepend migrated items so previously-saved items (rare, since new
+        // schema is the writer) end up on top.
+        migrated.extend(std::mem::take(&mut self.items));
+        self.items = migrated;
+    }
+
+    /// True when no module is pinned and no decoration exists. Used to decide
+    /// whether the sub-patch body should be rendered at all.
+    pub fn is_layout_empty(&self) -> bool {
+        self.items.is_empty()
+            && self.exposed_modules.is_empty()
+            && self.decorations.is_empty()
+    }
+
+    /// Iterate over all module pins in `items`. Returns (item_idx, &ExposedModule).
+    pub fn iter_module_pins(&self) -> impl Iterator<Item = (usize, &ExposedModule)> {
+        self.items.iter().enumerate().filter_map(|(i, it)| match it {
+            LayoutItem::Module(m) => Some((i, m)),
+            _ => None,
+        })
+    }
+
+    /// Append a module pin to the top of the Z-order. Returns the new index.
+    pub fn push_module_pin(&mut self, m: ExposedModule) -> usize {
+        self.items.push(LayoutItem::Module(m));
+        self.items.len() - 1
+    }
+
+    /// True when any module pin references `inner_node_id`.
+    pub fn has_module_pin_for(&self, inner_node_id: usize) -> bool {
+        self.iter_module_pins().any(|(_, m)| m.inner_node_id == inner_node_id)
+    }
+
+    /// Remove all module pins referencing `inner_node_id`. Adjusts
+    /// `selected_item` to stay valid.
+    pub fn remove_module_pins_for(&mut self, inner_node_id: usize) {
+        let mut to_remove: Vec<usize> = self.items.iter().enumerate().filter_map(|(i, it)| {
+            matches!(it, LayoutItem::Module(m) if m.inner_node_id == inner_node_id).then_some(i)
+        }).collect();
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for i in to_remove {
+            self.items.remove(i);
+            if let Some(sel) = self.selected_item {
+                if sel == i { self.selected_item = None; }
+                else if sel > i { self.selected_item = Some(sel - 1); }
+            }
+        }
+    }
+
+    /// Largest Y reached by any module pin (used by the "next pin Y" cascade
+    /// when adding a new pin via the editor).
+    pub fn module_pins_bottom_y(&self) -> f32 {
+        self.iter_module_pins()
+            .map(|(_, m)| m.pos[1] + m.size[1])
+            .fold(0.0f32, f32::max)
+    }
 }
 
 fn default_snap_grid_px() -> u32 { 8 }
@@ -192,12 +311,13 @@ impl Default for UiSubPatch {
             pins_in: vec![],
             pins_out: vec![],
             snarl: default_inner_snarl(),
+            items: vec![],
             exposed_modules: vec![],
+            decorations: vec![],
             snap_enabled: false,
             snap_grid_px: default_snap_grid_px(),
-            decorations: vec![],
-            selected_deco: None,
-            selected_pin: None,
+            selected_item: None,
+            cycle_pos: None,
         }
     }
 }

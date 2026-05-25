@@ -1975,12 +1975,13 @@ pub fn group_into_subpatch(
         pins_in,
         pins_out,
         snarl: Box::new(inner_snarl),
+        items: vec![],
         exposed_modules: vec![],
+        decorations: vec![],
         snap_enabled: false,
         snap_grid_px: 8,
-        decorations: vec![],
-        selected_deco: None,
-        selected_pin: None,
+        selected_item: None,
+        cycle_pos: None,
     };
 
     let subpatch_node = NodeData {

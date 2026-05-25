@@ -5077,7 +5077,7 @@ fn show_subpatch_editors(
                 Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
             };
             node_opt.and_then(|n| n.subpatch.as_ref())
-                .map(|sp| sp.exposed_modules.iter().map(|m| m.inner_node_id).collect())
+                .map(|sp| sp.iter_module_pins().map(|(_, m)| m.inner_node_id).collect())
                 .unwrap_or_default()
         };
 
@@ -5228,7 +5228,7 @@ fn show_subpatch_editors(
                 None    => app.tabs[active].canvas.snarl.get_node(node_id),
                 Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
             }.and_then(|n| n.subpatch.as_ref())
-             .map(|sp| sp.exposed_modules.iter().any(|m| m.inner_node_id == inner_id.0))
+             .map(|sp| sp.has_module_pin_for(inner_id.0))
              .unwrap_or(false);
             let unpin = any_existing && element_id == "default";
             if unpin {
@@ -5238,9 +5238,9 @@ fn show_subpatch_editors(
                 };
                 if let Some(node) = node_opt {
                     if let Some(sp) = node.subpatch.as_mut() {
-                        sp.exposed_modules.retain(|m| m.inner_node_id != inner_id.0);
+                        sp.remove_module_pins_for(inner_id.0);
                     }
-                    if node.subpatch.as_ref().map(|sp| sp.exposed_modules.is_empty()).unwrap_or(true) {
+                    if node.subpatch.as_ref().map(|sp| sp.is_layout_empty()).unwrap_or(true) {
                         node.extra.layout_unlocked = false;
                     }
                 }
@@ -5250,7 +5250,7 @@ fn show_subpatch_editors(
                     None    => app.tabs[active].canvas.snarl.get_node(node_id),
                     Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
                 }.and_then(|n| n.subpatch.as_ref())
-                 .map(|sp| sp.exposed_modules.iter().map(|m| m.pos[1] + m.size[1]).fold(0.0f32, f32::max))
+                 .map(|sp| sp.module_pins_bottom_y())
                  .unwrap_or(0.0);
                 let node_opt = match parent_editor_idx {
                     None    => app.tabs[active].canvas.snarl.get_node_mut(node_id),
@@ -5258,7 +5258,7 @@ fn show_subpatch_editors(
                 };
                 if let Some(node) = node_opt {
                     if let Some(sp) = node.subpatch.as_mut() {
-                        sp.exposed_modules.push(ExposedModule {
+                        sp.push_module_pin(ExposedModule {
                             inner_node_id: inner_id.0,
                             element_id,
                             pos: [PINNED_PAD, next_y + PINNED_PAD],
