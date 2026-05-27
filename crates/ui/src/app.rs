@@ -78,6 +78,28 @@ pub struct PatchTab {
     pub bypassed: bool,
     /// Auto-bypass: suppress output whenever no bound process is in the foreground.
     pub auto_bypass: bool,
+    /// Ephemeral Easy-mode UI state for this tab. Recomputed from the
+    /// canvas on activation, not serialized to `.fxp`.
+    pub easy_state: EasyState,
+}
+
+/// Per-tab transient state used only when Easy mode is active. Holds the
+/// preset-switch confirmation flow and a cached "current preset identity"
+/// so we can detect when the in-canvas sub-patch has been tweaked away
+/// from the on-disk preset. None of this is persisted.
+#[derive(Default)]
+pub struct EasyState {
+    /// Preset chip the user is hovering, used to highlight the chip.
+    pub hovered_preset: Option<std::path::PathBuf>,
+    /// Pending preset-switch confirmation. When set, the center panel
+    /// shows a "discard your tweaks?" modal; on confirm the preset at
+    /// this path is applied.
+    pub pending_preset_switch: Option<std::path::PathBuf>,
+    /// Path + canonical-JSON content hash of the preset that was last
+    /// loaded into this tab's sub-patch. Set when the user picks a chip;
+    /// compared against the live sub-patch hash each frame to detect
+    /// dirty state.
+    pub loaded_preset: Option<(std::path::PathBuf, u64)>,
 }
 
 impl PatchTab {
@@ -90,6 +112,7 @@ impl PatchTab {
             virtual_panel: VirtualDevicePanel::new(),
             bypassed: false,
             auto_bypass: false,
+            easy_state: EasyState::default(),
         }
     }
 }
@@ -98,6 +121,37 @@ impl PatchTab {
 /// the given snarl that targets a virtual device (id starts with
 /// `"virtual."`). Used to drive shared-pool reconciliation and the
 /// active-tab id filter.
+/// Predicate: does this canvas look like an Easy-mode-compatible
+/// patch? Used by File→Load Patch to auto-flip to Easy mode when a
+/// `.fxsp` is opened. Requires exactly one `subpatch` node whose
+/// inner UiSubPatch:
+///   * has at least one AutoMap-typed inlet AND one AutoMap-typed
+///     outlet (so wiring.rs::rewire can connect a device.source and
+///     virtual sinks through it), and
+///   * has a non-empty layout (`items` Vec) so the central panel
+///     shows actual content rather than "(pick a preset to begin)".
+/// Allows any number of device.source / device.sink nodes (zero in
+/// the .fxsp case since we just loaded a bare sub-patch).
+fn is_easy_compatible_canvas(canvas: &crate::canvas::Canvas) -> bool {
+    use flexinput_core::SignalType;
+    let mut subpatch_node: Option<&NodeData> = None;
+    for (_, n) in canvas.snarl.nodes_ids_data() {
+        match n.value.module_id.as_str() {
+            "subpatch" => {
+                if subpatch_node.is_some() { return false; } // more than one
+                subpatch_node = Some(&n.value);
+            }
+            "device.source" | "device.sink" => {} // allowed
+            _ => return false,                    // foreign node
+        }
+    }
+    let Some(node) = subpatch_node else { return false; };
+    let Some(sp) = node.subpatch.as_ref() else { return false; };
+    let has_in  = sp.pins_in.iter().any(|p| p.signal_type == SignalType::AutoMap);
+    let has_out = sp.pins_out.iter().any(|p| p.signal_type == SignalType::AutoMap);
+    has_in && has_out && !sp.items.is_empty()
+}
+
 fn snarl_virtual_device_ids(snarl: &Snarl<NodeData>) -> Vec<String> {
     snarl
         .nodes_ids_data()
@@ -459,6 +513,10 @@ impl FlexInputApp {
                     // on-patch-load camera setting so the saved view's
                     // arbitrary pan/zoom doesn't strand the user off-canvas.
                     canvas.pending_view_action = on_load_view;
+                    let easy_state = EasyState {
+                        loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
+                        ..EasyState::default()
+                    };
                     PatchTab {
                         title: pt.title,
                         file_path: pt.file_path,
@@ -467,6 +525,7 @@ impl FlexInputApp {
                         virtual_panel: VirtualDevicePanel::new(),
                         bypassed: false,
                         auto_bypass: pt.auto_bypass,
+                        easy_state,
                     }
                 }).collect(),
                 _ => vec![PatchTab::new_untitled(1)],
@@ -970,7 +1029,9 @@ impl eframe::App for FlexInputApp {
         let mut do_redo = false;
         let mut toggle_settings = false;
         let mut do_pin_toggle = false;
+        let mut do_set_mode: Option<settings::UiMode> = None;
         let pin_active_now = self.settings.pin_active;
+        let ui_mode_now = self.settings.ui_mode;
         let can_undo = self.tabs[self.active_tab].canvas.can_undo();
         let can_redo = self.tabs[self.active_tab].canvas.can_redo();
         let title_frame = egui::Frame::NONE.fill(ctx.style().visuals.panel_fill);
@@ -996,6 +1057,8 @@ impl eframe::App for FlexInputApp {
                     &mut toggle_settings,
                     pin_active_now,
                     &mut do_pin_toggle,
+                    ui_mode_now,
+                    &mut do_set_mode,
                 );
             });
         if toggle_settings {
@@ -1003,6 +1066,12 @@ impl eframe::App for FlexInputApp {
         }
         if do_pin_toggle {
             self.toggle_pin(ctx);
+        }
+        if let Some(new_mode) = do_set_mode {
+            if self.settings.ui_mode != new_mode {
+                self.settings.ui_mode = new_mode;
+                settings::save_settings(&self.settings);
+            }
         }
 
         // ── Tab bar ───────────────────────────────────────────────────────────────
@@ -1529,7 +1598,11 @@ impl eframe::App for FlexInputApp {
                 snarl_virtual_device_ids(&self.tabs[self.active_tab].canvas.snarl);
             let bound = self.tabs[self.active_tab].bound_exes.clone();
             let auto_bypass = self.tabs[self.active_tab].auto_bypass;
-            if let Some(saved_path) = self.tabs[self.active_tab].canvas.save_patch(vids, bound, auto_bypass) {
+            let preset_path = self.tabs[self.active_tab]
+                .easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone());
+            if let Some(saved_path) = self.tabs[self.active_tab].canvas
+                .save_patch(vids, bound, auto_bypass, preset_path)
+            {
                 let tab = &mut self.tabs[self.active_tab];
                 tab.title = saved_path.file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
@@ -1538,7 +1611,24 @@ impl eframe::App for FlexInputApp {
             }
         }
         if do_load {
-            if let Some((new_canvas, vids, bound, auto_bypass, path)) = crate::canvas::Canvas::load_patch() {
+            if let Some((new_canvas, vids, bound, auto_bypass, path, preset_path)) =
+                crate::canvas::Canvas::load_patch()
+            {
+                // If the loaded file was a .fxsp wrapped into an
+                // Easy-shaped canvas (single subpatch node) AND the
+                // sub-patch declares the AutoMap inlet/outlet pair
+                // plus has a non-empty layout, flip to Easy mode so
+                // the user lands in the preset-driven UI directly.
+                let loaded_was_fxsp = path.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("fxsp"))
+                    .unwrap_or(false);
+                if loaded_was_fxsp && is_easy_compatible_canvas(&new_canvas)
+                    && self.settings.ui_mode != settings::UiMode::Easy
+                {
+                    self.settings.ui_mode = settings::UiMode::Easy;
+                    settings::save_settings(&self.settings);
+                }
                 let tab = &mut self.tabs[self.active_tab];
                 tab.canvas = new_canvas;
                 tab.title = path.file_stem()
@@ -1547,6 +1637,11 @@ impl eframe::App for FlexInputApp {
                 tab.file_path = Some(path);
                 tab.bound_exes = bound;
                 tab.auto_bypass = auto_bypass;
+                // Restore Easy-mode preset link: rederive content hash
+                // from the live sub-patch. If the saved path is gone,
+                // EasyState will fall back to hash-matching against the
+                // current preset index (see center_panel::restore_link).
+                tab.easy_state.loaded_preset = preset_path.map(|p| (p, 0));
                 // Queue the configured on-load camera action. The canvas
                 // consumes this on its next render — it can't apply now
                 // because SnarlState / snarl_rect aren't in scope here.
@@ -1601,6 +1696,7 @@ impl eframe::App for FlexInputApp {
                     bound_exes: t.bound_exes.clone(),
                     auto_bypass: t.auto_bypass,
                     snarl: t.canvas.snarl.clone(),
+                    easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
                 }).collect();
                 let ws = PersistedWorkspace {
                     version: 1,
@@ -1629,6 +1725,10 @@ impl eframe::App for FlexInputApp {
                         let mut canvas = Canvas::new();
                         canvas.snarl = pt.snarl;
                         canvas.pending_view_action = on_load_view;
+                        let easy_state = EasyState {
+                            loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
+                            ..EasyState::default()
+                        };
                         PatchTab {
                             title: pt.title,
                             file_path: pt.file_path,
@@ -1637,6 +1737,7 @@ impl eframe::App for FlexInputApp {
                             virtual_panel: VirtualDevicePanel::new(),
                             bypassed: false,
                             auto_bypass: pt.auto_bypass,
+                            easy_state,
                         }
                     }).collect();
                     if !new_tabs.is_empty() {
@@ -1739,8 +1840,26 @@ impl eframe::App for FlexInputApp {
             s
         };
         let shared_pool_for_panel = Arc::clone(&self.shared_virtual_devices);
+        let easy_mode = self.settings.ui_mode == settings::UiMode::Easy;
+        let device_defaults_for_easy = crate::canvas::DeviceParamDefaults {
+            stick_deadzone: self.settings.default_stick_deadzone,
+            gyro_mult: self.settings.default_gyro_mult,
+            mouse_sensitivity: self.settings.default_mouse_sensitivity,
+        };
+        let user_presets_folder = self.settings.user_presets_folder.clone();
+        // Snapshots needed for the inner sub-patch render in Easy
+        // center panel (mirrors what show_subpatch_editors passes to
+        // inner_canvas.show in the Sub-Patch editor window).
+        let descriptors_for_easy = self.descriptors.clone();
+        let live_signals_for_easy = self.last_signals.clone();
+        let panic_shortcut_for_easy = self.panic_shortcut.clone();
+        // Pull favorites out so easy can mutate; we'll write back +
+        // persist if the user starred or reordered something.
+        let mut favorites_for_easy = self.settings.favorite_presets.clone();
+        let favorites_before = favorites_for_easy.clone();
         let tab = &mut self.tabs[self.active_tab];
-        let (virtual_panel, canvas) = (&mut tab.virtual_panel, &mut tab.canvas);
+        let (virtual_panel, canvas, easy_state) =
+            (&mut tab.virtual_panel, &mut tab.canvas, &mut tab.easy_state);
 
         // Device panels use a darker fill so they read as separate from the
         // canvas surface and the floating heading tabs visually integrate.
@@ -1797,12 +1916,17 @@ impl eframe::App for FlexInputApp {
             mouse_sensitivity: self.settings.default_mouse_sensitivity,
         };
 
+        // Both side panels are declared unconditionally so egui's
+        // remembered panel stack ordering is stable across Easy ↔
+        // Advanced toggles. In Easy mode the panel bodies are no-ops
+        // (height collapses to a zero-content frame) and the floating
+        // heading tabs are hidden.
         let top_resp = egui::TopBottomPanel::top("virtual_devices_panel")
             .resizable(false)
-            .exact_height(virt_h)
-            .frame(top_frame)
+            .exact_height(if easy_mode { 0.0 } else { virt_h })
+            .frame(if easy_mode { collapsed_frame } else { top_frame })
             .show(ctx, |ui| {
-                if virt_open > 0.01 {
+                if !easy_mode && virt_open > 0.01 {
                     virtual_panel.show(
                         ui,
                         &shared_pool_for_panel,
@@ -1816,44 +1940,44 @@ impl eframe::App for FlexInputApp {
 
         let bottom_resp = egui::TopBottomPanel::bottom("physical_devices_panel")
             .resizable(false)
-            .exact_height(phys_h)
-            .frame(bot_frame)
+            .exact_height(if easy_mode { 0.0 } else { phys_h })
+            .frame(if easy_mode { collapsed_frame } else { bot_frame })
             .show(ctx, |ui| {
-                if phys_open > 0.01 {
+                if !easy_mode && phys_open > 0.01 {
                     physical_devices::show(ui, devices, canvas, default_collapsed, device_defaults);
                 }
             });
-        // Only record the natural height when fully expanded so the snapshot
-        // isn't poisoned by the in-flight animation values.
-        if phys_open > 0.99 {
+        if !easy_mode && phys_open > 0.99 {
             self.bottom_panel_height = bottom_resp.response.rect.height();
         }
 
-        // Floating heading tabs hang off each panel's canvas-facing edge,
-        // nudged 1px down to sit on the canvas inner border.
-        let top_rect = top_resp.response.rect;
-        let bottom_rect = bottom_resp.response.rect;
-        let top_anchor_y = top_rect.bottom() + 5.0;
-        let bottom_anchor_y = bottom_rect.top() - 1.0;
-        let top_tab = crate::panels::physical_devices::draw_floating_heading(
-            ctx,
-            "heading_virtual_devices",
-            "Virtual Devices",
-            egui::pos2(top_rect.left() + 12.0, top_anchor_y),
-            crate::panels::physical_devices::TabDirection::Down,
-        );
-        if top_tab.clicked() {
-            self.virtual_panel_collapsed = !self.virtual_panel_collapsed;
-        }
-        let bottom_tab = crate::panels::physical_devices::draw_floating_heading(
-            ctx,
-            "heading_physical_devices",
-            "Physical Devices",
-            egui::pos2(bottom_rect.left() + 12.0, bottom_anchor_y),
-            crate::panels::physical_devices::TabDirection::Up,
-        );
-        if bottom_tab.clicked() {
-            self.physical_panel_collapsed = !self.physical_panel_collapsed;
+        if !easy_mode {
+            // Floating heading tabs hang off each panel's canvas-facing edge,
+            // nudged 1px down to sit on the canvas inner border.
+            let top_rect = top_resp.response.rect;
+            let bottom_rect = bottom_resp.response.rect;
+            let top_anchor_y = top_rect.bottom() + 5.0;
+            let bottom_anchor_y = bottom_rect.top() - 1.0;
+            let top_tab = crate::panels::physical_devices::draw_floating_heading(
+                ctx,
+                "heading_virtual_devices",
+                "Virtual Devices",
+                egui::pos2(top_rect.left() + 12.0, top_anchor_y),
+                crate::panels::physical_devices::TabDirection::Down,
+            );
+            if top_tab.clicked() {
+                self.virtual_panel_collapsed = !self.virtual_panel_collapsed;
+            }
+            let bottom_tab = crate::panels::physical_devices::draw_floating_heading(
+                ctx,
+                "heading_physical_devices",
+                "Physical Devices",
+                egui::pos2(bottom_rect.left() + 12.0, bottom_anchor_y),
+                crate::panels::physical_devices::TabDirection::Up,
+            );
+            if bottom_tab.clicked() {
+                self.physical_panel_collapsed = !self.physical_panel_collapsed;
+            }
         }
 
         // Seed outer canvas clipboard from inner when app_clipboard_from_inner is set
@@ -1908,7 +2032,75 @@ impl eframe::App for FlexInputApp {
         } else {
             egui::Frame::central_panel(&style_snapshot)
         };
+
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
+            if easy_mode {
+                // Two-pane Easy layout built INSIDE the CentralPanel
+                // (rather than using SidePanels) so the egui panel
+                // topology — and the layer ordering the snarl canvas
+                // relies on for set_sublayer — stays identical to
+                // Advanced mode. Allocating fixed-width child UIs
+                // sidesteps the "Background vs Middle" sublayer panic
+                // that toggling SidePanel registrations triggers.
+                //
+                // Left panel: input/output picker (scrollable gamepad
+                // list on top, output section on bottom). Central:
+                // sub-patch preset picker + body.
+                let total = ui.available_rect_before_wrap();
+                // Fixed left-panel width so cards / chips don't restyle
+                // as the user resizes the window. Only shrinks if the
+                // window itself is narrower than this baseline.
+                let side_w = 280.0_f32.min(total.width() * 0.5);
+                let gap = 6.0_f32;
+                let left_rect = egui::Rect::from_min_size(
+                    total.min,
+                    egui::vec2(side_w, total.height()),
+                );
+                let center_rect = egui::Rect::from_min_size(
+                    egui::pos2(total.min.x + side_w + gap, total.min.y),
+                    egui::vec2((total.width() - side_w - gap).max(0.0), total.height()),
+                );
+                // Darker panel background fill so the left panel
+                // visually groups itself apart from the central canvas.
+                ui.painter().rect_filled(
+                    left_rect,
+                    0.0,
+                    egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                    crate::easy::io_panel::show(
+                        ui,
+                        devices,
+                        canvas,
+                        &shared_pool_for_panel,
+                        default_collapsed,
+                        device_defaults_for_easy,
+                        &mut calibrate_request,
+                        &device_rates_snap,
+                    );
+                });
+                ui.scope_builder(egui::UiBuilder::new().max_rect(center_rect), |ui| {
+                    crate::easy::center_panel::show(
+                        ui,
+                        canvas,
+                        easy_state,
+                        user_presets_folder.as_deref(),
+                        device_defaults_for_easy,
+                        &descriptors_for_easy,
+                        devices,
+                        &live_device_ids,
+                        &live_signals_for_easy,
+                        &panic_shortcut_for_easy,
+                        &device_rates_snap,
+                        &mut favorites_for_easy,
+                    );
+                });
+                if favorites_for_easy != favorites_before {
+                    self.settings.favorite_presets = favorites_for_easy;
+                    settings::save_settings(&self.settings);
+                }
+                return;
+            }
             if see_through_on {
                 // `ui.max_rect()` here is the central panel's content
                 // area AFTER the 8 px inner_margin has been applied,
@@ -2493,6 +2685,37 @@ impl FlexInputApp {
                 ui.separator();
                 ui.add_space(6.0);
 
+                // ── Easy mode ───────────────────────────────────────────
+                ui.label(egui::RichText::new("Easy mode").strong());
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(
+                    "Folder scanned for user-authored .fxsp sub-patch presets, in addition to the factory presets shipped under app/assets/sub-patches/."
+                ).small().color(egui::Color32::from_gray(140)));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("User presets folder:");
+                    let label = self.settings.user_presets_folder.as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none)".into());
+                    ui.monospace(label);
+                    if ui.button("Browse…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                            self.settings.user_presets_folder = Some(p);
+                            dirty = true;
+                        }
+                    }
+                    if self.settings.user_presets_folder.is_some()
+                        && ui.button("Clear").clicked()
+                    {
+                        self.settings.user_presets_folder = None;
+                        dirty = true;
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
                 // ── Device defaults ─────────────────────────────────────
                 // Per-device sliders in the node header are seeded from these
                 // when a node is first added. Editing them later updates only
@@ -2661,6 +2884,7 @@ impl FlexInputApp {
             bound_exes: t.bound_exes.clone(),
             auto_bypass: t.auto_bypass,
             snarl: t.canvas.snarl.clone(),
+            easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
         }).collect();
         let ws = PersistedWorkspace {
             version: 1,
@@ -4612,6 +4836,8 @@ fn show_title_bar(
     toggle_settings: &mut bool,
     pin_active: bool,
     do_pin_toggle: &mut bool,
+    ui_mode: settings::UiMode,
+    do_set_mode: &mut Option<settings::UiMode>,
 ) {
     let bar = ui.max_rect();
     let h = bar.height();
@@ -4623,6 +4849,12 @@ fn show_title_bar(
     let drag = ui.interact(bar, ui.id().with("tb_drag"), egui::Sense::click_and_drag());
 
     // ── Left: File menu ────────────────────────────────────────────────────
+    // `left_cluster_right` tracks the actual right edge of the last
+    // widget rendered in the left cluster (set inside the closure
+    // after the Pin button). Used downstream by the mode pill to
+    // pick its leftmost-allowed position — far more accurate than
+    // using the static `left_w` allocation.
+    let mut left_cluster_right: f32 = bar.left();
     let left_rect = egui::Rect::from_min_size(bar.min, egui::vec2(left_w, h));
     ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -4655,6 +4887,12 @@ fn show_title_bar(
             {
                 *auto_switch = !*auto_switch;
             }
+
+            ui.add_space(6.0);
+            // Easy / Advanced mode toggle is rendered in the title-bar
+            // CENTER, to the left of the FlexInput logo (see
+            // `render_mode_pill` below). Keeps the File-menu cluster
+            // compact and matches the mockup placement.
 
             ui.add_space(6.0);
             // Short vertical divider that doesn't extend to the panel edges.
@@ -4705,6 +4943,9 @@ fn show_title_bar(
             } else {
                 "Pin window to stay on top of all others.\nConfigure global hotkey / Guide-button trigger in Settings."
             };
+            // Capture the rightmost edge of the left cluster so the
+            // mode pill knows where it can extend without overlapping.
+            left_cluster_right = pin_resp.rect.right();
             if pin_resp.on_hover_text(hover).clicked() {
                 *do_pin_toggle = true;
             }
@@ -4852,6 +5093,11 @@ fn show_title_bar(
     }
 
     // ── Center: logo + app name (clickable → Settings) ────────────────────
+    // FlexInput title TRIES to stay centered on `mid.x`. If the mode
+    // pill (which anchors to the LEFT of the title) doesn't fit
+    // because the window is too narrow, the title is pushed right so
+    // the pill never disappears — pill survives at all window sizes,
+    // and the title slides out of center only when necessary.
     let mid = bar.center();
     let base_color = ui.visuals().text_color();
     let font_id = egui::FontId::proportional(14.0);
@@ -4860,15 +5106,61 @@ fn show_title_bar(
 
     let logo_w = if logo.is_some() { 20.0 + 6.0 } else { 0.0 };
     let total_w = logo_w + text_size.x;
-    let start_x = mid.x - total_w / 2.0;
 
-    // Allocate the hit rect BEFORE painting so it wins over the title-bar
-    // drag interaction allocated at the top of this function.
-    let hit_rect = egui::Rect::from_center_size(
-        egui::pos2(mid.x, mid.y),
-        egui::vec2(total_w + 16.0, h - 6.0),
+    // ── Mode-pill / title layout solve ─────────────────────────────
+    // Pill height matches the window-control button height so the
+    // pill reads as a peer of those buttons. (h is the title-bar
+    // height; insetting 4 px keeps it visually aligned without
+    // touching the bar edges.)
+    let pill_h = (h - 4.0).max(20.0);
+    let pill_gap = 10.0_f32;        // gap between pill right and title left
+    let pill_left_min = left_cluster_right + 8.0;
+    let wide_w  = pill_size_px(MODE_WHOLE_PILL_SVG, pill_h).0;
+    let short_w = pill_size_px(MODE_SHORT_PILL_SVG, pill_h).0;
+    let hit_w = total_w + 16.0;
+
+    // Natural (preferred) layout — title centered on `mid.x`.
+    let title_left_natural = mid.x - hit_w / 2.0;
+    let pill_right_natural = title_left_natural - pill_gap;
+
+    // Pick the largest pill variant that fits in the natural layout.
+    let (chosen_w, variant) =
+        if pill_right_natural - pill_left_min >= wide_w {
+            (wide_w, ModePillVariant::Wide)
+        } else if pill_right_natural - pill_left_min >= short_w {
+            (short_w, ModePillVariant::Short)
+        } else {
+            // Even the short variant doesn't fit in the natural
+            // layout — push the title right to make room.
+            (short_w, ModePillVariant::Short)
+        };
+
+    // Final placement: pill's right edge is the LATER of "natural
+    // pill_right" or "pill_left_min + chosen_w". If the latter wins,
+    // the title slides right to keep its gap.
+    let pill_right = pill_right_natural
+        .max(pill_left_min + chosen_w);
+    let pill_left = pill_right - chosen_w;
+    let title_left = pill_right + pill_gap;
+
+    let pill_rect = egui::Rect::from_min_size(
+        egui::pos2(pill_left, mid.y - pill_h / 2.0),
+        egui::vec2(chosen_w, pill_h),
     );
+
+    // hit_rect must come from the FINAL title_left, not the natural
+    // center, so it stays aligned with the painted logo+text below.
+    let hit_rect = egui::Rect::from_min_size(
+        egui::pos2(title_left, mid.y - (h - 6.0) / 2.0),
+        egui::vec2(hit_w, h - 6.0),
+    );
+    let start_x = title_left + 8.0; // matches the +8 inset baked into hit_w
+
+    // IMPORTANT: register the hit_rect interact FIRST (early in the
+    // hit-test stack), then the pill (which is paint+interact). We
+    // want pill clicks to win where they overlap nothing else.
     let logo_resp = ui.interact(hit_rect, ui.id().with("logo_settings"), egui::Sense::click());
+    render_mode_pill(ui, pill_rect, variant, ui_mode, do_set_mode);
     if logo_resp.clicked() {
         *toggle_settings = true;
     }
@@ -4902,7 +5194,21 @@ fn show_title_bar(
     let painter = ui.painter();
     if let Some(tex) = logo {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        let logo_rect = egui::Rect::from_center_size(egui::pos2(start_x + 10.0, mid.y), egui::vec2(20.0, 20.0));
+        // Snap the logo destination rect to physical pixel boundaries
+        // so the bitmap downscale samples on-pixel — otherwise LINEAR
+        // sampling smears the alpha edges and the icon reads as fuzzy
+        // / aliased. Also: round the image SIZE to an exact 20×20 in
+        // device pixels (instead of logical) so the downscale ratio
+        // is integer-friendly.
+        let ppp = ctx.pixels_per_point();
+        let snap = |v: f32| (v * ppp).round() / ppp;
+        let cx = snap(start_x + 10.0);
+        let cy = snap(mid.y);
+        let half = snap(10.0);
+        let logo_rect = egui::Rect::from_min_max(
+            egui::pos2(cx - half, cy - half),
+            egui::pos2(cx + half, cy + half),
+        );
         painter.image(tex.id(), logo_rect, uv, logo_tint);
         painter.galley(egui::pos2(start_x + 20.0 + 6.0, mid.y - text_size.y / 2.0), galley, text_color);
     } else {
@@ -4925,6 +5231,183 @@ fn show_title_bar(
     }
 }
 
+// ── Mode pill (Easy / Advanced) ──────────────────────────────────────────────
+//
+// SVG-driven segmented control. Two presentation variants:
+//
+//   `Wide`  — `mode_whole_pill.svg` (outer pill with "Mode:" label
+//             baked in) + `easy_mode.svg` or `advanced_mode.svg`
+//             overlaid right-anchored on top of the pill. Both chip
+//             SVGs are a single graphic containing BOTH halves with
+//             the slanted divider already drawn; the active half is
+//             tinted, the inactive half is the muted variant. We
+//             just split the rendered image rectangle into two click
+//             zones (Easy on left, Advanced on right).
+//
+//   `Short` — `mode_short_pill.svg` (outer pill, no "Mode:" label) +
+//             same chip SVG overlay. Used when there isn't enough
+//             room between the File-menu cluster and the centered
+//             FlexInput title to fit the wide variant.
+
+const MODE_WHOLE_PILL_SVG: &[u8] = include_bytes!(
+    "../../../app/assets/mode_whole_pill.svg");
+const MODE_SHORT_PILL_SVG: &[u8] = include_bytes!(
+    "../../../app/assets/mode_short_pill.svg");
+const MODE_EASY_SVG: &[u8] = include_bytes!(
+    "../../../app/assets/easy_mode.svg");
+const MODE_ADV_SVG:  &[u8] = include_bytes!(
+    "../../../app/assets/advanced_mode.svg");
+
+// Render height in logical pixels; SVGs are 28/30 px tall by design,
+// 22 is a comfortable shrunk title-bar size.
+const MODE_PILL_RENDER_H: f32 = 22.0;
+
+#[derive(Clone, Copy, Debug)]
+enum ModePillVariant { Wide, Short }
+
+/// Compute the on-screen width that a pill SVG occupies when rendered
+/// at `render_h` logical pixels, preserving the SVG's intrinsic aspect.
+fn pill_size_px(svg_bytes: &[u8], render_h: f32) -> (f32, f32) {
+    // Cheap aspect probe: parse `viewBox` or width/height from the
+    // SVG header without going through usvg. Falls back to 1:1.
+    let text = std::str::from_utf8(svg_bytes).unwrap_or("");
+    let aspect = parse_svg_aspect(text).unwrap_or(1.0);
+    (render_h * aspect, render_h)
+}
+
+fn parse_svg_aspect(text: &str) -> Option<f32> {
+    // Look for the `viewBox="0 0 W H"` attribute first; fall back to
+    // separate width / height attributes if the viewBox is missing.
+    if let Some(vb_start) = text.find("viewBox=\"") {
+        let s = &text[vb_start + 9..];
+        if let Some(end) = s.find('"') {
+            let parts: Vec<&str> = s[..end].split_whitespace().collect();
+            if parts.len() == 4 {
+                let w: f32 = parts[2].parse().ok()?;
+                let h: f32 = parts[3].parse().ok()?;
+                if h > 0.0 { return Some(w / h); }
+            }
+        }
+    }
+    let w = parse_svg_attr(text, "width")?;
+    let h = parse_svg_attr(text, "height")?;
+    if h > 0.0 { Some(w / h) } else { None }
+}
+
+fn parse_svg_attr(text: &str, name: &str) -> Option<f32> {
+    let key = format!("{}=\"", name);
+    let i = text.find(&key)?;
+    let s = &text[i + key.len()..];
+    let end = s.find('"')?;
+    s[..end].parse().ok()
+}
+
+/// Rasterize an SVG to a cached non-square texture at exactly
+/// (w_px, h_px) DEVICE pixels. Reuses the recolored rasterizer; since
+/// w_px : h_px already matches the SVG aspect, no letterboxing occurs.
+fn mode_pill_texture(
+    ui: &egui::Ui,
+    bytes: &'static [u8],
+    w_px: u32,
+    h_px: u32,
+) -> Option<egui::TextureHandle> {
+    let cache_key = egui::Id::new(("mode_pill_tex", bytes.as_ptr() as usize, w_px, h_px));
+    if let Some(h) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key)) {
+        return Some(h);
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let img = crate::canvas::viewer::rasterize_svg_recolored(
+        text, w_px, h_px, "override", egui::Color32::TRANSPARENT)?;
+    let handle = ui.ctx().load_texture(
+        format!("mode_pill_{:p}_{}x{}", bytes.as_ptr(), w_px, h_px),
+        img,
+        egui::TextureOptions::LINEAR,
+    );
+    ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+    Some(handle)
+}
+
+fn paint_pill_svg(ui: &mut egui::Ui, bytes: &'static [u8], rect: egui::Rect) {
+    let ppp = ui.ctx().pixels_per_point();
+    // Snap the destination rect to physical pixel boundaries so the
+    // texture lands at integer texel positions — otherwise LINEAR
+    // sampling blends adjacent pixels and softens every edge,
+    // making the rasterized SVG text look blurry.
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(snap(rect.left()),  snap(rect.top())),
+        egui::pos2(snap(rect.right()), snap(rect.bottom())),
+    );
+    let w_px = ((rect.width())  * ppp).round() as u32;
+    let h_px = ((rect.height()) * ppp).round() as u32;
+    if let Some(tex) = mode_pill_texture(ui, bytes, w_px, h_px) {
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+    }
+}
+
+fn render_mode_pill(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    variant: ModePillVariant,
+    mode: settings::UiMode,
+    do_set_mode: &mut Option<settings::UiMode>,
+) {
+    // 1. Outer pill background (with or without "Mode:" label).
+    let bg_svg = match variant {
+        ModePillVariant::Wide  => MODE_WHOLE_PILL_SVG,
+        ModePillVariant::Short => MODE_SHORT_PILL_SVG,
+    };
+    paint_pill_svg(ui, bg_svg, rect);
+
+    // 2. Chip overlay (Easy/Adv combined) right-anchored on the pill.
+    // The chip SVG already contains both halves AND the slanted
+    // divider; only the colors differ between easy_mode.svg and
+    // advanced_mode.svg.
+    //
+    // Height note: the pill SVGs are 30 px tall (28 inner + 1 px
+    // stroke on each side); the chip SVGs are 28 px tall with no
+    // stroke. To keep the chip INSIDE the pill's outline, render it
+    // at a shrunk height matching the pill's inner content area.
+    let chip_svg = match mode {
+        settings::UiMode::Easy     => MODE_EASY_SVG,
+        settings::UiMode::Advanced => MODE_ADV_SVG,
+    };
+    let pill_inset = 1.0_f32; // matches the 1 px stroke on the pill SVGs
+    let chip_h = (rect.height() - 2.0 * pill_inset).max(1.0);
+    let (chip_w, _) = pill_size_px(chip_svg, chip_h);
+    let chip_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - chip_w - pill_inset,
+                   rect.top() + pill_inset),
+        egui::vec2(chip_w, chip_h),
+    );
+    paint_pill_svg(ui, chip_svg, chip_rect);
+
+    // 3. Click zones — split the chip rect down the middle. The SVGs
+    // were authored so the two halves are roughly equal-width either
+    // side of the slash, so a 50/50 split on the rect is close enough
+    // for hit-testing without parsing the slash geometry.
+    let mid_x = chip_rect.center().x;
+    let easy_zone = egui::Rect::from_min_max(
+        chip_rect.left_top(),
+        egui::pos2(mid_x, chip_rect.bottom()),
+    );
+    let adv_zone = egui::Rect::from_min_max(
+        egui::pos2(mid_x, chip_rect.top()),
+        chip_rect.right_bottom(),
+    );
+    let easy_resp = ui.interact(easy_zone,
+        ui.id().with("mode_pill_easy"), egui::Sense::click());
+    let adv_resp = ui.interact(adv_zone,
+        ui.id().with("mode_pill_adv"), egui::Sense::click());
+    if easy_resp.clicked() { *do_set_mode = Some(settings::UiMode::Easy); }
+    if adv_resp.clicked()  { *do_set_mode = Some(settings::UiMode::Advanced); }
+    if easy_resp.hovered() || adv_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+}
+
 // ── Sub-patch editor windows ──────────────────────────────────────────────────
 
 // Auto-placement step for newly-pinned modules (viewer PINNED_MOD_H + gap).
@@ -4934,12 +5417,12 @@ const PINNED_PAD: f32  = 4.0;
 /// On-disk representation of a single sub-patch (.fxsp). Distinct from the
 /// top-level patch format (.fxp) so the save/load dialog filters cleanly.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct SubPatchFile {
-    version: u32,
-    sub_patch: UiSubPatch,
+pub(crate) struct SubPatchFile {
+    pub(crate) version: u32,
+    pub(crate) sub_patch: UiSubPatch,
 }
 
-fn save_subpatch_file(sp: &UiSubPatch) -> Option<std::path::PathBuf> {
+pub(crate) fn save_subpatch_file(sp: &UiSubPatch) -> Option<std::path::PathBuf> {
     let default_name = if sp.display_name.is_empty() {
         "sub-patch.fxsp".to_string()
     } else {
@@ -4956,7 +5439,7 @@ fn save_subpatch_file(sp: &UiSubPatch) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-fn load_subpatch_file() -> Option<UiSubPatch> {
+pub(crate) fn load_subpatch_file() -> Option<UiSubPatch> {
     let path = rfd::FileDialog::new()
         .add_filter("FlexInput Sub-Patch", &["fxsp"])
         .pick_file()?;

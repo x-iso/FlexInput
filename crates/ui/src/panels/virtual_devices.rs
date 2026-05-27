@@ -90,11 +90,7 @@ impl VirtualDevicePanel {
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             let kind_prefix = kind_prefix_of(dev_id);
-                            if kind_prefix == "virtual.keymouse" {
-                                let (kb, ms) = remapper_icons::keymouse_pair_svgs();
-                                render_device_icon(ui, kb, CHIP_ICON_H);
-                                render_device_icon(ui, ms, CHIP_ICON_H);
-                            } else {
+                            {
                                 render_device_icon(
                                     ui,
                                     remapper_icons::virtual_device_card_svg(&kind_prefix),

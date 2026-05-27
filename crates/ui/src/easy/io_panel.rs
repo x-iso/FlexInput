@@ -1,0 +1,897 @@
+//! Easy-mode left panel — combined Input + Output picker.
+//!
+//! Top section ("Choose input device"): scrollable list of physical
+//! gamepad cards. Each card holds icon + name + Calibrate row +
+//! Deadzone / Gyro × sliders. All cards always render the controls
+//! (inactive cards preview the defaults disabled) for visual
+//! stability.
+//!
+//! Bottom section ("Choose output devices"): XInput / DS4 cards as a
+//! horizontal pair (mutually exclusive), then a full-width
+//! "Keyboard and Mouse" card with the Mouse speed slider inline.
+//! Active outputs are highlighted; clicks toggle them on/off.
+
+use std::collections::HashMap;
+
+use eframe::egui;
+use egui_snarl::NodeId;
+use flexinput_devices::{ControllerKind, PhysicalDevice};
+use flexinput_virtual::{create_device, kind_prefix};
+use serde_json::Value;
+
+use crate::canvas::remapper_icons;
+use crate::canvas::{header_controls, Canvas, DeviceParamDefaults};
+use crate::panels::device_icon::render_device_icon;
+use crate::panels::virtual_devices::SharedDevicePool;
+
+// Card colors — chosen to pop on the dark left-panel background
+// (#1a1a1a, painted by the app.rs call-site). The active variant
+// uses egui's selection color so it matches whatever theme accent
+// the user has configured.
+const CARD_FILL_INACTIVE:    egui::Color32 = egui::Color32::from_rgb(0x2a, 0x2a, 0x2a);
+const CARD_STROKE_INACTIVE:  egui::Color32 = egui::Color32::from_rgb(0x3a, 0x3a, 0x3a);
+
+const PANEL_PADDING: f32 = 10.0;
+const SECTION_GAP:   f32 = 14.0;
+const CARD_GAP:      f32 = 8.0;
+const CARD_ROUND:    f32 = 12.0;
+
+// Input card geometry
+const INPUT_CARD_ICON_H: f32 = 48.0;
+
+// Output card geometry
+const OUTPUT_CARD_ICON_H:    f32 = 36.0;
+// Compact gamepad-pair card: just icon + short label below.
+const OUTPUT_PAIR_CARD_H:    f32 = 76.0;
+// Keymouse: title row + Mouse speed (label+value) row + slider row.
+// ~18 + 18 + 14 + small gaps + insets ≈ 76 px.
+const OUTPUT_KBM_CARD_H:     f32 = 78.0;
+
+const KIND_XINPUT:   &str = "virtual.xinput";
+const KIND_DS4:      &str = "virtual.ds4";
+const KIND_KEYMOUSE: &str = "virtual.keymouse";
+
+pub fn show(
+    ui: &mut egui::Ui,
+    devices: &[PhysicalDevice],
+    canvas: &mut Canvas,
+    shared_pool: &SharedDevicePool,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
+    calibrate_request: &mut Option<NodeId>,
+    device_rates_hz: &HashMap<String, u32>,
+) {
+    // Reserve a fixed bottom area for the output section; the input
+    // list scrolls within whatever remains above it. The output
+    // section height is the sum of the two card heights + spacing +
+    // section header.
+    let total = ui.available_rect_before_wrap();
+    let output_h = OUTPUT_PAIR_CARD_H + CARD_GAP + OUTPUT_KBM_CARD_H
+        + 28.0 /* header */ + SECTION_GAP + PANEL_PADDING;
+    let top_h = (total.height() - output_h).max(120.0);
+    let top_rect = egui::Rect::from_min_size(
+        total.min,
+        egui::vec2(total.width(), top_h),
+    );
+    let bot_rect = egui::Rect::from_min_size(
+        egui::pos2(total.min.x, total.min.y + top_h),
+        egui::vec2(total.width(), output_h),
+    );
+
+    ui.scope_builder(egui::UiBuilder::new().max_rect(top_rect), |ui| {
+        // Force the clip rect on this scope to the input section's
+        // bounds so card painter calls (and child-UI widgets that
+        // narrow their own clip) can be re-intersected against this
+        // outer viewport — preventing input-card content from spilling
+        // into the output section when the list overflows.
+        ui.set_clip_rect(top_rect);
+        show_input_section(
+            ui, devices, canvas, default_collapsed, defaults,
+            calibrate_request, device_rates_hz,
+        );
+    });
+    ui.scope_builder(egui::UiBuilder::new().max_rect(bot_rect), |ui| {
+        ui.set_clip_rect(bot_rect);
+        show_output_section(ui, canvas, shared_pool, default_collapsed, defaults);
+    });
+}
+
+/// Paint top + bottom gradient strips over the ScrollArea's
+/// `viewport` (its `inner_rect`), hinting that more content exists
+/// when the list overflows. Strip alpha fades in over the first
+/// ~24 px of scroll travel so the cue doesn't pop in/out abruptly.
+/// Mirrors the device-panel side fades from Advanced mode.
+fn paint_scroll_fades(
+    ui: &egui::Ui,
+    viewport: egui::Rect,
+    content_h: f32,
+    offset_y: f32,
+) {
+    let viewport_h = viewport.height();
+    if content_h <= viewport_h { return; }
+    let max_offset = (content_h - viewport_h).max(0.0);
+    let frac_above = (offset_y / 24.0).clamp(0.0, 1.0);
+    let frac_below = ((max_offset - offset_y) / 24.0).clamp(0.0, 1.0);
+
+    let paint_fade = |from_top: bool, frac: f32| {
+        if frac <= 0.0 { return; }
+        let band_h = 18.0_f32;
+        let steps  = 6_i32;
+        for i in 0..steps {
+            let t0 = i as f32 / steps as f32;
+            let t1 = (i + 1) as f32 / steps as f32;
+            // Stronger near the edge, fading toward the middle.
+            let alpha = ((1.0 - t0) * 160.0 * frac) as u8;
+            let (y0, y1) = if from_top {
+                (viewport.top()    + t0 * band_h,
+                 viewport.top()    + t1 * band_h)
+            } else {
+                (viewport.bottom() - t1 * band_h,
+                 viewport.bottom() - t0 * band_h)
+            };
+            let strip = egui::Rect::from_min_max(
+                egui::pos2(viewport.left(),  y0),
+                egui::pos2(viewport.right(), y1),
+            );
+            ui.painter().with_clip_rect(viewport).rect_filled(
+                strip,
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_black_alpha(alpha),
+            );
+        }
+    };
+    paint_fade(true,  frac_above);
+    paint_fade(false, frac_below);
+}
+
+// ── Input ───────────────────────────────────────────────────────────
+
+fn show_input_section(
+    ui: &mut egui::Ui,
+    devices: &[PhysicalDevice],
+    canvas: &mut Canvas,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
+    calibrate_request: &mut Option<NodeId>,
+    device_rates_hz: &HashMap<String, u32>,
+) {
+    ui.add_space(PANEL_PADDING);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new("Choose input device").size(15.0).strong());
+    });
+    ui.add_space(SECTION_GAP * 0.5);
+
+    let gamepads: Vec<&PhysicalDevice> = devices.iter()
+        .filter(|d| !matches!(d.kind, ControllerKind::MidiIn | ControllerKind::MidiOut))
+        .collect();
+    let active_dev_id: Option<String> = canvas.snarl.nodes_ids_data()
+        .find(|(_, n)| n.value.module_id == "device.source")
+        .and_then(|(_, n)| n.value.params.get("device_id")
+            .and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    // Snapshot the actual viewport rect from INSIDE the ScrollArea's
+    // closure (= the same clip rect the input_card painter calls see).
+    // Reading `out.inner_rect` after the fact is slightly off from the
+    // real clip — the fade band ends up misaligned with where cards
+    // get cut. Setting this via interior mutability sidesteps that.
+    use std::cell::Cell;
+    let viewport_cell: Cell<Option<egui::Rect>> = Cell::new(None);
+
+    let out = egui::ScrollArea::vertical()
+        .id_salt("easy_input_scroll")
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            // Capture the true clip rect cards will be drawn against.
+            viewport_cell.set(Some(ui.clip_rect()));
+            if gamepads.is_empty() {
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("No gamepads detected.").weak());
+                    ui.label(egui::RichText::new("Plug one in and it will appear here.").weak());
+                });
+                return;
+            }
+            for d in &gamepads {
+                let is_active = active_dev_id.as_deref() == Some(d.id.as_str());
+                if input_card(
+                    ui, d, is_active, canvas, calibrate_request, device_rates_hz, defaults,
+                ) && !is_active {
+                    replace_active_source(canvas, d, default_collapsed, defaults);
+                    super::wiring::rewire(canvas);
+                }
+                ui.add_space(CARD_GAP);
+            }
+        });
+
+    // Paint scroll-edge fade shadows over the visible viewport when
+    // content overflows, hinting that more cards exist above/below.
+    let viewport = viewport_cell.get().unwrap_or(out.inner_rect);
+    paint_scroll_fades(ui, viewport, out.content_size.y, out.state.offset.y);
+}
+
+fn card_colors(ui: &egui::Ui, is_active: bool, hover: bool) -> (egui::Color32, egui::Color32, f32) {
+    if is_active {
+        let bg = ui.visuals().selection.bg_fill.gamma_multiply(0.35);
+        let stroke = ui.visuals().selection.stroke.color;
+        (bg, stroke, 1.5)
+    } else if hover {
+        let bg = CARD_FILL_INACTIVE.gamma_multiply(1.15);
+        (bg, CARD_STROKE_INACTIVE, 1.0)
+    } else {
+        (CARD_FILL_INACTIVE, CARD_STROKE_INACTIVE, 1.0)
+    }
+}
+
+/// Active accent fill applied to PART of a card (top half of input
+/// cards, left of keymouse card). The rest of the card stays on the
+/// inactive fill so sliders / controls read on the usual background.
+fn active_accent_fill(ui: &egui::Ui) -> egui::Color32 {
+    ui.visuals().selection.bg_fill.gamma_multiply(0.30)
+}
+
+/// Render one input card. Returns true if any non-control area of
+/// the card was clicked (signal to activate this device).
+///
+/// Card structure (split fill):
+///
+///   ┌─────────────────────────────────────┐
+///   │ ICON   Name             Calibrate  │  ← active accent fill (top half)
+///   │                          261 Hz     │
+///   ├─────────────────────────────────────┤
+///   │  Deadzone ▭▭▭▭▭▭▭▭▭▭▭▭▭▭▭ 0.06     │  ← inactive fill (sliders)
+///   │  Gyro ×   ▭▭▭▭▭▭▭▭▭▭▭▭▭▭▭ 3.50     │
+///   └─────────────────────────────────────┘
+fn input_card(
+    ui: &mut egui::Ui,
+    d: &PhysicalDevice,
+    is_active: bool,
+    canvas: &mut Canvas,
+    calibrate_request: &mut Option<NodeId>,
+    device_rates_hz: &HashMap<String, u32>,
+    defaults: DeviceParamDefaults,
+) -> bool {
+    let panel_avail = ui.available_width();
+    let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
+    // Top: icon (48 px) + tight inset. Bottom: two slider rows ~22 px
+    // each + small gap + insets.
+    let top_h = INPUT_CARD_ICON_H + 8.0;
+    let bot_h = 60.0;
+    let card_h = top_h + bot_h;
+
+    // Allocate the full card rect inside the parent VERTICAL layout
+    // (the scroll area). Padding on left/right is handled by sizing
+    // the inner rect to card_w (< panel width) and centering it.
+    let total_h = card_h;
+    let (full_row, _) = ui.allocate_exact_size(
+        egui::vec2(panel_avail, total_h),
+        egui::Sense::hover(),
+    );
+    let card_rect = egui::Rect::from_min_size(
+        egui::pos2(full_row.left() + PANEL_PADDING, full_row.top()),
+        egui::vec2(card_w, card_h),
+    );
+
+    // Viewport clip — intersect every painter call below with the
+    // parent ui's existing clip rect (the ScrollArea's viewport) AND
+    // the card_rect so card content never escapes either bound.
+    let viewport_clip = ui.clip_rect();
+    let card_visible_clip = card_rect.intersect(viewport_clip);
+
+    // ── Pass 1: paint card bg + (if active) top-half accent ──
+    let stroke_col = if is_active {
+        ui.visuals().selection.stroke.color
+    } else {
+        CARD_STROKE_INACTIVE
+    };
+    let stroke_w = if is_active { 1.5 } else { 1.0 };
+    ui.painter()
+        .with_clip_rect(viewport_clip)
+        .rect(card_rect, CARD_ROUND, CARD_FILL_INACTIVE,
+            egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
+    if is_active {
+        let top_band = egui::Rect::from_min_size(
+            card_rect.min,
+            egui::vec2(card_rect.width(), top_h),
+        );
+        let cr = egui::CornerRadius {
+            nw: CARD_ROUND as u8, ne: CARD_ROUND as u8, sw: 0, se: 0,
+        };
+        ui.painter()
+            .with_clip_rect(card_visible_clip)
+            .rect_filled(top_band, cr, active_accent_fill(ui));
+    }
+
+    // Card-body click sensing. Register BEFORE any inner widgets so
+    // later-added interactive widgets (Calibrate button, sliders,
+    // DragValues) win the hit test on their own rects. If registered
+    // last, this would swallow every click on a child widget.
+    let body_resp = ui.interact(
+        card_rect,
+        ui.id().with(("easy_input_card", d.id.as_str())),
+        egui::Sense::click(),
+    );
+
+    // ── Pass 2: render widgets inside the reserved rect ──
+    let top_rect = egui::Rect::from_min_size(
+        card_rect.min, egui::vec2(card_w, top_h));
+    let bot_rect = egui::Rect::from_min_size(
+        egui::pos2(card_rect.left(), card_rect.top() + top_h),
+        egui::vec2(card_w, bot_h));
+
+    // Card content horizontal padding — same value on left + right so
+    // the icon, name/Calibrate column, and bottom slider rows all use
+    // identical gutters.
+    const CARD_HPAD: f32 = 10.0;
+
+    // Top section: icon on the left, with a vertically-centered right
+    // column carrying (name, Calibrate+Hz).
+    let icon_x = top_rect.left() + CARD_HPAD;
+    let icon_y = top_rect.top() + 4.0;
+    let icon_w = INPUT_CARD_ICON_H;
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(icon_x, icon_y),
+        egui::vec2(icon_w, INPUT_CARD_ICON_H),
+    );
+    let mut icon_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(icon_rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    icon_ui.set_clip_rect(card_visible_clip);
+    render_device_icon(
+        &mut icon_ui,
+        remapper_icons::device_card_svg(d.kind),
+        INPUT_CARD_ICON_H,
+    );
+
+    // Right column: name (row 1) + Calibrate+Hz (row 2), y-centered
+    // against the icon. ~36 px tall → indent top by (icon_h - 36) / 2.
+    let right_col_h = 36.0_f32;
+    let right_col_top = top_rect.top() + 4.0
+        + (INPUT_CARD_ICON_H - right_col_h) * 0.5;
+    let right_col_left = icon_rect.right() + 8.0;
+    let right_col_rect = egui::Rect::from_min_max(
+        egui::pos2(right_col_left, right_col_top),
+        egui::pos2(card_rect.right() - CARD_HPAD, right_col_top + right_col_h),
+    );
+    let mut top_right = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(right_col_rect)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    top_right.set_clip_rect(card_visible_clip);
+    top_right.label(egui::RichText::new(&d.display_name)
+        .size(14.0).strong());
+    top_right.add_space(1.0);
+    top_right.horizontal(|ui| {
+        if is_active {
+            if let Some((node_id, dev_id)) = active_source(canvas) {
+                header_controls::render_calibrate_row(
+                    ui, node_id, &dev_id,
+                    device_rates_hz, calibrate_request,
+                );
+            }
+        } else {
+            ui.add_enabled(false, egui::Button::new(
+                egui::RichText::new("Calibrate").small()));
+            ui.label(egui::RichText::new(format!("{} Hz",
+                device_rates_hz.get(&d.id).copied().unwrap_or(0)))
+                .color(egui::Color32::from_rgb(140, 110, 60)).small());
+        }
+    });
+
+    // Bottom section: two stacked slider rows with bigger, more
+    // readable labels. Layout per row: [LABEL  | slider fills | value].
+    let mut bot_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(bot_rect.shrink2(egui::vec2(CARD_HPAD, 4.0)))
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    bot_ui.set_clip_rect(card_visible_clip);
+    if is_active {
+        if let Some(node_id) = find_source_node_for(canvas, &d.id) {
+            let dev_id_owned = d.id.clone();
+            if let Some(params) = canvas.snarl.get_node_mut(node_id).map(|n| &mut n.params) {
+                input_slider_rows(&mut bot_ui, params, &dev_id_owned, defaults, true);
+            }
+        }
+    } else {
+        let mut preview: HashMap<String, Value> = HashMap::new();
+        preview.insert("deadzone".into(),
+            Value::from(defaults.stick_deadzone as f64));
+        preview.insert("gyro_multiplier".into(),
+            Value::from(defaults.gyro_mult as f64));
+        input_slider_rows(&mut bot_ui, &mut preview, &d.id, defaults, false);
+    }
+
+    body_resp.clicked()
+}
+
+/// Easy-mode Deadzone / Gyro × slider rows. Bigger label font (size
+/// 12, regular weight — not the tiny weak label `slider_label` uses
+/// in Advanced mode) and the slider expands to fill the row's middle
+/// space so it ends just before the value box near the card's right
+/// edge.
+fn input_slider_rows(
+    ui: &mut egui::Ui,
+    params: &mut HashMap<String, Value>,
+    device_id: &str,
+    defaults: DeviceParamDefaults,
+    enabled: bool,
+) {
+    use crate::canvas::viewer::{device_source_caps, slider_track_double_clicked};
+    let (has_dz, has_gy, _) = device_source_caps(device_id, true);
+    let label_w = 64.0_f32;
+    let dv_w    = 52.0_f32;
+    let row_h   = 20.0_f32;
+    // Pixel-positioned row: place label, slider, and value box into
+    // explicit screen-coord sub-rects via `new_child` rather than
+    // relying on `ui.horizontal`'s cursor + item_spacing math. egui
+    // adds invisible internal margins to interactive widgets (drag-
+    // value frame inset, slider handle clearance) that make
+    // cursor-based layout overshoot. With explicit rects the value
+    // box's right edge is guaranteed to land at row_right.
+    let row = |ui: &mut egui::Ui, label: &str, val: &mut f32,
+               range: std::ops::RangeInclusive<f32>, log: bool,
+               default_val: f32, step: f32, decimals: usize|
+               -> bool
+    {
+        let initial = *val;
+        let row_avail = ui.available_width();
+        let (row_rect, _) = ui.allocate_exact_size(
+            egui::vec2(row_avail, row_h), egui::Sense::hover());
+        let gap = 6.0_f32;
+        let slider_w = (row_rect.width() - label_w - dv_w - 2.0 * gap).max(40.0);
+
+        let label_rect = egui::Rect::from_min_size(
+            row_rect.min, egui::vec2(label_w, row_h));
+        let slider_rect = egui::Rect::from_min_size(
+            egui::pos2(label_rect.right() + gap, row_rect.top()),
+            egui::vec2(slider_w, row_h));
+        let dv_rect = egui::Rect::from_min_size(
+            egui::pos2(row_rect.right() - dv_w, row_rect.top()),
+            egui::vec2(dv_w, row_h));
+
+        // Label (painted, no widget — keeps left edge exact).
+        ui.painter().text(
+            egui::pos2(label_rect.left(), label_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            ui.visuals().text_color(),
+        );
+
+        // Slider — override spacing.slider_width so the track fills
+        // the full middle slot (egui's default ~100 px leaves a gap).
+        let mut slider_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(slider_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        slider_ui.spacing_mut().slider_width = slider_w;
+        let mut slider = egui::Slider::new(val, range.clone())
+            .show_value(false)
+            .clamping(egui::SliderClamping::Always);
+        if log { slider = slider.logarithmic(true); }
+        let resp = slider_ui.add_sized([slider_w, row_h], slider);
+        if slider_track_double_clicked(&slider_ui, &resp) { *val = default_val; }
+
+        // Value box, pinned to row's right edge.
+        let mut dv_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(dv_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        dv_ui.add_sized(
+            [dv_w, row_h],
+            egui::DragValue::new(val)
+                .speed(step)
+                .range(range.clone())
+                .fixed_decimals(decimals),
+        );
+
+        (*val - initial).abs() > f32::EPSILON
+    };
+
+    ui.add_enabled_ui(enabled, |ui| {
+        if has_dz {
+            let mut dz = params.get("deadzone").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
+            if row(ui, "Deadzone", &mut dz, 0.0..=0.5, false,
+                   defaults.stick_deadzone, 0.005, 2)
+            {
+                params.insert("deadzone".into(), Value::from(dz as f64));
+            }
+        }
+        if has_gy {
+            let mut gm = params.get("gyro_multiplier").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            if row(ui, "Gyro ×", &mut gm, 0.1..=50.0, true,
+                   defaults.gyro_mult, 0.05, 2)
+            {
+                params.insert("gyro_multiplier".into(), Value::from(gm as f64));
+            }
+        }
+    });
+}
+
+fn find_source_node_for(canvas: &Canvas, device_id: &str) -> Option<NodeId> {
+    canvas.snarl.nodes_ids_data()
+        .find(|(_, n)| n.value.module_id == "device.source"
+            && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(device_id))
+        .map(|(id, _)| id)
+}
+
+fn active_source(canvas: &Canvas) -> Option<(NodeId, String)> {
+    canvas.snarl.nodes_ids_data()
+        .find(|(_, n)| n.value.module_id == "device.source")
+        .and_then(|(id, n)| {
+            n.value.params.get("device_id")
+                .and_then(|v| v.as_str())
+                .map(|s| (id, s.to_string()))
+        })
+}
+
+fn replace_active_source(
+    canvas: &mut Canvas,
+    device: &PhysicalDevice,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
+) {
+    let to_remove: Vec<NodeId> = canvas.snarl.nodes_ids_data()
+        .filter(|(_, n)| n.value.module_id == "device.source")
+        .map(|(id, _)| id)
+        .collect();
+    for id in to_remove { canvas.snarl.remove_node(id); }
+    canvas.add_device_source(device, default_collapsed, defaults);
+    super::layout::reposition_io_nodes(canvas);
+}
+
+// ── Output ──────────────────────────────────────────────────────────
+
+fn show_output_section(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    shared_pool: &SharedDevicePool,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
+) {
+    ui.add_space(8.0);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new("Choose output devices").size(15.0).strong());
+    });
+    ui.add_space(CARD_GAP);
+
+    let xinput_on   = has_sink_of_kind(canvas, KIND_XINPUT);
+    let ds4_on      = has_sink_of_kind(canvas, KIND_DS4);
+    let keymouse_on = has_sink_of_kind(canvas, KIND_KEYMOUSE);
+
+    // Gamepad pair row: XInput | DS4 (mutually exclusive).
+    let panel_w = ui.available_width();
+    let inner_w = (panel_w - 2.0 * PANEL_PADDING).max(120.0);
+    let pair_card_w = (inner_w - CARD_GAP) / 2.0;
+    ui.horizontal(|ui| {
+        ui.add_space(PANEL_PADDING);
+        if gamepad_card(ui, "xinput",
+            remapper_icons::virtual_device_card_svg(KIND_XINPUT),
+            xinput_on, pair_card_w)
+        {
+            if xinput_on {
+                remove_sinks_of_kind(canvas, KIND_XINPUT);
+            } else {
+                remove_sinks_of_kind(canvas, KIND_DS4);
+                ensure_sink_of_kind(canvas, KIND_XINPUT, shared_pool, default_collapsed, defaults);
+            }
+            super::wiring::rewire(canvas);
+        }
+        ui.add_space(CARD_GAP);
+        if gamepad_card(ui, "DS4",
+            remapper_icons::virtual_device_card_svg(KIND_DS4),
+            ds4_on, pair_card_w)
+        {
+            if ds4_on {
+                remove_sinks_of_kind(canvas, KIND_DS4);
+            } else {
+                remove_sinks_of_kind(canvas, KIND_XINPUT);
+                ensure_sink_of_kind(canvas, KIND_DS4, shared_pool, default_collapsed, defaults);
+            }
+            super::wiring::rewire(canvas);
+        }
+        ui.add_space(PANEL_PADDING);
+    });
+
+    ui.add_space(CARD_GAP);
+
+    // Keyboard and Mouse card with Mouse speed slider inline.
+    ui.horizontal(|ui| {
+        ui.add_space(PANEL_PADDING);
+        if keymouse_card(ui, keymouse_on, canvas, defaults, inner_w) {
+            if keymouse_on {
+                remove_sinks_of_kind(canvas, KIND_KEYMOUSE);
+            } else {
+                ensure_sink_of_kind(canvas, KIND_KEYMOUSE, shared_pool, default_collapsed, defaults);
+            }
+            super::wiring::rewire(canvas);
+        }
+        ui.add_space(PANEL_PADDING);
+    });
+}
+
+fn gamepad_card(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: &'static [u8],
+    is_active: bool,
+    width: f32,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(width, OUTPUT_PAIR_CARD_H),
+        egui::Sense::click(),
+    );
+    let (bg, stroke, stroke_w) = card_colors(ui, is_active, resp.hovered());
+    ui.painter().rect(rect, CARD_ROUND, bg,
+        egui::Stroke::new(stroke_w, stroke), egui::StrokeKind::Inside);
+    ui.scope_builder(egui::UiBuilder::new()
+        .max_rect(rect.shrink(8.0)), |ui|
+    {
+        ui.vertical_centered(|ui| {
+            render_device_icon(ui, icon, OUTPUT_CARD_ICON_H);
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(label).size(13.0).strong());
+        });
+    });
+    resp.clicked()
+}
+
+fn keymouse_card(
+    ui: &mut egui::Ui,
+    is_active: bool,
+    canvas: &mut Canvas,
+    defaults: DeviceParamDefaults,
+    width: f32,
+) -> bool {
+    // Card geometry — derived from content rather than a constant so
+    // the three stacked rows on the right always fit without spill.
+    //
+    //   ┌─────────────────────────────────────────┐
+    //   │ ICON   Keyboard and Mouse               │
+    //   │ ICON   Mouse speed:   [   300  ]        │
+    //   │ ICON   [══════════slider══════════]     │
+    //   └─────────────────────────────────────────┘
+    //
+    // ICON column is the LEFT-half accent surface; content stacks in
+    // the right column.
+    let icon_col_w = OUTPUT_CARD_ICON_H + 16.0;
+    let card_h = OUTPUT_KBM_CARD_H;
+
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(width, card_h),
+        egui::Sense::click(),
+    );
+
+    // ── Pass 1: bg + (if active) LEFT-half accent fill ──
+    let stroke_col = if is_active {
+        ui.visuals().selection.stroke.color
+    } else {
+        CARD_STROKE_INACTIVE
+    };
+    let stroke_w = if is_active { 1.5 } else { 1.0 };
+    ui.painter().rect(rect, CARD_ROUND, CARD_FILL_INACTIVE,
+        egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
+    if is_active {
+        let left_rect = egui::Rect::from_min_size(
+            rect.min, egui::vec2(icon_col_w, rect.height()),
+        );
+        let mut cr = egui::CornerRadius::ZERO;
+        cr.nw = CARD_ROUND as u8;
+        cr.sw = CARD_ROUND as u8;
+        ui.painter()
+            .with_clip_rect(rect)
+            .rect_filled(left_rect, cr, active_accent_fill(ui));
+    }
+
+    // ── Pass 2: widgets ──
+    let left_rect = egui::Rect::from_min_size(
+        rect.min, egui::vec2(icon_col_w, rect.height()),
+    );
+    let right_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + icon_col_w, rect.top()),
+        egui::vec2(rect.width() - icon_col_w, rect.height()),
+    );
+    // Left column: icon vertically centered.
+    let mut left_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(left_rect.shrink(6.0))
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    left_ui.set_clip_rect(rect);
+    let icon_top_pad = ((left_rect.height() - OUTPUT_CARD_ICON_H) * 0.5 - 6.0).max(0.0);
+    left_ui.add_space(icon_top_pad);
+    render_device_icon(&mut left_ui, remapper_icons::keymouse_svg(), OUTPUT_CARD_ICON_H);
+
+    // Right column: title (row 1), Mouse speed label + value (row 2),
+    // slider full width (row 3). Inner padding on the right matches
+    // the card's CARD_HPAD-equivalent (10 px) so the slider track and
+    // value box end flush with the same gutter as the input cards.
+    const RIGHT_HPAD: f32 = 8.0;
+    const RIGHT_TAIL_PAD: f32 = 10.0;
+    let right_inset = right_rect.shrink2(egui::vec2(0.0, 6.0));
+    let right_inset = egui::Rect::from_min_max(
+        egui::pos2(right_inset.left() + RIGHT_HPAD, right_inset.top()),
+        egui::pos2(right_inset.right() - RIGHT_TAIL_PAD, right_inset.bottom()),
+    );
+    let mut right_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(right_inset)
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    right_ui.set_clip_rect(rect);
+    // Nudge the title slightly down so it sits clear of the card
+    // top edge but doesn't dominate the card's vertical space.
+    right_ui.add_space(3.0);
+    right_ui.label(egui::RichText::new("Keyboard and Mouse").size(13.0).strong());
+    right_ui.add_space(2.0);
+    // Explicit content width for the right column so the value box +
+    // slider know exactly how much space they have.
+    let right_content_w = right_inset.width().max(40.0);
+    if is_active {
+        if let Some(km_node) = sink_node_of_kind(canvas, KIND_KEYMOUSE) {
+            if let Some(params) = canvas.snarl.get_node_mut(km_node).map(|n| &mut n.params) {
+                mouse_speed_stack(&mut right_ui, params, defaults, right_content_w);
+            }
+        }
+    } else {
+        right_ui.add_enabled_ui(false, |ui| {
+            let mut preview: HashMap<String, Value> = HashMap::new();
+            preview.insert("mouse_sensitivity".into(),
+                Value::from(defaults.mouse_sensitivity as f64));
+            mouse_speed_stack(ui, &mut preview, defaults, right_content_w);
+        });
+    }
+    resp.clicked()
+}
+
+/// Stacked Mouse-speed control for the keymouse card:
+///   row 1: "Mouse speed:" label + DragValue box
+///   row 2: full-width slider
+///
+/// Splitting label/value from the slider on separate rows keeps the
+/// slider track wide enough to be usable at narrow card widths and
+/// matches the mockup's vertical rhythm.
+fn mouse_speed_stack(
+    ui: &mut egui::Ui,
+    params: &mut HashMap<String, Value>,
+    defaults: DeviceParamDefaults,
+    content_w: f32,
+) {
+    let mut ms = params.get("mouse_sensitivity")
+        .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    let initial = ms;
+    let dv_w = 56.0_f32;
+    let row1_h = 20.0_f32;
+    let row2_h = 16.0_f32;
+
+    // Row 1: "Mouse speed:" label on the left, DragValue pinned flush
+    // to the row's right edge via an explicit screen-coord sub-rect
+    // (same technique as input_slider_rows — avoids egui internal
+    // widget margins drifting the right edge).
+    let (row1_rect, _) = ui.allocate_exact_size(
+        egui::vec2(content_w, row1_h), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(row1_rect.left(), row1_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Mouse speed:",
+        egui::FontId::proportional(12.0),
+        ui.visuals().text_color(),
+    );
+    let dv_rect = egui::Rect::from_min_size(
+        egui::pos2(row1_rect.right() - dv_w, row1_rect.top()),
+        egui::vec2(dv_w, row1_h));
+    let mut dv_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(dv_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    dv_ui.add_sized(
+        [dv_w, row1_h],
+        egui::DragValue::new(&mut ms)
+            .speed(0.5)
+            .range(0.0_f32..=3000.0)
+            .fixed_decimals(2),
+    );
+
+    // Tighter gap between the value-row and the slider so the slider
+    // sits closer to the row above (and the card stays compact).
+    ui.add_space(0.0);
+
+    // Row 2: slider pinned to the same content_w, so its right edge
+    // matches the value box's right edge on row 1. Override
+    // `spacing.slider_width` for this child UI — that's the value
+    // egui's Slider uses as its preferred width and it defaults to
+    // ~100 px, which would leave the track stopping mid-row even
+    // though `add_sized` reserves the full width.
+    let (row2_rect, _) = ui.allocate_exact_size(
+        egui::vec2(content_w, row2_h), egui::Sense::hover());
+    let mut slider_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(row2_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    slider_ui.spacing_mut().slider_width = content_w;
+    let resp = slider_ui.add_sized(
+        [content_w, row2_h],
+        egui::Slider::new(&mut ms, 0.0_f32..=3000.0)
+            .logarithmic(true)
+            .show_value(false)
+            .clamping(egui::SliderClamping::Always),
+    );
+    if resp.double_clicked() { ms = defaults.mouse_sensitivity; }
+
+    if (ms - initial).abs() > f32::EPSILON {
+        params.insert("mouse_sensitivity".into(), Value::from(ms as f64));
+    }
+}
+
+// ── Sink helpers ────────────────────────────────────────────────────
+
+fn has_sink_of_kind(canvas: &Canvas, kind_prefix_str: &str) -> bool {
+    canvas.snarl.nodes_ids_data().any(|(_, n)| {
+        n.value.module_id == "device.sink"
+            && n.value.params.get("device_id")
+                .and_then(|v| v.as_str())
+                .map(|did| kind_prefix(did) == kind_prefix_str)
+                .unwrap_or(false)
+    })
+}
+
+fn sink_node_of_kind(canvas: &Canvas, kind_prefix_str: &str) -> Option<NodeId> {
+    canvas.snarl.nodes_ids_data()
+        .find(|(_, n)| {
+            n.value.module_id == "device.sink"
+                && n.value.params.get("device_id")
+                    .and_then(|v| v.as_str())
+                    .map(|did| kind_prefix(did) == kind_prefix_str)
+                    .unwrap_or(false)
+        })
+        .map(|(id, _)| id)
+}
+
+fn remove_sinks_of_kind(canvas: &mut Canvas, kind_prefix_str: &str) {
+    let to_remove: Vec<NodeId> = canvas.snarl.nodes_ids_data()
+        .filter(|(_, n)| {
+            n.value.module_id == "device.sink"
+                && n.value.params.get("device_id")
+                    .and_then(|v| v.as_str())
+                    .map(|did| kind_prefix(did) == kind_prefix_str)
+                    .unwrap_or(false)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    for id in to_remove { canvas.snarl.remove_node(id); }
+}
+
+fn ensure_sink_of_kind(
+    canvas: &mut Canvas,
+    kind_id: &str,
+    pool: &SharedDevicePool,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
+) {
+    if has_sink_of_kind(canvas, kind_id) { return; }
+    let existing: Option<String> = {
+        let devs = pool.lock().unwrap();
+        devs.iter()
+            .find(|d| d.id().starts_with(kind_id))
+            .map(|d| d.id().to_string())
+    };
+    if existing.is_some() {
+        let devs = pool.lock().unwrap();
+        if let Some(d) = devs.iter().find(|d| d.id().starts_with(kind_id)) {
+            canvas.add_virtual_sink(d.as_ref(), default_collapsed, defaults);
+        }
+    } else {
+        let dev = create_device(kind_id, 0);
+        canvas.add_virtual_sink(dev.as_ref(), default_collapsed, defaults);
+        let mut devs = pool.lock().unwrap();
+        devs.push(dev);
+    }
+    super::layout::reposition_io_nodes(canvas);
+}

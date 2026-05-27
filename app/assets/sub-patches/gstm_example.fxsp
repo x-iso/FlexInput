@@ -1,0 +1,2341 @@
+{
+  "version": 1,
+  "sub_patch": {
+    "display_name": "Sub-patch",
+    "pins_in": [
+      {
+        "name": "Inlet",
+        "signal_type": "AutoMap"
+      }
+    ],
+    "pins_out": [
+      {
+        "name": "Outlet",
+        "signal_type": "AutoMap"
+      }
+    ],
+    "snarl": {
+      "nodes": {
+        "0": {
+          "value": {
+            "module_id": "subpatch.inlet",
+            "display_name": "Inlet",
+            "category": "SubPatch",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "Inlet",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {
+              "signal_type": "AutoMap",
+              "pin_index": 0
+            }
+          },
+          "pos": {
+            "x": -980.4612,
+            "y": 206.76073
+          },
+          "open": true
+        },
+        "1": {
+          "value": {
+            "module_id": "subpatch.outlet",
+            "display_name": "Outlet",
+            "category": "SubPatch",
+            "inputs": [
+              {
+                "name": "Outlet",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [],
+            "params": {
+              "signal_type": "AutoMap",
+              "pin_index": 0
+            }
+          },
+          "pos": {
+            "x": 1079.7065,
+            "y": 174.58923
+          },
+          "open": true
+        },
+        "2": {
+          "value": {
+            "module_id": "module.automap_split",
+            "display_name": "AutoMap Splitter",
+            "category": "AutoMap",
+            "inputs": [
+              {
+                "name": "Device",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "AutoMap",
+                "signal_type": "AutoMap",
+                "optional": false
+              },
+              {
+                "name": "Right Stick",
+                "signal_type": "Vec2",
+                "optional": false
+              },
+              {
+                "name": "LT dig / L2 / ZL",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "RT dig / R2 / ZR",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "Left Trigger (analog)",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Right Trigger (analog)",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "output_pin_ids": [
+                "automap_pass",
+                "right_stick",
+                "btn_lt_dig",
+                "btn_rt_dig",
+                "left_trigger",
+                "right_trigger"
+              ]
+            }
+          },
+          "pos": {
+            "x": -465.8281,
+            "y": 883.4254
+          },
+          "open": true
+        },
+        "3": {
+          "value": {
+            "module_id": "module.vec_response_curve",
+            "display_name": "RS Curve",
+            "category": "Processing",
+            "inputs": [
+              {
+                "name": "In",
+                "signal_type": "Vec2",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "Out",
+                "signal_type": "Vec2",
+                "optional": false
+              }
+            ],
+            "params": {
+              "biases": [
+                -0.017992638051509857,
+                -0.019424807280302048,
+                0.0,
+                0.0
+              ],
+              "scale_t": -0.5194040536880493,
+              "grid_y": 4,
+              "snap": false,
+              "grid_x": 4,
+              "points": [
+                [
+                  0.43329668045043945,
+                  0.008313586004078388
+                ],
+                [
+                  0.5313476920127869,
+                  0.21587200462818143
+                ],
+                [
+                  0.6496509909629822,
+                  0.5125924348831177
+                ],
+                [
+                  0.7580180168151855,
+                  0.7437652945518494
+                ],
+                [
+                  1.0,
+                  1.0
+                ]
+              ],
+              "trail_ms": 300,
+              "in_max": 1.0,
+              "out_max": 1.0
+            }
+          },
+          "pos": {
+            "x": -675.6034,
+            "y": 228.10922
+          },
+          "open": true
+        },
+        "4": {
+          "value": {
+            "module_id": "math.multiply",
+            "display_name": "Multiply",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "c",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 316.01306,
+            "y": 240.06723
+          },
+          "open": true
+        },
+        "5": {
+          "value": {
+            "module_id": "module.knob",
+            "display_name": "RS",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "value": 0.3023274838924408
+            }
+          },
+          "pos": {
+            "x": -350.1523,
+            "y": 293.6323
+          },
+          "open": true
+        },
+        "6": {
+          "value": {
+            "module_id": "module.average",
+            "display_name": "Average",
+            "category": "Processing",
+            "inputs": [
+              {
+                "name": "In",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "Out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {
+              "buf_size": 96.0,
+              "spike_mad": 0.0
+            }
+          },
+          "pos": {
+            "x": 368.37958,
+            "y": 15.318193
+          },
+          "open": true
+        },
+        "7": {
+          "value": {
+            "module_id": "module.automap_collect",
+            "display_name": "AutoMap Collector",
+            "category": "AutoMap",
+            "inputs": [
+              {
+                "name": "Device",
+                "signal_type": "AutoMap",
+                "optional": false
+              },
+              {
+                "name": "Right Stick",
+                "signal_type": "Vec2",
+                "optional": false
+              },
+              {
+                "name": "Mouse: X (delta)",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Mouse: Y (delta)",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Mouse: LMB",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "Mouse: RMB",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "AutoMap",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {
+              "collect_input_pin_ids": [
+                "right_stick",
+                "mouse_x",
+                "mouse_y",
+                "mouse_left",
+                "mouse_right"
+              ]
+            }
+          },
+          "pos": {
+            "x": 816.5758,
+            "y": 362.7288
+          },
+          "open": true
+        },
+        "8": {
+          "value": {
+            "module_id": "processing.gyro_3dof",
+            "display_name": "3DOF to 2D",
+            "category": "Processing",
+            "inputs": [
+              {
+                "name": "Device",
+                "signal_type": "AutoMap",
+                "optional": false
+              },
+              {
+                "name": "Reset",
+                "signal_type": "Bool",
+                "optional": true
+              },
+              {
+                "name": "Gyro X",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Gyro Y",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Gyro Z",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Accel X",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Accel Y",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "Accel Z",
+                "signal_type": "Float",
+                "optional": true
+              }
+            ],
+            "outputs": [
+              {
+                "name": "Out",
+                "signal_type": "Vec2",
+                "optional": false
+              },
+              {
+                "name": "X",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Y",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "inv_accel_z": false,
+              "inv_accel_y": false,
+              "inv_pitch": false,
+              "inv_accel_x": false,
+              "inv_roll": false,
+              "inv_yaw": false,
+              "mode": "player"
+            }
+          },
+          "pos": {
+            "x": -768.57056,
+            "y": -248.09908
+          },
+          "open": true
+        },
+        "9": {
+          "value": {
+            "module_id": "module.vec_response_curve",
+            "display_name": "Gyro Curve",
+            "category": "Processing",
+            "inputs": [
+              {
+                "name": "In",
+                "signal_type": "Vec2",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "Out",
+                "signal_type": "Vec2",
+                "optional": false
+              }
+            ],
+            "params": {
+              "snap": false,
+              "in_max": 0.5,
+              "scale_t": -0.7882746458053589,
+              "grid_x": 4,
+              "out_max": 1.0,
+              "trail_ms": 300,
+              "points": [
+                [
+                  0.2383357286453247,
+                  0.0
+                ],
+                [
+                  0.3423505425453186,
+                  0.29375597834587097
+                ],
+                [
+                  0.5,
+                  0.5
+                ],
+                [
+                  1.0,
+                  1.0
+                ]
+              ],
+              "biases": [
+                0.05117863416671753,
+                0.0,
+                0.0
+              ],
+              "grid_y": 4
+            }
+          },
+          "pos": {
+            "x": -461.44864,
+            "y": -254.1659
+          },
+          "open": true
+        },
+        "10": {
+          "value": {
+            "module_id": "math.multiply",
+            "display_name": "Multiply",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "c",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "d",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 132.76976,
+            "y": -197.69124
+          },
+          "open": true
+        },
+        "11": {
+          "value": {
+            "module_id": "module.constant",
+            "display_name": "Max sensitivity",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "value": 3000.0
+            }
+          },
+          "pos": {
+            "x": -109.316216,
+            "y": -94.18849
+          },
+          "open": true
+        },
+        "12": {
+          "value": {
+            "module_id": "module.knob",
+            "display_name": "Mouse",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "value": 0.6615382432937622
+            }
+          },
+          "pos": {
+            "x": -58.644432,
+            "y": -281.07318
+          },
+          "open": true
+        },
+        "13": {
+          "value": {
+            "module_id": "module.vec_to_axis",
+            "display_name": "Vec to Axis",
+            "category": "Converters",
+            "inputs": [
+              {
+                "name": "In",
+                "signal_type": "Vec2",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "X",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Y",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 602.3411,
+            "y": 115.43978
+          },
+          "open": true
+        },
+        "14": {
+          "value": {
+            "module_id": "math.negate",
+            "display_name": "Negate",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "in",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 697.9499,
+            "y": 277.49414
+          },
+          "open": true
+        },
+        "15": {
+          "value": {
+            "module_id": "math.add",
+            "display_name": "Add",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 481.39703,
+            "y": 197.64055
+          },
+          "open": true
+        },
+        "16": {
+          "value": {
+            "module_id": "math.multiply",
+            "display_name": "Multiply",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 676.57117,
+            "y": 347.5507
+          },
+          "open": true
+        },
+        "17": {
+          "value": {
+            "module_id": "math.divide",
+            "display_name": "Divide",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 1.943582,
+            "y": 143.14516
+          },
+          "open": true
+        },
+        "18": {
+          "value": {
+            "module_id": "module.constant",
+            "display_name": "Constant",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "value": 4.0
+            }
+          },
+          "pos": {
+            "x": 15.059204,
+            "y": 268.40387
+          },
+          "open": true
+        },
+        "19": {
+          "value": {
+            "module_id": "math.add",
+            "display_name": "Add",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": -13.622686,
+            "y": 360.03052
+          },
+          "open": true
+        },
+        "20": {
+          "value": {
+            "module_id": "math.clamp",
+            "display_name": "Clamp",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "in",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "min",
+                "signal_type": "Float",
+                "optional": true
+              },
+              {
+                "name": "max",
+                "signal_type": "Float",
+                "optional": true
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 113.78218,
+            "y": 362.6876
+          },
+          "open": true
+        },
+        "21": {
+          "value": {
+            "module_id": "module.constant",
+            "display_name": "Constant",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "value": 0.0
+            }
+          },
+          "pos": {
+            "x": -191.15312,
+            "y": 171.0894
+          },
+          "open": true
+        },
+        "22": {
+          "value": {
+            "module_id": "module.constant",
+            "display_name": "Constant",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "value": 1.0
+            }
+          },
+          "pos": {
+            "x": -145.4489,
+            "y": 376.7345
+          },
+          "open": true
+        },
+        "23": {
+          "value": {
+            "module_id": "module.response_curve",
+            "display_name": "Trigger anti-gyro bump",
+            "category": "Processing",
+            "inputs": [
+              {
+                "name": "In 1",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "In 2",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "In 3",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "Out 1",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Out 2",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "Out 3",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "in_min": -1.0,
+              "in_max": 1.0,
+              "trail_ms": 300,
+              "absolute": true,
+              "out_min": -1.0,
+              "grid_y": 4,
+              "snap": false,
+              "out_max": 1.0,
+              "biases": [
+                -0.13590510189533234,
+                -0.07194985449314117,
+                -0.15318021178245544,
+                0.026433756574988365,
+                0.0
+              ],
+              "scale_t": -1.0,
+              "grid_x": 4,
+              "points": [
+                [
+                  0.0,
+                  1.0
+                ],
+                [
+                  0.003283360041677952,
+                  0.0
+                ],
+                [
+                  0.6727005243301392,
+                  0.15484751760959625
+                ],
+                [
+                  0.8613196611404419,
+                  0.676702618598938
+                ],
+                [
+                  0.9531259536743164,
+                  0.8862584233283997
+                ],
+                [
+                  1.0,
+                  1.0
+                ]
+              ]
+            }
+          },
+          "pos": {
+            "x": 292.90216,
+            "y": 827.8016
+          },
+          "open": true
+        },
+        "24": {
+          "value": {
+            "module_id": "module.selector",
+            "display_name": "Selector",
+            "category": "Utility",
+            "inputs": [
+              {
+                "name": "select",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "in_0",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "in_1",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 534.553,
+            "y": 529.46356
+          },
+          "open": true
+        },
+        "25": {
+          "value": {
+            "module_id": "module.switch",
+            "display_name": "Anti-bump",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {
+              "active": true
+            }
+          },
+          "pos": {
+            "x": 682.3756,
+            "y": 727.6295
+          },
+          "open": true
+        },
+        "26": {
+          "value": {
+            "module_id": "logic.or",
+            "display_name": "OR",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 278.23682,
+            "y": 369.69876
+          },
+          "open": true
+        },
+        "27": {
+          "value": {
+            "module_id": "logic.greater_than",
+            "display_name": "RTpress",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 83.82564,
+            "y": 559.97986
+          },
+          "open": true
+        },
+        "28": {
+          "value": {
+            "module_id": "logic.or",
+            "display_name": "OR",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 295.81287,
+            "y": 456.69955
+          },
+          "open": true
+        },
+        "29": {
+          "value": {
+            "module_id": "logic.greater_than",
+            "display_name": "LTpress",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 86.46893,
+            "y": 490.53424
+          },
+          "open": true
+        },
+        "30": {
+          "value": {
+            "module_id": "logic.or",
+            "display_name": "OR",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 398.44833,
+            "y": 344.66098
+          },
+          "open": true
+        },
+        "31": {
+          "value": {
+            "module_id": "logic.delay",
+            "display_name": "Logic Delay",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "in",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {
+              "mode": "delay_false",
+              "time": 90.0,
+              "unit": "ms"
+            }
+          },
+          "pos": {
+            "x": 630.27606,
+            "y": 1167.5156
+          },
+          "open": true
+        },
+        "32": {
+          "value": {
+            "module_id": "module.average",
+            "display_name": "Average",
+            "category": "Processing",
+            "inputs": [
+              {
+                "name": "In",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "Out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {
+              "buf_size": 220.0,
+              "spike_mad": 0.0
+            }
+          },
+          "pos": {
+            "x": 281.0652,
+            "y": 1187.2194
+          },
+          "open": true
+        },
+        "33": {
+          "value": {
+            "module_id": "module.label",
+            "display_name": "Text",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [],
+            "params": {
+              "font_size": 16.0,
+              "text": "Right Stick settings"
+            }
+          },
+          "pos": {
+            "x": -680.3736,
+            "y": 114.085106
+          },
+          "open": true
+        },
+        "34": {
+          "value": {
+            "module_id": "logic.has_changed",
+            "display_name": "Has Changed",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "in",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "changed",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "increased",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "decreased",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": -656.99585,
+            "y": 634.6568
+          },
+          "open": true
+        },
+        "35": {
+          "value": {
+            "module_id": "module.selector",
+            "display_name": "Selector",
+            "category": "Utility",
+            "inputs": [
+              {
+                "name": "select",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "in_0",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "in_1",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 663.4456,
+            "y": 813.9734
+          },
+          "open": true
+        },
+        "36": {
+          "value": {
+            "module_id": "module.switch",
+            "display_name": "Pulse mode",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {
+              "active": true
+            }
+          },
+          "pos": {
+            "x": 682.67096,
+            "y": 1068.4592
+          },
+          "open": true
+        },
+        "37": {
+          "value": {
+            "module_id": "logic.delay",
+            "display_name": "Logic Delay",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "in",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {
+              "mode": "delay_false",
+              "time": 10.0,
+              "unit": "ms"
+            }
+          },
+          "pos": {
+            "x": -64.06199,
+            "y": 632.47754
+          },
+          "open": true
+        },
+        "38": {
+          "value": {
+            "module_id": "module.label",
+            "display_name": "Text",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [],
+            "params": {
+              "text": "Gyro settings",
+              "font_size": 16.0
+            }
+          },
+          "pos": {
+            "x": -673.1133,
+            "y": -377.48627
+          },
+          "open": true
+        },
+        "39": {
+          "value": {
+            "module_id": "module.label",
+            "display_name": "Text",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [],
+            "params": {
+              "text": "Anti-Triggerbump",
+              "font_size": 16.0,
+              "color": [
+                220,
+                220,
+                220,
+                255
+              ]
+            }
+          },
+          "pos": {
+            "x": 291.94055,
+            "y": 707.3727
+          },
+          "open": true
+        },
+        "40": {
+          "value": {
+            "module_id": "module.label",
+            "display_name": "Text",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [],
+            "params": {
+              "text": "Pulse mode",
+              "font_size": 14.0
+            }
+          },
+          "pos": {
+            "x": 718.0073,
+            "y": 975.46747
+          },
+          "open": true
+        },
+        "41": {
+          "value": {
+            "module_id": "module.label",
+            "display_name": "Text",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [],
+            "params": {
+              "font_size": 14.0,
+              "text": "Overall smoothing"
+            }
+          },
+          "pos": {
+            "x": 357.0765,
+            "y": -82.93627
+          },
+          "open": true
+        },
+        "42": {
+          "value": {
+            "module_id": "module.label",
+            "display_name": "Text",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [],
+            "params": {
+              "text": "Max sensitivity",
+              "font_size": 18.0
+            }
+          },
+          "pos": {
+            "x": -64.625336,
+            "y": 1.7610404
+          },
+          "open": true
+        },
+        "43": {
+          "value": {
+            "module_id": "display.vectorscope",
+            "display_name": "Vectorscope",
+            "category": "Display",
+            "inputs": [
+              {
+                "name": "ch1",
+                "signal_type": "Vec2",
+                "optional": false
+              }
+            ],
+            "outputs": [],
+            "params": {}
+          },
+          "pos": {
+            "x": 674.3778,
+            "y": -263.3125
+          },
+          "open": true
+        },
+        "44": {
+          "value": {
+            "module_id": "math.divide",
+            "display_name": "Divide",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": 523.95044,
+            "y": -247.44676
+          },
+          "open": true
+        },
+        "45": {
+          "value": {
+            "module_id": "module.constant",
+            "display_name": "Constant",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Float",
+                "optional": false
+              }
+            ],
+            "params": {
+              "value": 250.0
+            }
+          },
+          "pos": {
+            "x": 337.44983,
+            "y": -233.31425
+          },
+          "open": true
+        }
+      },
+      "wires": [
+        {
+          "out_pin": {
+            "node": 36,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 35,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 31,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 32,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 6,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 6,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 4
+          },
+          "in_pin": {
+            "node": 19,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 3,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 24,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 30,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 37,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 35,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 24,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 19,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 20,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 10,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 15,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 21,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 20,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 18,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 17,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 20,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 23,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 23,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 35,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 29,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 28,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 13,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 14,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 5,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 6,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 44,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 44,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 43,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 27,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 26,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 26,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 30,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 4,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 15,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 8,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 9,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 23,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 35,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 37,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 34,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 12,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 10,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 16,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 9,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 10,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 45,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 44,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 5
+          },
+          "in_pin": {
+            "node": 19,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 11,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 17,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 20,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 25,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 24,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 17,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 3
+          },
+          "in_pin": {
+            "node": 26,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 2
+          },
+          "in_pin": {
+            "node": 28,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 4
+          },
+          "in_pin": {
+            "node": 29,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 0,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 8,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 3,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 11,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 10,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 28,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 30,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 32,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 23,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 5
+          },
+          "in_pin": {
+            "node": 27,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 34,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 31,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 26,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 4
+          }
+        },
+        {
+          "out_pin": {
+            "node": 0,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 2,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 24,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 10,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 7,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 1,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 13,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 28,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 5
+          }
+        }
+      ]
+    },
+    "exposed_modules": [
+      {
+        "inner_node_id": 9,
+        "element_id": "curve",
+        "pos": [
+          0.0,
+          32.0
+        ],
+        "size": [
+          232.0,
+          144.0
+        ]
+      },
+      {
+        "inner_node_id": 38,
+        "element_id": "text",
+        "pos": [
+          0.0,
+          0.0
+        ],
+        "size": [
+          104.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 12,
+        "element_id": "value",
+        "pos": [
+          240.0,
+          32.0
+        ],
+        "size": [
+          40.0,
+          176.0
+        ]
+      },
+      {
+        "inner_node_id": 8,
+        "element_id": "mode",
+        "pos": [
+          104.0,
+          0.0
+        ],
+        "size": [
+          176.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 39,
+        "element_id": "text",
+        "pos": [
+          288.0,
+          216.0
+        ],
+        "size": [
+          176.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 23,
+        "element_id": "curve",
+        "pos": [
+          288.0,
+          248.0
+        ],
+        "size": [
+          208.0,
+          96.0
+        ]
+      },
+      {
+        "inner_node_id": 25,
+        "element_id": "toggle",
+        "pos": [
+          464.0,
+          216.0
+        ],
+        "size": [
+          32.0,
+          20.0
+        ]
+      },
+      {
+        "inner_node_id": 40,
+        "element_id": "text",
+        "pos": [
+          288.0,
+          352.0
+        ],
+        "size": [
+          81.599976,
+          22.0
+        ]
+      },
+      {
+        "inner_node_id": 36,
+        "element_id": "toggle",
+        "pos": [
+          376.0,
+          352.0
+        ],
+        "size": [
+          32.0,
+          20.0
+        ]
+      },
+      {
+        "inner_node_id": 33,
+        "element_id": "text",
+        "pos": [
+          0.0,
+          216.0
+        ],
+        "size": [
+          152.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 3,
+        "element_id": "curve",
+        "pos": [
+          0.0,
+          248.0
+        ],
+        "size": [
+          232.0,
+          136.0
+        ]
+      },
+      {
+        "inner_node_id": 5,
+        "element_id": "value",
+        "pos": [
+          240.0,
+          248.0
+        ],
+        "size": [
+          40.0,
+          168.0
+        ]
+      },
+      {
+        "inner_node_id": 31,
+        "element_id": "time",
+        "pos": [
+          288.0,
+          376.0
+        ],
+        "size": [
+          208.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 32,
+        "element_id": "samples",
+        "pos": [
+          288.0,
+          400.0
+        ],
+        "size": [
+          112.0,
+          18.0
+        ]
+      },
+      {
+        "inner_node_id": 6,
+        "element_id": "samples",
+        "pos": [
+          136.0,
+          432.0
+        ],
+        "size": [
+          104.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 41,
+        "element_id": "text",
+        "pos": [
+          0.0,
+          432.0
+        ],
+        "size": [
+          132.88712,
+          23.36684
+        ]
+      },
+      {
+        "inner_node_id": 42,
+        "element_id": "text",
+        "pos": [
+          264.0,
+          432.0
+        ],
+        "size": [
+          136.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 11,
+        "element_id": "value",
+        "pos": [
+          424.0,
+          432.0
+        ],
+        "size": [
+          72.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 9,
+        "element_id": "scale_row",
+        "pos": [
+          0.0,
+          184.0
+        ],
+        "size": [
+          232.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 3,
+        "element_id": "scale_row",
+        "pos": [
+          0.0,
+          392.0
+        ],
+        "size": [
+          232.0,
+          24.0
+        ]
+      },
+      {
+        "inner_node_id": 43,
+        "element_id": "display",
+        "pos": [
+          288.0,
+          0.0
+        ],
+        "size": [
+          208.0,
+          208.0
+        ]
+      }
+    ],
+    "snap_enabled": true,
+    "snap_grid_px": 8
+  }
+}

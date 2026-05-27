@@ -114,6 +114,22 @@ pub struct HidReading {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Connection { Usb, Bt }
 
+/// Per-axis stick calibration. center is the raw resting value; min/max are the
+/// raw extents at full deflection (each ~1500 LSB away from center, but varies
+/// per controller and per side). Values normalize raw → [-1, 1] as:
+///   raw < center: (raw - center) / (center - min)
+///   raw > center: (raw - center) / (max - center)
+#[derive(Clone, Copy, Default, Debug)]
+struct AxisCalib { min: u16, center: u16, max: u16 }
+
+#[derive(Clone, Copy, Default, Debug)]
+struct SwitchProCalib {
+    l_x: AxisCalib,
+    l_y: AxisCalib,
+    r_x: AxisCalib,
+    r_y: AxisCalib,
+}
+
 enum DeviceKind {
     Ds4,
     DualSense {
@@ -125,7 +141,15 @@ enum DeviceKind {
         #[cfg(windows)]
         haptic: Option<dualsense_haptic::HapticStream>,
     },
-    SwitchPro { initialized: bool, packet_counter: u8 },
+    SwitchPro {
+        initialized: bool,
+        packet_counter: u8,
+        /// Stick calibration read from SPI flash during init. None until the
+        /// SPI read succeeds; parsing falls back to a centered 12-bit identity
+        /// (center=2048, half-range=1500) when None so sticks still work even
+        /// if calibration read failed.
+        calib: Option<SwitchProCalib>,
+    },
 }
 
 struct HidEntry {
@@ -222,9 +246,9 @@ impl GyroManager {
 
         let entry = self.devices.get_mut(&(vid, pid, idx))?;
 
-        if let DeviceKind::SwitchPro { initialized, packet_counter } = &mut entry.kind {
+        if let DeviceKind::SwitchPro { initialized, packet_counter, calib } = &mut entry.kind {
             if !*initialized {
-                *initialized = init_switch_pro(&entry.device, packet_counter);
+                *initialized = init_switch_pro(&entry.device, packet_counter, calib);
             }
         }
 
@@ -321,7 +345,11 @@ impl GyroManager {
                 #[cfg(windows)]
                 haptic: None,
             },
-            KindTag::SwitchPro => DeviceKind::SwitchPro { initialized: false, packet_counter: 0 },
+            KindTag::SwitchPro => DeviceKind::SwitchPro {
+                initialized: false,
+                packet_counter: 0,
+                calib: None,
+            },
         };
         Some(HidEntry {
             device,
@@ -427,7 +455,7 @@ impl GyroManager {
                         }
                     }
                 }
-                DeviceKind::SwitchPro { initialized, packet_counter } => {
+                DeviceKind::SwitchPro { initialized, packet_counter, .. } => {
                     if !*initialized { continue; }
                     let left  = switch_rumble_encode(out.hd_l_amp as f32 / 255.0, out.hd_l_freq as f32 / 255.0);
                     let right = switch_rumble_encode(out.hd_r_amp as f32 / 255.0, out.hd_r_freq as f32 / 255.0);
@@ -451,7 +479,7 @@ fn hid_write(device: &HidDevice, data: &[u8]) {
 
 // ── Switch Pro initialisation ─────────────────────────────────────────────────
 
-fn init_switch_pro(device: &HidDevice, counter: &mut u8) -> bool {
+fn init_switch_pro(device: &HidDevice, counter: &mut u8, calib: &mut Option<SwitchProCalib>) -> bool {
     let mut buf = [0u8; 64];
 
     // USB handshake (silently ignored / fails on BT — that's fine).
@@ -479,6 +507,49 @@ fn init_switch_pro(device: &HidDevice, counter: &mut u8) -> bool {
     *counter = counter.wrapping_add(1);
     wait_for_ack(device, 0x21, &mut buf);
 
+    // Read stick calibration from SPI flash before switching to full report mode —
+    // SPI reads come back in a 0x21 ack with the requested data, and that's harder
+    // to filter from the firehose of 0x30 reports once full mode is enabled.
+    //
+    // Layout (dekuNukem/Nintendo_Switch_Reverse_Engineering spi_flash_notes.md):
+    //   0x603D, 9 bytes : factory L stick (max,center,min) — 12-bit packed
+    //   0x6046, 9 bytes : factory R stick (center,min,max) — 12-bit packed
+    //   0x8010, 11 bytes: user L calibration (first 2 bytes are "magic", 0xA1B2 = valid)
+    //   0x801B, 11 bytes: user R calibration (same magic format)
+    let factory_l = spi_read(device, 0x6_03D, 9, counter, &mut buf);
+    let factory_r = spi_read(device, 0x6_046, 9, counter, &mut buf);
+    let user_l    = spi_read(device, 0x8_010, 11, counter, &mut buf);
+    let user_r    = spi_read(device, 0x8_01B, 11, counter, &mut buf);
+
+    // User cal overrides factory when its magic bytes are 0xB2 0xA1 (LE 0xA1B2).
+    let l_data = match &user_l {
+        Some(d) if d.len() >= 11 && d[0] == 0xB2 && d[1] == 0xA1 => Some(&d[2..11]),
+        _ => factory_l.as_deref(),
+    };
+    let r_data = match &user_r {
+        Some(d) if d.len() >= 11 && d[0] == 0xB2 && d[1] == 0xA1 => Some(&d[2..11]),
+        _ => factory_r.as_deref(),
+    };
+
+    if let (Some(l), Some(r)) = (l_data, r_data) {
+        if l.len() >= 9 && r.len() >= 9 {
+            let (l_x_max, l_y_max) = unpack_12bit_pair(l, 0);
+            let (l_x_ctr, l_y_ctr) = unpack_12bit_pair(l, 3);
+            let (l_x_min, l_y_min) = unpack_12bit_pair(l, 6);
+            let (r_x_ctr, r_y_ctr) = unpack_12bit_pair(r, 0);
+            let (r_x_min, r_y_min) = unpack_12bit_pair(r, 3);
+            let (r_x_max, r_y_max) = unpack_12bit_pair(r, 6);
+            // SPI factory blob stores offsets relative to center for L's max/min and
+            // R's min/max. Convert to absolute raw values for the simple normalize.
+            *calib = Some(SwitchProCalib {
+                l_x: AxisCalib { min: l_x_ctr.saturating_sub(l_x_min), center: l_x_ctr, max: l_x_ctr.saturating_add(l_x_max) },
+                l_y: AxisCalib { min: l_y_ctr.saturating_sub(l_y_min), center: l_y_ctr, max: l_y_ctr.saturating_add(l_y_max) },
+                r_x: AxisCalib { min: r_x_ctr.saturating_sub(r_x_min), center: r_x_ctr, max: r_x_ctr.saturating_add(r_x_max) },
+                r_y: AxisCalib { min: r_y_ctr.saturating_sub(r_y_min), center: r_y_ctr, max: r_y_ctr.saturating_add(r_y_max) },
+            });
+        }
+    }
+
     // Subcommand 0x03 0x30 — full input report mode (sends 0x30 with IMU).
     if device.write(&subcommand(*counter, 0x03, &[0x30])).is_err() {
         return false;
@@ -497,6 +568,63 @@ fn wait_for_ack(device: &HidDevice, expected_id: u8, buf: &mut [u8; 64]) {
             }
         }
     }
+}
+
+/// Issue an SPI flash read subcommand (0x10) at `addr` for `len` bytes.
+/// Returns the payload bytes from the matching ack, or None on timeout / failure.
+/// The reply is a 0x21 ack whose subcommand byte (offset 14) is 0x10 and whose
+/// payload bytes 15..19 echo the address+length, followed by the data at byte 20.
+fn spi_read(device: &HidDevice, addr: u32, len: u8, counter: &mut u8, buf: &mut [u8; 64]) -> Option<Vec<u8>> {
+    let args = [
+        (addr & 0xFF) as u8,
+        ((addr >> 8) & 0xFF) as u8,
+        ((addr >> 16) & 0xFF) as u8,
+        ((addr >> 24) & 0xFF) as u8,
+        len, 0, 0, 0,
+    ];
+    if device.write(&subcommand(*counter, 0x10, &args)).is_err() {
+        return None;
+    }
+    *counter = counter.wrapping_add(1);
+    for _ in 0..30 {
+        if let Ok(n) = device.read_timeout(buf, 50) {
+            if n >= (20 + len as usize) && buf[0] == 0x21 && buf[14] == 0x10
+                && buf[15] == args[0] && buf[16] == args[1]
+                && buf[17] == args[2] && buf[18] == args[3]
+            {
+                return Some(buf[20..20 + len as usize].to_vec());
+            }
+        }
+    }
+    None
+}
+
+/// Unpack two consecutive 12-bit little-endian values from a 3-byte SPI calibration triple.
+/// Layout: [b0, b1, b2] → x = b0 | ((b1 & 0x0F) << 8), y = (b1 >> 4) | (b2 << 4).
+fn unpack_12bit_pair(data: &[u8], off: usize) -> (u16, u16) {
+    let b0 = data[off]     as u16;
+    let b1 = data[off + 1] as u16;
+    let b2 = data[off + 2] as u16;
+    let x = b0 | ((b1 & 0x0F) << 8);
+    let y = (b1 >> 4) | (b2 << 4);
+    (x, y)
+}
+
+/// Normalize a raw 12-bit stick reading into [-1, 1] using per-axis calibration.
+/// Asymmetric range (negative side and positive side may have different spans)
+/// is handled by dividing each half independently — matches Joy-Con / Pro
+/// firmware's own normalization.
+fn normalize_axis(raw: u16, c: AxisCalib) -> f32 {
+    let raw = raw as i32;
+    let center = c.center as i32;
+    let v = if raw >= center {
+        let span = (c.max as i32 - center).max(1);
+        (raw - center) as f32 / span as f32
+    } else {
+        let span = (center - c.min as i32).max(1);
+        (raw - center) as f32 / span as f32
+    };
+    v.clamp(-1.0, 1.0)
 }
 
 /// Build a 64-byte padded Switch Pro output report (report ID 0x01).
@@ -548,7 +676,7 @@ fn parse_report(buf: &[u8], kind: &mut DeviceKind) -> Option<HidReading> {
     match kind {
         DeviceKind::Ds4 => parse_ds4(buf),
         DeviceKind::DualSense { connection, .. } => parse_dualsense(buf, connection),
-        DeviceKind::SwitchPro { .. } => parse_switch_pro(buf),
+        DeviceKind::SwitchPro { calib, .. } => parse_switch_pro(buf, calib.as_ref()),
     }
 }
 
@@ -651,7 +779,7 @@ fn parse_dualsense_touch(buf: &[u8], off: usize) -> TouchPoint {
     }
 }
 
-fn parse_switch_pro(buf: &[u8]) -> Option<HidReading> {
+fn parse_switch_pro(buf: &[u8], calib: Option<&SwitchProCalib>) -> Option<HidReading> {
     // Report 0x30: standard input report with full button state and 3 IMU samples.
     // Layout (per dekuNukem/Nintendo_Switch_Reverse_Engineering bluetooth_hid_notes.md):
     //   byte 3 = right buttons:  bit0=Y, bit1=X, bit2=B, bit3=A, bit6=R, bit7=ZR
@@ -666,6 +794,24 @@ fn parse_switch_pro(buf: &[u8]) -> Option<HidReading> {
     let right  = buf[3];
     let shared = buf[4];
     let left   = buf[5];
+
+    // Raw 12-bit stick values, unpacked from the same packed-pair layout as SPI.
+    let (lx_raw, ly_raw) = unpack_12bit_pair(buf, 6);
+    let (rx_raw, ry_raw) = unpack_12bit_pair(buf, 9);
+
+    // Fallback identity calibration if SPI read failed: centered at 2048, half-range ~1500.
+    // The center matches an uncalibrated 12-bit stick at rest; range is the firmware default.
+    static FALLBACK: SwitchProCalib = SwitchProCalib {
+        l_x: AxisCalib { min: 548, center: 2048, max: 3548 },
+        l_y: AxisCalib { min: 548, center: 2048, max: 3548 },
+        r_x: AxisCalib { min: 548, center: 2048, max: 3548 },
+        r_y: AxisCalib { min: 548, center: 2048, max: 3548 },
+    };
+    let c = calib.unwrap_or(&FALLBACK);
+    let lx = normalize_axis(lx_raw, c.l_x);
+    let ly = normalize_axis(ly_raw, c.l_y);
+    let rx = normalize_axis(rx_raw, c.r_x);
+    let ry = normalize_axis(ry_raw, c.r_y);
 
     let switch_buttons = SwitchProButtons {
         btn_y:       right  & 0x01 != 0,
@@ -686,9 +832,7 @@ fn parse_switch_pro(buf: &[u8]) -> Option<HidReading> {
         dpad_left:   left   & 0x08 != 0,
         btn_l:       left   & 0x40 != 0,
         btn_zl:      left   & 0x80 != 0,
-        // Stick analog values are calibrated 12-bit; without per-controller calibration we
-        // leave these at zero — gilrs's stick path remains the source for stick axes.
-        lstick_x: 0.0, lstick_y: 0.0, rstick_x: 0.0, rstick_y: 0.0,
+        lstick_x: lx, lstick_y: ly, rstick_x: rx, rstick_y: ry,
     };
 
     let (mut ax, mut ay, mut az) = (0i32, 0i32, 0i32);

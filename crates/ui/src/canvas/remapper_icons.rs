@@ -281,6 +281,10 @@ const DEV_MIDI_IN:  &[u8] = a!("MIDI_in.svg");
 const DEV_MIDI_OUT: &[u8] = a!("MIDI_out.svg");
 const DEV_KBM_KEYBOARD: &[u8] = a!("KBM/keyboard.svg");
 const DEV_KBM_MOUSE:    &[u8] = a!("KBM/mouse.svg");
+/// Combined keyboard + mouse glyph — used wherever Virtual Keyboard
+/// & Mouse needs a single, compact icon (Easy mode card, virtual
+/// device panel chip, sub-patch node header).
+const DEV_KBM: &[u8] = a!("kbm.svg");
 
 /// Generic action icons used by panel chrome (add button, close button, …).
 pub const ADD_SVG:   &[u8] = a!("add.svg");
@@ -301,20 +305,19 @@ pub fn device_card_svg(kind: flexinput_devices::ControllerKind) -> &'static [u8]
 }
 
 /// Resolve a virtual-device card icon by `kind_prefix` (e.g. `"virtual.xinput"`).
-/// `virtual.keymouse` is rendered as two icons side-by-side by the panel — see
-/// `keymouse_pair_svgs`.
 pub fn virtual_device_card_svg(kind_prefix: &str) -> &'static [u8] {
     match kind_prefix {
-        "virtual.xinput" => DEV_XBOX,
-        "virtual.ds4"    => DEV_PS4,
-        _                => DEV_XBOX,
+        "virtual.xinput"   => DEV_XBOX,
+        "virtual.ds4"      => DEV_PS4,
+        "virtual.keymouse" => DEV_KBM,
+        _                  => DEV_XBOX,
     }
 }
 
-/// Keyboard + mouse glyph pair used for the Virtual Keyboard & Mouse card.
-pub fn keymouse_pair_svgs() -> (&'static [u8], &'static [u8]) {
-    (DEV_KBM_KEYBOARD, DEV_KBM_MOUSE)
-}
+/// Single combined keyboard + mouse glyph (replaces the prior
+/// `keymouse_pair_svgs` pair). Used by Easy mode + the virtual
+/// device chip + any other single-icon call site.
+pub fn keymouse_svg() -> &'static [u8] { DEV_KBM }
 
 /// One or two SVGs to render in a canvas device-node header.
 /// `Pair` is used only for `virtual.keymouse` (keyboard + mouse glyphs).
@@ -347,7 +350,7 @@ pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
         return match kind {
             "xinput"   => Some(NodeIconSpec::Single(DEV_XBOX)),
             "ds4"      => Some(NodeIconSpec::Single(DEV_PS4)),
-            "keymouse" => Some(NodeIconSpec::Pair(DEV_KBM_KEYBOARD, DEV_KBM_MOUSE)),
+            "keymouse" => Some(NodeIconSpec::Single(DEV_KBM)),
             _          => None,
         };
     }

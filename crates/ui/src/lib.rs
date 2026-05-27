@@ -1,5 +1,6 @@
 mod app;
 mod canvas;
+mod easy;
 mod guide_watcher;
 mod panels;
 mod panic_hotkey;

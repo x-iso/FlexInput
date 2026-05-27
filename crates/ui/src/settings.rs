@@ -31,6 +31,7 @@ fn default_see_through_alpha() -> f32 { 0.55 }
 fn default_pin_shortcut() -> PinShortcut { PinShortcut::default() }
 fn default_pin_guide_double_tap() -> bool { true }
 fn default_focus_flip_flop() -> bool { true }
+fn default_ui_mode() -> UiMode { UiMode::Easy }
 
 /// Keyboard shortcut for the always-on-top pin toggle. Mirrors
 /// `PanicShortcut` in shape — kept in `settings.rs` so the full settings
@@ -70,6 +71,18 @@ impl PinShortcut {
 /// node/header fill colors picked by `Canvas::new`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Theme { Dark, Light }
+
+/// Which top-level UI is shown across all tabs. Global — the header
+/// toggle flips every tab into the same view. Easy is the factory
+/// default: a three-panel preset-driven UI that hides the snarl canvas.
+/// Advanced reveals the underlying canvas exactly as it was before
+/// Easy mode existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum UiMode {
+    #[default]
+    Easy,
+    Advanced,
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -151,6 +164,20 @@ pub struct AppSettings {
     /// and we don't want users accidentally leaving it on across sessions.
     #[serde(default, skip)]
     pub profiler_enabled: bool,
+    /// Top-level UI mode. Easy = factory-default preset-driven view;
+    /// Advanced = legacy snarl canvas + side panels. Global across tabs.
+    #[serde(default = "default_ui_mode")]
+    pub ui_mode: UiMode,
+    /// Optional folder scanned for user-authored sub-patch presets
+    /// (`*.fxsp`). Scanned in addition to the factory presets shipped
+    /// under `app/assets/sub-patches/`.
+    #[serde(default)]
+    pub user_presets_folder: Option<std::path::PathBuf>,
+    /// Ordered list of preset file paths the user has starred as
+    /// favorites. Surfaced as the first category in the Easy mode
+    /// preset dropdown. Order is user-controlled via drag handles.
+    #[serde(default)]
+    pub favorite_presets: Vec<std::path::PathBuf>,
 }
 
 /// Camera behavior immediately after a patch is loaded into a tab.
@@ -188,6 +215,9 @@ impl Default for AppSettings {
             show_own_virtuals_as_physical: false,
             on_patch_load: OnPatchLoad::Off,
             profiler_enabled: false,
+            ui_mode: UiMode::Easy,
+            user_presets_folder: None,
+            favorite_presets: Vec::new(),
         }
     }
 }
@@ -279,6 +309,11 @@ pub struct PersistedTab {
     #[serde(default)]
     pub auto_bypass: bool,
     pub snarl: Snarl<NodeData>,
+    /// Path of the .fxsp preset most recently loaded into this tab's
+    /// Easy-mode sub-patch. Mirrors `UiPatch.easy_preset_path` so a
+    /// workspace round-trip restores the preset link.
+    #[serde(default)]
+    pub easy_preset_path: Option<std::path::PathBuf>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

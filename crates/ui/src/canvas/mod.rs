@@ -1,4 +1,5 @@
 mod curve;
+pub mod header_controls;
 pub mod node;
 pub mod remapper_icons;
 pub mod viewer;
@@ -45,6 +46,12 @@ pub struct UiPatch {
     /// Bypass output when the bound process is not in focus.
     #[serde(default)]
     pub auto_bypass: bool,
+    /// Path of the .fxsp preset most recently loaded into this tab's
+    /// sub-patch (Easy mode). Used to restore the "current preset"
+    /// link after reopening the app. Falls back to content-hash
+    /// matching against the preset index when the path is stale.
+    #[serde(default)]
+    pub easy_preset_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -1147,7 +1154,13 @@ impl Canvas {
 impl Canvas {
     /// Serialize the canvas + virtual device list to a `.fxp` file chosen by the user.
     /// Returns the chosen path on success so the caller can update the tab title.
-    pub fn save_patch(&self, virtual_device_ids: Vec<String>, bound_exes: Vec<String>, auto_bypass: bool) -> Option<std::path::PathBuf> {
+    pub fn save_patch(
+        &self,
+        virtual_device_ids: Vec<String>,
+        bound_exes: Vec<String>,
+        auto_bypass: bool,
+        easy_preset_path: Option<std::path::PathBuf>,
+    ) -> Option<std::path::PathBuf> {
         let path = rfd::FileDialog::new()
             .add_filter("FlexInput Patch", &["fxp"])
             .set_file_name("patch.fxp")
@@ -1159,6 +1172,7 @@ impl Canvas {
             virtual_device_ids,
             bound_exes,
             auto_bypass,
+            easy_preset_path,
         };
         if let Ok(json) = serde_json::to_string_pretty(&patch) {
             let _ = std::fs::write(&path, json);
@@ -1166,20 +1180,99 @@ impl Canvas {
         Some(path)
     }
 
-    /// Open a `.fxp` file and return the loaded Canvas, virtual device IDs, bound exes, auto-bypass flag, and path.
+    /// Open a `.fxp` file and return the loaded Canvas, virtual device IDs,
+    /// bound exes, auto-bypass flag, the path, and the Easy-mode preset path
+    /// (if the file recorded one).
     /// Returns `None` if the user cancels or the file is invalid.
-    pub fn load_patch() -> Option<(Canvas, Vec<String>, Vec<String>, bool, std::path::PathBuf)> {
+    pub fn load_patch() -> Option<(
+        Canvas,
+        Vec<String>,
+        Vec<String>,
+        bool,
+        std::path::PathBuf,
+        Option<std::path::PathBuf>,
+    )> {
+        // Accept both `.fxp` (full patches) and `.fxsp` (sub-patch
+        // presets). For .fxsp, build an empty canvas and drop in a
+        // single `subpatch` node carrying the loaded UiSubPatch — the
+        // user gets a one-click way to open a preset directly from
+        // File→Load Patch, and the app.rs caller switches to Easy
+        // mode if the result is Easy-compatible.
         let path = rfd::FileDialog::new()
-            .add_filter("FlexInput Patch", &["fxp"])
+            .add_filter("FlexInput Patch", &["fxp", "fxsp"])
+            .add_filter("Full Patch (.fxp)", &["fxp"])
+            .add_filter("Sub-Patch (.fxsp)", &["fxsp"])
             .pick_file()?;
 
         let json = std::fs::read_to_string(&path).ok()?;
-        let patch: UiPatch = serde_json::from_str(&json).ok()?;
+        let is_subpatch_file = path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("fxsp"))
+            .unwrap_or(false);
 
+        if is_subpatch_file {
+            // .fxsp → wrap into an Easy-shaped canvas.
+            #[derive(serde::Deserialize)]
+            struct SubPatchFileLite {
+                #[allow(dead_code)]
+                version: u32,
+                sub_patch: crate::canvas::node::UiSubPatch,
+            }
+            let file: SubPatchFileLite = serde_json::from_str(&json).ok()?;
+            let sp = file.sub_patch;
+            let mut canvas = Canvas::new();
+            // Build the outer `subpatch` node with pin descriptors
+            // mirrored from the sub-patch's declared pins, so external
+            // wires (added later in Advanced mode) line up correctly.
+            use flexinput_core::PinDescriptor;
+            let inputs: Vec<PinDescriptor> = sp.pins_in.iter()
+                .map(|p| PinDescriptor::new(&p.name, p.signal_type))
+                .collect();
+            let outputs: Vec<PinDescriptor> = sp.pins_out.iter()
+                .map(|p| PinDescriptor::new(&p.name, p.signal_type))
+                .collect();
+            let display = if sp.display_name.is_empty() {
+                path.file_stem().map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Sub-patch".into())
+            } else {
+                sp.display_name.clone()
+            };
+            let node = NodeData {
+                module_id: "subpatch".into(),
+                display_name: display,
+                category: "Patch".into(),
+                inputs,
+                outputs,
+                params: std::collections::HashMap::new(),
+                subpatch: Some(Box::new(sp)),
+                extra: Default::default(),
+            };
+            canvas.snarl.insert_node(canvas.spawn_position(), node);
+            return Some((
+                canvas,
+                Vec::new(),    // no virtual devices yet — Easy mode
+                               // adds them when user picks an output
+                Vec::new(),    // bound_exes
+                false,         // auto_bypass
+                path.clone(),
+                Some(path),    // record fxsp path so Easy mode's
+                               // restore_preset_link can re-link
+            ));
+        }
+
+        // .fxp → normal full-patch load path.
+        let patch: UiPatch = serde_json::from_str(&json).ok()?;
         let mut canvas = Canvas::new();
         canvas.snarl = patch.snarl;
         migrate_ds4_pin_ids(&mut canvas);
-        Some((canvas, patch.virtual_device_ids, patch.bound_exes, patch.auto_bypass, path))
+        Some((
+            canvas,
+            patch.virtual_device_ids,
+            patch.bound_exes,
+            patch.auto_bypass,
+            path,
+            patch.easy_preset_path,
+        ))
     }
 }
 

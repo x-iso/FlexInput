@@ -245,6 +245,44 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             n.extra.layout_unlocked = !is_unlocked;
                         }
                     }
+                    // Save / Load buttons — round-trip the sub-patch
+                    // to/from a .fxsp file. Mirror the same dialogs
+                    // used by the Easy-mode header so behavior stays
+                    // identical regardless of where the user triggers
+                    // it.
+                    if ui.small_button("Save…")
+                        .on_hover_text("Save sub-patch to a .fxsp file")
+                        .clicked()
+                    {
+                        if let Some(sp) = snarl.get_node(node).and_then(|n| n.subpatch.as_ref()) {
+                            let _ = crate::app::save_subpatch_file(sp);
+                        }
+                    }
+                    if ui.small_button("Load…")
+                        .on_hover_text("Load sub-patch from a .fxsp file (replaces current contents)")
+                        .clicked()
+                    {
+                        if let Some(loaded) = crate::app::load_subpatch_file() {
+                            if let Some(n) = snarl.get_node_mut(node) {
+                                // Update the node's display_name from
+                                // the loaded sub-patch so the canvas
+                                // header reflects the new identity.
+                                if !loaded.display_name.is_empty() {
+                                    n.display_name = loaded.display_name.clone();
+                                }
+                                // Mirror pins so outer wires can
+                                // remain valid if pin layouts match.
+                                use flexinput_core::PinDescriptor;
+                                n.inputs = loaded.pins_in.iter()
+                                    .map(|p| PinDescriptor::new(&p.name, p.signal_type))
+                                    .collect();
+                                n.outputs = loaded.pins_out.iter()
+                                    .map(|p| PinDescriptor::new(&p.name, p.signal_type))
+                                    .collect();
+                                n.subpatch = Some(Box::new(loaded));
+                            }
+                        }
+                    }
                 }
 
                 // Response Curve: Save / Load / Reset in the header.
@@ -1253,7 +1291,7 @@ fn show_midi_out_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
 /// - XInput (Xbox): deadzone + sticks calibration, no gyro
 /// - DualShock4 / DualSense / Switch Pro: deadzone + gyro + sticks
 /// - Generic HID / unknown: deadzone + sticks (conservative)
-fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {
+pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {
     if !is_device_source { return (false, false, false); }
     if dev_id.starts_with("midi_in") || dev_id.starts_with("midi_out") {
         return (false, false, false);
@@ -3429,7 +3467,7 @@ fn show_inlet_outlet_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
 /// dashed selection outline + corner resize handle and the underlying widget
 /// is disabled so the user can drag/resize without accidentally operating it.
 /// In Lock mode the widget is fully interactive and no chrome is drawn.
-fn show_subpatch_body(
+pub(crate) fn show_subpatch_body(
     outer_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
@@ -4448,8 +4486,14 @@ fn remap_pin_state_id(outer_layer: egui::LayerId, inner_id: NodeId, tag: &'stati
 }
 
 fn remap_layer_id(outer_layer: egui::LayerId, inner_id: NodeId, tag: &'static str) -> egui::LayerId {
+    // Child layer order MUST match parent_ui.layer_id().order — egui's
+    // set_sublayer debug_asserts on mismatched orders (panic message:
+    // "Trying to set sublayers across layers of different order").
+    // The CentralPanel that hosts the snarl canvas lives in
+    // Order::Background, so hardcoding Middle here used to fire the
+    // assert in debug builds whenever a sub-patch body rendered.
     egui::LayerId::new(
-        egui::Order::Middle,
+        outer_layer.order,
         egui::Id::new(("fxi_remap_pin_layer", outer_layer, inner_id.0, tag)),
     )
 }
@@ -5019,7 +5063,8 @@ fn render_label_text_pinned_scroll(
         body_h = inner.inner;
     } else {
         let body_layer = egui::LayerId::new(
-            egui::Order::Middle,
+            // Match parent layer order — see remap_layer_id for rationale.
+            ui.layer_id().order,
             egui::Id::new(("fxi_label_pin_layer", ui.layer_id().id, inner_id.0)),
         );
         let body_max_rect = egui::Rect::from_min_size(
@@ -6776,14 +6821,14 @@ fn estimate_device_body_width(ui: &egui::Ui, node: &NodeData) -> f32 {
 /// on its Response is always false — we overlay a click-sense interact on
 /// the same rect using a distinct id and read the double-click from there.
 /// Call AFTER rendering the slider so the overlay sits on top.
-fn slider_track_double_clicked(ui: &egui::Ui, slider_resp: &egui::Response) -> bool {
+pub(crate) fn slider_track_double_clicked(ui: &egui::Ui, slider_resp: &egui::Response) -> bool {
     let id = slider_resp.id.with("__dblclick_overlay");
     ui.interact(slider_resp.rect, id, egui::Sense::click()).double_clicked()
 }
 
 /// Fixed-width label cell used to align the leading column across the
 /// Deadzone / Gyro × / Mouse × slider rows in a device-node header.
-fn slider_label(ui: &mut egui::Ui, label: &str, cell_w: f32) {
+pub(crate) fn slider_label(ui: &mut egui::Ui, label: &str, cell_w: f32) {
     let (cell, _) = ui.allocate_exact_size(
         egui::vec2(cell_w, 18.0),
         egui::Sense::hover(),

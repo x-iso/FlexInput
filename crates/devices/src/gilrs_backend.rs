@@ -364,6 +364,16 @@ impl DeviceBackend for GilrsBackend {
                     // by Nintendo label vs physical position, and mis-routes Plus/Minus/Home/Capture.
                     // Pushing last makes these the authoritative values in the IO-thread HashMap.
                     if let Some(sb) = g.switch_buttons {
+                        // Sticks: raw-HID values calibrated from SPI flash are authoritative.
+                        // gilrs's WGI stick mapping can land on the wrong axes when the HID
+                        // device tree shifts (e.g. another driver install changes enumeration),
+                        // so we override unconditionally for Switch Pro.
+                        out.push((dev.clone(), "left_stick_x".into(),  Signal::Float(sb.lstick_x)));
+                        out.push((dev.clone(), "left_stick_y".into(),  Signal::Float(sb.lstick_y)));
+                        out.push((dev.clone(), "right_stick_x".into(), Signal::Float(sb.rstick_x)));
+                        out.push((dev.clone(), "right_stick_y".into(), Signal::Float(sb.rstick_y)));
+                        out.push((dev.clone(), "left_stick".into(),    Signal::Vec2(Vec2::new(sb.lstick_x, sb.lstick_y))));
+                        out.push((dev.clone(), "right_stick".into(),   Signal::Vec2(Vec2::new(sb.rstick_x, sb.rstick_y))));
                         // Face buttons by physical position (Nintendo's labels are weird):
                         out.push((dev.clone(), "btn_south".into(), Signal::Bool(sb.btn_b))); // B = south
                         out.push((dev.clone(), "btn_east".into(),  Signal::Bool(sb.btn_a))); // A = east
