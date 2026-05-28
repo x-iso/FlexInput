@@ -9,6 +9,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<SwitchModule>(),
         reg::<KnobModule>(),
         reg::<SelectorModule>(),
+        reg::<DropdownModule>(),
         reg::<LabelModule>(),
         reg::<SvgModule>(),
         ModuleRegistration {
@@ -46,7 +47,15 @@ impl Module for ConstantModule {
 
 // ── Switch ────────────────────────────────────────────────────────────────────
 
-/// Toggle that outputs a Bool (true/false) set via a checkbox in the body UI.
+/// Toggle that outputs a Bool. Three control sources, all live simultaneously:
+///   • `direct`  — while HIGH, forces `active = true`. Falling edge releases the
+///     override but leaves `active` at its current value (so subsequent latch
+///     or UI input can drive it back down).
+///   • `latch`   — rising edge toggles `active` (held HIGH does nothing further;
+///     the next rising edge toggles again).
+///   • UI click  — toggles `active` on the next snapshot.
+/// "Last writer wins": whichever source most recently changed state determines
+/// the current value, so any of the three can override the others at any time.
 #[derive(Default)]
 pub struct SwitchModule;
 
@@ -56,7 +65,10 @@ impl Module for SwitchModule {
             id: "module.switch",
             display_name: "Switch",
             category: "Utility",
-            inputs: vec![],
+            inputs: vec![
+                PinDescriptor::new("direct", SignalType::Bool),
+                PinDescriptor::new("latch",  SignalType::Bool),
+            ],
             outputs: vec![PinDescriptor::new("out", SignalType::Bool)],
         }
     }
@@ -164,6 +176,39 @@ impl Module for SelectorModule {
             Some(sig) => { let mut r = SmallVec::new(); r.push(sig); r }
             None => SmallVec::new(),
         }
+    }
+}
+
+// ── Dropdown ──────────────────────────────────────────────────────────────────
+
+/// User-editable list of string options. Body shows a dropdown box (pinnable,
+/// resizable) plus an editor list below it with add/remove/reorder controls.
+/// Outputs the selected option as both a quantised Float in [0, 1]
+/// (centre-of-bucket: `(idx + 0.5) / N`, matching `Selector`/`Split` decoding)
+/// and a raw Int index. Empty list → both outputs emit 0.
+///
+/// Persisted params:
+///   - `options`: Array of strings
+///   - `selected_index`: u64
+#[derive(Default)]
+pub struct DropdownModule;
+
+impl Module for DropdownModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.dropdown",
+            display_name: "Dropdown",
+            category: "Utility",
+            inputs: vec![],
+            outputs: vec![
+                PinDescriptor::new("value", SignalType::Float),
+                PinDescriptor::new("index", SignalType::Int),
+            ],
+        }
+    }
+    fn process(&mut self, _inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        // Resolved from params by the engine, like Constant/Knob/Switch.
+        SmallVec::new()
     }
 }
 

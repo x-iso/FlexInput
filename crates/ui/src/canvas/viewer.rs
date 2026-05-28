@@ -709,20 +709,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     .and_then(|n| n.subpatch.as_ref())
                     .and_then(|sp| sp.selected_item);
                 if let Some(idx) = sel_idx {
-                    let is_text_pin = snarl.get_node(node)
+                    let inner_mid: Option<String> = snarl.get_node(node)
                         .and_then(|n| n.subpatch.as_ref())
                         .and_then(|sp| sp.items.get(idx))
                         .and_then(|it| match it {
-                            LayoutItem::Module(m) => {
-                                let inner = sp_module_id(
-                                    snarl.get_node(node).and_then(|n| n.subpatch.as_deref()),
-                                    m.inner_node_id,
-                                );
-                                inner.map(|mid| mid == "module.label")
-                            }
-                            _ => Some(false),
-                        })
-                        .unwrap_or(false);
+                            LayoutItem::Module(m) => sp_module_id(
+                                snarl.get_node(node).and_then(|n| n.subpatch.as_deref()),
+                                m.inner_node_id,
+                            ),
+                            _ => None,
+                        });
+                    let is_text_pin   = inner_mid.as_deref() == Some("module.label");
+                    let is_switch_pin = inner_mid.as_deref() == Some("module.switch");
                     if let Some(sp) = snarl.get_node_mut(node).and_then(|n| n.subpatch.as_mut()) {
                         if idx < sp.items.len() {
                             match &mut sp.items[idx] {
@@ -731,6 +729,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                                 }
                                 LayoutItem::Module(_) if is_text_pin => {
                                     text_pin_inspector_strip_item(ui, &mut sp.items, idx);
+                                }
+                                LayoutItem::Module(_) if is_switch_pin => {
+                                    switch_pin_inspector_strip_item(ui, &mut sp.items, idx);
                                 }
                                 _ => {}
                             }
@@ -890,7 +891,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "display.readout" | "display.oscilloscope" | "display.vectorscope"
                 | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
                 | "math.add" | "math.subtract" | "math.multiply" | "math.divide"
-                | "module.selector" | "module.split"
+                | "module.selector" | "module.split" | "module.dropdown"
                 | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
                 | "generator.oscillator" | "processing.gyro_3dof"
                 | "module.automap_split" | "module.automap_collect"
@@ -959,6 +960,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             }
             "module.selector" => show_selector_body(node_id, inputs, ui, snarl),
             "module.split"    => show_split_body(node_id, outputs, ui, snarl),
+            "module.dropdown" => show_dropdown_body(node_id, ui, snarl),
             "module.label"    => show_label_body(node_id, ui, snarl),
             "module.svg"      => show_svg_body(node_id, ui, snarl),
             "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl),
@@ -1099,6 +1101,28 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 self.edit_subpatch_request = Some(node);
                 ui.close();
             }
+        }
+
+        // Switch: per-state caption + SVG icon editor. Available from the
+        // node's right-click menu on any canvas (top-level or inside a
+        // sub-patch). The sub-patch *layout* editor uses a separate inspector
+        // strip for per-pin colors — see `switch_pin_inspector_strip_item`.
+        //
+        // Submenus override the default close behavior to `CloseOnClickOutside`
+        // so clicking on the inline TextEdit / radio buttons doesn't dismiss
+        // the menu mid-edit. Only the explicit `ui.close()` calls (or clicking
+        // outside the popup) will close it.
+        if module_id == "module.switch" {
+            use egui::containers::menu::{MenuConfig, SubMenuButton};
+            use egui::PopupCloseBehavior;
+            ui.separator();
+            let cfg = || MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside);
+            SubMenuButton::new("ON state…").config(cfg()).ui(ui, |ui| {
+                switch_state_submenu(ui, node, snarl, true);
+            });
+            SubMenuButton::new("OFF state…").config(cfg()).ui(ui, |ui| {
+                switch_state_submenu(ui, node, snarl, false);
+            });
         }
 
         // "Replace with…" for physical device source/sink nodes.
@@ -2409,6 +2433,419 @@ fn show_split_body(
     });
 }
 
+// ── Dropdown ──────────────────────────────────────────────────────────────────
+//
+// Body layout (top-down):
+//   • ComboBox of the current options (pinnable element "selection",
+//     resizable width via egui::Resize so a pinned widget honours the
+//     user's chosen size in a sub-patch layout).
+//   • Vertical list of entries. Each row:
+//       [≡ drag handle] [× remove] [label (double-click / Alt-click to edit)]
+//   • "+" button below the last row to append a new entry.
+//
+// Persisted params:
+//   options:        Array<String>
+//   selected_index: u64
+//   box_width:      f64 (optional, persists the user's resize of the ComboBox)
+//
+// When the currently-selected entry is removed, selection clamps to the new
+// last index (matches the "Clamp to last" behaviour discussed in design).
+fn dropdown_read_options(node: &NodeData) -> Vec<String> {
+    node.params.get("options")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect())
+        .unwrap_or_else(|| vec!["Option 1".to_string(), "Option 2".to_string()])
+}
+
+fn dropdown_write_options(node: &mut NodeData, opts: &[String]) {
+    let arr: Vec<Value> = opts.iter().map(|s| Value::String(s.clone())).collect();
+    node.params.insert("options".to_string(), Value::Array(arr));
+}
+
+fn dropdown_read_selected(node: &NodeData, n: usize) -> usize {
+    let idx = node.params.get("selected_index")
+        .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    if n == 0 { 0 } else { idx.min(n - 1) }
+}
+
+fn dropdown_write_selected(node: &mut NodeData, idx: usize) {
+    node.params.insert("selected_index".to_string(), Value::from(idx as u64));
+}
+
+/// Per-node editing state held in egui memory: which row is being renamed and
+/// the in-progress text buffer for it. Cleared when editing ends (Enter,
+/// Escape, focus loss, or row delete).
+#[derive(Clone, Default)]
+struct DropdownEditState {
+    editing: Option<usize>,
+    buf: String,
+    /// Set when we just entered edit mode so we can focus the TextEdit on the
+    /// next frame.
+    request_focus: bool,
+}
+
+fn dropdown_edit_state(ctx: &egui::Context, node_id: NodeId) -> DropdownEditState {
+    ctx.data(|d| d.get_temp::<DropdownEditState>(
+        egui::Id::new(("fxi_dropdown_edit", node_id.0))
+    )).unwrap_or_default()
+}
+
+fn dropdown_set_edit_state(ctx: &egui::Context, node_id: NodeId, st: DropdownEditState) {
+    ctx.data_mut(|d| d.insert_temp(
+        egui::Id::new(("fxi_dropdown_edit", node_id.0)),
+        st,
+    ));
+}
+
+fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    // Snapshot params up-front.
+    let mut options = snarl.get_node(node_id).map(dropdown_read_options).unwrap_or_default();
+    let selected = snarl.get_node(node_id).map(|n| dropdown_read_selected(n, options.len())).unwrap_or(0);
+    let box_width = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("box_width").and_then(|v| v.as_f64()))
+        .map(|v| v as f32).unwrap_or(140.0).clamp(80.0, 600.0);
+
+    let mut new_selected = selected;
+    let mut options_changed = false;
+    let mut selected_changed = false;
+
+    ui.vertical(|ui| {
+        ui.set_min_width(box_width.max(140.0));
+
+        // ── ComboBox (pinnable) ──────────────────────────────────────────
+        let mut combo_rect = egui::Rect::NOTHING;
+        egui::Resize::default()
+            .id_salt(("dropdown_combo", node_id))
+            .default_size([box_width, 22.0])
+            .min_size([80.0, 22.0])
+            .max_size([600.0, 22.0])
+            .resizable([true, false])
+            .show(ui, |ui| {
+                let current = options.get(selected).cloned().unwrap_or_default();
+                let avail = ui.available_width();
+                let inner = ui.allocate_ui([avail, 22.0].into(), |ui| {
+                    egui::ComboBox::from_id_salt(("dropdown_combo_sel", node_id.0))
+                        .selected_text(if current.is_empty() { "—".to_string() } else { current })
+                        .width(avail)
+                        .show_ui(ui, |ui| {
+                            for (i, opt) in options.iter().enumerate() {
+                                let label = if opt.is_empty() { format!("(empty {i})") } else { opt.clone() };
+                                if ui.selectable_label(i == selected, label).clicked() {
+                                    new_selected = i;
+                                    selected_changed = true;
+                                }
+                            }
+                        });
+                });
+                combo_rect = inner.response.rect;
+            });
+        // Persist the new width if the user resized horizontally.
+        let new_w = combo_rect.width().clamp(80.0, 600.0);
+        if (new_w - box_width).abs() > 0.5 {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("box_width".to_string(), Value::from(new_w as f64));
+            }
+        }
+        register_exposable_element(ui, node_id, "selection", combo_rect);
+
+        ui.add_space(4.0);
+
+        // ── Editor list ─────────────────────────────────────────────────
+        let mut to_remove: Option<usize> = None;
+        let mut to_move: Option<(usize, isize)> = None;
+        let mut edit_state = dropdown_edit_state(ui.ctx(), node_id);
+        let alt = ui.input(|i| i.modifiers.alt);
+
+        for i in 0..options.len() {
+            let mut row_remove = false;
+            let mut row_move: isize = 0;
+            let mut commit_edit: Option<String> = None;
+            let mut cancel_edit = false;
+
+            ui.horizontal(|ui| {
+                // Drag handle. Drag vertically beyond half a row → reorder.
+                let handle = ui.add(egui::Label::new(
+                    egui::RichText::new("≡").monospace()
+                ).sense(egui::Sense::click_and_drag()));
+                if handle.dragged() {
+                    let dy = handle.drag_delta().y;
+                    // Accumulate drag in egui memory so a slow drag still
+                    // crosses the threshold instead of stalling on per-frame
+                    // sub-pixel deltas.
+                    let key = egui::Id::new(("fxi_dropdown_drag", node_id.0, i));
+                    let acc: f32 = ui.ctx().data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0) + dy;
+                    let row_h = 22.0_f32;
+                    let steps = (acc / row_h).trunc() as isize;
+                    if steps != 0 {
+                        row_move = steps;
+                        ui.ctx().data_mut(|d| d.insert_temp(key, acc - steps as f32 * row_h));
+                    } else {
+                        ui.ctx().data_mut(|d| d.insert_temp(key, acc));
+                    }
+                } else {
+                    let key = egui::Id::new(("fxi_dropdown_drag", node_id.0, i));
+                    ui.ctx().data_mut(|d| d.remove_temp::<f32>(key));
+                }
+
+                if ui.small_button("×").clicked() {
+                    row_remove = true;
+                }
+
+                let is_editing = edit_state.editing == Some(i);
+                if is_editing {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut edit_state.buf)
+                            .desired_width(ui.available_width().max(60.0))
+                    );
+                    if edit_state.request_focus {
+                        resp.request_focus();
+                        edit_state.request_focus = false;
+                    }
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let esc   = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if esc {
+                        cancel_edit = true;
+                    } else if enter || resp.lost_focus() {
+                        commit_edit = Some(edit_state.buf.clone());
+                    }
+                } else {
+                    let label_text = if options[i].is_empty() {
+                        format!("(empty {i})")
+                    } else {
+                        options[i].clone()
+                    };
+                    let label = ui.add(egui::Label::new(label_text)
+                        .sense(egui::Sense::click()));
+
+                    // Double-click OR Alt-click → enter edit mode.
+                    if label.double_clicked() || (alt && label.clicked()) {
+                        edit_state.editing = Some(i);
+                        edit_state.buf = options[i].clone();
+                        edit_state.request_focus = true;
+                    }
+
+                    // Single click (no Alt) → select this entry.
+                    if label.clicked() && !alt && !label.double_clicked() {
+                        new_selected = i;
+                        selected_changed = true;
+                    }
+
+                    // Right-click context menu.
+                    label.context_menu(|ui| {
+                        if ui.button("Rename").clicked() {
+                            edit_state.editing = Some(i);
+                            edit_state.buf = options[i].clone();
+                            edit_state.request_focus = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.add_enabled(i > 0, egui::Button::new("Move up")).clicked() {
+                            row_move = -1;
+                            ui.close_menu();
+                        }
+                        if ui.add_enabled(i + 1 < options.len(),
+                            egui::Button::new("Move down")).clicked()
+                        {
+                            row_move = 1;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Delete").clicked() {
+                            row_remove = true;
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+
+            if let Some(new_text) = commit_edit {
+                options[i] = new_text;
+                options_changed = true;
+                edit_state.editing = None;
+                edit_state.buf.clear();
+            }
+            if cancel_edit {
+                edit_state.editing = None;
+                edit_state.buf.clear();
+            }
+            if row_remove { to_remove = Some(i); }
+            if row_move != 0 { to_move = Some((i, row_move)); }
+        }
+
+        // ── Add button ──────────────────────────────────────────────────
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(18.0);
+            if ui.small_button("+").clicked() {
+                let next_n = options.len() + 1;
+                options.push(format!("Option {next_n}"));
+                options_changed = true;
+            }
+        });
+
+        // ── Apply mutations ─────────────────────────────────────────────
+        if let Some((i, dir)) = to_move {
+            let target = (i as isize + dir).clamp(0, options.len() as isize - 1) as usize;
+            if target != i {
+                options.swap(i, target);
+                options_changed = true;
+                // Keep selection pointing at the same logical entry.
+                if new_selected == i {
+                    new_selected = target;
+                    selected_changed = true;
+                } else if new_selected == target {
+                    new_selected = i;
+                    selected_changed = true;
+                }
+            }
+        }
+        if let Some(rm) = to_remove {
+            if rm < options.len() {
+                options.remove(rm);
+                options_changed = true;
+                // Stop editing if the deleted row was the active editor.
+                if edit_state.editing == Some(rm) {
+                    edit_state.editing = None;
+                    edit_state.buf.clear();
+                } else if let Some(e) = edit_state.editing {
+                    if e > rm { edit_state.editing = Some(e - 1); }
+                }
+                // Selection clamp: shift down if a row before the selection
+                // was deleted, otherwise clamp to the new last index.
+                if options.is_empty() {
+                    new_selected = 0;
+                } else if rm < new_selected {
+                    new_selected = new_selected.saturating_sub(1);
+                    selected_changed = true;
+                } else if new_selected >= options.len() {
+                    new_selected = options.len() - 1;
+                    selected_changed = true;
+                }
+            }
+        }
+
+        dropdown_set_edit_state(ui.ctx(), node_id, edit_state);
+    });
+
+    if options_changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            dropdown_write_options(node, &options);
+        }
+    }
+    if selected_changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            dropdown_write_selected(node, new_selected);
+        }
+    }
+}
+
+/// Renderer used when the dropdown's ComboBox is pinned into a sub-patch
+/// layout. Fills the full container (both axes) so the user can resize the
+/// layout slot freely in either direction; the selected-option text scales
+/// with the container's height. Click opens a popup of options.
+fn render_dropdown_selection(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let options = inner_snarl.get_node(inner_id).map(dropdown_read_options).unwrap_or_default();
+    let selected = inner_snarl.get_node(inner_id)
+        .map(|n| dropdown_read_selected(n, options.len()))
+        .unwrap_or(0);
+    let current = options.get(selected).cloned().unwrap_or_default();
+
+    let avail = egui::vec2(container.x.max(40.0), container.y.max(16.0));
+    let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+
+    // Visual: a button-like frame matching the active widget visuals so it
+    // sits naturally next to other pinned widgets in the layout.
+    let visuals = ui.style().interact(&resp);
+    let painter = ui.painter_at(rect);
+    painter.rect(
+        rect,
+        visuals.corner_radius,
+        visuals.bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    // Reserve a slice on the right for the ▼ caret so the label never overlaps it.
+    let caret_w = (rect.height() * 0.7).clamp(10.0, 24.0);
+    let text_rect = egui::Rect::from_min_max(
+        rect.min + egui::vec2(6.0, 0.0),
+        egui::pos2(rect.max.x - caret_w, rect.max.y),
+    );
+
+    // Text size scales with available height. Leave ~25% vertical padding so
+    // the glyphs don't kiss the frame; clamp to a sensible range.
+    let mut font_size = (rect.height() * 0.7).clamp(8.0, 64.0);
+    let label = if current.is_empty() { "—".to_string() } else { current };
+    // If the laid-out text is wider than the text slot at the height-derived
+    // size, shrink the font to fit so long entries stay readable.
+    let max_w = text_rect.width().max(1.0);
+    let measure = |size: f32| -> f32 {
+        let galley = painter.layout_no_wrap(
+            label.clone(),
+            egui::FontId::proportional(size),
+            visuals.text_color(),
+        );
+        galley.size().x
+    };
+    let w = measure(font_size);
+    if w > max_w {
+        font_size = (font_size * (max_w / w)).max(8.0);
+    }
+
+    painter.text(
+        egui::pos2(text_rect.min.x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &label,
+        egui::FontId::proportional(font_size),
+        visuals.text_color(),
+    );
+
+    // ▼ caret, centred in the reserved slot, scaled to height.
+    let caret_size = (rect.height() * 0.45).clamp(8.0, 22.0);
+    painter.text(
+        egui::pos2(rect.max.x - caret_w * 0.5, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "▼",
+        egui::FontId::proportional(caret_size),
+        visuals.text_color(),
+    );
+
+    // Popup menu: open on click, close on selection or outside-click.
+    let popup_id = egui::Id::new(("dropdown_pinned_popup", inner_id.0));
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    let mut chosen: Option<usize> = None;
+    egui::popup_below_widget(
+        ui, popup_id, &resp,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(rect.width().max(80.0));
+            for (i, opt) in options.iter().enumerate() {
+                let label = if opt.is_empty() { format!("(empty {i})") } else { opt.clone() };
+                if ui.selectable_label(i == selected, label).clicked() {
+                    chosen = Some(i);
+                }
+            }
+        },
+    );
+    if chosen.is_some() {
+        ui.memory_mut(|m| m.close_popup(popup_id));
+    }
+    if let Some(i) = chosen {
+        if let Some(node) = inner_snarl.get_node_mut(inner_id) {
+            dropdown_write_selected(node, i);
+        }
+    }
+}
+
 fn show_sink_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let device_id = snarl
         .get_node(node_id)
@@ -2498,20 +2935,336 @@ fn show_constant_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Node
     register_exposable_element(ui, node_id, "value", resp.rect);
 }
 
-fn show_switch_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let active = snarl
-        .get_node(node_id)
-        .and_then(|n| n.params.get("active").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    let mut a = active;
-    let label = if a { "ON" } else { "OFF" };
-    let resp = ui.toggle_value(&mut a, label);
-    if resp.changed() {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("active".to_string(), Value::Bool(a));
+// ── Switch ────────────────────────────────────────────────────────────────────
+//
+// Persisted params (all optional, defaults applied at read time):
+//   active:                   bool   — current state. UI clicks and the engine
+//                                      both write here; engine reconciles with
+//                                      the direct/latch inputs and writes back.
+//   caption_on / caption_off: String — text shown for each state.
+//   svg_on   / svg_off:       String — SVG source for the icon (empty = none).
+//   svg_on_rev / svg_off_rev: u64    — bump on edit to invalidate texture cache.
+//   caption_pos_on / caption_pos_off: "top" | "bottom" | "left" | "right"
+//                                    — placement of caption relative to icon.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptionPos { Top, Bottom, Left, Right }
+
+impl CaptionPos {
+    fn from_str(s: &str) -> Self {
+        match s { "top" => Self::Top, "bottom" => Self::Bottom, "left" => Self::Left, _ => Self::Right }
+    }
+    fn as_str(self) -> &'static str {
+        match self { Self::Top => "top", Self::Bottom => "bottom", Self::Left => "left", Self::Right => "right" }
+    }
+}
+
+struct SwitchState {
+    caption: String,
+    svg_data: String,
+    svg_rev: u64,
+    pos: CaptionPos,
+}
+
+fn read_switch_state(node: &NodeData, on: bool) -> SwitchState {
+    let (cap_key, svg_key, rev_key, pos_key, default_cap, default_pos) = if on {
+        ("caption_on", "svg_on", "svg_on_rev", "caption_pos_on", "ON", "right")
+    } else {
+        ("caption_off", "svg_off", "svg_off_rev", "caption_pos_off", "OFF", "right")
+    };
+    SwitchState {
+        caption: node.params.get(cap_key).and_then(|v| v.as_str())
+            .unwrap_or(default_cap).to_string(),
+        svg_data: node.params.get(svg_key).and_then(|v| v.as_str())
+            .unwrap_or("").to_string(),
+        svg_rev: node.params.get(rev_key).and_then(|v| v.as_u64()).unwrap_or(0),
+        pos: CaptionPos::from_str(
+            node.params.get(pos_key).and_then(|v| v.as_str()).unwrap_or(default_pos)
+        ),
+    }
+}
+
+/// Right-click submenu under "ON state…" / "OFF state…". Lets the user rename
+/// the caption, load/clear an SVG icon, and choose where the caption sits
+/// relative to the icon. All actions write directly into `node.params`.
+fn switch_state_submenu(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    snarl: &mut Snarl<NodeData>,
+    on: bool,
+) {
+    let st = snarl.get_node(node_id).map(|n| read_switch_state(n, on)).unwrap_or(SwitchState {
+        caption: (if on { "ON" } else { "OFF" }).to_string(),
+        svg_data: String::new(), svg_rev: 0, pos: CaptionPos::Right,
+    });
+    let (cap_key, svg_key, rev_key, pos_key) = if on {
+        ("caption_on", "svg_on", "svg_on_rev", "caption_pos_on")
+    } else {
+        ("caption_off", "svg_off", "svg_off_rev", "caption_pos_off")
+    };
+
+    // Caption text-edit.
+    let mut caption = st.caption.clone();
+    ui.horizontal(|ui| {
+        ui.label("Caption:");
+        let resp = ui.add(egui::TextEdit::singleline(&mut caption).desired_width(120.0));
+        if resp.changed() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert(cap_key.to_string(), Value::String(caption.clone()));
+            }
+        }
+    });
+
+    ui.separator();
+
+    // SVG icon: Load… / Clear.
+    let has_svg = !st.svg_data.is_empty();
+    ui.horizontal(|ui| {
+        if ui.button("Load SVG…").clicked() {
+            if let Some(path) = rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file() {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert(svg_key.to_string(), Value::String(text));
+                        node.params.insert(rev_key.to_string(), Value::from(st.svg_rev + 1));
+                    }
+                }
+            }
+            ui.close();
+        }
+        if has_svg && ui.button("Clear icon").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.remove(svg_key);
+                node.params.insert(rev_key.to_string(), Value::from(st.svg_rev + 1));
+            }
+            ui.close();
+        }
+    });
+
+    ui.separator();
+
+    // Caption position relative to icon. Only meaningful when an icon is set,
+    // but we still expose the choice so the user can pre-configure.
+    ui.label("Caption position:");
+    let mut chosen = st.pos;
+    for (label, value) in [
+        ("Above", CaptionPos::Top),
+        ("Below", CaptionPos::Bottom),
+        ("Left",  CaptionPos::Left),
+        ("Right", CaptionPos::Right),
+    ] {
+        if ui.radio(chosen == value, label).clicked() {
+            chosen = value;
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert(pos_key.to_string(), Value::String(value.as_str().to_string()));
+            }
         }
     }
-    register_exposable_element(ui, node_id, "toggle", resp.rect);
+}
+
+/// Rasterise an SVG to a square texture, cached per (node, side, rev, size).
+/// Returns None on parse failure or empty SVG.
+fn switch_icon_texture(
+    ui: &egui::Ui,
+    node_uid: usize,
+    side: &'static str,  // "on" or "off"
+    svg: &str,
+    rev: u64,
+    px: u32,
+) -> Option<egui::TextureHandle> {
+    if svg.is_empty() || px == 0 { return None; }
+    let key = egui::Id::new(("switch_icon_tex", node_uid, side, rev, px));
+    if let Some(h) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+        return Some(h);
+    }
+    let img = rasterize_svg_recolored(svg, px, px, "override", egui::Color32::TRANSPARENT)?;
+    let handle = ui.ctx().load_texture(
+        format!("switch-{}-{}-{}", node_uid, side, rev),
+        img,
+        egui::TextureOptions::LINEAR,
+    );
+    ui.ctx().data_mut(|d| d.insert_temp(key, handle.clone()));
+    Some(handle)
+}
+
+/// Lay out caption + icon inside `rect` according to `pos`. Returns (caption_rect, icon_rect).
+/// Either rect may be empty (caption empty → no caption_rect; no icon → no icon_rect).
+fn switch_layout_icon_caption(
+    rect: egui::Rect,
+    has_caption: bool,
+    has_icon: bool,
+    pos: CaptionPos,
+) -> (Option<egui::Rect>, Option<egui::Rect>) {
+    if !has_caption && !has_icon { return (None, None); }
+    if !has_caption { return (None, Some(rect)); }
+    if !has_icon    { return (Some(rect), None); }
+
+    // Both present: caption sits on the chosen side. Icon claims the
+    // remaining square (or the larger axis if the rect isn't square).
+    let pad = 2.0_f32;
+    match pos {
+        CaptionPos::Left => {
+            let cap_w = (rect.width() * 0.45).clamp(20.0, rect.width() - 20.0);
+            let cap = egui::Rect::from_min_size(rect.min, egui::vec2(cap_w, rect.height()));
+            let icon = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x + cap_w + pad, rect.min.y),
+                rect.max,
+            );
+            (Some(cap), Some(icon))
+        }
+        CaptionPos::Right => {
+            let cap_w = (rect.width() * 0.45).clamp(20.0, rect.width() - 20.0);
+            let icon = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.max.x - cap_w - pad, rect.max.y),
+            );
+            let cap = egui::Rect::from_min_max(
+                egui::pos2(rect.max.x - cap_w, rect.min.y),
+                rect.max,
+            );
+            (Some(cap), Some(icon))
+        }
+        CaptionPos::Top => {
+            let cap_h = (rect.height() * 0.35).clamp(12.0, rect.height() - 16.0);
+            let cap = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), cap_h));
+            let icon = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, rect.min.y + cap_h + pad),
+                rect.max,
+            );
+            (Some(cap), Some(icon))
+        }
+        CaptionPos::Bottom => {
+            let cap_h = (rect.height() * 0.35).clamp(12.0, rect.height() - 16.0);
+            let icon = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.max.x, rect.max.y - cap_h - pad),
+            );
+            let cap = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x, rect.max.y - cap_h),
+                egui::vec2(rect.width(), cap_h),
+            );
+            (Some(cap), Some(icon))
+        }
+    }
+}
+
+/// Paint icon + caption into the button rect for the current state.
+/// `fill_text` is the caption color; `icon_tint` is the SVG tint
+/// (Color32::WHITE for no tint, fully transparent for tint disabled).
+fn paint_switch_content(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    node_uid: usize,
+    state: &SwitchState,
+    on: bool,
+    text_col: egui::Color32,
+) {
+    let has_caption = !state.caption.is_empty();
+    let has_icon = !state.svg_data.is_empty();
+    let (cap_rect, icon_rect) = switch_layout_icon_caption(rect, has_caption, has_icon, state.pos);
+
+    if let Some(ir) = icon_rect {
+        // Square the icon within its slot.
+        let side_px = ir.width().min(ir.height()).round().max(1.0);
+        let icon_box = egui::Rect::from_center_size(ir.center(), egui::vec2(side_px, side_px));
+        let tex_px = (side_px as u32).max(8);
+        let side_id = if on { "on" } else { "off" };
+        if let Some(tex) = switch_icon_texture(ui, node_uid, side_id, &state.svg_data, state.svg_rev, tex_px) {
+            ui.painter().image(
+                tex.id(),
+                icon_box,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+    if let Some(cr) = cap_rect {
+        // Scale the caption to fill its slot. ~75% of slot height,
+        // shrink-to-fit horizontally so long captions stay readable.
+        let mut size = (cr.height() * 0.7).clamp(8.0, 64.0);
+        let painter = ui.painter();
+        let measure = |s: f32| -> f32 {
+            painter.layout_no_wrap(
+                state.caption.clone(),
+                egui::FontId::proportional(s),
+                text_col,
+            ).size().x
+        };
+        let max_w = cr.width().max(1.0);
+        let w = measure(size);
+        if w > max_w {
+            size = (size * (max_w / w)).max(8.0);
+        }
+        painter.text(
+            cr.center(),
+            egui::Align2::CENTER_CENTER,
+            &state.caption,
+            egui::FontId::proportional(size),
+            text_col,
+        );
+    }
+}
+
+fn read_switch_active(node: &NodeData) -> bool {
+    // Prefer the engine's last emitted value — it reconciles UI clicks with
+    // direct/latch inputs and is the authoritative current state. Fall back
+    // to the persisted `active` when no eval result is available yet (patch
+    // just opened, paused engine, etc.).
+    if let Some(Some(Signal::Bool(b))) = node.extra.last_out.first() {
+        return *b;
+    }
+    node.params.get("active").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Click handler shared by canvas body + pinned renderer. Bumps a monotonic
+/// `ui_toggle_seq` counter (engine toggles once per increment) and writes an
+/// optimistic flipped `active` so the button visually updates the same frame.
+fn switch_handle_click(node: &mut NodeData, current_active: bool) {
+    let seq = node.params.get("ui_toggle_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    node.params.insert("ui_toggle_seq".to_string(), Value::from(seq.wrapping_add(1)));
+    node.params.insert("active".to_string(), Value::Bool(!current_active));
+}
+
+fn show_switch_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let active = snarl.get_node(node_id).map(read_switch_active).unwrap_or(false);
+    let state = snarl.get_node(node_id).map(|n| read_switch_state(n, active)).unwrap_or(SwitchState {
+        caption: (if active { "ON" } else { "OFF" }).to_string(),
+        svg_data: String::new(), svg_rev: 0, pos: CaptionPos::Right,
+    });
+
+    // Compute a button size that comfortably fits the chosen caption + icon.
+    let has_icon = !state.svg_data.is_empty();
+    let has_caption = !state.caption.is_empty();
+    let min_w = if has_icon || has_caption { 64.0 } else { 48.0 };
+    let h = if has_icon { 32.0 } else { 22.0 };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(min_w, h), egui::Sense::click());
+
+    let visuals = if active {
+        ui.style().visuals.selection.bg_fill
+    } else {
+        ui.style().visuals.widgets.inactive.bg_fill
+    };
+    let stroke_col = if active {
+        ui.style().visuals.selection.stroke.color
+    } else {
+        ui.style().visuals.widgets.inactive.bg_stroke.color
+    };
+    let text_col = if active {
+        ui.style().visuals.strong_text_color()
+    } else {
+        ui.style().visuals.text_color()
+    };
+
+    let painter = ui.painter_at(rect);
+    painter.rect(rect, 4.0, visuals,
+        egui::Stroke::new(1.0, stroke_col), egui::StrokeKind::Inside);
+    paint_switch_content(ui, rect, node_id.0, &state, active, text_col);
+
+    if resp.clicked() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            switch_handle_click(node, active);
+        }
+    }
+    register_exposable_element(ui, node_id, "toggle", rect);
 }
 
 /// Body for the Text/Label module: editable multiline text + font-size slider.
@@ -4198,9 +4951,15 @@ fn render_pinned_element(
             render_constant_value(inner_id, ui, inner_snarl, container_size);
             return;
         }
-        // Switch: just the toggle.
+        // Dropdown: just the ComboBox, sized to the pinned container.
+        ("module.dropdown", "selection") => {
+            render_dropdown_selection(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        // Switch: just the toggle. Reads per-pin color overrides (fill /
+        // outline / text per state) from the outer snapshot if present.
         ("module.switch", "toggle") => {
-            render_switch_toggle(inner_id, ui, inner_snarl, container_size);
+            render_switch_toggle(inner_id, ui, inner_snarl, container_size, outer_snapshot, outer_id);
             return;
         }
         // Text label: scaled (width) + cropped (height) with scroll, mirroring
@@ -4399,6 +5158,7 @@ fn dispatch_pinned_body(
         "module.label"      => show_label_body(inner_id, ui, inner_snarl),
         "generator.oscillator" => show_oscillator_body(inner_id, &[], ui, inner_snarl),
         "module.selector"   => show_selector_body(inner_id, &[], ui, inner_snarl),
+        "module.dropdown"   => show_dropdown_body(inner_id, ui, inner_snarl),
         "module.response_curve"     => { show_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
         "module.vec_response_curve" => { show_vec_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
         "processing.gyro_3dof"      => show_gyro_3dof_body(inner_id, ui, inner_snarl),
@@ -4907,17 +5667,67 @@ fn render_switch_toggle(
     ui: &mut egui::Ui,
     inner_snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
+    outer_snapshot: Option<&Snarl<NodeData>>,
+    outer_id: NodeId,
 ) {
-    let active = inner_snarl.get_node(inner_id)
-        .and_then(|n| n.params.get("active").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    let mut a = active;
-    let label = if a { "ON" } else { "OFF" };
-    let h = container.y.max(24.0);
-    if ui.add_sized([container.x, h], egui::SelectableLabel::new(a, label)).clicked() {
-        a = !a;
+    let active = inner_snarl.get_node(inner_id).map(read_switch_active).unwrap_or(false);
+    let state = inner_snarl.get_node(inner_id)
+        .map(|n| read_switch_state(n, active))
+        .unwrap_or(SwitchState {
+            caption: (if active { "ON" } else { "OFF" }).to_string(),
+            svg_data: String::new(), svg_rev: 0, pos: CaptionPos::Right,
+        });
+
+    // Per-pin color override lookup from the outer sub-patch's items list.
+    let override_ = outer_snapshot
+        .and_then(|outer| outer.get_node(outer_id))
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| sp.items.iter().find_map(|it| match it {
+            LayoutItem::Module(m)
+                if m.inner_node_id == inner_id.0 && m.element_id == "toggle" =>
+                m.switch_override.clone(),
+            _ => None,
+        }))
+        .unwrap_or_default();
+
+    // Resolve effective fill / outline / text colors. Override fields beat
+    // theme defaults; defaults match the canvas-side body styling.
+    let theme_fill = if active {
+        ui.style().visuals.selection.bg_fill
+    } else {
+        ui.style().visuals.widgets.inactive.bg_fill
+    };
+    let theme_stroke = if active {
+        ui.style().visuals.selection.stroke.color
+    } else {
+        ui.style().visuals.widgets.inactive.bg_stroke.color
+    };
+    let theme_text = if active {
+        ui.style().visuals.strong_text_color()
+    } else {
+        ui.style().visuals.text_color()
+    };
+    let (ov_fill, ov_outline, ov_text) = if active {
+        (override_.fill_on, override_.outline_on, override_.text_on)
+    } else {
+        (override_.fill_off, override_.outline_off, override_.text_off)
+    };
+    let fill_col    = ov_fill.map(rgba_to_color32).unwrap_or(theme_fill);
+    let outline_col = ov_outline.map(rgba_to_color32).unwrap_or(theme_stroke);
+    let text_col    = ov_text.map(rgba_to_color32).unwrap_or(theme_text);
+    let outline_px  = override_.outline_px.unwrap_or(1.0);
+
+    let avail = egui::vec2(container.x.max(24.0), container.y.max(16.0));
+    let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+
+    let painter = ui.painter_at(rect);
+    painter.rect(rect, 4.0, fill_col,
+        egui::Stroke::new(outline_px, outline_col), egui::StrokeKind::Inside);
+    paint_switch_content(ui, rect, inner_id.0, &state, active, text_col);
+
+    if resp.clicked() {
         if let Some(node) = inner_snarl.get_node_mut(inner_id) {
-            node.params.insert("active".to_string(), Value::Bool(a));
+            switch_handle_click(node, active);
         }
     }
 }
@@ -5855,7 +6665,13 @@ fn render_response_curve_only(
 ) {
     let avail = egui::vec2(container.x.max(20.0), container.y.max(20.0));
     let (rect, bg_resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+    let bg_for_menu = bg_resp.clone();
     paint_response_curve_graph(inner_id, ui, inner_snarl, rect, bg_resp, is_vec);
+    // Right-click context menu — same actions as the canvas-editor body so the
+    // layout-pinned widget is fully usable on its own.
+    bg_for_menu.context_menu(|ui| {
+        curve_context_menu(ui, inner_id, inner_snarl, !is_vec, None);
+    });
 }
 
 /// Bare Log-Exp slider + Abs (only for non-vec) + Snap.
@@ -7871,16 +8687,30 @@ fn default_1()     -> f64  {  1.0  }
 fn default_4()     -> i64  {  4    }
 fn default_300()   -> i64  { 300   }
 
+/// Resolves the (points, biases) param keys to operate on for a given node.
+/// For two-way curves this respects `active_lane` so the user only touches
+/// the lane they're currently editing — keeps the file format identical to
+/// regular curves and avoids needing a two-lane file variant.
+fn curve_param_keys(node: &NodeData) -> (&'static str, &'static str) {
+    if node.module_id == "module.twoway_response_curve" {
+        let lane = node.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up");
+        if lane == "dn" { ("points_dn", "biases_dn") } else { ("points", "biases") }
+    } else {
+        ("points", "biases")
+    }
+}
+
 fn curve_header_save(node_id: NodeId, snarl: &Snarl<NodeData>) {
     let Some(n) = snarl.get_node(node_id) else { return };
-    let pts: Vec<[f64; 2]> = n.params.get("points")
+    let (pts_key, bias_key) = curve_param_keys(n);
+    let pts: Vec<[f64; 2]> = n.params.get(pts_key)
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|p| {
             let a = p.as_array()?;
             Some([a.get(0)?.as_f64()?, a.get(1)?.as_f64()?])
         }).collect())
         .unwrap_or_default();
-    let bss: Vec<f64> = n.params.get("biases")
+    let bss: Vec<f64> = n.params.get(bias_key)
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|b| b.as_f64()).collect())
         .unwrap_or_default();
@@ -7919,14 +8749,15 @@ fn curve_header_load(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData
     let Ok(json) = std::fs::read_to_string(path) else { return };
     let Ok(cf)   = serde_json::from_str::<CurveFile>(&json) else { return };
     let Some(node) = snarl.get_node_mut(node_id) else { return };
+    let (pts_key, bias_key) = curve_param_keys(node);
     let pts_json: Vec<Value> = cf.points.iter()
         .map(|p| serde_json::json!([p[0], p[1]]))
         .collect();
     let bss_json: Vec<Value> = cf.biases.iter()
         .filter_map(|&b| Number::from_f64(b).map(Value::Number))
         .collect();
-    node.params.insert("points".into(),  Value::Array(pts_json));
-    node.params.insert("biases".into(),  Value::Array(bss_json));
+    node.params.insert(pts_key.into(),  Value::Array(pts_json));
+    node.params.insert(bias_key.into(), Value::Array(bss_json));
     node.params.insert("grid_x".into(),  serde_json::json!(cf.grid_x));
     node.params.insert("grid_y".into(),  serde_json::json!(cf.grid_y));
     node.params.insert("snap".into(),    Value::Bool(cf.snap));
@@ -7950,8 +8781,13 @@ fn curve_header_load(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData
 
 fn curve_header_reset(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData>) {
     let Some(node) = snarl.get_node_mut(node_id) else { return };
-    node.params.insert("points".into(),           serde_json::json!([[0.0, 0.0], [1.0, 1.0]]));
-    node.params.insert("biases".into(),            serde_json::json!([0.0]));
+    // Two-way: reset only the currently-selected lane's points/biases. Other
+    // settings (grid, scale, range, etc.) are shared across both lanes and
+    // still reset together. For regular/vec curves `curve_param_keys` returns
+    // `("points", "biases")` so the behaviour is unchanged.
+    let (pts_key, bias_key) = curve_param_keys(node);
+    node.params.insert(pts_key.into(),             serde_json::json!([[0.0, 0.0], [1.0, 1.0]]));
+    node.params.insert(bias_key.into(),            serde_json::json!([0.0]));
     node.params.insert("grid_x".into(),            serde_json::json!(4i64));
     node.params.insert("grid_y".into(),            serde_json::json!(4i64));
     node.params.insert("snap".into(),              Value::Bool(false));
@@ -8379,6 +9215,36 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                 }
                 if has_active {
                     ui.ctx().request_repaint();
+                }
+
+                // Right-click on empty graph space → save/load/copy/paste/reset
+                // (same handlers the header buttons use, so file format and
+                // semantics are identical). A right-click on a control point
+                // is captured by `pt_resp.secondary_clicked()` above, so this
+                // menu only opens for clicks on graph background. On success
+                // we resync the local working buffers so the writeback block
+                // below doesn't clobber the change.
+                let mut menu_mutated = false;
+                bg_resp.context_menu(|ui| {
+                    if curve_context_menu(ui, node_id, snarl, true, None) {
+                        menu_mutated = true;
+                    }
+                });
+                if menu_mutated {
+                    if let Some(node) = snarl.get_node(node_id) {
+                        let (pk, bk) = curve_param_keys(node);
+                        new_points = node.params.get(pk).and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|p| {
+                                let a = p.as_array()?;
+                                Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+                            }).collect())
+                            .unwrap_or_else(|| vec![[0.0, 0.0], [1.0, 1.0]]);
+                        new_biases = node.params.get(bk).and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+                            .unwrap_or_default();
+                    }
+                    pts_changed = false;
+                    bias_changed = false;
                 }
             });
 
@@ -8859,6 +9725,31 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                     painter.circle_filled(c2s(graph_x, graph_y), 3.5, head_col);
                 }
                 if has_active { ui.ctx().request_repaint(); }
+
+                // Right-click on empty graph → save/load/copy/paste/reset
+                // (shared with the header buttons; uses .fxc format).
+                let mut menu_mutated = false;
+                bg_resp.context_menu(|ui| {
+                    if curve_context_menu(ui, node_id, snarl, false, None) {
+                        menu_mutated = true;
+                    }
+                });
+                if menu_mutated {
+                    if let Some(node) = snarl.get_node(node_id) {
+                        let (pk, bk) = curve_param_keys(node);
+                        new_points = node.params.get(pk).and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|p| {
+                                let a = p.as_array()?;
+                                Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+                            }).collect())
+                            .unwrap_or_else(|| vec![[0.0, 0.0], [1.0, 1.0]]);
+                        new_biases = node.params.get(bk).and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+                            .unwrap_or_default();
+                    }
+                    pts_changed = false;
+                    bias_changed = false;
+                }
             });
 
         // ── Write back curve points / biases ──────────────────────────────────
@@ -9369,6 +10260,47 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                     painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
                 }
                 if has_active { ui.ctx().request_repaint(); }
+
+                // Right-click on empty graph → save/load/copy/paste/reset for
+                // the *currently-selected* lane only (resolved via
+                // `curve_param_keys` inside the header helpers). Loading a
+                // curve into a two-way only replaces the active lane, so a
+                // user editing the Down lane can paste/load a single-lane
+                // curve into it without touching the Up lane.
+                let lane_name = if lane_up { "Up" } else { "Down" };
+                let mut menu_mutated = false;
+                bg_resp.context_menu(|ui| {
+                    // is_float=true: range fields (in_min/in_max/out_min/out_max)
+                    // are loaded too, matching the header Load behaviour.
+                    if curve_context_menu(ui, node_id, snarl, true, Some(lane_name)) {
+                        menu_mutated = true;
+                    }
+                });
+                if menu_mutated {
+                    if let Some(node) = snarl.get_node(node_id) {
+                        let (pk, bk) = curve_param_keys(node);
+                        let new_pts: Vec<[f32; 2]> = node.params.get(pk).and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|p| {
+                                let a = p.as_array()?;
+                                Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+                            }).collect())
+                            .unwrap_or_else(|| vec![[0.0, 0.0], [1.0, 1.0]]);
+                        let new_bss: Vec<f32> = node.params.get(bk).and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+                            .unwrap_or_default();
+                        if lane_up {
+                            new_pts_up    = new_pts;
+                            new_biases_up = new_bss;
+                            pts_up_changed  = false;
+                            bias_up_changed = false;
+                        } else {
+                            new_pts_dn    = new_pts;
+                            new_biases_dn = new_bss;
+                            pts_dn_changed  = false;
+                            bias_dn_changed = false;
+                        }
+                    }
+                }
             });
 
         // Write back curve changes
@@ -9535,7 +10467,19 @@ fn render_twoway_curve_only(
 ) {
     let avail = egui::vec2(container.x.max(20.0), container.y.max(20.0));
     let (rect, bg_resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+    let bg_for_menu = bg_resp.clone();
     paint_twoway_curve_graph(inner_id, ui, snarl, rect, bg_resp);
+    // Right-click on empty graph → save/load/copy/paste/reset for the active
+    // lane. The pinned widget doesn't expose the lane toggle, so users edit
+    // whichever lane was last selected in the source module (or via the
+    // "lane_toggle" pinned row if also pinned).
+    let lane_name = snarl.get_node(inner_id)
+        .and_then(|n| n.params.get("active_lane").and_then(|v| v.as_str()))
+        .map(|s| if s == "dn" { "Down" } else { "Up" })
+        .unwrap_or("Up");
+    bg_for_menu.context_menu(|ui| {
+        curve_context_menu(ui, inner_id, snarl, true, Some(lane_name));
+    });
 }
 
 /// Paints both up and down curves of a twoway response curve node into rect.
@@ -9888,6 +10832,115 @@ fn curve_scale_inv(y: f32, t: f32) -> f32 {
     if t.abs() < 1e-4 { return y; }
     let p = 2.0f32.powf(t * 3.0);
     y.clamp(0.0, 1.0).powf(1.0 / p)
+}
+
+// ── Response curve right-click menu ──────────────────────────────────────────
+//
+// Save/Load/Reset call into the existing `curve_header_*` helpers, which use
+// the canonical `.fxc` file format (`CurveFile` struct) and — via
+// `curve_param_keys` — operate on the currently-selected lane for two-way
+// curves. Copy/Paste live in egui memory only (no file format involved).
+
+const CURVE_CLIP_KEY: &str = "fxi_curve_clipboard";
+
+#[derive(Clone, Debug)]
+struct CurveClip {
+    points: Vec<[f32; 2]>,
+    biases: Vec<f32>,
+}
+
+/// Snapshot the active (points, biases) pair from a node, using the same
+/// per-lane resolution as save/load/reset (so two-way Copy grabs the lane
+/// the user is currently editing).
+fn curve_clipboard_copy_from(node: &NodeData) -> CurveClip {
+    let (pts_key, bias_key) = curve_param_keys(node);
+    let points: Vec<[f32; 2]> = node.params.get(pts_key)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|p| {
+            let a = p.as_array()?;
+            Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+        }).collect())
+        .unwrap_or_else(|| vec![[0.0, 0.0], [1.0, 1.0]]);
+    let biases: Vec<f32> = node.params.get(bias_key)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+        .unwrap_or_default();
+    CurveClip { points, biases }
+}
+
+/// Write a clipboard payload into the node's active lane (or the only lane
+/// for regular/vec curves). Biases are resized to `points.len() - 1` so the
+/// sampler invariant is maintained.
+fn curve_clipboard_paste_into(node: &mut NodeData, mut clip: CurveClip) {
+    let (pts_key, bias_key) = curve_param_keys(node);
+    let need = clip.points.len().saturating_sub(1);
+    clip.biases.resize(need, 0.0);
+    let pts: Vec<Value> = clip.points.iter()
+        .map(|p| serde_json::json!([p[0], p[1]])).collect();
+    let bss: Vec<Value> = clip.biases.iter()
+        .filter_map(|&b| Number::from_f64(b as f64).map(Value::Number))
+        .collect();
+    node.params.insert(pts_key.into(), Value::Array(pts));
+    node.params.insert(bias_key.into(), Value::Array(bss));
+}
+
+fn curve_clipboard_get(ctx: &egui::Context) -> Option<CurveClip> {
+    ctx.data(|d| d.get_temp::<CurveClip>(egui::Id::new(CURVE_CLIP_KEY)))
+}
+
+fn curve_clipboard_set(ctx: &egui::Context, data: CurveClip) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(CURVE_CLIP_KEY), data));
+}
+
+/// Shared right-click menu emitted by every response-curve widget (body and
+/// pinned variants). Save/Load/Reset go through the same helpers the header
+/// buttons call, so file format (.fxc) and per-lane semantics are identical.
+/// `lane_label` is "Up" or "Down" for two-way curves (used for menu prefixes
+/// like "Down curve: Reset") and `None` for regular/vec curves.
+fn curve_context_menu(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    snarl: &mut Snarl<NodeData>,
+    is_float: bool,
+    lane_label: Option<&str>,
+) -> bool {
+    let mut mutated = false;
+    let prefix = lane_label.map(|p| format!("{p} curve: ")).unwrap_or_default();
+
+    if ui.button(format!("{prefix}Reset")).clicked() {
+        curve_header_reset(node_id, is_float, snarl);
+        mutated = true;
+        ui.close();
+    }
+    ui.separator();
+    if ui.button(format!("{prefix}Copy")).clicked() {
+        if let Some(node) = snarl.get_node(node_id) {
+            let clip = curve_clipboard_copy_from(node);
+            curve_clipboard_set(ui.ctx(), clip);
+        }
+        ui.close();
+    }
+    let has_clip = curve_clipboard_get(ui.ctx()).is_some();
+    if ui.add_enabled(has_clip, egui::Button::new(format!("{prefix}Paste"))).clicked() {
+        if let Some(clip) = curve_clipboard_get(ui.ctx()) {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                curve_clipboard_paste_into(node, clip);
+                mutated = true;
+            }
+        }
+        ui.close();
+    }
+    ui.separator();
+    if ui.button(format!("{prefix}Save…")).clicked() {
+        curve_header_save(node_id, snarl);
+        ui.close();
+    }
+    if ui.button(format!("{prefix}Load…")).clicked() {
+        curve_header_load(node_id, is_float, snarl);
+        mutated = true;
+        ui.close();
+    }
+    mutated
 }
 
 // ── Signal helpers ────────────────────────────────────────────────────────────
@@ -11252,6 +12305,66 @@ fn text_pin_inspector_strip_item(
         exp.text_override = None;
     } else if ov.fill.is_some() || ov.outline.is_some() || ov.outline_px.is_some() {
         exp.text_override = Some(ov);
+    }
+}
+
+/// Inspector strip for the per-pin Switch color override (when the selected
+/// item is a Switch module pin). Exposes fill, outline, and caption colors
+/// for both ON and OFF states, plus a shared outline thickness.
+fn switch_pin_inspector_strip_item(
+    ui: &mut egui::Ui,
+    items: &mut Vec<LayoutItem>,
+    idx: usize,
+) {
+    use crate::canvas::node::PinSwitchOverride;
+    if idx >= items.len() { return; }
+    let exp = match &mut items[idx] {
+        LayoutItem::Module(m) => m,
+        _ => return,
+    };
+    let mut ov = exp.switch_override.clone().unwrap_or_default();
+    let mut clear = false;
+
+    ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Switch ON").small().strong());
+            let mut fill = ov.fill_on.unwrap_or([80, 140, 200, 255]);
+            if color_button(ui, "fill", &mut fill) { ov.fill_on = Some(fill); }
+            let mut outl = ov.outline_on.unwrap_or([180, 200, 220, 255]);
+            if color_button(ui, "outline", &mut outl) { ov.outline_on = Some(outl); }
+            let mut txt = ov.text_on.unwrap_or([255, 255, 255, 255]);
+            if color_button(ui, "text", &mut txt) { ov.text_on = Some(txt); }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Switch OFF").small().strong());
+            let mut fill = ov.fill_off.unwrap_or([60, 60, 65, 255]);
+            if color_button(ui, "fill", &mut fill) { ov.fill_off = Some(fill); }
+            let mut outl = ov.outline_off.unwrap_or([100, 100, 110, 255]);
+            if color_button(ui, "outline", &mut outl) { ov.outline_off = Some(outl); }
+            let mut txt = ov.text_off.unwrap_or([200, 200, 200, 255]);
+            if color_button(ui, "text", &mut txt) { ov.text_off = Some(txt); }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let mut opx = ov.outline_px.unwrap_or(1.0);
+            if ui.add(egui::DragValue::new(&mut opx).speed(0.1).range(0.0f32..=8.0).suffix("px"))
+                .on_hover_text("Outline thickness (both states)")
+                .changed()
+            {
+                ov.outline_px = Some(opx);
+            }
+            if ui.small_button("Reset").on_hover_text("Use theme defaults").clicked() {
+                clear = true;
+            }
+        });
+    });
+    if clear {
+        exp.switch_override = None;
+    } else {
+        let any = ov.fill_on.is_some() || ov.fill_off.is_some()
+            || ov.outline_on.is_some() || ov.outline_off.is_some()
+            || ov.text_on.is_some() || ov.text_off.is_some()
+            || ov.outline_px.is_some();
+        exp.switch_override = if any { Some(PinSwitchOverride { ..ov }) } else { None };
     }
 }
 

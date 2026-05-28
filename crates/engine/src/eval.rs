@@ -1811,8 +1811,82 @@ fn compute_node(
             vec![Some(Signal::Float(v))]
         }
         "module.switch" => {
-            let a = snap.params.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-            vec![Some(Signal::Bool(a))]
+            // The engine is the sole authority on `active`. The UI signals its
+            // intent through a monotonically-increasing `ui_toggle_seq` counter
+            // (bumped on each button click); the engine compares against its
+            // last-seen value and toggles. This avoids the two-writer race that
+            // happens when both UI and engine modify the same `active` param.
+            //
+            //   aux_f32[0] = current `active`         (0/1)
+            //   aux_f32[1] = previous `latch` level   (0/1)
+            //   aux_f32[2] = last-seen ui_toggle_seq  (truncated to f32; suitable
+            //                for counters well past patch lifetime — wraparound
+            //                isn't a concern in practice and a mismatch just
+            //                toggles once).
+            //   aux_f32[3] = init flag                (0 until first tick)
+            while state.aux_f32.len() < 4 { state.aux_f32.push(0.0); }
+            let initialised = state.aux_f32[3] > 0.5;
+            let prev_active = state.aux_f32[0] > 0.5;
+            let prev_latch  = state.aux_f32[1] > 0.5;
+            let prev_seq    = state.aux_f32[2];
+
+            let saved_active = snap.params.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+            let cur_seq = snap.params.get("ui_toggle_seq")
+                .and_then(|v| v.as_u64()).unwrap_or(0) as f32;
+            let direct = inputs.get(0).copied().flatten()
+                .and_then(|s| s.coerce_to(SignalType::Bool))
+                .map(|s| matches!(s, Signal::Bool(true))).unwrap_or(false);
+            let latch  = inputs.get(1).copied().flatten()
+                .and_then(|s| s.coerce_to(SignalType::Bool))
+                .map(|s| matches!(s, Signal::Bool(true))).unwrap_or(false);
+
+            // First tick after load: adopt the persisted `active` so saved
+            // patches reopen in their stored state.
+            let mut active = if initialised { prev_active } else { saved_active };
+
+            // UI clicks since last tick: toggle once per increment of the
+            // sequence counter. We can't replay individual clicks if many
+            // happened between ticks, so collapse to "differs → toggle once".
+            if initialised && cur_seq != prev_seq {
+                active = !active;
+            }
+            // Latch rising edge → toggle.
+            if latch && !prev_latch {
+                active = !active;
+            }
+            // Direct HIGH → force ON; falling edge does not force OFF.
+            if direct {
+                active = true;
+            }
+
+            state.aux_f32[0] = if active { 1.0 } else { 0.0 };
+            state.aux_f32[1] = if latch  { 1.0 } else { 0.0 };
+            state.aux_f32[2] = cur_seq;
+            state.aux_f32[3] = 1.0;
+
+            let out = vec![Some(Signal::Bool(active))];
+            state.last_signals = out.clone();
+            out
+        }
+        "module.dropdown" => {
+            let n = snap.params.get("options")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let idx = snap.params.get("selected_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            if n == 0 {
+                vec![Some(Signal::Float(0.0)), Some(Signal::Int(0))]
+            } else {
+                let idx = idx.min(n - 1);
+                // Centre-of-bucket quantisation: matches the inverse mapping
+                // used by `Selector`/`Split` ((sel*N).floor()), so wiring the
+                // float output into a Selector with N inputs selects bucket
+                // `idx` exactly.
+                let f = (idx as f32 + 0.5) / n as f32;
+                vec![Some(Signal::Float(f)), Some(Signal::Int(idx as i32))]
+            }
         }
         "generator.oscillator" => {
             let out = compute_oscillator(inputs, state, &snap.params, dt);

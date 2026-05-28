@@ -53,6 +53,12 @@ pub struct ExposedModule {
     /// the layout inspector strip; `None` fields fall back to module values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_override: Option<PinTextOverride>,
+    /// Per-pin Switch color override. Populated only for Switch-module pins
+    /// via the layout inspector strip. Each `None` field falls back to the
+    /// default visuals derived from the active state. Fill and outline can be
+    /// overridden independently for ON and OFF states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_override: Option<PinSwitchOverride>,
 }
 
 fn default_exposed_size() -> [f32; 2] { [220.0, 100.0] }
@@ -66,6 +72,21 @@ pub struct PinTextOverride {
     #[serde(default)] pub fill: Option<[u8; 4]>,
     #[serde(default)] pub outline: Option<[u8; 4]>,
     #[serde(default)] pub outline_px: Option<f32>,
+}
+
+/// Per-pin color override for pinned Switch modules. Allows the layout
+/// designer to recolor the button independently of theme visuals — each
+/// state (ON / OFF) can override fill, outline, and caption color. `None`
+/// fields fall back to the default theme-derived visuals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PinSwitchOverride {
+    #[serde(default)] pub fill_on:     Option<[u8; 4]>,
+    #[serde(default)] pub fill_off:    Option<[u8; 4]>,
+    #[serde(default)] pub outline_on:  Option<[u8; 4]>,
+    #[serde(default)] pub outline_off: Option<[u8; 4]>,
+    #[serde(default)] pub text_on:     Option<[u8; 4]>,
+    #[serde(default)] pub text_off:    Option<[u8; 4]>,
+    #[serde(default)] pub outline_px:  Option<f32>,
 }
 
 /// Text horizontal alignment for layout-decoration Text items.

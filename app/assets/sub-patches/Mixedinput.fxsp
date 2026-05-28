@@ -1,7 +1,7 @@
 {
   "version": 1,
   "sub_patch": {
-    "display_name": "Mixed input",
+    "display_name": "Mixed input w/ filter",
     "pins_in": [
       {
         "name": "Auto-Map",
@@ -56,11 +56,11 @@
               }
             ],
             "params": {
-              "scale_t": -0.7604460716247559,
-              "snap": false,
-              "trail_ms": 300,
-              "grid_x": 4,
               "out_max": 1.0,
+              "show_scaled_grid": true,
+              "scale_t": -0.7604460716247559,
+              "in_max": 1.0,
+              "grid_y": 4,
               "points": [
                 [
                   0.21110868453979492,
@@ -71,28 +71,28 @@
                   0.2004251927137375
                 ],
                 [
-                  0.560232400894165,
-                  0.4714865982532501
+                  0.5467188954353333,
+                  0.4680383801460266
                 ],
                 [
                   1.0,
                   1.0
                 ]
               ],
-              "show_scaled_grid": true,
-              "in_max": 1.0,
+              "trail_ms": 300,
               "show_grid_labels": true,
+              "grid_x": 4,
               "biases": [
                 0.0,
                 0.0,
                 0.0
               ],
-              "grid_y": 4
+              "snap": false
             }
           },
           "pos": {
-            "x": -1588.8358,
-            "y": 478.9149
+            "x": -1519.9755,
+            "y": 471.51056
           },
           "open": true
         },
@@ -123,8 +123,8 @@
             "params": {}
           },
           "pos": {
-            "x": -493.0917,
-            "y": 760.4223
+            "x": -871.58594,
+            "y": 741.177
           },
           "open": true
         },
@@ -149,16 +149,24 @@
             ],
             "params": {
               "ui_phase": "ready_to_add",
-              "_pressed_prev": [],
               "draft_input": [
                 "btn_rt_dig"
               ],
+              "mappings": [
+                [
+                  "touch_left"
+                ],
+                [
+                  "btn_capture"
+                ]
+              ],
+              "_pressed_prev": [],
               "_tp_click_mode": false
             }
           },
           "pos": {
-            "x": -1920.1136,
-            "y": 234.61792
+            "x": -2100.942,
+            "y": 197.85187
           },
           "open": true
         },
@@ -189,8 +197,8 @@
             "params": {}
           },
           "pos": {
-            "x": -606.875,
-            "y": 503.15936
+            "x": -902.4316,
+            "y": 667.05994
           },
           "open": true
         },
@@ -221,8 +229,8 @@
             "params": {}
           },
           "pos": {
-            "x": -298.01804,
-            "y": 761.6917
+            "x": -650.8516,
+            "y": 777.2713
           },
           "open": true
         },
@@ -246,9 +254,15 @@
               }
             ],
             "params": {
+              "snap": false,
               "grid_x": 4,
+              "scale_t": 0.19999998807907104,
+              "show_scaled_grid": true,
               "trail_ms": 300,
+              "out_max": 1.0,
               "grid_y": 4,
+              "in_max": 1.0,
+              "show_grid_labels": true,
               "points": [
                 [
                   0.0,
@@ -271,18 +285,12 @@
                   1.0
                 ]
               ],
-              "out_max": 1.0,
-              "show_scaled_grid": true,
-              "in_max": 1.0,
-              "show_grid_labels": true,
               "biases": [
                 0.0,
                 0.0,
                 0.0,
                 0.0
-              ],
-              "scale_t": 0.19999998807907104,
-              "snap": false
+              ]
             }
           },
           "pos": {
@@ -311,6 +319,8 @@
               }
             ],
             "params": {
+              "out_max": 1.0,
+              "show_scaled_grid": true,
               "points": [
                 [
                   0.0,
@@ -325,19 +335,17 @@
                   1.0
                 ]
               ],
-              "grid_y": 4,
-              "snap": false,
-              "grid_x": 4,
-              "out_max": 1.0,
-              "trail_ms": 300,
-              "show_scaled_grid": true,
               "biases": [
                 -0.03879748284816742,
                 0.0
               ],
+              "grid_y": 4,
+              "trail_ms": 300,
+              "snap": false,
               "in_max": 1.0,
               "scale_t": -0.5137927532196045,
-              "show_grid_labels": true
+              "show_grid_labels": true,
+              "grid_x": 4
             }
           },
           "pos": {
@@ -349,7 +357,7 @@
         "7": {
           "value": {
             "module_id": "module.knob",
-            "display_name": "Gyro ↔ RS contribution",
+            "display_name": "Gyro ↔ RS",
             "category": "Utility",
             "inputs": [],
             "outputs": [
@@ -360,13 +368,13 @@
               }
             ],
             "params": {
-              "bipolar": true,
-              "value": 0.3941510021686554
+              "value": 0.3941510021686554,
+              "bipolar": true
             }
           },
           "pos": {
-            "x": -1127.1913,
-            "y": 572.70996
+            "x": -1184.6132,
+            "y": 578.1787
           },
           "open": true
         },
@@ -384,12 +392,15 @@
               }
             ],
             "params": {
+              "caption_off": "off",
+              "ui_toggle_seq": 2,
+              "caption_on": "on",
               "active": true
             }
           },
           "pos": {
-            "x": -1002.56006,
-            "y": 883.1759
+            "x": -1214.4741,
+            "y": 925.5589
           },
           "open": true
         },
@@ -420,8 +431,8 @@
             "params": {}
           },
           "pos": {
-            "x": -483.7473,
-            "y": 648.2799
+            "x": -743.51276,
+            "y": 667.42053
           },
           "open": true
         },
@@ -457,8 +468,8 @@
             "params": {}
           },
           "pos": {
-            "x": -741.4875,
-            "y": 1027.5795
+            "x": -911.01843,
+            "y": 844.37665
           },
           "open": true
         },
@@ -527,18 +538,18 @@
               }
             ],
             "params": {
-              "inv_accel_z": false,
               "inv_accel_y": false,
-              "inv_roll": false,
+              "inv_accel_z": false,
               "inv_yaw": false,
-              "mode": "local",
+              "inv_roll": false,
               "inv_accel_x": false,
+              "mode": "world",
               "inv_pitch": false
             }
           },
           "pos": {
-            "x": -1905.5503,
-            "y": 522.23846
+            "x": -1919.6185,
+            "y": 511.8724
           },
           "open": true
         },
@@ -573,8 +584,8 @@
             "params": {}
           },
           "pos": {
-            "x": -134.70432,
-            "y": 608.3034
+            "x": -547.1072,
+            "y": 727.442
           },
           "open": true
         },
@@ -633,8 +644,8 @@
             }
           },
           "pos": {
-            "x": -123.52176,
-            "y": 871.8017
+            "x": -619.26447,
+            "y": 962.4713
           },
           "open": true
         },
@@ -707,8 +718,8 @@
               }
             ],
             "params": {
-              "pin_index": 0,
-              "signal_type": "AutoMap"
+              "signal_type": "AutoMap",
+              "pin_index": 0
             }
           },
           "pos": {
@@ -731,13 +742,92 @@
             ],
             "outputs": [],
             "params": {
-              "signal_type": "AutoMap",
-              "pin_index": 0
+              "pin_index": 0,
+              "signal_type": "AutoMap"
             }
           },
           "pos": {
-            "x": 293.28195,
-            "y": 777.92896
+            "x": -226.2483,
+            "y": 619.33563
+          },
+          "open": true
+        },
+        "17": {
+          "value": {
+            "module_id": "module.switch",
+            "display_name": "filter on",
+            "category": "Utility",
+            "inputs": [
+              {
+                "name": "direct",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "latch",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {
+              "active": true,
+              "caption_off": "off",
+              "caption_on": "on",
+              "ui_toggle_seq": 11
+            }
+          },
+          "pos": {
+            "x": -1720.1323,
+            "y": 162.11922
+          },
+          "open": true
+        },
+        "18": {
+          "value": {
+            "module_id": "module.selector",
+            "display_name": "Selector",
+            "category": "Utility",
+            "inputs": [
+              {
+                "name": "select",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "in_0",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "in_1",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "in_2",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": -1089.1931,
+            "y": 272.72275
           },
           "open": true
         },
@@ -768,8 +858,72 @@
             "params": {}
           },
           "pos": {
-            "x": -382.09674,
-            "y": 1168.439
+            "x": -803.1899,
+            "y": 1275.0787
+          },
+          "open": true
+        },
+        "20": {
+          "value": {
+            "module_id": "module.dropdown",
+            "display_name": "Gyro activation mode",
+            "category": "Utility",
+            "inputs": [],
+            "outputs": [
+              {
+                "name": "value",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "index",
+                "signal_type": "Int",
+                "optional": false
+              }
+            ],
+            "params": {
+              "options": [
+                "Hold to Activate",
+                "Hold to Suppress",
+                "Toggle"
+              ],
+              "selected_index": 1,
+              "box_width": 161.375
+            }
+          },
+          "pos": {
+            "x": -1560.8585,
+            "y": 90.19976
+          },
+          "open": true
+        },
+        "21": {
+          "value": {
+            "module_id": "module.average",
+            "display_name": "Average",
+            "category": "Processing",
+            "inputs": [
+              {
+                "name": "In",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "Out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {
+              "buf_size": 83.0,
+              "spike_mad": 20.0
+            }
+          },
+          "pos": {
+            "x": -1842.7085,
+            "y": 428.01437
           },
           "open": true
         },
@@ -800,8 +954,8 @@
             "params": {}
           },
           "pos": {
-            "x": -358.425,
-            "y": 1087.3925
+            "x": -800.0258,
+            "y": 1196.7676
           },
           "open": true
         },
@@ -847,8 +1001,8 @@
             "params": {}
           },
           "pos": {
-            "x": -897.16956,
-            "y": 711.53577
+            "x": -1044.8256,
+            "y": 747.08264
           },
           "open": true
         },
@@ -870,8 +1024,8 @@
             }
           },
           "pos": {
-            "x": -1349.444,
-            "y": 868.16626
+            "x": -1185.3815,
+            "y": 701.3695
           },
           "open": true
         },
@@ -893,8 +1047,8 @@
             }
           },
           "pos": {
-            "x": -1352.0591,
-            "y": 813.75256
+            "x": -1312.4106,
+            "y": 800.08075
           },
           "open": true
         },
@@ -914,8 +1068,8 @@
             "params": {}
           },
           "pos": {
-            "x": -1449.7815,
-            "y": 814.19684
+            "x": -1187.2815,
+            "y": 766.3453
           },
           "open": true
         },
@@ -933,12 +1087,218 @@
               }
             ],
             "params": {
+              "active": true,
+              "ui_toggle_seq": 6,
+              "caption_on": "on",
+              "caption_off": "off"
+            }
+          },
+          "pos": {
+            "x": -1059.7039,
+            "y": 1354.2556
+          },
+          "open": true
+        },
+        "28": {
+          "value": {
+            "module_id": "logic.not",
+            "display_name": "NOT",
+            "category": "Logic",
+            "inputs": [
+              {
+                "name": "in",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": -1317.8206,
+            "y": 239.85403
+          },
+          "open": true
+        },
+        "29": {
+          "value": {
+            "module_id": "math.multiply",
+            "display_name": "Multiply",
+            "category": "Math",
+            "inputs": [
+              {
+                "name": "a",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "b",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": -1439.3169,
+            "y": 258.8997
+          },
+          "open": true
+        },
+        "30": {
+          "value": {
+            "module_id": "module.remapper",
+            "display_name": "Remapper",
+            "category": "AutoMap",
+            "inputs": [
+              {
+                "name": "in",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "AutoMap",
+                "optional": false
+              }
+            ],
+            "params": {
+              "draft_output": [],
+              "_tp_click_mode": false,
+              "draft_input": [
+                "btn_rt_dig"
+              ],
+              "_pressed_prev": [],
+              "ui_phase": "ready_to_learn",
+              "mappings": []
+            }
+          },
+          "pos": {
+            "x": -942.9588,
+            "y": 491.65414
+          },
+          "open": true
+        },
+        "31": {
+          "value": {
+            "module_id": "module.selector",
+            "display_name": "filter",
+            "category": "Utility",
+            "inputs": [
+              {
+                "name": "select",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "in_0",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "in_1",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": -1562.9794,
+            "y": 345.35745
+          },
+          "open": true
+        },
+        "32": {
+          "value": {
+            "module_id": "module.switch",
+            "display_name": "Switch",
+            "category": "Utility",
+            "inputs": [
+              {
+                "name": "direct",
+                "signal_type": "Bool",
+                "optional": false
+              },
+              {
+                "name": "latch",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out",
+                "signal_type": "Bool",
+                "optional": false
+              }
+            ],
+            "params": {
               "active": true
             }
           },
           "pos": {
-            "x": -575.72015,
-            "y": 968.70953
+            "x": -1387.2804,
+            "y": 340.65582
+          },
+          "open": true
+        },
+        "33": {
+          "value": {
+            "module_id": "module.split",
+            "display_name": "filter or not",
+            "category": "Utility",
+            "inputs": [
+              {
+                "name": "select",
+                "signal_type": "Float",
+                "optional": false
+              },
+              {
+                "name": "in",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "outputs": [
+              {
+                "name": "out_0",
+                "signal_type": "Any",
+                "optional": false
+              },
+              {
+                "name": "out_1",
+                "signal_type": "Any",
+                "optional": false
+              }
+            ],
+            "params": {}
+          },
+          "pos": {
+            "x": -1771.923,
+            "y": 291.55643
           },
           "open": true
         }
@@ -946,12 +1306,62 @@
       "wires": [
         {
           "out_pin": {
-            "node": 3,
+            "node": 20,
             "output": 0
           },
           "in_pin": {
-            "node": 9,
+            "node": 18,
             "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 23,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 1,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 18,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 29,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 25,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 3,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 31,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 0,
+            "input": 1
           }
         },
         {
@@ -966,12 +1376,112 @@
         },
         {
           "out_pin": {
+            "node": 30,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 23,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 3,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 4
+          }
+        },
+        {
+          "out_pin": {
+            "node": 19,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 5
+          }
+        },
+        {
+          "out_pin": {
+            "node": 33,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 21,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 30,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 25,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 23,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 8,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 10,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
             "node": 6,
             "output": 0
           },
           "in_pin": {
+            "node": 10,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 10,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 1,
+            "output": 0
+          },
+          "in_pin": {
             "node": 12,
-            "input": 0
+            "input": 1
           }
         },
         {
@@ -981,216 +1491,6 @@
           },
           "in_pin": {
             "node": 16,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 5,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 1,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 12,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 4
-          }
-        },
-        {
-          "out_pin": {
-            "node": 23,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 3,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 25,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 3,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 14,
-            "output": 3
-          },
-          "in_pin": {
-            "node": 22,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 7,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 23,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 0,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 1,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 10,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 3
-          }
-        },
-        {
-          "out_pin": {
-            "node": 26,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 23,
-            "input": 3
-          }
-        },
-        {
-          "out_pin": {
-            "node": 23,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 1,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 25,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 23,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 15,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 2,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 9,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 4,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 4,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 12,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 4,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 14,
-            "output": 4
-          },
-          "in_pin": {
-            "node": 19,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 14,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 6,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 6,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 10,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 25,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 23,
-            "input": 4
-          }
-        },
-        {
-          "out_pin": {
-            "node": 15,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 14,
             "input": 0
           }
         },
@@ -1206,11 +1506,141 @@
         },
         {
           "out_pin": {
-            "node": 27,
+            "node": 21,
             "output": 0
           },
           "in_pin": {
-            "node": 19,
+            "node": 31,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 14,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 2,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 29,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 33,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 3
+          },
+          "in_pin": {
+            "node": 22,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 32,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 33,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 31,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 10,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 9,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 9,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 17,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 31,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 32,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 5,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 4,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 7,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 23,
             "input": 0
           }
         },
@@ -1226,12 +1656,12 @@
         },
         {
           "out_pin": {
-            "node": 10,
-            "output": 1
+            "node": 26,
+            "output": 0
           },
           "in_pin": {
-            "node": 9,
-            "input": 1
+            "node": 23,
+            "input": 3
           }
         },
         {
@@ -1246,21 +1676,31 @@
         },
         {
           "out_pin": {
-            "node": 19,
+            "node": 28,
             "output": 0
           },
           "in_pin": {
-            "node": 13,
-            "input": 5
+            "node": 18,
+            "input": 2
           }
         },
         {
           "out_pin": {
-            "node": 8,
+            "node": 25,
             "output": 0
           },
           "in_pin": {
-            "node": 10,
+            "node": 23,
+            "input": 4
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 28,
             "input": 0
           }
         },
@@ -1270,7 +1710,37 @@
             "output": 0
           },
           "in_pin": {
-            "node": 0,
+            "node": 29,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 17,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 33,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 6,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 4,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
             "input": 1
           }
         },
@@ -1282,6 +1752,56 @@
           "in_pin": {
             "node": 4,
             "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 4
+          },
+          "in_pin": {
+            "node": 19,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 3,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 9,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 27,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 19,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 0,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 1,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 6,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 0
           }
         }
       ]
@@ -1472,27 +1992,13 @@
       {
         "Module": {
           "inner_node_id": 0,
-          "element_id": "range_row",
+          "element_id": "grid_row",
           "pos": [
             328.0,
             304.0
           ],
           "size": [
-            184.0,
-            18.0
-          ]
-        }
-      },
-      {
-        "Module": {
-          "inner_node_id": 0,
-          "element_id": "grid_row",
-          "pos": [
-            328.0,
-            328.0
-          ],
-          "size": [
-            208.0,
+            196.0,
             18.0
           ]
         }
@@ -1846,7 +2352,7 @@
               360.0
             ],
             "size": [
-              312.0,
+              264.0,
               212.0
             ],
             "fill": [
@@ -1875,8 +2381,8 @@
             392.0
           ],
           "size": [
-            296.0,
-            172.0
+            248.0,
+            176.0
           ]
         }
       },
@@ -1885,14 +2391,14 @@
           "Text": {
             "pos": [
               328.0,
-              364.0
+              368.0
             ],
             "size": [
-              212.0,
-              24.0
+              116.0,
+              20.0
             ],
             "text": "Gyro activation:",
-            "font_size": 20.0,
+            "font_size": 16.0,
             "fill": [
               200,
               200,
@@ -1952,6 +2458,164 @@
             "outline_px": 0.0,
             "align": "Left"
           }
+        }
+      },
+      {
+        "Module": {
+          "inner_node_id": 21,
+          "element_id": "samples",
+          "pos": [
+            440.0,
+            328.0
+          ],
+          "size": [
+            92.0,
+            18.0
+          ]
+        }
+      },
+      {
+        "Deco": {
+          "Text": {
+            "pos": [
+              328.0,
+              328.0
+            ],
+            "size": [
+              80.0,
+              16.0
+            ],
+            "text": "Filter noise",
+            "font_size": 14.0,
+            "fill": [
+              200,
+              200,
+              200,
+              220
+            ],
+            "outline": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "outline_px": 0.0,
+            "align": "Left"
+          }
+        }
+      },
+      {
+        "Module": {
+          "inner_node_id": 21,
+          "element_id": "spike_mad",
+          "pos": [
+            536.0,
+            328.0
+          ],
+          "size": [
+            92.0,
+            18.0
+          ]
+        }
+      },
+      {
+        "Module": {
+          "inner_node_id": 20,
+          "element_id": "selection",
+          "pos": [
+            444.0,
+            364.0
+          ],
+          "size": [
+            132.0,
+            24.0
+          ]
+        }
+      },
+      {
+        "Deco": {
+          "Rect": {
+            "pos": [
+              592.0,
+              360.0
+            ],
+            "size": [
+              224.0,
+              212.0
+            ],
+            "fill": [
+              60,
+              60,
+              60,
+              180
+            ],
+            "stroke": [
+              255,
+              255,
+              255,
+              220
+            ],
+            "stroke_px": 0.0,
+            "corner_radius": 4.0
+          }
+        }
+      },
+      {
+        "Module": {
+          "inner_node_id": 30,
+          "element_id": "whole_module",
+          "pos": [
+            600.0,
+            392.0
+          ],
+          "size": [
+            208.0,
+            176.0
+          ]
+        }
+      },
+      {
+        "Deco": {
+          "Text": {
+            "pos": [
+              600.0,
+              368.0
+            ],
+            "size": [
+              208.0,
+              20.0
+            ],
+            "text": "Button mapping tool",
+            "font_size": 16.0,
+            "fill": [
+              200,
+              200,
+              200,
+              220
+            ],
+            "outline": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "outline_px": 0.0,
+            "align": "Left"
+          }
+        }
+      },
+      {
+        "Module": {
+          "inner_node_id": 17,
+          "element_id": "toggle",
+          "pos": [
+            404.0,
+            328.0
+          ],
+          "size": [
+            32.0,
+            18.0
+          ]
         }
       }
     ],

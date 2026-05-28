@@ -3788,6 +3788,18 @@ fn apply_display_state(
             if let Some(outs) = last_outputs.get(&uid) {
                 node.extra.last_out = outs.clone();
             }
+            // Switch: the engine reconciles UI clicks + direct/latch inputs
+            // and emits the resulting Bool as output[0]. Mirror that back into
+            // `params["active"]` so the UI body reads a value that's already
+            // in sync with the wires next frame.
+            if node.module_id == "module.switch" {
+                if let Some(Some(flexinput_core::Signal::Bool(b))) = node.extra.last_out.first() {
+                    let cur = node.params.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if cur != *b {
+                        node.params.insert("active".to_string(), serde_json::Value::Bool(*b));
+                    }
+                }
+            }
             // Scope samples: move (drain) the per-uid bucket out of
             // scope_lookup instead of cloning each `Vec<Option<f32>>`.
             // Each sample becomes a single push_back into the history
@@ -5747,6 +5759,7 @@ fn show_subpatch_editors(
                             pos: [PINNED_PAD, next_y + PINNED_PAD],
                             size: init_size,
                             text_override: None,
+                            switch_override: None,
                         });
                     }
                 }
