@@ -3154,23 +3154,27 @@ fn compute_gyro_3dof(
         state.aux_f32[1] += raw_y * dt;
 
         // Auto-centering: pull the integrated steering accumulator TOWARD
-        // the accelerometer-implied steering angle. Physical intuition:
-        // when the user holds the gamepad like an upright steering wheel,
-        // the controller's roll angle IS the steering angle the user is
-        // commanding. The accelerometer reveals that angle but is noisy;
-        // the integrated gyro is smooth but drifts. A weak complementary
-        // pull combines the two: aux ← aux + α (target − aux), where α
-        // = strength × dt and `target` is the accel-derived angle.
-        if recenter_strength > 0.0 {
-            // Roll source: controller roll about the forward axis. atan2
-            // of accel_x over accel_z gives a signed angle in radians.
-            let roll_angle = ax.atan2(az);
-            // Gravity source: full-vector projection. asin(ax / |a|) is
-            // the angle between gravity and the controller's Y axis,
-            // signed by the X component. More stable when the controller
-            // is pitched far forward/back than the bare atan2 of x/z.
+        // the accelerometer-implied steering angle. The "steering angle"
+        // depends on which gyro component is being integrated into X:
+        //   pitch_yaw  → X = yaw   → target = controller ROLL  (atan2 ax/az)
+        //   pitch_roll → X = roll  → target = controller PITCH (atan2 ay/az)
+        //   player/world → X = world yaw → azimuth around gravity is NOT
+        //     observable from accel alone, so we skip recentering here.
+        //
+        // The complementary form is: aux ← aux + α (target − aux), where
+        // α = strength × dt. The "roll" source is the raw atan2 (smooth
+        // near upright), the "gravity" source is asin(component/|a|)
+        // (more stable when the controller is pitched far over). Blend
+        // is a per-mode mix; both reduce to the same angle at small tilts.
+        if recenter_strength > 0.0 && (axis == "pitch_yaw" || axis == "pitch_roll") {
             let acc_mag = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
-            let grav_angle = (ax / acc_mag).clamp(-1.0, 1.0).asin();
+            let (roll_angle, grav_angle) = if axis == "pitch_roll" {
+                // Steering axis is roll → target follows controller PITCH.
+                (ay.atan2(az), (ay / acc_mag).clamp(-1.0, 1.0).asin())
+            } else {
+                // Steering axis is yaw → target follows controller ROLL.
+                (ax.atan2(az), (ax / acc_mag).clamp(-1.0, 1.0).asin())
+            };
             let target = (1.0 - recenter_blend) * roll_angle + recenter_blend * grav_angle;
             let alpha = (recenter_strength * dt).clamp(0.0, 1.0);
             state.aux_f32[0] += alpha * (target - state.aux_f32[0]);
