@@ -8,5 +8,5 @@ mod pin_hotkey;
 mod process_list;
 mod settings;
 
-pub use app::FlexInputApp;
+pub use app::{render_app_icon, FlexInputApp};
 pub use canvas::UiPatch;

@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-const ICON: &[u8] = include_bytes!("../assets/icon.png");
-
 fn main() -> eframe::Result<()> {
-    let icon = eframe::icon_data::from_png_bytes(ICON).expect("bundled icon is valid PNG");
+    // Window / taskbar icon — decoded from the pre-baked 256px logo PNG
+    // (rendered from icon_v2.svg). Decoding is instant; rasterizing the
+    // source SVG at 256px takes ~45s and was stalling startup.
+    let icon = flexinput_ui::render_app_icon().expect("bundled app icon PNG is valid");
 
     // Transparent viewport is enabled at startup so the runtime "see-through"
     // toggle (eye icon next to the zoom controls) can show whatever is behind
@@ -26,6 +27,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "FlexInput",
         native_options,
-        Box::new(|cc| Ok(Box::new(flexinput_ui::FlexInputApp::new(cc, ICON)))),
+        Box::new(|cc| Ok(Box::new(flexinput_ui::FlexInputApp::new(cc)))),
     )
 }

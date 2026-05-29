@@ -444,7 +444,7 @@ impl PanicShortcut {
 }
 
 impl FlexInputApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, icon_bytes: &[u8]) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
         // Install egui_extras image loaders so SVG images render inside nodes
         // and pinned sub-patch widgets. The svg feature pulls in resvg/usvg.
@@ -454,7 +454,12 @@ impl FlexInputApp {
         let midi_backend = Arc::new(Mutex::new(Some(MidiBackend::new())));
         // HidHide integration disabled pending a proper rewrite.
         let hidhide: Option<HidHideClient> = None;
-        let logo_texture = eframe::icon_data::from_png_bytes(icon_bytes).ok().map(|icon| {
+        // Title-bar logo tile. Loaded from a pre-baked 256px PNG (rendered
+        // from icon_v2.svg at build time) rather than rasterizing the SVG
+        // here — the SVG's blur/color-matrix filters take tens of seconds
+        // for resvg to rasterize, which previously stalled startup. The
+        // 256px source downscales crisply to the ~30px tile via mipmaps.
+        let logo_texture = eframe::icon_data::from_png_bytes(APP_ICON_PNG).ok().map(|icon| {
             // Pre-multiply alpha so blending at small render sizes doesn't
             // produce dark fringes around the logo's edges.
             let mut premul = Vec::with_capacity(icon.rgba.len());
@@ -466,11 +471,7 @@ impl FlexInputApp {
                 premul.push(px[3]);
             }
             let image = egui::ColorImage::from_rgba_premultiplied(
-                [icon.width as usize, icon.height as usize],
-                &premul,
-            );
-            // Mipmaps + linear min/mag give a clean downscale from the source
-            // PNG (large) to the ~20px render size in the title bar.
+                [icon.width as usize, icon.height as usize], &premul);
             let opts = egui::TextureOptions {
                 magnification: egui::TextureFilter::Linear,
                 minification:  egui::TextureFilter::Linear,
@@ -1076,13 +1077,31 @@ impl eframe::App for FlexInputApp {
 
         // ── Tab bar ───────────────────────────────────────────────────────────────
         let tab_bar_frame = egui::Frame::NONE.fill(ctx.style().visuals.widgets.noninteractive.bg_fill);
-        let (tab_switch, tab_close_idx, tab_new, bypass_toggle_idx) = egui::TopBottomPanel::top("tab_bar")
-            .exact_height(28.0)
+        let tab_actions = egui::TopBottomPanel::top("tab_bar")
+            .exact_height(32.0)
             .frame(tab_bar_frame)
             .show_separator_line(false)
-            .show(ctx, |ui| show_tab_bar(ui, &self.tabs, self.active_tab, &effective_bypass))
+            .show(ctx, |ui| show_tab_bar(ui, &self.tabs, self.active_tab, &effective_bypass, &mut self.auto_switch))
             .inner;
-        do_new = do_new || tab_new;
+        let TabBarActions {
+            switch_to: tab_switch,
+            close_idx: tab_close_idx,
+            new_tab: tab_new,
+            bypass_toggle: bypass_toggle_idx,
+            do_save: tab_save,
+            do_load: tab_load,
+            do_save_workspace: tab_save_ws,
+            do_load_workspace: tab_load_ws,
+            do_bind: tab_bind,
+            do_close: tab_close,
+        } = tab_actions;
+        do_new   = do_new   || tab_new;
+        do_save  = do_save  || tab_save;
+        do_load  = do_load  || tab_load;
+        do_save_workspace = do_save_workspace || tab_save_ws;
+        do_load_workspace = do_load_workspace || tab_load_ws;
+        do_bind  = do_bind  || tab_bind;
+        do_close = do_close || tab_close;
         if let Some(idx) = bypass_toggle_idx {
             if idx < self.tabs.len() {
                 // Any manual bypass action disengages auto mode.
@@ -4692,16 +4711,39 @@ fn sig_to_f32(s: Option<Signal>) -> Option<f32> {
 // ── Tab bar ───────────────────────────────────────────────────────────────────
 
 /// Returns (switch_to_idx, close_tab_idx, new_tab_requested, bypass_toggle_idx).
+/// Actions a single tab-bar frame can request. Bundled into a struct
+/// (rather than a wide tuple) now that the File menu / Auto-switch
+/// toggle live here alongside the tab list.
+struct TabBarActions {
+    switch_to: Option<usize>,
+    close_idx: Option<usize>,
+    new_tab: bool,
+    bypass_toggle: Option<usize>,
+    do_save: bool,
+    do_load: bool,
+    do_save_workspace: bool,
+    do_load_workspace: bool,
+    do_bind: bool,
+    do_close: bool,
+}
+
 fn show_tab_bar(
     ui: &mut egui::Ui,
     tabs: &[PatchTab],
     active_tab: usize,
     effective_bypass: &[bool],
-) -> (Option<usize>, Option<usize>, bool, Option<usize>) {
+    auto_switch: &mut bool,
+) -> TabBarActions {
     let mut switch_to: Option<usize> = None;
     let mut close_idx: Option<usize> = None;
     let mut new_tab = false;
     let mut bypass_toggle: Option<usize> = None;
+    let mut do_save = false;
+    let mut do_load = false;
+    let mut do_save_workspace = false;
+    let mut do_load_workspace = false;
+    let mut do_bind = false;
+    let mut do_close = false;
 
     let h = ui.available_height();
     let text_color  = ui.visuals().text_color();
@@ -4716,13 +4758,141 @@ fn show_tab_bar(
     let active_fill = darken(panel_fill, 22);
     let font_id     = egui::FontId::proportional(13.0);
 
-    egui::ScrollArea::horizontal()
-        .id_salt("tab_scroll")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
+    // The bar splits into two regions on one horizontal row:
+    //   1. A PINNED left cluster (File menu + Auto toggle + divider) that
+    //      never scrolls, sitting on a solid #1B1B1B "Side Shadow"
+    //      backdrop.
+    //   2. A horizontal ScrollArea holding only the tabs + "+" button.
+    // Tabs scrolling toward the divider fade into the Side Shadow; a
+    // right-edge fade appears when more tabs overflow off-screen.
+    let panel_outer = ui.max_rect();
+    // #1B1B1B from the mockup's Side Shadow gradient.
+    let shadow_solid = egui::Color32::from_rgb(27, 27, 27);
+
+    // `tabs_left` is filled in after the pinned cluster lays out; we need
+    // it both for the ScrollArea origin and the shadow geometry.
+    let mut tabs_left = panel_outer.left();
+
+    // Use horizontal_centered so EVERY item (the short File/Auto widgets
+    // AND the full-height tab rects) is vertically centered against the
+    // full row height — plain `horizontal()` top-aligns items placed
+    // before the tall tabs, which is what made File/Auto ride high.
+    ui.horizontal_centered(|ui| {
+        // Reserve a paint slot for the Side Shadow backdrop NOW, so it
+        // renders UNDER the File/Auto widgets that follow (same layer,
+        // earlier z). We fill it once `tabs_left` is known below.
+        let shadow_idx = ui.painter().add(egui::Shape::Noop);
+
+        // ── 1. Pinned File menu + Auto-switch cluster ──────────────────
+        ui.add_space(8.0);
+        ui.menu_button("File", |ui| {
+            if ui.button("New").clicked()                       { new_tab = true; ui.close(); }
+            if ui.button("Save Patch…").clicked()               { do_save  = true; ui.close(); }
+            if ui.button("Load Patch…").clicked()               { do_load  = true; ui.close(); }
+            ui.separator();
+            if ui.button("Save Workspace…").clicked()           { do_save_workspace = true; ui.close(); }
+            if ui.button("Load Workspace…").clicked()           { do_load_workspace = true; ui.close(); }
+            ui.separator();
+            if ui.button("Bind Tab to Process…").clicked()      { do_bind  = true; ui.close(); }
+            ui.separator();
+            if ui.button("Close Tab").clicked()                 { do_close = true; ui.close(); }
+        });
+
+        ui.add_space(6.0);
+
+        // Auto-switch toggle button. Rendered as a single selectable
+        // widget: "Auto" text + a filled circle (same style as the tab
+        // activity/bypass dot) that follows the current text color. Using
+        // a constant-size painted dot — rather than swapping ●/○ glyphs —
+        // keeps the button width fixed so toggling never shifts the row.
+        let auto_hover = if *auto_switch {
+            "Auto-switch ON — tabs switch when a bound process gains focus"
+        } else {
+            "Auto-switch OFF — tab switching is manual"
+        };
+        {
+            let font_id = egui::TextStyle::Button.resolve(ui.style());
+            let galley = ui.painter().layout_no_wrap(
+                "Auto".to_owned(), font_id, egui::Color32::PLACEHOLDER);
+            let pad = ui.spacing().button_padding;
+            let dot_d = 8.0_f32;          // dot diameter slot
+            let gap = 5.0_f32;            // text → dot gap
+            let content_w = galley.size().x + gap + dot_d;
+            // Height matches a normal button (text + vertical padding) so
+            // the Auto pill is the same height as the File button; the
+            // surrounding horizontal_centered layout vertically centers it
+            // in the tab row. (Using the full row height here made the
+            // selected-background pill taller than File.)
+            let size = egui::vec2(
+                content_w + pad.x * 2.0,
+                galley.size().y + pad.y * 2.0,
+            );
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            let vis = ui.style().interact_selectable(&resp, *auto_switch);
+            // Selectable background (matches egui's SelectableLabel).
+            if *auto_switch || resp.hovered() {
+                ui.painter().rect(
+                    rect, vis.corner_radius, vis.weak_bg_fill,
+                    egui::Stroke::NONE, egui::StrokeKind::Inside);
+            }
+            let text_color = vis.text_color();
+            let text_pos = egui::pos2(rect.left() + pad.x, rect.center().y - galley.size().y / 2.0);
+            ui.painter().galley(text_pos, galley.clone(), text_color);
+            let dot_cx = rect.left() + pad.x + galley.size().x + gap + dot_d / 2.0;
+            ui.painter().circle(
+                egui::pos2(dot_cx, rect.center().y),
+                4.0, text_color, egui::Stroke::new(1.2, text_color));
+            if resp.on_hover_text(auto_hover).clicked() {
+                *auto_switch = !*auto_switch;
+            }
+        }
+
+        // Divider between the pinned cluster and the scrolling tabs.
+        ui.add_space(8.0);
+        let (sep_rect, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
+        let inset = 7.0_f32;
+        let x = sep_rect.center().x;
+        ui.painter().line_segment(
+            [egui::pos2(x, sep_rect.top() + inset),
+             egui::pos2(x, sep_rect.bottom() - inset)],
+            egui::Stroke::new(1.0, sep_color),
+        );
+        ui.add_space(2.0);
+
+        // Left edge of the scrolling tab region — the Side Shadow fade is
+        // anchored here so tabs dissolve as they slide under the pinned
+        // cluster.
+        tabs_left = ui.cursor().left();
+
+        // Fill the reserved slot: solid #1B1B1B backdrop covering the
+        // pinned cluster (panel left → tabs_left). Because the slot was
+        // reserved before File/Auto, this paints UNDER them. Stop 1 px
+        // short of the bottom so the tab-bar / content border line stays
+        // visible (otherwise the dark block overlaps it).
+        ui.painter().set(
+            shadow_idx,
+            egui::Shape::rect_filled(
+                egui::Rect::from_min_max(
+                    panel_outer.left_top(),
+                    egui::pos2(tabs_left, panel_outer.bottom() - 1.0),
+                ),
+                egui::CornerRadius::ZERO,
+                shadow_solid,
+            ),
+        );
+
+        // ── 2. Scrolling tab strip (tabs + "+") ────────────────────────
+        let scroll_out = egui::ScrollArea::horizontal()
+            .id_salt("tab_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                // Initial left padding so the first tab sits clear of the
+                // Side Shadow fade when unscrolled. This padding scrolls
+                // away with the content, letting tabs slide under the
+                // fade once the user scrolls.
+                ui.add_space(64.0);
 
                 for (i, tab) in tabs.iter().enumerate() {
                     let is_active = i == active_tab;
@@ -4819,10 +4989,106 @@ fn show_tab_bar(
                 if plus_resp.clicked() {
                     new_tab = true;
                 }
+                });
             });
-        });
 
-    (switch_to, close_idx, new_tab, bypass_toggle)
+        // ── Side Shadow fades ──────────────────────────────────────────
+        // Left: #1B1B1B → transparent fade starting at the cluster
+        // boundary (the soft edge of the solid backdrop), so tabs
+        // dissolve as they scroll under File/Auto. Right: same fade,
+        // only when more tabs overflow off-screen.
+        paint_tab_scroll_shadows(ui.ctx(), &scroll_out, panel_outer, tabs_left, shadow_solid);
+    });
+
+    TabBarActions {
+        switch_to, close_idx, new_tab, bypass_toggle,
+        do_save, do_load, do_save_workspace, do_load_workspace,
+        do_bind, do_close,
+    }
+}
+
+/// Paint the tab-strip Side Shadow fades, matching the mockup's
+/// `linear-gradient(90deg, #1B1B1B 70%, transparent 100%)`.
+///
+/// LEFT: a `#1B1B1B → transparent` fade beginning at `tabs_left` — the
+/// soft right edge of the solid backdrop behind File/Auto — so tabs
+/// dissolve into it as they scroll under the pinned cluster. Always
+/// drawn. RIGHT: the mirror fade, only when more tabs overflow.
+fn paint_tab_scroll_shadows<R>(
+    ctx: &egui::Context,
+    out: &egui::scroll_area::ScrollAreaOutput<R>,
+    panel_outer: egui::Rect,
+    tabs_left: f32,
+    shadow_solid: egui::Color32,
+) {
+    const FADE_W: f32 = 42.0; // ~30% of the mockup's 141px Side Shadow
+    let inner = out.inner_rect;
+    let offset_x = out.state.offset.x;
+    let max_scroll = (out.content_size.x - inner.width()).max(0.0);
+    let can_scroll_right = offset_x < max_scroll - 0.5;
+
+    let layer = egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("tab_edge_fade", out.id)),
+    );
+    let mut painter = ctx.layer_painter(layer);
+    painter.set_clip_rect(panel_outer);
+
+    let clear = egui::Color32::TRANSPARENT;
+    let top = panel_outer.top();
+    // Stop 1 px above the bottom so the tab-bar / content border line
+    // stays visible under the fade.
+    let bot = panel_outer.bottom() - 1.0;
+    // Opaque lead-in that overlaps the base-layer backdrop (which ends at
+    // tabs_left), so a tab scrolled into this zone is fully hidden and
+    // there's no seam where the backdrop and fade meet.
+    const OVERLAP: f32 = 10.0;
+
+    // Opaque #1B1B1B lead-in covering [tabs_left - OVERLAP, tabs_left].
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(tabs_left - OVERLAP, top),
+            egui::pos2(tabs_left, bot)),
+        egui::CornerRadius::ZERO,
+        shadow_solid,
+    );
+    // Fade #1B1B1B → transparent over [tabs_left, tabs_left + FADE_W].
+    paint_tab_gradient_quad(&painter,
+        egui::pos2(tabs_left, top), egui::pos2(tabs_left + FADE_W, bot),
+        shadow_solid, clear, clear, shadow_solid);
+
+    // Right fade — transparent → solid #1B1B1B at the right edge, only
+    // when tabs overflow off-screen there.
+    if can_scroll_right {
+        let x0 = panel_outer.right() - FADE_W;
+        let x1 = panel_outer.right();
+        paint_tab_gradient_quad(&painter,
+            egui::pos2(x0, top), egui::pos2(x1, bot),
+            clear, shadow_solid, shadow_solid, clear);
+    }
+}
+
+/// Two-triangle horizontal gradient quad. Corner colors map tl, tr, br,
+/// bl. (Local copy mirroring the physical-devices panel helper to keep
+/// the tab-bar self-contained.)
+fn paint_tab_gradient_quad(
+    painter: &egui::Painter,
+    tl: egui::Pos2,
+    br: egui::Pos2,
+    c_tl: egui::Color32, c_tr: egui::Color32, c_br: egui::Color32, c_bl: egui::Color32,
+) {
+    use egui::epaint::{Mesh, Vertex};
+    let mut mesh = Mesh::default();
+    let uv = egui::epaint::WHITE_UV;
+    let tr = egui::pos2(br.x, tl.y);
+    let bl = egui::pos2(tl.x, br.y);
+    let i = mesh.vertices.len() as u32;
+    mesh.vertices.push(Vertex { pos: tl, uv, color: c_tl });
+    mesh.vertices.push(Vertex { pos: tr, uv, color: c_tr });
+    mesh.vertices.push(Vertex { pos: br, uv, color: c_br });
+    mesh.vertices.push(Vertex { pos: bl, uv, color: c_bl });
+    mesh.indices.extend_from_slice(&[i, i+1, i+2, i, i+2, i+3]);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 // (Removed: rounded-corner HRGN logic. SetWindowRgn interacted badly
@@ -4919,66 +5185,59 @@ fn show_title_bar(
     let h = bar.height();
     let btn_w = 46.0_f32;
     let ctrl_w = btn_w * 3.0;
-    let left_w = 300.0_f32;
+    // Wide enough for the Wide mode pill (~204 px) + dividers +
+    // undo/redo + pin without forcing the Short variant; capped so the
+    // cluster never crowds the centered FlexInput title on narrow
+    // windows (the pill auto-falls to its Short variant when squeezed).
+    let left_w = 380.0_f32.min(bar.width() * 0.42);
 
     // Full-bar drag sensing (placed first so interactive widgets above take priority).
     let drag = ui.interact(bar, ui.id().with("tb_drag"), egui::Sense::click_and_drag());
 
-    // ── Left: File menu ────────────────────────────────────────────────────
-    // `left_cluster_right` tracks the actual right edge of the last
-    // widget rendered in the left cluster (set inside the closure
-    // after the Pin button). Used downstream by the mode pill to
-    // pick its leftmost-allowed position — far more accurate than
-    // using the static `left_w` allocation.
-    let mut left_cluster_right: f32 = bar.left();
+    // The File menu / Auto-switch toggle moved down into the tab bar
+    // (see `show_tab_bar`); these params are still threaded through for
+    // potential future use but are no longer surfaced here.
+    let _ = (do_save, do_load, do_save_workspace, do_load_workspace,
+             do_new, do_close, do_bind, do_hidhide, auto_switch);
+
+    // ── Left cluster: Mode pill → undo/redo → pin ──────────────────────────
+    // The Easy/Advanced mode pill now anchors at the FAR LEFT of the
+    // title bar (where File/Auto used to live), followed by the
+    // undo/redo buttons and the pin toggle. Matches the new mockup.
     let left_rect = egui::Rect::from_min_size(bar.min, egui::vec2(left_w, h));
     ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            ui.menu_button("File", |ui| {
-                if ui.button("New").clicked()                       { *do_new   = true; ui.close(); }
-                if ui.button("Save Patch…").clicked()               { *do_save  = true; ui.close(); }
-                if ui.button("Load Patch…").clicked()               { *do_load  = true; ui.close(); }
-                ui.separator();
-                if ui.button("Save Workspace…").clicked()           { *do_save_workspace = true; ui.close(); }
-                if ui.button("Load Workspace…").clicked()           { *do_load_workspace = true; ui.close(); }
-                ui.separator();
-                if ui.button("Bind Tab to Process…").clicked()      { *do_bind  = true; ui.close(); }
-                ui.separator();
-                if ui.button("Close Tab").clicked()                 { *do_close = true; ui.close(); }
-            });
 
-            ui.add_space(6.0);
-
-            // Auto-switch toggle button
-            let auto_label = if *auto_switch { "Auto ●" } else { "Auto ○" };
-            let hover_text = if *auto_switch {
-                "Auto-switch ON — tabs switch when a bound process gains focus"
+            // ── Mode pill (Easy / Advanced) ────────────────────────────
+            // Adaptive: pick the widest variant that fits the slack in
+            // the left cluster. The pill is SVG-rendered with manual
+            // rect math, so allocate a slot in the left-to-right flow
+            // and hand that rect to `render_mode_pill`.
+            let pill_h = (h - 4.0).max(20.0);
+            let wide_w  = pill_size_px(MODE_WHOLE_PILL_SVG, pill_h).0;
+            let short_w = pill_size_px(MODE_SHORT_PILL_SVG, pill_h).0;
+            // Reserve room for undo/redo + pin + dividers after the pill
+            // (~120 px); if the window is narrow, fall back to the short
+            // pill so those controls never get clipped.
+            let avail = ui.available_width();
+            let (pill_w, variant) = if avail - wide_w >= 120.0 {
+                (wide_w, ModePillVariant::Wide)
             } else {
-                "Auto-switch OFF — tab switching is manual"
+                (short_w, ModePillVariant::Short)
             };
-            if ui.selectable_label(*auto_switch, auto_label)
-                .on_hover_text(hover_text)
-                .clicked()
-            {
-                *auto_switch = !*auto_switch;
-            }
+            let (pill_rect, _) = ui.allocate_exact_size(
+                egui::vec2(pill_w, pill_h), egui::Sense::hover());
+            render_mode_pill(ui, pill_rect, variant, ui_mode, do_set_mode);
 
+            // ── Divider before undo/redo ───────────────────────────────
             ui.add_space(6.0);
-            // Easy / Advanced mode toggle is rendered in the title-bar
-            // CENTER, to the left of the FlexInput logo (see
-            // `render_mode_pill` below). Keeps the File-menu cluster
-            // compact and matches the mockup placement.
-
-            ui.add_space(6.0);
-            // Short vertical divider that doesn't extend to the panel edges.
             let (sep_rect, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
             let inset = 8.0_f32;
-            let top = sep_rect.top() + inset;
-            let bottom = sep_rect.bottom() - inset;
             let x = sep_rect.center().x;
             ui.painter().line_segment(
-                [egui::pos2(x, top), egui::pos2(x, bottom)],
+                [egui::pos2(x, sep_rect.top() + inset),
+                 egui::pos2(x, sep_rect.bottom() - inset)],
                 egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
             ui.add_space(4.0);
@@ -5019,9 +5278,6 @@ fn show_title_bar(
             } else {
                 "Pin window to stay on top of all others.\nConfigure global hotkey / Guide-button trigger in Settings."
             };
-            // Capture the rightmost edge of the left cluster so the
-            // mode pill knows where it can extend without overlapping.
-            left_cluster_right = pin_resp.rect.right();
             if pin_resp.on_hover_text(hover).clicked() {
                 *do_pin_toggle = true;
             }
@@ -5168,75 +5424,54 @@ fn show_title_bar(
         });
     }
 
-    // ── Center: logo + app name (clickable → Settings) ────────────────────
-    // FlexInput title TRIES to stay centered on `mid.x`. If the mode
-    // pill (which anchors to the LEFT of the title) doesn't fit
-    // because the window is too narrow, the title is pushed right so
-    // the pill never disappears — pill survives at all window sizes,
-    // and the title slides out of center only when necessary.
+    // ── Center: FlexInput title (matches Figma `title` group) ─────────────
+    // Layout (Figma group 122×38, scaled to the title-bar height):
+    //   • Dark rounded "TitleBG" pill (#1B1B1B) behind logo + text;
+    //     gains a white outline on hover.
+    //   • Square logo tile (rasterized from icon_v2.svg — the dark
+    //     rounded square with the Fi glyph) overhanging the pill's left
+    //     edge, sized to the full bar height so it pokes slightly above
+    //     and below the pill.
+    //   • "FlexInput" text (16 px in Figma) just right of the tile.
+    // The whole group is clickable → opens Settings.
     let mid = bar.center();
-    let base_color = ui.visuals().text_color();
-    let font_id = egui::FontId::proportional(14.0);
+    let base_color = egui::Color32::WHITE; // Figma title text is pure white
+
+    // Figma proportions: logo 38, pill 32 tall, text 16 px.
+    // Scale to the bar: tile = bar height, pill a touch shorter — then a
+    // uniform 0.9 nudge so the whole group reads a touch smaller than the
+    // exact mockup measurements (matches the intended visual weight).
+    const TITLE_SCALE: f32 = 0.9;
+    let tile = ((h - 2.0) * TITLE_SCALE).max(24.0 * TITLE_SCALE);  // logo tile side (overhangs pill)
+    let pill_h = ((h - 6.0) * TITLE_SCALE).max(20.0 * TITLE_SCALE); // dark pill height
+    let text_px = 16.0_f32 * TITLE_SCALE;
+    let logo_text_gap = 8.0_f32 * TITLE_SCALE;     // gap between tile and text
+    let text_pad_right = 12.0_f32 * TITLE_SCALE;   // pill padding after the text
+
+    let font_id = egui::FontId::proportional(text_px);
     let galley = ui.painter().layout_no_wrap("FlexInput".to_string(), font_id, base_color);
     let text_size = galley.size();
 
-    let logo_w = if logo.is_some() { 20.0 + 6.0 } else { 0.0 };
-    let total_w = logo_w + text_size.x;
+    // The pill spans from a few px inside the tile's left to the right of
+    // the text; the tile overhangs the pill's left like in the mock.
+    let tile_overhang = 4.0_f32 * TITLE_SCALE; // how far the tile pokes past the pill left
+    let group_w = tile + logo_text_gap + text_size.x + text_pad_right;
+    let group_left = mid.x - group_w / 2.0;
 
-    // ── Mode-pill / title layout solve ─────────────────────────────
-    // Pill height matches the window-control button height so the
-    // pill reads as a peer of those buttons. (h is the title-bar
-    // height; insetting 4 px keeps it visually aligned without
-    // touching the bar edges.)
-    let pill_h = (h - 4.0).max(20.0);
-    let pill_gap = 10.0_f32;        // gap between pill right and title left
-    let pill_left_min = left_cluster_right + 8.0;
-    let wide_w  = pill_size_px(MODE_WHOLE_PILL_SVG, pill_h).0;
-    let short_w = pill_size_px(MODE_SHORT_PILL_SVG, pill_h).0;
-    let hit_w = total_w + 16.0;
-
-    // Natural (preferred) layout — title centered on `mid.x`.
-    let title_left_natural = mid.x - hit_w / 2.0;
-    let pill_right_natural = title_left_natural - pill_gap;
-
-    // Pick the largest pill variant that fits in the natural layout.
-    let (chosen_w, variant) =
-        if pill_right_natural - pill_left_min >= wide_w {
-            (wide_w, ModePillVariant::Wide)
-        } else if pill_right_natural - pill_left_min >= short_w {
-            (short_w, ModePillVariant::Short)
-        } else {
-            // Even the short variant doesn't fit in the natural
-            // layout — push the title right to make room.
-            (short_w, ModePillVariant::Short)
-        };
-
-    // Final placement: pill's right edge is the LATER of "natural
-    // pill_right" or "pill_left_min + chosen_w". If the latter wins,
-    // the title slides right to keep its gap.
-    let pill_right = pill_right_natural
-        .max(pill_left_min + chosen_w);
-    let pill_left = pill_right - chosen_w;
-    let title_left = pill_right + pill_gap;
-
-    let pill_rect = egui::Rect::from_min_size(
+    let tile_rect = egui::Rect::from_min_size(
+        egui::pos2(group_left, mid.y - tile / 2.0),
+        egui::vec2(tile, tile),
+    );
+    let pill_left = tile_rect.left() + tile_overhang;
+    let pill_rect = egui::Rect::from_min_max(
         egui::pos2(pill_left, mid.y - pill_h / 2.0),
-        egui::vec2(chosen_w, pill_h),
+        egui::pos2(group_left + group_w, mid.y + pill_h / 2.0),
     );
+    let text_left = tile_rect.right() + logo_text_gap;
 
-    // hit_rect must come from the FINAL title_left, not the natural
-    // center, so it stays aligned with the painted logo+text below.
-    let hit_rect = egui::Rect::from_min_size(
-        egui::pos2(title_left, mid.y - (h - 6.0) / 2.0),
-        egui::vec2(hit_w, h - 6.0),
-    );
-    let start_x = title_left + 8.0; // matches the +8 inset baked into hit_w
-
-    // IMPORTANT: register the hit_rect interact FIRST (early in the
-    // hit-test stack), then the pill (which is paint+interact). We
-    // want pill clicks to win where they overlap nothing else.
+    // Hit rect covers the whole group (tile + pill).
+    let hit_rect = tile_rect.union(pill_rect);
     let logo_resp = ui.interact(hit_rect, ui.id().with("logo_settings"), egui::Sense::click());
-    render_mode_pill(ui, pill_rect, variant, ui_mode, do_set_mode);
     if logo_resp.clicked() {
         *toggle_settings = true;
     }
@@ -5244,52 +5479,41 @@ fn show_title_bar(
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    // Subtle lighter fill always (reads against the dark title bar where a
-    // dark overlay would be invisible); outline reveals on hover.
-    let bg_fill = egui::Color32::from_white_alpha(if logo_resp.hovered() { 28 } else { 14 });
-    let bg_stroke = if logo_resp.hovered() {
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90))
+    // Dark pill background (#1B1B1B), brightening slightly on hover with
+    // an outline around the whole pill as the hover affordance.
+    let pill_fill = if logo_resp.hovered() {
+        egui::Color32::from_rgb(38, 38, 38)
+    } else {
+        egui::Color32::from_rgb(27, 27, 27) // #1B1B1B
+    };
+    let pill_stroke = if logo_resp.hovered() {
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110))
     } else {
         egui::Stroke::NONE
     };
     ui.painter().rect(
-        hit_rect,
+        pill_rect,
         egui::CornerRadius::same(6),
-        bg_fill,
-        bg_stroke,
+        pill_fill,
+        pill_stroke,
         egui::StrokeKind::Inside,
     );
 
-    let text_color = if logo_resp.hovered() { egui::Color32::WHITE } else { base_color };
-    let logo_tint  = if logo_resp.hovered() {
-        egui::Color32::WHITE
-    } else {
-        egui::Color32::from_rgba_premultiplied(220, 220, 220, 220)
-    };
-
+    // Logo tile + text.
     let painter = ui.painter();
     if let Some(tex) = logo {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        // Snap the logo destination rect to physical pixel boundaries
-        // so the bitmap downscale samples on-pixel — otherwise LINEAR
-        // sampling smears the alpha edges and the icon reads as fuzzy
-        // / aliased. Also: round the image SIZE to an exact 20×20 in
-        // device pixels (instead of logical) so the downscale ratio
-        // is integer-friendly.
+        // Snap to physical pixels so the bitmap downscale samples on-pixel
+        // (otherwise LINEAR sampling smears the icon's alpha edges).
         let ppp = ctx.pixels_per_point();
         let snap = |v: f32| (v * ppp).round() / ppp;
-        let cx = snap(start_x + 10.0);
-        let cy = snap(mid.y);
-        let half = snap(10.0);
         let logo_rect = egui::Rect::from_min_max(
-            egui::pos2(cx - half, cy - half),
-            egui::pos2(cx + half, cy + half),
+            egui::pos2(snap(tile_rect.left()), snap(tile_rect.top())),
+            egui::pos2(snap(tile_rect.right()), snap(tile_rect.bottom())),
         );
-        painter.image(tex.id(), logo_rect, uv, logo_tint);
-        painter.galley(egui::pos2(start_x + 20.0 + 6.0, mid.y - text_size.y / 2.0), galley, text_color);
-    } else {
-        painter.galley(egui::pos2(start_x, mid.y - text_size.y / 2.0), galley, text_color);
+        painter.image(tex.id(), logo_rect, uv, egui::Color32::WHITE);
     }
+    painter.galley(egui::pos2(text_left, mid.y - text_size.y / 2.0), galley, base_color);
 
     // Fire StartDrag on mouse-press (not drag_started) to avoid the
     // egui ~6 px threshold lag before the OS drag-move loop takes
@@ -5325,6 +5549,15 @@ fn show_title_bar(
 //             room between the File-menu cluster and the centered
 //             FlexInput title to fit the wide variant.
 
+/// App logo (the dark rounded "Fi" tile), pre-baked to a 256px PNG from
+/// `icon_v2.svg`. Used for both the title-bar logo and the OS
+/// window/taskbar icon. Baked rather than rasterized at runtime because
+/// the SVG's blur/color-matrix filters take ~45s for resvg to render at
+/// 256px — that delay was stalling app startup. Re-bake whenever the
+/// source SVG changes (render_app_icon → save_png at 256).
+pub(crate) const APP_ICON_PNG: &[u8] = include_bytes!(
+    "../../../app/assets/icon_v2_256.png");
+
 const MODE_WHOLE_PILL_SVG: &[u8] = include_bytes!(
     "../../../app/assets/mode_whole_pill.svg");
 const MODE_SHORT_PILL_SVG: &[u8] = include_bytes!(
@@ -5333,6 +5566,15 @@ const MODE_EASY_SVG: &[u8] = include_bytes!(
     "../../../app/assets/easy_mode.svg");
 const MODE_ADV_SVG:  &[u8] = include_bytes!(
     "../../../app/assets/advanced_mode.svg");
+
+/// Decode the pre-baked app-logo PNG ([`APP_ICON_PNG`], 256px) into an
+/// [`egui::IconData`] for the OS window / taskbar icon. Decoding a PNG is
+/// instant, unlike rasterizing the filter-heavy source SVG. Returns
+/// `None` if the bundled PNG fails to decode.
+pub fn render_app_icon() -> Option<egui::IconData> {
+    let icon = eframe::icon_data::from_png_bytes(APP_ICON_PNG).ok()?;
+    Some(egui::IconData { rgba: icon.rgba, width: icon.width, height: icon.height })
+}
 
 // Render height in logical pixels; SVGs are 28/30 px tall by design,
 // 22 is a comfortable shrunk title-bar size.
@@ -6019,3 +6261,6 @@ fn sync_inner_canvas_ports(
         }
     }
 }
+
+
+
