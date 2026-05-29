@@ -4387,11 +4387,75 @@ fn build_processing_graph_rec(
 
     let mut in_degree = vec![0usize; n];
     let mut dependents: Vec<Vec<usize>> = vec![vec![]; n];
+    // Helper: parse an _automap_*_id-style string (e.g. "remap:42", "collector:7",
+    // "forksel:3:0", "combiner:9") to the UID of the publishing node. Returns
+    // None for empty strings and unrecognised prefixes.
+    let uid_from_collector_id = |s: &str| -> Option<usize> {
+        let stripped = s.strip_prefix("collector:")
+            .or_else(|| s.strip_prefix("combiner:"))
+            .or_else(|| s.strip_prefix("remap:"))
+            .or_else(|| s.strip_prefix("forksel:").and_then(|t| t.split(':').next()))?;
+        stripped.parse::<usize>().ok()
+    };
     for (idx, snap) in snaps.iter().enumerate() {
         // Regular nodes: single-source inputs.
         for &(src_idx, _) in snap.input_sources.iter().flatten() {
             dependents[src_idx].push(idx);
             in_degree[idx] += 1;
+        }
+        // AutoMap-consuming non-sinks (Combiner, Selector, Fork): the
+        // `input_sources` chain only reaches the *immediate* upstream node, but
+        // these consumers read from `collector_sigs` keyed by the originating
+        // collector/remapper UID found by `find_automap_device_rec`. That UID
+        // may belong to a node several hops upstream (e.g. through a Splitter)
+        // or even inside a sub-patch — in either case the topo edge from the
+        // immediate predecessor is not enough to guarantee the collector
+        // publishes before this node reads. Add explicit deps so the
+        // Remapper / Collector / Combiner / Fork that backs each AutoMap input
+        // is scheduled before this consumer.
+        let is_am_consumer = matches!(snap.module_id.as_str(),
+            "module.automap_combiner"
+            | "module.automap_selector"
+            | "module.automap_fork"
+            | "module.automap_split");
+        if is_am_consumer {
+            let mut seen: HashSet<usize> = HashSet::new();
+            // Combiner: per-port collector IDs are pre-baked in
+            // `_automap_input_collectors`. Use them directly to avoid a second
+            // call into `find_automap_device_rec`.
+            let collector_ids: Vec<String> = snap.params.get("_automap_input_collectors")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+                .unwrap_or_default();
+            for cid in &collector_ids {
+                if let Some(uid) = uid_from_collector_id(cid) {
+                    if let Some(am_idx) = snaps.iter().position(|s| s.node_uid == uid) {
+                        if am_idx != idx && seen.insert(am_idx) {
+                            dependents[am_idx].push(idx);
+                            in_degree[idx] += 1;
+                        }
+                    }
+                }
+            }
+            // Fallback: walk every AutoMap input pin and trace through. Catches
+            // Selector / Fork / Split (which don't populate
+            // `_automap_input_collectors`) and any case where the param array
+            // is missing or stale.
+            let (outer_node_id, outer_node) = node_list[idx];
+            for i in 0..outer_node.inputs.len() {
+                if outer_node.inputs.get(i).map(|p| p.signal_type) != Some(SignalType::AutoMap) {
+                    continue;
+                }
+                let pin = snarl.in_pin(InPinId { node: outer_node_id, input: i });
+                let Some(&src) = pin.remotes.first() else { continue };
+                let Some((am_dev_id, _, _)) = find_automap_device_rec(snarl, src, parents) else { continue };
+                let Some(uid) = uid_from_collector_id(&am_dev_id) else { continue };
+                let Some(am_idx) = snaps.iter().position(|s| s.node_uid == uid) else { continue };
+                if am_idx != idx && seen.insert(am_idx) {
+                    dependents[am_idx].push(idx);
+                    in_degree[idx] += 1;
+                }
+            }
         }
         // Sink nodes: multi-source inputs (deduplicated per source node to avoid double-counting).
         // Skip for device.source self-sinks: their sink-half is handled in a

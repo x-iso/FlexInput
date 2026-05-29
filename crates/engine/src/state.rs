@@ -32,6 +32,11 @@ pub struct NodeState {
     pub prev_signals: Vec<Option<Signal>>,
     /// Generic f32 scratch space for stateful modules (timers, accumulators).
     pub aux_f32: Vec<f32>,
+    /// Per-mapping state for Remapper / Map Action press modes (4 floats per
+    /// mapping — see `eval::press_state_get`). Kept separate from `aux_f32`
+    /// so it can grow with the mapping list without clashing with the touchpad
+    /// zone accumulators already living at `aux_f32[0..3]`.
+    pub press_state: Vec<f32>,
     // ── Two-way Response Curve ────────────────────────────────────────────────
     /// Per-channel current lane: +1 = rising, -1 = falling.
     pub twoway_lane: Vec<i8>,

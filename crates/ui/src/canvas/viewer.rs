@@ -4412,14 +4412,19 @@ pub(crate) fn show_subpatch_body(
                 ui.allocate_ui_at_rect(element_rect, |ui| {
                     let new_clip = ui.clip_rect().intersect(element_rect);
                     ui.set_clip_rect(new_clip);
-                    ui.add_enabled_ui(!is_unlocked, |ui| {
-                        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
-                            render_pinned_element(
-                                inner_id, &module_id, &element_id, ui, &mut sp.snarl,
-                                mod_size, live_signals, panic_shortcut, automap_parent,
-                                outer_snap_ref, outer_id, is_unlocked,
-                            );
-                        }
+                    // Salt widget IDs by layout-item index so multiple pins of
+                    // the same inner module don't collide on their per-mapping
+                    // widget IDs (DragValue, Button, etc.).
+                    ui.push_id(("fxi_layout_pin", idx), |ui| {
+                        ui.add_enabled_ui(!is_unlocked, |ui| {
+                            if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+                                render_pinned_element(
+                                    inner_id, &module_id, &element_id, ui, &mut sp.snarl,
+                                    mod_size, live_signals, panic_shortcut, automap_parent,
+                                    outer_snap_ref, outer_id, is_unlocked,
+                                );
+                            }
+                        });
                     });
                 });
             }
@@ -5189,7 +5194,7 @@ fn dispatch_pinned_body(
 // source; we construct that InPin from the *inner* snarl so the body sees the
 // same wiring it would when rendered inside the sub-patch editor.
 
-const REMAP_DESIGN_W: f32 = 260.0;
+const REMAP_DESIGN_W: f32 = 380.0;
 
 fn remap_body_inputs_for(
     inner_id: NodeId,
@@ -6669,8 +6674,9 @@ fn render_response_curve_only(
     paint_response_curve_graph(inner_id, ui, inner_snarl, rect, bg_resp, is_vec);
     // Right-click context menu — same actions as the canvas-editor body so the
     // layout-pinned widget is fully usable on its own.
+    let _ = is_vec; // graph-only menu doesn't distinguish; kept for signature compat.
     bg_for_menu.context_menu(|ui| {
-        curve_context_menu(ui, inner_id, inner_snarl, !is_vec, None);
+        curve_context_menu(ui, inner_id, inner_snarl, None);
     });
 }
 
@@ -8779,6 +8785,40 @@ fn curve_header_load(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData
     }
 }
 
+/// Graph-only load: replaces just the active lane's `points` + `biases`
+/// from the chosen `.fxc` file. Range / grid / scale / trail / labels are
+/// left untouched so the right-click menu (which is also available from
+/// sub-patch layouts where module settings may not be visible) never
+/// surprises the user by changing hidden state.
+fn curve_graph_load(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("FlexInput Curve", &["fxc"])
+        .pick_file()
+    else { return };
+    let Ok(json) = std::fs::read_to_string(path) else { return };
+    let Ok(cf)   = serde_json::from_str::<CurveFile>(&json) else { return };
+    let Some(node) = snarl.get_node_mut(node_id) else { return };
+    let (pts_key, bias_key) = curve_param_keys(node);
+    let pts_json: Vec<Value> = cf.points.iter()
+        .map(|p| serde_json::json!([p[0], p[1]]))
+        .collect();
+    let bss_json: Vec<Value> = cf.biases.iter()
+        .filter_map(|&b| Number::from_f64(b).map(Value::Number))
+        .collect();
+    node.params.insert(pts_key.into(),  Value::Array(pts_json));
+    node.params.insert(bias_key.into(), Value::Array(bss_json));
+}
+
+/// Graph-only reset: snaps just the active lane back to the default
+/// `[(0,0), (1,1)]` identity curve. Like `curve_graph_load`, leaves other
+/// module settings (range, grid, scale, etc.) untouched.
+fn curve_graph_reset(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
+    let Some(node) = snarl.get_node_mut(node_id) else { return };
+    let (pts_key, bias_key) = curve_param_keys(node);
+    node.params.insert(pts_key.into(),  serde_json::json!([[0.0, 0.0], [1.0, 1.0]]));
+    node.params.insert(bias_key.into(), serde_json::json!([0.0]));
+}
+
 fn curve_header_reset(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData>) {
     let Some(node) = snarl.get_node_mut(node_id) else { return };
     // Two-way: reset only the currently-selected lane's points/biases. Other
@@ -9226,7 +9266,7 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                 // below doesn't clobber the change.
                 let mut menu_mutated = false;
                 bg_resp.context_menu(|ui| {
-                    if curve_context_menu(ui, node_id, snarl, true, None) {
+                    if curve_context_menu(ui, node_id, snarl, None) {
                         menu_mutated = true;
                     }
                 });
@@ -9730,7 +9770,7 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                 // (shared with the header buttons; uses .fxc format).
                 let mut menu_mutated = false;
                 bg_resp.context_menu(|ui| {
-                    if curve_context_menu(ui, node_id, snarl, false, None) {
+                    if curve_context_menu(ui, node_id, snarl, None) {
                         menu_mutated = true;
                     }
                 });
@@ -10270,9 +10310,9 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                 let lane_name = if lane_up { "Up" } else { "Down" };
                 let mut menu_mutated = false;
                 bg_resp.context_menu(|ui| {
-                    // is_float=true: range fields (in_min/in_max/out_min/out_max)
-                    // are loaded too, matching the header Load behaviour.
-                    if curve_context_menu(ui, node_id, snarl, true, Some(lane_name)) {
+                    // Graph-only: only points/biases for the active lane are
+                    // touched; range / grid / scale / lane toggle stay as-is.
+                    if curve_context_menu(ui, node_id, snarl, Some(lane_name)) {
                         menu_mutated = true;
                     }
                 });
@@ -10478,7 +10518,7 @@ fn render_twoway_curve_only(
         .map(|s| if s == "dn" { "Down" } else { "Up" })
         .unwrap_or("Up");
     bg_for_menu.context_menu(|ui| {
-        curve_context_menu(ui, inner_id, snarl, true, Some(lane_name));
+        curve_context_menu(ui, inner_id, snarl, Some(lane_name));
     });
 }
 
@@ -10893,22 +10933,23 @@ fn curve_clipboard_set(ctx: &egui::Context, data: CurveClip) {
 }
 
 /// Shared right-click menu emitted by every response-curve widget (body and
-/// pinned variants). Save/Load/Reset go through the same helpers the header
-/// buttons call, so file format (.fxc) and per-lane semantics are identical.
-/// `lane_label` is "Up" or "Down" for two-way curves (used for menu prefixes
-/// like "Down curve: Reset") and `None` for regular/vec curves.
+/// pinned variants). Reset and Load only touch the curve's points/biases —
+/// not range, grid, scale, or other module settings — so invoking the menu
+/// from a sub-patch layout (where module sliders may be hidden) never alters
+/// surrounding state the patch author tuned. Save still writes the full
+/// `.fxc` so files remain interchangeable with the header Save button.
+/// `lane_label` is "Up" or "Down" for two-way curves; `None` for regular/vec.
 fn curve_context_menu(
     ui: &mut egui::Ui,
     node_id: NodeId,
     snarl: &mut Snarl<NodeData>,
-    is_float: bool,
     lane_label: Option<&str>,
 ) -> bool {
     let mut mutated = false;
     let prefix = lane_label.map(|p| format!("{p} curve: ")).unwrap_or_default();
 
-    if ui.button(format!("{prefix}Reset")).clicked() {
-        curve_header_reset(node_id, is_float, snarl);
+    if ui.button(format!("{prefix}Reset")).on_hover_text("Reset only the curve (range / grid / scale stay as-is)").clicked() {
+        curve_graph_reset(node_id, snarl);
         mutated = true;
         ui.close();
     }
@@ -10935,8 +10976,8 @@ fn curve_context_menu(
         curve_header_save(node_id, snarl);
         ui.close();
     }
-    if ui.button(format!("{prefix}Load…")).clicked() {
-        curve_header_load(node_id, is_float, snarl);
+    if ui.button(format!("{prefix}Load…")).on_hover_text("Load only the curve from .fxc (range / grid / scale stay as-is)").clicked() {
+        curve_graph_load(node_id, snarl);
         mutated = true;
         ui.close();
     }
@@ -11150,6 +11191,411 @@ fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_i
     ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong());
 }
 
+/// Pixel-accurate mapping card outcome.
+struct MappingCardResult {
+    /// True if the delete (×) button was clicked.
+    delete_clicked: bool,
+    /// True if the mapping object was modified by any header control.
+    changed: bool,
+    /// Total card height (so caller can advance the cursor properly even
+    /// though we manage layout manually with painters + invisible buttons).
+    height: f32,
+}
+
+/// Render a mapping card pixel-accurate to Figma node 358:2 (Frame 1 → Group 1).
+///
+/// Card dimensions: 358×102 (card_w × CARD_H below).
+///   Header strip (y=0..31): controls all at y=5, h=20:
+///     × (5,5,20×20) | mode (33,5,20×20) | time gap (61,5,137×20)
+///                   | hold (206,5,62×20) | turbo (274,5,80×20)
+///   Body strip (y=31..102, fill #3C3C3C):
+///     in chip   (5,40,48×20)   chord chips start at (62,37), 26×26, pitch 32
+///     out chip  (5,72,48×20)   chord chips start at (62,69)
+///
+/// All sizes are in Figma px and rendered 1:1. Drawn at the current cursor
+/// position; the caller is responsible for sizing its container to fit.
+fn remapper_mapping_card_pixel(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    mapping_idx: usize,
+    mapping: &mut serde_json::Map<String, Value>,
+    in_pins: &[String],
+    out_pins: Option<&[String]>,    // None → Map Action variant (single row)
+    skin: super::remapper_icons::Skin,
+) -> MappingCardResult {
+    // ── Figma palette ─────────────────────────────────────────────────────
+    const C_CARD_BG:   Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);  // outer
+    const C_BORDER:    Color32 = Color32::BLACK;
+    const C_BODY_BG:   Color32 = Color32::from_rgb(0x3C, 0x3C, 0x3C);  // body
+    const C_PILL_DARK: Color32 = Color32::from_rgb(0x1B, 0x1B, 0x1B);  // time-gap left
+    const C_PILL_MID:  Color32 = Color32::from_rgb(0x4A, 0x4A, 0x4A);  // value box / toggle pill
+    const C_CHECK_BG:  Color32 = Color32::from_rgb(0xD9, 0xD9, 0xD9);  // checkbox
+    const C_INOUT_BG:  Color32 = Color32::from_rgb(0x76, 0x76, 0x76);  // in/out chip
+    const C_TEXT:      Color32 = Color32::WHITE;
+
+    // Card width is parameterized to fill the parent body. The mockup card
+    // is 358 wide at design scale; we scale all internal positions by the
+    // ratio of actual to design width so the layout stays pixel-correct.
+    const DESIGN_W: f32 = 358.0;
+    const CARD_H: f32 = 102.0;
+    const RADIUS: f32 = 5.0;
+    const TEXT_SIZE_HEADER: f32 = 13.0;
+    const TEXT_SIZE_INOUT:  f32 = 11.0;
+    const TEXT_SIZE_VALUE:  f32 = 13.0;
+    // Use available width capped at design size + leave space for the
+    // module's scrollbar on the right. The parent body is REMAP_DESIGN_W
+    // wide; the scrollbar takes ~7px on the right, plus we want a small
+    // visual gap.
+    let card_w = ui.available_width().min(DESIGN_W).max(280.0);
+    let _ = TEXT_SIZE_VALUE;
+
+    let s = card_w / DESIGN_W;
+
+    // Measure chord rows so the card can grow vertically when a chord wraps.
+    // chip_size = 26*s, gap = 6*s, plus = 12*s; row width budget is from
+    // `chord_x_start` (62*s) to `card_w - 5*s` on the right edge.
+    let chip_size = 26.0 * s;
+    let chord_gap = 6.0 * s;
+    let plus_w = 12.0 * s;
+    let chord_x_start = 62.0 * s;
+    let chord_avail_w = (card_w - 5.0 * s) - chord_x_start;
+    let row_pitch_y = (chip_size + 6.0 * s).max(32.0 * s);
+
+    let measure_rows = |pins: &[String]| -> usize {
+        let mut rows = 1usize;
+        let mut x = 0.0f32;
+        let mut first = true;
+        for p in pins {
+            if matches!(p.as_str(), "touchpad_any") { continue; }
+            let next_w = chip_size + if first { 0.0 } else { plus_w + chord_gap };
+            if !first && x + next_w > chord_avail_w {
+                rows += 1;
+                x = chip_size + chord_gap; // next row starts with this chip
+            } else {
+                x += next_w;
+                if !first { /* already counted */ }
+                x += chord_gap;
+            }
+            first = false;
+        }
+        rows.max(1)
+    };
+
+    let in_rows  = measure_rows(in_pins);
+    let out_rows = out_pins.map(measure_rows).unwrap_or(0);
+
+    // Header strip is 31px; each chord row reserves `row_pitch_y` of body
+    // space; bottom padding ~8px. Map Action has no out row.
+    let header_h = 31.0 * s;
+    let bottom_pad = 8.0 * s;
+    let body_h = in_rows as f32 * row_pitch_y
+        + if out_pins.is_some() { out_rows as f32 * row_pitch_y } else { 0.0 }
+        + bottom_pad;
+    let card_h = header_h + body_h;
+    let (card_rect, _) = ui.allocate_exact_size(
+        egui::vec2(card_w, card_h),
+        egui::Sense::hover(),
+    );
+    let card_origin = card_rect.min;
+    // Intersect with the parent's clip rect so we don't paint outside the
+    // body's visible band (otherwise layout-mode preview leaks card shapes
+    // above/below the container, since visual-transform doesn't clip
+    // descendant painter shapes).
+    let painter_clip = ui.clip_rect().intersect(card_rect);
+    let painter = ui.painter().with_clip_rect(painter_clip);
+
+    // ── Paint outer card + body fill ──────────────────────────────────────
+    painter.rect(
+        card_rect,
+        RADIUS,
+        C_CARD_BG,
+        egui::Stroke::new(1.0, C_BORDER),
+        egui::epaint::StrokeKind::Inside,
+    );
+    // Body fills the bottom portion (header strip is whatever sits above).
+    let body_top_y = 31.0 * s;
+    let body_rect = egui::Rect::from_min_max(
+        card_origin + egui::vec2(0.0, body_top_y),
+        card_origin + egui::vec2(card_w, card_h),
+    );
+    painter.rect_filled(body_rect, RADIUS, C_BODY_BG);
+    // Square off the body's top corners by overpainting the top edge with a
+    // small rect — the rounded radius lives only on the bottom of the card.
+    painter.rect_filled(
+        egui::Rect::from_min_size(body_rect.min, egui::vec2(card_w, RADIUS)),
+        0.0,
+        C_BODY_BG,
+    );
+
+    // Helpers: `at` scales a (Figma x,y) into painter space; `sz` scales a
+    // (Figma w,h) size. `s` is the design-to-actual scale factor (see above).
+    let at = |x: f32, y: f32| card_origin + egui::vec2(x * s, y * s);
+    let sz = |w: f32, h: f32| egui::vec2(w * s, h * s);
+
+    let mut changed = false;
+    let mut delete_clicked = false;
+
+    // Helper to paint a button background with idle + hover states. Matches
+    // the visual weight of the header pills so × and mode read as buttons.
+    let paint_button_bg = |painter: &egui::Painter, r: egui::Rect, hovered: bool| {
+        painter.rect_filled(r, 3.0, C_PILL_MID); // idle fill
+        if hovered {
+            painter.rect_filled(r, 3.0, Color32::from_white_alpha(28));
+        }
+    };
+
+    // ── × delete button: (5,5,20×20) ───────────────────────────────────────
+    {
+        let r = egui::Rect::from_min_size(at(5.0, 5.0), sz(20.0, 20.0));
+        let resp = ui.interact(r, ui.id().with(("del", mapping_idx)), egui::Sense::click());
+        paint_button_bg(&painter, r, resp.hovered());
+        painter.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(16.0 * s),
+            C_TEXT,
+        );
+        if resp.clicked() { delete_clicked = true; }
+    }
+
+    // ── Press-mode glyph button: (33,5,20×20) ─────────────────────────────
+    let mode_now = mapping.get("mode").and_then(|v| v.as_str()).unwrap_or("down").to_string();
+    {
+        let glyph = remapper_press_mode_glyph(&mode_now);
+        let r = egui::Rect::from_min_size(at(33.0, 5.0), sz(20.0, 20.0));
+        let resp = ui.interact(r, ui.id().with(("pm", mapping_idx)),
+            egui::Sense::click()).on_hover_text(
+                format!("Press mode: {}", remapper_press_mode_label(&mode_now)));
+        paint_button_bg(&painter, r, resp.hovered());
+        painter.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            egui::FontId::proportional(15.0 * s),
+            C_TEXT,
+        );
+        let popup_id = egui::Id::new(("fxi_press_mode_popup", node_id.0, mapping_idx));
+        if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
+        let mut picked: Option<&'static str> = None;
+        egui::popup_below_widget(
+            ui, popup_id, &resp,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(140.0);
+                for (val, g, label) in [
+                    ("down",       "↓", "Normal (gate)"),
+                    ("short",      "↕", "Short press"),
+                    ("long",       "⇓", "Long press"),
+                    ("double",     "↡", "Double tap"),
+                    ("on_press",   "↧", "On press"),
+                    ("on_release", "↥", "On release"),
+                ] {
+                    if ui.selectable_label(mode_now == val,
+                        format!("{g}  {label}")).clicked() { picked = Some(val); }
+                }
+            },
+        );
+        if let Some(new_mode) = picked {
+            if new_mode == "down" {
+                mapping.remove("mode");
+                mapping.remove("window_ms");
+                mapping.remove("sustain");
+            } else {
+                mapping.insert("mode".to_string(), Value::String(new_mode.to_string()));
+                if !mapping.contains_key("window_ms") {
+                    mapping.insert("window_ms".to_string(), serde_json::json!(200.0));
+                }
+            }
+            changed = true;
+            ui.memory_mut(|m| m.close_popup(popup_id));
+        }
+    }
+
+    // ── time gap pill: outer (61,5,137×20), valuebox (135,5,63×20) ────────
+    let turbo_on = mapping.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+    let gap_applies = matches!(mode_now.as_str(), "short" | "long" | "double") || turbo_on;
+    {
+        let outer = egui::Rect::from_min_size(at(61.0, 5.0), sz(137.0, 20.0));
+        let value_box = egui::Rect::from_min_size(at(61.0 + 74.0, 5.0), sz(63.0, 20.0));
+        let alpha = if gap_applies { 255 } else { 77 };
+        let mul = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha);
+        painter.rect_filled(outer, RADIUS, mul(C_PILL_DARK));
+        painter.rect_filled(value_box, RADIUS, mul(C_PILL_MID));
+        painter.text(
+            at(61.0 + 5.0, 5.0 + 10.0),
+            egui::Align2::LEFT_CENTER,
+            "time gap",
+            egui::FontId::proportional(TEXT_SIZE_HEADER * s),
+            mul(C_TEXT),
+        );
+        // Editable value: a tiny DragValue sized to the value_box.
+        let mut gap_ms = mapping.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(value_box)
+                .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+        );
+        child.add_enabled_ui(gap_applies, |ui| {
+            ui.spacing_mut().interact_size.y = 18.0 * s;
+            let resp = ui.add(
+                egui::DragValue::new(&mut gap_ms)
+                    .speed(5.0).range(10.0f32..=5000.0)
+                    .custom_formatter(|n, _| format!("{n:.0} ms")),
+            );
+            if resp.changed() {
+                if let Some(n) = serde_json::Number::from_f64(gap_ms as f64) {
+                    mapping.insert("window_ms".to_string(), Value::Number(n));
+                    changed = true;
+                }
+            }
+        });
+    }
+
+    // ── hold pill: (206,5,62×20), checkbox at +(45,3,14×14) ──────────────
+    let hold_applies = mode_now == "long";
+    {
+        let outer = egui::Rect::from_min_size(at(206.0, 5.0), sz(62.0, 20.0));
+        let cb_rect = egui::Rect::from_min_size(at(206.0 + 45.0, 5.0 + 3.0), sz(14.0, 14.0));
+        let alpha = if hold_applies { 255 } else { 77 };
+        let mul = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha);
+        painter.rect_filled(outer, RADIUS, mul(C_PILL_MID));
+        painter.text(
+            at(206.0 + 5.0, 5.0 + 10.0),
+            egui::Align2::LEFT_CENTER,
+            "hold",
+            egui::FontId::proportional(TEXT_SIZE_HEADER * s),
+            mul(C_TEXT),
+        );
+        painter.rect_filled(cb_rect, 3.0, mul(C_CHECK_BG));
+        let mut hold = mapping.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+        if hold {
+            painter.rect_filled(cb_rect.shrink(3.0 * s), 1.0, mul(C_PILL_DARK));
+        }
+        let resp = ui.interact(outer, ui.id().with(("hold", mapping_idx)),
+            if hold_applies { egui::Sense::click() } else { egui::Sense::hover() });
+        if hold_applies && resp.clicked() {
+            hold = !hold;
+            mapping.insert("sustain".to_string(), Value::Bool(hold));
+            changed = true;
+        }
+    }
+
+    // ── turbo pill: (274,5,80×20), checkbox at +(63,3,14×14) ──────────────
+    {
+        let outer = egui::Rect::from_min_size(at(274.0, 5.0), sz(80.0, 20.0));
+        let cb_rect = egui::Rect::from_min_size(at(274.0 + 63.0, 5.0 + 3.0), sz(14.0, 14.0));
+        painter.rect_filled(outer, RADIUS, C_PILL_MID);
+        painter.text(
+            at(274.0 + 5.0, 5.0 + 10.0),
+            egui::Align2::LEFT_CENTER,
+            "turbo",
+            egui::FontId::proportional(TEXT_SIZE_HEADER * s),
+            C_TEXT,
+        );
+        painter.rect_filled(cb_rect, 3.0, C_CHECK_BG);
+        let mut turbo = turbo_on;
+        if turbo {
+            painter.rect_filled(cb_rect.shrink(3.0 * s), 1.0, C_PILL_DARK);
+        }
+        let resp = ui.interact(outer, ui.id().with(("turbo", mapping_idx)),
+            egui::Sense::click());
+        if resp.clicked() {
+            turbo = !turbo;
+            mapping.insert("turbo".to_string(), Value::Bool(turbo));
+            changed = true;
+        }
+    }
+
+    // ── in / out label pill (label + arrow) ───────────────────────────────
+    let draw_io_pill = |label: &str, ox: f32, oy: f32| {
+        let r = egui::Rect::from_min_size(at(ox, oy), sz(48.0, 20.0));
+        painter.rect_filled(r, RADIUS, C_INOUT_BG);
+        painter.text(
+            at(ox + 4.0, oy + 10.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(TEXT_SIZE_INOUT * s),
+            C_TEXT,
+        );
+        painter.text(
+            at(ox + 29.0, oy + 10.0),
+            egui::Align2::LEFT_CENTER,
+            "→",
+            egui::FontId::proportional(13.0 * s),
+            C_TEXT,
+        );
+    };
+    draw_io_pill("in", 5.0, 40.0);
+
+    // ── chord chip row (painter-driven, wrap on overflow) ─────────────────
+    // Each chip is `chip_size` square. Label pill center is at y=50 (in row)
+    // and y=82 (out row); chord chip center matches by anchoring chip top-y
+    // = label-pill top-y - 3 (since chip is 6px taller than pill, half of
+    // that = 3 puts both centers at the same y).
+    let chord_y_in = 37.0 * s;    // = label_y(40) - 3, center at y=50
+    let chord_y_out_first = 69.0 * s; // = label_y(72) - 3, center at y=82
+
+    let chord_painter = painter.clone();
+    let mut render_chord_row_painter = |row_y_start: f32, pins: &[String]| {
+        let mut cur_x = chord_x_start;
+        let mut row_y = row_y_start;
+        let mut first = true;
+        for p in pins {
+            let render_id: &str = match p.as_str() {
+                "touchpad_left"   => "touch_left",
+                "touchpad_center" => "touch_center",
+                "touchpad_right"  => "touch_right",
+                "touchpad_any"    => continue, // shown as the click overlay
+                other => other,
+            };
+            // Width this chip will consume (incl. its leading "+", if any).
+            let prefix = if first { 0.0 } else { plus_w + chord_gap };
+            // Wrap to the next row if this chip doesn't fit. The first chip
+            // on a wrapped row drops its "+", since the prior row ended
+            // with the trailing chip already.
+            if !first && cur_x - chord_x_start + prefix + chip_size > chord_avail_w {
+                row_y += row_pitch_y;
+                cur_x = chord_x_start;
+                first = true;
+            }
+            if !first {
+                chord_painter.text(
+                    card_origin + egui::vec2(cur_x + plus_w * 0.5, row_y + chip_size * 0.5),
+                    egui::Align2::CENTER_CENTER,
+                    "+",
+                    egui::FontId::proportional(chip_size * 0.5),
+                    Color32::WHITE,
+                );
+                cur_x += plus_w + chord_gap;
+            }
+            first = false;
+            let chip_top_left = card_origin + egui::vec2(cur_x, row_y);
+            let painted_w = paint_chord_chip_to_rect(
+                &chord_painter, ui.ctx(), chip_top_left, chip_size, render_id, skin,
+            );
+            cur_x += painted_w + chord_gap;
+        }
+    };
+
+    render_chord_row_painter(chord_y_in, in_pins);
+    if let Some(out_pins) = out_pins {
+        // Out row starts after the in row's actual wrapped height — keep
+        // label pill paired with the first chip on the row.
+        let out_label_y = 40.0 * s + in_rows as f32 * row_pitch_y - 32.0 * s + 32.0 * s;
+        let out_label_design_y = (40.0 + in_rows as f32 * 32.0) / s;
+        let _ = out_label_y;
+        let _ = out_label_design_y;
+        // Simpler: derive out row's start-y from in_rows so wrap pushes
+        // the out row down by exactly one row pitch per extra in-row.
+        let extra = (in_rows as f32 - 1.0) * row_pitch_y;
+        draw_io_pill("out", 5.0, 72.0 + extra / s);
+        render_chord_row_painter(chord_y_out_first + extra, out_pins);
+    }
+
+    MappingCardResult { delete_clicked, changed, height: card_h }
+}
+
 /// Render a chord (list of pin ids) as chips separated by "+". When any
 /// pin is a click-zone variant, the chord is rewritten so the touchpad
 /// click icon appears once at the front, then plain zone chips follow:
@@ -11186,6 +11632,148 @@ fn remapper_render_chord(ui: &mut egui::Ui, pins: &[String], skin: super::remapp
         };
         emit_sep(ui, &mut first);
         remapper_render_chip(ui, render_id, skin);
+    }
+}
+
+/// Paint a chord chip directly via the painter at `top_left`, sized
+/// `chip_h × chip_h`. Resolution order for the icon:
+///   1. SVG for the *current* skin → render at full tint.
+///   2. SVG for any *other* skin → render at gray tint (the mapping was
+///      created on a different device; we still show the icon so the user
+///      sees which input it represents, but mark it visually inert).
+///   3. No SVG anywhere → fall back to a left-aligned text pill, gray.
+///
+/// Returns the painted chip width (= `chip_h` for icons, larger for text).
+fn paint_chord_chip_to_rect(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    top_left: egui::Pos2,
+    chip_h: f32,
+    pin_id: &str,
+    skin: super::remapper_icons::Skin,
+) -> f32 {
+    use super::remapper_icons::{self, Skin};
+
+    // Probe current skin first; fall back to any other skin that has the
+    // icon. `tinted` is true when we matched a non-current skin — the chip
+    // is then dimmed to communicate that it isn't available on the device.
+    let mut found: Option<(&'static [u8], bool)> = None;
+    if let Some(b) = remapper_icons::pin_svg(skin, pin_id) {
+        found = Some((b, false));
+    } else {
+        for s in [Skin::Xbox, Skin::Playstation, Skin::SwitchPro, Skin::Kbm] {
+            if s == skin { continue; }
+            if let Some(b) = remapper_icons::pin_svg(s, pin_id) {
+                found = Some((b, true));
+                break;
+            }
+        }
+    }
+
+    if let Some((bytes, dim)) = found {
+        let size_px = (chip_h * ctx.pixels_per_point()).round() as u32;
+        let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
+        let tex = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
+            .or_else(|| {
+                let text = std::str::from_utf8(bytes).ok()?;
+                let img = rasterize_svg_recolored(text, size_px, size_px, "override", Color32::TRANSPARENT)?;
+                let handle = ctx.load_texture(
+                    format!("remapper_icon_{:p}", bytes.as_ptr()),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                ctx.data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+                Some(handle)
+            });
+        if let Some(tex) = tex {
+            let rect = egui::Rect::from_min_size(top_left, egui::vec2(chip_h, chip_h));
+            let tint = if dim { Color32::from_rgba_unmultiplied(255, 255, 255, 95) }
+                       else  { Color32::WHITE };
+            painter.image(tex.id(), rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                tint);
+            return chip_h;
+        }
+    }
+
+    // Last-resort text pill — still useful for non-canonical pins (e.g.
+    // unmapped keys). Dimmed so it reads as "label, no icon available".
+    let label = remapper_pin_display(pin_id);
+    let font = egui::FontId::proportional(chip_h * 0.48);
+    let dim_text = Color32::from_rgba_unmultiplied(255, 255, 255, 160);
+    let galley = painter.layout_no_wrap(label, font, dim_text);
+    let text_w = galley.size().x;
+    let pad_x = chip_h * 0.30;
+    let pill_w = text_w + pad_x * 2.0;
+    let rect = egui::Rect::from_min_size(top_left, egui::vec2(pill_w, chip_h));
+    painter.rect_filled(rect, chip_h * 0.18, Color32::from_rgba_unmultiplied(0x76, 0x76, 0x76, 140));
+    painter.galley(
+        egui::pos2(rect.left() + pad_x, rect.center().y - galley.size().y * 0.5),
+        galley,
+        dim_text,
+    );
+    pill_w
+}
+
+fn remapper_render_chip_scaled(
+    ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_icons::Skin, chip_h: f32,
+) {
+    use super::remapper_icons;
+    if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
+        let size_px = (chip_h * ui.ctx().pixels_per_point()).round() as u32;
+        let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
+        let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
+            .or_else(|| {
+                let text = std::str::from_utf8(bytes).ok()?;
+                let img = rasterize_svg_recolored(text, size_px, size_px, "override", Color32::TRANSPARENT)?;
+                let handle = ui.ctx().load_texture(
+                    format!("remapper_icon_{:p}", bytes.as_ptr()),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+                Some(handle)
+            });
+        if let Some(tex) = tex {
+            ui.add(egui::Image::new(&tex)
+                .fit_to_exact_size(egui::vec2(chip_h, chip_h))
+                .tint(Color32::WHITE));
+            return;
+        }
+    }
+    ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(chip_h * 0.5).strong());
+}
+
+/// Like `remapper_render_chord` but uses an explicit chip size for all chips.
+fn remapper_render_chord_scaled(
+    ui: &mut egui::Ui, pins: &[String], skin: super::remapper_icons::Skin, chip_h: f32,
+) {
+    use super::remapper_icons::Skin;
+    let click_zone = |p: &str| matches!(p,
+        "touchpad_left" | "touchpad_center" | "touchpad_right" | "touchpad_any");
+    let has_click = pins.iter().any(|p| click_zone(p));
+    let mut first = true;
+    let sep_size = (chip_h * 0.55).max(10.0);
+    let mut emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
+        if !*first {
+            ui.label(egui::RichText::new("+").size(sep_size).strong().color(Color32::WHITE));
+        }
+        *first = false;
+    };
+    if has_click && skin == Skin::Playstation {
+        emit_sep(ui, &mut first);
+        remapper_render_chip_scaled(ui, "touchpad_any", skin, chip_h);
+    }
+    for p in pins {
+        let render_id: &str = match p.as_str() {
+            "touchpad_left"   => "touch_left",
+            "touchpad_center" => "touch_center",
+            "touchpad_right"  => "touch_right",
+            "touchpad_any"    => continue,
+            other => other,
+        };
+        emit_sep(ui, &mut first);
+        remapper_render_chip_scaled(ui, render_id, skin, chip_h);
     }
 }
 
@@ -11323,6 +11911,31 @@ fn remapper_write_str_array(node: &mut NodeData, key: &str, vals: &[String]) {
     let arr: Vec<Value> = vals.iter().map(|s| Value::String(s.clone())).collect();
     node.params.insert(key.to_string(), Value::Array(arr));
 }
+
+/// Press-mode glyphs shown on the per-mapping mode button. The popup menu
+/// the button opens uses the same glyphs as visual cues.
+fn remapper_press_mode_glyph(mode: &str) -> &'static str {
+    match mode {
+        "short"      => "↕",
+        "long"       => "⇓",
+        "double"     => "↡",
+        "on_press"   => "↧",
+        "on_release" => "↥",
+        _            => "↓",
+    }
+}
+
+fn remapper_press_mode_label(mode: &str) -> &'static str {
+    match mode {
+        "short"      => "Short press",
+        "long"       => "Long press",
+        "double"     => "Double tap",
+        "on_press"   => "On press",
+        "on_release" => "On release",
+        _            => "Normal (gate)",
+    }
+}
+
 
 fn show_remapper_body(
     node_id: NodeId,
@@ -11601,15 +12214,17 @@ fn show_remapper_body(
     // Allocate a fixed-width sub-UI so the body's measured min_rect is
     // bounded — egui-snarl reports body width as body_ui.min_rect, and a
     // bare `ui.vertical` with set_min_width fills the parent's available
-    // width, making the node permanently stuck wide once it grows. Pinning
-    // the width here means the node tracks this width exactly.
-    const BODY_W: f32 = 260.0;
-    // available_height can be infinite when snarl gives the body a tall
-    // payload_rect; clamp to a sane upper bound so wrap layouts don't get
-    // NaN from infinity arithmetic.
-    let body_h = ui.available_height().min(2000.0).max(28.0);
+    // width, making the node permanently stuck wide once it grows.
+    //
+    // For HEIGHT: use a tiny sentinel (1px). egui's `allocate_ui_with_layout`
+    // takes a *desired* size — when contents are larger the Ui grows to fit.
+    // Using a small desired height means the body never reserves dead space
+    // and the rect returned to snarl matches actual content height. (Earlier
+    // versions read `available_height` which created a feedback loop: each
+    // frame snarl reported a taller payload_rect, so the body grew by that.)
+    const BODY_W: f32 = 380.0;
     let body_resp = ui.allocate_ui_with_layout(
-        egui::vec2(BODY_W, body_h),
+        egui::vec2(BODY_W, 1.0),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
         ui.set_min_width(BODY_W);
@@ -11736,12 +12351,20 @@ fn show_remapper_body(
             ui.separator();
             ui.label(egui::RichText::new(format!("Mappings ({})", mappings.len())).size(13.0).weak());
             let mut to_remove: Option<usize> = None;
-            // Two-column layout: × button on the left in its own narrow
-            // column, chord chips in a wrapping right column. This keeps
-            // the × aligned with the first chord row and lets long chords
-            // wrap to additional lines without the X button overlapping.
-            const X_COL_W: f32 = 28.0;
-            const CHORD_COL_W: f32 = BODY_W - X_COL_W - 8.0; // leave inner spacing
+            // Card layout per mapping:
+            //   ┌──────────────────────────────────────────────────┐
+            //   │ [×] [↓ mode]  time gap [200ms]  hold✐ turbo✐     │
+            //   │  in →  [chip] + [chip]                            │
+            //   │  out → [chip]                                     │
+            //   └──────────────────────────────────────────────────┘
+            // Settings always render in the header; the ones that don't apply
+            // to the current mode render disabled (grayed). The in/out rows
+            // wrap chips when they overflow.
+            // Collapse default item_spacing so cards pack tightly. Without
+            // this, both the outer top-down layout and the inner horizontal
+            // wrapper add ~3px each between siblings.
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let mut press_mode_changed: Option<(usize, serde_json::Map<String, Value>)> = None;
             for (i, m) in mappings.iter().enumerate() {
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
@@ -11749,66 +12372,45 @@ fn show_remapper_body(
                 let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
-                // Estimate whether everything fits on one line. Chip ~28px,
-                // "+" separator ~12px, arrow ~26px. If estimate exceeds the
-                // chord column width, force a break: input chord wraps on
-                // its own row(s), then arrow + output on a new row.
-                let chip_w = 28.0_f32;
-                let sep_w = 12.0_f32;
-                let arrow_w = 26.0_f32;
-                let estimate = |pins: &[String]| -> f32 {
-                    if pins.is_empty() { return 0.0; }
-                    (pins.len() as f32) * chip_w
-                        + ((pins.len() as f32) - 1.0).max(0.0) * sep_w
-                };
-                let single_line_w = estimate(&in_pins) + arrow_w + estimate(&out_pins);
-                let force_break = single_line_w > CHORD_COL_W;
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::TOP),
-                    |ui| {
-                    // x button in a fixed 28x28 slot at the top of the row.
-                    // Align::TOP on the outer layout keeps it aligned with
-                    // the first chord line when the chord wraps to multiple
-                    // lines.
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(X_COL_W, 28.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            if ui.button(egui::RichText::new("×").size(13.0)).clicked() {
-                                to_remove = Some(i);
-                            }
-                        },
-                    );
-                    if force_break {
-                        ui.vertical(|ui| {
-                            ui.set_min_width(CHORD_COL_W);
-                            ui.set_max_width(CHORD_COL_W);
-                            ui.horizontal_wrapped(|ui| {
-                                remapper_render_chord(ui, &in_pins, skin);
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                remapper_render_arrow(ui);
-                                remapper_render_chord(ui, &out_pins, skin);
-                            });
-                        });
-                    } else {
+
+                let mut working: serde_json::Map<String, Value> = m.as_object().cloned().unwrap_or_default();
+                let mut working_changed = false;
+
+                ui.push_id(("fxi_remap_card", node_id.0, i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
                         ui.allocate_ui_with_layout(
-                            egui::vec2(CHORD_COL_W, 28.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
+                            egui::vec2((BODY_W - 18.0).min(358.0), 1.0),
+                            egui::Layout::top_down(egui::Align::Min),
                             |ui| {
-                                remapper_render_chord(ui, &in_pins, skin);
-                                remapper_render_arrow(ui);
-                                remapper_render_chord(ui, &out_pins, skin);
+                                let result = remapper_mapping_card_pixel(
+                                    ui, node_id, i, &mut working,
+                                    &in_pins, Some(&out_pins), skin,
+                                );
+                                if result.delete_clicked { to_remove = Some(i); }
+                                if result.changed { working_changed = true; }
                             },
                         );
-                    }
-                    },
-                );
+                    });
+                });
+
+                if working_changed {
+                    press_mode_changed = Some((i, working));
+                }
             }
             if let Some(idx) = to_remove {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     if let Some(Value::Array(arr)) = node.params.get_mut("mappings") {
                         if idx < arr.len() { arr.remove(idx); }
+                    }
+                }
+            }
+            if let Some((i, obj)) = press_mode_changed {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    if let Some(Value::Array(arr)) = node.params.get_mut("mappings") {
+                        if let Some(slot) = arr.get_mut(i) {
+                            *slot = Value::Object(obj);
+                        }
                     }
                 }
             }
@@ -12014,10 +12616,9 @@ fn show_map_action_body(
         .unwrap_or_else(|| "auto".to_string());
     let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
 
-    const BODY_W: f32 = 260.0;
-    let body_h = ui.available_height().min(2000.0).max(28.0);
+    const BODY_W: f32 = 380.0;
     let body_resp = ui.allocate_ui_with_layout(
-        egui::vec2(BODY_W, body_h),
+        egui::vec2(BODY_W, 1.0),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
         ui.set_min_width(BODY_W);
@@ -12068,33 +12669,66 @@ fn show_map_action_body(
             ui.separator();
             ui.label(egui::RichText::new(format!("Mappings ({})", mappings.len())).size(13.0).weak());
             let mut to_remove: Option<usize> = None;
-            const X_COL_W: f32 = 28.0;
-            const CHORD_COL_W: f32 = BODY_W - X_COL_W - 8.0;
+            // Card layout per mapping (Map Action variant): no in/out labels,
+            // just header + a single row listing the captured chord chips.
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let mut press_mode_changed: Option<(usize, serde_json::Map<String, Value>)> = None;
             for (i, m) in mappings.iter().enumerate() {
-                let in_pins: Vec<String> = m.as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                let chip_w = 28.0_f32; let sep_w = 12.0_f32; let estimate = |pins: &[String]| {
-                    if pins.is_empty() { return 0.0; }
-                    (pins.len() as f32) * chip_w + ((pins.len() as f32) - 1.0).max(0.0) * sep_w
-                };
-                let force_break = estimate(&in_pins) > CHORD_COL_W;
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                    ui.allocate_ui_with_layout(egui::vec2(X_COL_W, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("×").size(13.0)).clicked() { to_remove = Some(i); }
-                    });
-                    if force_break {
-                        ui.vertical(|ui| { ui.set_min_width(CHORD_COL_W); ui.set_max_width(CHORD_COL_W); ui.horizontal_wrapped(|ui| { remapper_render_chord(ui, &in_pins, skin); }); });
+                // Legacy Array<String> → upgrade to Object{ in, … } once edited.
+                let (in_pins, mut working): (Vec<String>, serde_json::Map<String, Value>) =
+                    if let Some(arr) = m.as_array() {
+                        let pins: Vec<String> = arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                        let in_arr: Vec<Value> = pins.iter()
+                            .map(|s| Value::String(s.clone())).collect();
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("in".to_string(), Value::Array(in_arr));
+                        (pins, obj)
+                    } else if let Some(obj) = m.as_object() {
+                        let pins: Vec<String> = obj.get("in").and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        (pins, obj.clone())
                     } else {
-                        ui.allocate_ui_with_layout(egui::vec2(CHORD_COL_W, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            remapper_render_chord(ui, &in_pins, skin);
-                        });
-                    }
+                        (Vec::new(), serde_json::Map::new())
+                    };
+
+                let mut working_changed = false;
+
+                ui.push_id(("fxi_mapact_card", node_id.0, i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2((BODY_W - 18.0).min(358.0), 1.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                let result = remapper_mapping_card_pixel(
+                                    ui, node_id, i, &mut working,
+                                    &in_pins, None, skin,
+                                );
+                                if result.delete_clicked { to_remove = Some(i); }
+                                if result.changed { working_changed = true; }
+                            },
+                        );
+                    });
                 });
+
+                if working_changed {
+                    press_mode_changed = Some((i, working));
+                }
             }
             if let Some(idx) = to_remove {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     if let Some(Value::Array(arr)) = node.params.get_mut("mappings") { if idx < arr.len() { arr.remove(idx); } }
+                }
+            }
+            if let Some((i, obj)) = press_mode_changed {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    if let Some(Value::Array(arr)) = node.params.get_mut("mappings") {
+                        if let Some(slot) = arr.get_mut(i) {
+                            *slot = Value::Object(obj);
+                        }
+                    }
                 }
             }
         }

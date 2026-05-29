@@ -397,6 +397,218 @@ fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
 /// dominates the perpendicular axis by 1.5× — so pushing slightly off-axis
 /// still captures a single direction, but a genuine diagonal fires both
 /// cardinals as a chord.
+// ── Press-mode state machine (Remapper / Map Action mapping options) ─────────
+//
+// Each Remapper / Map Action mapping carries an optional "press mode" that
+// transforms the raw held-state of the input chord into the gate that fires
+// the mapping. State is allocated per-mapping in `state.aux_f32` (4 floats
+// per mapping). Slots:
+//   [0] prev_input        — 0/1 held-state from the previous tick (rising/
+//                           falling edge detection).
+//   [1] press_start       — accumulated seconds since the press began (Long
+//                           uses this directly; Short and Double window-test
+//                           this against the configured window_ms).
+//   [2] trigger_remaining — seconds left for an artificial output pulse. The
+//                           Short replay (replay actual press duration) and
+//                           on-press / on-release 10 ms triggers all decrement
+//                           this each tick.
+//   [3] double_state      — 0 = idle, 1 = saw 1st rising, 2 = saw 1st falling,
+//                           3 = saw 2nd rising (output ON during this state).
+//                           Window-checked against [1] at each transition.
+
+const PRESS_SLOTS_PER_MAPPING: usize = 5;
+/// Short trigger duration emitted by on-press, on-release, and long-press
+/// non-sustain modes. 10 ms gives downstream counters / edge detectors a
+/// clean visible pulse without lingering as a held key.
+const PRESS_TRIGGER_PULSE_S: f32 = 0.010;
+
+#[derive(Copy, Clone)]
+enum PressMode {
+    Down,        // pass-through (default)
+    Short,       // on-off within window → replay original held duration
+    Long,        // held longer than window → sustain OR 10ms trigger
+    Double,      // double-tap within window → ON during 2nd press
+    OnPress,     // 10ms trigger on rising edge
+    OnRelease,   // 10ms trigger on falling edge
+}
+
+impl PressMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "short"      => Self::Short,
+            "long"       => Self::Long,
+            "double"     => Self::Double,
+            "on_press"   => Self::OnPress,
+            "on_release" => Self::OnRelease,
+            _            => Self::Down,
+        }
+    }
+}
+
+/// Read 4-slot state for a mapping. Resizes `press_state` if the node hasn't
+/// allocated this mapping's slots yet so callers don't have to.
+fn press_state_get(state: &mut NodeState, mapping_idx: usize) -> &mut [f32] {
+    let need = (mapping_idx + 1) * PRESS_SLOTS_PER_MAPPING;
+    if state.press_state.len() < need {
+        state.press_state.resize(need, 0.0);
+    }
+    let start = mapping_idx * PRESS_SLOTS_PER_MAPPING;
+    &mut state.press_state[start..start + PRESS_SLOTS_PER_MAPPING]
+}
+
+/// Apply the configured press mode to the raw input gate. Returns the
+/// transformed gate the mapping should treat as "held this tick".
+///
+/// `window_ms` is interpreted per mode (Short = max press duration to count
+/// as a tap; Long = min hold duration; Double = max time from 1st rising to
+/// 2nd rising). `sustain` is meaningful for Long only — when false, fire a
+/// 10 ms trigger on threshold crossing instead of holding while pressed.
+fn apply_press_mode(
+    raw_held: bool,
+    mode: PressMode,
+    window_ms: f32,
+    sustain: bool,
+    slots: &mut [f32],
+    dt: f32,
+) -> bool {
+    let prev_held = slots[0] > 0.5;
+    let rising  = raw_held && !prev_held;
+    let falling = !raw_held && prev_held;
+    let window_s = (window_ms.max(0.0)) / 1000.0;
+
+    // Trigger-pulse countdown is shared across modes; non-zero values force
+    // the output ON until the timer expires regardless of input state.
+    let mut trigger_remaining = (slots[2] - dt).max(0.0);
+
+    let out = match mode {
+        PressMode::Down => raw_held,
+        PressMode::OnPress => {
+            if rising { trigger_remaining = PRESS_TRIGGER_PULSE_S; }
+            trigger_remaining > 0.0
+        }
+        PressMode::OnRelease => {
+            if falling { trigger_remaining = PRESS_TRIGGER_PULSE_S; }
+            trigger_remaining > 0.0
+        }
+        PressMode::Long => {
+            // press_start (slots[1]) accumulates seconds while held.
+            if rising {
+                slots[1] = 0.0;
+                // double_state field is repurposed as "armed" flag for the
+                // non-sustain trigger so we fire once per press.
+                slots[3] = 0.0;
+            }
+            if raw_held {
+                slots[1] += dt;
+            } else {
+                slots[1] = 0.0;
+                slots[3] = 0.0;
+            }
+            let threshold_crossed = slots[1] >= window_s && window_s > 0.0;
+            if sustain {
+                threshold_crossed
+            } else {
+                if threshold_crossed && slots[3] < 0.5 {
+                    slots[3] = 1.0; // armed → fire exactly once per press
+                    trigger_remaining = PRESS_TRIGGER_PULSE_S;
+                }
+                trigger_remaining > 0.0
+            }
+        }
+        PressMode::Short => {
+            // Tracks the live press; on release we know its duration and can
+            // replay it. If the press never released within the window, the
+            // chord is suppressed entirely (mapping never fires).
+            //
+            // double_state field stores remaining replay seconds. When > 0
+            // we are in playback and the user's input is ignored until done.
+            let mut replay_remaining = slots[3];
+            if replay_remaining > 0.0 {
+                replay_remaining = (replay_remaining - dt).max(0.0);
+                slots[3] = replay_remaining;
+                slots[0] = if raw_held { 1.0 } else { 0.0 };
+                slots[1] = 0.0;
+                slots[2] = trigger_remaining;
+                return replay_remaining > 0.0;
+            }
+            if rising {
+                slots[1] = 0.0;
+            }
+            if raw_held {
+                slots[1] += dt;
+                if slots[1] > window_s && window_s > 0.0 {
+                    // Held too long — give up on this press; user has to
+                    // release and tap again. Suppressed until release.
+                    slots[1] = f32::INFINITY;
+                }
+            }
+            if falling {
+                let held_s = slots[1];
+                slots[1] = 0.0;
+                if held_s.is_finite() && (window_s <= 0.0 || held_s <= window_s) && held_s > 0.0 {
+                    // Qualifying tap → replay the press duration as output.
+                    slots[3] = held_s;
+                    slots[0] = 0.0;
+                    slots[2] = trigger_remaining;
+                    return true;
+                }
+            }
+            false
+        }
+        PressMode::Double => {
+            // double_state: 0 idle / 1 after 1st rising / 2 after 1st falling
+            //               / 3 during 2nd press (output ON)
+            // press_start: seconds since 1st rising edge (window check).
+            let mut s = slots[3] as i32;
+            if s != 0 {
+                slots[1] += dt;
+                if window_s > 0.0 && slots[1] > window_s {
+                    s = 0; // window expired before completing the gesture
+                    slots[1] = 0.0;
+                }
+            }
+            if rising {
+                if s == 0 {
+                    s = 1;
+                    slots[1] = 0.0;
+                } else if s == 2 {
+                    s = 3; // 2nd rising → output starts
+                }
+            }
+            if falling {
+                if s == 1 { s = 2; }
+                else if s == 3 {
+                    // 2nd falling → output ends, gesture consumed.
+                    s = 0;
+                    slots[1] = 0.0;
+                }
+            }
+            slots[3] = s as f32;
+            s == 3
+        }
+    };
+
+    slots[0] = if raw_held { 1.0 } else { 0.0 };
+    slots[2] = trigger_remaining;
+    out
+}
+
+/// Post-process the press-mode output with a turbo on/off cycle. When `held`
+/// is true the output cycles based on `gap_ms` as the full period (half on,
+/// half off). When `held` is false the phase resets so the next press starts
+/// at the ON portion. State lives in `slots[4]` (turbo phase seconds).
+fn apply_turbo(held: bool, gap_ms: f32, slots: &mut [f32], dt: f32) -> bool {
+    if !held {
+        slots[4] = 0.0;
+        return false;
+    }
+    let period_s = (gap_ms.max(20.0)) / 1000.0;
+    let mut phase = slots[4] + dt;
+    if phase >= period_s { phase -= period_s * (phase / period_s).floor(); }
+    slots[4] = phase;
+    phase < period_s * 0.5
+}
+
 fn derive_stick_cardinals(upstream: &mut HashMap<String, Signal>) {
     // Tuned for round-gate sticks where 45° physically caps at ~0.707.
     //   T_CARDINAL — minimum push for a single cardinal to fire when
@@ -595,16 +807,38 @@ fn eval_subgraph(
 
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
-            // Pass-through every canonical pin first, suppressing claimed inputs.
-            let mut sorted = mappings.clone();
-            sorted.sort_by(|a, b| {
-                let la = a.get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                let lb = b.get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            // Per-mapping press-mode pass — same logic as the top-level
+            // Remapper arm; uses ns_uid for state keying so subpatch instances
+            // don't collide with top-level instances.
+            let ns2 = state.entry(ns_uid).or_insert_with(NodeState::default);
+            let effective: Vec<bool> = mappings.iter().enumerate().map(|(i, m)| {
+                let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if in_pins.is_empty() { return false; }
+                let raw_held = in_pins.iter().all(|p| {
+                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                });
+                let mode = PressMode::from_str(
+                    m.get("mode").and_then(|v| v.as_str()).unwrap_or("down"));
+                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+                let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                let slots = press_state_get(ns2, i);
+                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
+                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
+            }).collect();
+
+            let mut sorted_idx: Vec<usize> = (0..mappings.len()).collect();
+            sorted_idx.sort_by(|&a, &b| {
+                let la = mappings[a].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let lb = mappings[b].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
                 lb.cmp(&la)
             });
             let mut triggered: Vec<(Vec<String>, Vec<String>)> = Vec::new();
             let mut claimed_inputs: HashSet<String> = HashSet::new();
-            for m in &sorted {
+            for &i in &sorted_idx {
+                let m = &mappings[i];
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
@@ -613,10 +847,7 @@ fn eval_subgraph(
                     .unwrap_or_default();
                 if in_pins.is_empty() { continue; }
                 if in_pins.iter().any(|p| claimed_inputs.contains(p)) { continue; }
-                let all_held = in_pins.iter().all(|p| {
-                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                });
-                if !all_held { continue; }
+                if !effective[i] { continue; }
                 for p in &in_pins { claimed_inputs.insert(p.clone()); }
                 triggered.push((in_pins, out_pins));
             }
@@ -729,20 +960,32 @@ fn eval_subgraph(
             upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
             upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
-            let mut any_trigger = false;
-            for m in &mappings {
-                if let Some(arr) = m.as_array() {
-                    if arr.is_empty() { continue; }
-                    let mut all_held = true;
-                    for v in arr {
-                        if let Some(pin) = v.as_str() {
-                            let held = read_upstream(pin).map(|s| s.as_bool()).unwrap_or(false);
-                            if !held { all_held = false; break; }
-                        }
-                    }
-                    if all_held { any_trigger = true; break; }
-                }
-            }
+            // Press-mode pass — mirrors Map Action top-level arm; supports both
+            // legacy Array<String> and new Object mapping forms.
+            let ns_map = state.entry(ns_uid).or_insert_with(NodeState::default);
+            let any_trigger = mappings.iter().enumerate().any(|(i, m)| {
+                let (in_pins, mode_s, window_ms, sustain, turbo) = if let Some(arr) = m.as_array() {
+                    let pins: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                    (pins, "down", 200.0_f32, false, false)
+                } else {
+                    let pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let mode = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+                    let win  = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                    let sus  = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let tur  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                    (pins, mode, win, sus, tur)
+                };
+                if in_pins.is_empty() { return false; }
+                let raw_held = in_pins.iter().all(|p| {
+                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                });
+                let mode = PressMode::from_str(mode_s);
+                let slots = press_state_get(ns_map, i);
+                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
+                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
+            });
             computed[idx] = vec![Some(Signal::Bool(any_trigger))];
             last_outputs.insert(ns_uid, computed[idx].clone());
             continue;
@@ -902,22 +1145,33 @@ pub fn eval_graph_tick(
 
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
-            // Each mapping is an Array<String> of input pin ids (AND). If any
-            // mapping's all-pins-held then the module outputs Bool(true).
-            let mut any_trigger = false;
-            for m in &mappings {
-                if let Some(arr) = m.as_array() {
-                    if arr.is_empty() { continue; }
-                    let mut all_held = true;
-                    for v in arr {
-                        if let Some(pin) = v.as_str() {
-                            let held = read_upstream(pin).map(|s| s.as_bool()).unwrap_or(false);
-                            if !held { all_held = false; break; }
-                        }
-                    }
-                    if all_held { any_trigger = true; break; }
-                }
-            }
+            // Mappings may be in legacy Array<String> form (chord only, mode=down)
+            // or in the new Object form `{ in, mode, window_ms, sustain }`. Resolve
+            // both and run each through the press-mode state machine.
+            let ns_map = state.entry(snap.node_uid).or_insert_with(NodeState::default);
+            let any_trigger = mappings.iter().enumerate().any(|(i, m)| {
+                let (in_pins, mode_s, window_ms, sustain, turbo) = if let Some(arr) = m.as_array() {
+                    let pins: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                    (pins, "down", 200.0_f32, false, false)
+                } else {
+                    let pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let mode = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+                    let win  = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                    let sus  = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let tur  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                    (pins, mode, win, sus, tur)
+                };
+                if in_pins.is_empty() { return false; }
+                let raw_held = in_pins.iter().all(|p| {
+                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                });
+                let mode = PressMode::from_str(mode_s);
+                let slots = press_state_get(ns_map, i);
+                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
+                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
+            });
 
             computed[idx] = vec![Some(Signal::Bool(any_trigger))];
             // Populate last_outputs for this node so the UI can display per-pin
@@ -1024,12 +1278,39 @@ pub fn eval_graph_tick(
 
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
-            // Determine which mappings are currently triggered (all input pins true).
-            // Sort by descending input-set size so longer combos win conflicts.
-            let mut sorted = mappings.clone();
-            sorted.sort_by(|a, b| {
-                let la = a.get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                let lb = b.get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            // Per-mapping press mode is stored under `mode` + `window_ms` +
+            // `sustain` on each mapping. The state machine must run for every
+            // mapping every tick (not just claimed ones) so Short / Long /
+            // Double detect edges without dropouts. Compute `effective_held`
+            // for each in original index order, then run the sort + claim pass
+            // using those values instead of re-reading raw input state.
+            let ns = state.entry(snap.node_uid).or_insert_with(NodeState::default);
+            let effective: Vec<bool> = mappings.iter().enumerate().map(|(i, m)| {
+                let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if in_pins.is_empty() { return false; }
+                let raw_held = in_pins.iter().all(|p| {
+                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                });
+                let mode = PressMode::from_str(
+                    m.get("mode").and_then(|v| v.as_str()).unwrap_or("down"));
+                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+                let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                let slots = press_state_get(ns, i);
+                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
+                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
+            }).collect();
+
+            // Determine which mappings are currently triggered. Sort indices
+            // by descending input-set size so longer combos win conflicts;
+            // original indices are preserved so we can look up `effective`
+            // and mapping fields afterwards.
+            let mut sorted_idx: Vec<usize> = (0..mappings.len()).collect();
+            sorted_idx.sort_by(|&a, &b| {
+                let la = mappings[a].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let lb = mappings[b].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
                 lb.cmp(&la)
             });
 
@@ -1038,7 +1319,8 @@ pub fn eval_graph_tick(
             // a shorter combo that overlaps cannot also fire from the same press.
             let mut triggered: Vec<(Vec<String>, Vec<String>)> = Vec::new();
             let mut claimed_inputs: HashSet<String> = HashSet::new();
-            for m in &sorted {
+            for &i in &sorted_idx {
+                let m = &mappings[i];
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
@@ -1047,10 +1329,7 @@ pub fn eval_graph_tick(
                     .unwrap_or_default();
                 if in_pins.is_empty() { continue; }
                 if in_pins.iter().any(|p| claimed_inputs.contains(p)) { continue; }
-                let all_held = in_pins.iter().all(|p| {
-                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                });
-                if !all_held { continue; }
+                if !effective[i] { continue; }
                 for p in &in_pins { claimed_inputs.insert(p.clone()); }
                 triggered.push((in_pins, out_pins));
             }
