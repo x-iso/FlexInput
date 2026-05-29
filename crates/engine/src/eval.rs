@@ -2953,26 +2953,35 @@ fn compute_counter(
 const SPIKE_WINDOW: usize = 20;
 const SPIKE_DEFAULT_K: f32 = 4.0;
 
+/// Minimum stddev floor. When the signal is genuinely stationary the
+/// computed MAD collapses to ~0, which would make every real motion sample
+/// look like an outlier. The floor sets a noise scale below which we don't
+/// try to flag anything — anything inside this band is allowed through.
+/// Tuned to a gyro/accel noise floor that's still tight enough to catch
+/// real 1-sample spikes (which typically jump dozens of units).
+const SPIKE_SIGMA_FLOOR: f32 = 0.02;
+
 fn spike_filter(buf: &mut VecDeque<f32>, sample: f32, k: f32) -> f32 {
-    // Push and trim — we work with the buffer BEFORE the new sample so the
-    // median/MAD reference is the recent past, not the current sample itself.
-    if buf.len() < 4 {
-        // Not enough history yet; pass through and accumulate.
-        buf.push_back(sample);
-        if buf.len() > SPIKE_WINDOW { buf.pop_front(); }
-        return sample;
-    }
-    let mut sorted: Vec<f32> = buf.iter().copied().collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[sorted.len() / 2];
-    let mut dev: Vec<f32> = sorted.iter().map(|x| (x - median).abs()).collect();
-    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mad = dev[dev.len() / 2];
-    // 1.4826 turns MAD into a robust stddev estimate for normal-ish signals.
-    let sigma = mad * 1.4826;
-    let threshold = (k * sigma).max(1e-4); // never collapse to zero
-    let out = if (sample - median).abs() > threshold { median } else { sample };
-    buf.push_back(out);
+    // Decide the output BEFORE mutating the buffer. We always push the
+    // *original* sample (not the filtered value) into the history —
+    // writing the suppressed output back would let one spike poison the
+    // baseline forever (MAD would stay at 0 and every subsequent motion
+    // sample would then read as an outlier).
+    let out = if buf.len() < 6 {
+        sample
+    } else {
+        let mut sorted: Vec<f32> = buf.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = sorted[sorted.len() / 2];
+        let mut dev: Vec<f32> = sorted.iter().map(|x| (x - median).abs()).collect();
+        dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mad = dev[dev.len() / 2];
+        // 1.4826 × MAD ≈ robust stddev; clamp to a noise-floor so a
+        // quiet signal can't make the threshold collapse to zero.
+        let sigma = (mad * 1.4826).max(SPIKE_SIGMA_FLOOR);
+        if (sample - median).abs() > k * sigma { median } else { sample }
+    };
+    buf.push_back(sample);
     if buf.len() > SPIKE_WINDOW { buf.pop_front(); }
     out
 }
@@ -3130,38 +3139,41 @@ fn compute_gyro_3dof(
     state.aux_f32[5] = if reset_now { 1.0 } else { 0.0 };
 
     let (out_x, out_y) = if family == "steering" {
+        // `exclude_y` suppresses the Y *output* — keeps X integrating as
+        // usual, but Y stays at zero. Use when the steering axis is the
+        // only thing you want from this module (e.g. a vehicle's wheel).
         let exclude_y = pb("steering_exclude_y", false);
         let recenter_blend = pf("recenter_blend", 0.5).clamp(0.0, 1.0); // 0=roll-only, 1=gravity-only
         let recenter_strength = pf("recenter_strength", 0.0).clamp(0.0, 4.0); // sec⁻¹ pull rate
         let ease_in = pf("reset_ease_in", 0.25).clamp(0.0, 2.0);
 
-        // Integrate steering accumulator from the raw rotation axis.
+        // Integrate both accumulators every tick — `exclude_y` only gates
+        // the output, not the integration, so toggling it on/off doesn't
+        // leave the Y accumulator stale.
         state.aux_f32[0] += raw_x * dt;
-        if exclude_y {
-            // Y passes through as instantaneous angular velocity instead.
-            // Useful for "steer-yaw, look-pitch" combo control schemes.
-        } else {
-            state.aux_f32[1] += raw_y * dt;
-        }
+        state.aux_f32[1] += raw_y * dt;
 
-        // Auto-centering: derive an "ideal X" the steering should drift
-        // toward, blended from two sources:
-        //   * Roll source: controller roll angle (atan2 of accel.x/accel.z).
-        //     A positive value means the user is tilting the controller
-        //     right; we pull steering toward 0 proportionally to that tilt.
-        //   * Gravity source: full-vector projection — compute the angle of
-        //     accel projected onto the steering plane and pull toward 0
-        //     proportional to how far from "down" the controller is.
+        // Auto-centering: pull the integrated steering accumulator TOWARD
+        // the accelerometer-implied steering angle. Physical intuition:
+        // when the user holds the gamepad like an upright steering wheel,
+        // the controller's roll angle IS the steering angle the user is
+        // commanding. The accelerometer reveals that angle but is noisy;
+        // the integrated gyro is smooth but drifts. A weak complementary
+        // pull combines the two: aux ← aux + α (target − aux), where α
+        // = strength × dt and `target` is the accel-derived angle.
         if recenter_strength > 0.0 {
-            let roll_angle = ax.atan2(az);                      // rad
-            let grav_angle = (ax / (ax * ax + ay * ay + az * az).sqrt().max(1e-3)).asin();
-            let target_offset = (1.0 - recenter_blend) * roll_angle + recenter_blend * grav_angle;
-            // Pull steering accumulator toward (current - target_offset), i.e.
-            // discount the part of the accumulator the user "meant" to be at
-            // their tilt position. Strength scales how aggressively we pull
-            // per second.
+            // Roll source: controller roll about the forward axis. atan2
+            // of accel_x over accel_z gives a signed angle in radians.
+            let roll_angle = ax.atan2(az);
+            // Gravity source: full-vector projection. asin(ax / |a|) is
+            // the angle between gravity and the controller's Y axis,
+            // signed by the X component. More stable when the controller
+            // is pitched far forward/back than the bare atan2 of x/z.
+            let acc_mag = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
+            let grav_angle = (ax / acc_mag).clamp(-1.0, 1.0).asin();
+            let target = (1.0 - recenter_blend) * roll_angle + recenter_blend * grav_angle;
             let alpha = (recenter_strength * dt).clamp(0.0, 1.0);
-            state.aux_f32[0] -= alpha * target_offset;
+            state.aux_f32[0] += alpha * (target - state.aux_f32[0]);
         }
 
         // Reset edge: start an ease-in toward zero. While ease-in > 0 we
@@ -3170,7 +3182,7 @@ fn compute_gyro_3dof(
         if state.aux_f32[6] > 0.001 && ease_in > 0.001 {
             let step = (dt / ease_in).clamp(0.0, 1.0);
             state.aux_f32[0] *= 1.0 - step;
-            if !exclude_y { state.aux_f32[1] *= 1.0 - step; }
+            state.aux_f32[1] *= 1.0 - step;
             state.aux_f32[6] = (state.aux_f32[6] - step).max(0.0);
         } else if reset_edge && ease_in <= 0.001 {
             state.aux_f32[0] = 0.0;
@@ -3179,7 +3191,7 @@ fn compute_gyro_3dof(
         }
 
         let x_out = state.aux_f32[0];
-        let y_out = if exclude_y { raw_y } else { state.aux_f32[1] };
+        let y_out = if exclude_y { 0.0 } else { state.aux_f32[1] };
         (x_out, y_out)
     } else {
         // Pointer family: pass-through angular velocity (or projected component).

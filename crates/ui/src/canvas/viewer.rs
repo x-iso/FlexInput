@@ -3799,7 +3799,7 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     if ui.checkbox(&mut exclude_y, egui::RichText::new("excl. Y").small())
-                        .on_hover_text("Y pass-through angular velocity instead of being integrated.\nUseful for steer-yaw / look-pitch combos.")
+                        .on_hover_text("Suppress the Y steering output (keeps Y at 0).\nUseful when only the X axis matters — e.g. a steering wheel\nwhere pitching the controller shouldn't move Y.")
                         .changed() { changed = true; }
                     ui.label(egui::RichText::new("re-center").small().weak())
                         .on_hover_text("How aggressively the steering accumulator is pulled toward\nthe accelerometer-implied centered position. 0 = off.");
