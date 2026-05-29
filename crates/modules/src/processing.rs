@@ -372,9 +372,11 @@ impl Module for Gyro3DOFModule {
                 PinDescriptor::new("Accel Z", SignalType::Float).optional(),
             ],
             outputs: vec![
-                PinDescriptor::new("Out", SignalType::Vec2),
-                PinDescriptor::new("X",   SignalType::Float),
-                PinDescriptor::new("Y",   SignalType::Float),
+                PinDescriptor::new("Out",   SignalType::Vec2),
+                PinDescriptor::new("X",     SignalType::Float),
+                PinDescriptor::new("Y",     SignalType::Float),
+                PinDescriptor::new("Lean",  SignalType::Float),
+                PinDescriptor::new("Lean!", SignalType::Bool),
             ],
         }
     }

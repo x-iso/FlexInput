@@ -507,7 +507,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // Rendered ABOVE the "Auto-Map" label so the AutoMap pin (Y =
             // bottom-of-header) sits in line with the label, not crowded
             // against the slider.
-            // Logarithmic 0..3000; double-click on the slider track resets
+            // Linear 0..3000; double-click on the slider track resets
             // to the global default (Settings → Device defaults).
             // Double-click on the value box keeps egui's inline-edit behavior.
             if is_keymouse_sink {
@@ -517,8 +517,6 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 ui.horizontal(|ui| {
                     slider_label(ui, "Mouse ×", LABEL_CELL_W);
                     let resp = ui.add(egui::Slider::new(&mut ms_edit, 0.0_f32..=3000.0)
-                        .logarithmic(true)
-                        .smallest_positive(0.01)
                         .show_value(false)
                         .clamping(egui::SliderClamping::Always));
                     if slider_track_double_clicked(ui, &resp) { ms_edit = self.param_defaults.mouse_sensitivity; }
@@ -3688,30 +3686,65 @@ fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, sn
     if let Some(r) = preview_rect { register_exposable_element(ui, node_id, "preview", r); }
 }
 
-fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (mode, inv_yaw, inv_pitch, inv_roll, inv_ax, inv_ay, inv_az, out_x, out_y) =
-        snarl.get_node(node_id).map(|n| {
-            let mode      = n.params.get("mode")      .and_then(|v| v.as_str()) .unwrap_or("local").to_string();
-            let inv_yaw   = n.params.get("inv_yaw")   .and_then(|v| v.as_bool()).unwrap_or(false);
-            let inv_pitch = n.params.get("inv_pitch")  .and_then(|v| v.as_bool()).unwrap_or(false);
-            let inv_roll  = n.params.get("inv_roll")   .and_then(|v| v.as_bool()).unwrap_or(false);
-            let inv_ax    = n.params.get("inv_accel_x").and_then(|v| v.as_bool()).unwrap_or(false);
-            let inv_ay    = n.params.get("inv_accel_y").and_then(|v| v.as_bool()).unwrap_or(false);
-            let inv_az    = n.params.get("inv_accel_z").and_then(|v| v.as_bool()).unwrap_or(false);
-            let out_x = if let Some(Some(Signal::Float(f))) = n.extra.last_signals.get(1) { *f } else { 0.0_f32 };
-            let out_y = if let Some(Some(Signal::Float(f))) = n.extra.last_signals.get(2) { *f } else { 0.0_f32 };
-            (mode, inv_yaw, inv_pitch, inv_roll, inv_ax, inv_ay, inv_az, out_x, out_y)
-        }).unwrap_or_default();
+/// Resolve the current (family, axis) tuple from a node, applying legacy
+/// `mode` fallback for patches saved before the split.
+fn gyro_read_family_axis(n: &NodeData) -> (String, String) {
+    if let Some(fam) = n.params.get("family").and_then(|v| v.as_str()) {
+        let axis = n.params.get("axis").and_then(|v| v.as_str()).unwrap_or("pitch_yaw");
+        return (fam.to_string(), axis.to_string());
+    }
+    match n.params.get("mode").and_then(|v| v.as_str()).unwrap_or("local") {
+        "player" => ("pointer".into(),  "player".into()),
+        "world"  => ("pointer".into(),  "world".into()),
+        "laser"  => ("steering".into(), "pitch_yaw".into()),
+        _        => ("pointer".into(),  "pitch_yaw".into()),
+    }
+}
 
-    let mut mode      = mode;
+const GYRO_AXIS_OPTIONS: [(&str, &str); 4] = [
+    ("pitch_yaw",  "Pitch+Yaw"),
+    ("pitch_roll", "Pitch+Roll"),
+    ("player",     "Player"),
+    ("world",      "World"),
+];
+
+fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let snap = snarl.get_node(node_id);
+    let (family, axis)       = snap.map(gyro_read_family_axis).unwrap_or_else(|| ("pointer".into(), "pitch_yaw".into()));
+    let inv_yaw   = snap.and_then(|n| n.params.get("inv_yaw")   .and_then(|v| v.as_bool())).unwrap_or(false);
+    let inv_pitch = snap.and_then(|n| n.params.get("inv_pitch")  .and_then(|v| v.as_bool())).unwrap_or(false);
+    let inv_roll  = snap.and_then(|n| n.params.get("inv_roll")   .and_then(|v| v.as_bool())).unwrap_or(false);
+    let inv_ax    = snap.and_then(|n| n.params.get("inv_accel_x").and_then(|v| v.as_bool())).unwrap_or(false);
+    let inv_ay    = snap.and_then(|n| n.params.get("inv_accel_y").and_then(|v| v.as_bool())).unwrap_or(false);
+    let inv_az    = snap.and_then(|n| n.params.get("inv_accel_z").and_then(|v| v.as_bool())).unwrap_or(false);
+    let exclude_y = snap.and_then(|n| n.params.get("steering_exclude_y").and_then(|v| v.as_bool())).unwrap_or(false);
+    let recenter_blend    = snap.and_then(|n| n.params.get("recenter_blend").and_then(|v| v.as_f64())).unwrap_or(0.5) as f32;
+    let recenter_strength = snap.and_then(|n| n.params.get("recenter_strength").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
+    let reset_ease_in     = snap.and_then(|n| n.params.get("reset_ease_in").and_then(|v| v.as_f64())).unwrap_or(0.25) as f32;
+    let spike_suppress    = snap.and_then(|n| n.params.get("spike_suppress").and_then(|v| v.as_bool())).unwrap_or(false);
+    let spike_k           = snap.and_then(|n| n.params.get("spike_k").and_then(|v| v.as_f64())).unwrap_or(4.0) as f32;
+    let lean_threshold    = snap.and_then(|n| n.params.get("lean_threshold").and_then(|v| v.as_f64())).unwrap_or(0.3) as f32;
+    let out_x = snap.and_then(|n| match n.extra.last_signals.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
+    let out_y = snap.and_then(|n| match n.extra.last_signals.get(2) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
+    let lean_v = snap.and_then(|n| match n.extra.last_signals.get(3) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
+
+    let mut family = family;
+    let mut axis = axis;
     let mut inv_gyro  = [inv_yaw, inv_pitch, inv_roll];
     let mut inv_accel = [inv_ax, inv_ay, inv_az];
+    let mut exclude_y = exclude_y;
+    let mut recenter_blend = recenter_blend;
+    let mut recenter_strength = recenter_strength;
+    let mut reset_ease_in = reset_ease_in;
+    let mut spike_suppress = spike_suppress;
+    let mut spike_k = spike_k;
+    let mut lean_threshold = lean_threshold;
     let mut changed   = false;
 
     const GYR_LABELS: [(&str, &str); 3] = [
         ("yaw",   "gyro_z — invert if rotating right gives negative X\n(expected: right = positive X)"),
         ("pitch", "gyro_y — invert if tilting up gives negative Y\n(expected: up = positive Y)"),
-        ("roll",  "gyro_x — only affects Player/World space gravity correction"),
+        ("roll",  "gyro_x — affects Lean output and Player/World gravity correction"),
     ];
     const ACC_LABELS: [(&str, &str); 3] = [
         ("X",  "accel_x — invert if Player/World horizontal correction is backwards"),
@@ -3719,19 +3752,73 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
         ("+Z", "accel_z — expected POSITIVE when controller is held flat face-up (≈ +1 G).\nInvert if your device reports negative when flat."),
     ];
 
-    let mut mode_rect: Option<egui::Rect> = None;
-    let mut gyr_rect:  Option<egui::Rect> = None;
-    let mut acc_rect:  Option<egui::Rect> = None;
+    // Helper that draws a 4-button mode picker. Returns true if a selection
+    // change occurred; updates `family` and `axis` in place.
+    let mut draw_mode_row = |ui: &mut egui::Ui, label: &str, target_family: &str,
+                              family: &mut String, axis: &mut String| -> bool {
+        let mut row_changed = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.label(egui::RichText::new(label).small().weak());
+            for (id, lbl) in GYRO_AXIS_OPTIONS {
+                let selected = family == target_family && axis == id;
+                if ui.selectable_label(selected, egui::RichText::new(lbl).small()).clicked() {
+                    *family = target_family.to_string();
+                    *axis   = id.to_string();
+                    row_changed = true;
+                }
+            }
+        });
+        row_changed
+    };
+
+    let mut pointer_rect:  Option<egui::Rect> = None;
+    let mut steering_rect: Option<egui::Rect> = None;
+    let mut stopts_rect:   Option<egui::Rect> = None;
+    let mut spike_rect:    Option<egui::Rect> = None;
+    let mut gyr_rect:      Option<egui::Rect> = None;
+    let mut acc_rect:      Option<egui::Rect> = None;
+    let mut lean_rect:     Option<egui::Rect> = None;
+
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
 
-        let r = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for (label, id) in [("Local", "local"), ("Player", "player"), ("World", "world"), ("Laser", "laser")] {
-                changed |= ui.selectable_value(&mut mode, id.to_string(), egui::RichText::new(label).small()).changed();
-            }
+        let r = ui.scope(|ui| {
+            if draw_mode_row(ui, "Pointer:", "pointer", &mut family, &mut axis) { changed = true; }
         });
-        mode_rect = Some(r.response.rect);
+        pointer_rect = Some(r.response.rect);
+
+        let r = ui.scope(|ui| {
+            if draw_mode_row(ui, "Steering:", "steering", &mut family, &mut axis) { changed = true; }
+        });
+        steering_rect = Some(r.response.rect);
+
+        // Steering-only options. Grayed when family != steering.
+        let r = ui.scope(|ui| {
+            ui.add_enabled_ui(family == "steering", |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if ui.checkbox(&mut exclude_y, egui::RichText::new("excl. Y").small())
+                        .on_hover_text("Y pass-through angular velocity instead of being integrated.\nUseful for steer-yaw / look-pitch combos.")
+                        .changed() { changed = true; }
+                    ui.label(egui::RichText::new("re-center").small().weak())
+                        .on_hover_text("How aggressively the steering accumulator is pulled toward\nthe accelerometer-implied centered position. 0 = off.");
+                    if ui.add(egui::DragValue::new(&mut recenter_strength)
+                        .speed(0.05).range(0.0..=4.0).suffix(" /s"))
+                        .changed() { changed = true; }
+                    ui.label(egui::RichText::new("blend").small().weak())
+                        .on_hover_text("0 = use controller roll angle only\n1 = use full-vector gravity projection only\n0.5 = blend both equally");
+                    if ui.add(egui::Slider::new(&mut recenter_blend, 0.0..=1.0).show_value(false))
+                        .changed() { changed = true; }
+                    ui.label(egui::RichText::new("ease").small().weak())
+                        .on_hover_text("Reset eases steering toward 0 over this many seconds.");
+                    if ui.add(egui::DragValue::new(&mut reset_ease_in)
+                        .speed(0.05).range(0.0..=2.0).suffix(" s"))
+                        .changed() { changed = true; }
+                });
+            });
+        });
+        stopts_rect = Some(r.response.rect);
 
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
@@ -3755,21 +3842,140 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
         });
         acc_rect = Some(r.response.rect);
 
+        // Spike filter row.
+        let r = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ui.checkbox(&mut spike_suppress, egui::RichText::new("suppress outlier spikes").small())
+                .on_hover_text("Replace single-sample outliers with the rolling median.\nUseful when gyro/accel produce occasional bad samples.")
+                .changed() { changed = true; }
+            ui.add_enabled_ui(spike_suppress, |ui| {
+                ui.label(egui::RichText::new("k").small().weak())
+                    .on_hover_text("Hampel sensitivity threshold (multiplier of robust stddev).\nLower = more aggressive, higher = only extreme spikes.");
+                if ui.add(egui::DragValue::new(&mut spike_k)
+                    .speed(0.1).range(1.0..=12.0))
+                    .changed() { changed = true; }
+            });
+        });
+        spike_rect = Some(r.response.rect);
+
+        // Lean threshold + live readout.
+        let r = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(egui::RichText::new("Lean threshold").small().weak())
+                .on_hover_text("|Lean| ≥ threshold triggers the Lean! Bool output.");
+            if ui.add(egui::DragValue::new(&mut lean_threshold)
+                .speed(0.02).range(0.01..=4.0))
+                .changed() { changed = true; }
+            ui.label(egui::RichText::new(format!("({:+.2})", lean_v)).small().weak());
+        });
+        lean_rect = Some(r.response.rect);
+
         ui.label(egui::RichText::new(format!("X:{:+.3}  Y:{:+.3}", out_x, out_y)).small().weak());
+
+        // Lean mapping cards — two lists (left / right). The actual card UI
+        // reuses the Map Action card via a helper so we keep one source of
+        // truth for press-mode / settings layout.
+        ui.separator();
+        show_gyro_lean_mapping_section(node_id, ui, snarl, "left",  &mut changed);
+        show_gyro_lean_mapping_section(node_id, ui, snarl, "right", &mut changed);
     });
-    if let Some(r) = mode_rect { register_exposable_element(ui, node_id, "mode",         r); }
-    if let Some(r) = gyr_rect  { register_exposable_element(ui, node_id, "gyro_invert",  r); }
-    if let Some(r) = acc_rect  { register_exposable_element(ui, node_id, "accel_invert", r); }
+
+    if let Some(r) = pointer_rect  { register_exposable_element(ui, node_id, "pointer_mode",  r); }
+    if let Some(r) = steering_rect { register_exposable_element(ui, node_id, "steering_mode", r); }
+    if let Some(r) = stopts_rect   { register_exposable_element(ui, node_id, "steering_opts", r); }
+    if let Some(r) = spike_rect    { register_exposable_element(ui, node_id, "spike_filter",  r); }
+    if let Some(r) = gyr_rect      { register_exposable_element(ui, node_id, "gyro_invert",   r); }
+    if let Some(r) = acc_rect      { register_exposable_element(ui, node_id, "accel_invert",  r); }
+    if let Some(r) = lean_rect     { register_exposable_element(ui, node_id, "lean_threshold", r); }
 
     if changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("mode".into(),       Value::String(mode));
-            node.params.insert("inv_yaw".into(),    Value::Bool(inv_gyro[0]));
-            node.params.insert("inv_pitch".into(),  Value::Bool(inv_gyro[1]));
-            node.params.insert("inv_roll".into(),   Value::Bool(inv_gyro[2]));
-            node.params.insert("inv_accel_x".into(),Value::Bool(inv_accel[0]));
-            node.params.insert("inv_accel_y".into(),Value::Bool(inv_accel[1]));
-            node.params.insert("inv_accel_z".into(),Value::Bool(inv_accel[2]));
+            node.params.insert("family".into(),         Value::String(family));
+            node.params.insert("axis".into(),           Value::String(axis));
+            // Strip the legacy `mode` key so it can't drift out of sync.
+            node.params.remove("mode");
+            node.params.insert("inv_yaw".into(),        Value::Bool(inv_gyro[0]));
+            node.params.insert("inv_pitch".into(),      Value::Bool(inv_gyro[1]));
+            node.params.insert("inv_roll".into(),       Value::Bool(inv_gyro[2]));
+            node.params.insert("inv_accel_x".into(),    Value::Bool(inv_accel[0]));
+            node.params.insert("inv_accel_y".into(),    Value::Bool(inv_accel[1]));
+            node.params.insert("inv_accel_z".into(),    Value::Bool(inv_accel[2]));
+            node.params.insert("steering_exclude_y".into(),
+                Value::Bool(exclude_y));
+            node.params.insert("recenter_blend".into(),
+                serde_json::Number::from_f64(recenter_blend as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("recenter_strength".into(),
+                serde_json::Number::from_f64(recenter_strength as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("reset_ease_in".into(),
+                serde_json::Number::from_f64(reset_ease_in as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("spike_suppress".into(), Value::Bool(spike_suppress));
+            node.params.insert("spike_k".into(),
+                serde_json::Number::from_f64(spike_k as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("lean_threshold".into(),
+                serde_json::Number::from_f64(lean_threshold as f64).map(Value::Number).unwrap_or(Value::Null));
+        }
+    }
+}
+
+/// Render one of the two lean mapping lists (left / right). Mappings are
+/// stored on the node as `lean_left` / `lean_right` arrays of objects shaped
+/// like Map Action mappings (`{ in: [pin_id...], mode, window_ms, sustain,
+/// turbo }`). For now we keep it dead-simple: a "Learn"-style Add button
+/// would be ideal but isn't wired up yet — users build mappings by editing
+/// the params directly through Map Action wires elsewhere.
+fn show_gyro_lean_mapping_section(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    side: &'static str,
+    changed: &mut bool,
+) {
+    let key = if side == "left" { "lean_left" } else { "lean_right" };
+    let title = if side == "left" { "Lean Left → " } else { "Lean Right → " };
+
+    let mappings: Vec<Value> = snarl.get_node(node_id)
+        .and_then(|n| n.params.get(key).and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).small().weak());
+        ui.label(egui::RichText::new(format!("({})", mappings.len())).small().weak());
+        if ui.small_button("+").on_hover_text("Add an empty mapping row\n(edit pins via direct AutoMap wires)").clicked() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let mut arr = node.params.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let mut obj = serde_json::Map::new();
+                obj.insert("in".into(), Value::Array(vec![]));
+                arr.push(Value::Object(obj));
+                node.params.insert(key.into(), Value::Array(arr));
+                *changed = true;
+            }
+        }
+    });
+
+    if mappings.is_empty() { return; }
+    let mut to_remove: Option<usize> = None;
+    for (i, m) in mappings.iter().enumerate() {
+        let pins: Vec<String> = m.as_object()
+            .and_then(|o| o.get("in").and_then(|v| v.as_array()))
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            if ui.small_button("×").on_hover_text("Remove this mapping").clicked() {
+                to_remove = Some(i);
+            }
+            if pins.is_empty() {
+                ui.label(egui::RichText::new("(no pins)").small().weak());
+            } else {
+                ui.label(egui::RichText::new(pins.join(" + ")).small());
+            }
+        });
+    }
+    if let Some(idx) = to_remove {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            if let Some(Value::Array(arr)) = node.params.get_mut(key) {
+                if idx < arr.len() { arr.remove(idx); }
+                *changed = true;
+            }
         }
     }
 }
@@ -4981,9 +5187,28 @@ fn render_pinned_element(
             show_svg_body_sized(inner_id, ui, inner_snarl, container_size);
             return;
         }
-        // Gyro 3DOF — three pinable rows.
-        ("processing.gyro_3dof", "mode") => {
-            render_gyro_mode_row(inner_id, ui, inner_snarl, container_size);
+        // Gyro 3DOF — pinable rows.
+        // Legacy "mode" stays mapped to the new pointer-mode renderer so
+        // patches saved before the split keep their pin working.
+        ("processing.gyro_3dof", "mode") |
+        ("processing.gyro_3dof", "pointer_mode") => {
+            render_gyro_mode_row(inner_id, ui, inner_snarl, container_size, "pointer");
+            return;
+        }
+        ("processing.gyro_3dof", "steering_mode") => {
+            render_gyro_mode_row(inner_id, ui, inner_snarl, container_size, "steering");
+            return;
+        }
+        ("processing.gyro_3dof", "steering_opts") => {
+            render_gyro_steering_opts_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("processing.gyro_3dof", "spike_filter") => {
+            render_gyro_spike_filter_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("processing.gyro_3dof", "lean_threshold") => {
+            render_gyro_lean_threshold_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
         ("processing.gyro_3dof", "gyro_invert") => {
@@ -5986,22 +6211,120 @@ fn render_label_text_pinned_scroll(
 
 // ── Gyro 3DOF row renderers ──────────────────────────────────────────────────
 
-fn render_gyro_mode_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
-    let mut mode = snarl.get_node(inner_id)
-        .and_then(|n| n.params.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()))
-        .unwrap_or_else(|| "local".to_string());
+fn render_gyro_mode_row(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+    target_family: &str,
+) {
+    let (cur_family, cur_axis) = snarl.get_node(inner_id)
+        .map(gyro_read_family_axis)
+        .unwrap_or_else(|| ("pointer".into(), "pitch_yaw".into()));
+    let mut family = cur_family;
+    let mut axis = cur_axis;
     let mut changed = false;
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(190.0, 22.0));
+    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        for (label, id) in [("Local", "local"), ("Player", "player"), ("World", "world"), ("Laser", "laser")] {
-            changed |= ui.selectable_value(&mut mode, id.to_string(), egui::RichText::new(label)).changed();
+        for (id, lbl) in GYRO_AXIS_OPTIONS {
+            let selected = family == target_family && axis == id;
+            if ui.selectable_label(selected, egui::RichText::new(lbl)).clicked() {
+                family = target_family.to_string();
+                axis   = id.to_string();
+                changed = true;
+            }
         }
     });
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
-            node.params.insert("mode".into(), Value::String(mode));
+            node.params.insert("family".into(), Value::String(family));
+            node.params.insert("axis".into(),   Value::String(axis));
+            node.params.remove("mode");
+        }
+    }
+}
+
+fn render_gyro_steering_opts_row(
+    inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+) {
+    let snap = snarl.get_node(inner_id);
+    let mut exclude_y = snap.and_then(|n| n.params.get("steering_exclude_y").and_then(|v| v.as_bool())).unwrap_or(false);
+    let mut blend     = snap.and_then(|n| n.params.get("recenter_blend").and_then(|v| v.as_f64())).unwrap_or(0.5) as f32;
+    let mut strength  = snap.and_then(|n| n.params.get("recenter_strength").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
+    let mut ease      = snap.and_then(|n| n.params.get("reset_ease_in").and_then(|v| v.as_f64())).unwrap_or(0.25) as f32;
+    let mut changed = false;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(260.0, 22.0));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        changed |= ui.checkbox(&mut exclude_y, egui::RichText::new("excl. Y")).changed();
+        ui.label(egui::RichText::new("re-center").weak());
+        changed |= ui.add(egui::DragValue::new(&mut strength).speed(0.05).range(0.0..=4.0).suffix(" /s")).changed();
+        ui.label(egui::RichText::new("blend").weak());
+        changed |= ui.add(egui::Slider::new(&mut blend, 0.0..=1.0).show_value(false)).changed();
+        ui.label(egui::RichText::new("ease").weak());
+        changed |= ui.add(egui::DragValue::new(&mut ease).speed(0.05).range(0.0..=2.0).suffix(" s")).changed();
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("steering_exclude_y".into(), Value::Bool(exclude_y));
+            node.params.insert("recenter_blend".into(),
+                serde_json::Number::from_f64(blend as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("recenter_strength".into(),
+                serde_json::Number::from_f64(strength as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("reset_ease_in".into(),
+                serde_json::Number::from_f64(ease as f64).map(Value::Number).unwrap_or(Value::Null));
+        }
+    }
+}
+
+fn render_gyro_spike_filter_row(
+    inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+) {
+    let snap = snarl.get_node(inner_id);
+    let mut suppress = snap.and_then(|n| n.params.get("spike_suppress").and_then(|v| v.as_bool())).unwrap_or(false);
+    let mut k        = snap.and_then(|n| n.params.get("spike_k").and_then(|v| v.as_f64())).unwrap_or(4.0) as f32;
+    let mut changed = false;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(180.0, 22.0));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        changed |= ui.checkbox(&mut suppress, egui::RichText::new("suppress spikes")).changed();
+        ui.add_enabled_ui(suppress, |ui| {
+            ui.label(egui::RichText::new("k").weak());
+            changed |= ui.add(egui::DragValue::new(&mut k).speed(0.1).range(1.0..=12.0)).changed();
+        });
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("spike_suppress".into(), Value::Bool(suppress));
+            node.params.insert("spike_k".into(),
+                serde_json::Number::from_f64(k as f64).map(Value::Number).unwrap_or(Value::Null));
+        }
+    }
+}
+
+fn render_gyro_lean_threshold_row(
+    inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+) {
+    let snap = snarl.get_node(inner_id);
+    let mut threshold = snap.and_then(|n| n.params.get("lean_threshold").and_then(|v| v.as_f64())).unwrap_or(0.3) as f32;
+    let lean_v = snap.and_then(|n| match n.extra.last_signals.get(3) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
+    let mut changed = false;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(180.0, 22.0));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(egui::RichText::new("Lean").weak());
+        changed |= ui.add(egui::DragValue::new(&mut threshold).speed(0.02).range(0.01..=4.0)).changed();
+        ui.label(egui::RichText::new(format!("({:+.2})", lean_v)).weak());
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("lean_threshold".into(),
+                serde_json::Number::from_f64(threshold as f64).map(Value::Number).unwrap_or(Value::Null));
         }
     }
 }

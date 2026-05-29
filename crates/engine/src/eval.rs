@@ -2945,6 +2945,61 @@ fn compute_counter(
     vec![Some(Signal::Float(output))]
 }
 
+// ─── Hampel-style outlier suppression ────────────────────────────────────────
+// State layout per axis (6 axes: gx, gy, gz, ax, ay, az):
+//   `dc_fast` and `dc_estimates` are NOT used here — we reuse `avg_bufs` to
+//   hold rolling-window samples per axis. Index 0..6 maps to gx, gy, gz, ax,
+//   ay, az respectively. This keeps state lean without adding new fields.
+const SPIKE_WINDOW: usize = 20;
+const SPIKE_DEFAULT_K: f32 = 4.0;
+
+fn spike_filter(buf: &mut VecDeque<f32>, sample: f32, k: f32) -> f32 {
+    // Push and trim — we work with the buffer BEFORE the new sample so the
+    // median/MAD reference is the recent past, not the current sample itself.
+    if buf.len() < 4 {
+        // Not enough history yet; pass through and accumulate.
+        buf.push_back(sample);
+        if buf.len() > SPIKE_WINDOW { buf.pop_front(); }
+        return sample;
+    }
+    let mut sorted: Vec<f32> = buf.iter().copied().collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let mut dev: Vec<f32> = sorted.iter().map(|x| (x - median).abs()).collect();
+    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = dev[dev.len() / 2];
+    // 1.4826 turns MAD into a robust stddev estimate for normal-ish signals.
+    let sigma = mad * 1.4826;
+    let threshold = (k * sigma).max(1e-4); // never collapse to zero
+    let out = if (sample - median).abs() > threshold { median } else { sample };
+    buf.push_back(out);
+    if buf.len() > SPIKE_WINDOW { buf.pop_front(); }
+    out
+}
+
+/// Translate legacy `mode` strings to the new (family, axis) split so saved
+/// patches keep working without manual migration.
+fn gyro_resolve_mode(params: &HashMap<String, Value>) -> (&'static str, &'static str) {
+    if let Some(family) = params.get("family").and_then(|v| v.as_str()) {
+        let axis = params.get("axis").and_then(|v| v.as_str()).unwrap_or("pitch_yaw");
+        let f: &'static str = match family { "steering" => "steering", _ => "pointer" };
+        let a: &'static str = match axis {
+            "pitch_roll" => "pitch_roll",
+            "player"     => "player",
+            "world"      => "world",
+            _            => "pitch_yaw",
+        };
+        return (f, a);
+    }
+    // Legacy fallback: old `mode` string.
+    match params.get("mode").and_then(|v| v.as_str()).unwrap_or("local") {
+        "player" => ("pointer",  "player"),
+        "world"  => ("pointer",  "world"),
+        "laser"  => ("steering", "pitch_yaw"),
+        _        => ("pointer",  "pitch_yaw"),
+    }
+}
+
 fn compute_gyro_3dof(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
@@ -2953,14 +3008,19 @@ fn compute_gyro_3dof(
     collector_sigs: &HashMap<(String, String), Signal>,
     dt: f32,
 ) -> Vec<Option<Signal>> {
-    let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("local");
+    let (family, axis) = gyro_resolve_mode(params);
 
     let inv = |name: &str| -> f32 {
         if params.get(name).and_then(|v| v.as_bool()).unwrap_or(false) { -1.0 } else { 1.0 }
     };
+    let pf = |name: &str, default: f32| -> f32 {
+        params.get(name).and_then(|v| v.as_f64()).map(|x| x as f32).unwrap_or(default)
+    };
+    let pb = |name: &str, default: bool| -> bool {
+        params.get(name).and_then(|v| v.as_bool()).unwrap_or(default)
+    };
 
     // Auto-map path: read all six axes from the connected device.
-    // If upstream is a fork/selector/collector, read from collector_sigs first.
     let (gx_am, gy_am, gz_am, ax_am, ay_am, az_am) =
         if let Some(dev_id) = params.get("_automap_device_id").and_then(|v| v.as_str()) {
             let collector_id = params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2999,37 +3059,53 @@ fn compute_gyro_3dof(
         };
 
     // Direct pin overrides (inputs 2–7: Gyro X/Y/Z, Accel X/Y/Z).
-    // A wired pin supersedes the auto-map value for that axis only.
     let pin_or = |idx: usize, fallback: f32| -> f32 {
         if inputs.get(idx).and_then(|s| *s).is_some() { get_f(inputs, idx, fallback) } else { fallback }
     };
-    let gx = pin_or(2, gx_am) * inv("inv_roll");
-    let gy = pin_or(3, gy_am);   // pitch inversion applied to out_y below
-    let gz = pin_or(4, gz_am);   // yaw   inversion applied to out_x below
-    let ax = pin_or(5, ax_am) * inv("inv_accel_x");
-    let ay = pin_or(6, ay_am) * inv("inv_accel_y");
-    let az = pin_or(7, az_am) * inv("inv_accel_z");
+    let mut gx = pin_or(2, gx_am) * inv("inv_roll");
+    let mut gy = pin_or(3, gy_am);
+    let mut gz = pin_or(4, gz_am);
+    let mut ax = pin_or(5, ax_am) * inv("inv_accel_x");
+    let mut ay = pin_or(6, ay_am) * inv("inv_accel_y");
+    let mut az = pin_or(7, az_am) * inv("inv_accel_z");
 
-    // aux_f32: [0]=laser_x, [1]=laser_y, [2]=smooth_gvx, [3]=smooth_gvy, [4]=smooth_gvz, [5]=prev_reset
-    while state.aux_f32.len() < 6 { state.aux_f32.push(0.0); }
+    // Optional outlier-spike suppression. Uses `state.avg_bufs` slots 0..6
+    // for per-axis history (`avg_bufs[0]` = gx, `[1]` = gy, etc.).
+    if pb("spike_suppress", false) {
+        let k = pf("spike_k", SPIKE_DEFAULT_K).clamp(1.0, 12.0);
+        while state.avg_bufs.len() < 6 { state.avg_bufs.push(VecDeque::with_capacity(SPIKE_WINDOW)); }
+        gx = spike_filter(&mut state.avg_bufs[0], gx, k);
+        gy = spike_filter(&mut state.avg_bufs[1], gy, k);
+        gz = spike_filter(&mut state.avg_bufs[2], gz, k);
+        ax = spike_filter(&mut state.avg_bufs[3], ax, k);
+        ay = spike_filter(&mut state.avg_bufs[4], ay, k);
+        az = spike_filter(&mut state.avg_bufs[5], az, k);
+    }
 
-    // Laser reset: inputs[1] is the optional Reset bool pin.
-    let reset_now = get_b(inputs, 1, false);
-    let reset_edge = reset_now && state.aux_f32[5] < 0.5;
-    state.aux_f32[5] = if reset_now { 1.0 } else { 0.0 };
-    if reset_edge { state.aux_f32[0] = 0.0; state.aux_f32[1] = 0.0; }
+    // aux_f32 layout:
+    //   [0] integrated steering X
+    //   [1] integrated steering Y
+    //   [2] smoothed gravity X (player/world)
+    //   [3] smoothed gravity Y
+    //   [4] smoothed gravity Z
+    //   [5] prev_reset edge guard
+    //   [6] ease-in residual (0..1 progresses while resetting)
+    while state.aux_f32.len() < 7 { state.aux_f32.push(0.0); }
 
-    let (out_x_raw, out_y_raw) = match mode {
+    // ── Axis selection: decide which gyro components feed X / Y / Lean ────
+    //
+    // For Player/World we project gyro onto the gravity-corrected frame.
+    // For Pitch+Yaw and Pitch+Roll, the lean axis is the unused rotation:
+    //   Pitch+Yaw  → lean = roll  (gx)
+    //   Pitch+Roll → lean = yaw   (gz)
+    //   Player/World → lean = component of gyro along the gravity-perpendicular
+    //                          axis (we use gx for now — controller-roll proxy)
+    let (raw_x, raw_y, raw_lean) = match axis {
+        "pitch_roll" => (gx, gy, gz),
         "player" | "world" => {
             let gyro  = glam::Vec3::new(gx, gy, gz);
             let accel = glam::Vec3::new(ax, ay, az);
-
-            // Low-pass filter the gravity estimate so that fast pitch oscillations do not
-            // alias into g_hat, which would cause world_yaw = dot(gyro, g_hat) to oscillate
-            // at 2× the pitch frequency — the "figure-8" Lissajous artifact.
-            // Player: 1 s time constant tracks slow resting-orientation changes.
-            // World:  3 s time constant gives a very stable reference frame.
-            let tau = if mode == "world" { 3.0_f32 } else { 1.0_f32 };
+            let tau = if axis == "world" { 3.0_f32 } else { 1.0_f32 };
             let alpha = 1.0 - (-dt / tau).exp();
             let acc_mag = accel.length();
             if acc_mag > 0.01 {
@@ -3041,28 +3117,91 @@ fn compute_gyro_3dof(
             let sg = glam::Vec3::new(state.aux_f32[2], state.aux_f32[3], state.aux_f32[4]);
             let sg_len = sg.length();
             let g_hat = if sg_len > 0.01 { sg / sg_len } else { glam::Vec3::new(0.0, 0.0, 1.0) };
-
             let world_yaw   = gyro.dot(g_hat);
             let gyro_no_yaw = gyro - world_yaw * g_hat;
-            (world_yaw, gyro_no_yaw.y)
+            (world_yaw, gyro_no_yaw.y, gx)
         }
-        "laser" => {
-            state.aux_f32[0] += gz * dt;
-            state.aux_f32[1] += gy * dt;
-            (state.aux_f32[0], state.aux_f32[1])
-        }
-        _ => (gz, gy), // "local": gz=yaw→X, gy=pitch→Y
+        _ => (gz, gy, gx), // pitch_yaw: gz=yaw→X, gy=pitch→Y, gx=roll→Lean
     };
 
-    // Apply yaw/pitch inversions to final output only (not inside the dot-product math).
-    let out_x = out_x_raw * inv("inv_yaw");
-    let out_y = out_y_raw * inv("inv_pitch");
+    // ── Steering integration + auto-recentering ───────────────────────────
+    let reset_now = get_b(inputs, 1, false);
+    let reset_edge = reset_now && state.aux_f32[5] < 0.5;
+    state.aux_f32[5] = if reset_now { 1.0 } else { 0.0 };
 
-    let out_vec = glam::Vec2::new(out_x, out_y);
+    let (out_x, out_y) = if family == "steering" {
+        let exclude_y = pb("steering_exclude_y", false);
+        let recenter_blend = pf("recenter_blend", 0.5).clamp(0.0, 1.0); // 0=roll-only, 1=gravity-only
+        let recenter_strength = pf("recenter_strength", 0.0).clamp(0.0, 4.0); // sec⁻¹ pull rate
+        let ease_in = pf("reset_ease_in", 0.25).clamp(0.0, 2.0);
+
+        // Integrate steering accumulator from the raw rotation axis.
+        state.aux_f32[0] += raw_x * dt;
+        if exclude_y {
+            // Y passes through as instantaneous angular velocity instead.
+            // Useful for "steer-yaw, look-pitch" combo control schemes.
+        } else {
+            state.aux_f32[1] += raw_y * dt;
+        }
+
+        // Auto-centering: derive an "ideal X" the steering should drift
+        // toward, blended from two sources:
+        //   * Roll source: controller roll angle (atan2 of accel.x/accel.z).
+        //     A positive value means the user is tilting the controller
+        //     right; we pull steering toward 0 proportionally to that tilt.
+        //   * Gravity source: full-vector projection — compute the angle of
+        //     accel projected onto the steering plane and pull toward 0
+        //     proportional to how far from "down" the controller is.
+        if recenter_strength > 0.0 {
+            let roll_angle = ax.atan2(az);                      // rad
+            let grav_angle = (ax / (ax * ax + ay * ay + az * az).sqrt().max(1e-3)).asin();
+            let target_offset = (1.0 - recenter_blend) * roll_angle + recenter_blend * grav_angle;
+            // Pull steering accumulator toward (current - target_offset), i.e.
+            // discount the part of the accumulator the user "meant" to be at
+            // their tilt position. Strength scales how aggressively we pull
+            // per second.
+            let alpha = (recenter_strength * dt).clamp(0.0, 1.0);
+            state.aux_f32[0] -= alpha * target_offset;
+        }
+
+        // Reset edge: start an ease-in toward zero. While ease-in > 0 we
+        // blend the steering accumulator toward 0 over `ease_in` seconds.
+        if reset_edge { state.aux_f32[6] = 1.0; }
+        if state.aux_f32[6] > 0.001 && ease_in > 0.001 {
+            let step = (dt / ease_in).clamp(0.0, 1.0);
+            state.aux_f32[0] *= 1.0 - step;
+            if !exclude_y { state.aux_f32[1] *= 1.0 - step; }
+            state.aux_f32[6] = (state.aux_f32[6] - step).max(0.0);
+        } else if reset_edge && ease_in <= 0.001 {
+            state.aux_f32[0] = 0.0;
+            state.aux_f32[1] = 0.0;
+            state.aux_f32[6] = 0.0;
+        }
+
+        let x_out = state.aux_f32[0];
+        let y_out = if exclude_y { raw_y } else { state.aux_f32[1] };
+        (x_out, y_out)
+    } else {
+        // Pointer family: pass-through angular velocity (or projected component).
+        // Reset has no effect — there's no accumulator.
+        (raw_x, raw_y)
+    };
+
+    // Apply yaw/pitch inversions to final output (NOT inside dot-product math).
+    let final_x = out_x * inv("inv_yaw");
+    let final_y = out_y * inv("inv_pitch");
+
+    // ── Lean output: analog magnitude + bool above threshold ──────────────
+    let lean_threshold = pf("lean_threshold", 0.3).clamp(0.01, 4.0);
+    let lean_val = raw_lean;
+    let lean_active = lean_val.abs() >= lean_threshold;
+
     vec![
-        Some(Signal::Vec2(out_vec)),
-        Some(Signal::Float(out_x)),
-        Some(Signal::Float(out_y)),
+        Some(Signal::Vec2(glam::Vec2::new(final_x, final_y))),
+        Some(Signal::Float(final_x)),
+        Some(Signal::Float(final_y)),
+        Some(Signal::Float(lean_val)),
+        Some(Signal::Bool(lean_active)),
     ]
 }
 

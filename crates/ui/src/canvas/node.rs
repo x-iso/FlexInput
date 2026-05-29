@@ -402,9 +402,13 @@ pub fn exposable_elements(module_id: &str) -> &'static [(&'static str, &'static 
         ],
         "display.readout"           => &[("value", "Live value display")],
         "processing.gyro_3dof"      => &[
-            ("mode",         "Mode (Local/Player/World/Laser)"),
-            ("gyro_invert",  "Gyro invert row (yaw/pitch/roll)"),
-            ("accel_invert", "Accel invert row (X/Y/+Z)"),
+            ("pointer_mode",   "Pointer mode (Pitch+Yaw/Pitch+Roll/Player/World)"),
+            ("steering_mode",  "Steering mode (Pitch+Yaw/Pitch+Roll/Player/World)"),
+            ("steering_opts",  "Steering options (excl.Y / re-center / blend / ease)"),
+            ("spike_filter",   "Outlier spike suppression"),
+            ("lean_threshold", "Lean threshold"),
+            ("gyro_invert",    "Gyro invert row (yaw/pitch/roll)"),
+            ("accel_invert",   "Accel invert row (X/Y/+Z)"),
         ],
         "module.average"    => &[
             ("samples",   "Sample count"),
