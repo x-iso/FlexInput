@@ -819,7 +819,6 @@ fn mouse_speed_stack(
     let resp = slider_ui.add_sized(
         [content_w, row2_h],
         egui::Slider::new(&mut ms, 0.0_f32..=3000.0)
-            .logarithmic(true)
             .show_value(false)
             .clamping(egui::SliderClamping::Always),
     );

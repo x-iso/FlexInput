@@ -162,6 +162,17 @@ struct HidEntry {
     /// of `take_event_count`. Used to feed the per-device polling-rate readout
     /// so gyro-only devices (and IMU activity in general) show real Hz.
     event_count: u32,
+    /// Per-axis snap-back spike filter state.
+    /// `spike_anchor` holds the IMU values currently being emitted to the
+    /// engine. `spike_pending` holds the most recently parsed packet,
+    /// deferred by one packet so we can judge whether it was a snap-back
+    /// outlier when the NEXT packet arrives. The filter only acts on the
+    /// six IMU axes; all other fields of `last` are written straight from
+    /// the freshest packet (button state, touchpad, etc).
+    spike_enabled: bool,
+    spike_sensitivity: f32,
+    spike_anchor: Option<HidReading>,
+    spike_pending: Option<HidReading>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -265,6 +276,25 @@ impl GyroManager {
         self.devices.remove(&(vid, pid, idx));
     }
 
+    /// Configure the per-device snap-back spike filter applied at the
+    /// HID polling layer. `sensitivity_pct` is 0..100 (50 = default).
+    /// Has no effect if the device hasn't been opened yet — callers
+    /// should retry on subsequent frames or just call every UI frame.
+    pub fn set_spike_filter(&mut self, vid: u16, pid: u16, idx: usize, on: bool, sensitivity_pct: f32) {
+        if let Some(e) = self.devices.get_mut(&(vid, pid, idx)) {
+            let s = sensitivity_pct.clamp(0.0, 100.0);
+            let changed = e.spike_enabled != on || (e.spike_sensitivity - s).abs() > f32::EPSILON;
+            if changed {
+                e.spike_enabled = on;
+                e.spike_sensitivity = s;
+                if !on {
+                    e.spike_anchor = None;
+                    e.spike_pending = None;
+                }
+            }
+        }
+    }
+
     /// Drains the count of parsed HID reports for `(vid, pid, idx)` since the
     /// previous call. Used by the I/O thread to attribute IMU activity to the
     /// per-device polling-rate readout.
@@ -358,6 +388,10 @@ impl GyroManager {
             out: OutputState::default(),
             output_active: false,
             event_count: 0,
+            spike_enabled: true,
+            spike_sensitivity: 50.0,
+            spike_anchor: None,
+            spike_pending: None,
         })
     }
 
@@ -662,13 +696,124 @@ fn drain_reports(entry: &mut HidEntry) -> bool {
             Err(_) => return false,
             Ok(n) => {
                 if let Some(r) = parse_report(&buf[..n], &mut entry.kind) {
-                    entry.last = r;
                     entry.event_count = entry.event_count.saturating_add(1);
+                    // Filter at the device-poll boundary. Each parsed `r`
+                    // is one true device sample (no engine upsampling),
+                    // so the snap-back rule sees a clean device-rate
+                    // signal. Sticks / buttons / touchpad are NOT
+                    // filtered — only the six IMU axes are touched.
+                    entry.last = if entry.spike_enabled {
+                        apply_spike_filter(entry, r)
+                    } else {
+                        // Filter off: pass through and reset state so a
+                        // future enable doesn't reuse stale anchor.
+                        entry.spike_anchor = None;
+                        entry.spike_pending = None;
+                        r
+                    };
                 }
             }
         }
     }
     true
+}
+
+/// Map 0..100 % sensitivity to a multiplier on the IMU noise floor used to
+/// qualify a packet as an outlier relative to its neighbors. Log-spaced so
+/// the full slider range produces meaningfully different behaviour:
+///   sensitivity = 0     → multiplier = 20  (only catches obvious excursions)
+///   sensitivity = 25    → multiplier ≈ 8.4
+///   sensitivity = 50    → multiplier ≈ 4
+///   sensitivity = 75    → multiplier ≈ 2
+///   sensitivity = 100   → multiplier = 1   (sub-noise spikes)
+fn spike_sensitivity_to_multiplier(sensitivity_pct: f32) -> f32 {
+    let s = (sensitivity_pct / 100.0).clamp(0.0, 1.0);
+    let log_hi = 1.0_f32.ln();   // 0
+    let log_lo = 20.0_f32.ln();
+    (log_lo + (log_hi - log_lo) * s).exp()
+}
+
+/// Per-axis outlier check on a (anchor, pending, arrival) triple.
+///
+/// Conceptual model: the "expected" trajectory at the pending packet is the
+/// linear interpolation between its neighbors (= the midpoint, since they
+/// are equally-spaced in time). If pending is far from that midpoint AND
+/// its neighbors are mutually consistent (small delta between anchor and
+/// arrival), pending is an outlier.
+///
+/// This is more robust than the original "pending must snap back to anchor"
+/// rule, which failed during real motion because the anchor itself drifts
+/// between packets. Here we compare pending to the LOCAL TRAJECTORY rather
+/// than a fixed point.
+///
+/// Returns `pending` value with each axis individually replaced by the
+/// midpoint when an outlier is detected.
+fn apply_spike_filter(entry: &mut HidEntry, arrival: HidReading) -> HidReading {
+    // Warmup: first packet — seed anchor only, return it unchanged.
+    if entry.spike_anchor.is_none() {
+        entry.spike_anchor = Some(arrival);
+        return arrival;
+    }
+    // Second packet — establish pending. Emit the anchor while we wait
+    // for the third packet to judge `pending`. (One-packet output delay.)
+    if entry.spike_pending.is_none() {
+        let anchor = entry.spike_anchor.unwrap();
+        entry.spike_pending = Some(arrival);
+        return anchor;
+    }
+    // Steady state: judge `pending` against `anchor` and `arrival`.
+    let anchor  = entry.spike_anchor.unwrap();
+    let pending = entry.spike_pending.unwrap();
+
+    let multiplier = spike_sensitivity_to_multiplier(entry.spike_sensitivity);
+    // Empirical floor calibrated to typical IMU quiescent jitter on the
+    // normalized scale (HidReading values are pre-divided by reference
+    // ranges, so flat-on-table jitter is on the order of 1e-3).
+    const NOISE_FLOOR: f32 = 0.003;
+    let dev_thresh = NOISE_FLOOR * multiplier;
+
+    let judge = |a: f32, p: f32, n: f32| -> f32 {
+        // Expected position at `p`: midpoint of its neighbors.
+        let midpoint = 0.5 * (a + n);
+        let deviation = (p - midpoint).abs();
+        // Neighbor consistency: how much the signal drifted between
+        // anchor and arrival across two packet intervals. If pending is
+        // a real fast-motion sample, this gap is comparable to its own
+        // deviation. If pending is an outlier, neighbors are still on
+        // the smooth trajectory and `outer_gap` is much smaller.
+        let outer_gap = (n - a).abs();
+
+        // Outlier iff pending is well off the midpoint AND its
+        // deviation is large relative to the neighbor-to-neighbor gap.
+        // The 2× factor is empirical: real motion typically has
+        // pending-to-midpoint roughly equal to outer_gap/2, so anything
+        // > outer_gap is excess deviation.
+        let was_spike = deviation > dev_thresh && deviation > outer_gap;
+
+        if was_spike { midpoint } else { p }
+    };
+
+    let mut emit = pending;
+    emit.gyro_x  = judge(anchor.gyro_x,  pending.gyro_x,  arrival.gyro_x);
+    emit.gyro_y  = judge(anchor.gyro_y,  pending.gyro_y,  arrival.gyro_y);
+    emit.gyro_z  = judge(anchor.gyro_z,  pending.gyro_z,  arrival.gyro_z);
+    emit.accel_x = judge(anchor.accel_x, pending.accel_x, arrival.accel_x);
+    emit.accel_y = judge(anchor.accel_y, pending.accel_y, arrival.accel_y);
+    emit.accel_z = judge(anchor.accel_z, pending.accel_z, arrival.accel_z);
+
+    // Advance: the value we just emitted becomes the new anchor; arrival
+    // becomes the new pending. (Per-axis emit means the anchor we carry
+    // forward is each axis's accepted value, not pending wholesale.)
+    let mut next_anchor = anchor;
+    next_anchor.gyro_x  = emit.gyro_x;
+    next_anchor.gyro_y  = emit.gyro_y;
+    next_anchor.gyro_z  = emit.gyro_z;
+    next_anchor.accel_x = emit.accel_x;
+    next_anchor.accel_y = emit.accel_y;
+    next_anchor.accel_z = emit.accel_z;
+    entry.spike_anchor  = Some(next_anchor);
+    entry.spike_pending = Some(arrival);
+    emit
 }
 
 fn parse_report(buf: &[u8], kind: &mut DeviceKind) -> Option<HidReading> {

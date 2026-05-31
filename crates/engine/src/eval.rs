@@ -456,6 +456,113 @@ fn press_state_get(state: &mut NodeState, mapping_idx: usize) -> &mut [f32] {
     &mut state.press_state[start..start + PRESS_SLOTS_PER_MAPPING]
 }
 
+/// Bit indices used by gesture_state for stick-cardinal visited bitmaps.
+/// Order: left(0), right(1), up(2), down(3). Same indexing for both
+/// left_stick and right_stick — bitmap[0] = left_stick visited cardinals,
+/// bitmap[1] = right_stick.
+const GESTURE_BIT_LEFT:  u8 = 1 << 0;
+const GESTURE_BIT_RIGHT: u8 = 1 << 1;
+const GESTURE_BIT_UP:    u8 = 1 << 2;
+const GESTURE_BIT_DOWN:  u8 = 1 << 3;
+
+/// Stick deflection threshold to "activate" gesture tracking. Below this,
+/// the stick is considered neutral and the visited bitmap resets.
+const GESTURE_ACTIVATE_MAG: f32 = 0.5;
+/// Hysteresis: once activated, the bitmap is only cleared when the stick
+/// falls back below this (lower) threshold. Prevents spurious resets when
+/// the stick passes through a quadrant boundary.
+const GESTURE_RESET_MAG: f32 = 0.3;
+
+/// Map a stick-cardinal pin id to (stick_index, bit). Returns None if the
+/// pin isn't a stick cardinal.
+fn gesture_pin_to_bit(pin_id: &str) -> Option<(usize, u8)> {
+    match pin_id {
+        "left_stick_left"   => Some((0, GESTURE_BIT_LEFT)),
+        "left_stick_right"  => Some((0, GESTURE_BIT_RIGHT)),
+        "left_stick_up"     => Some((0, GESTURE_BIT_UP)),
+        "left_stick_down"   => Some((0, GESTURE_BIT_DOWN)),
+        "right_stick_left"  => Some((1, GESTURE_BIT_LEFT)),
+        "right_stick_right" => Some((1, GESTURE_BIT_RIGHT)),
+        "right_stick_up"    => Some((1, GESTURE_BIT_UP)),
+        "right_stick_down"  => Some((1, GESTURE_BIT_DOWN)),
+        _ => None,
+    }
+}
+
+/// Compute the set of cardinal bits currently active for a stick given its
+/// (x, y) values. Uses the same 8-zone dominant-axis rule as
+/// `derive_stick_cardinals`: pure-axis ±0.5+ when one axis dominates;
+/// diagonal contributes BOTH neighboring cardinals when both axes are
+/// large enough. Returns 0 when the stick is neutral.
+fn gesture_active_bits(x: f32, y: f32) -> u8 {
+    let mag = (x * x + y * y).sqrt();
+    if mag < GESTURE_ACTIVATE_MAG { return 0; }
+    let mut bits = 0u8;
+    // 22.5° quadrant: a cardinal is "active" when its axis component is
+    // at least 0.5× the other axis (i.e., the stick is in that octant).
+    let ax = x.abs();
+    let ay = y.abs();
+    if x >  0.0 && ax > ay * 0.5 { bits |= GESTURE_BIT_RIGHT; }
+    if x <  0.0 && ax > ay * 0.5 { bits |= GESTURE_BIT_LEFT; }
+    if y >  0.0 && ay > ax * 0.5 { bits |= GESTURE_BIT_UP; }
+    if y <  0.0 && ay > ax * 0.5 { bits |= GESTURE_BIT_DOWN; }
+    bits
+}
+
+/// Read 2-slot gesture state for a mapping. Resizes if needed.
+fn gesture_state_get(state: &mut NodeState, mapping_idx: usize) -> &mut [u8; 2] {
+    if state.gesture_state.len() <= mapping_idx {
+        state.gesture_state.resize(mapping_idx + 1, [0, 0]);
+    }
+    &mut state.gesture_state[mapping_idx]
+}
+
+/// If `in_pins` contains at least one stick cardinal, return the per-stick
+/// required bitmaps (left, right) for the cardinal subset. Non-cardinal pins
+/// (buttons, triggers) are ignored here — the caller must enforce their hold
+/// state separately. Returns None when the chord has no stick cardinals, so
+/// the caller falls back to the standard simultaneous-press rule.
+fn gesture_required_bits(in_pins: &[&str]) -> Option<[u8; 2]> {
+    if in_pins.is_empty() { return None; }
+    let mut req = [0u8; 2];
+    let mut any_cardinal = false;
+    for &p in in_pins {
+        if let Some((stick, bit)) = gesture_pin_to_bit(p) {
+            req[stick] |= bit;
+            any_cardinal = true;
+        }
+    }
+    if any_cardinal { Some(req) } else { None }
+}
+
+/// Update the per-mapping gesture state for one tick and return whether the
+/// gesture is "complete" (all required cardinals visited at least once
+/// across both sticks). `upstream` provides current stick axis values.
+fn gesture_tick(
+    required: [u8; 2],
+    visited: &mut [u8; 2],
+    upstream: &HashMap<String, Signal>,
+) -> bool {
+    for (stick_idx, axis_pins) in [
+        (0usize, ("left_stick_x",  "left_stick_y")),
+        (1usize, ("right_stick_x", "right_stick_y")),
+    ] {
+        let req_bits = required[stick_idx];
+        if req_bits == 0 { continue; }
+        let x = upstream.get(axis_pins.0).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+        let y = upstream.get(axis_pins.1).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+        let mag = (x * x + y * y).sqrt();
+        if mag < GESTURE_RESET_MAG {
+            visited[stick_idx] = 0;
+        } else {
+            visited[stick_idx] |= gesture_active_bits(x, y);
+        }
+    }
+    // Complete iff every required bit on every stick has been visited.
+    (visited[0] & required[0]) == required[0]
+        && (visited[1] & required[1]) == required[1]
+}
+
 /// Apply the configured press mode to the raw input gate. Returns the
 /// transformed gate the mapping should treat as "held this tick".
 ///
@@ -660,6 +767,364 @@ fn combine_signals(a: Signal, b: Signal) -> Signal {
     }
 }
 
+// ── AutoMap consumer publishing helpers (shared by top-level + subgraph) ──────
+//
+// These three modules (Fork, Combiner, Selector) write into `collector_sigs`
+// under "<kind>:{key_uid}" so downstream consumers can resolve them via the
+// AutoMap routing scheme. `key_uid` is the publishing UID:
+//   - top-level: `snap.node_uid` (raw)
+//   - subgraph:  `namespaced_uid(outer_uid, snap.node_uid)`
+//
+// The subgraph form must use the namespaced UID so the keys match what
+// `find_automap_device_rec` in the UI produces when it walks the wire chain
+// across the sub-patch boundary.
+
+fn automap_fork_publish(
+    snap: &NodeSnap,
+    key_uid: usize,
+    computed: &[Vec<Option<Signal>>],
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+    let collector_id_upstream = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+    // inputs[0] = AutoMap (ignored as value), inputs[1] = select
+    let select = match snap.input_sources.get(1)
+        .and_then(|src| src.and_then(|(si, op)| computed.get(si).and_then(|v| v.get(op)).copied().flatten()))
+    {
+        Some(Signal::Float(f)) => {
+            let n = snap.n_outputs.max(1);
+            ((f.clamp(0.0, 1.0) * (n as f32 - 1.0 + 0.5)).floor() as usize).min(n - 1)
+        }
+        Some(Signal::Bool(b)) => if b { 1 } else { 0 },
+        _ => 0,
+    };
+    for out_idx in 0..snap.n_outputs {
+        if out_idx != select { continue; }
+        let key = format!("forksel:{}:{}", key_uid, out_idx);
+        for pin in flexinput_core::automap::ALL_PINS {
+            let sig = if !collector_id_upstream.is_empty() {
+                collector_sigs.get(&(collector_id_upstream.to_string(), pin.id.to_string())).copied()
+                    .or_else(|| dev_sigs.get(&(dev_id.to_string(), pin.id.to_string())).copied())
+            } else {
+                dev_sigs.get(&(dev_id.to_string(), pin.id.to_string())).copied()
+            };
+            if let Some(sig) = sig {
+                collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+            }
+        }
+        if !collector_id_upstream.is_empty() {
+            let copies: Vec<(String, Signal)> = collector_sigs.iter()
+                .filter(|((d, p), _)| {
+                    d == collector_id_upstream
+                        && !automap::ALL_PINS.iter().any(|ap| ap.id == p.as_str())
+                })
+                .map(|((_, p), s)| (p.clone(), *s))
+                .collect();
+            for (pin, sig) in copies {
+                collector_sigs.insert((key.clone(), pin), sig);
+            }
+        }
+    }
+}
+
+fn automap_combiner_publish(
+    snap: &NodeSnap,
+    key_uid: usize,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    let input_devs = snap.params.get("_automap_input_devs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let input_collectors = snap.params.get("_automap_input_collectors")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let policy_map = snap.params.get("combiner_pin_policy")
+        .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let port_map = snap.params.get("combiner_pin_port")
+        .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let key = format!("combiner:{}", key_uid);
+
+    fn clamp_for_pin(pin_id: &str, v: f32) -> f32 {
+        match pin_id {
+            "left_trigger" | "right_trigger" => v.clamp(0.0, 1.0),
+            "left_stick_x" | "left_stick_y"
+            | "right_stick_x" | "right_stick_y"
+            | "dpad_x" | "dpad_y" => v.clamp(-1.0, 1.0),
+            _ => v,
+        }
+    }
+    fn clamp_vec2_for_pin(pin_id: &str, v: glam::Vec2) -> glam::Vec2 {
+        if matches!(pin_id, "left_stick" | "right_stick" | "dpad") {
+            glam::Vec2::new(v.x.clamp(-1.0, 1.0), v.y.clamp(-1.0, 1.0))
+        } else { v }
+    }
+
+    fn read_pin_at(
+        i: usize, pin_id: &str,
+        input_devs: &[String], input_collectors: &[String],
+        collector_sigs: &HashMap<(String, String), Signal>,
+        dev_sigs: &HashMap<(String, String), Signal>,
+    ) -> Option<Signal> {
+        let collector_id = input_collectors.get(i).map(|s| s.as_str()).unwrap_or("");
+        let dev_id       = input_devs.get(i).map(|s| s.as_str()).unwrap_or("");
+        if !collector_id.is_empty() {
+            collector_sigs.get(&(collector_id.to_string(), pin_id.to_string())).copied()
+                .or_else(|| {
+                    if !dev_id.is_empty() {
+                        dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+                    } else { None }
+                })
+        } else if !dev_id.is_empty() {
+            dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+        } else {
+            None
+        }
+    }
+
+    for pin in flexinput_core::automap::ALL_PINS {
+        if let Some(port_v) = port_map.get(pin.id) {
+            if let Some(port_u) = port_v.as_u64() {
+                let n_inputs = input_devs.len();
+                if n_inputs == 0 { continue; }
+                let port = (port_u as usize).min(n_inputs - 1);
+                if let Some(sig) = read_pin_at(port, pin.id,
+                    &input_devs, &input_collectors, &collector_sigs, dev_sigs)
+                {
+                    collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+                }
+                continue;
+            }
+        }
+
+        let mut raw: Vec<Signal> = Vec::with_capacity(input_devs.len());
+        for i in 0..input_devs.len() {
+            if let Some(s) = read_pin_at(i, pin.id,
+                &input_devs, &input_collectors, &collector_sigs, dev_sigs)
+            {
+                raw.push(s);
+            }
+        }
+        if raw.is_empty() { continue; }
+
+        let policy = policy_map.get(pin.id).and_then(|v| v.as_str()).unwrap_or("SORT");
+        let resolved: Option<Signal> = match policy {
+            "SORT" => raw.into_iter().next(),
+            "OR" => match pin.signal_type {
+                flexinput_core::SignalType::Bool => {
+                    let any = raw.iter().any(|s| matches!(s, Signal::Bool(true)));
+                    Some(Signal::Bool(any))
+                }
+                flexinput_core::SignalType::Vec2 => {
+                    let pick = |sel: fn(&glam::Vec2) -> f32| {
+                        raw.iter().filter_map(|s| match s {
+                            Signal::Vec2(v) => Some(sel(v)), _ => None
+                        }).fold(0.0_f32, |acc, x|
+                            if x.abs() > acc.abs() { x } else { acc })
+                    };
+                    Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
+                        glam::Vec2::new(pick(|v| v.x), pick(|v| v.y)))))
+                }
+                _ => {
+                    let f = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).fold(0.0_f32, |acc, x|
+                        if x.abs() > acc.abs() { x } else { acc });
+                    Some(Signal::Float(clamp_for_pin(pin.id, f)))
+                }
+            },
+            "AND" => match pin.signal_type {
+                flexinput_core::SignalType::Bool => {
+                    let all = raw.iter().all(|s| matches!(s, Signal::Bool(true)));
+                    Some(Signal::Bool(all))
+                }
+                flexinput_core::SignalType::Vec2 => {
+                    let pick = |sel: fn(&glam::Vec2) -> f32| {
+                        let mut it = raw.iter().filter_map(|s| match s {
+                            Signal::Vec2(v) => Some(sel(v)), _ => None
+                        });
+                        let mut best = it.next().unwrap_or(0.0);
+                        for x in it {
+                            if x.abs() < best.abs() { best = x; }
+                        }
+                        best
+                    };
+                    Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
+                        glam::Vec2::new(pick(|v| v.x), pick(|v| v.y)))))
+                }
+                _ => {
+                    let mut it = raw.iter().filter_map(|s| sig_to_f32(Some(*s)));
+                    let mut best = it.next().unwrap_or(0.0);
+                    for x in it {
+                        if x.abs() < best.abs() { best = x; }
+                    }
+                    Some(Signal::Float(clamp_for_pin(pin.id, best)))
+                }
+            },
+            "XOR" => match pin.signal_type {
+                flexinput_core::SignalType::Bool => {
+                    let parity = raw.iter()
+                        .filter(|s| matches!(s, Signal::Bool(true))).count() % 2 == 1;
+                    Some(Signal::Bool(parity))
+                }
+                flexinput_core::SignalType::Vec2 => {
+                    let fold = |sel: fn(&glam::Vec2) -> f32| -> f32 {
+                        let xs: Vec<f32> = raw.iter().filter_map(|s| match s {
+                            Signal::Vec2(v) => Some(sel(v)), _ => None
+                        }).collect();
+                        if xs.is_empty() { return 0.0; }
+                        xs.iter().skip(1).fold(xs[0], |acc, &x| (acc - x).abs())
+                    };
+                    Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
+                        glam::Vec2::new(fold(|v| v.x), fold(|v| v.y)))))
+                }
+                _ => {
+                    let xs: Vec<f32> = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).collect();
+                    let v = if xs.is_empty() { 0.0 }
+                        else { xs.iter().skip(1).fold(xs[0], |acc, &x| (acc - x).abs()) };
+                    Some(Signal::Float(clamp_for_pin(pin.id, v)))
+                }
+            },
+            "ADD" => match pin.signal_type {
+                flexinput_core::SignalType::Bool => {
+                    let any = raw.iter().any(|s| matches!(s, Signal::Bool(true)));
+                    Some(Signal::Bool(any))
+                }
+                flexinput_core::SignalType::Vec2 => {
+                    let sum = raw.iter().fold(glam::Vec2::ZERO, |acc, s| match s {
+                        Signal::Vec2(v) => acc + *v, _ => acc
+                    });
+                    Some(Signal::Vec2(clamp_vec2_for_pin(pin.id, sum)))
+                }
+                _ => {
+                    let s: f32 = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).sum();
+                    Some(Signal::Float(clamp_for_pin(pin.id, s)))
+                }
+            },
+            "MULT" => match pin.signal_type {
+                flexinput_core::SignalType::Bool => {
+                    let all = raw.iter().all(|s| matches!(s, Signal::Bool(true)));
+                    Some(Signal::Bool(all))
+                }
+                flexinput_core::SignalType::Vec2 => {
+                    let first = match raw.first() {
+                        Some(Signal::Vec2(v)) => *v,
+                        _ => glam::Vec2::ZERO,
+                    };
+                    let mag_product = raw.iter().fold(1.0_f32, |acc, s| match s {
+                        Signal::Vec2(v) => acc * v.length(),
+                        _ => acc,
+                    });
+                    let dir = if first.length() > 0.0 {
+                        first.normalize()
+                    } else {
+                        glam::Vec2::ZERO
+                    };
+                    Some(Signal::Vec2(clamp_vec2_for_pin(pin.id, dir * mag_product)))
+                }
+                _ => {
+                    let is_signed = !matches!(pin.id,
+                        "left_trigger" | "right_trigger");
+                    let nums: Vec<f32> = raw.iter()
+                        .filter_map(|s| sig_to_f32(Some(*s))).collect();
+                    let v = if is_signed {
+                        let sign = nums.first().copied().unwrap_or(0.0);
+                        let mag = nums.iter().fold(1.0_f32, |a, b| a * b.abs());
+                        if sign < 0.0 { -mag } else { mag }
+                    } else {
+                        nums.iter().fold(1.0_f32, |a, b| a * b)
+                    };
+                    Some(Signal::Float(clamp_for_pin(pin.id, v)))
+                }
+            },
+            _ => None,
+        };
+        if let Some(s) = resolved {
+            collector_sigs.insert((key.clone(), pin.id.to_string()), s);
+        }
+    }
+
+    // Off-spec pass-through (Remapper's keyboard/mouse pins etc.).
+    {
+        let mut extras: HashMap<String, Signal> = HashMap::new();
+        for collector_id in input_collectors.iter().rev() {
+            if collector_id.is_empty() { continue; }
+            for ((dev, pin), &sig) in collector_sigs.iter() {
+                if dev != collector_id { continue; }
+                if automap::ALL_PINS.iter().any(|p| p.id == pin.as_str()) { continue; }
+                extras.insert(pin.clone(), sig);
+            }
+        }
+        for (pin, sig) in extras {
+            let dest_key = (key.clone(), pin);
+            if !collector_sigs.contains_key(&dest_key) {
+                collector_sigs.insert(dest_key, sig);
+            }
+        }
+    }
+}
+
+fn automap_selector_publish(
+    snap: &NodeSnap,
+    key_uid: usize,
+    computed: &[Vec<Option<Signal>>],
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    let n_inputs = snap.input_sources.len().saturating_sub(1).max(1);
+    let select = match snap.input_sources.get(0)
+        .and_then(|src| src.and_then(|(si, op)| computed.get(si).and_then(|v| v.get(op)).copied().flatten()))
+    {
+        Some(Signal::Float(f)) => {
+            let n = n_inputs as f32;
+            ((f.clamp(0.0, 1.0) * n).floor() as usize).min(n_inputs - 1)
+        }
+        Some(Signal::Bool(b)) => if b { 1 } else { 0 },
+        _ => 0,
+    };
+    let input_devs = snap.params.get("_automap_input_devs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let input_collectors = snap.params.get("_automap_input_collectors")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let selected_dev = input_devs.get(select).map(|s| s.as_str()).unwrap_or("").to_string();
+    let selected_collector = input_collectors.get(select).map(|s| s.as_str()).unwrap_or("").to_string();
+    let key = format!("forksel:{}:0", key_uid);
+    for pin in flexinput_core::automap::ALL_PINS {
+        let sig = if !selected_collector.is_empty() {
+            collector_sigs.get(&(selected_collector.clone(), pin.id.to_string())).copied()
+                .or_else(|| {
+                    if !selected_dev.is_empty() {
+                        dev_sigs.get(&(selected_dev.clone(), pin.id.to_string())).copied()
+                    } else { None }
+                })
+        } else if !selected_dev.is_empty() {
+            dev_sigs.get(&(selected_dev.clone(), pin.id.to_string())).copied()
+        } else {
+            None
+        };
+        if let Some(sig) = sig {
+            collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+        }
+    }
+    if !selected_collector.is_empty() {
+        let copies: Vec<(String, Signal)> = collector_sigs.iter()
+            .filter(|((d, p), _)| {
+                d == &selected_collector
+                    && !automap::ALL_PINS.iter().any(|ap| ap.id == p.as_str())
+            })
+            .map(|((_, p), s)| (p.clone(), *s))
+            .collect();
+        for (pin, sig) in copies {
+            collector_sigs.insert((key.clone(), pin), sig);
+        }
+    }
+}
+
 // ── Sub-patch inner evaluation ────────────────────────────────────────────────
 
 /// Namespaces inner node UIDs under their containing subpatch's UID to avoid
@@ -725,6 +1190,8 @@ fn eval_subgraph(
 
         // AutoMap collector inside a subpatch: inject signals into collector_sigs
         // using a namespaced key so it matches what find_automap_device produced.
+        // Mirrors the top-level arm: pass-through upstream first, then apply
+        // explicit collected-pin overrides.
         if snap.module_id == "module.automap_collect" {
             let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
                 .map(|src| src.and_then(|(si, op)| {
@@ -736,6 +1203,40 @@ fn eval_subgraph(
                 .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
                 .unwrap_or_default();
             let uid_key = format!("collector:{}", ns_uid);
+
+            // Phase 1: pass-through from upstream AutoMap source.
+            // See top-level arm for the rationale on iterating actual
+            // collector_sigs entries rather than `ALL_PINS`.
+            let upstream_dev = snap.params.get("_automap_device_id")
+                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let upstream_collector = snap.params.get("_automap_collector_id")
+                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !upstream_collector.is_empty() {
+                let copies: Vec<(String, Signal)> = collector_sigs.iter()
+                    .filter(|((dev, _), _)| dev == &upstream_collector)
+                    .map(|((_, pin), sig)| (pin.clone(), *sig))
+                    .collect();
+                for (pin, sig) in copies {
+                    collector_sigs.insert((uid_key.clone(), pin), sig);
+                }
+                if !upstream_dev.is_empty() {
+                    for pin in flexinput_core::automap::ALL_PINS {
+                        let key = (uid_key.clone(), pin.id.to_string());
+                        if collector_sigs.contains_key(&key) { continue; }
+                        if let Some(&sig) = dev_sigs.get(&(upstream_dev.clone(), pin.id.to_string())) {
+                            collector_sigs.insert(key, sig);
+                        }
+                    }
+                }
+            } else if !upstream_dev.is_empty() {
+                for pin in flexinput_core::automap::ALL_PINS {
+                    if let Some(&sig) = dev_sigs.get(&(upstream_dev.clone(), pin.id.to_string())) {
+                        collector_sigs.insert((uid_key.clone(), pin.id.to_string()), sig);
+                    }
+                }
+            }
+
+            // Phase 2: explicit collected-pin overrides.
             for (i, pin_id) in collect_ids.iter().enumerate() {
                 if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
                     if !pin_id.is_empty() {
@@ -807,20 +1308,47 @@ fn eval_subgraph(
 
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
-            // Per-mapping press-mode pass — same logic as the top-level
-            // Remapper arm; uses ns_uid for state keying so subpatch instances
-            // don't collide with top-level instances.
+            // Per-mapping effective pass — mirrors the top-level arm.
+            // Analog mode bypasses the press-mode machinery; see top-level
+            // arm comments for the gating rules.
             let ns2 = state.entry(ns_uid).or_insert_with(NodeState::default);
             let effective: Vec<bool> = mappings.iter().enumerate().map(|(i, m)| {
                 let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
                 if in_pins.is_empty() { return false; }
-                let raw_held = in_pins.iter().all(|p| {
-                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                });
-                let mode = PressMode::from_str(
-                    m.get("mode").and_then(|v| v.as_str()).unwrap_or("down"));
+                let mode_s = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+                if mode_s == "analog" {
+                    let mut has_cardinal = false;
+                    let mut any_cardinal_active = false;
+                    let mut all_buttons_held = true;
+                    for p in &in_pins {
+                        if analog_axis_for_cardinal(p).is_some() {
+                            has_cardinal = true;
+                            if analog_cardinal_input_value(&upstream, p) > 0.0 {
+                                any_cardinal_active = true;
+                            }
+                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
+                            all_buttons_held = false;
+                        }
+                    }
+                    return all_buttons_held && (!has_cardinal || any_cardinal_active);
+                }
+                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
+                    // Mixed chord: every non-cardinal pin must be currently
+                    // held while the stick gesture is completed.
+                    let buttons_held = in_pins.iter().all(|p| {
+                        if gesture_pin_to_bit(p).is_some() { return true; }
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    });
+                    let visited = gesture_state_get(ns2, i);
+                    buttons_held && gesture_tick(required, visited, &upstream)
+                } else {
+                    in_pins.iter().all(|p| {
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    })
+                };
+                let mode = PressMode::from_str(mode_s);
                 let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
                 let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
                 let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -835,8 +1363,8 @@ fn eval_subgraph(
                 let lb = mappings[b].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
                 lb.cmp(&la)
             });
-            let mut triggered: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-            let mut claimed_inputs: HashSet<String> = HashSet::new();
+            let mut triggered: Vec<(Vec<String>, Vec<String>, bool, usize)> = Vec::new();
+            let mut triggered_claims: Vec<(usize, Vec<String>)> = Vec::new();
             for &i in &sorted_idx {
                 let m = &mappings[i];
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
@@ -846,14 +1374,36 @@ fn eval_subgraph(
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
                 if in_pins.is_empty() { continue; }
-                if in_pins.iter().any(|p| claimed_inputs.contains(p)) { continue; }
                 if !effective[i] { continue; }
-                for p in &in_pins { claimed_inputs.insert(p.clone()); }
-                triggered.push((in_pins, out_pins));
+                let my_len = in_pins.len();
+                let suppressed = triggered_claims.iter().any(|(claim_len, claim_pins)| {
+                    *claim_len > my_len && in_pins.iter().all(|p| claim_pins.contains(p))
+                });
+                if suppressed { continue; }
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                let mut sorted_in = in_pins.clone();
+                sorted_in.sort();
+                triggered_claims.push((my_len, sorted_in));
+                triggered.push((in_pins, out_pins, is_analog, i));
             }
+            let mut claimed_inputs_digital: HashSet<String> = HashSet::new();
+            let mut claimed_inputs_analog:  HashSet<String> = HashSet::new();
+            for (in_pins, _, is_analog, _) in &triggered {
+                let target = if *is_analog { &mut claimed_inputs_analog } else { &mut claimed_inputs_digital };
+                for p in in_pins { target.insert(p.clone()); }
+            }
+            let analog_axis_suppress = analog_axis_suppression(&claimed_inputs_analog);
+
             for ap in automap::ALL_PINS {
-                let suppressed = claimed_inputs.contains(ap.id);
-                let sig = if suppressed {
+                let mut digital_suppress = claimed_inputs_digital.contains(ap.id);
+                if !digital_suppress {
+                    for cardinal in &claimed_inputs_digital {
+                        if let Some((axis_pin, _)) = analog_axis_for_cardinal(cardinal) {
+                            if axis_pin == ap.id { digital_suppress = true; break; }
+                        }
+                    }
+                }
+                let sig = if digital_suppress {
                     match ap.signal_type {
                         SignalType::Bool  => Signal::Bool(false),
                         SignalType::Float => Signal::Float(0.0),
@@ -861,28 +1411,197 @@ fn eval_subgraph(
                         SignalType::Int   => Signal::Int(0),
                         _ => continue,
                     }
-                } else {
-                    match read_upstream(ap.id) {
-                        Some(s) => s,
-                        None => continue,
+                } else if let Some(raw) = read_upstream(ap.id) {
+                    if let Some(&(neg, pos)) = analog_axis_suppress.get(&ap.id) {
+                        match raw {
+                            Signal::Float(v) => Signal::Float(apply_axis_clamp(v, (neg, pos))),
+                            other => other,
+                        }
+                    } else if matches!(ap.id, "left_stick" | "right_stick") {
+                        let (xa, ya) = if ap.id == "left_stick" {
+                            ("left_stick_x", "left_stick_y")
+                        } else {
+                            ("right_stick_x", "right_stick_y")
+                        };
+                        let xs = analog_axis_suppress.get(&xa).copied().unwrap_or((false, false));
+                        let ys = analog_axis_suppress.get(&ya).copied().unwrap_or((false, false));
+                        if xs == (false, false) && ys == (false, false) {
+                            raw
+                        } else if let Signal::Vec2(v) = raw {
+                            Signal::Vec2(Vec2::new(
+                                apply_axis_clamp(v.x, xs),
+                                apply_axis_clamp(v.y, ys),
+                            ))
+                        } else { raw }
+                    } else {
+                        raw
                     }
+                } else {
+                    continue;
                 };
                 collector_sigs.insert((key.clone(), ap.id.to_string()), sig);
             }
-            let mut all_out_pins: HashSet<String> = HashSet::new();
-            for m in &mappings {
-                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
-                    for v in arr { if let Some(s) = v.as_str() { all_out_pins.insert(s.to_string()); } }
+            {
+                let mut local_up: HashMap<String, Signal> = HashMap::new();
+                for axis in ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"] {
+                    if let Some(&sig) = collector_sigs.get(&(key.clone(), axis.to_string())) {
+                        local_up.insert(axis.to_string(), sig);
+                    }
+                }
+                derive_stick_cardinals(&mut local_up);
+                for (k, v) in local_up {
+                    if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
+                        || k.ends_with("_left") || k.ends_with("_right"))
+                    {
+                        collector_sigs.insert((key.clone(), k), v);
+                    }
                 }
             }
-            let mut asserted: HashSet<String> = HashSet::new();
-            for (_, out_pins) in &triggered { for p in out_pins { asserted.insert(p.clone()); } }
-            for out_pin in &all_out_pins {
+
+            // Analog override (identical-input-chord, later wins).
+            let mut analog_emit_idx: Vec<usize> = Vec::new();
+            {
+                let mut analog_indices: Vec<usize> = (0..triggered.len())
+                    .filter(|&t| triggered[t].2)
+                    .collect();
+                analog_indices.sort_by_key(|&t| triggered[t].3);
+                let mut keep: Vec<bool> = vec![true; analog_indices.len()];
+                for a in 0..analog_indices.len() {
+                    if !keep[a] { continue; }
+                    let (ref ain, _, _, _) = triggered[analog_indices[a]];
+                    let mut a_set: Vec<&String> = ain.iter().collect();
+                    a_set.sort();
+                    for b in (a + 1)..analog_indices.len() {
+                        let (ref bin, _, _, _) = triggered[analog_indices[b]];
+                        if ain.len() != bin.len() { continue; }
+                        let mut b_set: Vec<&String> = bin.iter().collect();
+                        b_set.sort();
+                        if a_set == b_set { keep[a] = false; break; }
+                    }
+                }
+                for (a, t_idx) in analog_indices.iter().enumerate() {
+                    if keep[a] { analog_emit_idx.push(*t_idx); }
+                }
+            }
+
+            let mut analog_axis_acc: HashMap<&'static str, f32> = HashMap::new();
+            let mut analog_button_out: HashSet<String> = HashSet::new();
+            for &t_idx in &analog_emit_idx {
+                let (ref in_pins, ref out_pins, _, orig_i) = triggered[t_idx];
+                let m = &mappings[orig_i];
+                let turbo  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                let slots = press_state_get(ns2, orig_i);
+                let n = in_pins.len().min(out_pins.len());
+                for (in_p, out_p) in in_pins[..n].iter().zip(out_pins[..n].iter()) {
+                    let in_is_cardinal = analog_axis_for_cardinal(in_p).is_some();
+                    let out_axis_opt = analog_axis_for_cardinal(out_p);
+                    let mag_from_input = if in_is_cardinal {
+                        analog_cardinal_input_value(&upstream, in_p)
+                    } else { 1.0 };
+                    if let Some((axis_pin, sign)) = out_axis_opt {
+                        let contrib = sign * mag_from_input;
+                        let entry = analog_axis_acc.entry(axis_pin).or_insert(0.0);
+                        *entry += contrib;
+                    } else {
+                        let active = if turbo {
+                            apply_turbo(true, window_ms, slots, dt)
+                        } else { true };
+                        if active { analog_button_out.insert(out_p.clone()); }
+                    }
+                }
+            }
+            for (axis_pin, v) in &analog_axis_acc {
+                let clamped = v.clamp(-1.0, 1.0);
+                collector_sigs.insert((key.clone(), (*axis_pin).to_string()), Signal::Float(clamped));
+            }
+            // Update bundled Vec2 pins so downstream sinks that read the
+            // Vec2 form (`left_stick`/`right_stick`) see the analog-driven
+            // values too. Without this, the sink's Vec2-vs-axis conflict
+            // resolver picks the Vec2 (which still carries the suppressed
+            // pass-through) and drops the analog axis writes.
+            for (vec2_pin, x_axis, y_axis) in [
+                ("left_stick", "left_stick_x", "left_stick_y"),
+                ("right_stick", "right_stick_x", "right_stick_y"),
+            ] {
+                let x_override = analog_axis_acc.get(&x_axis).copied();
+                let y_override = analog_axis_acc.get(&y_axis).copied();
+                if x_override.is_none() && y_override.is_none() { continue; }
+                let cur = collector_sigs.get(&(key.clone(), vec2_pin.to_string()))
+                    .and_then(|s| if let Signal::Vec2(v) = s { Some(*v) } else { None })
+                    .unwrap_or(Vec2::ZERO);
+                let x = x_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.x);
+                let y = y_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.y);
+                collector_sigs.insert((key.clone(), vec2_pin.to_string()), Signal::Vec2(Vec2::new(x, y)));
+            }
+
+            // Digital publish pass.
+            let mut digital_all_out_pins: HashSet<String> = HashSet::new();
+            for m in mappings.iter() {
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                if is_analog { continue; }
+                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+                    for v in arr { if let Some(s) = v.as_str() { digital_all_out_pins.insert(s.to_string()); } }
+                }
+            }
+            let mut digital_asserted: HashSet<String> = HashSet::new();
+            for (_, out_pins, is_analog, _) in &triggered {
+                if *is_analog { continue; }
+                for p in out_pins { digital_asserted.insert(p.clone()); }
+            }
+            for out_pin in &digital_all_out_pins {
                 let sig_type = automap::ALL_PINS.iter()
                     .find(|p| p.id == out_pin.as_str())
                     .map(|p| p.signal_type)
                     .unwrap_or(SignalType::Bool);
-                let on = asserted.contains(out_pin);
+                let on = digital_asserted.contains(out_pin);
+                if on {
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(1.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(1),
+                        _                 => Signal::Bool(true),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                } else {
+                    if upstream.contains_key(out_pin.as_str()) { continue; }
+                    if analog_button_out.contains(out_pin)
+                        || analog_axis_acc.iter().any(|(ap, _)| *ap == out_pin.as_str())
+                    {
+                        continue;
+                    }
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(0.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(0),
+                        _                 => Signal::Bool(false),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                }
+            }
+
+            // Analog button-out emissions + release pass.
+            let mut analog_button_pins: HashSet<String> = HashSet::new();
+            for m in mappings.iter() {
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                if !is_analog { continue; }
+                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            if analog_axis_for_cardinal(s).is_none() {
+                                analog_button_pins.insert(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            for out_pin in &analog_button_pins {
+                if digital_asserted.contains(out_pin) { continue; }
+                let on = analog_button_out.contains(out_pin);
+                let sig_type = automap::ALL_PINS.iter()
+                    .find(|p| p.id == out_pin.as_str())
+                    .map(|p| p.signal_type)
+                    .unwrap_or(SignalType::Bool);
                 if on {
                     let sig = match sig_type {
                         SignalType::Float => Signal::Float(1.0),
@@ -960,10 +1679,12 @@ fn eval_subgraph(
             upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
             upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
-            // Press-mode pass — mirrors Map Action top-level arm; supports both
-            // legacy Array<String> and new Object mapping forms.
+            // Press-mode pass — mirrors Map Action top-level arm.
             let ns_map = state.entry(ns_uid).or_insert_with(NodeState::default);
-            let any_trigger = mappings.iter().enumerate().any(|(i, m)| {
+            let mut any_trigger = false;
+            let mut any_analog_present = false;
+            let mut max_analog_mag: f32 = 0.0;
+            for (i, m) in mappings.iter().enumerate() {
                 let (in_pins, mode_s, window_ms, sustain, turbo) = if let Some(arr) = m.as_array() {
                     let pins: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                     (pins, "down", 200.0_f32, false, false)
@@ -977,16 +1698,89 @@ fn eval_subgraph(
                     let tur  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
                     (pins, mode, win, sus, tur)
                 };
-                if in_pins.is_empty() { return false; }
-                let raw_held = in_pins.iter().all(|p| {
-                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                });
+                if in_pins.is_empty() { continue; }
+                if mode_s == "analog" {
+                    any_analog_present = true;
+                    let mut has_cardinal = false;
+                    let mut any_cardinal_active = false;
+                    let mut all_buttons_held = true;
+                    let mut local_max: f32 = 0.0;
+                    for p in &in_pins {
+                        if analog_axis_for_cardinal(p).is_some() {
+                            has_cardinal = true;
+                            let mag = analog_cardinal_input_value(&upstream, p);
+                            if mag > 0.0 { any_cardinal_active = true; }
+                            if mag > local_max { local_max = mag; }
+                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
+                            all_buttons_held = false;
+                        }
+                    }
+                    let active = all_buttons_held && (!has_cardinal || any_cardinal_active);
+                    let active_after_turbo = if turbo {
+                        let slots = press_state_get(ns_map, i);
+                        apply_turbo(active, window_ms, slots, dt)
+                    } else { active };
+                    if active_after_turbo {
+                        any_trigger = true;
+                        let mag = if has_cardinal { local_max } else { 1.0 };
+                        if mag > max_analog_mag { max_analog_mag = mag; }
+                    }
+                    continue;
+                }
+                // Mirror Remapper digital gesture-mode handling.
+                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
+                    let buttons_held = in_pins.iter().all(|p| {
+                        if gesture_pin_to_bit(p).is_some() { return true; }
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    });
+                    let visited = gesture_state_get(ns_map, i);
+                    buttons_held && gesture_tick(required, visited, &upstream)
+                } else {
+                    in_pins.iter().all(|p| {
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    })
+                };
                 let mode = PressMode::from_str(mode_s);
                 let slots = press_state_get(ns_map, i);
                 let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
-            });
-            computed[idx] = vec![Some(Signal::Bool(any_trigger))];
+                let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+                if held { any_trigger = true; }
+            }
+            let out_sig = if any_analog_present {
+                let mag = if max_analog_mag > 0.0 {
+                    max_analog_mag
+                } else if any_trigger { 1.0 } else { 0.0 };
+                Signal::Float(mag)
+            } else {
+                Signal::Bool(any_trigger)
+            };
+            computed[idx] = vec![Some(out_sig)];
+            last_outputs.insert(ns_uid, computed[idx].clone());
+            continue;
+        }
+
+        // AutoMap fork / combiner / selector inside a sub-patch. Same helpers
+        // as the top-level loop, but keyed under `ns_uid` so downstream sinks
+        // (and the UI's `find_automap_device_rec` walker, which folds the outer
+        // chain when it crosses the subpatch boundary) look up the right entry
+        // in `collector_sigs`. Without these arms, the sub-patch falls through
+        // to `compute_node` which doesn't touch `collector_sigs` at all —
+        // upstream Remapper / Collector overrides get dropped on the floor.
+        if snap.module_id == "module.automap_fork" {
+            automap_fork_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs);
+            computed[idx] = vec![None; snap.n_outputs];
+            last_outputs.insert(ns_uid, computed[idx].clone());
+            continue;
+        }
+        if snap.module_id == "module.automap_combiner" {
+            automap_combiner_publish(snap, ns_uid, dev_sigs, collector_sigs);
+            computed[idx] = vec![None];
+            last_outputs.insert(ns_uid, computed[idx].clone());
+            continue;
+        }
+        if snap.module_id == "module.automap_selector" {
+            automap_selector_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs);
+            computed[idx] = vec![None];
             last_outputs.insert(ns_uid, computed[idx].clone());
             continue;
         }
@@ -1002,6 +1796,22 @@ fn eval_subgraph(
             node_state.aux_f32 = vals.clone();
         }
         let node_outputs = compute_node(snap, &inputs, node_state, dev_sigs, collector_sigs, dt);
+
+        // ── 3DOF lean dispatch (subgraph eval) ───────────────────────────
+        //
+        // Mirror of the top-level dispatch — the 3DOF module commonly sits
+        // inside a sub-patch (gyro pre-processing wrapped behind a clean
+        // interface). Without this block, lean mappings inside a subpatch
+        // wouldn't fire even though their UI works the same way.
+        //
+        // Uses `ns_uid` (namespaced UID) so the collector key matches what
+        // `find_automap_device_rec` in app.rs computes when something
+        // downstream traces back through the subpatch boundary.
+        if snap.module_id == "processing.gyro_3dof" {
+            lean_dispatch_into_collector_sigs(
+                snap, ns_uid, &node_outputs, node_state, collector_sigs, dt,
+            );
+        }
 
         // Display state for inner nodes — keyed by namespaced UID so the UI walk
         // can find them when populating `node.extra.last_signals` / `history`.
@@ -1146,10 +1956,19 @@ pub fn eval_graph_tick(
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
             // Mappings may be in legacy Array<String> form (chord only, mode=down)
-            // or in the new Object form `{ in, mode, window_ms, sustain }`. Resolve
-            // both and run each through the press-mode state machine.
+            // or in the new Object form `{ in, mode, window_ms, sustain }`.
+            //
+            // Output signal kind depends on which mode(s) are present:
+            //   - All-digital mappings → emit Bool ("any active").
+            //   - Any analog mapping present → emit Float (max magnitude
+            //     across all active analog mappings, falling back to 1.0
+            //     when only a digital mapping is active so digital triggers
+            //     still drive Float-consuming wires at full deflection).
             let ns_map = state.entry(snap.node_uid).or_insert_with(NodeState::default);
-            let any_trigger = mappings.iter().enumerate().any(|(i, m)| {
+            let mut any_trigger = false;
+            let mut any_analog_present = false;
+            let mut max_analog_mag: f32 = 0.0;
+            for (i, m) in mappings.iter().enumerate() {
                 let (in_pins, mode_s, window_ms, sustain, turbo) = if let Some(arr) = m.as_array() {
                     let pins: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                     (pins, "down", 200.0_f32, false, false)
@@ -1163,17 +1982,76 @@ pub fn eval_graph_tick(
                     let tur  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
                     (pins, mode, win, sus, tur)
                 };
-                if in_pins.is_empty() { return false; }
-                let raw_held = in_pins.iter().all(|p| {
-                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                });
+                if in_pins.is_empty() { continue; }
+                if mode_s == "analog" {
+                    any_analog_present = true;
+                    // Combo gate (same as Remapper): all non-cardinal pins
+                    // held AND any cardinal contributing a non-zero mag.
+                    // Track the strongest cardinal magnitude for Float out.
+                    let mut has_cardinal = false;
+                    let mut any_cardinal_active = false;
+                    let mut all_buttons_held = true;
+                    let mut local_max: f32 = 0.0;
+                    for p in &in_pins {
+                        if analog_axis_for_cardinal(p).is_some() {
+                            has_cardinal = true;
+                            let mag = analog_cardinal_input_value(&upstream, p);
+                            if mag > 0.0 { any_cardinal_active = true; }
+                            if mag > local_max { local_max = mag; }
+                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
+                            all_buttons_held = false;
+                        }
+                    }
+                    let active = all_buttons_held && (!has_cardinal || any_cardinal_active);
+                    let active_after_turbo = if turbo {
+                        let slots = press_state_get(ns_map, i);
+                        apply_turbo(active, window_ms, slots, dt)
+                    } else { active };
+                    if active_after_turbo {
+                        any_trigger = true;
+                        // For pure-button analog (no cardinal), magnitude
+                        // defaults to 1.0 so the Float still pulses to 1
+                        // during the gated tick.
+                        let mag = if has_cardinal { local_max } else { 1.0 };
+                        if mag > max_analog_mag { max_analog_mag = mag; }
+                    }
+                    continue;
+                }
+                // All-cardinal chords on a single stick can't be
+                // simultaneously held — use the gesture-visited bitmap so
+                // half-circles and full sweeps complete the combo. Mirrors
+                // Remapper's digital path.
+                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
+                    let buttons_held = in_pins.iter().all(|p| {
+                        if gesture_pin_to_bit(p).is_some() { return true; }
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    });
+                    let visited = gesture_state_get(ns_map, i);
+                    buttons_held && gesture_tick(required, visited, &upstream)
+                } else {
+                    in_pins.iter().all(|p| {
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    })
+                };
                 let mode = PressMode::from_str(mode_s);
                 let slots = press_state_get(ns_map, i);
                 let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
-            });
+                let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+                if held { any_trigger = true; }
+            }
 
-            computed[idx] = vec![Some(Signal::Bool(any_trigger))];
+            let out_sig = if any_analog_present {
+                // Float output when analog mode is in play. Digital trigger
+                // contributes a magnitude of 1.0 (full deflection) so the
+                // same Float wire works for mixed digital+analog mappings.
+                let mag = if max_analog_mag > 0.0 {
+                    max_analog_mag
+                } else if any_trigger { 1.0 } else { 0.0 };
+                Signal::Float(mag)
+            } else {
+                Signal::Bool(any_trigger)
+            };
+            computed[idx] = vec![Some(out_sig)];
             // Populate last_outputs for this node so the UI can display per-pin
             // signal glow (mirrors the general-path behaviour below).
             last_outputs.insert(snap.node_uid, computed[idx].clone());
@@ -1284,17 +2162,63 @@ pub fn eval_graph_tick(
             // Double detect edges without dropouts. Compute `effective_held`
             // for each in original index order, then run the sort + claim pass
             // using those values instead of re-reading raw input state.
+            //
+            // Analog mode is gated differently from digital modes:
+            //   - Non-cardinal `in` pins must all be held (combo gate).
+            //   - If any cardinal `in` pin exists, its axis magnitude must
+            //     exceed GESTURE_ACTIVATE_MAG so we know the stick is being
+            //     pushed in (one of) the mapped direction(s).
+            //   - Pure cardinal `in`: just magnitude check, no gesture trace.
+            //   - Press-mode pipeline is bypassed; analog mode owns its own
+            //     "active" definition. Turbo on analog button-outputs is
+            //     applied during the publish pass below.
             let ns = state.entry(snap.node_uid).or_insert_with(NodeState::default);
             let effective: Vec<bool> = mappings.iter().enumerate().map(|(i, m)| {
                 let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
                 if in_pins.is_empty() { return false; }
-                let raw_held = in_pins.iter().all(|p| {
-                    read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                });
-                let mode = PressMode::from_str(
-                    m.get("mode").and_then(|v| v.as_str()).unwrap_or("down"));
+                let mode_s = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+                if mode_s == "analog" {
+                    // Buttons (non-cardinal) all held? Cardinals: any
+                    // non-zero magnitude is enough — analog mode passes the
+                    // live magnitude through, no activation threshold.
+                    let mut has_cardinal = false;
+                    let mut any_cardinal_active = false;
+                    let mut all_buttons_held = true;
+                    for p in &in_pins {
+                        if analog_axis_for_cardinal(p).is_some() {
+                            has_cardinal = true;
+                            if analog_cardinal_input_value(&upstream, p) > 0.0 {
+                                any_cardinal_active = true;
+                            }
+                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
+                            all_buttons_held = false;
+                        }
+                    }
+                    // Pure-button analog mappings (no cardinal in) reduce to
+                    // "all held" — same as Down mode. Reasonable fallback.
+                    return all_buttons_held && (!has_cardinal || any_cardinal_active);
+                }
+                // Stick-gesture path: when every `in` pin is a stick cardinal,
+                // the chord can never be "simultaneously held" (a single stick
+                // can't be Left AND Right at the same instant). Instead we
+                // track which cardinals have been visited during the active
+                // gesture and fire when all required cardinals across both
+                // sticks have been visited at least once.
+                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
+                    let buttons_held = in_pins.iter().all(|p| {
+                        if gesture_pin_to_bit(p).is_some() { return true; }
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    });
+                    let visited = gesture_state_get(ns, i);
+                    buttons_held && gesture_tick(required, visited, &upstream)
+                } else {
+                    in_pins.iter().all(|p| {
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    })
+                };
+                let mode = PressMode::from_str(mode_s);
                 let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
                 let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
                 let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1315,10 +2239,20 @@ pub fn eval_graph_tick(
             });
 
             // Trigger pass 1: identify triggered mappings and the pins they consume.
-            // claimed_inputs tracks pins suppressed by a longer triggered combo, so
-            // a shorter combo that overlaps cannot also fire from the same press.
-            let mut triggered: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-            let mut claimed_inputs: HashSet<String> = HashSet::new();
+            //
+            // Suppression rule for overlapping mappings:
+            //   - A mapping is suppressed iff a STRICTLY LONGER triggered
+            //     mapping has already claimed all of its inputs (longer
+            //     chord wins over shorter sub-chord).
+            //   - Mappings with the SAME input set are allowed to coexist
+            //     so users can fan one button out to multiple outputs:
+            //     `Y → X` and `Y → Y` both fire when Y is pressed.
+            //
+            // Analog mappings with IDENTICAL input chords have an extra
+            // last-wins override applied during the publish pass below
+            // (user-error guard for conflicting analog writes).
+            let mut triggered: Vec<(Vec<String>, Vec<String>, bool, usize)> = Vec::new(); // (in, out, is_analog, orig_idx)
+            let mut triggered_claims: Vec<(usize, Vec<String>)> = Vec::new();
             for &i in &sorted_idx {
                 let m = &mappings[i];
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
@@ -1328,18 +2262,46 @@ pub fn eval_graph_tick(
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
                 if in_pins.is_empty() { continue; }
-                if in_pins.iter().any(|p| claimed_inputs.contains(p)) { continue; }
                 if !effective[i] { continue; }
-                for p in &in_pins { claimed_inputs.insert(p.clone()); }
-                triggered.push((in_pins, out_pins));
+                let my_len = in_pins.len();
+                let suppressed = triggered_claims.iter().any(|(claim_len, claim_pins)| {
+                    *claim_len > my_len && in_pins.iter().all(|p| claim_pins.contains(p))
+                });
+                if suppressed { continue; }
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                let mut sorted_in = in_pins.clone();
+                sorted_in.sort();
+                triggered_claims.push((my_len, sorted_in));
+                triggered.push((in_pins, out_pins, is_analog, i));
             }
 
+            // Claimed inputs split by mode so pass-through suppression for
+            // analog cardinal claims can use axis-side clamping rather than
+            // hard-zeroing the entire axis.
+            let mut claimed_inputs_digital: HashSet<String> = HashSet::new();
+            let mut claimed_inputs_analog: HashSet<String>  = HashSet::new();
+            for (in_pins, _, is_analog, _) in &triggered {
+                let target = if *is_analog { &mut claimed_inputs_analog } else { &mut claimed_inputs_digital };
+                for p in in_pins { target.insert(p.clone()); }
+            }
+            let analog_axis_suppress = analog_axis_suppression(&claimed_inputs_analog);
+
             // Pass-through every canonical pin first, suppressing claimed inputs.
-            // Bool pins suppress to false; Float/Vec2 suppress to zero so downstream
-            // virtual sinks see no analog leakage from a consumed trigger.
+            // Digital-claimed pins zero out fully; analog-claimed cardinals
+            // clamp the axis to the opposite side only.
             for ap in automap::ALL_PINS {
-                let suppressed = claimed_inputs.contains(ap.id);
-                let sig = if suppressed {
+                // Hard suppression for digital-claimed pins (incl. their
+                // axis-pin equivalents when a cardinal was claimed digitally).
+                let mut digital_suppress = claimed_inputs_digital.contains(ap.id);
+                if !digital_suppress {
+                    // A digital-claimed cardinal also zeros its axis pin.
+                    for cardinal in &claimed_inputs_digital {
+                        if let Some((axis_pin, _)) = analog_axis_for_cardinal(cardinal) {
+                            if axis_pin == ap.id { digital_suppress = true; break; }
+                        }
+                    }
+                }
+                let sig = if digital_suppress {
                     match ap.signal_type {
                         SignalType::Bool  => Signal::Bool(false),
                         SignalType::Float => Signal::Float(0.0),
@@ -1347,64 +2309,266 @@ pub fn eval_graph_tick(
                         SignalType::Int   => Signal::Int(0),
                         _ => continue,
                     }
-                } else {
-                    match read_upstream(ap.id) {
-                        Some(s) => s,
-                        None => continue,
+                } else if let Some(raw) = read_upstream(ap.id) {
+                    // Analog suppression for stick axis pins: clamp only the
+                    // consumed side(s).
+                    if let Some(&(neg, pos)) = analog_axis_suppress.get(&ap.id) {
+                        match raw {
+                            Signal::Float(v) => Signal::Float(apply_axis_clamp(v, (neg, pos))),
+                            Signal::Vec2(v) => {
+                                // Axis-named pin only fires for Float; Vec2
+                                // versions ("left_stick") handled separately.
+                                Signal::Vec2(v)
+                            }
+                            other => other,
+                        }
+                    } else if matches!(ap.id, "left_stick" | "right_stick") {
+                        // For the bundled Vec2 pin: apply suppression to
+                        // each component independently.
+                        let (xa, ya) = if ap.id == "left_stick" {
+                            ("left_stick_x", "left_stick_y")
+                        } else {
+                            ("right_stick_x", "right_stick_y")
+                        };
+                        let xs = analog_axis_suppress.get(&xa).copied().unwrap_or((false, false));
+                        let ys = analog_axis_suppress.get(&ya).copied().unwrap_or((false, false));
+                        if xs == (false, false) && ys == (false, false) {
+                            raw
+                        } else if let Signal::Vec2(v) = raw {
+                            Signal::Vec2(Vec2::new(
+                                apply_axis_clamp(v.x, xs),
+                                apply_axis_clamp(v.y, ys),
+                            ))
+                        } else { raw }
+                    } else {
+                        raw
                     }
+                } else {
+                    continue;
                 };
                 collector_sigs.insert((key.clone(), ap.id.to_string()), sig);
             }
 
-            // Collect every output pin mentioned in ANY mapping (triggered or
-            // not). Released mappings must explicitly publish "false" so the
-            // downstream sink sees the transition — otherwise sinks with sticky
-            // state (e.g. virtual KB/M's learned_keys → enigo) latch the OS
-            // key as held until the patch is reloaded.
-            let mut all_out_pins: HashSet<String> = HashSet::new();
-            for m in &mappings {
-                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            all_out_pins.insert(s.to_string());
+            // Recompute synthetic cardinals for the (possibly clamped) axes
+            // so downstream consumers see consistent cardinal bools. Reads
+            // from collector_sigs we just wrote, mutates back.
+            {
+                let mut local_up: HashMap<String, Signal> = HashMap::new();
+                for axis in ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"] {
+                    if let Some(&sig) = collector_sigs.get(&(key.clone(), axis.to_string())) {
+                        local_up.insert(axis.to_string(), sig);
+                    }
+                }
+                derive_stick_cardinals(&mut local_up);
+                for (k, v) in local_up {
+                    if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
+                        || k.ends_with("_left") || k.ends_with("_right"))
+                    {
+                        collector_sigs.insert((key.clone(), k), v);
+                    }
+                }
+            }
+
+            // ── Analog publish pass ──────────────────────────────────────
+            //
+            // Apply identical-input-chord override (last wins). Build the
+            // set of analog mappings to actually emit, suppressing any
+            // earlier analog mapping whose input chord matches a later one.
+            let mut analog_emit_idx: Vec<usize> = Vec::new();
+            {
+                // Walk triggered in original mapping order so "later in the
+                // user's list wins". `triggered` was built in sorted_idx
+                // (longest-first) order; recover original order via the
+                // orig_idx we stored.
+                let mut analog_indices: Vec<usize> = (0..triggered.len())
+                    .filter(|&t| triggered[t].2)
+                    .collect();
+                analog_indices.sort_by_key(|&t| triggered[t].3);
+                let mut keep: Vec<bool> = vec![true; analog_indices.len()];
+                for a in 0..analog_indices.len() {
+                    if !keep[a] { continue; }
+                    let (ref ain, _, _, _) = triggered[analog_indices[a]];
+                    let mut a_set: Vec<&String> = ain.iter().collect();
+                    a_set.sort();
+                    for b in (a + 1)..analog_indices.len() {
+                        let (ref bin, _, _, _) = triggered[analog_indices[b]];
+                        if ain.len() != bin.len() { continue; }
+                        let mut b_set: Vec<&String> = bin.iter().collect();
+                        b_set.sort();
+                        if a_set == b_set {
+                            // Later (higher index) wins → suppress earlier.
+                            keep[a] = false;
+                            break;
+                        }
+                    }
+                }
+                for (a, t_idx) in analog_indices.iter().enumerate() {
+                    if keep[a] { analog_emit_idx.push(*t_idx); }
+                }
+            }
+
+            // Accumulate cardinal-axis writes additively; track button-output
+            // emissions per output-pin for turbo / sustain handling.
+            let mut analog_axis_acc: HashMap<&'static str, f32> = HashMap::new();
+            let mut analog_button_out: HashSet<String> = HashSet::new();
+            let mut analog_out_pins: HashSet<String> = HashSet::new();
+            for &t_idx in &analog_emit_idx {
+                let (ref in_pins, ref out_pins, _, orig_i) = triggered[t_idx];
+                let m = &mappings[orig_i];
+                let turbo  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                let slots = press_state_get(ns, orig_i);
+                // Zip in↔out by index; drop the excess from whichever side
+                // is longer.
+                let n = in_pins.len().min(out_pins.len());
+                for (in_p, out_p) in in_pins[..n].iter().zip(out_pins[..n].iter()) {
+                    analog_out_pins.insert(out_p.clone());
+                    let in_is_cardinal  = analog_axis_for_cardinal(in_p).is_some();
+                    let out_axis_opt    = analog_axis_for_cardinal(out_p);
+                    let mag_from_input = if in_is_cardinal {
+                        analog_cardinal_input_value(&upstream, in_p)
+                    } else {
+                        // Non-cardinal in pin in this slot — when paired with
+                        // a cardinal out, drive it at full magnitude while the
+                        // gate is open (the effective[] check guaranteed all
+                        // non-cardinal buttons are held).
+                        1.0
+                    };
+                    if let Some((axis_pin, sign)) = out_axis_opt {
+                        let contrib = sign * mag_from_input;
+                        // Sum across all (mapping × in/out pair) contributions.
+                        let entry = analog_axis_acc.entry(axis_pin).or_insert(0.0);
+                        *entry += contrib;
+                    } else {
+                        // Non-cardinal out: button / key. Turbo pulses; else
+                        // straight gate.
+                        let active = if turbo {
+                            apply_turbo(true, window_ms, slots, dt)
+                        } else { true };
+                        if active {
+                            analog_button_out.insert(out_p.clone());
                         }
                     }
                 }
             }
-            // Determine which output pins are currently asserted (any triggered
-            // mapping listing them in its `out`).
-            let mut asserted: HashSet<String> = HashSet::new();
-            for (_, out_pins) in &triggered {
-                for p in out_pins { asserted.insert(p.clone()); }
+            // Commit axis accumulator: clamp ±1 then write.
+            for (axis_pin, v) in &analog_axis_acc {
+                let clamped = v.clamp(-1.0, 1.0);
+                collector_sigs.insert((key.clone(), (*axis_pin).to_string()), Signal::Float(clamped));
             }
-            // Overlay rule per output pin:
-            //   - If the mapping fires this tick, write the asserted value.
-            //   - If the mapping is released:
-            //       * Output pin that the upstream device naturally emits
-            //         (e.g. btn_east on a gamepad) — leave the pass-through
-            //         value alone so the button still works natively when not
-            //         being driven by a mapping.
-            //       * Output pin the upstream doesn't emit (e.g. key_q,
-            //         mouse_left) — write false/zero so downstream sinks with
-            //         sticky state (virtual KB/M) see the release transition.
-            for out_pin in &all_out_pins {
+            // Update bundled Vec2 pins so downstream sinks that read the
+            // Vec2 form (`left_stick`/`right_stick`) see the analog-driven
+            // values too. Without this, the sink's Vec2-vs-axis conflict
+            // resolver picks the Vec2 (which still carries the suppressed
+            // pass-through) and drops the analog axis writes.
+            for (vec2_pin, x_axis, y_axis) in [
+                ("left_stick", "left_stick_x", "left_stick_y"),
+                ("right_stick", "right_stick_x", "right_stick_y"),
+            ] {
+                let x_override = analog_axis_acc.get(&x_axis).copied();
+                let y_override = analog_axis_acc.get(&y_axis).copied();
+                if x_override.is_none() && y_override.is_none() { continue; }
+                let cur = collector_sigs.get(&(key.clone(), vec2_pin.to_string()))
+                    .and_then(|s| if let Signal::Vec2(v) = s { Some(*v) } else { None })
+                    .unwrap_or(Vec2::ZERO);
+                let x = x_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.x);
+                let y = y_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.y);
+                collector_sigs.insert((key.clone(), vec2_pin.to_string()), Signal::Vec2(Vec2::new(x, y)));
+            }
+
+            // ── Digital publish pass (existing semantics) ────────────────
+            //
+            // Collect every output pin mentioned in any DIGITAL mapping so
+            // released ones can publish false/0. Analog-only out pins are
+            // handled by the analog pass above.
+            let mut digital_all_out_pins: HashSet<String> = HashSet::new();
+            for (i, m) in mappings.iter().enumerate() {
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                if is_analog { continue; }
+                let _ = i;
+                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            digital_all_out_pins.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+            let mut digital_asserted: HashSet<String> = HashSet::new();
+            for (_, out_pins, is_analog, _) in &triggered {
+                if *is_analog { continue; }
+                for p in out_pins { digital_asserted.insert(p.clone()); }
+            }
+            for out_pin in &digital_all_out_pins {
                 let sig_type = automap::ALL_PINS.iter()
                     .find(|p| p.id == out_pin.as_str())
                     .map(|p| p.signal_type)
                     .unwrap_or(SignalType::Bool);
-                let on = asserted.contains(out_pin);
+                let on = digital_asserted.contains(out_pin);
                 if on {
                     let sig = match sig_type {
                         SignalType::Float => Signal::Float(1.0),
-                        SignalType::Vec2  => continue, // not driven by chord mappings
+                        SignalType::Vec2  => continue,
                         SignalType::Int   => Signal::Int(1),
                         _                 => Signal::Bool(true),
                     };
                     collector_sigs.insert((key.clone(), out_pin.clone()), sig);
                 } else {
-                    // Released. Only force a zero/false write if the upstream
-                    // wouldn't have produced anything for this pin (i.e. KB/M
-                    // output pins not present on the upstream gamepad).
+                    if upstream.contains_key(out_pin.as_str()) { continue; }
+                    // If an analog mapping has already written this same out
+                    // pin (e.g., the user fans a button to it from a different
+                    // mapping), don't overwrite with zero.
+                    if analog_button_out.contains(out_pin)
+                        || analog_axis_acc.iter().any(|(ap, _)| *ap == out_pin.as_str())
+                    {
+                        continue;
+                    }
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(0.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(0),
+                        _                 => Signal::Bool(false),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                }
+            }
+
+            // ── Analog button-out emissions + release pass ───────────────
+            //
+            // Bool/Int analog out pins: write true while active. For released
+            // analog out pins (mapping inactive this tick), write false/0
+            // only when upstream doesn't naturally emit it (mirrors digital
+            // release rule).
+            let mut analog_button_pins: HashSet<String> = HashSet::new();
+            for m in &mappings {
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                if !is_analog { continue; }
+                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            if analog_axis_for_cardinal(s).is_none() {
+                                analog_button_pins.insert(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            for out_pin in &analog_button_pins {
+                if digital_asserted.contains(out_pin) { continue; } // digital wins for this pin
+                let on = analog_button_out.contains(out_pin);
+                let sig_type = automap::ALL_PINS.iter()
+                    .find(|p| p.id == out_pin.as_str())
+                    .map(|p| p.signal_type)
+                    .unwrap_or(SignalType::Bool);
+                if on {
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(1.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(1),
+                        _                 => Signal::Bool(true),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                } else {
                     if upstream.contains_key(out_pin.as_str()) { continue; }
                     let sig = match sig_type {
                         SignalType::Float => Signal::Float(0.0),
@@ -1421,6 +2585,18 @@ pub fn eval_graph_tick(
         }
 
         // ── module.automap_collect: inject individual inputs into collector_sigs ──
+        //
+        // Two-phase write into collector_sigs[("collector:{uid}", pin)]:
+        //   1. Pass-through pins from the upstream AutoMap bus — pulled
+        //      either from upstream `collector_sigs` (if upstream is a
+        //      Remapper/Collector/Fork/Selector/Combiner/Lean) or from
+        //      raw `dev_sigs` (if upstream is a physical device). This
+        //      ensures mapped output pins from an upstream Remapper still
+        //      reach downstream sinks even though the user didn't add
+        //      those pins via the Collector's "+" dropdown.
+        //   2. Explicit collected-pin overrides — values wired by the user
+        //      to the collector's individual input ports. These win over
+        //      pass-through for the same pin id.
         if snap.module_id == "module.automap_collect" {
             let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
                 .map(|src| src.and_then(|(si, op)| {
@@ -1432,6 +2608,47 @@ pub fn eval_graph_tick(
                 .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
                 .unwrap_or_default();
             let uid_key = format!("collector:{}", snap.node_uid);
+
+            // Phase 1: pass-through from upstream AutoMap source.
+            // Iterating upstream's actual collector_sigs entries (not just
+            // `ALL_PINS`) is required so off-spec pin names — Remapper's
+            // mapped keyboard keys like `key_f`, custom mouse buttons, etc.
+            // — also flow through. `ALL_PINS` only covers canonical pin ids.
+            let upstream_dev = snap.params.get("_automap_device_id")
+                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let upstream_collector = snap.params.get("_automap_collector_id")
+                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !upstream_collector.is_empty() {
+                // Copy EVERY entry from the upstream collector key.
+                let copies: Vec<(String, Signal)> = collector_sigs.iter()
+                    .filter(|((dev, _), _)| dev == &upstream_collector)
+                    .map(|((_, pin), sig)| (pin.clone(), *sig))
+                    .collect();
+                for (pin, sig) in copies {
+                    collector_sigs.insert((uid_key.clone(), pin), sig);
+                }
+                // For canonical pins not present on the upstream collector
+                // (e.g. when upstream is a Remapper that only writes mapped
+                // pins, not pass-through), fall back to raw device samples.
+                if !upstream_dev.is_empty() {
+                    for pin in flexinput_core::automap::ALL_PINS {
+                        let key = (uid_key.clone(), pin.id.to_string());
+                        if collector_sigs.contains_key(&key) { continue; }
+                        if let Some(&sig) = dev_sigs.get(&(upstream_dev.clone(), pin.id.to_string())) {
+                            collector_sigs.insert(key, sig);
+                        }
+                    }
+                }
+            } else if !upstream_dev.is_empty() {
+                // No upstream collector — pure raw device pass-through.
+                for pin in flexinput_core::automap::ALL_PINS {
+                    if let Some(&sig) = dev_sigs.get(&(upstream_dev.clone(), pin.id.to_string())) {
+                        collector_sigs.insert((uid_key.clone(), pin.id.to_string()), sig);
+                    }
+                }
+            }
+
+            // Phase 2: explicit collected-pin overrides (win over pass-through).
             for (i, pin_id) in collect_ids.iter().enumerate() {
                 if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
                     if !pin_id.is_empty() {
@@ -1445,34 +2662,7 @@ pub fn eval_graph_tick(
 
         // ── module.automap_fork: gate AutoMap bus to selected output ─────────
         if snap.module_id == "module.automap_fork" {
-            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
-            let collector_id_upstream = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
-            // inputs[0] = AutoMap (ignored as value), inputs[1] = select
-            let select = match snap.input_sources.get(1)
-                .and_then(|src| src.and_then(|(si, op)| computed.get(si).and_then(|v| v.get(op)).copied().flatten()))
-            {
-                Some(Signal::Float(f)) => {
-                    let n = snap.n_outputs.max(1);
-                    ((f.clamp(0.0, 1.0) * (n as f32 - 1.0 + 0.5)).floor() as usize).min(n - 1)
-                }
-                Some(Signal::Bool(b)) => if b { 1 } else { 0 },
-                _ => 0,
-            };
-            for out_idx in 0..snap.n_outputs {
-                if out_idx != select { continue; }
-                let key = format!("forksel:{}:{}", snap.node_uid, out_idx);
-                for pin in flexinput_core::automap::ALL_PINS {
-                    let sig = if !collector_id_upstream.is_empty() {
-                        collector_sigs.get(&(collector_id_upstream.to_string(), pin.id.to_string())).copied()
-                            .or_else(|| dev_sigs.get(&(dev_id.to_string(), pin.id.to_string())).copied())
-                    } else {
-                        dev_sigs.get(&(dev_id.to_string(), pin.id.to_string())).copied()
-                    };
-                    if let Some(sig) = sig {
-                        collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
-                    }
-                }
-            }
+            automap_fork_publish(snap, snap.node_uid, &computed, dev_sigs, &mut collector_sigs);
             computed[idx] = vec![None; snap.n_outputs];
             continue;
         }
@@ -1487,283 +2677,16 @@ pub fn eval_graph_tick(
         //   - MULT: product, clamped per pin
         // Writes into collector_sigs under "combiner:{uid}".
         if snap.module_id == "module.automap_combiner" {
-            let input_devs = snap.params.get("_automap_input_devs")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
-                .unwrap_or_default();
-            let input_collectors = snap.params.get("_automap_input_collectors")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
-                .unwrap_or_default();
-            let policy_map = snap.params.get("combiner_pin_policy")
-                .and_then(|v| v.as_object()).cloned().unwrap_or_default();
-            // Per-pin port pinning: if present, this pin reads ONLY from the
-            // specified port (clamped to last connected port). Bypasses policy.
-            let port_map = snap.params.get("combiner_pin_port")
-                .and_then(|v| v.as_object()).cloned().unwrap_or_default();
-            let key = format!("combiner:{}", snap.node_uid);
-
-            // Pin-type-aware clamping. Triggers are [0,1]; stick axes / dpad axes
-            // / left-right sticks are [-1,1]. Gyro/accel/mouse remain unclamped.
-            fn clamp_for_pin(pin_id: &str, v: f32) -> f32 {
-                match pin_id {
-                    "left_trigger" | "right_trigger" => v.clamp(0.0, 1.0),
-                    "left_stick_x" | "left_stick_y"
-                    | "right_stick_x" | "right_stick_y"
-                    | "dpad_x" | "dpad_y" => v.clamp(-1.0, 1.0),
-                    _ => v,
-                }
-            }
-            fn clamp_vec2_for_pin(pin_id: &str, v: glam::Vec2) -> glam::Vec2 {
-                if matches!(pin_id, "left_stick" | "right_stick" | "dpad") {
-                    glam::Vec2::new(v.x.clamp(-1.0, 1.0), v.y.clamp(-1.0, 1.0))
-                } else { v }
-            }
-
-            // Read per-port pin signal at a given index, preferring collector
-            // override over raw device samples (matches Splitter's behaviour).
-            fn read_pin_at(
-                i: usize, pin_id: &str,
-                input_devs: &[String], input_collectors: &[String],
-                collector_sigs: &HashMap<(String, String), Signal>,
-                dev_sigs: &HashMap<(String, String), Signal>,
-            ) -> Option<Signal> {
-                let collector_id = input_collectors.get(i).map(|s| s.as_str()).unwrap_or("");
-                let dev_id       = input_devs.get(i).map(|s| s.as_str()).unwrap_or("");
-                if !collector_id.is_empty() {
-                    collector_sigs.get(&(collector_id.to_string(), pin_id.to_string())).copied()
-                        .or_else(|| {
-                            if !dev_id.is_empty() {
-                                dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
-                            } else { None }
-                        })
-                } else if !dev_id.is_empty() {
-                    dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
-                } else {
-                    None
-                }
-            }
-
-            for pin in flexinput_core::automap::ALL_PINS {
-                // Per-pin port pin: if set, route exclusively from that port
-                // (clamped to the last connected port). Skip the rest of the
-                // policy machinery entirely.
-                if let Some(port_v) = port_map.get(pin.id) {
-                    if let Some(port_u) = port_v.as_u64() {
-                        let n_inputs = input_devs.len();
-                        if n_inputs == 0 { continue; }
-                        let port = (port_u as usize).min(n_inputs - 1);
-                        if let Some(sig) = read_pin_at(port, pin.id,
-                            &input_devs, &input_collectors, &collector_sigs, dev_sigs)
-                        {
-                            collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
-                        }
-                        continue;
-                    }
-                }
-
-                // Collect raw values from every connected input.
-                let mut raw: Vec<Signal> = Vec::with_capacity(input_devs.len());
-                for i in 0..input_devs.len() {
-                    if let Some(s) = read_pin_at(i, pin.id,
-                        &input_devs, &input_collectors, &collector_sigs, dev_sigs)
-                    {
-                        raw.push(s);
-                    }
-                }
-                if raw.is_empty() { continue; }
-
-                let policy = policy_map.get(pin.id).and_then(|v| v.as_str()).unwrap_or("SORT");
-                let resolved: Option<Signal> = match policy {
-                    "SORT" => {
-                        // Connection-priority: highest port that *offers* the
-                        // pin wins, even when its current value is idle. Lower
-                        // ports are completely shadowed for this pin. Since
-                        // `raw` is built by walking ports top-down and pushing
-                        // only when read_pin_at returns Some, the first entry
-                        // is exactly the highest-priority port that has it.
-                        raw.into_iter().next()
-                    }
-                    "OR" => match pin.signal_type {
-                        flexinput_core::SignalType::Bool => {
-                            let any = raw.iter().any(|s| matches!(s, Signal::Bool(true)));
-                            Some(Signal::Bool(any))
-                        }
-                        flexinput_core::SignalType::Vec2 => {
-                            // Per-component max-abs, preserving sign of the contributing component.
-                            let pick = |sel: fn(&glam::Vec2) -> f32| {
-                                raw.iter().filter_map(|s| match s {
-                                    Signal::Vec2(v) => Some(sel(v)), _ => None
-                                }).fold(0.0_f32, |acc, x|
-                                    if x.abs() > acc.abs() { x } else { acc })
-                            };
-                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
-                                glam::Vec2::new(pick(|v| v.x), pick(|v| v.y)))))
-                        }
-                        _ => {
-                            // Float / Int: max(|x|) preserving sign.
-                            let f = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).fold(0.0_f32, |acc, x|
-                                if x.abs() > acc.abs() { x } else { acc });
-                            Some(Signal::Float(clamp_for_pin(pin.id, f)))
-                        }
-                    },
-                    "AND" => match pin.signal_type {
-                        flexinput_core::SignalType::Bool => {
-                            let all = raw.iter().all(|s| matches!(s, Signal::Bool(true)));
-                            Some(Signal::Bool(all))
-                        }
-                        flexinput_core::SignalType::Vec2 => {
-                            let pick = |sel: fn(&glam::Vec2) -> f32| {
-                                let mut it = raw.iter().filter_map(|s| match s {
-                                    Signal::Vec2(v) => Some(sel(v)), _ => None
-                                });
-                                let mut best = it.next().unwrap_or(0.0);
-                                for x in it {
-                                    if x.abs() < best.abs() { best = x; }
-                                }
-                                best
-                            };
-                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
-                                glam::Vec2::new(pick(|v| v.x), pick(|v| v.y)))))
-                        }
-                        _ => {
-                            let mut it = raw.iter().filter_map(|s| sig_to_f32(Some(*s)));
-                            let mut best = it.next().unwrap_or(0.0);
-                            for x in it {
-                                if x.abs() < best.abs() { best = x; }
-                            }
-                            Some(Signal::Float(clamp_for_pin(pin.id, best)))
-                        }
-                    },
-                    "XOR" => match pin.signal_type {
-                        flexinput_core::SignalType::Bool => {
-                            let parity = raw.iter()
-                                .filter(|s| matches!(s, Signal::Bool(true))).count() % 2 == 1;
-                            Some(Signal::Bool(parity))
-                        }
-                        flexinput_core::SignalType::Vec2 => {
-                            // |a - b| folded across all inputs, per component.
-                            let fold = |sel: fn(&glam::Vec2) -> f32| -> f32 {
-                                let xs: Vec<f32> = raw.iter().filter_map(|s| match s {
-                                    Signal::Vec2(v) => Some(sel(v)), _ => None
-                                }).collect();
-                                if xs.is_empty() { return 0.0; }
-                                xs.iter().skip(1).fold(xs[0], |acc, &x| (acc - x).abs())
-                            };
-                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id,
-                                glam::Vec2::new(fold(|v| v.x), fold(|v| v.y)))))
-                        }
-                        _ => {
-                            let xs: Vec<f32> = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).collect();
-                            let v = if xs.is_empty() { 0.0 }
-                                else { xs.iter().skip(1).fold(xs[0], |acc, &x| (acc - x).abs()) };
-                            Some(Signal::Float(clamp_for_pin(pin.id, v)))
-                        }
-                    },
-                    "ADD" => match pin.signal_type {
-                        flexinput_core::SignalType::Bool => {
-                            let any = raw.iter().any(|s| matches!(s, Signal::Bool(true)));
-                            Some(Signal::Bool(any))
-                        }
-                        flexinput_core::SignalType::Vec2 => {
-                            let sum = raw.iter().fold(glam::Vec2::ZERO, |acc, s| match s {
-                                Signal::Vec2(v) => acc + *v, _ => acc
-                            });
-                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id, sum)))
-                        }
-                        _ => {
-                            let s: f32 = raw.iter().filter_map(|s| sig_to_f32(Some(*s))).sum();
-                            Some(Signal::Float(clamp_for_pin(pin.id, s)))
-                        }
-                    },
-                    "MULT" => match pin.signal_type {
-                        flexinput_core::SignalType::Bool => {
-                            let all = raw.iter().all(|s| matches!(s, Signal::Bool(true)));
-                            Some(Signal::Bool(all))
-                        }
-                        flexinput_core::SignalType::Vec2 => {
-                            // Polar MULT: multiply input *lengths*, keep
-                            // port-0's *direction*. With circular sticks a
-                            // full diagonal is length 1, so two full diagonal
-                            // deflections both yield length 1 instead of the
-                            // per-component product collapsing to (0.5, 0.5).
-                            // Direction comes from port 0 because SORT means
-                            // "port 0 owns this pin" everywhere else too.
-                            let first = match raw.first() {
-                                Some(Signal::Vec2(v)) => *v,
-                                _ => glam::Vec2::ZERO,
-                            };
-                            let mag_product = raw.iter().fold(1.0_f32, |acc, s| match s {
-                                Signal::Vec2(v) => acc * v.length(),
-                                _ => acc,
-                            });
-                            let dir = if first.length() > 0.0 {
-                                first.normalize()
-                            } else {
-                                glam::Vec2::ZERO
-                            };
-                            Some(Signal::Vec2(clamp_vec2_for_pin(pin.id, dir * mag_product)))
-                        }
-                        _ => {
-                            // For unsigned pins (triggers [0,1]) plain product
-                            // is correct. For signed pins, take port-0 sign ×
-                            // product of magnitudes so two negative inputs
-                            // don't flip into a positive output.
-                            let is_signed = !matches!(pin.id,
-                                "left_trigger" | "right_trigger");
-                            let nums: Vec<f32> = raw.iter()
-                                .filter_map(|s| sig_to_f32(Some(*s))).collect();
-                            let v = if is_signed {
-                                let sign = nums.first().copied().unwrap_or(0.0);
-                                let mag = nums.iter().fold(1.0_f32, |a, b| a * b.abs());
-                                if sign < 0.0 { -mag } else { mag }
-                            } else {
-                                nums.iter().fold(1.0_f32, |a, b| a * b)
-                            };
-                            Some(Signal::Float(clamp_for_pin(pin.id, v)))
-                        }
-                    },
-                    _ => None, // unknown policy → silent
-                };
-                if let Some(s) = resolved {
-                    collector_sigs.insert((key.clone(), pin.id.to_string()), s);
-                }
-            }
+            automap_combiner_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
             computed[idx] = vec![None];
             continue;
         }
-
         // ── module.automap_selector: gate selected AutoMap input to output ────
         if snap.module_id == "module.automap_selector" {
-            // inputs[0] = select, inputs[1..] = AutoMap buses
-            let n_inputs = snap.input_sources.len().saturating_sub(1).max(1);
-            let select = match snap.input_sources.get(0)
-                .and_then(|src| src.and_then(|(si, op)| computed.get(si).and_then(|v| v.get(op)).copied().flatten()))
-            {
-                Some(Signal::Float(f)) => {
-                    let n = n_inputs as f32;
-                    ((f.clamp(0.0, 1.0) * n).floor() as usize).min(n_inputs - 1)
-                }
-                Some(Signal::Bool(b)) => if b { 1 } else { 0 },
-                _ => 0,
-            };
-            let input_devs = snap.params.get("_automap_input_devs")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>())
-                .unwrap_or_default();
-            let selected_dev = input_devs.get(select).map(|s| s.as_str()).unwrap_or("");
-            let key = format!("forksel:{}:0", snap.node_uid);
-            if !selected_dev.is_empty() {
-                for pin in flexinput_core::automap::ALL_PINS {
-                    if let Some(sig) = dev_sigs.get(&(selected_dev.to_string(), pin.id.to_string())).copied() {
-                        collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
-                    }
-                }
-            }
+            automap_selector_publish(snap, snap.node_uid, &computed, dev_sigs, &mut collector_sigs);
             computed[idx] = vec![None];
             continue;
         }
-
         // ── device.sink: collect combined inputs, populate sink_outputs ──────
         if let Some(ref st) = snap.sink_target {
             // Pins that have at least one actual direct wire (non-empty multi_sources).
@@ -1830,7 +2753,8 @@ pub fn eval_graph_tick(
                 let is_collector = src_dev.starts_with("collector:")
                     || src_dev.starts_with("forksel:")
                     || src_dev.starts_with("remap:")
-                    || src_dev.starts_with("combiner:");
+                    || src_dev.starts_with("combiner:")
+                    || src_dev.starts_with("lean:");
                 for (mapped_src, mapped_dst) in automap::resolve_mapping(&src_ids, &dst_ids) {
                     if directly_wired.contains(mapped_dst) { continue; }
                     // For collectors (including fork/selector gates): check collector_sigs first,
@@ -1959,6 +2883,31 @@ pub fn eval_graph_tick(
         }
 
         let node_outputs = compute_node(snap, &inputs, node_state, dev_sigs, &collector_sigs, dt);
+
+        // ── 3DOF lean dispatch: emit per-pin signals via the Map output ──
+        //
+        // The lean_left / lean_right sections each own an array of mappings
+        // (Map-Action-shaped: `{ out, mode, window_ms, sustain, turbo }`).
+        // A mapping's raw-held bool is whether the lean magnitude has
+        // crossed `lean_threshold` on the corresponding side. The held
+        // value flows through the standard press-mode pipeline (down /
+        // short / long / double / on_press / on_release / turbo) the same
+        // way Map Action does. Asserted output pins are written into
+        // `collector_sigs` under "lean:{uid}" so a downstream AutoMap
+        // collector (or subpatch outlet) routes them to gamepad/KB sinks.
+        //
+        // Analog mode is special: instead of treating the side as a
+        // raw_held bool, the module produces a pulse train at frequency
+        // |lean| × MAX_FREQ_HZ, with each pulse held for `window_ms` ms
+        // (sustain on → window_ms × 4 for "long" taps). Released mappings
+        // and below-threshold leans produce no pulses. Press-state slot
+        // [0] tracks the phase seconds in [0, period).
+        if snap.module_id == "processing.gyro_3dof" {
+            lean_dispatch_into_collector_sigs(
+                snap, snap.node_uid, &node_outputs, node_state,
+                &mut collector_sigs, dt,
+            );
+        }
 
         match snap.module_id.as_str() {
             "display.oscilloscope" | "display.readout" => {
@@ -2945,45 +3894,234 @@ fn compute_counter(
     vec![Some(Signal::Float(output))]
 }
 
-// ─── Hampel-style outlier suppression ────────────────────────────────────────
-// State layout per axis (6 axes: gx, gy, gz, ax, ay, az):
-//   `dc_fast` and `dc_estimates` are NOT used here — we reuse `avg_bufs` to
-//   hold rolling-window samples per axis. Index 0..6 maps to gx, gy, gz, ax,
-//   ay, az respectively. This keeps state lean without adding new fields.
-const SPIKE_WINDOW: usize = 20;
-const SPIKE_DEFAULT_K: f32 = 4.0;
+/// For Analog mode, a synthetic stick-cardinal Bool (left_stick_right, etc.)
+/// captured during Learn is reinterpreted as "drive the underlying analog
+/// axis in that direction." Returns (axis_pin_id, sign) where sign is +1
+/// for the positive direction (right/up) or -1 for the negative direction
+/// (left/down). Returns None when the pin isn't a stick cardinal — those
+/// fall through to normal pulse-train Bool emission.
+fn analog_axis_for_cardinal(pin_id: &str) -> Option<(&'static str, f32)> {
+    match pin_id {
+        "left_stick_right"  => Some(("left_stick_x",   1.0)),
+        "left_stick_left"   => Some(("left_stick_x",  -1.0)),
+        "left_stick_up"     => Some(("left_stick_y",   1.0)),
+        "left_stick_down"   => Some(("left_stick_y",  -1.0)),
+        "right_stick_right" => Some(("right_stick_x",  1.0)),
+        "right_stick_left"  => Some(("right_stick_x", -1.0)),
+        "right_stick_up"    => Some(("right_stick_y",  1.0)),
+        "right_stick_down"  => Some(("right_stick_y", -1.0)),
+        _ => None,
+    }
+}
 
-/// Minimum stddev floor. When the signal is genuinely stationary the
-/// computed MAD collapses to ~0, which would make every real motion sample
-/// look like an outlier. The floor sets a noise scale below which we don't
-/// try to flag anything — anything inside this band is allowed through.
-/// Tuned to a gyro/accel noise floor that's still tight enough to catch
-/// real 1-sample spikes (which typically jump dozens of units).
-const SPIKE_SIGMA_FLOOR: f32 = 0.02;
+/// Return the signed analog magnitude an input cardinal currently contributes
+/// to its axis: 0.0 when the stick is neutral or pushed in the opposite
+/// direction; up to ±1.0 at full deflection in the cardinal's direction.
+/// Used by analog-mode Remapper / Map Action to drive output axes from
+/// input cardinals' live magnitudes (no gesture gate).
+fn analog_cardinal_input_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> f32 {
+    let Some((axis_pin, cardinal_sign)) = analog_axis_for_cardinal(pin_id) else { return 0.0; };
+    let axis_val = upstream.get(axis_pin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+    let signed = axis_val * cardinal_sign;
+    signed.max(0.0).min(1.0)
+}
 
-fn spike_filter(buf: &mut VecDeque<f32>, sample: f32, k: f32) -> f32 {
-    // Decide the output BEFORE mutating the buffer. We always push the
-    // *original* sample (not the filtered value) into the history —
-    // writing the suppressed output back would let one spike poison the
-    // baseline forever (MAD would stay at 0 and every subsequent motion
-    // sample would then read as an outlier).
-    let out = if buf.len() < 6 {
-        sample
-    } else {
-        let mut sorted: Vec<f32> = buf.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = sorted[sorted.len() / 2];
-        let mut dev: Vec<f32> = sorted.iter().map(|x| (x - median).abs()).collect();
-        dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mad = dev[dev.len() / 2];
-        // 1.4826 × MAD ≈ robust stddev; clamp to a noise-floor so a
-        // quiet signal can't make the threshold collapse to zero.
-        let sigma = (mad * 1.4826).max(SPIKE_SIGMA_FLOOR);
-        if (sample - median).abs() > k * sigma { median } else { sample }
-    };
-    buf.push_back(sample);
-    if buf.len() > SPIKE_WINDOW { buf.pop_front(); }
+/// For each analog-mode mapping that claims a stick cardinal input, build
+/// the suppression mask: for each axis, which sides (positive / negative)
+/// should be clamped to zero in the pass-through. Pass-through then writes
+/// `clamp(x, neg_clamp, pos_clamp)` where `pos_clamp = 0` if the positive
+/// cardinal is claimed (left_stick_right, etc.) and `neg_clamp = 0` if the
+/// negative cardinal is claimed.
+///
+/// Returns a map from axis pin id → (neg_clamp_to_zero, pos_clamp_to_zero).
+fn analog_axis_suppression(claimed: &HashSet<String>) -> HashMap<&'static str, (bool, bool)> {
+    let mut out: HashMap<&'static str, (bool, bool)> = HashMap::new();
+    for cardinal in claimed {
+        if let Some((axis, sign)) = analog_axis_for_cardinal(cardinal) {
+            let entry = out.entry(axis).or_insert((false, false));
+            if sign > 0.0 { entry.1 = true; } else { entry.0 = true; }
+        }
+    }
     out
+}
+
+/// Apply axis-side suppression to a stick axis Float value. `(neg, pos)` —
+/// when `neg` is true, clamp negative values to 0; when `pos` is true,
+/// clamp positive values to 0.
+fn apply_axis_clamp(v: f32, suppress: (bool, bool)) -> f32 {
+    let (neg, pos) = suppress;
+    let mut out = v;
+    if neg && out < 0.0 { out = 0.0; }
+    if pos && out > 0.0 { out = 0.0; }
+    out
+}
+
+/// Shared lean-dispatch for the 3DOF module. Called from both the
+/// top-level eval loop and the subgraph eval loop with the appropriate
+/// UID (snap.node_uid for top-level, ns_uid for subpatches). Writes to
+/// `collector_sigs[("lean:UID", pin_id)]` for every output pin named in
+/// any `lean_left` / `lean_right` mapping.
+fn lean_dispatch_into_collector_sigs(
+    snap: &NodeSnap,
+    uid: usize,
+    node_outputs: &[Option<Signal>],
+    node_state: &mut NodeState,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+    dt: f32,
+) {
+    let lean_val = node_outputs.get(3)
+        .and_then(|s| *s)
+        .map(|s| s.as_float())
+        .unwrap_or(0.0);
+    let lean_threshold = snap.params.get("lean_threshold")
+        .and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.3);
+    let left_active  = lean_val <= -lean_threshold;
+    let right_active = lean_val >=  lean_threshold;
+    let lean_mag = lean_val.abs().min(1.0);
+
+    let lean_left  = snap.params.get("lean_left")
+        .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let lean_right = snap.params.get("lean_right")
+        .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    // Collect every output pin mentioned in any mapping so released ones
+    // can publish false/0. Stick cardinals always also publish to their
+    // underlying analog axis (Analog and non-Analog modes both emit on
+    // the axis — cardinals aren't valid sink pin ids on their own, so
+    // without the axis remap nothing reaches the destination device).
+    let mut all_out_pins: HashSet<String> = HashSet::new();
+    for m in lean_left.iter().chain(lean_right.iter()) {
+        if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    all_out_pins.insert(s.to_string());
+                    if let Some((axis_pin, _)) = analog_axis_for_cardinal(s) {
+                        all_out_pins.insert(axis_pin.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut asserted: HashMap<String, Signal> = HashMap::new();
+    const MAX_FREQ_HZ: f32 = 20.0;
+
+    for (side_idx, side_pair) in [
+        (left_active, &lean_left), (right_active, &lean_right),
+    ].iter().enumerate() {
+        let (active, mappings) = side_pair;
+        let base_idx = if side_idx == 0 { 0 } else { lean_left.len() };
+        for (i, m) in mappings.iter().enumerate() {
+            let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            if out_pins.is_empty() { continue; }
+            let mode_s    = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+            let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+            let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+            let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            let slots = press_state_get(node_state, base_idx + i);
+
+            let (held_now, analog_val_opt): (bool, Option<f32>) = if mode_s == "analog" {
+                if !*active || lean_mag < 0.01 {
+                    slots[0] = 0.0;
+                    (false, Some(0.0))
+                } else {
+                    let period = (1.0 / (lean_mag * MAX_FREQ_HZ)).max(0.020);
+                    let mut tap_on_s = (window_ms / 1000.0).max(0.005);
+                    if sustain { tap_on_s *= 4.0; }
+                    tap_on_s = tap_on_s.min(period * 0.9);
+                    slots[0] += dt;
+                    if slots[0] >= period { slots[0] -= period; }
+                    let pulse_on = slots[0] < tap_on_s;
+                    (pulse_on, Some(lean_mag))
+                }
+            } else {
+                let mode = PressMode::from_str(mode_s);
+                let held = apply_press_mode(*active, mode, window_ms, sustain, slots, dt);
+                let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+                (held, None)
+            };
+
+            let is_analog_mode = mode_s == "analog";
+            for p in &out_pins {
+                // Cardinal → analog-axis remap (all press modes):
+                // A stick-cardinal like `left_stick_right` represents the
+                // user's INTENT to drive that axis in that direction. The
+                // cardinal pin id isn't a valid sink pin on any virtual
+                // gamepad — the actual emit must go to the underlying
+                // axis (left_stick_x / left_stick_y) with the cardinal's
+                // sign (right/up = +, left/down = -). In Analog mode the
+                // magnitude tracks lean_mag; in other press modes it's a
+                // gated full-deflection write (±1.0 when held, 0 when not).
+                if let Some((axis_pin, cardinal_sign)) = analog_axis_for_cardinal(p.as_str()) {
+                    let mag = if is_analog_mode {
+                        if !*active { 0.0 } else { analog_val_opt.unwrap_or(1.0) }
+                    } else if held_now {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    if mag > 0.0 {
+                        let new_v = cardinal_sign * mag;
+                        let sig = Signal::Float(new_v);
+                        // Combine if multiple mappings target the same axis
+                        // — use the larger-magnitude write (winning sign).
+                        asserted
+                            .entry(axis_pin.to_string())
+                            .and_modify(|existing| {
+                                if let Signal::Float(prev) = existing {
+                                    if new_v.abs() > prev.abs() {
+                                        *existing = Signal::Float(new_v);
+                                    }
+                                }
+                            })
+                            .or_insert(sig);
+                    }
+                    continue;
+                }
+                let sig_type = automap::ALL_PINS.iter()
+                    .find(|x| x.id == p.as_str())
+                    .map(|x| x.signal_type).unwrap_or(SignalType::Bool);
+                let emit = match (is_analog_mode, sig_type) {
+                    (true, SignalType::Float) => *active,
+                    (true, SignalType::Vec2)  => false,
+                    (true, _)                 => held_now,
+                    (false, _)                => held_now,
+                };
+                if !emit { continue; }
+                let sig = match sig_type {
+                    SignalType::Float => {
+                        let mag = analog_val_opt.unwrap_or(1.0);
+                        let signed = if is_analog_mode {
+                            if side_idx == 0 { -mag } else { mag }
+                        } else { mag };
+                        Signal::Float(signed)
+                    }
+                    SignalType::Vec2 => continue,
+                    SignalType::Int   => Signal::Int(1),
+                    _                 => Signal::Bool(true),
+                };
+                asserted.entry(p.clone()).or_insert(sig);
+            }
+        }
+    }
+
+    let key = format!("lean:{}", uid);
+    for p in &all_out_pins {
+        let sig_type = automap::ALL_PINS.iter().find(|x| x.id == p.as_str())
+            .map(|x| x.signal_type).unwrap_or(SignalType::Bool);
+        let sig = asserted.get(p).copied().unwrap_or_else(|| {
+            match sig_type {
+                SignalType::Float => Signal::Float(0.0),
+                SignalType::Vec2  => Signal::Vec2(Vec2::ZERO),
+                SignalType::Int   => Signal::Int(0),
+                _                 => Signal::Bool(false),
+            }
+        });
+        collector_sigs.insert((key.clone(), p.clone()), sig);
+    }
 }
 
 /// Translate legacy `mode` strings to the new (family, axis) split so saved
@@ -3071,25 +4209,15 @@ fn compute_gyro_3dof(
     let pin_or = |idx: usize, fallback: f32| -> f32 {
         if inputs.get(idx).and_then(|s| *s).is_some() { get_f(inputs, idx, fallback) } else { fallback }
     };
-    let mut gx = pin_or(2, gx_am) * inv("inv_roll");
-    let mut gy = pin_or(3, gy_am);
-    let mut gz = pin_or(4, gz_am);
-    let mut ax = pin_or(5, ax_am) * inv("inv_accel_x");
-    let mut ay = pin_or(6, ay_am) * inv("inv_accel_y");
-    let mut az = pin_or(7, az_am) * inv("inv_accel_z");
-
-    // Optional outlier-spike suppression. Uses `state.avg_bufs` slots 0..6
-    // for per-axis history (`avg_bufs[0]` = gx, `[1]` = gy, etc.).
-    if pb("spike_suppress", false) {
-        let k = pf("spike_k", SPIKE_DEFAULT_K).clamp(1.0, 12.0);
-        while state.avg_bufs.len() < 6 { state.avg_bufs.push(VecDeque::with_capacity(SPIKE_WINDOW)); }
-        gx = spike_filter(&mut state.avg_bufs[0], gx, k);
-        gy = spike_filter(&mut state.avg_bufs[1], gy, k);
-        gz = spike_filter(&mut state.avg_bufs[2], gz, k);
-        ax = spike_filter(&mut state.avg_bufs[3], ax, k);
-        ay = spike_filter(&mut state.avg_bufs[4], ay, k);
-        az = spike_filter(&mut state.avg_bufs[5], az, k);
-    }
+    let gx = pin_or(2, gx_am) * inv("inv_roll");
+    let gy = pin_or(3, gy_am);
+    let gz = pin_or(4, gz_am);
+    let ax = pin_or(5, ax_am) * inv("inv_accel_x");
+    let ay = pin_or(6, ay_am) * inv("inv_accel_y");
+    let az = pin_or(7, az_am) * inv("inv_accel_z");
+    // (Spike suppression moved to the device polling layer — see
+    // `flexinput_devices::gyro::apply_spike_filter`. The engine sees an
+    // already-clean IMU stream.)
 
     // aux_f32 layout:
     //   [0] integrated steering X
@@ -3101,15 +4229,16 @@ fn compute_gyro_3dof(
     //   [6] ease-in residual (0..1 progresses while resetting)
     while state.aux_f32.len() < 7 { state.aux_f32.push(0.0); }
 
-    // ── Axis selection: decide which gyro components feed X / Y / Lean ────
+    // ── Axis selection: decide which gyro components feed X / Y ───────────
     //
     // For Player/World we project gyro onto the gravity-corrected frame.
-    // For Pitch+Yaw and Pitch+Roll, the lean axis is the unused rotation:
-    //   Pitch+Yaw  → lean = roll  (gx)
-    //   Pitch+Roll → lean = yaw   (gz)
-    //   Player/World → lean = component of gyro along the gravity-perpendicular
-    //                          axis (we use gx for now — controller-roll proxy)
-    let (raw_x, raw_y, raw_lean) = match axis {
+    // For Pitch+Yaw and Pitch+Roll, the X/Y feed is gyro rates as before.
+    //
+    // Lean is derived separately below from accel tilt (NOT a gyro rate) so
+    // that holding a tilted controller still asserts a steady lean signal
+    // and rocking back through center doesn't produce a spurious opposite
+    // lean. See the lean derivation block after this match.
+    let (raw_x, raw_y, _raw_lean_unused) = match axis {
         "pitch_roll" => (gx, gy, gz),
         "player" | "world" => {
             let gyro  = glam::Vec3::new(gx, gy, gz);
@@ -3128,9 +4257,9 @@ fn compute_gyro_3dof(
             let g_hat = if sg_len > 0.01 { sg / sg_len } else { glam::Vec3::new(0.0, 0.0, 1.0) };
             let world_yaw   = gyro.dot(g_hat);
             let gyro_no_yaw = gyro - world_yaw * g_hat;
-            (world_yaw, gyro_no_yaw.y, gx)
+            (world_yaw, gyro_no_yaw.y, 0.0)
         }
-        _ => (gz, gy, gx), // pitch_yaw: gz=yaw→X, gy=pitch→Y, gx=roll→Lean
+        _ => (gz, gy, 0.0), // pitch_yaw: gz=yaw→X, gy=pitch→Y
     };
 
     // ── Steering integration + auto-recentering ───────────────────────────
@@ -3143,7 +4272,6 @@ fn compute_gyro_3dof(
         // usual, but Y stays at zero. Use when the steering axis is the
         // only thing you want from this module (e.g. a vehicle's wheel).
         let exclude_y = pb("steering_exclude_y", false);
-        let recenter_blend = pf("recenter_blend", 0.5).clamp(0.0, 1.0); // 0=roll-only, 1=gravity-only
         let recenter_strength = pf("recenter_strength", 0.0).clamp(0.0, 4.0); // sec⁻¹ pull rate
         let ease_in = pf("reset_ease_in", 0.25).clamp(0.0, 2.0);
 
@@ -3153,31 +4281,34 @@ fn compute_gyro_3dof(
         state.aux_f32[0] += raw_x * dt;
         state.aux_f32[1] += raw_y * dt;
 
-        // Auto-centering: pull the integrated steering accumulator TOWARD
-        // the accelerometer-implied steering angle. The "steering angle"
-        // depends on which gyro component is being integrated into X:
-        //   pitch_yaw  → X = yaw   → target = controller ROLL  (atan2 ax/az)
-        //   pitch_roll → X = roll  → target = controller PITCH (atan2 ay/az)
-        //   player/world → X = world yaw → azimuth around gravity is NOT
-        //     observable from accel alone, so we skip recentering here.
+        // X recenter — gated by axis (yaw isn't observable when flat).
+        //   Pitch+Yaw  : heading = atan2(ay, ax), weight ≈ |sin tilt|
+        //   Pitch+Roll : heading = atan2(ay, az), weight ≈ cos pitch
+        //   Player/World: skipped (azimuth around gravity unobservable
+        //                  from accel alone).
         //
-        // The complementary form is: aux ← aux + α (target − aux), where
-        // α = strength × dt. The "roll" source is the raw atan2 (smooth
-        // near upright), the "gravity" source is asin(component/|a|)
-        // (more stable when the controller is pitched far over). Blend
-        // is a per-mode mix; both reduce to the same angle at small tilts.
+        // Y recenter is intentionally NOT implemented as an independent
+        // atan2 — the per-axis approach couples X and Y badly (Y motion
+        // → large ax → atan2(ay, ax) whiplash → spurious X drift). The
+        // proper fix is to maintain a continuous 3DOF pose estimate and
+        // project both axes from it; that rework is pending. Until then,
+        // Y centers only via the manual reset (ease_in).
         if recenter_strength > 0.0 && (axis == "pitch_yaw" || axis == "pitch_roll") {
             let acc_mag = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
-            let (roll_angle, grav_angle) = if axis == "pitch_roll" {
-                // Steering axis is roll → target follows controller PITCH.
-                (ay.atan2(az), (ay / acc_mag).clamp(-1.0, 1.0).asin())
+            let (heading, weight) = if axis == "pitch_roll" {
+                let w = (ay * ay + az * az).sqrt() / acc_mag;
+                (ay.atan2(az), w)
             } else {
-                // Steering axis is yaw → target follows controller ROLL.
-                (ax.atan2(az), (ax / acc_mag).clamp(-1.0, 1.0).asin())
+                // pitch_yaw
+                let w = (ax * ax + ay * ay).sqrt() / acc_mag;
+                (ay.atan2(ax), w)
             };
-            let target = (1.0 - recenter_blend) * roll_angle + recenter_blend * grav_angle;
-            let alpha = (recenter_strength * dt).clamp(0.0, 1.0);
-            state.aux_f32[0] += alpha * (target - state.aux_f32[0]);
+            let two_pi = std::f32::consts::TAU;
+            let mut delta = heading - state.aux_f32[0];
+            // Wrap to (-π, π] without depending on rem_euclid edge cases.
+            delta -= two_pi * ((delta / two_pi) + 0.5).floor();
+            let alpha = (recenter_strength * weight * dt).clamp(0.0, 1.0);
+            state.aux_f32[0] += alpha * delta;
         }
 
         // Reset edge: start an ease-in toward zero. While ease-in > 0 we
@@ -3207,9 +4338,24 @@ fn compute_gyro_3dof(
     let final_x = out_x * inv("inv_yaw");
     let final_y = out_y * inv("inv_pitch");
 
-    // ── Lean output: analog magnitude + bool above threshold ──────────────
+    // ── Lean output: tilt fraction from accelerometer ─────────────────────
+    //
+    // Lean is the controller's signed side-tilt as a fraction of full
+    // sideways. Positive = right lean (right grip drops, +ay in FlexInput
+    // accel convention). Magnitude in [0, 1] where 1 ≈ on its side.
+    //
+    // This is derived from accel ONLY, not gyro rate, so:
+    //   - Holding a tilted controller produces a STEADY non-zero lean.
+    //   - Returning to neutral smoothly ramps back to 0 (no spurious
+    //     opposite spike like raw gyro rate would give).
+    //
+    // For Pitch+Roll / Player / World modes the rotation around gravity
+    // is not directly observable from accel; we still use the same side-
+    // tilt measure since "is the controller tilted sideways" is the
+    // intuitive lean axis regardless of how X/Y are derived.
+    let acc_mag_full = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
+    let lean_val = (ay / acc_mag_full).clamp(-1.0, 1.0);
     let lean_threshold = pf("lean_threshold", 0.3).clamp(0.01, 4.0);
-    let lean_val = raw_lean;
     let lean_active = lean_val.abs() >= lean_threshold;
 
     vec![
@@ -3218,6 +4364,11 @@ fn compute_gyro_3dof(
         Some(Signal::Float(final_y)),
         Some(Signal::Float(lean_val)),
         Some(Signal::Bool(lean_active)),
+        // Map (AutoMap) — routing-only, no per-frame value. Slot must
+        // exist so its index lines up with the module descriptor; the
+        // actual per-pin signals are written into collector_sigs under
+        // "lean:{uid}" by the dispatch block in `eval_graph_tick`.
+        None,
     ]
 }
 

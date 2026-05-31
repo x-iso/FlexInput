@@ -346,6 +346,10 @@ pub struct FlexInputApp {
     /// Per-pin time-windowed scope rings (raw values + timestamps) for the
     /// calibration window. Populated by the I/O thread at polling Hz.
     pub scope_taps: flexinput_engine::ScopeTaps,
+    /// Per-device snap-back spike filter settings (enabled, sensitivity 0..100).
+    /// Written by the UI (calibration window) when the user toggles or drags
+    /// the slider; read by the I/O thread each tick and pushed to backends.
+    pub spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
     // ── Always-on-top pin ────────────────────────────────────────────────
     /// Set by both the global keyboard hotkey thread and the Guide-button
     /// watcher thread when the user fires their configured pin toggle. The
@@ -561,6 +565,8 @@ impl FlexInputApp {
 
         let device_rates = flexinput_engine::new_device_rates();
         let scope_taps   = flexinput_engine::new_scope_taps();
+        let spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         spawn_io_thread(
             backends,
             Arc::clone(&midi_backend),
@@ -574,6 +580,7 @@ impl FlexInputApp {
             Arc::clone(&polling_hz),
             Arc::clone(&device_rates),
             Arc::clone(&scope_taps),
+            Arc::clone(&spike_filter_settings),
         );
 
         spawn_midi_watch_thread(
@@ -685,6 +692,7 @@ impl FlexInputApp {
             polling_hz,
             device_rates,
             scope_taps,
+            spike_filter_settings,
             pin_toggle_requested,
             pin_shortcut_shared,
             pin_guide_cfg,
@@ -2167,7 +2175,7 @@ impl eframe::App for FlexInputApp {
         }
         {
             puffin::profile_scope!("calibration_show_windows");
-            crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps);
+            crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps, &self.spike_filter_settings);
         }
 
         // Only update app_clipboard from outer canvas when the user actually copied
@@ -2935,6 +2943,7 @@ fn spawn_io_thread(
     polling_hz: Arc<AtomicU32>,
     device_rates: flexinput_engine::DeviceRates,
     scope_taps: flexinput_engine::ScopeTaps,
+    spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
 ) {
     use std::time::{Duration, Instant};
 
@@ -2973,6 +2982,20 @@ fn spawn_io_thread(
                 // Re-read polling rate each iteration so live retunes apply.
                 let hz = polling_hz.load(Ordering::Relaxed).clamp(60, 4000);
                 let interval = Duration::from_nanos(1_000_000_000 / hz as u64);
+
+                // Push per-device snap-back spike-filter settings to backends.
+                // Cheap: each backend's `set_spike_filter` early-returns when
+                // the value is unchanged. We do this BEFORE polling so the
+                // filter applies to this iteration's samples.
+                {
+                    puffin::profile_scope!("push_spike_filter");
+                    let settings = spike_filter_settings.read().unwrap();
+                    for (dev_id, (on, sens)) in settings.iter() {
+                        for backend in &mut backends {
+                            backend.set_spike_filter(dev_id, *on, *sens);
+                        }
+                    }
+                }
 
                 // ── Poll physical inputs ──────────────────────────────────────
                 let mut signals: HashMap<(String, String), Signal> = HashMap::new();
@@ -3946,6 +3969,18 @@ pub fn find_automap_device_id_for_viewer(
                 .iter().map(|p| p.id.to_string()).collect();
             return Some((remap_id, canonical_pins, upstream_dev_id));
         }
+        if node.module_id == "processing.gyro_3dof" {
+            let pin_type = node.outputs.get(src.output).map(|p| p.signal_type);
+            if pin_type != Some(SignalType::AutoMap) { return None; }
+            let lean_uid = match parents {
+                None => src.node.0,
+                Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
+            };
+            let lean_id = format!("lean:{}", lean_uid);
+            let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+                .iter().map(|p| p.id.to_string()).collect();
+            return Some((lean_id, canonical_pins, None));
+        }
         if node.module_id == "subpatch" {
             let sp = node.subpatch.as_ref()?;
             let outlet_id: NodeId = sp.snarl.nodes_ids_data()
@@ -4076,6 +4111,25 @@ fn find_automap_device_rec(
         let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
             .iter().map(|p| p.id.to_string()).collect();
         return Some((remap_id, canonical_pins, upstream_dev_id));
+    }
+    if node.module_id == "processing.gyro_3dof" {
+        // Lean dispatch publishes per-pin signals into collector_sigs under
+        // `lean:{uid}`. Only the `Map` AutoMap output pin (the last output)
+        // resolves to this collector — wires from the other outputs (Out,
+        // X, Y, Lean, Lean!) are typed Float / Vec2 / Bool and shouldn't
+        // hit this path, but we guard on signal type just in case.
+        let pin_type = node.outputs.get(src.output).map(|p| p.signal_type);
+        if pin_type != Some(SignalType::AutoMap) { return None; }
+        // No upstream fallback — the 3DOF module's Device input feeds gyro
+        // data, not a passthrough for other gamepad pins.
+        let lean_uid = match parents {
+            None => src.node.0,
+            Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
+        };
+        let lean_id = format!("lean:{}", lean_uid);
+        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+            .iter().map(|p| p.id.to_string()).collect();
+        return Some((lean_id, canonical_pins, None));
     }
     if node.module_id == "subpatch" {
         // Wire enters the subpatch via output pin `src.output`. Find the outlet
@@ -4236,7 +4290,8 @@ fn build_processing_graph_rec(
         if matches!(node.module_id.as_str(),
             "processing.gyro_3dof" | "module.automap_split"
             | "module.automap_fork" | "module.automap_selector"
-            | "module.remapper" | "module.map_action")
+            | "module.remapper" | "module.map_action"
+            | "module.automap_collect")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {
@@ -4248,11 +4303,12 @@ fn build_processing_graph_rec(
                         params.insert("_automap_device_id".to_string(), serde_json::Value::String(real_id));
                         // _automap_collector_id = virtual collector key to read from collector_sigs first.
                         // Covers automap_collect ("collector:"), fork/selector ("forksel:"),
-                        // combiner ("combiner:"), and remapper ("remap:").
+                        // combiner ("combiner:"), remapper ("remap:"), and gyro lean ("lean:").
                         if dev_id.starts_with("collector:")
                             || dev_id.starts_with("forksel:")
                             || dev_id.starts_with("combiner:")
                             || dev_id.starts_with("remap:")
+                            || dev_id.starts_with("lean:")
                         {
                             params.insert("_automap_collector_id".to_string(),
                                 serde_json::Value::String(dev_id));
@@ -4260,18 +4316,34 @@ fn build_processing_graph_rec(
                     }
                 }
             }
-            // Selector: also inject device_id for each additional AutoMap input (in_1, in_2, ...).
+            // Selector: inject parallel dev / collector strings per port so
+            // eval can read overrides from upstream Remapper/Collector/etc.
+            // before falling back to raw device samples. Mirrors Combiner.
             if node.module_id == "module.automap_selector" {
                 let mut extra_devs: Vec<serde_json::Value> = Vec::new();
+                let mut extra_collectors: Vec<serde_json::Value> = Vec::new();
                 for i in 1..node.inputs.len() {
                     let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
-                    let dev_str = pin.remotes.first()
-                        .and_then(|&src| find_automap_device_rec(snarl, src, parents))
-                        .map(|(dev_id, _, fallback)| fallback.unwrap_or(dev_id))
-                        .unwrap_or_default();
+                    let resolved = pin.remotes.first()
+                        .and_then(|&src| find_automap_device_rec(snarl, src, parents));
+                    let (dev_str, coll_str) = match resolved {
+                        Some((dev_id, _, fallback)) => {
+                            let is_collector = dev_id.starts_with("collector:")
+                                || dev_id.starts_with("forksel:")
+                                || dev_id.starts_with("remap:")
+                                || dev_id.starts_with("combiner:")
+                                || dev_id.starts_with("lean:");
+                            let dev = fallback.unwrap_or_else(|| if is_collector { String::new() } else { dev_id.clone() });
+                            let coll = if is_collector { dev_id } else { String::new() };
+                            (dev, coll)
+                        }
+                        None => (String::new(), String::new()),
+                    };
                     extra_devs.push(serde_json::Value::String(dev_str));
+                    extra_collectors.push(serde_json::Value::String(coll_str));
                 }
                 params.insert("_automap_input_devs".to_string(), serde_json::Value::Array(extra_devs));
+                params.insert("_automap_input_collectors".to_string(), serde_json::Value::Array(extra_collectors));
             }
         }
         // Note: we intentionally do NOT mutate the source `snarl` here.
@@ -4295,7 +4367,8 @@ fn build_processing_graph_rec(
                         let is_collector = dev_id.starts_with("collector:")
                             || dev_id.starts_with("forksel:")
                             || dev_id.starts_with("remap:")
-                            || dev_id.starts_with("combiner:");
+                            || dev_id.starts_with("combiner:")
+                            || dev_id.starts_with("lean:");
                         let dev = fallback.unwrap_or_else(|| if is_collector { String::new() } else { dev_id.clone() });
                         let coll = if is_collector { dev_id } else { String::new() };
                         (dev, coll)
@@ -4413,8 +4486,25 @@ fn build_processing_graph_rec(
         let stripped = s.strip_prefix("collector:")
             .or_else(|| s.strip_prefix("combiner:"))
             .or_else(|| s.strip_prefix("remap:"))
+            .or_else(|| s.strip_prefix("lean:"))
             .or_else(|| s.strip_prefix("forksel:").and_then(|t| t.split(':').next()))?;
         stripped.parse::<usize>().ok()
+    };
+    // Inside a sub-patch, `find_automap_device_rec` returns NAMESPACED uids
+    // (folded via `namespaced_uid(outer_chain, node.uid)`) so they match the
+    // keys the engine's subgraph eval publishes to. But `snap.node_uid` in
+    // the inner snap list is the RAW uid (= NodeId.0), since the inner
+    // build hasn't applied namespacing to its own snaps. Compare against
+    // the raw-uid equivalent: strip the outer chain.
+    let outer_chain_uid: Option<usize> = parents.map(fold_outer_uid);
+    let match_inner_uid = |target_uid: usize, snap_uid: usize| -> bool {
+        if snap_uid == target_uid { return true; }
+        if let Some(outer) = outer_chain_uid {
+            if flexinput_engine::namespaced_uid(outer, snap_uid) == target_uid {
+                return true;
+            }
+        }
+        false
     };
     for (idx, snap) in snaps.iter().enumerate() {
         // Regular nodes: single-source inputs.
@@ -4436,7 +4526,8 @@ fn build_processing_graph_rec(
             "module.automap_combiner"
             | "module.automap_selector"
             | "module.automap_fork"
-            | "module.automap_split");
+            | "module.automap_split"
+            | "module.automap_collect");
         if is_am_consumer {
             let mut seen: HashSet<usize> = HashSet::new();
             // Combiner: per-port collector IDs are pre-baked in
@@ -4448,7 +4539,7 @@ fn build_processing_graph_rec(
                 .unwrap_or_default();
             for cid in &collector_ids {
                 if let Some(uid) = uid_from_collector_id(cid) {
-                    if let Some(am_idx) = snaps.iter().position(|s| s.node_uid == uid) {
+                    if let Some(am_idx) = snaps.iter().position(|s| match_inner_uid(uid, s.node_uid)) {
                         if am_idx != idx && seen.insert(am_idx) {
                             dependents[am_idx].push(idx);
                             in_degree[idx] += 1;
@@ -4469,7 +4560,7 @@ fn build_processing_graph_rec(
                 let Some(&src) = pin.remotes.first() else { continue };
                 let Some((am_dev_id, _, _)) = find_automap_device_rec(snarl, src, parents) else { continue };
                 let Some(uid) = uid_from_collector_id(&am_dev_id) else { continue };
-                let Some(am_idx) = snaps.iter().position(|s| s.node_uid == uid) else { continue };
+                let Some(am_idx) = snaps.iter().position(|s| match_inner_uid(uid, s.node_uid)) else { continue };
                 if am_idx != idx && seen.insert(am_idx) {
                     dependents[am_idx].push(idx);
                     in_degree[idx] += 1;
@@ -4504,7 +4595,7 @@ fn build_processing_graph_rec(
                     .or_else(|| am_dev_id.strip_prefix("forksel:").and_then(|s| s.split(':').next()));
                 if let Some(uid_str) = uid_str {
                     if let Ok(uid) = uid_str.parse::<usize>() {
-                        if let Some(am_idx) = snaps.iter().position(|s| s.node_uid == uid) {
+                        if let Some(am_idx) = snaps.iter().position(|s| match_inner_uid(uid, s.node_uid)) {
                             if seen.insert(am_idx) {
                                 dependents[am_idx].push(idx);
                                 in_degree[idx] += 1;
@@ -4892,7 +4983,7 @@ fn show_tab_bar(
                 // Side Shadow fade when unscrolled. This padding scrolls
                 // away with the content, letting tabs slide under the
                 // fade once the user scrolls.
-                ui.add_space(64.0);
+                ui.add_space(50.0);
 
                 for (i, tab) in tabs.iter().enumerate() {
                     let is_active = i == active_tab;
@@ -5027,8 +5118,10 @@ fn paint_tab_scroll_shadows<R>(
     let max_scroll = (out.content_size.x - inner.width()).max(0.0);
     let can_scroll_right = offset_x < max_scroll - 0.5;
 
+    // Render the fade on Background so floating windows (which default to
+    // Order::Middle) sit on top of it instead of being overlaid by it.
     let layer = egui::LayerId::new(
-        egui::Order::Middle,
+        egui::Order::Background,
         egui::Id::new(("tab_edge_fade", out.id)),
     );
     let mut painter = ctx.layer_painter(layer);

@@ -219,8 +219,10 @@ pub fn paint_scroll_edge_fades<R>(
     let can_scroll_left  = offset_x > 0.5;
     let can_scroll_right = offset_x < max_scroll - 0.5;
 
+    // Render the fade on Background so floating windows (which default to
+    // Order::Middle) sit on top of it instead of being overlaid by it.
     let layer = egui::LayerId::new(
-        egui::Order::Middle,
+        egui::Order::Background,
         egui::Id::new(("edge_fade", out.id)),
     );
     let mut painter = ctx.layer_painter(layer);

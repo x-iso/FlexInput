@@ -11,6 +11,7 @@
 //! Per-session UI state lives in `egui::Memory` keyed by NodeId.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use eframe::egui;
@@ -25,10 +26,10 @@ use crate::canvas::Canvas;
 
 /// Fraction of the window width allocated to the left text column. The rest
 /// (minus a gap) becomes the right widget column.
-const LEFT_FRAC: f32 = 0.30;
+const LEFT_FRAC: f32 = 0.40;
 /// Minimum left-column width — clamps so instruction text never goes too
 /// narrow on small windows.
-const LEFT_MIN_W: f32 = 280.0;
+const LEFT_MIN_W: f32 = 320.0;
 
 /// Gap between the two side-by-side vectorscopes / triggers.
 const SCOPE_GAP_FRAC: f32 = 0.03;
@@ -105,7 +106,7 @@ impl Layout {
         let scope_gap = (right_w * SCOPE_GAP_FRAC).clamp(8.0, 24.0);
         let cell_w = ((right_w - scope_gap) * 0.5).max(120.0);
         let cell_h = cell_w; // vectorscope is square
-        let gyro_h = (right_w / SCOPE_ASPECT).clamp(120.0, 220.0);
+        let gyro_h = (right_w / SCOPE_ASPECT).clamp(100.0, 180.0);
         // Trigger widget gains an outer range-clamp arc, so reserve more
         // box around the inner threshold arc + silhouette.
         let trig_w = cell_w * 0.72;
@@ -319,12 +320,15 @@ fn state_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_state", node)) }
 
 // ── Public entry: render all open windows ────────────────────────────────────
 
+pub type SpikeSettings = Arc<RwLock<HashMap<String, (bool, f32)>>>;
+
 pub fn show_windows(
     ctx: &egui::Context,
     canvas: &mut Canvas,
     open: &mut HashSet<NodeId>,
     live: &LiveSignals,
     scope_taps: &flexinput_engine::ScopeTaps,
+    spike_settings: &SpikeSettings,
 ) {
     let entries: Vec<(NodeId, String, String)> = open.iter()
         .filter_map(|&nid| {
@@ -349,21 +353,26 @@ pub fn show_windows(
         let screen = ctx.screen_rect();
         // Default to a compact size matching the min, so the window opens
         // as small as it can go and the user can grow it if needed.
-        let min_w = (screen.width()  * 0.50).clamp(560.0, 760.0);
-        let min_h = (screen.height() * 0.55).clamp(320.0, 560.0);
+        let min_w = (screen.width()  * 0.40).clamp(480.0, 700.0);
+        let min_h = (screen.height() * 0.40).clamp(280.0, 460.0);
         let default_w = min_w;
         let default_h = min_h;
+        // Opaque window frame — without an explicit fill the tab strip's
+        // drop-shadow from underneath bleeds through the window content.
+        let mut window_frame = egui::Frame::window(&ctx.style());
+        window_frame.fill = ctx.style().visuals.window_fill;
         egui::Window::new(title)
             .id(egui::Id::new(("cal_window", node_id)))
             .open(&mut is_open)
             .resizable(true)
             .collapsible(true)
+            .frame(window_frame)
             .default_width(default_w)
             .default_height(default_h)
             .min_width(min_w)
             .min_height(min_h)
             .show(ctx, |ui| {
-                draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps);
+                draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps, spike_settings);
             });
         if !is_open {
             to_close.push(node_id);
@@ -381,10 +390,11 @@ fn draw_window_body(
     caps: CalCaps,
     live: &LiveSignals,
     scope_taps: &flexinput_engine::ScopeTaps,
+    spike_settings: &SpikeSettings,
 ) {
     let lo = Layout::compute(ui);
     if caps.gyro {
-        gyro_section(ui, canvas, node_id, dev_id, live, lo, scope_taps);
+        gyro_section(ui, canvas, node_id, dev_id, live, lo, scope_taps, spike_settings);
         ui.separator();
     }
     if caps.sticks {
@@ -412,6 +422,53 @@ fn cal_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add_sized([100.0, 30.0], egui::Button::new(
         egui::RichText::new(label).size(15.0)
     ))
+}
+
+/// Like [`cal_button`] but with an orange progress fill animating left→right
+/// on top of the button when `progress` ∈ (0.0, 1.0). Used during gyro
+/// calibration so the user gets visual feedback without a separate
+/// "Sampling… N/M" label causing layout jitter.
+fn cal_button_with_progress(ui: &mut egui::Ui, label: &str, progress: f32) -> egui::Response {
+    let resp = cal_button(ui, label);
+    let p = progress.clamp(0.0, 1.0);
+    if p > 0.0 {
+        let rect = resp.rect;
+        let fill_w = rect.width() * p;
+        let fill_rect = egui::Rect::from_min_size(
+            rect.min,
+            egui::vec2(fill_w, rect.height()),
+        );
+        // Translucent orange so the underlying button glyphs stay visible
+        // and the bar reads as a fill rather than a coverup.
+        ui.painter().rect_filled(
+            fill_rect,
+            ui.style().visuals.widgets.active.corner_radius,
+            ORANGE.gamma_multiply(0.35),
+        );
+    }
+    resp
+}
+
+/// Generic variant — same progress overlay, but for arbitrary-sized buttons
+/// (the axis-alignment Roll/Pitch/Yaw rotate buttons are taller than the
+/// standard cal button). Renders the supplied button and overlays the bar.
+fn add_button_with_progress(ui: &mut egui::Ui, button: egui::Button<'_>, progress: f32) -> egui::Response {
+    let resp = ui.add(button);
+    let p = progress.clamp(0.0, 1.0);
+    if p > 0.0 {
+        let rect = resp.rect;
+        let fill_w = rect.width() * p;
+        let fill_rect = egui::Rect::from_min_size(
+            rect.min,
+            egui::vec2(fill_w, rect.height()),
+        );
+        ui.painter().rect_filled(
+            fill_rect,
+            ui.style().visuals.widgets.active.corner_radius,
+            ORANGE.gamma_multiply(0.35),
+        );
+    }
+    resp
 }
 
 /// One paragraph of instruction text at the larger calibration-window size.
@@ -452,11 +509,13 @@ fn gyro_section(
     live: &LiveSignals,
     lo: Layout,
     scope_taps: &flexinput_engine::ScopeTaps,
+    spike_settings: &SpikeSettings,
 ) {
     let done = canvas.snarl.get_node(node_id)
         .and_then(|n| n.params.get("gyro_calibrated").and_then(|v| v.as_bool()))
         .unwrap_or(false);
-    section_header(ui, "Gyro Calibration", done);
+    let _ = done; // header check intentionally suppressed per new design
+    section_header(ui, "Gyro Calibration", false);
 
     // Raw samples this frame.
     let raw_gx = read_float(live, dev_id, "gyro_x");
@@ -550,16 +609,40 @@ fn gyro_section(
         .and_then(|n| n.params.get("skip_accel_cal").and_then(|v| v.as_bool()))
         .unwrap_or(false);
 
+    // Read axis-alignment state once — used by both the Axis alignment
+    // button row in the left column and the sample-collection block at
+    // the end of this function.
+    let (or_sampling_axis, or_n, or_captured) = ui.ctx().data(|d| {
+        d.get_temp::<WindowState>(state_id(node_id))
+            .map(|s| (s.orient.sampling_axis, s.orient.sampling_n, s.orient.captured))
+            .unwrap_or((None, 0, [false; 3]))
+    });
+    let axis_names = ["Roll", "Pitch", "Yaw"];
+    let axis_hints = ["tilt side-to-side", "rock front-to-back", "rotate like a wheel"];
+
     ui.horizontal(|ui| {
+        // ── LEFT COLUMN ────────────────────────────────────────────────
         ui.vertical(|ui| {
             ui.set_width(lo.left_w);
-            instruct_line(ui, &[
-                (false, "Before beginning calibration "),
-                (true,  "put your gamepad flat on a level surface."),
-            ]);
-            ui.add_space(10.0);
+
+            // Instructions paragraph.
+            instruct_line(ui, &[(false, "Before beginning calibration")]);
+            instruct_line(ui, &[(true, "put your gamepad flat on level surface.")]);
+            ui.add_space(6.0);
+
+            // start / reset / ✓ skip accelerometer — all on one line.
+            // The start button gains an orange progress overlay during
+            // sampling so there's no separate "Sampling… N/M" label
+            // shifting the layout below.
             ui.horizontal(|ui| {
-                if cal_button(ui, if sampling_now { "Stop" } else { "Start" }).clicked() {
+                let gyro_progress = if sampling_now {
+                    (n_now as f32 / GYRO_SAMPLE_FRAMES as f32).clamp(0.0, 1.0)
+                } else { 0.0 };
+                if cal_button_with_progress(
+                    ui,
+                    if sampling_now { "stop" } else { "start" },
+                    gyro_progress,
+                ).clicked() {
                     ui.ctx().data_mut(|d| {
                         let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
                         if sampling_now {
@@ -574,49 +657,182 @@ fn gyro_section(
                         }
                     });
                 }
-                if cal_button(ui, "Reset").clicked() {
+                if cal_button(ui, "reset").clicked() {
                     if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                         n.params.insert("gyro_offset".into(), serde_json::json!([0.0_f32, 0.0, 0.0]));
                         n.params.insert("accel_offset".into(), serde_json::json!([0.0_f32, 0.0, 0.0]));
                         n.params.insert("gyro_calibrated".into(), Value::Bool(false));
                     }
                 }
-            });
-            if sampling_now {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(format!("Sampling… {}/{}", n_now, GYRO_SAMPLE_FRAMES))
-                    .size(INSTRUCT_SIZE).color(ORANGE));
-            }
-
-            ui.add_space(10.0);
-            // Skip-accel checkbox.
-            let mut skip_accel = skip_accel_initial;
-            if ui.checkbox(&mut skip_accel,
-                egui::RichText::new("Skip Accelerometer calibration").size(INSTRUCT_SIZE))
-                .changed()
-            {
-                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                    n.params.insert("skip_accel_cal".into(), Value::Bool(skip_accel));
-                    if skip_accel {
-                        n.params.insert("accel_offset".into(), serde_json::json!([0.0_f32, 0.0, 0.0]));
+                let mut skip_accel = skip_accel_initial;
+                if ui.checkbox(&mut skip_accel,
+                    egui::RichText::new("skip accelerometer").size(INSTRUCT_SIZE - 1.0))
+                    .changed()
+                {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.insert("skip_accel_cal".into(), Value::Bool(skip_accel));
+                        if skip_accel {
+                            n.params.insert("accel_offset".into(), serde_json::json!([0.0_f32, 0.0, 0.0]));
+                        }
                     }
                 }
+            });
+
+            ui.add_space(8.0);
+
+            // "Axis alignment" header + inline solve / reset buttons.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Axis alignment").size(INSTRUCT_SIZE).strong());
+                let all = or_captured.iter().all(|c| *c);
+                if ui.add_enabled(all && or_sampling_axis.is_none(),
+                    egui::Button::new(egui::RichText::new("solve").size(INSTRUCT_SIZE - 1.0))).clicked()
+                {
+                    let (samples, accel_mean) = ui.ctx().data(|d| {
+                        let st = d.get_temp::<WindowState>(state_id(node_id));
+                        let samples = st.as_ref().map(|s| s.orient.samples.clone()).unwrap_or_default();
+                        let accel_mean = st.as_ref().and_then(|s| {
+                            let mut sum = [0.0_f64; 3];
+                            let mut n   = 0_u64;
+                            for ai in 0..3 {
+                                if !s.orient.captured[ai] || s.orient.accel_n[ai] == 0 { continue; }
+                                let inv = 1.0 / s.orient.accel_n[ai] as f64;
+                                sum[0] += s.orient.accel_sum[ai][0] * inv;
+                                sum[1] += s.orient.accel_sum[ai][1] * inv;
+                                sum[2] += s.orient.accel_sum[ai][2] * inv;
+                                n += 1;
+                            }
+                            if n == 0 { return None; }
+                            let k = 1.0 / n as f64;
+                            Some([(sum[0] * k) as f32, (sum[1] * k) as f32, (sum[2] * k) as f32])
+                        });
+                        (samples, accel_mean)
+                    });
+                    if let Some(m) = solve_orient_matrix(&samples, accel_mean) {
+                        if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                            n.params.insert("gyro_orient_matrix".into(), serde_json::json!(m.to_vec()));
+                        }
+                    }
+                }
+                if ui.button(egui::RichText::new("reset").size(INSTRUCT_SIZE - 1.0)).clicked() {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.remove("gyro_orient_matrix");
+                    }
+                    ui.ctx().data_mut(|d| {
+                        let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                        st.orient = OrientSession::default();
+                    });
+                }
+            });
+
+            // Roll / Pitch / Yaw axis-capture buttons — three across.
+            // The active button gets an orange progress overlay; the
+            // "N/M" sampling text is dropped because the fill IS the
+            // progress indicator (and avoids button-label width jitter).
+            ui.horizontal(|ui| {
+                for ai in 0..3 {
+                    let active = or_sampling_axis == Some(ai);
+                    let core = if or_captured[ai] {
+                        format!("{} ✓", axis_names[ai])
+                    } else {
+                        axis_names[ai].to_string()
+                    };
+                    let label = format!("{}\n{}", core, axis_hints[ai]);
+                    let btn = egui::Button::new(egui::RichText::new(label).size(INSTRUCT_SIZE - 1.0));
+                    let progress = if active {
+                        (or_n as f32 / ORIENT_SAMPLE_FRAMES as f32).clamp(0.0, 1.0)
+                    } else { 0.0 };
+                    let enabled = or_sampling_axis.is_none() || active;
+                    let resp = if enabled {
+                        add_button_with_progress(ui, btn, progress)
+                    } else {
+                        ui.add_enabled(false, btn)
+                    };
+                    if resp.clicked() {
+                        ui.ctx().data_mut(|d| {
+                            let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
+                            if active {
+                                st.orient.sampling_axis = None;
+                                st.orient.sampling_n = 0;
+                            } else {
+                                st.orient.sampling_axis = Some(ai);
+                                st.orient.sampling_n = 0;
+                                st.orient.samples[ai].clear();
+                                st.orient.captured[ai] = false;
+                            }
+                        });
+                    }
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(
+                "if normal calibration method doesn't help\n\
+                 or you have some IMU misalignment:\n\
+                 do pure single-axis rotation per button, then solve")
+                .size(INSTRUCT_SIZE - 2.0)
+                .color(Color32::from_gray(140)));
+        });
+
+        // ── RIGHT COLUMN ───────────────────────────────────────────────
+        ui.vertical(|ui| {
+            ui.set_width(lo.right_w);
+
+            // Oscilloscope.
+            gyro_scope(ui, node_id, dev_id, lo, skip_accel_initial, canvas, scope_taps);
+
+            // Outlier spike-filter row — directly beneath the scope so
+            // dragging sensitivity gives instant visual feedback on the
+            // trace above.
+            let mut enabled = canvas.snarl.get_node(node_id)
+                .and_then(|n| n.params.get("spike_suppress").and_then(|v| v.as_bool()))
+                .unwrap_or(true);
+            let mut sens = canvas.snarl.get_node(node_id)
+                .and_then(|n| n.params.get("spike_sensitivity").and_then(|v| v.as_f64()))
+                .unwrap_or(50.0) as f32;
+            let mut filter_changed = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new("Outlier spike filter")
+                    .size(INSTRUCT_SIZE).strong());
+                if ui.checkbox(&mut enabled, "")
+                    .on_hover_text("Suppress single-packet outlier spikes at the HID polling layer.\n\
+                                    Spikes that get through still show on the scope above —\n\
+                                    tune sensitivity until the trace is clean.")
+                    .changed() { filter_changed = true; }
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.label(egui::RichText::new("sensitivity").weak());
+                    if ui.add(egui::Slider::new(&mut sens, 0.0..=100.0)
+                        .suffix(" %").show_value(true))
+                        .on_hover_text("0 % = filter off (raw samples pass through).\n\
+                                        100 % = aggressive (catches near-noise excursions).")
+                        .changed() { filter_changed = true; }
+                });
+            });
+            if filter_changed {
+                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                    n.params.insert("spike_suppress".into(), Value::Bool(enabled));
+                    n.params.insert("spike_sensitivity".into(),
+                        serde_json::Number::from_f64(sens as f64)
+                            .map(Value::Number).unwrap_or(Value::Null));
+                }
             }
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("Invert axis").size(INSTRUCT_SIZE).strong());
-            ui.add_space(2.0);
-            // Read current invert state (3 + 3 bools).
+            if let Ok(mut map) = spike_settings.write() {
+                map.insert(dev_id.to_string(), (enabled, sens));
+            }
+
+            // Invert axis — single row: Gyro: X Y Z   Accel: X Y Z.
             let g_inv = read_invert3(canvas, node_id, "gyro_invert");
             let a_inv = read_invert3(canvas, node_id, "accel_invert");
             let mut g_new = g_inv;
             let mut a_new = a_inv;
             ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Invert axis").size(INSTRUCT_SIZE).strong());
+                ui.add_space(4.0);
                 ui.label(egui::RichText::new("Gyro:").size(INSTRUCT_SIZE).weak());
-                ui.checkbox(&mut g_new[0], egui::RichText::new("Roll").size(INSTRUCT_SIZE));
-                ui.checkbox(&mut g_new[1], egui::RichText::new("Pitch").size(INSTRUCT_SIZE));
-                ui.checkbox(&mut g_new[2], egui::RichText::new("Yaw").size(INSTRUCT_SIZE));
-            });
-            ui.horizontal(|ui| {
+                ui.checkbox(&mut g_new[0], egui::RichText::new("X").size(INSTRUCT_SIZE));
+                ui.checkbox(&mut g_new[1], egui::RichText::new("Y").size(INSTRUCT_SIZE));
+                ui.checkbox(&mut g_new[2], egui::RichText::new("Z").size(INSTRUCT_SIZE));
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("Accel:").size(INSTRUCT_SIZE).weak());
                 ui.checkbox(&mut a_new[0], egui::RichText::new("X").size(INSTRUCT_SIZE));
                 ui.checkbox(&mut a_new[1], egui::RichText::new("Y").size(INSTRUCT_SIZE));
@@ -630,117 +846,6 @@ fn gyro_section(
             if a_new != a_inv {
                 if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                     n.params.insert("accel_invert".into(), serde_json::json!(a_new));
-                }
-            }
-        });
-        gyro_scope(ui, node_id, dev_id, lo, skip_accel_initial, canvas, scope_taps);
-    });
-
-    // ── Axis Alignment row (full-width, beneath the scope) ─────────────────
-    //
-    // Some controllers (modded units, or factories with looser mount
-    // tolerances) have their IMU chip soldered at a small angle. Pure
-    // body-frame rotations then bleed into multiple axes. The matrix
-    // compensates by remapping the chip's frame back to the controller's
-    // body frame. Three short single-axis rotations + PCA → an
-    // orthonormal rotation matrix.
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Axis Alignment").size(INSTRUCT_SIZE).strong());
-        // "Calibrated" indicator if a non-identity matrix exists.
-        let has_m = canvas.snarl.get_node(node_id)
-            .and_then(|n| n.params.get("gyro_orient_matrix"))
-            .and_then(|v| v.as_array())
-            .map(|a| a.len() == 9)
-            .unwrap_or(false);
-        if has_m {
-            ui.label(egui::RichText::new("✓ matrix set")
-                .color(Color32::from_rgb(80, 200, 100)).size(INSTRUCT_SIZE - 1.0));
-        }
-        ui.label(egui::RichText::new(
-            "  ·  pure single-axis rotation per button, then Solve")
-            .color(Color32::from_gray(140)).size(INSTRUCT_SIZE - 2.0));
-    });
-    ui.add_space(2.0);
-    let (or_sampling_axis, or_n, or_captured) = ui.ctx().data(|d| {
-        d.get_temp::<WindowState>(state_id(node_id))
-            .map(|s| (s.orient.sampling_axis, s.orient.sampling_n, s.orient.captured))
-            .unwrap_or((None, 0, [false; 3]))
-    });
-    let axis_names = ["Roll", "Pitch", "Yaw"];
-    let axis_hints = ["tilt side-to-side", "rock front-to-back", "rotate like a wheel"];
-    ui.horizontal(|ui| {
-        for ai in 0..3 {
-            let active = or_sampling_axis == Some(ai);
-            let core = if active {
-                format!("{}  {}/{}", axis_names[ai], or_n, ORIENT_SAMPLE_FRAMES)
-            } else if or_captured[ai] {
-                format!("{} ✓", axis_names[ai])
-            } else {
-                axis_names[ai].to_string()
-            };
-            let label = format!("{}\n{}", core, axis_hints[ai]);
-            if ui.add_enabled(or_sampling_axis.is_none() || active,
-                egui::Button::new(egui::RichText::new(label).size(INSTRUCT_SIZE - 1.0))).clicked()
-            {
-                ui.ctx().data_mut(|d| {
-                    let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
-                    if active {
-                        st.orient.sampling_axis = None;
-                        st.orient.sampling_n = 0;
-                    } else {
-                        st.orient.sampling_axis = Some(ai);
-                        st.orient.sampling_n = 0;
-                        st.orient.samples[ai].clear();
-                        st.orient.captured[ai] = false;
-                    }
-                });
-            }
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(egui::RichText::new("Clear").size(INSTRUCT_SIZE - 1.0)).clicked() {
-                if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                    n.params.remove("gyro_orient_matrix");
-                }
-                ui.ctx().data_mut(|d| {
-                    let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
-                    st.orient = OrientSession::default();
-                });
-            }
-            let all = or_captured.iter().all(|c| *c);
-            if ui.add_enabled(all && or_sampling_axis.is_none(),
-                egui::Button::new(egui::RichText::new("Solve & Apply").size(INSTRUCT_SIZE - 1.0))).clicked()
-            {
-                let (samples, accel_mean) = ui.ctx().data(|d| {
-                    let st = d.get_temp::<WindowState>(state_id(node_id));
-                    let samples = st.as_ref().map(|s| s.orient.samples.clone()).unwrap_or_default();
-                    // Average the three captured accel passes into one
-                    // chip-frame gravity vector. Each pass already
-                    // contains the running sum + count.
-                    let accel_mean = st.as_ref().and_then(|s| {
-                        let mut sum = [0.0_f64; 3];
-                        let mut n   = 0_u64;
-                        for ai in 0..3 {
-                            if !s.orient.captured[ai] || s.orient.accel_n[ai] == 0 { continue; }
-                            // Per-pass mean, then sum the means so each
-                            // pass contributes equally regardless of
-                            // sample count.
-                            let inv = 1.0 / s.orient.accel_n[ai] as f64;
-                            sum[0] += s.orient.accel_sum[ai][0] * inv;
-                            sum[1] += s.orient.accel_sum[ai][1] * inv;
-                            sum[2] += s.orient.accel_sum[ai][2] * inv;
-                            n += 1;
-                        }
-                        if n == 0 { return None; }
-                        let k = 1.0 / n as f64;
-                        Some([(sum[0] * k) as f32, (sum[1] * k) as f32, (sum[2] * k) as f32])
-                    });
-                    (samples, accel_mean)
-                });
-                if let Some(m) = solve_orient_matrix(&samples, accel_mean) {
-                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-                        n.params.insert("gyro_orient_matrix".into(), serde_json::json!(m.to_vec()));
-                    }
                 }
             }
         });

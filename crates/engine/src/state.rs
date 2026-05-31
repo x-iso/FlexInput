@@ -37,6 +37,14 @@ pub struct NodeState {
     /// so it can grow with the mapping list without clashing with the touchpad
     /// zone accumulators already living at `aux_f32[0..3]`.
     pub press_state: Vec<f32>,
+    /// Per-mapping stick-gesture progress for Remapper / Map Action mappings
+    /// whose `in` set is entirely stick cardinals. Two `u8` bitmaps per
+    /// mapping (left_stick, right_stick), each bit indexed in `CARDINAL_BITS`
+    /// order. A bit becomes 1 when the matching cardinal has been visited
+    /// during the active gesture; the bitmap resets when the stick returns
+    /// to neutral (mag < 0.3). Gesture-mappings fire when every required
+    /// cardinal across both sticks has been visited at least once.
+    pub gesture_state: Vec<[u8; 2]>,
     // ── Two-way Response Curve ────────────────────────────────────────────────
     /// Per-channel current lane: +1 = rising, -1 = falling.
     pub twoway_lane: Vec<i8>,

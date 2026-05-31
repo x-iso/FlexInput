@@ -965,7 +965,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "logic.delay"   => show_logic_delay_body(node_id, ui, snarl),
             "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl),
             "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl),
-            "processing.gyro_3dof"  => show_gyro_3dof_body(node_id, ui, snarl),
+            "processing.gyro_3dof"  => show_gyro_3dof_body(
+                node_id, inputs, ui, snarl, self.live_signals,
+                self.panic_shortcut, self.automap_parent.as_ref(),
+            ),
             "module.automap_split"     => show_automap_split_body(node_id, outputs, ui, snarl),
             "module.automap_collect"   => show_automap_collect_body(node_id, inputs, ui, snarl),
             "module.automap_fork"      => show_automap_fork_body(node_id, outputs, ui, snarl),
@@ -3708,7 +3711,16 @@ const GYRO_AXIS_OPTIONS: [(&str, &str); 4] = [
     ("world",      "World"),
 ];
 
-fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+fn show_gyro_3dof_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) {
+    let _ = inputs; // wire-presence + upstream device id read below
     let snap = snarl.get_node(node_id);
     let (family, axis)       = snap.map(gyro_read_family_axis).unwrap_or_else(|| ("pointer".into(), "pitch_yaw".into()));
     let inv_yaw   = snap.and_then(|n| n.params.get("inv_yaw")   .and_then(|v| v.as_bool())).unwrap_or(false);
@@ -3718,11 +3730,8 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
     let inv_ay    = snap.and_then(|n| n.params.get("inv_accel_y").and_then(|v| v.as_bool())).unwrap_or(false);
     let inv_az    = snap.and_then(|n| n.params.get("inv_accel_z").and_then(|v| v.as_bool())).unwrap_or(false);
     let exclude_y = snap.and_then(|n| n.params.get("steering_exclude_y").and_then(|v| v.as_bool())).unwrap_or(false);
-    let recenter_blend    = snap.and_then(|n| n.params.get("recenter_blend").and_then(|v| v.as_f64())).unwrap_or(0.5) as f32;
     let recenter_strength = snap.and_then(|n| n.params.get("recenter_strength").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let reset_ease_in     = snap.and_then(|n| n.params.get("reset_ease_in").and_then(|v| v.as_f64())).unwrap_or(0.25) as f32;
-    let spike_suppress    = snap.and_then(|n| n.params.get("spike_suppress").and_then(|v| v.as_bool())).unwrap_or(false);
-    let spike_k           = snap.and_then(|n| n.params.get("spike_k").and_then(|v| v.as_f64())).unwrap_or(4.0) as f32;
     let lean_threshold    = snap.and_then(|n| n.params.get("lean_threshold").and_then(|v| v.as_f64())).unwrap_or(0.3) as f32;
     let out_x = snap.and_then(|n| match n.extra.last_signals.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
     let out_y = snap.and_then(|n| match n.extra.last_signals.get(2) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
@@ -3733,11 +3742,8 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
     let mut inv_gyro  = [inv_yaw, inv_pitch, inv_roll];
     let mut inv_accel = [inv_ax, inv_ay, inv_az];
     let mut exclude_y = exclude_y;
-    let mut recenter_blend = recenter_blend;
     let mut recenter_strength = recenter_strength;
     let mut reset_ease_in = reset_ease_in;
-    let mut spike_suppress = spike_suppress;
-    let mut spike_k = spike_k;
     let mut lean_threshold = lean_threshold;
     let mut changed   = false;
 
@@ -3772,13 +3778,14 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
         row_changed
     };
 
-    let mut pointer_rect:  Option<egui::Rect> = None;
-    let mut steering_rect: Option<egui::Rect> = None;
-    let mut stopts_rect:   Option<egui::Rect> = None;
-    let mut spike_rect:    Option<egui::Rect> = None;
-    let mut gyr_rect:      Option<egui::Rect> = None;
-    let mut acc_rect:      Option<egui::Rect> = None;
-    let mut lean_rect:     Option<egui::Rect> = None;
+    let mut pointer_rect:    Option<egui::Rect> = None;
+    let mut steering_rect:   Option<egui::Rect> = None;
+    let mut stopts_rect:     Option<egui::Rect> = None;
+    let mut gyr_rect:        Option<egui::Rect> = None;
+    let mut acc_rect:        Option<egui::Rect> = None;
+    let mut lean_rect:       Option<egui::Rect> = None;
+    let mut lean_left_rect:  Option<egui::Rect> = None;
+    let mut lean_right_rect: Option<egui::Rect> = None;
 
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
@@ -3802,13 +3809,9 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
                         .on_hover_text("Suppress the Y steering output (keeps Y at 0).\nUseful when only the X axis matters — e.g. a steering wheel\nwhere pitching the controller shouldn't move Y.")
                         .changed() { changed = true; }
                     ui.label(egui::RichText::new("re-center").small().weak())
-                        .on_hover_text("How aggressively the steering accumulator is pulled toward\nthe accelerometer-implied centered position. 0 = off.");
+                        .on_hover_text("Pulls the steering accumulator toward a tilt-compensated\nheading derived from accel. Strength scales by how observable\nthat heading is — flat controller → no pull, tilted → strong\npull. 0 disables. Units: /s.");
                     if ui.add(egui::DragValue::new(&mut recenter_strength)
                         .speed(0.05).range(0.0..=4.0).suffix(" /s"))
-                        .changed() { changed = true; }
-                    ui.label(egui::RichText::new("blend").small().weak())
-                        .on_hover_text("0 = use controller roll angle only\n1 = use full-vector gravity projection only\n0.5 = blend both equally");
-                    if ui.add(egui::Slider::new(&mut recenter_blend, 0.0..=1.0).show_value(false))
                         .changed() { changed = true; }
                     ui.label(egui::RichText::new("ease").small().weak())
                         .on_hover_text("Reset eases steering toward 0 over this many seconds.");
@@ -3842,22 +3845,6 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
         });
         acc_rect = Some(r.response.rect);
 
-        // Spike filter row.
-        let r = ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if ui.checkbox(&mut spike_suppress, egui::RichText::new("suppress outlier spikes").small())
-                .on_hover_text("Replace single-sample outliers with the rolling median.\nUseful when gyro/accel produce occasional bad samples.")
-                .changed() { changed = true; }
-            ui.add_enabled_ui(spike_suppress, |ui| {
-                ui.label(egui::RichText::new("k").small().weak())
-                    .on_hover_text("Hampel sensitivity threshold (multiplier of robust stddev).\nLower = more aggressive, higher = only extreme spikes.");
-                if ui.add(egui::DragValue::new(&mut spike_k)
-                    .speed(0.1).range(1.0..=12.0))
-                    .changed() { changed = true; }
-            });
-        });
-        spike_rect = Some(r.response.rect);
-
         // Lean threshold + live readout.
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -3872,21 +3859,34 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
 
         ui.label(egui::RichText::new(format!("X:{:+.3}  Y:{:+.3}", out_x, out_y)).small().weak());
 
-        // Lean mapping cards — two lists (left / right). The actual card UI
-        // reuses the Map Action card via a helper so we keep one source of
-        // truth for press-mode / settings layout.
+        // Lean mapping cards — two lists (left / right). Each section has
+        // its own Learn/Add chord-capture state machine and renders mapping
+        // cards using the shared pixel-accurate card from Remapper/Map
+        // Action (with allow_analog_mode=true so the Analog press mode is
+        // available in the dropdown).
         ui.separator();
-        show_gyro_lean_mapping_section(node_id, ui, snarl, "left",  &mut changed);
-        show_gyro_lean_mapping_section(node_id, ui, snarl, "right", &mut changed);
+        let lean_left_resp = ui.scope(|ui| {
+            show_gyro_lean_mapping_section(
+                node_id, ui, snarl, "left",  inputs, live_signals, panic_shortcut, automap_parent,
+            );
+        });
+        lean_left_rect = Some(lean_left_resp.response.rect);
+        let lean_right_resp = ui.scope(|ui| {
+            show_gyro_lean_mapping_section(
+                node_id, ui, snarl, "right", inputs, live_signals, panic_shortcut, automap_parent,
+            );
+        });
+        lean_right_rect = Some(lean_right_resp.response.rect);
     });
 
-    if let Some(r) = pointer_rect  { register_exposable_element(ui, node_id, "pointer_mode",  r); }
-    if let Some(r) = steering_rect { register_exposable_element(ui, node_id, "steering_mode", r); }
-    if let Some(r) = stopts_rect   { register_exposable_element(ui, node_id, "steering_opts", r); }
-    if let Some(r) = spike_rect    { register_exposable_element(ui, node_id, "spike_filter",  r); }
-    if let Some(r) = gyr_rect      { register_exposable_element(ui, node_id, "gyro_invert",   r); }
-    if let Some(r) = acc_rect      { register_exposable_element(ui, node_id, "accel_invert",  r); }
-    if let Some(r) = lean_rect     { register_exposable_element(ui, node_id, "lean_threshold", r); }
+    if let Some(r) = pointer_rect    { register_exposable_element(ui, node_id, "pointer_mode",  r); }
+    if let Some(r) = steering_rect   { register_exposable_element(ui, node_id, "steering_mode", r); }
+    if let Some(r) = stopts_rect     { register_exposable_element(ui, node_id, "steering_opts", r); }
+    if let Some(r) = gyr_rect        { register_exposable_element(ui, node_id, "gyro_invert",   r); }
+    if let Some(r) = acc_rect        { register_exposable_element(ui, node_id, "accel_invert",  r); }
+    if let Some(r) = lean_rect       { register_exposable_element(ui, node_id, "lean_threshold", r); }
+    if let Some(r) = lean_left_rect  { register_exposable_element(ui, node_id, "lean_left",     r); }
+    if let Some(r) = lean_right_rect { register_exposable_element(ui, node_id, "lean_right",    r); }
 
     if changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -3902,82 +3902,244 @@ fn show_gyro_3dof_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Nod
             node.params.insert("inv_accel_z".into(),    Value::Bool(inv_accel[2]));
             node.params.insert("steering_exclude_y".into(),
                 Value::Bool(exclude_y));
-            node.params.insert("recenter_blend".into(),
-                serde_json::Number::from_f64(recenter_blend as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.remove("recenter_blend");
             node.params.insert("recenter_strength".into(),
                 serde_json::Number::from_f64(recenter_strength as f64).map(Value::Number).unwrap_or(Value::Null));
             node.params.insert("reset_ease_in".into(),
                 serde_json::Number::from_f64(reset_ease_in as f64).map(Value::Number).unwrap_or(Value::Null));
-            node.params.insert("spike_suppress".into(), Value::Bool(spike_suppress));
-            node.params.insert("spike_k".into(),
-                serde_json::Number::from_f64(spike_k as f64).map(Value::Number).unwrap_or(Value::Null));
+            // Spike-filter moved to the device polling layer; drop the
+            // legacy per-module params so they can't drift out of sync.
+            node.params.remove("spike_suppress");
+            node.params.remove("spike_sensitivity");
+            node.params.remove("spike_k");
             node.params.insert("lean_threshold".into(),
                 serde_json::Number::from_f64(lean_threshold as f64).map(Value::Number).unwrap_or(Value::Null));
         }
     }
 }
 
-/// Render one of the two lean mapping lists (left / right). Mappings are
-/// stored on the node as `lean_left` / `lean_right` arrays of objects shaped
-/// like Map Action mappings (`{ in: [pin_id...], mode, window_ms, sustain,
-/// turbo }`). For now we keep it dead-simple: a "Learn"-style Add button
-/// would be ideal but isn't wired up yet — users build mappings by editing
-/// the params directly through Map Action wires elsewhere.
+/// Render one of the two lean mapping lists (left / right). Each section
+/// owns an independent chord-capture state machine keyed by side so the
+/// two can be edited simultaneously. Mappings are stored on the node as
+/// `lean_left` / `lean_right` arrays of objects shaped like Map Action
+/// mappings BUT with `out` (destination chord) instead of `in` — the lean
+/// trigger IS the section, so what we capture is what to FIRE.
+///
+/// Schema: `{ out: [pin_id...], mode?, window_ms?, sustain?, turbo? }`.
+/// Legacy entries with `in:[]` get upgraded in-place on first display.
 fn show_gyro_lean_mapping_section(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     side: &'static str,
-    changed: &mut bool,
+    inputs: &[InPin],
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
-    let key = if side == "left" { "lean_left" } else { "lean_right" };
-    let title = if side == "left" { "Lean Left → " } else { "Lean Right → " };
+    let key            = if side == "left" { "lean_left" } else { "lean_right" };
+    let phase_key      = if side == "left" { "_lean_left_phase" } else { "_lean_right_phase" };
+    let draft_key      = if side == "left" { "_lean_left_draft" } else { "_lean_right_draft" };
+    let prev_key       = if side == "left" { "_lean_left_pressed_prev" } else { "_lean_right_pressed_prev" };
+    let title          = if side == "left" { "Lean Left → " } else { "Lean Right → " };
 
-    let mappings: Vec<Value> = snarl.get_node(node_id)
-        .and_then(|n| n.params.get(key).and_then(|v| v.as_array()).cloned())
-        .unwrap_or_default();
+    // ── Migration: if legacy entries with `in` exist, rewrite to `out`.
+    {
+        let needs_upgrade = snarl.get_node(node_id)
+            .and_then(|n| n.params.get(key).and_then(|v| v.as_array()))
+            .map(|arr| arr.iter().any(|m| m.as_object()
+                .map(|o| o.contains_key("in") && !o.contains_key("out")).unwrap_or(false)))
+            .unwrap_or(false);
+        if needs_upgrade {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                if let Some(Value::Array(arr)) = node.params.get_mut(key) {
+                    for v in arr.iter_mut() {
+                        if let Some(obj) = v.as_object_mut() {
+                            if let Some(ins) = obj.remove("in") {
+                                obj.insert("out".to_string(), ins);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
+    // ── Read state ───────────────────────────────────────────────────────
+    let wired = inputs.first().map(|p| !p.remotes.is_empty()).unwrap_or(false);
+    let upstream_dev_id = if wired {
+        remapper_upstream_device_id(snarl, node_id, 0, automap_parent)
+    } else { None };
+
+    let (phase, draft, pressed_prev, mappings) = snarl.get_node(node_id).map(|n| (
+        n.params.get(phase_key).and_then(|v| v.as_str()).unwrap_or("idle").to_string(),
+        remapper_read_str_array(n, draft_key),
+        remapper_read_str_array(n, prev_key),
+        n.params.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+    )).unwrap_or_else(|| ("idle".into(), vec![], vec![], vec![]));
+
+    // ── Capture state machine ───────────────────────────────────────────
+    // Only ticks while `phase == "learning"` (active capture session).
+    // No auto-enter-on-wire — Learn is button-gated, otherwise the gyro
+    // module's normal AutoMap-in wire would constantly try to capture.
+    let mut pressed_now: Vec<String> = Vec::new();
+    if phase == "learning" {
+        if let (Some(dev), true) = (&upstream_dev_id, wired) {
+            pressed_now = remapper_pressed_now(live_signals, dev);
+        }
+        // Always merge global KB/M during learning.
+        for p in remapper_kbm_pressed_now(ui, panic_shortcut) {
+            if !pressed_now.iter().any(|q| q == &p) { pressed_now.push(p); }
+        }
+    }
+
+    let mut new_phase = phase.clone();
+    let mut new_draft = draft.clone();
+
+    if new_phase == "learning" {
+        let rising: Vec<&String> = pressed_now.iter()
+            .filter(|p| !pressed_prev.iter().any(|q| q == *p))
+            .collect();
+        let prev_was_empty = pressed_prev.is_empty();
+        if !rising.is_empty() && prev_was_empty && !new_draft.is_empty() {
+            // Re-capture: new burst after a previous chord.
+            new_draft = rising.iter().map(|s| (*s).clone()).collect();
+        } else if !pressed_now.is_empty() {
+            for p in &pressed_now {
+                if !new_draft.iter().any(|q| q == p) { new_draft.push(p.clone()); }
+            }
+        }
+        // No auto-latch; user explicitly clicks Add or Stop.
+    }
+
+    // Persist state machine results before rendering.
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.params.insert(phase_key.to_string(), Value::String(new_phase.clone()));
+        remapper_write_str_array(node, draft_key, &new_draft);
+        remapper_write_str_array(node, prev_key, &pressed_now);
+    }
+
+    // ── Render ──────────────────────────────────────────────────────────
+    let skin_param = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "auto".to_string());
+    let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
+
+    // Force a top-down layout in a fixed-width sub-UI so we lay out the
+    // same way regardless of parent layout (some pinned-widget contexts
+    // hand us a horizontal parent — without this the header + each card
+    // would lay out left-to-right instead of stacking).
+    const BODY_W: f32 = 380.0;
+    ui.allocate_ui_with_layout(
+        egui::vec2(BODY_W, 1.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+    ui.set_min_width(BODY_W);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).small().weak());
         ui.label(egui::RichText::new(format!("({})", mappings.len())).small().weak());
-        if ui.small_button("+").on_hover_text("Add an empty mapping row\n(edit pins via direct AutoMap wires)").clicked() {
+
+        let in_learning = new_phase == "learning";
+        let learn_label = if in_learning { "Stop" } else { "Learn" };
+        let learn_resp = ui.add_enabled(
+            wired || in_learning,
+            egui::Button::new(egui::RichText::new(learn_label).size(13.0)),
+        ).on_hover_text(if wired {
+            "Capture a gamepad / keyboard chord to fire when leaning this direction"
+        } else {
+            "Connect the gyro module's Device input to enable gamepad capture\n(keyboard can be captured without a wire once Learn is active)"
+        });
+        if learn_resp.clicked() {
             if let Some(node) = snarl.get_node_mut(node_id) {
-                let mut arr = node.params.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                let mut obj = serde_json::Map::new();
-                obj.insert("in".into(), Value::Array(vec![]));
-                arr.push(Value::Object(obj));
-                node.params.insert(key.into(), Value::Array(arr));
-                *changed = true;
+                if in_learning {
+                    node.params.insert(phase_key.to_string(), Value::String("idle".to_string()));
+                } else {
+                    node.params.insert(phase_key.to_string(), Value::String("learning".to_string()));
+                    remapper_write_str_array(node, draft_key, &[]);
+                    remapper_write_str_array(node, prev_key, &[]);
+                }
+            }
+        }
+
+        let add_enabled = in_learning && !new_draft.is_empty();
+        if ui.add_enabled(add_enabled,
+            egui::Button::new(egui::RichText::new("Add").size(13.0))).clicked()
+        {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let out_arr: Vec<Value> = new_draft.iter().map(|s| Value::String(s.clone())).collect();
+                let mut entry = serde_json::Map::new();
+                entry.insert("out".to_string(), Value::Array(out_arr));
+                let mut all = mappings.clone();
+                all.push(Value::Object(entry));
+                node.params.insert(key.to_string(), Value::Array(all));
+                // Stay in learning so the user can chain more captures.
+                remapper_write_str_array(node, draft_key, &[]);
+                remapper_write_str_array(node, prev_key, &[]);
             }
         }
     });
 
+    // Status / draft preview line while learning.
+    if new_phase == "learning" {
+        if new_draft.is_empty() {
+            ui.label(egui::RichText::new("Press a button or combination")
+                .size(13.0).color(Color32::from_rgb(106, 167, 255)));
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                remapper_render_chord(ui, &new_draft, skin);
+            });
+        }
+        ui.ctx().request_repaint();
+    }
+
+    // ── Mapping cards ───────────────────────────────────────────────────
     if mappings.is_empty() { return; }
     let mut to_remove: Option<usize> = None;
+    let mut to_update: Option<(usize, serde_json::Map<String, Value>)> = None;
+    ui.spacing_mut().item_spacing.y = 2.0;
     for (i, m) in mappings.iter().enumerate() {
-        let pins: Vec<String> = m.as_object()
-            .and_then(|o| o.get("in").and_then(|v| v.as_array()))
+        let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
             .unwrap_or_default();
-        ui.horizontal(|ui| {
-            if ui.small_button("×").on_hover_text("Remove this mapping").clicked() {
-                to_remove = Some(i);
-            }
-            if pins.is_empty() {
-                ui.label(egui::RichText::new("(no pins)").small().weak());
-            } else {
-                ui.label(egui::RichText::new(pins.join(" + ")).small());
-            }
+        let mut working: serde_json::Map<String, Value> = m.as_object().cloned().unwrap_or_default();
+        let mut working_changed = false;
+        ui.push_id(("fxi_lean_card", node_id.0, side, i), |ui| {
+            // Cap card width at 358 (Figma design width) so the painter's
+            // scale factor `s` stays = 1.0. Above that, all painter-drawn
+            // text + pills scale up while built-in widgets (DragValue)
+            // keep their default size, so the time-gap value box ends up
+            // looking oversized relative to the labels.
+            ui.allocate_ui_with_layout(
+                egui::vec2(358.0_f32.min(ui.available_width()), 1.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let result = remapper_mapping_card_pixel(
+                        ui, node_id, i, &mut working,
+                        &out_pins, None, skin, true,
+                    );
+                    if result.delete_clicked { to_remove = Some(i); }
+                    if result.changed { working_changed = true; }
+                },
+            );
         });
+        if working_changed { to_update = Some((i, working)); }
     }
     if let Some(idx) = to_remove {
         if let Some(node) = snarl.get_node_mut(node_id) {
             if let Some(Value::Array(arr)) = node.params.get_mut(key) {
                 if idx < arr.len() { arr.remove(idx); }
-                *changed = true;
             }
         }
     }
+    if let Some((i, obj)) = to_update {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            if let Some(Value::Array(arr)) = node.params.get_mut(key) {
+                if let Some(slot) = arr.get_mut(i) { *slot = Value::Object(obj); }
+            }
+        }
+    }
+        }, // close allocate_ui_with_layout closure
+    );
 }
 
 fn show_counter_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
@@ -5203,10 +5365,6 @@ fn render_pinned_element(
             render_gyro_steering_opts_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
-        ("processing.gyro_3dof", "spike_filter") => {
-            render_gyro_spike_filter_row(inner_id, ui, inner_snarl, container_size);
-            return;
-        }
         ("processing.gyro_3dof", "lean_threshold") => {
             render_gyro_lean_threshold_row(inner_id, ui, inner_snarl, container_size);
             return;
@@ -5217,6 +5375,20 @@ fn render_pinned_element(
         }
         ("processing.gyro_3dof", "accel_invert") => {
             render_accel_invert_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("processing.gyro_3dof", "lean_left") => {
+            render_gyro_lean_section_pin(
+                inner_id, ui, inner_snarl, container_size, "left",
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
+            return;
+        }
+        ("processing.gyro_3dof", "lean_right") => {
+            render_gyro_lean_section_pin(
+                inner_id, ui, inner_snarl, container_size, "right",
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
             return;
         }
         // Response curve graphs (regular and Vec): render only the curve
@@ -5391,7 +5563,16 @@ fn dispatch_pinned_body(
         "module.dropdown"   => show_dropdown_body(inner_id, ui, inner_snarl),
         "module.response_curve"     => { show_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
         "module.vec_response_curve" => { show_vec_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
-        "processing.gyro_3dof"      => show_gyro_3dof_body(inner_id, ui, inner_snarl),
+        "processing.gyro_3dof"      => {
+            // Inner-snarl (layout-mode preview): Learn/capture not wired
+            // here since we lack live_signals / panic_shortcut. Mapping
+            // editing still works (Add/×/press-mode); capture is no-op.
+            let empty: std::collections::HashMap<(String, String), Signal>
+                = std::collections::HashMap::new();
+            let panic_dummy = crate::app::PanicShortcut::default();
+            show_gyro_3dof_body(inner_id, &[], ui, inner_snarl, &empty,
+                &panic_dummy, None);
+        }
         "logic.greater_than" | "logic.less_than" => show_or_equal_body(inner_id, ui, inner_snarl),
         "logic.delay"       => show_logic_delay_body(inner_id, ui, inner_snarl),
         "logic.counter"     => show_counter_body(inner_id, &[], ui, inner_snarl),
@@ -6251,27 +6432,23 @@ fn render_gyro_steering_opts_row(
 ) {
     let snap = snarl.get_node(inner_id);
     let mut exclude_y = snap.and_then(|n| n.params.get("steering_exclude_y").and_then(|v| v.as_bool())).unwrap_or(false);
-    let mut blend     = snap.and_then(|n| n.params.get("recenter_blend").and_then(|v| v.as_f64())).unwrap_or(0.5) as f32;
     let mut strength  = snap.and_then(|n| n.params.get("recenter_strength").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let mut ease      = snap.and_then(|n| n.params.get("reset_ease_in").and_then(|v| v.as_f64())).unwrap_or(0.25) as f32;
     let mut changed = false;
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(260.0, 22.0));
+    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         changed |= ui.checkbox(&mut exclude_y, egui::RichText::new("excl. Y")).changed();
         ui.label(egui::RichText::new("re-center").weak());
         changed |= ui.add(egui::DragValue::new(&mut strength).speed(0.05).range(0.0..=4.0).suffix(" /s")).changed();
-        ui.label(egui::RichText::new("blend").weak());
-        changed |= ui.add(egui::Slider::new(&mut blend, 0.0..=1.0).show_value(false)).changed();
         ui.label(egui::RichText::new("ease").weak());
         changed |= ui.add(egui::DragValue::new(&mut ease).speed(0.05).range(0.0..=2.0).suffix(" s")).changed();
     });
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("steering_exclude_y".into(), Value::Bool(exclude_y));
-            node.params.insert("recenter_blend".into(),
-                serde_json::Number::from_f64(blend as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.remove("recenter_blend");
             node.params.insert("recenter_strength".into(),
                 serde_json::Number::from_f64(strength as f64).map(Value::Number).unwrap_or(Value::Null));
             node.params.insert("reset_ease_in".into(),
@@ -6280,30 +6457,56 @@ fn render_gyro_steering_opts_row(
     }
 }
 
-fn render_gyro_spike_filter_row(
-    inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2,
+/// Layout-pin renderer for a single lean section (left or right). Reuses
+/// the same transform-layer / scaled-content / custom-scrollbar machinery
+/// as Remapper's whole-module pin via `render_remap_whole_module_impl`.
+/// The body callback curries `side` and forwards to `show_gyro_lean_mapping_section`.
+fn render_gyro_lean_section_pin(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    side: &'static str,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    bridged_parent: Option<&AutomapGlowParent<'_>>,
+    is_layout_mode: bool,
 ) {
-    let snap = snarl.get_node(inner_id);
-    let mut suppress = snap.and_then(|n| n.params.get("spike_suppress").and_then(|v| v.as_bool())).unwrap_or(false);
-    let mut k        = snap.and_then(|n| n.params.get("spike_k").and_then(|v| v.as_f64())).unwrap_or(4.0) as f32;
-    let mut changed = false;
-    ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(180.0, 22.0));
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        changed |= ui.checkbox(&mut suppress, egui::RichText::new("suppress spikes")).changed();
-        ui.add_enabled_ui(suppress, |ui| {
-            ui.label(egui::RichText::new("k").weak());
-            changed |= ui.add(egui::DragValue::new(&mut k).speed(0.1).range(1.0..=12.0)).changed();
-        });
-    });
-    if changed {
-        if let Some(node) = snarl.get_node_mut(inner_id) {
-            node.params.insert("spike_suppress".into(), Value::Bool(suppress));
-            node.params.insert("spike_k".into(),
-                serde_json::Number::from_f64(k as f64).map(Value::Number).unwrap_or(Value::Null));
+    let tag: &'static str = if side == "left" { "lean_l" } else { "lean_r" };
+    let mappings_key = if side == "left" { "lean_left" } else { "lean_right" };
+    let draft_key    = if side == "left" { "_lean_left_draft" } else { "_lean_right_draft" };
+
+    let hash_mappings = move |n: &NodeData| -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if let Some(arr) = n.params.get(mappings_key).and_then(|v| v.as_array()) {
+            for m in arr {
+                m.to_string().hash(&mut h);
+                0u8.hash(&mut h);
+            }
         }
-    }
+        h.finish()
+    };
+    let hash_draft = move |n: &NodeData| -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for s in remapper_read_str_array(n, draft_key) {
+            s.hash(&mut h);
+            0u8.hash(&mut h);
+        }
+        h.finish()
+    };
+
+    render_remap_whole_module_impl(
+        tag, inner_id, ui, inner_snarl, container_size,
+        live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+        "Lean section",
+        move |id, ins, ui, sn, sigs, panic, am| {
+            show_gyro_lean_mapping_section(id, ui, sn, side, ins, sigs, panic, am);
+        },
+        hash_mappings,
+        hash_draft,
+    );
 }
 
 fn render_gyro_lean_threshold_row(
@@ -8151,6 +8354,17 @@ fn resolve_automap_glow_output(
         "module.automap_split" | "module.automap_collect" | "module.remapper" => {
             let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
             walk_automap_input(live_signals, snarl, src.node, am_idx, parent)
+        }
+        // 3DOF lean dispatch: the Map output is only the AutoMap port
+        // (index 5). Other outputs use their own glow rules. The Map's
+        // activity tracks the absolute Lean value (output index 3 of the
+        // module's last_signals) — non-zero lean = active dispatch.
+        "processing.gyro_3dof" if node.outputs.get(src.output).map(|p| p.signal_type) == Some(SignalType::AutoMap) => {
+            let lean = match node.extra.last_signals.get(3) {
+                Some(Some(Signal::Float(f))) => f.abs(),
+                _ => 0.0,
+            };
+            Some(lean.clamp(0.0, 1.0))
         }
         "module.automap_fork" => {
             // Either output mirrors the input bus's activity (gating is logical).
@@ -11545,6 +11759,7 @@ fn remapper_mapping_card_pixel(
     in_pins: &[String],
     out_pins: Option<&[String]>,    // None → Map Action variant (single row)
     skin: super::remapper_icons::Skin,
+    allow_analog_mode: bool,        // true for Lean cards and Remapper/Map Action (since analog support added)
 ) -> MappingCardResult {
     // ── Figma palette ─────────────────────────────────────────────────────
     const C_CARD_BG:   Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);  // outer
@@ -11698,7 +11913,10 @@ fn remapper_mapping_card_pixel(
             egui::FontId::proportional(15.0 * s),
             C_TEXT,
         );
-        let popup_id = egui::Id::new(("fxi_press_mode_popup", node_id.0, mapping_idx));
+        // Scoped via ui.id() so it inherits the caller's push_id (e.g. each
+        // lean section pushes (side, idx) — without this, Lean Left[0] and
+        // Lean Right[0] popups collide on the same global id.
+        let popup_id = ui.id().with(("fxi_press_mode_popup", mapping_idx));
         if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
         let mut picked: Option<&'static str> = None;
         egui::popup_below_widget(
@@ -11706,14 +11924,18 @@ fn remapper_mapping_card_pixel(
             egui::PopupCloseBehavior::CloseOnClickOutside,
             |ui| {
                 ui.set_min_width(140.0);
-                for (val, g, label) in [
+                let mut options: Vec<(&'static str, &'static str, &'static str)> = vec![
                     ("down",       "↓", "Normal (gate)"),
                     ("short",      "↕", "Short press"),
                     ("long",       "⇓", "Long press"),
                     ("double",     "↡", "Double tap"),
                     ("on_press",   "↧", "On press"),
                     ("on_release", "↥", "On release"),
-                ] {
+                ];
+                if allow_analog_mode {
+                    options.push(("analog", "∿", "Analog"));
+                }
+                for (val, g, label) in options {
                     if ui.selectable_label(mode_now == val,
                         format!("{g}  {label}")).clicked() { picked = Some(val); }
                 }
@@ -11737,7 +11959,9 @@ fn remapper_mapping_card_pixel(
 
     // ── time gap pill: outer (61,5,137×20), valuebox (135,5,63×20) ────────
     let turbo_on = mapping.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-    let gap_applies = matches!(mode_now.as_str(), "short" | "long" | "double") || turbo_on;
+    // `analog` reuses the time_gap field as the per-tap duration (when
+    // outputs are bool) — see eval. So it counts as "applies".
+    let gap_applies = matches!(mode_now.as_str(), "short" | "long" | "double" | "analog") || turbo_on;
     {
         let outer = egui::Rect::from_min_size(at(61.0, 5.0), sz(137.0, 20.0));
         let value_box = egui::Rect::from_min_size(at(61.0 + 74.0, 5.0), sz(63.0, 20.0));
@@ -11776,7 +12000,8 @@ fn remapper_mapping_card_pixel(
     }
 
     // ── hold pill: (206,5,62×20), checkbox at +(45,3,14×14) ──────────────
-    let hold_applies = mode_now == "long";
+    // In `analog` mode, `hold` toggles short-tap vs long-tap pulse trains.
+    let hold_applies = mode_now == "long" || mode_now == "analog";
     {
         let outer = egui::Rect::from_min_size(at(206.0, 5.0), sz(62.0, 20.0));
         let cb_rect = egui::Rect::from_min_size(at(206.0 + 45.0, 5.0 + 3.0), sz(14.0, 14.0));
@@ -12244,6 +12469,7 @@ fn remapper_press_mode_glyph(mode: &str) -> &'static str {
         "double"     => "↡",
         "on_press"   => "↧",
         "on_release" => "↥",
+        "analog"     => "∿",
         _            => "↓",
     }
 }
@@ -12255,6 +12481,7 @@ fn remapper_press_mode_label(mode: &str) -> &'static str {
         "double"     => "Double tap",
         "on_press"   => "On press",
         "on_release" => "On release",
+        "analog"     => "Analog",
         _            => "Normal (gate)",
     }
 }
@@ -12709,6 +12936,7 @@ fn show_remapper_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin,
+                                    true,
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
@@ -13028,6 +13256,7 @@ fn show_map_action_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin,
+                                    true,
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }

@@ -377,6 +377,11 @@ impl Module for Gyro3DOFModule {
                 PinDescriptor::new("Y",     SignalType::Float),
                 PinDescriptor::new("Lean",  SignalType::Float),
                 PinDescriptor::new("Lean!", SignalType::Bool),
+                // AutoMap-out carries downstream per-pin signals produced
+                // by the module's lean_left / lean_right mapping arrays.
+                // Same contract as Remapper: pin injection happens in
+                // eval.rs.
+                PinDescriptor::new("Map",   SignalType::AutoMap),
             ],
         }
     }
@@ -431,7 +436,12 @@ impl Module for MapActionModule {
             display_name: "Map Action",
             category: "AutoMap",
             inputs:  vec![PinDescriptor::new("in",  SignalType::AutoMap)],
-            outputs: vec![PinDescriptor::new("out", SignalType::Bool)],
+            // Output is Any: digital press modes emit Bool ("any mapping
+            // currently active"); analog mode emits the signed magnitude
+            // of the currently-driving input cardinal as Float so the wire
+            // carries continuous values for the analog stick-direction
+            // remap use case.
+            outputs: vec![PinDescriptor::new("out", SignalType::Any)],
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }

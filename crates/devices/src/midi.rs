@@ -109,11 +109,7 @@ impl MidiBackend {
         self.in_entries.retain(|e| pinned_device_ids.contains(&e.device_id));
         let before_out = self.out_entries.len();
         self.out_entries.retain(|e| pinned_device_ids.contains(&e.device_id));
-        let released = (before_in - self.in_entries.len()) + (before_out - self.out_entries.len());
-        if released > 0 {
-            eprintln!("[midi] release_unpinned: closed {} handles (in={}, out={} remain)",
-                released, self.in_entries.len(), self.out_entries.len());
-        }
+        let _released = (before_in - self.in_entries.len()) + (before_out - self.out_entries.len());
     }
 
     /// Apply a previously-fetched live port list: drop entries whose port
@@ -177,11 +173,7 @@ impl MidiBackend {
             added_out += 1;
         }
 
-        if added_in + dropped_in + added_out + dropped_out > 0 {
-            eprintln!("[midi] apply_port_diff: in +{}/-{}={}, out +{}/-{}={}",
-                added_in, dropped_in, self.in_entries.len(),
-                added_out, dropped_out, self.out_entries.len());
-        }
+        let _ = (added_in, dropped_in, added_out, dropped_out);
     }
 
     /// Convenience: fetch live ports and apply the diff in one call.

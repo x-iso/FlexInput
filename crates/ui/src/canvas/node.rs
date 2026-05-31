@@ -404,11 +404,12 @@ pub fn exposable_elements(module_id: &str) -> &'static [(&'static str, &'static 
         "processing.gyro_3dof"      => &[
             ("pointer_mode",   "Pointer mode (Pitch+Yaw/Pitch+Roll/Player/World)"),
             ("steering_mode",  "Steering mode (Pitch+Yaw/Pitch+Roll/Player/World)"),
-            ("steering_opts",  "Steering options (excl.Y / re-center / blend / ease)"),
-            ("spike_filter",   "Outlier spike suppression"),
+            ("steering_opts",  "Steering options (excl.Y / re-center / ease)"),
             ("lean_threshold", "Lean threshold"),
             ("gyro_invert",    "Gyro invert row (yaw/pitch/roll)"),
             ("accel_invert",   "Accel invert row (X/Y/+Z)"),
+            ("lean_left",      "Lean Left section (Learn + mapping cards)"),
+            ("lean_right",     "Lean Right section (Learn + mapping cards)"),
         ],
         "module.average"    => &[
             ("samples",   "Sample count"),

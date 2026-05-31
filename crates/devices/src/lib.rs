@@ -45,6 +45,11 @@ pub trait DeviceBackend: Send {
     /// thread to compute live per-device polling rates. Default: empty
     /// (backends that don't track events are reported as 0 Hz).
     fn take_event_counts(&mut self) -> Vec<(String, u32)> { Vec::new() }
+    /// Configure the snap-back outlier-spike filter for a specific
+    /// physical device. Called from the I/O loop each tick with the
+    /// current UI settings (cheap no-op if unchanged). Backends without
+    /// a raw IMU stream should ignore this.
+    fn set_spike_filter(&mut self, _device_id: &str, _enabled: bool, _sensitivity_pct: f32) {}
 }
 
 pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {
