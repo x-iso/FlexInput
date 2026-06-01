@@ -64,6 +64,20 @@ pub(crate) fn svg_icon_button(
     resp
 }
 
+/// Device-card icon that doubles as a rumble "ping" button. Renders the family
+/// SVG (color-inverts on hover for affordance), shows a pointer cursor and a
+/// tooltip, and returns the click `Response`. Used on physical device cards in
+/// both Easy and Advanced mode so the user can identify which pad is which.
+pub(crate) fn ping_device_icon(
+    ui: &mut egui::Ui,
+    bytes: &'static [u8],
+    height: f32,
+) -> egui::Response {
+    let resp = svg_icon_button(ui, bytes, height);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Ping (rumble)")
+}
+
 fn load_svg_texture(
     ui: &egui::Ui,
     bytes: &'static [u8],

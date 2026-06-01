@@ -83,4 +83,12 @@ impl ControllerKind {
             Self::MidiOut    => "MIDI Output Port",
         }
     }
+
+    /// Whether this controller exposes pressure-sensitive analog triggers
+    /// (LT/RT as a 0..1 axis). Switch Pro's ZL/ZR are digital-only buttons, so
+    /// it returns false — the UI forces the digital-trigger override ON for it.
+    /// MIDI ports have no triggers and return false too.
+    pub fn has_analog_triggers(self) -> bool {
+        matches!(self, Self::XInput | Self::DualShock4 | Self::DualSense | Self::Generic)
+    }
 }

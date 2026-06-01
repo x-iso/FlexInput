@@ -396,6 +396,7 @@ impl Canvas {
         param_defaults: DeviceParamDefaults,
         ui: &mut egui::Ui,
         automap_parent: Option<crate::canvas::viewer::AutomapGlowParent<'_>>,
+        ping_requests: Option<&crate::easy::io_panel::PingRequests>,
     ) -> Option<NodeId> {
         let ctx = ui.ctx().clone();
 
@@ -549,6 +550,7 @@ impl Canvas {
             param_defaults,
             calibrate_request: None,
             automap_parent,
+            ping_requests,
         };
         // Capture the snarl_id BEFORE show so we can manipulate SnarlState
         // (zoom / pan) from the zoom-control overlay below.

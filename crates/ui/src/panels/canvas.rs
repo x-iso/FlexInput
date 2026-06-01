@@ -16,10 +16,11 @@ pub fn show(
     device_rates: &HashMap<String, u32>,
     param_defaults: DeviceParamDefaults,
     ui: &mut egui::Ui,
+    ping_requests: &crate::easy::io_panel::PingRequests,
 ) -> Option<NodeId> {
     canvas.show(
         descriptors, live_device_ids, live_signals,
         panic_shortcut, physical_devices, device_rates,
-        param_defaults, ui, None,
+        param_defaults, ui, None, Some(ping_requests),
     )
 }

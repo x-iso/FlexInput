@@ -41,6 +41,12 @@ pub struct SinkTarget {
     /// defers the multi_sources read to a post-pass so the chain has produced
     /// values by the time we read them.
     pub is_self_sink: bool,
+    /// When true, the AutoMap digital→analog trigger bridge is allowed for this
+    /// sink: a pressed `btn_lt_dig`/`btn_rt_dig` may drive the virtual analog
+    /// `left_trigger`/`right_trigger` as a lowest-priority fallback. Set from the
+    /// upstream physical source's `digital_triggers` opt-in (always on for
+    /// digital-only pads like Switch Pro). Default false.
+    pub digital_trigger_bridge: bool,
 }
 
 #[derive(Clone)]

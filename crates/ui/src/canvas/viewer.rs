@@ -65,6 +65,10 @@ pub struct FlexViewer<'a> {
     /// Parent snarl frame for resolving AutoMap pin glow that crosses sub-patch
     /// boundaries. `None` at the root canvas; set by the inner sub-patch editor.
     pub automap_parent: Option<AutomapGlowParent<'a>>,
+    /// Shared rumble-ping queue. A click on a device.source's icon pushes that
+    /// device's id here for the I/O thread to pulse. `None` on inner sub-patch
+    /// canvases (no physical device sources to ping).
+    pub ping_requests: Option<&'a crate::easy::io_panel::PingRequests>,
 }
 
 impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
@@ -178,9 +182,24 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             ui.horizontal(|ui| {
                 if let Some(spec) = &icon_spec {
                     use crate::canvas::remapper_icons::NodeIconSpec;
-                    use crate::panels::device_icon::render_device_icon;
+                    use crate::panels::device_icon::{ping_device_icon, render_device_icon};
                     const ICON_H: f32 = 40.0;
                     match spec {
+                        // A physical device.source icon doubles as a rumble-ping
+                        // button (click → 200 ms pulse) so the user can identify
+                        // which hardware this node maps to.
+                        NodeIconSpec::Single(bytes) if is_device_source
+                            && self.ping_requests.is_some()
+                            && dev_id_str.starts_with("gilrs:") =>
+                        {
+                            if ping_device_icon(ui, bytes, ICON_H).clicked() {
+                                if let Some(q) = self.ping_requests {
+                                    if let Ok(mut q) = q.lock() {
+                                        q.push(dev_id_owned.clone());
+                                    }
+                                }
+                            }
+                        }
                         NodeIconSpec::Single(bytes) => render_device_icon(ui, bytes, ICON_H),
                         NodeIconSpec::Pair(a, b) => {
                             render_device_icon(ui, a, ICON_H);
@@ -639,6 +658,14 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         }
                     }
                 }
+            }
+
+            // Digital-trigger override toggle for physical gamepad sources.
+            // See `digital_trigger_toggle` in easy::io_panel for the semantics —
+            // forced ON + disabled for digital-only pads (Switch Pro), opt-in
+            // elsewhere. Stored on the node's `digital_triggers` param.
+            if is_device_source && dev_id_str.starts_with("gilrs:") {
+                digital_trigger_header_toggle(ui, snarl, node, dev_id_str);
             }
 
             // Second header row — only visible while in Layout mode for this
@@ -1226,6 +1253,55 @@ fn show_midi_out_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
 /// - XInput (Xbox): deadzone + sticks calibration, no gyro
 /// - DualShock4 / DualSense / Switch Pro: deadzone + gyro + sticks
 /// - Generic HID / unknown: deadzone + sticks (conservative)
+/// Whether a `gilrs:<slug>:<inst>` device has pressure-sensitive analog
+/// triggers. Switch Pro (digital-only ZL/ZR) returns false. Unknown slugs are
+/// treated as analog-capable (conservative — they keep the opt-in toggle).
+fn slug_has_analog_triggers(dev_id: &str) -> bool {
+    let slug = dev_id.strip_prefix("gilrs:")
+        .and_then(|r| r.split(':').next())
+        .unwrap_or("");
+    slug != "switch_pro"
+}
+
+/// Advanced-mode device.source body toggle for the digital-trigger override.
+/// Mirrors the Easy-mode `digital_trigger_toggle`: forced ON + disabled for
+/// digital-only pads, opt-in (default OFF) for pads with real analog triggers.
+fn digital_trigger_header_toggle(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node: NodeId,
+    dev_id: &str,
+) {
+    let forced = !slug_has_analog_triggers(dev_id);
+    let stored = snarl.get_node(node)
+        .and_then(|n| n.params.get("digital_triggers"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut checked = forced || stored;
+
+    // Persist the forced value so the engine sees it even without a click.
+    if forced && !stored {
+        if let Some(n) = snarl.get_node_mut(node) {
+            n.params.insert("digital_triggers".into(), Value::Bool(true));
+        }
+    }
+
+    ui.add_enabled_ui(!forced, |ui| {
+        let label = if forced { "Digital triggers (only option)" } else { "Digital triggers \u{2192} analog" };
+        let resp = ui.checkbox(&mut checked, egui::RichText::new(label).small());
+        if resp.changed() {
+            if let Some(n) = snarl.get_node_mut(node) {
+                n.params.insert("digital_triggers".into(), Value::Bool(checked));
+            }
+        }
+        resp.on_hover_text(
+            "Drive the virtual pad's analog triggers from this controller's digital \
+             ZL/ZR buttons. A press maps to a full pull; otherwise the real analog \
+             value is used.",
+        );
+    });
+}
+
 pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {
     if !is_device_source { return (false, false, false); }
     if dev_id.starts_with("midi_in") || dev_id.starts_with("midi_out") {

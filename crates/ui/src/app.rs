@@ -434,6 +434,10 @@ pub struct FlexInputApp {
     /// Written by the UI (calibration window) when the user toggles or drags
     /// the slider; read by the I/O thread each tick and pushed to backends.
     pub spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
+    /// Pending rumble-ping requests, pushed by the UI when the user clicks a
+    /// device-card icon. The I/O thread drains this each tick, starts a 200 ms
+    /// rumble pulse on the named physical device, and stops it when it expires.
+    pub ping_requests: Arc<Mutex<Vec<String>>>,
     // ── Always-on-top pin ────────────────────────────────────────────────
     /// Set by both the global keyboard hotkey thread and the Guide-button
     /// watcher thread when the user fires their configured pin toggle. The
@@ -651,6 +655,7 @@ impl FlexInputApp {
         let scope_taps   = flexinput_engine::new_scope_taps();
         let spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let ping_requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         spawn_io_thread(
             backends,
             Arc::clone(&midi_backend),
@@ -665,6 +670,7 @@ impl FlexInputApp {
             Arc::clone(&device_rates),
             Arc::clone(&scope_taps),
             Arc::clone(&spike_filter_settings),
+            Arc::clone(&ping_requests),
         );
 
         spawn_midi_watch_thread(
@@ -777,6 +783,7 @@ impl FlexInputApp {
             device_rates,
             scope_taps,
             spike_filter_settings,
+            ping_requests,
             pin_toggle_requested,
             pin_shortcut_shared,
             pin_guide_cfg,
@@ -1951,6 +1958,7 @@ impl eframe::App for FlexInputApp {
             s
         };
         let shared_pool_for_panel = Arc::clone(&self.shared_virtual_devices);
+        let ping_requests_for_panel = Arc::clone(&self.ping_requests);
         let easy_mode = self.settings.ui_mode == settings::UiMode::Easy;
         let device_defaults_for_easy = crate::canvas::DeviceParamDefaults {
             stick_deadzone: self.settings.default_stick_deadzone,
@@ -2237,6 +2245,7 @@ impl eframe::App for FlexInputApp {
                         device_defaults_for_easy,
                         &mut calibrate_request,
                         &device_rates_snap,
+                        &ping_requests_for_panel,
                     );
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(center_rect), |ui| {
@@ -2305,7 +2314,7 @@ impl eframe::App for FlexInputApp {
             calibrate_request = crate::panels::canvas::show(
                 canvas, &self.descriptors, &live_device_ids, &self.last_signals,
                 &self.panic_shortcut, devices, &device_rates_snap,
-                device_defaults, ui,
+                device_defaults, ui, &ping_requests_for_panel,
             );
         });
         if let Some(node) = calibrate_request {
@@ -3092,6 +3101,7 @@ fn spawn_io_thread(
     device_rates: flexinput_engine::DeviceRates,
     scope_taps: flexinput_engine::ScopeTaps,
     spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
+    ping_requests: Arc<Mutex<Vec<String>>>,
 ) {
     use std::time::{Duration, Instant};
 
@@ -3122,6 +3132,12 @@ fn spawn_io_thread(
             let mut dev_event_acc: HashMap<String, u32> = HashMap::new();
             let mut dev_rate_ema: HashMap<String, f32> = HashMap::new();
             let mut last_rate_publish = Instant::now();
+
+            // Active rumble-ping pulses: device_id → instant the pulse should stop.
+            // Started when the UI pushes a ping request; cleared once expired (sending
+            // a single rumble-off so the motors don't latch).
+            let mut ping_until: HashMap<String, Instant> = HashMap::new();
+            const PING_RUMBLE_MS: u64 = 200;
 
             loop {
                 puffin::GlobalProfiler::lock().new_frame();
@@ -3321,6 +3337,47 @@ fn spawn_io_thread(
                                 }
                             }
                         }
+                    }
+                }
+
+                // ── Rumble ping ──────────────────────────────────────────────
+                // Diagnostic pulse so the user can confirm which physical pad a
+                // card maps to. Runs regardless of bypass — it's a deliberate,
+                // user-initiated action, not patch output. New requests start a
+                // 200 ms pulse; we drive both motors while active and send a
+                // single rumble-off when the deadline passes.
+                {
+                    let now = Instant::now();
+                    if let Ok(mut reqs) = ping_requests.try_lock() {
+                        for dev_id in reqs.drain(..) {
+                            ping_until.insert(dev_id, now + Duration::from_millis(PING_RUMBLE_MS));
+                        }
+                    }
+                    if !ping_until.is_empty() {
+                        let mut expired: Vec<String> = Vec::new();
+                        for (dev_id, deadline) in ping_until.iter() {
+                            let active = now < *deadline;
+                            let amp = if active { Signal::Float(1.0) } else { Signal::Float(0.0) };
+                            // Drive every rumble pin family so the ping works
+                            // regardless of controller type — each backend ignores
+                            // pins it doesn't recognise:
+                            //   rumble_strong/weak → XInput motors, DS4/DualSense
+                            //                        classic motors
+                            //   hd_l_amp/hd_r_amp  → Switch Pro HD rumble (needs a
+                            //                        non-zero freq to be audible, so
+                            //                        we set ~320 Hz too)
+                            let freq = if active { Signal::Float(0.6) } else { Signal::Float(0.0) };
+                            for backend in &mut backends {
+                                backend.send(dev_id, "rumble_strong", amp);
+                                backend.send(dev_id, "rumble_weak", amp);
+                                backend.send(dev_id, "hd_l_amp", amp);
+                                backend.send(dev_id, "hd_r_amp", amp);
+                                backend.send(dev_id, "hd_l_freq", freq);
+                                backend.send(dev_id, "hd_r_freq", freq);
+                            }
+                            if !active { expired.push(dev_id.clone()); }
+                        }
+                        for dev_id in expired { ping_until.remove(&dev_id); }
                     }
                 }
 
@@ -4026,6 +4083,17 @@ fn find_automap_device(snarl: &Snarl<NodeData>, src: OutPinId) -> Option<(String
     find_automap_device_rec(snarl, src, None)
 }
 
+/// True when `id` names a real I/O device (physical pad, MIDI port, or virtual
+/// sink) rather than a synthetic AutoMap-bus key (`collector:`, `remap:`,
+/// `forksel:`, `combiner:`, `lean:`). Used to decide when to fall back to the
+/// underlying physical device for feedback (reverse) routing.
+fn is_real_device_id(id: &str) -> bool {
+    id.starts_with("gilrs:")
+        || id.starts_with("midi_in:")
+        || id.starts_with("midi_out:")
+        || id.starts_with("virtual.")
+}
+
 /// Public helper for the viewer: resolve an AutoMap chain back to the
 /// originating physical device id (or a sensible fallback) for UI capture.
 /// Returns `Some(device_id)` when resolved, or `None` when not wired.
@@ -4331,6 +4399,21 @@ fn build_processing_graph_rec(
 
     let mut dirty_uids: Vec<usize> = Vec::new();
 
+    // Pre-pass: physical device ids whose source node enabled the digital→analog
+    // trigger bridge (or that are digital-only pads, where it's always on). A sink
+    // only honours the bridge when its upstream source is in this set.
+    let mut digital_trigger_devs: HashSet<String> = HashSet::new();
+    for (_id, node) in &node_list {
+        if node.module_id != "device.source" { continue; }
+        let Some(dev_id) = node.params.get("device_id").and_then(|v| v.as_str()) else { continue; };
+        let opted_in = node.params.get("digital_triggers").and_then(|v| v.as_bool()).unwrap_or(false);
+        let digital_only = dev_id.strip_prefix("gilrs:")
+            .and_then(|r| r.split(':').next()) == Some("switch_pro");
+        if opted_in || digital_only {
+            digital_trigger_devs.insert(dev_id.to_string());
+        }
+    }
+
     // Pre-pass: collect, for each physical device_id used as an AutoMap source,
     // the list of virtual sink device_ids that auto-map from it. Used to wire
     // feedback signals (rumble, lightbar) backward along AutoMap connections.
@@ -4340,13 +4423,24 @@ fn build_processing_graph_rec(
             || (node.module_id == "device.source" && !node.inputs.is_empty());
         if !is_sink { continue; }
         // Find this sink's AutoMap source device_id (if wired).
+        //
+        // When the wire passes through an AutoMap module (Collector, Fork,
+        // Selector, Remapper, Combiner, 3DOF), `find_automap_device_rec`
+        // returns a SYNTHETIC key (`collector:{uid}`, `remap:{uid}`, …) as the
+        // first element and the real upstream physical device as the fallback
+        // (third element). Feedback flows back to the *physical* device, so the
+        // map must be keyed by the physical id — fall back to it whenever the
+        // resolved id isn't itself a real device id. Without this, routing a pad
+        // through a sub-patch full of AutoMap modules silently drops rumble.
         let automap_src_dev = (0..node.inputs.len()).find_map(|i| {
             if node.inputs.get(i).map(|p| p.signal_type) != Some(SignalType::AutoMap) {
                 return None;
             }
             let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
             let &src = pin.remotes.first()?;
-            find_automap_device_rec(snarl, src, parents).map(|(d, _, _)| d)
+            find_automap_device_rec(snarl, src, parents).map(|(d, _, fallback)| {
+                if is_real_device_id(&d) { d } else { fallback.unwrap_or(d) }
+            })
         });
         let Some(src_dev) = automap_src_dev else { continue; };
         let sink_dev = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -4428,7 +4522,19 @@ fn build_processing_graph_rec(
             // Their output signals (rumble, lightbar) flow back to this sink's haptic inputs.
             let feedback_sources = feedback_map.get(&sink_dev_id).cloned().unwrap_or_default();
 
-            Some(SinkTarget { device_id: sink_dev_id, pin_ids, multi_sources, automap_source, automap_fallback_dev, feedback_sources, is_self_sink: false })
+            // Digital→analog trigger bridge: enabled when the upstream PHYSICAL
+            // source opted in (or is digital-only). The upstream physical id is the
+            // fallback dev when routed through a collector, else the automap source
+            // id when it's itself a real device.
+            let upstream_phys = automap_fallback_dev.clone().or_else(|| {
+                automap_source.as_ref().map(|(d, _)| d.clone())
+                    .filter(|d| is_real_device_id(d))
+            });
+            let digital_trigger_bridge = upstream_phys
+                .map(|d| digital_trigger_devs.contains(&d))
+                .unwrap_or(false);
+
+            Some(SinkTarget { device_id: sink_dev_id, pin_ids, multi_sources, automap_source, automap_fallback_dev, feedback_sources, is_self_sink: false, digital_trigger_bridge })
         } else {
             None
         };
@@ -6297,7 +6403,7 @@ fn show_subpatch_editors(
                     let _ = inner_canvas.show(
                         descriptors, live_device_ids, &live_signals,
                         &panic_shortcut, devices, &device_rates_inner,
-                        device_defaults_inner, ui, automap_parent,
+                        device_defaults_inner, ui, automap_parent, None,
                     );
                 });
 

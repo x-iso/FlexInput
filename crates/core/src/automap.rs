@@ -169,17 +169,21 @@ pub fn resolve_mapping<'a>(src_pins: &[&'a str], dst_pins: &[&'a str]) -> Vec<(&
     let mut result = Vec::new();
     let mut claimed_dst = std::collections::HashSet::new();
 
+    // Pass 1: direct ID matches across ALL sources first. A direct match (same name on
+    // both sides) is the authoritative owner of its destination and must not be pre-empted
+    // by an earlier source's semantic fan-out. Doing every direct match before any fan-out
+    // makes ordering of `src_pins` irrelevant.
     for &src_id in src_pins {
-        // 1. Direct ID match — same name on both sides (always wins for that destination).
         if let Some(&dst_id) = dst_pins.iter().find(|&&d| d == src_id) {
             if claimed_dst.insert(dst_id) {
                 result.push((src_id, dst_id));
             }
         }
+    }
 
-        // 2. Semantic group match — fan out to every other group member that exists on the
-        // destination side (and isn't already claimed).  Lets btn_lt_dig drive left_trigger
-        // alongside the direct btn_lt_dig→btn_lt_dig mapping, btn_capture↔btn_mute, etc.
+    // Pass 2: semantic group fan-out for destinations a direct match didn't claim.
+    // Lets btn_capture↔btn_mute bridge when only one name exists on each side.
+    for &src_id in src_pins {
         if let Some(group) = SEMANTIC_GROUPS.iter().find(|g| g.contains(&src_id)).copied() {
             for &group_id in group {
                 if group_id == src_id { continue; }
@@ -192,5 +196,73 @@ pub fn resolve_mapping<'a>(src_pins: &[&'a str], dst_pins: &[&'a str]) -> Vec<(&
         }
     }
 
+    // Pass 3: the digital↔analog trigger bridge is special — both the analog
+    // (`left_trigger`/`right_trigger`) and digital (`btn_lt_dig`/`btn_rt_dig`) source pins
+    // must reach the analog destination, even though pass 1 already gave it a direct owner.
+    // On controllers whose analog trigger is dead (Switch Pro ZL/ZR are digital-only, so
+    // `left_trigger` is never published), the engine combines these by magnitude and the
+    // live digital press wins. Without this extra mapping the digital source could never
+    // drive the analog trigger. Emitted in addition to (not instead of) the direct mapping.
+    for &(dig, analog) in &[("btn_lt_dig", "left_trigger"), ("btn_rt_dig", "right_trigger")] {
+        let has_dig_src = src_pins.contains(&dig);
+        let has_analog_dst = dst_pins.contains(&analog);
+        if has_dig_src && has_analog_dst && !result.iter().any(|&(s, d)| s == dig && d == analog) {
+            result.push((dig, analog));
+        }
+    }
+
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every gamepad source node exposes both the analog trigger pin and the digital
+    // trigger button pin (see gamepad::standard_outputs). A virtual gamepad sink exposes
+    // both too. The analog destination must be reachable from BOTH sources so the engine
+    // can pick whichever carries a live signal — critical for Switch Pro / DualSense, whose
+    // ZL/ZR (or whose HID-parsed L2/R2) only populate the digital pin in some paths.
+    #[test]
+    fn digital_trigger_reaches_analog_destination() {
+        // Order deliberately puts analog before digital, matching standard_outputs().
+        let src = ["left_trigger", "right_trigger", "btn_lt_dig", "btn_rt_dig"];
+        let dst = ["left_trigger", "right_trigger", "btn_lt_dig", "btn_rt_dig"];
+        let m = resolve_mapping(&src, &dst);
+
+        assert!(m.contains(&("btn_lt_dig", "left_trigger")), "digital LT must reach analog LT: {m:?}");
+        assert!(m.contains(&("btn_rt_dig", "right_trigger")), "digital RT must reach analog RT: {m:?}");
+        // Direct matches still present.
+        assert!(m.contains(&("left_trigger", "left_trigger")));
+        assert!(m.contains(&("btn_lt_dig", "btn_lt_dig")));
+    }
+
+    // When the source has no analog trigger pin at all (a hypothetical digital-only node),
+    // the digital source must still drive the analog destination.
+    #[test]
+    fn digital_only_source_drives_analog() {
+        let src = ["btn_lt_dig", "btn_rt_dig"];
+        let dst = ["left_trigger", "right_trigger", "btn_lt_dig", "btn_rt_dig"];
+        let m = resolve_mapping(&src, &dst);
+        assert!(m.contains(&("btn_lt_dig", "left_trigger")), "{m:?}");
+        assert!(m.contains(&("btn_rt_dig", "right_trigger")), "{m:?}");
+    }
+
+    #[test]
+    fn capture_mute_bridge_still_works() {
+        let m = resolve_mapping(&["btn_capture"], &["btn_mute"]);
+        assert_eq!(m, vec![("btn_capture", "btn_mute")]);
+    }
+
+    // No duplicate (src, dst) pairs — the engine would double-process them.
+    #[test]
+    fn no_duplicate_pairs() {
+        let src = ["left_trigger", "btn_lt_dig"];
+        let dst = ["left_trigger", "btn_lt_dig"];
+        let mut m = resolve_mapping(&src, &dst);
+        let n = m.len();
+        m.sort();
+        m.dedup();
+        assert_eq!(m.len(), n, "duplicate pairs in resolve_mapping output");
+    }
 }

@@ -371,6 +371,13 @@ fn preprocess_dev_sigs(
             post_process_device_pin(&key.1, src, entry.0, entry.1, &entry.2, is_imu),
         );
     }
+
+    // NOTE: the digital-trigger override (driving the virtual analog trigger from
+    // a digital ZL/ZR) is intentionally NOT applied here at the source level — it
+    // would clobber the `left_trigger` signal for everyone downstream, breaking
+    // manual AutoMap injection and Remapper analog output. Instead it's applied as
+    // a lowest-priority fallback at the AutoMap sink write (see the trigger handling
+    // around the `resolve_mapping` consumer in `eval_graph_tick`).
     out
 }
 
@@ -1458,25 +1465,30 @@ fn eval_subgraph(
                 }
             }
 
-            // Analog override (identical-input-chord, later wins).
+            // Analog override (identical input+output chord, later wins). Two
+            // analog mappings that share an input but target DIFFERENT outputs
+            // (e.g. left_stick_up→right_trigger AND left_stick_up→left_stick_up
+            // to keep the stick output) must BOTH fire and accumulate — only a
+            // true duplicate (same inputs AND same outputs) is overridden.
             let mut analog_emit_idx: Vec<usize> = Vec::new();
             {
                 let mut analog_indices: Vec<usize> = (0..triggered.len())
                     .filter(|&t| triggered[t].2)
                     .collect();
                 analog_indices.sort_by_key(|&t| triggered[t].3);
+                let sorted_set = |v: &Vec<String>| -> Vec<String> {
+                    let mut s = v.clone(); s.sort(); s
+                };
                 let mut keep: Vec<bool> = vec![true; analog_indices.len()];
                 for a in 0..analog_indices.len() {
                     if !keep[a] { continue; }
-                    let (ref ain, _, _, _) = triggered[analog_indices[a]];
-                    let mut a_set: Vec<&String> = ain.iter().collect();
-                    a_set.sort();
+                    let (ref ain, ref aout, _, _) = triggered[analog_indices[a]];
+                    let (a_in, a_out) = (sorted_set(ain), sorted_set(aout));
                     for b in (a + 1)..analog_indices.len() {
-                        let (ref bin, _, _, _) = triggered[analog_indices[b]];
-                        if ain.len() != bin.len() { continue; }
-                        let mut b_set: Vec<&String> = bin.iter().collect();
-                        b_set.sort();
-                        if a_set == b_set { keep[a] = false; break; }
+                        let (ref bin, ref bout, _, _) = triggered[analog_indices[b]];
+                        if a_in == sorted_set(bin) && a_out == sorted_set(bout) {
+                            keep[a] = false; break;
+                        }
                     }
                 }
                 for (a, t_idx) in analog_indices.iter().enumerate() {
@@ -1496,6 +1508,7 @@ fn eval_subgraph(
                 for (in_p, out_p) in in_pins[..n].iter().zip(out_pins[..n].iter()) {
                     let in_is_cardinal = analog_axis_for_cardinal(in_p).is_some();
                     let out_axis_opt = analog_axis_for_cardinal(out_p);
+                    let out_trigger = analog_trigger_out(out_p);
                     let mag_from_input = if in_is_cardinal {
                         analog_cardinal_input_value(&upstream, in_p)
                     } else { 1.0 };
@@ -1503,6 +1516,14 @@ fn eval_subgraph(
                         let contrib = sign * mag_from_input;
                         let entry = analog_axis_acc.entry(axis_pin).or_insert(0.0);
                         *entry += contrib;
+                    } else if let Some(trigger_pin) = out_trigger {
+                        // Triggers are one-sided 0..1 axes. Mapping a stick
+                        // cardinal → trigger in analog mode drives the trigger
+                        // with the input's live magnitude (the whole point of
+                        // analog mode on a pad like Switch Pro that lacks analog
+                        // triggers of its own). Accumulate unsigned magnitude.
+                        let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
+                        *entry += mag_from_input.max(0.0);
                     } else {
                         let active = if turbo {
                             apply_turbo(true, window_ms, slots, dt)
@@ -1588,7 +1609,12 @@ fn eval_subgraph(
                 if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
                     for v in arr {
                         if let Some(s) = v.as_str() {
-                            if analog_axis_for_cardinal(s).is_none() {
+                            // Triggers are analog axes (handled by analog_axis_acc),
+                            // not buttons — exclude them from the binary on/off
+                            // release pass or it would clobber the analog value.
+                            if analog_axis_for_cardinal(s).is_none()
+                                && analog_trigger_out(s).is_none()
+                            {
                                 analog_button_pins.insert(s.to_string());
                             }
                         }
@@ -2371,9 +2397,12 @@ pub fn eval_graph_tick(
 
             // ── Analog publish pass ──────────────────────────────────────
             //
-            // Apply identical-input-chord override (last wins). Build the
-            // set of analog mappings to actually emit, suppressing any
-            // earlier analog mapping whose input chord matches a later one.
+            // Apply identical input+output-chord override (last wins). Build the
+            // set of analog mappings to actually emit, suppressing any earlier
+            // analog mapping that is a TRUE duplicate (same inputs AND same
+            // outputs) of a later one. Mappings sharing an input but targeting
+            // different outputs (e.g. left_stick_up→right_trigger alongside
+            // left_stick_up→left_stick_up to keep the stick) both fire.
             let mut analog_emit_idx: Vec<usize> = Vec::new();
             {
                 // Walk triggered in original mapping order so "later in the
@@ -2384,19 +2413,18 @@ pub fn eval_graph_tick(
                     .filter(|&t| triggered[t].2)
                     .collect();
                 analog_indices.sort_by_key(|&t| triggered[t].3);
+                let sorted_set = |v: &Vec<String>| -> Vec<String> {
+                    let mut s = v.clone(); s.sort(); s
+                };
                 let mut keep: Vec<bool> = vec![true; analog_indices.len()];
                 for a in 0..analog_indices.len() {
                     if !keep[a] { continue; }
-                    let (ref ain, _, _, _) = triggered[analog_indices[a]];
-                    let mut a_set: Vec<&String> = ain.iter().collect();
-                    a_set.sort();
+                    let (ref ain, ref aout, _, _) = triggered[analog_indices[a]];
+                    let (a_in, a_out) = (sorted_set(ain), sorted_set(aout));
                     for b in (a + 1)..analog_indices.len() {
-                        let (ref bin, _, _, _) = triggered[analog_indices[b]];
-                        if ain.len() != bin.len() { continue; }
-                        let mut b_set: Vec<&String> = bin.iter().collect();
-                        b_set.sort();
-                        if a_set == b_set {
-                            // Later (higher index) wins → suppress earlier.
+                        let (ref bin, ref bout, _, _) = triggered[analog_indices[b]];
+                        if a_in == sorted_set(bin) && a_out == sorted_set(bout) {
+                            // Later (higher index) wins → suppress earlier dup.
                             keep[a] = false;
                             break;
                         }
@@ -2425,6 +2453,7 @@ pub fn eval_graph_tick(
                     analog_out_pins.insert(out_p.clone());
                     let in_is_cardinal  = analog_axis_for_cardinal(in_p).is_some();
                     let out_axis_opt    = analog_axis_for_cardinal(out_p);
+                    let out_trigger     = analog_trigger_out(out_p);
                     let mag_from_input = if in_is_cardinal {
                         analog_cardinal_input_value(&upstream, in_p)
                     } else {
@@ -2439,6 +2468,13 @@ pub fn eval_graph_tick(
                         // Sum across all (mapping × in/out pair) contributions.
                         let entry = analog_axis_acc.entry(axis_pin).or_insert(0.0);
                         *entry += contrib;
+                    } else if let Some(trigger_pin) = out_trigger {
+                        // One-sided 0..1 trigger axis — drive it with the input's
+                        // live magnitude (converts analog stick direction into
+                        // analog trigger travel, incl. on pads lacking analog
+                        // triggers like Switch Pro).
+                        let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
+                        *entry += mag_from_input.max(0.0);
                     } else {
                         // Non-cardinal out: button / key. Turbo pulses; else
                         // straight gate.
@@ -2546,7 +2582,12 @@ pub fn eval_graph_tick(
                 if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
                     for v in arr {
                         if let Some(s) = v.as_str() {
-                            if analog_axis_for_cardinal(s).is_none() {
+                            // Triggers are analog axes (handled by analog_axis_acc),
+                            // not buttons — exclude them from the binary on/off
+                            // release pass or it would clobber the analog value.
+                            if analog_axis_for_cardinal(s).is_none()
+                                && analog_trigger_out(s).is_none()
+                            {
                                 analog_button_pins.insert(s.to_string());
                             }
                         }
@@ -2755,11 +2796,15 @@ pub fn eval_graph_tick(
                     || src_dev.starts_with("remap:")
                     || src_dev.starts_with("combiner:")
                     || src_dev.starts_with("lean:");
-                for (mapped_src, mapped_dst) in automap::resolve_mapping(&src_ids, &dst_ids) {
-                    if directly_wired.contains(mapped_dst) { continue; }
-                    // For collectors (including fork/selector gates): check collector_sigs first,
-                    // then fall back to upstream device.
-                    let sig_opt = if is_collector {
+                // Digital→analog trigger bridges (`btn_lt_dig`→`left_trigger`,
+                // `btn_rt_dig`→`right_trigger`) are a LOWEST-PRIORITY fallback:
+                // they only fill the analog trigger when no primary source — the
+                // real analog `left_trigger`/`right_trigger`, a manually-injected
+                // AutoMap value, or a Remapper analog mapping — already drove it.
+                // Deferred to a second pass so primaries (processed first) win.
+                let mut deferred_digital_triggers: Vec<(&str, &str)> = Vec::new();
+                let resolve_sig = |mapped_src: &str| -> Option<Signal> {
+                    if is_collector {
                         collector_sigs.get(&(src_dev.clone(), mapped_src.to_string())).copied()
                             .or_else(|| {
                                 st.automap_fallback_dev.as_ref().and_then(|fb| {
@@ -2768,14 +2813,46 @@ pub fn eval_graph_tick(
                             })
                     } else {
                         dev_sigs.get(&(src_dev.clone(), mapped_src.to_string())).copied()
-                    };
-                    if let Some(sig) = sig_opt {
+                    }
+                };
+                for (mapped_src, mapped_dst) in automap::resolve_mapping(&src_ids, &dst_ids) {
+                    if directly_wired.contains(mapped_dst) { continue; }
+                    let is_digital_trigger_bridge =
+                        matches!((mapped_src, mapped_dst),
+                            ("btn_lt_dig", "left_trigger") | ("btn_rt_dig", "right_trigger"));
+                    if is_digital_trigger_bridge {
+                        // Only honour the bridge when the upstream source opted in
+                        // (or is a digital-only pad). Otherwise a pad with real
+                        // analog triggers would have its digital button leak into
+                        // the analog trigger.
+                        if st.digital_trigger_bridge {
+                            deferred_digital_triggers.push((mapped_src, mapped_dst));
+                        }
+                        continue;
+                    }
+                    if let Some(sig) = resolve_sig(mapped_src) {
                         // Type coercion (Bool↔Float) is performed by the virtual device's
                         // send() via Signal::as_float / as_bool, so we just hand the raw
                         // signal off — semantic groups already routed it to the right pin.
                         sink_outputs
                             .entry((st.device_id.clone(), mapped_dst.to_string()))
                             .or_insert(scale_for_sink(mapped_dst, sig));
+                    }
+                }
+                // Second pass: digital-trigger fallback. Writes the analog trigger
+                // ONLY when a primary source didn't (real analog, manual injection,
+                // or Remapper analog). The digital button drives the FULL value —
+                // pressed → 1.0, released → 0.0. We must write the 0.0 on release
+                // too, otherwise the trigger latches at its last pressed value and
+                // never lets go. On a mixed pad the real analog trigger always
+                // writes a primary (even 0.0), so `contains_key` skips this and the
+                // real analog wins as intended.
+                for (mapped_src, mapped_dst) in deferred_digital_triggers {
+                    let key = (st.device_id.clone(), mapped_dst.to_string());
+                    if sink_outputs.contains_key(&key) { continue; }
+                    if let Some(sig) = resolve_sig(mapped_src) {
+                        let v = if sig.as_bool() { 1.0 } else { 0.0 };
+                        sink_outputs.insert(key, Signal::Float(v));
                     }
                 }
                 // Wildcard pass-through for virtual keyboard/mouse sinks: forward EVERY
@@ -3914,6 +3991,24 @@ fn analog_axis_for_cardinal(pin_id: &str) -> Option<(&'static str, f32)> {
     }
 }
 
+/// Map an analog-mode output pin to its one-sided trigger axis, if it is one.
+/// Triggers are 0..1 (no negative side), so analog mappings drive them with the
+/// input's unsigned magnitude. Returns the trigger pin id, or None for non-trigger
+/// outputs (which the caller treats as cardinal axes or buttons).
+///
+/// The digital trigger buttons (`btn_lt_dig`/`btn_rt_dig`) also map here: a
+/// Remapper captures its output by chord-learning, so on a pad whose trigger is
+/// a digital button (Switch Pro ZL/ZR) the captured `out` pin is the digital
+/// button, not the analog trigger. In ANALOG mode the user's intent is analog
+/// travel, so we route the digital-trigger-button target to its analog pin.
+fn analog_trigger_out(pin_id: &str) -> Option<&'static str> {
+    match pin_id {
+        "left_trigger"  | "btn_lt_dig" => Some("left_trigger"),
+        "right_trigger" | "btn_rt_dig" => Some("right_trigger"),
+        _ => None,
+    }
+}
+
 /// Return the signed analog magnitude an input cardinal currently contributes
 /// to its axis: 0.0 when the stick is neutral or pushed in the opposite
 /// direction; up to ±1.0 at full deflection in the cardinal's direction.
@@ -4489,5 +4584,188 @@ fn sig_scalar(s: Signal) -> f32 {
         Signal::Int(i)   => i as f32,
         Signal::Bool(b)  => if b { 1.0 } else { 0.0 },
         Signal::Vec2(v)  => v.length(),
+    }
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::*;
+    use crate::graph::SinkTarget;
+
+    fn canonical_pins() -> Vec<String> {
+        automap::ALL_PINS.iter().map(|p| p.id.to_string()).collect()
+    }
+
+    fn empty_node(uid: usize, module_id: &str) -> NodeSnap {
+        NodeSnap {
+            node_uid: uid,
+            module_id: module_id.to_string(),
+            params: HashMap::new(),
+            n_outputs: 0,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: Vec::new(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    fn sink_node(uid: usize, device_id: &str, src_dev: &str, bridge: bool) -> NodeSnap {
+        let mut n = empty_node(uid, "device.sink");
+        n.sink_target = Some(SinkTarget {
+            device_id: device_id.to_string(),
+            // All canonical pins are valid sink destinations.
+            pin_ids: canonical_pins(),
+            multi_sources: vec![Vec::new(); canonical_pins().len()],
+            automap_source: Some((src_dev.to_string(), canonical_pins())),
+            automap_fallback_dev: Some("gilrs:switch_pro:0".to_string()),
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: bridge,
+        });
+        n
+    }
+
+    // Remapper in analog mode mapping a stick cardinal → right_trigger should
+    // produce a CONTINUOUS value tracking how far the stick is pushed, not a
+    // binary 0/1. Regression guard for the "stick→trigger outputs binary" bug.
+    #[test]
+    fn remapper_analog_stick_to_trigger_is_continuous() {
+        let remap_uid = 1usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String("gilrs:switch_pro:0".into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["right_trigger"], "mode": "analog" }
+        ]));
+
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
+        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // Stick pushed halfway up (y = +0.5).
+        let mut dev = HashMap::new();
+        dev.insert(("gilrs:switch_pro:0".to_string(), "left_stick_y".to_string()), Signal::Float(0.5));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let v = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
+            .map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 0.5).abs() < 0.05, "half stick push should give ~0.5 trigger, got {v}");
+
+        // Full push → full trigger.
+        dev.insert(("gilrs:switch_pro:0".to_string(), "left_stick_y".to_string()), Signal::Float(1.0));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let v = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
+            .map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 1.0).abs() < 0.05, "full stick push should give ~1.0 trigger, got {v}");
+
+        // Neutral stick → trigger releases to 0.
+        dev.insert(("gilrs:switch_pro:0".to_string(), "left_stick_y".to_string()), Signal::Float(0.0));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let v = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
+            .map(|s| s.as_float()).unwrap_or(0.0);
+        assert!(v.abs() < 0.05, "neutral stick should release trigger to 0, got {v}");
+    }
+
+    // A Remapper captures its output by chord-learning, so on a Switch Pro the
+    // user maps to the DIGITAL ZR button (`btn_rt_dig`), not `right_trigger`.
+    // In analog mode that digital-trigger target must still produce continuous
+    // analog travel on the virtual pad — not a binary press.
+    #[test]
+    fn remapper_analog_to_digital_trigger_button_is_continuous() {
+        let remap_uid = 1usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String("gilrs:switch_pro:0".into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["btn_rt_dig"], "mode": "analog" }
+        ]));
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
+        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        let mut dev = HashMap::new();
+        dev.insert(("gilrs:switch_pro:0".to_string(), "left_stick_y".to_string()), Signal::Float(0.5));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let v = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
+            .map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 0.5).abs() < 0.05, "analog map to digital ZR should give ~0.5 analog RT, got {v}");
+    }
+
+    // Two analog mappings sharing an input but with different outputs must BOTH
+    // fire: left_stick_up→right_trigger AND left_stick_up→left_stick_up should
+    // drive the trigger AND keep the stick output (not replace one another).
+    #[test]
+    fn analog_same_input_different_outputs_both_fire() {
+        let remap_uid = 1usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String("gilrs:switch_pro:0".into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["right_trigger"],  "mode": "analog" },
+            { "in": ["left_stick_up"], "out": ["left_stick_up"],  "mode": "analog" }
+        ]));
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
+        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        let mut dev = HashMap::new();
+        dev.insert(("gilrs:switch_pro:0".to_string(), "left_stick_y".to_string()), Signal::Float(1.0));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+
+        let rt = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
+            .map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((rt - 1.0).abs() < 0.05, "trigger mapping should still fire, got RT={rt}");
+        // The stick output must be preserved (left_stick_y stays at +1).
+        let ly = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick_y".to_string()))
+            .map(|s| s.as_float());
+        let lstick = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick".to_string()))
+            .and_then(|s| if let Signal::Vec2(v) = s { Some(v.y) } else { None });
+        let y = ly.or(lstick).unwrap_or(-1.0);
+        assert!((y - 1.0).abs() < 0.05, "stick output should be preserved, got left_stick_y={y}");
+    }
+
+    // The implicit digital→analog bridge must RELEASE: pressing then releasing
+    // the Switch digital ZR should drive the virtual analog RT to 1.0 then back
+    // to 0.0 (regression guard for the "stuck at full press" bug).
+    #[test]
+    fn digital_bridge_presses_and_releases() {
+        // Direct device → sink (no remapper); src_dev is the physical device.
+        let sink = sink_node(1, "virtual.xinput:0", "gilrs:switch_pro:0", true);
+        let graph = ProcessingGraph { nodes: vec![sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // ZR pressed.
+        let mut dev = HashMap::new();
+        dev.insert(("gilrs:switch_pro:0".to_string(), "btn_rt_dig".to_string()), Signal::Bool(true));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let v = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
+            .map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 1.0).abs() < 0.01, "pressed ZR should give full RT, got {v}");
+
+        // ZR released → must go back to 0, not latch.
+        dev.insert(("gilrs:switch_pro:0".to_string(), "btn_rt_dig".to_string()), Signal::Bool(false));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let v = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()))
+            .map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!(v.abs() < 0.01, "released ZR should release RT to 0, got {v}");
+    }
+
+    // With the bridge DISABLED (analog-capable pad, toggle off), the digital
+    // button must NOT leak into the analog trigger.
+    #[test]
+    fn digital_bridge_disabled_does_not_leak() {
+        let sink = sink_node(1, "virtual.xinput:0", "gilrs:xinput:0", false);
+        let graph = ProcessingGraph { nodes: vec![sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        let mut dev = HashMap::new();
+        dev.insert(("gilrs:xinput:0".to_string(), "btn_rt_dig".to_string()), Signal::Bool(true));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let leaked = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()));
+        assert!(leaked.is_none(), "bridge off: digital button must not drive analog trigger, got {leaked:?}");
     }
 }

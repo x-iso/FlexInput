@@ -12,6 +12,7 @@
 //! Active outputs are highlighted; clicks toggle them on/off.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use egui_snarl::NodeId;
@@ -21,8 +22,11 @@ use serde_json::Value;
 
 use crate::canvas::remapper_icons;
 use crate::canvas::{header_controls, Canvas, DeviceParamDefaults};
-use crate::panels::device_icon::render_device_icon;
+use crate::panels::device_icon::{ping_device_icon, render_device_icon};
 use crate::panels::virtual_devices::SharedDevicePool;
+
+/// Shared queue of rumble-ping requests drained by the I/O thread.
+pub type PingRequests = Arc<Mutex<Vec<String>>>;
 
 // Card colors — chosen to pop on the dark left-panel background
 // (#1a1a1a, painted by the app.rs call-site). The active variant
@@ -60,6 +64,7 @@ pub fn show(
     defaults: DeviceParamDefaults,
     calibrate_request: &mut Option<NodeId>,
     device_rates_hz: &HashMap<String, u32>,
+    ping_requests: &PingRequests,
 ) {
     // Reserve a fixed bottom area for the output section; the input
     // list scrolls within whatever remains above it. The output
@@ -87,7 +92,7 @@ pub fn show(
         ui.set_clip_rect(top_rect);
         show_input_section(
             ui, devices, canvas, default_collapsed, defaults,
-            calibrate_request, device_rates_hz,
+            calibrate_request, device_rates_hz, ping_requests,
         );
     });
     ui.scope_builder(egui::UiBuilder::new().max_rect(bot_rect), |ui| {
@@ -154,6 +159,7 @@ fn show_input_section(
     defaults: DeviceParamDefaults,
     calibrate_request: &mut Option<NodeId>,
     device_rates_hz: &HashMap<String, u32>,
+    ping_requests: &PingRequests,
 ) {
     ui.add_space(PANEL_PADDING);
     ui.vertical_centered(|ui| {
@@ -195,6 +201,7 @@ fn show_input_section(
                 let is_active = active_dev_id.as_deref() == Some(d.id.as_str());
                 if input_card(
                     ui, d, is_active, canvas, calibrate_request, device_rates_hz, defaults,
+                    ping_requests,
                 ) && !is_active {
                     replace_active_source(canvas, d, default_collapsed, defaults);
                     super::wiring::rewire(canvas);
@@ -249,13 +256,15 @@ fn input_card(
     calibrate_request: &mut Option<NodeId>,
     device_rates_hz: &HashMap<String, u32>,
     defaults: DeviceParamDefaults,
+    ping_requests: &PingRequests,
 ) -> bool {
     let panel_avail = ui.available_width();
     let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
     // Top: icon (48 px) + tight inset. Bottom: two slider rows ~22 px
-    // each + small gap + insets.
+    // each + small gap + insets, plus a digital-trigger toggle row.
     let top_h = INPUT_CARD_ICON_H + 8.0;
-    let bot_h = 60.0;
+    let trigger_row_h = 22.0;
+    let bot_h = 60.0 + trigger_row_h;
     let card_h = top_h + bot_h;
 
     // Allocate the full card rect inside the parent VERTICAL layout
@@ -338,11 +347,19 @@ fn input_card(
             .layout(egui::Layout::top_down(egui::Align::LEFT)),
     );
     icon_ui.set_clip_rect(card_visible_clip);
-    render_device_icon(
+    // The device icon doubles as a "ping" button: clicking it pulses the
+    // physical pad's rumble for 200 ms so the user can tell which hardware
+    // this card maps to. Only meaningful for pads that have rumble motors.
+    let resp = ping_device_icon(
         &mut icon_ui,
         remapper_icons::device_card_svg(d.kind),
         INPUT_CARD_ICON_H,
     );
+    if resp.clicked() {
+        if let Ok(mut q) = ping_requests.lock() {
+            q.push(d.id.clone());
+        }
+    }
 
     // Right column: name (row 1) + Calibrate+Hz (row 2), y-centered
     // against the icon. ~36 px tall → indent top by (icon_h - 36) / 2.
@@ -393,6 +410,7 @@ fn input_card(
             let dev_id_owned = d.id.clone();
             if let Some(params) = canvas.snarl.get_node_mut(node_id).map(|n| &mut n.params) {
                 input_slider_rows(&mut bot_ui, params, &dev_id_owned, defaults, true);
+                digital_trigger_toggle(&mut bot_ui, params, d.kind, true);
             }
         }
     } else {
@@ -402,6 +420,7 @@ fn input_card(
         preview.insert("gyro_multiplier".into(),
             Value::from(defaults.gyro_mult as f64));
         input_slider_rows(&mut bot_ui, &mut preview, &d.id, defaults, false);
+        digital_trigger_toggle(&mut bot_ui, &mut preview, d.kind, false);
     }
 
     body_resp.clicked()
@@ -510,6 +529,51 @@ fn input_slider_rows(
                 params.insert("gyro_multiplier".into(), Value::from(gm as f64));
             }
         }
+    });
+}
+
+/// Digital-trigger override toggle. When on, the virtual pad's analog triggers
+/// are driven by the physical pad's digital ZL/ZR (a pressed button forces the
+/// analog trigger to full; otherwise the real analog value passes through).
+///
+/// Switch Pro has no analog triggers, so the option is forced ON and the
+/// checkbox is disabled there — it's the only way to get triggers from it.
+/// Pads with real analog triggers default OFF and can opt in.
+fn digital_trigger_toggle(
+    ui: &mut egui::Ui,
+    params: &mut HashMap<String, Value>,
+    kind: ControllerKind,
+    enabled: bool,
+) {
+    // Only gamepads have triggers; skip MIDI ports entirely.
+    if matches!(kind, ControllerKind::MidiIn | ControllerKind::MidiOut) { return; }
+
+    let forced = !kind.has_analog_triggers(); // Switch Pro / digital-only → forced on.
+    let stored = params.get("digital_triggers").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut checked = forced || stored;
+
+    // Keep the stored param in sync with the forced state so the engine sees
+    // `digital_triggers = true` for Switch Pro even if the user never clicked.
+    if forced && !stored {
+        params.insert("digital_triggers".into(), Value::Bool(true));
+    }
+
+    ui.add_space(2.0);
+    ui.add_enabled_ui(enabled && !forced, |ui| {
+        let label = if forced {
+            "Digital triggers (only option)"
+        } else {
+            "Digital triggers \u{2192} analog"
+        };
+        let resp = ui.checkbox(&mut checked, egui::RichText::new(label).size(11.0));
+        if resp.changed() {
+            params.insert("digital_triggers".into(), Value::Bool(checked));
+        }
+        resp.on_hover_text(
+            "Drive the virtual pad's analog triggers from this controller's digital \
+             ZL/ZR buttons. A press maps to a full pull; otherwise the real analog \
+             value is used.",
+        );
     });
 }
 
