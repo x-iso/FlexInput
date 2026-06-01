@@ -121,6 +121,90 @@ impl PatchTab {
 /// the given snarl that targets a virtual device (id starts with
 /// `"virtual."`). Used to drive shared-pool reconciliation and the
 /// active-tab id filter.
+/// ctx-data slot holding the rect the inner-shadow gradient should hug.
+/// Written during the CentralPanel pass: the content area below the tab
+/// strip in Easy mode, or the canvas rect in Advanced mode. Read by
+/// `paint_inner_window_shadow` after the frame's panels are laid out.
+const INNER_SHADOW_RECT_KEY: &str = "flexinput::inner_shadow_rect";
+
+/// Paint a pronounced inner-edge shadow: a true gradient that darkens
+/// the edges of the *content* rect and fades smoothly to transparent
+/// toward the center. Only painted while see-through is active — its
+/// job is to ground the window dimensions against the desktop bleeding
+/// through; in opaque mode the solid surfaces already read as edges.
+///
+/// The gradient is a real triangle mesh (an outer ring of vertices at
+/// peak alpha, an inner ring at zero alpha) so the GPU interpolates the
+/// alpha per-pixel — no visible stepping like a stack of strokes.
+///
+/// `content_rect` comes from `INNER_SHADOW_RECT_KEY`: the area below the
+/// tab strip (Easy mode) or the canvas rect (Advanced mode).
+fn paint_inner_window_shadow(ctx: &egui::Context) {
+    use egui::epaint::{Mesh, Vertex};
+    if !ctx.data(|d| d.get_temp::<bool>(
+        egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY)))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Some(rect) = ctx.data(|d| d.get_temp::<egui::Rect>(
+        egui::Id::new(INNER_SHADOW_RECT_KEY)))
+    else { return };
+    if rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
+
+    // Pronounced: a ~28px band fading from opaque-ish black at the
+    // edge to fully transparent inward.
+    const BAND: f32 = 28.0;
+    const PEAK_ALPHA: u8 = 130;
+    let band = BAND.min(rect.width() * 0.5).min(rect.height() * 0.5);
+    if band <= 0.0 { return; }
+
+    let outer = rect;
+    let inner = rect.shrink(band);
+    let edge = egui::Color32::from_black_alpha(PEAK_ALPHA);
+    let center = egui::Color32::TRANSPARENT;
+    let uv = egui::epaint::WHITE_UV;
+
+    let mut mesh = Mesh::default();
+    // 8 vertices: 4 outer corners (edge color) then 4 inner corners
+    // (transparent). The GPU interpolates alpha across each band.
+    let mut push = |p: egui::Pos2, c: egui::Color32| {
+        let idx = mesh.vertices.len() as u32;
+        mesh.vertices.push(Vertex { pos: p, uv, color: c });
+        idx
+    };
+    let o_tl = push(outer.left_top(), edge);
+    let o_tr = push(outer.right_top(), edge);
+    let o_br = push(outer.right_bottom(), edge);
+    let o_bl = push(outer.left_bottom(), edge);
+    let i_tl = push(inner.left_top(), center);
+    let i_tr = push(inner.right_top(), center);
+    let i_br = push(inner.right_bottom(), center);
+    let i_bl = push(inner.left_bottom(), center);
+
+    // Four trapezoidal bands (top, right, bottom, left), each two tris,
+    // with edge verts at peak alpha and inner verts transparent.
+    for &[a, b, c, d] in &[
+        [o_tl, o_tr, i_tr, i_tl], // top
+        [o_tr, o_br, i_br, i_tr], // right
+        [o_br, o_bl, i_bl, i_br], // bottom
+        [o_bl, o_tl, i_tl, i_bl], // left
+    ] {
+        mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
+    }
+
+    // Background order: this runs AFTER the CentralPanel pass, so within
+    // the Background layer the shadow paints over the canvas / sub-patch
+    // body content, but Background sits below `Middle` (floating windows)
+    // and `Foreground` (menus / popups) — so the shadow stays behind all
+    // of those rather than bleeding over them.
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::new("app_inner_shadow"),
+    ));
+    painter.add(mesh);
+}
+
 /// Predicate: does this canvas look like an Easy-mode-compatible
 /// patch? Used by File→Load Patch to auto-flip to Easy mode when a
 /// `.fxsp` is opened. Requires exactly one `subpatch` node whose
@@ -2074,6 +2158,20 @@ impl eframe::App for FlexInputApp {
                 // list on top, output section on bottom). Central:
                 // sub-patch preset picker + body.
                 let total = ui.available_rect_before_wrap();
+                // `total` is inset from the window edge by the central
+                // panel's inner margin (~8px). The visible window edge
+                // sits in that surround ring. Compute the full content
+                // bounds (ring included) so (a) the surround doesn't go
+                // fully transparent in see-through mode, and (b) the
+                // inner shadow hugs the real window edge with no offset.
+                let margin = style_snapshot.spacing.window_margin.left as f32;
+                let outer_total = total.expand(margin.max(8.0));
+                // Stash the FULL content area (everything below the tab
+                // strip, out to the window edge) so the post-frame inner-
+                // shadow pass hugs the real edge rather than the margin-
+                // inset content rect.
+                ctx.data_mut(|d| d.insert_temp(
+                    egui::Id::new(INNER_SHADOW_RECT_KEY), outer_total));
                 // Fixed left-panel width so cards / chips don't restyle
                 // as the user resizes the window. Only shrinks if the
                 // window itself is narrower than this baseline.
@@ -2087,13 +2185,48 @@ impl eframe::App for FlexInputApp {
                     egui::pos2(total.min.x + side_w + gap, total.min.y),
                     egui::vec2((total.width() - side_w - gap).max(0.0), total.height()),
                 );
+                // See-through handling for Easy mode. In opaque mode the
+                // left panel uses its solid dark fill and the central
+                // area inherits the (opaque) CentralPanel frame. In
+                // see-through mode BOTH backgrounds get the user-chosen
+                // alpha so the desktop bleeds through evenly — the
+                // central frame fill was set TRANSPARENT above, so we
+                // paint the alpha-faded central fill ourselves here,
+                // mirroring how the Advanced canvas fades its bg_frame.
+                let st_alpha: f32 = ctx.data(|d|
+                    d.get_temp::<f32>(egui::Id::new(crate::canvas::SEE_THROUGH_ALPHA_KEY))
+                ).unwrap_or(1.0);
+                let left_fill = if see_through_on {
+                    let a = (st_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    egui::Color32::from_rgba_unmultiplied(0x1a, 0x1a, 0x1a, a)
+                } else {
+                    egui::Color32::from_rgb(0x1a, 0x1a, 0x1a)
+                };
+                if see_through_on {
+                    // Fill the FULL surround ring (out to the window edge)
+                    // with the alpha-faded panel fill first, so the
+                    // central-panel inner margin doesn't read as a fully-
+                    // transparent border. The per-panel fills below paint
+                    // on top of this, matching opacity throughout.
+                    let base = style_snapshot.visuals.extreme_bg_color;
+                    let a = (st_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    ui.painter().rect_filled(
+                        outer_total, 0.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            base.r(), base.g(), base.b(), a),
+                    );
+                    // Central area: alpha-faded panel fill so the
+                    // sub-patch body floats over a translucent surface
+                    // instead of a fully-transparent void.
+                    ui.painter().rect_filled(
+                        center_rect, 0.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            base.r(), base.g(), base.b(), a),
+                    );
+                }
                 // Darker panel background fill so the left panel
                 // visually groups itself apart from the central canvas.
-                ui.painter().rect_filled(
-                    left_rect,
-                    0.0,
-                    egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
-                );
+                ui.painter().rect_filled(left_rect, 0.0, left_fill);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                     crate::easy::io_panel::show(
                         ui,
@@ -2163,6 +2296,11 @@ impl eframe::App for FlexInputApp {
                         egui::pos2(outer.right(), inner.bottom())),
                     egui::CornerRadius::ZERO, frame_color);
             }
+            // Stash the canvas content area so the post-frame inner-
+            // shadow pass scopes its gradient to the canvas rather than
+            // the whole window (Advanced mode).
+            ctx.data_mut(|d| d.insert_temp(
+                egui::Id::new(INNER_SHADOW_RECT_KEY), ui.max_rect()));
             puffin::profile_scope!("canvas_show");
             calibrate_request = crate::panels::canvas::show(
                 canvas, &self.descriptors, &live_device_ids, &self.last_signals,
@@ -2214,6 +2352,16 @@ impl eframe::App for FlexInputApp {
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+
+        // ── Inner edge shadow ────────────────────────────────────────────
+        // A pronounced gradient darkening at all four window edges,
+        // fading to transparent toward the center. Grounds the
+        // window's dimensions — especially useful in see-through mode
+        // where the minimalist surfaces can blur into the desktop, but
+        // it's a subtle depth cue in opaque mode too. Painted on a
+        // foreground layer UNDER the 1px border so the border still
+        // reads as the crisp outer edge.
+        paint_inner_window_shadow(ctx);
 
         // ── Window border ────────────────────────────────────────────────
         // We turned off OS decorations (`with_decorations(false)`) so
@@ -5181,7 +5329,7 @@ fn paint_tab_gradient_quad(
     mesh.vertices.push(Vertex { pos: br, uv, color: c_br });
     mesh.vertices.push(Vertex { pos: bl, uv, color: c_bl });
     mesh.indices.extend_from_slice(&[i, i+1, i+2, i, i+2, i+3]);
-    painter.add(egui::Shape::mesh(mesh));
+    painter.add(mesh);
 }
 
 // (Removed: rounded-corner HRGN logic. SetWindowRgn interacted badly
@@ -5374,6 +5522,14 @@ fn show_title_bar(
             if pin_resp.on_hover_text(hover).clicked() {
                 *do_pin_toggle = true;
             }
+
+            // ── See-through eye toggle ──────────────────────────────────
+            // Shares the same ctx-data slots the (legacy) zoom-overlay
+            // eye used, so see-through state + opacity stay in sync no
+            // matter which mode the user is in. Click toggles; hover
+            // pops out a vertical opacity slider.
+            ui.add_space(4.0);
+            render_eye_toggle(ui, h);
         });
     });
 
@@ -5675,6 +5831,85 @@ const MODE_PILL_RENDER_H: f32 = 22.0;
 
 #[derive(Clone, Copy, Debug)]
 enum ModePillVariant { Wide, Short }
+
+/// See-through eye toggle for the title bar. Click flips see-through on/off;
+/// hover pops out a vertical opacity slider below the button. Reads & writes
+/// the same ctx-data slots (`SEE_THROUGH_DATA_KEY` / `SEE_THROUGH_ALPHA_KEY`)
+/// that `FlexInputApp::update` mirrors into `settings`, so it works from
+/// either Easy or Advanced mode without threading state through.
+fn render_eye_toggle(ui: &mut egui::Ui, bar_h: f32) {
+    let see_through_id = egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY);
+    let see_through_on: bool = ui.ctx().data(|d| d.get_temp::<bool>(see_through_id))
+        .unwrap_or(false);
+
+    let eye_label = egui::RichText::new("👁").size(14.0);
+    let eye_btn = egui::SelectableLabel::new(see_through_on, eye_label);
+    let eye_resp = ui.add_sized(egui::vec2(26.0, (bar_h - 6.0).max(18.0)), eye_btn);
+    let hover = if see_through_on {
+        "See-through: ON — click to make app fully opaque.\nHover to adjust opacity."
+    } else {
+        "See-through: OFF — click to make app translucent.\nHover to adjust opacity."
+    };
+    let eye_resp = eye_resp.on_hover_text(hover);
+    if eye_resp.clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(see_through_id, !see_through_on));
+    }
+
+    // Opacity popover BELOW the button (title bar is at the top of the
+    // window, so the slider drops down). Same grace-timer pattern as the
+    // legacy zoom-overlay version so the cursor can travel from the eye
+    // to the slider without the popup closing mid-traversal.
+    let popup_id = ui.id().with("titlebar_see_through_popup");
+    let last_hover_id = popup_id.with("last_hover");
+    const POPUP_GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
+    let now = std::time::Instant::now();
+    let last_hover: Option<std::time::Instant> =
+        ui.ctx().data(|d| d.get_temp::<std::time::Instant>(last_hover_id));
+    if eye_resp.hovered() {
+        ui.ctx().data_mut(|d| d.insert_temp(last_hover_id, now));
+    }
+    let popup_visible = eye_resp.hovered()
+        || last_hover.map(|t| now.duration_since(t) < POPUP_GRACE).unwrap_or(false);
+    if popup_visible {
+        let alpha_id = egui::Id::new(crate::canvas::SEE_THROUGH_ALPHA_KEY);
+        let mut alpha: f32 = ui.ctx().data(|d| d.get_temp::<f32>(alpha_id))
+            .unwrap_or(0.55);
+        let popup_area = egui::Area::new(popup_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(
+                eye_resp.rect.center().x - 28.0,
+                eye_resp.rect.bottom() + 4.0,
+            ))
+            .interactable(true);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        let popup_resp = popup_area.show(ui.ctx(), |ui| {
+            let bg = ui.visuals().window_fill();
+            egui::Frame::default()
+                .fill(egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 240))
+                .stroke(egui::Stroke::new(1.0,
+                    ui.visuals().widgets.noninteractive.bg_stroke.color))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(format!("{:.0}%", alpha * 100.0)).small());
+                        let resp = ui.add_sized(
+                            egui::vec2(40.0, 96.0),
+                            egui::Slider::new(&mut alpha, 0.0_f32..=1.0)
+                                .vertical().show_value(false),
+                        );
+                        if resp.changed() {
+                            ui.ctx().data_mut(|d|
+                                d.insert_temp(alpha_id, alpha.clamp(0.0, 1.0)));
+                        }
+                    });
+                }).response
+        }).response;
+        if eye_resp.hovered() || popup_resp.hovered() {
+            ui.ctx().data_mut(|d| d.insert_temp(last_hover_id, now));
+        }
+    }
+}
 
 /// Compute the on-screen width that a pill SVG occupies when rendered
 /// at `render_h` logical pixels, preserving the SVG's intrinsic aspect.

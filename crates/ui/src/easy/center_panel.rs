@@ -61,6 +61,33 @@ pub fn show(
     show_preset_picker(ui, canvas, easy_state, &presets, favorites);
     show_pending_modal(ui, canvas, easy_state, &presets);
 
+    // Layout-editing properties panel — directly below the preset bar, only
+    // while 🎨 (layout edit) is active and a sub-patch exists. This mirrors the
+    // controls row at the top of the sub-patch node in Advanced layout mode:
+    // snap toggle + grid step, Add-decoration buttons, and the per-selection
+    // style inspector.
+    if matches!(compat, Compat::Ok) {
+        if let Some(oid) = find_subpatch(canvas) {
+            let unlocked = canvas.snarl.get_node(oid)
+                .map(|n| n.extra.layout_unlocked)
+                .unwrap_or(false);
+            if unlocked {
+                ui.add_space(4.0);
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Layout editing").small().strong().weak());
+                        egui::ScrollArea::horizontal()
+                            .id_salt(("easy_layout_controls_scroll", oid.0))
+                            .show(ui, |ui| {
+                                crate::canvas::viewer::layout_editing_controls(
+                                    ui, &mut canvas.snarl, oid);
+                            });
+                    });
+            }
+        }
+    }
+
     ui.add_space(6.0);
     ui.separator();
 
@@ -176,7 +203,8 @@ fn show_preset_picker(
         let ui = &mut row_ui;
         // Left padding so the cluster is roughly centered.
         let label_w = 56.0; // "Preset:" label
-        let trailing_w = 72.0; // Save + Load buttons + spacing
+        // 🎨 🔧 (layout/edit) + 💾 📂 (save/load) buttons + spacing.
+        let trailing_w = 150.0;
         // Bar width = whatever fits between label and the trailing
         // buttons, clamped so it doesn't collapse on narrow windows.
         let bar_w = (ui.available_width() - label_w - trailing_w - 16.0)
@@ -251,7 +279,10 @@ fn show_preset_picker(
             });
         }
 
-        ui.add_space(6.0);
+        // ── Save (💾) + Load (📂) buttons ───────────────────────────
+        // Save/Load come FIRST (left), with the layout-edit/patch-edit
+        // pair after them (right), separated by a small gap.
+        ui.add_space(10.0);
         if ui.add_sized([28.0, 28.0],
             egui::Button::new(egui::RichText::new("💾").size(14.0)))
             .on_hover_text("Save sub-patch to .fxsp")
@@ -273,6 +304,44 @@ fn show_preset_picker(
         {
             if let Some(loaded) = crate::app::load_subpatch_file() {
                 apply_subpatch_inline(canvas, easy_state, &loaded, None);
+            }
+        }
+
+        // ── Layout-edit (🎨) + Edit (🔧) buttons ────────────────────
+        // Separated slightly from Save/Load. 🎨 toggles the sub-patch's
+        // layout-unlocked state (drag/resize/select decorations in
+        // place); 🔧 opens the full Advanced sub-patch editor window.
+        ui.add_space(10.0);
+        let layout_unlocked = outer_id
+            .and_then(|id| canvas.snarl.get_node(id))
+            .map(|n| n.extra.layout_unlocked)
+            .unwrap_or(false);
+        let palette_btn = egui::SelectableLabel::new(
+            layout_unlocked, egui::RichText::new("🎨").size(14.0));
+        if ui.add_sized([28.0, 28.0], palette_btn)
+            .on_hover_text(if layout_unlocked {
+                "Layout edit: ON — drag, resize, and select elements.\nClick to lock."
+            } else {
+                "Layout edit: OFF — click to arrange elements on the sub-patch body."
+            })
+            .clicked()
+        {
+            if let Some(oid) = outer_id {
+                if let Some(n) = canvas.snarl.get_node_mut(oid) {
+                    n.extra.layout_unlocked = !layout_unlocked;
+                }
+            }
+        }
+        if ui.add_sized([28.0, 28.0],
+            egui::Button::new(egui::RichText::new("🔧").size(14.0)))
+            .on_hover_text("Open the sub-patch editor (add/wire modules)")
+            .clicked()
+        {
+            if let Some(oid) = outer_id {
+                // Same mechanism the Advanced canvas uses: stash the
+                // request; `show_subpatch_editors` consumes it next
+                // frame and spawns the editor viewport window.
+                canvas.pending_edit_subpatch = Some(oid);
             }
         }
     }
@@ -1103,9 +1172,13 @@ fn render_subpatch_body(
     let panel_rect = ui.available_rect_before_wrap();
     let panel_w = panel_rect.width().max(40.0);
     let panel_h = panel_rect.height().max(40.0);
-    // Width-only scale fit; never upscale. Scaled width fits the
-    // panel exactly, scaled height drives vertical-scroll overflow.
-    let scale = (panel_w / natural_w).min(1.0).max(0.05);
+    // Width-fit scale: stretch the body to fill the panel width, both
+    // down (when the window is small) and up to a 1.5x cap (when there's
+    // unused horizontal room). Scaled height drives vertical-scroll
+    // overflow. The 1.5 cap keeps text/widgets from ballooning on very
+    // wide windows; the 0.05 floor avoids a degenerate zero scale.
+    const MAX_UPSCALE: f32 = 1.5;
+    let scale = (panel_w / natural_w).clamp(0.05, MAX_UPSCALE);
     let scaled_w = natural_w * scale;
     let scaled_h = natural_h * scale;
     let scroll_overflow = (scaled_h - panel_h).max(0.0);

@@ -644,100 +644,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // Second header row — only visible while in Layout mode for this
             // sub-patch. Snap settings live on the sub-patch itself (they
             // belong to its body's drag/resize behavior, not to the editor).
+            // Factored into `layout_editing_controls` so Easy mode renders the
+            // same controls below its preset bar.
             if is_subpatch && is_unlocked {
-                let (mut snap_enabled, mut snap_grid_px) = snarl.get_node(node)
-                    .and_then(|n| n.subpatch.as_ref())
-                    .map(|sp| (sp.snap_enabled, sp.snap_grid_px))
-                    .unwrap_or((false, 8));
-                let mut changed = false;
-                let mut add_kind: Option<&'static str> = None;
-                ui.horizontal(|ui| {
-                    let was = snap_enabled;
-                    ui.checkbox(&mut snap_enabled, egui::RichText::new("Snap").small())
-                        .on_hover_text("Snap pinned-element positions and sizes to a grid in Layout mode");
-                    if snap_enabled != was { changed = true; }
-                    ui.add_enabled_ui(snap_enabled, |ui| {
-                        ui.label(egui::RichText::new("grid").small().weak());
-                        let mut g = snap_grid_px as i32;
-                        if ui.add(egui::DragValue::new(&mut g)
-                            .speed(0.5)
-                            .range(2i32..=64)
-                            .suffix("px"))
-                            .on_hover_text("Grid step in pixels (rounded to multiples of 2)")
-                            .changed()
-                        {
-                            let g2 = ((g.max(2)) / 2 * 2) as u32;
-                            if g2 != snap_grid_px { snap_grid_px = g2; changed = true; }
-                        }
-                    });
-                    ui.separator();
-                    ui.label(egui::RichText::new("Add:").small().weak());
-                    if ui.small_button("T").on_hover_text("Add Text label").clicked() {
-                        add_kind = Some("text");
-                    }
-                    if ui.small_button("▢").on_hover_text("Add Rectangle").clicked() {
-                        add_kind = Some("rect");
-                    }
-                    if ui.small_button("◯").on_hover_text("Add Ellipse").clicked() {
-                        add_kind = Some("ellipse");
-                    }
-                    if ui.small_button("╱").on_hover_text("Add Line").clicked() {
-                        add_kind = Some("line");
-                    }
-                    if ui.small_button("SVG").on_hover_text("Add SVG").clicked() {
-                        add_kind = Some("svg");
-                    }
-                });
-                if changed {
-                    if let Some(sp) = snarl.get_node_mut(node).and_then(|n| n.subpatch.as_mut()) {
-                        sp.snap_enabled = snap_enabled;
-                        sp.snap_grid_px = snap_grid_px;
-                    }
-                }
-                if let Some(kind) = add_kind {
-                    if let Some(sp) = snarl.get_node_mut(node).and_then(|n| n.subpatch.as_mut()) {
-                        let deco = make_default_decoration(kind);
-                        sp.items.push(LayoutItem::Deco(deco));
-                        sp.selected_item = Some(sp.items.len() - 1);
-                    }
-                }
-
-                // Inspector strip for the currently selected item.
-                let sel_idx = snarl.get_node(node)
-                    .and_then(|n| n.subpatch.as_ref())
-                    .and_then(|sp| sp.selected_item);
-                if let Some(idx) = sel_idx {
-                    let inner_mid: Option<String> = snarl.get_node(node)
-                        .and_then(|n| n.subpatch.as_ref())
-                        .and_then(|sp| sp.items.get(idx))
-                        .and_then(|it| match it {
-                            LayoutItem::Module(m) => sp_module_id(
-                                snarl.get_node(node).and_then(|n| n.subpatch.as_deref()),
-                                m.inner_node_id,
-                            ),
-                            _ => None,
-                        });
-                    let is_text_pin   = inner_mid.as_deref() == Some("module.label");
-                    let is_switch_pin = inner_mid.as_deref() == Some("module.switch");
-                    if let Some(sp) = snarl.get_node_mut(node).and_then(|n| n.subpatch.as_mut()) {
-                        if idx < sp.items.len() {
-                            match &mut sp.items[idx] {
-                                LayoutItem::Deco(_) => {
-                                    decoration_inspector_strip_item(ui, &mut sp.items, idx);
-                                }
-                                LayoutItem::Module(_) if is_text_pin => {
-                                    text_pin_inspector_strip_item(ui, &mut sp.items, idx);
-                                }
-                                LayoutItem::Module(_) if is_switch_pin => {
-                                    switch_pin_inspector_strip_item(ui, &mut sp.items, idx);
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            sp.selected_item = None;
-                        }
-                    }
-                }
+                layout_editing_controls(ui, snarl, node);
             }
         });
     }
@@ -4658,6 +4568,7 @@ pub(crate) fn show_subpatch_body(
     if !is_unlocked {
         if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
             sp.selected_item = None;
+            sp.selected_items.clear();
             sp.cycle_pos = None;
         }
     }
@@ -4748,6 +4659,13 @@ pub(crate) fn show_subpatch_body(
     let mut zaction: Option<(usize, &'static str)> = None;
     let mut delete_idx: Option<usize> = None;
     let mut stale_remove: Option<usize> = None;
+    // Right-click actions for the selection. `dup_request` duplicates every
+    // selected DECORATION (module pins are excluded). `copy_style_from`
+    // stashes one item's style to the ctx clipboard; `paste_style` applies it
+    // to all selected items where the field exists.
+    let mut dup_request = false;
+    let mut copy_style_from: Option<usize> = None;
+    let mut paste_style = false;
 
     let snap = |v: f32| -> f32 {
         if snap_enabled && snap_grid > 0.5 { (v / snap_grid).round() * snap_grid } else { v }
@@ -4862,6 +4780,13 @@ pub(crate) fn show_subpatch_body(
             .unwrap_or(false)
     } else { false };
 
+    // Marquee (rubber-band) selection state: body-local start point, set when
+    // a Shift+primary press begins in empty space. While the marquee is active
+    // we paint the rect each frame and, on release, select every item whose
+    // bbox the rect overlaps.
+    let marquee_key = egui::Id::new(("li_marquee", outer_id.0));
+    let marquee_start: Option<[f32; 2]> = ui.ctx().data(|d| d.get_temp(marquee_key));
+
     // Track press-down: stash local press pos. If the cursor is over a
     // higher layer (popup / menu / window) at press time, mark the press as
     // "ignore" so the release doesn't trigger background-click logic.
@@ -4870,6 +4795,14 @@ pub(crate) fn show_subpatch_body(
             if body_rect.contains(p) && !pointer_on_higher_layer {
                 let local = [p.x - origin.x, p.y - origin.y];
                 ui.ctx().data_mut(|d| d.insert_temp(press_state_key, (local, true, false)));
+                // Begin a marquee when Shift is held and the press landed in
+                // empty space (no item under the cursor).
+                if shift_held {
+                    let on_item = items.iter().any(|it| it.hit_test(local));
+                    if !on_item {
+                        ui.ctx().data_mut(|d| d.insert_temp(marquee_key, local));
+                    }
+                }
             } else {
                 ui.ctx().data_mut(|d| d.insert_temp(press_state_key, ([f32::NAN, f32::NAN], true, true)));
             }
@@ -4907,31 +4840,109 @@ pub(crate) fn show_subpatch_body(
                         } else {
                             click_local = Some(cur_local);
                             if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
-                                let near_prev = sp.cycle_pos.map(|q| {
-                                    ((q[0]-cur_local[0]).powi(2) + (q[1]-cur_local[1]).powi(2)).sqrt() < 6.0
-                                }).unwrap_or(false);
-                                let cur_sel = sp.selected_item;
-                                let new_sel = if near_prev && hits.len() > 1 {
-                                    let cur_pos = cur_sel.and_then(|s| hits.iter().position(|&h| h == s));
-                                    match cur_pos {
-                                        Some(pos) => hits[(pos + 1) % hits.len()],
-                                        None      => hits[0],
+                                if shift_held {
+                                    // Shift+click toggles the topmost hit in/out
+                                    // of the multi-selection set. Primary follows
+                                    // the toggled item (or a remaining member).
+                                    let target = hits[0];
+                                    if let Some(pos) = sp.selected_items.iter().position(|&i| i == target) {
+                                        sp.selected_items.remove(pos);
+                                        if sp.selected_item == Some(target) {
+                                            sp.selected_item = sp.selected_items.last().copied();
+                                        }
+                                    } else {
+                                        sp.selected_items.push(target);
+                                        sp.selected_item = Some(target);
                                     }
+                                    sp.cycle_pos = None;
                                 } else {
-                                    hits[0]
-                                };
-                                sp.selected_item = Some(new_sel);
-                                sp.cycle_pos = Some(cur_local);
+                                    // Plain click: cycle through overlapping
+                                    // items at the same spot; replace the whole
+                                    // selection with the single chosen item.
+                                    let near_prev = sp.cycle_pos.map(|q| {
+                                        ((q[0]-cur_local[0]).powi(2) + (q[1]-cur_local[1]).powi(2)).sqrt() < 6.0
+                                    }).unwrap_or(false);
+                                    // Only cycle when the current single selection
+                                    // is one of the hits (so clicking a stack you
+                                    // already have selected steps through it).
+                                    let single = sp.selected_items.len() <= 1;
+                                    let cur_sel = sp.selected_item;
+                                    let new_sel = if single && near_prev && hits.len() > 1 {
+                                        let cur_pos = cur_sel.and_then(|s| hits.iter().position(|&h| h == s));
+                                        match cur_pos {
+                                            Some(pos) => hits[(pos + 1) % hits.len()],
+                                            None      => hits[0],
+                                        }
+                                    } else {
+                                        hits[0]
+                                    };
+                                    sp.selected_item = Some(new_sel);
+                                    sp.selected_items = vec![new_sel];
+                                    sp.cycle_pos = Some(cur_local);
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        // Marquee release: if a rubber-band was active, select every item
+        // whose bbox overlaps the dragged rectangle (replaces the current
+        // selection). A near-zero rect (no real drag) just clears below via
+        // click_in_empty. Done regardless of `suppress` so a marquee that
+        // briefly passed under a popup still commits.
+        if let (Some(start), Some(p)) = (marquee_start, pointer_local) {
+            let cur = [p.x - origin.x, p.y - origin.y];
+            let min = [start[0].min(cur[0]), start[1].min(cur[1])];
+            let max = [start[0].max(cur[0]), start[1].max(cur[1])];
+            let area = (max[0] - min[0]) * (max[1] - min[1]);
+            if area >= 16.0 {
+                let picked: Vec<usize> = items.iter().enumerate().filter_map(|(i, it)| {
+                    let (lp, ls) = it.bbox();
+                    let i_min = lp;
+                    let i_max = [lp[0] + ls[0].max(1.0), lp[1] + ls[1].max(1.0)];
+                    // AABB overlap test.
+                    let overlap = i_min[0] <= max[0] && i_max[0] >= min[0]
+                        && i_min[1] <= max[1] && i_max[1] >= min[1];
+                    overlap.then_some(i)
+                }).collect();
+                if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+                    sp.selected_item = picked.last().copied();
+                    sp.selected_items = picked;
+                    sp.cycle_pos = None;
+                }
+                // A committed marquee is not an empty click.
+                click_in_empty = false;
+            }
+            ui.ctx().data_mut(|d| d.remove_temp::<[f32; 2]>(marquee_key));
+        }
         // Always clear press state after release (suppressed or not).
         ui.ctx().data_mut(|d| d.remove_temp::<PressState>(press_state_key));
     }
     let _ = click_local;
+
+    // Paint the live marquee rectangle while the rubber-band drag is in
+    // progress (Shift held, primary down, started in empty space).
+    if let (Some(start), Some(p), true) = (marquee_start, pointer_local, primary_down) {
+        let cur = [p.x - origin.x, p.y - origin.y];
+        let r = egui::Rect::from_two_pos(
+            origin + egui::vec2(start[0], start[1]),
+            origin + egui::vec2(cur[0], cur[1]),
+        );
+        let painter = ui.painter().with_clip_rect(body_rect);
+        painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(120, 180, 255, 30));
+        painter.rect_stroke(
+            r, egui::CornerRadius::ZERO,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 200)),
+            egui::StrokeKind::Inside,
+        );
+        ui.ctx().request_repaint();
+    }
+    // If the primary button is no longer down but a stale marquee slot
+    // remains (e.g. release happened off-window), clear it.
+    if !primary_down && marquee_start.is_some() {
+        ui.ctx().data_mut(|d| d.remove_temp::<[f32; 2]>(marquee_key));
+    }
 
     // Background interact for right-click "Add ▶" menu only (left-clicks
     // are handled manually above; this catches secondary clicks in the
@@ -4975,6 +4986,7 @@ pub(crate) fn show_subpatch_body(
     if click_in_empty {
         if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
             sp.selected_item = None;
+            sp.selected_items.clear();
             sp.cycle_pos = None;
         }
     }
@@ -4983,15 +4995,30 @@ pub(crate) fn show_subpatch_body(
     let selected_idx = snarl.get_node(outer_id)
         .and_then(|n| n.subpatch.as_ref())
         .and_then(|sp| sp.selected_item);
+    // Snapshot the full multi-selection set for the paint/drag pass.
+    let selected_set: Vec<usize> = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .map(|sp| sp.selected_items.clone())
+        .unwrap_or_default();
 
-    // Per-item paint pass + drag/resize for the selected item only.
+    // Multi-drag accumulator: when the user drags a member of a multi-
+    // selection, we record the delta here and apply it to EVERY selected
+    // item in the commit pass (so they move together).
+    let mut multi_drag_delta: Option<[f32; 2]> = None;
+    let is_multi = selected_set.len() > 1;
+
+    // Per-item paint pass + drag/resize. Outline = any item in the selection
+    // set; resize handle / line endpoints / inspector = the PRIMARY only.
     for (idx, it) in items.iter().enumerate() {
         let (lp, ls) = it.bbox();
         let rect = egui::Rect::from_min_size(
             origin + egui::vec2(lp[0], lp[1]),
             egui::vec2(ls[0].max(8.0), ls[1].max(8.0)),
         );
-        let is_sel = selected_idx == Some(idx);
+        let in_set = selected_set.contains(&idx);
+        let is_primary = selected_idx == Some(idx);
+        // `is_sel` drives the selection outline color: highlight every member.
+        let is_sel = in_set || is_primary;
 
         // Outline.
         let outline_col = if is_sel {
@@ -5013,6 +5040,11 @@ pub(crate) fn show_subpatch_body(
             }
             LayoutItem::Deco(d) => d.type_label().to_string(),
         };
+        // Context-menu state flags (computed once per item).
+        let is_deco_idx = matches!(it, LayoutItem::Deco(_));
+        let has_style_clip = ui.ctx().data(|d|
+            d.get_temp::<ItemStyle>(layout_style_clipboard_key()).is_some());
+        let n_selected = selected_set.len();
 
         // Line: two endpoint handles instead of corner resize.
         if let LayoutItem::Deco(LayoutDecoration::Line { a, b, .. }) = it {
@@ -5028,7 +5060,9 @@ pub(crate) fn show_subpatch_body(
             };
             ui.painter().rect_filled(ha_rect, 1.0, handle_col);
             ui.painter().rect_filled(hb_rect, 1.0, handle_col);
-            if is_sel {
+            // Endpoint editing is single-item only (the PRIMARY). In a
+            // multi-selection the line moves as a whole via multi-drag.
+            if is_primary && !is_multi {
                 let ar = ui.interact(ha_rect, egui::Id::new(("li_la", outer_id.0, idx)), egui::Sense::click_and_drag());
                 let br = ui.interact(hb_rect, egui::Id::new(("li_lb", outer_id.0, idx)), egui::Sense::click_and_drag());
                 if ar.drag_started() {
@@ -5053,13 +5087,29 @@ pub(crate) fn show_subpatch_body(
                     new_line[idx] = Some((cur_a, nb));
                 }
             }
+            // In a multi-selection a selected line translates as a whole
+            // (endpoint editing is disabled above). Hit-test along the
+            // segment so the whole line is grabbable for the group move.
+            if is_multi && in_set {
+                let line_rect = egui::Rect::from_two_pos(pa, pb).expand(6.0);
+                let lresp = ui.interact(
+                    line_rect,
+                    egui::Id::new(("li_line_move", outer_id.0, idx)),
+                    egui::Sense::click_and_drag(),
+                );
+                if lresp.dragged_by(egui::PointerButton::Primary) {
+                    let dd = lresp.drag_delta();
+                    let prev_acc = multi_drag_delta.unwrap_or([0.0, 0.0]);
+                    multi_drag_delta = Some([prev_acc[0] + dd.x, prev_acc[1] + dd.y]);
+                }
+            }
         } else {
             // ── Body drag for the SELECTED non-Line item — registered BEFORE
             //    the resize handle so the handle (registered later) wins
             //    inside its corner area, while the body drag wins everywhere
             //    else inside the rect. Using the full rect (no corner cut)
             //    means narrow rectangles remain fully draggable.
-            if is_sel {
+            if in_set {
                 let body = ui.interact(
                     rect,
                     egui::Id::new(("li_body_drag", outer_id.0, idx)),
@@ -5071,20 +5121,33 @@ pub(crate) fn show_subpatch_body(
                 if body.dragged_by(egui::PointerButton::Primary) {
                     let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(drag_pos_id(idx))).unwrap_or([lp[0],lp[1],0.0,0.0]);
                     let dd = body.drag_delta();
-                    ui.ctx().data_mut(|d| d.insert_temp(drag_pos_id(idx), [prev[0], prev[1], prev[2]+dd.x, prev[3]+dd.y]));
-                    let tx = snap(prev[0] + prev[2] + dd.x).max(0.0);
-                    let ty = snap(prev[1] + prev[3] + dd.y).max(0.0);
-                    new_pos[idx] = Some([tx, ty]);
+                    if is_multi {
+                        // Multi-selection: record the raw (snapped) delta and
+                        // apply it to EVERY selected item in the commit pass so
+                        // they translate together. Don't write new_pos[idx]
+                        // here — the commit pass handles all members uniformly.
+                        let prev_acc = multi_drag_delta.unwrap_or([0.0, 0.0]);
+                        multi_drag_delta = Some([
+                            prev_acc[0] + dd.x,
+                            prev_acc[1] + dd.y,
+                        ]);
+                    } else {
+                        ui.ctx().data_mut(|d| d.insert_temp(drag_pos_id(idx), [prev[0], prev[1], prev[2]+dd.x, prev[3]+dd.y]));
+                        let tx = snap(prev[0] + prev[2] + dd.x).max(0.0);
+                        let ty = snap(prev[1] + prev[3] + dd.y).max(0.0);
+                        new_pos[idx] = Some([tx, ty]);
+                    }
                 }
             }
 
             // Corner resize handle (ghost when unselected) — registered AFTER
-            // the body drag so it wins inside its small corner area.
+            // the body drag so it wins inside its small corner area. Resize is
+            // single-item only (the PRIMARY); a multi-selection only moves.
             let handle_rect = egui::Rect::from_min_size(
                 egui::pos2(rect.max.x - RESIZE_HANDLE, rect.max.y - RESIZE_HANDLE),
                 egui::vec2(RESIZE_HANDLE, RESIZE_HANDLE),
             );
-            if is_sel {
+            if is_primary && !is_multi {
                 let h_resp = ui.interact(
                     handle_rect,
                     egui::Id::new(("li_resize", outer_id.0, idx)),
@@ -5142,31 +5205,62 @@ pub(crate) fn show_subpatch_body(
                 egui::Sense::click(),
             );
             ctx_resp.context_menu(|ui| {
-                ui.label(egui::RichText::new(&menu_header).small().strong());
-                ui.separator();
-                if ui.button("Send to surface").clicked()  { zaction = Some((idx, "top"));    ui.close_menu(); }
-                if ui.button("Step Up").clicked()          { zaction = Some((idx, "up"));     ui.close_menu(); }
-                if ui.button("Step Down").clicked()        { zaction = Some((idx, "down"));   ui.close_menu(); }
-                if ui.button("Send to background").clicked(){ zaction = Some((idx, "bottom")); ui.close_menu(); }
-                ui.separator();
-                if ui.button("Unpin").clicked()            { delete_idx = Some(idx);           ui.close_menu(); }
+                layout_item_context_menu(
+                    ui, idx, is_deco_idx, has_style_clip, n_selected,
+                    &mut zaction, &mut delete_idx,
+                    &mut dup_request, &mut copy_style_from, &mut paste_style,
+                    &menu_header,
+                );
             });
         } else if let Some((_, resp)) = hit_responses.iter().find(|(i, _)| *i == idx) {
             resp.clone().context_menu(|ui| {
-                ui.label(egui::RichText::new(&menu_header).small().strong());
-                ui.separator();
-                if ui.button("Send to surface").clicked()  { zaction = Some((idx, "top"));    ui.close_menu(); }
-                if ui.button("Step Up").clicked()          { zaction = Some((idx, "up"));     ui.close_menu(); }
-                if ui.button("Step Down").clicked()        { zaction = Some((idx, "down"));   ui.close_menu(); }
-                if ui.button("Send to background").clicked(){ zaction = Some((idx, "bottom")); ui.close_menu(); }
-                ui.separator();
-                if ui.button("Unpin").clicked()            { delete_idx = Some(idx);           ui.close_menu(); }
+                layout_item_context_menu(
+                    ui, idx, is_deco_idx, has_style_clip, n_selected,
+                    &mut zaction, &mut delete_idx,
+                    &mut dup_request, &mut copy_style_from, &mut paste_style,
+                    &menu_header,
+                );
             });
         }
     }
 
+    // Read the style clipboard BEFORE the mutable `sp` borrow below so the
+    // paste-style path can apply it without re-borrowing ctx data mid-borrow.
+    let style_clip_for_paste: Option<ItemStyle> = if paste_style {
+        ui.ctx().data(|d| d.get_temp::<ItemStyle>(layout_style_clipboard_key()))
+    } else { None };
+    // Set inside the `sp` borrow when the layout becomes empty; applied after.
+    let mut clear_unlocked = false;
+
     // ── Commit pending mutations ─────────────────────────────────────────────
     if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+        // Multi-drag: translate every selected item by the shared delta. Done
+        // first (before the single-item new_pos pass, which is skipped while
+        // is_multi). Each member is clamped to ≥0 and snapped independently so
+        // the group keeps its relative layout.
+        if let Some([ddx, ddy]) = multi_drag_delta {
+            for &i in selected_set.iter() {
+                if let Some(it) = sp.items.get_mut(i) {
+                    match it {
+                        LayoutItem::Module(m) => {
+                            m.pos = [snap(m.pos[0] + ddx).max(0.0), snap(m.pos[1] + ddy).max(0.0)];
+                        }
+                        LayoutItem::Deco(d) => match d {
+                            LayoutDecoration::Text { pos, .. }
+                            | LayoutDecoration::Rect { pos, .. }
+                            | LayoutDecoration::Ellipse { pos, .. }
+                            | LayoutDecoration::Svg  { pos, .. } => {
+                                *pos = [snap(pos[0] + ddx).max(0.0), snap(pos[1] + ddy).max(0.0)];
+                            }
+                            LayoutDecoration::Line { a, b, .. } => {
+                                *a = [snap(a[0] + ddx).max(0.0), snap(a[1] + ddy).max(0.0)];
+                                *b = [snap(b[0] + ddx).max(0.0), snap(b[1] + ddy).max(0.0)];
+                            }
+                        },
+                    }
+                }
+            }
+        }
         let n_items = sp.items.len();
         for (i, it) in sp.items.iter_mut().enumerate() {
             if let Some(p) = new_pos.get(i).copied().flatten() {
@@ -5223,22 +5317,299 @@ pub(crate) fn show_subpatch_body(
                     else if s > i { sp.selected_item = Some(s - 1); }
                 }
             }
-            if sp.items.is_empty() {
-                if let Some(node) = snarl.get_node_mut(outer_id) {
-                    node.extra.layout_unlocked = false;
-                }
-            }
+            // Deferred so we don't re-borrow `snarl` inside this `sp` borrow.
+            if sp.items.is_empty() { clear_unlocked = true; }
         }
         if let Some(kind) = bg_add {
             let d = make_default_decoration(kind);
-            if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
-                sp.items.push(LayoutItem::Deco(d));
-                sp.selected_item = Some(sp.items.len() - 1);
+            sp.items.push(LayoutItem::Deco(d));
+            sp.selected_item = Some(sp.items.len() - 1);
+            sp.selected_items = vec![sp.items.len() - 1];
+        }
+
+        // ── Duplicate selection (decorations only) ──────────────────────
+        // Clone every selected DECORATION, offset by [12,12] so the copy is
+        // visible, append in the original z-order, and reselect the new
+        // clones. Module pins are skipped (they reference an inner node).
+        if dup_request {
+            // Take the selection set to clone from (paint order preserved).
+            let mut to_clone: Vec<usize> =
+                if !selected_set.is_empty() { selected_set.clone() }
+                else if let Some(p) = selected_idx { vec![p] }
+                else { Vec::new() };
+            to_clone.sort_unstable();
+            let mut new_indices: Vec<usize> = Vec::new();
+            for src in to_clone {
+                if let Some(LayoutItem::Deco(d)) = sp.items.get(src) {
+                    let mut nd = d.clone();
+                    match &mut nd {
+                        LayoutDecoration::Text { pos, .. }
+                        | LayoutDecoration::Rect { pos, .. }
+                        | LayoutDecoration::Ellipse { pos, .. }
+                        | LayoutDecoration::Svg  { pos, .. } => {
+                            pos[0] += 12.0; pos[1] += 12.0;
+                        }
+                        LayoutDecoration::Line { a, b, .. } => {
+                            a[0] += 12.0; a[1] += 12.0;
+                            b[0] += 12.0; b[1] += 12.0;
+                        }
+                    }
+                    sp.items.push(LayoutItem::Deco(nd));
+                    new_indices.push(sp.items.len() - 1);
+                }
+            }
+            if !new_indices.is_empty() {
+                sp.selected_item = new_indices.last().copied();
+                sp.selected_items = new_indices;
+                sp.cycle_pos = None;
+            }
+        }
+
+        // ── Paste style across the selection ────────────────────────────
+        // Apply the ctx style clipboard to every selected item (or the
+        // primary if there's only a single selection) where the field
+        // exists. `copy_style_from` is handled outside the `sp` borrow below.
+        if paste_style {
+            if let Some(clip) = style_clip_for_paste.as_ref() {
+                let targets: Vec<usize> =
+                    if !selected_set.is_empty() { selected_set.clone() }
+                    else if let Some(p) = selected_idx { vec![p] }
+                    else { Vec::new() };
+                for t in targets {
+                    if let Some(it) = sp.items.get_mut(t) {
+                        clip.apply_to(it);
+                    }
+                }
             }
         }
     }
 
+    // Deferred empty-layout cleanup (outside the `sp` borrow above).
+    if clear_unlocked {
+        if let Some(node) = snarl.get_node_mut(outer_id) {
+            node.extra.layout_unlocked = false;
+        }
+    }
+
+    // ── Copy style → ctx clipboard (outside the `sp` borrow) ────────────
+    if let Some(src) = copy_style_from {
+        let style = snarl.get_node(outer_id)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.items.get(src))
+            .map(item_style_of);
+        if let Some(style) = style {
+            ui.ctx().data_mut(|d| d.insert_temp(layout_style_clipboard_key(), style));
+        }
+    }
+
     false
+}
+
+/// Render the full layout-editing controls row: snap toggle + grid step, the
+/// "Add" decoration buttons, and the per-selection inspector strip. Shown at
+/// the top of the Advanced sub-patch node body in Layout mode AND below the
+/// Easy-mode preset bar, so both surfaces expose identical layout tools.
+/// Caller is responsible for only invoking this while layout editing is active.
+pub(crate) fn layout_editing_controls(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    outer_id: NodeId,
+) {
+    let (mut snap_enabled, mut snap_grid_px) = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .map(|sp| (sp.snap_enabled, sp.snap_grid_px))
+        .unwrap_or((false, 8));
+    let mut changed = false;
+    let mut add_kind: Option<&'static str> = None;
+    ui.horizontal(|ui| {
+        let was = snap_enabled;
+        ui.checkbox(&mut snap_enabled, egui::RichText::new("Snap").small())
+            .on_hover_text("Snap pinned-element positions and sizes to a grid in Layout mode");
+        if snap_enabled != was { changed = true; }
+        ui.add_enabled_ui(snap_enabled, |ui| {
+            ui.label(egui::RichText::new("grid").small().weak());
+            let mut g = snap_grid_px as i32;
+            if ui.add(egui::DragValue::new(&mut g)
+                .speed(0.5)
+                .range(2i32..=64)
+                .suffix("px"))
+                .on_hover_text("Grid step in pixels (rounded to multiples of 2)")
+                .changed()
+            {
+                let g2 = ((g.max(2)) / 2 * 2) as u32;
+                if g2 != snap_grid_px { snap_grid_px = g2; changed = true; }
+            }
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("Add:").small().weak());
+        if ui.small_button("T").on_hover_text("Add Text label").clicked() {
+            add_kind = Some("text");
+        }
+        if ui.small_button("▢").on_hover_text("Add Rectangle").clicked() {
+            add_kind = Some("rect");
+        }
+        if ui.small_button("◯").on_hover_text("Add Ellipse").clicked() {
+            add_kind = Some("ellipse");
+        }
+        if ui.small_button("╱").on_hover_text("Add Line").clicked() {
+            add_kind = Some("line");
+        }
+        if ui.small_button("SVG").on_hover_text("Add SVG").clicked() {
+            add_kind = Some("svg");
+        }
+    });
+    if changed {
+        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+            sp.snap_enabled = snap_enabled;
+            sp.snap_grid_px = snap_grid_px;
+        }
+    }
+    if let Some(kind) = add_kind {
+        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+            let deco = make_default_decoration(kind);
+            sp.items.push(LayoutItem::Deco(deco));
+            let idx = sp.items.len() - 1;
+            sp.selected_item = Some(idx);
+            sp.selected_items = vec![idx];
+        }
+    }
+
+    // Inspector strip for the currently selected item (+ bulk-style
+    // propagation across a multi-selection).
+    layout_inspector_strip(ui, snarl, outer_id);
+}
+
+/// Render the inspector strip for the currently-selected layout item and, when
+/// a multi-selection is active, propagate any style change the user makes on the
+/// PRIMARY to the rest of the selection (where the field exists). Shared between
+/// the Advanced sub-patch node body and the Easy-mode central panel so both
+/// surfaces edit styling identically. No-op when nothing is selected.
+pub(crate) fn layout_inspector_strip(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    outer_id: NodeId,
+) {
+    let sel_idx = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| sp.selected_item);
+    let Some(idx) = sel_idx else { return };
+
+    let inner_mid: Option<String> = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| sp.items.get(idx))
+        .and_then(|it| match it {
+            LayoutItem::Module(m) => sp_module_id(
+                snarl.get_node(outer_id).and_then(|n| n.subpatch.as_deref()),
+                m.inner_node_id,
+            ),
+            _ => None,
+        });
+    let is_text_pin   = inner_mid.as_deref() == Some("module.label");
+    let is_switch_pin = inner_mid.as_deref() == Some("module.switch");
+
+    // Snapshot the primary's style BEFORE the inspector edits it (only when a
+    // multi-selection is active — single-select needs no propagation).
+    let multi: Vec<usize> = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .map(|sp| sp.selected_items.clone())
+        .unwrap_or_default();
+    let before: Option<ItemStyle> = if multi.len() > 1 {
+        snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.items.get(idx)).map(item_style_of)
+    } else { None };
+
+    if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+        if idx < sp.items.len() {
+            match &mut sp.items[idx] {
+                LayoutItem::Deco(_) => {
+                    decoration_inspector_strip_item(ui, &mut sp.items, idx);
+                }
+                LayoutItem::Module(_) if is_text_pin => {
+                    text_pin_inspector_strip_item(ui, &mut sp.items, idx);
+                }
+                LayoutItem::Module(_) if is_switch_pin => {
+                    switch_pin_inspector_strip_item(ui, &mut sp.items, idx);
+                }
+                _ => {}
+            }
+        } else {
+            sp.selected_item = None;
+        }
+    }
+
+    // Diff the primary against its pre-edit snapshot and apply the changed
+    // style fields to the rest of the selection.
+    if let Some(before) = before {
+        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+            if let Some(after) = sp.items.get(idx).map(item_style_of) {
+                let changed = before.diff(&after);
+                if changed.any() {
+                    for &j in multi.iter() {
+                        if j == idx { continue; }
+                        if let Some(it) = sp.items.get_mut(j) {
+                            changed.apply_to(it);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// ctx-data slot holding a copied layout-item style for paste-across.
+fn layout_style_clipboard_key() -> egui::Id {
+    egui::Id::new("flexinput::layout_style_clipboard")
+}
+
+/// Shared per-item right-click context menu for the layout editor. Used for
+/// both the selected (primary) item and non-selected items. Sets the various
+/// pending-action flags the caller commits after the loop.
+#[allow(clippy::too_many_arguments)]
+fn layout_item_context_menu(
+    ui: &mut egui::Ui,
+    idx: usize,
+    is_deco: bool,
+    has_style_clip: bool,
+    n_selected: usize,
+    zaction: &mut Option<(usize, &'static str)>,
+    delete_idx: &mut Option<usize>,
+    dup_request: &mut bool,
+    copy_style_from: &mut Option<usize>,
+    paste_style: &mut bool,
+    menu_header: &str,
+) {
+    ui.label(egui::RichText::new(menu_header).small().strong());
+    ui.separator();
+    if ui.button("Send to surface").clicked()   { *zaction = Some((idx, "top"));    ui.close_menu(); }
+    if ui.button("Step Up").clicked()           { *zaction = Some((idx, "up"));     ui.close_menu(); }
+    if ui.button("Step Down").clicked()         { *zaction = Some((idx, "down"));   ui.close_menu(); }
+    if ui.button("Send to background").clicked(){ *zaction = Some((idx, "bottom")); ui.close_menu(); }
+    ui.separator();
+    // Style copy/paste. Copy stashes THIS item's style; paste applies the
+    // clipboard to the whole selection (or this item if nothing else selected).
+    if ui.button("Copy style").clicked() { *copy_style_from = Some(idx); ui.close_menu(); }
+    ui.add_enabled_ui(has_style_clip, |ui| {
+        let label = if n_selected > 1 {
+            format!("Paste style to {} selected", n_selected)
+        } else {
+            "Paste style".to_string()
+        };
+        if ui.button(label).clicked() { *paste_style = true; ui.close_menu(); }
+    });
+    // Duplicate — decorations only (module widgets reference an inner node and
+    // can't be cloned as standalone layout items). Duplicates the whole
+    // decoration selection when multiple are selected.
+    if is_deco {
+        ui.separator();
+        let dlabel = if n_selected > 1 {
+            "Duplicate selection".to_string()
+        } else {
+            "Duplicate".to_string()
+        };
+        if ui.button(dlabel).clicked() { *dup_request = true; ui.close_menu(); }
+    }
+    ui.separator();
+    if ui.button("Unpin").clicked() { *delete_idx = Some(idx); ui.close_menu(); }
 }
 
 /// Apply a Z-order action against a `Vec<LayoutItem>` (paint order).
@@ -13313,6 +13684,7 @@ fn make_default_decoration(kind: &str) -> LayoutDecoration {
             outline: [0, 0, 0, 0],
             outline_px: 0.0,
             align: TextAlign::Left,
+            valign: crate::canvas::node::TextVAlign::Top,
         },
         "rect" => LayoutDecoration::Rect {
             pos: [16.0, 16.0],
@@ -13374,6 +13746,104 @@ fn color_button(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4]) -> bool {
     changed
 }
 
+/// Flattened style snapshot of a layout item, used for bulk-style propagation
+/// across a multi-selection. Each field is `Option` so we can both (a) capture
+/// only what an item kind actually has, and (b) diff to find what the user
+/// changed. `apply_to` writes a changed field onto another item only where that
+/// item kind exposes the same field — e.g. changing a Rect's fill while a Line
+/// is also selected leaves the Line's (absent) fill untouched.
+#[derive(Clone, Default, PartialEq)]
+struct ItemStyle {
+    fill: Option<[u8; 4]>,
+    stroke: Option<[u8; 4]>,
+    stroke_px: Option<f32>,
+    corner_radius: Option<f32>,
+    font_size: Option<f32>,
+    // Text-pin / switch-pin overrides are deliberately NOT bulk-propagated
+    // here (they're per-module-kind and rarely span a mixed selection); the
+    // decoration-level fill/stroke covers the common decoration case.
+}
+
+impl ItemStyle {
+    fn any(&self) -> bool {
+        self.fill.is_some() || self.stroke.is_some() || self.stroke_px.is_some()
+            || self.corner_radius.is_some() || self.font_size.is_some()
+    }
+    /// Build the set of fields that differ between `self` (before) and `after`.
+    fn diff(&self, after: &ItemStyle) -> ItemStyle {
+        fn pick<T: PartialEq + Copy>(b: Option<T>, a: Option<T>) -> Option<T> {
+            match (b, a) { (Some(bv), Some(av)) if bv != av => Some(av), _ => None }
+        }
+        ItemStyle {
+            fill: pick(self.fill, after.fill),
+            stroke: pick(self.stroke, after.stroke),
+            stroke_px: pick(self.stroke_px, after.stroke_px),
+            corner_radius: pick(self.corner_radius, after.corner_radius),
+            font_size: pick(self.font_size, after.font_size),
+        }
+    }
+    /// Apply each changed field to `it` where that field exists on the item.
+    fn apply_to(&self, it: &mut LayoutItem) {
+        let LayoutItem::Deco(d) = it else { return };
+        match d {
+            LayoutDecoration::Text { fill, outline, outline_px, font_size, .. } => {
+                if let Some(v) = self.fill { *fill = v; }
+                if let Some(v) = self.stroke { *outline = v; }
+                if let Some(v) = self.stroke_px { *outline_px = v; }
+                if let Some(v) = self.font_size { *font_size = v; }
+            }
+            LayoutDecoration::Rect { fill, stroke, stroke_px, corner_radius, .. } => {
+                if let Some(v) = self.fill { *fill = v; }
+                if let Some(v) = self.stroke { *stroke = v; }
+                if let Some(v) = self.stroke_px { *stroke_px = v; }
+                if let Some(v) = self.corner_radius { *corner_radius = v; }
+            }
+            LayoutDecoration::Ellipse { fill, stroke, stroke_px, .. } => {
+                if let Some(v) = self.fill { *fill = v; }
+                if let Some(v) = self.stroke { *stroke = v; }
+                if let Some(v) = self.stroke_px { *stroke_px = v; }
+            }
+            LayoutDecoration::Line { stroke, stroke_px, .. } => {
+                if let Some(v) = self.stroke { *stroke = v; }
+                if let Some(v) = self.stroke_px { *stroke_px = v; }
+            }
+            LayoutDecoration::Svg { stroke, stroke_px, .. } => {
+                if let Some(v) = self.stroke { *stroke = v; }
+                if let Some(v) = self.stroke_px { *stroke_px = v; }
+            }
+        }
+    }
+}
+
+/// Snapshot the bulk-propagatable style of a layout item. For Text the
+/// `outline`/`outline_px` map onto the generic `stroke`/`stroke_px` slots so a
+/// stroke change made on, say, a Rect can carry to a Text outline.
+fn item_style_of(it: &LayoutItem) -> ItemStyle {
+    match it {
+        LayoutItem::Deco(LayoutDecoration::Text { fill, outline, outline_px, font_size, .. }) => ItemStyle {
+            fill: Some(*fill), stroke: Some(*outline), stroke_px: Some(*outline_px),
+            corner_radius: None, font_size: Some(*font_size),
+        },
+        LayoutItem::Deco(LayoutDecoration::Rect { fill, stroke, stroke_px, corner_radius, .. }) => ItemStyle {
+            fill: Some(*fill), stroke: Some(*stroke), stroke_px: Some(*stroke_px),
+            corner_radius: Some(*corner_radius), font_size: None,
+        },
+        LayoutItem::Deco(LayoutDecoration::Ellipse { fill, stroke, stroke_px, .. }) => ItemStyle {
+            fill: Some(*fill), stroke: Some(*stroke), stroke_px: Some(*stroke_px),
+            corner_radius: None, font_size: None,
+        },
+        LayoutItem::Deco(LayoutDecoration::Line { stroke, stroke_px, .. }) => ItemStyle {
+            fill: None, stroke: Some(*stroke), stroke_px: Some(*stroke_px),
+            corner_radius: None, font_size: None,
+        },
+        LayoutItem::Deco(LayoutDecoration::Svg { stroke, stroke_px, .. }) => ItemStyle {
+            fill: None, stroke: Some(*stroke), stroke_px: Some(*stroke_px),
+            corner_radius: None, font_size: None,
+        },
+        LayoutItem::Module(_) => ItemStyle::default(),
+    }
+}
+
 /// Render the contextual inspector strip for the selected decoration inside
 /// a `LayoutItem::Deco`. Bails out cleanly if `idx` is stale or not a deco.
 /// Z-order is controlled via the right-click menu, not this strip.
@@ -13391,7 +13861,8 @@ fn decoration_inspector_strip_item(
         ui.label(egui::RichText::new(deco.type_label()).small().strong());
         ui.separator();
         match deco {
-            LayoutDecoration::Text { text, font_size, fill, outline, outline_px, align, .. } => {
+            LayoutDecoration::Text { text, font_size, fill, outline, outline_px, align, valign, .. } => {
+                use crate::canvas::node::TextVAlign;
                 ui.add(egui::TextEdit::singleline(text).desired_width(140.0).hint_text("text"));
                 ui.add(egui::DragValue::new(font_size).speed(0.25).range(6.0f32..=96.0).suffix("px"))
                     .on_hover_text("Font size");
@@ -13407,6 +13878,15 @@ fn decoration_inspector_strip_item(
                         ui.selectable_value(align, TextAlign::Center, "Center");
                         ui.selectable_value(align, TextAlign::Right, "Right");
                     });
+                egui::ComboBox::from_id_salt(("deco_valign", idx))
+                    .width(70.0)
+                    .selected_text(match *valign { TextVAlign::Top => "Top", TextVAlign::Center => "Middle", TextVAlign::Bottom => "Bottom" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(valign, TextVAlign::Top, "Top");
+                        ui.selectable_value(valign, TextVAlign::Center, "Middle");
+                        ui.selectable_value(valign, TextVAlign::Bottom, "Bottom");
+                    })
+                    .response.on_hover_text("Vertical alignment");
             }
             LayoutDecoration::Rect { fill, stroke, stroke_px, corner_radius, .. } => {
                 color_button(ui, "fill", fill);
@@ -13604,23 +14084,35 @@ fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco: &LayoutDe
             painter.line_segment([p1, p2],
                 egui::Stroke::new(*stroke_px, rgba_to_color32(*stroke)));
         }
-        LayoutDecoration::Text { pos, size, text, font_size, fill, outline, outline_px, align } => {
+        LayoutDecoration::Text { pos, size, text, font_size, fill, outline, outline_px, align, valign } => {
+            use crate::canvas::node::TextVAlign;
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
                 egui::vec2(size[0].max(1.0), size[1].max(1.0)),
             );
-            let (anchor, x) = match align {
-                TextAlign::Left   => (egui::Align2::LEFT_TOP,   r.min.x),
-                TextAlign::Center => (egui::Align2::CENTER_TOP, r.center().x),
-                TextAlign::Right  => (egui::Align2::RIGHT_TOP,  r.max.x),
+            // Horizontal anchor + x from `align`; vertical anchor + y from
+            // `valign`. We combine the two into a single Align2 so the glyph
+            // run is positioned within the box per both axes.
+            let (h_align2_kind, x) = match align {
+                TextAlign::Left   => (0u8, r.min.x),
+                TextAlign::Center => (1u8, r.center().x),
+                TextAlign::Right  => (2u8, r.max.x),
             };
+            let (v_kind, y) = match valign {
+                TextVAlign::Top    => (0u8, r.min.y),
+                TextVAlign::Center => (1u8, r.center().y),
+                TextVAlign::Bottom => (2u8, r.max.y),
+            };
+            let ax = match h_align2_kind { 0 => egui::Align::LEFT, 1 => egui::Align::Center, _ => egui::Align::RIGHT };
+            let ay = match v_kind        { 0 => egui::Align::TOP,  1 => egui::Align::Center, _ => egui::Align::BOTTOM };
+            let anchor = egui::Align2([ax, ay]);
             let fcol = rgba_to_color32(*fill);
             let ocol = rgba_to_color32(*outline);
             // Cheap text outline: paint 8-direction offset copies first.
             if ocol.a() > 0 && *outline_px > 0.05 {
                 for (dx, dy) in [(-1.0,0.0),(1.0,0.0),(0.0,-1.0),(0.0,1.0),(-1.0,-1.0),(1.0,-1.0),(-1.0,1.0),(1.0,1.0)] {
                     painter.text(
-                        egui::pos2(x + dx * *outline_px, r.min.y + dy * *outline_px),
+                        egui::pos2(x + dx * *outline_px, y + dy * *outline_px),
                         anchor, text,
                         egui::FontId::proportional(*font_size),
                         ocol,
@@ -13628,7 +14120,7 @@ fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco: &LayoutDe
                 }
             }
             painter.text(
-                egui::pos2(x, r.min.y),
+                egui::pos2(x, y),
                 anchor, text,
                 egui::FontId::proportional(*font_size),
                 fcol,

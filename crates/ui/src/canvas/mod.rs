@@ -1569,13 +1569,6 @@ fn draw_zoom_controls(
     let mut clicked_reset  = false;
     let mut clicked_plus   = false;
     let mut clicked_fit    = false;
-    let mut clicked_eye    = false;
-
-    // Read the current see-through state so the eye button can render in
-    // its active style without the caller having to plumb it through.
-    let see_through_id = egui::Id::new(SEE_THROUGH_DATA_KEY);
-    let see_through_on: bool = ui.ctx().data(|d| d.get_temp::<bool>(see_through_id))
-        .unwrap_or(false);
 
     area.show(ui.ctx(), |ui| {
         let bg = ui.visuals().window_fill();
@@ -1589,106 +1582,9 @@ fn draw_zoom_controls(
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
 
-                // ── See-through toggle (eye icon) ─────────────────────────
-                // Click toggles see-through; hover pops out a vertical
-                // opacity slider so the user can adjust without diving
-                // into the Settings window.
-                let eye_label = egui::RichText::new("👁").monospace().size(14.0);
-                let eye_btn = egui::SelectableLabel::new(see_through_on, eye_label);
-                let eye_resp = ui.add_sized(egui::vec2(24.0, 22.0), eye_btn);
-                let hover = if see_through_on {
-                    "See-through: ON — click to make app fully opaque.\nHover to adjust opacity."
-                } else {
-                    "See-through: OFF — click to make app translucent.\nHover to adjust opacity."
-                };
-                let eye_resp = eye_resp.on_hover_text(hover);
-                clicked_eye = eye_resp.clicked();
-
-                // Opacity popover: anchored above the eye button.
-                // Stays open while either the eye OR the popup is
-                // hovered, plus a 3-second grace window after the
-                // last hover so the user can travel from the eye
-                // across the gap to the slider without it closing
-                // mid-traversal. Without the grace timer, the popup
-                // hides for one frame between leaving the eye and
-                // entering the slider rect, and never recovers.
-                let popup_id = snarl_id.with("see_through_popup");
-                let last_hover_id = popup_id.with("last_hover");
-                const POPUP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
-                let now = std::time::Instant::now();
-                let last_hover: Option<std::time::Instant> = ui.ctx().data(|d|
-                    d.get_temp::<std::time::Instant>(last_hover_id)
-                );
-                if eye_resp.hovered() {
-                    ui.ctx().data_mut(|d| d.insert_temp(last_hover_id, now));
-                }
-                let popup_visible = eye_resp.hovered()
-                    || last_hover.map(|t| now.duration_since(t) < POPUP_GRACE)
-                        .unwrap_or(false);
-                if popup_visible {
-                    let alpha_id = egui::Id::new(SEE_THROUGH_ALPHA_KEY);
-                    let mut alpha: f32 = ui.ctx().data(|d|
-                        d.get_temp::<f32>(alpha_id)
-                    ).unwrap_or(0.55);
-                    let popup_area = egui::Area::new(popup_id)
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(egui::pos2(
-                            eye_resp.rect.center().x - 28.0,
-                            eye_resp.rect.top() - 130.0,
-                        ))
-                        .interactable(true);
-                    // We need continuous repaints during the grace
-                    // window so the timer-driven hide actually fires
-                    // — without this the UI would freeze open until
-                    // the next external event.
-                    ui.ctx().request_repaint_after(
-                        std::time::Duration::from_millis(100));
-                    let popup_resp = popup_area.show(ui.ctx(), |ui| {
-                        let bg = ui.visuals().window_fill();
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_rgba_unmultiplied(
-                                bg.r(), bg.g(), bg.b(), 240))
-                            .stroke(egui::Stroke::new(1.0,
-                                ui.visuals().widgets.noninteractive.bg_stroke.color))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin::same(6))
-                            .show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(egui::RichText::new(
-                                        format!("{:.0}%", alpha * 100.0))
-                                        .small());
-                                    let resp = ui.add_sized(
-                                        egui::vec2(40.0, 96.0),
-                                        egui::Slider::new(&mut alpha, 0.0_f32..=1.0)
-                                            .vertical()
-                                            .show_value(false),
-                                    );
-                                    if resp.changed() {
-                                        ui.ctx().data_mut(|d| d.insert_temp(
-                                            alpha_id, alpha.clamp(0.0, 1.0),
-                                        ));
-                                    }
-                                });
-                            }).response
-                    }).response;
-                    // Refresh the grace timer any time either widget
-                    // is hovered, so the popup stays open as long as
-                    // the cursor lives on the slider.
-                    if eye_resp.hovered() || popup_resp.hovered() {
-                        ui.ctx().data_mut(|d|
-                            d.insert_temp(last_hover_id, now));
-                    }
-                }
-
-                // Short separator between the visual toggle and the
-                // numeric zoom group.
-                let (sep_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(1.0, 18.0), egui::Sense::hover());
-                ui.painter().line_segment(
-                    [sep_rect.center_top(), sep_rect.center_bottom()],
-                    egui::Stroke::new(1.0,
-                        ui.visuals().widgets.noninteractive.bg_stroke.color),
-                );
+                // (See-through eye toggle relocated to the title bar so it
+                // works from both Easy and Advanced mode — see
+                // `app::render_eye_toggle`.)
 
                 clicked_minus = ui.add(egui::Button::new(
                     egui::RichText::new("−").monospace())
@@ -1717,12 +1613,6 @@ fn draw_zoom_controls(
         });
     });
 
-    if clicked_eye {
-        // Flip and persist into the temp data slot. The app polls this
-        // each frame in `update` and mirrors it into `settings.see_through_active`
-        // (which the theme applier uses to thin panel/window alpha).
-        ui.ctx().data_mut(|d| d.insert_temp(see_through_id, !see_through_on));
-    }
     if clicked_minus {
         let new_scale = (cur_scale / 1.25).clamp(MIN_SCALE, MAX_SCALE);
         zoom_about(&mut state, snarl_rect.center(), new_scale);
@@ -2074,6 +1964,7 @@ pub fn group_into_subpatch(
         snap_enabled: false,
         snap_grid_px: 8,
         selected_item: None,
+        selected_items: Vec::new(),
         cycle_pos: None,
     };
 

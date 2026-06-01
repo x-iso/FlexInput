@@ -93,6 +93,11 @@ pub struct PinSwitchOverride {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TextAlign { #[default] Left, Center, Right }
 
+/// Text vertical alignment for layout-decoration Text items, within the item's
+/// bounding box.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TextVAlign { #[default] Top, Center, Bottom }
+
 /// Layout-only decorations placed on a sub-patch body. Distinct from
 /// `ExposedModule` (which mirrors an inner module's UI); decorations don't
 /// reference an inner node. Vec order = paint order (first = bottom).
@@ -107,6 +112,8 @@ pub enum LayoutDecoration {
         outline: [u8; 4],
         outline_px: f32,
         align: TextAlign,
+        #[serde(default)]
+        valign: TextVAlign,
     },
     Svg {
         pos: [f32; 2],
@@ -238,10 +245,19 @@ pub struct UiSubPatch {
     /// Grid step in logical pixels. Stepped in increments of 2 to keep things tidy.
     #[serde(default = "default_snap_grid_px")]
     pub snap_grid_px: u32,
-    /// Runtime-only: currently selected item index (into `items`). Cleared on
-    /// layout-mode exit.
+    /// Runtime-only: PRIMARY selected item index (into `items`). Drives the
+    /// inspector strip and resize handle. Cleared on layout-mode exit. When a
+    /// multi-selection is active, this is the last item the user clicked (it is
+    /// always also present in `selected_items`).
     #[serde(skip)]
     pub selected_item: Option<usize>,
+    /// Runtime-only: full multi-selection set (indices into `items`). Source of
+    /// truth for "what is selected". Empty ⇒ nothing selected. When non-empty
+    /// it always contains `selected_item`. Multi-drag moves every member; bulk
+    /// style edits apply to every member where the field exists. Cleared on
+    /// layout-mode exit.
+    #[serde(skip)]
+    pub selected_items: Vec<usize>,
     /// Runtime-only: tracks the last hit position + cursor pos for click-cycle
     /// behavior (so repeated clicks at the same spot cycle through overlapping
     /// items rather than always selecting the topmost).
@@ -338,6 +354,7 @@ impl Default for UiSubPatch {
             snap_enabled: false,
             snap_grid_px: default_snap_grid_px(),
             selected_item: None,
+            selected_items: Vec::new(),
             cycle_pos: None,
         }
     }
