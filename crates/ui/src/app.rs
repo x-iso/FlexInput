@@ -602,6 +602,7 @@ impl FlexInputApp {
                 Some(ws) if !ws.tabs.is_empty() => ws.tabs.into_iter().map(|pt| {
                     let mut canvas = Canvas::new();
                     canvas.snarl = pt.snarl;
+                    crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
                     // Restored patches are conceptually "loaded" — honor the
                     // on-patch-load camera setting so the saved view's
                     // arbitrary pan/zoom doesn't strand the user off-canvas.
@@ -1842,6 +1843,7 @@ impl eframe::App for FlexInputApp {
                     let new_tabs: Vec<PatchTab> = ws.tabs.into_iter().map(|pt| {
                         let mut canvas = Canvas::new();
                         canvas.snarl = pt.snarl;
+                        crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
                         canvas.pending_view_action = on_load_view;
                         let easy_state = EasyState {
                             loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
@@ -6454,6 +6456,7 @@ fn show_subpatch_editors(
                     }
                 }
                 inner_canvas.snarl = *loaded.snarl;
+                crate::canvas::migrate_loaded_snarl(&mut inner_canvas.snarl);
             }
         }
 

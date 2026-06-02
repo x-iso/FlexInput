@@ -1887,6 +1887,14 @@ fn show_automap_combiner_body(
         let mut to_remove: Option<usize> = None;
         let mut to_move: Option<(usize, usize)> = None;
 
+        // Per-port default merge policy (SORT default). Applies to every pin a
+        // port offers that has no per-pin override. Collected here; written
+        // after the loop to avoid a mutable-borrow conflict with `snarl`.
+        let port_default_map: serde_json::Map<String, Value> = snarl.get_node(node_id)
+            .and_then(|node| node.params.get("combiner_port_default"))
+            .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        let mut next_port_default: Vec<(usize, &'static str)> = Vec::new();
+
         for i in 0..n {
             // A port "is in conflict" if any pin it offers is offered by ≥2 ports.
             let is_conflict_row = infos.get(i).map_or(false, |info| {
@@ -1918,6 +1926,22 @@ fn show_automap_combiner_body(
                     if !dev_label.is_empty() {
                         ui.label(egui::RichText::new(dev_label).small().weak());
                     }
+                    // Per-port default policy dropdown (SORT default).
+                    let cur_default = port_default_map.get(&i.to_string())
+                        .and_then(|v| v.as_str()).unwrap_or("SORT");
+                    let pd_id = egui::Id::new(("automap_combiner_port_default", node_id, i));
+                    egui::ComboBox::from_id_salt(pd_id)
+                        .selected_text(egui::RichText::new(cur_default).small())
+                        .width(58.0)
+                        .show_ui(ui, |ui| {
+                            for &mode in &["SORT", "OR", "AND", "XOR", "ADD", "MULT"] {
+                                if ui.selectable_label(cur_default == mode,
+                                    egui::RichText::new(mode).small()).clicked()
+                                {
+                                    next_port_default.push((i, mode));
+                                }
+                            }
+                        });
                 });
             });
             if let Some(dragged_idx) = dropped {
@@ -1930,6 +1954,24 @@ fn show_automap_combiner_body(
         }
         if let Some((from, to)) = to_move {
             combiner_move_input(node_id, inputs, snarl, from, to);
+        }
+        if !next_port_default.is_empty() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let mut map = node.params.get("combiner_port_default")
+                    .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                for (port, mode) in next_port_default {
+                    if mode == "SORT" {
+                        map.remove(&port.to_string()); // SORT is the implicit default.
+                    } else {
+                        map.insert(port.to_string(), Value::String(mode.to_string()));
+                    }
+                }
+                if map.is_empty() {
+                    node.params.remove("combiner_port_default");
+                } else {
+                    node.params.insert("combiner_port_default".to_string(), Value::Object(map));
+                }
+            }
         }
 
         ui.add_space(2.0);
@@ -5761,6 +5803,13 @@ fn render_pinned_element(
             );
             return;
         }
+        ("module.automap_combiner", "whole_module") => {
+            render_combiner_whole_module(
+                inner_id, ui, inner_snarl, container_size,
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
+            return;
+        }
         // Knob slider: scaled-up slider taking the full container width.
         ("module.knob", "value") => {
             render_knob_value(inner_id, ui, inner_snarl, container_size);
@@ -6157,6 +6206,44 @@ fn render_map_action_whole_module(
         },
         remap_hash_mappings,
         |n| remap_hash_draft(n, false),
+    );
+}
+
+/// Hash of the Combiner's resolution settings (input count + per-pin policy /
+/// port overrides + per-port defaults) so the whole-module layout widget
+/// re-bases its scroll when the config changes, mirroring the Remapper's
+/// capture-hash behaviour.
+fn combiner_hash_config(n: &NodeData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    n.inputs.len().hash(&mut h);
+    for key in ["combiner_pin_policy", "combiner_pin_port", "combiner_port_default"] {
+        if let Some(v) = n.params.get(key) {
+            v.to_string().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn render_combiner_whole_module(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    is_layout_mode: bool,
+) {
+    render_remap_whole_module_impl(
+        "combiner", inner_id, ui, inner_snarl, container_size,
+        live_signals, panic_shortcut, automap_parent, is_layout_mode,
+        "Combiner",
+        |id, ins, ui, sn, sigs, _panic, _am| {
+            show_automap_combiner_body(id, ins, ui, sn, sigs);
+        },
+        combiner_hash_config,
+        combiner_hash_config,
     );
 }
 

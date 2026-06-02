@@ -436,12 +436,18 @@ impl Module for MapActionModule {
             display_name: "Map Action",
             category: "AutoMap",
             inputs:  vec![PinDescriptor::new("in",  SignalType::AutoMap)],
-            // Output is Any: digital press modes emit Bool ("any mapping
-            // currently active"); analog mode emits the signed magnitude
-            // of the currently-driving input cardinal as Float so the wire
-            // carries continuous values for the analog stick-direction
-            // remap use case.
-            outputs: vec![PinDescriptor::new("out", SignalType::Any)],
+            // Two separate outputs:
+            //   out        — Bool: "any mapping active". In analog mode this
+            //                is a freq-modulated tap train (Hold → PWM,
+            //                Turbo → ×2 frequency) so a digital destination
+            //                reflects how far the analog input is pushed.
+            //   out_analog — Float 0..1: the pure max magnitude across active
+            //                mappings (digital-active contributes 1.0). Drives
+            //                continuous destinations (axes / triggers).
+            outputs: vec![
+                PinDescriptor::new("Gate",   SignalType::Bool),
+                PinDescriptor::new("Analog", SignalType::Float),
+            ],
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }

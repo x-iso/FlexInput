@@ -61,6 +61,12 @@ fn is_mouse_pin(pin_id: &str) -> bool {
 /// resolution so we never lose detail through resampling.
 pub const STICK_RADIAL_BUCKETS: usize = 72;
 
+/// Default stick deadzone applied when a `device.source` node omits the
+/// `deadzone` param OR no source node exists for a device whose signals
+/// still reach AutoMap consumers (Remapper / Map Action / sink AutoMap).
+/// Must match the UI's `default_deadzone()` so every code path agrees.
+pub const DEFAULT_STICK_DEADZONE: f32 = 0.1;
+
 /// Per-device-source calibration applied before deadzone / gyro_multiplier.
 /// All fields are no-ops when uncalibrated (centers=0, scales=1, ranges=identity).
 #[derive(Clone, Debug)]
@@ -299,12 +305,17 @@ fn preprocess_dev_sigs(
     for snap in &graph.nodes {
         if snap.module_id != "device.source" { continue; }
         let Some(dev_id) = snap.device_id.as_deref() else { continue; };
-        let dz = snap.params.get("deadzone").and_then(|v| v.as_f64()).unwrap_or(0.1) as f32;
+        let dz = snap.params.get("deadzone").and_then(|v| v.as_f64())
+            .map(|v| v as f32).unwrap_or(DEFAULT_STICK_DEADZONE);
         let gm = snap.params.get("gyro_multiplier").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
         let cal = load_device_cal(&snap.params);
         params.insert(dev_id.to_string(), (dz, gm, cal));
     }
-    let default_entry = (0.0_f32, 1.0_f32, DeviceCal::default());
+    // Fallback for devices whose signals reach AutoMap consumers without a
+    // `device.source` node in the graph. Stick deadzone still applies (using
+    // the default) so analog stick→key / stick→button mappings don't pass raw
+    // sub-deadzone jitter through. gyro_multiplier stays at unity.
+    let default_entry = (DEFAULT_STICK_DEADZONE, 1.0_f32, DeviceCal::default());
 
     // ── Pass 1: 3-axis matrix transform for gyro/accel triples ──────────────
     //
@@ -723,6 +734,114 @@ fn apply_turbo(held: bool, gap_ms: f32, slots: &mut [f32], dt: f32) -> bool {
     phase < period_s * 0.5
 }
 
+/// Maximum tap/PWM frequency for analog→digital modulation at full deflection.
+/// Shared by the Remapper, Map Action, and 3DOF-Lean analog dispatch so all
+/// three feel identical. Turbo doubles this.
+pub const ANALOG_DIGITAL_MAX_FREQ_HZ: f32 = 20.0;
+
+/// Drive a DIGITAL (button/key) destination from an analog input magnitude.
+/// Three behaviours, selected by `sustain` (Hold) and `turbo`:
+///
+///   - **Plain** (Hold off): a tap train. `window_ms` is the *minimum* tap
+///     period (lowest frequency); the period shortens as `mag → 1` up to
+///     `MAX_FREQ_HZ` (×2 with Turbo). Each tap is a clean 50%-duty square
+///     wave so it always reads as a distinct tap rather than a held key.
+///   - **Hold** (sustain on): PWM. `window_ms` is the fixed pulse PERIOD and
+///     `mag` is the duty cycle — `mag=0` → flat off, `mag=1` → full gate.
+///     With Turbo the period also shortens with `mag` (PWM + freq-mod).
+///   - **Turbo, Hold off**: same tap train as Plain but at ×2 max frequency.
+///
+/// `mag` is the post-deadzone input deflection in 0..1. `slots[0]` holds the
+/// phase accumulator (seconds in `[0, period)`); it is reset when `mag` is ~0.
+/// Returns whether the digital output is asserted this tick.
+fn analog_digital_pulse(
+    mag: f32,
+    window_ms: f32,
+    sustain: bool,
+    turbo: bool,
+    slots: &mut [f32],
+    dt: f32,
+) -> bool {
+    let mag = mag.clamp(0.0, 1.0);
+    if mag < 0.01 {
+        slots[0] = 0.0;
+        return false;
+    }
+    let max_freq = if turbo {
+        ANALOG_DIGITAL_MAX_FREQ_HZ * 2.0
+    } else {
+        ANALOG_DIGITAL_MAX_FREQ_HZ
+    };
+
+    if sustain {
+        // ── Hold = PWM: duty cycle tracks amplitude ──────────────────────
+        // Period is fixed by window_ms; Turbo additionally scales it down
+        // with amplitude so a harder push pulses faster as well as wider.
+        let base_period = (window_ms / 1000.0).max(0.020);
+        let period = if turbo {
+            (1.0 / (mag * max_freq)).clamp(0.020, base_period)
+        } else {
+            base_period
+        };
+        let on_s = (mag * period).clamp(0.0, period);
+        slots[0] += dt;
+        if slots[0] >= period { slots[0] -= period; }
+        // mag≈1 → on_s≈period → effectively always on (full gate).
+        slots[0] < on_s || on_s >= period
+    } else {
+        // ── Plain / Turbo = tap train: frequency tracks amplitude ────────
+        // `window_ms` sets ONLY the minimum period (lowest tap frequency);
+        // a harder push shortens the period up to `max_freq`. Each tap is a
+        // clean 50%-duty square wave so it always reads as a distinct tap —
+        // NOT a near-held key (the old `tap_on = window_ms` made the duty
+        // ~90% at the period floor, which felt held).
+        let min_period = (window_ms / 1000.0).max(1.0 / max_freq);
+        let period = (1.0 / (mag * max_freq)).max(min_period);
+        slots[0] += dt;
+        if slots[0] >= period { slots[0] -= period; }
+        slots[0] < period * 0.5
+    }
+}
+
+/// When a processed Vec2 (`left_stick`/`right_stick`/`dpad`) arrives on the
+/// AutoMap collector but its X/Y axis pins did NOT (they fell back to raw
+/// device samples), the Vec2 is authoritative — a Vec Response Curve wired on
+/// the whole stick into a Collector port must drive the axes (and the cardinals
+/// derived from them). Split such a Vec2 into its axis pins in `upstream`.
+///
+/// Per-axis overrides are untouched: if the axes ARE present on the collector,
+/// they win (the user processed them individually).
+fn vec2_authoritative_axis_fill(
+    upstream: &mut HashMap<String, Signal>,
+    collector_id: &str,
+    collector_sigs: &HashMap<(String, String), Signal>,
+) {
+    if collector_id.is_empty() { return; }
+    let coll = |pin: &str| collector_sigs.get(&(collector_id.to_string(), pin.to_string())).copied();
+    for (vec2, xa, ya) in [
+        ("left_stick",  "left_stick_x",  "left_stick_y"),
+        ("right_stick", "right_stick_x", "right_stick_y"),
+        ("dpad",        "dpad_x",        "dpad_y"),
+    ] {
+        // Need a Vec2 from the collector to be authoritative about.
+        let Some(Signal::Vec2(v)) = coll(vec2) else { continue; };
+        // Axes absent on the collector → derive them from the Vec2 outright.
+        // Axes present but DISAGREE with the Vec2 → the Vec2 was processed
+        // (e.g. a Vec Response Curve on the whole stick) while the axes are the
+        // unprocessed pass-through, so the Vec2 wins. When they agree (the
+        // common raw case, or per-axis processing that also updated the Vec2),
+        // leave the axes alone.
+        let ax = coll(xa).map(|s| s.as_float());
+        let ay = coll(ya).map(|s| s.as_float());
+        let disagree = |axis: Option<f32>, comp: f32| match axis {
+            Some(a) => (a - comp).abs() > 1e-3,
+            None => true,
+        };
+        if disagree(ax, v.x) { upstream.insert(xa.to_string(), Signal::Float(v.x)); }
+        if disagree(ay, v.y) { upstream.insert(ya.to_string(), Signal::Float(v.y)); }
+    }
+}
+
 fn derive_stick_cardinals(upstream: &mut HashMap<String, Signal>) {
     // Tuned for round-gate sticks where 45° physically caps at ~0.707.
     //   T_CARDINAL — minimum push for a single cardinal to fire when
@@ -761,6 +880,36 @@ fn derive_stick_cardinals(upstream: &mut HashMap<String, Signal>) {
         upstream.insert(down.to_string(),  Signal::Bool(down_on));
         upstream.insert(left.to_string(),  Signal::Bool(left_on));
         upstream.insert(right.to_string(), Signal::Bool(right_on));
+    }
+}
+
+/// Reserved collector-pin-name prefix marking a pin that an upstream consumer
+/// (Remapper) CLAIMED. A downstream Combiner reads these to suppress the same
+/// pin on lower-priority inputs (hierarchy), unless that port's policy is ADD.
+const CONSUMED_PREFIX: &str = "__consumed__:";
+
+/// Write `__consumed__:{pin}` markers into `collector_sigs` under `key` for
+/// every pin a Remapper claimed — both the claimed cardinals/buttons and the
+/// underlying stick axes of any claimed cardinal (so a Combiner suppresses the
+/// raw axis too, not just the synthetic cardinal).
+fn publish_consumed_markers(
+    key: &str,
+    claimed_digital: &HashSet<String>,
+    claimed_analog: &HashSet<String>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    let mark = |pin: &str, collector_sigs: &mut HashMap<(String, String), Signal>| {
+        collector_sigs.insert((key.to_string(), format!("{CONSUMED_PREFIX}{pin}")), Signal::Int(1));
+    };
+    for pin in claimed_digital.iter().chain(claimed_analog.iter()) {
+        mark(pin, collector_sigs);
+        // Suppress the underlying axis AND bundled Vec2 too (covers sticks and
+        // D-pad), otherwise the virtual device regenerates the consumed
+        // direction from the still-raw axis / Vec2.
+        if let Some((axis_pin, _)) = cardinal_axis_for_suppression(pin) {
+            mark(axis_pin, collector_sigs);
+            if let Some(v) = vec2_pin_for_axis(axis_pin) { mark(v, collector_sigs); }
+        }
     }
 }
 
@@ -853,6 +1002,12 @@ fn automap_combiner_publish(
         .and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let port_map = snap.params.get("combiner_pin_port")
         .and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    // Per-PORT default policy: `{ "0": "ADD", "1": "SORT", … }`. Applies to any
+    // pin offered by that port that has no per-pin override. When several ports
+    // offer a pin, the lowest-index (highest-priority) port that actually
+    // carries the pin this tick wins the default. Falls back to global SORT.
+    let port_default_map = snap.params.get("combiner_port_default")
+        .and_then(|v| v.as_object()).cloned().unwrap_or_default();
     let key = format!("combiner:{}", key_uid);
 
     fn clamp_for_pin(pin_id: &str, v: f32) -> f32 {
@@ -907,6 +1062,64 @@ fn automap_combiner_publish(
             }
         }
 
+        // Effective policy: per-pin override > per-port default (from the
+        // lowest-index port that actually carries this pin) > global SORT.
+        let policy: &str = if let Some(p) = policy_map.get(pin.id).and_then(|v| v.as_str()) {
+            p
+        } else {
+            let mut from_port = "SORT";
+            if !port_default_map.is_empty() {
+                for i in 0..input_devs.len() {
+                    let offers = read_pin_at(i, pin.id,
+                        &input_devs, &input_collectors, &collector_sigs, dev_sigs).is_some();
+                    if !offers { continue; }
+                    if let Some(p) = port_default_map.get(&i.to_string()).and_then(|v| v.as_str()) {
+                        from_port = p;
+                        break;
+                    }
+                }
+            }
+            from_port
+        };
+
+        // Hierarchy suppression: if an upstream Remapper on ANY input collector
+        // CONSUMED this pin (mapped it away), the higher-level decision wins for
+        // every port — the pin is dropped from all inputs, including raw-device
+        // ports that still carry it. EXCEPTION: ADD explicitly opts into mixing,
+        // so a Combiner port set to ADD keeps its value.
+        let marker = format!("{CONSUMED_PREFIX}{}", pin.id);
+        let any_consumed = input_collectors.iter().any(|cid| {
+            !cid.is_empty() && collector_sigs.contains_key(&(cid.to_string(), marker.clone()))
+        });
+        if any_consumed && policy != "ADD" {
+            // Hierarchy: a pin an upstream Remapper claimed is owned by that
+            // Remapper. Take ITS (already per-side-suppressed) value — which
+            // clears only the mapped direction, leaving e.g. dpad_right intact —
+            // and ignore the raw ports entirely. The consuming collector is the
+            // FIRST input collector that carries the marker.
+            //
+            // We must WRITE the value (even when it's off/zero), never drop it:
+            // a virtual device latches the last value for any pin it stops
+            // receiving, so a dropped consumed D-pad/button would stay stuck.
+            let consuming = input_collectors.iter().find(|cid| {
+                !cid.is_empty()
+                    && collector_sigs.contains_key(&((*cid).clone(), marker.clone()))
+            }).cloned();
+            let owned = consuming
+                .and_then(|cid| collector_sigs.get(&(cid, pin.id.to_string())).copied());
+            let sig = owned.unwrap_or(match pin.signal_type {
+                flexinput_core::SignalType::Bool => Signal::Bool(false),
+                flexinput_core::SignalType::Vec2 => Signal::Vec2(glam::Vec2::ZERO),
+                flexinput_core::SignalType::Int  => Signal::Int(0),
+                _ => Signal::Float(0.0),
+            });
+            collector_sigs.insert((key.clone(), pin.id.to_string()), sig);
+            // Re-publish the marker so a Combiner-of-Combiners keeps honouring
+            // the hierarchy.
+            collector_sigs.insert((key.clone(), marker.clone()), Signal::Int(1));
+            continue;
+        }
+
         let mut raw: Vec<Signal> = Vec::with_capacity(input_devs.len());
         for i in 0..input_devs.len() {
             if let Some(s) = read_pin_at(i, pin.id,
@@ -916,8 +1129,6 @@ fn automap_combiner_publish(
             }
         }
         if raw.is_empty() { continue; }
-
-        let policy = policy_map.get(pin.id).and_then(|v| v.as_str()).unwrap_or("SORT");
         let resolved: Option<Signal> = match policy {
             "SORT" => raw.into_iter().next(),
             "OR" => match pin.signal_type {
@@ -1135,10 +1346,34 @@ fn automap_selector_publish(
 // ── Sub-patch inner evaluation ────────────────────────────────────────────────
 
 /// Namespaces inner node UIDs under their containing subpatch's UID to avoid
-/// collisions in the shared `state` map when multiple subpatches share inner node indices.
+/// collisions in the shared `state` map (and the `remap:`/`collector:` keys the
+/// UI's AutoMap resolver derives) when multiple subpatches — including nested
+/// ones — share inner node indices.
+///
+/// The previous `(outer << 20) + inner + 1` was NOT injective: a left-shift by
+/// 20 discards high bits, so two different `(outer, inner)` pairs (e.g. a
+/// top-level subpatch's Remapper and a differently-nested one) could alias to
+/// the same UID. That made the two distinct nodes write the SAME collector key,
+/// each clobbering the other's per-frame output (observed as a Remapper's
+/// suppressed D-pad direction leaking through). This uses a splitmix64-style
+/// finalizer over a 128→64 fold of the two operands, which is effectively
+/// collision-free for the small integer node ids in play.
+///
+/// MUST stay identical between the engine eval and the UI's `find_automap_device`
+/// walkers — both call this same function so their keys agree.
 #[inline]
 pub fn namespaced_uid(outer: usize, inner: usize) -> usize {
-    outer.wrapping_shl(20).wrapping_add(inner.wrapping_add(1))
+    // Reserve a marker bit so a namespaced uid never collides with a raw
+    // top-level node uid (which are small snarl indices). +1 on inner keeps
+    // inner==0 distinguishable.
+    let mut z = (outer as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add((inner as u64).wrapping_add(1));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // Force the high bit set so these never alias a plain (small) node uid.
+    (z | 0x8000_0000_0000_0000) as usize
 }
 
 /// Evaluates the inner graph of a sub-patch node.
@@ -1259,394 +1494,8 @@ fn eval_subgraph(
         // does, but publish under the namespaced remap key so downstream
         // sinks (or outer graph routing) can pick up the overrides.
         if snap.module_id == "module.remapper" {
-            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
-            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
-            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let key = format!("remap:{}", ns_uid);
-
-            let mut upstream: HashMap<String, Signal> = HashMap::new();
-            for ap in automap::ALL_PINS {
-                let sig = if !collector_id.is_empty() {
-                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
-                } else { None }
-                .or_else(|| {
-                    if !dev_id.is_empty() {
-                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
-                    } else { None }
-                });
-                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
-            }
-            derive_stick_cardinals(&mut upstream);
-
-            // Touchpad accumulation (click-mode) — reuse the state's aux_f32
-            let touch_click = upstream.get("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
-            let zone_of_x = |x: f32| -> usize {
-                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
-            };
-            let mut touch_only = [false; 3];
-            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
-                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
-                if !active { continue; }
-                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
-                touch_only[zone_of_x(x)] = true;
-            }
-            let ns = state.entry(ns_uid).or_insert_with(NodeState::default);
-            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
-            if !touch_click {
-                ns.aux_f32[0] = 0.0; ns.aux_f32[1] = 0.0; ns.aux_f32[2] = 0.0;
-            } else {
-                for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
-                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
-                    if !active { continue; }
-                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
-                    ns.aux_f32[zone_of_x(x)] = 1.0;
-                }
-            }
-            let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
-            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
-            if touch_click { touch_only = [false;3]; }
-            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
-            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
-            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
-            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
-            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
-            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
-            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
-
-            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
-
-            // Per-mapping effective pass — mirrors the top-level arm.
-            // Analog mode bypasses the press-mode machinery; see top-level
-            // arm comments for the gating rules.
-            let ns2 = state.entry(ns_uid).or_insert_with(NodeState::default);
-            let effective: Vec<bool> = mappings.iter().enumerate().map(|(i, m)| {
-                let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
-                if in_pins.is_empty() { return false; }
-                let mode_s = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-                if mode_s == "analog" {
-                    let mut has_cardinal = false;
-                    let mut any_cardinal_active = false;
-                    let mut all_buttons_held = true;
-                    for p in &in_pins {
-                        if analog_axis_for_cardinal(p).is_some() {
-                            has_cardinal = true;
-                            if analog_cardinal_input_value(&upstream, p) > 0.0 {
-                                any_cardinal_active = true;
-                            }
-                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
-                            all_buttons_held = false;
-                        }
-                    }
-                    return all_buttons_held && (!has_cardinal || any_cardinal_active);
-                }
-                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
-                    // Mixed chord: every non-cardinal pin must be currently
-                    // held while the stick gesture is completed.
-                    let buttons_held = in_pins.iter().all(|p| {
-                        if gesture_pin_to_bit(p).is_some() { return true; }
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    });
-                    let visited = gesture_state_get(ns2, i);
-                    buttons_held && gesture_tick(required, visited, &upstream)
-                } else {
-                    in_pins.iter().all(|p| {
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    })
-                };
-                let mode = PressMode::from_str(mode_s);
-                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-                let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-                let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                let slots = press_state_get(ns2, i);
-                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
-            }).collect();
-
-            let mut sorted_idx: Vec<usize> = (0..mappings.len()).collect();
-            sorted_idx.sort_by(|&a, &b| {
-                let la = mappings[a].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                let lb = mappings[b].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                lb.cmp(&la)
-            });
-            let mut triggered: Vec<(Vec<String>, Vec<String>, bool, usize)> = Vec::new();
-            let mut triggered_claims: Vec<(usize, Vec<String>)> = Vec::new();
-            for &i in &sorted_idx {
-                let m = &mappings[i];
-                let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                if in_pins.is_empty() { continue; }
-                if !effective[i] { continue; }
-                let my_len = in_pins.len();
-                let suppressed = triggered_claims.iter().any(|(claim_len, claim_pins)| {
-                    *claim_len > my_len && in_pins.iter().all(|p| claim_pins.contains(p))
-                });
-                if suppressed { continue; }
-                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
-                let mut sorted_in = in_pins.clone();
-                sorted_in.sort();
-                triggered_claims.push((my_len, sorted_in));
-                triggered.push((in_pins, out_pins, is_analog, i));
-            }
-            let mut claimed_inputs_digital: HashSet<String> = HashSet::new();
-            let mut claimed_inputs_analog:  HashSet<String> = HashSet::new();
-            for (in_pins, _, is_analog, _) in &triggered {
-                let target = if *is_analog { &mut claimed_inputs_analog } else { &mut claimed_inputs_digital };
-                for p in in_pins { target.insert(p.clone()); }
-            }
-            let analog_axis_suppress = analog_axis_suppression(&claimed_inputs_analog);
-
-            for ap in automap::ALL_PINS {
-                let mut digital_suppress = claimed_inputs_digital.contains(ap.id);
-                if !digital_suppress {
-                    for cardinal in &claimed_inputs_digital {
-                        if let Some((axis_pin, _)) = analog_axis_for_cardinal(cardinal) {
-                            if axis_pin == ap.id { digital_suppress = true; break; }
-                        }
-                    }
-                }
-                let sig = if digital_suppress {
-                    match ap.signal_type {
-                        SignalType::Bool  => Signal::Bool(false),
-                        SignalType::Float => Signal::Float(0.0),
-                        SignalType::Vec2  => Signal::Vec2(Vec2::ZERO),
-                        SignalType::Int   => Signal::Int(0),
-                        _ => continue,
-                    }
-                } else if let Some(raw) = read_upstream(ap.id) {
-                    if let Some(&(neg, pos)) = analog_axis_suppress.get(&ap.id) {
-                        match raw {
-                            Signal::Float(v) => Signal::Float(apply_axis_clamp(v, (neg, pos))),
-                            other => other,
-                        }
-                    } else if matches!(ap.id, "left_stick" | "right_stick") {
-                        let (xa, ya) = if ap.id == "left_stick" {
-                            ("left_stick_x", "left_stick_y")
-                        } else {
-                            ("right_stick_x", "right_stick_y")
-                        };
-                        let xs = analog_axis_suppress.get(&xa).copied().unwrap_or((false, false));
-                        let ys = analog_axis_suppress.get(&ya).copied().unwrap_or((false, false));
-                        if xs == (false, false) && ys == (false, false) {
-                            raw
-                        } else if let Signal::Vec2(v) = raw {
-                            Signal::Vec2(Vec2::new(
-                                apply_axis_clamp(v.x, xs),
-                                apply_axis_clamp(v.y, ys),
-                            ))
-                        } else { raw }
-                    } else {
-                        raw
-                    }
-                } else {
-                    continue;
-                };
-                collector_sigs.insert((key.clone(), ap.id.to_string()), sig);
-            }
-            {
-                let mut local_up: HashMap<String, Signal> = HashMap::new();
-                for axis in ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"] {
-                    if let Some(&sig) = collector_sigs.get(&(key.clone(), axis.to_string())) {
-                        local_up.insert(axis.to_string(), sig);
-                    }
-                }
-                derive_stick_cardinals(&mut local_up);
-                for (k, v) in local_up {
-                    if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
-                        || k.ends_with("_left") || k.ends_with("_right"))
-                    {
-                        collector_sigs.insert((key.clone(), k), v);
-                    }
-                }
-            }
-
-            // Analog override (identical input+output chord, later wins). Two
-            // analog mappings that share an input but target DIFFERENT outputs
-            // (e.g. left_stick_up→right_trigger AND left_stick_up→left_stick_up
-            // to keep the stick output) must BOTH fire and accumulate — only a
-            // true duplicate (same inputs AND same outputs) is overridden.
-            let mut analog_emit_idx: Vec<usize> = Vec::new();
-            {
-                let mut analog_indices: Vec<usize> = (0..triggered.len())
-                    .filter(|&t| triggered[t].2)
-                    .collect();
-                analog_indices.sort_by_key(|&t| triggered[t].3);
-                let sorted_set = |v: &Vec<String>| -> Vec<String> {
-                    let mut s = v.clone(); s.sort(); s
-                };
-                let mut keep: Vec<bool> = vec![true; analog_indices.len()];
-                for a in 0..analog_indices.len() {
-                    if !keep[a] { continue; }
-                    let (ref ain, ref aout, _, _) = triggered[analog_indices[a]];
-                    let (a_in, a_out) = (sorted_set(ain), sorted_set(aout));
-                    for b in (a + 1)..analog_indices.len() {
-                        let (ref bin, ref bout, _, _) = triggered[analog_indices[b]];
-                        if a_in == sorted_set(bin) && a_out == sorted_set(bout) {
-                            keep[a] = false; break;
-                        }
-                    }
-                }
-                for (a, t_idx) in analog_indices.iter().enumerate() {
-                    if keep[a] { analog_emit_idx.push(*t_idx); }
-                }
-            }
-
-            let mut analog_axis_acc: HashMap<&'static str, f32> = HashMap::new();
-            let mut analog_button_out: HashSet<String> = HashSet::new();
-            for &t_idx in &analog_emit_idx {
-                let (ref in_pins, ref out_pins, _, orig_i) = triggered[t_idx];
-                let m = &mappings[orig_i];
-                let turbo  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-                let slots = press_state_get(ns2, orig_i);
-                let n = in_pins.len().min(out_pins.len());
-                for (in_p, out_p) in in_pins[..n].iter().zip(out_pins[..n].iter()) {
-                    let in_is_cardinal = analog_axis_for_cardinal(in_p).is_some();
-                    let out_axis_opt = analog_axis_for_cardinal(out_p);
-                    let out_trigger = analog_trigger_out(out_p);
-                    let mag_from_input = if in_is_cardinal {
-                        analog_cardinal_input_value(&upstream, in_p)
-                    } else { 1.0 };
-                    if let Some((axis_pin, sign)) = out_axis_opt {
-                        let contrib = sign * mag_from_input;
-                        let entry = analog_axis_acc.entry(axis_pin).or_insert(0.0);
-                        *entry += contrib;
-                    } else if let Some(trigger_pin) = out_trigger {
-                        // Triggers are one-sided 0..1 axes. Mapping a stick
-                        // cardinal → trigger in analog mode drives the trigger
-                        // with the input's live magnitude (the whole point of
-                        // analog mode on a pad like Switch Pro that lacks analog
-                        // triggers of its own). Accumulate unsigned magnitude.
-                        let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
-                        *entry += mag_from_input.max(0.0);
-                    } else {
-                        let active = if turbo {
-                            apply_turbo(true, window_ms, slots, dt)
-                        } else { true };
-                        if active { analog_button_out.insert(out_p.clone()); }
-                    }
-                }
-            }
-            for (axis_pin, v) in &analog_axis_acc {
-                let clamped = v.clamp(-1.0, 1.0);
-                collector_sigs.insert((key.clone(), (*axis_pin).to_string()), Signal::Float(clamped));
-            }
-            // Update bundled Vec2 pins so downstream sinks that read the
-            // Vec2 form (`left_stick`/`right_stick`) see the analog-driven
-            // values too. Without this, the sink's Vec2-vs-axis conflict
-            // resolver picks the Vec2 (which still carries the suppressed
-            // pass-through) and drops the analog axis writes.
-            for (vec2_pin, x_axis, y_axis) in [
-                ("left_stick", "left_stick_x", "left_stick_y"),
-                ("right_stick", "right_stick_x", "right_stick_y"),
-            ] {
-                let x_override = analog_axis_acc.get(&x_axis).copied();
-                let y_override = analog_axis_acc.get(&y_axis).copied();
-                if x_override.is_none() && y_override.is_none() { continue; }
-                let cur = collector_sigs.get(&(key.clone(), vec2_pin.to_string()))
-                    .and_then(|s| if let Signal::Vec2(v) = s { Some(*v) } else { None })
-                    .unwrap_or(Vec2::ZERO);
-                let x = x_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.x);
-                let y = y_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.y);
-                collector_sigs.insert((key.clone(), vec2_pin.to_string()), Signal::Vec2(Vec2::new(x, y)));
-            }
-
-            // Digital publish pass.
-            let mut digital_all_out_pins: HashSet<String> = HashSet::new();
-            for m in mappings.iter() {
-                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
-                if is_analog { continue; }
-                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
-                    for v in arr { if let Some(s) = v.as_str() { digital_all_out_pins.insert(s.to_string()); } }
-                }
-            }
-            let mut digital_asserted: HashSet<String> = HashSet::new();
-            for (_, out_pins, is_analog, _) in &triggered {
-                if *is_analog { continue; }
-                for p in out_pins { digital_asserted.insert(p.clone()); }
-            }
-            for out_pin in &digital_all_out_pins {
-                let sig_type = automap::ALL_PINS.iter()
-                    .find(|p| p.id == out_pin.as_str())
-                    .map(|p| p.signal_type)
-                    .unwrap_or(SignalType::Bool);
-                let on = digital_asserted.contains(out_pin);
-                if on {
-                    let sig = match sig_type {
-                        SignalType::Float => Signal::Float(1.0),
-                        SignalType::Vec2  => continue,
-                        SignalType::Int   => Signal::Int(1),
-                        _                 => Signal::Bool(true),
-                    };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
-                } else {
-                    if upstream.contains_key(out_pin.as_str()) { continue; }
-                    if analog_button_out.contains(out_pin)
-                        || analog_axis_acc.iter().any(|(ap, _)| *ap == out_pin.as_str())
-                    {
-                        continue;
-                    }
-                    let sig = match sig_type {
-                        SignalType::Float => Signal::Float(0.0),
-                        SignalType::Vec2  => continue,
-                        SignalType::Int   => Signal::Int(0),
-                        _                 => Signal::Bool(false),
-                    };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
-                }
-            }
-
-            // Analog button-out emissions + release pass.
-            let mut analog_button_pins: HashSet<String> = HashSet::new();
-            for m in mappings.iter() {
-                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
-                if !is_analog { continue; }
-                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            // Triggers are analog axes (handled by analog_axis_acc),
-                            // not buttons — exclude them from the binary on/off
-                            // release pass or it would clobber the analog value.
-                            if analog_axis_for_cardinal(s).is_none()
-                                && analog_trigger_out(s).is_none()
-                            {
-                                analog_button_pins.insert(s.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            for out_pin in &analog_button_pins {
-                if digital_asserted.contains(out_pin) { continue; }
-                let on = analog_button_out.contains(out_pin);
-                let sig_type = automap::ALL_PINS.iter()
-                    .find(|p| p.id == out_pin.as_str())
-                    .map(|p| p.signal_type)
-                    .unwrap_or(SignalType::Bool);
-                if on {
-                    let sig = match sig_type {
-                        SignalType::Float => Signal::Float(1.0),
-                        SignalType::Vec2  => continue,
-                        SignalType::Int   => Signal::Int(1),
-                        _                 => Signal::Bool(true),
-                    };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
-                } else {
-                    if upstream.contains_key(out_pin.as_str()) { continue; }
-                    let sig = match sig_type {
-                        SignalType::Float => Signal::Float(0.0),
-                        SignalType::Vec2  => continue,
-                        SignalType::Int   => Signal::Int(0),
-                        _                 => Signal::Bool(false),
-                    };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
-                }
-            }
+            // Shared Remapper evaluation (identical at top level and in sub-patches).
+            eval_remapper_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
 
             computed[idx] = vec![None];
             continue;
@@ -1656,131 +1505,8 @@ fn eval_subgraph(
         // write last_outputs keyed by the namespaced UID so UI/outer bodies
         // can observe inner output state.
         if snap.module_id == "module.map_action" {
-            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
-            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
-            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let mut upstream: HashMap<String, Signal> = HashMap::new();
-            for ap in automap::ALL_PINS {
-                let sig = if !collector_id.is_empty() {
-                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
-                } else { None }
-                .or_else(|| {
-                    if !dev_id.is_empty() {
-                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
-                    } else { None }
-                });
-                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
-            }
-            derive_stick_cardinals(&mut upstream);
-            let touch_click = upstream.get("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
-            let zone_of_x = |x: f32| -> usize {
-                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
-            };
-            let mut touch_only = [false; 3];
-            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
-                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
-                if !active { continue; }
-                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
-                touch_only[zone_of_x(x)] = true;
-            }
-            let ns = state.entry(ns_uid).or_insert_with(NodeState::default);
-            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
-            if !touch_click { ns.aux_f32[0] = 0.0; ns.aux_f32[1] = 0.0; ns.aux_f32[2] = 0.0; }
-            else {
-                for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
-                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
-                    if !active { continue; }
-                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
-                    ns.aux_f32[zone_of_x(x)] = 1.0;
-                }
-            }
-            let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
-            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
-            if touch_click { touch_only = [false;3]; }
-            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
-            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
-            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
-            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
-            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
-            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
-            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
-            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
-            // Press-mode pass — mirrors Map Action top-level arm.
-            let ns_map = state.entry(ns_uid).or_insert_with(NodeState::default);
-            let mut any_trigger = false;
-            let mut any_analog_present = false;
-            let mut max_analog_mag: f32 = 0.0;
-            for (i, m) in mappings.iter().enumerate() {
-                let (in_pins, mode_s, window_ms, sustain, turbo) = if let Some(arr) = m.as_array() {
-                    let pins: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    (pins, "down", 200.0_f32, false, false)
-                } else {
-                    let pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                        .unwrap_or_default();
-                    let mode = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-                    let win  = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-                    let sus  = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let tur  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                    (pins, mode, win, sus, tur)
-                };
-                if in_pins.is_empty() { continue; }
-                if mode_s == "analog" {
-                    any_analog_present = true;
-                    let mut has_cardinal = false;
-                    let mut any_cardinal_active = false;
-                    let mut all_buttons_held = true;
-                    let mut local_max: f32 = 0.0;
-                    for p in &in_pins {
-                        if analog_axis_for_cardinal(p).is_some() {
-                            has_cardinal = true;
-                            let mag = analog_cardinal_input_value(&upstream, p);
-                            if mag > 0.0 { any_cardinal_active = true; }
-                            if mag > local_max { local_max = mag; }
-                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
-                            all_buttons_held = false;
-                        }
-                    }
-                    let active = all_buttons_held && (!has_cardinal || any_cardinal_active);
-                    let active_after_turbo = if turbo {
-                        let slots = press_state_get(ns_map, i);
-                        apply_turbo(active, window_ms, slots, dt)
-                    } else { active };
-                    if active_after_turbo {
-                        any_trigger = true;
-                        let mag = if has_cardinal { local_max } else { 1.0 };
-                        if mag > max_analog_mag { max_analog_mag = mag; }
-                    }
-                    continue;
-                }
-                // Mirror Remapper digital gesture-mode handling.
-                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
-                    let buttons_held = in_pins.iter().all(|p| {
-                        if gesture_pin_to_bit(p).is_some() { return true; }
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    });
-                    let visited = gesture_state_get(ns_map, i);
-                    buttons_held && gesture_tick(required, visited, &upstream)
-                } else {
-                    in_pins.iter().all(|p| {
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    })
-                };
-                let mode = PressMode::from_str(mode_s);
-                let slots = press_state_get(ns_map, i);
-                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-                let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
-                if held { any_trigger = true; }
-            }
-            let out_sig = if any_analog_present {
-                let mag = if max_analog_mag > 0.0 {
-                    max_analog_mag
-                } else if any_trigger { 1.0 } else { 0.0 };
-                Signal::Float(mag)
-            } else {
-                Signal::Bool(any_trigger)
-            };
-            computed[idx] = vec![Some(out_sig)];
+            // Shared Map Action evaluation (identical at top level and sub-patch).
+            computed[idx] = eval_map_action_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
             last_outputs.insert(ns_uid, computed[idx].clone());
             continue;
         }
@@ -1925,701 +1651,16 @@ pub fn eval_graph_tick(
     for (idx, snap) in graph.nodes.iter().enumerate() {
         // ── module.map_action: AutoMap in → Bool out based on stored mappings ──
         if snap.module_id == "module.map_action" {
-            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
-            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
-            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            // Snapshot upstream values for every canonical pin once.
-            let mut upstream: HashMap<String, Signal> = HashMap::new();
-            for ap in automap::ALL_PINS {
-                let sig = if !collector_id.is_empty() {
-                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
-                } else { None }
-                .or_else(|| {
-                    if !dev_id.is_empty() {
-                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
-                    } else { None }
-                });
-                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
-            }
-            // Derive synthetic pins (stick cardinals + touchpad variants)
-            derive_stick_cardinals(&mut upstream);
-            // Touchpad handling mirrors Remapper's behaviour (click accumulation)
-            let touch_click = upstream.get("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
-            let zone_of_x = |x: f32| -> usize {
-                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
-            };
-            let mut touch_only = [false; 3];
-            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
-                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
-                if !active { continue; }
-                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
-                touch_only[zone_of_x(x)] = true;
-            }
-            // Click-variant zones are stored in per-node state; reuse NodeState aux_f32
-            let ns = state.entry(snap.node_uid).or_insert_with(NodeState::default);
-            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
-            if !touch_click {
-                ns.aux_f32[0] = 0.0; ns.aux_f32[1] = 0.0; ns.aux_f32[2] = 0.0;
-            } else {
-                for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
-                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
-                    if !active { continue; }
-                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
-                    ns.aux_f32[zone_of_x(x)] = 1.0;
-                }
-            }
-            let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
-            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
-            if touch_click { touch_only = [false;3]; }
-            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
-            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
-            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
-            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
-            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
-            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
-            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
-
-            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
-
-            // Mappings may be in legacy Array<String> form (chord only, mode=down)
-            // or in the new Object form `{ in, mode, window_ms, sustain }`.
-            //
-            // Output signal kind depends on which mode(s) are present:
-            //   - All-digital mappings → emit Bool ("any active").
-            //   - Any analog mapping present → emit Float (max magnitude
-            //     across all active analog mappings, falling back to 1.0
-            //     when only a digital mapping is active so digital triggers
-            //     still drive Float-consuming wires at full deflection).
-            let ns_map = state.entry(snap.node_uid).or_insert_with(NodeState::default);
-            let mut any_trigger = false;
-            let mut any_analog_present = false;
-            let mut max_analog_mag: f32 = 0.0;
-            for (i, m) in mappings.iter().enumerate() {
-                let (in_pins, mode_s, window_ms, sustain, turbo) = if let Some(arr) = m.as_array() {
-                    let pins: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    (pins, "down", 200.0_f32, false, false)
-                } else {
-                    let pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                        .unwrap_or_default();
-                    let mode = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-                    let win  = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-                    let sus  = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let tur  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                    (pins, mode, win, sus, tur)
-                };
-                if in_pins.is_empty() { continue; }
-                if mode_s == "analog" {
-                    any_analog_present = true;
-                    // Combo gate (same as Remapper): all non-cardinal pins
-                    // held AND any cardinal contributing a non-zero mag.
-                    // Track the strongest cardinal magnitude for Float out.
-                    let mut has_cardinal = false;
-                    let mut any_cardinal_active = false;
-                    let mut all_buttons_held = true;
-                    let mut local_max: f32 = 0.0;
-                    for p in &in_pins {
-                        if analog_axis_for_cardinal(p).is_some() {
-                            has_cardinal = true;
-                            let mag = analog_cardinal_input_value(&upstream, p);
-                            if mag > 0.0 { any_cardinal_active = true; }
-                            if mag > local_max { local_max = mag; }
-                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
-                            all_buttons_held = false;
-                        }
-                    }
-                    let active = all_buttons_held && (!has_cardinal || any_cardinal_active);
-                    let active_after_turbo = if turbo {
-                        let slots = press_state_get(ns_map, i);
-                        apply_turbo(active, window_ms, slots, dt)
-                    } else { active };
-                    if active_after_turbo {
-                        any_trigger = true;
-                        // For pure-button analog (no cardinal), magnitude
-                        // defaults to 1.0 so the Float still pulses to 1
-                        // during the gated tick.
-                        let mag = if has_cardinal { local_max } else { 1.0 };
-                        if mag > max_analog_mag { max_analog_mag = mag; }
-                    }
-                    continue;
-                }
-                // All-cardinal chords on a single stick can't be
-                // simultaneously held — use the gesture-visited bitmap so
-                // half-circles and full sweeps complete the combo. Mirrors
-                // Remapper's digital path.
-                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
-                    let buttons_held = in_pins.iter().all(|p| {
-                        if gesture_pin_to_bit(p).is_some() { return true; }
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    });
-                    let visited = gesture_state_get(ns_map, i);
-                    buttons_held && gesture_tick(required, visited, &upstream)
-                } else {
-                    in_pins.iter().all(|p| {
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    })
-                };
-                let mode = PressMode::from_str(mode_s);
-                let slots = press_state_get(ns_map, i);
-                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-                let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
-                if held { any_trigger = true; }
-            }
-
-            let out_sig = if any_analog_present {
-                // Float output when analog mode is in play. Digital trigger
-                // contributes a magnitude of 1.0 (full deflection) so the
-                // same Float wire works for mixed digital+analog mappings.
-                let mag = if max_analog_mag > 0.0 {
-                    max_analog_mag
-                } else if any_trigger { 1.0 } else { 0.0 };
-                Signal::Float(mag)
-            } else {
-                Signal::Bool(any_trigger)
-            };
-            computed[idx] = vec![Some(out_sig)];
-            // Populate last_outputs for this node so the UI can display per-pin
-            // signal glow (mirrors the general-path behaviour below).
+            // Shared Map Action evaluation (identical at top level and sub-patch).
+            computed[idx] = eval_map_action_node(snap, snap.node_uid, dev_sigs, &collector_sigs, state, dt);
             last_outputs.insert(snap.node_uid, computed[idx].clone());
             continue;
         }
 
         // ── module.remapper: pass-through + per-mapping override + consume ────
         if snap.module_id == "module.remapper" {
-            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
-            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
-            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let key = format!("remap:{}", snap.node_uid);
-
-            // Snapshot upstream values for every canonical pin once, so we can
-            // freely mutate collector_sigs below without aliasing the read side.
-            let mut upstream: HashMap<String, Signal> = HashMap::new();
-            for ap in automap::ALL_PINS {
-                let sig = if !collector_id.is_empty() {
-                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
-                } else { None }
-                .or_else(|| {
-                    if !dev_id.is_empty() {
-                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
-                    } else { None }
-                });
-                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
-            }
-            // Derive synthetic cardinal-direction Bool pins from each stick's
-            // (x, y) so they can participate in mapping triggers just like
-            // buttons. See `derive_stick_cardinals` for the dominant-axis rule.
-            derive_stick_cardinals(&mut upstream);
-
-            // Derive touchpad zone pins. Two parallel variants:
-            //   touch_*       — fire whenever a finger is in that zone, click
-            //                   or not. Up to 2 zones at once (one per finger).
-            //                   No accumulation; transient, instantaneous.
-            //   touchpad_*    — fire only while btn_touchpad is held. While
-            //                   held, every zone any finger has visited stays
-            //                   asserted (swipe accumulation) so a drag
-            //                   across all three zones produces a 3-pin chord.
-            //                   Release of btn_touchpad clears the accumulator.
-            // Per-zone override: if touchpad_N (click variant) fires, touch_N
-            // (touch-only) is forced false so a click-mapped zone takes over
-            // from a touch-mapped one rather than firing both.
-            let touch_click = upstream.get("btn_touchpad")
-                .map(|s| s.as_bool()).unwrap_or(false);
-            let zone_of_x = |x: f32| -> usize {
-                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
-            };
-            // Touch-only zones — each active finger asserts exactly one zone
-            // (the one its X currently sits in). Moving a finger from zone A
-            // to zone B drops A and asserts B for that finger. With two
-            // fingers active, two zones can fire simultaneously. No swipe
-            // accumulation here — that's reserved for the click variant.
-            let mut touch_only = [false; 3];
-            for (xpin, apin) in [("touch1_x","touch1_active"),
-                                 ("touch2_x","touch2_active")] {
-                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
-                if !active { continue; }
-                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
-                touch_only[zone_of_x(x)] = true;
-            }
-            // Click-variant zones — accumulated in per-node aux_f32.
-            let ns = state.entry(snap.node_uid).or_insert_with(NodeState::default);
-            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
-            if !touch_click {
-                ns.aux_f32[0] = 0.0;
-                ns.aux_f32[1] = 0.0;
-                ns.aux_f32[2] = 0.0;
-            } else {
-                for (xpin, apin) in [("touch1_x","touch1_active"),
-                                     ("touch2_x","touch2_active")] {
-                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
-                    if !active { continue; }
-                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
-                    ns.aux_f32[zone_of_x(x)] = 1.0;
-                }
-            }
-            let click_zone = [
-                ns.aux_f32[0] > 0.5,
-                ns.aux_f32[1] > 0.5,
-                ns.aux_f32[2] > 0.5,
-            ];
-            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
-            // Click suppresses all touch-only zones — once btn_touchpad
-            // fires, the click variants own the touchpad.
-            if touch_click {
-                touch_only[0] = false;
-                touch_only[1] = false;
-                touch_only[2] = false;
-            }
-            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
-            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
-            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
-            // touchpad_any — "click anywhere on the pad". Available via the
-            // Special… dropdown only (not auto-captured) so users opt in.
-            // Fires together with the specific-zone pin additively.
-            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
-            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
-            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
-            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
-
-            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
-
-            // Per-mapping press mode is stored under `mode` + `window_ms` +
-            // `sustain` on each mapping. The state machine must run for every
-            // mapping every tick (not just claimed ones) so Short / Long /
-            // Double detect edges without dropouts. Compute `effective_held`
-            // for each in original index order, then run the sort + claim pass
-            // using those values instead of re-reading raw input state.
-            //
-            // Analog mode is gated differently from digital modes:
-            //   - Non-cardinal `in` pins must all be held (combo gate).
-            //   - If any cardinal `in` pin exists, its axis magnitude must
-            //     exceed GESTURE_ACTIVATE_MAG so we know the stick is being
-            //     pushed in (one of) the mapped direction(s).
-            //   - Pure cardinal `in`: just magnitude check, no gesture trace.
-            //   - Press-mode pipeline is bypassed; analog mode owns its own
-            //     "active" definition. Turbo on analog button-outputs is
-            //     applied during the publish pass below.
-            let ns = state.entry(snap.node_uid).or_insert_with(NodeState::default);
-            let effective: Vec<bool> = mappings.iter().enumerate().map(|(i, m)| {
-                let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
-                if in_pins.is_empty() { return false; }
-                let mode_s = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-                if mode_s == "analog" {
-                    // Buttons (non-cardinal) all held? Cardinals: any
-                    // non-zero magnitude is enough — analog mode passes the
-                    // live magnitude through, no activation threshold.
-                    let mut has_cardinal = false;
-                    let mut any_cardinal_active = false;
-                    let mut all_buttons_held = true;
-                    for p in &in_pins {
-                        if analog_axis_for_cardinal(p).is_some() {
-                            has_cardinal = true;
-                            if analog_cardinal_input_value(&upstream, p) > 0.0 {
-                                any_cardinal_active = true;
-                            }
-                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
-                            all_buttons_held = false;
-                        }
-                    }
-                    // Pure-button analog mappings (no cardinal in) reduce to
-                    // "all held" — same as Down mode. Reasonable fallback.
-                    return all_buttons_held && (!has_cardinal || any_cardinal_active);
-                }
-                // Stick-gesture path: when every `in` pin is a stick cardinal,
-                // the chord can never be "simultaneously held" (a single stick
-                // can't be Left AND Right at the same instant). Instead we
-                // track which cardinals have been visited during the active
-                // gesture and fire when all required cardinals across both
-                // sticks have been visited at least once.
-                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
-                    let buttons_held = in_pins.iter().all(|p| {
-                        if gesture_pin_to_bit(p).is_some() { return true; }
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    });
-                    let visited = gesture_state_get(ns, i);
-                    buttons_held && gesture_tick(required, visited, &upstream)
-                } else {
-                    in_pins.iter().all(|p| {
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    })
-                };
-                let mode = PressMode::from_str(mode_s);
-                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-                let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-                let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                let slots = press_state_get(ns, i);
-                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
-            }).collect();
-
-            // Determine which mappings are currently triggered. Sort indices
-            // by descending input-set size so longer combos win conflicts;
-            // original indices are preserved so we can look up `effective`
-            // and mapping fields afterwards.
-            let mut sorted_idx: Vec<usize> = (0..mappings.len()).collect();
-            sorted_idx.sort_by(|&a, &b| {
-                let la = mappings[a].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                let lb = mappings[b].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                lb.cmp(&la)
-            });
-
-            // Trigger pass 1: identify triggered mappings and the pins they consume.
-            //
-            // Suppression rule for overlapping mappings:
-            //   - A mapping is suppressed iff a STRICTLY LONGER triggered
-            //     mapping has already claimed all of its inputs (longer
-            //     chord wins over shorter sub-chord).
-            //   - Mappings with the SAME input set are allowed to coexist
-            //     so users can fan one button out to multiple outputs:
-            //     `Y → X` and `Y → Y` both fire when Y is pressed.
-            //
-            // Analog mappings with IDENTICAL input chords have an extra
-            // last-wins override applied during the publish pass below
-            // (user-error guard for conflicting analog writes).
-            let mut triggered: Vec<(Vec<String>, Vec<String>, bool, usize)> = Vec::new(); // (in, out, is_analog, orig_idx)
-            let mut triggered_claims: Vec<(usize, Vec<String>)> = Vec::new();
-            for &i in &sorted_idx {
-                let m = &mappings[i];
-                let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                if in_pins.is_empty() { continue; }
-                if !effective[i] { continue; }
-                let my_len = in_pins.len();
-                let suppressed = triggered_claims.iter().any(|(claim_len, claim_pins)| {
-                    *claim_len > my_len && in_pins.iter().all(|p| claim_pins.contains(p))
-                });
-                if suppressed { continue; }
-                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
-                let mut sorted_in = in_pins.clone();
-                sorted_in.sort();
-                triggered_claims.push((my_len, sorted_in));
-                triggered.push((in_pins, out_pins, is_analog, i));
-            }
-
-            // Claimed inputs split by mode so pass-through suppression for
-            // analog cardinal claims can use axis-side clamping rather than
-            // hard-zeroing the entire axis.
-            let mut claimed_inputs_digital: HashSet<String> = HashSet::new();
-            let mut claimed_inputs_analog: HashSet<String>  = HashSet::new();
-            for (in_pins, _, is_analog, _) in &triggered {
-                let target = if *is_analog { &mut claimed_inputs_analog } else { &mut claimed_inputs_digital };
-                for p in in_pins { target.insert(p.clone()); }
-            }
-            let analog_axis_suppress = analog_axis_suppression(&claimed_inputs_analog);
-
-            // Pass-through every canonical pin first, suppressing claimed inputs.
-            // Digital-claimed pins zero out fully; analog-claimed cardinals
-            // clamp the axis to the opposite side only.
-            for ap in automap::ALL_PINS {
-                // Hard suppression for digital-claimed pins (incl. their
-                // axis-pin equivalents when a cardinal was claimed digitally).
-                let mut digital_suppress = claimed_inputs_digital.contains(ap.id);
-                if !digital_suppress {
-                    // A digital-claimed cardinal also zeros its axis pin.
-                    for cardinal in &claimed_inputs_digital {
-                        if let Some((axis_pin, _)) = analog_axis_for_cardinal(cardinal) {
-                            if axis_pin == ap.id { digital_suppress = true; break; }
-                        }
-                    }
-                }
-                let sig = if digital_suppress {
-                    match ap.signal_type {
-                        SignalType::Bool  => Signal::Bool(false),
-                        SignalType::Float => Signal::Float(0.0),
-                        SignalType::Vec2  => Signal::Vec2(Vec2::ZERO),
-                        SignalType::Int   => Signal::Int(0),
-                        _ => continue,
-                    }
-                } else if let Some(raw) = read_upstream(ap.id) {
-                    // Analog suppression for stick axis pins: clamp only the
-                    // consumed side(s).
-                    if let Some(&(neg, pos)) = analog_axis_suppress.get(&ap.id) {
-                        match raw {
-                            Signal::Float(v) => Signal::Float(apply_axis_clamp(v, (neg, pos))),
-                            Signal::Vec2(v) => {
-                                // Axis-named pin only fires for Float; Vec2
-                                // versions ("left_stick") handled separately.
-                                Signal::Vec2(v)
-                            }
-                            other => other,
-                        }
-                    } else if matches!(ap.id, "left_stick" | "right_stick") {
-                        // For the bundled Vec2 pin: apply suppression to
-                        // each component independently.
-                        let (xa, ya) = if ap.id == "left_stick" {
-                            ("left_stick_x", "left_stick_y")
-                        } else {
-                            ("right_stick_x", "right_stick_y")
-                        };
-                        let xs = analog_axis_suppress.get(&xa).copied().unwrap_or((false, false));
-                        let ys = analog_axis_suppress.get(&ya).copied().unwrap_or((false, false));
-                        if xs == (false, false) && ys == (false, false) {
-                            raw
-                        } else if let Signal::Vec2(v) = raw {
-                            Signal::Vec2(Vec2::new(
-                                apply_axis_clamp(v.x, xs),
-                                apply_axis_clamp(v.y, ys),
-                            ))
-                        } else { raw }
-                    } else {
-                        raw
-                    }
-                } else {
-                    continue;
-                };
-                collector_sigs.insert((key.clone(), ap.id.to_string()), sig);
-            }
-
-            // Recompute synthetic cardinals for the (possibly clamped) axes
-            // so downstream consumers see consistent cardinal bools. Reads
-            // from collector_sigs we just wrote, mutates back.
-            {
-                let mut local_up: HashMap<String, Signal> = HashMap::new();
-                for axis in ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"] {
-                    if let Some(&sig) = collector_sigs.get(&(key.clone(), axis.to_string())) {
-                        local_up.insert(axis.to_string(), sig);
-                    }
-                }
-                derive_stick_cardinals(&mut local_up);
-                for (k, v) in local_up {
-                    if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
-                        || k.ends_with("_left") || k.ends_with("_right"))
-                    {
-                        collector_sigs.insert((key.clone(), k), v);
-                    }
-                }
-            }
-
-            // ── Analog publish pass ──────────────────────────────────────
-            //
-            // Apply identical input+output-chord override (last wins). Build the
-            // set of analog mappings to actually emit, suppressing any earlier
-            // analog mapping that is a TRUE duplicate (same inputs AND same
-            // outputs) of a later one. Mappings sharing an input but targeting
-            // different outputs (e.g. left_stick_up→right_trigger alongside
-            // left_stick_up→left_stick_up to keep the stick) both fire.
-            let mut analog_emit_idx: Vec<usize> = Vec::new();
-            {
-                // Walk triggered in original mapping order so "later in the
-                // user's list wins". `triggered` was built in sorted_idx
-                // (longest-first) order; recover original order via the
-                // orig_idx we stored.
-                let mut analog_indices: Vec<usize> = (0..triggered.len())
-                    .filter(|&t| triggered[t].2)
-                    .collect();
-                analog_indices.sort_by_key(|&t| triggered[t].3);
-                let sorted_set = |v: &Vec<String>| -> Vec<String> {
-                    let mut s = v.clone(); s.sort(); s
-                };
-                let mut keep: Vec<bool> = vec![true; analog_indices.len()];
-                for a in 0..analog_indices.len() {
-                    if !keep[a] { continue; }
-                    let (ref ain, ref aout, _, _) = triggered[analog_indices[a]];
-                    let (a_in, a_out) = (sorted_set(ain), sorted_set(aout));
-                    for b in (a + 1)..analog_indices.len() {
-                        let (ref bin, ref bout, _, _) = triggered[analog_indices[b]];
-                        if a_in == sorted_set(bin) && a_out == sorted_set(bout) {
-                            // Later (higher index) wins → suppress earlier dup.
-                            keep[a] = false;
-                            break;
-                        }
-                    }
-                }
-                for (a, t_idx) in analog_indices.iter().enumerate() {
-                    if keep[a] { analog_emit_idx.push(*t_idx); }
-                }
-            }
-
-            // Accumulate cardinal-axis writes additively; track button-output
-            // emissions per output-pin for turbo / sustain handling.
-            let mut analog_axis_acc: HashMap<&'static str, f32> = HashMap::new();
-            let mut analog_button_out: HashSet<String> = HashSet::new();
-            let mut analog_out_pins: HashSet<String> = HashSet::new();
-            for &t_idx in &analog_emit_idx {
-                let (ref in_pins, ref out_pins, _, orig_i) = triggered[t_idx];
-                let m = &mappings[orig_i];
-                let turbo  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-                let slots = press_state_get(ns, orig_i);
-                // Zip in↔out by index; drop the excess from whichever side
-                // is longer.
-                let n = in_pins.len().min(out_pins.len());
-                for (in_p, out_p) in in_pins[..n].iter().zip(out_pins[..n].iter()) {
-                    analog_out_pins.insert(out_p.clone());
-                    let in_is_cardinal  = analog_axis_for_cardinal(in_p).is_some();
-                    let out_axis_opt    = analog_axis_for_cardinal(out_p);
-                    let out_trigger     = analog_trigger_out(out_p);
-                    let mag_from_input = if in_is_cardinal {
-                        analog_cardinal_input_value(&upstream, in_p)
-                    } else {
-                        // Non-cardinal in pin in this slot — when paired with
-                        // a cardinal out, drive it at full magnitude while the
-                        // gate is open (the effective[] check guaranteed all
-                        // non-cardinal buttons are held).
-                        1.0
-                    };
-                    if let Some((axis_pin, sign)) = out_axis_opt {
-                        let contrib = sign * mag_from_input;
-                        // Sum across all (mapping × in/out pair) contributions.
-                        let entry = analog_axis_acc.entry(axis_pin).or_insert(0.0);
-                        *entry += contrib;
-                    } else if let Some(trigger_pin) = out_trigger {
-                        // One-sided 0..1 trigger axis — drive it with the input's
-                        // live magnitude (converts analog stick direction into
-                        // analog trigger travel, incl. on pads lacking analog
-                        // triggers like Switch Pro).
-                        let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
-                        *entry += mag_from_input.max(0.0);
-                    } else {
-                        // Non-cardinal out: button / key. Turbo pulses; else
-                        // straight gate.
-                        let active = if turbo {
-                            apply_turbo(true, window_ms, slots, dt)
-                        } else { true };
-                        if active {
-                            analog_button_out.insert(out_p.clone());
-                        }
-                    }
-                }
-            }
-            // Commit axis accumulator: clamp ±1 then write.
-            for (axis_pin, v) in &analog_axis_acc {
-                let clamped = v.clamp(-1.0, 1.0);
-                collector_sigs.insert((key.clone(), (*axis_pin).to_string()), Signal::Float(clamped));
-            }
-            // Update bundled Vec2 pins so downstream sinks that read the
-            // Vec2 form (`left_stick`/`right_stick`) see the analog-driven
-            // values too. Without this, the sink's Vec2-vs-axis conflict
-            // resolver picks the Vec2 (which still carries the suppressed
-            // pass-through) and drops the analog axis writes.
-            for (vec2_pin, x_axis, y_axis) in [
-                ("left_stick", "left_stick_x", "left_stick_y"),
-                ("right_stick", "right_stick_x", "right_stick_y"),
-            ] {
-                let x_override = analog_axis_acc.get(&x_axis).copied();
-                let y_override = analog_axis_acc.get(&y_axis).copied();
-                if x_override.is_none() && y_override.is_none() { continue; }
-                let cur = collector_sigs.get(&(key.clone(), vec2_pin.to_string()))
-                    .and_then(|s| if let Signal::Vec2(v) = s { Some(*v) } else { None })
-                    .unwrap_or(Vec2::ZERO);
-                let x = x_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.x);
-                let y = y_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.y);
-                collector_sigs.insert((key.clone(), vec2_pin.to_string()), Signal::Vec2(Vec2::new(x, y)));
-            }
-
-            // ── Digital publish pass (existing semantics) ────────────────
-            //
-            // Collect every output pin mentioned in any DIGITAL mapping so
-            // released ones can publish false/0. Analog-only out pins are
-            // handled by the analog pass above.
-            let mut digital_all_out_pins: HashSet<String> = HashSet::new();
-            for (i, m) in mappings.iter().enumerate() {
-                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
-                if is_analog { continue; }
-                let _ = i;
-                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            digital_all_out_pins.insert(s.to_string());
-                        }
-                    }
-                }
-            }
-            let mut digital_asserted: HashSet<String> = HashSet::new();
-            for (_, out_pins, is_analog, _) in &triggered {
-                if *is_analog { continue; }
-                for p in out_pins { digital_asserted.insert(p.clone()); }
-            }
-            for out_pin in &digital_all_out_pins {
-                let sig_type = automap::ALL_PINS.iter()
-                    .find(|p| p.id == out_pin.as_str())
-                    .map(|p| p.signal_type)
-                    .unwrap_or(SignalType::Bool);
-                let on = digital_asserted.contains(out_pin);
-                if on {
-                    let sig = match sig_type {
-                        SignalType::Float => Signal::Float(1.0),
-                        SignalType::Vec2  => continue,
-                        SignalType::Int   => Signal::Int(1),
-                        _                 => Signal::Bool(true),
-                    };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
-                } else {
-                    if upstream.contains_key(out_pin.as_str()) { continue; }
-                    // If an analog mapping has already written this same out
-                    // pin (e.g., the user fans a button to it from a different
-                    // mapping), don't overwrite with zero.
-                    if analog_button_out.contains(out_pin)
-                        || analog_axis_acc.iter().any(|(ap, _)| *ap == out_pin.as_str())
-                    {
-                        continue;
-                    }
-                    let sig = match sig_type {
-                        SignalType::Float => Signal::Float(0.0),
-                        SignalType::Vec2  => continue,
-                        SignalType::Int   => Signal::Int(0),
-                        _                 => Signal::Bool(false),
-                    };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
-                }
-            }
-
-            // ── Analog button-out emissions + release pass ───────────────
-            //
-            // Bool/Int analog out pins: write true while active. For released
-            // analog out pins (mapping inactive this tick), write false/0
-            // only when upstream doesn't naturally emit it (mirrors digital
-            // release rule).
-            let mut analog_button_pins: HashSet<String> = HashSet::new();
-            for m in &mappings {
-                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
-                if !is_analog { continue; }
-                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            // Triggers are analog axes (handled by analog_axis_acc),
-                            // not buttons — exclude them from the binary on/off
-                            // release pass or it would clobber the analog value.
-                            if analog_axis_for_cardinal(s).is_none()
-                                && analog_trigger_out(s).is_none()
-                            {
-                                analog_button_pins.insert(s.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            for out_pin in &analog_button_pins {
-                if digital_asserted.contains(out_pin) { continue; } // digital wins for this pin
-                let on = analog_button_out.contains(out_pin);
-                let sig_type = automap::ALL_PINS.iter()
-                    .find(|p| p.id == out_pin.as_str())
-                    .map(|p| p.signal_type)
-                    .unwrap_or(SignalType::Bool);
-                if on {
-                    let sig = match sig_type {
-                        SignalType::Float => Signal::Float(1.0),
-                        SignalType::Vec2  => continue,
-                        SignalType::Int   => Signal::Int(1),
-                        _                 => Signal::Bool(true),
-                    };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
-                } else {
-                    if upstream.contains_key(out_pin.as_str()) { continue; }
-                    let sig = match sig_type {
-                        SignalType::Float => Signal::Float(0.0),
-                        SignalType::Vec2  => continue,
-                        SignalType::Int   => Signal::Int(0),
-                        _                 => Signal::Bool(false),
-                    };
-                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
-                }
-            }
+            // Shared Remapper evaluation (identical at top level and in sub-patches).
+            eval_remapper_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
 
             computed[idx] = vec![None];
             continue;
@@ -2974,11 +2015,11 @@ pub fn eval_graph_tick(
         // collector (or subpatch outlet) routes them to gamepad/KB sinks.
         //
         // Analog mode is special: instead of treating the side as a
-        // raw_held bool, the module produces a pulse train at frequency
-        // |lean| × MAX_FREQ_HZ, with each pulse held for `window_ms` ms
-        // (sustain on → window_ms × 4 for "long" taps). Released mappings
-        // and below-threshold leans produce no pulses. Press-state slot
-        // [0] tracks the phase seconds in [0, period).
+        // raw_held bool, it drives the destination through the shared
+        // `analog_digital_pulse` modulator — Hold → PWM (duty = |lean|),
+        // Turbo → ×2 max frequency, plain → tap train whose frequency
+        // tracks |lean|. Released mappings and below-threshold leans
+        // produce no pulses. Press-state slot [0] tracks the phase seconds.
         if snap.module_id == "processing.gyro_3dof" {
             lean_dispatch_into_collector_sigs(
                 snap, snap.node_uid, &node_outputs, node_state,
@@ -3991,6 +3032,871 @@ fn analog_axis_for_cardinal(pin_id: &str) -> Option<(&'static str, f32)> {
     }
 }
 
+/// Like `analog_axis_for_cardinal` but ALSO covers D-pad directions. Used only
+/// for SUPPRESSION (zeroing the underlying axis + Vec2 when a cardinal is
+/// claimed), NOT for analog output routing — the D-pad is a quantized digital
+/// hat, so we don't want to drive `dpad_x/y` as a continuous analog axis. But
+/// when a Remapper consumes `dpad_up`, the raw `dpad_y`/`dpad` Vec2 must be
+/// suppressed too, otherwise the virtual device regenerates the Bool D-pad from
+/// them and the claimed direction leaks straight through.
+fn cardinal_axis_for_suppression(pin_id: &str) -> Option<(&'static str, f32)> {
+    match pin_id {
+        "dpad_right" => Some(("dpad_x",  1.0)),
+        "dpad_left"  => Some(("dpad_x", -1.0)),
+        "dpad_up"    => Some(("dpad_y",  1.0)),
+        "dpad_down"  => Some(("dpad_y", -1.0)),
+        _ => analog_axis_for_cardinal(pin_id),
+    }
+}
+
+/// The bundled Vec2 pin id and component (true = y) for a stick/dpad axis pin.
+fn vec2_pin_for_axis(axis_pin: &str) -> Option<&'static str> {
+    match axis_pin {
+        "left_stick_x"  | "left_stick_y"  => Some("left_stick"),
+        "right_stick_x" | "right_stick_y" => Some("right_stick"),
+        "dpad_x"        | "dpad_y"        => Some("dpad"),
+        _ => None,
+    }
+}
+
+/// Per-side suppression derived from a Remapper's CLAIMED cardinals (sticks +
+/// D-pad). For each affected axis pin we record `(neg, pos)` — which side to
+/// clamp to zero. Claiming `dpad_left` clamps only the negative side of
+/// `dpad_x`, leaving `dpad_x` positive and `dpad_y` entirely untouched. The
+/// matching cardinal Bool pins are returned separately to be zeroed directly.
+/// Works for both digital and analog claims — the D-pad is digital but the
+/// per-side rule is identical, and it preserves the directions the user did
+/// NOT map.
+struct CardinalSuppression {
+    /// axis pin → (clamp_negative, clamp_positive)
+    axis_sides: HashMap<&'static str, (bool, bool)>,
+    /// cardinal Bool pins to force false (only the claimed directions)
+    bool_pins: HashSet<&'static str>,
+}
+
+fn cardinal_suppression(claimed: &HashSet<String>) -> CardinalSuppression {
+    let mut axis_sides: HashMap<&'static str, (bool, bool)> = HashMap::new();
+    let mut bool_pins: HashSet<&'static str> = HashSet::new();
+    for cardinal in claimed {
+        if let Some((axis, sign)) = cardinal_axis_for_suppression(cardinal) {
+            let entry = axis_sides.entry(axis).or_insert((false, false));
+            if sign > 0.0 { entry.1 = true; } else { entry.0 = true; }
+            // Canonical cardinal name for the claimed direction.
+            if let Some(name) = CARDINAL_PIN_IDS.iter().find(|n| *n == cardinal) {
+                bool_pins.insert(name);
+            }
+        }
+    }
+    CardinalSuppression { axis_sides, bool_pins }
+}
+
+/// All stick + D-pad cardinal Bool pin ids (used to resolve `&'static str`).
+const CARDINAL_PIN_IDS: &[&str] = &[
+    "left_stick_up", "left_stick_down", "left_stick_left", "left_stick_right",
+    "right_stick_up", "right_stick_down", "right_stick_left", "right_stick_right",
+    "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+];
+
+/// Shared Remapper pass-through + suppression pass, called identically by the
+/// top-level and sub-patch Remapper arms (so the two never diverge). For every
+/// canonical pin it writes `collector_sigs[(key, pin)]`:
+///   - consumed input pins → explicit off
+///   - claimed cardinals → per-side axis/Vec2 clamp + Bool off (sticks + D-pad)
+///   - unmapped pins → raw pass-through
+/// Then recomputes synthetic stick cardinals from the clamped axes and publishes
+/// the consumed-pin markers for downstream Combiner hierarchy suppression.
+/// Evaluate a Remapper node — shared by the top-level loop and the sub-patch
+/// (`eval_subgraph`) loop so the two can never diverge. `uid` is the publishing
+/// id: `snap.node_uid` at top level, the namespaced uid inside a sub-patch. It
+/// keys `collector_sigs["remap:{uid}"]`, the per-node `state`, and `last_outputs`.
+fn eval_remapper_node(
+    snap: &NodeSnap,
+    uid: usize,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+    state: &mut HashMap<usize, NodeState>,
+    dt: f32,
+) {
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let key = format!("remap:{}", uid);
+
+            // Snapshot upstream values for every canonical pin once, so we can
+            // freely mutate collector_sigs below without aliasing the read side.
+            let mut upstream: HashMap<String, Signal> = HashMap::new();
+            for ap in automap::ALL_PINS {
+                let sig = if !collector_id.is_empty() {
+                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
+                } else { None }
+                .or_else(|| {
+                    if !dev_id.is_empty() {
+                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
+                    } else { None }
+                });
+                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+            }
+            // A processed Vec2 on the collector is authoritative over raw axes.
+            vec2_authoritative_axis_fill(&mut upstream, collector_id, &*collector_sigs);
+            // Derive synthetic cardinal-direction Bool pins from each stick's
+            // (x, y) so they can participate in mapping triggers just like
+            // buttons. See `derive_stick_cardinals` for the dominant-axis rule.
+            derive_stick_cardinals(&mut upstream);
+
+            // Derive touchpad zone pins. Two parallel variants:
+            //   touch_*       — fire whenever a finger is in that zone, click
+            //                   or not. Up to 2 zones at once (one per finger).
+            //                   No accumulation; transient, instantaneous.
+            //   touchpad_*    — fire only while btn_touchpad is held. While
+            //                   held, every zone any finger has visited stays
+            //                   asserted (swipe accumulation) so a drag
+            //                   across all three zones produces a 3-pin chord.
+            //                   Release of btn_touchpad clears the accumulator.
+            // Per-zone override: if touchpad_N (click variant) fires, touch_N
+            // (touch-only) is forced false so a click-mapped zone takes over
+            // from a touch-mapped one rather than firing both.
+            let touch_click = upstream.get("btn_touchpad")
+                .map(|s| s.as_bool()).unwrap_or(false);
+            let zone_of_x = |x: f32| -> usize {
+                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
+            };
+            // Touch-only zones — each active finger asserts exactly one zone
+            // (the one its X currently sits in). Moving a finger from zone A
+            // to zone B drops A and asserts B for that finger. With two
+            // fingers active, two zones can fire simultaneously. No swipe
+            // accumulation here — that's reserved for the click variant.
+            let mut touch_only = [false; 3];
+            for (xpin, apin) in [("touch1_x","touch1_active"),
+                                 ("touch2_x","touch2_active")] {
+                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                if !active { continue; }
+                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                touch_only[zone_of_x(x)] = true;
+            }
+            // Click-variant zones — accumulated in per-node aux_f32.
+            let ns = state.entry(uid).or_insert_with(NodeState::default);
+            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
+            if !touch_click {
+                ns.aux_f32[0] = 0.0;
+                ns.aux_f32[1] = 0.0;
+                ns.aux_f32[2] = 0.0;
+            } else {
+                for (xpin, apin) in [("touch1_x","touch1_active"),
+                                     ("touch2_x","touch2_active")] {
+                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                    if !active { continue; }
+                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                    ns.aux_f32[zone_of_x(x)] = 1.0;
+                }
+            }
+            let click_zone = [
+                ns.aux_f32[0] > 0.5,
+                ns.aux_f32[1] > 0.5,
+                ns.aux_f32[2] > 0.5,
+            ];
+            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
+            // Click suppresses all touch-only zones — once btn_touchpad
+            // fires, the click variants own the touchpad.
+            if touch_click {
+                touch_only[0] = false;
+                touch_only[1] = false;
+                touch_only[2] = false;
+            }
+            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
+            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
+            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
+            // touchpad_any — "click anywhere on the pad". Available via the
+            // Special… dropdown only (not auto-captured) so users opt in.
+            // Fires together with the specific-zone pin additively.
+            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
+            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
+            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
+            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
+
+            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
+
+            // Per-mapping press mode is stored under `mode` + `window_ms` +
+            // `sustain` on each mapping. The state machine must run for every
+            // mapping every tick (not just claimed ones) so Short / Long /
+            // Double detect edges without dropouts. Compute `effective_held`
+            // for each in original index order, then run the sort + claim pass
+            // using those values instead of re-reading raw input state.
+            //
+            // Analog mode is gated differently from digital modes:
+            //   - Non-cardinal `in` pins must all be held (combo gate).
+            //   - If any cardinal `in` pin exists, its axis magnitude must
+            //     exceed GESTURE_ACTIVATE_MAG so we know the stick is being
+            //     pushed in (one of) the mapped direction(s).
+            //   - Pure cardinal `in`: just magnitude check, no gesture trace.
+            //   - Press-mode pipeline is bypassed; analog mode owns its own
+            //     "active" definition. Turbo on analog button-outputs is
+            //     applied during the publish pass below.
+            let ns = state.entry(uid).or_insert_with(NodeState::default);
+            let effective: Vec<bool> = mappings.iter().enumerate().map(|(i, m)| {
+                let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if in_pins.is_empty() { return false; }
+                let mode_s = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+                if mode_s == "analog" {
+                    // Buttons (non-cardinal) all held? Cardinals: any
+                    // non-zero magnitude is enough — analog mode passes the
+                    // live magnitude through, no activation threshold.
+                    let mut has_cardinal = false;
+                    let mut any_cardinal_active = false;
+                    let mut all_buttons_held = true;
+                    for p in &in_pins {
+                        if analog_axis_for_cardinal(p).is_some() {
+                            has_cardinal = true;
+                            if analog_cardinal_input_value(&upstream, p) > 0.0 {
+                                any_cardinal_active = true;
+                            }
+                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
+                            all_buttons_held = false;
+                        }
+                    }
+                    // Pure-button analog mappings (no cardinal in) reduce to
+                    // "all held" — same as Down mode. Reasonable fallback.
+                    return all_buttons_held && (!has_cardinal || any_cardinal_active);
+                }
+                // Stick-gesture path: when every `in` pin is a stick cardinal,
+                // the chord can never be "simultaneously held" (a single stick
+                // can't be Left AND Right at the same instant). Instead we
+                // track which cardinals have been visited during the active
+                // gesture and fire when all required cardinals across both
+                // sticks have been visited at least once.
+                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
+                    let buttons_held = in_pins.iter().all(|p| {
+                        if gesture_pin_to_bit(p).is_some() { return true; }
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    });
+                    let visited = gesture_state_get(ns, i);
+                    buttons_held && gesture_tick(required, visited, &upstream)
+                } else {
+                    in_pins.iter().all(|p| {
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    })
+                };
+                let mode = PressMode::from_str(mode_s);
+                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+                let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                let slots = press_state_get(ns, i);
+                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
+                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
+            }).collect();
+
+            // Physical-hold state per mapping, INDEPENDENT of press mode — true
+            // whenever the mapping's input chord is currently held/deflected.
+            // Used for input SUPPRESSION: a consumed input must stay suppressed
+            // for as long as it is held, even when the press-mode gate (on-press
+            // pulse, double-tap window, etc.) is momentarily closed. Otherwise
+            // the raw input would leak through while the user keeps holding it.
+            let held_now: Vec<bool> = mappings.iter().map(|m| {
+                let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if in_pins.is_empty() { return false; }
+                in_pins.iter().all(|p| {
+                    if analog_axis_for_cardinal(p).is_some() {
+                        analog_cardinal_input_value(&upstream, p) > 0.0
+                    } else {
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    }
+                })
+            }).collect();
+
+            // Determine which mappings are currently triggered. Sort indices
+            // by descending input-set size so longer combos win conflicts;
+            // original indices are preserved so we can look up `effective`
+            // and mapping fields afterwards.
+            let mut sorted_idx: Vec<usize> = (0..mappings.len()).collect();
+            sorted_idx.sort_by(|&a, &b| {
+                let la = mappings[a].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let lb = mappings[b].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                lb.cmp(&la)
+            });
+
+            // Trigger pass 1: identify triggered mappings and the pins they consume.
+            //
+            // Suppression rule for overlapping mappings:
+            //   - A mapping is suppressed iff a STRICTLY LONGER triggered
+            //     mapping has already claimed all of its inputs (longer
+            //     chord wins over shorter sub-chord).
+            //   - Mappings with the SAME input set are allowed to coexist
+            //     so users can fan one button out to multiple outputs:
+            //     `Y → X` and `Y → Y` both fire when Y is pressed.
+            //
+            // Analog mappings with IDENTICAL input chords have an extra
+            // last-wins override applied during the publish pass below
+            // (user-error guard for conflicting analog writes).
+            let mut triggered: Vec<(Vec<String>, Vec<String>, bool, usize)> = Vec::new(); // (in, out, is_analog, orig_idx)
+            let mut triggered_claims: Vec<(usize, Vec<String>)> = Vec::new();
+            for &i in &sorted_idx {
+                let m = &mappings[i];
+                let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if in_pins.is_empty() { continue; }
+                if !effective[i] { continue; }
+                let my_len = in_pins.len();
+                let suppressed = triggered_claims.iter().any(|(claim_len, claim_pins)| {
+                    *claim_len > my_len && in_pins.iter().all(|p| claim_pins.contains(p))
+                });
+                if suppressed { continue; }
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                let mut sorted_in = in_pins.clone();
+                sorted_in.sort();
+                triggered_claims.push((my_len, sorted_in));
+                triggered.push((in_pins, out_pins, is_analog, i));
+            }
+
+            // Claimed inputs split by mode so pass-through suppression for
+            // analog cardinal claims can use axis-side clamping rather than
+            // hard-zeroing the entire axis.
+            //
+            // Suppression follows PHYSICAL HOLD (`held_now`), not the press-mode
+            // gate (`effective`/`triggered`): once a mapping consumes an input,
+            // that input is suppressed for as long as it's held, regardless of
+            // press mode. EXCEPTION — an input a mapping routes back to ITSELF
+            // (e.g. `dpad_left → dpad_left`, a deliberate pass-through) is NOT
+            // suppressed, so the user can keep an input while also reacting to it.
+            let mut self_mapped: HashSet<String> = HashSet::new();
+            for m in &mappings {
+                let ins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                let outs: Vec<&str> = m.get("out").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                for p in &ins {
+                    if outs.contains(p) { self_mapped.insert((*p).to_string()); }
+                }
+            }
+            let mut claimed_inputs_digital: HashSet<String> = HashSet::new();
+            let mut claimed_inputs_analog: HashSet<String>  = HashSet::new();
+            for (i, m) in mappings.iter().enumerate() {
+                if !held_now[i] { continue; }
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let target = if is_analog { &mut claimed_inputs_analog } else { &mut claimed_inputs_digital };
+                for p in in_pins {
+                    if self_mapped.contains(&p) { continue; }
+                    target.insert(p);
+                }
+            }
+            // Pass-through + per-side suppression (sticks + D-pad) + consumed
+            // markers — shared with the sub-patch arm so they never diverge.
+            remapper_pass_through_and_suppress(
+                &key, &upstream,
+                &claimed_inputs_digital, &claimed_inputs_analog,
+                collector_sigs,
+            );
+
+            // ── Analog publish pass ──────────────────────────────────────
+            //
+            // Apply identical input+output-chord override (last wins). Build the
+            // set of analog mappings to actually emit, suppressing any earlier
+            // analog mapping that is a TRUE duplicate (same inputs AND same
+            // outputs) of a later one. Mappings sharing an input but targeting
+            // different outputs (e.g. left_stick_up→right_trigger alongside
+            // left_stick_up→left_stick_up to keep the stick) both fire.
+            let mut analog_emit_idx: Vec<usize> = Vec::new();
+            {
+                // Walk triggered in original mapping order so "later in the
+                // user's list wins". `triggered` was built in sorted_idx
+                // (longest-first) order; recover original order via the
+                // orig_idx we stored.
+                let mut analog_indices: Vec<usize> = (0..triggered.len())
+                    .filter(|&t| triggered[t].2)
+                    .collect();
+                analog_indices.sort_by_key(|&t| triggered[t].3);
+                let sorted_set = |v: &Vec<String>| -> Vec<String> {
+                    let mut s = v.clone(); s.sort(); s
+                };
+                let mut keep: Vec<bool> = vec![true; analog_indices.len()];
+                for a in 0..analog_indices.len() {
+                    if !keep[a] { continue; }
+                    let (ref ain, ref aout, _, _) = triggered[analog_indices[a]];
+                    let (a_in, a_out) = (sorted_set(ain), sorted_set(aout));
+                    for b in (a + 1)..analog_indices.len() {
+                        let (ref bin, ref bout, _, _) = triggered[analog_indices[b]];
+                        if a_in == sorted_set(bin) && a_out == sorted_set(bout) {
+                            // Later (higher index) wins → suppress earlier dup.
+                            keep[a] = false;
+                            break;
+                        }
+                    }
+                }
+                for (a, t_idx) in analog_indices.iter().enumerate() {
+                    if keep[a] { analog_emit_idx.push(*t_idx); }
+                }
+            }
+
+            // Accumulate cardinal-axis writes additively; track button-output
+            // emissions per output-pin for turbo / sustain handling.
+            let mut analog_axis_acc: HashMap<&'static str, f32> = HashMap::new();
+            let mut analog_button_out: HashSet<String> = HashSet::new();
+            let mut analog_out_pins: HashSet<String> = HashSet::new();
+            for &t_idx in &analog_emit_idx {
+                let (ref in_pins, ref out_pins, _, orig_i) = triggered[t_idx];
+                let m = &mappings[orig_i];
+                let turbo  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                let sustain = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                let slots = press_state_get(ns, orig_i);
+                // Zip in↔out by index; drop the excess from whichever side
+                // is longer.
+                let n = in_pins.len().min(out_pins.len());
+                for (in_p, out_p) in in_pins[..n].iter().zip(out_pins[..n].iter()) {
+                    analog_out_pins.insert(out_p.clone());
+                    let in_is_cardinal  = analog_axis_for_cardinal(in_p).is_some();
+                    let out_axis_opt    = analog_axis_for_cardinal(out_p);
+                    let out_trigger     = analog_trigger_out(out_p);
+                    let mag_from_input = if in_is_cardinal {
+                        analog_cardinal_input_value(&upstream, in_p)
+                    } else {
+                        // Non-cardinal in pin in this slot — when paired with
+                        // a cardinal out, drive it at full magnitude while the
+                        // gate is open (the effective[] check guaranteed all
+                        // non-cardinal buttons are held).
+                        1.0
+                    };
+                    if let Some((axis_pin, sign)) = out_axis_opt {
+                        let contrib = sign * mag_from_input;
+                        // Sum across all (mapping × in/out pair) contributions.
+                        let entry = analog_axis_acc.entry(axis_pin).or_insert(0.0);
+                        *entry += contrib;
+                    } else if let Some(trigger_pin) = out_trigger {
+                        // One-sided 0..1 trigger axis — drive it with the input's
+                        // live magnitude (converts analog stick direction into
+                        // analog trigger travel, incl. on pads lacking analog
+                        // triggers like Switch Pro).
+                        let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
+                        *entry += mag_from_input.max(0.0);
+                    } else {
+                        // Non-cardinal out: button / key. Analog magnitude
+                        // drives a freq-modulated tap train (or PWM under
+                        // Hold) so a digital destination still reflects HOW
+                        // FAR the stick is pushed — matching the 3DOF-Lean
+                        // analog→digital behaviour.
+                        let active = analog_digital_pulse(
+                            mag_from_input, window_ms, sustain, turbo, slots, dt,
+                        );
+                        if active {
+                            analog_button_out.insert(out_p.clone());
+                        }
+                    }
+                }
+            }
+            // Commit axis accumulator: clamp ±1 then write.
+            for (axis_pin, v) in &analog_axis_acc {
+                let clamped = v.clamp(-1.0, 1.0);
+                collector_sigs.insert((key.clone(), (*axis_pin).to_string()), Signal::Float(clamped));
+            }
+            // Update bundled Vec2 pins so downstream sinks that read the
+            // Vec2 form (`left_stick`/`right_stick`) see the analog-driven
+            // values too. Without this, the sink's Vec2-vs-axis conflict
+            // resolver picks the Vec2 (which still carries the suppressed
+            // pass-through) and drops the analog axis writes.
+            for (vec2_pin, x_axis, y_axis) in [
+                ("left_stick", "left_stick_x", "left_stick_y"),
+                ("right_stick", "right_stick_x", "right_stick_y"),
+            ] {
+                let x_override = analog_axis_acc.get(&x_axis).copied();
+                let y_override = analog_axis_acc.get(&y_axis).copied();
+                if x_override.is_none() && y_override.is_none() { continue; }
+                let cur = collector_sigs.get(&(key.clone(), vec2_pin.to_string()))
+                    .and_then(|s| if let Signal::Vec2(v) = s { Some(*v) } else { None })
+                    .unwrap_or(Vec2::ZERO);
+                let x = x_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.x);
+                let y = y_override.map(|v| v.clamp(-1.0, 1.0)).unwrap_or(cur.y);
+                collector_sigs.insert((key.clone(), vec2_pin.to_string()), Signal::Vec2(Vec2::new(x, y)));
+            }
+
+            // ── Digital publish pass (existing semantics) ────────────────
+            //
+            // Collect every output pin mentioned in any DIGITAL mapping so
+            // released ones can publish false/0. Analog-only out pins are
+            // handled by the analog pass above.
+            let mut digital_all_out_pins: HashSet<String> = HashSet::new();
+            for (i, m) in mappings.iter().enumerate() {
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                if is_analog { continue; }
+                let _ = i;
+                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            digital_all_out_pins.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+            let mut digital_asserted: HashSet<String> = HashSet::new();
+            for (_, out_pins, is_analog, _) in &triggered {
+                if *is_analog { continue; }
+                for p in out_pins { digital_asserted.insert(p.clone()); }
+            }
+            for out_pin in &digital_all_out_pins {
+                let sig_type = automap::ALL_PINS.iter()
+                    .find(|p| p.id == out_pin.as_str())
+                    .map(|p| p.signal_type)
+                    .unwrap_or(SignalType::Bool);
+                let on = digital_asserted.contains(out_pin);
+                if on {
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(1.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(1),
+                        _                 => Signal::Bool(true),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                } else {
+                    if upstream.contains_key(out_pin.as_str()) { continue; }
+                    // If an analog mapping has already written this same out
+                    // pin (e.g., the user fans a button to it from a different
+                    // mapping), don't overwrite with zero.
+                    if analog_button_out.contains(out_pin)
+                        || analog_axis_acc.iter().any(|(ap, _)| *ap == out_pin.as_str())
+                    {
+                        continue;
+                    }
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(0.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(0),
+                        _                 => Signal::Bool(false),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                }
+            }
+
+            // ── Analog button-out emissions + release pass ───────────────
+            //
+            // Bool/Int analog out pins: write true while active. For released
+            // analog out pins (mapping inactive this tick), write false/0
+            // only when upstream doesn't naturally emit it (mirrors digital
+            // release rule).
+            let mut analog_button_pins: HashSet<String> = HashSet::new();
+            for m in &mappings {
+                let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
+                if !is_analog { continue; }
+                if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            // Triggers are analog axes (handled by analog_axis_acc),
+                            // not buttons — exclude them from the binary on/off
+                            // release pass or it would clobber the analog value.
+                            if analog_axis_for_cardinal(s).is_none()
+                                && analog_trigger_out(s).is_none()
+                            {
+                                analog_button_pins.insert(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            for out_pin in &analog_button_pins {
+                if digital_asserted.contains(out_pin) { continue; } // digital wins for this pin
+                let on = analog_button_out.contains(out_pin);
+                let sig_type = automap::ALL_PINS.iter()
+                    .find(|p| p.id == out_pin.as_str())
+                    .map(|p| p.signal_type)
+                    .unwrap_or(SignalType::Bool);
+                if on {
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(1.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(1),
+                        _                 => Signal::Bool(true),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                } else {
+                    if upstream.contains_key(out_pin.as_str()) { continue; }
+                    let sig = match sig_type {
+                        SignalType::Float => Signal::Float(0.0),
+                        SignalType::Vec2  => continue,
+                        SignalType::Int   => Signal::Int(0),
+                        _                 => Signal::Bool(false),
+                    };
+                    collector_sigs.insert((key.clone(), out_pin.clone()), sig);
+                }
+            }
+}
+
+/// Evaluate a Map Action node — shared by the top-level and sub-patch loops.
+/// Returns the 2-element output vec [Bool gate, Float analog]. `uid` is the
+/// publishing id (snap.node_uid at top level, namespaced uid in a sub-patch);
+/// it keys the per-node `state`.
+fn eval_map_action_node(
+    snap: &NodeSnap,
+    uid: usize,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &HashMap<(String, String), Signal>,
+    state: &mut HashMap<usize, NodeState>,
+    dt: f32,
+) -> Vec<Option<Signal>> {
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            let mappings = snap.params.get("mappings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            // Snapshot upstream values for every canonical pin once.
+            let mut upstream: HashMap<String, Signal> = HashMap::new();
+            for ap in automap::ALL_PINS {
+                let sig = if !collector_id.is_empty() {
+                    collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied()
+                } else { None }
+                .or_else(|| {
+                    if !dev_id.is_empty() {
+                        dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied()
+                    } else { None }
+                });
+                if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+            }
+            // A processed Vec2 on the collector is authoritative over raw axes.
+            vec2_authoritative_axis_fill(&mut upstream, collector_id, &collector_sigs);
+            // Derive synthetic pins (stick cardinals + touchpad variants)
+            derive_stick_cardinals(&mut upstream);
+            // Touchpad handling mirrors Remapper's behaviour (click accumulation)
+            let touch_click = upstream.get("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
+            let zone_of_x = |x: f32| -> usize {
+                if x < -1.0/3.0 { 0 } else if x > 1.0/3.0 { 2 } else { 1 }
+            };
+            let mut touch_only = [false; 3];
+            for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                if !active { continue; }
+                let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                touch_only[zone_of_x(x)] = true;
+            }
+            // Click-variant zones are stored in per-node state; reuse NodeState aux_f32
+            let ns = state.entry(uid).or_insert_with(NodeState::default);
+            if ns.aux_f32.len() < 3 { ns.aux_f32.resize(3, 0.0); }
+            if !touch_click {
+                ns.aux_f32[0] = 0.0; ns.aux_f32[1] = 0.0; ns.aux_f32[2] = 0.0;
+            } else {
+                for (xpin, apin) in [("touch1_x","touch1_active"), ("touch2_x","touch2_active")] {
+                    let active = upstream.get(apin).map(|s| s.as_bool()).unwrap_or(false);
+                    if !active { continue; }
+                    let x = upstream.get(xpin).map(|s| sig_scalar(*s)).unwrap_or(0.0);
+                    ns.aux_f32[zone_of_x(x)] = 1.0;
+                }
+            }
+            let click_zone = [ ns.aux_f32[0] > 0.5, ns.aux_f32[1] > 0.5, ns.aux_f32[2] > 0.5 ];
+            let any_zone = click_zone[0] || click_zone[1] || click_zone[2];
+            if touch_click { touch_only = [false;3]; }
+            upstream.insert("touchpad_left".to_string(),   Signal::Bool(click_zone[0]));
+            upstream.insert("touchpad_center".to_string(), Signal::Bool(click_zone[1]));
+            upstream.insert("touchpad_right".to_string(),  Signal::Bool(click_zone[2]));
+            upstream.insert("touchpad_any".to_string(),    Signal::Bool(touch_click && any_zone));
+            upstream.insert("touch_left".to_string(),      Signal::Bool(touch_only[0]));
+            upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
+            upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
+
+            let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
+
+            // Mappings may be in legacy Array<String> form (chord only, mode=down)
+            // or in the new Object form `{ in, mode, window_ms, sustain }`.
+            //
+            // Output signal kind depends on which mode(s) are present:
+            //   - All-digital mappings → emit Bool ("any active").
+            //   - Any analog mapping present → emit Float (max magnitude
+            //     across all active analog mappings, falling back to 1.0
+            //     when only a digital mapping is active so digital triggers
+            //     still drive Float-consuming wires at full deflection).
+            let ns_map = state.entry(uid).or_insert_with(NodeState::default);
+            let mut any_trigger = false;
+            let mut any_analog_present = false;
+            let mut max_analog_mag: f32 = 0.0;
+            for (i, m) in mappings.iter().enumerate() {
+                let (in_pins, mode_s, window_ms, sustain, turbo) = if let Some(arr) = m.as_array() {
+                    let pins: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                    (pins, "down", 200.0_f32, false, false)
+                } else {
+                    let pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let mode = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+                    let win  = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                    let sus  = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let tur  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+                    (pins, mode, win, sus, tur)
+                };
+                if in_pins.is_empty() { continue; }
+                if mode_s == "analog" {
+                    any_analog_present = true;
+                    // Combo gate (same as Remapper): all non-cardinal pins
+                    // held AND any cardinal contributing a non-zero mag.
+                    // Track the strongest cardinal magnitude for Float out.
+                    let mut has_cardinal = false;
+                    let mut any_cardinal_active = false;
+                    let mut all_buttons_held = true;
+                    let mut local_max: f32 = 0.0;
+                    for p in &in_pins {
+                        if analog_axis_for_cardinal(p).is_some() {
+                            has_cardinal = true;
+                            let mag = analog_cardinal_input_value(&upstream, p);
+                            if mag > 0.0 { any_cardinal_active = true; }
+                            if mag > local_max { local_max = mag; }
+                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
+                            all_buttons_held = false;
+                        }
+                    }
+                    let active = all_buttons_held && (!has_cardinal || any_cardinal_active);
+                    // For pure-button analog (no cardinal), magnitude defaults
+                    // to 1.0 while gated so the Float output reads full.
+                    let mag = if !active {
+                        0.0
+                    } else if has_cardinal { local_max } else { 1.0 };
+                    // out_analog: pure magnitude (max across active mappings).
+                    if mag > max_analog_mag { max_analog_mag = mag; }
+                    // out (Bool): freq-modulated tap train / PWM (Hold) / ×2
+                    // (Turbo) driven by the magnitude, so a digital destination
+                    // reflects how far the input is pushed.
+                    let slots = press_state_get(ns_map, i);
+                    if analog_digital_pulse(mag, window_ms, sustain, turbo, slots, dt) {
+                        any_trigger = true;
+                    }
+                    continue;
+                }
+                // All-cardinal chords on a single stick can't be
+                // simultaneously held — use the gesture-visited bitmap so
+                // half-circles and full sweeps complete the combo. Mirrors
+                // Remapper's digital path.
+                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
+                    let buttons_held = in_pins.iter().all(|p| {
+                        if gesture_pin_to_bit(p).is_some() { return true; }
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    });
+                    let visited = gesture_state_get(ns_map, i);
+                    buttons_held && gesture_tick(required, visited, &upstream)
+                } else {
+                    in_pins.iter().all(|p| {
+                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
+                    })
+                };
+                let mode = PressMode::from_str(mode_s);
+                let slots = press_state_get(ns_map, i);
+                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
+                let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+                if held { any_trigger = true; }
+            }
+
+            // Two outputs: out (Bool gate/tap-train) + out_analog (Float mag).
+            // out_analog falls back to 1.0 when only digital mappings drove the
+            // gate so a Float-consuming wire still sees full deflection.
+            let analog_mag = if max_analog_mag > 0.0 {
+                max_analog_mag
+            } else if any_trigger && !any_analog_present { 1.0 } else { max_analog_mag };
+            return vec![
+                Some(Signal::Bool(any_trigger)),
+                Some(Signal::Float(analog_mag.clamp(0.0, 1.0))),
+            ];
+}
+
+fn remapper_pass_through_and_suppress(
+    key: &str,
+    upstream: &HashMap<String, Signal>,
+    claimed_digital: &HashSet<String>,
+    claimed_analog: &HashSet<String>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    let mut all_claimed: HashSet<String> = claimed_digital.clone();
+    all_claimed.extend(claimed_analog.iter().cloned());
+    let suppression = cardinal_suppression(&all_claimed);
+
+    for ap in automap::ALL_PINS {
+        let raw = if all_claimed.contains(ap.id) {
+            None
+        } else {
+            upstream.get(ap.id).copied()
+        };
+        let Some(raw) = raw else {
+            if all_claimed.contains(ap.id) {
+                let off = match ap.signal_type {
+                    SignalType::Bool  => Signal::Bool(false),
+                    SignalType::Float => Signal::Float(0.0),
+                    SignalType::Vec2  => Signal::Vec2(Vec2::ZERO),
+                    SignalType::Int   => Signal::Int(0),
+                    _ => continue,
+                };
+                collector_sigs.insert((key.to_string(), ap.id.to_string()), off);
+            }
+            continue;
+        };
+        let sig = suppress_signal_for_pin(ap.id, raw, &suppression);
+        collector_sigs.insert((key.to_string(), ap.id.to_string()), sig);
+    }
+
+    // Recompute synthetic stick cardinals from the (possibly clamped) axes so
+    // downstream consumers see consistent cardinal bools.
+    {
+        let mut local_up: HashMap<String, Signal> = HashMap::new();
+        for axis in ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"] {
+            if let Some(&sig) = collector_sigs.get(&(key.to_string(), axis.to_string())) {
+                local_up.insert(axis.to_string(), sig);
+            }
+        }
+        derive_stick_cardinals(&mut local_up);
+        for (k, v) in local_up {
+            if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
+                || k.ends_with("_left") || k.ends_with("_right"))
+            {
+                collector_sigs.insert((key.to_string(), k), v);
+            }
+        }
+    }
+
+    publish_consumed_markers(key, claimed_digital, claimed_analog, collector_sigs);
+}
+
+/// Apply per-side `CardinalSuppression` to one pin's raw pass-through value:
+///   - axis Float (`dpad_x`, `left_stick_y`, …): clamp the consumed side(s).
+///   - bundled Vec2 (`dpad`, `left_stick`, …): clamp each component's side(s).
+///   - claimed cardinal Bool: forced false.
+///   - everything else: unchanged.
+/// Only the directions the user mapped are affected; the rest pass through.
+fn suppress_signal_for_pin(
+    pin_id: &str,
+    raw: Signal,
+    sup: &CardinalSuppression,
+) -> Signal {
+    // Claimed cardinal Bool → off.
+    if sup.bool_pins.contains(pin_id) {
+        return Signal::Bool(false);
+    }
+    // Axis Float → side clamp.
+    if let Some(&(neg, pos)) = sup.axis_sides.get(pin_id) {
+        if let Signal::Float(v) = raw {
+            return Signal::Float(apply_axis_clamp(v, (neg, pos)));
+        }
+        return raw;
+    }
+    // Bundled Vec2 → per-component side clamp.
+    let axes: Option<(&str, &str)> = match pin_id {
+        "left_stick"  => Some(("left_stick_x",  "left_stick_y")),
+        "right_stick" => Some(("right_stick_x", "right_stick_y")),
+        "dpad"        => Some(("dpad_x",         "dpad_y")),
+        _ => None,
+    };
+    if let Some((xa, ya)) = axes {
+        let xs = sup.axis_sides.get(xa).copied().unwrap_or((false, false));
+        let ys = sup.axis_sides.get(ya).copied().unwrap_or((false, false));
+        if xs == (false, false) && ys == (false, false) {
+            return raw;
+        }
+        if let Signal::Vec2(v) = raw {
+            return Signal::Vec2(Vec2::new(
+                apply_axis_clamp(v.x, xs),
+                apply_axis_clamp(v.y, ys),
+            ));
+        }
+    }
+    raw
+}
+
 /// Map an analog-mode output pin to its one-sided trigger axis, if it is one.
 /// Triggers are 0..1 (no negative side), so analog mappings drive them with the
 /// input's unsigned magnitude. Returns the trigger pin id, or None for non-trigger
@@ -4021,24 +3927,6 @@ fn analog_cardinal_input_value(upstream: &HashMap<String, Signal>, pin_id: &str)
     signed.max(0.0).min(1.0)
 }
 
-/// For each analog-mode mapping that claims a stick cardinal input, build
-/// the suppression mask: for each axis, which sides (positive / negative)
-/// should be clamped to zero in the pass-through. Pass-through then writes
-/// `clamp(x, neg_clamp, pos_clamp)` where `pos_clamp = 0` if the positive
-/// cardinal is claimed (left_stick_right, etc.) and `neg_clamp = 0` if the
-/// negative cardinal is claimed.
-///
-/// Returns a map from axis pin id → (neg_clamp_to_zero, pos_clamp_to_zero).
-fn analog_axis_suppression(claimed: &HashSet<String>) -> HashMap<&'static str, (bool, bool)> {
-    let mut out: HashMap<&'static str, (bool, bool)> = HashMap::new();
-    for cardinal in claimed {
-        if let Some((axis, sign)) = analog_axis_for_cardinal(cardinal) {
-            let entry = out.entry(axis).or_insert((false, false));
-            if sign > 0.0 { entry.1 = true; } else { entry.0 = true; }
-        }
-    }
-    out
-}
 
 /// Apply axis-side suppression to a stick axis Float value. `(neg, pos)` —
 /// when `neg` is true, clamp negative values to 0; when `pos` is true,
@@ -4099,7 +3987,6 @@ fn lean_dispatch_into_collector_sigs(
     }
 
     let mut asserted: HashMap<String, Signal> = HashMap::new();
-    const MAX_FREQ_HZ: f32 = 20.0;
 
     for (side_idx, side_pair) in [
         (left_active, &lean_left), (right_active, &lean_right),
@@ -4123,13 +4010,13 @@ fn lean_dispatch_into_collector_sigs(
                     slots[0] = 0.0;
                     (false, Some(0.0))
                 } else {
-                    let period = (1.0 / (lean_mag * MAX_FREQ_HZ)).max(0.020);
-                    let mut tap_on_s = (window_ms / 1000.0).max(0.005);
-                    if sustain { tap_on_s *= 4.0; }
-                    tap_on_s = tap_on_s.min(period * 0.9);
-                    slots[0] += dt;
-                    if slots[0] >= period { slots[0] -= period; }
-                    let pulse_on = slots[0] < tap_on_s;
+                    // Shared analog→digital modulation: Hold → PWM (duty =
+                    // lean_mag), Turbo → ×2 max frequency, plain → tap train
+                    // whose frequency tracks lean_mag. Float destinations
+                    // ignore `pulse_on` and use `lean_mag` directly below.
+                    let pulse_on = analog_digital_pulse(
+                        lean_mag, window_ms, sustain, turbo, slots, dt,
+                    );
                     (pulse_on, Some(lean_mag))
                 }
             } else {
@@ -4639,8 +4526,11 @@ mod trigger_tests {
             { "in": ["left_stick_up"], "out": ["right_trigger"], "mode": "analog" }
         ]));
 
+        // Zero-deadzone source so this test measures continuity, not the
+        // deadzone curve (deadzone is covered by the dedicated tests above).
+        let src = source_node(3, "gilrs:switch_pro:0", 0.0);
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
-        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
 
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
@@ -4680,8 +4570,9 @@ mod trigger_tests {
         remap.params.insert("mappings".into(), serde_json::json!([
             { "in": ["left_stick_up"], "out": ["btn_rt_dig"], "mode": "analog" }
         ]));
+        let src = source_node(3, "gilrs:switch_pro:0", 0.0);
         let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
-        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
         let mut state = HashMap::new();
         let mut out = TickOutput::default();
 
@@ -4767,5 +4658,577 @@ mod trigger_tests {
         eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
         let leaked = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()));
         assert!(leaked.is_none(), "bridge off: digital button must not drive analog trigger, got {leaked:?}");
+    }
+
+    /// Build a `device.source` node carrying a `deadzone` param so
+    /// `preprocess_dev_sigs` picks it up for the named device.
+    fn source_node(uid: usize, device_id: &str, deadzone: f32) -> NodeSnap {
+        let mut n = empty_node(uid, "device.source");
+        n.device_id = Some(device_id.to_string());
+        n.params.insert("deadzone".into(), Value::from(deadzone as f64));
+        n
+    }
+
+    // A direct AutoMap wire (device.source → sink) must apply the source
+    // node's stick deadzone. A small stick value inside the deadzone must
+    // collapse to 0 at the sink; a value past it must pass through (rescaled).
+    #[test]
+    fn automap_stick_respects_source_deadzone() {
+        let src = source_node(1, "gilrs:xinput:0", 0.2);
+        let sink = sink_node(2, "virtual.xinput:0", "gilrs:xinput:0", false);
+        let graph = ProcessingGraph { nodes: vec![src, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // Stick nudged to 0.1 — inside the 0.2 deadzone → sink must read 0.
+        let mut dev = HashMap::new();
+        dev.insert(("gilrs:xinput:0".to_string(), "left_stick_x".to_string()), Signal::Float(0.1));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let x = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick_x".to_string()))
+            .map(|s| s.as_float());
+        let lstick_x = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick".to_string()))
+            .and_then(|s| if let Signal::Vec2(v) = s { Some(v.x) } else { None });
+        let v = x.or(lstick_x).unwrap_or(0.0);
+        assert!(v.abs() < 1e-4, "stick inside deadzone must collapse to 0 at sink, got {v}");
+
+        // Stick pushed to 0.6 — past the deadzone → passes through (rescaled).
+        dev.insert(("gilrs:xinput:0".to_string(), "left_stick_x".to_string()), Signal::Float(0.6));
+        eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
+        let x = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick_x".to_string()))
+            .map(|s| s.as_float());
+        let lstick_x = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick".to_string()))
+            .and_then(|s| if let Signal::Vec2(v) = s { Some(v.x) } else { None });
+        let v = x.or(lstick_x).unwrap_or(0.0);
+        assert!(v > 0.01, "stick past deadzone must reach sink, got {v}");
+    }
+
+    /// device.source → Remapper (analog stick-cardinal → key) → keymouse sink.
+    /// Reproduces the user-reported case: WASD via analog-mode stick mapping.
+    fn keymouse_sink_from_remap(uid: usize, remap_uid: usize) -> NodeSnap {
+        let mut n = empty_node(uid, "device.sink");
+        n.sink_target = Some(SinkTarget {
+            device_id: "virtual.keymouse:0".to_string(),
+            pin_ids: canonical_pins(),
+            multi_sources: vec![Vec::new(); canonical_pins().len()],
+            automap_source: Some((format!("remap:{remap_uid}"), canonical_pins())),
+            automap_fallback_dev: None,
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+        });
+        n
+    }
+
+    #[test]
+    fn analog_stick_to_key_respects_source_deadzone() {
+        let dev = "gilrs:xinput:0";
+        let remap_uid = 2usize;
+        let src = source_node(1, dev, 0.3); // 0.3 deadzone on the device.
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["key_w"], "mode": "analog" }
+        ]));
+        let sink = keymouse_sink_from_remap(3, remap_uid);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // Stick pushed UP to 0.15 — INSIDE the 0.3 deadzone. key_w must NOT fire.
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(0.15));
+        eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+        let w = out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "key_w".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        assert!(!w, "stick inside deadzone must NOT fire key_w, but it did");
+
+        // Stick pushed UP to 0.8 — past the deadzone. key_w must fire.
+        sigs.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(0.8));
+        eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+        let w = out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "key_w".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        assert!(w, "stick past deadzone must fire key_w, but it didn't");
+    }
+
+    /// Even when no device.source node carries the deadzone (the device feeds
+    /// AutoMap consumers like the Remapper without its source node present in
+    /// the graph), stick pins must still get the default deadzone rather than
+    /// passing through raw. Regression guard for the "analog stick→key ignores
+    /// deadzone" report.
+    #[test]
+    fn analog_stick_to_key_default_deadzone_without_source_node() {
+        let dev = "gilrs:xinput:0";
+        let remap_uid = 2usize;
+        // No source_node: only remapper + sink. The default deadzone must
+        // still apply (DEFAULT_STICK_DEADZONE), not 0.
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["key_w"], "mode": "analog" }
+        ]));
+        let sink = keymouse_sink_from_remap(3, remap_uid);
+        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // 0.05 is below the default deadzone → key_w must NOT fire.
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(0.05));
+        eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+        let w = out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "key_w".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        assert!(!w, "small stick (below default deadzone) must NOT fire key_w");
+    }
+
+    /// Run the graph for `ticks` frames at `dt`, holding `stick_y`, and return
+    /// (on_count, edge_count) for the keymouse `out_pin`. Edges count rising
+    /// transitions so we can tell a tap train apart from a steady gate.
+    fn count_pulses(
+        dev: &str, remap_uid: usize, out_pin: &str, mode_extra: serde_json::Value,
+        stick_y: f32, ticks: usize, dt: f32,
+    ) -> (usize, usize) {
+        let src = source_node(1, dev, 0.0); // zero deadzone: measure modulation only.
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        let mut mapping = serde_json::json!(
+            { "in": ["left_stick_up"], "out": [out_pin], "mode": "analog" }
+        );
+        if let Some(obj) = mapping.as_object_mut() {
+            if let Some(extra) = mode_extra.as_object() {
+                for (k, v) in extra { obj.insert(k.clone(), v.clone()); }
+            }
+        }
+        remap.params.insert("mappings".into(), serde_json::Value::Array(vec![mapping]));
+        let sink = keymouse_sink_from_remap(3, remap_uid);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(stick_y));
+
+        let mut on = 0usize;
+        let mut edges = 0usize;
+        let mut prev = false;
+        for _ in 0..ticks {
+            eval_graph_tick(&graph, &mut state, &sigs, dt, &mut out);
+            let w = out.sink_outputs.get(&("virtual.keymouse:0".to_string(), out_pin.to_string()))
+                .map(|s| s.as_bool()).unwrap_or(false);
+            if w { on += 1; }
+            if w && !prev { edges += 1; }
+            prev = w;
+        }
+        (on, edges)
+    }
+
+    // Plain analog → digital must produce a TAP TRAIN, and a harder push must
+    // tap MORE often than a light push (frequency tracks amplitude).
+    #[test]
+    fn analog_digital_tap_train_frequency_tracks_amplitude() {
+        let extra = serde_json::json!({ "window_ms": 30.0 });
+        // 1 second at 1ms ticks for clean frequency counting.
+        let (_, edges_light) = count_pulses("gilrs:xinput:0", 2, "key_w", extra.clone(), 0.3, 1000, 0.001);
+        let (_, edges_hard)  = count_pulses("gilrs:xinput:0", 2, "key_w", extra, 1.0, 1000, 0.001);
+        assert!(edges_light >= 2, "light push should still tap a few times, got {edges_light}");
+        assert!(edges_hard > edges_light,
+            "harder push must tap more often: hard={edges_hard} light={edges_light}");
+    }
+
+    // Hold mode → PWM: duty cycle (ON fraction) must track amplitude. A
+    // light push has a low duty; full deflection is (near) always on.
+    #[test]
+    fn analog_digital_hold_pwm_duty_tracks_amplitude() {
+        let extra = serde_json::json!({ "window_ms": 40.0, "sustain": true });
+        let (on_light, _) = count_pulses("gilrs:xinput:0", 2, "key_w", extra.clone(), 0.25, 1000, 0.001);
+        let (on_full, _)  = count_pulses("gilrs:xinput:0", 2, "key_w", extra, 1.0, 1000, 0.001);
+        let duty_light = on_light as f32 / 1000.0;
+        let duty_full  = on_full as f32 / 1000.0;
+        assert!(duty_light > 0.05 && duty_light < 0.6,
+            "light Hold duty should be low-ish, got {duty_light}");
+        assert!(duty_full > 0.9, "full deflection Hold should be near-always-on, got {duty_full}");
+    }
+
+    // Turbo (no Hold) doubles the max frequency, so at full deflection it
+    // taps more often than plain analog at the same window_ms.
+    #[test]
+    fn analog_digital_turbo_doubles_frequency() {
+        let plain = serde_json::json!({ "window_ms": 30.0 });
+        let turbo = serde_json::json!({ "window_ms": 30.0, "turbo": true });
+        let (_, edges_plain) = count_pulses("gilrs:xinput:0", 2, "key_w", plain, 1.0, 1000, 0.001);
+        let (_, edges_turbo) = count_pulses("gilrs:xinput:0", 2, "key_w", turbo, 1.0, 1000, 0.001);
+        assert!(edges_turbo > edges_plain,
+            "turbo must tap faster at full deflection: turbo={edges_turbo} plain={edges_plain}");
+    }
+
+    // Unit-level coverage of the shared analog→digital modulator.
+    #[test]
+    fn analog_digital_pulse_unit() {
+        let dt = 0.001;
+        let run = |mag: f32, window_ms: f32, sustain: bool, turbo: bool| -> (usize, usize) {
+            let mut slots = [0.0f32; PRESS_SLOTS_PER_MAPPING];
+            let mut on = 0usize;
+            let mut edges = 0usize;
+            let mut prev = false;
+            for _ in 0..1000 {
+                let v = analog_digital_pulse(mag, window_ms, sustain, turbo, &mut slots, dt);
+                if v { on += 1; }
+                if v && !prev { edges += 1; }
+                prev = v;
+            }
+            (on, edges)
+        };
+
+        // Zero magnitude → never on.
+        assert_eq!(run(0.0, 30.0, false, false).0, 0, "mag 0 must be silent");
+
+        // Plain tap train: more deflection → more taps.
+        let (_, e_light) = run(0.3, 30.0, false, false);
+        let (_, e_hard)  = run(1.0, 30.0, false, false);
+        assert!(e_hard > e_light, "freq must rise with mag: {e_hard} > {e_light}");
+
+        // Regression: at the REALISTIC default window_ms (200ms) the plain
+        // tap train must be ~50% duty (a clean tap), NOT a near-held key.
+        // The old tap_on=window_ms made this ~90% duty → felt held.
+        let (on_default, edges_default) = run(1.0, 200.0, false, false);
+        let duty = on_default as f32 / 1000.0;
+        assert!(duty > 0.35 && duty < 0.65,
+            "plain tap at default window must be ~50% duty, got {duty} (held-key regression)");
+        assert!(edges_default >= 4, "must actually tap multiple times in 1s, got {edges_default}");
+
+        // Hold PWM: duty tracks magnitude; full → always on.
+        let (on_q, _)    = run(0.25, 40.0, true, false);
+        let (on_full, _) = run(1.0, 40.0, true, false);
+        assert!(on_q > 0 && (on_q as f32 / 1000.0) < 0.6, "quarter duty should be low, got {on_q}/1000");
+        assert!(on_full as f32 / 1000.0 > 0.9, "full Hold should be near always-on, got {on_full}/1000");
+
+        // Turbo doubles frequency at full deflection.
+        let (_, e_plain) = run(1.0, 30.0, false, false);
+        let (_, e_turbo) = run(1.0, 30.0, false, true);
+        assert!(e_turbo > e_plain, "turbo faster: {e_turbo} > {e_plain}");
+    }
+
+    // Processing wired BEFORE a Collector (explicit input port) must be what
+    // the downstream Remapper sees — not the raw device sample. Here a
+    // `module.constant` stands in for a Response Curve that re-maps the stick
+    // amplitude: the device pushes left_stick_y small (raw), but the constant
+    // feeds left_stick_y = 0.9 into the collector port. The Remapper's analog
+    // stick→key mapping must therefore see ~0.9, firing key_w.
+    #[test]
+    fn processing_through_collector_drives_remapper_amplitude() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0);
+
+        // Constant node → emulates Response Curve output (Float 0.9).
+        let mut konst = empty_node(2, "module.constant");
+        konst.n_outputs = 1;
+        konst.params.insert("value".into(), Value::from(0.9_f64));
+
+        // Collector: AutoMap bus (input 0, from device) + explicit port for
+        // left_stick_y (input 1, from the constant). _collect_pin_ids[0] names
+        // that port's pin.
+        let mut collect = empty_node(3, "module.automap_collect");
+        collect.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        collect.params.insert("_collect_pin_ids".into(),
+            Value::Array(vec![Value::String("left_stick_y".into())]));
+        // input_sources: [0]=bus (device.source idx 0 out 0), [1]=constant out 0.
+        collect.input_sources = vec![Some((0, 0)), Some((1, 0))];
+
+        // Remapper reads the collector, maps left_stick_up (analog) → key_w.
+        let remap_uid = 4usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_collector_id".into(),
+            Value::String("collector:3".into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["key_w"], "mode": "analog", "window_ms": 30.0 }
+        ]));
+        let sink = keymouse_sink_from_remap(5, remap_uid);
+
+        let graph = ProcessingGraph { nodes: vec![src, konst, collect, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // Device stick is near-neutral (0.05) — raw would not fire. The
+        // collector override (0.9) should drive the Remapper instead.
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(0.05));
+
+        // Run several ticks; key_w should tap at least once (proves the
+        // processed 0.9 amplitude reached the Remapper, not the raw 0.05).
+        let mut fired = false;
+        for _ in 0..200 {
+            eval_graph_tick(&graph, &mut state, &sigs, 0.001, &mut out);
+            if out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "key_w".to_string()))
+                .map(|s| s.as_bool()).unwrap_or(false)
+            {
+                fired = true; break;
+            }
+        }
+        assert!(fired, "processed amplitude through Collector must drive the Remapper (key_w never fired)");
+    }
+
+    // Combiner hierarchy: a pin a Remapper CONSUMED (mapped away) must not leak
+    // through a lower-priority raw-device port under a non-ADD policy, but ADD
+    // explicitly opts back into mixing.
+    fn combiner_node(
+        uid: usize, remap_uid: usize, raw_dev: &str, policy: &str,
+    ) -> NodeSnap {
+        let mut n = empty_node(uid, "module.automap_combiner");
+        // Port 0 = Remapper collector; Port 1 = raw device.
+        n.params.insert("_automap_input_devs".into(), Value::Array(vec![
+            Value::String(String::new()),
+            Value::String(raw_dev.into()),
+        ]));
+        n.params.insert("_automap_input_collectors".into(), Value::Array(vec![
+            Value::String(format!("remap:{remap_uid}")),
+            Value::String(String::new()),
+        ]));
+        let mut policy_obj = serde_json::Map::new();
+        policy_obj.insert("btn_south".into(), Value::String(policy.into()));
+        n.params.insert("combiner_pin_policy".into(), Value::Object(policy_obj));
+        n.input_sources = vec![Some((0, 0)), Some((1, 0))]; // shape only
+        n
+    }
+
+    fn run_combiner_leak(policy: &str) -> bool {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0);
+        // Remapper consumes btn_south (maps it to btn_west), so btn_south is
+        // claimed and should be suppressed downstream.
+        let remap_uid = 2usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["btn_west"], "mode": "down" }
+        ]));
+        let combiner = combiner_node(3, remap_uid, dev, policy);
+        // Sink auto-maps FROM the combiner.
+        let sink = sink_node(4, "virtual.xinput:0", "combiner:3", false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, combiner, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // Physical btn_south held.
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(true));
+        eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+        // Did btn_south leak to the sink?
+        out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_south".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false)
+    }
+
+    #[test]
+    fn combiner_suppresses_consumed_pin_unless_add() {
+        // SORT (default) and OR must NOT leak the consumed btn_south.
+        assert!(!run_combiner_leak("SORT"), "SORT must suppress consumed btn_south");
+        assert!(!run_combiner_leak("OR"),   "OR must suppress consumed btn_south");
+        // ADD explicitly mixes → the raw-port btn_south is allowed through.
+        assert!(run_combiner_leak("ADD"), "ADD must let the raw btn_south mix through");
+    }
+
+    // Per-PORT default policy: setting the raw port's default to ADD opts that
+    // port back into mixing for ALL its pins (no per-pin override needed), so a
+    // consumed pin leaks through exactly as an explicit per-pin ADD would.
+    #[test]
+    fn combiner_per_port_default_add_opts_into_mixing() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0);
+        let remap_uid = 2usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["btn_west"], "mode": "down" }
+        ]));
+        // Combiner with NO per-pin policy, but port 1 (raw) default = ADD.
+        let mut combiner = empty_node(3, "module.automap_combiner");
+        combiner.params.insert("_automap_input_devs".into(), Value::Array(vec![
+            Value::String(String::new()), Value::String(dev.into()),
+        ]));
+        combiner.params.insert("_automap_input_collectors".into(), Value::Array(vec![
+            Value::String(format!("remap:{remap_uid}")), Value::String(String::new()),
+        ]));
+        let mut port_def = serde_json::Map::new();
+        port_def.insert("1".into(), Value::String("ADD".into()));
+        combiner.params.insert("combiner_port_default".into(), Value::Object(port_def));
+        combiner.input_sources = vec![Some((0, 0)), Some((1, 0))];
+
+        let sink = sink_node(4, "virtual.xinput:0", "combiner:3", false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, combiner, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(true));
+        eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+
+        let leaked = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_south".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        assert!(leaked, "port-default ADD must opt the raw port into mixing (btn_south should pass)");
+    }
+
+    // D-pad PER-SIDE suppression: mapping only `dpad_left` away must suppress
+    // the left direction across ALL three representations (Bool, dpad_x
+    // negative side, dpad Vec2 x-negative) — but leave `dpad_right`, the
+    // positive X side, and the entire Y axis / up-down untouched.
+    #[test]
+    fn dpad_left_mapped_away_suppresses_only_left_side() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0);
+        let remap_uid = 2usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["dpad_left"], "out": ["btn_south"], "mode": "down" }
+        ]));
+        let sink = sink_node(3, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // Physical D-pad: LEFT held (claimed) AND DOWN held (NOT claimed).
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "dpad_left".to_string()), Signal::Bool(true));
+        sigs.insert((dev.to_string(), "dpad_down".to_string()), Signal::Bool(true));
+        sigs.insert((dev.to_string(), "dpad_x".to_string()),    Signal::Float(-1.0));
+        sigs.insert((dev.to_string(), "dpad_y".to_string()),    Signal::Float(-1.0));
+        sigs.insert((dev.to_string(), "dpad".to_string()),      Signal::Vec2(Vec2::new(-1.0, -1.0)));
+        eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+
+        let get_b = |p: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), p.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+        let get_f = |p: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), p.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
+        let dpad_vec = || out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), "dpad".to_string()))
+            .and_then(|s| if let Signal::Vec2(v) = s { Some(*v) } else { None }).unwrap_or(Vec2::ZERO);
+
+        // Mapped target fires.
+        assert!(get_b("btn_south"), "dpad_left→btn_south must fire");
+
+        // The sink resolves Vec2-vs-axis conflicts by keeping ONE form, so read
+        // the effective X/Y as (axis pin) OR (Vec2 component) — whichever the
+        // sink kept.
+        let eff_x = if out.sink_outputs.contains_key(&("virtual.xinput:0".to_string(), "dpad_x".to_string())) {
+            get_f("dpad_x") } else { dpad_vec().x };
+        let eff_y = if out.sink_outputs.contains_key(&("virtual.xinput:0".to_string(), "dpad_y".to_string())) {
+            get_f("dpad_y") } else { dpad_vec().y };
+
+        // LEFT is fully suppressed across all representations.
+        assert!(!get_b("dpad_left"), "dpad_left Bool must be suppressed");
+        assert!(eff_x >= -1e-4, "dpad left (x-negative) must be clamped, got {eff_x}");
+
+        // DOWN (not claimed) must SURVIVE.
+        assert!(get_b("dpad_down"), "unmapped dpad_down Bool must pass through");
+        assert!((eff_y - (-1.0)).abs() < 1e-4, "dpad_y (down) must be untouched, got {eff_y}");
+    }
+
+    // Vec2-authoritative: when the device provides a strong `left_stick` Vec2
+    // but near-zero axis floats, a Collector forwards both, and the Remapper
+    // must derive its axes (and cardinals) from the Vec2 — so an analog
+    // stick→key mapping fires. Guards the "processed whole-stick Vec2 before a
+    // Collector doesn't reach the Remapper" gap.
+    #[test]
+    fn processed_vec2_on_collector_drives_remapper_axes() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0);
+
+        // Collector: pure AutoMap bus pass-through from the device (no explicit
+        // ports). Phase-1 forwards left_stick Vec2 AND the axis floats.
+        let mut collect = empty_node(3, "module.automap_collect");
+        collect.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        collect.input_sources = vec![Some((0, 0))];
+
+        let remap_uid = 4usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_collector_id".into(), Value::String("collector:3".into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["key_w"], "mode": "analog", "window_ms": 30.0 }
+        ]));
+        let sink = keymouse_sink_from_remap(5, remap_uid);
+        let graph = ProcessingGraph { nodes: vec![src, collect, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // Axes near-zero, but the left_stick VEC2 pushed up (y=0.9).
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.0));
+        sigs.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(0.0));
+        sigs.insert((dev.to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(0.0, 0.9)));
+
+        let mut fired = false;
+        for _ in 0..200 {
+            eval_graph_tick(&graph, &mut state, &sigs, 0.001, &mut out);
+            if out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "key_w".to_string()))
+                .map(|s| s.as_bool()).unwrap_or(false) { fired = true; break; }
+        }
+        assert!(fired, "processed left_stick Vec2 must drive the axes the Remapper reads (key_w never fired)");
+    }
+
+    // A consumed input must stay suppressed for as long as it is HELD, even in
+    // a press mode whose output gate is momentary (on-press fires a ~10ms pulse
+    // then closes). Regression for "on-press mapping fires its output then leaks
+    // the raw input while still held".
+    #[test]
+    fn consumed_input_suppressed_while_held_in_on_press_mode() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0);
+        let remap_uid = 2usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["dpad_left"], "out": ["btn_west"], "mode": "on_press" }
+        ]));
+        let sink = sink_node(3, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // Hold D-pad LEFT across many frames (well past the on-press pulse).
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "dpad_left".to_string()), Signal::Bool(true));
+        sigs.insert((dev.to_string(), "dpad_x".to_string()),    Signal::Float(-1.0));
+        sigs.insert((dev.to_string(), "dpad".to_string()),      Signal::Vec2(Vec2::new(-1.0, 0.0)));
+
+        let mut leaked_after_pulse = false;
+        for frame in 0..60 {
+            eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+            // After the first few frames (pulse over), dpad_left must NOT leak.
+            if frame >= 10 {
+                let dl = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "dpad_left".to_string()))
+                    .map(|s| s.as_bool()).unwrap_or(false);
+                let dx = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "dpad_x".to_string()))
+                    .map(|s| s.as_float()).unwrap_or(0.0);
+                let dvx = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "dpad".to_string()))
+                    .and_then(|s| if let Signal::Vec2(v) = s { Some(v.x) } else { None }).unwrap_or(0.0);
+                // effective left value via whichever representation the sink kept
+                let eff = if dl { -1.0 } else { dx.min(dvx) };
+                if eff < -1e-4 { leaked_after_pulse = true; }
+            }
+        }
+        assert!(!leaked_after_pulse, "held dpad_left leaked through after the on-press pulse ended");
+    }
+
+    // The self-map exception: a mapping that routes an input back to ITSELF must
+    // NOT suppress it (deliberate pass-through), even alongside another mapping.
+    #[test]
+    fn self_mapped_input_is_not_suppressed() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0);
+        let remap_uid = 2usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["dpad_left"], "out": ["btn_west"],  "mode": "on_press" },
+            { "in": ["dpad_left"], "out": ["dpad_left"],  "mode": "down" }
+        ]));
+        let sink = sink_node(3, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "dpad_left".to_string()), Signal::Bool(true));
+        for _ in 0..20 { eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out); }
+
+        let dl = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "dpad_left".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        assert!(dl, "self-mapped dpad_left must pass through (not be suppressed)");
     }
 }

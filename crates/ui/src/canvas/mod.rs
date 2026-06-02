@@ -34,6 +34,28 @@ impl Default for DeviceParamDefaults {
     }
 }
 
+/// Bring a loaded `Snarl` up to date with the current module descriptors for
+/// pin-layout changes that can't be expressed through `#[serde(default)]`.
+///
+/// Currently: Map Action gained a second output (`out_analog`, Float) in
+/// addition to its original Bool `out`. Patches saved before that have a single
+/// serialized output pin; append the missing pin so the node renders and wires
+/// correctly. The original wire stays on pin 0 (`out`), exactly as before.
+/// Recurses into sub-patches.
+pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
+    for (_, node) in snarl.nodes_ids_data_mut() {
+        if node.value.module_id == "module.map_action" && node.value.outputs.len() < 2 {
+            node.value.outputs = vec![
+                PinDescriptor::new("Gate",   SignalType::Bool),
+                PinDescriptor::new("Analog", SignalType::Float),
+            ];
+        }
+        if let Some(sp) = node.value.subpatch.as_mut() {
+            migrate_loaded_snarl(&mut sp.snarl);
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct UiPatch {
     pub version: u32,
@@ -1267,6 +1289,7 @@ impl Canvas {
         let mut canvas = Canvas::new();
         canvas.snarl = patch.snarl;
         migrate_ds4_pin_ids(&mut canvas);
+        migrate_loaded_snarl(&mut canvas.snarl);
         Some((
             canvas,
             patch.virtual_device_ids,

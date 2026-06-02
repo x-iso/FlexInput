@@ -460,6 +460,7 @@ pub fn exposable_elements(module_id: &str) -> &'static [(&'static str, &'static 
         "display.vectorscope"  => &[("display", "Vectorscope display")],
         "module.remapper"      => &[("whole_module", "Whole module")],
         "module.map_action"    => &[("whole_module", "Whole module")],
+        "module.automap_combiner" => &[("whole_module", "Whole module")],
         _ => &[],
     }
 }
