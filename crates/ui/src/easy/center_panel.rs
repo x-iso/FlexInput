@@ -1236,6 +1236,23 @@ fn render_subpatch_body(
     // Convert scroll offset to body-local coords (post-scale-inverse).
     let scroll_body = scroll_y / scale;
 
+    // ── Pre-render snapshot for undo capture of pinned-widget value edits ────
+    // The Easy-mode body renders the sub-patch's inner snarl directly through
+    // `show_subpatch_body` below — it bypasses `Canvas::show()`, so the
+    // value-edit detector there never sees these mutations. We replicate the
+    // same gate-and-snapshot the canvas uses: clone the pre-mutation snarl only
+    // on frames where the user is plausibly interacting, then hand it to
+    // `track_value_edits` after the render so a settled gesture (slider release,
+    // value entered, toggle click) commits exactly one undo entry.
+    let needs_snapshot = ui.ctx().input(|i| {
+        i.pointer.any_down()
+            || i.pointer.any_released()
+            || i.pointer.any_pressed()
+            || i.events.iter().any(|e| matches!(e,
+                egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)))
+    });
+    let pre_snapshot = if needs_snapshot { Some(canvas.snarl.clone()) } else { None };
+
     let area_id = egui::Id::new(("easy_subpatch_body_area", outer_id.0));
     egui::Area::new(area_id)
         .order(egui::Order::Middle)
@@ -1327,6 +1344,14 @@ fn render_subpatch_body(
             }
             let _ = scaled_w; // reserved for future right-edge layout
         });
+
+    // Capture any pinned-widget value edit made this frame into undo/redo
+    // (commit-on-settle, coalesced to one entry per gesture). Only runs when we
+    // took a pre-snapshot above, i.e. on interaction frames — idle frames skip
+    // the serialize entirely.
+    if needs_snapshot {
+        canvas.track_value_edits(ui.ctx(), pre_snapshot.as_ref());
+    }
 
     ui.ctx().data_mut(|d| d.insert_temp(scroll_id, scroll_y));
 }

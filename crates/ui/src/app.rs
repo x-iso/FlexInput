@@ -1703,7 +1703,27 @@ impl eframe::App for FlexInputApp {
             self.set_active_tab(new_idx);
         }
 
-        // Undo / Redo from title bar buttons.
+        // Keyboard Undo / Redo in Easy mode. Advanced mode handles Ctrl+Z /
+        // Ctrl+Shift+Z inside `Canvas::show()`, but that path doesn't run in
+        // Easy mode (the central panel returns early before `canvas::show`), so
+        // the shortcut would otherwise be dead there even though pinned-widget
+        // edits are now undoable. Skip when a text field holds focus so typing
+        // (pinned Label text, preset rename) isn't hijacked.
+        if self.settings.ui_mode == settings::UiMode::Easy && !ctx.wants_keyboard_input() {
+            let (kz, ksz) = ctx.input(|i| {
+                let z = i.events.iter().any(|e| matches!(e,
+                    egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. }
+                    if modifiers.ctrl && !modifiers.shift));
+                let sz = i.events.iter().any(|e| matches!(e,
+                    egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. }
+                    if modifiers.ctrl && modifiers.shift));
+                (z, sz)
+            });
+            if kz { do_undo = true; }
+            if ksz { do_redo = true; }
+        }
+
+        // Undo / Redo from title bar buttons (and the Easy-mode keyboard path).
         if do_undo { self.tabs[self.active_tab].canvas.undo(); }
         if do_redo { self.tabs[self.active_tab].canvas.redo(); }
 

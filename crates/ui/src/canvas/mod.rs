@@ -104,6 +104,16 @@ pub struct Canvas {
     rename_state: Option<(egui_snarl::NodeId, String, egui::Pos2)>,
     undo_stack: Vec<Snarl<NodeData>>,
     redo_stack: Vec<Snarl<NodeData>>,
+    /// Fingerprint (serialized FNV-1a) of the snarl as of the last committed
+    /// undo state. Used by the value-edit detector in `show()` to recognise
+    /// when a param/value gesture has actually changed persistent state vs.
+    /// the live-signal churn in `NodeExtra` (which is `#[serde(skip)]` and so
+    /// never affects the fingerprint).
+    committed_fingerprint: u64,
+    /// Snarl clone captured at the START of an in-progress value gesture (the
+    /// first frame the snarl diverged from `committed_fingerprint` while the
+    /// user was interacting). Becomes the undo entry when the gesture settles.
+    pending_value_baseline: Option<Snarl<NodeData>>,
     clipboard: Option<ClipboardData>,
     /// Incremented every time copy_selected() is called. Used by app.rs to detect
     /// whether the user actually copied something in an inner canvas this frame,
@@ -189,6 +199,10 @@ impl Canvas {
             rename_state: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            // Empty snarl fingerprint; recomputed lazily on the first
+            // interaction frame and refreshed after every commit/undo/redo.
+            committed_fingerprint: 0,
+            pending_value_baseline: None,
             clipboard: None,
             clipboard_gen: 0,
             mutation_gen: 0,
@@ -205,6 +219,30 @@ impl Canvas {
     pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
     pub fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
 
+    /// FNV-1a hash of the serialized snarl. `NodeData.extra` is `#[serde(skip)]`,
+    /// so the live per-frame signal history / readouts churned by the processing
+    /// thread do NOT affect this — only persistent state (params, positions,
+    /// wires, subpatch contents) does. Mirrors `hash_subpatch` in
+    /// `easy/center_panel.rs`.
+    fn snarl_fingerprint(&self) -> u64 {
+        let bytes = serde_json::to_vec(&self.snarl).unwrap_or_default();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in &bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    /// Adopt the current snarl as the committed undo baseline. Called after any
+    /// path that pushes an undo entry or replaces the snarl wholesale, so the
+    /// value-edit detector in `show()` won't mistake that change for a fresh
+    /// user gesture. Also drops any half-captured value gesture.
+    fn sync_committed_fingerprint(&mut self) {
+        self.committed_fingerprint = self.snarl_fingerprint();
+        self.pending_value_baseline = None;
+    }
+
     /// Snapshot the current snarl state onto the undo stack, clearing redo.
     fn push_undo(&mut self) {
         self.undo_stack.push(self.snarl.clone());
@@ -213,6 +251,7 @@ impl Canvas {
         }
         self.redo_stack.clear();
         self.mutation_gen = self.mutation_gen.wrapping_add(1);
+        self.sync_committed_fingerprint();
     }
 
     /// Push an externally-taken pre-mutation snapshot onto the undo stack.
@@ -223,6 +262,7 @@ impl Canvas {
         }
         self.redo_stack.clear();
         self.mutation_gen = self.mutation_gen.wrapping_add(1);
+        self.sync_committed_fingerprint();
     }
 
     pub fn undo(&mut self) {
@@ -230,6 +270,7 @@ impl Canvas {
             self.redo_stack.push(self.snarl.clone());
             self.snarl = prev;
             self.mutation_gen = self.mutation_gen.wrapping_add(1);
+            self.sync_committed_fingerprint();
         }
     }
 
@@ -238,6 +279,93 @@ impl Canvas {
             self.undo_stack.push(self.snarl.clone());
             self.snarl = next;
             self.mutation_gen = self.mutation_gen.wrapping_add(1);
+            self.sync_committed_fingerprint();
+        }
+    }
+
+    /// Commit-on-settle undo capture for in-node value/param edits — sliders,
+    /// drag-values, color pickers, text fields, dropdowns, toggles, point
+    /// editors. These write straight into `node.params` (or a nested subpatch's
+    /// params, for pinned widgets) without changing node/wire counts, so the
+    /// structural-mutation detector misses them.
+    ///
+    /// Strategy: snapshot the pre-gesture state the moment params first diverge
+    /// under user input, hold it untouched while the user keeps dragging/typing,
+    /// and push exactly ONE undo entry when the interaction ends. `pre`, when
+    /// supplied, is a pre-mutation snarl clone already taken this frame (reused
+    /// as the baseline to avoid a second clone).
+    ///
+    /// Called from `Canvas::show()` AND from the Easy-mode pinned-body render
+    /// path (`easy::center_panel`), which mutates `self.snarl` directly without
+    /// going through `show()`. Must be invoked only on frames that could mutate
+    /// the snarl (gate on interaction) so idle frames stay allocation-free.
+    pub(crate) fn track_value_edits(
+        &mut self,
+        ctx: &egui::Context,
+        pre: Option<&Snarl<NodeData>>,
+    ) {
+        let now_fp = self.snarl_fingerprint();
+        // Lazily seed the committed fingerprint on the first interaction frame
+        // after construction/load so a no-op interaction isn't read as an edit.
+        if self.committed_fingerprint == 0 && self.pending_value_baseline.is_none() {
+            self.committed_fingerprint = now_fp;
+        }
+
+        // "Ongoing" = the user is still mid-gesture: a button held down, an
+        // active drag, or a focused text field. A click that changes a value
+        // and releases on the same frame is NOT ongoing.
+        let interaction_ongoing = ctx.input(|i| i.pointer.any_down())
+            || ctx.is_using_pointer()
+            || ctx.wants_keyboard_input();
+        // "This-frame input" = any pointer/keyboard activity this frame,
+        // including a press+release click or a key. Distinguishes a user-driven
+        // edit from a snarl swap done outside any UI interaction (patch load,
+        // device panel, preset apply, undo/redo) which carries no input.
+        let input_this_frame = interaction_ongoing
+            || ctx.input(|i| {
+                i.pointer.any_pressed()
+                    || i.pointer.any_released()
+                    || i.events.iter().any(|e|
+                        matches!(e, egui::Event::Key { pressed: true, .. }
+                            | egui::Event::Text(_)))
+            });
+
+        if now_fp != self.committed_fingerprint {
+            // Capture the pre-gesture baseline on the first diverging frame.
+            if self.pending_value_baseline.is_none() {
+                if input_this_frame {
+                    // User-driven value edit — stash the pre-gesture snapshot as
+                    // the future undo entry (reuse this frame's clone when given).
+                    self.pending_value_baseline =
+                        Some(pre.cloned().unwrap_or_else(|| self.snarl.clone()));
+                } else {
+                    // Divergence with NO input this frame came from outside a UI
+                    // interaction — a patch load, device-panel add/remove, preset
+                    // apply, or an undo/redo that replaced the snarl. Those paths
+                    // own their undo (or intentionally have none); adopt the new
+                    // state as the committed baseline without an undo entry.
+                    self.committed_fingerprint = now_fp;
+                }
+            }
+            // Commit once the gesture has settled. `interaction_ongoing` stays
+            // true for every frame of a slider/point drag or while a text field
+            // is focused, so we never commit mid-gesture — the single held
+            // baseline coalesces the whole gesture into one undo entry. The
+            // instant it goes false (pointer released, focus left) the value is
+            // final, so we commit immediately. This also covers a same-frame
+            // click+release (toggle, dropdown, color swatch), which captures and
+            // commits in one pass so a baseline is never left dangling.
+            if !interaction_ongoing {
+                if let Some(baseline) = self.pending_value_baseline.take() {
+                    self.push_snapshot(baseline);
+                }
+                self.committed_fingerprint = now_fp;
+            }
+        } else if self.pending_value_baseline.is_some() {
+            // User dragged the value back to where it started (or the edit was
+            // reverted) — nothing actually changed, so drop the pending baseline
+            // without polluting the undo stack.
+            self.pending_value_baseline = None;
         }
     }
 
@@ -653,8 +781,16 @@ impl Canvas {
             self.snarl.nodes_ids_data().count(),
             self.snarl.wires().count(),
         );
+        // Tracks whether ANY undo entry was committed this frame (structural
+        // here, or rename/replace/group/wire-menu paths below). The value-edit
+        // detector at the end of `show()` skips committing when this is set, so
+        // a single user action never produces two undo entries.
+        let mut committed_this_frame = false;
         if pre_counts != post_counts || viewer.push_undo_request {
-            if let Some(snap) = pre_snapshot {
+            // Keep `pre_snapshot` intact for the value-edit detector by cloning
+            // here; this extra clone only happens on the rare frame where a
+            // structural mutation lands, never on plain value-drag frames.
+            if let Some(snap) = pre_snapshot.clone() {
                 self.push_snapshot(snap);
             } else {
                 // Snapshot was skipped (gating thought the frame was idle)
@@ -666,6 +802,7 @@ impl Canvas {
                 // be widened.
                 self.push_snapshot(self.snarl.clone());
             }
+            committed_this_frame = true;
         }
 
         if let Some(pending) = viewer.pending_wire_menu {
@@ -947,6 +1084,19 @@ impl Canvas {
                             }
                         });
                 });
+        }
+
+        // ── Value/param-edit undo capture (commit-on-settle) ──────────────────
+        // Structural changes (add/delete/wire/paste/rename/group/replace) are
+        // already committed above. `track_value_edits` catches the rest: in-node
+        // value edits — sliders, drag-values, color pickers, text fields,
+        // dropdowns, toggles, point editors — which write straight into
+        // `node.params` during `show()` without changing node/wire counts. We
+        // only run it on frames that could plausibly mutate the snarl (the same
+        // `needs_snapshot` gate the pre-show clone uses) so idle frames stay
+        // allocation-free.
+        if needs_snapshot && !committed_this_frame {
+            self.track_value_edits(&ctx, pre_snapshot.as_ref());
         }
 
         calibrate_request
