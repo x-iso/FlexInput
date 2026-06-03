@@ -59,6 +59,12 @@ pub struct ExposedModule {
     /// overridden independently for ON and OFF states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_override: Option<PinSwitchOverride>,
+    /// Per-pin graph color override. Populated only for graph-module pins
+    /// (Response Curve, Oscilloscope, Vectorscope) via the layout inspector
+    /// strip. `None` fields fall back to the module's default rendering
+    /// (15% transparent background, theme grid, MULTI_COLORS channel palette).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_override: Option<PinGraphOverride>,
 }
 
 fn default_exposed_size() -> [f32; 2] { [220.0, 100.0] }
@@ -87,6 +93,26 @@ pub struct PinSwitchOverride {
     #[serde(default)] pub text_on:     Option<[u8; 4]>,
     #[serde(default)] pub text_off:    Option<[u8; 4]>,
     #[serde(default)] pub outline_px:  Option<f32>,
+}
+
+/// Per-pin color override for pinned graph modules (Response Curve,
+/// Oscilloscope, Vectorscope). `None` on a field means "use the module's
+/// default rendering". `background` overrides the graph fill (which defaults
+/// to a 15%-alpha black); `outline` + `outline_px` draw a frame around the
+/// graph rect; `channel_colors[ch]` overrides the line/dot color for input
+/// channel `ch` (falling back to the built-in MULTI_COLORS palette when the
+/// slot is absent or `None`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PinGraphOverride {
+    #[serde(default)] pub background:  Option<[u8; 4]>,
+    #[serde(default)] pub outline:     Option<[u8; 4]>,
+    #[serde(default)] pub outline_px:  Option<f32>,
+    /// Gridline / axis color. `None` falls back to the default brighter grid
+    /// (same neutral hue as the graph axis labels).
+    #[serde(default)] pub gridline:    Option<[u8; 4]>,
+    /// Per-channel line/dot color, indexed by channel. A `None` (or missing
+    /// trailing) entry falls back to the default palette for that channel.
+    #[serde(default)] pub channel_colors: Vec<Option<[u8; 4]>>,
 }
 
 /// Text horizontal alignment for layout-decoration Text items.

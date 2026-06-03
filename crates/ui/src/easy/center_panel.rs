@@ -73,17 +73,50 @@ pub fn show(
                 .unwrap_or(false);
             if unlocked {
                 ui.add_space(4.0);
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::symmetric(8, 6))
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Layout editing").small().strong().weak());
-                        egui::ScrollArea::horizontal()
-                            .id_salt(("easy_layout_controls_scroll", oid.0))
+                // Render the inspector strip into a FOREGROUND-order layer so its
+                // color pickers and buttons always win pointer input over the
+                // sub-patch body, which lives in an Order::Middle Area. Without
+                // this, body widgets that scroll up underneath the inspector
+                // (their interact rects ride a transformed sublayer that the
+                // body clip doesn't bound for hit-testing) sit "in front" of the
+                // Background-layer inspector and silently swallow clicks.
+                //
+                // A layered child UI doesn't advance the parent's cursor, so we
+                // measure the rendered height and reserve it explicitly, keeping
+                // the body below the inspector in the normal flow.
+                let start = ui.cursor().min;
+                let avail_w = ui.available_width();
+                let inspector_layer = egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new(("easy_layout_inspector_layer", oid.0)),
+                );
+                let built = ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .layer_id(inspector_layer)
+                        .max_rect(egui::Rect::from_min_size(
+                            start,
+                            egui::vec2(avail_w, ui.available_height()),
+                        )),
+                    |ui| {
+                        ui.set_width(avail_w);
+                        egui::Frame::group(ui.style())
+                            .inner_margin(egui::Margin::symmetric(8, 6))
                             .show(ui, |ui| {
-                                crate::canvas::viewer::layout_editing_controls(
-                                    ui, &mut canvas.snarl, oid);
+                                ui.set_width(avail_w - 16.0);
+                                ui.label(egui::RichText::new("Layout editing").small().strong().weak());
+                                egui::ScrollArea::horizontal()
+                                    .id_salt(("easy_layout_controls_scroll", oid.0))
+                                    .show(ui, |ui| {
+                                        crate::canvas::viewer::layout_editing_controls(
+                                            ui, &mut canvas.snarl, oid);
+                                    });
                             });
-                    });
+                    },
+                );
+                // Reserve the inspector's footprint in the parent flow so the
+                // body Area below starts beneath it.
+                let used = built.response.rect;
+                ui.allocate_rect(used, egui::Sense::hover());
             }
         }
     }

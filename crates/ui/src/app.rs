@@ -6517,6 +6517,7 @@ fn show_subpatch_editors(
                             size: init_size,
                             text_override: None,
                             switch_override: None,
+                            graph_override: None,
                         });
                     }
                 }

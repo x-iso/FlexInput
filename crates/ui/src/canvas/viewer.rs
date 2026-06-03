@@ -4922,6 +4922,16 @@ pub(crate) fn show_subpatch_body(
     let from_global = parent_to_global.inverse();
     let pointer_local = ui.ctx().input(|i| i.pointer.latest_pos()).map(|p| from_global * p);
     let pointer_global = ui.ctx().input(|i| i.pointer.latest_pos());
+    // Visible viewport in body-local coords. In Easy mode the body lives on a
+    // scrolled+scaled sublayer whose clip rect is the panel window — content
+    // scrolled out of view (and anything ABOVE the panel, like the layout
+    // inspector strip) maps to a body-local point OUTSIDE this rect. Guarding
+    // selection on it stops inspector clicks from registering as clicks on
+    // scrolled-away items, whose body-local bbox the inverse transform can
+    // otherwise alias onto. `body_rect.contains` alone is insufficient because
+    // it spans the whole (unscrolled) body, not just the visible window.
+    let visible_rect = ui.clip_rect();
+    let in_view = |p: egui::Pos2| body_rect.contains(p) && visible_rect.contains(p);
     let primary_down   = ui.ctx().input(|i| i.pointer.primary_down());
     let secondary_down = ui.ctx().input(|i| i.pointer.secondary_down());
     let prev: Option<PressState> = ui.ctx().data(|d| d.get_temp(press_state_key));
@@ -4952,7 +4962,7 @@ pub(crate) fn show_subpatch_body(
     // "ignore" so the release doesn't trigger background-click logic.
     if primary_down && !primary_was_down {
         if let Some(p) = pointer_local {
-            if body_rect.contains(p) && !pointer_on_higher_layer {
+            if in_view(p) && !pointer_on_higher_layer {
                 let local = [p.x - origin.x, p.y - origin.y];
                 ui.ctx().data_mut(|d| d.insert_temp(press_state_key, (local, true, false)));
                 // Begin a marquee when Shift is held and the press landed in
@@ -4987,7 +4997,7 @@ pub(crate) fn show_subpatch_body(
     if primary_just_released {
         if !suppress {
             if let (Some(p), Some(start)) = (pointer_local, prev_press) {
-                if body_rect.contains(p) && !start[0].is_nan() {
+                if in_view(p) && !start[0].is_nan() {
                     let cur_local = [p.x - origin.x, p.y - origin.y];
                     let dx = cur_local[0] - start[0];
                     let dy = cur_local[1] - start[1];
@@ -5666,6 +5676,35 @@ pub(crate) fn layout_inspector_strip(
         });
     let is_text_pin   = inner_mid.as_deref() == Some("module.label");
     let is_switch_pin = inner_mid.as_deref() == Some("module.switch");
+    let is_graph_pin = matches!(
+        inner_mid.as_deref(),
+        Some("module.response_curve")
+            | Some("module.vec_response_curve")
+            | Some("module.twoway_response_curve")
+            | Some("display.oscilloscope")
+            | Some("display.vectorscope")
+    );
+
+    // Channel count for the graph pin's per-channel color row. Response curves
+    // expose `min(inputs, outputs)` channels; scopes one per input. Resolved
+    // here from the inner node since the inspector strip only sees the items.
+    let graph_channels: usize = if is_graph_pin {
+        snarl.get_node(outer_id)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.items.get(idx).and_then(|it| match it {
+                LayoutItem::Module(m) => sp.snarl
+                    .get_node(egui_snarl::NodeId(m.inner_node_id))
+                    .map(|inner| match inner.module_id.as_str() {
+                        "module.response_curve"
+                        | "module.vec_response_curve"
+                        | "module.twoway_response_curve" =>
+                            inner.inputs.len().min(inner.outputs.len()).max(1),
+                        _ => inner.inputs.len().max(1),
+                    }),
+                _ => None,
+            }))
+            .unwrap_or(1)
+    } else { 1 };
 
     // Snapshot the primary's style BEFORE the inspector edits it (only when a
     // multi-selection is active — single-select needs no propagation).
@@ -5689,6 +5728,9 @@ pub(crate) fn layout_inspector_strip(
                 }
                 LayoutItem::Module(_) if is_switch_pin => {
                     switch_pin_inspector_strip_item(ui, &mut sp.items, idx);
+                }
+                LayoutItem::Module(_) if is_graph_pin => {
+                    graph_pin_inspector_strip_item(ui, &mut sp.items, idx, graph_channels);
                 }
                 _ => {}
             }
@@ -5830,6 +5872,22 @@ fn render_pinned_element(
         None => None,
     };
     let bridged_parent = bridged_parent_holder.as_ref();
+
+    // Per-pin graph color override (Response Curve / Oscilloscope / Vectorscope).
+    // Looked up once here so the bare renderers receive a resolved value rather
+    // than re-walking the outer snapshot. Matches on inner node + element id,
+    // mirroring the Switch override lookup in `render_switch_toggle`.
+    let graph_ov: Option<crate::canvas::node::PinGraphOverride> = outer_snapshot
+        .and_then(|outer| outer.get_node(outer_id))
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| sp.items.iter().find_map(|it| match it {
+            LayoutItem::Module(m)
+                if m.inner_node_id == inner_id.0 && m.element_id == element_id =>
+                m.graph_override.clone(),
+            _ => None,
+        }));
+    let graph_ov_ref = graph_ov.as_ref();
+
     match (module_id, element_id) {
         ("module.remapper", "whole_module") => {
             render_remapper_whole_module(
@@ -5932,11 +5990,11 @@ fn render_pinned_element(
         // Response curve graphs (regular and Vec): render only the curve
         // canvas, no surrounding sliders.
         ("module.response_curve", "curve") => {
-            render_response_curve_only(inner_id, ui, inner_snarl, container_size, false);
+            render_response_curve_only(inner_id, ui, inner_snarl, container_size, false, graph_ov_ref);
             return;
         }
         ("module.vec_response_curve", "curve") => {
-            render_response_curve_only(inner_id, ui, inner_snarl, container_size, true);
+            render_response_curve_only(inner_id, ui, inner_snarl, container_size, true, graph_ov_ref);
             return;
         }
         ("module.response_curve", "scale_row") => {
@@ -5973,7 +6031,7 @@ fn render_pinned_element(
         }
         // Two-way Response Curve
         ("module.twoway_response_curve", "curve") => {
-            render_twoway_curve_only(inner_id, ui, inner_snarl, container_size);
+            render_twoway_curve_only(inner_id, ui, inner_snarl, container_size, graph_ov_ref);
             return;
         }
         ("module.twoway_response_curve", "scale_row") => {
@@ -6053,7 +6111,7 @@ fn render_pinned_element(
         }
         // Oscilloscope — bare display + bare controls row.
         ("display.oscilloscope", "display") => {
-            render_oscilloscope_display(inner_id, ui, inner_snarl, container_size);
+            render_oscilloscope_display(inner_id, ui, inner_snarl, container_size, graph_ov_ref);
             return;
         }
         ("display.oscilloscope", "controls") => {
@@ -6062,7 +6120,7 @@ fn render_pinned_element(
         }
         // Vectorscope — bare display.
         ("display.vectorscope", "display") => {
-            render_vectorscope_display(inner_id, ui, inner_snarl, container_size);
+            render_vectorscope_display(inner_id, ui, inner_snarl, container_size, graph_ov_ref);
             return;
         }
         _ => {}
@@ -6336,14 +6394,23 @@ where
     // ── 2. Detect "new capture" — compare current state vs last frame ───────
     // (Skip update in layout mode so the user's chosen scroll position is
     // preserved across layout/lock toggles.)
+    //
+    // The scroll only re-snaps to the top when *new input is detected* — i.e.
+    // the capture draft changes (a freshly pressed gamepad/keyboard chord, or
+    // the draft being cleared by Add). It deliberately does NOT re-snap when
+    // the user edits an existing mapping (toggling press mode, dragging the
+    // time-gap value, flipping hold/turbo) — those mutate the `mappings` array
+    // but must leave the user's scroll position where it is. `cur_map_h` is
+    // still tracked/persisted for potential future use, but does not gate the
+    // re-snap. (For the Combiner, `draft_len_fn == map_len_fn`, so its
+    // config-change rebase still fires through the draft path.)
     let state_key = remap_pin_state_id(ui.layer_id(), inner_id, tag);
     let (cur_draft_h, cur_map_h): (u64, u64) = inner_snarl.get_node(inner_id).map(|n| {
         (draft_len_fn(n), map_len_fn(n))
     }).unwrap_or((0, 0));
     let prev: Option<RemapPinState> = ui.ctx().data(|d| d.get_temp(state_key));
-    let (prev_offset, prev_draft, prev_map) = prev.unwrap_or((0.0, cur_draft_h, cur_map_h));
-    let any_capture_change = (cur_draft_h != prev_draft || cur_map_h != prev_map)
-        && !is_layout_mode;
+    let (prev_offset, prev_draft, _prev_map) = prev.unwrap_or((0.0, cur_draft_h, cur_map_h));
+    let any_capture_change = (cur_draft_h != prev_draft) && !is_layout_mode;
 
     // ── 3. Compute pointer-over check via raw input (the body layer above
     //       intercepts the parent's hover Response, so we go to the source).
@@ -6361,6 +6428,52 @@ where
         let wheel = ui.input(|i| i.smooth_scroll_delta.y);
         if wheel != 0.0 {
             scroll_offset_body -= wheel / scale;
+        }
+    }
+
+    // ── 4b. Auto-scroll while a card is being drag-reordered ────────────────
+    // The body (rendered below) sets a per-body-layer flag while a mapping card
+    // is being dragged. When the drag pointer nears the top/bottom edge of the
+    // visible band, nudge the scroll so off-screen rows come into reach. We
+    // read last frame's flag (the body renders after this point); the drag
+    // spans many frames so the one-frame lag is invisible. A repaint is
+    // requested so the scroll keeps advancing even with a stationary pointer.
+    if !is_layout_mode {
+        let drag_flag_id = egui::Id::new((
+            "fxi_reorder_drag_active",
+            remap_layer_id(ui.layer_id(), inner_id, tag),
+        ));
+        let drag_active = ui.ctx().data(|d| d.get_temp::<bool>(drag_flag_id)).unwrap_or(false);
+        if drag_active {
+            if let Some(g) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                let local = from_global * g; // parent-UI/container coords
+                // Edge band: within this many px of the container's top/bottom
+                // triggers auto-scroll, ramping to `max_speed` at the very edge.
+                let band = 28.0_f32.min(container_h * 0.4);
+                let max_speed = 14.0_f32; // body px per frame at the edge
+                let mut delta = 0.0;
+                let dist_top = local.y - container_rect.top();
+                let dist_bot = container_rect.bottom() - local.y;
+                if dist_top < band {
+                    let t = ((band - dist_top) / band).clamp(0.0, 1.0);
+                    delta -= max_speed * t / scale;
+                } else if dist_bot < band {
+                    let t = ((band - dist_bot) / band).clamp(0.0, 1.0);
+                    delta += max_speed * t / scale;
+                }
+                if delta != 0.0 {
+                    scroll_offset_body += delta;
+                    ui.ctx().request_repaint();
+                    // Publish the applied scroll delta so the dragged card can
+                    // add it to its visual lift and stay glued to the pointer
+                    // while the body scrolls under it. (`begin` consumes it.)
+                    let comp_id = egui::Id::new((
+                        "fxi_reorder_scroll_comp",
+                        remap_layer_id(ui.layer_id(), inner_id, tag),
+                    ));
+                    ui.ctx().data_mut(|d| d.insert_temp(comp_id, delta));
+                }
+            }
         }
     }
 
@@ -7502,6 +7615,7 @@ fn render_oscilloscope_display(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
+    graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
     let (history, n_channels, win_ms, osc_scale, osc_auto, osc_uni) = snarl.get_node(inner_id).map(|n| {
         let win = n.params.get("osc_win_ms").and_then(|v| v.as_f64()).unwrap_or(200.0).clamp(10.0, 10_000.0) as f32;
@@ -7528,7 +7642,9 @@ fn render_oscilloscope_display(
     let avail = egui::vec2(container.x.max(40.0), container.y.max(24.0));
     let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+    let (graph_bg, graph_outline) = graph_chrome(graph_ov);
+    painter.rect_filled(rect, 2.0, graph_bg);
+    let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
 
     for i in 1..4 {
         let y = if osc_uni {
@@ -7541,14 +7657,14 @@ fn render_oscilloscope_display(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
             egui::Stroke::new(
                 if is_zero { 1.0 } else { 0.5 },
-                if is_zero { Color32::from_gray(55) } else { Color32::from_gray(40) },
+                if is_zero { grid_axis } else { grid_faint },
             ),
         );
     }
     if osc_uni {
         painter.line_segment(
             [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.bottom())],
-            egui::Stroke::new(1.0, Color32::from_gray(55)),
+            egui::Stroke::new(1.0, grid_axis),
         );
     }
 
@@ -7583,10 +7699,14 @@ fn render_oscilloscope_display(
                     egui::pos2(x, y)
                 })
             }).collect();
+            let ch_col = graph_channel_color(graph_ov, ch);
             for w in pts.windows(2) {
-                painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, MULTI_COLORS[ch % MULTI_COLORS.len()]));
+                painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, ch_col));
             }
         }
+    }
+    if let Some(stroke) = graph_outline {
+        painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
     }
     ui.ctx().request_repaint();
     let _ = inner_id;
@@ -7649,6 +7769,7 @@ fn render_vectorscope_display(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
+    graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
     // Visualization tail length — bounded so we don't pay for samples
     // that won't be drawn. History buffer itself can be much longer
@@ -7669,17 +7790,19 @@ fn render_vectorscope_display(
     let side = container.x.min(container.y).max(40.0);
     let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+    let (graph_bg, graph_outline) = graph_chrome(graph_ov);
+    painter.rect_filled(rect, 2.0, graph_bg);
+    let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
     painter.line_segment(
         [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
-        egui::Stroke::new(0.5, Color32::from_gray(50)),
+        egui::Stroke::new(0.5, grid_axis),
     );
     painter.line_segment(
         [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
-        egui::Stroke::new(0.5, Color32::from_gray(50)),
+        egui::Stroke::new(0.5, grid_axis),
     );
     painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
-        egui::Stroke::new(0.5, Color32::from_gray(40)));
+        egui::Stroke::new(0.5, grid_faint));
 
     // Trail rendering: instead of one circle per sample (was up to 2000
     // painter calls per channel per frame), we emit a small number of
@@ -7697,7 +7820,7 @@ fn render_vectorscope_display(
     let hx = rect.width() * 0.45;
     let hy = rect.height() * 0.45;
     for ch in 0..n_channels {
-        let col = MULTI_COLORS[ch % MULTI_COLORS.len()];
+        let col = graph_channel_color(graph_ov, ch);
         let xi = ch * 2;
         let yi = ch * 2 + 1;
 
@@ -7756,6 +7879,9 @@ fn render_vectorscope_display(
     let has_trail = nt > 0;
     let has_live = last_signals.iter().any(|s| matches!(s, Some(Signal::Vec2(_))));
     if has_trail || has_live { ui.ctx().request_repaint(); }
+    if let Some(stroke) = graph_outline {
+        painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+    }
     let _ = inner_id;
 }
 
@@ -7769,11 +7895,12 @@ fn render_response_curve_only(
     inner_snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
     is_vec: bool,
+    graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
     let avail = egui::vec2(container.x.max(20.0), container.y.max(20.0));
     let (rect, bg_resp) = ui.allocate_exact_size(avail, egui::Sense::click());
     let bg_for_menu = bg_resp.clone();
-    paint_response_curve_graph(inner_id, ui, inner_snarl, rect, bg_resp, is_vec);
+    paint_response_curve_graph(inner_id, ui, inner_snarl, rect, bg_resp, is_vec, graph_ov);
     // Right-click context menu — same actions as the canvas-editor body so the
     // layout-pinned widget is fully usable on its own.
     let _ = is_vec; // graph-only menu doesn't distinguish; kept for signature compat.
@@ -7986,6 +8113,7 @@ fn paint_response_curve_graph(
     rect: egui::Rect,
     bg_resp: egui::Response,
     is_vec: bool,
+    graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
     // Initialise params on first use (kept consistent with the body renderers).
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
@@ -8138,13 +8266,15 @@ fn paint_response_curve_graph(
         (x_lo + su * x_range, y_lo + sv * y_range)
     };
 
-    painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+    let (graph_bg, graph_outline) = graph_chrome(graph_ov);
+    painter.rect_filled(rect, 2.0, graph_bg);
 
-    let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
+    let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
+    let gs = egui::Stroke::new(0.5, grid_faint);
     for &x in &grid_x_positions { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
     for &y in &grid_y_positions { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
     painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
-        egui::Stroke::new(0.5, Color32::from_gray(55)));
+        egui::Stroke::new(0.5, grid_axis));
 
     if show_grid_labels {
         const MIN_LABEL_PX: f32 = 20.0;
@@ -8337,7 +8467,7 @@ fn paint_response_curve_graph(
         } else { trail.clear(); }
         let trail_pts: Vec<(f32, std::time::Instant)> = trail.iter().cloned().collect();
         ui.data_mut(|d| d.insert_temp(trail_id, trail));
-        let ch_col = MULTI_COLORS[ch % MULTI_COLORS.len()];
+        let ch_col = graph_channel_color(graph_ov, ch);
         for w in trail_pts.windows(2) {
             let (x0, _)  = w[0];
             let (x1, t1) = w[1];
@@ -8361,6 +8491,11 @@ fn paint_response_curve_graph(
         painter.circle_filled(c2s(graph_x, graph_y), 3.5, head_col);
     }
     if has_active { ui.ctx().request_repaint(); }
+
+    // Optional override frame, painted last so it sits above the graph content.
+    if let Some(stroke) = graph_outline {
+        painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+    }
 
     // Write back curve points / biases.
     if pts_changed || bias_changed {
@@ -9249,6 +9384,57 @@ fn channel_label_color(module_id: &str, ch: usize) -> Option<Color32> {
 
 // ── Display module body renderers ─────────────────────────────────────────────
 
+/// Default graph background: the dark base (`gray 16`) at 60% opacity so the
+/// sub-patch / canvas background shows through. Shared by all graph displays
+/// (Response Curve, Oscilloscope, Vectorscope) on both the editor-body and the
+/// pinned-layout render paths. Layout widgets may override this via
+/// `PinGraphOverride::background`.
+/// Unmultiplied source is (16,16,16,153); premultiplied bytes ≈ round(16*153/255)=10.
+const GRAPH_BG_DEFAULT: Color32 = Color32::from_rgba_premultiplied(10, 10, 10, 153);
+
+/// Per-channel line/dot color, honoring an optional `PinGraphOverride`'s
+/// `channel_colors[ch]` when present, else the built-in palette.
+fn graph_channel_color(ov: Option<&crate::canvas::node::PinGraphOverride>, ch: usize) -> Color32 {
+    ov.and_then(|o| o.channel_colors.get(ch).copied().flatten())
+        .map(rgba_to_color32)
+        .unwrap_or(MULTI_COLORS[ch % MULTI_COLORS.len()])
+}
+
+/// Resolved graph chrome from an optional override: (background fill, outline
+/// stroke). The outline is `None` when no override outline is set or its width
+/// rounds to zero — graphs draw no frame by default.
+fn graph_chrome(
+    ov: Option<&crate::canvas::node::PinGraphOverride>,
+) -> (Color32, Option<egui::Stroke>) {
+    let bg = ov.and_then(|o| o.background).map(rgba_to_color32).unwrap_or(GRAPH_BG_DEFAULT);
+    let outline = ov.and_then(|o| {
+        let px = o.outline_px.unwrap_or(0.0);
+        let col = o.outline.map(rgba_to_color32)?;
+        (px > 0.05 && col.a() > 0).then(|| egui::Stroke::new(px, col))
+    });
+    (bg, outline)
+}
+
+/// Default gridline / axis color — same neutral hue as the graph axis labels
+/// (`rgba 180,180,180,160`), brighter than the old `gray 35–55` lines.
+const GRAPH_GRID_DEFAULT: Color32 = Color32::from_rgba_premultiplied(113, 113, 113, 160);
+
+/// Resolved grid colors from an optional override: `(faint, axis)`. `axis` is
+/// the user-chosen (or default) gridline color used for the brighter zero /
+/// centre / diagonal lines; `faint` is the dimmer subdivision color, derived as
+/// ~64% of the axis color so a single override swatch drives both intensities
+/// consistently (mirrors the old 35-vs-55 gray relationship).
+fn graph_grid_colors(ov: Option<&crate::canvas::node::PinGraphOverride>) -> (Color32, Color32) {
+    let axis = ov.and_then(|o| o.gridline).map(rgba_to_color32).unwrap_or(GRAPH_GRID_DEFAULT);
+    let faint = Color32::from_rgba_unmultiplied(
+        (axis.r() as f32 * 0.64) as u8,
+        (axis.g() as f32 * 0.64) as u8,
+        (axis.b() as f32 * 0.64) as u8,
+        axis.a(),
+    );
+    (faint, axis)
+}
+
 const SCOPE_COLORS: [Color32; 4] = [
     Color32::from_rgb(255, 80,  80),   // red
     Color32::from_rgb(80,  220, 80),   // green
@@ -9343,7 +9529,8 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
                 let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
                 display_rect = Some(rect);
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+                painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
+                let (grid_faint, grid_axis) = graph_grid_colors(None);
 
                 // Grid lines.
                 for i in 1..4 {
@@ -9357,7 +9544,7 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
                         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                         egui::Stroke::new(
                             if is_zero { 1.0 } else { 0.5 },
-                            if is_zero { Color32::from_gray(55) } else { Color32::from_gray(40) },
+                            if is_zero { grid_axis } else { grid_faint },
                         ),
                     );
                 }
@@ -9365,7 +9552,7 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
                 if osc_uni {
                     painter.line_segment(
                         [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.bottom())],
-                        egui::Stroke::new(1.0, Color32::from_gray(55)),
+                        egui::Stroke::new(1.0, grid_axis),
                     );
                 }
 
@@ -9527,17 +9714,18 @@ fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, s
         }
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+        painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
+        let (grid_faint, grid_axis) = graph_grid_colors(None);
         painter.line_segment(
             [egui::pos2(rect.center().x, rect.top()), egui::pos2(rect.center().x, rect.bottom())],
-            egui::Stroke::new(0.5, Color32::from_gray(50)),
+            egui::Stroke::new(0.5, grid_axis),
         );
         painter.line_segment(
             [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
-            egui::Stroke::new(0.5, Color32::from_gray(50)),
+            egui::Stroke::new(0.5, grid_axis),
         );
         painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.45,
-            egui::Stroke::new(0.5, Color32::from_gray(40)));
+            egui::Stroke::new(0.5, grid_faint));
 
         // Fading polyline trail. Replaces the per-sample circle dot
         // cloud — 600 samples ⇒ 12 polyline shapes per channel rather
@@ -10133,7 +10321,7 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     (x_lo + snap_u * x_range, y_lo + snap_v * y_range)
                 };
 
-                painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+                painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
 
                 let grid_x_positions: Vec<f32> = (1..grid_x)
                     .map(|i| x_lo + snap_nodes_x[i] * x_range)
@@ -10142,7 +10330,8 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     .map(|i| y_lo + snap_nodes_y[i] * y_range)
                     .collect();
 
-                let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
+                let (grid_faint, grid_axis) = graph_grid_colors(None);
+                let gs = egui::Stroke::new(0.5, grid_faint);
                 for &x in &grid_x_positions {
                     painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
                 }
@@ -10150,7 +10339,7 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
                 }
                 painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
-                    egui::Stroke::new(0.5, Color32::from_gray(55)));
+                    egui::Stroke::new(0.5, grid_axis));
 
                 // Labels: show the real input/output value at each grid line.
                 // Graph x is the SCALED domain (curve_scale maps real→graph), so
@@ -10689,12 +10878,13 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                     (x_lo + snap_u * x_range, y_lo + snap_v * y_range)
                 };
 
-                painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+                painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
 
                 let grid_x_positions: Vec<f32> = (1..grid_x).map(|i| x_lo + snap_nodes_x[i] * x_range).collect();
                 let grid_y_positions: Vec<f32> = (1..grid_y).map(|i| y_lo + snap_nodes_y[i] * y_range).collect();
 
-                let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
+                let (grid_faint, grid_axis) = graph_grid_colors(None);
+                let gs = egui::Stroke::new(0.5, grid_faint);
                 for &x in &grid_x_positions {
                     painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs);
                 }
@@ -10702,7 +10892,7 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                     painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs);
                 }
                 painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)],
-                    egui::Stroke::new(0.5, Color32::from_gray(55)));
+                    egui::Stroke::new(0.5, grid_axis));
 
                 if show_grid_labels {
                     const MIN_LABEL_PX: f32 = 20.0;
@@ -11175,7 +11365,7 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                 ]};
 
                 let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+                painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
 
                 let abs_max_in  = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
                 let abs_max_out = out_max.abs().max(out_min.abs()).max(f32::EPSILON);
@@ -11227,10 +11417,11 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                 };
                 let gxp: Vec<f32> = (1..gx_f).map(|i| x_lo + sx[i] * x_range).collect();
                 let gyp: Vec<f32> = (1..gy_f).map(|i| y_lo + sy[i] * y_range).collect();
-                let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
+                let (grid_faint, grid_axis) = graph_grid_colors(None);
+                let gs = egui::Stroke::new(0.5, grid_faint);
                 for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
                 for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-                painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, Color32::from_gray(55)));
+                painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, grid_axis));
 
                 if sgl {
                     const MPX: f32 = 20.0;
@@ -11617,11 +11808,12 @@ fn render_twoway_curve_only(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
+    graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
     let avail = egui::vec2(container.x.max(20.0), container.y.max(20.0));
     let (rect, bg_resp) = ui.allocate_exact_size(avail, egui::Sense::click());
     let bg_for_menu = bg_resp.clone();
-    paint_twoway_curve_graph(inner_id, ui, snarl, rect, bg_resp);
+    paint_twoway_curve_graph(inner_id, ui, snarl, rect, bg_resp, graph_ov);
     // Right-click on empty graph → save/load/copy/paste/reset for the active
     // lane. The pinned widget doesn't expose the lane toggle, so users edit
     // whichever lane was last selected in the source module (or via the
@@ -11643,6 +11835,7 @@ fn paint_twoway_curve_graph(
     snarl: &mut Snarl<NodeData>,
     rect: egui::Rect,
     bg_resp: egui::Response,
+    graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
     let node_data = match snarl.get_node(node_id).cloned() { Some(n) => n, None => return };
 
@@ -11702,7 +11895,8 @@ fn paint_twoway_curve_graph(
     ]};
 
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, Color32::from_gray(16));
+    let (graph_bg, graph_outline) = graph_chrome(graph_ov);
+    painter.rect_filled(rect, 2.0, graph_bg);
 
     // Grid
     let abs_max_in  = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
@@ -11719,10 +11913,11 @@ fn paint_twoway_curve_graph(
     };
     let gxp: Vec<f32> = (1..grid_x).map(|i| x_lo + i as f32 / grid_x as f32 * x_range).collect();
     let gyp: Vec<f32> = (1..grid_y).map(|i| y_lo + i as f32 / grid_y as f32 * y_range).collect();
-    let gs = egui::Stroke::new(0.5, Color32::from_gray(35));
+    let (grid_faint, grid_axis) = graph_grid_colors(graph_ov);
+    let gs = egui::Stroke::new(0.5, grid_faint);
     for &x in &gxp { painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
     for &y in &gyp { painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
-    painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, Color32::from_gray(55)));
+    painter.line_segment([c2s(x_lo, y_lo), c2s(x_hi, y_hi)], egui::Stroke::new(0.5, grid_axis));
 
     if sgl {
         let lc = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
@@ -11883,7 +12078,7 @@ fn paint_twoway_curve_graph(
         } else { tbuf.clear(); }
         let tlist: Vec<(f32, std::time::Instant)> = tbuf.iter().cloned().collect();
         ui.data_mut(|d| { d.insert_temp(tid, tbuf); d.insert_temp(tlid, lane_id); });
-        let ch_col = MULTI_COLORS[ch % MULTI_COLORS.len()];
+        let ch_col = graph_channel_color(graph_ov, ch);
 
         // Trail resamples curve between x positions to follow curve shape
         for w in tlist.windows(2) {
@@ -11922,6 +12117,11 @@ fn paint_twoway_curve_graph(
         painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
     }
     if has_active { ui.ctx().request_repaint(); }
+
+    // Optional override frame, drawn last so it sits above the graph content.
+    if let Some(stroke) = graph_outline {
+        painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+    }
 }
 
 fn render_twoway_hyst_row(
@@ -12304,6 +12504,536 @@ fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_i
     ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong());
 }
 
+// ── Mapping-list display filter ───────────────────────────────────────────────
+//
+// Remapper / Map Action / Lean all render a (sometimes long) list of mapping
+// cards. The filter row above the list lets the user narrow it to:
+//   • All mappings        — neutral chip, default.
+//   • Filter: {input}     — GREEN. "Follow live input": the currently-pressed
+//                           gamepad/KB-M input set is latched regardless of
+//                           which chip is active, so the green/blue labels
+//                           always PREVIEW their target. The set LATCHES — it
+//                           keeps the last detected input(s) after release and
+//                           updates to the newest press. The list only narrows
+//                           once green is clicked; a card passes if it contains
+//                           ANY latched
+//                           input.
+//   • All {Stick} mappings— BLUE. Enabled when any latched input is stick-
+//                           derived; matches any card referencing ANY direction
+//                           of that same stick (the whole vector group). Greyed
+//                           when no latched input is stick-derived.
+//
+// "Filterable pins" are a card's captured INPUT chord for Remapper/Map Action
+// (the `in` field) and its captured OUTPUT chord for Lean (the `out` field —
+// Lean cards have no input, the lean direction is the trigger, so we match the
+// pressed input against the assigned outputs instead). The blue group also
+// matches analog destinations (stick axes/cardinals) on the output side.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapFilterKind { All, Input, Stick }
+
+/// Persisted per (node, section) filter state: which chip is active + the
+/// latched "current input(s)" the green/blue chips resolve against.
+#[derive(Clone)]
+struct MapFilterState {
+    kind: MapFilterKind,
+    /// Last live-pressed input set (latched across release; updated to the
+    /// newest non-empty press). Empty until the user presses something while
+    /// the green/blue filter is active.
+    current_inputs: Vec<String>,
+}
+
+impl Default for MapFilterState {
+    fn default() -> Self {
+        MapFilterState { kind: MapFilterKind::All, current_inputs: Vec::new() }
+    }
+}
+
+impl MapFilterState {
+    /// First latched input that belongs to an input group, if any, with its
+    /// group label + member pins.
+    fn group(&self) -> Option<(&'static str, &'static [&'static str])> {
+        self.current_inputs.iter().find_map(|p| input_group_of(p))
+    }
+}
+
+/// Map a pin id to the input group it belongs to: (group label, member pin
+/// ids). Groups bundle every representation a card might have captured — for
+/// the analog groups that means the Vec2, both axes, and the four synthetic
+/// cardinals; for D-Pad the Vec2, axes, and four cardinals; for buttons the
+/// related set. The grouped filter matches any card referencing any member.
+fn input_group_of(pin_id: &str) -> Option<(&'static str, &'static [&'static str])> {
+    const LEFT_STICK: &[&str] = &[
+        "left_stick", "left_stick_x", "left_stick_y",
+        "left_stick_up", "left_stick_down", "left_stick_left", "left_stick_right",
+    ];
+    const RIGHT_STICK: &[&str] = &[
+        "right_stick", "right_stick_x", "right_stick_y",
+        "right_stick_up", "right_stick_down", "right_stick_left", "right_stick_right",
+    ];
+    const DPAD: &[&str] = &[
+        "dpad", "dpad_x", "dpad_y",
+        "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+    ];
+    const TRIGGERS: &[&str] = &[
+        "left_trigger", "right_trigger", "btn_lt_dig", "btn_rt_dig",
+    ];
+    const FACE: &[&str] = &[
+        "btn_south", "btn_east", "btn_west", "btn_north",
+    ];
+    const BUMPERS: &[&str] = &["btn_lb", "btn_rb"];
+    // Menu cluster: Back/Select/Share (−) + Start/Options (+).
+    const MENU: &[&str] = &["btn_back", "btn_start"];
+    // System cluster: Guide/Home, Capture/Share-button, Mic/Mute.
+    const SYSTEM: &[&str] = &["btn_guide", "btn_capture", "btn_mute"];
+    // Stick clicks (L3/R3) — a natural pair too.
+    const STICK_CLICKS: &[&str] = &["btn_ls", "btn_rs"];
+    for (label, members) in [
+        ("Left Stick", LEFT_STICK),
+        ("Right Stick", RIGHT_STICK),
+        ("D-Pad", DPAD),
+        ("Triggers", TRIGGERS),
+        ("Face Buttons", FACE),
+        ("Bumpers", BUMPERS),
+        ("Menu", MENU),
+        ("System", SYSTEM),
+        ("Stick Clicks", STICK_CLICKS),
+    ] {
+        if members.contains(&pin_id) { return Some((label, members)); }
+    }
+    None
+}
+
+/// Does a mapping pass the active filter? `filter_pins` is the card's input
+/// chord (Remapper/Map Action) or output chord (Lean).
+fn mapping_passes_filter(state: &MapFilterState, filter_pins: &[String]) -> bool {
+    match state.kind {
+        MapFilterKind::All => true,
+        MapFilterKind::Input => {
+            if state.current_inputs.is_empty() { return true; }
+            // Any-of: card passes if it contains any latched input.
+            filter_pins.iter().any(|p| state.current_inputs.iter().any(|q| q == p))
+        }
+        MapFilterKind::Stick => {
+            match state.group() {
+                Some((_, members)) =>
+                    filter_pins.iter().any(|p| members.contains(&p.as_str())),
+                // No latched input belongs to a group → grouped filter is
+                // inert; show all (the chip renders greyed, so the user can't
+                // actually select this state, but guard defensively).
+                None => true,
+            }
+        }
+    }
+}
+
+/// Render the three filter chips and return the resolved filter state. The
+/// caller persists nothing — state lives in egui temp data keyed by
+/// `filter_id`. `live_input` is the set of currently-pressed pin ids (gamepad
+/// + KB/M), used to drive the green "follow live input" behaviour. Returns the
+/// active `MapFilterState` to test each card against.
+fn mapping_filter_row(
+    ui: &mut egui::Ui,
+    filter_id: egui::Id,
+    count_label: &str,
+    live_input: &[String],
+    skin: super::remapper_icons::Skin,
+) -> MapFilterState {
+    let _ = skin; // reserved: could render the input as an icon chip later
+    let mut state: MapFilterState =
+        ui.ctx().data(|d| d.get_temp(filter_id)).unwrap_or_default();
+
+    // Always follow the live input set and LATCH it — regardless of which chip
+    // is active. A non-empty press replaces the latched set; releasing keeps
+    // the last set. This lets the green/blue chips PREVIEW what they'd filter
+    // to (their labels stay live) even while "All mappings" is selected; the
+    // list only narrows once the user actually clicks green or blue.
+    if !live_input.is_empty() && live_input != state.current_inputs.as_slice() {
+        state.current_inputs = live_input.to_vec();
+    }
+
+    // Colors. Neutral pill matches the card header mid-grey; green/blue are
+    // muted so an active chip reads as "selected" without glare.
+    const C_NEUTRAL:  Color32 = Color32::from_rgb(0x4A, 0x4A, 0x4A);
+    const C_GREEN:    Color32 = Color32::from_rgb(0x2E, 0x7D, 0x46);
+    const C_GREEN_HI: Color32 = Color32::from_rgb(0x3F, 0xA8, 0x5F);
+    const C_BLUE:     Color32 = Color32::from_rgb(0x2C, 0x5A, 0x8C);
+    const C_BLUE_HI:  Color32 = Color32::from_rgb(0x42, 0x82, 0xC4);
+
+    let group = state.group();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+
+        // ── All mappings chip ──────────────────────────────────────────────
+        let all_active = state.kind == MapFilterKind::All;
+        let all_txt = format!("All mappings {count_label}");
+        let all_resp = filter_chip(
+            ui, &all_txt, all_active,
+            C_NEUTRAL, Color32::from_white_alpha(36), true,
+        );
+        if all_resp.clicked() { state.kind = MapFilterKind::All; }
+
+        // ── Green "Filter: {input}" chip ───────────────────────────────────
+        // Label previews the latched input even under "All" (the latch updates
+        // every frame above). Clicking just switches the active filter to it.
+        let input_active = state.kind == MapFilterKind::Input;
+        let input_label = filter_inputs_label(&state.current_inputs);
+        let green_resp = filter_chip(
+            ui, &input_label, input_active,
+            C_GREEN, C_GREEN_HI, true,
+        ).on_hover_text(
+            "Show only mappings that contain the input(s) you press.\nLatches the last detected input(s); keeps filtering after release.",
+        );
+        if green_resp.clicked() { state.kind = MapFilterKind::Input; }
+
+        // ── Blue "Grouped mappings" chip ───────────────────────────────────
+        // Always rendered (stable row width); greyed + non-interactive when no
+        // latched input belongs to a group. When active it shows the resolved
+        // group (Left/Right Stick, D-Pad, Triggers, Face Buttons).
+        let (group_label, group_enabled) = match group {
+            Some((grp, _)) => (format!("Grouped: {grp}"), true),
+            None => ("Grouped mappings".to_string(), false),
+        };
+        let group_active = state.kind == MapFilterKind::Stick;
+        let blue_resp = filter_chip(
+            ui, &group_label, group_active,
+            C_BLUE, C_BLUE_HI, group_enabled,
+        ).on_hover_text(
+            "Show every mapping in the same input group as the latched input\n(e.g. all D-Pad directions, all face buttons, the whole stick).",
+        );
+        if group_enabled && blue_resp.clicked() { state.kind = MapFilterKind::Stick; }
+        // If the user was on the grouped filter but no latched input belongs to
+        // a group any more, fall back to All so the list never silently shows
+        // everything under a now-inert grouped chip.
+        if state.kind == MapFilterKind::Stick && group.is_none() {
+            state.kind = MapFilterKind::All;
+        }
+    });
+
+    ui.ctx().data_mut(|d| d.insert_temp(filter_id, state.clone()));
+    state
+}
+
+/// Compact pin name for the filter row, kept short so all three chips fit on
+/// one line. Stick cardinals/axes abbreviate to "LS Left", "RS Up", "LS X";
+/// D-Pad to "D-Pad Left"; everything else falls back to the canonical display
+/// name (already short for buttons — "LB", "South", "Start", …).
+fn filter_pin_label(pin_id: &str) -> String {
+    match pin_id {
+        "left_stick_up"     => "LS Up".into(),
+        "left_stick_down"   => "LS Down".into(),
+        "left_stick_left"   => "LS Left".into(),
+        "left_stick_right"  => "LS Right".into(),
+        "right_stick_up"    => "RS Up".into(),
+        "right_stick_down"  => "RS Down".into(),
+        "right_stick_left"  => "RS Left".into(),
+        "right_stick_right" => "RS Right".into(),
+        "left_stick_x"  => "LS X".into(),
+        "left_stick_y"  => "LS Y".into(),
+        "right_stick_x" => "RS X".into(),
+        "right_stick_y" => "RS Y".into(),
+        "left_stick"    => "LS".into(),
+        "right_stick"   => "RS".into(),
+        "dpad_up"    => "D-Pad Up".into(),
+        "dpad_down"  => "D-Pad Down".into(),
+        "dpad_left"  => "D-Pad Left".into(),
+        "dpad_right" => "D-Pad Right".into(),
+        _ => remapper_pin_display(pin_id),
+    }
+}
+
+/// Build the green chip's label from the latched input set: "Filter: <input>"
+/// with a "+N" suffix when a chord was latched.
+fn filter_inputs_label(inputs: &[String]) -> String {
+    match inputs.split_first() {
+        None => "Filter: press input".to_string(),
+        Some((first, rest)) if rest.is_empty() =>
+            format!("Filter: {}", filter_pin_label(first)),
+        Some((first, rest)) =>
+            format!("Filter: {} +{}", filter_pin_label(first), rest.len()),
+    }
+}
+
+/// A small pill button used by the filter row. `base` is the idle fill, `hi`
+/// the hover/active fill. When `enabled` is false it paints dim and reports a
+/// non-interactive (hover-only) response.
+fn filter_chip(
+    ui: &mut egui::Ui,
+    text: &str,
+    active: bool,
+    base: Color32,
+    hi: Color32,
+    enabled: bool,
+) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::proportional(12.0),
+        Color32::WHITE,
+    );
+    let pad = egui::vec2(8.0, 3.0);
+    let size = galley.size() + pad * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        size,
+        if enabled { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+    let fill = if !enabled {
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 60)
+    } else if active {
+        hi
+    } else if resp.hovered() {
+        // Blend toward hi on hover.
+        Color32::from_rgba_unmultiplied(
+            ((base.r() as u16 + hi.r() as u16) / 2) as u8,
+            ((base.g() as u16 + hi.g() as u16) / 2) as u8,
+            ((base.b() as u16 + hi.b() as u16) / 2) as u8,
+            255,
+        )
+    } else {
+        base
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, fill);
+    if active {
+        painter.rect_stroke(
+            rect, 4.0,
+            egui::Stroke::new(1.0, Color32::from_white_alpha(180)),
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+    let text_col = if enabled { Color32::WHITE } else { Color32::from_white_alpha(120) };
+    painter.galley(
+        rect.min + pad,
+        galley.clone(),
+        text_col,
+    );
+    resp
+}
+
+// ── Mapping-card drag-to-reorder ──────────────────────────────────────────────
+//
+// Cards are painter-driven and variable-height (chords wrap), and may live in a
+// transformed layer (the pinned whole-module widget). Reorder is implemented
+// against that reality:
+//   • The card body (below the header) is the drag handle (Sense in the card).
+//   • While a card is dragged, it visually lifts (paint offset) and the list
+//     opens an insertion gap at the drop target; other cards slide.
+//   • The target index is derived from the live pointer-Y compared against the
+//     PREVIOUS frame's card centers (recorded in egui temp data). A one-frame
+//     lag during an active drag is imperceptible (we repaint each frame).
+//   • Commit happens on drag release; the caller splices the underlying array.
+
+/// One row of the per-node layout map: (mapping index, center-Y, height).
+type CardLayoutRow = (usize, f32, f32);
+
+#[derive(Clone, Default)]
+struct ReorderPersist {
+    /// Active drag: (from_index, accumulated_dy). None when idle.
+    drag: Option<(usize, f32)>,
+    /// Last frame's visible card geometry, in the card UI's LOCAL coordinate
+    /// space (same space the drag Response reports positions in). Recording
+    /// local — not global — coords keeps the target math correct inside the
+    /// pinned whole-module widget's transformed layer.
+    layout: Vec<CardLayoutRow>,
+    /// Last frame's pointer Y in that same local space, captured from the
+    /// dragged card's `interact_pointer_pos()`. Used to resolve the insertion
+    /// target one frame later (imperceptible during an active drag).
+    pointer_y: Option<f32>,
+}
+
+/// Live view of reorder state for the current frame. Built once before the card
+/// loop, queried per card, finalized after.
+struct ReorderView {
+    state_id: egui::Id,
+    enabled: bool,
+    /// (from, accum_dy) carried from last frame.
+    drag: Option<(usize, f32)>,
+    /// Insertion target computed from last-frame layout + live pointer. Only
+    /// meaningful while `drag` is Some.
+    target: Option<usize>,
+    /// Display slot the dragged card occupied last frame (so we can suppress a
+    /// redundant gap right where it already sits).
+    from_slot: Option<usize>,
+    /// Fresh layout being accumulated this frame.
+    new_layout: Vec<CardLayoutRow>,
+    /// Pointer Y (local space) captured this frame from the dragged card.
+    new_pointer_y: Option<f32>,
+    /// Approx card height (px) for sizing the insertion gap. Taken from the
+    /// dragged card's last-known height, falling back to a default.
+    gap_h: f32,
+    /// Set on release; caller reads via `take_commit`.
+    commit: Option<(usize, usize)>,
+}
+
+impl ReorderView {
+    fn begin(ui: &egui::Ui, state_id: egui::Id, enabled: bool) -> Self {
+        let persist: ReorderPersist =
+            ui.ctx().data(|d| d.get_temp(state_id)).unwrap_or_default();
+        let mut drag = if enabled { persist.drag } else { None };
+
+        // Fold in any auto-scroll compensation published by the enclosing
+        // whole-module widget last frame, so the lifted card stays glued to the
+        // pointer while the body scrolls under it. Keyed by this body's layer.
+        // Consume-and-clear so each published delta is applied exactly once.
+        if let Some((_, dy)) = drag.as_mut() {
+            let comp_id = egui::Id::new(("fxi_reorder_scroll_comp", ui.layer_id()));
+            let comp = ui.ctx().data_mut(|d| {
+                let v = d.get_temp::<f32>(comp_id).unwrap_or(0.0);
+                if v != 0.0 { d.insert_temp(comp_id, 0.0_f32); }
+                v
+            });
+            *dy += comp;
+        }
+        let drag = drag;
+
+        // Compute insertion target from last frame's pointer Y (in card-local
+        // space) vs last frame's card centers (same space). Target is the
+        // index the dragged card would land *before* (== layout.len() means
+        // "after the last card").
+        let mut target = None;
+        let mut gap_h = 96.0;
+        let mut from_slot = None;
+        if let Some((from, _)) = drag {
+            for (slot, (i, _, h)) in persist.layout.iter().enumerate() {
+                if *i == from { gap_h = *h; from_slot = Some(slot); }
+            }
+            if let Some(py) = persist.pointer_y {
+                // Cards are in display order in `layout`; find the first whose
+                // center is below the pointer → insert before it.
+                let mut t = persist.layout.len();
+                for (slot, (_, cy, _)) in persist.layout.iter().enumerate() {
+                    if py < *cy { t = slot; break; }
+                }
+                target = Some(t);
+            }
+        }
+
+        ReorderView {
+            state_id, enabled, drag, target, from_slot,
+            new_layout: Vec::new(),
+            new_pointer_y: None,
+            gap_h,
+            commit: None,
+        }
+    }
+
+    /// Visual lift to pass as `drag_offset_y` for card `idx`.
+    fn offset_for(&self, idx: usize) -> f32 {
+        match self.drag {
+            Some((from, dy)) if from == idx => dy,
+            _ => 0.0,
+        }
+    }
+
+    /// True when the insertion target sits exactly where the dragged card
+    /// already is (its own slot or the slot just after) — in that case opening
+    /// a gap would just double the displacement, so suppress it.
+    fn target_is_noop(&self) -> bool {
+        match (self.from_slot, self.target) {
+            (Some(f), Some(t)) => t == f || t == f + 1,
+            _ => false,
+        }
+    }
+
+    /// Whether an insertion gap should be drawn *before* the card that will be
+    /// rendered at display position `slot` (0-based among visible cards).
+    fn gap_before(&self, slot: usize) -> Option<f32> {
+        if self.target_is_noop() { return None; }
+        match (self.drag, self.target) {
+            (Some(_), Some(t)) if t == slot => Some(self.gap_h * 0.5),
+            _ => None,
+        }
+    }
+
+    /// Trailing gap after the final visible card (target past the end).
+    fn gap_after_last(&self, visible_count: usize) -> Option<f32> {
+        if self.target_is_noop() { return None; }
+        match (self.drag, self.target) {
+            (Some(_), Some(t)) if t >= visible_count => Some(self.gap_h * 0.5),
+            _ => None,
+        }
+    }
+
+    /// Record this card's geometry and fold its drag interaction into the
+    /// state machine. `idx` is the mapping's array index.
+    fn observe(&mut self, idx: usize, result: &MappingCardResult) {
+        self.new_layout.push((idx, result.rect.center().y, result.rect.height()));
+        if !self.enabled { return; }
+        let Some(resp) = result.body_drag.as_ref() else { return };
+        if resp.drag_started() {
+            self.drag = Some((idx, 0.0));
+        } else if resp.dragged() {
+            if let Some((from, dy)) = self.drag.as_mut() {
+                if *from == idx { *dy += resp.drag_delta().y; }
+            }
+            // Capture the pointer in this card's LOCAL space for next-frame
+            // target resolution. `interact_pointer_pos` already accounts for
+            // the responding layer's transform.
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.new_pointer_y = Some(p.y);
+            }
+        } else if resp.drag_stopped() {
+            if let Some((from, _)) = self.drag {
+                if from == idx {
+                    if let Some(to) = self.target {
+                        self.commit = Some((from, to));
+                    }
+                    self.drag = None;
+                }
+            }
+        }
+    }
+
+    /// Persist state for next frame; returns a pending reorder to apply.
+    fn finish(mut self, ui: &egui::Ui) -> Option<(usize, usize)> {
+        let commit = self.commit.take();
+        // Sort layout by center-Y so display order is correct even if the
+        // loop visited indices out of order (it doesn't, but be safe).
+        self.new_layout.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let active = self.drag.is_some();
+        let persist = ReorderPersist {
+            drag: self.drag,
+            layout: self.new_layout,
+            pointer_y: self.new_pointer_y,
+        };
+        ui.ctx().data_mut(|d| d.insert_temp(self.state_id, persist));
+        // Publish a per-layer "card drag in progress" flag so the enclosing
+        // whole-module widget can auto-scroll the body toward the drag edge.
+        // Keyed by the body layer (== this ui's layer) so the outer reads it
+        // with the same key. Cleared (set false) when idle.
+        let flag_id = egui::Id::new(("fxi_reorder_drag_active", ui.layer_id()));
+        ui.ctx().data_mut(|d| d.insert_temp(flag_id, active));
+        if active { ui.ctx().request_repaint(); }
+        commit
+    }
+}
+
+/// Draw a subtle insertion-gap highlight and reserve `h` vertical space.
+fn draw_insertion_gap(ui: &mut egui::Ui, h: f32) {
+    let w = ui.available_width().min(358.0).max(100.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    let band = egui::Rect::from_center_size(
+        rect.center(),
+        egui::vec2(rect.width(), 3.0),
+    );
+    let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(rect));
+    painter.rect_filled(band, 1.5, Color32::from_rgb(0x3F, 0xA8, 0x5F));
+}
+
+/// Move element `from` to land before display position `to` (where `to` counts
+/// slots in the *current* order; `to == len` appends). No-op if it doesn't move.
+fn reorder_array(arr: &mut Vec<Value>, from: usize, to: usize) {
+    if from >= arr.len() { return; }
+    // `to` is an insertion slot in the original indexing. After removing
+    // `from`, indices above it shift down by one.
+    let to = to.min(arr.len());
+    if to == from || to == from + 1 { return; } // already in place
+    let item = arr.remove(from);
+    let insert_at = if to > from { to - 1 } else { to };
+    let insert_at = insert_at.min(arr.len());
+    arr.insert(insert_at, item);
+}
+
 /// Pixel-accurate mapping card outcome.
 struct MappingCardResult {
     /// True if the delete (×) button was clicked.
@@ -12313,6 +13043,13 @@ struct MappingCardResult {
     /// Total card height (so caller can advance the cursor properly even
     /// though we manage layout manually with painters + invisible buttons).
     height: f32,
+    /// Drag interaction on the card *body* (the area below the header strip).
+    /// Used by the caller's reorder state machine. `None` when reordering is
+    /// disabled for this card.
+    body_drag: Option<egui::Response>,
+    /// The card's full on-screen rect (origin + size) at its natural (un-lifted)
+    /// position, in the current UI's coordinate space.
+    rect: egui::Rect,
 }
 
 /// Render a mapping card pixel-accurate to Figma node 358:2 (Frame 1 → Group 1).
@@ -12336,6 +13073,8 @@ fn remapper_mapping_card_pixel(
     out_pins: Option<&[String]>,    // None → Map Action variant (single row)
     skin: super::remapper_icons::Skin,
     allow_analog_mode: bool,        // true for Lean cards and Remapper/Map Action (since analog support added)
+    reorder_enabled: bool,          // sense a drag on the body for reorder
+    drag_offset_y: f32,             // visual lift (paint offset) while dragging this card
 ) -> MappingCardResult {
     // ── Figma palette ─────────────────────────────────────────────────────
     const C_CARD_BG:   Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);  // outer
@@ -12406,10 +13145,16 @@ fn remapper_mapping_card_pixel(
         + if out_pins.is_some() { out_rows as f32 * row_pitch_y } else { 0.0 }
         + bottom_pad;
     let card_h = header_h + body_h;
-    let (card_rect, _) = ui.allocate_exact_size(
+    let (natural_rect, _) = ui.allocate_exact_size(
         egui::vec2(card_w, card_h),
         egui::Sense::hover(),
     );
+    // While this card is being dragged for reorder, lift its *painted* and
+    // *interactive* geometry by `drag_offset_y` so it visually follows the
+    // pointer, while the layout slot it vacated stays reserved (the caller
+    // opens the insertion gap elsewhere). Layout-affecting code keeps using
+    // `natural_rect`; everything visual uses the lifted `card_rect`.
+    let card_rect = natural_rect.translate(egui::vec2(0.0, drag_offset_y));
     let card_origin = card_rect.min;
     // Intersect with the parent's clip rect so we don't paint outside the
     // body's visible band (otherwise layout-mode preview leaks card shapes
@@ -12535,9 +13280,17 @@ fn remapper_mapping_card_pixel(
 
     // ── time gap pill: outer (61,5,137×20), valuebox (135,5,63×20) ────────
     let turbo_on = mapping.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-    // `analog` reuses the time_gap field as the per-tap duration (when
-    // outputs are bool) — see eval. So it counts as "applies".
-    let gap_applies = matches!(mode_now.as_str(), "short" | "long" | "double" | "analog") || turbo_on;
+    // Modes that read the time-gap value:
+    //   short/long/double — window timing; analog — per-tap duration;
+    //   on_press/on_release — emitted trigger duration (see apply_press_mode);
+    //   any mode with turbo on — turbo period.
+    let gap_applies = matches!(mode_now.as_str(),
+        "short" | "long" | "double" | "analog" | "on_press" | "on_release") || turbo_on;
+    // Turbo is only meaningful for sustained/continuous gates. It's grayed for
+    // short, double, and the edge-trigger modes (on_press/on_release) — turbo
+    // on a one-shot edge pulse has no sensible meaning.
+    let turbo_applies = !matches!(mode_now.as_str(),
+        "short" | "double" | "on_press" | "on_release");
     {
         let outer = egui::Rect::from_min_size(at(61.0, 5.0), sz(137.0, 20.0));
         let value_box = egui::Rect::from_min_size(at(61.0 + 74.0, 5.0), sz(63.0, 20.0));
@@ -12609,22 +13362,30 @@ fn remapper_mapping_card_pixel(
     {
         let outer = egui::Rect::from_min_size(at(274.0, 5.0), sz(80.0, 20.0));
         let cb_rect = egui::Rect::from_min_size(at(274.0 + 63.0, 5.0 + 3.0), sz(14.0, 14.0));
-        painter.rect_filled(outer, RADIUS, C_PILL_MID);
+        let alpha = if turbo_applies { 255 } else { 77 };
+        let mul = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha);
+        painter.rect_filled(outer, RADIUS, mul(C_PILL_MID));
         painter.text(
             at(274.0 + 5.0, 5.0 + 10.0),
             egui::Align2::LEFT_CENTER,
             "turbo",
             egui::FontId::proportional(TEXT_SIZE_HEADER * s),
-            C_TEXT,
+            mul(C_TEXT),
         );
-        painter.rect_filled(cb_rect, 3.0, C_CHECK_BG);
-        let mut turbo = turbo_on;
+        painter.rect_filled(cb_rect, 3.0, mul(C_CHECK_BG));
+        // Effective turbo is off when the mode doesn't support it; clear a
+        // stale stored `turbo:true` so it can't silently affect the engine.
+        let mut turbo = turbo_on && turbo_applies;
+        if turbo_on && !turbo_applies {
+            mapping.remove("turbo");
+            changed = true;
+        }
         if turbo {
-            painter.rect_filled(cb_rect.shrink(3.0 * s), 1.0, C_PILL_DARK);
+            painter.rect_filled(cb_rect.shrink(3.0 * s), 1.0, mul(C_PILL_DARK));
         }
         let resp = ui.interact(outer, ui.id().with(("turbo", mapping_idx)),
-            egui::Sense::click());
-        if resp.clicked() {
+            if turbo_applies { egui::Sense::click() } else { egui::Sense::hover() });
+        if turbo_applies && resp.clicked() {
             turbo = !turbo;
             mapping.insert("turbo".to_string(), Value::Bool(turbo));
             changed = true;
@@ -12717,7 +13478,32 @@ fn remapper_mapping_card_pixel(
         render_chord_row_painter(chord_y_out_first + extra, out_pins);
     }
 
-    MappingCardResult { delete_clicked, changed, height: card_h }
+    // ── Body drag handle (reorder) ─────────────────────────────────────────
+    // The whole body strip (below the 31px header) is the drag handle. The
+    // header keeps its own button interactions; body chips are paint-only so
+    // there's no conflict. A grab cursor signals the affordance on hover.
+    let body_drag = if reorder_enabled {
+        let handle_rect = egui::Rect::from_min_max(
+            card_origin + egui::vec2(0.0, body_top_y),
+            card_rect.max,
+        );
+        let resp = ui.interact(
+            handle_rect,
+            ui.id().with(("card_drag", mapping_idx)),
+            egui::Sense::click_and_drag(),
+        );
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        Some(resp)
+    } else {
+        None
+    };
+
+    MappingCardResult {
+        delete_clicked, changed, height: card_h,
+        body_drag, rect: natural_rect,
+    }
 }
 
 /// Render a chord (list of pin ids) as chips separated by "+". When any
@@ -13475,7 +14261,27 @@ fn show_remapper_body(
         if !mappings.is_empty() {
             ui.add_space(4.0);
             ui.separator();
-            ui.label(egui::RichText::new(format!("Mappings ({})", mappings.len())).size(13.0).weak());
+
+            // Filter row. The live-input read here is independent of the
+            // capture state machine above — the user filters by pressing an
+            // input while NOT in learning. Read SOURCE pins only (the upstream
+            // device on the wire) — deliberately NOT the OS keyboard/mouse: a
+            // Remapper that maps a button → a key injects that key on the
+            // virtual sink, and the OS would then report it as "pressed",
+            // flickering the filter from source to destination. The source side
+            // is all we want to filter by.
+            let filter_live: Vec<String> = match (&upstream_dev_id, wired) {
+                (Some(dev), true) => remapper_pressed_now(live_signals, dev),
+                _ => Vec::new(),
+            };
+            let filter = mapping_filter_row(
+                ui,
+                egui::Id::new(("fxi_remap_filter", node_id.0)),
+                &format!("({})", mappings.len()),
+                &filter_live,
+                skin,
+            );
+
             let mut to_remove: Option<usize> = None;
             // Card layout per mapping:
             //   ┌──────────────────────────────────────────────────┐
@@ -13491,6 +14297,14 @@ fn show_remapper_body(
             // wrapper add ~3px each between siblings.
             ui.spacing_mut().item_spacing.y = 2.0;
             let mut press_mode_changed: Option<(usize, serde_json::Map<String, Value>)> = None;
+            // Reordering operates on the full array; only enabled when no
+            // filter is narrowing the visible set (so the dragged index maps
+            // 1:1 to the underlying array).
+            let reorder_enabled = filter.kind == MapFilterKind::All;
+            let mut rv = ReorderView::begin(
+                ui, egui::Id::new(("fxi_remap_reorder", node_id.0)), reorder_enabled,
+            );
+            let mut slot = 0usize; // display position among visible cards
             for (i, m) in mappings.iter().enumerate() {
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
@@ -13499,8 +14313,13 @@ fn show_remapper_body(
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
 
+                if !mapping_passes_filter(&filter, &in_pins) { continue; }
+
+                if let Some(h) = rv.gap_before(slot) { draw_insertion_gap(ui, h); }
+
                 let mut working: serde_json::Map<String, Value> = m.as_object().cloned().unwrap_or_default();
                 let mut working_changed = false;
+                let drag_off = rv.offset_for(i);
 
                 ui.push_id(("fxi_remap_card", node_id.0, i), |ui| {
                     ui.horizontal(|ui| {
@@ -13512,10 +14331,11 @@ fn show_remapper_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin,
-                                    true,
+                                    true, reorder_enabled, drag_off,
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
+                                rv.observe(i, &result);
                             },
                         );
                     });
@@ -13523,6 +14343,16 @@ fn show_remapper_body(
 
                 if working_changed {
                     press_mode_changed = Some((i, working));
+                }
+                slot += 1;
+            }
+            if let Some(h) = rv.gap_after_last(slot) { draw_insertion_gap(ui, h); }
+            let reorder = rv.finish(ui);
+            if let Some((from, to)) = reorder {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    if let Some(Value::Array(arr)) = node.params.get_mut("mappings") {
+                        reorder_array(arr, from, to);
+                    }
                 }
             }
             if let Some(idx) = to_remove {
@@ -13794,12 +14624,32 @@ fn show_map_action_body(
         if !mappings.is_empty() {
             ui.add_space(4.0);
             ui.separator();
-            ui.label(egui::RichText::new(format!("Mappings ({})", mappings.len())).size(13.0).weak());
+
+            // Filter row — SOURCE pins only (upstream device on the wire), not
+            // OS KB/M, so an injected destination key never flickers the
+            // filter. See the Remapper note for the full rationale.
+            let filter_live: Vec<String> = match (&upstream_dev_id, wired) {
+                (Some(dev), true) => remapper_pressed_now(live_signals, dev),
+                _ => Vec::new(),
+            };
+            let filter = mapping_filter_row(
+                ui,
+                egui::Id::new(("fxi_mapact_filter", node_id.0)),
+                &format!("({})", mappings.len()),
+                &filter_live,
+                skin,
+            );
+
             let mut to_remove: Option<usize> = None;
             // Card layout per mapping (Map Action variant): no in/out labels,
             // just header + a single row listing the captured chord chips.
             ui.spacing_mut().item_spacing.y = 2.0;
             let mut press_mode_changed: Option<(usize, serde_json::Map<String, Value>)> = None;
+            let reorder_enabled = filter.kind == MapFilterKind::All;
+            let mut rv = ReorderView::begin(
+                ui, egui::Id::new(("fxi_mapact_reorder", node_id.0)), reorder_enabled,
+            );
+            let mut slot = 0usize;
             for (i, m) in mappings.iter().enumerate() {
                 // Legacy Array<String> → upgrade to Object{ in, … } once edited.
                 let (in_pins, mut working): (Vec<String>, serde_json::Map<String, Value>) =
@@ -13820,7 +14670,12 @@ fn show_map_action_body(
                         (Vec::new(), serde_json::Map::new())
                     };
 
+                if !mapping_passes_filter(&filter, &in_pins) { continue; }
+
+                if let Some(h) = rv.gap_before(slot) { draw_insertion_gap(ui, h); }
+
                 let mut working_changed = false;
+                let drag_off = rv.offset_for(i);
 
                 ui.push_id(("fxi_mapact_card", node_id.0, i), |ui| {
                     ui.horizontal(|ui| {
@@ -13832,10 +14687,11 @@ fn show_map_action_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin,
-                                    true,
+                                    true, reorder_enabled, drag_off,
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
+                                rv.observe(i, &result);
                             },
                         );
                     });
@@ -13843,6 +14699,15 @@ fn show_map_action_body(
 
                 if working_changed {
                     press_mode_changed = Some((i, working));
+                }
+                slot += 1;
+            }
+            if let Some(h) = rv.gap_after_last(slot) { draw_insertion_gap(ui, h); }
+            if let Some((from, to)) = rv.finish(ui) {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    if let Some(Value::Array(arr)) = node.params.get_mut("mappings") {
+                        reorder_array(arr, from, to);
+                    }
                 }
             }
             if let Some(idx) = to_remove {
@@ -13964,6 +14829,11 @@ struct ItemStyle {
     stroke_px: Option<f32>,
     corner_radius: Option<f32>,
     font_size: Option<f32>,
+    // Graph-pin override (Response Curve / Oscilloscope / Vectorscope). Carried
+    // whole so copy/paste-style and multi-select propagation transfer the
+    // background, outline, and per-channel line/dot colors together. Applied
+    // only onto other graph pins (see `apply_to`).
+    graph: Option<crate::canvas::node::PinGraphOverride>,
     // Text-pin / switch-pin overrides are deliberately NOT bulk-propagated
     // here (they're per-module-kind and rarely span a mixed selection); the
     // decoration-level fill/stroke covers the common decoration case.
@@ -13973,6 +14843,7 @@ impl ItemStyle {
     fn any(&self) -> bool {
         self.fill.is_some() || self.stroke.is_some() || self.stroke_px.is_some()
             || self.corner_radius.is_some() || self.font_size.is_some()
+            || self.graph.is_some()
     }
     /// Build the set of fields that differ between `self` (before) and `after`.
     fn diff(&self, after: &ItemStyle) -> ItemStyle {
@@ -13985,11 +14856,29 @@ impl ItemStyle {
             stroke_px: pick(self.stroke_px, after.stroke_px),
             corner_radius: pick(self.corner_radius, after.corner_radius),
             font_size: pick(self.font_size, after.font_size),
+            // Clone (not Copy) so picked by reference comparison.
+            graph: match (&self.graph, &after.graph) {
+                (b, Some(a)) if b.as_ref() != Some(a) => Some(a.clone()),
+                _ => None,
+            },
         }
     }
     /// Apply each changed field to `it` where that field exists on the item.
     fn apply_to(&self, it: &mut LayoutItem) {
-        let LayoutItem::Deco(d) = it else { return };
+        let d = match it {
+            LayoutItem::Deco(d) => d,
+            // Graph-pin styling rides on the `graph` payload only; copy/paste
+            // and propagation between graph pins go through here.
+            LayoutItem::Module(m) => {
+                if let Some(g) = &self.graph {
+                    let empty = g.background.is_none() && g.outline.is_none()
+                        && g.outline_px.is_none() && g.gridline.is_none()
+                        && g.channel_colors.iter().all(|c| c.is_none());
+                    m.graph_override = if empty { None } else { Some(g.clone()) };
+                }
+                return;
+            }
+        };
         match d {
             LayoutDecoration::Text { fill, outline, outline_px, font_size, .. } => {
                 if let Some(v) = self.fill { *fill = v; }
@@ -14028,24 +14917,36 @@ fn item_style_of(it: &LayoutItem) -> ItemStyle {
         LayoutItem::Deco(LayoutDecoration::Text { fill, outline, outline_px, font_size, .. }) => ItemStyle {
             fill: Some(*fill), stroke: Some(*outline), stroke_px: Some(*outline_px),
             corner_radius: None, font_size: Some(*font_size),
+            ..ItemStyle::default()
         },
         LayoutItem::Deco(LayoutDecoration::Rect { fill, stroke, stroke_px, corner_radius, .. }) => ItemStyle {
             fill: Some(*fill), stroke: Some(*stroke), stroke_px: Some(*stroke_px),
             corner_radius: Some(*corner_radius), font_size: None,
+            ..ItemStyle::default()
         },
         LayoutItem::Deco(LayoutDecoration::Ellipse { fill, stroke, stroke_px, .. }) => ItemStyle {
             fill: Some(*fill), stroke: Some(*stroke), stroke_px: Some(*stroke_px),
             corner_radius: None, font_size: None,
+            ..ItemStyle::default()
         },
         LayoutItem::Deco(LayoutDecoration::Line { stroke, stroke_px, .. }) => ItemStyle {
             fill: None, stroke: Some(*stroke), stroke_px: Some(*stroke_px),
             corner_radius: None, font_size: None,
+            ..ItemStyle::default()
         },
         LayoutItem::Deco(LayoutDecoration::Svg { stroke, stroke_px, .. }) => ItemStyle {
             fill: None, stroke: Some(*stroke), stroke_px: Some(*stroke_px),
             corner_radius: None, font_size: None,
+            ..ItemStyle::default()
         },
-        LayoutItem::Module(_) => ItemStyle::default(),
+        // Module pins only carry their graph override into the style snapshot
+        // (text/switch pin overrides stay per-kind and aren't bulk-propagated).
+        // `graph_override` is only ever populated on graph pins, so this is
+        // inert for other module kinds.
+        LayoutItem::Module(m) => ItemStyle {
+            graph: m.graph_override.clone(),
+            ..ItemStyle::default()
+        },
     }
 }
 
@@ -14239,6 +15140,84 @@ fn switch_pin_inspector_strip_item(
     }
 }
 
+/// Inspector strip for the per-pin graph color override (Response Curve,
+/// Oscilloscope, Vectorscope). Exposes background + outline + outline width,
+/// then one color swatch per input channel for the line/dot color. All controls
+/// share one wrapped row, so when there isn't enough width (e.g. Easy mode) the
+/// channel swatches wrap onto a second row automatically. `n_channels` is the
+/// inner module's resolved channel count.
+fn graph_pin_inspector_strip_item(
+    ui: &mut egui::Ui,
+    items: &mut Vec<LayoutItem>,
+    idx: usize,
+    n_channels: usize,
+) {
+    use crate::canvas::node::PinGraphOverride;
+    if idx >= items.len() { return; }
+    let exp = match &mut items[idx] {
+        LayoutItem::Module(m) => m,
+        _ => return,
+    };
+    let mut ov = exp.graph_override.clone().unwrap_or_default();
+    let mut clear = false;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Graph pin override").small().strong());
+        ui.separator();
+
+        // Background: default is the shared 60%-opacity base.
+        let mut bg = ov.background.unwrap_or([16, 16, 16, 153]);
+        if color_button(ui, "bg", &mut bg) { ov.background = Some(bg); }
+
+        // Outline: off by default (transparent / 0px).
+        let mut outl = ov.outline.unwrap_or([180, 180, 180, 255]);
+        if color_button(ui, "outline", &mut outl) { ov.outline = Some(outl); }
+        let mut opx = ov.outline_px.unwrap_or(0.0);
+        if ui.add(egui::DragValue::new(&mut opx).speed(0.1).range(0.0f32..=8.0).suffix("px"))
+            .on_hover_text("Outline thickness")
+            .changed()
+        {
+            ov.outline_px = Some(opx);
+        }
+
+        // Gridline / axis color. Default matches the brighter label hue
+        // (unmultiplied 180,180,180,160 == GRAPH_GRID_DEFAULT premultiplied).
+        let mut grid = ov.gridline.unwrap_or([180, 180, 180, 160]);
+        if color_button(ui, "grid", &mut grid) { ov.gridline = Some(grid); }
+
+        ui.separator();
+
+        // One line/dot color swatch per channel. Each defaults to the built-in
+        // palette entry for that channel.
+        ov.channel_colors.resize(n_channels, None);
+        for ch in 0..n_channels {
+            let default = MULTI_COLORS[ch % MULTI_COLORS.len()];
+            let mut col = ov.channel_colors[ch]
+                .unwrap_or([default.r(), default.g(), default.b(), 255]);
+            if color_button(ui, &format!("Ch{}", ch + 1), &mut col) {
+                ov.channel_colors[ch] = Some(col);
+            }
+        }
+
+        if ui.small_button("Reset").on_hover_text("Use the module's default colors").clicked() {
+            clear = true;
+        }
+    });
+
+    if clear {
+        exp.graph_override = None;
+    } else {
+        let any = ov.background.is_some()
+            || ov.outline.is_some()
+            || ov.outline_px.is_some()
+            || ov.gridline.is_some()
+            || ov.channel_colors.iter().any(|c| c.is_some());
+        // Drop trailing None channel slots so we don't serialize empty tails.
+        while matches!(ov.channel_colors.last(), Some(None)) { ov.channel_colors.pop(); }
+        exp.graph_override = if any { Some(PinGraphOverride { ..ov }) } else { None };
+    }
+}
+
 /// Paint a single decoration into the given body painter. Coordinates are in
 /// body-local space; caller already translated `origin` and provides absolute
 /// `painter` and `offset` to add to local coords.
@@ -14387,3 +15366,220 @@ fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco: &LayoutDe
 // (Old `show_subpatch_decorations` has been folded into `show_subpatch_body`.
 //  Decorations + module pins share one Z-order, one selection, and one
 //  interaction layer.)
+
+#[cfg(test)]
+mod mapping_list_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn arr(items: &[&str]) -> Vec<Value> {
+        items.iter().map(|s| Value::String((*s).to_string())).collect()
+    }
+    fn ids(arr: &[Value]) -> Vec<String> {
+        arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+    }
+
+    // ── reorder_array: insertion-slot semantics + index shift ──────────────
+    // `to` is an insertion slot in the ORIGINAL indexing (the slot the dragged
+    // card lands *before*); `to == len` appends. Moving down must account for
+    // the gap left behind once `from` is removed.
+
+    #[test]
+    fn reorder_move_down_past_one() {
+        // [A,B,C,D], drag A (idx0) to land before slot 2 → after B.
+        let mut a = arr(&["A", "B", "C", "D"]);
+        reorder_array(&mut a, 0, 2);
+        assert_eq!(ids(&a), vec!["B", "A", "C", "D"]);
+    }
+
+    #[test]
+    fn reorder_move_to_end() {
+        // drag A to slot len (append).
+        let mut a = arr(&["A", "B", "C"]);
+        reorder_array(&mut a, 0, 3);
+        assert_eq!(ids(&a), vec!["B", "C", "A"]);
+    }
+
+    #[test]
+    fn reorder_move_up() {
+        // [A,B,C,D], drag D (idx3) to land before slot 1 → between A and B.
+        let mut a = arr(&["A", "B", "C", "D"]);
+        reorder_array(&mut a, 3, 1);
+        assert_eq!(ids(&a), vec!["A", "D", "B", "C"]);
+    }
+
+    #[test]
+    fn reorder_noop_same_slot() {
+        // target == from or from+1 is a no-op (card already there).
+        let mut a = arr(&["A", "B", "C"]);
+        reorder_array(&mut a, 1, 1);
+        assert_eq!(ids(&a), vec!["A", "B", "C"]);
+        reorder_array(&mut a, 1, 2);
+        assert_eq!(ids(&a), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn reorder_out_of_range_from_is_safe() {
+        let mut a = arr(&["A", "B"]);
+        reorder_array(&mut a, 5, 0);
+        assert_eq!(ids(&a), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn reorder_target_past_end_clamps() {
+        let mut a = arr(&["A", "B", "C"]);
+        reorder_array(&mut a, 0, 99);
+        assert_eq!(ids(&a), vec!["B", "C", "A"]);
+    }
+
+    // ── input_group_of ────────────────────────────────────────────────────
+    #[test]
+    fn input_group_classifies_all_groups() {
+        assert_eq!(input_group_of("left_stick_up").map(|(l, _)| l), Some("Left Stick"));
+        assert_eq!(input_group_of("left_stick_x").map(|(l, _)| l), Some("Left Stick"));
+        assert_eq!(input_group_of("left_stick").map(|(l, _)| l), Some("Left Stick"));
+        assert_eq!(input_group_of("right_stick_left").map(|(l, _)| l), Some("Right Stick"));
+        // D-Pad: Vec2, axes, and cardinals all map to the D-Pad group.
+        assert_eq!(input_group_of("dpad_up").map(|(l, _)| l), Some("D-Pad"));
+        assert_eq!(input_group_of("dpad").map(|(l, _)| l), Some("D-Pad"));
+        assert_eq!(input_group_of("dpad_x").map(|(l, _)| l), Some("D-Pad"));
+        // Triggers: analog + digital.
+        assert_eq!(input_group_of("left_trigger").map(|(l, _)| l), Some("Triggers"));
+        assert_eq!(input_group_of("btn_rt_dig").map(|(l, _)| l), Some("Triggers"));
+        // Face buttons (canonical diamond ids).
+        assert_eq!(input_group_of("btn_south").map(|(l, _)| l), Some("Face Buttons"));
+        assert_eq!(input_group_of("btn_north").map(|(l, _)| l), Some("Face Buttons"));
+        // Bumpers / Menu / System / Stick clicks.
+        assert_eq!(input_group_of("btn_lb").map(|(l, _)| l), Some("Bumpers"));
+        assert_eq!(input_group_of("btn_rb").map(|(l, _)| l), Some("Bumpers"));
+        assert_eq!(input_group_of("btn_back").map(|(l, _)| l), Some("Menu"));
+        assert_eq!(input_group_of("btn_start").map(|(l, _)| l), Some("Menu"));
+        assert_eq!(input_group_of("btn_guide").map(|(l, _)| l), Some("System"));
+        assert_eq!(input_group_of("btn_capture").map(|(l, _)| l), Some("System"));
+        assert_eq!(input_group_of("btn_mute").map(|(l, _)| l), Some("System"));
+        assert_eq!(input_group_of("btn_ls").map(|(l, _)| l), Some("Stick Clicks"));
+        assert_eq!(input_group_of("btn_rs").map(|(l, _)| l), Some("Stick Clicks"));
+        // Still ungrouped: touchpad click, gyro/accel axes, etc.
+        assert_eq!(input_group_of("btn_touchpad"), None);
+        assert_eq!(input_group_of("gyro_x"), None);
+    }
+
+    // ── mapping_passes_filter ─────────────────────────────────────────────
+    fn state(kind: MapFilterKind, input: &str) -> MapFilterState {
+        let inputs = if input.is_empty() { vec![] } else { vec![input.to_string()] };
+        MapFilterState { kind, current_inputs: inputs }
+    }
+    fn state_multi(kind: MapFilterKind, inputs: &[&str]) -> MapFilterState {
+        MapFilterState { kind, current_inputs: inputs.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn filter_all_passes_everything() {
+        let s = state(MapFilterKind::All, "");
+        assert!(mapping_passes_filter(&s, &["btn_a".into()]));
+        assert!(mapping_passes_filter(&s, &[]));
+    }
+
+    #[test]
+    fn filter_input_matches_only_containing_card() {
+        let s = state(MapFilterKind::Input, "btn_a");
+        assert!(mapping_passes_filter(&s, &["btn_a".into(), "btn_b".into()]));
+        assert!(!mapping_passes_filter(&s, &["btn_x".into()]));
+    }
+
+    #[test]
+    fn filter_input_empty_current_shows_all() {
+        // Green selected but nothing pressed yet → don't hide everything.
+        let s = state(MapFilterKind::Input, "");
+        assert!(mapping_passes_filter(&s, &["btn_a".into()]));
+    }
+
+    #[test]
+    fn filter_stick_matches_any_direction_of_same_stick() {
+        // Pressing left_stick_up; a card mapped from left_stick_left (a
+        // different direction of the SAME stick) should pass the blue filter.
+        let s = state(MapFilterKind::Stick, "left_stick_up");
+        assert!(mapping_passes_filter(&s, &["left_stick_left".into()]));
+        assert!(mapping_passes_filter(&s, &["left_stick_x".into()]));
+        // A right-stick card must NOT match a left-stick group.
+        assert!(!mapping_passes_filter(&s, &["right_stick_up".into()]));
+        // A plain button card must not match.
+        assert!(!mapping_passes_filter(&s, &["btn_a".into()]));
+    }
+
+    #[test]
+    fn filter_stick_matches_analog_destination_for_lean() {
+        // Lean cards filter by OUTPUT; an analog destination (stick axis) on
+        // the output side must match the blue group when the live input is a
+        // direction of that stick.
+        let s = state(MapFilterKind::Stick, "right_stick_right");
+        assert!(mapping_passes_filter(&s, &["right_stick_y".into()]));
+        assert!(mapping_passes_filter(&s, &["right_stick".into()]));
+    }
+
+    #[test]
+    fn filter_group_dpad_bundles_all_directions() {
+        // Pressing one D-Pad direction groups every D-Pad representation.
+        let s = state(MapFilterKind::Stick, "dpad_left");
+        assert!(mapping_passes_filter(&s, &["dpad_right".into()]));
+        assert!(mapping_passes_filter(&s, &["dpad".into()]));
+        assert!(mapping_passes_filter(&s, &["dpad_y".into()]));
+        assert!(!mapping_passes_filter(&s, &["left_stick_left".into()]));
+    }
+
+    #[test]
+    fn filter_group_face_buttons_and_triggers() {
+        let face = state(MapFilterKind::Stick, "btn_south");
+        assert!(mapping_passes_filter(&face, &["btn_north".into()]));
+        assert!(mapping_passes_filter(&face, &["btn_east".into()]));
+        assert!(!mapping_passes_filter(&face, &["btn_lb".into()]));
+
+        let trig = state(MapFilterKind::Stick, "left_trigger");
+        assert!(mapping_passes_filter(&trig, &["right_trigger".into()]));
+        assert!(mapping_passes_filter(&trig, &["btn_lt_dig".into()]));
+        assert!(!mapping_passes_filter(&trig, &["btn_south".into()]));
+    }
+
+    #[test]
+    fn filter_input_chord_matches_any_of_latched() {
+        // A latched chord (LB + A) shows mappings containing EITHER input.
+        let s = state_multi(MapFilterKind::Input, &["btn_lb", "btn_a"]);
+        assert!(mapping_passes_filter(&s, &["btn_a".into()]));
+        assert!(mapping_passes_filter(&s, &["btn_lb".into(), "btn_x".into()]));
+        assert!(!mapping_passes_filter(&s, &["btn_y".into()]));
+    }
+
+    #[test]
+    fn filter_stick_uses_first_stick_in_latched_set() {
+        // Latched set has a button AND a stick direction; blue resolves to the
+        // stick group regardless of ordering of non-stick entries.
+        let s = state_multi(MapFilterKind::Stick, &["btn_a", "left_stick_down"]);
+        assert!(mapping_passes_filter(&s, &["left_stick_left".into()]));
+        assert!(!mapping_passes_filter(&s, &["right_stick_up".into()]));
+    }
+
+    #[test]
+    fn filter_label_uses_filter_prefix_and_chord_count() {
+        assert_eq!(filter_inputs_label(&[]), "Filter: press input");
+        assert_eq!(
+            filter_inputs_label(&["btn_south".to_string()]),
+            format!("Filter: {}", filter_pin_label("btn_south")),
+        );
+        let two = vec!["btn_lb".to_string(), "btn_south".to_string()];
+        assert_eq!(
+            filter_inputs_label(&two),
+            format!("Filter: {} +1", filter_pin_label("btn_lb")),
+        );
+    }
+
+    #[test]
+    fn filter_pin_label_abbreviates_sticks() {
+        assert_eq!(filter_pin_label("left_stick_left"), "LS Left");
+        assert_eq!(filter_pin_label("right_stick_up"), "RS Up");
+        assert_eq!(filter_pin_label("left_stick_x"), "LS X");
+        assert_eq!(filter_pin_label("right_stick"), "RS");
+        assert_eq!(filter_pin_label("dpad_left"), "D-Pad Left");
+        // Non-stick falls back to the canonical (already-short) display name.
+        assert_eq!(filter_pin_label("btn_lb"), remapper_pin_display("btn_lb"));
+    }
+}
