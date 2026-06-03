@@ -4134,7 +4134,7 @@ pub fn find_automap_device_id_for_viewer(
                 .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
             return Some((dev_id, pin_ids, None));
         }
-        if node.module_id == "module.automap_split" {
+        if node.module_id == "module.automap_split" || node.module_id == "module.feedback_control" {
             let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
             let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
             let upstream = *in_pin.remotes.first()?;
@@ -4257,7 +4257,8 @@ fn find_automap_device_rec(
             .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
         return Some((dev_id, pin_ids, None));
     }
-    if node.module_id == "module.automap_split" {
+    if node.module_id == "module.automap_split" || node.module_id == "module.feedback_control" {
+        // Both pass the AutoMap bus through on output 0 from their AutoMap input.
         let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
         let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
         let upstream = *in_pin.remotes.first()?;
@@ -4385,6 +4386,66 @@ fn find_automap_device_rec(
         let outer_in = parent.snarl.in_pin(InPinId { node: parent.subpatch_id, input: pin_idx });
         let upstream = *outer_in.remotes.first()?;
         return find_automap_device_rec(parent.snarl, upstream, parent.prev);
+    }
+    None
+}
+
+/// Downstream sibling of [`find_automap_device_rec`]: follow an AutoMap bus
+/// FORWARD from an output pin to the destination `device.sink`'s device_id,
+/// crossing sub-patch boundaries (out through outlets, in through inlets).
+/// Returns the first `device.sink` reached. Used by the Feedback Control node to
+/// locate the virtual destination whose rumble/light request its outlets tap.
+fn find_automap_dest_sink_rec(
+    snarl: &Snarl<NodeData>,
+    dst: InPinId,
+    parents: Option<&AutomapParent<'_>>,
+    depth: u32,
+) -> Option<String> {
+    if depth > 64 { return None; }
+    let node = snarl.get_node(dst.node)?;
+    // Destination device sink — the end of the line.
+    if node.module_id == "device.sink" {
+        return node.params.get("device_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    }
+    // Outlet: pop OUT to the parent snarl, continue from the subpatch node's
+    // matching output pin.
+    if node.module_id == "subpatch.outlet" {
+        let pin_idx = node.params.get("pin_index").and_then(|v| v.as_u64())? as usize;
+        let parent = parents?;
+        let out_pin = parent.snarl.out_pin(OutPinId { node: parent.subpatch_id, output: pin_idx });
+        for &downstream in &out_pin.remotes {
+            if let Some(d) = find_automap_dest_sink_rec(parent.snarl, downstream, parent.prev, depth + 1) {
+                return Some(d);
+            }
+        }
+        return None;
+    }
+    // Wire entered a subpatch via input pin `dst.input`. Pop IN: find the inlet
+    // with the matching pin_index and continue from its output downstream.
+    if node.module_id == "subpatch" {
+        let sp = node.subpatch.as_ref()?;
+        let inlet_id: NodeId = sp.snarl.nodes_ids_data()
+            .find(|(_, n)| n.value.module_id == "subpatch.inlet"
+                && n.value.params.get("pin_index").and_then(|v| v.as_u64())
+                    == Some(dst.input as u64))
+            .map(|(id, _)| id)?;
+        let frame = AutomapParent { snarl, subpatch_id: dst.node, prev: parents };
+        let inlet_out = sp.snarl.out_pin(OutPinId { node: inlet_id, output: 0 });
+        for &downstream in &inlet_out.remotes {
+            if let Some(d) = find_automap_dest_sink_rec(&sp.snarl, downstream, Some(&frame), depth + 1) {
+                return Some(d);
+            }
+        }
+        return None;
+    }
+    // Pass-through AutoMap modules forward the bus on their AutoMap output 0
+    // (Splitter, Collector, Fork, Selector, Combiner, Remapper, Feedback Control).
+    // Follow output pin 0's downstream remotes.
+    let out_pin = snarl.out_pin(OutPinId { node: dst.node, output: 0 });
+    for &downstream in &out_pin.remotes {
+        if let Some(d) = find_automap_dest_sink_rec(snarl, downstream, parents, depth + 1) {
+            return Some(d);
+        }
     }
     None
 }
@@ -4657,6 +4718,43 @@ fn build_processing_graph_rec(
             let collect_ids = node.params.get("collect_input_pin_ids")
                 .and_then(|v| v.as_array()).cloned().unwrap_or_default();
             params.insert("_collect_pin_ids".to_string(), serde_json::Value::Array(collect_ids));
+        }
+
+        // Feedback Control: stamp the resolved physical source (inlet injection
+        // target) and virtual destination (outlet tap source), plus the fixed
+        // inlet/outlet pin-id lists so eval can key collector_sigs / dev_sigs.
+        if node.module_id == "module.feedback_control" {
+            // Inlet injection target: upstream physical pad on AutoMap input 0.
+            let src_dev = {
+                let pin = snarl.in_pin(InPinId { node: *node_id, input: 0 });
+                pin.remotes.first()
+                    .and_then(|&src| find_automap_device_rec(snarl, src, parents))
+                    .map(|(dev_id, _, fallback)| {
+                        if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
+                    })
+                    .filter(|d| is_real_device_id(d))
+            };
+            if let Some(d) = src_dev {
+                params.insert("_fb_source_dev".to_string(), serde_json::Value::String(d));
+            }
+            // Outlet tap source: downstream virtual destination on AutoMap output 0.
+            let dest_dev = {
+                let out_pin = snarl.out_pin(OutPinId { node: *node_id, output: 0 });
+                out_pin.remotes.iter().find_map(|&downstream| {
+                    find_automap_dest_sink_rec(snarl, downstream, parents, 0)
+                        .filter(|d| d.starts_with("virtual."))
+                })
+            };
+            if let Some(d) = dest_dev {
+                params.insert("_fb_dest_dev".to_string(), serde_json::Value::String(d));
+            }
+            // Fixed inlet/outlet pin-id lists (parallel to inputs[1..] / outputs[1..]).
+            let inlet_ids: Vec<serde_json::Value> = flexinput_core::automap::FEEDBACK_INLET_PINS
+                .iter().map(|p| serde_json::Value::String(p.id.to_string())).collect();
+            let outlet_ids: Vec<serde_json::Value> = flexinput_core::automap::FEEDBACK_OUTLET_PINS
+                .iter().map(|p| serde_json::Value::String(p.id.to_string())).collect();
+            params.insert("_fb_inlet_ids".to_string(), serde_json::Value::Array(inlet_ids));
+            params.insert("_fb_outlet_ids".to_string(), serde_json::Value::Array(outlet_ids));
         }
 
         // For subpatch nodes: recursively build the inner graph and locate outlet nodes.

@@ -937,6 +937,74 @@ fn combine_signals(a: Signal, b: Signal) -> Signal {
 // `find_automap_device_rec` in the UI produces when it walks the wire chain
 // across the sub-patch boundary.
 
+/// Feedback Control node: inject wired inlet values into the physical source
+/// pad's haptic channel and read outlet taps from the virtual destination's
+/// feedback. Shared by the top-level loop and `eval_subgraph`.
+///
+/// Injection key: `("feedback_inject:{_fb_source_dev}", inlet_pin_id)`. The
+/// physical `device.source` sink drains this in its feedback pass, keyed by its
+/// own device id — so the bridge needs no per-uid plumbing and works at any
+/// sub-patch depth. Multiple injectors targeting one pad combine additively.
+///
+/// Returns the node's full output vector: output[0] = AutoMap pass-through
+/// (None placeholder), outputs[1..] = outlet taps (per `_fb_outlet_ids`).
+fn feedback_control_publish(
+    snap: &NodeSnap,
+    computed: &[Vec<Option<Signal>>],
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) -> Vec<Option<Signal>> {
+    // Resolve wired inputs for this node (input[0] = AutoMap bus, ignored as a
+    // value; inputs[1..] = inlets parallel to `_fb_inlet_ids`).
+    let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+        .map(|src| src.and_then(|(si, op)| {
+            computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+        }))
+        .collect();
+
+    // ── Inlet injection ──────────────────────────────────────────────────────
+    let source_dev = snap.params.get("_fb_source_dev").and_then(|v| v.as_str()).unwrap_or("");
+    if !source_dev.is_empty() {
+        let inlet_ids = snap.params.get("_fb_inlet_ids").and_then(|v| v.as_array());
+        if let Some(inlet_ids) = inlet_ids {
+            let key = format!("feedback_inject:{source_dev}");
+            for (i, pin_v) in inlet_ids.iter().enumerate() {
+                let Some(pin_id) = pin_v.as_str() else { continue; };
+                if pin_id.is_empty() { continue; }
+                // inputs[i + 1] — skip the AutoMap bus at input[0].
+                if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
+                    // Additive combine when several injectors hit the same pin
+                    // on the same device (last-writer-wins would silently drop).
+                    let entry = collector_sigs.entry((key.clone(), pin_id.to_string()));
+                    use std::collections::hash_map::Entry;
+                    match entry {
+                        Entry::Occupied(mut o) => { *o.get_mut() = combine_signals(*o.get(), sig); }
+                        Entry::Vacant(v)       => { v.insert(sig); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Outlet taps ──────────────────────────────────────────────────────────
+    let dest_dev = snap.params.get("_fb_dest_dev").and_then(|v| v.as_str()).unwrap_or("");
+    let outlet_ids = snap.params.get("_fb_outlet_ids").and_then(|v| v.as_array());
+    let mut out: Vec<Option<Signal>> = vec![None; snap.n_outputs];
+    if let Some(outlet_ids) = outlet_ids {
+        for (i, pin_v) in outlet_ids.iter().enumerate() {
+            let Some(pin_id) = pin_v.as_str() else { continue; };
+            // output[i + 1] — skip the AutoMap pass-through at output[0].
+            let out_idx = i + 1;
+            if out_idx >= out.len() { break; }
+            if dest_dev.is_empty() { continue; }
+            if let Some(&sig) = dev_sigs.get(&(dest_dev.to_string(), pin_id.to_string())) {
+                out[out_idx] = Some(sig);
+            }
+        }
+    }
+    out
+}
+
 fn automap_fork_publish(
     snap: &NodeSnap,
     key_uid: usize,
@@ -1538,6 +1606,17 @@ fn eval_subgraph(
             last_outputs.insert(ns_uid, computed[idx].clone());
             continue;
         }
+        // Feedback Control inside a sub-patch — the common case (device pins
+        // aren't reachable there, which is the whole reason this node exists).
+        // The injection key is the PHYSICAL device id (stamped at build time),
+        // not the uid, so no namespacing is needed; outlets read dev_sigs by the
+        // stamped virtual destination id. Identical to the top-level arm.
+        if snap.module_id == "module.feedback_control" {
+            let out = feedback_control_publish(snap, &computed, dev_sigs, collector_sigs);
+            last_outputs.insert(ns_uid, out.clone());
+            computed[idx] = out;
+            continue;
+        }
 
         let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
             .map(|src| src.and_then(|(si, op)| {
@@ -1771,6 +1850,14 @@ pub fn eval_graph_tick(
             computed[idx] = vec![None];
             continue;
         }
+        // ── module.feedback_control: inject inlets into the physical pad's
+        //    feedback channel; tap outlets from the virtual destination. ──────
+        if snap.module_id == "module.feedback_control" {
+            let out = feedback_control_publish(snap, &computed, dev_sigs, &mut collector_sigs);
+            last_outputs.insert(snap.node_uid, out.clone());
+            computed[idx] = out;
+            continue;
+        }
         // ── device.sink: collect combined inputs, populate sink_outputs ──────
         if let Some(ref st) = snap.sink_target {
             // Pins that have at least one actual direct wire (non-empty multi_sources).
@@ -1962,6 +2049,9 @@ pub fn eval_graph_tick(
                 }
             }
 
+            // (Feedback Control injection is drained in a post-pass after the
+            //  main loop — see below — so every injector node has run first.)
+
             // device.source nodes with haptic inputs, and device.sink nodes with
             // feedback output pins, still need output computation — don't skip them.
             if snap.module_id != "device.source" && snap.n_outputs == 0 {
@@ -2109,6 +2199,74 @@ pub fn eval_graph_tick(
                 sink_outputs.insert((st.device_id.clone(), pin_id.clone()), sig);
             }
         }
+    }
+
+    // Post-pass: Feedback Control injection drain. Runs AFTER the main loop so
+    // every `module.feedback_control` node — at the top level or nested in any
+    // sub-patch — has already written its inlet values into `collector_sigs`
+    // under `feedback_inject:{physical_dev_id}`. For each physical sink, route
+    // those values to the device's haptic inputs (direct pin-id match first,
+    // then `resolve_feedback_pin` rumble/lightbar aliasing). Direct wires and
+    // the auto-feedback in the main loop both win via `or_insert`.
+    //
+    // Cheap early-out: skip entirely unless at least one injector wrote this
+    // tick (the common case is no Feedback Control nodes at all).
+    let has_injection = collector_sigs.keys()
+        .any(|(dev, _)| dev.starts_with("feedback_inject:"));
+    if has_injection {
+        puffin::profile_scope!("feedback_inject_post_pass");
+        for snap in graph.nodes.iter() {
+            let Some(ref st) = snap.sink_target else { continue; };
+            if st.device_id.starts_with("virtual.") { continue; }
+            let inject_key = format!("feedback_inject:{}", st.device_id);
+            let dst_pins: Vec<&str> = st.pin_ids.iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| p.as_str())
+                .collect();
+            // Pins with at least one real direct wire keep priority.
+            let directly_wired: std::collections::HashSet<&str> = st.pin_ids.iter().enumerate()
+                .filter(|(i, pid)| !pid.is_empty() && st.multi_sources.get(*i).map_or(false, |s| !s.is_empty()))
+                .map(|(_, pid)| pid.as_str())
+                .collect();
+            for pin in flexinput_core::automap::FEEDBACK_INLET_PINS {
+                let Some(&sig) = collector_sigs.get(&(inject_key.clone(), pin.id.to_string()))
+                else { continue; };
+                let dst_pin = if dst_pins.iter().any(|&p| p == pin.id) {
+                    Some(pin.id)
+                } else {
+                    flexinput_core::automap::resolve_feedback_pin(pin.id, &dst_pins)
+                };
+                let Some(dst_pin) = dst_pin else { continue; };
+                if directly_wired.contains(dst_pin) { continue; }
+                // Precedence: direct wire > injection > auto-feedback. The
+                // main-loop auto-feedback pass may have already `or_insert`-ed a
+                // value for this pin — typically `0.0` (the virtual sink's idle
+                // rumble when no game is driving it). A plain `or_insert` here
+                // would let that idle `0.0` mask the user's explicit injection,
+                // producing only a brief buzz on the rising edge. Instead COMBINE
+                // additively (clamped) so injection adds on top of any real game
+                // rumble and overrides idle silence.
+                use std::collections::hash_map::Entry;
+                match sink_outputs.entry((st.device_id.clone(), dst_pin.to_string())) {
+                    Entry::Occupied(mut o) => {
+                        let merged = combine_signals(*o.get(), sig);
+                        *o.get_mut() = clamp_feedback_signal(dst_pin, merged);
+                    }
+                    Entry::Vacant(v) => { v.insert(sig); }
+                }
+            }
+        }
+    }
+}
+
+/// Clamp a combined feedback value to the valid range for its haptic pin so
+/// additive merging (game rumble + injected effect) can't overflow. Amplitudes
+/// and most haptic pins are 0–1; everything falls back to 0–1 which is correct
+/// for the rumble/lightbar/amp pins the Feedback Control node injects.
+fn clamp_feedback_signal(_pin: &str, sig: Signal) -> Signal {
+    match sig {
+        Signal::Float(f) => Signal::Float(f.clamp(0.0, 1.0)),
+        other => other,
     }
 }
 

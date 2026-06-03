@@ -63,6 +63,64 @@ pub struct AutoMapPin {
 
 use crate::SignalType;
 
+/// Every haptic / feedback INPUT port across all controller families — the
+/// universal set of injection targets exposed as inlets by the Feedback Control
+/// module. This is the union of all `inputs_for(kind)` families in
+/// `crates/devices/src/layouts.rs`. When injected onto a pad that lacks a given
+/// port, the value is silently dropped (the pin simply isn't in the device's
+/// haptic-input list — see the engine feedback pass / `resolve_feedback_pin`).
+///
+/// Keep this in sync with `layouts.rs`; `feedback_inlet_union_covers_all_families`
+/// in `crates/devices` (or the core test below) guards against drift.
+pub const FEEDBACK_INLET_PINS: &[AutoMapPin] = &[
+    // ── Classic rumble (XInput-compatible; every pad) ─────────────────────────
+    AutoMapPin { id: "rumble_strong", display_name: "Rumble (strong)",         signal_type: SignalType::Float },
+    AutoMapPin { id: "rumble_weak",   display_name: "Rumble (weak)",           signal_type: SignalType::Float },
+    // ── Light bar (DS4 / DualSense) ───────────────────────────────────────────
+    AutoMapPin { id: "lightbar_r",    display_name: "Light Bar R",             signal_type: SignalType::Float },
+    AutoMapPin { id: "lightbar_g",    display_name: "Light Bar G",             signal_type: SignalType::Float },
+    AutoMapPin { id: "lightbar_b",    display_name: "Light Bar B",             signal_type: SignalType::Float },
+    // ── Switch Pro HD rumble (per-side amp + carrier freq) ────────────────────
+    AutoMapPin { id: "hd_l_amp",      display_name: "HD Rumble L: Amplitude",  signal_type: SignalType::Float },
+    AutoMapPin { id: "hd_l_freq",     display_name: "HD Rumble L: Frequency",  signal_type: SignalType::Float },
+    AutoMapPin { id: "hd_r_amp",      display_name: "HD Rumble R: Amplitude",  signal_type: SignalType::Float },
+    AutoMapPin { id: "hd_r_freq",     display_name: "HD Rumble R: Frequency",  signal_type: SignalType::Float },
+    AutoMapPin { id: "hd_rumble_l",   display_name: "HD Rumble L (legacy)",    signal_type: SignalType::Float },
+    AutoMapPin { id: "hd_rumble_r",   display_name: "HD Rumble R (legacy)",    signal_type: SignalType::Float },
+    // ── DualSense HD haptics (USB only) ───────────────────────────────────────
+    AutoMapPin { id: "ds_l_amp",      display_name: "DS Haptic L: Amplitude",  signal_type: SignalType::Float },
+    AutoMapPin { id: "ds_l_freq",     display_name: "DS Haptic L: Frequency",  signal_type: SignalType::Float },
+    AutoMapPin { id: "ds_r_amp",      display_name: "DS Haptic R: Amplitude",  signal_type: SignalType::Float },
+    AutoMapPin { id: "ds_r_freq",     display_name: "DS Haptic R: Frequency",  signal_type: SignalType::Float },
+    // ── DualSense LEDs ────────────────────────────────────────────────────────
+    AutoMapPin { id: "player_led",    display_name: "Player LED",              signal_type: SignalType::Float },
+    AutoMapPin { id: "mic_led",       display_name: "Mic LED",                 signal_type: SignalType::Float },
+    // ── DualSense adaptive triggers ───────────────────────────────────────────
+    AutoMapPin { id: "trigger_r_mode",     display_name: "R.Trigger Mode",     signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_r_start",    display_name: "R.Trigger Start",    signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_r_end",      display_name: "R.Trigger End",      signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_r_strength", display_name: "R.Trigger Strength", signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_r_freq",     display_name: "R.Trigger Freq",     signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_l_mode",     display_name: "L.Trigger Mode",     signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_l_start",    display_name: "L.Trigger Start",    signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_l_end",      display_name: "L.Trigger End",      signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_l_strength", display_name: "L.Trigger Strength", signal_type: SignalType::Float },
+    AutoMapPin { id: "trigger_l_freq",     display_name: "L.Trigger Freq",     signal_type: SignalType::Float },
+];
+
+/// Basic feedback OUTPUT taps the game is requesting on the virtual destination
+/// device — exposed as outlets by the Feedback Control module. This is the
+/// subset that virtual source-pins actually publish via `poll_outputs`
+/// (`*_SOURCE_PINS` in `crates/virtual/src/layouts.rs`): classic rumble plus
+/// the DS4/DualSense light bar.
+pub const FEEDBACK_OUTLET_PINS: &[AutoMapPin] = &[
+    AutoMapPin { id: "rumble_strong", display_name: "Rumble (strong)", signal_type: SignalType::Float },
+    AutoMapPin { id: "rumble_weak",   display_name: "Rumble (weak)",   signal_type: SignalType::Float },
+    AutoMapPin { id: "lightbar_r",    display_name: "Light Bar R",     signal_type: SignalType::Float },
+    AutoMapPin { id: "lightbar_g",    display_name: "Light Bar G",     signal_type: SignalType::Float },
+    AutoMapPin { id: "lightbar_b",    display_name: "Light Bar B",     signal_type: SignalType::Float },
+];
+
 /// Canonical list of all gamepad signals that AutoMap covers.
 /// Used by AutoMap Splitter/Collector UIs and for signal resolution.
 /// Order: bundled vectors first, then individual axes, then buttons.

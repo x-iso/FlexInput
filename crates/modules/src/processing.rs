@@ -19,6 +19,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<AutoMapCombiner>(),
         reg::<RemapperModule>(),
         reg::<MapActionModule>(),
+        reg::<FeedbackControlModule>(),
     ]
 }
 
@@ -415,6 +416,47 @@ impl Module for RemapperModule {
             category: "AutoMap",
             inputs:  vec![PinDescriptor::new("in",  SignalType::AutoMap)],
             outputs: vec![PinDescriptor::new("out", SignalType::AutoMap)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Feedback Control ──────────────────────────────────────────────────────────
+//
+// Surfaces the otherwise-hidden AutoMap feedback channel as real node pins so
+// rumble/light effects can be injected (or the game's feedback request tapped)
+// from inside a sub-patch, where device pins aren't reachable.
+//
+//   • input 0  "Device" (AutoMap) — sits inline on the bus; passes straight to
+//              output 0. Used to trace the upstream physical source pad (inject
+//              target) and the downstream virtual destination (tap source).
+//   • inputs 1..N  — universal haptic union (FEEDBACK_INLET_PINS). Wired effect
+//              signals here inject backward along the bus into the physical pad;
+//              ports the connected pad lacks are silently dropped.
+//   • output 0  "AutoMap" — bus pass-through.
+//   • outputs 1..M  — basic rumble/light taps (FEEDBACK_OUTLET_PINS) read from
+//              the downstream virtual destination's feedback source-pins.
+//
+// process() returns empty — eval.rs injects inlets into collector_sigs and reads
+// outlet taps from dev_sigs, matching the AutoMap Splitter/Collector pattern.
+#[derive(Default)]
+pub struct FeedbackControlModule;
+
+impl Module for FeedbackControlModule {
+    fn descriptor() -> ModuleDescriptor {
+        use flexinput_core::automap::{FEEDBACK_INLET_PINS, FEEDBACK_OUTLET_PINS};
+        let mut inputs = vec![PinDescriptor::new("Device", SignalType::AutoMap)];
+        inputs.extend(FEEDBACK_INLET_PINS.iter()
+            .map(|p| PinDescriptor::new(p.display_name, p.signal_type).optional()));
+        let mut outputs = vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)];
+        outputs.extend(FEEDBACK_OUTLET_PINS.iter()
+            .map(|p| PinDescriptor::new(p.display_name, p.signal_type)));
+        ModuleDescriptor {
+            id: "module.feedback_control",
+            display_name: "Feedback Control",
+            category: "AutoMap",
+            inputs,
+            outputs,
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }

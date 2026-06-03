@@ -31,6 +31,36 @@ fn midi_kinds_return_empty_outputs() {
     assert!(layouts::outputs_for(ControllerKind::MidiOut).is_empty());
 }
 
+// ── Feedback Control inlet union coverage ───────────────────────────────────────
+
+/// The Feedback Control module exposes `FEEDBACK_INLET_PINS` (core) as its
+/// universal injection inlets. Every haptic input pin any controller family
+/// actually exposes via `inputs_for` MUST appear in that union — otherwise a
+/// supported port would be silently unreachable from the node. Guards against
+/// `layouts.rs` adding a haptic pin without updating the core constant.
+#[test]
+fn feedback_inlet_union_covers_all_input_families() {
+    use flexinput_core::automap::FEEDBACK_INLET_PINS;
+    let union: std::collections::HashSet<&str> =
+        FEEDBACK_INLET_PINS.iter().map(|p| p.id).collect();
+    for kind in [
+        ControllerKind::XInput,
+        ControllerKind::DualShock4,
+        ControllerKind::DualSense,
+        ControllerKind::SwitchPro,
+        ControllerKind::Generic,
+    ] {
+        for pin in layouts::inputs_for(kind) {
+            assert!(
+                union.contains(pin.id.as_str()),
+                "{kind:?} haptic input pin `{}` is missing from FEEDBACK_INLET_PINS \
+                 — add it to crates/core/src/automap.rs",
+                pin.id,
+            );
+        }
+    }
+}
+
 // ── DualShock 4 ───────────────────────────────────────────────────────────────
 
 #[test]
