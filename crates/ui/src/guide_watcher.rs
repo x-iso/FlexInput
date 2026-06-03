@@ -110,7 +110,18 @@ pub fn spawn_guide_watcher(
                     for ((dev, sig), val) in &snapshot {
                         if sig != "btn_guide" { continue; }
                         let Signal::Bool(now_pressed) = val else { continue; };
-                        let was_pressed = *guide_prev.get(dev).unwrap_or(&false);
+                        // First time we see this device's guide signal,
+                        // seed its prev state with the current sample and
+                        // bail. Otherwise an edge-true initial value (the
+                        // Switch Pro's Home can latch true during the BT
+                        // handshake) reads as a phantom false→true rising
+                        // edge the instant the pad is detected, firing a
+                        // ghost pin toggle. We only fire on transitions we
+                        // actually witnessed.
+                        let Some(&was_pressed) = guide_prev.get(dev) else {
+                            guide_prev.insert(dev.clone(), *now_pressed);
+                            continue;
+                        };
                         if *now_pressed && !was_pressed {
                             // Chord gate: if configured, the chord
                             // signal must also be true on this same
