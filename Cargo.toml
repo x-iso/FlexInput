@@ -83,3 +83,23 @@ arc-swap     = "1"
 
 [patch.crates-io]
 egui-snarl = { path = "vendor/egui-snarl" }
+
+# ── Debug-build performance ─────────────────────────────────────────────────
+# The processing thread runs at 2 kHz (500 µs/tick budget) and the device-io
+# thread at up to 4 kHz. At opt-level = 0 the engine's per-tick eval and the
+# unoptimized egui/wgpu render path are slow enough that:
+#   • eval_graph_tick blows the 500 µs budget and the catchup loop saturates
+#     its `ticks.min(16)` cap, collapsing the effective processing rate, and
+#   • heavy unoptimized render frames starve the equal-priority input threads.
+# Both show up as input latency that only appears in debug.
+#
+# Fix: optimize our own crates lightly (opt-level = 1 — fast enough to hit the
+# real-time budgets while keeping line-level debuggability) and optimize all
+# dependencies fully (opt-level = 3 — egui/wgpu/glam/arc-swap are never the
+# code you step through). This is the standard egui/game-loop dev profile and
+# does not affect release behavior.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

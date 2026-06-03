@@ -16,3 +16,8 @@ smallvec       = { workspace = true }
 # permanently in place.
 puffin         = { workspace = true }
 arc-swap       = { workspace = true }
+
+# Used only to raise the processing thread's scheduling priority on Windows so
+# the 2 kHz engine tick is scheduled ahead of UI/render work (input latency).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

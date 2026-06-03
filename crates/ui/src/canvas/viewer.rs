@@ -4122,15 +4122,45 @@ fn show_gyro_lean_mapping_section(
 
     // ── Mapping cards ───────────────────────────────────────────────────
     if mappings.is_empty() { return; }
+
+    // Filter row. Lean cards capture OUTPUTS (the lean direction is the
+    // trigger), so the filter matches the live-pressed input against each
+    // card's assigned outputs. The grouped chip also catches analog
+    // destinations (stick axes/cardinals) on the output side. Read SOURCE pins
+    // only (the upstream device) — not OS KB/M — so injected output keys don't
+    // flicker the filter.
+    let filter_live: Vec<String> = match (&upstream_dev_id, wired) {
+        (Some(dev), true) => remapper_pressed_now(live_signals, dev),
+        _ => Vec::new(),
+    };
+    let filter = mapping_filter_row(
+        ui,
+        egui::Id::new(("fxi_lean_filter", node_id.0, side)),
+        &format!("({})", mappings.len()),
+        &filter_live,
+        skin,
+    );
+
     let mut to_remove: Option<usize> = None;
     let mut to_update: Option<(usize, serde_json::Map<String, Value>)> = None;
     ui.spacing_mut().item_spacing.y = 2.0;
+    let reorder_enabled = filter.kind == MapFilterKind::All;
+    let mut rv = ReorderView::begin(
+        ui, egui::Id::new(("fxi_lean_reorder", node_id.0, side)), reorder_enabled,
+    );
+    let mut slot = 0usize;
     for (i, m) in mappings.iter().enumerate() {
         let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
             .unwrap_or_default();
+
+        if !mapping_passes_filter(&filter, &out_pins) { continue; }
+
+        if let Some(h) = rv.gap_before(slot) { draw_insertion_gap(ui, h); }
+
         let mut working: serde_json::Map<String, Value> = m.as_object().cloned().unwrap_or_default();
         let mut working_changed = false;
+        let drag_off = rv.offset_for(i);
         ui.push_id(("fxi_lean_card", node_id.0, side, i), |ui| {
             // Cap card width at 358 (Figma design width) so the painter's
             // scale factor `s` stays = 1.0. Above that, all painter-drawn
@@ -4144,13 +4174,25 @@ fn show_gyro_lean_mapping_section(
                     let result = remapper_mapping_card_pixel(
                         ui, node_id, i, &mut working,
                         &out_pins, None, skin, true,
+                        reorder_enabled, drag_off,
                     );
                     if result.delete_clicked { to_remove = Some(i); }
                     if result.changed { working_changed = true; }
+                    rv.observe(i, &result);
                 },
             );
         });
         if working_changed { to_update = Some((i, working)); }
+        slot += 1;
+    }
+    if let Some(h) = rv.gap_after_last(slot) { draw_insertion_gap(ui, h); }
+    let reorder = rv.finish(ui);
+    if let Some((from, to)) = reorder {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            if let Some(Value::Array(arr)) = node.params.get_mut(key) {
+                reorder_array(arr, from, to);
+            }
+        }
     }
     if let Some(idx) = to_remove {
         if let Some(node) = snarl.get_node_mut(node_id) {

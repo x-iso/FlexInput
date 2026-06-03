@@ -3120,6 +3120,20 @@ fn spawn_io_thread(
             unsafe {
                 let r = windows_sys::Win32::Media::timeBeginPeriod(1);
                 eprintln!("[device-io] timeBeginPeriod(1) -> {} (0 == TIMERR_NOERROR)", r);
+
+                // Input must win over UI rendering. This thread polls physical
+                // inputs and flushes the virtual-device outputs — the hard
+                // real-time leg of the input→output path. Pin it above the UI
+                // and render threads so a busy frame can never delay an input
+                // flush. TIME_CRITICAL (not just ABOVE_NORMAL) because the loop
+                // is a tight bounded poll-and-sleep: it yields the CPU every
+                // iteration via `thread::sleep`, so it can't starve other
+                // threads, but while runnable it should preempt them.
+                use windows_sys::Win32::System::Threading::{
+                    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+                };
+                let ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                eprintln!("[device-io] SetThreadPriority(TIME_CRITICAL) -> {} (nonzero == ok)", ok);
             }
             let mut last_enum = Instant::now() - Duration::from_secs(10);
             let mut last_midi_out: HashMap<(String, String), Signal> = HashMap::new();

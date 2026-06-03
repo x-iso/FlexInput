@@ -608,11 +608,13 @@ fn apply_press_mode(
     let out = match mode {
         PressMode::Down => raw_held,
         PressMode::OnPress => {
-            if rising { trigger_remaining = PRESS_TRIGGER_PULSE_S; }
+            // `window_ms` sets the emitted trigger duration (floored at the
+            // 10 ms minimum pulse so a 0/tiny value still registers).
+            if rising { trigger_remaining = window_s.max(PRESS_TRIGGER_PULSE_S); }
             trigger_remaining > 0.0
         }
         PressMode::OnRelease => {
-            if falling { trigger_remaining = PRESS_TRIGGER_PULSE_S; }
+            if falling { trigger_remaining = window_s.max(PRESS_TRIGGER_PULSE_S); }
             trigger_remaining > 0.0
         }
         PressMode::Long => {
@@ -4904,6 +4906,56 @@ mod trigger_tests {
         let (_, e_plain) = run(1.0, 30.0, false, false);
         let (_, e_turbo) = run(1.0, 30.0, false, true);
         assert!(e_turbo > e_plain, "turbo faster: {e_turbo} > {e_plain}");
+    }
+
+    // on_press / on_release now honor `window_ms` as the emitted trigger
+    // duration (floored at the 10ms minimum pulse).
+    #[test]
+    fn on_press_release_trigger_duration_tracks_window_ms() {
+        let dt = 0.001; // 1 ms/tick
+
+        // Drive a press: hold for `hold_ticks`, then release; count how many
+        // ticks the output stays ON after the relevant edge.
+        let run_on_press = |window_ms: f32| -> usize {
+            let mut slots = [0.0f32; PRESS_SLOTS_PER_MAPPING];
+            let mut on = 0usize;
+            // rising edge at tick 0; hold a few ticks then release.
+            for t in 0..1000 {
+                let raw = t < 5; // pressed for 5 ms
+                if apply_press_mode(raw, PressMode::OnPress, window_ms, false, &mut slots, dt) {
+                    on += 1;
+                }
+            }
+            on
+        };
+
+        // ~50 ms window → ~50 on-ticks (within tolerance for the dt countdown).
+        let n50 = run_on_press(50.0);
+        assert!((45..=55).contains(&n50), "50ms on_press should stay ~50 ticks, got {n50}");
+        // ~200 ms window → ~200 on-ticks.
+        let n200 = run_on_press(200.0);
+        assert!((190..=210).contains(&n200), "200ms on_press should stay ~200 ticks, got {n200}");
+        // Longer window → strictly longer trigger.
+        assert!(n200 > n50, "larger window_ms must lengthen the trigger");
+
+        // Floor: a 0 ms window still emits at least the 10ms minimum pulse.
+        let n0 = run_on_press(0.0);
+        assert!(n0 >= 9 && n0 <= 12, "0ms window floors to ~10ms pulse, got {n0}");
+
+        // on_release fires on the falling edge with the same duration rule.
+        let run_on_release = |window_ms: f32| -> usize {
+            let mut slots = [0.0f32; PRESS_SLOTS_PER_MAPPING];
+            let mut on = 0usize;
+            for t in 0..1000 {
+                let raw = t < 5; // release happens at tick 5
+                if apply_press_mode(raw, PressMode::OnRelease, window_ms, false, &mut slots, dt) {
+                    on += 1;
+                }
+            }
+            on
+        };
+        let r100 = run_on_release(100.0);
+        assert!((95..=105).contains(&r100), "100ms on_release should stay ~100 ticks, got {r100}");
     }
 
     // Processing wired BEFORE a Collector (explicit input port) must be what

@@ -144,6 +144,21 @@ pub fn spawn_processing_thread(
     sample_rate: Arc<AtomicU32>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        // Raise this thread above the UI/render threads. The engine ticks at
+        // 2 kHz and feeds the I/O thread's sink bus; if a busy render frame
+        // delays the tick, fresh output is late and the user feels input lag.
+        // ABOVE_NORMAL (not TIME_CRITICAL): the loop runs near-continuously,
+        // so TIME_CRITICAL could starve the UI — we want input ahead of
+        // rendering, not the UI frozen. The I/O thread (TIME_CRITICAL) remains
+        // the highest-priority leg as the hard real-time output path.
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            };
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+
         let mut next_tick = Instant::now();
         let mut state: HashMap<usize, NodeState> = HashMap::new();
         // Persistent scratch reused across ticks (cleared in-place at the
