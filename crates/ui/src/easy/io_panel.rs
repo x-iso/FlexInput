@@ -65,7 +65,14 @@ pub fn show(
     calibrate_request: &mut Option<NodeId>,
     device_rates_hz: &HashMap<String, u32>,
     ping_requests: &PingRequests,
+    nav_mode: &mut HashMap<String, bool>,
+    nav_mode_default: bool,
 ) {
+    // Collector for gamepad-nav left-panel targets (rect + action), published
+    // to a ctx temp at the end so the nav driver can hit-test the RS/gyro cursor
+    // against device cards, sliders, checkboxes, and output toggles.
+    let mut nav_targets: Vec<crate::gamepad_nav::LeftNavTarget> = Vec::new();
+
     // Reserve a fixed bottom area for the output section; the input
     // list scrolls within whatever remains above it. The output
     // section height is the sum of the two card heights + spacing +
@@ -93,11 +100,19 @@ pub fn show(
         show_input_section(
             ui, devices, canvas, default_collapsed, defaults,
             calibrate_request, device_rates_hz, ping_requests,
+            nav_mode, nav_mode_default, &mut nav_targets,
         );
     });
     ui.scope_builder(egui::UiBuilder::new().max_rect(bot_rect), |ui| {
         ui.set_clip_rect(bot_rect);
-        show_output_section(ui, canvas, shared_pool, default_collapsed, defaults);
+        show_output_section(ui, canvas, shared_pool, default_collapsed, defaults,
+            &mut nav_targets);
+    });
+
+    // Publish the collected nav targets (stamped with the current pass).
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(crate::gamepad_nav::left_targets_id(), (pass, nav_targets))
     });
 }
 
@@ -160,6 +175,9 @@ fn show_input_section(
     calibrate_request: &mut Option<NodeId>,
     device_rates_hz: &HashMap<String, u32>,
     ping_requests: &PingRequests,
+    nav_mode: &mut HashMap<String, bool>,
+    nav_mode_default: bool,
+    nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
 ) {
     ui.add_space(PANEL_PADDING);
     ui.vertical_centered(|ui| {
@@ -199,12 +217,17 @@ fn show_input_section(
             }
             for d in &gamepads {
                 let is_active = active_dev_id.as_deref() == Some(d.id.as_str());
+                let nav_on = *nav_mode.entry(d.id.clone()).or_insert(nav_mode_default);
+                let mut nav_toggle: Option<bool> = None;
                 if input_card(
                     ui, d, is_active, canvas, calibrate_request, device_rates_hz, defaults,
-                    ping_requests,
+                    ping_requests, nav_on, &mut nav_toggle, nav_targets,
                 ) && !is_active {
                     replace_active_source(canvas, d, default_collapsed, defaults);
                     super::wiring::rewire(canvas);
+                }
+                if let Some(v) = nav_toggle {
+                    nav_mode.insert(d.id.clone(), v);
                 }
                 ui.add_space(CARD_GAP);
             }
@@ -257,6 +280,9 @@ fn input_card(
     device_rates_hz: &HashMap<String, u32>,
     defaults: DeviceParamDefaults,
     ping_requests: &PingRequests,
+    nav_on: bool,
+    nav_toggle: &mut Option<bool>,
+    nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
 ) -> bool {
     let panel_avail = ui.available_width();
     let card_w = (panel_avail - 2.0 * PANEL_PADDING).max(180.0);
@@ -395,6 +421,56 @@ fn input_card(
                 device_rates_hz.get(&d.id).copied().unwrap_or(0)))
                 .color(egui::Color32::from_rgb(140, 110, 60)).small());
         }
+        // UI-navigation toggle — accent-colored when on, matching the
+        // active-card selection hue used for the nav glow. Lives at the
+        // right edge of the header row on every card (any pad can drive
+        // the UI, not just the active source).
+        // Rasterize the controller-nav SVG once per (tint) and cache the texture
+        // in ctx memory. Tinted white when ON (against the accent fill), gray
+        // when OFF.
+        let icon_tint = if nav_on {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_gray(190)
+        };
+        let tex: Option<egui::TextureHandle> = {
+            let key = egui::Id::new(("controller_nav_icon", nav_on));
+            let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key));
+            cached.or_else(|| {
+                const NAV_SVG: &str = include_str!("../../../../app/assets/controller_nav.svg");
+                crate::canvas::viewer::rasterize_svg_recolored(NAV_SVG, 32, 32, "override", icon_tint)
+                    .map(|img| {
+                        let t = ui.ctx().load_texture("controller_nav_icon", img,
+                            egui::TextureOptions::LINEAR);
+                        ui.ctx().data_mut(|d| d.insert_temp(key, t.clone()));
+                        t
+                    })
+            })
+        };
+        let btn = match &tex {
+            Some(t) => egui::Button::image(
+                egui::Image::new((t.id(), egui::vec2(15.0, 15.0)))),
+            None => egui::Button::new(egui::RichText::new("🎮").size(13.0)),
+        };
+        let nav_resp = ui.add(
+            btn.fill(if nav_on {
+                    ui.visuals().selection.bg_fill
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .stroke(if nav_on {
+                    egui::Stroke::new(1.0, ui.visuals().selection.stroke.color)
+                } else {
+                    egui::Stroke::NONE
+                }),
+        ).on_hover_text(if nav_on {
+            "UI navigation ON — this gamepad drives FlexInput's UI while focused (mapped output suppressed). Click to disable."
+        } else {
+            "UI navigation OFF — click to let this gamepad drive FlexInput's UI while focused."
+        });
+        if nav_resp.clicked() {
+            *nav_toggle = Some(!nav_on);
+        }
     });
 
     // Bottom section: two stacked slider rows with bigger, more
@@ -421,6 +497,65 @@ fn input_card(
             Value::from(defaults.gyro_mult as f64));
         input_slider_rows(&mut bot_ui, &mut preview, &d.id, defaults, false);
         digital_trigger_toggle(&mut bot_ui, &mut preview, d.kind, false);
+    }
+
+    // ── Publish gamepad-nav targets for this card ──────────────────────
+    // Card top-half = "select this input device". Active card also exposes
+    // its sliders + digital-triggers checkbox as edit targets. Rects mirror
+    // the layout `input_slider_rows` / `digital_trigger_toggle` produce so the
+    // cursor hit-test lands where the user sees the control.
+    {
+        use crate::gamepad_nav::{LeftNavAction, LeftNavTarget};
+        // Select target: the header band only (avoid covering the sliders).
+        nav_targets.push(LeftNavTarget {
+            rect: top_rect,
+            action: LeftNavAction::SelectInput { device_id: d.id.clone() },
+        });
+        if is_active {
+            if let Some(node_id) = find_source_node_for(canvas, &d.id) {
+                use crate::canvas::viewer::device_source_caps;
+                let (has_dz, has_gy, _) = device_source_caps(&d.id, true);
+                // Bottom inner rect matches `bot_rect.shrink2((CARD_HPAD, 4.0))`.
+                let inner = bot_rect.shrink2(egui::vec2(CARD_HPAD, 4.0));
+                let row_h = 20.0_f32;
+                let mut y = inner.top();
+                if has_dz {
+                    nav_targets.push(LeftNavTarget {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(inner.left(), y), egui::vec2(inner.width(), row_h)),
+                        action: LeftNavAction::AdjustParam {
+                            node: node_id, key: "deadzone".into(),
+                            lo: 0.0, hi: 0.5, step: 0.005,
+                            default: defaults.stick_deadzone, log: false,
+                        },
+                    });
+                    y += row_h;
+                }
+                if has_gy {
+                    nav_targets.push(LeftNavTarget {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(inner.left(), y), egui::vec2(inner.width(), row_h)),
+                        action: LeftNavAction::AdjustParam {
+                            node: node_id, key: "gyro_multiplier".into(),
+                            lo: 0.1, hi: 50.0, step: 0.05,
+                            default: defaults.gyro_mult, log: true,
+                        },
+                    });
+                    y += row_h;
+                }
+                // Digital-triggers checkbox (only when the pad has analog
+                // triggers — otherwise it's forced-on & disabled).
+                if d.kind.has_analog_triggers() {
+                    nav_targets.push(LeftNavTarget {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(inner.left(), y + 2.0),
+                            egui::vec2(inner.width(), row_h)),
+                        action: LeftNavAction::ToggleParam {
+                            node: node_id, key: "digital_triggers".into() },
+                    });
+                }
+            }
+        }
     }
 
     body_resp.clicked()
@@ -617,7 +752,9 @@ fn show_output_section(
     shared_pool: &SharedDevicePool,
     default_collapsed: bool,
     defaults: DeviceParamDefaults,
+    nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
 ) {
+    use crate::gamepad_nav::{LeftNavAction, LeftNavTarget};
     ui.add_space(8.0);
     ui.vertical_centered(|ui| {
         ui.label(egui::RichText::new("Choose output devices").size(15.0).strong());
@@ -634,10 +771,10 @@ fn show_output_section(
     let pair_card_w = (inner_w - CARD_GAP) / 2.0;
     ui.horizontal(|ui| {
         ui.add_space(PANEL_PADDING);
-        if gamepad_card(ui, "xinput",
+        let (xi_click, xi_rect) = gamepad_card(ui, "xinput",
             remapper_icons::virtual_device_card_svg(KIND_XINPUT),
-            xinput_on, pair_card_w)
-        {
+            xinput_on, pair_card_w);
+        if xi_click {
             if xinput_on {
                 remove_sinks_of_kind(canvas, KIND_XINPUT);
             } else {
@@ -646,11 +783,13 @@ fn show_output_section(
             }
             super::wiring::rewire(canvas);
         }
+        nav_targets.push(LeftNavTarget { rect: xi_rect,
+            action: LeftNavAction::ToggleOutput { kind: KIND_XINPUT.into() } });
         ui.add_space(CARD_GAP);
-        if gamepad_card(ui, "DS4",
+        let (ds_click, ds_rect) = gamepad_card(ui, "DS4",
             remapper_icons::virtual_device_card_svg(KIND_DS4),
-            ds4_on, pair_card_w)
-        {
+            ds4_on, pair_card_w);
+        if ds_click {
             if ds4_on {
                 remove_sinks_of_kind(canvas, KIND_DS4);
             } else {
@@ -659,6 +798,8 @@ fn show_output_section(
             }
             super::wiring::rewire(canvas);
         }
+        nav_targets.push(LeftNavTarget { rect: ds_rect,
+            action: LeftNavAction::ToggleOutput { kind: KIND_DS4.into() } });
         ui.add_space(PANEL_PADDING);
     });
 
@@ -667,13 +808,29 @@ fn show_output_section(
     // Keyboard and Mouse card with Mouse speed slider inline.
     ui.horizontal(|ui| {
         ui.add_space(PANEL_PADDING);
-        if keymouse_card(ui, keymouse_on, canvas, defaults, inner_w) {
+        let (km_click, km_rect, ms_target) =
+            keymouse_card(ui, keymouse_on, canvas, defaults, inner_w);
+        if km_click {
             if keymouse_on {
                 remove_sinks_of_kind(canvas, KIND_KEYMOUSE);
             } else {
                 ensure_sink_of_kind(canvas, KIND_KEYMOUSE, shared_pool, default_collapsed, defaults);
             }
             super::wiring::rewire(canvas);
+        }
+        // Toggle target: the LEFT icon column (so it doesn't cover the slider).
+        let icon_col_w = OUTPUT_CARD_ICON_H + 16.0;
+        let toggle_rect = egui::Rect::from_min_size(
+            km_rect.min, egui::vec2(icon_col_w, km_rect.height()));
+        nav_targets.push(LeftNavTarget { rect: toggle_rect,
+            action: LeftNavAction::ToggleOutput { kind: KIND_KEYMOUSE.into() } });
+        if let Some((km_node, ms_rect)) = ms_target {
+            nav_targets.push(LeftNavTarget { rect: ms_rect,
+                action: LeftNavAction::AdjustParam {
+                    node: km_node, key: "mouse_sensitivity".into(),
+                    lo: 0.0, hi: 3000.0, step: 0.5,
+                    default: defaults.mouse_sensitivity, log: false,
+                } });
         }
         ui.add_space(PANEL_PADDING);
     });
@@ -685,7 +842,7 @@ fn gamepad_card(
     icon: &'static [u8],
     is_active: bool,
     width: f32,
-) -> bool {
+) -> (bool, egui::Rect) {
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, OUTPUT_PAIR_CARD_H),
         egui::Sense::click(),
@@ -702,7 +859,7 @@ fn gamepad_card(
             ui.label(egui::RichText::new(label).size(13.0).strong());
         });
     });
-    resp.clicked()
+    (resp.clicked(), rect)
 }
 
 fn keymouse_card(
@@ -711,7 +868,7 @@ fn keymouse_card(
     canvas: &mut Canvas,
     defaults: DeviceParamDefaults,
     width: f32,
-) -> bool {
+) -> (bool, egui::Rect, Option<(NodeId, egui::Rect)>) {
     // Card geometry — derived from content rather than a constant so
     // the three stacked rows on the right always fit without spill.
     //
@@ -796,11 +953,19 @@ fn keymouse_card(
     // Explicit content width for the right column so the value box +
     // slider know exactly how much space they have.
     let right_content_w = right_inset.width().max(40.0);
+    let mut mouse_target: Option<(NodeId, egui::Rect)> = None;
     if is_active {
         if let Some(km_node) = sink_node_of_kind(canvas, KIND_KEYMOUSE) {
             if let Some(params) = canvas.snarl.get_node_mut(km_node).map(|n| &mut n.params) {
                 mouse_speed_stack(&mut right_ui, params, defaults, right_content_w);
             }
+            // Mouse-speed nav target: the value-row + slider span (lower ~36 px
+            // of the right column), mirroring `mouse_speed_stack`'s two rows.
+            let ms_rect = egui::Rect::from_min_max(
+                egui::pos2(right_inset.left(), right_inset.top() + 22.0),
+                egui::pos2(right_inset.right(), right_inset.bottom()),
+            );
+            mouse_target = Some((km_node, ms_rect));
         }
     } else {
         right_ui.add_enabled_ui(false, |ui| {
@@ -810,7 +975,7 @@ fn keymouse_card(
             mouse_speed_stack(ui, &mut preview, defaults, right_content_w);
         });
     }
-    resp.clicked()
+    (resp.clicked(), rect, mouse_target)
 }
 
 /// Stacked Mouse-speed control for the keymouse card:
@@ -957,4 +1122,16 @@ fn ensure_sink_of_kind(
         devs.push(dev);
     }
     super::layout::reposition_io_nodes(canvas);
+}
+
+/// Public entry for gamepad-nav: add (or reuse) a virtual sink of `kind_id`.
+/// Mirrors the io_panel card-click path so output toggles behave identically.
+pub fn nav_ensure_sink(
+    canvas: &mut Canvas,
+    kind_id: &str,
+    pool: &SharedDevicePool,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
+) {
+    ensure_sink_of_kind(canvas, kind_id, pool, default_collapsed, defaults);
 }

@@ -1,6 +1,8 @@
 mod app;
 mod canvas;
 mod easy;
+mod gamepad_nav;
+mod kbm_picker;
 mod guide_watcher;
 mod panels;
 mod panic_hotkey;

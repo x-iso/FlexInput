@@ -316,6 +316,7 @@ struct SubPatchEditor {
     last_synced_parent_gen: Option<u64>,
 }
 
+
 pub struct FlexInputApp {
     engine: Engine,
     tabs: Vec<PatchTab>,
@@ -388,6 +389,12 @@ pub struct FlexInputApp {
     active_tab_device_ids: Arc<RwLock<HashSet<String>>>,
     /// Bypass flag: when true the I/O thread calls reset_outputs() instead of flush().
     io_bypass: Arc<AtomicBool>,
+    /// Gamepad-UI-nav suppression: when true the I/O thread treats output like
+    /// `io_bypass` (resets instead of flushing). Set each frame to
+    /// `focused && any nav-enabled device active`, so mapped output is silenced
+    /// while the controller drives FlexInput's own UI, and resumes the instant
+    /// FlexInput loses focus. Raw input keeps publishing, so live graphs update.
+    ui_nav_suppress: Arc<AtomicBool>,
     // ── MIDI watch thread shared state ────────────────────────────────────────
     /// MIDI device IDs (`midi_in:N` / `midi_out:N`) referenced by canvas
     /// device.source / device.sink nodes across all tabs. The MIDI watch
@@ -420,6 +427,9 @@ pub struct FlexInputApp {
     settings_open: bool,
     /// Set when settings have changed and need to be written out at end of frame.
     settings_dirty: bool,
+    /// Gamepad UI-navigation runtime state (per-device toggle, selection/edit
+    /// level, cursor, Alt+Tab switcher). Runtime-only — not serialized.
+    gamepad_nav: crate::gamepad_nav::GamepadNav,
     /// Live processing rate handed to the engine thread.
     sample_rate_hz: Arc<AtomicU32>,
     /// Live device polling rate handed to the I/O thread.
@@ -603,6 +613,9 @@ impl FlexInputApp {
                     let mut canvas = Canvas::new();
                     canvas.snarl = pt.snarl;
                     crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
+                    // Wipe any stale in-progress capture/learn state from saved
+                    // remapper-family nodes so a restored patch starts clean.
+                    clear_canvas_capture_state(&mut canvas);
                     // Restored patches are conceptually "loaded" — honor the
                     // on-patch-load camera setting so the saved view's
                     // arbitrary pan/zoom doesn't strand the user off-canvas.
@@ -631,6 +644,7 @@ impl FlexInputApp {
         let shared_midi_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
         let pinned_midi_ids = Arc::new(RwLock::new(HashSet::<String>::new()));
         let io_bypass      = Arc::new(AtomicBool::new(false));
+        let ui_nav_suppress = Arc::new(AtomicBool::new(false));
 
         // App-level shared virtual-device pool. Reconciled from every
         // restored tab's canvas so re-opening the app brings back the
@@ -665,6 +679,7 @@ impl FlexInputApp {
             Arc::clone(&shared_virtual_devices),
             Arc::clone(&active_tab_device_ids),
             Arc::clone(&io_bypass),
+            Arc::clone(&ui_nav_suppress),
             Arc::clone(&shared_devices),
             Arc::clone(&shared_midi_devices),
             Arc::clone(&polling_hz),
@@ -769,6 +784,7 @@ impl FlexInputApp {
             shared_virtual_devices,
             active_tab_device_ids,
             io_bypass,
+            ui_nav_suppress,
             pinned_midi_ids,
             shared_midi_devices,
             panic_shortcut: panic_shortcut.clone(),
@@ -779,6 +795,7 @@ impl FlexInputApp {
             settings: app_settings,
             settings_open: false,
             settings_dirty: false,
+            gamepad_nav: crate::gamepad_nav::GamepadNav::default(),
             sample_rate_hz,
             polling_hz,
             device_rates,
@@ -874,6 +891,15 @@ impl eframe::App for FlexInputApp {
         {
             puffin::profile_scope!("read_devices_clone");
             self.devices = self.shared_devices.read().unwrap().clone();
+        }
+
+        // Gamepad UI navigation: consume the active nav device's input and
+        // drive FlexInput's own UI. Must run after `last_signals` is refreshed
+        // (above) and before the Easy panel renders so selection/edit changes
+        // show this frame. Also publishes the `ui_nav_suppress` flag.
+        {
+            puffin::profile_scope!("gamepad_nav");
+            self.run_gamepad_nav(ctx);
         }
 
         // Publish the set of `midi_in:N` / `midi_out:N` IDs referenced by
@@ -1654,6 +1680,8 @@ impl eframe::App for FlexInputApp {
 
         // ── Settings window ───────────────────────────────────────────────────
         self.draw_settings_window(ctx);
+        self.draw_gp_settings_panel(ctx);
+        self.draw_kbm_picker(ctx);
         if self.settings_dirty {
             settings::save_settings(&self.settings);
             self.settings_dirty = false;
@@ -1770,6 +1798,7 @@ impl eframe::App for FlexInputApp {
                 }
                 let tab = &mut self.tabs[self.active_tab];
                 tab.canvas = new_canvas;
+                clear_canvas_capture_state(&mut tab.canvas);
                 tab.title = path.file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Untitled".to_string());
@@ -1864,6 +1893,7 @@ impl eframe::App for FlexInputApp {
                         let mut canvas = Canvas::new();
                         canvas.snarl = pt.snarl;
                         crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
+                        clear_canvas_capture_state(&mut canvas);
                         canvas.pending_view_action = on_load_view;
                         let easy_state = EasyState {
                             loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
@@ -1998,6 +2028,12 @@ impl eframe::App for FlexInputApp {
         // persist if the user starred or reordered something.
         let mut favorites_for_easy = self.settings.favorite_presets.clone();
         let favorites_before = favorites_for_easy.clone();
+        let nav_mode_default = self.settings.gamepad_ui_nav_default;
+        // Disjoint borrow: `tab` below borrows only `self.tabs`, so this
+        // independent borrow of `self.gamepad_nav` is allowed. io_panel takes
+        // `&mut .mode`; center_panel takes the whole `&mut gamepad_nav` for
+        // preset-dropdown navigation.
+        let gamepad_nav = &mut self.gamepad_nav;
         let tab = &mut self.tabs[self.active_tab];
         let (virtual_panel, canvas, easy_state) =
             (&mut tab.virtual_panel, &mut tab.canvas, &mut tab.easy_state);
@@ -2268,6 +2304,8 @@ impl eframe::App for FlexInputApp {
                         &mut calibrate_request,
                         &device_rates_snap,
                         &ping_requests_for_panel,
+                        &mut gamepad_nav.mode,
+                        nav_mode_default,
                     );
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(center_rect), |ui| {
@@ -2284,6 +2322,7 @@ impl eframe::App for FlexInputApp {
                         &panic_shortcut_for_easy,
                         &device_rates_snap,
                         &mut favorites_for_easy,
+                        gamepad_nav,
                     );
                 });
                 if favorites_for_easy != favorites_before {
@@ -2384,6 +2423,9 @@ impl eframe::App for FlexInputApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
+        // ── Gamepad-nav overlays: cursor ─────────────────────────────────
+        self.draw_nav_cursor(ctx);
+
         // ── Inner edge shadow ────────────────────────────────────────────
         // A pronounced gradient darkening at all four window edges,
         // fading to transparent toward the center. Grounds the
@@ -2462,7 +2504,2799 @@ impl eframe::App for FlexInputApp {
     }
 }
 
+/// What kind of gamepad interaction the selected sub-patch widget supports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavWidgetKind {
+    /// Not interactable (label, graph, svg, …).
+    None,
+    /// Knob / constant — South enters value-edit, dpad/stick adjusts.
+    Value,
+    /// Dropdown — South enters, dpad/stick cycles options.
+    Dropdown,
+    /// Switch — South toggles directly (no edit mode).
+    Toggle,
+    /// Response curve — RT adds a dot, LT deletes a dot (direct, no edit mode).
+    Curve,
+    /// Remapper / Map Action — LT/RT cycle the mapping filter (direct).
+    Remapper,
+    /// Multi-control row — South enters; left/right pick a field; up/down/stick
+    /// edit it. Covers gyro rows, curve option rows, counter min/max, etc. Also
+    /// used for single-field generic widgets (one field).
+    MultiField,
+}
+
+/// Identifies a setting in the gamepad-native settings panel for get/set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GpSettingKey {
+    PollingHz,
+    SampleRateHz,
+    NavDefault,
+    CursorMaxSpeed,
+    CursorAccel,
+    Contrast,
+    KeepWorkspace,
+    CollapseNodes,
+    ShowVirtuals,
+    DefDeadzone,
+    DefGyroMult,
+    DefMouseSens,
+}
+
+/// Stepping model for a generic numeric nav param.
+#[derive(Clone, Copy, PartialEq)]
+enum NavStep {
+    /// Decade-quantized (ms / sample counts): step size grows by powers of ten
+    /// with the value's magnitude. <10 → 1 (fine 0.1); 10–100 → 5 (fine 1);
+    /// 100–1000 → 50 (fine 10); etc.
+    Decade,
+    /// Plain proportional (0..1-style params like phase): fraction of the value.
+    Linear,
+}
+
+/// Numeric-edit descriptor for a generic nav-editable widget element.
+#[derive(Clone, Copy)]
+struct NavParamSpec {
+    key: &'static str,
+    lo: f32,
+    hi: f32,
+    default: f32,
+    step: NavStep,
+}
+
+/// One editable field inside a (possibly multi-control) widget element. Pinned
+/// rows often bundle several controls (gyro steering opts, curve range, counter
+/// min/max, invert checkboxes, …). The nav editor focuses one field at a time
+/// (left/right between fields) and edits it (up/down or stick). `label` shows in
+/// the focus HUD.
+#[derive(Clone)]
+enum NavField {
+    Value { key: &'static str, lo: f32, hi: f32, default: f32, step: NavStep },
+    Enum  { key: &'static str, opts: &'static [&'static str] },
+    Toggle { key: &'static str },
+    /// Writes two params at once from a chosen option (label, value_a, value_b)
+    /// — for the gyro mode rows that set family+axis together.
+    EnumPair { key_a: &'static str, key_b: &'static str,
+               opts: &'static [(&'static str, &'static str, &'static str)] },
+}
+
+#[derive(Clone)]
+struct NavFieldDef {
+    label: &'static str,
+    field: NavField,
+}
+
+/// How a gamepad-settings row is edited.
+enum GpSettingKind {
+    Toggle { key: GpSettingKey },
+    IntSlider { lo: f32, hi: f32, step: f32, key: GpSettingKey },
+    FloatSlider { lo: f32, hi: f32, step: f32, key: GpSettingKey },
+}
+
+/// One row in the gamepad-native settings panel.
+struct GpSettingRow {
+    label: String,
+    kind: GpSettingKind,
+    suffix: &'static str,
+}
+
 impl FlexInputApp {
+    /// Per-frame gamepad UI-navigation driver. Reads the active nav device's
+    /// signals, drives FlexInput's own UI (selection / edit / tabs / menus /
+    /// cursor / Alt+Tab), and publishes the output-suppression flag.
+    ///
+    /// Runs only in Easy mode. Output suppression is gated on FlexInput holding
+    /// window focus, so alt-tabbing to a game restores normal mappings.
+    fn run_gamepad_nav(&mut self, ctx: &egui::Context) {
+        use crate::gamepad_nav as gn;
+
+        let raw_focused = ctx.input(|i| i.focused);
+        let easy_mode = self.settings.ui_mode == settings::UiMode::Easy;
+        let nav_default = self.settings.gamepad_ui_nav_default;
+
+        // Click-through / pin pass-through intent: while pinned-and-passthrough
+        // the user wants raw input to reach the window underneath, so nav is
+        // disabled and nothing is suppressed.
+        let click_through = self.settings.pin_active && self.settings.see_through_active;
+
+        // The driver also runs when the app is pinned on-top (Windows may report
+        // it unfocused even though it's visible and the user is driving it) and
+        // while the Alt+Tab switcher is engaged (OS Alt+Tab steals focus the
+        // moment Alt presses, but we must keep holding Alt until Select is
+        // released). Pass-through pin disables nav entirely.
+        let focused = (raw_focused || self.settings.pin_active || self.gamepad_nav.alt_tab_active)
+            && !click_through;
+
+        // Determine the active nav device: among nav-enabled devices, the one
+        // showing activity this frame. We read each device's signals fresh.
+        let mut active_dev: Option<String> = None;
+        let mut active_input: Option<gn::NavInput> = None;
+        if focused && easy_mode {
+            // The nav device is the PHYSICAL input backing the active tab's
+            // `device.source` node — i.e. the gamepad the user actually picked
+            // in the Easy input panel. This excludes FlexInput's own virtual
+            // output pads (which loop back as `gilrs:xinput:*` and carry no
+            // input), which is what made nav read a silent device before.
+            let mut source_dev: Option<String> = self.tabs[self.active_tab].canvas.snarl
+                .nodes_ids_data()
+                .find(|(_, n)| n.value.module_id == "device.source")
+                .and_then(|(_, n)| n.value.params.get("device_id")
+                    .and_then(|v| v.as_str()).map(|s| s.to_string()));
+            // Fallback: when the default is on and this tab has no source
+            // device selected yet, drive nav from the first connected physical
+            // gamepad so tab-switching / menus still work (you can navigate to
+            // a tab and pick a device). Excludes MIDI and FlexInput's own
+            // virtual pads.
+            if source_dev.is_none() && nav_default {
+                source_dev = self.devices.iter()
+                    .find(|d| !matches!(d.kind,
+                        flexinput_devices::ControllerKind::MidiIn
+                        | flexinput_devices::ControllerKind::MidiOut)
+                        && !d.id.starts_with("virtual."))
+                    .map(|d| d.id.clone());
+            }
+            if let Some(dev) = source_dev {
+                let on = *self.gamepad_nav.mode.entry(dev.clone()).or_insert(nav_default);
+                let nav = gn::read_nav_input(&self.last_signals, &dev, &self.gamepad_nav.prev_pressed);
+                if on {
+                    // Always track this device every frame (active or idle) so
+                    // edge detection stays correct frame-to-frame.
+                    active_dev = Some(dev);
+                    active_input = Some(nav);
+                }
+            }
+        }
+
+        // Suppression + capture-hold key on the resolved active nav device (the
+        // physical source). Suppress mapped output while focused + nav-enabled
+        // so the controller drives only the UI.
+        let any_nav_enabled = active_dev.is_some();
+        self.ui_nav_suppress.store(any_nav_enabled, Ordering::Relaxed);
+        if let Some(dev) = &active_dev {
+            let pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|data| {
+                data.insert_temp(egui::Id::new(("gp_nav_active", dev.clone())), pass);
+                // Global flag: nav owns the sub-patch selection this frame, so
+                // the body renderer must NOT clear `selected_item` (it normally
+                // wipes selection every frame when not in layout-edit mode).
+                data.insert_temp(egui::Id::new("gp_nav_owns_selection"), pass);
+            });
+        }
+
+        let (dev_id, nav) = match (active_dev, active_input) {
+            (Some(d), Some(n)) => (d, n),
+            _ => {
+                // No active device this frame. Still age out the cursor and
+                // release a stuck Alt if the switcher was somehow left on.
+                if self.gamepad_nav.alt_tab_active && !focused {
+                    self.alt_tab_release();
+                }
+                if self.gamepad_nav.cursor_visible
+                    && self.gamepad_nav.cursor_last_move.elapsed().as_secs_f32() > 3.0
+                {
+                    self.gamepad_nav.cursor_visible = false;
+                }
+                // No nav-enabled device at all → clear stale edge state.
+                self.gamepad_nav.prev_pressed.clear();
+                return;
+            }
+        };
+
+        let dt = ctx
+            .input(|i| i.stable_dt)
+            .clamp(0.001, 0.1);
+
+        // ── Alt+Tab window switcher (Select held) ───────────────────────────
+        // While engaged, the controller is dedicated to the switcher.
+        if self.gamepad_nav.alt_tab_active {
+            self.drive_alt_tab(&dev_id, &nav);
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Select / minus → Alt+Tab window switcher (hold to keep switching) ─
+        // Engaged immediately on press; holds Alt while Select is held, releases
+        // (commits) on release. No File menu — egui menus can't be gamepad-
+        // navigated, so Select is dedicated to the OS switcher.
+        if nav.is_rising("btn_back") {
+            self.enter_alt_tab(&dev_id);
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Start: tap = preset dropdown, hold (>250ms) = gamepad Settings ───
+        if nav.is_rising("btn_start") {
+            self.gamepad_nav.start_down_at = Some(std::time::Instant::now());
+            self.gamepad_nav.start_hold_fired = false;
+        }
+        if nav.pressed.contains("btn_start") {
+            if let Some(t) = self.gamepad_nav.start_down_at {
+                if !self.gamepad_nav.start_hold_fired && t.elapsed().as_millis() >= 250 {
+                    // Open the gamepad-native settings panel (the real Settings
+                    // window can't be gamepad-navigated). Toggle so a second
+                    // hold closes it.
+                    self.gamepad_nav.settings_open = !self.gamepad_nav.settings_open;
+                    if self.gamepad_nav.settings_open {
+                        self.gamepad_nav.settings_index = 0;
+                        self.gamepad_nav.settings_editing = false;
+                    }
+                    self.gamepad_nav.start_hold_fired = true;
+                }
+            }
+        } else if let Some(t) = self.gamepad_nav.start_down_at.take() {
+            // Released before the hold threshold → tap → toggle preset dropdown.
+            if t.elapsed().as_millis() < 250 && !self.gamepad_nav.start_hold_fired {
+                self.gamepad_nav.preset_nav_open = !self.gamepad_nav.preset_nav_open;
+            }
+        }
+
+        // ── Gamepad settings panel (modal: captures dpad/South/East/West) ────
+        if self.gamepad_nav.settings_open {
+            let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
+            let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
+            self.nav_drive_gp_settings(&nav, rt_rising, lt_rising);
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            self.gamepad_nav.prev_rt = nav.rt > 0.5;
+            self.gamepad_nav.prev_lt = nav.lt > 0.5;
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Virtual KB/M picker (modal: captures dpad/LS/South/North/East) ────
+        if self.gamepad_nav.kbm_picker_open {
+            let mut step_dir: Option<gn::NavDir> = None;
+            if nav.is_rising("dpad_up") { step_dir = Some(gn::NavDir::Up); }
+            else if nav.is_rising("dpad_down") { step_dir = Some(gn::NavDir::Down); }
+            else if nav.is_rising("dpad_left") { step_dir = Some(gn::NavDir::Left); }
+            else if nav.is_rising("dpad_right") { step_dir = Some(gn::NavDir::Right); }
+            if step_dir.is_none() {
+                if let Some(d) = gn::stick_dir(nav.lstick) {
+                    if self.gamepad_nav.repeat_dir != Some(d) {
+                        self.gamepad_nav.repeat_dir = Some(d);
+                        step_dir = Some(d);
+                    }
+                } else {
+                    self.gamepad_nav.repeat_dir = None;
+                }
+            }
+            self.drive_kbm_picker(step_dir, &nav);
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Preset dropdown navigation (modal: captures dpad/South/East) ──────
+        // When open, the controller drives the preset list (rendered + applied
+        // by the Easy center panel, which owns the preset index/apply logic).
+        if self.gamepad_nav.preset_nav_open {
+            self.gamepad_nav.preset_nav_step = 0;
+            if nav.is_rising("dpad_up") { self.gamepad_nav.preset_nav_step = -1; }
+            if nav.is_rising("dpad_down") { self.gamepad_nav.preset_nav_step = 1; }
+            if let Some(d) = gn::stick_dir(nav.lstick) {
+                // Discrete step per fresh deflection (no auto-repeat for a list).
+                if self.gamepad_nav.repeat_dir != Some(d) {
+                    self.gamepad_nav.repeat_dir = Some(d);
+                    match d {
+                        gn::NavDir::Up => self.gamepad_nav.preset_nav_step = -1,
+                        gn::NavDir::Down => self.gamepad_nav.preset_nav_step = 1,
+                        _ => {}
+                    }
+                }
+            } else {
+                self.gamepad_nav.repeat_dir = None;
+            }
+            if nav.is_rising("btn_south") || (nav.rt > 0.5 && !self.gamepad_nav.prev_rt) {
+                self.gamepad_nav.preset_nav_select = true;
+            }
+            if nav.is_rising("btn_east") {
+                self.gamepad_nav.preset_nav_open = false;
+            }
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            self.gamepad_nav.prev_rt = nav.rt > 0.5;
+            self.gamepad_nav.prev_lt = nav.lt > 0.5;
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── LB/RB: switch tabs ───────────────────────────────────────────────
+        if nav.is_rising("btn_lb") && self.active_tab > 0 {
+            self.set_active_tab(self.active_tab - 1);
+        }
+        if nav.is_rising("btn_rb") && self.active_tab + 1 < self.tabs.len() {
+            self.set_active_tab(self.active_tab + 1);
+        }
+
+        // ── Undo / redo ──────────────────────────────────────────────────────
+        if nav.is_rising("btn_ls") {
+            let canvas = &mut self.tabs[self.active_tab].canvas;
+            if canvas.can_undo() {
+                canvas.undo();
+            }
+        }
+        if nav.is_rising("btn_rs") {
+            let canvas = &mut self.tabs[self.active_tab].canvas;
+            if canvas.can_redo() {
+                canvas.redo();
+            }
+        }
+
+        // ── Cursor (right stick + gyro) ──────────────────────────────────────
+        self.update_nav_cursor(ctx, &nav, dt);
+
+        // ── Analog trigger context (default: RT = confirm/enter, LT = back) ──
+        // Widget-specific trigger contexts (curve dot add/delete, remapper
+        // filter cycle) are a planned follow-up; the default confirm/back
+        // mapping below composes with the edit-level handling.
+        let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
+        let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
+        self.gamepad_nav.prev_rt = nav.rt > 0.5;
+        self.gamepad_nav.prev_lt = nav.lt > 0.5;
+
+        // ── Left I/O panel navigation (cursor-driven) ────────────────────────
+        // When the RS/gyro cursor is over a left-panel target, South/RT acts on
+        // it (select input device, toggle output, enter slider edit). While a
+        // slider edit is in progress, the controller drives that value and the
+        // sub-patch handling is skipped. Returns true when it consumed input.
+        if self.nav_drive_left_panel(ctx, &nav, dt, rt_rising, lt_rising) {
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Selection + edit on the active tab's sub-patch ───────────────────
+        let outer_id = {
+            let canvas = &self.tabs[self.active_tab].canvas;
+            canvas
+                .snarl
+                .nodes_ids_data()
+                .find(|(_, n)| n.value.module_id == "subpatch")
+                .map(|(id, _)| id)
+        };
+        if let Some(outer_id) = outer_id {
+            self.nav_drive_subpatch(ctx, outer_id, &nav, dt, rt_rising, lt_rising);
+            // Publish glow state for the subpatch renderer: presence of the key
+            // means "draw the nav selection glow"; value = is-editing.
+            let editing = matches!(
+                self.gamepad_nav.edit_level,
+                crate::gamepad_nav::EditLevel::Editing
+                    | crate::gamepad_nav::EditLevel::CurveDots
+                    | crate::gamepad_nav::EditLevel::CurveDot
+                    | crate::gamepad_nav::EditLevel::RemapScroll
+            );
+            let pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new(("gp_nav_glow", outer_id.0)), (pass, editing))
+            });
+            // Draw the mapping-card glow at top level (NOT inside the remapper
+            // body's child layer — that deadlocks epaint). Uses global rects the
+            // body published last frame.
+            if matches!(self.gamepad_nav.edit_level,
+                crate::gamepad_nav::EditLevel::RemapScroll
+                | crate::gamepad_nav::EditLevel::RemapCard)
+            {
+                self.nav_draw_remap_card_glow(ctx, outer_id);
+            }
+        }
+
+        self.gamepad_nav.prev_pressed = nav.pressed.clone();
+        ctx.request_repaint();
+    }
+
+    /// Selection + value-edit handling within the sub-patch identified by
+    /// `outer_id`. Splits into widget-level (move selection) and editing-level
+    /// (adjust the focused control).
+    fn nav_drive_subpatch(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        dt: f32,
+        rt_rising: bool,
+        lt_rising: bool,
+    ) {
+        use crate::gamepad_nav::{self as gn, EditLevel, NavDir};
+
+        // Resolve directional intent: dpad = discrete; stick = auto-repeat.
+        let mut step_dir: Option<NavDir> = None;
+        if nav.is_rising("dpad_up") {
+            step_dir = Some(NavDir::Up);
+        } else if nav.is_rising("dpad_down") {
+            step_dir = Some(NavDir::Down);
+        } else if nav.is_rising("dpad_left") {
+            step_dir = Some(NavDir::Left);
+        } else if nav.is_rising("dpad_right") {
+            step_dir = Some(NavDir::Right);
+        }
+
+        // Left-stick auto-repeat. Magnitude scales speed.
+        let stick = gn::stick_dir(nav.lstick);
+        let mag = nav.lstick.length();
+        if let Some(sd) = stick {
+            if self.gamepad_nav.repeat_dir != Some(sd) {
+                self.gamepad_nav.repeat_dir = Some(sd);
+                self.gamepad_nav.repeat_accum = 1.0; // immediate first step
+            }
+            let rate = 6.0 + ((mag - 0.5) / 0.5).clamp(0.0, 1.0) * 12.0;
+            self.gamepad_nav.repeat_accum += dt * rate;
+            if self.gamepad_nav.repeat_accum >= 1.0 {
+                self.gamepad_nav.repeat_accum -= 1.0;
+                if step_dir.is_none() {
+                    step_dir = Some(sd);
+                }
+            }
+        } else {
+            self.gamepad_nav.repeat_dir = None;
+            self.gamepad_nav.repeat_accum = 0.0;
+        }
+
+        match self.gamepad_nav.edit_level {
+            EditLevel::Widget => {
+                // Move selection spatially.
+                if let Some(dir) = step_dir {
+                    let canvas = &mut self.tabs[self.active_tab].canvas;
+                    if let Some(sp) = canvas
+                        .snarl
+                        .get_node_mut(outer_id)
+                        .and_then(|n| n.subpatch.as_mut())
+                    {
+                        if let Some(next) = gn::nearest_in_dir(&sp.items, sp.selected_item, dir) {
+                            sp.selected_item = Some(next);
+                            sp.selected_items = vec![next];
+                        } else if sp.selected_item.is_none() {
+                            // Seed selection at the first navigable item.
+                            if let Some(seed) = gn::nearest_in_dir(&sp.items, None, dir) {
+                                sp.selected_item = Some(seed);
+                                sp.selected_items = vec![seed];
+                            }
+                        }
+                    }
+                }
+                // If the RS/gyro cursor is visible, RT/South first MOVES the
+                // selection to whatever widget the cursor is over (the cursor's
+                // whole point: visually pick the target). Only then do we act on
+                // it. Falls through to act on the existing selection when the
+                // cursor isn't over any item.
+                if (nav.is_rising("btn_south") || rt_rising)
+                    && self.gamepad_nav.cursor_visible
+                {
+                    if let Some(hit) = self.nav_cursor_hit_item(ctx, outer_id) {
+                        let canvas = &mut self.tabs[self.active_tab].canvas;
+                        if let Some(sp) = canvas
+                            .snarl
+                            .get_node_mut(outer_id)
+                            .and_then(|n| n.subpatch.as_mut())
+                        {
+                            sp.selected_item = Some(hit);
+                            sp.selected_items = vec![hit];
+                        }
+                    }
+                }
+                let kind = self.nav_selected_kind(outer_id);
+                // Response curve: South ENTERS the curve (dot navigation). Once
+                // inside, LT/RT add/remove dots and South again edits a dot.
+                if matches!(kind, NavWidgetKind::Curve) {
+                    if nav.is_rising("btn_south") || rt_rising {
+                        self.gamepad_nav.edit_level = EditLevel::CurveDots;
+                        self.gamepad_nav.curve_dot = 0;
+                        self.gamepad_nav.edit_baseline = Some(Box::new(
+                            self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+                    }
+                    let _ = lt_rising;
+                } else if matches!(kind, NavWidgetKind::Remapper) {
+                    // Remapper / Map Action / Combiner / Lean: South ENTERS the
+                    // widget (scroll mode — up/down scrolls the mapping list,
+                    // North arms Learn/capture, LT/RT cycle the filter, East
+                    // exits). RT/LT also cycle the filter directly at widget
+                    // level for quick access without entering.
+                    if nav.is_rising("btn_south") {
+                        self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+                    } else if rt_rising || lt_rising {
+                        if let Some(inner) = self.nav_selected_inner_node(outer_id) {
+                            let dir = if rt_rising { 1 } else { -1 };
+                            crate::canvas::viewer::nav_cycle_remapper_filter(ctx, inner.0, dir);
+                        }
+                    }
+                } else {
+                    // South / RT → act on the selected widget by kind.
+                    if nav.is_rising("btn_south") || rt_rising {
+                        match kind {
+                            NavWidgetKind::Toggle => {
+                                // Switch: toggle immediately, one undo entry.
+                                let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+                                if self.nav_toggle_switch(outer_id) {
+                                    self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+                                }
+                            }
+                            NavWidgetKind::Value | NavWidgetKind::Dropdown
+                            | NavWidgetKind::MultiField => {
+                                self.gamepad_nav.edit_level = EditLevel::Editing;
+                                self.gamepad_nav.fine_increment = false;
+                                self.gamepad_nav.field_index = 0;
+                                // Snapshot for a single coalesced undo entry on exit.
+                                self.gamepad_nav.edit_baseline = Some(Box::new(
+                                    self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+                                // Dropdown: open its real popup so all options are
+                                // visible while cycling (the pinned combo is a
+                                // custom button with an egui-memory popup flag).
+                                if matches!(kind, NavWidgetKind::Dropdown) {
+                                    self.nav_set_dropdown_popup(ctx, outer_id, true);
+                                }
+                            }
+                            NavWidgetKind::Curve | NavWidgetKind::Remapper
+                            | NavWidgetKind::None => {}
+                        }
+                    }
+                    let _ = lt_rising; // no back action at widget level
+                }
+            }
+            EditLevel::Editing => {
+                let kind = self.nav_selected_kind(outer_id);
+                // East / LT / back → exit to widget level, committing the edit
+                // as one undo entry if anything actually changed.
+                if nav.is_rising("btn_east") || lt_rising {
+                    self.gamepad_nav.edit_level = EditLevel::Widget;
+                    self.nav_set_dropdown_popup(ctx, outer_id, false);
+                    if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {
+                        self.tabs[self.active_tab].canvas.commit_undo_if_changed(*baseline);
+                    }
+                } else if matches!(kind, NavWidgetKind::MultiField) {
+                    // Unified multi-field editor: left/right pick a field, up/down
+                    // & stick edit it, West=fine, North=reset, South=cycle/toggle.
+                    self.nav_drive_fields(ctx, outer_id, nav, dt, step_dir, rt_rising, mag);
+                } else if matches!(kind, NavWidgetKind::Dropdown) {
+                    // Real Dropdown (dynamic options param): up/down or South/RT
+                    // cycles; South/RT also confirm-exits to widget level.
+                    if let Some(dir) = step_dir {
+                        let d = match dir {
+                            NavDir::Down | NavDir::Right => 1,
+                            NavDir::Up | NavDir::Left => -1,
+                        };
+                        self.nav_cycle_dropdown(outer_id, d);
+                    }
+                    if nav.is_rising("btn_south") || rt_rising {
+                        self.gamepad_nav.edit_level = EditLevel::Widget;
+                        self.nav_set_dropdown_popup(ctx, outer_id, false);
+                        if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {
+                            self.tabs[self.active_tab].canvas.commit_undo_if_changed(*baseline);
+                        }
+                    }
+                } else {
+                    let _ = rt_rising;
+                    // West → toggle fine increments (knob/constant).
+                    if nav.is_rising("btn_west") {
+                        self.gamepad_nav.fine_increment = !self.gamepad_nav.fine_increment;
+                    }
+                    // North → reset to default.
+                    if nav.is_rising("btn_north") {
+                        self.nav_reset_selected(outer_id);
+                    }
+                    if matches!(kind, NavWidgetKind::Value) {
+                        // Knob/constant: linear normalized nudge.
+                        let fine = self.gamepad_nav.fine_increment;
+                        let base_step = if fine { 0.005 } else { 0.02 };
+                        let mut delta = 0.0f32;
+                        if let Some(dir) = step_dir {
+                            let s = match dir {
+                                NavDir::Right | NavDir::Up => 1.0,
+                                NavDir::Left | NavDir::Down => -1.0,
+                            };
+                            delta += s * base_step;
+                        }
+                        if mag > 0.5 {
+                            let sens = if fine { 0.15 } else { 0.6 };
+                            delta += nav.lstick.x * sens * dt;
+                        }
+                        if delta != 0.0 {
+                            self.nav_adjust_selected(outer_id, delta);
+                        }
+                    }
+                }
+            }
+            EditLevel::CurveDots => {
+                self.nav_drive_curve_dots(ctx, outer_id, nav, step_dir, rt_rising, lt_rising);
+            }
+            EditLevel::CurveDot => {
+                self.nav_drive_curve_dot(ctx, outer_id, nav, dt, step_dir, rt_rising, lt_rising);
+            }
+            EditLevel::RemapScroll => {
+                self.nav_drive_remapper(ctx, outer_id, nav, dt, step_dir, rt_rising, lt_rising);
+            }
+            EditLevel::RemapCard => {
+                self.nav_drive_remap_card(ctx, outer_id, nav, dt, step_dir, rt_rising, mag);
+            }
+        }
+    }
+
+    /// Draw the mapping-card selection glow at top level using the GLOBAL rects
+    /// the remapper body published last frame (`gp_nav_remap_card_rects`). Must
+    /// run outside the body's child layer — painting from inside it deadlocks
+    /// epaint's graphics lock.
+    fn nav_draw_remap_card_glow(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        let cur_pass = ctx.cumulative_pass_nr();
+        let accent = ctx.style().visuals.selection.stroke.color;
+        let [r, g, b, _] = accent.to_array();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0))));
+        let ring = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
+            if !rect.is_finite() || rect.width() < 1.0 { return; }
+            let n = 6;
+            for i in 0..n {
+                let t = (i as f32 + 1.0) / n as f32;
+                let grow = t * max_grow;
+                let a = (peak * (1.0 - t)).round() as u8;
+                if a == 0 { continue; }
+                painter.rect_stroke(rect.expand(grow), round + grow,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                    egui::StrokeKind::Outside);
+            }
+            painter.rect_stroke(rect.expand(1.0), round,
+                egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+        };
+
+        // Card glow (selected/entered card + focused header field).
+        if let Some((pass, card, field, entered)) = ctx.data(|d|
+            d.get_temp::<(u64, egui::Rect, Option<egui::Rect>, bool)>(
+                egui::Id::new(("gp_nav_remap_card_rects", inner.0))))
+        {
+            if cur_pass.saturating_sub(pass) <= 2 {
+                ring(card, 5.0, if entered { 130.0 } else { 90.0 }, 7.0);
+                if entered {
+                    if let Some(fr) = field { ring(fr, 4.0, 160.0, 6.0); }
+                }
+            }
+        }
+
+        // Action-button glow (Learn / Special / Add) when an action is focused.
+        let act_sel: Option<usize> = ctx.data(|d|
+            d.get_temp::<(u64, usize)>(egui::Id::new(("gp_nav_remap_action", inner.0))))
+            .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 2)
+            .map(|(_, i)| i)
+            .filter(|i| *i != usize::MAX);
+        if let Some(ai) = act_sel {
+            if let Some((pass, rects)) = ctx.data(|d|
+                d.get_temp::<(u64, Vec<egui::Rect>)>(egui::Id::new(("gp_nav_action_rects", inner.0))))
+            {
+                if cur_pass.saturating_sub(pass) <= 2 {
+                    if let Some(rect) = rects.get(ai) { ring(*rect, 4.0, 130.0, 6.0); }
+                }
+            }
+        }
+    }
+
+    /// Mappings array key for the selected remapper-family node. Remapper /
+    /// Map Action / Combiner use `"mappings"`; gyro lean sections use
+    /// `"lean_left"` / `"lean_right"` keyed by the pinned element id.
+    fn nav_remap_mappings_key(&self, outer_id: egui_snarl::NodeId) -> &'static str {
+        match self.nav_selected_element(outer_id).as_ref().map(|(_, e)| e.as_str()) {
+            Some("lean_left") => "lean_left",
+            Some("lean_right") => "lean_right",
+            _ => "mappings",
+        }
+    }
+
+    /// Number of mapping cards in the selected remapper-family widget.
+    fn nav_remap_card_count(&self, outer_id: egui_snarl::NodeId) -> usize {
+        let key = self.nav_remap_mappings_key(outer_id);
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return 0; };
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas.snarl.get_node(outer_id)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
+            .map(|a| a.len()).unwrap_or(0)
+    }
+
+    /// Mutable access to the selected node's mappings array, runs `f` on it, and
+    /// returns whether `f` reported a change (writing back only then).
+    fn nav_remap_with_mappings<F>(&mut self, outer_id: egui_snarl::NodeId, f: F) -> bool
+    where F: FnOnce(&mut Vec<serde_json::Value>) -> bool {
+        let key = self.nav_remap_mappings_key(outer_id);
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false; };
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return false; };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return false; };
+        let mut arr = node.params.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let changed = f(&mut arr);
+        if changed {
+            node.params.insert(key.to_string(), serde_json::Value::Array(arr));
+        }
+        changed
+    }
+
+    /// Read a card's `mode` string (default "down").
+    fn nav_remap_card_mode(&self, outer_id: egui_snarl::NodeId, idx: usize) -> Option<String> {
+        let key = self.nav_remap_mappings_key(outer_id);
+        let inner = self.nav_selected_inner_node(outer_id)?;
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let arr = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?
+            .snarl.get_node(inner)?.params.get(key)?.as_array()?;
+        let m = arr.get(idx)?;
+        Some(m.get("mode").and_then(|v| v.as_str()).unwrap_or("down").to_string())
+    }
+
+    /// Read a card's bool field (default false).
+    fn nav_remap_card_bool(&self, outer_id: egui_snarl::NodeId, idx: usize, key: &str) -> bool {
+        let mkey = self.nav_remap_mappings_key(outer_id);
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false; };
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|node| node.params.get(mkey).and_then(|v| v.as_array()))
+            .and_then(|a| a.get(idx))
+            .and_then(|m| m.get(key).and_then(|v| v.as_bool()))
+            .unwrap_or(false)
+    }
+
+    fn nav_remap_set_card_bool(&mut self, outer_id: egui_snarl::NodeId, idx: usize, key: &str, val: bool) {
+        let key = key.to_string();
+        self.nav_remap_with_mappings(outer_id, |arr| {
+            if let Some(m) = arr.get_mut(idx).and_then(|v| v.as_object_mut()) {
+                m.insert(key, serde_json::Value::Bool(val));
+                true
+            } else { false }
+        });
+    }
+
+    /// Delete card `idx`.
+    fn nav_remap_delete_card(&mut self, outer_id: egui_snarl::NodeId, idx: usize) -> bool {
+        self.nav_remap_with_mappings(outer_id, |arr| {
+            if idx < arr.len() { arr.remove(idx); true } else { false }
+        })
+    }
+
+    /// Reset card `idx` to the default press mode (down) + clear its params.
+    fn nav_remap_reset_card(&mut self, outer_id: egui_snarl::NodeId, idx: usize) -> bool {
+        self.nav_remap_with_mappings(outer_id, |arr| {
+            if let Some(m) = arr.get_mut(idx).and_then(|v| v.as_object_mut()) {
+                let had = m.contains_key("mode") || m.contains_key("window_ms")
+                    || m.contains_key("sustain") || m.contains_key("turbo");
+                m.remove("mode");
+                m.remove("window_ms");
+                m.remove("sustain");
+                m.remove("turbo");
+                had
+            } else { false }
+        })
+    }
+
+    /// Cycle card `idx`'s press mode by `dir`, applying the same default-param
+    /// fixups the card renderer's popup does (down clears window_ms/sustain;
+    /// other modes seed window_ms). Mirrors the analog availability rule.
+    fn nav_remap_cycle_mode(&mut self, outer_id: egui_snarl::NodeId, idx: usize, dir: i32) {
+        // Modes: analog only offered for remapper-family + lean (all our cases
+        // allow it). Order mirrors the popup.
+        const MODES: &[&str] = &["down","short","long","double","on_press","on_release","analog"];
+        self.nav_remap_with_mappings(outer_id, |arr| {
+            let Some(m) = arr.get_mut(idx).and_then(|v| v.as_object_mut()) else { return false; };
+            let cur = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+            let ci = MODES.iter().position(|x| *x == cur).unwrap_or(0) as i32;
+            let next = MODES[(ci + dir).rem_euclid(MODES.len() as i32) as usize];
+            if next == "down" {
+                m.remove("mode");
+                m.remove("window_ms");
+                m.remove("sustain");
+            } else {
+                m.insert("mode".into(), serde_json::Value::String(next.to_string()));
+                if !m.contains_key("window_ms") {
+                    m.insert("window_ms".into(), serde_json::json!(200.0));
+                }
+            }
+            true
+        });
+    }
+
+    /// Nudge card `idx`'s `window_ms` by `delta`, clamped to 10..5000.
+    fn nav_remap_nudge_window(&mut self, outer_id: egui_snarl::NodeId, idx: usize, delta: f32) {
+        self.nav_remap_with_mappings(outer_id, |arr| {
+            let Some(m) = arr.get_mut(idx).and_then(|v| v.as_object_mut()) else { return false; };
+            let cur = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+            let next = (cur + delta).clamp(10.0, 5000.0);
+            m.insert("window_ms".into(), serde_json::json!(next as f64));
+            true
+        });
+    }
+
+    /// Drive a remapper-family widget the user has ENTERED (RemapScroll level):
+    /// up/down moves the SELECTED CARD, North resets it (or arms Learn when the
+    /// list is empty), West deletes it, South ENTERS it (`RemapCard`), LT/RT
+    /// cycle the filter, East exits. The selected card is published for the body
+    /// to glow + auto-scroll into view.
+    fn nav_drive_remapper(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        _dt: f32,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        rt_rising: bool,
+        lt_rising: bool,
+    ) {
+        use crate::gamepad_nav::{EditLevel, NavDir};
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else {
+            self.gamepad_nav.edit_level = EditLevel::Widget;
+            return;
+        };
+
+        // While capture is ARMED or IN PROGRESS (the user pressed Learn), the
+        // nav driver goes INERT for this device so the raw button/combo reaches
+        // the capture machine instead of being eaten as navigation. Capture
+        // latches on release inside the body; we resume once it leaves the
+        // capturing/learning phases (and the arm clears). Selection is still
+        // published so the glow persists.
+        // Inert ONLY while a nav-mode capture is actually ARMED. The arm now
+        // persists through the whole chord (it clears on latch, not at capture
+        // start), so `armed` alone covers the entire capture window. We must NOT
+        // gate on phase=="capturing" alone — Map Action auto-sits in "capturing"
+        // whenever wired, so doing so would block East/South forever (the user's
+        // "stuck in Map Action" bug).
+        let armed = self.get_subpatch_param_bool(outer_id, inner, "_nav_capture_armed").unwrap_or(false);
+        if armed {
+            self.nav_publish_remap_selection(ctx, outer_id, inner);
+            ctx.request_repaint();
+            return;
+        }
+
+        // East exits the widget (only when not mid-capture).
+        if nav.is_rising("btn_east") {
+            self.gamepad_nav.edit_level = EditLevel::Widget;
+            return;
+        }
+
+        // LT/RT cycle the mapping filter.
+        if rt_rising || lt_rising {
+            let dir = if rt_rising { 1 } else { -1 };
+            crate::canvas::viewer::nav_cycle_remapper_filter(ctx, inner.0, dir);
+        }
+
+        // Two navigation rows:
+        //   • the ACTION row (Learn / Special / Add) — navigated LEFT/RIGHT,
+        //     since the buttons sit side-by-side; cursor 0..n_actions.
+        //   • the CARD list below it — navigated UP/DOWN; cursor n_actions..total.
+        // Up from the first card lands on the action row (keeping the horizontal
+        // sub-index where possible); Down from the action row lands on the first
+        // card. South activates the focused item; West deletes a focused card.
+        let actions = self.nav_remap_action_items(outer_id, inner);
+        let n_actions = actions.len();
+        let count = self.nav_remap_card_count(outer_id);
+        let total = n_actions + count;
+        if total == 0 { return; }
+        if self.gamepad_nav.card_index >= total { self.gamepad_nav.card_index = total - 1; }
+
+        let cur = self.gamepad_nav.card_index;
+        let on_actions = cur < n_actions;
+        let new_cur = match step_dir {
+            Some(NavDir::Left) if on_actions => cur.saturating_sub(1),
+            Some(NavDir::Right) if on_actions => (cur + 1).min(n_actions.saturating_sub(1)),
+            // Down: from the action row → first card; within cards → next card.
+            Some(NavDir::Down) => {
+                if on_actions { n_actions.min(total - 1) }
+                else { (cur + 1).min(total - 1) }
+            }
+            // Up: within cards → prev card; from the first card → action row.
+            Some(NavDir::Up) => {
+                if on_actions { cur } // already at the top row
+                else if cur == n_actions { if n_actions > 0 { 0 } else { cur } }
+                else { cur - 1 }
+            }
+            _ => cur,
+        };
+        self.gamepad_nav.card_index = new_cur;
+        let sel = new_cur;
+
+        if sel < n_actions {
+            // An action button/dropdown is focused → South activates it.
+            if nav.is_rising("btn_south") {
+                let action = actions[sel];
+                if action == "_nav_act_special" {
+                    // Open the virtual KB/M picker instead of the mouse-only
+                    // ComboBox (which a gamepad can't drive).
+                    self.gamepad_nav.kbm_picker_open = true;
+                    self.gamepad_nav.kbm_picker_row = 0;
+                    self.gamepad_nav.kbm_picker_col = 0;
+                    self.gamepad_nav.kbm_picker_node = Some(inner);
+                    self.gamepad_nav.kbm_picker_outer = Some(outer_id);
+                } else {
+                    self.set_subpatch_param_bool(outer_id, inner, action, true);
+                }
+                ctx.request_repaint();
+            }
+        } else {
+            // A mapping card is focused.
+            let card_idx = sel - n_actions;
+            if nav.is_rising("btn_west") {
+                let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+                if self.nav_remap_delete_card(outer_id, card_idx) {
+                    self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+                }
+            } else if nav.is_rising("btn_south") {
+                self.gamepad_nav.edit_level = EditLevel::RemapCard;
+                self.gamepad_nav.remap_card = card_idx;
+                self.gamepad_nav.card_field = 0;
+                self.gamepad_nav.edit_baseline = Some(Box::new(
+                    self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+            }
+        }
+
+        self.nav_publish_remap_selection(ctx, outer_id, inner);
+    }
+
+    /// Drive the virtual KB/M picker (modal). `step_dir` is the resolved
+    /// dpad/stick direction this frame. South appends the focused pin to the
+    /// remapper's `draft_output`; North resets `draft_output`; East closes.
+    fn drive_kbm_picker(
+        &mut self,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        nav: &crate::gamepad_nav::NavInput,
+    ) {
+        use crate::gamepad_nav::NavDir;
+        use crate::kbm_picker::{clamp_cursor, KBM_LAYOUT};
+
+        // East closes the picker.
+        if nav.is_rising("btn_east") {
+            self.gamepad_nav.kbm_picker_open = false;
+            return;
+        }
+        let (mut row, mut col) = clamp_cursor(
+            self.gamepad_nav.kbm_picker_row, self.gamepad_nav.kbm_picker_col);
+
+        match step_dir {
+            Some(NavDir::Left)  => col = col.saturating_sub(1),
+            Some(NavDir::Right) => col = (col + 1).min(KBM_LAYOUT[row].len() - 1),
+            Some(NavDir::Up)    => {
+                row = row.saturating_sub(1);
+                col = col.min(KBM_LAYOUT[row].len() - 1);
+            }
+            Some(NavDir::Down)  => {
+                row = (row + 1).min(KBM_LAYOUT.len() - 1);
+                col = col.min(KBM_LAYOUT[row].len() - 1);
+            }
+            None => {}
+        }
+        self.gamepad_nav.kbm_picker_row = row;
+        self.gamepad_nav.kbm_picker_col = col;
+
+        let Some(outer) = self.gamepad_nav.kbm_picker_outer else {
+            self.gamepad_nav.kbm_picker_open = false; return; };
+        let Some(inner) = self.gamepad_nav.kbm_picker_node else {
+            self.gamepad_nav.kbm_picker_open = false; return; };
+
+        // North resets the output chord.
+        if nav.is_rising("btn_north") {
+            self.set_subpatch_param_str_array(outer, inner, "draft_output", &[]);
+            return;
+        }
+        // South appends the focused pin (de-duped) + ensures the learning phase
+        // so the chosen output shows and Add becomes available.
+        if nav.is_rising("btn_south") {
+            let pin = KBM_LAYOUT[row][col].pin.to_string();
+            let mut out = self.nav_remap_draft_vec(outer, inner, "draft_output");
+            if !out.iter().any(|p| *p == pin) { out.push(pin); }
+            self.set_subpatch_param_str_array(outer, inner, "draft_output", &out);
+            self.set_subpatch_param_str(outer, inner, "ui_phase", "learning");
+        }
+    }
+
+    /// Read a string-array draft as a Vec<String>.
+    fn nav_remap_draft_vec(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, key: &str)
+        -> Vec<String>
+    {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas.snarl.get_node(outer).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Write a string-array param on an inner sub-patch node.
+    fn set_subpatch_param_str_array(&mut self, outer: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str, vals: &[String])
+    {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer).and_then(|n| n.subpatch.as_mut()) else { return; };
+        if let Some(node) = sp.snarl.get_node_mut(inner) {
+            let arr: Vec<serde_json::Value> = vals.iter()
+                .map(|s| serde_json::Value::String(s.clone())).collect();
+            node.params.insert(key.to_string(), serde_json::Value::Array(arr));
+        }
+    }
+
+    /// Ordered list of active action-button activation keys for the current
+    /// phase. MUST match, in order and presence, the buttons the body renders
+    /// (and the order it publishes their rects): Learn, Clear, Special, Add —
+    /// each present only when the body shows it.
+    fn nav_remap_action_items(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
+        -> Vec<&'static str>
+    {
+        let mid = self.nav_selected_module_id(outer_id);
+        let phase = self.nav_remap_phase(outer_id, inner);
+        let in_draft = self.nav_remap_draft_len(outer_id, inner, "draft_input") > 0;
+        let out_draft = self.nav_remap_draft_len(outer_id, inner, "draft_output") > 0;
+        let latched = matches!(phase.as_str(), "ready_to_learn" | "learning");
+        let has_draft = in_draft || out_draft || latched;
+        match mid.as_deref() {
+            Some("module.remapper") => {
+                // Learn, Clear(has_draft), Special(latched), Add(out_draft&&latched).
+                let mut v = vec!["_nav_act_learn"];
+                if has_draft { v.push("_nav_act_clear"); }
+                if latched { v.push("_nav_act_special"); }
+                if out_draft && latched { v.push("_nav_act_add"); }
+                v
+            }
+            // Map Action / Lean / Combiner: Learn, Clear(has_draft), Add(in_draft).
+            _ => {
+                let mut v = vec!["_nav_act_learn"];
+                if has_draft { v.push("_nav_act_clear"); }
+                if in_draft { v.push("_nav_act_add"); }
+                v
+            }
+        }
+    }
+
+    /// Publish the RemapScroll selection (action vs card) so the body glows the
+    /// focused item. Action items glow their button rect (published by the body);
+    /// cards glow via the existing card-rect publish.
+    fn nav_publish_remap_selection(&self, ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
+    {
+        let n_actions = self.nav_remap_action_items(outer_id, inner).len();
+        let sel = self.gamepad_nav.card_index;
+        let pass = ctx.cumulative_pass_nr();
+        let entered = matches!(self.gamepad_nav.edit_level,
+            crate::gamepad_nav::EditLevel::RemapCard);
+        // (selected_action_index or usize::MAX, card_index or usize::MAX, entered)
+        let (act_sel, card_sel) = if entered {
+            (usize::MAX, self.gamepad_nav.remap_card)
+        } else if sel < n_actions {
+            (sel, usize::MAX)
+        } else {
+            (usize::MAX, sel - n_actions)
+        };
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0)),
+                (pass, card_sel, entered));
+            d.insert_temp(egui::Id::new(("gp_nav_remap_action", inner.0)),
+                (pass, act_sel));
+        });
+        ctx.request_repaint();
+    }
+
+    /// Read the remapper-family node's `ui_phase` (default "capturing").
+    fn nav_remap_phase(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> String {
+        self.get_subpatch_param_str(outer_id, inner, "ui_phase")
+            .unwrap_or_else(|| "capturing".to_string())
+    }
+    /// Length of the captured input/output drafts.
+    fn nav_remap_draft_len(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId, key: &str) -> usize {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
+            .map(|a| a.len()).unwrap_or(0)
+    }
+
+    /// Drive header-field editing of the entered mapping card (`RemapCard`):
+    /// left/right move between the fields that APPLY for the current mode
+    /// (press-mode / time-gap / hold / turbo — grayed-out ones skipped), up/down
+    /// or South edit the focused field, North resets the card, East exits.
+    fn nav_drive_remap_card(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        dt: f32,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        rt_rising: bool,
+        mag: f32,
+    ) {
+        use crate::gamepad_nav::{EditLevel, NavDir};
+        if nav.is_rising("btn_east") {
+            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {
+                self.tabs[self.active_tab].canvas.commit_undo_if_changed(*baseline);
+            }
+            return;
+        }
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else {
+            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            return;
+        };
+        let _ = inner;
+        let idx = self.gamepad_nav.remap_card;
+        // North resets the entered card's press mode + params to default.
+        if nav.is_rising("btn_north") {
+            self.nav_remap_reset_card(outer_id, idx);
+        }
+        // Header fields, in display order: 0=press-mode, 1=time-gap, 2=hold,
+        // 3=turbo. Compute which apply for the current mode (mirror the card
+        // renderer's gray-out rules) so we can skip the inert ones.
+        let Some(mode) = self.nav_remap_card_mode(outer_id, idx) else {
+            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            return;
+        };
+        let turbo_on = self.nav_remap_card_bool(outer_id, idx, "turbo");
+        let gap_applies = matches!(mode.as_str(),
+            "short"|"long"|"double"|"analog"|"on_press"|"on_release") || turbo_on;
+        let hold_applies = mode == "long" || mode == "analog";
+        let turbo_applies = !matches!(mode.as_str(), "short"|"double"|"on_press"|"on_release");
+        // Field 0 (press-mode) always applies.
+        let applies = [true, gap_applies, hold_applies, turbo_applies];
+
+        // Left/right move to the previous/next applicable field.
+        let mut field = self.gamepad_nav.card_field.min(3);
+        let move_dir = match step_dir {
+            Some(NavDir::Left) => -1i32,
+            Some(NavDir::Right) => 1,
+            _ => 0,
+        };
+        if move_dir != 0 {
+            let mut f = field as i32;
+            for _ in 0..4 {
+                f = (f + move_dir).rem_euclid(4);
+                if applies[f as usize] { break; }
+            }
+            field = f as usize;
+            self.gamepad_nav.card_field = field;
+        }
+        // If the focused field became inert (mode changed), snap to press-mode.
+        if !applies[field] { field = 0; self.gamepad_nav.card_field = 0; }
+
+        // Edit the focused field with up/down (and South for toggles / mode).
+        let edit_press = match step_dir {
+            Some(NavDir::Up) => 1i32,
+            Some(NavDir::Down) => -1,
+            _ => 0,
+        };
+        let south = nav.is_rising("btn_south") || rt_rising;
+        match field {
+            0 => {
+                // Press mode: cycle through the available modes. South or
+                // up/down advance; down goes back.
+                let dir = if south { 1 } else { edit_press };
+                if dir != 0 { self.nav_remap_cycle_mode(outer_id, idx, dir); }
+            }
+            1 => {
+                // Time gap (window_ms): decade-ish nudge, 10..5000.
+                let mut delta = 0.0f32;
+                let fine = self.gamepad_nav.fine_increment;
+                if nav.is_rising("btn_west") {
+                    self.gamepad_nav.fine_increment = !self.gamepad_nav.fine_increment;
+                }
+                let step = if fine { 1.0 } else { 5.0 };
+                if edit_press != 0 { delta += edit_press as f32 * step; }
+                if mag > 0.5 {
+                    let accel = self.settings.cursor_accel.max(1.0);
+                    let c = -nav.lstick.y;
+                    delta += c.signum() * c.abs().powf(accel) * step * 40.0 * dt;
+                }
+                if delta != 0.0 {
+                    self.nav_remap_nudge_window(outer_id, idx, delta);
+                }
+            }
+            2 => {
+                if south || edit_press != 0 {
+                    let cur = self.nav_remap_card_bool(outer_id, idx, "sustain");
+                    let next = if south { !cur } else { edit_press > 0 };
+                    self.nav_remap_set_card_bool(outer_id, idx, "sustain", next);
+                }
+            }
+            3 => {
+                if south || edit_press != 0 {
+                    let cur = self.nav_remap_card_bool(outer_id, idx, "turbo");
+                    let next = if south { !cur } else { edit_press > 0 };
+                    self.nav_remap_set_card_bool(outer_id, idx, "turbo", next);
+                }
+            }
+            _ => {}
+        }
+
+        // Publish selected card + focused field so the body glows them.
+        let pass = ctx.cumulative_pass_nr();
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0)), (pass, idx, true));
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card_field", inner.0)), (pass, field as u64));
+        });
+        ctx.request_repaint();
+    }
+
+    /// Unified multi-field editor. Left/right move the focused field; up/down +
+    /// stick-X edit the focused field (Value = nudge, Enum/EnumPair = cycle,
+    /// Toggle = on South or up/down). West=fine, North=reset focused field.
+    /// Publishes the focus index + a small HUD label so the user sees what's
+    /// targeted (since the underlying body rows aren't gamepad-aware).
+    fn nav_drive_fields(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        dt: f32,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        rt_rising: bool,
+        mag: f32,
+    ) {
+        use crate::gamepad_nav::NavDir;
+        let fields = self.nav_element_fields(outer_id);
+        if fields.is_empty() { return; }
+        let n = fields.len();
+        self.gamepad_nav.field_index = self.gamepad_nav.field_index.min(n - 1);
+
+        // West → fine. North → reset focused field.
+        if nav.is_rising("btn_west") {
+            self.gamepad_nav.fine_increment = !self.gamepad_nav.fine_increment;
+        }
+        let fine = self.gamepad_nav.fine_increment;
+
+        // Left/right: move field focus (when multiple). Up/down: edit value.
+        // For single-field elements, left/right also edit (no focus to move).
+        let multi = n > 1;
+        let mut edit_press = 0i32; // -1/+1 from dpad up/down or stick
+        if let Some(dir) = step_dir {
+            match dir {
+                NavDir::Left if multi => {
+                    self.gamepad_nav.field_index = self.gamepad_nav.field_index.saturating_sub(1);
+                }
+                NavDir::Right if multi => {
+                    self.gamepad_nav.field_index = (self.gamepad_nav.field_index + 1).min(n - 1);
+                }
+                NavDir::Up   | NavDir::Right => edit_press = 1,
+                NavDir::Down | NavDir::Left  => edit_press = -1,
+            }
+        }
+        let idx = self.gamepad_nav.field_index;
+        let def = fields[idx].clone();
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+
+        // North → reset focused field.
+        if nav.is_rising("btn_north") {
+            match &def.field {
+                NavField::Value { key, default, .. } =>
+                    self.set_subpatch_param_f32(outer_id, inner, key, *default),
+                NavField::Enum { key, opts } =>
+                    self.set_subpatch_param_str(outer_id, inner, key, opts[0]),
+                NavField::Toggle { key } =>
+                    self.set_subpatch_param_bool(outer_id, inner, key, false),
+                NavField::EnumPair { key_a, key_b, opts } => {
+                    self.set_subpatch_param_str(outer_id, inner, key_a, opts[0].1);
+                    self.set_subpatch_param_str(outer_id, inner, key_b, opts[0].2);
+                }
+            }
+        }
+
+        match &def.field {
+            NavField::Value { key, lo, hi, default, step } => {
+                let press = edit_press as f32;
+                let cont = if mag > 0.5 { nav.lstick.x } else { 0.0 };
+                if press != 0.0 || cont != 0.0 {
+                    self.nav_adjust_field_value(outer_id, inner, *key, *lo, *hi, *default, *step,
+                        press, cont, fine, dt);
+                }
+            }
+            NavField::Enum { key, opts } => {
+                // South or up/down cycles; up/right = +1, down/left = -1.
+                let dir = if nav.is_rising("btn_south") || rt_rising { 1 } else { edit_press };
+                if dir != 0 {
+                    let cur = self.get_subpatch_param_str(outer_id, inner, key)
+                        .unwrap_or_else(|| opts[0].to_string());
+                    let cu = opts.iter().position(|o| *o == cur).unwrap_or(0) as i32;
+                    let next = opts[(cu + dir).rem_euclid(opts.len() as i32) as usize];
+                    self.set_subpatch_param_str(outer_id, inner, key, next);
+                }
+            }
+            NavField::Toggle { key } => {
+                if nav.is_rising("btn_south") || rt_rising || edit_press != 0 {
+                    let cur = self.get_subpatch_param_bool(outer_id, inner, key).unwrap_or(false);
+                    // up/right → on, down/left → off; South toggles.
+                    let next = if nav.is_rising("btn_south") || rt_rising { !cur }
+                               else { edit_press > 0 };
+                    self.set_subpatch_param_bool(outer_id, inner, key, next);
+                }
+            }
+            NavField::EnumPair { key_a, key_b, opts } => {
+                let dir = if nav.is_rising("btn_south") || rt_rising { 1 } else { edit_press };
+                if dir != 0 {
+                    let a = self.get_subpatch_param_str(outer_id, inner, key_a).unwrap_or_default();
+                    let b = self.get_subpatch_param_str(outer_id, inner, key_b).unwrap_or_default();
+                    let cu = opts.iter().position(|o| o.1 == a && o.2 == b).unwrap_or(0) as i32;
+                    let nx = &opts[(cu + dir).rem_euclid(opts.len() as i32) as usize];
+                    self.set_subpatch_param_str(outer_id, inner, key_a, nx.1);
+                    self.set_subpatch_param_str(outer_id, inner, key_b, nx.2);
+                }
+            }
+        }
+
+        // Publish a focus HUD near the selected item so the user sees which
+        // field is targeted + its label/value.
+        self.nav_publish_field_hud(ctx, outer_id, inner, &fields, idx, fine);
+    }
+
+    /// Value-field nudge: decade or linear stepping (shared with the standalone
+    /// numeric widgets), per-field bounds.
+    #[allow(clippy::too_many_arguments)]
+    fn nav_adjust_field_value(&mut self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        key: &str, lo: f32, hi: f32, default: f32, step: NavStep,
+        press: f32, cont: f32, fine: bool, dt: f32)
+    {
+        let cur = self.get_subpatch_param_f32(outer_id, inner, key).unwrap_or(default);
+        let press_step = match step {
+            NavStep::Decade => {
+                let v = (cur - lo).abs().max(1e-6);
+                let decade = 10f32.powf(v.log10().floor()).max(1.0);
+                let coarse = if decade <= 1.0 { 1.0 } else { decade * 0.5 };
+                if fine { coarse * 0.1 } else { coarse }
+            }
+            NavStep::Linear => {
+                let span = (hi - lo).abs().max(f32::EPSILON);
+                span * if fine { 0.005 } else { 0.02 }
+            }
+        };
+        let accel = self.settings.cursor_accel.max(1.0);
+        let cont_curved = cont.signum() * cont.abs().clamp(0.0, 1.0).powf(accel);
+        let cont_per_s = press_step * if fine { 8.0 } else { 25.0 };
+        let mut delta = 0.0f32;
+        if press != 0.0 { delta += press * press_step; }
+        if cont != 0.0  { delta += cont_curved * cont_per_s * dt; }
+        if delta == 0.0 { return; }
+        // Whole-unit params read better rounded — but a small linear step (e.g.
+        // grid 1..20 → step ~0.38) rounds back to the current value and looks
+        // dead. For those, a discrete dpad/stick press must move at least one
+        // whole unit in the press direction.
+        let whole = matches!(key, "buf_size" | "grid_x" | "grid_y" | "trail_ms");
+        let mut next = (cur + delta).clamp(lo, hi);
+        if whole {
+            next = next.round();
+            if press != 0.0 && (next - cur.round()).abs() < 0.5 {
+                next = (cur.round() + press.signum()).clamp(lo, hi);
+            }
+            // These renderers read the param with `as_i64()` and ignore a JSON
+            // float, so whole-unit params MUST be stored as integers.
+            self.set_subpatch_param_i64(outer_id, inner, key, next as i64);
+            return;
+        }
+        self.set_subpatch_param_f32(outer_id, inner, key, next);
+    }
+
+    /// Publish the multi-field focus HUD (pass-stamped) for the renderer overlay
+    /// + a foreground text label so the user sees the focused field.
+    fn nav_publish_field_hud(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, fields: &[NavFieldDef], idx: usize, fine: bool)
+    {
+        let def = &fields[idx];
+        // Read the focused field's current value as a string for the HUD.
+        let val_str = match &def.field {
+            NavField::Value { key, .. } =>
+                self.get_subpatch_param_f32(outer_id, inner, key)
+                    .map(|v| format!("{:.3}", v)).unwrap_or_default(),
+            NavField::Enum { key, .. } | NavField::EnumPair { key_a: key, .. } =>
+                self.get_subpatch_param_str(outer_id, inner, key).unwrap_or_default(),
+            NavField::Toggle { key } =>
+                if self.get_subpatch_param_bool(outer_id, inner, key).unwrap_or(false) { "ON".into() } else { "OFF".into() },
+        };
+        // Find the item's screen rect (published by render_subpatch_body) to
+        // anchor the HUD just above it.
+        let rects: Option<(u64, Vec<(usize, egui::Rect)>)> =
+            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_item_rects", outer_id.0))));
+        let sel = {
+            let canvas = &self.tabs[self.active_tab].canvas;
+            canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
+                .and_then(|sp| sp.selected_item)
+        };
+        let rect = rects.and_then(|(_, rs)| sel.and_then(|s| rs.iter().find(|(i,_)| *i == s).map(|(_,r)| *r)));
+        let Some(rect) = rect else { return; };
+        let accent = ctx.style().visuals.selection.stroke.color;
+
+        // Per-field inner glow: if the row renderer published per-control rects
+        // this frame, draw an outward bloom ring on the focused field's rect so
+        // the user sees WHICH sub-control is targeted (the HUD pill names it; the
+        // ring points at it). Falls back silently to pill-only when a renderer
+        // hasn't been instrumented.
+        let element = self.nav_selected_element(outer_id)
+            .map(|(_, e)| e).unwrap_or_default();
+        let field_rects: Option<(u64, Vec<egui::Rect>)> =
+            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner.0, element))));
+        if let Some((_, frs)) = field_rects {
+            if let Some(fr) = frs.get(idx) {
+                if fr.is_finite() && fr.width() > 0.5 {
+                    let [r, g, b, _] = accent.to_array();
+                    let p = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground, egui::Id::new(("gp_nav_field_glow", outer_id.0))));
+                    let rings = 6;
+                    for i in 0..rings {
+                        let t = (i as f32 + 1.0) / rings as f32;
+                        let grow = t * 7.0;
+                        let a = (150.0 * (1.0 - t)).round() as u8;
+                        if a == 0 { continue; }
+                        p.rect_stroke(fr.expand(grow), 5.0 + grow,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                            egui::StrokeKind::Outside);
+                    }
+                    p.rect_stroke(fr.expand(1.5), 5.0, egui::Stroke::new(2.0, accent),
+                        egui::StrokeKind::Outside);
+                }
+            }
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground, egui::Id::new(("gp_nav_field_hud", outer_id.0))));
+        let n = fields.len();
+        let label = if n > 1 {
+            format!("[{}/{}] {} = {}{}", idx + 1, n, def.label, val_str,
+                if fine { "  (fine)" } else { "" })
+        } else {
+            format!("{} = {}{}", def.label, val_str, if fine { "  (fine)" } else { "" })
+        };
+        let pos = egui::pos2(rect.center().x, rect.top() - 6.0);
+        // Background pill for legibility.
+        let galley = painter.layout_no_wrap(label.clone(),
+            egui::FontId::proportional(12.0), egui::Color32::WHITE);
+        let pad = egui::vec2(6.0, 3.0);
+        let bg = egui::Rect::from_center_size(
+            egui::pos2(pos.x, pos.y - galley.size().y * 0.5),
+            galley.size() + pad * 2.0);
+        painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(20, 20, 24, 230));
+        painter.rect_stroke(bg, 4.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+        painter.text(egui::pos2(pos.x, pos.y - galley.size().y * 0.5),
+            egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+    }
+
+    /// Read/write a String param on an inner sub-patch node.
+    fn get_subpatch_param_str(&self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str) -> Option<String>
+    {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        sp.snarl.get_node(inner)?.params.get(key)?.as_str().map(|s| s.to_string())
+    }
+    fn set_subpatch_param_str(&mut self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str, val: &str)
+    {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        if let Some(node) = sp.snarl.get_node_mut(inner) {
+            node.params.insert(key.to_string(), serde_json::Value::String(val.to_string()));
+        }
+    }
+    fn set_subpatch_param_bool(&mut self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str, val: bool)
+    {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        if let Some(node) = sp.snarl.get_node_mut(inner) {
+            node.params.insert(key.to_string(), serde_json::Value::Bool(val));
+        }
+    }
+    fn get_subpatch_param_bool(&self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str) -> Option<bool>
+    {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        sp.snarl.get_node(inner)?.params.get(key)?.as_bool()
+    }
+
+    /// Hit-test the RS/gyro cursor against the sub-patch item screen rects
+    /// published by `render_subpatch_body` last frame. Returns the index of the
+    /// topmost item under the cursor (last in paint order wins), or None.
+    fn nav_cursor_hit_item(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) -> Option<usize> {
+        let cursor = self.gamepad_nav.cursor_pos;
+        let rects: Option<(u64, Vec<(usize, egui::Rect)>)> =
+            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_item_rects", outer_id.0))));
+        let (_pass, rects) = rects?;
+        // Only consider items that are actually interactable — skip text titles,
+        // graphs, svgs and other decorative elements the cursor passes over.
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        rects
+            .iter()
+            .rev()
+            .find(|(i, r)| r.contains(cursor) && Self::sp_item_is_editable(sp, *i))
+            .map(|(i, _)| *i)
+    }
+
+    /// True if sub-patch item `idx` is a gamepad-editable widget (knob/constant/
+    /// dropdown/switch/curve/remapper), not a decorative element. Only the
+    /// `"curve"` element of a response curve is selectable (its scale/range/grid
+    /// rows are separate, non-dot elements).
+    fn sp_item_is_editable(
+        sp: &crate::canvas::node::UiSubPatch,
+        idx: usize,
+    ) -> bool {
+        use crate::canvas::node::LayoutItem;
+        let Some(LayoutItem::Module(m)) = sp.items.get(idx) else { return false; };
+        let inner = egui_snarl::NodeId(m.inner_node_id);
+        let Some(mid) = sp.snarl.get_node(inner).map(|n| n.module_id.clone()) else { return false; };
+        Self::elem_is_nav_target(&mid, &m.element_id)
+    }
+
+    /// Pure (module, element) test for "the cursor can target this and the nav
+    /// driver has a handler for it". Single source of truth shared by the cursor
+    /// hit-test and any other place that needs targetability without selection
+    /// context. Mirrors the arms of `nav_selected_kind`.
+    fn elem_is_nav_target(mid: &str, elem: &str) -> bool {
+        match (mid, elem) {
+            // Single-actuation widgets.
+            ("module.knob", _) | ("module.constant", _)
+            | ("module.dropdown", _) | ("module.switch", _) => true,
+            // Curves: the dot graph plus every editable option row.
+            ("module.response_curve", "curve")
+            | ("module.vec_response_curve", "curve")
+            | ("module.twoway_response_curve", "curve") => true,
+            // Remapper-family mapping widgets (filter cycle + in-body capture).
+            ("module.remapper", _) | ("module.map_action", _)
+            | ("module.automap_combiner", _) => true,
+            ("processing.gyro_3dof", "lean_left")
+            | ("processing.gyro_3dof", "lean_right") => true,
+            // Everything else is a field row — targetable iff it has fields.
+            _ => Self::elem_has_fields(mid, elem),
+        }
+    }
+
+    /// Static mirror of `nav_element_fields`' coverage (pure (module, element)
+    /// test) — used by the cursor hit-test, which has no selection context.
+    /// MUST stay in sync with `nav_element_fields`.
+    fn elem_has_fields(mid: &str, elem: &str) -> bool {
+        matches!(
+            (mid, elem),
+            ("module.delay", "ms")
+            | ("module.average", "samples") | ("module.average", "spike_mad")
+            | ("module.dc_filter", "window_ms") | ("module.dc_filter", "decay_ms")
+            | ("logic.delay", "time") | ("logic.delay", "mode")
+            | ("generator.oscillator", "freq") | ("generator.oscillator", "phase")
+            | ("generator.oscillator", "shape")
+            | ("processing.gyro_3dof", "lean_threshold")
+            | ("processing.gyro_3dof", "pointer_mode") | ("processing.gyro_3dof", "mode")
+            | ("processing.gyro_3dof", "steering_mode")
+            | ("processing.gyro_3dof", "steering_opts")
+            | ("processing.gyro_3dof", "gyro_invert") | ("processing.gyro_3dof", "accel_invert")
+            | ("logic.counter", "mode") | ("logic.counter", "range_mode")
+            | ("logic.counter", "step") | ("logic.counter", "min_max")
+            | ("module.selector", "mode") | ("module.selector", "range_mode")
+            | ("module.selector", "step") | ("module.selector", "min_max")
+            | ("module.response_curve", "scale_row") | ("module.response_curve", "range_row")
+            | ("module.response_curve", "grid_row") | ("module.response_curve", "grid_options_row")
+            | ("module.vec_response_curve", "scale_row") | ("module.vec_response_curve", "range_row")
+            | ("module.vec_response_curve", "grid_row") | ("module.vec_response_curve", "grid_options_row")
+            | ("module.twoway_response_curve", "scale_row") | ("module.twoway_response_curve", "range_row")
+            | ("module.twoway_response_curve", "grid_row") | ("module.twoway_response_curve", "grid_options_row")
+            | ("module.twoway_response_curve", "hyst_row") | ("module.twoway_response_curve", "interp_row")
+            | ("module.twoway_response_curve", "lane_toggle")
+            | ("display.oscilloscope", "controls")
+        )
+    }
+
+    /// Cursor-driven navigation of the left I/O panel. Returns true when it
+    /// consumed this frame's input (so sub-patch nav is skipped).
+    ///
+    /// - Not editing: if the cursor is visible and South/RT rises over a target,
+    ///   dispatch it — select input device, toggle output sink, toggle the
+    ///   digital-triggers checkbox, or (for sliders) ENTER a left-edit.
+    /// - Editing a slider: stick/dpad nudges the value, West toggles fine,
+    ///   North resets to default, East/LT exits (committing one undo entry).
+    fn nav_drive_left_panel(
+        &mut self,
+        ctx: &egui::Context,
+        nav: &crate::gamepad_nav::NavInput,
+        dt: f32,
+        rt_rising: bool,
+        lt_rising: bool,
+    ) -> bool {
+        use crate::gamepad_nav::{self as gn, LeftNavAction, NavDir};
+
+        // Published targets (this frame, from io_panel). Used for hover-glow and
+        // to recover the editing target's rect.
+        let targets: Vec<gn::LeftNavTarget> = ctx
+            .data(|d| d.get_temp::<(u64, Vec<gn::LeftNavTarget>)>(gn::left_targets_id()))
+            .map(|(_, t)| t)
+            .unwrap_or_default();
+
+        // Glow helper: edge ring + OUTWARD bloom only — never fills the widget
+        // interior, so the slider/checkbox underneath stays fully visible while
+        // editing. The bloom is concentric outside-strokes with falling alpha (a
+        // true outward gradient). `editing` brightens + widens it.
+        let glow = |rect: egui::Rect, editing: bool| {
+            let accent = ctx.style().visuals.selection.stroke.color;
+            let [r, g, b, _] = accent.to_array();
+            let round = 10.0_f32;
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground, egui::Id::new("gp_nav_left_glow")));
+            // Outward bloom: a handful of expanding rings fading to transparent.
+            let rings = 7;
+            let max_grow = if editing { 9.0 } else { 6.0 };
+            let peak = if editing { 150.0 } else { 90.0 };
+            for i in 0..rings {
+                let t = (i as f32 + 1.0) / rings as f32; // 0..1 outward
+                let grow = t * max_grow;
+                let a = (peak * (1.0 - t)).round() as u8;
+                if a == 0 { continue; }
+                painter.rect_stroke(
+                    rect.expand(grow), round + grow,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            // Crisp edge ring on the widget border.
+            painter.rect_stroke(rect.expand(1.0), round,
+                egui::Stroke::new(if editing { 2.0 } else { 1.25 }, accent),
+                egui::StrokeKind::Outside);
+        };
+
+        // ── Editing a left-panel slider ──────────────────────────────────
+        if let Some(action) = self.gamepad_nav.left_edit.clone() {
+            let LeftNavAction::AdjustParam { node, key, lo, hi, step, default, log } = action
+            else {
+                // Non-adjust actions never enter edit; clear defensively.
+                self.gamepad_nav.left_edit = None;
+                return false;
+            };
+
+            // Exit (East / LT) → commit one undo entry if changed.
+            if nav.is_rising("btn_east") || lt_rising {
+                self.gamepad_nav.left_edit = None;
+                if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {
+                    self.tabs[self.active_tab].canvas.commit_undo_if_changed(*baseline);
+                }
+                return true;
+            }
+            // West → fine increments. North → reset to default.
+            if nav.is_rising("btn_west") {
+                self.gamepad_nav.fine_increment = !self.gamepad_nav.fine_increment;
+            }
+            if nav.is_rising("btn_north") {
+                self.set_node_param_f32(node, &key, default);
+                return true;
+            }
+
+            // Directional delta: dpad step + left-stick continuous.
+            let fine = self.gamepad_nav.fine_increment;
+            let span = hi - lo;
+            // Per-press step is a fraction of the range; fine = ¼ of that.
+            let base_step = span * if fine { 0.01 } else { 0.04 };
+            let mut delta = 0.0f32;
+            let mut step_dir: Option<NavDir> = None;
+            if nav.is_rising("dpad_right") || nav.is_rising("dpad_up") { step_dir = Some(NavDir::Right); }
+            else if nav.is_rising("dpad_left") || nav.is_rising("dpad_down") { step_dir = Some(NavDir::Left); }
+            if let Some(d) = step_dir {
+                delta += if matches!(d, NavDir::Right) { base_step } else { -base_step };
+            }
+            let mag = nav.lstick.length();
+            if mag > 0.5 {
+                let sens = span * if fine { 0.15 } else { 0.6 };
+                delta += nav.lstick.x * sens * dt;
+            }
+            if delta != 0.0 {
+                let cur = self.get_node_param_f32(node, &key).unwrap_or(default);
+                let next = if log {
+                    // Multiplicative step in log space for log-scaled sliders.
+                    let factor = 1.0 + (delta / span);
+                    (cur * factor).clamp(lo, hi)
+                } else {
+                    (cur + delta).clamp(lo, hi)
+                };
+                self.set_node_param_f32(node, &key, next);
+            }
+            // Glow the editing target (look its rect up by node+key).
+            if let Some(t) = targets.iter().find(|t| matches!(&t.action,
+                LeftNavAction::AdjustParam { node: n, key: k, .. } if *n == node && *k == key))
+            {
+                glow(t.rect, true);
+            }
+            let _ = (rt_rising, step);
+            return true;
+        }
+
+        // ── Not editing: hover-glow + act on the target under the cursor ──
+        if !self.gamepad_nav.cursor_visible {
+            return false;
+        }
+        let cursor = self.gamepad_nav.cursor_pos;
+        // Hover highlight whatever target the cursor is over (even without a
+        // press) so the user sees what South/RT will act on.
+        if let Some(hov) = targets.iter().rev().find(|t| t.rect.contains(cursor)) {
+            glow(hov.rect, false);
+        }
+        if !(nav.is_rising("btn_south") || rt_rising) {
+            return false;
+        }
+        let Some(hit) = targets.iter().rev().find(|t| t.rect.contains(cursor)) else {
+            return false;
+        };
+        match hit.action.clone() {
+            LeftNavAction::SelectInput { device_id } => {
+                self.nav_select_input_device(&device_id);
+            }
+            LeftNavAction::ToggleOutput { kind } => {
+                self.nav_toggle_output_sink(&kind);
+            }
+            LeftNavAction::ToggleParam { node, key } => {
+                let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+                let cur = self.get_node_param_bool(node, &key).unwrap_or(false);
+                self.set_node_param_bool(node, &key, !cur);
+                self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+            }
+            action @ LeftNavAction::AdjustParam { .. } => {
+                // Enter slider edit; snapshot for a single coalesced undo entry.
+                self.gamepad_nav.edit_baseline = Some(Box::new(
+                    self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+                self.gamepad_nav.fine_increment = false;
+                self.gamepad_nav.left_edit = Some(action);
+            }
+        }
+        true
+    }
+
+    /// Make `device_id` the active input source (mirrors the io_panel card
+    /// click path: remove existing source nodes, add this device, rewire).
+    fn nav_select_input_device(&mut self, device_id: &str) {
+        let already = {
+            let canvas = &self.tabs[self.active_tab].canvas;
+            canvas.snarl.nodes_ids_data()
+                .find(|(_, n)| n.value.module_id == "device.source")
+                .and_then(|(_, n)| n.value.params.get("device_id")
+                    .and_then(|v| v.as_str())) == Some(device_id)
+        };
+        if already { return; }
+        let Some(dev) = self.devices.iter().find(|d| d.id == device_id).cloned()
+        else { return; };
+        let defaults = self.nav_device_defaults();
+        let collapsed = self.settings.device_nodes_default_collapsed;
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let to_remove: Vec<egui_snarl::NodeId> = canvas.snarl.nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == "device.source")
+            .map(|(id, _)| id)
+            .collect();
+        for id in to_remove { canvas.snarl.remove_node(id); }
+        canvas.add_device_source(&dev, collapsed, defaults);
+        crate::easy::layout::reposition_io_nodes(canvas);
+        crate::easy::wiring::rewire(canvas);
+    }
+
+    /// Device param defaults from settings (mirrors the Easy panel's inline
+    /// construction).
+    fn nav_device_defaults(&self) -> crate::canvas::DeviceParamDefaults {
+        crate::canvas::DeviceParamDefaults {
+            stick_deadzone: self.settings.default_stick_deadzone,
+            gyro_mult: self.settings.default_gyro_mult,
+            mouse_sensitivity: self.settings.default_mouse_sensitivity,
+        }
+    }
+
+    /// Toggle a virtual output sink on/off by kind prefix (xinput/ds4/keymouse),
+    /// honoring the xinput⇄ds4 mutual exclusion the io_panel enforces.
+    fn nav_toggle_output_sink(&mut self, kind: &str) {
+        use flexinput_virtual::kind_prefix;
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let has = canvas.snarl.nodes_ids_data().any(|(_, n)| {
+            n.value.module_id == "device.sink"
+                && n.value.params.get("device_id").and_then(|v| v.as_str())
+                    .map(|d| kind_prefix(d) == kind).unwrap_or(false)
+        });
+        let remove_kind = |canvas: &mut Canvas, k: &str| {
+            let ids: Vec<egui_snarl::NodeId> = canvas.snarl.nodes_ids_data()
+                .filter(|(_, n)| n.value.module_id == "device.sink"
+                    && n.value.params.get("device_id").and_then(|v| v.as_str())
+                        .map(|d| kind_prefix(d) == k).unwrap_or(false))
+                .map(|(id, _)| id).collect();
+            for id in ids { canvas.snarl.remove_node(id); }
+        };
+        if has {
+            remove_kind(canvas, kind);
+        } else {
+            // xinput and ds4 are mutually exclusive.
+            if kind == "virtual.xinput" { remove_kind(canvas, "virtual.ds4"); }
+            if kind == "virtual.ds4" { remove_kind(canvas, "virtual.xinput"); }
+            let defaults = self.nav_device_defaults();
+            let collapsed = self.settings.device_nodes_default_collapsed;
+            let pool = std::sync::Arc::clone(&self.shared_virtual_devices);
+            let canvas = &mut self.tabs[self.active_tab].canvas;
+            crate::easy::io_panel::nav_ensure_sink(
+                canvas, kind, &pool, collapsed, defaults);
+        }
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        crate::easy::wiring::rewire(canvas);
+    }
+
+    /// Read an f32 param on an active-tab node (top-level snarl).
+    fn get_node_param_f32(&self, node: egui_snarl::NodeId, key: &str) -> Option<f32> {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas.snarl.get_node(node)?.params.get(key)?.as_f64().map(|v| v as f32)
+    }
+    /// Write an f32 param on an active-tab node (top-level snarl).
+    fn set_node_param_f32(&mut self, node: egui_snarl::NodeId, key: &str, val: f32) {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        if let Some(n) = canvas.snarl.get_node_mut(node) {
+            n.params.insert(key.to_string(), serde_json::Value::from(val as f64));
+        }
+    }
+    fn get_node_param_bool(&self, node: egui_snarl::NodeId, key: &str) -> Option<bool> {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas.snarl.get_node(node)?.params.get(key)?.as_bool()
+    }
+    fn set_node_param_bool(&mut self, node: egui_snarl::NodeId, key: &str, val: bool) {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        if let Some(n) = canvas.snarl.get_node_mut(node) {
+            n.params.insert(key.to_string(), serde_json::Value::Bool(val));
+        }
+    }
+
+    /// Resolve the inner module id of the selected sub-patch item, if it's a
+    /// Module item.
+    #[allow(dead_code)]
+    fn nav_selected_module_id(&self, outer_id: egui_snarl::NodeId) -> Option<String> {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        let sel = sp.selected_item?;
+        let item = sp.items.get(sel)?;
+        if let crate::canvas::node::LayoutItem::Module(m) = item {
+            let inner = egui_snarl::NodeId(m.inner_node_id);
+            sp.snarl.get_node(inner).map(|n| n.module_id.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the inner node id of the selected sub-patch item, if it's a
+    /// Module item.
+    fn nav_selected_inner_node(&self, outer_id: egui_snarl::NodeId) -> Option<egui_snarl::NodeId> {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        let sel = sp.selected_item?;
+        if let crate::canvas::node::LayoutItem::Module(m) = sp.items.get(sel)? {
+            Some(egui_snarl::NodeId(m.inner_node_id))
+        } else {
+            None
+        }
+    }
+
+    /// (module_id, element_id) of the selected sub-patch item.
+    fn nav_selected_element(&self, outer_id: egui_snarl::NodeId) -> Option<(String, String)> {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        let sel = sp.selected_item?;
+        if let crate::canvas::node::LayoutItem::Module(m) = sp.items.get(sel)? {
+            let mid = sp.snarl.get_node(egui_snarl::NodeId(m.inner_node_id))?.module_id.clone();
+            Some((mid, m.element_id.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Numeric-edit descriptor for the selected element, if it edits a single
+    /// scalar param: (param_key, lo, hi, step, default). `step` is the per-press
+    /// nudge in param units; the continuous stick path scales off (hi-lo). This
+    /// table is what lets a generic Value editor drive every numeric widget
+    /// (delay, average, dc_filter, oscillator, logic thresholds, …) by its
+    /// exposed `element_id`, not just knob/constant.
+    fn nav_value_param(&self, outer_id: egui_snarl::NodeId) -> Option<NavParamSpec> {
+        let (mid, elem) = self.nav_selected_element(outer_id)?;
+        // Param keys + element_ids verified against each module body's pinned
+        // dispatch (`render_dragvalue_param` / oscillator rows). Decade stepping
+        // for time/sample counts (wide ranges); Linear for 0..1-ish params.
+        use NavStep::*;
+        let (key, lo, hi, default, step) = match (mid.as_str(), elem.as_str()) {
+            ("module.delay", "ms")            => ("delay_ms",   0.0,  60_000.0, 100.0, Decade),
+            ("module.average", "samples")     => ("buf_size",   1.0,  10_000.0, 10.0,  Decade),
+            ("module.average", "spike_mad")   => ("spike_mad",  0.0,  20.0,     0.0,   Linear),
+            ("module.dc_filter", "window_ms") => ("window_ms",  10.0, 60_000.0, 500.0, Decade),
+            ("module.dc_filter", "decay_ms")  => ("decay_ms",   10.0, 60_000.0, 200.0, Decade),
+            ("logic.delay", "time")           => ("time",       0.0,  60_000.0, 100.0, Decade),
+            ("generator.oscillator", "freq")  => ("freq_param", 0.01, 200.0,    1.0,   Decade),
+            ("generator.oscillator", "phase") => ("phase_param",0.0,  1.0,      0.0,   Linear),
+            ("logic.counter", "step")         => ("step_param", 0.001,10_000.0, 1.0,   Decade),
+            ("processing.gyro_3dof", "lean_threshold") => ("lean_threshold", 0.01, 4.0, 0.3, Linear),
+            _ => return None,
+        };
+        Some(NavParamSpec { key, lo, hi, default, step })
+    }
+
+    /// Enum-cycle descriptor for a selected element backed by a String param
+    /// with an ordered option set: (param_key, options). South/dpad cycles it.
+    /// Superseded by the unified field editor; kept for reference.
+    #[allow(dead_code)]
+    fn nav_enum_spec(&self, outer_id: egui_snarl::NodeId)
+        -> Option<(&'static str, &'static [&'static str])>
+    {
+        let (mid, elem) = self.nav_selected_element(outer_id)?;
+        let d: (&'static str, &'static [&'static str]) = match (mid.as_str(), elem.as_str()) {
+            ("generator.oscillator", "shape") =>
+                ("shape", &["sine", "triangle", "saw", "square"]),
+            ("logic.delay", "mode") =>
+                ("mode", &["delay_true", "delay_false"]),
+            ("logic.counter", "mode") =>
+                ("mode", &["loop", "limit", "bounce", "unlimited"]),
+            _ => return None,
+        };
+        Some(d)
+    }
+
+    /// Cycle the selected enum-string element by `dir` (+1/-1), wrapping.
+    #[allow(dead_code)]
+    fn nav_cycle_enum(&mut self, outer_id: egui_snarl::NodeId, dir: i32) {
+        let Some((key, opts)) = self.nav_enum_spec(outer_id) else { return; };
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let cur = node.params.get(key).and_then(|v| v.as_str()).unwrap_or(opts[0]);
+        let idx = opts.iter().position(|o| *o == cur).unwrap_or(0) as i32;
+        let next = opts[(idx + dir).rem_euclid(opts.len() as i32) as usize];
+        node.params.insert(key.to_string(), serde_json::Value::String(next.to_string()));
+    }
+
+    /// Master field table: every multi-control (and single-control) widget
+    /// element maps to its ordered list of editable fields. The unified
+    /// multi-field editor (`nav_drive_fields`) walks these. Returns empty for
+    /// elements with no nav-editable fields. Verified against the pinned render
+    /// functions' param keys.
+    fn nav_element_fields(&self, outer_id: egui_snarl::NodeId) -> Vec<NavFieldDef> {
+        use NavField::*;
+        use NavStep::{Decade, Linear};
+        let Some((mid, elem)) = self.nav_selected_element(outer_id) else { return vec![]; };
+        // Gyro axis options (family, axis) for the pointer/steering mode rows.
+        const GYRO_PTR: &[(&str, &str, &str)] = &[
+            ("Pitch+Yaw", "pointer", "pitch_yaw"),
+            ("Pitch+Roll", "pointer", "pitch_roll"),
+            ("Player", "pointer", "player"),
+            ("World", "pointer", "world"),
+        ];
+        const GYRO_STEER: &[(&str, &str, &str)] = &[
+            ("Pitch+Yaw", "steering", "pitch_yaw"),
+            ("Pitch+Roll", "steering", "pitch_roll"),
+            ("Player", "steering", "player"),
+            ("World", "steering", "world"),
+        ];
+        let v = |key, lo, hi, default, step| NavField::Value { key, lo, hi, default, step };
+        macro_rules! f { ($l:expr, $field:expr) => { NavFieldDef { label: $l, field: $field } }; }
+        match (mid.as_str(), elem.as_str()) {
+            // ── single-field elements (also driven by the unified editor) ──
+            ("module.delay", "ms")            => vec![f!("ms", v("delay_ms",0.0,60_000.0,100.0,Decade))],
+            ("module.average", "samples")     => vec![f!("Samples", v("buf_size",1.0,10_000.0,10.0,Decade))],
+            ("module.average", "spike_mad")   => vec![f!("Spike MAD", v("spike_mad",0.0,20.0,0.0,Linear))],
+            ("module.dc_filter", "window_ms") => vec![f!("Window ms", v("window_ms",10.0,60_000.0,500.0,Decade))],
+            ("module.dc_filter", "decay_ms")  => vec![f!("Decay ms", v("decay_ms",10.0,60_000.0,200.0,Decade))],
+            ("logic.delay", "time")           => vec![f!("Time", v("time",0.0,60_000.0,100.0,Decade))],
+            ("logic.delay", "mode")           => vec![f!("Mode", Enum{key:"mode",opts:&["delay_true","delay_false"]})],
+            ("generator.oscillator", "freq")  => vec![f!("Freq", v("freq_param",0.01,200.0,1.0,Decade))],
+            ("generator.oscillator", "phase") => vec![f!("Phase", v("phase_param",0.0,1.0,0.0,Linear))],
+            ("generator.oscillator", "shape") => vec![f!("Shape", Enum{key:"shape",opts:&["sine","triangle","saw","square"]})],
+            ("processing.gyro_3dof", "lean_threshold") => vec![f!("Lean", v("lean_threshold",0.01,4.0,0.3,Linear))],
+            // ── multi-field rows ──
+            ("logic.counter", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
+            ("logic.counter", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
+            ("logic.counter", "step") => vec![f!("Step", v("step_param",0.001,10_000.0,1.0,Decade))],
+            ("logic.counter", "min_max") => vec![
+                f!("Min", v("min_param",-1_000_000.0,1_000_000.0,0.0,Linear)),
+                f!("Max", v("max_param",-1_000_000.0,1_000_000.0,10.0,Linear)),
+            ],
+            ("processing.gyro_3dof", "pointer_mode") | ("processing.gyro_3dof", "mode") =>
+                vec![f!("Pointer", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_PTR})],
+            ("processing.gyro_3dof", "steering_mode") =>
+                vec![f!("Steering", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_STEER})],
+            ("processing.gyro_3dof", "steering_opts") => vec![
+                f!("excl. Y", Toggle{key:"steering_exclude_y"}),
+                f!("re-center", v("recenter_strength",0.0,4.0,0.0,Linear)),
+                f!("ease", v("reset_ease_in",0.0,2.0,0.25,Linear)),
+            ],
+            ("processing.gyro_3dof", "gyro_invert") => vec![
+                f!("yaw", Toggle{key:"inv_yaw"}),
+                f!("pitch", Toggle{key:"inv_pitch"}),
+                f!("roll", Toggle{key:"inv_roll"}),
+            ],
+            ("processing.gyro_3dof", "accel_invert") => vec![
+                f!("accX", Toggle{key:"inv_accel_x"}),
+                f!("accY", Toggle{key:"inv_accel_y"}),
+                f!("accZ", Toggle{key:"inv_accel_z"}),
+            ],
+            // ── curve option rows ──
+            ("module.response_curve", "scale_row") | ("module.twoway_response_curve", "scale_row") => vec![
+                f!("Log/Exp", v("scale_t",-1.0,1.0,0.0,Linear)),
+                f!("Abs", Toggle{key:"absolute"}),
+                f!("Snap", Toggle{key:"snap"}),
+            ],
+            ("module.vec_response_curve", "scale_row") => vec![
+                f!("Log/Exp", v("scale_t",-1.0,1.0,0.0,Linear)),
+                f!("Snap", Toggle{key:"snap"}),
+            ],
+            ("module.response_curve", "range_row") | ("module.twoway_response_curve", "range_row") => vec![
+                f!("In↓", v("in_min",-100.0,100.0,-1.0,Linear)),
+                f!("In↑", v("in_max",-100.0,100.0,1.0,Linear)),
+                f!("Out↓", v("out_min",-100.0,100.0,-1.0,Linear)),
+                f!("Out↑", v("out_max",-100.0,100.0,1.0,Linear)),
+            ],
+            ("module.vec_response_curve", "range_row") => vec![
+                f!("In max", v("in_max",-100.0,100.0,1.0,Linear)),
+                f!("Out max", v("out_max",-100.0,100.0,1.0,Linear)),
+            ],
+            ("module.response_curve", "grid_row") | ("module.vec_response_curve", "grid_row")
+            | ("module.twoway_response_curve", "grid_row") => vec![
+                f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
+                f!("Grid V", v("grid_y",1.0,20.0,4.0,Linear)),
+                f!("Trail ms", v("trail_ms",0.0,1000.0,300.0,Decade)),
+            ],
+            ("module.response_curve", "grid_options_row") | ("module.vec_response_curve", "grid_options_row")
+            | ("module.twoway_response_curve", "grid_options_row") => vec![
+                f!("Scale grid", Toggle{key:"show_scaled_grid"}),
+                f!("Labels", Toggle{key:"show_grid_labels"}),
+            ],
+            ("module.twoway_response_curve", "hyst_row") => vec![
+                f!("Hyst %", v("hysteresis_pct",0.001,10.0,0.5,Linear)),
+                f!("Hyst ms", v("hysteresis_ms",0.02,50.0,20.0,Linear)),
+            ],
+            ("module.twoway_response_curve", "interp_row") => vec![
+                f!("Interp ms", v("interp_ms",0.0,500.0,50.0,Decade)),
+            ],
+            ("module.twoway_response_curve", "lane_toggle") => vec![
+                f!("Lane", Enum{key:"active_lane",opts:&["up","dn"]}),
+            ],
+            // Oscilloscope controls row: Win (log ms) / Scale / Auto / Bi-Uni.
+            ("display.oscilloscope", "controls") => vec![
+                f!("Win ms", v("osc_win_ms",10.0,10_000.0,200.0,Decade)),
+                f!("Scale", v("osc_scale",0.001,100.0,1.0,Decade)),
+                f!("Auto", Toggle{key:"osc_auto"}),
+                f!("Uni", Toggle{key:"osc_uni"}),
+            ],
+            // Selector mirrors counter's controls.
+            ("module.selector", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
+            ("module.selector", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
+            ("module.selector", "step") => vec![f!("Step", v("step_param",0.001,10_000.0,1.0,Decade))],
+            ("module.selector", "min_max") => vec![
+                f!("Min", v("min_param",-1_000_000.0,1_000_000.0,0.0,Linear)),
+                f!("Max", v("max_param",-1_000_000.0,1_000_000.0,10.0,Linear)),
+            ],
+            _ => vec![],
+        }
+    }
+
+    /// Kind of gamepad interaction the selected widget supports.
+    fn nav_selected_kind(&self, outer_id: egui_snarl::NodeId) -> NavWidgetKind {
+        // The selected item's element_id: a curve module can be pinned as the
+        // dot-graph ("curve") or as separate scale/range/grid rows — only the
+        // graph element supports dot editing.
+        let elem = {
+            let canvas = &self.tabs[self.active_tab].canvas;
+            canvas.snarl.get_node(outer_id)
+                .and_then(|n| n.subpatch.as_ref())
+                .and_then(|sp| sp.selected_item.and_then(|i| sp.items.get(i)))
+                .and_then(|it| match it {
+                    crate::canvas::node::LayoutItem::Module(m) => Some(m.element_id.clone()),
+                    _ => None,
+                })
+        };
+        match self.nav_selected_module_id(outer_id).as_deref() {
+            Some("module.knob") | Some("module.constant") => NavWidgetKind::Value,
+            Some("module.dropdown") => NavWidgetKind::Dropdown,
+            Some("module.switch") => NavWidgetKind::Toggle,
+            Some("module.response_curve")
+            | Some("module.vec_response_curve")
+            | Some("module.twoway_response_curve")
+                if elem.as_deref() == Some("curve") => NavWidgetKind::Curve,
+            Some("module.remapper") | Some("module.map_action")
+            | Some("module.automap_combiner") => NavWidgetKind::Remapper,
+            // Gyro lean sections are remapper-family mapping rows (Learn/capture +
+            // filter), unlike gyro's other elements which are plain field rows.
+            Some("processing.gyro_3dof")
+                if matches!(elem.as_deref(), Some("lean_left") | Some("lean_right"))
+                => NavWidgetKind::Remapper,
+            // Everything else with a field definition (single- or multi-control)
+            // routes through the unified multi-field editor.
+            _ if !self.nav_element_fields(outer_id).is_empty() => NavWidgetKind::MultiField,
+            _ => NavWidgetKind::None,
+        }
+    }
+
+    /// Adjust the selected widget by a directional `delta`. For value widgets
+    /// (knob/constant) this is a continuous nudge; for dropdowns it cycles the
+    /// selection by sign(delta).
+    fn nav_adjust_selected(&mut self, outer_id: egui_snarl::NodeId, delta: f32) {
+        // `delta` arrives normalized to a 0..1-style range by the caller. For
+        // generic params we rescale it to the param's own (hi-lo) span so the
+        // feel is consistent regardless of units (ms, samples, Hz, …).
+        let generic = self.nav_value_param(outer_id);
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        if let Some(spec) = generic {
+            let span = (spec.hi - spec.lo).abs().max(f32::EPSILON);
+            let cur = self.get_subpatch_param_f32(outer_id, inner, spec.key).unwrap_or(spec.default);
+            let next = (cur + delta * span).clamp(spec.lo, spec.hi);
+            self.set_subpatch_param_f32(outer_id, inner, spec.key, next);
+            return;
+        }
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        match node.module_id.as_str() {
+            "module.knob" => {
+                let bipolar = node.params.get("bipolar").and_then(|v| v.as_bool()).unwrap_or(false);
+                let (lo, hi) = if bipolar { (-1.0f32, 1.0f32) } else { (0.0f32, 1.0f32) };
+                let cur = node.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let next = (cur + delta).clamp(lo, hi);
+                node.params.insert("value".to_string(), serde_json::Value::from(next as f64));
+            }
+            "module.constant" => {
+                // Constants are unbounded; scale the nudge a bit larger.
+                let cur = node.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                node.params.insert("value".to_string(),
+                    serde_json::Value::from((cur + delta) as f64));
+            }
+            _ => {}
+        }
+    }
+
+    /// Proportional (log-ish) adjust for a generic numeric widget. `press` is a
+    /// per-frame discrete impulse (±1 from dpad rising), `cont` is the stick X
+    /// (-1..1), `fine` halves the rates. The step scales with the value's own
+    /// magnitude so wide ranges (0..60000) are usable: ~6%/press coarse,
+    /// ~1.5%/press fine; continuous ~120%/s coarse, ~25%/s fine at full stick.
+    /// A range-derived floor lets the value climb off exactly 0.
+    #[allow(dead_code)]
+    fn nav_adjust_generic(&mut self, outer_id: egui_snarl::NodeId,
+        press: f32, cont: f32, fine: bool, dt: f32)
+    {
+        let Some(spec) = self.nav_value_param(outer_id) else { return; };
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        let cur = self.get_subpatch_param_f32(outer_id, inner, spec.key).unwrap_or(spec.default);
+        let (lo, hi) = (spec.lo, spec.hi);
+
+        // Per-press discrete step.
+        let press_step = match spec.step {
+            // Decade: step = magnitude's decade (1/10/100/…) × {1 coarse, 0.1 fine}.
+            // <10 → 1 (fine 0.1); 10–100 → 5? — user wants 5 in the 10–100 band.
+            // Use: decade d = 10^floor(log10(v)); coarse = d (with a 5× bump in
+            // the [1,10)·d upper half? no — keep simple decade), fine = d/10.
+            NavStep::Decade => {
+                // Band by the value's decade: 1,10,100,… Coarse step per band:
+                //   <10 → 1   |  10–100 → 5  |  100–1000 → 50  |  1000+ → 500 …
+                // i.e. 1 in the first band, half-decade above. Fine = coarse/10
+                // (so <10 fine = 0.1 ms sub-ms, 10–100 fine = 0.5, etc.).
+                let v = (cur - lo).abs().max(1e-6);
+                let decade = 10f32.powf(v.log10().floor()).max(1.0); // 1,10,100,…
+                let coarse = if decade <= 1.0 { 1.0 } else { decade * 0.5 };
+                if fine { coarse * 0.1 } else { coarse }
+            }
+            // Linear (phase etc.): fixed fraction of the 0..1-ish range.
+            NavStep::Linear => {
+                let span = (hi - lo).abs().max(f32::EPSILON);
+                span * if fine { 0.005 } else { 0.02 }
+            }
+        };
+
+        // Continuous stick step: an accelerated curve on |cont| (gentle low,
+        // fast at full deflection), scaled to the same step magnitude per second.
+        let accel = self.settings.cursor_accel.max(1.0);
+        let cont_curved = cont.signum() * cont.abs().clamp(0.0, 1.0).powf(accel);
+        // At full deflection, ~ (press_step × steps_per_sec). Coarse ≈ 25/s of
+        // the press step, fine ≈ 8/s.
+        let cont_per_s = press_step * if fine { 8.0 } else { 25.0 };
+
+        let mut delta = 0.0f32;
+        if press != 0.0 { delta += press * press_step; }
+        if cont != 0.0  { delta += cont_curved * cont_per_s * dt; }
+        if delta == 0.0 { return; }
+
+        let next = (cur + delta).clamp(lo, hi);
+        // Decade params that represent whole units (samples) read better rounded;
+        // ms/Hz tolerate fractions. Round sample counts to integers.
+        let next = if spec.key == "buf_size" { next.round() } else { next };
+        self.set_subpatch_param_f32(outer_id, inner, spec.key, next);
+    }
+
+    /// Read/write an f32 param on an INNER sub-patch node (inside outer_id's
+    /// sub-patch snarl).
+    fn get_subpatch_param_f32(&self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str) -> Option<f32>
+    {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        sp.snarl.get_node(inner)?.params.get(key)?.as_f64().map(|v| v as f32)
+    }
+    fn set_subpatch_param_f32(&mut self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str, val: f32)
+    {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        if let Some(node) = sp.snarl.get_node_mut(inner) {
+            node.params.insert(key.to_string(), serde_json::Value::from(val as f64));
+        }
+    }
+    /// Store an integer-valued param as a JSON integer (renderers that read with
+    /// `as_i64()` ignore a JSON float).
+    fn set_subpatch_param_i64(&mut self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str, val: i64)
+    {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        if let Some(node) = sp.snarl.get_node_mut(inner) {
+            node.params.insert(key.to_string(), serde_json::Value::from(val));
+        }
+    }
+
+    /// Open or close the selected dropdown's pinned popup (the real options
+    /// list), matching the click-to-toggle popup the renderer manages in egui
+    /// memory under `("dropdown_pinned_popup", inner_id.0)`.
+    fn nav_set_dropdown_popup(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId, open: bool) {
+        if !matches!(self.nav_selected_module_id(outer_id).as_deref(), Some("module.dropdown")) {
+            return;
+        }
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        let popup_id = egui::Id::new(("dropdown_pinned_popup", inner.0));
+        ctx.memory_mut(|m| {
+            let is_open = m.is_popup_open(popup_id);
+            if open && !is_open { m.open_popup(popup_id); }
+            else if !open && is_open { m.close_popup(popup_id); }
+        });
+    }
+
+    /// Cycle the selected dropdown by `dir` (+1/-1), wrapping. No-op otherwise.
+    fn nav_cycle_dropdown(&mut self, outer_id: egui_snarl::NodeId, dir: i32) {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        if node.module_id != "module.dropdown" { return; }
+        let n = node.params.get("options").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        if n == 0 { return; }
+        let cur = node.params.get("selected_index").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+        let next = (cur + dir).rem_euclid(n as i32);
+        node.params.insert("selected_index".to_string(), serde_json::Value::from(next as u64));
+    }
+
+    /// Toggle the selected switch's `active` state. Returns true if a switch was
+    /// toggled (so the caller can record undo).
+    fn nav_toggle_switch(&mut self, outer_id: egui_snarl::NodeId) -> bool {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false; };
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return false; };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return false; };
+        if node.module_id != "module.switch" { return false; }
+        // Current state must come from the engine's last emitted value when
+        // present (it reconciles UI clicks with direct/latch inputs); the
+        // persisted `active` is only a fallback. Toggling the stale param alone
+        // gets overwritten by `last_out` next frame, so we also bump the
+        // `ui_toggle_seq` the engine watches — exactly like a mouse click
+        // (`switch_handle_click`).
+        let cur = match node.extra.last_out.first() {
+            Some(Some(Signal::Bool(b))) => *b,
+            _ => node.params.get("active").and_then(|v| v.as_bool()).unwrap_or(false),
+        };
+        let seq = node.params.get("ui_toggle_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        node.params.insert("ui_toggle_seq".to_string(), serde_json::Value::from(seq.wrapping_add(1)));
+        node.params.insert("active".to_string(), serde_json::Value::Bool(!cur));
+        true
+    }
+
+    /// Read/parse the selected curve node's `points` (Vec<[f32;2]>), if the
+    /// selection is a response-curve module. Returns (inner_node_id, points).
+    /// Param keys (points, biases) for the curve's currently-edited lane. The
+    /// two-way curve has an up lane (`points`) and a down lane (`points_dn`),
+    /// switched by its `active_lane` param; the driver edits whichever is active
+    /// so it matches the lane shown (and glowed) in the body. Other curves only
+    /// have `points`.
+    fn nav_curve_keys(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
+        -> (&'static str, &'static str)
+    {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let lane_dn = canvas.snarl.get_node(outer_id)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .filter(|node| node.module_id == "module.twoway_response_curve")
+            .and_then(|node| node.params.get("active_lane").and_then(|v| v.as_str()))
+            == Some("dn");
+        if lane_dn { ("points_dn", "biases_dn") } else { ("points", "biases") }
+    }
+
+    fn nav_curve_points(&self, outer_id: egui_snarl::NodeId)
+        -> Option<(egui_snarl::NodeId, Vec<[f32; 2]>)>
+    {
+        let inner = self.nav_selected_inner_node(outer_id)?;
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        let node = sp.snarl.get_node(inner)?;
+        if !matches!(node.module_id.as_str(),
+            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve")
+        { return None; }
+        let (pts_key, _) = self.nav_curve_keys(outer_id, inner);
+        let pts: Vec<[f32; 2]> = node.params.get(pts_key)?.as_array()?
+            .iter().filter_map(|p| {
+                let a = p.as_array()?;
+                Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+            }).collect();
+        if pts.len() < 2 { return None; }
+        Some((inner, pts))
+    }
+
+    /// Write a points Vec back to a curve node (keeps `biases` length in sync
+    /// at one-per-segment, padding/truncating with 0.0).
+    fn nav_curve_write_points(&mut self, inner: egui_snarl::NodeId,
+        outer_id: egui_snarl::NodeId, pts: &[[f32; 2]])
+    {
+        let (pts_key, bias_key) = self.nav_curve_keys(outer_id, inner);
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+        else { return; };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let arr: Vec<serde_json::Value> = pts.iter()
+            .map(|p| serde_json::json!([p[0] as f64, p[1] as f64])).collect();
+        node.params.insert(pts_key.into(), serde_json::Value::Array(arr));
+        // biases: one per segment (points-1).
+        let want = pts.len().saturating_sub(1);
+        let mut biases: Vec<f64> = node.params.get(bias_key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|b| b.as_f64()).collect())
+            .unwrap_or_default();
+        biases.resize(want, 0.0);
+        node.params.insert(bias_key.into(),
+            serde_json::Value::Array(biases.into_iter().map(serde_json::Value::from).collect()));
+    }
+
+    /// Graph X/Y span for a curve (absolute curves: 0..1; bipolar: -1..1).
+    /// Derived from the published geometry bounds.
+    fn nav_curve_bounds(&self, ctx: &egui::Context, inner: egui_snarl::NodeId)
+        -> (f32, f32, f32, f32)
+    {
+        self.nav_curve_geom(ctx, inner)
+            .map(|(_, xl, xh, yl, yh)| (xl, xh, yl, yh))
+            .unwrap_or((0.0, 1.0, 0.0, 1.0))
+    }
+
+    /// Convert the cursor's screen pos to graph coords, if the cursor is over
+    /// this curve's graph rect.
+    fn nav_curve_cursor_graph(&self, ctx: &egui::Context, inner: egui_snarl::NodeId)
+        -> Option<[f32; 2]>
+    {
+        let (rect, x_lo, x_hi, y_lo, y_hi) = self.nav_curve_geom(ctx, inner)?;
+        let p = self.gamepad_nav.cursor_pos;
+        if !rect.contains(p) { return None; }
+        Some([
+            x_lo + (p.x - rect.left()) / rect.width() * (x_hi - x_lo),
+            y_lo + (rect.bottom() - p.y) / rect.height() * (y_hi - y_lo),
+        ])
+    }
+
+    /// Index of the curve dot nearest the cursor (when over the graph), else None.
+    fn nav_curve_dot_near_cursor(&self, ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> Option<usize>
+    {
+        let g = self.nav_curve_cursor_graph(ctx, inner)?;
+        let (_, pts) = self.nav_curve_points(outer_id)?;
+        let (x_lo, x_hi, y_lo, y_hi) = self.nav_curve_bounds(ctx, inner);
+        let sx = (x_hi - x_lo).abs().max(f32::EPSILON);
+        let sy = (y_hi - y_lo).abs().max(f32::EPSILON);
+        pts.iter().enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = ((a[0]-g[0])/sx).powi(2) + ((a[1]-g[1])/sy).powi(2);
+                let db = ((b[0]-g[0])/sx).powi(2) + ((b[1]-g[1])/sy).powi(2);
+                da.partial_cmp(&db).unwrap()
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// Add a dot at the cursor's graph position (when the cursor is over the
+    /// graph). Returns the inserted index, or None if the cursor isn't on it.
+    fn nav_curve_add_at_cursor(&mut self, ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> Option<usize>
+    {
+        let g = self.nav_curve_cursor_graph(ctx, inner)?;
+        let (x_lo, x_hi, y_lo, y_hi) = self.nav_curve_bounds(ctx, inner);
+        let (_, mut pts) = self.nav_curve_points(outer_id)?;
+        let gx = g[0].clamp(x_lo, x_hi);
+        let gy = g[1].clamp(y_lo, y_hi);
+        let idx = pts.partition_point(|p| p[0] < gx);
+        pts.insert(idx, [gx, gy]);
+        self.nav_curve_write_points(inner, outer_id, &pts);
+        Some(idx)
+    }
+
+    /// Delete a specific dot index (guards endpoints / min 2 points).
+    fn nav_curve_delete_index(&mut self, outer_id: egui_snarl::NodeId, idx: usize) -> bool {
+        let Some((inner, mut pts)) = self.nav_curve_points(outer_id) else { return false; };
+        if pts.len() <= 2 { return false; }
+        // Keep the two endpoints; only interior dots are deletable.
+        if idx == 0 || idx >= pts.len() - 1 { return false; }
+        pts.remove(idx);
+        self.nav_curve_write_points(inner, outer_id, &pts);
+        true
+    }
+
+    /// Move dot `i` by (dx, dy) in graph space. Endpoints keep their fixed X
+    /// (only Y moves); interior dots clamp X between neighbors.
+    fn nav_curve_move_dot(&mut self, outer_id: egui_snarl::NodeId, i: usize, dx: f32, dy: f32) {
+        let Some((inner, mut pts)) = self.nav_curve_points(outer_id) else { return; };
+        if i >= pts.len() { return; }
+        // Bounds from the node: absolute → 0..1 ; bipolar → -1..1. Infer from
+        // the existing endpoints' x.
+        let x_lo = pts.first().map(|p| p[0]).unwrap_or(0.0);
+        let x_hi = pts.last().map(|p| p[0]).unwrap_or(1.0);
+        let (y_lo, y_hi) = if x_lo < 0.0 { (-1.0, 1.0) } else { (0.0, 1.0) };
+        let is_end = i == 0 || i == pts.len() - 1;
+        let new_x = if is_end {
+            pts[i][0] // endpoints fixed in X
+        } else {
+            let lo = pts[i - 1][0] + 0.001;
+            let hi = pts[i + 1][0] - 0.001;
+            (pts[i][0] + dx).clamp(lo, hi)
+        };
+        let new_y = (pts[i][1] + dy).clamp(y_lo, y_hi);
+        pts[i] = [new_x, new_y];
+        self.nav_curve_write_points(inner, outer_id, &pts);
+    }
+
+    /// Adjust the bias (curvature) of the segment to the RIGHT of dot `i` by
+    /// `db`, clamped to [-1, 1]. (Biases are one-per-segment.)
+    fn nav_curve_adjust_bias(&mut self, outer_id: egui_snarl::NodeId, i: usize, db: f32) {
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        let (pts_key, bias_key) = self.nav_curve_keys(outer_id, inner);
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        let n_pts = node.params.get(pts_key).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        if n_pts < 2 { return; }
+        let seg = i.min(n_pts - 2); // segment index to the right of dot i
+        let mut biases: Vec<f64> = node.params.get(bias_key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|b| b.as_f64()).collect())
+            .unwrap_or_default();
+        biases.resize(n_pts - 1, 0.0);
+        biases[seg] = (biases[seg] as f32 + db).clamp(-1.0, 1.0) as f64;
+        node.params.insert(bias_key.into(),
+            serde_json::Value::Array(biases.into_iter().map(serde_json::Value::from).collect()));
+    }
+
+    /// Read the curve geometry the curve body published last frame:
+    /// (graph rect, x_lo, x_hi, y_lo, y_hi). Lets the driver map graph↔screen.
+    fn nav_curve_geom(&self, ctx: &egui::Context, inner: egui_snarl::NodeId)
+        -> Option<(egui::Rect, f32, f32, f32, f32)>
+    {
+        let g: (u64, egui::Rect, f32, f32, f32, f32) =
+            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_geom", inner.0))))?;
+        Some((g.1, g.2, g.3, g.4, g.5))
+    }
+
+    /// Publish the highlighted dot + editing flag so the curve body rings it.
+    fn nav_publish_curve_sel(&self, ctx: &egui::Context, inner: egui_snarl::NodeId, editing: bool) {
+        let pass = ctx.cumulative_pass_nr();
+        let idx = self.gamepad_nav.curve_dot;
+        ctx.data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_curve_sel", inner.0)), (pass, idx, editing)));
+    }
+
+    /// `CurveDots` level: dpad/LS highlights a dot, RT adds (at cursor if
+    /// visible else largest gap), LT deletes (nearest cursor / highlighted),
+    /// South enters dot move, East exits the curve.
+    fn nav_drive_curve_dots(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        rt_rising: bool,
+        lt_rising: bool,
+    ) {
+        use crate::gamepad_nav::{EditLevel, NavDir};
+        let Some((inner, pts)) = self.nav_curve_points(outer_id) else {
+            // Not a curve any more — bail to widget level.
+            self.gamepad_nav.edit_level = EditLevel::Widget;
+            return;
+        };
+        // Clamp highlight to valid range.
+        self.gamepad_nav.curve_dot = self.gamepad_nav.curve_dot.min(pts.len() - 1);
+
+        // East → exit the curve (commit one undo entry for the whole session).
+        if nav.is_rising("btn_east") {
+            self.gamepad_nav.edit_level = EditLevel::Widget;
+            if let Some(b) = self.gamepad_nav.edit_baseline.take() {
+                self.tabs[self.active_tab].canvas.commit_undo_if_changed(*b);
+            }
+            return;
+        }
+
+        // dpad/LS left-right steps the highlight between dots.
+        match step_dir {
+            Some(NavDir::Left) => {
+                self.gamepad_nav.curve_dot = self.gamepad_nav.curve_dot.saturating_sub(1);
+            }
+            Some(NavDir::Right) => {
+                self.gamepad_nav.curve_dot = (self.gamepad_nav.curve_dot + 1).min(pts.len() - 1);
+            }
+            _ => {}
+        }
+
+        // RT/LT are CURSOR-DRIVEN: they require the RS/gyro cursor to be over
+        // the graph. RT adds a dot at the cursor's graph position; LT deletes the
+        // dot nearest the cursor. When the cursor isn't over the graph (e.g. the
+        // user is stepping dots with the dpad), the triggers do nothing — so the
+        // action is always exactly where the cursor points.
+        let cursor_on_graph =
+            self.gamepad_nav.cursor_visible
+            && self.nav_curve_cursor_graph(ctx, inner).is_some();
+        if rt_rising && cursor_on_graph {
+            let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+            if let Some(idx) = self.nav_curve_add_at_cursor(ctx, outer_id, inner) {
+                self.gamepad_nav.curve_dot = idx;
+                self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+            }
+        }
+        if lt_rising && cursor_on_graph {
+            if let Some(target) = self.nav_curve_dot_near_cursor(ctx, outer_id, inner) {
+                let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+                if self.nav_curve_delete_index(outer_id, target) {
+                    self.gamepad_nav.curve_dot = self.gamepad_nav.curve_dot.min(
+                        self.nav_curve_points(outer_id).map(|(_, p)| p.len().saturating_sub(1)).unwrap_or(0));
+                    self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+                }
+            }
+        }
+
+        // South → grab the highlighted dot under the cursor first (if visible).
+        if nav.is_rising("btn_south") {
+            if self.gamepad_nav.cursor_visible {
+                if let Some(idx) = self.nav_curve_dot_near_cursor(ctx, outer_id, inner) {
+                    self.gamepad_nav.curve_dot = idx;
+                }
+            }
+            self.gamepad_nav.edit_level = EditLevel::CurveDot;
+            self.gamepad_nav.fine_increment = false;
+        }
+
+        self.nav_publish_curve_sel(ctx, inner, false);
+    }
+
+    /// `CurveDot` level: dpad/LS moves the highlighted dot in X/Y; hold-North
+    /// edits the segment curvature (bias); East/South returns to dot nav.
+    fn nav_drive_curve_dot(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        dt: f32,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        rt_rising: bool,
+        lt_rising: bool,
+    ) {
+        use crate::gamepad_nav::EditLevel;
+        let _ = (rt_rising, lt_rising, step_dir);
+        let Some((inner, pts)) = self.nav_curve_points(outer_id) else {
+            self.gamepad_nav.edit_level = EditLevel::Widget;
+            return;
+        };
+        let i = self.gamepad_nav.curve_dot.min(pts.len() - 1);
+
+        // East / South → back to dot navigation.
+        if nav.is_rising("btn_east") || nav.is_rising("btn_south") {
+            self.gamepad_nav.edit_level = EditLevel::CurveDots;
+            self.nav_publish_curve_sel(ctx, inner, false);
+            return;
+        }
+        // West → toggle fine increments.
+        if nav.is_rising("btn_west") {
+            self.gamepad_nav.fine_increment = !self.gamepad_nav.fine_increment;
+        }
+
+        let fine = self.gamepad_nav.fine_increment;
+        let mag = nav.lstick.length();
+
+        // Hold North → adjust segment curvature (bias) instead of moving the
+        // dot. Bias spans only [-1, 1], so rates are deliberately gentle — a
+        // full-deflection hold takes several seconds to cross the range, and
+        // fine is much slower again for precise shaping.
+        if nav.pressed.contains("btn_north") {
+            let mut db = 0.0f32;
+            let s = if fine { 0.003 } else { 0.012 }; // per dpad press
+            // Discrete: dpad rising edges only (stick is the continuous path).
+            if nav.is_rising("dpad_right") || nav.is_rising("dpad_up") { db += s; }
+            if nav.is_rising("dpad_left") || nav.is_rising("dpad_down") { db -= s; }
+            if mag > 0.3 {
+                // Continuous: ~0.15/s coarse, ~0.03/s fine at full deflection.
+                let rate = if fine { 0.03 } else { 0.15 };
+                db += nav.lstick.y * rate * dt;
+            }
+            if db != 0.0 { self.nav_curve_adjust_bias(outer_id, i, db); }
+            self.nav_publish_curve_sel(ctx, inner, true);
+            // Tell the body to show its bias (curvature) handles this frame.
+            let pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|d| d.insert_temp(
+                egui::Id::new(("gp_nav_curve_bias", inner.0)), pass));
+            return;
+        }
+
+        // Move the dot in X/Y. dpad = one discrete step (rising edge only);
+        // LS = continuous. Using dpad rising avoids double-applying when the
+        // stick auto-repeat would also fill `step_dir`.
+        let _ = step_dir;
+        let step = if fine { 0.0015 } else { 0.015 };
+        let mut dx = 0.0f32;
+        let mut dy = 0.0f32;
+        if nav.is_rising("dpad_left") { dx -= step; }
+        if nav.is_rising("dpad_right") { dx += step; }
+        if nav.is_rising("dpad_up") { dy += step; }
+        if nav.is_rising("dpad_down") { dy -= step; }
+        if mag > 0.08 {
+            // Accelerated stick response (gentle first half, fast toward full
+            // deflection) — speed scales with |axis|^accel per axis, matching the
+            // cursor feel. Coarse top ≈0.5/s, fine top ≈0.07/s (graph units/s).
+            let accel = self.settings.cursor_accel.max(1.0);
+            let top = if fine { 0.07 } else { 0.5 };
+            let curve = |a: f32| -> f32 {
+                a.signum() * a.abs().clamp(0.0, 1.0).powf(accel) * top * dt
+            };
+            dx += curve(nav.lstick.x);
+            dy += curve(nav.lstick.y); // +y up
+        }
+        if dx != 0.0 || dy != 0.0 {
+            self.nav_curve_move_dot(outer_id, i, dx, dy);
+        }
+        self.nav_publish_curve_sel(ctx, inner, true);
+    }
+
+    /// Reset the selected widget's value to its default (0.0 for knob/constant;
+    /// the descriptor default for generic numeric widgets).
+    fn nav_reset_selected(&mut self, outer_id: egui_snarl::NodeId) {
+        if let Some(spec) = self.nav_value_param(outer_id) {
+            if let Some(inner) = self.nav_selected_inner_node(outer_id) {
+                self.set_subpatch_param_f32(outer_id, inner, spec.key, spec.default);
+            }
+            return;
+        }
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
+        if matches!(node.module_id.as_str(), "module.knob" | "module.constant") {
+            node.params.insert("value".to_string(), serde_json::Value::from(0.0f64));
+        }
+    }
+
+    /// Enter the Alt+Tab window switcher: hold Alt and tap Tab once. Keeps
+    /// Alt held while Select stays down; releasing Select commits.
+    fn enter_alt_tab(&mut self, _dev_id: &str) {
+        #[cfg(windows)]
+        {
+            let tapper = self
+                .gamepad_nav
+                .key_tapper
+                .get_or_insert_with(flexinput_virtual::windows::UiKeyTapper::new);
+            tapper.alt_down();
+            tapper.tap("tab");
+        }
+        self.gamepad_nav.alt_tab_active = true;
+        self.gamepad_nav.rs_arrow_armed = true;
+    }
+
+    /// Drive the active Alt+Tab switcher: while Select is held, right-stick
+    /// flicks tap arrow keys (one per flick). Releasing Select releases Alt.
+    fn drive_alt_tab(&mut self, _dev_id: &str, nav: &crate::gamepad_nav::NavInput) {
+        // Released Select → commit.
+        if !nav.pressed.contains("btn_back") {
+            self.alt_tab_release();
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let rs = nav.rstick;
+            let mag = rs.length();
+            if self.gamepad_nav.rs_arrow_armed && mag > 0.6 {
+                let dir = if rs.x.abs() >= rs.y.abs() {
+                    if rs.x >= 0.0 { "arrowright" } else { "arrowleft" }
+                } else {
+                    // Screen Y grows downward; stick +y is up.
+                    if rs.y >= 0.0 { "arrowup" } else { "arrowdown" }
+                };
+                if let Some(tapper) = &mut self.gamepad_nav.key_tapper {
+                    tapper.tap(dir);
+                }
+                self.gamepad_nav.rs_arrow_armed = false;
+            } else if mag < 0.3 {
+                self.gamepad_nav.rs_arrow_armed = true;
+            }
+        }
+    }
+
+    /// Release a held Alt (ends the switcher) and clear switcher state.
+    fn alt_tab_release(&mut self) {
+        #[cfg(windows)]
+        if let Some(tapper) = &mut self.gamepad_nav.key_tapper {
+            tapper.alt_up();
+        }
+        self.gamepad_nav.alt_tab_active = false;
+        self.gamepad_nav.rs_arrow_armed = true;
+    }
+
+    /// Update the right-stick + gyro cursor overlay position/visibility.
+    fn update_nav_cursor(
+        &mut self,
+        ctx: &egui::Context,
+        nav: &crate::gamepad_nav::NavInput,
+        dt: f32,
+    ) {
+        // Accelerated response: slow start, ramps up hard in the back half.
+        // speed = RS_MAX * deflection^RS_EXP with RS_EXP > 1 (a genuinely
+        // accelerating curve). Both are user-tunable in Settings; defaults are
+        // sized so ~30% deflection ≈ the OLD top speed (~900 px/s):
+        //   18250 * 0.30^2.5 ≈ 900.
+        let rs_max = self.settings.cursor_max_speed;
+        let rs_exp = self.settings.cursor_accel;
+        // Gyro values are normalized dps/2000 (GYRO_REF_DPS), so a ~200°/s turn
+        // is ≈0.1. Scale so that maps to a gentle ~150 px/s fine nudge.
+        const GYRO_FINE: f32 = 3000.0; // px/s per normalized-gyro unit, while visible
+        let screen = ctx.screen_rect();
+        let gn = &mut self.gamepad_nav;
+        if !gn.cursor_visible {
+            // Seed at screen center on first appearance.
+            gn.cursor_pos = screen.center();
+        }
+        let rs = nav.rstick;
+        let mag = rs.length();
+        if mag > 0.08 {
+            // Direction from the stick, speed from the accelerated curve on the
+            // magnitude (slow start, fast late when rs_exp > 1).
+            let speed = rs_max * mag.clamp(0.0, 1.0).powf(rs_exp);
+            let dir = rs / mag; // unit vector
+            // Stick +y is up; screen y grows down → negate y.
+            gn.cursor_pos += egui::vec2(dir.x, -dir.y) * speed * dt;
+            gn.cursor_visible = true;
+            gn.cursor_last_move = std::time::Instant::now();
+        }
+        if gn.cursor_visible {
+            // Gyro fine movement (pitch = vertical, yaw = horizontal).
+            gn.cursor_pos += egui::vec2(nav.gyro_yaw, -nav.gyro_pitch) * GYRO_FINE * dt;
+            gn.cursor_pos.x = gn.cursor_pos.x.clamp(screen.min.x, screen.max.x);
+            gn.cursor_pos.y = gn.cursor_pos.y.clamp(screen.min.y, screen.max.y);
+            if gn.cursor_last_move.elapsed().as_secs_f32() > 3.0 {
+                gn.cursor_visible = false;
+            }
+        }
+    }
+
+    /// Draw the right-stick/gyro cursor overlay when visible.
+    fn draw_nav_cursor(&mut self, ctx: &egui::Context) {
+        if !self.gamepad_nav.cursor_visible {
+            return;
+        }
+        // Lazily rasterize + upload the circular target SVG, tinted with the
+        // selection accent.
+        if self.gamepad_nav.cursor_tex.is_none() {
+            const CURSOR_SVG: &str =
+                include_str!("../../../app/assets/flair_circle_target_с.svg");
+            let accent = ctx.style().visuals.selection.stroke.color;
+            if let Some(img) = crate::canvas::viewer::rasterize_svg_recolored(
+                CURSOR_SVG, 128, 128, "override", accent,
+            ) {
+                let tex = ctx.load_texture("gp_nav_cursor", img, egui::TextureOptions::LINEAR);
+                self.gamepad_nav.cursor_tex = Some(tex);
+            }
+        }
+        let Some(tex) = &self.gamepad_nav.cursor_tex else { return; };
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("gp_nav_cursor_layer"),
+        ));
+        let size = egui::vec2(56.0, 56.0);
+        let rect = egui::Rect::from_center_size(self.gamepad_nav.cursor_pos, size);
+        painter.image(
+            tex.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        ctx.request_repaint();
+    }
+
     /// Switch the active tab and refresh the I/O thread's device id filter.
     /// Devices in the shared pool that the new tab doesn't reference are
     /// silenced (`reset_outputs()`) immediately so a drifting axis from
@@ -2554,6 +5388,361 @@ impl FlexInputApp {
     /// Render the Settings modal. Reads/writes `self.settings`, mirrors live
     /// values into the engine/I-O atomics, and flips `settings_dirty` so the
     /// outer update loop persists settings.json at end of frame.
+    /// Ordered list of gamepad-navigable settings rows. Keeps the panel and the
+    /// driver in lock-step (same indices). Each row is a kind + label; the
+    /// numeric kinds carry their range/step so the driver can nudge them.
+    fn gp_settings_rows(&self) -> Vec<GpSettingRow> {
+        use GpSettingKind::*;
+        vec![
+            GpSettingRow { label: "Max polling rate".into(),
+                kind: IntSlider { lo: settings::POLLING_HZ_MIN as f32,
+                    hi: settings::POLLING_HZ_MAX as f32, step: 50.0,
+                    key: GpSettingKey::PollingHz }, suffix: " Hz" },
+            GpSettingRow { label: "Processing sample rate".into(),
+                kind: IntSlider { lo: settings::SAMPLE_RATE_HZ_MIN as f32,
+                    hi: settings::SAMPLE_RATE_HZ_MAX as f32, step: 50.0,
+                    key: GpSettingKey::SampleRateHz }, suffix: " Hz" },
+            GpSettingRow { label: "Gamepad UI nav by default".into(),
+                kind: Toggle { key: GpSettingKey::NavDefault }, suffix: "" },
+            GpSettingRow { label: "Cursor max speed".into(),
+                kind: IntSlider { lo: 1000.0, hi: 30000.0, step: 250.0,
+                    key: GpSettingKey::CursorMaxSpeed }, suffix: " px/s" },
+            GpSettingRow { label: "Cursor acceleration".into(),
+                kind: FloatSlider { lo: 1.0, hi: 4.0, step: 0.05,
+                    key: GpSettingKey::CursorAccel }, suffix: "" },
+            GpSettingRow { label: "Contrast".into(),
+                kind: FloatSlider { lo: -1.0, hi: 1.0, step: 0.05,
+                    key: GpSettingKey::Contrast }, suffix: "" },
+            GpSettingRow { label: "Keep tabs on launch".into(),
+                kind: Toggle { key: GpSettingKey::KeepWorkspace }, suffix: "" },
+            GpSettingRow { label: "Collapse new device nodes".into(),
+                kind: Toggle { key: GpSettingKey::CollapseNodes }, suffix: "" },
+            GpSettingRow { label: "Show own virtuals as physical".into(),
+                kind: Toggle { key: GpSettingKey::ShowVirtuals }, suffix: "" },
+            GpSettingRow { label: "Default deadzone".into(),
+                kind: FloatSlider { lo: 0.0, hi: 0.5, step: 0.005,
+                    key: GpSettingKey::DefDeadzone }, suffix: "" },
+            GpSettingRow { label: "Default gyro ×".into(),
+                kind: FloatSlider { lo: 0.1, hi: 50.0, step: 0.05,
+                    key: GpSettingKey::DefGyroMult }, suffix: "" },
+            GpSettingRow { label: "Default mouse speed".into(),
+                kind: FloatSlider { lo: 0.0, hi: 3000.0, step: 1.0,
+                    key: GpSettingKey::DefMouseSens }, suffix: "" },
+        ]
+    }
+
+    /// Current numeric value of a settings key (bools as 0/1).
+    fn gp_setting_value(&self, key: GpSettingKey) -> f32 {
+        use GpSettingKey::*;
+        match key {
+            PollingHz => self.settings.polling_hz as f32,
+            SampleRateHz => self.settings.sample_rate_hz as f32,
+            NavDefault => self.settings.gamepad_ui_nav_default as i32 as f32,
+            CursorMaxSpeed => self.settings.cursor_max_speed,
+            CursorAccel => self.settings.cursor_accel,
+            Contrast => self.settings.contrast,
+            KeepWorkspace => self.settings.keep_workspace as i32 as f32,
+            CollapseNodes => self.settings.device_nodes_default_collapsed as i32 as f32,
+            ShowVirtuals => self.settings.show_own_virtuals_as_physical as i32 as f32,
+            DefDeadzone => self.settings.default_stick_deadzone,
+            DefGyroMult => self.settings.default_gyro_mult,
+            DefMouseSens => self.settings.default_mouse_sensitivity,
+        }
+    }
+
+    /// Write a numeric value to a settings key (bools from !=0), pushing any
+    /// live-thread side effects, and mark settings dirty.
+    fn gp_setting_set(&mut self, key: GpSettingKey, val: f32) {
+        use GpSettingKey::*;
+        match key {
+            PollingHz => {
+                let v = (val.round() as u32)
+                    .clamp(settings::POLLING_HZ_MIN, settings::POLLING_HZ_MAX);
+                self.settings.polling_hz = v;
+                self.polling_hz.store(v, Ordering::Relaxed);
+            }
+            SampleRateHz => {
+                let v = (val.round() as u32)
+                    .clamp(settings::SAMPLE_RATE_HZ_MIN, settings::SAMPLE_RATE_HZ_MAX);
+                self.settings.sample_rate_hz = v;
+                self.sample_rate_hz.store(v, Ordering::Relaxed);
+            }
+            NavDefault => self.settings.gamepad_ui_nav_default = val != 0.0,
+            CursorMaxSpeed => self.settings.cursor_max_speed = val.clamp(1000.0, 30000.0),
+            CursorAccel => self.settings.cursor_accel = val.clamp(1.0, 4.0),
+            Contrast => self.settings.contrast = val.clamp(-1.0, 1.0),
+            KeepWorkspace => {
+                self.settings.keep_workspace = val != 0.0;
+                if !self.settings.keep_workspace { settings::delete_workspace(); }
+            }
+            CollapseNodes => self.settings.device_nodes_default_collapsed = val != 0.0,
+            ShowVirtuals => self.settings.show_own_virtuals_as_physical = val != 0.0,
+            DefDeadzone => self.settings.default_stick_deadzone = val.clamp(0.0, 0.5),
+            DefGyroMult => self.settings.default_gyro_mult = val.clamp(0.1, 50.0),
+            DefMouseSens => self.settings.default_mouse_sensitivity = val.clamp(0.0, 3000.0),
+        }
+        self.settings_dirty = true;
+    }
+
+    /// Drive the gamepad settings panel (modal). dpad/stick up/down moves the
+    /// highlighted row; South toggles a bool or enters/exits numeric edit; while
+    /// editing, left/right nudges the value. East closes (or exits edit). West
+    /// = fine step. North = (numeric) reset is not wired — values have explicit
+    /// ranges; skip.
+    fn nav_drive_gp_settings(
+        &mut self,
+        nav: &crate::gamepad_nav::NavInput,
+        rt_rising: bool,
+        lt_rising: bool,
+    ) {
+        use crate::gamepad_nav::{self as gn, NavDir};
+        let rows = self.gp_settings_rows();
+        if rows.is_empty() { return; }
+        let editing = self.gamepad_nav.settings_editing;
+
+        // Directional intent (dpad discrete + fresh stick deflection).
+        let mut dir: Option<NavDir> = None;
+        if nav.is_rising("dpad_up") { dir = Some(NavDir::Up); }
+        else if nav.is_rising("dpad_down") { dir = Some(NavDir::Down); }
+        else if nav.is_rising("dpad_left") { dir = Some(NavDir::Left); }
+        else if nav.is_rising("dpad_right") { dir = Some(NavDir::Right); }
+        if dir.is_none() {
+            if let Some(sd) = gn::stick_dir(nav.lstick) {
+                if self.gamepad_nav.repeat_dir != Some(sd) {
+                    self.gamepad_nav.repeat_dir = Some(sd);
+                    dir = Some(sd);
+                }
+            } else {
+                self.gamepad_nav.repeat_dir = None;
+            }
+        }
+
+        if !editing {
+            // Row navigation.
+            match dir {
+                Some(NavDir::Up) => {
+                    self.gamepad_nav.settings_index =
+                        self.gamepad_nav.settings_index.saturating_sub(1);
+                }
+                Some(NavDir::Down) => {
+                    self.gamepad_nav.settings_index =
+                        (self.gamepad_nav.settings_index + 1).min(rows.len() - 1);
+                }
+                _ => {}
+            }
+            let idx = self.gamepad_nav.settings_index.min(rows.len() - 1);
+            let row = &rows[idx];
+            // South / RT → toggle bool or enter numeric edit.
+            if nav.is_rising("btn_south") || rt_rising {
+                match &row.kind {
+                    GpSettingKind::Toggle { key } => {
+                        let cur = self.gp_setting_value(*key);
+                        self.gp_setting_set(*key, if cur != 0.0 { 0.0 } else { 1.0 });
+                    }
+                    _ => { self.gamepad_nav.settings_editing = true; }
+                }
+            }
+            // East / LT → close panel.
+            if nav.is_rising("btn_east") || lt_rising {
+                self.gamepad_nav.settings_open = false;
+            }
+        } else {
+            let idx = self.gamepad_nav.settings_index.min(rows.len() - 1);
+            let row = &rows[idx];
+            let fine = nav.pressed.contains("btn_west");
+            // Left/right (dpad or stick) nudges the value.
+            let (lo, hi, step, key) = match &row.kind {
+                GpSettingKind::IntSlider { lo, hi, step, key }
+                | GpSettingKind::FloatSlider { lo, hi, step, key } => (*lo, *hi, *step, *key),
+                GpSettingKind::Toggle { .. } => { self.gamepad_nav.settings_editing = false; return; }
+            };
+            let mut delta = 0.0f32;
+            let s = step * if fine { 0.25 } else { 1.0 };
+            match dir {
+                Some(NavDir::Right) | Some(NavDir::Up) => delta += s,
+                Some(NavDir::Left) | Some(NavDir::Down) => delta -= s,
+                _ => {}
+            }
+            let mag = nav.lstick.length();
+            if mag > 0.5 {
+                let span = hi - lo;
+                delta += nav.lstick.x * span * if fine { 0.15 } else { 0.6 }
+                    * 0.016; // ~per-frame scale
+            }
+            if delta != 0.0 {
+                let cur = self.gp_setting_value(key);
+                self.gp_setting_set(key, (cur + delta).clamp(lo, hi));
+            }
+            // South / East / RT / LT → leave edit (back to row nav).
+            if nav.is_rising("btn_south") || nav.is_rising("btn_east")
+                || rt_rising || lt_rising
+            {
+                self.gamepad_nav.settings_editing = false;
+            }
+        }
+    }
+
+    /// Render the gamepad-native settings panel (driven by `nav_drive_gp_settings`).
+    /// A self-contained modal mirroring the gamepad-relevant subset of global
+    /// settings, navigable purely by controller (the real Settings window can't
+    /// be). Display-only here — all mutation happens in the driver.
+    fn draw_gp_settings_panel(&mut self, ctx: &egui::Context) {
+        if !self.gamepad_nav.settings_open { return; }
+        let rows = self.gp_settings_rows();
+        let sel = self.gamepad_nav.settings_index.min(rows.len().saturating_sub(1));
+        let editing = self.gamepad_nav.settings_editing;
+        let accent = ctx.style().visuals.selection.stroke.color;
+
+        egui::Window::new("🎮 Settings")
+            .id(egui::Id::new("gp_settings_panel"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    "D-pad/stick: move   South: edit/toggle   ←/→: adjust   \
+                     West: fine   East: close")
+                    .small().color(egui::Color32::from_gray(150)));
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                for (i, row) in rows.iter().enumerate() {
+                    let is_sel = i == sel;
+                    let val = self.gp_setting_value(match &row.kind {
+                        GpSettingKind::Toggle { key }
+                        | GpSettingKind::IntSlider { key, .. }
+                        | GpSettingKind::FloatSlider { key, .. } => *key,
+                    });
+                    let val_str = match &row.kind {
+                        GpSettingKind::Toggle { .. } =>
+                            if val != 0.0 { "ON".to_string() } else { "OFF".to_string() },
+                        GpSettingKind::IntSlider { .. } =>
+                            format!("{}{}", val.round() as i64, row.suffix),
+                        GpSettingKind::FloatSlider { .. } =>
+                            format!("{:.2}{}", val, row.suffix),
+                    };
+
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+                    let painter = ui.painter();
+                    if is_sel {
+                        let bright = editing && !matches!(row.kind, GpSettingKind::Toggle { .. });
+                        let [r, g, b, _] = accent.to_array();
+                        painter.rect_filled(rect, 5.0,
+                            egui::Color32::from_rgba_unmultiplied(r, g, b,
+                                if bright { 70 } else { 40 }));
+                        painter.rect_stroke(rect, 5.0,
+                            egui::Stroke::new(if bright { 2.0 } else { 1.0 }, accent),
+                            egui::StrokeKind::Inside);
+                    }
+                    painter.text(
+                        egui::pos2(rect.left() + 10.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER, &row.label,
+                        egui::FontId::proportional(13.0),
+                        ui.visuals().text_color());
+                    painter.text(
+                        egui::pos2(rect.right() - 10.0, rect.center().y),
+                        egui::Align2::RIGHT_CENTER, &val_str,
+                        egui::FontId::proportional(13.0),
+                        if is_sel { accent } else { ui.visuals().weak_text_color() });
+                    ui.add_space(2.0);
+                }
+            });
+        ctx.request_repaint();
+    }
+
+    /// Render the virtual KB/M picker modal: a keyboard-ish grid of KBM icons
+    /// with the focused cell highlighted, the current output chord shown above,
+    /// and control hints. Input is handled in `drive_kbm_picker`; this is
+    /// display-only. Rendered top-level (not in a sublayer), so painting here is
+    /// safe.
+    fn draw_kbm_picker(&mut self, ctx: &egui::Context) {
+        if !self.gamepad_nav.kbm_picker_open { return; }
+        use crate::kbm_picker::{clamp_cursor, KBM_LAYOUT};
+        let (sel_row, sel_col) = clamp_cursor(
+            self.gamepad_nav.kbm_picker_row, self.gamepad_nav.kbm_picker_col);
+        let accent = ctx.style().visuals.selection.stroke.color;
+
+        // Current output chord for the header preview.
+        let chord: Vec<String> = match (self.gamepad_nav.kbm_picker_outer,
+                                        self.gamepad_nav.kbm_picker_node) {
+            (Some(o), Some(i)) => self.nav_remap_draft_vec(o, i, "draft_output"),
+            _ => Vec::new(),
+        };
+
+        egui::Window::new("⌨ KB/M picker")
+            .id(egui::Id::new("gp_kbm_picker"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    "LS/D-pad: move   South: add   North: clear   East: done")
+                    .small().color(egui::Color32::from_gray(150)));
+                ui.add_space(4.0);
+                // Output chord preview.
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Output:").small().weak());
+                    if chord.is_empty() {
+                        ui.label(egui::RichText::new("(none)").small().italics().weak());
+                    } else {
+                        for (i, pin) in chord.iter().enumerate() {
+                            if i > 0 { ui.label(egui::RichText::new("+").strong()); }
+                            ui.label(egui::RichText::new(kbm_pin_label(pin)).strong());
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                const UNIT: f32 = 30.0; // px per grid unit
+                const GAP: f32 = 4.0;
+                let skin = crate::canvas::remapper_icons::Skin::Kbm;
+                for (r, rowdef) in KBM_LAYOUT.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = GAP;
+                        for (c, cell) in rowdef.iter().enumerate() {
+                            let w = cell.width * UNIT + (cell.width - 1.0) * GAP;
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(w, UNIT), egui::Sense::hover());
+                            let focused = r == sel_row && c == sel_col;
+                            let painter = ui.painter();
+                            // Cell background + focus highlight.
+                            let bg = if focused {
+                                let [rr, gg, bb, _] = accent.to_array();
+                                egui::Color32::from_rgba_unmultiplied(rr, gg, bb, 60)
+                            } else {
+                                egui::Color32::from_gray(40)
+                            };
+                            painter.rect_filled(rect, 4.0, bg);
+                            if focused {
+                                painter.rect_stroke(rect, 4.0,
+                                    egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+                            }
+                            // Icon (or text fallback), centered.
+                            if let Some(tex) = kbm_cell_texture(ctx, skin, cell.pin) {
+                                let s = (UNIT - 6.0).min(w - 6.0).max(8.0);
+                                let img_rect = egui::Rect::from_center_size(
+                                    rect.center(), egui::vec2(s, s));
+                                painter.image(tex.id(), img_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE);
+                            } else {
+                                painter.text(rect.center(), egui::Align2::CENTER_CENTER,
+                                    kbm_pin_label(cell.pin),
+                                    egui::FontId::proportional(12.0),
+                                    ui.visuals().text_color());
+                            }
+                        }
+                    });
+                    ui.add_space(GAP);
+                }
+            });
+        ctx.request_repaint();
+    }
+
     fn draw_settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open { return; }
         let mut open = true;
@@ -2619,6 +5808,48 @@ impl FlexInputApp {
                 ui.label(egui::RichText::new(
                     "Engine tick rate. Higher = lower latency, more CPU."
                 ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Gamepad UI navigation ──────────────────────────────
+                ui.label(egui::RichText::new("Gamepad UI navigation").strong());
+                ui.add_space(4.0);
+                if ui.checkbox(&mut self.settings.gamepad_ui_nav_default,
+                    "Enable gamepad UI navigation by default")
+                    .on_hover_text(
+                        "When on, newly-seen gamepads start in UI-navigation mode: while \
+                         FlexInput holds focus the controller drives FlexInput's own UI and \
+                         its mapped output is suppressed. Alt-tab away and mappings resume \
+                         automatically. Toggle per-device on each gamepad card."
+                    )
+                    .changed()
+                {
+                    dirty = true;
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Cursor max speed")
+                        .on_hover_text("Top speed of the right-stick/gyro nav cursor at full deflection (px/s). The actual speed follows the acceleration curve below up to this cap.");
+                    let resp = ui.add(egui::Slider::new(
+                        &mut self.settings.cursor_max_speed, 1000.0..=30000.0)
+                        .suffix(" px/s"));
+                    if resp.changed() { dirty = true; }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Cursor acceleration")
+                        .on_hover_text("How the cursor speed ramps with stick deflection. 1.0 = linear; higher = slower start and a faster top end (deflection raised to this power).");
+                    let mut a = self.settings.cursor_accel;
+                    let resp = ui.add(egui::Slider::new(&mut a, 1.0..=4.0)
+                        .fixed_decimals(2));
+                    if resp.double_clicked() { a = 2.0; }
+                    if (a - self.settings.cursor_accel).abs() > f32::EPSILON {
+                        self.settings.cursor_accel = a.clamp(1.0, 4.0);
+                        dirty = true;
+                    }
+                });
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -3117,6 +6348,8 @@ fn spawn_io_thread(
     // every tick — background tabs don't drive output.
     active_tab_device_ids: Arc<RwLock<HashSet<String>>>,
     io_bypass: Arc<AtomicBool>,
+    // Gamepad-UI-nav suppression — treated identically to `io_bypass`.
+    ui_nav_suppress: Arc<AtomicBool>,
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     polling_hz: Arc<AtomicU32>,
@@ -3300,7 +6533,8 @@ fn spawn_io_thread(
                 // actually route signals this tick; devices outside the
                 // filter receive `reset_outputs()` so a background tab's
                 // device idles instead of holding its last state.
-                let bypass = io_bypass.load(Ordering::Relaxed);
+                let bypass = io_bypass.load(Ordering::Relaxed)
+                    || ui_nav_suppress.load(Ordering::Relaxed);
                 let active_ids = active_tab_device_ids.read().unwrap().clone();
                 {
                     puffin::profile_scope!("route_virtual_devices");
@@ -6306,6 +9540,89 @@ const PINNED_PAD: f32  = 4.0;
 pub(crate) struct SubPatchFile {
     pub(crate) version: u32,
     pub(crate) sub_patch: UiSubPatch,
+}
+
+/// Short human label for a KB/M pin (fallback when no icon, or for the chord
+/// preview). Strips the `key_`/`mouse_`/`scroll_` prefix and prettifies a few.
+fn kbm_pin_label(pin: &str) -> String {
+    match pin {
+        "mouse_left" => "LMB".into(),
+        "mouse_right" => "RMB".into(),
+        "mouse_middle" => "MMB".into(),
+        "scroll_up" => "Scroll↑".into(),
+        "scroll_down" => "Scroll↓".into(),
+        "key_space" => "Space".into(),
+        "key_enter" => "Enter".into(),
+        "key_backspace" => "Bksp".into(),
+        "key_escape" => "Esc".into(),
+        "key_capslock" => "Caps".into(),
+        "key_backtick" => "`".into(),
+        "key_arrowup" => "↑".into(),
+        "key_arrowdown" => "↓".into(),
+        "key_arrowleft" => "←".into(),
+        "key_arrowright" => "→".into(),
+        _ => {
+            let s = pin.strip_prefix("key_").or_else(|| pin.strip_prefix("mouse_"))
+                .unwrap_or(pin);
+            let s = s.strip_prefix("num").unwrap_or(s);
+            let mut cs = s.chars();
+            cs.next().map(|f| f.to_uppercase().collect::<String>() + cs.as_str())
+                .unwrap_or_else(|| s.to_string())
+        }
+    }
+}
+
+/// Rasterize a KB/M pin's SVG icon to a cached texture (white, transparent bg).
+fn kbm_cell_texture(ctx: &egui::Context, skin: crate::canvas::remapper_icons::Skin, pin: &str)
+    -> Option<egui::TextureHandle>
+{
+    let bytes = crate::canvas::remapper_icons::pin_svg(skin, pin)?;
+    let size_px = (26.0 * ctx.pixels_per_point()).round() as u32;
+    let cache_key = egui::Id::new(("kbm_picker_icon", bytes.as_ptr() as usize, size_px));
+    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key)) {
+        return Some(tex);
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let img = crate::canvas::viewer::rasterize_svg_recolored(
+        text, size_px, size_px, "override", egui::Color32::TRANSPARENT)?;
+    let handle = ctx.load_texture(
+        format!("kbm_picker_icon_{:p}", bytes.as_ptr()), img, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(cache_key, handle.clone()));
+    Some(handle)
+}
+
+/// Clear the transient capture/learn state on every remapper-family inner node
+/// of a sub-patch. These params (`ui_phase`, `draft_input`, `draft_output`,
+/// `_pressed_prev`, `_nav_capture_armed`, `_nav_arm_idle`, `_tp_click_mode`,
+/// `_tp_zones`) describe an in-progress capture gesture, not saved configuration
+/// — they must never carry across a patch open or app launch (otherwise a
+/// half-captured chord from a previous session blocks starting a fresh Learn).
+/// The committed `mappings` array is left untouched.
+pub(crate) fn clear_transient_capture_state(sp: &mut UiSubPatch) {
+    const TRANSIENT: &[&str] = &[
+        "ui_phase", "draft_input", "draft_output", "_pressed_prev",
+        "_nav_capture_armed", "_nav_arm_idle", "_nav_act_learn",
+        "_nav_act_special", "_nav_act_add", "_tp_click_mode", "_tp_zones",
+    ];
+    for (_, node_ref) in sp.snarl.nodes_ids_data_mut() {
+        let node = &mut node_ref.value;
+        if matches!(node.module_id.as_str(),
+            "module.remapper" | "module.map_action" | "module.automap_combiner"
+            | "processing.gyro_3dof")
+        {
+            for k in TRANSIENT { node.params.remove(*k); }
+        }
+    }
+}
+
+/// Clear transient capture state across every sub-patch in a canvas (the outer
+/// snarl's nodes that carry a `.subpatch`). Used on patch/workspace load.
+pub(crate) fn clear_canvas_capture_state(canvas: &mut crate::canvas::Canvas) {
+    for (_, node_ref) in canvas.snarl.nodes_ids_data_mut() {
+        if let Some(sp) = node_ref.value.subpatch.as_mut() {
+            clear_transient_capture_state(sp);
+        }
+    }
 }
 
 pub(crate) fn save_subpatch_file(sp: &UiSubPatch) -> Option<std::path::PathBuf> {

@@ -1237,3 +1237,64 @@ fn egui_key_name_to_enigo(name: &str) -> Option<Key> {
         _ => return None,
     })
 }
+
+/// Minimal UI-thread keyboard tapper for the gamepad Alt+Tab window switcher.
+///
+/// Independent of the virtual-device pool (which the I/O thread resets every
+/// tick while UI-nav suppression is active). Owns its own `Enigo` and presses
+/// keys synchronously on the caller's (UI) thread — exactly what the switcher
+/// needs: hold Alt, tap Tab / arrow keys, release Alt to commit.
+pub struct UiKeyTapper {
+    enigo: Option<Enigo>,
+    alt_down: bool,
+}
+
+impl Default for UiKeyTapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UiKeyTapper {
+    pub fn new() -> Self {
+        Self {
+            enigo: Enigo::new(&Settings::default()).ok(),
+            alt_down: false,
+        }
+    }
+
+    /// Press (hold) Alt if not already held.
+    pub fn alt_down(&mut self) {
+        if self.alt_down {
+            return;
+        }
+        if let Some(e) = &mut self.enigo {
+            let _ = e.key(Key::Alt, Direction::Press);
+            self.alt_down = true;
+        }
+    }
+
+    /// Release Alt if held (commits the Windows switcher selection).
+    pub fn alt_up(&mut self) {
+        if !self.alt_down {
+            return;
+        }
+        if let Some(e) = &mut self.enigo {
+            let _ = e.key(Key::Alt, Direction::Release);
+        }
+        self.alt_down = false;
+    }
+
+    pub fn is_alt_down(&self) -> bool {
+        self.alt_down
+    }
+
+    /// Tap a key once (press + release). `name` accepts the egui-debug or
+    /// `key_*` forms understood by `egui_key_name_to_enigo`, e.g. "tab",
+    /// "arrowleft".
+    pub fn tap(&mut self, name: &str) {
+        if let (Some(e), Some(k)) = (&mut self.enigo, egui_key_name_to_enigo(name)) {
+            let _ = e.key(k, Direction::Click);
+        }
+    }
+}

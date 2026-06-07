@@ -44,6 +44,7 @@ pub fn show(
     panic_shortcut: &PanicShortcut,
     device_rates: &HashMap<String, u32>,
     favorites: &mut Vec<PathBuf>,
+    gamepad_nav: &mut crate::gamepad_nav::GamepadNav,
 ) {
     let presets = load_index(user_presets_folder);
     // Lazy restore of the loaded-preset link after app reopen:
@@ -58,6 +59,9 @@ pub fn show(
     restore_preset_link(canvas, easy_state, &presets);
     let compat = check_compat(canvas);
 
+    // Resolve gamepad preset-nav state (open flag + highlight) BEFORE the
+    // dropdown renders, so the body can glow the highlighted row this frame.
+    show_gamepad_preset_nav(ui, canvas, easy_state, &presets, favorites, gamepad_nav);
     show_preset_picker(ui, canvas, easy_state, &presets, favorites);
     show_pending_modal(ui, canvas, easy_state, &presets);
 
@@ -139,10 +143,13 @@ pub fn show(
                     ui.label(egui::RichText::new("Pick a preset above to begin.").weak());
                 });
             } else {
+                let cursor = if gamepad_nav.cursor_visible {
+                    Some(gamepad_nav.cursor_pos)
+                } else { None };
                 render_subpatch_body(
                     ui, canvas, defaults,
                     descriptors, physical_devices, live_device_ids,
-                    live_signals, panic_shortcut, device_rates,
+                    live_signals, panic_shortcut, device_rates, cursor,
                 );
             }
         }
@@ -901,6 +908,15 @@ fn preset_row(
             ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.5),
         );
     }
+    // Gamepad-nav highlight: glow the row the controller is pointing at.
+    let gp_highlight: Option<PathBuf> =
+        ui.ctx().data(|d| d.get_temp(preset_nav_highlight_id()));
+    if gp_highlight.as_ref() == Some(&p.path) {
+        let accent = ui.visuals().selection.stroke.color;
+        ui.painter().rect_filled(rect, 4.0, accent.gamma_multiply(0.25));
+        ui.painter().rect_stroke(rect, 4.0,
+            egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+    }
 
     // Record geometry once per favorites section so drag reorder
     // can compute drop targets from pointer Y.
@@ -1183,6 +1199,7 @@ fn render_subpatch_body(
     live_signals: &HashMap<(String, String), Signal>,
     panic_shortcut: &PanicShortcut,
     _device_rates: &HashMap<String, u32>,
+    nav_cursor: Option<egui::Pos2>,
 ) {
     let Some(outer_id) = find_subpatch(canvas) else { return; };
 
@@ -1229,6 +1246,42 @@ fn render_subpatch_body(
             let wheel = ui.ctx().input(|i| i.smooth_scroll_delta.y);
             if wheel != 0.0 {
                 scroll_y = (scroll_y - wheel).clamp(0.0, scroll_overflow);
+            }
+        }
+    }
+
+    // Auto-scroll to keep the gamepad-nav selection (or the RS cursor) in view.
+    if scroll_overflow > 0.0 {
+        let margin = 24.0_f32;
+        // Selected item span in screen-Y (post-scale, pre-scroll offset).
+        let nav_owns: bool = {
+            let stamp: Option<u64> = ui.ctx().data(|d|
+                d.get_temp(egui::Id::new("gp_nav_owns_selection")));
+            stamp == Some(ui.ctx().cumulative_pass_nr())
+        };
+        if nav_owns {
+            if let Some((top, bot)) = canvas.snarl.get_node(outer_id)
+                .and_then(|n| n.subpatch.as_ref())
+                .and_then(|sp| sp.selected_item.and_then(|i| sp.items.get(i)))
+                .map(|item| { let (p, s) = item.bbox(); (p[1] * scale, (p[1] + s[1]) * scale) })
+            {
+                // Desired visible window in the same (pre-offset) space is
+                // [scroll_y, scroll_y + panel_h]. Nudge to include the item.
+                if top - margin < scroll_y {
+                    scroll_y = (top - margin).max(0.0);
+                } else if bot + margin > scroll_y + panel_h {
+                    scroll_y = (bot + margin - panel_h).min(scroll_overflow);
+                }
+                scroll_y = scroll_y.clamp(0.0, scroll_overflow);
+            }
+        }
+        // Keep the RS cursor in view too (when visible).
+        if let Some(cpos) = nav_cursor {
+            let cy = cpos.y - panel_rect.top();
+            if cy < margin {
+                scroll_y = (scroll_y - (margin - cy)).clamp(0.0, scroll_overflow);
+            } else if cy > panel_h - margin {
+                scroll_y = (scroll_y + (cy - (panel_h - margin))).clamp(0.0, scroll_overflow);
             }
         }
     }
@@ -1345,6 +1398,88 @@ fn render_subpatch_body(
             let _ = scaled_w; // reserved for future right-edge layout
         });
 
+    // ── Publish per-item SCREEN rects for gamepad cursor hit-testing ─────
+    // The nav driver runs before this panel paints, so it can't compute these
+    // itself. Stash them (in the SAME screen transform the glow uses) so next
+    // frame's driver can hit-test the RS/gyro cursor against widgets and pick
+    // whichever the cursor is over. One-frame latency is invisible at repaint
+    // cadence. Vec of (item_index, screen_rect).
+    {
+        let mut rects: Vec<(usize, egui::Rect)> = Vec::new();
+        if let Some(sp) = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref()) {
+            for (i, item) in sp.items.iter().enumerate() {
+                let (lp, ls) = item.bbox();
+                let min = panel_rect.min
+                    + egui::vec2(lp[0] * scale, lp[1] * scale - scroll_y);
+                let size = egui::vec2(ls[0].max(1.0) * scale, ls[1].max(1.0) * scale);
+                rects.push((i, egui::Rect::from_min_size(min, size)));
+            }
+        }
+        let pass = ui.ctx().cumulative_pass_nr();
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(egui::Id::new(("gp_nav_item_rects", outer_id.0)), (pass, rects))
+        });
+    }
+
+    // ── Gamepad-nav selection glow ──────────────────────────────────────
+    // The nav driver (run earlier this frame) stamps a temp value keyed by
+    // outer_id with (pass_nr, is_editing) when a nav device is active. Draw a
+    // steady glowing outline around the selected item, mapping its body-local
+    // bbox through the same transform the body layer uses:
+    //   screen = panel_rect.min + body_pos*scale - (0, scroll_y)
+    let glow: Option<(u64, bool)> =
+        ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_glow", outer_id.0))));
+    if let Some((pass, editing)) = glow {
+        if pass == ui.ctx().cumulative_pass_nr() {
+            let sel = canvas.snarl.get_node(outer_id)
+                .and_then(|n| n.subpatch.as_ref())
+                .and_then(|sp| sp.selected_item.map(|i| (i, sp)));
+            if let Some((sel_idx, sp)) = sel {
+                if let Some(item) = sp.items.get(sel_idx) {
+                    let (lp, ls) = item.bbox();
+                    let min = panel_rect.min
+                        + egui::vec2(lp[0] * scale, lp[1] * scale - scroll_y);
+                    let size = egui::vec2(ls[0].max(1.0) * scale, ls[1].max(1.0) * scale);
+                    let rect = egui::Rect::from_min_size(min, size);
+                    let accent = ui.visuals().selection.stroke.color;
+                    let [r, g, b, _] = accent.to_array();
+                    let base_round = 6.0_f32;
+
+                    // Edge ring + OUTWARD bloom only — never fills the widget
+                    // interior, so the control underneath stays fully visible
+                    // while editing. Bloom = concentric outside-strokes with
+                    // falling alpha (a true outward gradient).
+                    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new(("gp_nav_glow_top", outer_id.0)),
+                    )).with_clip_rect(panel_rect);
+                    let rings = 7;
+                    let max_grow = if editing { 9.0 } else { 6.0 };
+                    let peak = if editing { 150.0 } else { 90.0 };
+                    for i in 0..rings {
+                        let t = (i as f32 + 1.0) / rings as f32;
+                        let grow = t * max_grow;
+                        let a = (peak * (1.0 - t)).round() as u8;
+                        if a == 0 { continue; }
+                        painter.rect_stroke(
+                            rect.expand(grow), base_round + grow,
+                            egui::Stroke::new(2.0,
+                                egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    painter.rect_stroke(
+                        rect.expand(1.0),
+                        base_round,
+                        egui::Stroke::new(if editing { 2.0 } else { 1.25 },
+                            accent.gamma_multiply(if editing { 1.0 } else { 0.75 })),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+        }
+    }
+
     // Capture any pinned-widget value edit made this frame into undo/redo
     // (commit-on-settle, coalesced to one entry per gesture). Only runs when we
     // took a pre-snapshot above, i.e. on interaction frames — idle frames skip
@@ -1370,6 +1505,108 @@ fn is_subpatch_dirty(canvas: &Canvas, easy_state: &EasyState, presets: &[PresetI
     !presets.iter().any(|p| p.content_hash == current_hash)
 }
 
+/// Gamepad-driven preset dropdown navigation. Opened by a Start tap; the nav
+/// driver feeds directional steps / select / open state via `gamepad_nav`.
+/// Renders a simple highlighted list and applies the chosen preset on select.
+/// Build the preset list in the SAME visual order the dropdown body renders:
+/// Favorites (in favorites order) → Factory → User. Returns the ordered paths.
+fn preset_display_order(presets: &[PresetInfo], favorites: &[PathBuf]) -> Vec<PathBuf> {
+    let mut order: Vec<PathBuf> = Vec::new();
+    // Favorites first, in favorites order, only those that resolve.
+    for f in favorites {
+        if presets.iter().any(|p| &p.path == f) && !order.contains(f) {
+            order.push(f.clone());
+        }
+    }
+    // Then Factory, then User — skipping anything already shown as a favorite.
+    for src in [PresetSource::Factory, PresetSource::User] {
+        for p in presets.iter().filter(|p| p.source == src) {
+            if !order.contains(&p.path) {
+                order.push(p.path.clone());
+            }
+        }
+    }
+    order
+}
+
+/// Ctx-data id holding the path the gamepad is currently highlighting in the
+/// dropdown, so `preset_row` can draw a glow on the matching row.
+fn preset_nav_highlight_id() -> egui::Id {
+    egui::Id::new("flexinput_easy_preset_nav_highlight")
+}
+
+/// Gamepad-driven preset selection — drives the REAL dropdown. Tap-Start opens
+/// it; dpad/stick move the highlight through the displayed order; South applies;
+/// East closes. The highlighted path is published to ctx data so `preset_row`
+/// glows the matching row.
+fn show_gamepad_preset_nav(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    easy_state: &mut EasyState,
+    presets: &[PresetInfo],
+    favorites: &[PathBuf],
+    gamepad_nav: &mut crate::gamepad_nav::GamepadNav,
+) {
+    let open_id = preset_dropdown_open_id();
+    if !gamepad_nav.preset_nav_open {
+        // Closed by the driver (East / re-tap Start). If we still hold a stale
+        // highlight, we were the one that opened the real dropdown — close it
+        // too, and clear the highlight.
+        let had_highlight = ui.ctx().data(|d|
+            d.get_temp::<PathBuf>(preset_nav_highlight_id()).is_some());
+        if had_highlight {
+            ui.ctx().data_mut(|d| {
+                d.remove::<PathBuf>(preset_nav_highlight_id());
+                d.insert_temp(open_id, false);
+            });
+        }
+        return;
+    }
+    // Keep the real dropdown open while nav owns it.
+    ui.ctx().data_mut(|d| d.insert_temp(open_id, true));
+
+    let order = preset_display_order(presets, favorites);
+    if order.is_empty() {
+        gamepad_nav.preset_nav_open = false;
+        ui.ctx().data_mut(|d| d.insert_temp(open_id, false));
+        return;
+    }
+    let n = order.len();
+    if gamepad_nav.preset_nav_index >= n {
+        gamepad_nav.preset_nav_index = 0;
+    }
+    let step = std::mem::take(&mut gamepad_nav.preset_nav_step);
+    if step != 0 {
+        let cur = gamepad_nav.preset_nav_index as i32;
+        gamepad_nav.preset_nav_index = (cur + step).rem_euclid(n as i32) as usize;
+    }
+    // Apply selection → same path as a mouse Pick.
+    if std::mem::take(&mut gamepad_nav.preset_nav_select) {
+        let path = order[gamepad_nav.preset_nav_index].clone();
+        if let Some(p) = presets.iter().find(|p| p.path == path) {
+            let active = easy_state.loaded_preset.as_ref()
+                .map(|(p2, _)| p2.as_path()) == Some(p.path.as_path());
+            if !active {
+                if is_subpatch_dirty(canvas, easy_state, presets) {
+                    easy_state.pending_preset_switch = Some(p.path.clone());
+                } else {
+                    apply_preset(canvas, easy_state, p);
+                }
+            }
+        }
+        gamepad_nav.preset_nav_open = false;
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(open_id, false);
+            d.remove::<PathBuf>(preset_nav_highlight_id());
+        });
+        return;
+    }
+    // Publish the highlighted path for `preset_row` to glow.
+    let hl = order[gamepad_nav.preset_nav_index].clone();
+    ui.ctx().data_mut(|d| d.insert_temp(preset_nav_highlight_id(), hl));
+    ui.ctx().request_repaint();
+}
+
 fn apply_preset(canvas: &mut Canvas, easy_state: &mut EasyState, p: &PresetInfo) {
     let Ok(bytes) = std::fs::read(&p.path) else { return; };
     let Ok(file): Result<crate::app::SubPatchFile, _> = serde_json::from_slice(&bytes) else { return; };
@@ -1393,7 +1630,12 @@ fn apply_preset(canvas: &mut Canvas, easy_state: &mut EasyState, p: &PresetInfo)
         }
     };
     if let Some(n) = canvas.snarl.get_node_mut(node_id) {
-        n.subpatch = Some(Box::new(file.sub_patch.clone()));
+        let mut sp = file.sub_patch.clone();
+        // A freshly loaded preset must start with no in-progress capture/learn
+        // gesture — clear transient remapper-family capture state so stale
+        // captures don't block a fresh Learn.
+        crate::app::clear_transient_capture_state(&mut sp);
+        n.subpatch = Some(Box::new(sp));
         n.display_name = p.display_name.clone();
         mirror_pins(n, &file.sub_patch);
     }

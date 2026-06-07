@@ -219,6 +219,34 @@ impl Canvas {
     pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
     pub fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
 
+    /// Take a clone of the current snarl, for use as an undo baseline (e.g. the
+    /// gamepad nav driver snapshots before a value-edit gesture begins).
+    pub(crate) fn snapshot_for_undo(&self) -> Snarl<NodeData> {
+        self.snarl.clone()
+    }
+
+    /// Commit a previously-taken `baseline` as one undo entry, but only if the
+    /// snarl actually changed since. Used by the gamepad nav edit gesture
+    /// (snapshot on enter-edit, commit on exit) — its direct `node.params`
+    /// writes don't go through the pointer/keyboard `track_value_edits` path.
+    pub(crate) fn commit_undo_if_changed(&mut self, baseline: Snarl<NodeData>) {
+        if self.snarl_fingerprint() != Self::fingerprint_of(&baseline) {
+            self.push_snapshot(baseline);
+        }
+    }
+
+    /// FNV-1a fingerprint of an arbitrary snarl (same scheme as
+    /// `snarl_fingerprint`, for comparing a stored baseline).
+    fn fingerprint_of(snarl: &Snarl<NodeData>) -> u64 {
+        let bytes = serde_json::to_vec(snarl).unwrap_or_default();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in &bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
     /// FNV-1a hash of the serialized snarl. `NodeData.extra` is `#[serde(skip)]`,
     /// so the live per-frame signal history / readouts churned by the processing
     /// thread do NOT affect this — only persistent state (params, positions,

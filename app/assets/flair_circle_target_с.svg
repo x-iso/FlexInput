@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="100%" height="100%" viewBox="0 0 128 128" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linejoin:round;stroke-miterlimit:2;">
+    <g transform="matrix(2,0,0,2,0,0)">
+        <path d="M32,8C36.467,8 40.5,9.067 44.1,11.2L41.05,16.4C38.383,14.8 35.367,14 32,14C28.667,14 25.65,14.8 22.95,16.4L19.95,11.2C23.517,9.067 27.533,8 32,8M56,32C56,36.433 54.95,40.433 52.85,44L47.65,41C49.217,38.333 50,35.333 50,32C50,28.667 49.217,25.667 47.65,23L52.85,20C54.95,23.533 56,27.533 56,32M32,56C27.567,56 23.567,54.95 20,52.85L23,47.65C25.667,49.217 28.667,50 32,50C35.333,50 38.35,49.217 41.05,47.65L44.05,52.85C40.483,54.95 36.467,56 32,56M8,32C8,27.533 9.067,23.517 11.2,19.95L16.4,22.95L16,23.65C14.667,26.15 14,28.933 14,32C14,35.067 14.667,37.85 16,40.35L16.4,41L11.15,44.05C9.05,40.45 8,36.433 8,32" style="fill:url(#_Radial1);fill-rule:nonzero;"/>
+        <g transform="matrix(1,0,0,1,-0.0390577,0.0230797)">
+            <circle cx="32.039" cy="31.977" r="6.241" style="fill:url(#_Radial2);"/>
+        </g>
+    </g>
+    <defs>
+        <radialGradient id="_Radial1" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(24,0,0,24,32,32)"><stop offset="0" style="stop-color:white;stop-opacity:0"/><stop offset="0.56" style="stop-color:white;stop-opacity:0"/><stop offset="0.66" style="stop-color:white;stop-opacity:0.09"/><stop offset="0.79" style="stop-color:white;stop-opacity:0.3"/><stop offset="0.91" style="stop-color:white;stop-opacity:0.38"/><stop offset="0.96" style="stop-color:white;stop-opacity:0.55"/><stop offset="1" style="stop-color:white;stop-opacity:0.7"/></radialGradient>
+        <radialGradient id="_Radial2" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(6.24113,0,0,6.24113,32.0391,31.9769)"><stop offset="0" style="stop-color:white;stop-opacity:0"/><stop offset="0.28" style="stop-color:white;stop-opacity:0.09"/><stop offset="0.61" style="stop-color:white;stop-opacity:0.11"/><stop offset="0.83" style="stop-color:white;stop-opacity:0.2"/><stop offset="0.92" style="stop-color:white;stop-opacity:0.37"/><stop offset="1" style="stop-color:white;stop-opacity:0.53"/></radialGradient>
+    </defs>
+</svg>

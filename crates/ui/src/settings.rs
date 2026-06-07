@@ -29,6 +29,8 @@ fn default_theme() -> Theme { Theme::Dark }
 fn default_contrast() -> f32 { 0.0 }
 fn default_see_through_alpha() -> f32 { 0.55 }
 fn default_pin_shortcut() -> PinShortcut { PinShortcut::default() }
+fn default_cursor_max_speed() -> f32 { 4000.0 }
+fn default_cursor_accel() -> f32 { 2.0 }
 fn default_pin_guide_double_tap() -> bool { true }
 fn default_focus_flip_flop() -> bool { true }
 fn default_ui_mode() -> UiMode { UiMode::Easy }
@@ -130,6 +132,20 @@ pub struct AppSettings {
     /// If true, the controller Guide/PS button also toggles the pin.
     #[serde(default)]
     pub pin_via_guide: bool,
+    /// Default nav-mode state for newly-seen gamepads. Per-device runtime
+    /// overrides live in `FlexInputApp::gamepad_nav.mode` (not persisted).
+    /// When on, the controller drives FlexInput's own UI (with mapped output
+    /// suppressed) while FlexInput holds focus.
+    #[serde(default)]
+    pub gamepad_ui_nav_default: bool,
+    /// Top speed (px/s at full right-stick deflection) of the gamepad-nav
+    /// cursor. The actual speed follows an accelerated curve up to this cap.
+    #[serde(default = "default_cursor_max_speed")]
+    pub cursor_max_speed: f32,
+    /// Acceleration exponent for the cursor speed curve: speed scales with
+    /// deflection^cursor_accel. >1 = slow start, fast late; 1 = linear.
+    #[serde(default = "default_cursor_accel")]
+    pub cursor_accel: f32,
     /// If true, Guide-button activation requires a double-tap (within ~300ms);
     /// otherwise a single tap fires. Default true to avoid colliding with
     /// the Game Bar / Steam overlay's own Guide-button handling.
@@ -209,6 +225,9 @@ impl Default for AppSettings {
             pin_active: false,
             pin_shortcut: PinShortcut::default(),
             pin_via_guide: false,
+            gamepad_ui_nav_default: false,
+            cursor_max_speed: 4000.0,
+            cursor_accel: 2.0,
             pin_guide_double_tap: true,
             focus_flip_flop: true,
             pin_guide_chord: None,

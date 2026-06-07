@@ -1881,7 +1881,7 @@ fn show_automap_combiner_body(
         overlap.get(pin_id).map_or(false, |w| w.len() >= 2)
     };
 
-    ui.vertical(|ui| {
+    let body_resp = ui.vertical(|ui| {
         ui.set_min_width(140.0);
 
         let mut to_remove: Option<usize> = None;
@@ -2191,6 +2191,10 @@ fn show_automap_combiner_body(
                 }
             });
     });
+    // Register the whole body as the pinnable element so Layout mode's "Pin
+    // element ▶ Whole module" works for the combiner (matches remapper /
+    // map_action, which were registered but the combiner was missed).
+    register_exposable_element(ui, node_id, "whole_module", body_resp.response.rect);
 }
 
 // ── MIDI pin removal helpers ──────────────────────────────────────────────────
@@ -4724,8 +4728,15 @@ pub(crate) fn show_subpatch_body(
         .map(|n| n.extra.layout_unlocked)
         .unwrap_or(false);
 
-    // Clear runtime selection on Layout-mode exit.
-    if !is_unlocked {
+    // Clear runtime selection on Layout-mode exit — UNLESS gamepad UI nav owns
+    // the selection this frame (it drives `selected_item` outside layout-edit
+    // mode; the app stamps a pass-numbered flag when a nav device is active).
+    let nav_owns_selection = {
+        let stamp: Option<u64> = ui.ctx().data(|d|
+            d.get_temp(egui::Id::new("gp_nav_owns_selection")));
+        stamp == Some(ui.ctx().cumulative_pass_nr())
+    };
+    if !is_unlocked && !nav_owns_selection {
         if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
             sp.selected_item = None;
             sp.selected_items.clear();
@@ -5888,6 +5899,15 @@ fn render_pinned_element(
         }));
     let graph_ov_ref = graph_ov.as_ref();
 
+    // Record which element of this inner node is currently being rendered, so
+    // `publish_nav_field_rects` (called from inside the row renderers, which only
+    // receive `inner_id`) can key its rects by (inner, element). Without this,
+    // every row of a multi-element module (gyro, curve, …) would publish to the
+    // same inner-id key and the focused-field glow would land on whichever row
+    // painted last — not the one being edited.
+    ui.ctx().data_mut(|d| d.insert_temp(
+        egui::Id::new(("gp_nav_cur_element", inner_id.0)), element_id.to_string()));
+
     match (module_id, element_id) {
         ("module.remapper", "whole_module") => {
             render_remapper_whole_module(
@@ -6428,6 +6448,21 @@ where
         let wheel = ui.input(|i| i.smooth_scroll_delta.y);
         if wheel != 0.0 {
             scroll_offset_body -= wheel / scale;
+        }
+    }
+    // Gamepad-nav scroll: the nav driver publishes a body-space scroll delta
+    // (px) keyed by inner node id while the user is inside this widget
+    // (RemapScroll level). Apply it directly — no pointer-over gate, since the
+    // driver only targets the selected widget.
+    if !is_layout_mode {
+        let scroll_id = egui::Id::new(("gp_nav_remap_scroll", inner_id.0));
+        let cur_pass = ui.ctx().cumulative_pass_nr();
+        if let Some((pass, delta)) = ui.ctx().data(|d| d.get_temp::<(u64, f32)>(scroll_id)) {
+            // Accept this frame's or last frame's stamp (driver runs before the
+            // body paints, but allow a 1-frame lag for safety).
+            if cur_pass.saturating_sub(pass) <= 1 {
+                scroll_offset_body += delta;
+            }
         }
     }
 
@@ -7126,14 +7161,19 @@ fn render_gyro_steering_opts_row(
     let mut changed = false;
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 3];
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        changed |= ui.checkbox(&mut exclude_y, egui::RichText::new("excl. Y")).changed();
+        let r = ui.checkbox(&mut exclude_y, egui::RichText::new("excl. Y"));
+        fr[0] = r.rect; changed |= r.changed();
         ui.label(egui::RichText::new("re-center").weak());
-        changed |= ui.add(egui::DragValue::new(&mut strength).speed(0.05).range(0.0..=4.0).suffix(" /s")).changed();
+        let r = ui.add(egui::DragValue::new(&mut strength).speed(0.05).range(0.0..=4.0).suffix(" /s"));
+        fr[1] = r.rect; changed |= r.changed();
         ui.label(egui::RichText::new("ease").weak());
-        changed |= ui.add(egui::DragValue::new(&mut ease).speed(0.05).range(0.0..=2.0).suffix(" s")).changed();
+        let r = ui.add(egui::DragValue::new(&mut ease).speed(0.05).range(0.0..=2.0).suffix(" s"));
+        fr[2] = r.rect; changed |= r.changed();
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("steering_exclude_y".into(), Value::Bool(exclude_y));
@@ -7232,13 +7272,15 @@ fn render_gyro_invert_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl
     let mut changed = false;
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(180.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 3];
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         ui.label(egui::RichText::new("Gyr:").weak());
-        changed |= ui.checkbox(&mut yaw,   egui::RichText::new("yaw")).changed();
-        changed |= ui.checkbox(&mut pitch, egui::RichText::new("pitch")).changed();
-        changed |= ui.checkbox(&mut roll,  egui::RichText::new("roll")).changed();
+        let r = ui.checkbox(&mut yaw,   egui::RichText::new("yaw"));   fr[0] = r.rect; changed |= r.changed();
+        let r = ui.checkbox(&mut pitch, egui::RichText::new("pitch")); fr[1] = r.rect; changed |= r.changed();
+        let r = ui.checkbox(&mut roll,  egui::RichText::new("roll"));  fr[2] = r.rect; changed |= r.changed();
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("inv_yaw".into(),   Value::Bool(yaw));
@@ -7259,13 +7301,15 @@ fn render_accel_invert_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     let mut changed = false;
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(160.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 3];
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         ui.label(egui::RichText::new("Acc:").weak());
-        changed |= ui.checkbox(&mut x, egui::RichText::new("X")).changed();
-        changed |= ui.checkbox(&mut y, egui::RichText::new("Y")).changed();
-        changed |= ui.checkbox(&mut z, egui::RichText::new("+Z")).changed();
+        let r = ui.checkbox(&mut x, egui::RichText::new("X"));  fr[0] = r.rect; changed |= r.changed();
+        let r = ui.checkbox(&mut y, egui::RichText::new("Y"));  fr[1] = r.rect; changed |= r.changed();
+        let r = ui.checkbox(&mut z, egui::RichText::new("+Z")); fr[2] = r.rect; changed |= r.changed();
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("inv_accel_x".into(), Value::Bool(x));
@@ -7282,6 +7326,75 @@ fn render_accel_invert_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
 ///
 /// `natural` is the size the row was authored for (typically the size captured
 /// at pin time / the rect this element occupies on the original module body).
+/// Publish the per-field interactive-control rects of a pinned multi-control row
+/// so the gamepad-nav driver can draw a glow on the focused field. Rects are the
+/// `Response` rects in the SAME order as `nav_element_fields` for this element,
+/// converted to global screen space. Keyed by inner node id; pass-stamped so the
+/// driver can ignore stale data. Cheap no-op cost when nav is inactive (just a
+/// temp insert), so renderers always publish.
+fn publish_nav_field_rects(ui: &egui::Ui, inner_id: NodeId, local_rects: &[egui::Rect]) {
+    if local_rects.is_empty() { return; }
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let rects: Vec<egui::Rect> = local_rects.iter().map(|r| to_global * *r).collect();
+    let pass = ui.ctx().cumulative_pass_nr();
+    // Key by (inner, element): a single inner node exposes several element rows,
+    // each rendered separately, so the inner id alone is ambiguous.
+    let element: String = ui.ctx().data(|d|
+        d.get_temp(egui::Id::new(("gp_nav_cur_element", inner_id.0)))).unwrap_or_default();
+    ui.ctx().data_mut(|d| d.insert_temp(
+        egui::Id::new(("gp_nav_field_rects", inner_id.0, element)), (pass, rects)));
+}
+
+/// Publish the remapper-family action buttons' GLOBAL rects (Learn, Special,
+/// Add) so the nav driver can glow the focused one. NOTHING rects are omitted.
+/// Order matches `nav_remap_action_items`: Learn, Special, Add — entries with a
+/// NOTHING rect are skipped so the published list lines up with the driver's
+/// (which already drops Special/Add when they don't apply).
+fn publish_nav_action_rects(ui: &egui::Ui, node_id: NodeId, action_rects: &[egui::Rect]) {
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    // Keep the LOCAL rects too, in publish order, for the scroll-into-view check.
+    let mut local: Vec<egui::Rect> = Vec::with_capacity(action_rects.len());
+    let mut rects: Vec<egui::Rect> = Vec::with_capacity(action_rects.len());
+    for &r in action_rects {
+        if r.is_finite() && r.width() > 0.5 { local.push(r); rects.push(to_global * r); }
+    }
+    // IMPORTANT: never nest ctx lock acquisitions. `cumulative_pass_nr()`,
+    // `data()`, and `data_mut()` each take the egui ctx lock; calling one inside
+    // another's closure deadlocks epaint (the freeze the user hit). So read every
+    // ctx value into a plain local FIRST, then operate on locals.
+    let pass = ui.ctx().cumulative_pass_nr();
+    let action_sel: Option<(u64, usize)> = ui.ctx()
+        .data(|d| d.get_temp(egui::Id::new(("gp_nav_remap_action", node_id.0))));
+    let clip = ui.clip_rect();
+
+    ui.ctx().data_mut(|d| d.insert_temp(
+        egui::Id::new(("gp_nav_action_rects", node_id.0)), (pass, rects)));
+
+    // If an action button is the current nav selection and it's (partly) above/
+    // below the visible band, request a scroll so it comes into view. The action
+    // row sits at the top of the body, so this brings the buttons back on-screen
+    // when the user navigates up from the cards.
+    let act_sel = action_sel
+        .filter(|(p, _)| pass.saturating_sub(*p) <= 2)
+        .map(|(_, i)| i)
+        .filter(|i| *i != usize::MAX);
+    if let Some(ai) = act_sel {
+        if let Some(r) = local.get(ai) {
+            let mut need = 0.0f32;
+            if r.top() < clip.top() + 4.0 { need = r.top() - (clip.top() + 4.0); }
+            else if r.bottom() > clip.bottom() - 4.0 { need = r.bottom() - (clip.bottom() - 4.0); }
+            if need.abs() > 1.0 {
+                ui.ctx().data_mut(|d| d.insert_temp(
+                    egui::Id::new(("gp_nav_remap_scroll", node_id.0)),
+                    (pass, need)));
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+}
+
 fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::Vec2) -> f32 {
     let sx = (container.x / natural.x.max(1.0)).clamp(0.5, 4.0);
     let sy = (container.y / natural.y.max(1.0)).clamp(0.5, 4.0);
@@ -7416,12 +7529,16 @@ fn render_counter_min_max(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl
     let mut changed = false;
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(180.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 2];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Min").weak());
-        changed |= ui.add(egui::DragValue::new(&mut min_p).speed(0.1)).changed();
+        let r = ui.add(egui::DragValue::new(&mut min_p).speed(0.1));
+        fr[0] = r.rect; changed |= r.changed();
         ui.label(egui::RichText::new("Max").weak());
-        changed |= ui.add_enabled(mode != "unlimited", egui::DragValue::new(&mut max_p).speed(0.1)).changed();
+        let r = ui.add_enabled(mode != "unlimited", egui::DragValue::new(&mut max_p).speed(0.1));
+        fr[1] = r.rect; changed |= r.changed();
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             if let Some(n) = Number::from_f64(min_p as f64) { node.params.insert("min_param".into(), Value::Number(n)); }
@@ -7729,31 +7846,36 @@ fn render_oscilloscope_controls(
     }).unwrap_or((200.0, 1.0, false, false, 1.0));
 
     let mut changed = false;
+    let mut fr = [egui::Rect::NOTHING; 4];
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(360.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Win").weak());
-        changed |= ui.add(egui::Slider::new(&mut win_ms, 10.0f32..=10_000.0)
-            .logarithmic(true).show_value(false)).changed();
+        let r = ui.add(egui::Slider::new(&mut win_ms, 10.0f32..=10_000.0)
+            .logarithmic(true).show_value(false));
+        fr[0] = r.rect; changed |= r.changed();
         let lbl = if win_ms >= 1000.0 { format!("{:.1}s", win_ms / 1000.0) } else { format!("{:.0}ms", win_ms) };
         ui.label(egui::RichText::new(lbl).weak());
         ui.separator();
         ui.label(egui::RichText::new("Scale").weak());
         if au {
-            ui.label(egui::RichText::new(format!("{:.3}", eff_scale)).weak());
+            fr[1] = ui.label(egui::RichText::new(format!("{:.3}", eff_scale)).weak()).rect;
         } else {
-            changed |= ui.add(egui::DragValue::new(&mut sc).speed(0.01)
-                .range(0.001f32..=100.0).max_decimals(3)).changed();
+            let r = ui.add(egui::DragValue::new(&mut sc).speed(0.01)
+                .range(0.001f32..=100.0).max_decimals(3));
+            fr[1] = r.rect; changed |= r.changed();
         }
         let was_au = au;
-        ui.checkbox(&mut au, egui::RichText::new("Auto"));
+        fr[2] = ui.checkbox(&mut au, egui::RichText::new("Auto")).rect;
         changed |= au != was_au;
         ui.separator();
         let was_uni = uni;
-        ui.selectable_value(&mut uni, false, egui::RichText::new("Bi"));
-        ui.selectable_value(&mut uni, true,  egui::RichText::new("Uni"));
+        let rb = ui.selectable_value(&mut uni, false, egui::RichText::new("Bi"));
+        let ru = ui.selectable_value(&mut uni, true,  egui::RichText::new("Uni"));
+        fr[3] = rb.rect.union(ru.rect);
         changed |= uni != was_uni;
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             if let Some(n) = Number::from_f64(win_ms as f64) { node.params.insert("osc_win_ms".into(), Value::Number(n)); }
@@ -7927,6 +8049,7 @@ fn render_response_curve_scale_row(
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     let mut changed = false;
+    let mut fr: Vec<egui::Rect> = Vec::with_capacity(3);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Log").weak());
         // Slider takes a portion of available width so it scales with the row.
@@ -7934,6 +8057,7 @@ fn render_response_curve_scale_row(
         let slider_h = ui.spacing().interact_size.y.min(20.0).max(10.0);
         let (slider_rect, slider_resp) =
             ui.allocate_exact_size(egui::vec2(slider_w, slider_h), egui::Sense::click_and_drag());
+        fr.push(slider_rect);
         if slider_resp.double_clicked() { sc_t = 0.0; changed = true; }
         else if slider_resp.dragged() {
             sc_t = (sc_t + slider_resp.drag_delta().x / slider_rect.width() * 2.0).clamp(-1.0, 1.0);
@@ -7956,13 +8080,16 @@ fn render_response_curve_scale_row(
         ui.separator();
         if !is_vec {
             let was = absolute;
-            ui.checkbox(&mut absolute, egui::RichText::new("Abs"));
+            let r = ui.checkbox(&mut absolute, egui::RichText::new("Abs"));
+            fr.push(r.rect);
             changed |= absolute != was;
         }
         let was = snap_on;
-        ui.checkbox(&mut snap_on, egui::RichText::new("Snap"));
+        let r = ui.checkbox(&mut snap_on, egui::RichText::new("Snap"));
+        fr.push(r.rect);
         changed |= snap_on != was;
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             if let Some(n) = Number::from_f64(sc_t as f64) { node.params.insert("scale_t".into(), Value::Number(n)); }
@@ -7990,13 +8117,17 @@ fn render_response_curve_range_row(
             let o = n.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             (i, o)
         }).unwrap_or((1.0, 1.0));
+        let mut fr = [egui::Rect::NOTHING; 2];
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("In max").weak());
-            changed |= ui.add(egui::DragValue::new(&mut i_max).speed(0.01).max_decimals(2)).changed();
+            let r = ui.add(egui::DragValue::new(&mut i_max).speed(0.01).max_decimals(2));
+            fr[0] = r.rect; changed |= r.changed();
             ui.separator();
             ui.label(egui::RichText::new("Out max").weak());
-            changed |= ui.add(egui::DragValue::new(&mut o_max).speed(0.01).max_decimals(2)).changed();
+            let r = ui.add(egui::DragValue::new(&mut o_max).speed(0.01).max_decimals(2));
+            fr[1] = r.rect; changed |= r.changed();
         });
+        publish_nav_field_rects(ui, inner_id, &fr);
         if changed {
             if let Some(node) = snarl.get_node_mut(inner_id) {
                 if let Some(n) = Number::from_f64(i_max as f64) { node.params.insert("in_max".into(),  Value::Number(n)); }
@@ -8011,15 +8142,21 @@ fn render_response_curve_range_row(
             let o1 = n.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or( 1.0) as f32;
             (i0, i1, o0, o1)
         }).unwrap_or((-1.0, 1.0, -1.0, 1.0));
+        let mut fr = [egui::Rect::NOTHING; 4];
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("In").weak());
-            changed |= ui.add(egui::DragValue::new(&mut i0).speed(0.01).prefix("↓").max_decimals(2)).changed();
-            changed |= ui.add(egui::DragValue::new(&mut i1).speed(0.01).prefix("↑").max_decimals(2)).changed();
+            let r = ui.add(egui::DragValue::new(&mut i0).speed(0.01).prefix("↓").max_decimals(2));
+            fr[0] = r.rect; changed |= r.changed();
+            let r = ui.add(egui::DragValue::new(&mut i1).speed(0.01).prefix("↑").max_decimals(2));
+            fr[1] = r.rect; changed |= r.changed();
             ui.separator();
             ui.label(egui::RichText::new("Out").weak());
-            changed |= ui.add(egui::DragValue::new(&mut o0).speed(0.01).prefix("↓").max_decimals(2)).changed();
-            changed |= ui.add(egui::DragValue::new(&mut o1).speed(0.01).prefix("↑").max_decimals(2)).changed();
+            let r = ui.add(egui::DragValue::new(&mut o0).speed(0.01).prefix("↓").max_decimals(2));
+            fr[2] = r.rect; changed |= r.changed();
+            let r = ui.add(egui::DragValue::new(&mut o1).speed(0.01).prefix("↑").max_decimals(2));
+            fr[3] = r.rect; changed |= r.changed();
         });
+        publish_nav_field_rects(ui, inner_id, &fr);
         if changed {
             if let Some(node) = snarl.get_node_mut(inner_id) {
                 for (k, v) in [
@@ -8049,17 +8186,22 @@ fn render_response_curve_grid_row(
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     let mut changed = false;
+    let mut field_rects = [egui::Rect::NOTHING; 3];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Grid").weak());
-        changed |= ui.add(egui::DragValue::new(&mut gx).speed(0.25)
-            .range(1.0..=20.0).max_decimals(0).prefix("H ")).changed();
-        changed |= ui.add(egui::DragValue::new(&mut gy).speed(0.25)
-            .range(1.0..=20.0).max_decimals(0).prefix("V ")).changed();
+        let rh = ui.add(egui::DragValue::new(&mut gx).speed(0.25)
+            .range(1.0..=20.0).max_decimals(0).prefix("H "));
+        field_rects[0] = rh.rect; changed |= rh.changed();
+        let rv = ui.add(egui::DragValue::new(&mut gy).speed(0.25)
+            .range(1.0..=20.0).max_decimals(0).prefix("V "));
+        field_rects[1] = rv.rect; changed |= rv.changed();
         ui.separator();
         ui.label(egui::RichText::new("Trail").weak());
-        changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0)
-            .range(0i64..=1000).suffix("ms")).changed();
+        let rt = ui.add(egui::DragValue::new(&mut tm).speed(5.0)
+            .range(0i64..=1000).suffix("ms"));
+        field_rects[2] = rt.rect; changed |= rt.changed();
     });
+    publish_nav_field_rects(ui, inner_id, &field_rects);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("grid_x".into(),   serde_json::json!(gx as i64));
@@ -8084,16 +8226,18 @@ fn render_response_curve_grid_options_row(
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     let mut changed = false;
+    let mut fr = [egui::Rect::NOTHING; 2];
     ui.horizontal(|ui| {
         let was = ssg;
-        ui.checkbox(&mut ssg, egui::RichText::new("Scale grid"))
-            .on_hover_text("Adapt grid lines to the current Log/Exp scaling");
+        fr[0] = ui.checkbox(&mut ssg, egui::RichText::new("Scale grid"))
+            .on_hover_text("Adapt grid lines to the current Log/Exp scaling").rect;
         changed |= ssg != was;
         let was = sgl;
-        ui.checkbox(&mut sgl, egui::RichText::new("Labels"))
-            .on_hover_text("Show value labels on grid lines");
+        fr[1] = ui.checkbox(&mut sgl, egui::RichText::new("Labels"))
+            .on_hover_text("Show value labels on grid lines").rect;
         changed |= sgl != was;
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("show_scaled_grid".into(), Value::Bool(ssg));
@@ -8354,7 +8498,11 @@ fn paint_response_curve_graph(
     let pt_id_tag   = if is_vec { "vcpt_only" }    else { "cpt_only" };
     let trail_id_tag = if is_vec { "vtrail_only" } else { "trail_only" };
 
-    let alt_held = ui.input(|i| i.modifiers.alt);
+    // Bias handles show on mouse Alt OR gamepad bias mode (hold-North).
+    let nav_bias = ui.ctx().data(|d|
+        d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
+        == Some(ui.ctx().cumulative_pass_nr());
+    let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
     if alt_held && new_points.len() >= 2 {
         while new_biases.len() < new_points.len() - 1 { new_biases.push(0.0); }
         for seg in 0..(new_points.len() - 1) {
@@ -8423,6 +8571,43 @@ fn paint_response_curve_graph(
         let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
         painter.circle_filled(screen, 5.0, col);
         painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+
+        // Gamepad-nav: highlight the dot the driver selected. Driver publishes
+        // (pass, selected_idx, editing_dot) under ("gp_nav_curve_sel", node).
+        let sel: Option<(u64, usize, bool)> = ui.ctx().data(|d|
+            d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+        if let Some((pass, sel_i, editing_dot)) = sel {
+            if pass == ui.ctx().cumulative_pass_nr() && sel_i == i {
+                let accent = ui.visuals().selection.stroke.color;
+                let [r8, g8, b8, _] = accent.to_array();
+                for k in 0..5 {
+                    let t = (k as f32 + 1.0) / 5.0;
+                    let rr = (if editing_dot { 16.0 } else { 12.0 }) * t;
+                    let a = ((if editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
+                    if a == 0 { continue; }
+                    painter.circle_stroke(screen, rr,
+                        egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                }
+                painter.circle_filled(screen, if editing_dot { 6.0 } else { 5.0 }, accent);
+                painter.circle_stroke(screen, if editing_dot { 6.0 } else { 5.0 },
+                    egui::Stroke::new(1.5, Color32::WHITE));
+            }
+        }
+    }
+
+    // Gamepad-nav: publish curve geometry (graph rect + axis bounds) so the
+    // driver can map graph↔screen for dot stepping, cursor hit-test, and moves.
+    // Transform the rect to GLOBAL (screen) space — in Easy mode this body
+    // renders on a scaled/scrolled sub-layer, so the raw rect is body-local and
+    // would never match the screen-space gamepad cursor.
+    {
+        let pass = ui.ctx().cumulative_pass_nr();
+        let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+            .unwrap_or(egui::emath::TSTransform::IDENTITY);
+        let screen_rect = to_global * rect;
+        ui.ctx().data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_curve_geom", node_id.0)),
+            (pass, screen_rect, x_lo, x_hi, y_lo, y_hi)));
     }
 
     if bg_resp.double_clicked() {
@@ -10243,6 +10428,24 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     x_lo + (pos.x - rect.left()) / rect.width() * x_range,
                     y_lo + (rect.bottom() - pos.y) / rect.height() * y_range,
                 ]};
+                // Publish geometry for gamepad-nav (graph↔screen mapping), using
+                // the same temp ids the multi-channel curve body uses. The rect
+                // is transformed to GLOBAL (screen) space — in Easy mode the body
+                // renders on a scaled/scrolled sub-layer, so the raw rect is in
+                // body-local coords and would never match the screen-space cursor.
+                let pass = ui.ctx().cumulative_pass_nr();
+                let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+                    .unwrap_or(egui::emath::TSTransform::IDENTITY);
+                let screen_rect = to_global * rect;
+                ui.ctx().data_mut(|d| d.insert_temp(
+                    egui::Id::new(("gp_nav_curve_geom", node_id.0)),
+                    (pass, screen_rect, x_lo, x_hi, y_lo, y_hi)));
+                // Read the nav-selected dot (pass, idx, editing) for the highlight.
+                let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
+                    .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+                let nav_sel_dot: Option<usize> = nav_sel
+                    .filter(|(p, _, _)| *p == pass)
+                    .map(|(_, i, _)| i);
                 // Compute grid node positions (including 0 and 1 endpoints) in
                 // normalized [0,1] graph space, with redistribution of crowded lines.
                 // In bidirectional mode (not absolute) scaling is applied symmetrically
@@ -10418,7 +10621,12 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     }
                 }
 
-                let alt_held = ui.input(|i| i.modifiers.alt);
+                // Bias handles show on mouse Alt OR when the gamepad driver is in
+                // bias mode this frame (hold-North in CurveDot level).
+                let nav_bias = ui.ctx().data(|d|
+                    d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
+                    == Some(ui.ctx().cumulative_pass_nr());
+                let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
                 if alt_held && new_points.len() >= 2 {
                     while new_biases.len() < new_points.len() - 1 { new_biases.push(0.0); }
                     for seg in 0..(new_points.len() - 1) {
@@ -10483,7 +10691,21 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                         remove_idx = Some(i);
                         pts_changed = true;
                     }
-                    let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
+                    // Gamepad-nav selected dot: accent glow ring so the user can
+                    // see which point is targeted for move/delete.
+                    if nav_sel_dot == Some(i) {
+                        let accent = ui.visuals().selection.stroke.color;
+                        let [r, g, b, _] = accent.to_array();
+                        for k in 1..=4 {
+                            let rad = 6.0 + k as f32 * 2.5;
+                            let a = (120.0 * (1.0 - k as f32 / 5.0)) as u8;
+                            painter.circle_stroke(screen, rad,
+                                egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r, g, b, a)));
+                        }
+                        painter.circle_stroke(screen, 7.0, egui::Stroke::new(2.0, accent));
+                    }
+                    let nav_here = nav_sel_dot == Some(i);
+                    let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
                 }
@@ -11364,6 +11586,21 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                     y_lo + (rect.bottom() - pos.y) / rect.height() * y_range,
                 ]};
 
+                // Gamepad-nav: publish graph geometry (global/screen space) + read
+                // the selected-dot index, same as the float/vec curve bodies.
+                let pass = ui.ctx().cumulative_pass_nr();
+                let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+                    .unwrap_or(egui::emath::TSTransform::IDENTITY);
+                ui.ctx().data_mut(|d| d.insert_temp(
+                    egui::Id::new(("gp_nav_curve_geom", node_id.0)),
+                    (pass, to_global * rect, x_lo, x_hi, y_lo, y_hi)));
+                let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
+                    .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+                let nav_sel_dot: Option<usize> = nav_sel
+                    .filter(|(p, _, _)| *p == pass)
+                    .map(|(_, i, _)| i);
+                let nav_editing_dot: bool = nav_sel.map(|(_, _, e)| e).unwrap_or(false);
+
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
 
@@ -11455,8 +11692,11 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                     for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, Color32::from_gray(200))); }
                 }
 
-                // Alt-drag bias handles
-                let alt_held = ui.input(|i| i.modifiers.alt);
+                // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
+                let nav_bias = ui.ctx().data(|d|
+                    d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
+                    == Some(ui.ctx().cumulative_pass_nr());
+                let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
                 if alt_held && new_edit_pts.len() >= 2 {
                     while new_edit_biases.len() < new_edit_pts.len() - 1 { new_edit_biases.push(0.0); }
                     for seg in 0..(new_edit_pts.len() - 1) {
@@ -11496,7 +11736,24 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                     }
                     if pt_resp.drag_stopped() { ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(oid)); }
                     if pt_resp.secondary_clicked() && edit_pts_r.len() > 2 { remove_idx = Some(i); *pts_changed_ref = true; }
-                    let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
+                    // Gamepad-nav selected-dot highlight (active lane only).
+                    if nav_sel_dot == Some(i) {
+                        let accent = ui.visuals().selection.stroke.color;
+                        let [r8, g8, b8, _] = accent.to_array();
+                        for k in 0..5 {
+                            let t = (k as f32 + 1.0) / 5.0;
+                            let rr = (if nav_editing_dot { 16.0 } else { 12.0 }) * t;
+                            let a = ((if nav_editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
+                            if a == 0 { continue; }
+                            painter.circle_stroke(screen, rr,
+                                egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                        }
+                        painter.circle_filled(screen, if nav_editing_dot { 6.0 } else { 5.0 }, accent);
+                        painter.circle_stroke(screen, if nav_editing_dot { 6.0 } else { 5.0 },
+                            egui::Stroke::new(1.5, Color32::WHITE));
+                    }
+                    let nav_here = nav_sel_dot == Some(i);
+                    let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
                 }
@@ -11894,6 +12151,21 @@ fn paint_twoway_curve_graph(
         y_lo + (rect.bottom() - pos.y) / rect.height() * y_range,
     ]};
 
+    // Gamepad-nav: publish geometry (global/screen space) + read the selected
+    // dot + bias-mode flag, same as the regular/vec curve graph.
+    let pass = ui.ctx().cumulative_pass_nr();
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    ui.ctx().data_mut(|d| d.insert_temp(
+        egui::Id::new(("gp_nav_curve_geom", node_id.0)),
+        (pass, to_global * rect, x_lo, x_hi, y_lo, y_hi)));
+    let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
+        .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+    let nav_sel_dot: Option<usize> = nav_sel.filter(|(p,_,_)| *p == pass).map(|(_,i,_)| i);
+    let nav_editing_dot: bool = nav_sel.map(|(_,_,e)| e).unwrap_or(false);
+    let nav_bias = ui.ctx().data(|d|
+        d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0)))) == Some(pass);
+
     let painter = ui.painter_at(rect);
     let (graph_bg, graph_outline) = graph_chrome(graph_ov);
     painter.rect_filled(rect, 2.0, graph_bg);
@@ -11962,8 +12234,8 @@ fn paint_twoway_curve_graph(
         for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, Color32::from_gray(200))); }
     }
 
-    // Alt-drag bias handles
-    let alt_held = ui.input(|i| i.modifiers.alt);
+    // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
+    let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
     if alt_held && new_edit_pts.len() >= 2 {
         while new_edit_biases.len() < new_edit_pts.len() - 1 { new_edit_biases.push(0.0); }
         for seg in 0..(new_edit_pts.len()-1) {
@@ -12003,7 +12275,24 @@ fn paint_twoway_curve_graph(
         }
         if pt_resp.drag_stopped() { ui.ctx().data_mut(|d| d.remove_temp::<[f32;4]>(oid)); }
         if pt_resp.secondary_clicked() && edit_pts.len() > 2 { remove_idx = Some(i); pts_changed = true; }
-        let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
+        // Gamepad-nav selected-dot highlight (active lane).
+        if nav_sel_dot == Some(i) {
+            let accent = ui.visuals().selection.stroke.color;
+            let [r8, g8, b8, _] = accent.to_array();
+            for k in 0..5 {
+                let t = (k as f32 + 1.0) / 5.0;
+                let rr = (if nav_editing_dot { 16.0 } else { 12.0 }) * t;
+                let a = ((if nav_editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
+                if a == 0 { continue; }
+                painter.circle_stroke(screen, rr,
+                    egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+            }
+            painter.circle_filled(screen, if nav_editing_dot { 6.0 } else { 5.0 }, accent);
+            painter.circle_stroke(screen, if nav_editing_dot { 6.0 } else { 5.0 },
+                egui::Stroke::new(1.5, Color32::WHITE));
+        }
+        let nav_here = nav_sel_dot == Some(i);
+        let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { Color32::from_gray(190) };
         painter.circle_filled(screen, 5.0, col);
         painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
     }
@@ -12138,11 +12427,15 @@ fn render_twoway_hyst_row(
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     let mut changed = false;
+    let mut fr = [egui::Rect::NOTHING; 2];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Hyst").weak());
-        changed |= ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%")).changed();
-        changed |= ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms")).changed();
+        let r = ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%"));
+        fr[0] = r.rect; changed |= r.changed();
+        let r = ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms"));
+        fr[1] = r.rect; changed |= r.changed();
     });
+    publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             if let Some(n) = Number::from_f64(h_pct as f64) { node.params.insert("hysteresis_pct".into(), Value::Number(n)); }
@@ -12715,6 +13008,28 @@ fn mapping_filter_row(
     state
 }
 
+/// Gamepad-nav: cycle a Remapper/Map-Action node's mapping filter by `dir`
+/// (+1 forward, -1 back). Mirrors the chip click order All → Input → Stick,
+/// skipping Stick when no input group is currently latched (matches the UI's
+/// own greyed-Stick guard). The filter state lives in egui temp keyed by
+/// `("fxi_remap_filter", node_id.0)`.
+pub fn nav_cycle_remapper_filter(ctx: &egui::Context, inner_node_id: usize, dir: i32) {
+    let filter_id = egui::Id::new(("fxi_remap_filter", inner_node_id));
+    let mut state: MapFilterState =
+        ctx.data(|d| d.get_temp(filter_id)).unwrap_or_default();
+    let has_group = state.group().is_some();
+    // Available kinds in cycle order; Stick only when a group is latched.
+    let kinds: &[MapFilterKind] = if has_group {
+        &[MapFilterKind::All, MapFilterKind::Input, MapFilterKind::Stick]
+    } else {
+        &[MapFilterKind::All, MapFilterKind::Input]
+    };
+    let cur = kinds.iter().position(|k| *k == state.kind).unwrap_or(0) as i32;
+    let next = (cur + dir).rem_euclid(kinds.len() as i32) as usize;
+    state.kind = kinds[next];
+    ctx.data_mut(|d| d.insert_temp(filter_id, state));
+}
+
 /// Compact pin name for the filter row, kept short so all three chips fit on
 /// one line. Stick cardinals/axes abbreviate to "LS Left", "RS Up", "LS X";
 /// D-Pad to "D-Pad Left"; everything else falls back to the canonical display
@@ -13194,6 +13509,24 @@ fn remapper_mapping_card_pixel(
     let mut changed = false;
     let mut delete_clicked = false;
 
+    // ── Gamepad-nav selection state for this card ───────────────────────────
+    // The nav driver publishes (pass, selected_idx, entered) keyed by node id,
+    // and (pass, field) for the focused header field. We glow the selected card
+    // and (when entered) the focused field; field rects are captured below as
+    // each header control is laid out: [press-mode, time-gap, hold, turbo].
+    let cur_pass = ui.ctx().cumulative_pass_nr();
+    let (nav_card_sel, nav_card_entered) = ui.ctx()
+        .data(|d| d.get_temp::<(u64, usize, bool)>(egui::Id::new(("gp_nav_remap_card", node_id.0))))
+        .filter(|(p, _, _)| cur_pass.saturating_sub(*p) <= 1)
+        .map(|(_, i, e)| (Some(i), e))
+        .unwrap_or((None, false));
+    let nav_card_field: Option<u64> = ui.ctx()
+        .data(|d| d.get_temp::<(u64, u64)>(egui::Id::new(("gp_nav_remap_card_field", node_id.0))))
+        .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 1)
+        .map(|(_, f)| f);
+    let nav_this = nav_card_sel == Some(mapping_idx);
+    let mut nav_field_rects = [egui::Rect::NOTHING; 4];
+
     // Helper to paint a button background with idle + hover states. Matches
     // the visual weight of the header pills so × and mode read as buttons.
     let paint_button_bg = |painter: &egui::Painter, r: egui::Rect, hovered: bool| {
@@ -13223,6 +13556,7 @@ fn remapper_mapping_card_pixel(
     {
         let glyph = remapper_press_mode_glyph(&mode_now);
         let r = egui::Rect::from_min_size(at(33.0, 5.0), sz(20.0, 20.0));
+        nav_field_rects[0] = r;
         let resp = ui.interact(r, ui.id().with(("pm", mapping_idx)),
             egui::Sense::click()).on_hover_text(
                 format!("Press mode: {}", remapper_press_mode_label(&mode_now)));
@@ -13294,6 +13628,7 @@ fn remapper_mapping_card_pixel(
     {
         let outer = egui::Rect::from_min_size(at(61.0, 5.0), sz(137.0, 20.0));
         let value_box = egui::Rect::from_min_size(at(61.0 + 74.0, 5.0), sz(63.0, 20.0));
+        nav_field_rects[1] = value_box;
         let alpha = if gap_applies { 255 } else { 77 };
         let mul = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha);
         painter.rect_filled(outer, RADIUS, mul(C_PILL_DARK));
@@ -13334,6 +13669,7 @@ fn remapper_mapping_card_pixel(
     {
         let outer = egui::Rect::from_min_size(at(206.0, 5.0), sz(62.0, 20.0));
         let cb_rect = egui::Rect::from_min_size(at(206.0 + 45.0, 5.0 + 3.0), sz(14.0, 14.0));
+        nav_field_rects[2] = outer;
         let alpha = if hold_applies { 255 } else { 77 };
         let mul = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha);
         painter.rect_filled(outer, RADIUS, mul(C_PILL_MID));
@@ -13362,6 +13698,7 @@ fn remapper_mapping_card_pixel(
     {
         let outer = egui::Rect::from_min_size(at(274.0, 5.0), sz(80.0, 20.0));
         let cb_rect = egui::Rect::from_min_size(at(274.0 + 63.0, 5.0 + 3.0), sz(14.0, 14.0));
+        nav_field_rects[3] = outer;
         let alpha = if turbo_applies { 255 } else { 77 };
         let mul = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha);
         painter.rect_filled(outer, RADIUS, mul(C_PILL_MID));
@@ -13499,6 +13836,45 @@ fn remapper_mapping_card_pixel(
     } else {
         None
     };
+
+    // ── Gamepad-nav selection: PUBLISH global rects (do NOT paint here) ──────
+    // The remapper body renders inside a child TSTransform layer; painting onto
+    // a foreground layer from in here (and re-locking the ctx graphics RwLock
+    // mid-paint) deadlocks epaint. Also `card_rect`/field rects are in the child
+    // layer's LOCAL space — painting them directly put the glow far off-screen.
+    // So we convert to GLOBAL space and publish; the nav driver (top-level,
+    // outside any sublayer) draws the glow + handles auto-scroll.
+    if nav_this {
+        let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+            .unwrap_or(egui::emath::TSTransform::IDENTITY);
+        let card_g = to_global * card_rect;
+        let field_g = nav_card_field
+            .and_then(|f| nav_field_rects.get(f as usize).copied())
+            .filter(|fr| fr.is_finite() && fr.width() > 0.5)
+            .map(|fr| to_global * fr);
+        let pass = ui.ctx().cumulative_pass_nr();
+        ui.ctx().data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_remap_card_rects", node_id.0)),
+            (pass, card_g, field_g, nav_card_entered)));
+
+        // Auto-scroll: if the selected card is outside the visible band, request
+        // a body-space scroll so it comes into view. This only touches data,
+        // never graphics, so it's deadlock-safe.
+        let clip = ui.clip_rect();
+        let mut need = 0.0f32;
+        if card_rect.top() < clip.top() + 4.0 {
+            need = card_rect.top() - (clip.top() + 4.0);
+        } else if card_rect.bottom() > clip.bottom() - 4.0 {
+            need = card_rect.bottom() - (clip.bottom() - 4.0);
+        }
+        if need.abs() > 1.0 {
+            let body_delta = need / s.max(0.01);
+            ui.ctx().data_mut(|d| d.insert_temp(
+                egui::Id::new(("gp_nav_remap_scroll", node_id.0)),
+                (pass, body_delta)));
+            ui.ctx().request_repaint();
+        }
+    }
 
     MappingCardResult {
         delete_clicked, changed, height: card_h,
@@ -13810,6 +14186,30 @@ fn remapper_pin_display(pin_id: &str) -> String {
     pin_id.to_string()
 }
 
+/// Short, skin-aware label for a nav (face) button used in gamepad-flow status
+/// hints. `which` is "north" / "east" / "south" / "west". Xbox uses letters, PS
+/// the shapes, Switch the swapped A/B layout; anything else falls back to the
+/// cardinal name in brackets. (Reserved for future status-hint use.)
+#[allow(dead_code)]
+fn nav_button_label(skin: super::remapper_icons::Skin, which: &str) -> &'static str {
+    use super::remapper_icons::Skin;
+    match (skin, which) {
+        (Skin::Xbox, "north") => "Y",
+        (Skin::Xbox, "east")  => "B",
+        (Skin::Xbox, "south") => "A",
+        (Skin::Xbox, "west")  => "X",
+        (Skin::Playstation, "north") => "△",
+        (Skin::Playstation, "east")  => "○",
+        (Skin::Playstation, "south") => "✕",
+        (Skin::Playstation, "west")  => "□",
+        (_, "north") => "North",
+        (_, "east")  => "East",
+        (_, "south") => "South",
+        (_, "west")  => "West",
+        _ => "?",
+    }
+}
+
 fn remapper_read_str_array(node: &NodeData, key: &str) -> Vec<String> {
     node.params.get(key)
         .and_then(|v| v.as_array())
@@ -13890,6 +14290,34 @@ fn show_remapper_body(
             }
         }
     }
+
+    // Is gamepad UI-nav active for the upstream device this frame? While it is,
+    // the controller is driving FlexInput's own UI, so the capture state
+    // machine must HOLD a latched combo instead of re-capturing every press.
+    // The app's nav driver pass-stamps a temp flag per nav device each frame.
+    let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
+        let stamp: Option<u64> = ui.ctx().data(|d|
+            d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
+        stamp == Some(ui.ctx().cumulative_pass_nr())
+    }).unwrap_or(false);
+
+    // While UI-nav is active, the auto-capture state machine is suppressed (the
+    // controller drives the UI). The nav driver arms a one-shot capture by
+    // setting `_nav_capture_armed` when the user picks the Learn button with
+    // South. CRUCIAL: the Learn press itself is on the controller, so we must
+    // NOT begin capturing while that press (or anything) is still held — capture
+    // may only open AFTER the device has gone fully idle once post-arm. We track
+    // that with `_nav_arm_idle`: set true the first frame the device is empty
+    // while armed; only then does `capture_ok` allow a capture to start.
+    let nav_capture_armed = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("_nav_capture_armed"))
+        .and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut nav_arm_idle = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("_nav_arm_idle"))
+        .and_then(|v| v.as_bool()).unwrap_or(false);
+    let capture_ok = !nav_active_for_device || (nav_capture_armed && nav_arm_idle);
+    let mut clear_capture_arm = false;
+    let mut set_arm_idle: Option<bool> = None;
 
     // Touchpad zones. Mirror of the rule in `flexinput_engine::eval`
     // (Remapper arm). Two parallel pin variants:
@@ -14036,6 +14464,14 @@ fn show_remapper_body(
     let prev_was_empty = pressed_prev.is_empty();
     let now_empty = pressed_now.is_empty();
 
+    // Arm-idle handshake: once armed, mark idle the first frame the device is
+    // empty (so the Learn press has been released). `capture_ok` next frame then
+    // permits a capture. While armed-but-not-idle, no capture starts.
+    if nav_capture_armed && !nav_arm_idle && now_empty {
+        nav_arm_idle = true;
+        set_arm_idle = Some(true);
+    }
+
     // touch_* pins are transient (a finger occupies one zone at a time),
     // unlike buttons/sticks which are held. Capture must reflect the
     // current touch zones, not the union across the swipe — otherwise
@@ -14044,11 +14480,14 @@ fn show_remapper_body(
     let mut reset_click_mode = false;
     match new_phase.as_str() {
         "capturing" => {
-            if !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
-                // New burst after a previous latched combo → replace.
+            if capture_ok && !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
+                // New burst after a previous latched combo → replace. Skipped
+                // while UI-nav is active (unless a one-shot capture is armed) so
+                // further gamepad use (now driving the UI) doesn't overwrite the
+                // in-progress capture.
                 new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
                 reset_click_mode = true;
-            } else if !pressed_now.is_empty() {
+            } else if capture_ok && !pressed_now.is_empty() {
                 // Drop any transient pins that are no longer asserted —
                 // moving a finger between zones must replace, not accumulate.
                 new_draft_input.retain(|p| {
@@ -14079,29 +14518,41 @@ fn show_remapper_body(
                 new_phase = "ready_to_learn".to_string();
                 // Capture is complete and latched — clear click_mode so a
                 // fresh touch (with no click) on a new capture can be
-                // captured as touch_*.
+                // captured as touch_*. Clear the one-shot arm here (on LATCH,
+                // not at capture start) so the whole chord accumulates first.
                 reset_click_mode = true;
+                if nav_capture_armed { clear_capture_arm = true; }
             }
         }
         "ready_to_learn" => {
-            // A new press from idle (prev empty) re-captures.
-            if !rising.is_empty() && prev_was_empty {
+            // A new press from idle (prev empty) re-captures. Held frozen while
+            // UI-nav is active so the latched combo survives gamepad UI use —
+            // unless a one-shot capture was armed (North / Capture button).
+            if capture_ok && !rising.is_empty() && prev_was_empty {
                 new_phase = "capturing".to_string();
                 new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
                 reset_click_mode = true;
             }
         }
         "learning" => {
-            if !rising.is_empty() && prev_was_empty && !new_draft_output.is_empty() {
+            // Output capture. Gated by `capture_ok` so that in nav mode the
+            // Learn-button press isn't captured — capture only opens after the
+            // arm-idle handshake (Learn press released, device idle once).
+            if capture_ok && !rising.is_empty() && prev_was_empty && !new_draft_output.is_empty() {
                 new_draft_output = rising.iter().map(|s| (*s).clone()).collect();
-            } else if !pressed_now.is_empty() {
+            } else if capture_ok && !pressed_now.is_empty() {
                 for p in &pressed_now {
                     if !new_draft_output.iter().any(|q| q == p) {
                         new_draft_output.push(p.clone());
                     }
                 }
             }
-            // Learning has no auto-latch; user clicks Add or Stop.
+            // Output latches (clears the one-shot arm) when the device returns to
+            // idle with a non-empty output draft, so a held chord accumulates
+            // fully first; the user then clicks Add. Stays in `learning`.
+            if nav_capture_armed && now_empty && !new_draft_output.is_empty() {
+                clear_capture_arm = true;
+            }
         }
         _ => {}
     }
@@ -14114,6 +14565,13 @@ fn show_remapper_body(
         remapper_write_str_array(node, "_pressed_prev", &pressed_now);
         if reset_click_mode {
             node.params.insert("_tp_click_mode".to_string(), Value::from(false));
+        }
+        if let Some(v) = set_arm_idle {
+            node.params.insert("_nav_arm_idle".to_string(), Value::from(v));
+        }
+        if clear_capture_arm {
+            node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
+            node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
         }
     }
 
@@ -14142,23 +14600,25 @@ fn show_remapper_body(
         ui.set_min_width(BODY_W);
 
         // Status line.
-        let status = if !wired {
-            ("Connect Auto-Map wire to start mapping", Color32::from_rgb(232, 180, 65))
+        let blue = Color32::from_rgb(106, 167, 255);
+        let green = Color32::from_rgb(127, 201, 127);
+        let (status_txt, status_col): (String, Color32) = if !wired {
+            ("Connect Auto-Map wire to start mapping".into(), Color32::from_rgb(232, 180, 65))
         } else {
             match new_phase.as_str() {
                 "capturing" if new_draft_input.is_empty() =>
-                    ("Press a button or combination", Color32::from_rgb(106, 167, 255)),
+                    ("Press a button or combination".into(), blue),
                 "ready_to_learn" =>
-                    ("Captured — click Learn (press again to re-capture)", Color32::from_rgb(127, 201, 127)),
+                    ("Captured — click Learn (press again to re-capture)".into(), green),
                 "learning" if new_draft_output.is_empty() =>
-                    ("Press target key or button", Color32::from_rgb(106, 167, 255)),
+                    ("Press target key or button".into(), blue),
                 "learning" =>
-                    ("Captured output — click Add", Color32::from_rgb(127, 201, 127)),
-                _ => ("", Color32::TRANSPARENT),
+                    ("Captured output — click Add".into(), green),
+                _ => (String::new(), Color32::TRANSPARENT),
             }
         };
-        if !status.0.is_empty() {
-            ui.label(egui::RichText::new(status.0).size(13.0).color(status.1));
+        if !status_txt.is_empty() {
+            ui.label(egui::RichText::new(status_txt).size(13.0).color(status_col));
         }
         let _ = upstream_dev_id;
         let _ = &pressed_now;
@@ -14187,35 +14647,90 @@ fn show_remapper_body(
 
         ui.add_space(2.0);
 
-        // Action row
+        // Action row. "Learn" is context-aware:
+        //   • capturing + empty draft → arm INPUT capture (needed in nav mode
+        //     where auto-capture is suppressed; harmless otherwise).
+        //   • ready_to_learn → start OUTPUT learning.
+        //   • learning → Stop.
+        // The three controls (Learn / Special / Add) are also gamepad-activatable
+        // via `_nav_act_learn|special|add` flags the nav driver sets on South,
+        // and their rects are published so the driver can glow the focused one.
         let in_learning = new_phase == "learning";
         let learn_enabled = new_phase == "ready_to_learn";
-        let add_enabled = in_learning && !new_draft_output.is_empty();
+        let need_input_arm = new_phase != "ready_to_learn" && new_phase != "learning"
+            && new_draft_input.is_empty();
+        let add_enabled = (in_learning && !new_draft_output.is_empty())
+            || (learn_enabled && !new_draft_output.is_empty());
+
+        // A draft exists if either chord has content — Clear is shown then.
+        let has_draft = !new_draft_input.is_empty() || !new_draft_output.is_empty()
+            || new_phase == "ready_to_learn" || new_phase == "learning";
+
+        // Consume one-shot gamepad activation flags.
+        let (act_learn, act_special, act_add, act_clear) = {
+            let n = snarl.get_node(node_id);
+            let g = |k: &str| n.and_then(|n| n.params.get(k)).and_then(|v| v.as_bool()).unwrap_or(false);
+            (g("_nav_act_learn"), g("_nav_act_special"), g("_nav_act_add"), g("_nav_act_clear"))
+        };
+        if act_learn || act_special || act_add || act_clear {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("_nav_act_learn".into(), Value::from(false));
+                node.params.insert("_nav_act_special".into(), Value::from(false));
+                node.params.insert("_nav_act_add".into(), Value::from(false));
+                node.params.insert("_nav_act_clear".into(), Value::from(false));
+            }
+        }
+
+        let mut learn_rect = egui::Rect::NOTHING;
+        let mut special_rect = egui::Rect::NOTHING;
+        let mut add_rect = egui::Rect::NOTHING;
+        let mut clear_rect = egui::Rect::NOTHING;
         ui.horizontal(|ui| {
             let learn_label = if in_learning { "Stop" } else { "Learn" };
             let learn_btn = ui.add_enabled(
-                learn_enabled || in_learning,
+                true,
                 egui::Button::new(egui::RichText::new(learn_label).size(13.0)),
             );
-            if learn_btn.clicked() {
+            learn_rect = learn_btn.rect;
+            if learn_btn.clicked() || act_learn {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     if in_learning {
                         // Stop → keep latched input, drop output draft.
                         node.params.insert("ui_phase".to_string(), Value::String("ready_to_learn".to_string()));
                         remapper_write_str_array(node, "draft_output", &[]);
-                    } else {
+                    } else if learn_enabled {
+                        // Input latched → start output learning + arm capture.
+                        // arm_idle=false so capture waits for the Learn press to
+                        // release before it begins.
                         node.params.insert("ui_phase".to_string(), Value::String("learning".to_string()));
                         remapper_write_str_array(node, "draft_output", &[]);
+                        node.params.insert("_nav_capture_armed".to_string(), Value::from(true));
+                        node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
+                    } else {
+                        // Start input capture: arm a one-shot so the next chord
+                        // is captured (blocks nav until release+latch).
+                        node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
+                        remapper_write_str_array(node, "draft_input", &[]);
+                        node.params.insert("_nav_capture_armed".to_string(), Value::from(true));
+                        node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
                     }
                 }
+                let _ = need_input_arm;
             }
 
             // Special dropdown — appends pins that can't be press-captured (mouse
             // buttons / scroll / explicit modifiers) directly to draft_output.
-            // Only meaningful during learning.
-            if in_learning {
+            // Available once input is latched (ready_to_learn) AND during output
+            // learning, so a gamepad user can pick a mouse action BEFORE (or
+            // instead of) learning a gamepad output chord. Gamepad South (via
+            // `_nav_act_special`) opens the popup.
+            if in_learning || learn_enabled {
+                let combo_id = egui::Id::new((node_id, "remapper_special"));
+                if act_special {
+                    ui.memory_mut(|m| m.open_popup(combo_id));
+                }
                 let mut to_append: Option<&'static str> = None;
-                egui::ComboBox::from_id_salt((node_id, "remapper_special"))
+                let combo = egui::ComboBox::from_id_salt((node_id, "remapper_special"))
                     .selected_text(egui::RichText::new("Special…").size(13.0))
                     .width(130.0)
                     .show_ui(ui, |ui| {
@@ -14226,19 +14741,44 @@ fn show_remapper_body(
                             }
                         }
                     });
+                special_rect = combo.response.rect;
                 if let Some(id) = to_append {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         let mut arr = new_draft_output.clone();
                         arr.push(id.to_string());
                         remapper_write_str_array(node, "draft_output", &arr);
+                        // Picking an output from ready_to_learn moves us into the
+                        // learning phase so the chosen output is shown + Add-able.
+                        if learn_enabled {
+                            node.params.insert("ui_phase".to_string(), Value::String("learning".to_string()));
+                        }
+                    }
+                }
+            }
+
+            // Clear button — abandons the in-progress capture/learn and starts
+            // over (back to input capturing, drafts emptied). Shown whenever a
+            // draft exists so a botched capture can be reset WITHOUT finishing.
+            if has_draft {
+                let clear_btn = ui.add(egui::Button::new(egui::RichText::new("Clear").size(13.0)));
+                clear_rect = clear_btn.rect;
+                if clear_btn.clicked() || act_clear {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
+                        remapper_write_str_array(node, "draft_input", &[]);
+                        remapper_write_str_array(node, "draft_output", &[]);
+                        remapper_write_str_array(node, "_pressed_prev", &[]);
+                        node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
+                        node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
+                        node.params.insert("_tp_click_mode".to_string(), Value::from(false));
                     }
                 }
             }
 
             // Add button — appends mapping and resets drafts.
-            if ui.add_enabled(add_enabled, egui::Button::new(egui::RichText::new("Add").size(13.0)))
-                .clicked()
-            {
+            let add_btn = ui.add_enabled(add_enabled, egui::Button::new(egui::RichText::new("Add").size(13.0)));
+            add_rect = add_btn.rect;
+            if (add_btn.clicked() || act_add) && add_enabled {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     let in_arr: Vec<Value> = new_draft_input.iter()
                         .map(|s| Value::String(s.clone())).collect();
@@ -14256,6 +14796,10 @@ fn show_remapper_body(
                 }
             }
         });
+        // Publish action-button rects (global) so the nav driver can glow the
+        // focused one. Order MUST match `nav_remap_action_items`:
+        // Learn, Clear, Special, Add (entries omitted in phases where absent).
+        publish_nav_action_rects(ui, node_id, &[learn_rect, clear_rect, special_rect, add_rect]);
 
         // Mapping list.
         if !mappings.is_empty() {
@@ -14270,9 +14814,16 @@ fn show_remapper_body(
             // virtual sink, and the OS would then report it as "pressed",
             // flickering the filter from source to destination. The source side
             // is all we want to filter by.
-            let filter_live: Vec<String> = match (&upstream_dev_id, wired) {
-                (Some(dev), true) => remapper_pressed_now(live_signals, dev),
-                _ => Vec::new(),
+            // While UI-nav drives the controller, live presses are navigation,
+            // not a filter intent — so filter relative to the LAST CAPTURED chord
+            // (the Learn draft) instead. Outside nav, follow live source input.
+            let filter_live: Vec<String> = if nav_active_for_device {
+                new_draft_input.clone()
+            } else {
+                match (&upstream_dev_id, wired) {
+                    (Some(dev), true) => remapper_pressed_now(live_signals, dev),
+                    _ => Vec::new(),
+                }
             };
             let filter = mapping_filter_row(
                 ui,
@@ -14414,6 +14965,31 @@ fn show_map_action_body(
         _ => Vec::new(),
     };
 
+    // Hold the latched combo while gamepad UI-nav is active for this device
+    // (mirror of the Remapper guard). Pass-stamped per device by the app.
+    let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
+        let stamp: Option<u64> = ui.ctx().data(|d|
+            d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
+        stamp == Some(ui.ctx().cumulative_pass_nr())
+    }).unwrap_or(false);
+    // One-shot capture arm: in nav mode, auto-capture is suppressed so the
+    // gamepad can drive the UI without polluting the mapping. The "Capture"
+    // button (clickable via gamepad South) sets `_nav_capture_armed`, which lets
+    // the very next combo be captured despite nav mode; it auto-clears once a
+    // combo latches (ready_to_add).
+    let nav_capture_armed = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("_nav_capture_armed"))
+        .and_then(|v| v.as_bool()).unwrap_or(false);
+    // Arm-idle handshake (see remapper body): capture only opens after the Learn
+    // press has released and the device went idle once post-arm.
+    let mut nav_arm_idle = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("_nav_arm_idle"))
+        .and_then(|v| v.as_bool()).unwrap_or(false);
+    // Capture is allowed when nav isn't active, OR when armed AND idle-seen.
+    let capture_ok = !nav_active_for_device || (nav_capture_armed && nav_arm_idle);
+    let mut clear_capture_arm = false;
+    let mut set_arm_idle: Option<bool> = None;
+
     // Prepare draft state for capture logic.
     let mut new_phase = phase.clone();
     let mut new_draft_input = draft_input.clone();
@@ -14498,13 +15074,20 @@ fn show_map_action_body(
     let prev_was_empty = pressed_prev.is_empty();
     let now_empty = pressed_now.is_empty();
 
+    // Arm-idle: mark idle the first frame the device is empty after arming, so
+    // the Learn press has released before capture opens.
+    if nav_capture_armed && !nav_arm_idle && now_empty {
+        nav_arm_idle = true;
+        set_arm_idle = Some(true);
+    }
+
     let is_transient = |p: &str| p == "touch_left" || p == "touch_center" || p == "touch_right";
     match new_phase.as_str() {
         "capturing" => {
-            if !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
+            if capture_ok && !rising.is_empty() && prev_was_empty && !new_draft_input.is_empty() {
                 new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
                 reset_click_mode = true;
-            } else if !pressed_now.is_empty() {
+            } else if capture_ok && !pressed_now.is_empty() {
                 new_draft_input.retain(|p| { !is_transient(p) || pressed_now.iter().any(|q| q == p) });
                 for p in &pressed_now {
                     if !new_draft_input.iter().any(|q| q == p) { new_draft_input.push(p.clone()); }
@@ -14531,10 +15114,12 @@ fn show_map_action_body(
                 // Clear sticky click_mode so the next capture (e.g. a fresh
                 // touch without click) can register touch_* zones again.
                 reset_click_mode = true;
+                // A combo latched → disarm the one-shot nav capture.
+                if nav_capture_armed { clear_capture_arm = true; }
             }
         }
         "ready_to_add" => {
-            if !rising.is_empty() && prev_was_empty {
+            if capture_ok && !rising.is_empty() && prev_was_empty {
                 new_phase = "capturing".to_string();
                 new_draft_input = rising.iter().map(|s| (*s).clone()).collect();
                 reset_click_mode = true;
@@ -14565,6 +15150,13 @@ fn show_map_action_body(
         if reset_click_mode {
             node.params.insert("_tp_click_mode".to_string(), Value::from(false));
         }
+        if let Some(v) = set_arm_idle {
+            node.params.insert("_nav_arm_idle".to_string(), Value::from(v));
+        }
+        if clear_capture_arm {
+            node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
+            node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
+        }
     }
 
     // Render
@@ -14580,17 +15172,20 @@ fn show_map_action_body(
         |ui| {
         ui.set_min_width(BODY_W);
 
-        // Status line
-        let status = if !wired {
-            ("Connect Auto-Map wire to start mapping", Color32::from_rgb(232, 180, 65))
+        // Status line.
+        let blue = Color32::from_rgb(106, 167, 255);
+        let green = Color32::from_rgb(127, 201, 127);
+        let (status_txt, status_col): (String, Color32) = if !wired {
+            ("Connect Auto-Map wire to start mapping".into(), Color32::from_rgb(232, 180, 65))
         } else {
             match new_phase.as_str() {
-                "capturing" if new_draft_input.is_empty() => ("Press a button or combination", Color32::from_rgb(106, 167, 255)),
-                "ready_to_add" => ("Captured — click Add", Color32::from_rgb(127, 201, 127)),
-                _ => ("", Color32::TRANSPARENT),
+                "capturing" if new_draft_input.is_empty() => ("Press Learn, then a button or combination".into(), blue),
+                "capturing" => ("Press your input chord; release to capture".into(), blue),
+                "ready_to_add" => ("Captured — click Add".into(), green),
+                _ => (String::new(), Color32::TRANSPARENT),
             }
         };
-        if !status.0.is_empty() { ui.label(egui::RichText::new(status.0).size(13.0).color(status.1)); }
+        if !status_txt.is_empty() { ui.label(egui::RichText::new(status_txt).size(13.0).color(status_col)); }
         let _ = upstream_dev_id;
         let _ = &pressed_now;
 
@@ -14600,12 +15195,55 @@ fn show_map_action_body(
 
         ui.add_space(2.0);
 
-        // Action row: only Add
-        // For Map Action we allow Add as soon as a capture exists — enable
-        // whenever we're wired and have a non-empty draft input.
+        // Action row: Learn (arm input capture), Clear, Add. All gamepad-
+        // activatable via `_nav_act_*` flags; rects published for nav glow.
         let add_enabled = wired && !new_draft_input.is_empty();
+        let has_draft = !new_draft_input.is_empty();
+        let (act_learn, act_add, act_clear) = {
+            let n = snarl.get_node(node_id);
+            let g = |k: &str| n.and_then(|n| n.params.get(k)).and_then(|v| v.as_bool()).unwrap_or(false);
+            (g("_nav_act_learn"), g("_nav_act_add"), g("_nav_act_clear"))
+        };
+        if act_learn || act_add || act_clear {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("_nav_act_learn".into(), Value::from(false));
+                node.params.insert("_nav_act_add".into(), Value::from(false));
+                node.params.insert("_nav_act_clear".into(), Value::from(false));
+            }
+        }
+        let mut learn_rect = egui::Rect::NOTHING;
+        let mut clear_rect = egui::Rect::NOTHING;
+        let mut add_rect = egui::Rect::NOTHING;
         ui.horizontal(|ui| {
-            if ui.add_enabled(add_enabled, egui::Button::new(egui::RichText::new("Add").size(13.0))).clicked() {
+            let learn_btn = ui.add_enabled(wired,
+                egui::Button::new(egui::RichText::new("Learn").size(13.0)));
+            learn_rect = learn_btn.rect;
+            if (learn_btn.clicked() || act_learn) && wired {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
+                    remapper_write_str_array(node, "draft_input", &[]);
+                    remapper_write_str_array(node, "_pressed_prev", &[]);
+                    node.params.insert("_nav_capture_armed".to_string(), Value::from(true));
+                    node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
+                }
+            }
+            if has_draft {
+                let clear_btn = ui.add(egui::Button::new(egui::RichText::new("Clear").size(13.0)));
+                clear_rect = clear_btn.rect;
+                if clear_btn.clicked() || act_clear {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("ui_phase".to_string(), Value::String("capturing".to_string()));
+                        remapper_write_str_array(node, "draft_input", &[]);
+                        remapper_write_str_array(node, "_pressed_prev", &[]);
+                        node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
+                        node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
+                        node.params.insert("_tp_click_mode".to_string(), Value::from(false));
+                    }
+                }
+            }
+            let add_btn = ui.add_enabled(add_enabled, egui::Button::new(egui::RichText::new("Add").size(13.0)));
+            add_rect = add_btn.rect;
+            if (add_btn.clicked() || act_add) && add_enabled {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     let arr: Vec<Value> = new_draft_input.iter().map(|s| Value::String(s.clone())).collect();
                     let mut all = mappings.clone();
@@ -14616,9 +15254,18 @@ fn show_map_action_body(
                     remapper_write_str_array(node, "_pressed_prev", &[]);
                     // Clear sticky click_mode so the next capture starts fresh.
                     node.params.insert("_tp_click_mode".to_string(), Value::from(false));
+                    node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
                 }
             }
+            // Show a "Capturing…" hint while a one-shot arm is pending so the
+            // user knows to press their chord now.
+            if nav_capture_armed && new_draft_input.is_empty() {
+                ui.label(egui::RichText::new("Capturing… press your input")
+                    .size(12.0).color(Color32::from_rgb(106, 167, 255)));
+            }
         });
+        // Map Action action order: Learn, Clear, Add (no Special).
+        publish_nav_action_rects(ui, node_id, &[learn_rect, clear_rect, add_rect]);
 
         // Mapping list: each mapping is Array<String> (input chord)
         if !mappings.is_empty() {
@@ -14627,10 +15274,16 @@ fn show_map_action_body(
 
             // Filter row — SOURCE pins only (upstream device on the wire), not
             // OS KB/M, so an injected destination key never flickers the
-            // filter. See the Remapper note for the full rationale.
-            let filter_live: Vec<String> = match (&upstream_dev_id, wired) {
-                (Some(dev), true) => remapper_pressed_now(live_signals, dev),
-                _ => Vec::new(),
+            // filter. See the Remapper note for the full rationale. In UI-nav
+            // mode, filter by the last captured chord (Learn) rather than live
+            // navigation presses.
+            let filter_live: Vec<String> = if nav_active_for_device {
+                new_draft_input.clone()
+            } else {
+                match (&upstream_dev_id, wired) {
+                    (Some(dev), true) => remapper_pressed_now(live_signals, dev),
+                    _ => Vec::new(),
+                }
             };
             let filter = mapping_filter_row(
                 ui,

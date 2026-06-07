@@ -56,13 +56,21 @@
               }
             ],
             "params": {
+              "out_max": 1.0,
+              "show_grid_labels": true,
+              "biases": [
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
               "scale_t": -0.7604460716247559,
-              "snap": false,
-              "in_max": 1.0,
               "show_scaled_grid": true,
-              "trail_ms": 300,
-              "grid_y": 4,
               "grid_x": 4,
+              "in_max": 1.0,
+              "trail_ms": 300,
+              "snap": false,
+              "grid_y": 4,
               "points": [
                 [
                   0.0,
@@ -84,14 +92,6 @@
                   1.0,
                   1.0
                 ]
-              ],
-              "show_grid_labels": true,
-              "out_max": 1.0,
-              "biases": [
-                0.0,
-                0.0,
-                0.0,
-                0.0
               ]
             }
           },
@@ -153,13 +153,10 @@
               }
             ],
             "params": {
-              "mappings": [],
               "_pressed_prev": [],
-              "_tp_click_mode": false,
-              "draft_input": [
-                "btn_lt_dig"
-              ],
-              "ui_phase": "ready_to_add"
+              "mappings": [],
+              "ui_phase": "capturing",
+              "draft_input": []
             }
           },
           "pos": {
@@ -252,17 +249,14 @@
               }
             ],
             "params": {
+              "grid_x": 4,
               "out_max": 1.0,
+              "scale_t": 0.0,
+              "show_grid_labels": true,
+              "trail_ms": 300,
               "biases": [
                 0.0
               ],
-              "snap": false,
-              "scale_t": 0.0,
-              "show_scaled_grid": true,
-              "trail_ms": 300,
-              "show_grid_labels": true,
-              "grid_x": 4,
-              "grid_y": 4,
               "in_max": 1.0,
               "points": [
                 [
@@ -273,7 +267,10 @@
                   1.0,
                   1.0
                 ]
-              ]
+              ],
+              "grid_y": 4,
+              "show_scaled_grid": true,
+              "snap": false
             }
           },
           "pos": {
@@ -302,14 +299,11 @@
               }
             ],
             "params": {
-              "grid_y": 4,
               "scale_t": -0.5137927532196045,
-              "show_grid_labels": true,
-              "trail_ms": 300,
+              "grid_y": 4,
               "grid_x": 4,
-              "show_scaled_grid": true,
-              "snap": false,
-              "in_max": 1.0,
+              "trail_ms": 300,
+              "show_grid_labels": true,
               "points": [
                 [
                   0.0,
@@ -324,11 +318,14 @@
                   1.0
                 ]
               ],
+              "show_scaled_grid": true,
+              "in_max": 1.0,
               "out_max": 1.0,
               "biases": [
                 -0.03879748284816742,
                 0.0
-              ]
+              ],
+              "snap": false
             }
           },
           "pos": {
@@ -351,7 +348,7 @@
               }
             ],
             "params": {
-              "value": 0.40237781405448914,
+              "value": 0.3565569818019867,
               "bipolar": true
             }
           },
@@ -376,9 +373,9 @@
             ],
             "params": {
               "ui_toggle_seq": 8,
-              "caption_on": "on",
               "active": false,
-              "caption_off": "off"
+              "caption_off": "off",
+              "caption_on": "on"
             }
           },
           "pos": {
@@ -536,32 +533,32 @@
               }
             ],
             "params": {
-              "_lean_right_phase": "idle",
-              "inv_accel_z": false,
-              "spike_sensitivity": 100.0,
-              "reset_ease_in": 0.10000000149011612,
+              "inv_accel_x": false,
+              "spike_suppress": true,
+              "_lean_left_draft": [
+                "key_ctrl"
+              ],
               "steering_exclude_y": false,
-              "lean_threshold": 0.20000000298023224,
               "_lean_left_pressed_prev": [],
               "lean_left": [],
+              "recenter_strength": 0.0,
+              "reset_ease_in": 0.10000000149011612,
               "inv_yaw": false,
-              "lean_right": [],
+              "inv_accel_z": false,
+              "lean_threshold": 0.20000000298023224,
               "_lean_right_pressed_prev": [],
+              "spike_sensitivity": 100.0,
+              "lean_right": [],
               "family": "pointer",
-              "inv_roll": false,
-              "inv_accel_x": false,
+              "_lean_right_phase": "idle",
               "inv_accel_y": false,
               "inv_pitch": false,
+              "inv_roll": false,
               "_lean_right_draft": [
                 "key_ctrl"
               ],
-              "spike_suppress": true,
-              "recenter_strength": 0.0,
               "axis": "player",
-              "_lean_left_phase": "idle",
-              "_lean_left_draft": [
-                "key_ctrl"
-              ]
+              "_lean_left_phase": "idle"
             }
           },
           "pos": {
@@ -643,13 +640,13 @@
                 "optional": false
               },
               {
-                "name": "Left Trigger (analog)",
-                "signal_type": "Float",
+                "name": "LT (dig)",
+                "signal_type": "Bool",
                 "optional": false
               },
               {
-                "name": "Right Trigger (analog)",
-                "signal_type": "Float",
+                "name": "RT (dig)",
+                "signal_type": "Bool",
                 "optional": false
               }
             ],
@@ -667,8 +664,8 @@
                 "right_stick",
                 "mouse_left",
                 "mouse_right",
-                "left_trigger",
-                "right_trigger"
+                "btn_lt_dig",
+                "btn_rt_dig"
               ]
             }
           },
@@ -747,8 +744,8 @@
               }
             ],
             "params": {
-              "pin_index": 0,
-              "signal_type": "AutoMap"
+              "signal_type": "AutoMap",
+              "pin_index": 0
             }
           },
           "pos": {
@@ -771,8 +768,8 @@
             ],
             "outputs": [],
             "params": {
-              "pin_index": 0,
-              "signal_type": "AutoMap"
+              "signal_type": "AutoMap",
+              "pin_index": 0
             }
           },
           "pos": {
@@ -806,10 +803,10 @@
               }
             ],
             "params": {
-              "caption_off": "off",
+              "ui_toggle_seq": 17,
               "caption_on": "on",
-              "active": true,
-              "ui_toggle_seq": 16
+              "caption_off": "off",
+              "active": false
             }
           },
           "pos": {
@@ -880,12 +877,12 @@
             ],
             "params": {
               "selected_index": 1,
+              "box_width": 161.375,
               "options": [
                 "Hold to Activate",
                 "Hold to Suppress",
                 "Toggle"
-              ],
-              "box_width": 161.375
+              ]
             }
           },
           "pos": {
@@ -1052,10 +1049,10 @@
               }
             ],
             "params": {
+              "active": false,
               "caption_off": "off",
               "ui_toggle_seq": 9,
-              "caption_on": "on",
-              "active": false
+              "caption_on": "on"
             }
           },
           "pos": {
@@ -1143,14 +1140,11 @@
               }
             ],
             "params": {
+              "draft_input": [],
               "draft_output": [],
-              "_tp_click_mode": false,
-              "ui_phase": "ready_to_learn",
+              "mappings": [],
               "_pressed_prev": [],
-              "draft_input": [
-                "btn_lt_dig"
-              ],
-              "mappings": []
+              "ui_phase": "capturing"
             }
           },
           "pos": {
@@ -1222,9 +1216,9 @@
             ],
             "params": {
               "active": false,
+              "caption_on": "",
               "svg_on_rev": 2,
-              "caption_pos_on": "right",
-              "caption_on": ""
+              "caption_pos_on": "right"
             }
           },
           "pos": {
@@ -1290,13 +1284,10 @@
               }
             ],
             "params": {
-              "draft_input": [
-                "btn_lt_dig"
-              ],
               "_pressed_prev": [],
-              "ui_phase": "ready_to_add",
               "mappings": [],
-              "_tp_click_mode": false
+              "ui_phase": "capturing",
+              "draft_input": []
             }
           },
           "pos": {
@@ -1374,8 +1365,8 @@
             "params": {}
           },
           "pos": {
-            "x": -1583.648,
-            "y": 1031.3909
+            "x": -1662.0221,
+            "y": 997.92773
           },
           "open": true
         },
@@ -1492,8 +1483,8 @@
             "params": {}
           },
           "pos": {
-            "x": -1568.1166,
-            "y": 1196.9009
+            "x": -1668.5059,
+            "y": 1129.9746
           },
           "open": true
         },
@@ -1612,72 +1603,12 @@
       "wires": [
         {
           "out_pin": {
-            "node": 25,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 23,
-            "input": 4
-          }
-        },
-        {
-          "out_pin": {
-            "node": 11,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 29,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 4,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 12,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
             "node": 14,
-            "output": 1
+            "output": 3
           },
           "in_pin": {
-            "node": 6,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 29,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 33,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 39,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 42,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
             "node": 37,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 4
+            "input": 1
           }
         },
         {
@@ -1692,72 +1623,12 @@
         },
         {
           "out_pin": {
-            "node": 27,
+            "node": 2,
             "output": 0
           },
           "in_pin": {
-            "node": 37,
+            "node": 28,
             "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 5,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 38,
-            "input": 4
-          }
-        },
-        {
-          "out_pin": {
-            "node": 25,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 3,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 15,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 30,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 20,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 18,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 42,
-            "output": 2
-          },
-          "in_pin": {
-            "node": 43,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 31,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 0,
-            "input": 1
           }
         },
         {
@@ -1772,16 +1643,6 @@
         },
         {
           "out_pin": {
-            "node": 14,
-            "output": 3
-          },
-          "in_pin": {
-            "node": 37,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
             "node": 33,
             "output": 0
           },
@@ -1792,11 +1653,41 @@
         },
         {
           "out_pin": {
-            "node": 24,
+            "node": 30,
             "output": 0
           },
           "in_pin": {
+            "node": 36,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 43,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 20,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
             "node": 23,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 1,
             "input": 1
           }
         },
@@ -1812,62 +1703,22 @@
         },
         {
           "out_pin": {
-            "node": 36,
+            "node": 15,
             "output": 0
           },
           "in_pin": {
-            "node": 16,
+            "node": 2,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 17,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 33,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 21,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 31,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 4,
+            "node": 40,
             "output": 0
           },
           "in_pin": {
             "node": 13,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 30,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 36,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 2,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 32,
-            "input": 1
+            "input": 6
           }
         },
         {
@@ -1886,68 +1737,68 @@
             "output": 0
           },
           "in_pin": {
-            "node": 12,
+            "node": 42,
             "input": 1
           }
         },
         {
           "out_pin": {
-            "node": 28,
+            "node": 17,
             "output": 0
           },
           "in_pin": {
-            "node": 18,
+            "node": 33,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 4,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 27,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 37,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 24,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 23,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 5,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 38,
+            "input": 4
+          }
+        },
+        {
+          "out_pin": {
+            "node": 21,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 31,
             "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 8,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 10,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 15,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 2,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 39,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 38,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 18,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 29,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 6,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 38,
-            "input": 3
           }
         },
         {
@@ -1962,51 +1813,31 @@
         },
         {
           "out_pin": {
-            "node": 1,
-            "output": 0
+            "node": 11,
+            "output": 5
           },
           "in_pin": {
-            "node": 42,
-            "input": 1
+            "node": 36,
+            "input": 2
           }
         },
         {
           "out_pin": {
-            "node": 10,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 43,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 23,
+            "node": 25,
             "output": 0
           },
           "in_pin": {
             "node": 3,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 17,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 31,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 23,
+            "node": 29,
             "output": 0
           },
           "in_pin": {
-            "node": 1,
+            "node": 33,
             "input": 1
           }
         },
@@ -2022,12 +1853,172 @@
         },
         {
           "out_pin": {
-            "node": 26,
+            "node": 17,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 31,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 35,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 32,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 10,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 9,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 8,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 10,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 37,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 4
+          }
+        },
+        {
+          "out_pin": {
+            "node": 23,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 3,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 6,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 38,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 42,
+            "output": 3
+          },
+          "in_pin": {
+            "node": 41,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 4,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 11,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 29,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 30,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 28,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 36,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 16,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 25,
             "output": 0
           },
           "in_pin": {
             "node": 23,
-            "input": 3
+            "input": 4
+          }
+        },
+        {
+          "out_pin": {
+            "node": 39,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 38,
+            "input": 0
           }
         },
         {
@@ -2042,12 +2033,42 @@
         },
         {
           "out_pin": {
-            "node": 0,
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 1,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
             "output": 1
           },
           "in_pin": {
-            "node": 1,
+            "node": 6,
             "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 31,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 0,
+            "input": 1
           }
         },
         {
@@ -2062,22 +2083,22 @@
         },
         {
           "out_pin": {
-            "node": 40,
-            "output": 0
+            "node": 33,
+            "output": 1
           },
           "in_pin": {
-            "node": 13,
-            "input": 6
+            "node": 21,
+            "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 14,
-            "output": 4
+            "node": 7,
+            "output": 0
           },
           "in_pin": {
-            "node": 40,
-            "input": 1
+            "node": 23,
+            "input": 0
           }
         },
         {
@@ -2086,17 +2107,17 @@
             "output": 0
           },
           "in_pin": {
-            "node": 28,
-            "input": 0
+            "node": 32,
+            "input": 1
           }
         },
         {
           "out_pin": {
             "node": 42,
-            "output": 1
+            "output": 2
           },
           "in_pin": {
-            "node": 4,
+            "node": 43,
             "input": 1
           }
         },
@@ -2112,51 +2133,51 @@
         },
         {
           "out_pin": {
-            "node": 11,
-            "output": 5
-          },
-          "in_pin": {
-            "node": 36,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 15,
+            "node": 38,
             "output": 0
           },
           "in_pin": {
-            "node": 13,
+            "node": 12,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 15,
-            "output": 0
+            "node": 42,
+            "output": 1
           },
           "in_pin": {
-            "node": 35,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 2,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 18,
+            "node": 4,
             "input": 1
           }
         },
         {
           "out_pin": {
-            "node": 15,
+            "node": 10,
             "output": 0
           },
           "in_pin": {
-            "node": 14,
+            "node": 43,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 41,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 9,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
             "input": 0
           }
         },
@@ -2172,62 +2193,62 @@
         },
         {
           "out_pin": {
-            "node": 9,
+            "node": 18,
             "output": 0
           },
           "in_pin": {
-            "node": 4,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 43,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 3
-          }
-        },
-        {
-          "out_pin": {
-            "node": 7,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 23,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 41,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 42,
-            "output": 3
-          },
-          "in_pin": {
-            "node": 41,
+            "node": 29,
             "input": 1
           }
         },
         {
           "out_pin": {
-            "node": 32,
+            "node": 26,
             "output": 0
           },
           "in_pin": {
-            "node": 18,
+            "node": 23,
             "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 39,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 42,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 4
+          },
+          "in_pin": {
+            "node": 40,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 0,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 1,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 14,
+            "input": 0
           }
         },
         {
@@ -2238,36 +2259,6 @@
           "in_pin": {
             "node": 13,
             "input": 5
-          }
-        },
-        {
-          "out_pin": {
-            "node": 33,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 21,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 10,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 9,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 38,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 12,
-            "input": 0
           }
         }
       ]
@@ -3012,11 +3003,11 @@
           "inner_node_id": 20,
           "element_id": "selection",
           "pos": [
-            436.0,
-            224.0
+            432.0,
+            220.0
           ],
           "size": [
-            104.0,
+            92.0,
             18.0
           ]
         }
