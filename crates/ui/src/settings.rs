@@ -64,7 +64,8 @@ impl PinShortcut {
         if self.shift { parts.push("Shift"); }
         if self.alt   { parts.push("Alt"); }
         if self.win   { parts.push("Win"); }
-        let key = self.key.as_deref().unwrap_or("…");
+        let key_raw = self.key.as_deref().unwrap_or("…");
+        let key = match key_raw { "Backtick" => "~", other => other };
         if parts.is_empty() { key.to_string() } else { format!("{}+{}", parts.join("+"), key) }
     }
 }
@@ -194,6 +195,20 @@ pub struct AppSettings {
     /// preset dropdown. Order is user-controlled via drag handles.
     #[serde(default)]
     pub favorite_presets: Vec<std::path::PathBuf>,
+    /// Optional gamepad button combo (canonical pin ids, e.g. `["btn_lb",
+    /// "btn_rb", "btn_back"]`) that toggles SEE-THROUGH mode. Learned via a
+    /// chord-capture button in Settings. None = unassigned.
+    #[serde(default)]
+    pub seethrough_chord: Option<Vec<String>>,
+    /// Optional gamepad button combo that toggles PANIC mode. None = unassigned.
+    #[serde(default)]
+    pub panic_chord: Option<Vec<String>>,
+    /// When true, the see-through / panic gamepad combos above only fire while
+    /// the driving gamepad is in UI-navigation mode (so the same buttons stay
+    /// free for in-game mappings otherwise). When false, they fire whenever
+    /// FlexInput is focused and a nav-eligible gamepad is connected.
+    #[serde(default = "default_true")]
+    pub gamepad_chords_nav_only: bool,
 }
 
 /// Camera behavior immediately after a patch is loaded into a tab.
@@ -237,6 +252,9 @@ impl Default for AppSettings {
             ui_mode: UiMode::Easy,
             user_presets_folder: None,
             favorite_presets: Vec::new(),
+            seethrough_chord: None,
+            panic_chord: None,
+            gamepad_chords_nav_only: true,
         }
     }
 }

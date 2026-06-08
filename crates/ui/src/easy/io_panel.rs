@@ -67,6 +67,7 @@ pub fn show(
     ping_requests: &PingRequests,
     nav_mode: &mut HashMap<String, bool>,
     nav_mode_default: bool,
+    nav_excluded: &std::collections::HashSet<String>,
 ) {
     // Collector for gamepad-nav left-panel targets (rect + action), published
     // to a ctx temp at the end so the nav driver can hit-test the RS/gyro cursor
@@ -100,7 +101,7 @@ pub fn show(
         show_input_section(
             ui, devices, canvas, default_collapsed, defaults,
             calibrate_request, device_rates_hz, ping_requests,
-            nav_mode, nav_mode_default, &mut nav_targets,
+            nav_mode, nav_mode_default, nav_excluded, &mut nav_targets,
         );
     });
     ui.scope_builder(egui::UiBuilder::new().max_rect(bot_rect), |ui| {
@@ -177,6 +178,7 @@ fn show_input_section(
     ping_requests: &PingRequests,
     nav_mode: &mut HashMap<String, bool>,
     nav_mode_default: bool,
+    nav_excluded: &std::collections::HashSet<String>,
     nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
 ) {
     ui.add_space(PANEL_PADDING);
@@ -217,11 +219,18 @@ fn show_input_section(
             }
             for d in &gamepads {
                 let is_active = active_dev_id.as_deref() == Some(d.id.as_str());
-                let nav_on = *nav_mode.entry(d.id.clone()).or_insert(nav_mode_default);
+                // FlexInput's own loopback virtual: nav is disabled (and forced
+                // off) so it can't drive the UI from our own output.
+                let nav_disabled = nav_excluded.contains(&d.id);
+                let nav_on = if nav_disabled {
+                    false
+                } else {
+                    *nav_mode.entry(d.id.clone()).or_insert(nav_mode_default)
+                };
                 let mut nav_toggle: Option<bool> = None;
                 if input_card(
                     ui, d, is_active, canvas, calibrate_request, device_rates_hz, defaults,
-                    ping_requests, nav_on, &mut nav_toggle, nav_targets,
+                    ping_requests, nav_on, nav_disabled, &mut nav_toggle, nav_targets,
                 ) && !is_active {
                     replace_active_source(canvas, d, default_collapsed, defaults);
                     super::wiring::rewire(canvas);
@@ -281,6 +290,7 @@ fn input_card(
     defaults: DeviceParamDefaults,
     ping_requests: &PingRequests,
     nav_on: bool,
+    nav_disabled: bool,
     nav_toggle: &mut Option<bool>,
     nav_targets: &mut Vec<crate::gamepad_nav::LeftNavTarget>,
 ) -> bool {
@@ -427,18 +437,17 @@ fn input_card(
         // the UI, not just the active source).
         // Rasterize the controller-nav SVG once per (tint) and cache the texture
         // in ctx memory. Tinted white when ON (against the accent fill), gray
-        // when OFF.
-        let icon_tint = if nav_on {
-            egui::Color32::WHITE
-        } else {
-            egui::Color32::from_gray(190)
-        };
+        // Render the SVG with its NATIVE colors (outlines/fills preserved) — a
+        // fully-transparent tint (alpha 0) makes rasterize_svg_recolored skip its
+        // recolor pass entirely. On/off state is conveyed by the button's fill +
+        // stroke below, not by tinting the glyph.
         let tex: Option<egui::TextureHandle> = {
-            let key = egui::Id::new(("controller_nav_icon", nav_on));
+            let key = egui::Id::new("controller_nav_icon_native");
             let cached = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key));
             cached.or_else(|| {
                 const NAV_SVG: &str = include_str!("../../../../app/assets/controller_nav.svg");
-                crate::canvas::viewer::rasterize_svg_recolored(NAV_SVG, 32, 32, "override", icon_tint)
+                crate::canvas::viewer::rasterize_svg_recolored(
+                    NAV_SVG, 32, 32, "override", egui::Color32::TRANSPARENT)
                     .map(|img| {
                         let t = ui.ctx().load_texture("controller_nav_icon", img,
                             egui::TextureOptions::LINEAR);
@@ -449,10 +458,17 @@ fn input_card(
         };
         let btn = match &tex {
             Some(t) => egui::Button::image(
-                egui::Image::new((t.id(), egui::vec2(15.0, 15.0)))),
+                egui::Image::new((t.id(), egui::vec2(15.0, 15.0)))
+                    // Dim the glyph when disabled so the grayed state reads.
+                    .tint(if nav_disabled {
+                        egui::Color32::from_gray(110)
+                    } else {
+                        egui::Color32::WHITE
+                    })),
             None => egui::Button::new(egui::RichText::new("🎮").size(13.0)),
         };
-        let nav_resp = ui.add(
+        let nav_resp = ui.add_enabled(
+            !nav_disabled,
             btn.fill(if nav_on {
                     ui.visuals().selection.bg_fill
                 } else {
@@ -463,12 +479,14 @@ fn input_card(
                 } else {
                     egui::Stroke::NONE
                 }),
-        ).on_hover_text(if nav_on {
+        ).on_hover_text(if nav_disabled {
+            "UI navigation unavailable — this is FlexInput's own virtual output (shown as physical). Driving the UI from it would feed back into your own mappings."
+        } else if nav_on {
             "UI navigation ON — this gamepad drives FlexInput's UI while focused (mapped output suppressed). Click to disable."
         } else {
             "UI navigation OFF — click to let this gamepad drive FlexInput's UI while focused."
         });
-        if nav_resp.clicked() {
+        if nav_resp.clicked() && !nav_disabled {
             *nav_toggle = Some(!nav_on);
         }
     });

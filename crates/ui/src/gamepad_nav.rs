@@ -33,6 +33,13 @@ pub enum NavDir {
     Right,
 }
 
+/// Which global shortcut a gamepad chord-capture is binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChordTarget {
+    SeeThrough,
+    Panic,
+}
+
 /// Selection model levels.
 /// - `Widget`: moving the selection between sub-patch widgets.
 /// - `Editing`: editing a scalar/dropdown widget's value.
@@ -109,6 +116,11 @@ pub struct GamepadNav {
     pub repeat_dir: Option<NavDir>,
     /// Widget-level vs editing-a-widget.
     pub edit_level: EditLevel,
+    /// The physical device id driving nav this frame (set by `run_gamepad_nav`
+    /// when a nav-enabled source is active, cleared otherwise). Used by the
+    /// bottom legend bar to (a) decide whether to show and (b) pick the button
+    /// glyph skin (Xbox / PlayStation / Switch).
+    pub active_dev: Option<String>,
     /// West toggles fine increments / lower stick sensitivity while editing.
     pub fine_increment: bool,
     /// Pre-edit snarl snapshot, taken when entering Editing on a widget; pushed
@@ -168,14 +180,46 @@ pub struct GamepadNav {
     /// fields that apply for the current mode (grayed-out ones are skipped).
     pub card_field: usize,
     /// Virtual KB/M picker (opened from a Remapper's Special slot). When open,
-    /// the modal grid captures nav input: LS/dpad move the (row,col) cursor,
-    /// South appends the focused pin to the output chord, North resets it, East
-    /// closes. `kbm_picker_node`/`_outer` identify the remapper being edited.
+    /// the modal grid captures nav input: LS/dpad move the cursor, South appends
+    /// the focused pin to the output chord, North resets it, East closes.
+    /// `kbm_picker_node`/`_outer` identify the remapper being edited.
     pub kbm_picker_open: bool,
-    pub kbm_picker_row: usize,
-    pub kbm_picker_col: usize,
+    /// Index into `kbm_picker::KBM_LAYOUT` of the focused cell. The layout uses
+    /// absolute (x,y) positions with separated clusters (nav cluster + arrows +
+    /// mouse to the right of the main block), so the cursor is a flat cell index
+    /// navigated spatially (nearest-in-direction), not a row/col pair.
+    pub kbm_picker_idx: usize,
     pub kbm_picker_node: Option<egui_snarl::NodeId>,
     pub kbm_picker_outer: Option<egui_snarl::NodeId>,
+    /// Draft param the picker appends to — `draft_output` for the Remapper,
+    /// `_lean_<side>_draft` for a Lean section. And the phase param to flip into
+    /// the learning/learning-equivalent state after a pick (Remapper: `ui_phase`
+    /// → "learning"; Lean: `_lean_<side>_phase` → "learning").
+    pub kbm_picker_draft_key: String,
+    pub kbm_picker_phase_key: Option<String>,
+    /// Press-mode picker (opened from a mapping card's press-mode field via
+    /// South). Modal: up/down move `press_mode_idx`, South applies the
+    /// highlighted mode to card `press_mode_card`, East cancels.
+    /// `press_mode_outer` identifies the remapper-family widget being edited.
+    pub press_mode_open: bool,
+    pub press_mode_idx: usize,
+    pub press_mode_card: usize,
+    pub press_mode_outer: Option<egui_snarl::NodeId>,
+    /// Shortcut-chord learn: which shortcut is currently capturing a gamepad
+    /// button combo (None = not learning). While Some, nav input is diverted to
+    /// chord capture (accumulate held buttons, latch on full release).
+    pub chord_learn: Option<ChordTarget>,
+    /// Accumulated chord during capture (canonical button pin ids).
+    pub chord_draft: Vec<String>,
+    /// Arm-idle latch for chord capture: false right after learn starts; flips
+    /// true the first frame all buttons are released. Accumulation only begins
+    /// once true, so the South press that STARTED the learn (or any held button)
+    /// isn't swept into the chord.
+    pub chord_arm_idle: bool,
+    /// Edge trackers: was each shortcut combo fully satisfied last frame? Used
+    /// to fire the toggle once per press, not every frame the combo is held.
+    pub seethrough_chord_down: bool,
+    pub panic_chord_down: bool,
     /// UI-thread keyboard tapper for the Alt+Tab switcher. Independent of the
     /// device pool (which the I/O thread resets while nav-suppression is on).
     #[cfg(windows)]
@@ -190,6 +234,7 @@ impl Default for GamepadNav {
             repeat_accum: 0.0,
             repeat_dir: None,
             edit_level: EditLevel::Widget,
+            active_dev: None,
             fine_increment: false,
             edit_baseline: None,
             cursor_pos: egui::Pos2::ZERO,
@@ -216,10 +261,20 @@ impl Default for GamepadNav {
             remap_card: 0,
             card_field: 0,
             kbm_picker_open: false,
-            kbm_picker_row: 0,
-            kbm_picker_col: 0,
+            kbm_picker_idx: 0,
             kbm_picker_node: None,
             kbm_picker_outer: None,
+            kbm_picker_draft_key: String::from("draft_output"),
+            kbm_picker_phase_key: None,
+            press_mode_open: false,
+            press_mode_idx: 0,
+            press_mode_card: 0,
+            press_mode_outer: None,
+            chord_learn: None,
+            chord_draft: Vec::new(),
+            chord_arm_idle: false,
+            seethrough_chord_down: false,
+            panic_chord_down: false,
             #[cfg(windows)]
             key_tapper: None,
         }

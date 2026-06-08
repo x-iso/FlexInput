@@ -44,6 +44,12 @@ fn pretty_chord_name(sig: &str) -> String {
     }
 }
 
+/// Human label for a gamepad button COMBO (`["btn_lb","btn_rb"]` → "LB / L1 +
+/// RB / R1"). Empty/None handled by callers.
+fn pretty_chord_combo(combo: &[String]) -> String {
+    combo.iter().map(|p| pretty_chord_name(p)).collect::<Vec<_>>().join(" + ")
+}
+
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     #[cfg(windows)]
@@ -902,6 +908,23 @@ impl eframe::App for FlexInputApp {
             self.run_gamepad_nav(ctx);
         }
 
+        // Desktop Settings window shortcut-chord capture: when a learn is in
+        // flight but the gamepad settings panel is NOT open, the capture was
+        // started from the real Settings window (mouse). Pump it from any
+        // connected gamepad so the user can still press a controller combo
+        // there. The gamepad-panel path captures inside nav_drive_gp_settings.
+        if self.gamepad_nav.chord_learn.is_some() && !self.gamepad_nav.settings_open {
+            self.drive_chord_learn_desktop();
+        }
+
+        // Global (non-nav-only) shortcut-chord toggles: when the user has opted
+        // out of nav-only, the see-through / panic combos fire from ANY connected
+        // gamepad whenever FlexInput is focused — independent of nav mode. The
+        // nav-only path lives inside run_gamepad_nav (driving device only).
+        if !self.settings.gamepad_chords_nav_only && self.gamepad_nav.chord_learn.is_none() {
+            self.check_shortcut_chords_global(ctx);
+        }
+
         // Publish the set of `midi_in:N` / `midi_out:N` IDs referenced by
         // canvas device.source / device.sink nodes (across all tabs and
         // sub-patch editors). The MIDI watch thread reads this to decide
@@ -1682,6 +1705,7 @@ impl eframe::App for FlexInputApp {
         self.draw_settings_window(ctx);
         self.draw_gp_settings_panel(ctx);
         self.draw_kbm_picker(ctx);
+        self.draw_press_mode_picker(ctx);
         if self.settings_dirty {
             settings::save_settings(&self.settings);
             self.settings_dirty = false;
@@ -1996,6 +2020,17 @@ impl eframe::App for FlexInputApp {
             &devices_owned
         };
         let bottom_panel_height = self.bottom_panel_height;
+        // Device ids that are FlexInput's own virtual pads (visible in the
+        // physical list via `show_own_virtuals_as_physical`). Their nav toggle is
+        // grayed + forced off so navigating from our own loopback output can't
+        // create a feedback loop. Computed before the panel borrows below.
+        let nav_excluded_ids = self.own_virtual_device_ids();
+        // Belt-and-suspenders: ensure any excluded device is OFF in the nav map
+        // (covers the case where the global default flipped it on before the
+        // device was recognized as a loopback virtual).
+        for id in &nav_excluded_ids {
+            if let Some(v) = self.gamepad_nav.mode.get_mut(id) { *v = false; }
+        }
         // Pre-compute the set of device ids referenced by *non-active* tab
         // canvases so the panel can grey out the close (X) button on any
         // chip another tab still needs.
@@ -2012,6 +2047,13 @@ impl eframe::App for FlexInputApp {
         let shared_pool_for_panel = Arc::clone(&self.shared_virtual_devices);
         let ping_requests_for_panel = Arc::clone(&self.ping_requests);
         let easy_mode = self.settings.ui_mode == settings::UiMode::Easy;
+
+        // Gamepad-nav legend bar — declared before the physical-devices panel so
+        // it docks outermost/lowest at the very bottom. Drawn here (before the
+        // `&mut self.gamepad_nav` disjoint borrow below) as a read-only `&self`
+        // call. Visible only while a nav-enabled gamepad drives the UI.
+        self.draw_gp_legend_bar(ctx);
+
         let device_defaults_for_easy = crate::canvas::DeviceParamDefaults {
             stick_deadzone: self.settings.default_stick_deadzone,
             gyro_mult: self.settings.default_gyro_mult,
@@ -2306,6 +2348,7 @@ impl eframe::App for FlexInputApp {
                         &ping_requests_for_panel,
                         &mut gamepad_nav.mode,
                         nav_mode_default,
+                        &nav_excluded_ids,
                     );
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(center_rect), |ui| {
@@ -2540,6 +2583,7 @@ enum GpSettingKey {
     DefDeadzone,
     DefGyroMult,
     DefMouseSens,
+    ChordsNavOnly,
 }
 
 /// Stepping model for a generic numeric nav param.
@@ -2590,6 +2634,10 @@ enum GpSettingKind {
     Toggle { key: GpSettingKey },
     IntSlider { lo: f32, hi: f32, step: f32, key: GpSettingKey },
     FloatSlider { lo: f32, hi: f32, step: f32, key: GpSettingKey },
+    /// Gamepad shortcut chord: South closes the panel and starts a chord
+    /// capture for `target` (so the user can press the combo with the panel
+    /// out of the way). Displays the currently-assigned combo.
+    ChordLearn { target: crate::gamepad_nav::ChordTarget },
 }
 
 /// One row in the gamepad-native settings panel.
@@ -2626,43 +2674,70 @@ impl FlexInputApp {
         let focused = (raw_focused || self.settings.pin_active || self.gamepad_nav.alt_tab_active)
             && !click_through;
 
-        // Determine the active nav device: among nav-enabled devices, the one
-        // showing activity this frame. We read each device's signals fresh.
+        // Determine the active nav device. ALL nav-enabled physical gamepads can
+        // drive the UI simultaneously by a last-active-input-takes-over rule:
+        // each frame we pick the device showing fresh activity (a button press or
+        // a stick/trigger deflection past the deadzone — gyro is EXCLUDED since
+        // it's effectively always active), and keep driving the previously-active
+        // device when nothing is moving (so edge detection stays stable). Devices
+        // excluded: MIDI, and FlexInput's own loopback virtuals (feedback loop).
         let mut active_dev: Option<String> = None;
         let mut active_input: Option<gn::NavInput> = None;
         if focused && easy_mode {
-            // The nav device is the PHYSICAL input backing the active tab's
-            // `device.source` node — i.e. the gamepad the user actually picked
-            // in the Easy input panel. This excludes FlexInput's own virtual
-            // output pads (which loop back as `gilrs:xinput:*` and carry no
-            // input), which is what made nav read a silent device before.
-            let mut source_dev: Option<String> = self.tabs[self.active_tab].canvas.snarl
-                .nodes_ids_data()
-                .find(|(_, n)| n.value.module_id == "device.source")
-                .and_then(|(_, n)| n.value.params.get("device_id")
-                    .and_then(|v| v.as_str()).map(|s| s.to_string()));
-            // Fallback: when the default is on and this tab has no source
-            // device selected yet, drive nav from the first connected physical
-            // gamepad so tab-switching / menus still work (you can navigate to
-            // a tab and pick a device). Excludes MIDI and FlexInput's own
-            // virtual pads.
-            if source_dev.is_none() && nav_default {
-                source_dev = self.devices.iter()
-                    .find(|d| !matches!(d.kind,
-                        flexinput_devices::ControllerKind::MidiIn
-                        | flexinput_devices::ControllerKind::MidiOut)
-                        && !d.id.starts_with("virtual."))
-                    .map(|d| d.id.clone());
+            // FlexInput's own loopback virtuals — excluded from nav to avoid a
+            // feedback loop driving the UI from our own output.
+            let nav_excluded_ids = self.own_virtual_device_ids();
+            // Eligible = nav-enabled, non-MIDI, not our own virtual loopback.
+            let eligible: Vec<String> = self.devices.iter()
+                .filter(|d| !matches!(d.kind,
+                    flexinput_devices::ControllerKind::MidiIn
+                    | flexinput_devices::ControllerKind::MidiOut))
+                .filter(|d| !nav_excluded_ids.contains(&d.id))
+                .filter(|d| *self.gamepad_nav.mode.entry(d.id.clone()).or_insert(nav_default))
+                .map(|d| d.id.clone())
+                .collect();
+
+            // Find the device with fresh activity this frame (rising button OR
+            // stick/trigger past deadzone). Prefer one that ISN'T the current
+            // sticky device only when it's actually active, so the last input
+            // wins; otherwise keep the sticky one.
+            const STICK_DZ: f32 = 0.35;
+            const TRIG_DZ: f32 = 0.5;
+            let prev_pressed = self.gamepad_nav.prev_pressed.clone();
+            let mut newly_active: Option<String> = None;
+            for id in &eligible {
+                let nav = gn::read_nav_input(&self.last_signals, id, &prev_pressed);
+                let rising = nav.pressed.iter().any(|p| !prev_pressed.contains(p));
+                let moved = nav.lstick.length() > STICK_DZ
+                    || nav.rstick.length() > STICK_DZ
+                    || nav.lt > TRIG_DZ || nav.rt > TRIG_DZ;
+                if rising || moved { newly_active = Some(id.clone()); break; }
             }
-            if let Some(dev) = source_dev {
-                let on = *self.gamepad_nav.mode.entry(dev.clone()).or_insert(nav_default);
+
+            // Resolve the driving device: a newly-active one wins; else keep the
+            // sticky device if still eligible; else seed from the tab's source or
+            // the first eligible device.
+            let sticky_ok = self.gamepad_nav.active_dev.as_ref()
+                .map(|d| eligible.contains(d)).unwrap_or(false);
+            let chosen = newly_active
+                .or_else(|| if sticky_ok { self.gamepad_nav.active_dev.clone() } else { None })
+                .or_else(|| {
+                    // Seed: the active tab's source device if it's eligible…
+                    let src = self.tabs[self.active_tab].canvas.snarl
+                        .nodes_ids_data()
+                        .find(|(_, n)| n.value.module_id == "device.source")
+                        .and_then(|(_, n)| n.value.params.get("device_id")
+                            .and_then(|v| v.as_str()).map(|s| s.to_string()));
+                    match src {
+                        Some(s) if eligible.contains(&s) => Some(s),
+                        _ => eligible.first().cloned(),
+                    }
+                });
+
+            if let Some(dev) = chosen {
                 let nav = gn::read_nav_input(&self.last_signals, &dev, &self.gamepad_nav.prev_pressed);
-                if on {
-                    // Always track this device every frame (active or idle) so
-                    // edge detection stays correct frame-to-frame.
-                    active_dev = Some(dev);
-                    active_input = Some(nav);
-                }
+                active_dev = Some(dev);
+                active_input = Some(nav);
             }
         }
 
@@ -2682,7 +2757,7 @@ impl FlexInputApp {
             });
         }
 
-        let (dev_id, nav) = match (active_dev, active_input) {
+        let (dev_id, mut nav) = match (active_dev, active_input) {
             (Some(d), Some(n)) => (d, n),
             _ => {
                 // No active device this frame. Still age out the cursor and
@@ -2697,13 +2772,41 @@ impl FlexInputApp {
                 }
                 // No nav-enabled device at all → clear stale edge state.
                 self.gamepad_nav.prev_pressed.clear();
+                self.gamepad_nav.active_dev = None;
                 return;
             }
         };
+        // When the driving device CHANGES (another pad took over), suppress this
+        // frame's rising edges so the new pad's already-held buttons don't fire
+        // an action on the switch frame — the user must release+repress to act.
+        // (The stick/move paths still respond immediately, which is fine.)
+        let device_changed = self.gamepad_nav.active_dev.as_deref() != Some(dev_id.as_str());
+        if device_changed {
+            nav.rising.clear();
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+        }
+        // Record the active nav device so the bottom legend bar can render with
+        // the right button-glyph skin this frame.
+        self.gamepad_nav.active_dev = Some(dev_id.clone());
 
         let dt = ctx
             .input(|i| i.stable_dt)
             .clamp(0.001, 0.1);
+
+        // ── Shortcut-chord toggles (see-through / panic) ─────────────────────
+        // When nav-only: fire from the driving nav device here. When NOT nav-
+        // only, a global scan in update() handles it (so the combo works even
+        // when this device's nav toggle is off), so skip here to avoid double-
+        // firing.
+        if self.settings.gamepad_chords_nav_only
+            && self.process_shortcut_chords(ctx, &nav)
+        {
+            // A shortcut combo fired this frame — consume input so its buttons
+            // don't also drive navigation (e.g. Back in the combo ≠ Alt-Tab).
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
 
         // ── Alt+Tab window switcher (Select held) ───────────────────────────
         // While engaged, the controller is dedicated to the switcher.
@@ -2781,6 +2884,31 @@ impl FlexInputApp {
                 }
             }
             self.drive_kbm_picker(step_dir, &nav);
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Press-mode picker (modal: up/down move, South apply, East cancel) ─
+        if self.gamepad_nav.press_mode_open {
+            let mut step_dir: Option<gn::NavDir> = None;
+            if nav.is_rising("dpad_up") { step_dir = Some(gn::NavDir::Up); }
+            else if nav.is_rising("dpad_down") { step_dir = Some(gn::NavDir::Down); }
+            if step_dir.is_none() {
+                if let Some(d) = gn::stick_dir(nav.lstick) {
+                    if matches!(d, gn::NavDir::Up | gn::NavDir::Down)
+                        && self.gamepad_nav.repeat_dir != Some(d)
+                    {
+                        self.gamepad_nav.repeat_dir = Some(d);
+                        step_dir = Some(d);
+                    } else if !matches!(d, gn::NavDir::Up | gn::NavDir::Down) {
+                        self.gamepad_nav.repeat_dir = None;
+                    }
+                } else {
+                    self.gamepad_nav.repeat_dir = None;
+                }
+            }
+            self.drive_press_mode_picker(step_dir, &nav);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
             return;
@@ -3134,6 +3262,7 @@ impl FlexInputApp {
     /// epaint's graphics lock.
     fn nav_draw_remap_card_glow(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        let scope = self.nav_remap_mappings_key(outer_id);
         let cur_pass = ctx.cumulative_pass_nr();
         let accent = ctx.style().visuals.selection.stroke.color;
         let [r, g, b, _] = accent.to_array();
@@ -3158,7 +3287,7 @@ impl FlexInputApp {
         // Card glow (selected/entered card + focused header field).
         if let Some((pass, card, field, entered)) = ctx.data(|d|
             d.get_temp::<(u64, egui::Rect, Option<egui::Rect>, bool)>(
-                egui::Id::new(("gp_nav_remap_card_rects", inner.0))))
+                egui::Id::new(("gp_nav_remap_card_rects", inner.0, scope))))
         {
             if cur_pass.saturating_sub(pass) <= 2 {
                 ring(card, 5.0, if entered { 130.0 } else { 90.0 }, 7.0);
@@ -3170,13 +3299,13 @@ impl FlexInputApp {
 
         // Action-button glow (Learn / Special / Add) when an action is focused.
         let act_sel: Option<usize> = ctx.data(|d|
-            d.get_temp::<(u64, usize)>(egui::Id::new(("gp_nav_remap_action", inner.0))))
+            d.get_temp::<(u64, usize)>(egui::Id::new(("gp_nav_remap_action", inner.0, scope))))
             .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 2)
             .map(|(_, i)| i)
             .filter(|i| *i != usize::MAX);
         if let Some(ai) = act_sel {
             if let Some((pass, rects)) = ctx.data(|d|
-                d.get_temp::<(u64, Vec<egui::Rect>)>(egui::Id::new(("gp_nav_action_rects", inner.0))))
+                d.get_temp::<(u64, Vec<egui::Rect>)>(egui::Id::new(("gp_nav_action_rects", inner.0, scope))))
             {
                 if cur_pass.saturating_sub(pass) <= 2 {
                     if let Some(rect) = rects.get(ai) { ring(*rect, 4.0, 130.0, 6.0); }
@@ -3225,6 +3354,28 @@ impl FlexInputApp {
         changed
     }
 
+    /// Mutate card `idx` as an object map, UPGRADING a legacy `Array<String>`
+    /// entry (Map Action's old format) to `{ in: [strings] }` first so the edit
+    /// lands. Without this, press-mode / toggle edits on never-yet-edited Map
+    /// Action cards silently no-op (the entry isn't an object). Returns whether
+    /// `f` reported a change.
+    fn nav_remap_card_obj_mut<F>(&mut self, outer_id: egui_snarl::NodeId, idx: usize, f: F) -> bool
+    where F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> bool {
+        self.nav_remap_with_mappings(outer_id, |arr| {
+            let Some(slot) = arr.get_mut(idx) else { return false; };
+            // Upgrade legacy [strings] → { in: [strings] }.
+            if let Some(pins) = slot.as_array().map(|a| a.clone()) {
+                let mut obj = serde_json::Map::new();
+                obj.insert("in".to_string(), serde_json::Value::Array(pins));
+                *slot = serde_json::Value::Object(obj);
+            }
+            match slot.as_object_mut() {
+                Some(m) => f(m),
+                None => false,
+            }
+        })
+    }
+
     /// Read a card's `mode` string (default "down").
     fn nav_remap_card_mode(&self, outer_id: egui_snarl::NodeId, idx: usize) -> Option<String> {
         let key = self.nav_remap_mappings_key(outer_id);
@@ -3251,11 +3402,9 @@ impl FlexInputApp {
 
     fn nav_remap_set_card_bool(&mut self, outer_id: egui_snarl::NodeId, idx: usize, key: &str, val: bool) {
         let key = key.to_string();
-        self.nav_remap_with_mappings(outer_id, |arr| {
-            if let Some(m) = arr.get_mut(idx).and_then(|v| v.as_object_mut()) {
-                m.insert(key, serde_json::Value::Bool(val));
-                true
-            } else { false }
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+            m.insert(key, serde_json::Value::Bool(val));
+            true
         });
     }
 
@@ -3268,31 +3417,51 @@ impl FlexInputApp {
 
     /// Reset card `idx` to the default press mode (down) + clear its params.
     fn nav_remap_reset_card(&mut self, outer_id: egui_snarl::NodeId, idx: usize) -> bool {
-        self.nav_remap_with_mappings(outer_id, |arr| {
-            if let Some(m) = arr.get_mut(idx).and_then(|v| v.as_object_mut()) {
-                let had = m.contains_key("mode") || m.contains_key("window_ms")
-                    || m.contains_key("sustain") || m.contains_key("turbo");
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+            let had = m.contains_key("mode") || m.contains_key("window_ms")
+                || m.contains_key("sustain") || m.contains_key("turbo");
+            m.remove("mode");
+            m.remove("window_ms");
+            m.remove("sustain");
+            m.remove("turbo");
+            had
+        })
+    }
+
+    /// Press modes in popup order (analog is offered for all remapper-family +
+    /// lean widgets, which are the only ones with editable cards). Shared by the
+    /// inline cycle and the press-mode picker modal.
+    const PRESS_MODES: &'static [&'static str] =
+        &["down","short","long","double","on_press","on_release","analog"];
+
+    /// Set card `idx`'s press mode to `mode` directly, applying the same
+    /// default-param fixups the renderer's popup does.
+    fn nav_remap_set_mode(&mut self, outer_id: egui_snarl::NodeId, idx: usize, mode: &str) {
+        let mode = mode.to_string();
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+            if mode == "down" {
                 m.remove("mode");
                 m.remove("window_ms");
                 m.remove("sustain");
-                m.remove("turbo");
-                had
-            } else { false }
-        })
+            } else {
+                m.insert("mode".into(), serde_json::Value::String(mode.clone()));
+                if !m.contains_key("window_ms") {
+                    m.insert("window_ms".into(), serde_json::json!(200.0));
+                }
+            }
+            true
+        });
     }
 
     /// Cycle card `idx`'s press mode by `dir`, applying the same default-param
     /// fixups the card renderer's popup does (down clears window_ms/sustain;
     /// other modes seed window_ms). Mirrors the analog availability rule.
     fn nav_remap_cycle_mode(&mut self, outer_id: egui_snarl::NodeId, idx: usize, dir: i32) {
-        // Modes: analog only offered for remapper-family + lean (all our cases
-        // allow it). Order mirrors the popup.
-        const MODES: &[&str] = &["down","short","long","double","on_press","on_release","analog"];
-        self.nav_remap_with_mappings(outer_id, |arr| {
-            let Some(m) = arr.get_mut(idx).and_then(|v| v.as_object_mut()) else { return false; };
+        let modes = Self::PRESS_MODES;
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
             let cur = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-            let ci = MODES.iter().position(|x| *x == cur).unwrap_or(0) as i32;
-            let next = MODES[(ci + dir).rem_euclid(MODES.len() as i32) as usize];
+            let ci = modes.iter().position(|x| *x == cur).unwrap_or(0) as i32;
+            let next = modes[(ci + dir).rem_euclid(modes.len() as i32) as usize];
             if next == "down" {
                 m.remove("mode");
                 m.remove("window_ms");
@@ -3309,8 +3478,7 @@ impl FlexInputApp {
 
     /// Nudge card `idx`'s `window_ms` by `delta`, clamped to 10..5000.
     fn nav_remap_nudge_window(&mut self, outer_id: egui_snarl::NodeId, idx: usize, delta: f32) {
-        self.nav_remap_with_mappings(outer_id, |arr| {
-            let Some(m) = arr.get_mut(idx).and_then(|v| v.as_object_mut()) else { return false; };
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
             let cur = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
             let next = (cur + delta).clamp(10.0, 5000.0);
             m.insert("window_ms".into(), serde_json::json!(next as f64));
@@ -3351,7 +3519,14 @@ impl FlexInputApp {
         // gate on phase=="capturing" alone — Map Action auto-sits in "capturing"
         // whenever wired, so doing so would block East/South forever (the user's
         // "stuck in Map Action" bug).
-        let armed = self.get_subpatch_param_bool(outer_id, inner, "_nav_capture_armed").unwrap_or(false);
+        // Lean sections arm via side-scoped `_lean_<side>_armed`; everything else
+        // via `_nav_capture_armed`.
+        let armed_key = match self.nav_lean_side(outer_id) {
+            Some("left") => "_lean_left_armed",
+            Some("right") => "_lean_right_armed",
+            _ => "_nav_capture_armed",
+        };
+        let armed = self.get_subpatch_param_bool(outer_id, inner, armed_key).unwrap_or(false);
         if armed {
             self.nav_publish_remap_selection(ctx, outer_id, inner);
             ctx.request_repaint();
@@ -3409,14 +3584,28 @@ impl FlexInputApp {
             // An action button/dropdown is focused → South activates it.
             if nav.is_rising("btn_south") {
                 let action = actions[sel];
-                if action == "_nav_act_special" {
-                    // Open the virtual KB/M picker instead of the mouse-only
-                    // ComboBox (which a gamepad can't drive).
+                // Special (Remapper or Lean) opens the virtual KB/M picker
+                // instead of the mouse-only ComboBox. The picker writes its chord
+                // into the widget's draft param — `draft_output` for the
+                // Remapper, `_lean_<side>_draft` for a Lean section.
+                let lean_draft = match action {
+                    "_nav_act_special_left" => Some("_lean_left_draft"),
+                    "_nav_act_special_right" => Some("_lean_right_draft"),
+                    _ => None,
+                };
+                if action == "_nav_act_special" || lean_draft.is_some() {
                     self.gamepad_nav.kbm_picker_open = true;
-                    self.gamepad_nav.kbm_picker_row = 0;
-                    self.gamepad_nav.kbm_picker_col = 0;
+                    self.gamepad_nav.kbm_picker_idx = 0;
                     self.gamepad_nav.kbm_picker_node = Some(inner);
                     self.gamepad_nav.kbm_picker_outer = Some(outer_id);
+                    self.gamepad_nav.kbm_picker_draft_key =
+                        lean_draft.unwrap_or("draft_output").to_string();
+                    self.gamepad_nav.kbm_picker_phase_key =
+                        match action {
+                            "_nav_act_special_left" => Some("_lean_left_phase"),
+                            "_nav_act_special_right" => Some("_lean_right_phase"),
+                            _ => None,
+                        }.map(|s| s.to_string());
                 } else {
                     self.set_subpatch_param_bool(outer_id, inner, action, true);
                 }
@@ -3451,50 +3640,87 @@ impl FlexInputApp {
         nav: &crate::gamepad_nav::NavInput,
     ) {
         use crate::gamepad_nav::NavDir;
-        use crate::kbm_picker::{clamp_cursor, KBM_LAYOUT};
+        use crate::kbm_picker::{clamp_index, nearest_in_dir, KBM_LAYOUT};
 
         // East closes the picker.
         if nav.is_rising("btn_east") {
             self.gamepad_nav.kbm_picker_open = false;
             return;
         }
-        let (mut row, mut col) = clamp_cursor(
-            self.gamepad_nav.kbm_picker_row, self.gamepad_nav.kbm_picker_col);
-
-        match step_dir {
-            Some(NavDir::Left)  => col = col.saturating_sub(1),
-            Some(NavDir::Right) => col = (col + 1).min(KBM_LAYOUT[row].len() - 1),
-            Some(NavDir::Up)    => {
-                row = row.saturating_sub(1);
-                col = col.min(KBM_LAYOUT[row].len() - 1);
-            }
-            Some(NavDir::Down)  => {
-                row = (row + 1).min(KBM_LAYOUT.len() - 1);
-                col = col.min(KBM_LAYOUT[row].len() - 1);
-            }
-            None => {}
-        }
-        self.gamepad_nav.kbm_picker_row = row;
-        self.gamepad_nav.kbm_picker_col = col;
+        // Spatial navigation: move to the nearest cell in the pressed direction.
+        // The layout has separated clusters (nav cluster + arrows + mouse to the
+        // right), so we navigate by cell geometry rather than row/col stepping.
+        let mut idx = clamp_index(self.gamepad_nav.kbm_picker_idx);
+        idx = match step_dir {
+            Some(NavDir::Left)  => nearest_in_dir(idx, -1.0, 0.0),
+            Some(NavDir::Right) => nearest_in_dir(idx, 1.0, 0.0),
+            Some(NavDir::Up)    => nearest_in_dir(idx, 0.0, -1.0),
+            Some(NavDir::Down)  => nearest_in_dir(idx, 0.0, 1.0),
+            None => idx,
+        };
+        self.gamepad_nav.kbm_picker_idx = idx;
 
         let Some(outer) = self.gamepad_nav.kbm_picker_outer else {
             self.gamepad_nav.kbm_picker_open = false; return; };
         let Some(inner) = self.gamepad_nav.kbm_picker_node else {
             self.gamepad_nav.kbm_picker_open = false; return; };
+        let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
+        let phase_key = self.gamepad_nav.kbm_picker_phase_key.clone();
 
         // North resets the output chord.
         if nav.is_rising("btn_north") {
-            self.set_subpatch_param_str_array(outer, inner, "draft_output", &[]);
+            self.set_subpatch_param_str_array(outer, inner, &draft_key, &[]);
             return;
         }
-        // South appends the focused pin (de-duped) + ensures the learning phase
-        // so the chosen output shows and Add becomes available.
+        // South appends the focused pin (de-duped) + flips the widget into the
+        // phase that shows the draft + enables Add, WITHOUT running the gamepad
+        // capture machine (so the South used to pick isn't swept into the chord).
         if nav.is_rising("btn_south") {
-            let pin = KBM_LAYOUT[row][col].pin.to_string();
-            let mut out = self.nav_remap_draft_vec(outer, inner, "draft_output");
+            let pin = KBM_LAYOUT[idx].pin.to_string();
+            let mut out = self.nav_remap_draft_vec(outer, inner, &draft_key);
             if !out.iter().any(|p| *p == pin) { out.push(pin); }
-            self.set_subpatch_param_str_array(outer, inner, "draft_output", &out);
-            self.set_subpatch_param_str(outer, inner, "ui_phase", "learning");
+            self.set_subpatch_param_str_array(outer, inner, &draft_key, &out);
+            // Lean uses `_lean_<side>_phase` → "ready" (non-capturing display).
+            // Remapper uses `ui_phase` → "learning" (its Add-able output state);
+            // its capture machine is gated by `capture_ok` (armed&&idle), and we
+            // did NOT arm here, so picking via the picker never sweeps gamepad
+            // presses into the output chord.
+            match phase_key.as_deref() {
+                Some(pk) => self.set_subpatch_param_str(outer, inner, pk, "ready"),
+                None => self.set_subpatch_param_str(outer, inner, "ui_phase", "learning"),
+            }
+        }
+    }
+
+    /// Drive the press-mode picker modal: up/down move the highlight, South
+    /// applies the highlighted mode to the target card (and closes), East
+    /// cancels.
+    fn drive_press_mode_picker(
+        &mut self,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        nav: &crate::gamepad_nav::NavInput,
+    ) {
+        use crate::gamepad_nav::NavDir;
+        if nav.is_rising("btn_east") {
+            self.gamepad_nav.press_mode_open = false;
+            return;
+        }
+        let n = Self::PRESS_MODES.len();
+        let mut i = self.gamepad_nav.press_mode_idx.min(n - 1);
+        match step_dir {
+            Some(NavDir::Up)   => i = i.saturating_sub(1),
+            Some(NavDir::Down) => i = (i + 1).min(n - 1),
+            _ => {}
+        }
+        self.gamepad_nav.press_mode_idx = i;
+
+        if nav.is_rising("btn_south") {
+            if let Some(outer) = self.gamepad_nav.press_mode_outer {
+                let card = self.gamepad_nav.press_mode_card;
+                let mode = Self::PRESS_MODES[i];
+                self.nav_remap_set_mode(outer, card, mode);
+            }
+            self.gamepad_nav.press_mode_open = false;
         }
     }
 
@@ -3530,6 +3756,29 @@ impl FlexInputApp {
     fn nav_remap_action_items(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
         -> Vec<&'static str>
     {
+        // Gyro Lean sections use a SEPARATE state model (`_lean_<side>_phase`
+        // "idle"/"learning" + `_lean_<side>_draft`), and their body consumes
+        // side-scoped `_nav_act_learn_<side>` / `_nav_act_add_<side>` flags.
+        if let Some(side) = self.nav_lean_side(outer_id) {
+            let phase = self.nav_lean_phase(outer_id, inner, side);
+            let addable = matches!(phase.as_str(), "learning" | "ready");
+            let draft = self.nav_lean_draft_len(outer_id, inner, side) > 0;
+            // has_draft mirrors the body: any captured/picked output OR mid-learn.
+            let has_draft = draft || matches!(phase.as_str(), "learning" | "ready");
+            // Visual order (must match the body + published rects):
+            // Learn (always), Special (always), Clear(has_draft),
+            // Add ((learning||ready) && draft non-empty).
+            let mut v = vec![if side == "left" { "_nav_act_learn_left" } else { "_nav_act_learn_right" }];
+            v.push(if side == "left" { "_nav_act_special_left" } else { "_nav_act_special_right" });
+            if has_draft {
+                v.push(if side == "left" { "_nav_act_clear_left" } else { "_nav_act_clear_right" });
+            }
+            if addable && draft {
+                v.push(if side == "left" { "_nav_act_add_left" } else { "_nav_act_add_right" });
+            }
+            return v;
+        }
+
         let mid = self.nav_selected_module_id(outer_id);
         let phase = self.nav_remap_phase(outer_id, inner);
         let in_draft = self.nav_remap_draft_len(outer_id, inner, "draft_input") > 0;
@@ -3538,14 +3787,15 @@ impl FlexInputApp {
         let has_draft = in_draft || out_draft || latched;
         match mid.as_deref() {
             Some("module.remapper") => {
-                // Learn, Clear(has_draft), Special(latched), Add(out_draft&&latched).
+                // Visual order (must match the body + published rects):
+                // Learn, Special(latched), Clear(has_draft), Add(out_draft&&latched).
                 let mut v = vec!["_nav_act_learn"];
-                if has_draft { v.push("_nav_act_clear"); }
                 if latched { v.push("_nav_act_special"); }
+                if has_draft { v.push("_nav_act_clear"); }
                 if out_draft && latched { v.push("_nav_act_add"); }
                 v
             }
-            // Map Action / Lean / Combiner: Learn, Clear(has_draft), Add(in_draft).
+            // Map Action / Combiner: Learn, Clear(has_draft), Add(in_draft).
             _ => {
                 let mut v = vec!["_nav_act_learn"];
                 if has_draft { v.push("_nav_act_clear"); }
@@ -3553,6 +3803,32 @@ impl FlexInputApp {
                 v
             }
         }
+    }
+
+    /// If the selected element is a gyro Lean section, return its side
+    /// (`"left"`/`"right"`).
+    fn nav_lean_side(&self, outer_id: egui_snarl::NodeId) -> Option<&'static str> {
+        match self.nav_selected_element(outer_id).as_ref().map(|(_, e)| e.as_str()) {
+            Some("lean_left") => Some("left"),
+            Some("lean_right") => Some("right"),
+            _ => None,
+        }
+    }
+
+    /// Read a Lean section's phase param (`_lean_<side>_phase`, default "idle").
+    fn nav_lean_phase(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, side: &str) -> String {
+        let key = if side == "left" { "_lean_left_phase" } else { "_lean_right_phase" };
+        self.get_subpatch_param_str(outer, inner, key).unwrap_or_else(|| "idle".to_string())
+    }
+
+    /// Length of a Lean section's capture draft (`_lean_<side>_draft`).
+    fn nav_lean_draft_len(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, side: &str) -> usize {
+        let key = if side == "left" { "_lean_left_draft" } else { "_lean_right_draft" };
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas.snarl.get_node(outer).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
+            .map(|a| a.len()).unwrap_or(0)
     }
 
     /// Publish the RemapScroll selection (action vs card) so the body glows the
@@ -3564,6 +3840,7 @@ impl FlexInputApp {
         let n_actions = self.nav_remap_action_items(outer_id, inner).len();
         let sel = self.gamepad_nav.card_index;
         let pass = ctx.cumulative_pass_nr();
+        let scope = self.nav_remap_mappings_key(outer_id);
         let entered = matches!(self.gamepad_nav.edit_level,
             crate::gamepad_nav::EditLevel::RemapCard);
         // (selected_action_index or usize::MAX, card_index or usize::MAX, entered)
@@ -3575,9 +3852,9 @@ impl FlexInputApp {
             (usize::MAX, sel - n_actions)
         };
         ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0)),
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0, scope)),
                 (pass, card_sel, entered));
-            d.insert_temp(egui::Id::new(("gp_nav_remap_action", inner.0)),
+            d.insert_temp(egui::Id::new(("gp_nav_remap_action", inner.0, scope)),
                 (pass, act_sel));
         });
         ctx.request_repaint();
@@ -3624,6 +3901,17 @@ impl FlexInputApp {
             return;
         };
         let _ = inner;
+        // Clamp the entered-card index to the live card range so a stale index
+        // (count shrank, e.g. a card was deleted) edits a valid card instead of
+        // silently bailing to RemapScroll (the "modes/toggles don't work" bug).
+        let count = self.nav_remap_card_count(outer_id);
+        if count == 0 {
+            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            return;
+        }
+        if self.gamepad_nav.remap_card >= count {
+            self.gamepad_nav.remap_card = count - 1;
+        }
         let idx = self.gamepad_nav.remap_card;
         // North resets the entered card's press mode + params to default.
         if nav.is_rising("btn_north") {
@@ -3672,10 +3960,21 @@ impl FlexInputApp {
         let south = nav.is_rising("btn_south") || rt_rising;
         match field {
             0 => {
-                // Press mode: cycle through the available modes. South or
-                // up/down advance; down goes back.
-                let dir = if south { 1 } else { edit_press };
-                if dir != 0 { self.nav_remap_cycle_mode(outer_id, idx, dir); }
+                // Press mode: South OPENS the press-mode picker (a modal list of
+                // the available modes with glyphs + labels) so the user can see
+                // what each option does. Up/down still nudge the mode inline as a
+                // quick alternative.
+                if south {
+                    let cur = self.nav_remap_card_mode(outer_id, idx)
+                        .unwrap_or_else(|| "down".to_string());
+                    self.gamepad_nav.press_mode_open = true;
+                    self.gamepad_nav.press_mode_card = idx;
+                    self.gamepad_nav.press_mode_outer = Some(outer_id);
+                    self.gamepad_nav.press_mode_idx =
+                        Self::PRESS_MODES.iter().position(|m| *m == cur).unwrap_or(0);
+                } else if edit_press != 0 {
+                    self.nav_remap_cycle_mode(outer_id, idx, edit_press);
+                }
             }
             1 => {
                 // Time gap (window_ms): decade-ish nudge, 10..5000.
@@ -3685,11 +3984,17 @@ impl FlexInputApp {
                     self.gamepad_nav.fine_increment = !self.gamepad_nav.fine_increment;
                 }
                 let step = if fine { 1.0 } else { 5.0 };
-                if edit_press != 0 { delta += edit_press as f32 * step; }
+                // Discrete dpad step OR continuous stick — not both, so the two
+                // don't double-count / fight. Up = increase for both. In this
+                // codebase up-stick is +y (see gamepad_nav::stick_dir), so use
+                // +lstick.y directly (the prior `-y` inverted the stick relative
+                // to the dpad).
                 if mag > 0.5 {
                     let accel = self.settings.cursor_accel.max(1.0);
-                    let c = -nav.lstick.y;
+                    let c = nav.lstick.y;
                     delta += c.signum() * c.abs().powf(accel) * step * 40.0 * dt;
+                } else if edit_press != 0 {
+                    delta += edit_press as f32 * step;
                 }
                 if delta != 0.0 {
                     self.nav_remap_nudge_window(outer_id, idx, delta);
@@ -3714,9 +4019,10 @@ impl FlexInputApp {
 
         // Publish selected card + focused field so the body glows them.
         let pass = ctx.cumulative_pass_nr();
+        let scope = self.nav_remap_mappings_key(outer_id);
         ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0)), (pass, idx, true));
-            d.insert_temp(egui::Id::new(("gp_nav_remap_card_field", inner.0)), (pass, field as u64));
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0, scope)), (pass, idx, true));
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card_field", inner.0, scope)), (pass, field as u64));
         });
         ctx.request_repaint();
     }
@@ -5217,6 +5523,204 @@ impl FlexInputApp {
         self.gamepad_nav.rs_arrow_armed = true;
     }
 
+    /// Pins acceptable in a shortcut chord: every bool button on the pad
+    /// (face / shoulder / digital-trigger / stick-click / dpad / system). No
+    /// pin is excluded — North is just as bindable as any other.
+    const CHORD_PINS: &[&str] = &[
+        "btn_south", "btn_east", "btn_west", "btn_north",
+        "btn_lb", "btn_rb", "btn_lt_dig", "btn_rt_dig",
+        "btn_ls", "btn_rs", "btn_start", "btn_back",
+        "btn_guide", "btn_touchpad", "btn_mute",
+        "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+    ];
+
+    /// Shortcut-chord capture for the DESKTOP Settings window (mouse-started
+    /// learn, gamepad panel closed). Aggregates held chord pins across all
+    /// connected non-MIDI gamepads (no nav-mode requirement), arm-idles once,
+    /// and latches the combo on full release. No button is excluded.
+    fn drive_chord_learn_desktop(&mut self) {
+        let excluded = self.own_virtual_device_ids();
+        let mut held: Vec<String> = Vec::new();
+        for d in self.devices.iter().filter(|d| !matches!(d.kind,
+            flexinput_devices::ControllerKind::MidiIn
+            | flexinput_devices::ControllerKind::MidiOut))
+            .filter(|d| !excluded.contains(&d.id))
+        {
+            for pin in Self::CHORD_PINS {
+                let down = self.last_signals
+                    .get(&(d.id.clone(), pin.to_string()))
+                    .map(|s| s.as_bool()).unwrap_or(false);
+                if down && !held.iter().any(|q| q == pin) {
+                    held.push(pin.to_string());
+                }
+            }
+        }
+        let held_any = !held.is_empty();
+        if !self.gamepad_nav.chord_arm_idle {
+            if !held_any { self.gamepad_nav.chord_arm_idle = true; }
+            return;
+        }
+        for pin in &held {
+            if !self.gamepad_nav.chord_draft.iter().any(|q| q == pin) {
+                self.gamepad_nav.chord_draft.push(pin.clone());
+            }
+        }
+        if !held_any && !self.gamepad_nav.chord_draft.is_empty() {
+            let draft = std::mem::take(&mut self.gamepad_nav.chord_draft);
+            // Same rule as the panel: combos only (>= 2). East-alone cancels;
+            // any other single button is rejected (keep listening).
+            if draft.len() < 2 {
+                self.gamepad_nav.chord_arm_idle = false;
+                if draft == ["btn_east"] {
+                    self.gamepad_nav.chord_learn = None;
+                }
+                return;
+            }
+            self.commit_chord(draft);
+        }
+    }
+
+    /// Shortcut-chord capture, driven from inside the gamepad settings panel
+    /// while a ChordLearn row is learning. Mirrors the widget Learn flow: the
+    /// panel stays open and shows the listening state, we wait for the device
+    /// to go idle ONCE (arm-idle) so the South that started the capture isn't
+    /// swept in, accumulate every held button while the user presses the combo,
+    /// and LATCH into the target setting the moment everything releases (after
+    /// at least one button was held). East aborts with no binding written.
+    fn drive_gp_chord_capture(&mut self, nav: &crate::gamepad_nav::NavInput) {
+        let held: Vec<String> = Self::CHORD_PINS.iter()
+            .filter(|p| nav.pressed.contains(**p))
+            .map(|p| p.to_string())
+            .collect();
+        let held_any = !held.is_empty();
+
+        // Arm-idle: don't accumulate until the device has gone fully idle once
+        // since learn started — otherwise the (still-held) South that opened the
+        // capture lands in the combo.
+        if !self.gamepad_nav.chord_arm_idle {
+            if !held_any { self.gamepad_nav.chord_arm_idle = true; }
+            return;
+        }
+
+        // Accumulate the held chord (union over the press) — East included, so a
+        // combo CAN contain East as long as it is pressed together with at least
+        // one other button.
+        for pin in &held {
+            if !self.gamepad_nav.chord_draft.iter().any(|q| q == pin) {
+                self.gamepad_nav.chord_draft.push(pin.clone());
+            }
+        }
+
+        // On full release, interpret the captured draft.
+        if !held_any && !self.gamepad_nav.chord_draft.is_empty() {
+            let draft = std::mem::take(&mut self.gamepad_nav.chord_draft);
+            // Shortcuts MUST be combos (>= 2 buttons). A single button never
+            // latches: East-alone cancels the capture (back); any other single
+            // button is simply rejected and we keep listening.
+            if draft.len() < 2 {
+                self.gamepad_nav.chord_arm_idle = false;
+                if draft == ["btn_east"] {
+                    self.gamepad_nav.chord_learn = None; // cancel
+                }
+                return;
+            }
+            self.commit_chord(draft);
+        }
+    }
+
+    /// Latch a captured combo into the active `chord_learn` target and exit
+    /// capture. Shared by the gamepad-panel and desktop-window capture paths.
+    fn commit_chord(&mut self, chord: Vec<String>) {
+        use crate::gamepad_nav::ChordTarget;
+        self.gamepad_nav.chord_arm_idle = false;
+        match self.gamepad_nav.chord_learn.take() {
+            Some(ChordTarget::SeeThrough) => self.settings.seethrough_chord = Some(chord),
+            Some(ChordTarget::Panic)      => self.settings.panic_chord = Some(chord),
+            None => {}
+        }
+        self.settings_dirty = true;
+    }
+
+    /// Detect the assigned see-through / panic gamepad combos in `nav` and fire
+    /// the toggle once per full press (rising edge of "all combo buttons held").
+    /// Respects `gamepad_chords_nav_only`: when set, only fires while the driving
+    /// device is actually in nav mode (which it is here — this runs inside the
+    /// nav driver after the device resolved); when unset it still requires the
+    /// driver to be active, but that's the same code path. The nav-only flag
+    /// therefore gates whether we evaluate at all vs. always (see caller note).
+    fn process_shortcut_chords(&mut self, ctx: &egui::Context, nav: &crate::gamepad_nav::NavInput) -> bool {
+        let chord_held = |chord: &Option<Vec<String>>| -> bool {
+            match chord {
+                Some(c) if !c.is_empty() => c.iter().all(|p| nav.pressed.contains(p)),
+                _ => false,
+            }
+        };
+        let mut fired = false;
+        // See-through.
+        let st_now = chord_held(&self.settings.seethrough_chord);
+        if st_now && !self.gamepad_nav.seethrough_chord_down {
+            let next = !self.settings.see_through_active;
+            self.settings.see_through_active = next;
+            self.settings_dirty = true;
+            // Mirror into the temp slot the eye-toggle uses so the canvas frame
+            // picks it up this frame (update() also syncs settings↔slot).
+            ctx.data_mut(|d| d.insert_temp(
+                egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY), next));
+            fired = true;
+        }
+        self.gamepad_nav.seethrough_chord_down = st_now;
+        // Panic.
+        let pn_now = chord_held(&self.settings.panic_chord);
+        if pn_now && !self.gamepad_nav.panic_chord_down {
+            self.panic_active = !self.panic_active;
+            fired = true;
+        }
+        self.gamepad_nav.panic_chord_down = pn_now;
+        fired
+    }
+
+    /// Non-nav-only shortcut-chord detection: scan every eligible gamepad
+    /// (non-MIDI, not our own loopback virtual) for the assigned see-through /
+    /// panic combos and fire once per full press. Only called when FlexInput is
+    /// focused and `gamepad_chords_nav_only` is false.
+    fn check_shortcut_chords_global(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.focused) { return; }
+        // Nothing to do if no combos are assigned.
+        if self.settings.seethrough_chord.is_none() && self.settings.panic_chord.is_none() {
+            self.gamepad_nav.seethrough_chord_down = false;
+            self.gamepad_nav.panic_chord_down = false;
+            return;
+        }
+        let excluded = self.own_virtual_device_ids();
+        let any_holds = |chord: &Option<Vec<String>>| -> bool {
+            let Some(c) = chord else { return false; };
+            if c.is_empty() { return false; }
+            self.devices.iter()
+                .filter(|d| !matches!(d.kind,
+                    flexinput_devices::ControllerKind::MidiIn
+                    | flexinput_devices::ControllerKind::MidiOut))
+                .filter(|d| !excluded.contains(&d.id))
+                .any(|d| c.iter().all(|pin| {
+                    self.last_signals.get(&(d.id.clone(), pin.clone()))
+                        .map(|s| s.as_bool()).unwrap_or(false)
+                }))
+        };
+        let st_now = any_holds(&self.settings.seethrough_chord);
+        if st_now && !self.gamepad_nav.seethrough_chord_down {
+            let next = !self.settings.see_through_active;
+            self.settings.see_through_active = next;
+            self.settings_dirty = true;
+            ctx.data_mut(|d| d.insert_temp(
+                egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY), next));
+        }
+        self.gamepad_nav.seethrough_chord_down = st_now;
+        let pn_now = any_holds(&self.settings.panic_chord);
+        if pn_now && !self.gamepad_nav.panic_chord_down {
+            self.panic_active = !self.panic_active;
+        }
+        self.gamepad_nav.panic_chord_down = pn_now;
+    }
+
     /// Update the right-stick + gyro cursor overlay position/visibility.
     fn update_nav_cursor(
         &mut self,
@@ -5428,6 +5932,12 @@ impl FlexInputApp {
             GpSettingRow { label: "Default mouse speed".into(),
                 kind: FloatSlider { lo: 0.0, hi: 3000.0, step: 1.0,
                     key: GpSettingKey::DefMouseSens }, suffix: "" },
+            GpSettingRow { label: "Shortcuts: nav-only".into(),
+                kind: Toggle { key: GpSettingKey::ChordsNavOnly }, suffix: "" },
+            GpSettingRow { label: "Shortcut: See-through".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::SeeThrough }, suffix: "" },
+            GpSettingRow { label: "Shortcut: Panic".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Panic }, suffix: "" },
         ]
     }
 
@@ -5447,6 +5957,7 @@ impl FlexInputApp {
             DefDeadzone => self.settings.default_stick_deadzone,
             DefGyroMult => self.settings.default_gyro_mult,
             DefMouseSens => self.settings.default_mouse_sensitivity,
+            ChordsNavOnly => self.settings.gamepad_chords_nav_only as i32 as f32,
         }
     }
 
@@ -5480,6 +5991,7 @@ impl FlexInputApp {
             DefDeadzone => self.settings.default_stick_deadzone = val.clamp(0.0, 0.5),
             DefGyroMult => self.settings.default_gyro_mult = val.clamp(0.1, 50.0),
             DefMouseSens => self.settings.default_mouse_sensitivity = val.clamp(0.0, 3000.0),
+            ChordsNavOnly => self.settings.gamepad_chords_nav_only = val != 0.0,
         }
         self.settings_dirty = true;
     }
@@ -5499,6 +6011,20 @@ impl FlexInputApp {
         let rows = self.gp_settings_rows();
         if rows.is_empty() { return; }
         let editing = self.gamepad_nav.settings_editing;
+
+        // ── Shortcut-chord capture (panel stays open, mirrors the widget Learn
+        // flow exactly) ─────────────────────────────────────────────────────
+        // When a ChordLearn row is "learning", the panel is listening: we wait
+        // for the device to go idle ONCE (so the South press that started the
+        // capture isn't swept in), then accumulate every held button (ANY pin
+        // is bindable — North included), and the moment everything releases we
+        // latch the combo into the target setting and exit capture, leaving the
+        // panel open on the same row. East aborts capture (back), no binding
+        // written. This is identical to how a widget's Learn captures input.
+        if self.gamepad_nav.chord_learn.is_some() {
+            self.drive_gp_chord_capture(nav);
+            return;
+        }
 
         // Directional intent (dpad discrete + fresh stick deflection).
         let mut dir: Option<NavDir> = None;
@@ -5532,14 +6058,36 @@ impl FlexInputApp {
             }
             let idx = self.gamepad_nav.settings_index.min(rows.len() - 1);
             let row = &rows[idx];
-            // South / RT → toggle bool or enter numeric edit.
+            // South / RT → toggle bool, enter numeric edit, or start a chord
+            // capture (which closes the panel so the user can press the combo).
             if nav.is_rising("btn_south") || rt_rising {
                 match &row.kind {
                     GpSettingKind::Toggle { key } => {
                         let cur = self.gp_setting_value(*key);
                         self.gp_setting_set(*key, if cur != 0.0 { 0.0 } else { 1.0 });
                     }
+                    GpSettingKind::ChordLearn { target } => {
+                        // Start listening — panel STAYS open and shows the
+                        // listening state on this row. Capture runs in
+                        // `drive_gp_chord_capture` (early-returned above while
+                        // learning). Arm-idle = false so the South that started
+                        // this isn't swept into the combo.
+                        self.gamepad_nav.chord_learn = Some(*target);
+                        self.gamepad_nav.chord_draft.clear();
+                        self.gamepad_nav.chord_arm_idle = false;
+                    }
                     _ => { self.gamepad_nav.settings_editing = true; }
+                }
+            }
+            // North → clear the assigned binding on a ChordLearn row.
+            if nav.is_rising("btn_north") {
+                if let GpSettingKind::ChordLearn { target } = &row.kind {
+                    use crate::gamepad_nav::ChordTarget;
+                    match target {
+                        ChordTarget::SeeThrough => self.settings.seethrough_chord = None,
+                        ChordTarget::Panic      => self.settings.panic_chord = None,
+                    }
+                    self.settings_dirty = true;
                 }
             }
             // East / LT → close panel.
@@ -5554,7 +6102,9 @@ impl FlexInputApp {
             let (lo, hi, step, key) = match &row.kind {
                 GpSettingKind::IntSlider { lo, hi, step, key }
                 | GpSettingKind::FloatSlider { lo, hi, step, key } => (*lo, *hi, *step, *key),
-                GpSettingKind::Toggle { .. } => { self.gamepad_nav.settings_editing = false; return; }
+                GpSettingKind::Toggle { .. } | GpSettingKind::ChordLearn { .. } => {
+                    self.gamepad_nav.settings_editing = false; return;
+                }
             };
             let mut delta = 0.0f32;
             let s = step * if fine { 0.25 } else { 1.0 };
@@ -5592,6 +6142,10 @@ impl FlexInputApp {
         let sel = self.gamepad_nav.settings_index.min(rows.len().saturating_sub(1));
         let editing = self.gamepad_nav.settings_editing;
         let accent = ctx.style().visuals.selection.stroke.color;
+        // Skin for combo glyphs: the active nav device's, else Xbox.
+        let glyph_skin = self.gamepad_nav.active_dev.as_deref()
+            .map(crate::canvas::remapper_icons::skin_from_device_id)
+            .unwrap_or(crate::canvas::remapper_icons::Skin::Xbox);
 
         egui::Window::new("🎮 Settings")
             .id(egui::Id::new("gp_settings_panel"))
@@ -5600,33 +6154,75 @@ impl FlexInputApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .default_width(380.0)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(
-                    "D-pad/stick: move   South: edit/toggle   ←/→: adjust   \
-                     West: fine   East: close")
-                    .small().color(egui::Color32::from_gray(150)));
+                if self.gamepad_nav.chord_learn.is_some() {
+                    ui.label(egui::RichText::new(
+                        "Listening… hold a 2+ button combo and release to bind   \
+                         (East alone: cancel)")
+                        .small().color(egui::Color32::from_rgb(230, 185, 95)));
+                } else {
+                    ui.label(egui::RichText::new(
+                        "D-pad/stick: move   South: edit/toggle   ←/→: adjust   \
+                         West: fine   North: clear shortcut   East: close")
+                        .small().color(egui::Color32::from_gray(150)));
+                }
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(4.0);
                 for (i, row) in rows.iter().enumerate() {
                     let is_sel = i == sel;
-                    let val = self.gp_setting_value(match &row.kind {
-                        GpSettingKind::Toggle { key }
-                        | GpSettingKind::IntSlider { key, .. }
-                        | GpSettingKind::FloatSlider { key, .. } => *key,
-                    });
+
+                    // Is this row currently capturing a shortcut combo?
+                    let learning_row = matches!(&row.kind, GpSettingKind::ChordLearn { target }
+                        if self.gamepad_nav.chord_learn == Some(*target));
+
+                    // For an idle ChordLearn row with a stored binding we draw
+                    // the combo as glyph icons (trim + tooltip). Otherwise the
+                    // value is a plain right-aligned string.
+                    let mut combo_icons: Option<Vec<String>> = None;
                     let val_str = match &row.kind {
-                        GpSettingKind::Toggle { .. } =>
-                            if val != 0.0 { "ON".to_string() } else { "OFF".to_string() },
-                        GpSettingKind::IntSlider { .. } =>
-                            format!("{}{}", val.round() as i64, row.suffix),
-                        GpSettingKind::FloatSlider { .. } =>
-                            format!("{:.2}{}", val, row.suffix),
+                        GpSettingKind::Toggle { key } =>
+                            if self.gp_setting_value(*key) != 0.0 { "ON".to_string() } else { "OFF".to_string() },
+                        GpSettingKind::IntSlider { key, .. } =>
+                            format!("{}{}", self.gp_setting_value(*key).round() as i64, row.suffix),
+                        GpSettingKind::FloatSlider { key, .. } =>
+                            format!("{:.2}{}", self.gp_setting_value(*key), row.suffix),
+                        GpSettingKind::ChordLearn { target } => {
+                            use crate::gamepad_nav::ChordTarget;
+                            if self.gamepad_nav.chord_learn == Some(*target) {
+                                // Learning: live listening state. Show the combo
+                                // captured so far as icons too.
+                                if self.gamepad_nav.chord_draft.is_empty() {
+                                    "◉ Listening…".to_string()
+                                } else {
+                                    combo_icons = Some(self.gamepad_nav.chord_draft.clone());
+                                    String::new()
+                                }
+                            } else {
+                                let assigned = match target {
+                                    ChordTarget::SeeThrough => self.settings.seethrough_chord.as_ref(),
+                                    ChordTarget::Panic => self.settings.panic_chord.as_ref(),
+                                };
+                                match assigned {
+                                    Some(c) if !c.is_empty() => { combo_icons = Some(c.clone()); String::new() }
+                                    _ => "(none)".to_string(),
+                                }
+                            }
+                        }
                     };
 
-                    let (rect, _) = ui.allocate_exact_size(
+                    let (rect, resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
                     let painter = ui.painter();
-                    if is_sel {
+                    if learning_row {
+                        // Warm "listening" highlight, distinct from the cool
+                        // selection accent, so it's obvious the panel is capturing.
+                        let warm = egui::Color32::from_rgb(220, 170, 80);
+                        let [r, g, b, _] = warm.to_array();
+                        painter.rect_filled(rect, 5.0,
+                            egui::Color32::from_rgba_unmultiplied(r, g, b, 60));
+                        painter.rect_stroke(rect, 5.0,
+                            egui::Stroke::new(2.0, warm), egui::StrokeKind::Inside);
+                    } else if is_sel {
                         let bright = editing && !matches!(row.kind, GpSettingKind::Toggle { .. });
                         let [r, g, b, _] = accent.to_array();
                         painter.rect_filled(rect, 5.0,
@@ -5636,16 +6232,75 @@ impl FlexInputApp {
                             egui::Stroke::new(if bright { 2.0 } else { 1.0 }, accent),
                             egui::StrokeKind::Inside);
                     }
-                    painter.text(
-                        egui::pos2(rect.left() + 10.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER, &row.label,
-                        egui::FontId::proportional(13.0),
+                    // Row label (left). Measure its width so combo glyphs know
+                    // how far left they may extend before crowding it.
+                    let label_galley = painter.layout_no_wrap(
+                        row.label.clone(), egui::FontId::proportional(13.0),
                         ui.visuals().text_color());
-                    painter.text(
-                        egui::pos2(rect.right() - 10.0, rect.center().y),
-                        egui::Align2::RIGHT_CENTER, &val_str,
-                        egui::FontId::proportional(13.0),
-                        if is_sel { accent } else { ui.visuals().weak_text_color() });
+                    let label_right = rect.left() + 10.0 + label_galley.size().x;
+                    painter.galley(
+                        egui::pos2(rect.left() + 10.0, rect.center().y - label_galley.size().y * 0.5),
+                        label_galley, ui.visuals().text_color());
+
+                    if let Some(pins) = combo_icons {
+                        // Draw the combo as glyph icons right-to-left, with "+"
+                        // separators. If they would crowd the label, trim the
+                        // overflow (leftmost icons) and prefix a "…"; the full
+                        // combo is always available in a hover tooltip.
+                        const G: f32 = 18.0;       // glyph size
+                        const SEP: f32 = 9.0;      // width budget for a "+"
+                        const PAD: f32 = 16.0;     // min gap from the label text
+                        let min_x = label_right + PAD;
+                        let mut x = rect.right() - 10.0;
+                        let cy = rect.center().y;
+                        let icon_col = if learning_row { egui::Color32::from_rgb(230, 185, 95) }
+                            else if is_sel { accent } else { egui::Color32::from_gray(210) };
+                        let mut trimmed = false;
+                        // Walk pins from last to first, placing each icon to the
+                        // left of the previous, stopping when we run out of room.
+                        for (j, pin) in pins.iter().enumerate().rev() {
+                            // Reserve room for a leading "…" if there are still
+                            // earlier pins we might not fit.
+                            let need_ellipsis = j > 0;
+                            let reserve = if need_ellipsis { SEP } else { 0.0 };
+                            if x - G < min_x + reserve {
+                                trimmed = true;
+                                break;
+                            }
+                            let icon_rect = egui::Rect::from_min_size(
+                                egui::pos2(x - G, cy - G * 0.5), egui::vec2(G, G));
+                            if let Some(tex) = self.gp_legend_glyph(ctx, glyph_skin, pin) {
+                                painter.image(tex.id(), icon_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE);
+                            } else {
+                                painter.text(icon_rect.center(), egui::Align2::CENTER_CENTER,
+                                    gp_pin_token(pin), egui::FontId::proportional(11.0), icon_col);
+                            }
+                            x -= G;
+                            if j > 0 {
+                                x -= SEP;
+                                painter.text(egui::pos2(x + SEP * 0.5, cy),
+                                    egui::Align2::CENTER_CENTER, "+",
+                                    egui::FontId::proportional(12.0), icon_col);
+                            }
+                        }
+                        if trimmed {
+                            painter.text(egui::pos2(x, cy), egui::Align2::RIGHT_CENTER, "…",
+                                egui::FontId::proportional(13.0), icon_col);
+                        }
+                        // Full combo tooltip (always, since even untrimmed icons
+                        // can be ambiguous).
+                        resp.on_hover_text(pretty_chord_combo(&pins));
+                    } else {
+                        painter.text(
+                            egui::pos2(rect.right() - 10.0, rect.center().y),
+                            egui::Align2::RIGHT_CENTER, &val_str,
+                            egui::FontId::proportional(13.0),
+                            if learning_row { egui::Color32::from_rgb(230, 185, 95) }
+                            else if is_sel { accent }
+                            else { ui.visuals().weak_text_color() });
+                    }
                     ui.add_space(2.0);
                 }
             });
@@ -5659,17 +6314,25 @@ impl FlexInputApp {
     /// safe.
     fn draw_kbm_picker(&mut self, ctx: &egui::Context) {
         if !self.gamepad_nav.kbm_picker_open { return; }
-        use crate::kbm_picker::{clamp_cursor, KBM_LAYOUT};
-        let (sel_row, sel_col) = clamp_cursor(
-            self.gamepad_nav.kbm_picker_row, self.gamepad_nav.kbm_picker_col);
+        use crate::kbm_picker::{clamp_index, layout_extent, KBM_LAYOUT};
+        let sel = clamp_index(self.gamepad_nav.kbm_picker_idx);
         let accent = ctx.style().visuals.selection.stroke.color;
 
-        // Current output chord for the header preview.
+        // Current output chord for the header preview (read from whichever draft
+        // param this picker session targets).
+        let dk = self.gamepad_nav.kbm_picker_draft_key.clone();
         let chord: Vec<String> = match (self.gamepad_nav.kbm_picker_outer,
                                         self.gamepad_nav.kbm_picker_node) {
-            (Some(o), Some(i)) => self.nav_remap_draft_vec(o, i, "draft_output"),
+            (Some(o), Some(i)) => self.nav_remap_draft_vec(o, i, &dk),
             _ => Vec::new(),
         };
+
+        const UNIT: f32 = 30.0; // px per grid unit
+        const GAP: f32 = 3.0;   // gap between adjacent keys
+        let (ext_x, ext_y) = layout_extent();
+        let board_w = ext_x * (UNIT + GAP);
+        let board_h = ext_y * (UNIT + GAP);
+        let skin = crate::canvas::remapper_icons::Skin::Kbm;
 
         egui::Window::new("⌨ KB/M picker")
             .id(egui::Id::new("gp_kbm_picker"))
@@ -5695,52 +6358,417 @@ impl FlexInputApp {
                 });
                 ui.add_space(6.0);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(6.0);
 
-                const UNIT: f32 = 30.0; // px per grid unit
-                const GAP: f32 = 4.0;
-                let skin = crate::canvas::remapper_icons::Skin::Kbm;
-                for (r, rowdef) in KBM_LAYOUT.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = GAP;
-                        for (c, cell) in rowdef.iter().enumerate() {
-                            let w = cell.width * UNIT + (cell.width - 1.0) * GAP;
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(w, UNIT), egui::Sense::hover());
-                            let focused = r == sel_row && c == sel_col;
-                            let painter = ui.painter();
-                            // Cell background + focus highlight.
-                            let bg = if focused {
-                                let [rr, gg, bb, _] = accent.to_array();
-                                egui::Color32::from_rgba_unmultiplied(rr, gg, bb, 60)
-                            } else {
-                                egui::Color32::from_gray(40)
-                            };
-                            painter.rect_filled(rect, 4.0, bg);
-                            if focused {
-                                painter.rect_stroke(rect, 4.0,
-                                    egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
-                            }
-                            // Icon (or text fallback), centered.
-                            if let Some(tex) = kbm_cell_texture(ctx, skin, cell.pin) {
-                                let s = (UNIT - 6.0).min(w - 6.0).max(8.0);
-                                let img_rect = egui::Rect::from_center_size(
-                                    rect.center(), egui::vec2(s, s));
-                                painter.image(tex.id(), img_rect,
-                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                    egui::Color32::WHITE);
-                            } else {
-                                painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                                    kbm_pin_label(cell.pin),
-                                    egui::FontId::proportional(12.0),
-                                    ui.visuals().text_color());
-                            }
-                        }
-                    });
-                    ui.add_space(GAP);
+                // Absolute-positioned keyboard: allocate one canvas sized to the
+                // layout extent, then place each cell at its (x,y)*unit origin so
+                // the nav cluster + arrows + mouse sit in their own clusters to
+                // the right of the main block.
+                let (canvas, _) = ui.allocate_exact_size(
+                    egui::vec2(board_w, board_h), egui::Sense::hover());
+                let painter = ui.painter_at(canvas);
+                for (i, cell) in KBM_LAYOUT.iter().enumerate() {
+                    let min = canvas.min + egui::vec2(
+                        cell.x * (UNIT + GAP), cell.y * (UNIT + GAP));
+                    let size = egui::vec2(
+                        cell.width * UNIT + (cell.width - 1.0) * GAP, UNIT);
+                    let rect = egui::Rect::from_min_size(min, size);
+                    let focused = i == sel;
+                    // Cell background + focus highlight.
+                    let bg = if focused {
+                        let [rr, gg, bb, _] = accent.to_array();
+                        egui::Color32::from_rgba_unmultiplied(rr, gg, bb, 60)
+                    } else {
+                        egui::Color32::from_gray(40)
+                    };
+                    painter.rect_filled(rect, 4.0, bg);
+                    if focused {
+                        painter.rect_stroke(rect, 4.0,
+                            egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+                    }
+                    // Icon (or text fallback), centered.
+                    if let Some(tex) = kbm_cell_texture(ctx, skin, cell.pin) {
+                        let s = (UNIT - 6.0).min(size.x - 6.0).max(8.0);
+                        let img_rect = egui::Rect::from_center_size(
+                            rect.center(), egui::vec2(s, s));
+                        painter.image(tex.id(), img_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE);
+                    } else {
+                        painter.text(rect.center(), egui::Align2::CENTER_CENTER,
+                            kbm_pin_label(cell.pin),
+                            egui::FontId::proportional(11.0),
+                            ui.visuals().text_color());
+                    }
                 }
             });
         ctx.request_repaint();
+    }
+
+    /// Modal press-mode picker: a vertical list of the press modes (glyph +
+    /// label + short description) with the current/highlighted one accented.
+    /// Opened from a mapping card's press-mode field; input handled in
+    /// `drive_press_mode_picker`.
+    fn draw_press_mode_picker(&mut self, ctx: &egui::Context) {
+        if !self.gamepad_nav.press_mode_open { return; }
+        let sel = self.gamepad_nav.press_mode_idx.min(Self::PRESS_MODES.len() - 1);
+        // Current mode on the target card (to mark the active row).
+        let cur_mode = self.gamepad_nav.press_mode_outer.map(|o|
+            self.nav_remap_card_mode(o, self.gamepad_nav.press_mode_card)
+                .unwrap_or_else(|| "down".to_string()))
+            .unwrap_or_else(|| "down".to_string());
+        let accent = ctx.style().visuals.selection.stroke.color;
+
+        egui::Window::new("Press mode")
+            .id(egui::Id::new("gp_press_mode_picker"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    "LS/D-pad: move   South: apply   East: cancel")
+                    .small().color(egui::Color32::from_gray(150)));
+                ui.add_space(6.0);
+                for (i, mode) in Self::PRESS_MODES.iter().enumerate() {
+                    let glyph = crate::canvas::viewer::remapper_press_mode_glyph(mode);
+                    let label = crate::canvas::viewer::remapper_press_mode_label(mode);
+                    let focused = i == sel;
+                    let is_cur = *mode == cur_mode;
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(220.0, 26.0), egui::Sense::hover());
+                    let painter = ui.painter();
+                    if focused {
+                        let [r, g, b, _] = accent.to_array();
+                        painter.rect_filled(rect, 4.0,
+                            egui::Color32::from_rgba_unmultiplied(r, g, b, 55));
+                        painter.rect_stroke(rect, 4.0,
+                            egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+                    }
+                    painter.text(rect.left_center() + egui::vec2(10.0, 0.0),
+                        egui::Align2::LEFT_CENTER, glyph,
+                        egui::FontId::proportional(16.0), ui.visuals().text_color());
+                    painter.text(rect.left_center() + egui::vec2(34.0, 0.0),
+                        egui::Align2::LEFT_CENTER, label,
+                        egui::FontId::proportional(13.0), ui.visuals().text_color());
+                    if is_cur {
+                        painter.text(rect.right_center() - egui::vec2(8.0, 0.0),
+                            egui::Align2::RIGHT_CENTER, "●",
+                            egui::FontId::proportional(10.0), accent);
+                    }
+                }
+            });
+        ctx.request_repaint();
+    }
+
+    /// Context-sensitive button legend for the current gamepad-nav state.
+    /// Returns ordered `(glyphs, label)` hints, where `glyphs` is one or more
+    /// gamepad pin ids drawn side-by-side before the label (e.g. LS + D-pad for
+    /// "Navigate", LB + RB for "Tab"). Directional helpers (`hint_move`,
+    /// `hint_horiz`, `hint_vert`) bundle the stick + matching D-pad glyphs.
+    fn gp_legend_hints(&self) -> Vec<(Vec<&'static str>, &'static str)> {
+        use crate::gamepad_nav::EditLevel;
+
+        // Stick + D-pad bundles so both navigation methods are advertised.
+        // `_move` uses the all-direction glyphs; `_horiz`/`_vert` use the
+        // axis-specific (both-arrows) glyphs.
+        let hint_move  = || vec!["left_stick", "dpad"];                       // any direction
+        let hint_horiz = || vec!["left_stick_horizontal", "dpad_horizontal"]; // left/right axis
+        let hint_vert  = || vec!["left_stick_vertical", "dpad_vertical"];     // up/down axis
+
+        // Modal contexts take priority over the sub-patch edit level.
+        if self.gamepad_nav.kbm_picker_open {
+            return vec![
+                (hint_move(), "Move"),
+                (vec!["btn_south"], "Add key"),
+                (vec!["btn_north"], "Clear chord"),
+                (vec!["btn_east"], "Done"),
+            ];
+        }
+        if self.gamepad_nav.settings_open {
+            // While a shortcut row is learning, the panel is listening for a
+            // combo — show the capture hints (release to bind, East to abort).
+            if self.gamepad_nav.chord_learn.is_some() {
+                return vec![
+                    (vec![], "Hold a 2+ button combo, release to bind"),
+                    (vec!["btn_east"], "Press alone: cancel"),
+                ];
+            }
+            return vec![
+                (hint_vert(), "Move"),
+                (vec!["btn_south"], if self.gamepad_nav.settings_editing { "Apply" } else { "Edit" }),
+                (hint_horiz(), "Adjust"),
+                (vec!["btn_west"], "Fine"),
+                (vec!["btn_north"], "Clear shortcut"),
+                (vec!["btn_east"], "Close"),
+            ];
+        }
+        if self.gamepad_nav.alt_tab_active {
+            return vec![
+                (vec!["right_stick"], "Switch window"),
+                (vec!["btn_back"], "Release to commit"),
+            ];
+        }
+        if self.gamepad_nav.preset_nav_open {
+            return vec![
+                (hint_move(), "Move"),
+                (vec!["btn_south"], "Apply preset"),
+                (vec!["btn_start"], "Close"),
+            ];
+        }
+        if self.gamepad_nav.press_mode_open {
+            return vec![
+                (hint_vert(), "Move"),
+                (vec!["btn_south"], "Apply"),
+                (vec!["btn_east"], "Cancel"),
+            ];
+        }
+        if self.gamepad_nav.left_edit.is_some() {
+            return vec![
+                (hint_horiz(), "Adjust"),
+                (vec!["btn_west"], "Fine"),
+                (vec!["btn_north"], "Reset"),
+                (vec!["btn_east"], "Done"),
+            ];
+        }
+
+        match self.gamepad_nav.edit_level {
+            EditLevel::Widget => vec![
+                (hint_move(), "Navigate"),
+                (vec!["right_stick"], "Cursor"),
+                (vec!["btn_south", "right_trigger"], "Select / Edit"),
+                (vec!["btn_lb", "btn_rb"], "Tab"),
+                (vec!["btn_start"], "Presets"),
+                (vec!["btn_start"], "Hold: Settings"),
+                (vec!["btn_back"], "Alt-Tab"),
+                (vec!["btn_ls"], "Undo"),
+                (vec!["btn_rs"], "Redo"),
+            ],
+            EditLevel::Editing => {
+                // Row-type (multi-field) widgets split the axes: horizontal =
+                // select field, vertical = adjust value. Single-value widgets
+                // (knob / constant) adjust on any direction.
+                let multi = self.nav_active_outer_id()
+                    .map(|o| matches!(self.nav_selected_kind(o),
+                        NavWidgetKind::MultiField))
+                    .unwrap_or(false);
+                if multi {
+                    vec![
+                        (hint_horiz(), "Select field"),
+                        (hint_vert(), "Adjust"),
+                        (vec!["btn_south"], "Confirm"),
+                        (vec!["btn_west"], "Fine"),
+                        (vec!["btn_north"], "Reset"),
+                        (vec!["btn_east"], "Back"),
+                    ]
+                } else {
+                    vec![
+                        (hint_move(), "Adjust"),
+                        (vec!["btn_south"], "Confirm"),
+                        (vec!["btn_west"], "Fine"),
+                        (vec!["btn_north"], "Reset"),
+                        (vec!["btn_east"], "Back"),
+                    ]
+                }
+            }
+            EditLevel::CurveDots => vec![
+                (hint_move(), "Pick dot"),
+                (vec!["btn_south"], "Edit dot"),
+                (vec!["right_trigger"], "Add dot"),
+                (vec!["left_trigger"], "Delete dot"),
+                (vec!["btn_east"], "Back"),
+            ],
+            EditLevel::CurveDot => vec![
+                (hint_move(), "Move dot"),
+                (vec!["btn_west"], "Fine"),
+                (vec!["btn_east"], "Back"),
+            ],
+            EditLevel::RemapScroll => vec![
+                (hint_move(), "Navigate"),
+                (vec!["btn_south"], "Select / Enter"),
+                (vec!["btn_north"], "Reset card"),
+                (vec!["btn_west"], "Delete card"),
+                (vec!["left_trigger", "right_trigger"], "Filter"),
+                (vec!["btn_east"], "Back"),
+            ],
+            EditLevel::RemapCard => vec![
+                (hint_horiz(), "Field"),
+                (hint_vert(), "Adjust"),
+                (vec!["btn_south"], "Toggle / Open"),
+                (vec!["btn_north"], "Reset card"),
+                (vec!["btn_east"], "Back"),
+            ],
+        }
+    }
+
+    /// Device ids in `self.devices` that are FlexInput's OWN virtual output
+    /// pads looping back through the OS as physical gamepads. These must be
+    /// excluded from UI navigation (driving the UI from a device that mirrors
+    /// our own output would create a feedback loop / double inputs). Uses the
+    /// same reverse-walk match as the physical-list filter: for each virtual we
+    /// emit, mark the *last* gilrs entry of that ControllerKind as ours (gilrs
+    /// lists in plug order, so a real pad plugged before our virtual stays
+    /// real). Returns ids regardless of the `show_own_virtuals_as_physical`
+    /// setting — the exclusion applies whenever such a device is visible.
+    fn own_virtual_device_ids(&self) -> std::collections::HashSet<String> {
+        use std::collections::HashMap;
+        let mut to_skip: HashMap<flexinput_devices::ControllerKind, usize> = HashMap::new();
+        {
+            let pool = self.shared_virtual_devices.lock().unwrap();
+            for d in pool.iter() {
+                let kind = match flexinput_virtual::kind_prefix(d.id()).as_str() {
+                    "virtual.xinput" => Some(flexinput_devices::ControllerKind::XInput),
+                    "virtual.ds4"    => Some(flexinput_devices::ControllerKind::DualShock4),
+                    _ => None,
+                };
+                if let Some(k) = kind { *to_skip.entry(k).or_insert(0) += 1; }
+            }
+        }
+        let mut owned = std::collections::HashSet::new();
+        for (k, n) in to_skip.iter() {
+            let mut remaining = *n;
+            for i in (0..self.devices.len()).rev() {
+                if remaining == 0 { break; }
+                if self.devices[i].kind == *k && !owned.contains(&self.devices[i].id) {
+                    owned.insert(self.devices[i].id.clone());
+                    remaining -= 1;
+                }
+            }
+        }
+        owned
+    }
+
+    /// Resolve the active Easy sub-patch outer node id (the `subpatch` node in
+    /// the active tab), if any. Used by the legend to inspect the selected
+    /// widget kind.
+    fn nav_active_outer_id(&self) -> Option<egui_snarl::NodeId> {
+        self.tabs.get(self.active_tab)?.canvas.snarl
+            .nodes_ids_data()
+            .find(|(_, n)| n.value.module_id == "subpatch")
+            .map(|(id, _)| id)
+    }
+
+    /// One gamepad-shortcut chord row: a label, a Learn button that captures a
+    /// button combo (sets `gamepad_nav.chord_learn`), and a clear (✕). Shared by
+    /// the desktop Settings window and the gamepad-native settings panel.
+    /// Returns true if the setting changed (so the caller marks dirty).
+    fn gamepad_shortcut_row(&mut self, ui: &mut egui::Ui, label: &str,
+        target: crate::gamepad_nav::ChordTarget) -> bool
+    {
+        use crate::gamepad_nav::ChordTarget;
+        let mut changed = false;
+        let learning = self.gamepad_nav.chord_learn == Some(target);
+        // Snapshot the assigned combo + presence as owned values so no borrow of
+        // self.settings is held across the closure (which mutates self).
+        let (assigned_label, has_assigned) = {
+            let assigned: Option<&Vec<String>> = match target {
+                ChordTarget::SeeThrough => self.settings.seethrough_chord.as_ref(),
+                ChordTarget::Panic      => self.settings.panic_chord.as_ref(),
+            };
+            (assigned.map(|c| pretty_chord_combo(c)), assigned.is_some())
+        };
+        let face = if learning {
+            "Hold 2+ buttons, release…".to_string()
+        } else {
+            assigned_label.unwrap_or_else(|| "(none)".to_string())
+        };
+        ui.horizontal(|ui| {
+            ui.label(format!("{label}:"));
+            let mut btn = egui::Button::new(egui::RichText::new(face).size(12.0));
+            if learning {
+                btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+            }
+            if ui.add(btn).on_hover_text(
+                "Click, then hold a 2+ button gamepad combo and release it to bind.\n\
+                 Captured while held; latches when you let go. \
+                 (Press East alone to cancel.)").clicked()
+            {
+                // Toggle learn for this target; clear any in-flight draft and
+                // require a full release before accumulating.
+                self.gamepad_nav.chord_learn = if learning { None } else { Some(target) };
+                self.gamepad_nav.chord_draft.clear();
+                self.gamepad_nav.chord_arm_idle = false;
+            }
+            if has_assigned
+                && ui.small_button("✕").on_hover_text("Clear shortcut").clicked()
+            {
+                match target {
+                    ChordTarget::SeeThrough => self.settings.seethrough_chord = None,
+                    ChordTarget::Panic      => self.settings.panic_chord = None,
+                }
+                if learning { self.gamepad_nav.chord_learn = None; }
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    /// Bottom legend bar listing the active gamepad's button actions for the
+    /// current nav context. Visible only while a nav-enabled gamepad drives the
+    /// UI (`active_dev` set this frame by `run_gamepad_nav`).
+    fn draw_gp_legend_bar(&self, ctx: &egui::Context) {
+        let Some(dev) = self.gamepad_nav.active_dev.clone() else { return; };
+        let skin = crate::canvas::remapper_icons::skin_from_device_id(&dev);
+        let hints = self.gp_legend_hints();
+        if hints.is_empty() { return; }
+
+        egui::TopBottomPanel::bottom("gp_legend_bar")
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(egui::Frame::default()
+                .fill(ctx.style().visuals.panel_fill)
+                .inner_margin(egui::Margin::symmetric(10, 5)))
+            .show(ctx, |ui| {
+                // Wrap so a long hint set folds onto a second line instead of
+                // overflowing the window width on narrow displays.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    const GLYPH: f32 = 18.0;
+                    for (i, (pins, label)) in hints.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(3.0);
+                            ui.separator();
+                            ui.add_space(3.0);
+                        }
+                        // One or more glyphs (e.g. LS + D-pad, LB + RB) shown
+                        // side-by-side before the shared label.
+                        for (j, pin) in pins.iter().enumerate() {
+                            if j > 0 {
+                                ui.label(egui::RichText::new("/").size(11.0).weak());
+                            }
+                            if let Some(tex) = self.gp_legend_glyph(ctx, skin, pin) {
+                                ui.add(egui::Image::new((tex.id(), egui::vec2(GLYPH, GLYPH))));
+                            } else {
+                                // No glyph under this skin — short textual token.
+                                ui.label(egui::RichText::new(gp_pin_token(pin)).strong().size(12.0));
+                            }
+                        }
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new(*label).size(12.0));
+                    }
+                });
+            });
+    }
+
+    /// Cached glyph texture for a gamepad button pin under a skin (white-bg-free
+    /// SVG rendered with native colors). Cached per (skin, pin) on ctx temp data.
+    fn gp_legend_glyph(&self, ctx: &egui::Context,
+        skin: crate::canvas::remapper_icons::Skin, pin: &str)
+        -> Option<egui::TextureHandle>
+    {
+        let key = egui::Id::new(("gp_legend_glyph", skin.as_str(), pin));
+        if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+            return Some(t);
+        }
+        let bytes = crate::canvas::remapper_icons::pin_svg(skin, pin)?;
+        let svg = std::str::from_utf8(bytes).ok()?;
+        // Native colors (transparent tint → recolor pass skipped).
+        let img = crate::canvas::viewer::rasterize_svg_recolored(
+            svg, 36, 36, "override", egui::Color32::TRANSPARENT)?;
+        let t = ctx.load_texture(format!("gp_legend_{}_{}", skin.as_str(), pin),
+            img, egui::TextureOptions::LINEAR);
+        ctx.data_mut(|d| d.insert_temp(key, t.clone()));
+        Some(t)
     }
 
     fn draw_settings_window(&mut self, ctx: &egui::Context) {
@@ -6045,6 +7073,33 @@ impl FlexInputApp {
                     cfg.enabled = self.settings.pin_via_guide;
                     cfg.require_double_tap = self.settings.pin_guide_double_tap;
                     cfg.chord_signal = self.settings.pin_guide_chord.clone();
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // ── Gamepad shortcuts ───────────────────────────────────
+                // Assign a gamepad button combo to toggle see-through / panic.
+                // Learned by clicking Learn then pressing+releasing a combo.
+                ui.label(egui::RichText::new("Gamepad shortcuts").strong());
+                ui.add_space(4.0);
+                if self.gamepad_shortcut_row(ui, "See-through", crate::gamepad_nav::ChordTarget::SeeThrough) {
+                    dirty = true;
+                }
+                if self.gamepad_shortcut_row(ui, "Panic mode", crate::gamepad_nav::ChordTarget::Panic) {
+                    dirty = true;
+                }
+                ui.add_space(2.0);
+                if ui.checkbox(&mut self.settings.gamepad_chords_nav_only,
+                    "Only when in gamepad navigation mode")
+                    .on_hover_text(
+                        "On: these combos fire only while the driving gamepad is in UI-navigation mode \
+                         (so the same buttons stay free for in-game mappings otherwise).\n\
+                         Off: they fire from any connected gamepad whenever FlexInput is focused.")
+                    .changed()
+                {
+                    dirty = true;
                 }
 
                 ui.add_space(10.0);
@@ -9549,8 +10604,16 @@ fn kbm_pin_label(pin: &str) -> String {
         "mouse_left" => "LMB".into(),
         "mouse_right" => "RMB".into(),
         "mouse_middle" => "MMB".into(),
+        "mouse_back" => "MB4".into(),
+        "mouse_forward" => "MB5".into(),
         "scroll_up" => "Scroll↑".into(),
         "scroll_down" => "Scroll↓".into(),
+        "key_pageup" => "PgUp".into(),
+        "key_pagedown" => "PgDn".into(),
+        "key_insert" => "Ins".into(),
+        "key_delete" => "Del".into(),
+        "key_printscreen" => "PrtSc".into(),
+        "key_pause" => "Pause".into(),
         "key_space" => "Space".into(),
         "key_enter" => "Enter".into(),
         "key_backspace" => "Bksp".into(),
@@ -9569,6 +10632,25 @@ fn kbm_pin_label(pin: &str) -> String {
             cs.next().map(|f| f.to_uppercase().collect::<String>() + cs.as_str())
                 .unwrap_or_else(|| s.to_string())
         }
+    }
+}
+
+/// Short textual token for a gamepad pin used in the legend bar when no glyph
+/// is available under the active skin (sticks/triggers don't always have a
+/// directional SVG). Keeps the hint readable as a fallback.
+fn gp_pin_token(pin: &str) -> &'static str {
+    match pin {
+        "left_stick" | "left_stick_left" | "left_stick_up"
+            | "left_stick_horizontal" | "left_stick_vertical" => "LS",
+        "right_stick" => "RS",
+        "dpad_up" | "dpad_left" | "dpad_down" | "dpad_right"
+            | "dpad" | "dpad_horizontal" | "dpad_vertical" => "Dpad",
+        "btn_south" => "A", "btn_east" => "B", "btn_west" => "X", "btn_north" => "Y",
+        "btn_lb" => "LB", "btn_rb" => "RB",
+        "left_trigger" => "LT", "right_trigger" => "RT",
+        "btn_ls" => "LS▾", "btn_rs" => "RS▾",
+        "btn_start" => "Start", "btn_back" => "Back",
+        _ => "•",
     }
 }
 
@@ -9602,7 +10684,17 @@ pub(crate) fn clear_transient_capture_state(sp: &mut UiSubPatch) {
     const TRANSIENT: &[&str] = &[
         "ui_phase", "draft_input", "draft_output", "_pressed_prev",
         "_nav_capture_armed", "_nav_arm_idle", "_nav_act_learn",
-        "_nav_act_special", "_nav_act_add", "_tp_click_mode", "_tp_zones",
+        "_nav_act_special", "_nav_act_add", "_nav_act_clear",
+        "_tp_click_mode", "_tp_zones",
+        // Gyro Lean per-side capture transients.
+        "_lean_left_phase", "_lean_left_draft", "_lean_left_pressed_prev",
+        "_lean_left_armed", "_lean_left_arm_idle",
+        "_nav_act_learn_left", "_nav_act_special_left", "_nav_act_add_left",
+        "_nav_act_clear_left",
+        "_lean_right_phase", "_lean_right_draft", "_lean_right_pressed_prev",
+        "_lean_right_armed", "_lean_right_arm_idle",
+        "_nav_act_learn_right", "_nav_act_special_right", "_nav_act_add_right",
+        "_nav_act_clear_right",
     ];
     for (_, node_ref) in sp.snarl.nodes_ids_data_mut() {
         let node = &mut node_ref.value;

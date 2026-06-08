@@ -1207,6 +1207,8 @@ fn egui_key_name_to_enigo(name: &str) -> Option<Key> {
         "end"              => Key::End,
         "pageup"           => Key::PageUp,
         "pagedown"         => Key::PageDown,
+        "printscreen"      => Key::Snapshot, // VK_SNAPSHOT (the Print Screen key)
+        "pause"            => Key::Pause,    // VK_PAUSE (Pause/Break)
         "arrowup"          => Key::UpArrow,
         "arrowdown"        => Key::DownArrow,
         "arrowleft"        => Key::LeftArrow,

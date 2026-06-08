@@ -3973,6 +3973,8 @@ fn show_gyro_lean_mapping_section(
     let phase_key      = if side == "left" { "_lean_left_phase" } else { "_lean_right_phase" };
     let draft_key      = if side == "left" { "_lean_left_draft" } else { "_lean_right_draft" };
     let prev_key       = if side == "left" { "_lean_left_pressed_prev" } else { "_lean_right_pressed_prev" };
+    let armed_key      = if side == "left" { "_lean_left_armed" } else { "_lean_right_armed" };
+    let arm_idle_key   = if side == "left" { "_lean_left_arm_idle" } else { "_lean_right_arm_idle" };
     let title          = if side == "left" { "Lean Left → " } else { "Lean Right → " };
 
     // ── Migration: if legacy entries with `in` exist, rewrite to `out`.
@@ -4010,6 +4012,25 @@ fn show_gyro_lean_mapping_section(
         n.params.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default(),
     )).unwrap_or_else(|| ("idle".into(), vec![], vec![], vec![]));
 
+    // Gamepad UI-nav active for the upstream device this frame? While it is, the
+    // controller drives FlexInput's UI, so capture must not begin until the
+    // Learn press has been released. Mirrors the Remapper's arm/arm-idle
+    // handshake but scoped per Lean side.
+    let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
+        let stamp: Option<u64> = ui.ctx().data(|d|
+            d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
+        stamp == Some(ui.ctx().cumulative_pass_nr())
+    }).unwrap_or(false);
+    let nav_capture_armed = snarl.get_node(node_id)
+        .and_then(|n| n.params.get(armed_key)).and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut nav_arm_idle = snarl.get_node(node_id)
+        .and_then(|n| n.params.get(arm_idle_key)).and_then(|v| v.as_bool()).unwrap_or(false);
+    // Capture may proceed when not in nav mode, OR (nav mode) once armed AND the
+    // device has gone idle once since arming (so the Learn press is released).
+    let capture_ok = !nav_active_for_device || (nav_capture_armed && nav_arm_idle);
+    let mut clear_capture_arm = false;
+    let mut set_arm_idle: Option<bool> = None;
+
     // ── Capture state machine ───────────────────────────────────────────
     // Only ticks while `phase == "learning"` (active capture session).
     // No auto-enter-on-wire — Learn is button-gated, otherwise the gyro
@@ -4025,6 +4046,14 @@ fn show_gyro_lean_mapping_section(
         }
     }
 
+    // Arm-idle latch: first frame the device is empty while armed, flip arm_idle
+    // true so the NEXT non-empty press begins the capture (post Learn release).
+    let now_empty = pressed_now.is_empty();
+    if nav_capture_armed && !nav_arm_idle && now_empty {
+        set_arm_idle = Some(true);
+        nav_arm_idle = true;
+    }
+
     let mut new_phase = phase.clone();
     let mut new_draft = draft.clone();
 
@@ -4033,15 +4062,23 @@ fn show_gyro_lean_mapping_section(
             .filter(|p| !pressed_prev.iter().any(|q| q == *p))
             .collect();
         let prev_was_empty = pressed_prev.is_empty();
-        if !rising.is_empty() && prev_was_empty && !new_draft.is_empty() {
+        // Capture gated on `capture_ok` so a still-held Learn press (nav mode)
+        // doesn't get captured; once the chord lands and releases, the arm
+        // clears so subsequent nav presses don't overwrite it.
+        if capture_ok && !rising.is_empty() && prev_was_empty && !new_draft.is_empty() {
             // Re-capture: new burst after a previous chord.
             new_draft = rising.iter().map(|s| (*s).clone()).collect();
-        } else if !pressed_now.is_empty() {
+        } else if capture_ok && !pressed_now.is_empty() {
             for p in &pressed_now {
                 if !new_draft.iter().any(|q| q == p) { new_draft.push(p.clone()); }
             }
         }
-        // No auto-latch; user explicitly clicks Add or Stop.
+        // Latch on release: once a chord was captured and the device goes idle,
+        // clear the arm so navigation resumes (the draft is kept for Add).
+        if nav_capture_armed && now_empty && !new_draft.is_empty() {
+            clear_capture_arm = true;
+        }
+        // No auto-latch of the mapping itself; user explicitly clicks Add/Stop.
     }
 
     // Persist state machine results before rendering.
@@ -4049,6 +4086,11 @@ fn show_gyro_lean_mapping_section(
         node.params.insert(phase_key.to_string(), Value::String(new_phase.clone()));
         remapper_write_str_array(node, draft_key, &new_draft);
         remapper_write_str_array(node, prev_key, &pressed_now);
+        if let Some(v) = set_arm_idle { node.params.insert(arm_idle_key.to_string(), Value::from(v)); }
+        if clear_capture_arm {
+            node.params.insert(armed_key.to_string(), Value::from(false));
+            node.params.insert(arm_idle_key.to_string(), Value::from(false));
+        }
     }
 
     // ── Render ──────────────────────────────────────────────────────────
@@ -4067,6 +4109,58 @@ fn show_gyro_lean_mapping_section(
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
     ui.set_min_width(BODY_W);
+
+    // Side-scoped `_nav_act_*` flag keys (set by the nav driver on South).
+    let lk = if side == "left" { "_nav_act_learn_left" }   else { "_nav_act_learn_right" };
+    let ak = if side == "left" { "_nav_act_add_left" }     else { "_nav_act_add_right" };
+    let sk = if side == "left" { "_nav_act_special_left" } else { "_nav_act_special_right" };
+    let ck = if side == "left" { "_nav_act_clear_left" }   else { "_nav_act_clear_right" };
+    // Consume side-scoped one-shot gamepad activation flags. Mirrors the
+    // Remapper/Map Action `_nav_act_*` pattern so a controller can drive
+    // Learn / Special / Clear / Add in the Lean sections too.
+    let (act_learn, act_add, act_special, act_clear) = {
+        let n = snarl.get_node(node_id);
+        let g = |k: &str| n.and_then(|n| n.params.get(k)).and_then(|v| v.as_bool()).unwrap_or(false);
+        (g(lk), g(ak), g(sk), g(ck))
+    };
+    if act_learn || act_add || act_special || act_clear {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert(lk.to_string(), Value::from(false));
+            node.params.insert(ak.to_string(), Value::from(false));
+            node.params.insert(sk.to_string(), Value::from(false));
+            node.params.insert(ck.to_string(), Value::from(false));
+        }
+    }
+
+    // Status line. Before Learn: prompt to Learn or pick Special. During
+    // learning: prompt for the chord (or show the draft).
+    {
+        let blue = Color32::from_rgb(106, 167, 255);
+        let green = Color32::from_rgb(127, 201, 127);
+        // idle (no draft) → prompt for Learn/Special; "ready" (Special-picked
+        // draft) → prompt to Add; "learning" handled by the draft preview below.
+        if new_phase != "learning" {
+            if new_phase == "ready" && !draft.is_empty() {
+                ui.label(egui::RichText::new("Picked — click Add (or Learn to add a chord)")
+                    .size(13.0).color(green));
+            } else {
+                let txt = if !wired {
+                    "Connect the gyro Device input, then Learn (or select Special)"
+                } else {
+                    "Press Learn to start capture or select Special"
+                };
+                ui.label(egui::RichText::new(txt).size(13.0).color(blue));
+            }
+        }
+    }
+
+    let mut learn_rect = egui::Rect::NOTHING;
+    let mut special_rect = egui::Rect::NOTHING;
+    let mut clear_rect = egui::Rect::NOTHING;
+    let mut add_rect = egui::Rect::NOTHING;
+    // A draft exists if the section captured/picked any output, or is mid-learn.
+    let has_draft = !new_draft.is_empty()
+        || new_phase == "learning" || new_phase == "ready";
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).small().weak());
         ui.label(egui::RichText::new(format!("({})", mappings.len())).small().weak());
@@ -4081,22 +4175,98 @@ fn show_gyro_lean_mapping_section(
         } else {
             "Connect the gyro module's Device input to enable gamepad capture\n(keyboard can be captured without a wire once Learn is active)"
         });
-        if learn_resp.clicked() {
+        learn_rect = learn_resp.rect;
+        if (learn_resp.clicked() || act_learn) && (wired || in_learning) {
+            // Coming from "ready" (Special pins already picked) keeps the draft
+            // so a gamepad chord SUMS onto the Special pins; from idle, start
+            // fresh.
+            let from_ready = new_phase == "ready";
             if let Some(node) = snarl.get_node_mut(node_id) {
                 if in_learning {
                     node.params.insert(phase_key.to_string(), Value::String("idle".to_string()));
+                    node.params.insert(armed_key.to_string(), Value::from(false));
+                    node.params.insert(arm_idle_key.to_string(), Value::from(false));
                 } else {
                     node.params.insert(phase_key.to_string(), Value::String("learning".to_string()));
-                    remapper_write_str_array(node, draft_key, &[]);
+                    if !from_ready {
+                        remapper_write_str_array(node, draft_key, &[]);
+                    }
                     remapper_write_str_array(node, prev_key, &[]);
+                    // Arm a one-shot nav capture: arm_idle=false so capture waits
+                    // for the Learn press to release before it begins.
+                    node.params.insert(armed_key.to_string(), Value::from(true));
+                    node.params.insert(arm_idle_key.to_string(), Value::from(false));
                 }
             }
         }
 
-        let add_enabled = in_learning && !new_draft.is_empty();
-        if ui.add_enabled(add_enabled,
-            egui::Button::new(egui::RichText::new("Add").size(13.0))).clicked()
+        // Special dropdown — appends pins that can't be press-captured (mouse
+        // buttons / scroll / explicit modifiers) directly to the Lean output
+        // draft. Available BEFORE Learn (idle) and during learning, so a gamepad
+        // user can pick a mouse/keyboard action. Gamepad South (via
+        // `_nav_act_special_<side>`) opens it / the KB/M picker.
         {
+            let combo_id = egui::Id::new((node_id, "lean_special", side));
+            if act_special {
+                ui.memory_mut(|m| m.open_popup(combo_id));
+            }
+            let mut to_append: Option<&'static str> = None;
+            let combo = egui::ComboBox::from_id_salt((node_id, "lean_special", side))
+                .selected_text(egui::RichText::new("Special…").size(13.0))
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for (label, id) in REMAPPER_SPECIAL_PINS {
+                        if new_draft.iter().any(|p| p == id) { continue; }
+                        if ui.selectable_label(false, egui::RichText::new(*label).size(13.0)).clicked() {
+                            to_append = Some(id);
+                        }
+                    }
+                });
+            special_rect = combo.response.rect;
+            if let Some(id) = to_append {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    let mut arr = new_draft.clone();
+                    arr.push(id.to_string());
+                    remapper_write_str_array(node, draft_key, &arr);
+                    new_draft.push(id.to_string());
+                    // Picking a Special pin moves to "ready" (NOT "learning"):
+                    // the draft shows and Add is enabled, but the gamepad capture
+                    // machine does NOT tick — so the South used to navigate the
+                    // picker isn't swept into the chord and Learn stays "Learn".
+                    node.params.insert(phase_key.to_string(), Value::String("ready".to_string()));
+                    new_phase = "ready".to_string();
+                    // Picking via Special also disarms any pending nav capture.
+                    node.params.insert(armed_key.to_string(), Value::from(false));
+                    node.params.insert(arm_idle_key.to_string(), Value::from(false));
+                }
+            }
+        }
+
+        // Clear button — abandons the captured/picked output and starts over
+        // (back to idle, draft emptied, capture disarmed). Shown whenever a draft
+        // exists so a botched capture/pick can be reset WITHOUT finishing.
+        if has_draft {
+            let clear_btn = ui.add(egui::Button::new(egui::RichText::new("Clear").size(13.0)));
+            clear_rect = clear_btn.rect;
+            if clear_btn.clicked() || act_clear {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert(phase_key.to_string(), Value::String("idle".to_string()));
+                    remapper_write_str_array(node, draft_key, &[]);
+                    remapper_write_str_array(node, prev_key, &[]);
+                    node.params.insert(armed_key.to_string(), Value::from(false));
+                    node.params.insert(arm_idle_key.to_string(), Value::from(false));
+                }
+                new_draft.clear();
+                new_phase = "idle".to_string();
+            }
+        }
+
+        let add_enabled = !new_draft.is_empty()
+            && (new_phase == "learning" || new_phase == "ready");
+        let add_resp = ui.add_enabled(add_enabled,
+            egui::Button::new(egui::RichText::new("Add").size(13.0)));
+        add_rect = add_resp.rect;
+        if (add_resp.clicked() || act_add) && add_enabled {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 let out_arr: Vec<Value> = new_draft.iter().map(|s| Value::String(s.clone())).collect();
                 let mut entry = serde_json::Map::new();
@@ -4104,24 +4274,39 @@ fn show_gyro_lean_mapping_section(
                 let mut all = mappings.clone();
                 all.push(Value::Object(entry));
                 node.params.insert(key.to_string(), Value::Array(all));
-                // Stay in learning so the user can chain more captures.
                 remapper_write_str_array(node, draft_key, &[]);
                 remapper_write_str_array(node, prev_key, &[]);
+                // Disarm so a held nav press after Add doesn't re-capture.
+                node.params.insert(armed_key.to_string(), Value::from(false));
+                node.params.insert(arm_idle_key.to_string(), Value::from(false));
+                // If we Added a Special-only pick ("ready"), return to idle (no
+                // active capture). From "learning" (gamepad), stay learning so
+                // the user can chain more captures with the same Learn session.
+                if new_phase == "ready" {
+                    node.params.insert(phase_key.to_string(), Value::String("idle".to_string()));
+                }
             }
         }
     });
+    // Publish action-button rects (global) so the nav driver can glow the
+    // focused one. Order MUST match `nav_remap_action_items` for Lean: Learn,
+    // Special, Clear(has_draft), Add((learning||ready) && draft). Use the cards'
+    // scope.
+    publish_nav_action_rects_scoped(ui, node_id, key,
+        &[learn_rect, special_rect, clear_rect, add_rect]);
 
-    // Status / draft preview line while learning.
-    if new_phase == "learning" {
-        if new_draft.is_empty() {
-            ui.label(egui::RichText::new("Press a button or combination")
-                .size(13.0).color(Color32::from_rgb(106, 167, 255)));
-        } else {
-            ui.horizontal_wrapped(|ui| {
-                remapper_render_chord(ui, &new_draft, skin);
-            });
-        }
+    // Status / draft preview line. During "learning" with an empty draft, prompt
+    // for the chord; otherwise (learning or "ready" with a draft) show the
+    // captured/picked chord chips so the user sees what Add will commit.
+    if new_phase == "learning" && new_draft.is_empty() {
+        ui.label(egui::RichText::new("Press a button or combination")
+            .size(13.0).color(Color32::from_rgb(106, 167, 255)));
         ui.ctx().request_repaint();
+    } else if (new_phase == "learning" || new_phase == "ready") && !new_draft.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            remapper_render_chord(ui, &new_draft, skin);
+        });
+        if new_phase == "learning" { ui.ctx().request_repaint(); }
     }
 
     // ── Mapping cards ───────────────────────────────────────────────────
@@ -4178,7 +4363,7 @@ fn show_gyro_lean_mapping_section(
                     let result = remapper_mapping_card_pixel(
                         ui, node_id, i, &mut working,
                         &out_pins, None, skin, true,
-                        reorder_enabled, drag_off,
+                        reorder_enabled, drag_off, key,
                     );
                     if result.delete_clicked { to_remove = Some(i); }
                     if result.changed { working_changed = true; }
@@ -7352,6 +7537,12 @@ fn publish_nav_field_rects(ui: &egui::Ui, inner_id: NodeId, local_rects: &[egui:
 /// NOTHING rect are skipped so the published list lines up with the driver's
 /// (which already drops Special/Add when they don't apply).
 fn publish_nav_action_rects(ui: &egui::Ui, node_id: NodeId, action_rects: &[egui::Rect]) {
+    publish_nav_action_rects_scoped(ui, node_id, "mappings", action_rects);
+}
+
+/// As `publish_nav_action_rects`, but scoped by a string discriminator so two
+/// mapping lists sharing one node (gyro Lean left/right) publish independently.
+fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, scope: &str, action_rects: &[egui::Rect]) {
     let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
         .unwrap_or(egui::emath::TSTransform::IDENTITY);
     // Keep the LOCAL rects too, in publish order, for the scroll-into-view check.
@@ -7366,11 +7557,11 @@ fn publish_nav_action_rects(ui: &egui::Ui, node_id: NodeId, action_rects: &[egui
     // ctx value into a plain local FIRST, then operate on locals.
     let pass = ui.ctx().cumulative_pass_nr();
     let action_sel: Option<(u64, usize)> = ui.ctx()
-        .data(|d| d.get_temp(egui::Id::new(("gp_nav_remap_action", node_id.0))));
+        .data(|d| d.get_temp(egui::Id::new(("gp_nav_remap_action", node_id.0, scope))));
     let clip = ui.clip_rect();
 
     ui.ctx().data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_action_rects", node_id.0)), (pass, rects)));
+        egui::Id::new(("gp_nav_action_rects", node_id.0, scope)), (pass, rects)));
 
     // If an action button is the current nav selection and it's (partly) above/
     // below the visible band, request a scroll so it comes into view. The action
@@ -7386,6 +7577,9 @@ fn publish_nav_action_rects(ui: &egui::Ui, node_id: NodeId, action_rects: &[egui
             if r.top() < clip.top() + 4.0 { need = r.top() - (clip.top() + 4.0); }
             else if r.bottom() > clip.bottom() - 4.0 { need = r.bottom() - (clip.bottom() - 4.0); }
             if need.abs() > 1.0 {
+                // Scroll-into-view temp stays UNscoped (keyed by node id): the
+                // two consumers read it unscoped, and lean left/right action
+                // rows live in separate scroll bodies so cross-talk is harmless.
                 ui.ctx().data_mut(|d| d.insert_temp(
                     egui::Id::new(("gp_nav_remap_scroll", node_id.0)),
                     (pass, need)));
@@ -13390,6 +13584,8 @@ fn remapper_mapping_card_pixel(
     allow_analog_mode: bool,        // true for Lean cards and Remapper/Map Action (since analog support added)
     reorder_enabled: bool,          // sense a drag on the body for reorder
     drag_offset_y: f32,             // visual lift (paint offset) while dragging this card
+    nav_scope: &str,                // nav-temp key scope: "mappings" / "lean_left" / "lean_right"
+                                    // — disambiguates the two Lean lists sharing one node
 ) -> MappingCardResult {
     // ── Figma palette ─────────────────────────────────────────────────────
     const C_CARD_BG:   Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);  // outer
@@ -13516,12 +13712,12 @@ fn remapper_mapping_card_pixel(
     // each header control is laid out: [press-mode, time-gap, hold, turbo].
     let cur_pass = ui.ctx().cumulative_pass_nr();
     let (nav_card_sel, nav_card_entered) = ui.ctx()
-        .data(|d| d.get_temp::<(u64, usize, bool)>(egui::Id::new(("gp_nav_remap_card", node_id.0))))
+        .data(|d| d.get_temp::<(u64, usize, bool)>(egui::Id::new(("gp_nav_remap_card", node_id.0, nav_scope))))
         .filter(|(p, _, _)| cur_pass.saturating_sub(*p) <= 1)
         .map(|(_, i, e)| (Some(i), e))
         .unwrap_or((None, false));
     let nav_card_field: Option<u64> = ui.ctx()
-        .data(|d| d.get_temp::<(u64, u64)>(egui::Id::new(("gp_nav_remap_card_field", node_id.0))))
+        .data(|d| d.get_temp::<(u64, u64)>(egui::Id::new(("gp_nav_remap_card_field", node_id.0, nav_scope))))
         .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 1)
         .map(|(_, f)| f);
     let nav_this = nav_card_sel == Some(mapping_idx);
@@ -13854,7 +14050,7 @@ fn remapper_mapping_card_pixel(
             .map(|fr| to_global * fr);
         let pass = ui.ctx().cumulative_pass_nr();
         ui.ctx().data_mut(|d| d.insert_temp(
-            egui::Id::new(("gp_nav_remap_card_rects", node_id.0)),
+            egui::Id::new(("gp_nav_remap_card_rects", node_id.0, nav_scope)),
             (pass, card_g, field_g, nav_card_entered)));
 
         // Auto-scroll: if the selected card is outside the visible band, request
@@ -14224,7 +14420,7 @@ fn remapper_write_str_array(node: &mut NodeData, key: &str, vals: &[String]) {
 
 /// Press-mode glyphs shown on the per-mapping mode button. The popup menu
 /// the button opens uses the same glyphs as visual cues.
-fn remapper_press_mode_glyph(mode: &str) -> &'static str {
+pub(crate) fn remapper_press_mode_glyph(mode: &str) -> &'static str {
     match mode {
         "short"      => "↕",
         "long"       => "⇓",
@@ -14236,7 +14432,7 @@ fn remapper_press_mode_glyph(mode: &str) -> &'static str {
     }
 }
 
-fn remapper_press_mode_label(mode: &str) -> &'static str {
+pub(crate) fn remapper_press_mode_label(mode: &str) -> &'static str {
     match mode {
         "short"      => "Short press",
         "long"       => "Long press",
@@ -14606,8 +14802,16 @@ fn show_remapper_body(
             ("Connect Auto-Map wire to start mapping".into(), Color32::from_rgb(232, 180, 65))
         } else {
             match new_phase.as_str() {
-                "capturing" if new_draft_input.is_empty() =>
-                    ("Press a button or combination".into(), blue),
+                // Before capture is armed (gamepad nav: Learn not yet pressed)
+                // we prompt for Learn; once armed/capture is open, prompt for the
+                // button combo.
+                "capturing" if new_draft_input.is_empty() => {
+                    if nav_active_for_device && !capture_ok {
+                        ("Press Learn to start input capture".into(), blue)
+                    } else {
+                        ("Press a button or combination".into(), blue)
+                    }
+                }
                 "ready_to_learn" =>
                     ("Captured — click Learn (press again to re-capture)".into(), green),
                 "learning" if new_draft_output.is_empty() =>
@@ -14797,9 +15001,9 @@ fn show_remapper_body(
             }
         });
         // Publish action-button rects (global) so the nav driver can glow the
-        // focused one. Order MUST match `nav_remap_action_items`:
-        // Learn, Clear, Special, Add (entries omitted in phases where absent).
-        publish_nav_action_rects(ui, node_id, &[learn_rect, clear_rect, special_rect, add_rect]);
+        // focused one. Order MUST match `nav_remap_action_items` AND the visual
+        // layout: Learn, Special, Clear, Add (entries NOTHING where absent).
+        publish_nav_action_rects(ui, node_id, &[learn_rect, special_rect, clear_rect, add_rect]);
 
         // Mapping list.
         if !mappings.is_empty() {
@@ -14882,7 +15086,7 @@ fn show_remapper_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin,
-                                    true, reorder_enabled, drag_off,
+                                    true, reorder_enabled, drag_off, "mappings",
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
@@ -15179,7 +15383,13 @@ fn show_map_action_body(
             ("Connect Auto-Map wire to start mapping".into(), Color32::from_rgb(232, 180, 65))
         } else {
             match new_phase.as_str() {
-                "capturing" if new_draft_input.is_empty() => ("Press Learn, then a button or combination".into(), blue),
+                "capturing" if new_draft_input.is_empty() => {
+                    if nav_active_for_device && !capture_ok {
+                        ("Press Learn to start input capture".into(), blue)
+                    } else {
+                        ("Press a button or combination".into(), blue)
+                    }
+                }
                 "capturing" => ("Press your input chord; release to capture".into(), blue),
                 "ready_to_add" => ("Captured — click Add".into(), green),
                 _ => (String::new(), Color32::TRANSPARENT),
@@ -15340,7 +15550,7 @@ fn show_map_action_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin,
-                                    true, reorder_enabled, drag_off,
+                                    true, reorder_enabled, drag_off, "mappings",
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
