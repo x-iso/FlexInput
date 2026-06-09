@@ -542,7 +542,8 @@ impl PanicShortcut {
         if self.shift { parts.push("Shift"); }
         if self.alt   { parts.push("Alt"); }
         if self.win   { parts.push("Win"); }
-        let key = self.key.as_deref().unwrap_or("…");
+        let key_raw = self.key.as_deref().unwrap_or("…");
+        let key = match key_raw { "Backtick" => "~", other => other };
         if parts.is_empty() {
             key.to_string()
         } else {

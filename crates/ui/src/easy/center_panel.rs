@@ -1608,7 +1608,13 @@ fn show_gamepad_preset_nav(
 }
 
 fn apply_preset(canvas: &mut Canvas, easy_state: &mut EasyState, p: &PresetInfo) {
-    let Ok(bytes) = std::fs::read(&p.path) else { return; };
+    let owned;
+    let bytes: &[u8] = if let Some(b) = p.embedded_bytes {
+        b
+    } else {
+        owned = match std::fs::read(&p.path) { Ok(b) => b, Err(_) => return };
+        &owned
+    };
     let Ok(file): Result<crate::app::SubPatchFile, _> = serde_json::from_slice(&bytes) else { return; };
 
     let existing: Option<NodeId> = find_subpatch(canvas);

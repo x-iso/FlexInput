@@ -2,6 +2,7 @@
 name    = "flexinput-ui"
 version.workspace = true
 edition.workspace = true
+build   = "build.rs"
 
 [dependencies]
 flexinput-core    = { workspace = true }
