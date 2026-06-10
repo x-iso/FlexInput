@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use egui_snarl::NodeId;
 use flexinput_core::{ModuleDescriptor, Signal};
+
+use crate::app::request_repaint_throttled;
 use flexinput_devices::PhysicalDevice;
 
 use crate::app::{EasyState, PanicShortcut};
@@ -1604,7 +1606,7 @@ fn show_gamepad_preset_nav(
     // Publish the highlighted path for `preset_row` to glow.
     let hl = order[gamepad_nav.preset_nav_index].clone();
     ui.ctx().data_mut(|d| d.insert_temp(preset_nav_highlight_id(), hl));
-    ui.ctx().request_repaint();
+    request_repaint_throttled(ui.ctx());
 }
 
 fn apply_preset(canvas: &mut Canvas, easy_state: &mut EasyState, p: &PresetInfo) {

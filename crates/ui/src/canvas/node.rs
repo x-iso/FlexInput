@@ -35,6 +35,19 @@ pub struct NodeExtra {
     pub trig_acc: Vec<Vec<Option<f32>>>,
     /// True when a capture is currently being accumulated.
     pub trig_armed: bool,
+    /// Hash of the input signal(s) the last time this node's renderer asked
+    /// "did my input change since last frame?". Used by oscilloscope /
+    /// vectorscope / trigscope to gate their `request_repaint()` call so
+    /// they only force vsync while a signal is actually animating —
+    /// without this, three idle scopes lock the whole window at vsync
+    /// the same way the response curves did.
+    pub prev_input_hash: u64,
+    /// Frame counter for the conditional-repaint gate. While the input
+    /// looks unchanged, we still want to repaint occasionally so any
+    /// pending visual decay (vectorscope trail fade, scope sweep
+    /// completing) catches up. Reset to 0 whenever the input changes;
+    /// incremented every frame the input looks stable.
+    pub idle_frames_since_change: u32,
 }
 
 /// An inner module's exposed UI element pinned to the sub-patch body, rendered

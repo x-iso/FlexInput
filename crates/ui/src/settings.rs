@@ -209,6 +209,10 @@ pub struct AppSettings {
     /// FlexInput is focused and a nav-eligible gamepad is connected.
     #[serde(default = "default_true")]
     pub gamepad_chords_nav_only: bool,
+    /// Repaint rate applied while the window is unfocused / minimized.
+    /// Focused window always paints at vsync. Range BG_REPAINT_HZ_MIN..=MAX.
+    #[serde(default = "default_bg_repaint_hz")]
+    pub bg_repaint_hz: u32,
 }
 
 /// Camera behavior immediately after a patch is loaded into a tab.
@@ -222,6 +226,19 @@ pub enum OnPatchLoad {
     /// Pan + scale so every node is visible with a small margin.
     ZoomToFit,
 }
+
+/// Repaint rate (Hz) applied ONLY while the window is unfocused or
+/// minimized. The focused window always paints at vsync — the user is
+/// actively tweaking and visual smoothness matters there. Background
+/// rate caps the wasted GPU/CPU when the user is playing a game or
+/// using another app while FlexInput sits in the tray.
+///
+/// Range 1–30 Hz. 10 Hz default: smooth enough to glance at, low
+/// enough to drop CPU meaningfully.
+pub const BG_REPAINT_HZ_MIN: u32 = 1;
+pub const BG_REPAINT_HZ_MAX: u32 = 30;
+pub const BG_REPAINT_HZ_DEFAULT: u32 = 10;
+fn default_bg_repaint_hz() -> u32 { BG_REPAINT_HZ_DEFAULT }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -255,6 +272,7 @@ impl Default for AppSettings {
             seethrough_chord: None,
             panic_chord: None,
             gamepad_chords_nav_only: true,
+            bg_repaint_hz: BG_REPAINT_HZ_DEFAULT,
         }
     }
 }

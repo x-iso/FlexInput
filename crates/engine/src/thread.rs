@@ -253,8 +253,22 @@ pub fn spawn_processing_thread(
                 }
             }
 
-            // Short sleep to yield the CPU; catches up on the next wakeup.
-            thread::sleep(Duration::from_micros(200));
+            // Sleep until the next tick deadline, capped at 1 ms so we still
+            // respond to a sample-rate change within ~1 ms. The old fixed
+            // 200 µs spin was a major CPU sink: at 2 kHz target (500 µs
+            // interval), waking every 200 µs to find 0 or 1 ticks pending
+            // burned ~5k wake-ups/sec for almost no real work.
+            //
+            // Now: if we're already behind (next_tick <= now), don't
+            // sleep at all — head straight back into the catchup loop.
+            // If we're ahead, sleep the remaining gap so the wakeup
+            // lands right when the next tick is due.
+            let now2 = Instant::now();
+            if next_tick > now2 {
+                let gap = next_tick - now2;
+                let sleep_for = gap.min(Duration::from_millis(1));
+                thread::sleep(sleep_for);
+            }
         }
     })
 }

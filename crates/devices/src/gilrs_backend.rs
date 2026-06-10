@@ -151,19 +151,31 @@ impl DeviceBackend for GilrsBackend {
         // conflicting synthetic button releases that fight the native WGI DPad button events,
         // causing flicker and broken diagonals. DPad discrete outputs are derived manually
         // below from both axis_data (HAT/USB path) and button_data (BT/WGI path).
-        while let Some(ev) = self.gilrs.next_event() {
-            // Count raw events per gilrs gamepad id so the I/O thread can
-            // compute live per-device polling rates. We bump on every event
-            // (Axis/Button/Connected/Disconnected/Dropped) — a single iter of
-            // device data typically produces several events together, which
-            // matches what users see as "device polled this frame".
-            *self.event_counts.entry(usize::from(ev.id)).or_insert(0) += 1;
-            self.gilrs.update(&ev);
+        let mut ev_count = 0u32;
+        {
+            puffin::profile_scope!("gilrs_next_event_drain");
+            while let Some(ev) = self.gilrs.next_event() {
+                // Count raw events per gilrs gamepad id so the I/O thread can
+                // compute live per-device polling rates. We bump on every event
+                // (Axis/Button/Connected/Disconnected/Dropped) — a single iter of
+                // device data typically produces several events together, which
+                // matches what users see as "device polled this frame".
+                *self.event_counts.entry(usize::from(ev.id)).or_insert(0) += 1;
+                self.gilrs.update(&ev);
+                ev_count += 1;
+            }
         }
+        // event count is captured below as a data field on a dedicated scope
+        // to avoid the function-body profile_scope trap (RAII guard would
+        // otherwise span to function exit and falsely include later work).
+        let _ = ev_count;
 
         // Flush staged rumble / lightbar outputs *before* reading inputs so any
         // device.sink writes from the previous frame land on the controller.
-        self.gyro.flush_outputs();
+        {
+            puffin::profile_scope!("gyro_flush_outputs");
+            self.gyro.flush_outputs();
+        }
 
         let mut out = Vec::new();
         let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
@@ -174,6 +186,14 @@ impl DeviceBackend for GilrsBackend {
         // can be resolved to per-device polling rates.
         self.id_to_dev.clear();
 
+        // Wrap the gamepads() walk in an explicit block so the profile
+        // scope's RAII guard ends with the for loop — NOT with the function.
+        // Bare profile_scope! at this depth would falsely include the
+        // post-walk `out` return at function exit (the misleading-scope
+        // trap we've hit twice now). Matching `}` is at the original
+        // for-loop closing brace, with an extra `}` to close this wrapper.
+        {
+        puffin::profile_scope!("gilrs_gamepads_walk");
         for (gilrs_id, pad) in self.gilrs.gamepads() {
             // Apply the same ViGEmBus filter as enumerate() so IDs stay in sync.
             if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
@@ -407,6 +427,7 @@ impl DeviceBackend for GilrsBackend {
                 }
             }
         }
+        } // end gilrs_gamepads_walk profile_scope block
 
         out
     }

@@ -157,6 +157,21 @@ struct HidEntry {
     kind: DeviceKind,
     last: HidReading,
     out: OutputState,
+    /// Output state at the time of the last successful HID write. If `out`
+    /// matches this, the controller already has the current state and we
+    /// can skip the USB write entirely — the I/O thread runs at 500 Hz
+    /// but real-world rumble / lightbar / trigger updates happen at
+    /// dozens of Hz at most, so 99 %+ of writes are redundant. Sending
+    /// only on change drops gyro_flush_outputs from ~8 ms/iter to a few
+    /// microseconds when nothing's changing. Also kinder to USB bandwidth.
+    /// `None` forces the first write after connect / option change.
+    last_sent: Option<OutputState>,
+    /// Last Instant we successfully wrote to the device. Used together
+    /// with `last_sent` to enforce a minimum heartbeat (~1 Hz) — some
+    /// firmware (DS4) drops back to safe defaults if it doesn't see a
+    /// host output report for a while, so we re-send the current state
+    /// every second even when unchanged.
+    last_sent_at: Option<std::time::Instant>,
     output_active: bool,
     /// Number of HID input reports successfully parsed since the last drain
     /// of `take_event_count`. Used to feed the per-device polling-rate readout
@@ -175,7 +190,7 @@ struct HidEntry {
     spike_pending: Option<HidReading>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct OutputState {
     /// Big / heavy / low-frequency motor (DS4 "left", DualSense `motor_left`).
     rumble_strong: u8,
@@ -386,6 +401,8 @@ impl GyroManager {
             kind,
             last: HidReading::default(),
             out: OutputState::default(),
+            last_sent: None,
+            last_sent_at: None,
             output_active: false,
             event_count: 0,
             spike_enabled: true,
@@ -450,8 +467,26 @@ impl GyroManager {
     /// Send pending output reports for every device that has been driven at
     /// least once. Call once per frame.
     pub fn flush_outputs(&mut self) {
+        // Heartbeat interval: re-send the current output state at least
+        // this often even if unchanged. DS4 firmware drops to defaults if
+        // it doesn't see a host report for ~5 s; 1 s is conservative.
+        const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
+        let now = std::time::Instant::now();
         for entry in self.devices.values_mut() {
             if !entry.output_active { continue; }
+            // Skip the USB write when the output state hasn't changed since
+            // the last successful write AND we're within the heartbeat
+            // window. At 500 Hz I/O loop, this turns 500 redundant writes
+            // per second per device into ~1 — gyro_flush_outputs goes from
+            // ~8 ms/iter to a few µs in the steady state.
+            let unchanged = entry.last_sent == Some(entry.out);
+            let within_heartbeat = entry.last_sent_at
+                .map(|t| now.duration_since(t) < HEARTBEAT)
+                .unwrap_or(false);
+            if unchanged && within_heartbeat { continue; }
+            // Snapshot the output state we're about to send so we can stamp
+            // `last_sent` after the match without re-borrowing `entry`.
+            let to_send = entry.out;
             let HidEntry { device, kind, out, .. } = entry;
             match kind {
                 DeviceKind::Ds4 => {
@@ -498,6 +533,13 @@ impl GyroManager {
                     hid_write(device, &pkt);
                 }
             }
+            // Record what we just wrote so the next iteration can skip
+            // if nothing's changed. If the hid_write failed (debug logs
+            // it; release silently swallows) we still record — re-trying
+            // every 2 ms buys nothing, and the heartbeat will re-send
+            // within a second anyway.
+            entry.last_sent = Some(to_send);
+            entry.last_sent_at = Some(now);
         }
     }
 }

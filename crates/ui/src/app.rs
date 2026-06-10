@@ -21,6 +21,30 @@ use crate::{
     settings::{self, AppSettings, PersistedTab, PersistedWorkspace, PinShortcut},
 };
 
+/// When set, internal `request_repaint_throttled()` callers (scope
+/// renderers, animation widgets, etc.) skip their repaint request,
+/// letting the explicit base-rate scheduler at the end of `update()`
+/// dictate the next frame. This is the ONLY way to actually enforce a
+/// repaint ceiling in egui — `request_repaint_after(d)` is a "no later
+/// than d" hint that any `request_repaint()` (delay 0) call will beat
+/// in the same frame. Without suppressing those at source, the 5 Hz
+/// background throttle and the user's 15/30/60 Hz Repaint rate setting
+/// have no effect on heavy scope-laden patches.
+///
+/// Set at the very top of `App::update()` based on viewport focus state
+/// and the current Repaint rate setting; consumed by every renderer
+/// that would otherwise call `request_repaint()` unconditionally.
+pub(crate) static REPAINT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Renderer-internal repaint request that honors `REPAINT_SUPPRESSED`.
+/// Replaces bare `ctx.request_repaint()` in widget code so the
+/// throttle / background-cap can actually take effect.
+pub(crate) fn request_repaint_throttled(ctx: &egui::Context) {
+    if !REPAINT_SUPPRESSED.load(Ordering::Relaxed) {
+        ctx.request_repaint();
+    }
+}
+
 /// Human-readable name for a chord button signal (e.g. `"btn_lb"` →
 /// `"LB"`). Falls back to the raw signal name for anything we don't
 /// recognise.
@@ -320,6 +344,11 @@ struct SubPatchEditor {
     /// pre-sync when the parent hasn't mutated. `None` means "never synced"
     /// (force a sync on the next frame).
     last_synced_parent_gen: Option<u64>,
+    /// Inner canvas mutation_gen at end of the previous frame. If unchanged
+    /// at end of current frame, the user did not edit anything inside this
+    /// editor, so the write-back snarl clone (line ~11205) can be skipped
+    /// entirely — saving a full 50-node graph clone per idle editor frame.
+    last_inner_gen: Option<u64>,
 }
 
 
@@ -511,6 +540,11 @@ pub struct FlexInputApp {
     /// `#[allow(dead_code)]` keeps the release warning down.
     #[allow(dead_code)]
     profiler_server: Option<puffin_http::Server>,
+    /// Last bg_repaint_hz setting we logged. Debug-only — used to print
+    /// the active rate exactly once per change so we can verify the
+    /// slider is actually wired through to ctx.request_repaint_after.
+    #[cfg(debug_assertions)]
+    last_logged_repaint_hz: Option<u32>,
     /// Last (theme, contrast bits, see_through_active, alpha bits) tuple
     /// applied to the egui style. The per-frame `apply_theme_and_contrast`
     /// call short-circuits when the tuple matches the current settings —
@@ -842,6 +876,8 @@ impl FlexInputApp {
             pin_last_external_hwnd: None,
             self_hwnd: None,
             profiler_server: None,
+            #[cfg(debug_assertions)]
+            last_logged_repaint_hz: None,
             theme_applied_for: None,
         };
         // Seed the recovery dirty-signal from the restored tabs so the first
@@ -877,8 +913,26 @@ impl eframe::App for FlexInputApp {
             settings::save_settings(&self.settings);
             crate::relaunch_self_and_exit();
         }
-        let dt = self.last_update.elapsed().as_secs_f32().clamp(0.001, 0.1);
-        self.last_update = std::time::Instant::now();
+
+        // ── Visibility / focus state ────────────────────────────────────
+        // Tracked here, consumed by the repaint-scheduling code at the
+        // tail of update(). When minimized OR unfocused, we cap the
+        // base repaint rate at 5 Hz regardless of the user's Settings →
+        // Repaint rate, but we still run the full UI pass — animations
+        // tick, gamepad-nav cursor moves, the focus-flip handoff to a
+        // virtual output runs, etc. Skipping the pass entirely broke
+        // gamepad-nav → virtual-output transitions.
+        let vp_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        let vp_focused   = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let bg_throttle  = vp_minimized || !vp_focused;
+        // Renderer-internal `request_repaint_throttled()` calls (scope
+        // tracers, marquee animations, glow effects, etc.) skip when
+        // this flag is set. We ONLY suppress while the window is in the
+        // background — when focused, the user wants smooth visuals and
+        // every animation gets vsync. When backgrounded, the user's
+        // bg_repaint_hz dictates the rate and inner repaint requests
+        // are short-circuited at the source.
+        REPAINT_SUPPRESSED.store(bg_throttle, Ordering::Relaxed);
 
         // Cache our own HWND on the first frame we have one. We need it
         // for direct Win32 work that can't go through eframe: dropping
@@ -2384,6 +2438,7 @@ impl eframe::App for FlexInputApp {
                 // visually groups itself apart from the central canvas.
                 ui.painter().rect_filled(left_rect, 0.0, left_fill);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                    puffin::profile_scope!("easy_io_panel_show");
                     crate::easy::io_panel::show(
                         ui,
                         devices,
@@ -2400,6 +2455,7 @@ impl eframe::App for FlexInputApp {
                     );
                 });
                 ui.scope_builder(egui::UiBuilder::new().max_rect(center_rect), |ui| {
+                    puffin::profile_scope!("easy_center_panel_show");
                     crate::easy::center_panel::show(
                         ui,
                         canvas,
@@ -2493,25 +2549,36 @@ impl eframe::App for FlexInputApp {
             show_subpatch_editors(self, ctx, &live_device_ids);
         }
 
-        // When the patch is live (has nodes or virtual devices), paint every
-        // vsync — `request_repaint()` with no delay tells eframe to paint
-        // next frame; the swap-chain throttles to the monitor refresh rate,
-        // so no beating with arbitrary monitor refresh rates.
-        //
-        // When idle (empty patch and no virtual devices), fall back to a
-        // slow 100 ms tick. Always-repainting on the desktop PC produces
-        // worse strobing than the conditional path on some GPU/driver
-        // combos (likely a glow + DWM swap-chain interaction). Empty patch
-        // is a transient state; once a node is dropped the live path kicks
-        // in and rendering is smooth.
-        // Repaint heuristic: live path runs whenever a virtual device is
-        // referenced by the active tab's canvas. Background-tab devices
-        // don't need vsync repaints here — their UI is hidden.
+        // Repaint scheduling:
+        //   Focused → vsync (or 100 ms fallback for empty patch). The user
+        //       is actively using the app; smoothness wins. Animated
+        //       widgets (scopes, glow) can request vsync freely — they
+        //       go through request_repaint_throttled() but suppression
+        //       is off when focused so the request lands.
+        //   Background → user's chosen bg_repaint_hz (clamped 1..30).
+        //       REPAINT_SUPPRESSED is true above, so widget-internal
+        //       repaints are short-circuited, and the only request that
+        //       lands is this one, which dictates the rate.
         let has_virtual = !self.active_tab_device_ids.read().unwrap().is_empty();
-        if canvas_has_nodes || has_virtual {
+        let bg_hz = self.settings.bg_repaint_hz
+            .clamp(settings::BG_REPAINT_HZ_MIN, settings::BG_REPAINT_HZ_MAX);
+        let bg_interval_ms = 1000_u64 / bg_hz as u64;
+        if bg_throttle {
+            ctx.request_repaint_after(std::time::Duration::from_millis(bg_interval_ms));
+        } else if canvas_has_nodes || has_virtual {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        // Sanity log when the setting changes — eyeballing whether the
+        // slider is actually wired through. Throttle to one print per change.
+        #[cfg(debug_assertions)]
+        {
+            if self.last_logged_repaint_hz != Some(bg_hz) {
+                eprintln!("[settings] bg_repaint_hz = {} (interval = {} ms)",
+                    bg_hz, bg_interval_ms);
+                self.last_logged_repaint_hz = Some(bg_hz);
+            }
         }
 
         // ── Gamepad-nav overlays: cursor ─────────────────────────────────
@@ -2630,6 +2697,7 @@ enum NavWidgetKind {
 enum GpSettingKey {
     PollingHz,
     SampleRateHz,
+    BgRepaintHz,
     NavDefault,
     CursorMaxSpeed,
     CursorAccel,
@@ -2691,6 +2759,11 @@ enum GpSettingKind {
     Toggle { key: GpSettingKey },
     IntSlider { lo: f32, hi: f32, step: f32, key: GpSettingKey },
     FloatSlider { lo: f32, hi: f32, step: f32, key: GpSettingKey },
+    /// Discrete cycle through a fixed list of (value, label) pairs. The
+    /// underlying value is stored as `f32` (matching IntSlider) but the
+    /// display string comes from the label. Used for enum settings where
+    /// a slider doesn't make sense (e.g. Repaint rate: Monitor / 60 / 30 / 15 Hz).
+    Cycle { key: GpSettingKey, opts: &'static [(f32, &'static str)] },
     /// Gamepad shortcut chord: South closes the panel and starts a chord
     /// capture for `target` (so the user can press the combo with the panel
     /// out of the way). Displays the currently-assigned combo.
@@ -5963,6 +6036,10 @@ impl FlexInputApp {
                 kind: IntSlider { lo: settings::SAMPLE_RATE_HZ_MIN as f32,
                     hi: settings::SAMPLE_RATE_HZ_MAX as f32, step: 50.0,
                     key: GpSettingKey::SampleRateHz }, suffix: " Hz" },
+            GpSettingRow { label: "Background repaint rate".into(),
+                kind: IntSlider { lo: settings::BG_REPAINT_HZ_MIN as f32,
+                    hi: settings::BG_REPAINT_HZ_MAX as f32, step: 1.0,
+                    key: GpSettingKey::BgRepaintHz }, suffix: " Hz" },
             GpSettingRow { label: "Gamepad UI nav by default".into(),
                 kind: Toggle { key: GpSettingKey::NavDefault }, suffix: "" },
             GpSettingRow { label: "Cursor max speed".into(),
@@ -6004,6 +6081,7 @@ impl FlexInputApp {
         match key {
             PollingHz => self.settings.polling_hz as f32,
             SampleRateHz => self.settings.sample_rate_hz as f32,
+            BgRepaintHz => self.settings.bg_repaint_hz as f32,
             NavDefault => self.settings.gamepad_ui_nav_default as i32 as f32,
             CursorMaxSpeed => self.settings.cursor_max_speed,
             CursorAccel => self.settings.cursor_accel,
@@ -6034,6 +6112,11 @@ impl FlexInputApp {
                     .clamp(settings::SAMPLE_RATE_HZ_MIN, settings::SAMPLE_RATE_HZ_MAX);
                 self.settings.sample_rate_hz = v;
                 self.sample_rate_hz.store(v, Ordering::Relaxed);
+            }
+            BgRepaintHz => {
+                let v = (val.round() as u32)
+                    .clamp(settings::BG_REPAINT_HZ_MIN, settings::BG_REPAINT_HZ_MAX);
+                self.settings.bg_repaint_hz = v;
             }
             NavDefault => self.settings.gamepad_ui_nav_default = val != 0.0,
             CursorMaxSpeed => self.settings.cursor_max_speed = val.clamp(1000.0, 30000.0),
@@ -6155,11 +6238,29 @@ impl FlexInputApp {
             let idx = self.gamepad_nav.settings_index.min(rows.len() - 1);
             let row = &rows[idx];
             let fine = nav.pressed.contains("btn_west");
+            // Cycle gets its own handler — left/right step by one option,
+            // wrapping. No fine step / stick deflection (it's a discrete
+            // choice). Done early so the slider math below doesn't fire.
+            if let GpSettingKind::Cycle { key, opts } = &row.kind {
+                let cur = self.gp_setting_value(*key);
+                let cur_idx = opts.iter().position(|(v, _)| (v - cur).abs() < 0.5)
+                    .unwrap_or(0) as i32;
+                let n = opts.len() as i32;
+                let new_idx = match dir {
+                    Some(NavDir::Right) | Some(NavDir::Up) => (cur_idx + 1).rem_euclid(n),
+                    Some(NavDir::Left)  | Some(NavDir::Down) => (cur_idx - 1).rem_euclid(n),
+                    _ => cur_idx,
+                };
+                if new_idx != cur_idx {
+                    self.gp_setting_set(*key, opts[new_idx as usize].0);
+                }
+                return;
+            }
             // Left/right (dpad or stick) nudges the value.
             let (lo, hi, step, key) = match &row.kind {
                 GpSettingKind::IntSlider { lo, hi, step, key }
                 | GpSettingKind::FloatSlider { lo, hi, step, key } => (*lo, *hi, *step, *key),
-                GpSettingKind::Toggle { .. } | GpSettingKind::ChordLearn { .. } => {
+                GpSettingKind::Toggle { .. } | GpSettingKind::ChordLearn { .. } | GpSettingKind::Cycle { .. } => {
                     self.gamepad_nav.settings_editing = false; return;
                 }
             };
@@ -6243,6 +6344,12 @@ impl FlexInputApp {
                             format!("{}{}", self.gp_setting_value(*key).round() as i64, row.suffix),
                         GpSettingKind::FloatSlider { key, .. } =>
                             format!("{:.2}{}", self.gp_setting_value(*key), row.suffix),
+                        GpSettingKind::Cycle { key, opts } => {
+                            let v = self.gp_setting_value(*key);
+                            opts.iter().find(|(val, _)| (val - v).abs() < 0.5)
+                                .map(|(_, label)| (*label).to_string())
+                                .unwrap_or_else(|| format!("?{:.0}", v))
+                        }
                         GpSettingKind::ChordLearn { target } => {
                             use crate::gamepad_nav::ChordTarget;
                             if self.gamepad_nav.chord_learn == Some(*target) {
@@ -6892,6 +6999,22 @@ impl FlexInputApp {
                 });
                 ui.label(egui::RichText::new(
                     "Engine tick rate. Higher = lower latency, more CPU."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Background repaint rate")
+                        .on_hover_text("Repaint rate applied when the window is minimized or another app has focus. The focused window always paints at vsync regardless.");
+                    let resp = ui.add(egui::Slider::new(
+                        &mut self.settings.bg_repaint_hz,
+                        settings::BG_REPAINT_HZ_MIN..=settings::BG_REPAINT_HZ_MAX,
+                    ).suffix(" Hz"));
+                    if resp.changed() {
+                        dirty = true;
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "How often the UI repaints while FlexInput sits in the background. Lower = less CPU while you play a game, higher = smoother glanceable visuals. Has no effect when the window is focused."
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(10.0);
@@ -10859,17 +10982,25 @@ fn show_subpatch_editors(
     ctx: &egui::Context,
     live_device_ids: &std::collections::HashSet<String>,
 ) {
+    let active = app.active_tab;
+    // Fast path: no editors and no pending open request → nothing to do.
+    // Called every frame from update(), so skip all per-frame work in the
+    // common case (empty workspace / no editor open).
+    if app.sub_patch_editors.is_empty() && app.tabs[active].canvas.pending_edit_subpatch.is_none() {
+        return;
+    }
     // Snapshot once so the inner-canvas show call can borrow this immutably while
     // `app` is borrowed mutably for sub-patch editor state.
-    let live_signals = app.last_signals.clone();
+    // NOTE: `live_signals` is NOT cloned here — `app.last_signals` is already
+    // a fresh per-frame clone from `proc_device_signals` (see update()), and
+    // we borrow it inside the closure. Saves one HashMap clone per editor
+    // frame at large patches.
     let panic_shortcut = app.panic_shortcut.clone();
-    let device_rates_inner = app.device_rates.read().map(|r| r.clone()).unwrap_or_default();
     let device_defaults_inner = crate::canvas::DeviceParamDefaults {
         stick_deadzone: app.settings.default_stick_deadzone,
         gyro_mult: app.settings.default_gyro_mult,
         mouse_sensitivity: app.settings.default_mouse_sensitivity,
     };
-    let active = app.active_tab;
 
     // Open new editors requested this frame by the canvas viewer.
     let pending = app.tabs[active].canvas.pending_edit_subpatch.take();
@@ -10893,6 +11024,7 @@ fn show_subpatch_editors(
                 open: true,
                 last_clipboard_gen: 0,
                 last_synced_parent_gen: None,
+                last_inner_gen: None,
             });
         }
     }
@@ -10952,6 +11084,7 @@ fn show_subpatch_editors(
             j != i && e.tab_idx == active && e.parent_editor_idx == Some(i)
         });
         if !has_active_child {
+            puffin::profile_scope!("editor_presync");
             let outer_inner = match parent_editor_idx {
                 None    => app.tabs[active].canvas.snarl.get_node(node_id),
                 Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
@@ -11004,6 +11137,7 @@ fn show_subpatch_editors(
             format!("✦ {}", display_name)
         };
 
+        puffin::profile_scope!("editor_viewport_show");
         ctx.show_viewport_immediate(
             viewport_id,
             egui::ViewportBuilder::default()
@@ -11054,9 +11188,19 @@ fn show_subpatch_editors(
                     }),
                 };
                 egui::CentralPanel::default().show(vctx, |ui| {
+                    puffin::profile_scope!("editor_inner_canvas_show");
+                    // Borrow `app.last_signals` directly (no clone). For
+                    // device_rates we hold a short-lived read guard across
+                    // the show call so it borrows the underlying map rather
+                    // than cloning it. Canvas::show only reads, never
+                    // touches the RwLock itself, so no deadlock risk.
+                    let empty = std::collections::HashMap::new();
+                    let guard = app.device_rates.read();
+                    let device_rates_ref: &std::collections::HashMap<String, u32> =
+                        match &guard { Ok(r) => r, Err(_) => &empty };
                     let _ = inner_canvas.show(
-                        descriptors, live_device_ids, &live_signals,
-                        &panic_shortcut, devices, &device_rates_inner,
+                        descriptors, live_device_ids, &app.last_signals,
+                        &panic_shortcut, devices, device_rates_ref,
                         device_defaults_inner, ui, automap_parent, None,
                     );
                 });
@@ -11184,13 +11328,25 @@ fn show_subpatch_editors(
         }
 
         // Write-back inner snarl to parent node.
-        let inner_snarl = app.sub_patch_editors[i].canvas.snarl.clone();
-        let node_opt = match parent_editor_idx {
-            None    => app.tabs[active].canvas.snarl.get_node_mut(node_id),
-            Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node_mut(node_id),
-        };
-        if let Some(node) = node_opt {
-            if let Some(sp) = node.subpatch.as_mut() { *sp.snarl = inner_snarl; }
+        // Gated on inner canvas mutation: if the editor didn't mutate
+        // anything this frame (no user input, no structural change),
+        // there's nothing new to write back — the parent's sp.snarl
+        // already matches what we'd write. Skip the full snarl clone
+        // entirely on idle frames. `last_inner_gen` is bumped any time
+        // the inner canvas mutates (push_undo/push_snapshot/undo/redo).
+        let cur_inner_gen = app.sub_patch_editors[i].canvas.mutation_gen;
+        let prev_inner_gen = app.sub_patch_editors[i].last_inner_gen;
+        if prev_inner_gen != Some(cur_inner_gen) {
+            puffin::profile_scope!("editor_writeback");
+            let inner_snarl = app.sub_patch_editors[i].canvas.snarl.clone();
+            let node_opt = match parent_editor_idx {
+                None    => app.tabs[active].canvas.snarl.get_node_mut(node_id),
+                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node_mut(node_id),
+            };
+            if let Some(node) = node_opt {
+                if let Some(sp) = node.subpatch.as_mut() { *sp.snarl = inner_snarl; }
+            }
+            app.sub_patch_editors[i].last_inner_gen = Some(cur_inner_gen);
         }
 
         if !open { to_close.push(i); }
@@ -11217,6 +11373,7 @@ fn show_subpatch_editors(
                 open: true,
                 last_clipboard_gen: 0,
                 last_synced_parent_gen: None,
+                last_inner_gen: None,
             });
         }
     }

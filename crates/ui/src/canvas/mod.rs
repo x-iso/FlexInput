@@ -16,6 +16,8 @@ use flexinput_devices::PhysicalDevice;
 use flexinput_virtual::{SinkPin, SourcePin, VirtualDevice};
 use serde_json::Value;
 
+use crate::app::request_repaint_throttled;
+
 const MAX_UNDO: usize = 50;
 
 /// Per-device param seeds applied when a device node is first added to the
@@ -734,7 +736,10 @@ impl Canvas {
         // (zoom / pan) from the zoom-control overlay below.
         let snarl_id = ui.make_persistent_id("flexinput_canvas");
         let snarl_rect = ui.available_rect_before_wrap();
-        self.snarl.show(&mut viewer, &self.style, "flexinput_canvas", ui);
+        {
+            puffin::profile_scope!("snarl_show");
+            self.snarl.show(&mut viewer, &self.style, "flexinput_canvas", ui);
+        }
         let calibrate_request = viewer.calibrate_request;
 
         // Snapshot the current viewport-center in canvas space so new-node
@@ -791,7 +796,7 @@ impl Canvas {
                 // We modified the view after the snarl already rendered
                 // this frame; request another paint so the user sees the
                 // new framing immediately.
-                ui.ctx().request_repaint();
+                request_repaint_throttled(ui.ctx());
             }
         }
 
@@ -1670,7 +1675,7 @@ fn draw_spawn_glow(
     let now = std::time::Instant::now();
     glow.retain(|_, t| now.duration_since(*t).as_secs_f32() * 1000.0 < DURATION_MS);
     if glow.is_empty() { return; }
-    ui.ctx().request_repaint();
+    request_repaint_throttled(ui.ctx());
 
     // Canvas → screen transform.
     let st = SnarlState::load(ui.ctx(), snarl_id, snarl, snarl_rect, 0.2, 2.0);

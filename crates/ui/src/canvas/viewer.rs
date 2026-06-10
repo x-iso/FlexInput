@@ -12,6 +12,7 @@ use super::{
     curve::sample_curve,
     node::{LayoutDecoration, LayoutItem, NodeData, TextAlign},
 };
+use crate::app::request_repaint_throttled;
 
 pub struct FlexViewer<'a> {
     pub descriptors: &'a [ModuleDescriptor],
@@ -4076,7 +4077,7 @@ fn paint_envelope_curve_graph(
         painter.circle_filled(c2s(ph, ph_y), 3.5,
             Color32::from_rgba_unmultiplied(dot_col.r(), dot_col.g(), dot_col.b(), 220));
 
-        ui.ctx().request_repaint();
+        request_repaint_throttled(ui.ctx());
     }
 
     // Optional override outline frame
@@ -5163,12 +5164,12 @@ fn show_gyro_lean_mapping_section(
     if new_phase == "learning" && new_draft.is_empty() {
         ui.label(egui::RichText::new("Press a button or combination")
             .size(13.0).color(Color32::from_rgb(106, 167, 255)));
-        ui.ctx().request_repaint();
+        request_repaint_throttled(ui.ctx());
     } else if (new_phase == "learning" || new_phase == "ready") && !new_draft.is_empty() {
         ui.horizontal_wrapped(|ui| {
             remapper_render_chord(ui, &new_draft, skin);
         });
-        if new_phase == "learning" { ui.ctx().request_repaint(); }
+        if new_phase == "learning" { request_repaint_throttled(ui.ctx()); }
     }
 
     // ── Mapping cards ───────────────────────────────────────────────────
@@ -6165,7 +6166,7 @@ pub(crate) fn show_subpatch_body(
             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 200)),
             egui::StrokeKind::Inside,
         );
-        ui.ctx().request_repaint();
+        request_repaint_throttled(ui.ctx());
     }
     // If the primary button is no longer down but a stale marquee slot
     // remains (e.g. release happened off-window), clear it.
@@ -7579,7 +7580,7 @@ where
                 }
                 if delta != 0.0 {
                     scroll_offset_body += delta;
-                    ui.ctx().request_repaint();
+                    request_repaint_throttled(ui.ctx());
                     // Publish the applied scroll delta so the dragged card can
                     // add it to its visual lift and stay glued to the pointer
                     // while the body scrolls under it. (`begin` consumes it.)
@@ -8479,7 +8480,7 @@ fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, scope: &str, 
                 ui.ctx().data_mut(|d| d.insert_temp(
                     egui::Id::new(("gp_nav_remap_scroll", node_id.0)),
                     (pass, need)));
-                ui.ctx().request_repaint();
+                request_repaint_throttled(ui.ctx());
             }
         }
     }
@@ -8824,6 +8825,8 @@ fn render_oscilloscope_display(
     container: egui::Vec2,
     graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
+    // Conditional vsync — see scope_should_request_repaint above.
+    let _ = scope_should_request_repaint(inner_id, snarl, ui.ctx());
     let (history, n_channels, win_ms, osc_scale, osc_auto, osc_uni) = snarl.get_node(inner_id).map(|n| {
         let win = n.params.get("osc_win_ms").and_then(|v| v.as_f64()).unwrap_or(200.0).clamp(10.0, 10_000.0) as f32;
         let sc  = n.params.get("osc_scale") .and_then(|v| v.as_f64()).unwrap_or(1.0).max(0.001) as f32;
@@ -8915,7 +8918,7 @@ fn render_oscilloscope_display(
     if let Some(stroke) = graph_outline {
         painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
     }
-    ui.ctx().request_repaint();
+    request_repaint_throttled(ui.ctx());
     let _ = inner_id;
 }
 
@@ -8983,6 +8986,8 @@ fn render_vectorscope_display(
     container: egui::Vec2,
     graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
+    // Conditional vsync — see scope_should_request_repaint above.
+    let _ = scope_should_request_repaint(inner_id, snarl, ui.ctx());
     // Visualization tail length — bounded so we don't pay for samples
     // that won't be drawn. History buffer itself can be much longer
     // (20k entries by default).
@@ -9090,7 +9095,7 @@ fn render_vectorscope_display(
     // (no history, no live input) is static.
     let has_trail = nt > 0;
     let has_live = last_signals.iter().any(|s| matches!(s, Some(Signal::Vec2(_))));
-    if has_trail || has_live { ui.ctx().request_repaint(); }
+    if has_trail || has_live { request_repaint_throttled(ui.ctx()); }
     if let Some(stroke) = graph_outline {
         painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
     }
@@ -9109,6 +9114,7 @@ fn render_response_curve_only(
     is_vec: bool,
     graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
+    // No vsync bypass — same rationale as show_response_curve_body.
     let avail = egui::vec2(container.x.max(20.0), container.y.max(20.0));
     let (rect, bg_resp) = ui.allocate_exact_size(avail, egui::Sense::click());
     let bg_for_menu = bg_resp.clone();
@@ -9765,7 +9771,7 @@ fn paint_response_curve_graph(
         let head_col = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 220);
         painter.circle_filled(c2s(graph_x, graph_y), 3.5, head_col);
     }
-    if has_active { ui.ctx().request_repaint(); }
+    if has_active { request_repaint_throttled(ui.ctx()); }
 
     // Optional override frame, painted last so it sits above the graph content.
     if let Some(stroke) = graph_outline {
@@ -10756,7 +10762,61 @@ fn show_readout_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
     register_exposable_element(ui, node_id, "value", resp.rect);
 }
 
+/// Decide whether a scope-like module should bypass the user's base
+/// Repaint rate and force vsync this frame. Returns true when the input
+/// signal looks like it changed since last frame, OR when we haven't
+/// repainted in a while (so the scope's own decay/sweep animations
+/// catch up even on an idle input). Hashes are stashed on the node's
+/// `NodeExtra` so the next frame can compare.
+///
+/// The hash is FNV-1a over the f32 bit patterns of every channel's
+/// current sample — cheap to compute and zero allocations.
+///
+/// `MAX_IDLE_FRAMES` is the longest stretch we'll skip repaints during
+/// a steady signal; at 30 Hz that's 1 s, plenty fast for the human
+/// to perceive an updated reading after they touch the input again.
+fn scope_should_request_repaint(
+    node_id: NodeId,
+    snarl: &mut Snarl<NodeData>,
+    ctx: &egui::Context,
+) -> bool {
+    const MAX_IDLE_FRAMES: u32 = 30;
+    let Some(node) = snarl.get_node_mut(node_id) else { return false; };
+    let mut h: u64 = 0xcbf29ce484222325;
+    for sig in &node.extra.last_signals {
+        let f = match sig {
+            Some(Signal::Float(v)) => *v,
+            Some(Signal::Bool(b))  => if *b { 1.0 } else { 0.0 },
+            Some(Signal::Vec2(v))  => v.x + v.y * 1.3137,
+            _ => 0.0,
+        };
+        h ^= f.to_bits() as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let changed = h != node.extra.prev_input_hash;
+    node.extra.prev_input_hash = h;
+    if changed {
+        node.extra.idle_frames_since_change = 0;
+        request_repaint_throttled(ctx);
+        true
+    } else {
+        node.extra.idle_frames_since_change =
+            node.extra.idle_frames_since_change.saturating_add(1);
+        if node.extra.idle_frames_since_change < MAX_IDLE_FRAMES {
+            request_repaint_throttled(ctx);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    // Request vsync only while the input signal is animating (see
+    // `scope_should_request_repaint` for the gate's logic). A stationary
+    // scope with no input change settles to the user's base Repaint
+    // rate after ~1 s; the moment a sample changes the gate re-arms.
+    let _ = scope_should_request_repaint(node_id, snarl, ui.ctx());
     // ── Init params on first use ──────────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("osc_win_ms")).unwrap_or(false);
     if needs_init {
@@ -10938,6 +10998,8 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
 }
 
 fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    // Conditional vsync — see scope_should_request_repaint above.
+    let _ = scope_should_request_repaint(node_id, snarl, ui.ctx());
     // Bounded tail clone: we only render the last MAX_VS_TRAIL samples,
     // so cloning the full 20k-entry history every frame was pure waste.
     // See `render_vectorscope_display` for the equivalent change on the
@@ -11094,6 +11156,8 @@ fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, s
 // ── Trigger Scope ─────────────────────────────────────────────────────────────
 
 fn show_trigscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    // Conditional vsync — see scope_should_request_repaint above.
+    let _ = scope_should_request_repaint(node_id, snarl, ui.ctx());
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("ts_win_ms")).unwrap_or(false);
     if needs_init {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -11294,6 +11358,8 @@ fn render_trigscope_display(
     container: egui::Vec2,
     graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
+    // Conditional vsync — see scope_should_request_repaint above.
+    let _ = scope_should_request_repaint(inner_id, snarl, ui.ctx());
     let (display_data, n_channels, ts_scale, ts_auto, ts_uni, is_live, win_ms) = snarl.get_node(inner_id).map(|n| {
         let sc  = n.params.get("ts_scale") .and_then(|v| v.as_f64()).unwrap_or(1.0).max(0.001) as f32;
         let au  = n.params.get("ts_auto")  .and_then(|v| v.as_bool()).unwrap_or(false);
@@ -11793,6 +11859,13 @@ fn curve_header_reset(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeDat
 }
 
 fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    // Curve graphs intentionally do NOT force vsync repaint. The curve
+    // itself is static and the only animated element is the input/output
+    // tracer dot, which is plenty smooth at the user's chosen base
+    // Repaint rate (30 Hz is imperceptibly different from 60 Hz for a
+    // single moving dot). Forcing vsync here previously was the main
+    // reason a multi-curve Easy patch sat at 17 % CPU — every visible
+    // curve ratcheted the whole window up to monitor refresh rate.
     // ── Initialise params on first use ────────────────────────────────────────
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
@@ -12237,7 +12310,7 @@ fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin
                     painter.circle_filled(c2s(graph_x, graph_y), 3.5, head_col);
                 }
                 if has_active {
-                    ui.ctx().request_repaint();
+                    request_repaint_throttled(ui.ctx());
                 }
 
                 // Right-click on empty graph space → save/load/copy/paste/reset
@@ -12748,7 +12821,7 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
                     let head_col = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 220);
                     painter.circle_filled(c2s(graph_x, graph_y), 3.5, head_col);
                 }
-                if has_active { ui.ctx().request_repaint(); }
+                if has_active { request_repaint_throttled(ui.ctx()); }
 
                 // Right-click on empty graph → save/load/copy/paste/reset
                 // (shared with the header buttons; uses .fxc format).
@@ -12912,6 +12985,7 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
 
 #[allow(clippy::too_many_lines)]
 fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    // No vsync bypass — same rationale as show_response_curve_body.
     let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("points")).unwrap_or(false);
     if needs_init {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -13319,7 +13393,7 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                     let rp  = head - fwd * (r * 0.5) - perp * (r * 0.7);
                     painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
                 }
-                if has_active { ui.ctx().request_repaint(); }
+                if has_active { request_repaint_throttled(ui.ctx()); }
 
                 // Right-click on empty graph → save/load/copy/paste/reset for
                 // the *currently-selected* lane only (resolved via
@@ -13526,6 +13600,7 @@ fn render_twoway_curve_only(
     container: egui::Vec2,
     graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
+    // No vsync bypass — same rationale as show_response_curve_body.
     let avail = egui::vec2(container.x.max(20.0), container.y.max(20.0));
     let (rect, bg_resp) = ui.allocate_exact_size(avail, egui::Sense::click());
     let bg_for_menu = bg_resp.clone();
@@ -13864,7 +13939,7 @@ fn paint_twoway_curve_graph(
         let (tip, l, rp) = (head + fwd*r, head - fwd*(r*0.5) + perp*(r*0.7), head - fwd*(r*0.5) - perp*(r*0.7));
         painter.add(egui::Shape::convex_polygon(vec![tip, l, rp], Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230), egui::Stroke::NONE));
     }
-    if has_active { ui.ctx().request_repaint(); }
+    if has_active { request_repaint_throttled(ui.ctx()); }
 
     // Optional override frame, drawn last so it sits above the graph content.
     if let Some(stroke) = graph_outline {
@@ -14777,7 +14852,7 @@ impl ReorderView {
         // with the same key. Cleared (set false) when idle.
         let flag_id = egui::Id::new(("fxi_reorder_drag_active", ui.layer_id()));
         ui.ctx().data_mut(|d| d.insert_temp(flag_id, active));
-        if active { ui.ctx().request_repaint(); }
+        if active { request_repaint_throttled(ui.ctx()); }
         commit
     }
 }
@@ -15333,7 +15408,7 @@ fn remapper_mapping_card_pixel(
             ui.ctx().data_mut(|d| d.insert_temp(
                 egui::Id::new(("gp_nav_remap_scroll", node_id.0)),
                 (pass, body_delta)));
-            ui.ctx().request_repaint();
+            request_repaint_throttled(ui.ctx());
         }
     }
 
@@ -16400,7 +16475,7 @@ fn show_remapper_body(
     // gamepad-driven capture (when wired) and OS-key learning (when in
     // learning phase regardless of wire state).
     if wired || new_phase == "learning" {
-        ui.ctx().request_repaint();
+        request_repaint_throttled(ui.ctx());
     }
 }
 
@@ -16858,7 +16933,7 @@ fn show_map_action_body(
     register_exposable_element(ui, node_id, "whole_module", body_resp.response.rect);
 
     // Request repaint so capture ticks each frame while wired
-    if wired { ui.ctx().request_repaint(); }
+    if wired { request_repaint_throttled(ui.ctx()); }
 }
 
 // ── Layout decorations ──────────────────────────────────────────────────────
