@@ -43,6 +43,11 @@ pub struct GuideWatchConfig {
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33); // ~30 Hz
 const DOUBLE_TAP_MS: u64 = 300;
+/// Per-device settle window after first sight of its guide signal.
+/// Edges before this elapses are tracked but not honored — long enough
+/// to cover a controller's BT handshake / initial raw-HID garbage,
+/// short enough that a deliberate tap right after connecting still works.
+const SETTLE_MS: u64 = 750;
 
 /// Buttons valid as chord candidates. Only Bool signals are considered;
 /// `btn_guide` is excluded so we don't accidentally bind guide-as-chord.
@@ -63,6 +68,13 @@ pub fn spawn_guide_watcher(
         .spawn(move || {
             // Per-device rising-edge state for the guide button.
             let mut guide_prev: HashMap<String, bool> = HashMap::new();
+            // Per-device instant we first observed that device's guide
+            // signal. Edges are ignored until SETTLE_MS after first sight
+            // so a controller's BT handshake / first raw-HID reports —
+            // which can momentarily latch Home/Guide true — don't read as
+            // a real false→true tap and ghost-toggle the pin. Covers both
+            // a pad present at app launch and one hot-plugged later.
+            let mut guide_seen_at: HashMap<String, Instant> = HashMap::new();
             // For learn-chord mode: previous state of every Bool signal
             // so we can spot a fresh rising edge of a non-guide button.
             let mut learn_prev: HashMap<(String, String), bool> = HashMap::new();
@@ -111,18 +123,26 @@ pub fn spawn_guide_watcher(
                         if sig != "btn_guide" { continue; }
                         let Signal::Bool(now_pressed) = val else { continue; };
                         // First time we see this device's guide signal,
-                        // seed its prev state with the current sample and
-                        // bail. Otherwise an edge-true initial value (the
-                        // Switch Pro's Home can latch true during the BT
-                        // handshake) reads as a phantom false→true rising
-                        // edge the instant the pad is detected, firing a
-                        // ghost pin toggle. We only fire on transitions we
-                        // actually witnessed.
+                        // record when and seed its prev state with the
+                        // current sample, then bail. Otherwise an edge-true
+                        // initial value (the Switch Pro's Home can latch
+                        // true during the BT handshake) reads as a phantom
+                        // false→true rising edge the instant the pad is
+                        // detected, firing a ghost pin toggle.
                         let Some(&was_pressed) = guide_prev.get(dev) else {
                             guide_prev.insert(dev.clone(), *now_pressed);
+                            guide_seen_at.insert(dev.clone(), Instant::now());
                             continue;
                         };
-                        if *now_pressed && !was_pressed {
+                        // Settle window: track state but ignore edges until
+                        // the device has been observed for SETTLE_MS. Kills
+                        // the inconsistent startup / hot-plug misfire where
+                        // handshake noise produces a real-looking false→true
+                        // a poll or two after first sight.
+                        let settled = guide_seen_at.get(dev)
+                            .map(|t| t.elapsed() >= Duration::from_millis(SETTLE_MS))
+                            .unwrap_or(true);
+                        if *now_pressed && !was_pressed && settled {
                             // Chord gate: if configured, the chord
                             // signal must also be true on this same
                             // device at the moment the guide rises.
@@ -155,6 +175,7 @@ pub fn spawn_guide_watcher(
                     }
                 } else {
                     guide_prev.clear();
+                    guide_seen_at.clear();
                     last_tap_at = None;
                 }
 

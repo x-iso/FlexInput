@@ -232,6 +232,34 @@ mod imp {
         }
     }
 
+    /// Yield foreground from `hwnd` by activating the window directly
+    /// beneath it in the z-order. Used as a pin-off fallback when we have
+    /// no remembered external window to hand focus to: since pin-on made us
+    /// the active window, simply clearing topmost leaves us visually stuck
+    /// at the front until something else is activated. Activating the next
+    /// window down lets us fall out of the front. No-op if there's nothing
+    /// suitable beneath us.
+    pub fn yield_foreground_below(hwnd_isize: isize) {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindow, GW_HWNDNEXT, IsWindowVisible, SetForegroundWindow,
+        };
+        unsafe {
+            let mut h = hwnd_isize as HWND;
+            if h.is_null() { return; }
+            // Walk down the z-order for the first visible window that isn't us.
+            for _ in 0..64 {
+                let next = GetWindow(h, GW_HWNDNEXT);
+                if next.is_null() { return; }
+                if IsWindowVisible(next) != 0 {
+                    SetForegroundWindow(next);
+                    return;
+                }
+                h = next;
+            }
+        }
+    }
+
     /// Drop `hwnd` out of the topmost z-order band synchronously, without
     /// changing focus. We need this on pin-off because `eframe` defers
     /// the `WindowLevel::Normal` viewport command into winit's event
@@ -259,7 +287,7 @@ mod imp {
 pub use imp::{
     enumerate_windows, enumerate_processes_full, foreground_exe,
     foreground_hwnd, bring_hwnd_to_front,
-    drop_topmost,
+    drop_topmost, yield_foreground_below,
 };
 
 #[cfg(not(windows))]
@@ -285,4 +313,7 @@ pub fn bring_hwnd_to_front(_hwnd: isize) -> bool { false }
 
 #[cfg(not(windows))]
 pub fn drop_topmost(_hwnd: isize) {}
+
+#[cfg(not(windows))]
+pub fn yield_foreground_below(_hwnd: isize) {}
 

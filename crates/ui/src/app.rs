@@ -525,6 +525,15 @@ pub struct FlexInputApp {
     /// button, FlexInput itself is foreground, so we need a remembered
     /// pointer to the window that was foreground *before* that.
     pin_last_external_hwnd: Option<isize>,
+    /// Deferred pin-off foreground handoff. On pin-off we must yield the
+    /// foreground to another window, but doing it inside the same frame as
+    /// `toggle_pin` races eframe's deferred `WindowLevel::Normal` viewport
+    /// command (processed by winit *after* this frame), which re-activates
+    /// us — the user sees the target app blink forward then FlexInput snap
+    /// back. So we stash the target here and re-assert it for a few frames
+    /// once the level change has settled. `Some((hwnd_or_0, frames_left))`;
+    /// hwnd 0 means "no specific target — yield to whatever's beneath us".
+    pin_pending_yield: Option<(isize, u8)>,
     /// FlexInput's own HWND (set on first `update()` call by reading
     /// `eframe::Frame::window_handle()`). Used for direct Win32
     /// operations that can't be routed through eframe — dropping
@@ -874,6 +883,7 @@ impl FlexInputApp {
             pin_learning: false,
             pin_prev_foreground_hwnd: None,
             pin_last_external_hwnd: None,
+            pin_pending_yield: None,
             self_hwnd: None,
             profiler_server: None,
             #[cfg(debug_assertions)]
@@ -1160,6 +1170,29 @@ impl eframe::App for FlexInputApp {
         // thread, where the Win32 calls are safe to make.
         if self.pin_toggle_requested.swap(false, Ordering::Relaxed) {
             self.toggle_pin(ctx);
+        }
+
+        // Deferred pin-off foreground handoff. Scheduled by `toggle_pin` on
+        // pin-off as `(target, delay_frames)`. eframe processes the
+        // `WindowLevel::Normal` command in winit ~1 frame after we issue it,
+        // and that re-activates us — so if we yielded foreground inline the
+        // target app would blink forward then FlexInput would snap back. We
+        // instead wait out the delay (requesting repaints so idle frames
+        // still tick) and do the handoff ONCE, after the level change has
+        // settled. Doing it once avoids spamming the synthetic ALT keystroke
+        // `bring_hwnd_to_front` uses to defeat focus-stealing prevention.
+        if let Some((hwnd, delay)) = self.pin_pending_yield {
+            if delay > 0 {
+                self.pin_pending_yield = Some((hwnd, delay - 1));
+                ctx.request_repaint();
+            } else {
+                if hwnd != 0 {
+                    let _ = crate::process_list::bring_hwnd_to_front(hwnd);
+                } else if let Some(me) = self.self_hwnd {
+                    crate::process_list::yield_foreground_below(me);
+                }
+                self.pin_pending_yield = None;
+            }
         }
 
         // Effective bypass: manual toggle OR (auto mode on AND auto-bypass AND bound process not in focus).
@@ -2791,18 +2824,19 @@ impl FlexInputApp {
         let easy_mode = self.settings.ui_mode == settings::UiMode::Easy;
         let nav_default = self.settings.gamepad_ui_nav_default;
 
-        // Click-through / pin pass-through intent: while pinned-and-passthrough
-        // the user wants raw input to reach the window underneath, so nav is
-        // disabled and nothing is suppressed.
-        let click_through = self.settings.pin_active && self.settings.see_through_active;
-
         // The driver also runs when the app is pinned on-top (Windows may report
         // it unfocused even though it's visible and the user is driving it) and
         // while the Alt+Tab switcher is engaged (OS Alt+Tab steals focus the
         // moment Alt presses, but we must keep holding Alt until Select is
-        // released). Pass-through pin disables nav entirely.
-        let focused = (raw_focused || self.settings.pin_active || self.gamepad_nav.alt_tab_active)
-            && !click_through;
+        // released).
+        //
+        // NOTE: see-through is a purely visual backdrop-alpha effect — it does
+        // NOT make the window click-through at the Win32 level (no
+        // WS_EX_TRANSPARENT is ever applied). An earlier gate disabled nav
+        // whenever pin + see-through were both on, treating see-through as a
+        // pass-through intent that was never implemented. That left the window
+        // pinned, on top, and visible but with nav dead. Removed.
+        let focused = raw_focused || self.settings.pin_active || self.gamepad_nav.alt_tab_active;
 
         // Determine the active nav device. ALL nav-enabled physical gamepads can
         // drive the UI simultaneously by a last-active-input-takes-over rule:
@@ -2952,7 +2986,7 @@ impl FlexInputApp {
         // (commits) on release. No File menu — egui menus can't be gamepad-
         // navigated, so Select is dedicated to the OS switcher.
         if nav.is_rising("btn_back") {
-            self.enter_alt_tab(&dev_id);
+            self.enter_alt_tab(&dev_id, ctx);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
             return;
@@ -5600,7 +5634,21 @@ impl FlexInputApp {
 
     /// Enter the Alt+Tab window switcher: hold Alt and tap Tab once. Keeps
     /// Alt held while Select stays down; releasing Select commits.
-    fn enter_alt_tab(&mut self, _dev_id: &str) {
+    fn enter_alt_tab(&mut self, _dev_id: &str, ctx: &egui::Context) {
+        // Alt-tabbing away from a pinned FlexInput is self-defeating: it
+        // would stay always-on-top over whatever window the user switches
+        // to. Un-pin as part of entering the switcher. We don't run the full
+        // `toggle_pin` foreground-yield here — Alt+Tab itself decides the new
+        // foreground — we just clear the always-on-top level and topmost band.
+        if self.settings.pin_active {
+            self.settings.pin_active = false;
+            self.settings_dirty = true;
+            ctx.send_viewport_cmd(
+                egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+            if let Some(hwnd) = self.self_hwnd {
+                crate::process_list::drop_topmost(hwnd);
+            }
+        }
         #[cfg(windows)]
         {
             let tapper = self
@@ -5990,6 +6038,17 @@ impl FlexInputApp {
             egui::WindowLevel::Normal
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        // Pin-on: AlwaysOnTop raises z-order but does NOT activate the
+        // window, so Windows can leave us topmost-but-unfocused — keyboard
+        // input and gamepad-nav focus paths then misbehave (the window is
+        // pinned and on top yet acts unfocused). Activate ourselves so the
+        // OS actually reports focus. (bring_hwnd_to_front also re-raises
+        // z-order, harmless while we're already topmost.)
+        if new_state {
+            if let Some(hwnd) = self.self_hwnd {
+                let _ = crate::process_list::bring_hwnd_to_front(hwnd);
+            }
+        }
         // Pin-off: drop our topmost synchronously via Win32. eframe
         // defers the `WindowLevel::Normal` command into winit's event
         // loop, so if we relied on it alone we'd still be in the
@@ -5999,11 +6058,31 @@ impl FlexInputApp {
             if let Some(hwnd) = self.self_hwnd {
                 crate::process_list::drop_topmost(hwnd);
             }
-            if self.settings.focus_flip_flop {
-                if let Some(hwnd) = self.pin_prev_foreground_hwnd.take() {
-                    let _ = crate::process_list::bring_hwnd_to_front(hwnd);
-                }
-            }
+            // Because pin-ON now actively makes FlexInput the foreground
+            // window (see above), clearing topmost is not enough to drop us
+            // from the front on pin-OFF: Windows keeps the active window
+            // visually frontmost until some other window is activated, so
+            // we'd stay stuck on top until the user clicked away and back.
+            // We must therefore yield foreground to another window.
+            //
+            //  * flip-flop ON  → return focus to the specific window that was
+            //    foreground when we pinned (the tweak-and-resume workflow).
+            //  * flip-flop OFF → hand foreground to the last external window
+            //    we saw so we fall out of the front naturally.
+            //
+            // Crucially this is DEFERRED, not done inline: eframe processes
+            // the `WindowLevel::Normal` command above in winit *after* this
+            // frame, and that re-activates us — doing the handoff now would
+            // be immediately undone (target app blinks forward, FlexInput
+            // snaps back). We stash the target and re-assert it over the next
+            // few frames in `update()` once the level change has settled.
+            let yield_to = if self.settings.focus_flip_flop {
+                self.pin_prev_foreground_hwnd.take()
+            } else {
+                self.pin_last_external_hwnd
+            };
+            // hwnd 0 sentinel = no specific target; yield to whatever's below.
+            self.pin_pending_yield = Some((yield_to.unwrap_or(0), 5));
         }
     }
 
