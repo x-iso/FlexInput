@@ -83,6 +83,13 @@ arc-swap     = "1"
 
 [patch.crates-io]
 egui-snarl = { path = "vendor/egui-snarl" }
+# Vendored to fix the one unrecoverable GPU panic we hit: when a fullscreen
+# game resets the graphics device, egui-wgpu's `update_buffers` panics because
+# `queue.write_buffer_with` returns `None`. The vendored copy turns that panic
+# into a skipped frame + a process-global `GPU_LOST` flag so the app can save
+# state and relaunch cleanly instead of crashing. See `vendor/egui-wgpu/
+# src/renderer.rs` (search "GPU_LOST") and `app/src/main.rs`.
+egui-wgpu = { path = "vendor/egui-wgpu" }
 
 # ── Debug-build performance ─────────────────────────────────────────────────
 # The processing thread runs at 2 kHz (500 µs/tick budget) and the device-io

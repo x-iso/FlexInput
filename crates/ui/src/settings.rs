@@ -395,3 +395,55 @@ pub fn load_workspace_from(path: &std::path::Path) -> Option<PersistedWorkspace>
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
+
+// ── Crash-recovery snapshot (always-on, separate from opt-in workspace) ───────
+//
+// Distinct from `workspace.json` on purpose:
+//   • workspace.json is the *opt-in* "reopen my tabs next launch" feature,
+//     gated on `keep_workspace`. A user who never enabled it still must not
+//     lose work to a GPU-loss relaunch.
+//   • recovery.json is written continuously (autosave-on-settle) regardless of
+//     that setting, consumed exactly once on the next boot, then deleted. It
+//     only ever survives if the process did not exit normally — a normal exit
+//     clears it. See `FlexInputApp::write_recovery_snapshot` /
+//     `take_recovery_workspace` and `app/src/main.rs`'s relaunch path.
+
+fn recovery_path() -> Option<std::path::PathBuf> {
+    let mut p = appdata_dir()?;
+    p.push("recovery.json");
+    Some(p)
+}
+
+/// Atomically write the crash-recovery snapshot: serialize to a sibling temp
+/// file, then rename over `recovery.json`. The rename is atomic on the same
+/// volume, so a crash (or GPU-loss relaunch) mid-write can never leave a
+/// half-written file for the next boot to choke on.
+pub fn save_recovery(ws: &PersistedWorkspace) {
+    let Some(dst) = recovery_path() else { return; };
+    let Ok(json) = serde_json::to_vec_pretty(ws) else { return; };
+    let tmp = dst.with_extension("json.tmp");
+    if std::fs::write(&tmp, &json).is_err() {
+        return;
+    }
+    // rename() replaces the destination atomically on Windows (ReplaceFile
+    // semantics) and POSIX. If it fails, drop the temp so we don't litter.
+    if std::fs::rename(&tmp, &dst).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Load the crash-recovery snapshot if one exists (i.e. the last run did not
+/// exit cleanly). Returns None when absent or unparseable.
+pub fn load_recovery() -> Option<PersistedWorkspace> {
+    let p = recovery_path()?;
+    let bytes = std::fs::read(&p).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Delete the crash-recovery snapshot. Called on clean exit and immediately
+/// after a recovery snapshot has been consumed on boot.
+pub fn delete_recovery() {
+    if let Some(p) = recovery_path() {
+        let _ = std::fs::remove_file(&p);
+    }
+}

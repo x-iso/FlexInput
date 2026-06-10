@@ -341,6 +341,13 @@ pub struct FlexInputApp {
     hidhide: Option<HidHideClient>,
     last_update: std::time::Instant,
     bottom_panel_height: f32,
+    /// Summed `mutation_gen` across all tabs as of the last crash-recovery
+    /// snapshot write. The recovery snapshot (`recovery.json`) is rewritten
+    /// only when this total changes between frames and no value gesture is in
+    /// progress — i.e. once per settled edit, mirroring the undo commit-on-
+    /// settle signal. Cheap idle frames never re-serialize. See
+    /// `maybe_write_recovery_snapshot`.
+    last_recovery_mutation_gen: u64,
     /// Whether the Virtual Devices (top) panel is collapsed (only its heading tab visible).
     virtual_panel_collapsed: bool,
     /// Whether the Physical Devices (bottom) panel is collapsed.
@@ -614,34 +621,47 @@ impl FlexInputApp {
             settings::OnPatchLoad::Center    => Some(crate::canvas::PendingViewAction::Center),
             settings::OnPatchLoad::ZoomToFit => Some(crate::canvas::PendingViewAction::ZoomToFit),
         };
-        let tabs = if app_settings.keep_workspace {
+        let persisted_tab_to_patch = |pt: PersistedTab| -> PatchTab {
+            let mut canvas = Canvas::new();
+            canvas.snarl = pt.snarl;
+            crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
+            // Wipe any stale in-progress capture/learn state from saved
+            // remapper-family nodes so a restored patch starts clean.
+            clear_canvas_capture_state(&mut canvas);
+            // Restored patches are conceptually "loaded" — honor the
+            // on-patch-load camera setting so the saved view's
+            // arbitrary pan/zoom doesn't strand the user off-canvas.
+            canvas.pending_view_action = on_load_view;
+            let easy_state = EasyState {
+                loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
+                ..EasyState::default()
+            };
+            PatchTab {
+                title: pt.title,
+                file_path: pt.file_path,
+                bound_exes: pt.bound_exes,
+                canvas,
+                virtual_panel: VirtualDevicePanel::new(),
+                bypassed: false,
+                auto_bypass: pt.auto_bypass,
+                easy_state,
+            }
+        };
+        // A crash-recovery snapshot takes precedence over the opt-in workspace:
+        // its presence means the last run did NOT exit cleanly (a GPU-loss
+        // relaunch or hard crash), so restoring it is how the relaunch becomes
+        // seamless. It's consumed exactly once — deleted immediately after we
+        // read it — and is honored regardless of `keep_workspace`. If absent,
+        // we fall back to the opt-in workspace, then to one empty tab.
+        let tabs = if let Some(ws) = settings::load_recovery().filter(|ws| !ws.tabs.is_empty()) {
+            eprintln!("Restoring {} tab(s) from crash-recovery snapshot.", ws.tabs.len());
+            settings::delete_recovery();
+            ws.tabs.into_iter().map(persisted_tab_to_patch).collect()
+        } else if app_settings.keep_workspace {
             match settings::load_workspace() {
-                Some(ws) if !ws.tabs.is_empty() => ws.tabs.into_iter().map(|pt| {
-                    let mut canvas = Canvas::new();
-                    canvas.snarl = pt.snarl;
-                    crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
-                    // Wipe any stale in-progress capture/learn state from saved
-                    // remapper-family nodes so a restored patch starts clean.
-                    clear_canvas_capture_state(&mut canvas);
-                    // Restored patches are conceptually "loaded" — honor the
-                    // on-patch-load camera setting so the saved view's
-                    // arbitrary pan/zoom doesn't strand the user off-canvas.
-                    canvas.pending_view_action = on_load_view;
-                    let easy_state = EasyState {
-                        loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
-                        ..EasyState::default()
-                    };
-                    PatchTab {
-                        title: pt.title,
-                        file_path: pt.file_path,
-                        bound_exes: pt.bound_exes,
-                        canvas,
-                        virtual_panel: VirtualDevicePanel::new(),
-                        bypassed: false,
-                        auto_bypass: pt.auto_bypass,
-                        easy_state,
-                    }
-                }).collect(),
+                Some(ws) if !ws.tabs.is_empty() => {
+                    ws.tabs.into_iter().map(persisted_tab_to_patch).collect()
+                }
                 _ => vec![PatchTab::new_untitled(1)],
             }
         } else {
@@ -754,7 +774,7 @@ impl FlexInputApp {
             .map(|n| n + 1)
             .unwrap_or(2);
 
-        Self {
+        let mut app = Self {
             engine: Engine::new(),
             tabs,
             active_tab: 0,
@@ -769,6 +789,9 @@ impl FlexInputApp {
             hidhide,
             last_update: std::time::Instant::now(),
             bottom_panel_height: 220.0,
+            // Seeded below from the restored tabs so the first frame doesn't
+            // pointlessly rewrite the recovery snapshot we may have just loaded.
+            last_recovery_mutation_gen: 0,
             virtual_panel_collapsed: false,
             physical_panel_collapsed: false,
             auto_switch: false,
@@ -820,7 +843,12 @@ impl FlexInputApp {
             self_hwnd: None,
             profiler_server: None,
             theme_applied_for: None,
-        }
+        };
+        // Seed the recovery dirty-signal from the restored tabs so the first
+        // frame doesn't immediately rewrite the snapshot we may have just
+        // loaded (the restored tabs already carry their mutation_gen).
+        app.last_recovery_mutation_gen = app.total_mutation_gen();
+        app
     }
 }
 
@@ -830,6 +858,25 @@ impl eframe::App for FlexInputApp {
         // check); only does real work while the profiler toggle is on.
         puffin::GlobalProfiler::lock().new_frame();
         puffin::profile_function!();
+
+        // ── GPU-loss recovery ────────────────────────────────────────────
+        // The vendored egui-wgpu raises this flag (instead of panicking) when
+        // the graphics device is lost mid-frame — a fullscreen game resetting
+        // the device, a driver TDR, or VRAM exhaustion. eframe 0.33 can't
+        // rebuild the device in place, so we recover by relaunching a fresh
+        // process. Our latest work is already on disk via the always-on
+        // recovery snapshot, so the new instance restores it seamlessly. This
+        // is the graceful path; the panic hook in `app/src/main.rs` is the
+        // last-ditch net for any loss we didn't convert. Checked first thing so
+        // we never try to render another frame on the dead device.
+        if eframe::egui_wgpu::GPU_LOST.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("GPU device lost — saving recovery snapshot and relaunching.");
+            // Force a final snapshot regardless of the dirty signal, then hand
+            // off to a fresh process and exit this one.
+            settings::save_recovery(&self.build_persisted_workspace());
+            settings::save_settings(&self.settings);
+            crate::relaunch_self_and_exit();
+        }
         let dt = self.last_update.elapsed().as_secs_f32().clamp(0.001, 0.1);
         self.last_update = std::time::Instant::now();
 
@@ -2520,6 +2567,11 @@ impl eframe::App for FlexInputApp {
         }
         // Refresh the I/O thread's active-tab device id filter.
         self.refresh_active_tab_device_ids();
+
+        // Crash-recovery autosave. Runs last, after every edit path has
+        // converged for the frame, and no-ops unless a settled edit changed
+        // persistent state since the previous write (see the method docs).
+        self.maybe_write_recovery_snapshot();
     }
 
     /// Called by eframe just before the application exits. Persist workspace
@@ -2527,6 +2579,10 @@ impl eframe::App for FlexInputApp {
     fn on_exit(&mut self) {
         settings::save_settings(&self.settings);
         self.save_workspace_now();
+        // Clean exit — discard the crash-recovery snapshot so the next launch
+        // starts fresh. It only survives an *abnormal* exit (GPU-loss relaunch
+        // or hard crash), which is exactly when we want to restore from it.
+        settings::delete_recovery();
     }
 
     /// Override of the default eframe clear color (which is a 70%-opaque
@@ -7369,8 +7425,10 @@ impl FlexInputApp {
 
     /// Serialize the current tab set to workspace.json. No-op if the user
     /// has not opted in to workspace persistence.
-    fn save_workspace_now(&self) {
-        if !self.settings.keep_workspace { return; }
+    /// Snapshot the full tab/canvas state into a `PersistedWorkspace`. Shared
+    /// by the opt-in workspace save and the always-on crash-recovery save so
+    /// both serialize identical state.
+    fn build_persisted_workspace(&self) -> PersistedWorkspace {
         let tabs: Vec<PersistedTab> = self.tabs.iter().map(|t| PersistedTab {
             title: t.title.clone(),
             file_path: t.file_path.clone(),
@@ -7379,12 +7437,39 @@ impl FlexInputApp {
             snarl: t.canvas.snarl.clone(),
             easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
         }).collect();
-        let ws = PersistedWorkspace {
+        PersistedWorkspace {
             version: 1,
             active_tab: self.active_tab,
             tabs,
-        };
-        settings::save_workspace(&ws);
+        }
+    }
+
+    fn save_workspace_now(&self) {
+        if !self.settings.keep_workspace { return; }
+        settings::save_workspace(&self.build_persisted_workspace());
+    }
+
+    /// Sum `mutation_gen` over all tabs. Used as the cheap dirty signal for the
+    /// crash-recovery autosave — it advances on every snarl mutation (any
+    /// push_undo / push_snapshot / undo / redo), so a change between frames
+    /// means persistent state changed.
+    fn total_mutation_gen(&self) -> u64 {
+        self.tabs.iter().map(|t| t.canvas.mutation_gen).fold(0u64, u64::wrapping_add)
+    }
+
+    /// Write the crash-recovery snapshot if (and only if) a settled edit
+    /// happened since the last write. Called once per frame from `update`.
+    /// Independent of `keep_workspace`: even a user who never opted into tab
+    /// persistence must not lose work to a GPU-loss relaunch. The write is
+    /// atomic (temp + rename) so the panic-hook / relaunch path can never read
+    /// a half-written file.
+    fn maybe_write_recovery_snapshot(&mut self) {
+        let gen = self.total_mutation_gen();
+        if gen == self.last_recovery_mutation_gen {
+            return;
+        }
+        self.last_recovery_mutation_gen = gen;
+        settings::save_recovery(&self.build_persisted_workspace());
     }
 }
 

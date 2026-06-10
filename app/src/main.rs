@@ -1,37 +1,46 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-/// Installs a panic hook that intercepts the *one* unrecoverable GPU panic we
-/// know about and exits cleanly instead of dumping a Rust backtrace.
+/// Installs a panic hook that intercepts an unrecoverable GPU panic and
+/// relaunches FlexInput instead of dumping a Rust backtrace.
 ///
 /// When a fullscreen game resets the GPU (driver TDR / exclusive-fullscreen
-/// mode switch), our D3D12 device is lost. The very next frame, egui-wgpu's
-/// `write_buffer_with` returns `None` and the vendored renderer panics with
-/// "Failed to create staging buffer ...". This panic exists verbatim in every
-/// egui-wgpu release through 0.34.3 — upgrading does not fix it, and true
-/// recovery would require recreating the whole `RenderState`, which egui-wgpu
-/// does not expose. We pair this with `PowerPreference::LowPower` (see
-/// `native_options` below) so the overlay lives on the integrated GPU and is
-/// not caught in the game's device reset in the first place; this hook is the
-/// safety net for the residual case (and for genuine VRAM exhaustion).
+/// mode switch), our device can be lost. The vendored egui-wgpu (see
+/// `vendor/egui-wgpu/src/renderer.rs`) normally catches this case, raises the
+/// `GPU_LOST` flag instead of panicking, and `FlexInputApp::update` then saves
+/// state and relaunches gracefully. This hook is the *last-ditch net* for any
+/// device-loss path that still reaches a panic — older "Failed to create
+/// staging buffer" messages, or a panic raised from a context our flag check
+/// hasn't run in yet.
+///
+/// We pair both with `PowerPreference::LowPower` (see `native_options` below)
+/// so the overlay lives on the integrated GPU and is not caught in the game's
+/// device reset in the first place — that removes the root cause for the common
+/// case. The user's latest work is already on disk via the always-on recovery
+/// snapshot, so the relaunched instance restores it seamlessly.
 fn install_gpu_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let msg = info.to_string();
-        if msg.contains("Failed to create staging buffer") {
+        let gpu_lost = msg.contains("Failed to create staging buffer")
+            || msg.contains("GPU device lost");
+        if gpu_lost {
+            // The release build is `windows_subsystem = "windows"` with no
+            // logger surfaced to a console, so drop a breadcrumb next to the
+            // exe for the user/support to see why FlexInput blinked mid-game.
             let note = "GPU device was lost (another app, likely a fullscreen game, \
-                 reset the graphics device). FlexInput cannot recover the render \
-                 context and is exiting cleanly. Restart FlexInput after the game \
-                 closes.";
-            // The release build is `windows_subsystem = "windows"` with no logger
-            // configured, so stderr is invisible. Drop a breadcrumb next to the
-            // exe so the user/support can see why FlexInput vanished mid-game.
+                 reset the graphics device). FlexInput is relaunching to recover; \
+                 your patch is restored from the crash-recovery snapshot.";
             eprintln!("{note}");
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(dir) = exe.parent() {
                     let _ = std::fs::write(dir.join("flexinput-gpu-lost.log"), note);
                 }
             }
-            std::process::exit(0);
+            // Spawn a fresh instance and exit this dead-GPU process. The
+            // recovery snapshot the child restores from was written by the
+            // app's autosave-on-settle (and forced on the GPU_LOST path); we
+            // do NOT delete it here — the child consumes it on boot.
+            flexinput_ui::relaunch_self_and_exit();
         }
         default_hook(info);
     }));
@@ -51,20 +60,23 @@ fn main() -> eframe::Result<()> {
     // RGBA surface; whether anything bleeds through is controlled per-frame
     // by the alpha values in panel/window fills (see
     // `settings::apply_theme_and_contrast`).
-    // Prefer the integrated GPU over the discrete one. eframe defaults to
-    // `PowerPreference::HighPerformance`, which puts our UI on the same
-    // discrete GPU a fullscreen game is using. When that game triggers a
-    // driver reset (TDR) or an exclusive-fullscreen mode switch, our device is
-    // lost and the next frame panics inside egui-wgpu (see
-    // `install_gpu_panic_hook`). A controller-overlay UI does not need the
-    // discrete GPU, and the integrated GPU is not caught in the game's reset —
-    // so `LowPower` removes the root cause for the common case. We start from
-    // the default config and override only the power preference, preserving
+    // GPU selection: use eframe's default (`PowerPreference::HighPerformance`),
+    // i.e. the discrete GPU on a dual-GPU machine.
+    //
+    // We previously forced `LowPower` to dodge a known crash: when a fullscreen
+    // game on the discrete GPU triggers a driver reset (TDR) or an exclusive-
+    // fullscreen mode switch, our device is lost and egui-wgpu used to `panic!`
+    // the whole process on the next frame. That root-cause avoidance is no
+    // longer necessary — the vendored egui-wgpu now turns device loss into a
+    // skipped frame + `GPU_LOST` flag, and FlexInput saves its workspace and
+    // relaunches cleanly (see `install_gpu_panic_hook`, the `GPU_LOST` check in
+    // `FlexInputApp::update`, and `vendor/egui-wgpu/src/renderer.rs`).
+    //
+    // Running on the discrete GPU deliberately keeps us in the device-reset
+    // blast radius, which is the worst case for the recovery path — the best
+    // way to keep that path honest. The plain default config preserves
     // `present_mode: AutoVsync` and the surface-error handler.
-    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
-    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
-        setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
-    }
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
