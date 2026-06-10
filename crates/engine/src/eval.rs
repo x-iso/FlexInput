@@ -1654,6 +1654,13 @@ fn eval_subgraph(
                 scope_samples.push((ns_uid, sample));
                 last_inputs.insert(ns_uid, inputs.clone());
             }
+            "display.trigscope" => {
+                // inputs[0] is trigger; inputs[1..] are data channels.
+                // Emit all inputs so the UI can do trigger-edge detection.
+                let sample = inputs.iter().map(|s| sig_to_f32(*s)).collect();
+                scope_samples.push((ns_uid, sample));
+                last_inputs.insert(ns_uid, inputs.clone());
+            }
             "display.vectorscope" => {
                 let sample = inputs.iter().flat_map(|sig| match sig {
                     Some(Signal::Vec2(v)) => [Some(v.x), Some(v.y)],
@@ -1670,6 +1677,9 @@ fn eval_subgraph(
             }
             "processing.gyro_3dof" => {
                 last_inputs.insert(ns_uid, node_outputs.clone());
+            }
+            "generator.envelope" => {
+                last_inputs.insert(ns_uid, node_state.last_signals.clone());
             }
             _ => {}
         }
@@ -2125,6 +2135,11 @@ pub fn eval_graph_tick(
                 scope_samples.push((snap.node_uid, sample));
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
+            "display.trigscope" => {
+                let sample = inputs.iter().map(|s| sig_to_f32(*s)).collect();
+                scope_samples.push((snap.node_uid, sample));
+                last_inputs.insert(snap.node_uid, inputs.clone());
+            }
             "display.vectorscope" => {
                 let sample = inputs.iter().flat_map(|sig| match sig {
                     Some(Signal::Vec2(v)) => [Some(v.x), Some(v.y)],
@@ -2138,6 +2153,10 @@ pub fn eval_graph_tick(
             }
             "module.twoway_response_curve" => {
                 last_inputs.insert(snap.node_uid, inputs.clone());
+            }
+            "generator.envelope" => {
+                // last_signals = [output, phase]; UI reads phase from index 1 for playhead
+                last_inputs.insert(snap.node_uid, node_state.last_signals.clone());
             }
             // Export outputs (not inputs) so the UI body can show a live readout.
             "processing.gyro_3dof" => {
@@ -2398,6 +2417,10 @@ fn compute_node(
             let out = compute_oscillator(inputs, state, &snap.params, dt);
             state.last_signals = out.clone();
             out
+        }
+        "generator.envelope" => {
+            // last_signals set inside compute_envelope: [output, phase]
+            compute_envelope(inputs, state, &snap.params, dt)
         }
         "module.delay" => {
             let out = compute_delay(inputs, state, &snap.params);
@@ -2732,6 +2755,146 @@ pub fn osc_sample(shape: &str, phase: f32) -> f32 {
         "square"   => if phase < 0.5 { 1.0 } else { -1.0 },
         _          => 0.0,
     }
+}
+
+// ── Envelope Generator ────────────────────────────────────────────────────────
+//
+// State layout in aux_f32:
+//   [0] = current phase (0..1 along the curve X axis)
+//   [1] = previous trigger value (0/1)
+//   [2] = stage: 0=idle, 1=running, 2=sustain_hold (hold mode), 3=release (hold mode)
+//
+// last_signals = [Some(Float(output)), Some(Float(phase))] so the UI can read
+// the phase at index 1 to render the playhead on the envelope graph.
+fn compute_envelope(
+    inputs: &[Option<Signal>],
+    state: &mut NodeState,
+    params: &HashMap<String, Value>,
+    dt: f32,
+) -> Vec<Option<Signal>> {
+    let mode       = params.get("mode")    .and_then(|v| v.as_str()).unwrap_or("oneshot");
+    let timebase   = params.get("timebase").and_then(|v| v.as_str()).unwrap_or("ms");
+    let time_param = params.get("time_mul").and_then(|v| v.as_f64()).unwrap_or(500.0) as f32;
+    let sustain_x  = params.get("sustain") .and_then(|v| v.as_f64()).unwrap_or(0.5)   as f32;
+    let pts    = curve_points_from_params(params);
+    let biases = biases_from_params(params);
+
+    let trig_wired = inputs.get(0).and_then(|s| *s).is_some();
+    let time_wired = inputs.get(1).and_then(|s| *s).is_some();
+    let time_val   = if time_wired { get_f(inputs, 1, time_param).max(0.0) } else { time_param };
+
+    let period_s = match timebase {
+        "s"  => time_val.max(0.0001),
+        "hz" => if time_val > 0.0 { 1.0 / time_val } else { 1.0 },
+        _    => (time_val / 1000.0).max(0.0001),
+    };
+    let dt_phase = (dt / period_s).min(1.0);
+
+    while state.aux_f32.len() < 4 { state.aux_f32.push(0.0); }
+    let mut phase = state.aux_f32[0];
+    let prev_trig = state.aux_f32[1];
+    let mut stage = state.aux_f32[2];
+    // Discontinuity epoch: bumped every time `phase` is set non-continuously
+    // (retrigger, loop wrap, loop release-reset, hold early-release jump). The
+    // UI reads this from last_signals[2] and breaks the trail across an epoch
+    // change so the dot teleports (old trail fades in place) rather than drawing
+    // a bridging streak across the jump.
+    let mut epoch = state.aux_f32[3];
+
+    let trigger   = get_b(inputs, 0, false);
+    let trig_edge = trigger && prev_trig < 0.5;
+
+    match mode {
+        "hold" => {
+            if trig_edge { phase = 0.0; stage = 1.0; epoch += 1.0; }
+            if stage == 1.0 {
+                phase += dt_phase;
+                if phase >= sustain_x {
+                    phase = sustain_x.clamp(0.0, 1.0);
+                    stage = 2.0;
+                } else if !trigger {
+                    // Released before reaching sustain. Jump onto the release side
+                    // (X >= sustain_x) at the point whose curve value best matches
+                    // the current output, so the dot lands at a similar level. This
+                    // works whether the release trends down (lands partway down) or
+                    // up (lands at/above sustain — never drops below current value).
+                    let current_y = sample_curve(&pts, phase, &biases);
+                    let steps = 200u32;
+                    let mut best_x = sustain_x.clamp(0.0, 1.0);
+                    let mut best_d = f32::INFINITY;
+                    for i in 0..=steps {
+                        let x = sustain_x + (1.0 - sustain_x) * i as f32 / steps as f32;
+                        let d = (sample_curve(&pts, x, &biases) - current_y).abs();
+                        if d < best_d { best_d = d; best_x = x; }
+                    }
+                    phase = best_x;
+                    stage = 3.0;
+                    epoch += 1.0; // teleport across the sustain point
+                }
+            }
+            if stage == 2.0 && !trigger { stage = 3.0; }
+            if stage == 3.0 {
+                phase += dt_phase;
+                if phase >= 1.0 { phase = 1.0; stage = 0.0; }
+            }
+        }
+        "loop" => {
+            if trig_wired && !trigger {
+                // Trigger released: snap back to the initial position.
+                if phase != 0.0 { epoch += 1.0; }
+                phase = 0.0;
+            } else {
+                if trig_edge { phase = 0.0; epoch += 1.0; }
+                let advanced = phase + dt_phase;
+                if advanced >= 1.0 { epoch += 1.0; } // wrapped around
+                phase = advanced % 1.0;
+            }
+        }
+        "bounce" | "bounce_hold" => {
+            // Forward while held, reverse back to the start on release. Motion is
+            // continuous in both directions, so no epoch bump — the trail follows
+            // the dot backward as it recedes. In "bounce_hold" the output is held
+            // flat at the sustain value once phase passes sustain_x (see
+            // sample_phase below): time keeps advancing through the post-sustain
+            // buffer, so a long hold takes just as long to recede back to sustain
+            // before the value starts falling.
+            if trigger {
+                phase = (phase + dt_phase).min(1.0);
+            } else {
+                phase = (phase - dt_phase).max(0.0);
+            }
+        }
+        _ => { // "oneshot"
+            if trig_edge { phase = 0.0; stage = 1.0; epoch += 1.0; }
+            if stage == 1.0 {
+                phase += dt_phase;
+                if phase >= 1.0 { phase = 1.0; stage = 0.0; }
+            }
+        }
+    }
+
+    state.aux_f32[0] = phase;
+    state.aux_f32[1] = if trigger { 1.0 } else { 0.0 };
+    state.aux_f32[2] = stage;
+    state.aux_f32[3] = epoch;
+
+    // bounce_hold freezes the curve at the sustain point for the buffer zone;
+    // every other mode samples the live phase.
+    let sample_phase = if mode == "bounce_hold" {
+        phase.min(sustain_x.clamp(0.0, 1.0))
+    } else {
+        phase
+    };
+    let output = sample_curve(&pts, sample_phase, &biases).clamp(0.0, 1.0);
+    state.last_signals = vec![
+        Some(Signal::Float(output)),
+        Some(Signal::Float(phase)),
+        Some(Signal::Float(epoch)),
+        // Applied time value in the current unit — the UI shows this in the
+        // grayed-out time box when the Time input is wired.
+        Some(Signal::Float(time_val)),
+    ];
+    vec![Some(Signal::Float(output))]
 }
 
 fn compute_delay(

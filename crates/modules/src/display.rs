@@ -6,6 +6,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<ReadoutModule>(),
         reg::<OscilloscopeModule>(),
         reg::<VectorscopeModule>(),
+        reg::<TriggerScopeModule>(),
     ]
 }
 
@@ -47,6 +48,30 @@ impl Module for OscilloscopeModule {
                 PinDescriptor::new("ch2", SignalType::Float),
                 PinDescriptor::new("ch3", SignalType::Float),
                 PinDescriptor::new("ch4", SignalType::Float),
+            ],
+            outputs: vec![],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Trigger Scope ─────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub struct TriggerScopeModule;
+
+impl Module for TriggerScopeModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "display.trigscope",
+            display_name: "Trigger Scope",
+            category: "Display",
+            inputs: vec![
+                PinDescriptor::new("trig", SignalType::Float),
+                PinDescriptor::new("ch1",  SignalType::Float),
+                PinDescriptor::new("ch2",  SignalType::Float),
+                PinDescriptor::new("ch3",  SignalType::Float),
+                PinDescriptor::new("ch4",  SignalType::Float),
             ],
             outputs: vec![],
         }

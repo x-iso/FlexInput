@@ -25,6 +25,16 @@ pub struct NodeExtra {
     pub aux_f32_dirty: bool,
     /// True while the sub-patch body is in drag-to-reposition layout edit mode.
     pub layout_unlocked: bool,
+    /// Frozen waveform capture for trigger-scope nodes. Updated only on a
+    /// rising edge of the trigger input; `None` until the first trigger fires.
+    /// Each entry is one sample: `[trig_val, ch1, ch2, …]`.
+    pub trig_capture: Option<Vec<Vec<Option<f32>>>>,
+    /// Previous trigger-pin value used for rising-edge detection.
+    pub trig_prev: f32,
+    /// Accumulation buffer filled while capture is in progress.
+    pub trig_acc: Vec<Vec<Option<f32>>>,
+    /// True when a capture is currently being accumulated.
+    pub trig_armed: bool,
 }
 
 /// An inner module's exposed UI element pinned to the sub-patch body, rendered
@@ -479,8 +489,20 @@ pub fn exposable_elements(module_id: &str) -> &'static [(&'static str, &'static 
             ("phase",    "Phase + Bi/Uni"),
             ("preview",  "Waveform preview"),
         ],
+        "generator.envelope" => &[
+            ("curve",            "Envelope graph"),
+            ("time_row",         "Time multiplier + unit"),
+            ("mode_row",         "Mode (One-shot / Hold / Loop / Bounce / B+Hold)"),
+            ("sustain_row",      "Sustain point"),
+            ("grid_row",         "Grid divisions + Snap"),
+            ("grid_options_row", "Show grid / labels"),
+        ],
         "display.oscilloscope" => &[
             ("display",  "Scope display"),
+            ("controls", "Win / Scale / Auto / Bi-Uni"),
+        ],
+        "display.trigscope" => &[
+            ("display",  "Trigger scope display"),
             ("controls", "Win / Scale / Auto / Bi-Uni"),
         ],
         "display.vectorscope"  => &[("display", "Vectorscope display")],

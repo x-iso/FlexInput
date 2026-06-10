@@ -6,7 +6,7 @@ use eframe::egui;
 use egui_snarl::{InPinId, NodeId, OutPinId, Snarl};
 use flexinput_core::{ModuleDescriptor, PinDescriptor, Signal, SignalType, SubPatchPin};
 use flexinput_devices::{init_backends, midi::cc_display_name, DeviceBackend, HidHideClient, MidiBackend, PhysicalDevice};
-use flexinput_engine::{Engine, NodeSnap, ProcessingGraph, ProcessingOutput, SinkBus, spawn_processing_thread};
+use flexinput_engine::{Engine, NodeSnap, ProcessingGraph, ProcessingOutput, SinkBus, current_sample_rate, spawn_processing_thread};
 use flexinput_modules::all_modules;
 use flexinput_virtual::VirtualDevice;
 
@@ -8252,7 +8252,7 @@ fn eval_module(id: &str, out_idx: usize, inputs: &[Option<Signal>], node: &NodeD
             }
         }
         // Stateful modules: output computed by update_stateful_nodes() each frame.
-        "logic.has_changed" | "logic.delay" | "logic.counter" | "generator.oscillator" | "module.delay" | "processing.gyro_3dof" => {
+        "logic.has_changed" | "logic.delay" | "logic.counter" | "generator.oscillator" | "generator.envelope" | "module.delay" | "processing.gyro_3dof" => {
             node.extra.last_signals.get(out_idx).copied().flatten()
         }
         "module.average" | "module.dc_filter" => {
@@ -8378,10 +8378,34 @@ fn apply_display_state(
             // Each sample becomes a single push_back into the history
             // ring with no intermediate copy.
             if let Some(samples) = scope_lookup.remove(&uid) {
-                let h = &mut node.extra.history;
-                for s in samples {
-                    if h.len() >= HISTORY_LEN { h.pop_front(); }
-                    h.push_back(s);
+                let is_trigscope = node.module_id == "display.trigscope";
+                if is_trigscope {
+                    let win_samples = {
+                        let win_ms = node.params.get("ts_win_ms").and_then(|v| v.as_f64()).unwrap_or(200.0).clamp(10.0, 10_000.0) as f32;
+                        (win_ms / 1000.0 * current_sample_rate() as f32) as usize
+                    };
+                    for s in samples {
+                        let trig_val = s.first().copied().flatten().unwrap_or(0.0);
+                        let rising = node.extra.trig_prev <= 0.0 && trig_val > 0.0;
+                        node.extra.trig_prev = trig_val;
+                        if rising && !node.extra.trig_armed {
+                            node.extra.trig_armed = true;
+                            node.extra.trig_acc.clear();
+                        }
+                        if node.extra.trig_armed {
+                            node.extra.trig_acc.push(s);
+                            if node.extra.trig_acc.len() >= win_samples {
+                                node.extra.trig_capture = Some(std::mem::take(&mut node.extra.trig_acc));
+                                node.extra.trig_armed = false;
+                            }
+                        }
+                    }
+                } else {
+                    let h = &mut node.extra.history;
+                    for s in samples {
+                        if h.len() >= HISTORY_LEN { h.pop_front(); }
+                        h.push_back(s);
+                    }
                 }
             }
         }
@@ -9416,6 +9440,7 @@ const DISPLAY_IDS: &[&str] = &[
     "display.readout",
     "display.oscilloscope",
     "display.vectorscope",
+    "display.trigscope",
 ];
 const HISTORY_LEN: usize = 20000;
 
