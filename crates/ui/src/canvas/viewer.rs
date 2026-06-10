@@ -3737,7 +3737,10 @@ fn envelope_init_params(node: &mut crate::canvas::NodeData) {
     node.params.insert("time_mul".into(),         serde_json::json!(500.0f64));
     node.params.insert("timebase".into(),         Value::String("ms".into()));
     node.params.insert("sustain".into(),          serde_json::json!(0.3f64));
-    node.params.insert("mode".into(),             Value::String("oneshot".into()));
+    // Behavior flags (off = one-shot); combinable Hold / Bounce / Loop.
+    node.params.insert("hold".into(),             Value::Bool(false));
+    node.params.insert("bounce".into(),           Value::Bool(false));
+    node.params.insert("loop".into(),             Value::Bool(false));
 }
 
 /// Core envelope graph painter — curve editing + sustain line + playhead + live trail.
@@ -3772,10 +3775,13 @@ fn paint_envelope_curve_graph(
             let sgl  = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
             let tmul = n.params.get("time_mul").and_then(|v| v.as_f64()).unwrap_or(500.0) as f32;
             let tb   = n.params.get("timebase").and_then(|v| v.as_str()).unwrap_or("ms").to_string();
-            let md   = n.params.get("mode").and_then(|v| v.as_str()).unwrap_or("oneshot").to_string();
-            (pts, bss, gx, gy, sn, sus, sg, sgl, tmul, tb, md)
-        }).unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 0.0]], vec![], 4, 4, false, 0.3, true, false, 500.0, "ms".into(), "oneshot".into()));
-    let is_bounce_hold = mode == "bounce_hold";
+            let (hold, bounce, loopf) = flexinput_engine::envelope_flags(&n.params);
+            (pts, bss, gx, gy, sn, sus, sg, sgl, tmul, tb, (hold, bounce, loopf))
+        }).unwrap_or_else(|| (vec![[0.0, 0.0], [1.0, 0.0]], vec![], 4, 4, false, 0.3, true, false, 500.0, "ms".into(), (false, false, false)));
+    let (hold, bounce, loopf) = mode;
+    // The flat-value "buffer" visual applies only to Hold+Bounce without Loop.
+    let buffer_mode = hold && bounce && !loopf;
+    let _ = loopf;
 
     // Period (seconds) — used for X labels and trail duration
     let period_s: f32 = match timebase.as_str() {
@@ -3800,7 +3806,7 @@ fn paint_envelope_curve_graph(
     let mut bias_changed = false;
 
     // Sustain always sits on a control point: snap to the nearest point X (drives
-    // the orange line and, in bounce_hold, the flat-hold region). Computed up
+    // the orange line and, in Hold+Bounce, the flat-hold region). Computed up
     // front from the current points so the curve drawing can dim the post-sustain
     // segment. During an active drag this lags one frame, same as the slider thumb.
     let sustain_snapped = if !new_points.is_empty() {
@@ -3809,9 +3815,9 @@ fn paint_envelope_curve_graph(
             .unwrap_or(sustain)
     } else { sustain };
     let sustain_changed = (sustain_snapped - sustain).abs() > 1e-6;
-    // Sample the curve, applying the bounce_hold flat-hold past the sustain point.
+    // Sample the curve, applying the Hold+Bounce flat-hold past the sustain point.
     let sample_y = |pts: &[[f32; 2]], biases: &[f32], x: f32| -> f32 {
-        let sx = if is_bounce_hold { x.min(sustain_snapped) } else { x };
+        let sx = if buffer_mode { x.min(sustain_snapped) } else { x };
         flexinput_engine::sample_curve(pts, sx, biases).clamp(0.0, 1.0)
     };
 
@@ -3883,7 +3889,7 @@ fn paint_envelope_curve_graph(
         }
     }
 
-    // Curve — mid-gray so the colored trail stands out. In bounce_hold the curve
+    // Curve — mid-gray so the colored trail stands out. In Hold+Bounce the curve
     // after the sustain point is inactive (the value is held flat through the
     // buffer), so dim it and draw the held horizontal path in the active color.
     if new_points.len() >= 2 {
@@ -3895,11 +3901,11 @@ fn paint_envelope_curve_graph(
             let x1 = (i + 1) as f32 / steps as f32;
             let y0 = flexinput_engine::sample_curve(&new_points, x0, &new_biases).clamp(0.0, 1.0);
             let y1 = flexinput_engine::sample_curve(&new_points, x1, &new_biases).clamp(0.0, 1.0);
-            let col = if is_bounce_hold && x0 >= sustain_snapped { dim_col } else { main_col };
+            let col = if buffer_mode && x0 >= sustain_snapped { dim_col } else { main_col };
             painter.line_segment([c2s(x0, y0), c2s(x1, y1)], egui::Stroke::new(1.5, col));
         }
-        // bounce_hold: held horizontal path at the sustain value across the buffer.
-        if is_bounce_hold {
+        // Hold+Bounce: held horizontal path at the sustain value across the buffer.
+        if buffer_mode {
             let hold_y = flexinput_engine::sample_curve(&new_points, sustain_snapped, &new_biases).clamp(0.0, 1.0);
             painter.line_segment(
                 [c2s(sustain_snapped, hold_y), c2s(1.0, hold_y)],
@@ -4065,7 +4071,7 @@ fn paint_envelope_curve_graph(
             }
         }
 
-        // Live dot at current position (held flat past sustain in bounce_hold)
+        // Live dot at current position (held flat past sustain in Hold+Bounce)
         let ph_y = sample_y(&new_points, &new_biases, ph);
         painter.circle_filled(c2s(ph, ph_y), 3.5,
             Color32::from_rgba_unmultiplied(dot_col.r(), dot_col.g(), dot_col.b(), 220));
@@ -4102,9 +4108,9 @@ fn paint_envelope_curve_graph(
 fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     if let Some(node) = snarl.get_node_mut(node_id) { envelope_init_params(node); }
 
-    let (mode, timebase, time_mul, sustain, grid_x, grid_y, snap, show_grid, show_grid_labels) =
+    let (flags, timebase, time_mul, sustain, grid_x, grid_y, snap, show_grid, show_grid_labels) =
         snarl.get_node(node_id).map(|n| {
-            let m   = n.params.get("mode")    .and_then(|v| v.as_str()).unwrap_or("oneshot").to_string();
+            let fl  = flexinput_engine::envelope_flags(&n.params);
             let tb  = n.params.get("timebase").and_then(|v| v.as_str()).unwrap_or("ms").to_string();
             let tm  = n.params.get("time_mul").and_then(|v| v.as_f64()).unwrap_or(500.0) as f32;
             let su  = n.params.get("sustain") .and_then(|v| v.as_f64()).unwrap_or(0.3)   as f32;
@@ -4113,8 +4119,8 @@ fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
             let sn  = n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
             let sg  = n.params.get("show_grid").and_then(|v| v.as_bool()).unwrap_or(true);
             let sgl = n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
-            (m, tb, tm, su, gx, gy, sn, sg, sgl)
-        }).unwrap_or_else(|| ("oneshot".into(), "ms".into(), 500.0, 0.3, 4, 4, false, true, false));
+            (fl, tb, tm, su, gx, gy, sn, sg, sgl)
+        }).unwrap_or_else(|| ((false, false, false), "ms".into(), 500.0, 0.3, 4, 4, false, true, false));
 
     // Detect Time-input wiring from the snarl directly (input pin 1) rather than
     // the passed `inputs` slice — the sub-patch inner body is rendered with an
@@ -4122,7 +4128,7 @@ fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
     let _ = inputs;
     let time_wired = !snarl.in_pin(InPinId { node: node_id, input: 1 }).remotes.is_empty();
 
-    let mut mode     = mode;
+    let (mut hold, mut bounce, mut loopf) = flags;
     let mut timebase = timebase;
     let mut time_mul = time_mul;
     let mut sustain  = sustain;
@@ -4173,10 +4179,10 @@ fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
         { sustain = s as f32; }
 
         // Sustain row — directly under the graph. Snaps to the nearest control
-        // point; enabled in Hold mode only.
+        // point; relevant only when Hold is enabled.
         let r = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Sustain").small().weak());
-            let sustain_active = mode == "hold" || mode == "bounce_hold";
+            let sustain_active = hold;
             let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
                 .show_value(false)
                 .clamp_to_range(true);
@@ -4229,14 +4235,21 @@ fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
         });
         time_rect = Some(r.response.rect);
 
-        // Mode row
+        // Behavior row: combinable Hold / Bounce / Loop checkboxes.
+        // Off = one-shot.
         let r = ui.horizontal(|ui| {
-            changed |= ui.selectable_value(&mut mode, "oneshot".into(),     egui::RichText::new("One-shot").small()).changed();
-            changed |= ui.selectable_value(&mut mode, "hold".into(),        egui::RichText::new("Hold").small()).changed();
-            changed |= ui.selectable_value(&mut mode, "loop".into(),        egui::RichText::new("Loop").small()).changed();
-            changed |= ui.selectable_value(&mut mode, "bounce".into(),      egui::RichText::new("Bounce").small()).changed();
-            changed |= ui.selectable_value(&mut mode, "bounce_hold".into(), egui::RichText::new("B+Hold").small())
-                .on_hover_text("Bounce, holding the sustain value through a time buffer before receding").changed();
+            let b0 = hold;
+            ui.checkbox(&mut hold, egui::RichText::new("Hold").small())
+                .on_hover_text("Run to the sustain point and hold there while the trigger is held");
+            changed |= hold != b0;
+            let b1 = bounce;
+            ui.checkbox(&mut bounce, egui::RichText::new("Bounce").small())
+                .on_hover_text("Ping-pong: forward while held, reverse back to the start on release");
+            changed |= bounce != b1;
+            let b2 = loopf;
+            ui.checkbox(&mut loopf, egui::RichText::new("Loop").small())
+                .on_hover_text("Repeat the active segment while the trigger is held");
+            changed |= loopf != b2;
         });
         mode_rect = Some(r.response.rect);
 
@@ -4271,7 +4284,10 @@ fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
 
     if changed || sustain_changed {
         if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("mode".into(),     Value::String(mode));
+            node.params.insert("hold".into(),     Value::Bool(hold));
+            node.params.insert("bounce".into(),   Value::Bool(bounce));
+            node.params.insert("loop".into(),     Value::Bool(loopf));
+            node.params.remove("mode"); // superseded by the flags above
             node.params.insert("timebase".into(), Value::String(timebase));
             if let Some(n) = Number::from_f64(time_mul as f64) {
                 node.params.insert("time_mul".into(), Value::Number(n));
@@ -4396,29 +4412,30 @@ fn render_envelope_mode_row(
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(180.0, 22.0));
 
-    let mode = snarl.get_node(inner_id)
-        .and_then(|n| n.params.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()))
-        .unwrap_or_else(|| "oneshot".into());
+    let (mut hold, mut bounce, mut loopf) = snarl.get_node(inner_id)
+        .map(|n| flexinput_engine::envelope_flags(&n.params))
+        .unwrap_or((false, false, false));
 
-    let mut mode    = mode;
     let mut changed = false;
-    let mut fr: Vec<egui::Rect> = Vec::with_capacity(5);
+    let mut fr: Vec<egui::Rect> = Vec::with_capacity(3);
     ui.horizontal(|ui| {
-        let r = ui.selectable_value(&mut mode, "oneshot".into(), egui::RichText::new("One-shot").small());
-        fr.push(r.rect); changed |= r.changed();
-        let r = ui.selectable_value(&mut mode, "hold".into(),    egui::RichText::new("Hold").small());
-        fr.push(r.rect); changed |= r.changed();
-        let r = ui.selectable_value(&mut mode, "loop".into(),    egui::RichText::new("Loop").small());
-        fr.push(r.rect); changed |= r.changed();
-        let r = ui.selectable_value(&mut mode, "bounce".into(),  egui::RichText::new("Bounce").small());
-        fr.push(r.rect); changed |= r.changed();
-        let r = ui.selectable_value(&mut mode, "bounce_hold".into(), egui::RichText::new("B+Hold").small());
-        fr.push(r.rect); changed |= r.changed();
+        let b0 = hold;
+        let r = ui.checkbox(&mut hold, egui::RichText::new("Hold").small());
+        fr.push(r.rect); changed |= hold != b0;
+        let b1 = bounce;
+        let r = ui.checkbox(&mut bounce, egui::RichText::new("Bounce").small());
+        fr.push(r.rect); changed |= bounce != b1;
+        let b2 = loopf;
+        let r = ui.checkbox(&mut loopf, egui::RichText::new("Loop").small());
+        fr.push(r.rect); changed |= loopf != b2;
     });
     publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
-            node.params.insert("mode".into(), Value::String(mode));
+            node.params.insert("hold".into(),   Value::Bool(hold));
+            node.params.insert("bounce".into(), Value::Bool(bounce));
+            node.params.insert("loop".into(),   Value::Bool(loopf));
+            node.params.remove("mode");
         }
     }
 }
@@ -4432,11 +4449,11 @@ fn render_envelope_sustain_row(
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(180.0, 22.0));
 
-    let (mode, sustain) = snarl.get_node(inner_id).map(|n| {
-        let m  = n.params.get("mode")   .and_then(|v| v.as_str()).unwrap_or("oneshot").to_string();
+    let (hold, sustain) = snarl.get_node(inner_id).map(|n| {
+        let (h, _, _) = flexinput_engine::envelope_flags(&n.params);
         let su = n.params.get("sustain").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
-        (m, su)
-    }).unwrap_or_else(|| ("oneshot".into(), 0.3));
+        (h, su)
+    }).unwrap_or((false, 0.3));
 
     let pts_x: Vec<f32> = snarl.get_node(inner_id)
         .and_then(|n| n.params.get("points").and_then(|v| v.as_array()).map(|arr| {
@@ -4449,7 +4466,7 @@ fn render_envelope_sustain_row(
 
     let mut sustain = sustain;
     let mut changed = false;
-    let sustain_active = mode == "hold" || mode == "bounce_hold";
+    let sustain_active = hold;
 
     let mut fr: Vec<egui::Rect> = Vec::with_capacity(2);
     ui.horizontal(|ui| {
@@ -8469,9 +8486,9 @@ fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, scope: &str, 
 }
 
 fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::Vec2) -> f32 {
-    let sx = (container.x / natural.x.max(1.0)).clamp(0.5, 4.0);
-    let sy = (container.y / natural.y.max(1.0)).clamp(0.5, 4.0);
-    let scale = sx.min(sy).clamp(0.5, 4.0);
+    // Settings widgets scale by the container WIDTH so they grow to fill the
+    // space as the pinned element is widened (height follows the content).
+    let scale = (container.x / natural.x.max(1.0)).clamp(0.5, 4.0);
     if (scale - 1.0).abs() < 0.02 { return 1.0; }
 
     // Scale all named text styles uniformly so labels, buttons, and DragValues

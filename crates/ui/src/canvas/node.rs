@@ -492,7 +492,7 @@ pub fn exposable_elements(module_id: &str) -> &'static [(&'static str, &'static 
         "generator.envelope" => &[
             ("curve",            "Envelope graph"),
             ("time_row",         "Time multiplier + unit"),
-            ("mode_row",         "Mode (One-shot / Hold / Loop / Bounce / B+Hold)"),
+            ("mode_row",         "Behavior (Hold / Bounce / Loop)"),
             ("sustain_row",      "Sustain point"),
             ("grid_row",         "Grid divisions + Snap"),
             ("grid_options_row", "Show grid / labels"),
