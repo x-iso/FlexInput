@@ -170,6 +170,19 @@ impl HidHideClient {
     /// Tries to open with read+write access first (needed by the driver's
     /// internal access check on SET operations); falls back to read-only.
     pub fn try_open() -> Option<Self> {
+        // Debug builds can emulate a missing HidHide driver via
+        // `FLEXINPUT_FAKE_NO_HIDHIDE=1` so the driver-missing UI is testable
+        // without uninstalling HidHide.
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(v) = std::env::var("FLEXINPUT_FAKE_NO_HIDHIDE") {
+                let v = v.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+                    eprintln!("[hidhide] try_open: forced missing (FLEXINPUT_FAKE_NO_HIDHIDE)");
+                    return None;
+                }
+            }
+        }
         #[cfg(windows)] {
             use win32::*;
             let path = to_wide(r"\\.\HidHide");

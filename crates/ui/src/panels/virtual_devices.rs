@@ -60,17 +60,6 @@ impl VirtualDevicePanel {
             }).collect()
         };
 
-        // Driver dependency banner
-        if !vigem_available() {
-            ui.horizontal(|ui| {
-                let warn = RichText::new("⚠ ViGEmBus missing").color(Color32::from_rgb(220, 160, 40));
-                ui.label(warn).on_hover_text("Required for Virtual XInput and Virtual DualShock 4");
-                if ui.small_button("Install").clicked() {
-                    let _ = open::that("https://github.com/nefarius/ViGEmBus/releases/latest");
-                }
-            });
-        }
-
         let scroll_out = egui::ScrollArea::horizontal()
             .id_salt("virtual_scroll")
             .auto_shrink([false, false])
@@ -197,6 +186,7 @@ impl VirtualDevicePanel {
                 ui.label(RichText::new("Add virtual output").strong());
                 ui.separator();
 
+                let vigem_ok = vigem_available();
                 for kind in available_device_kinds() {
                     let already = if kind.allows_multiple {
                         false
@@ -205,8 +195,31 @@ impl VirtualDevicePanel {
                         devs.iter().any(|a| a.id().starts_with(kind.kind_id))
                     };
 
+                    // ViGEmBus-backed kinds (XInput / DS4) can't be created
+                    // until the driver is installed; show an inline warning +
+                    // install link next to the relevant option.
+                    let needs_vigem = matches!(kind.kind_id, "virtual.xinput" | "virtual.ds4");
+                    let blocked_by_driver = needs_vigem && !vigem_ok;
+
+                    ui.horizontal(|ui| {
                     if already {
                         ui.add_enabled(false, egui::Button::new(kind.display_name));
+                    } else if blocked_by_driver {
+                        ui.add_enabled(false, egui::Button::new(kind.display_name));
+                        let warn = ui
+                            .add(egui::Label::new(
+                                RichText::new("⚠ missing driver")
+                                    .small()
+                                    .color(Color32::from_rgb(220, 160, 40)),
+                            ).sense(egui::Sense::click()))
+                            .on_hover_text(
+                                "Requires ViGEmBus — click to install",
+                            );
+                        if warn.clicked() {
+                            let _ = open::that(
+                                "https://github.com/nefarius/ViGEmBus/releases/latest",
+                            );
+                        }
                     } else if ui.button(kind.display_name).clicked() {
                         let instance = {
                             let devs = pool.lock().unwrap();
@@ -231,6 +244,7 @@ impl VirtualDevicePanel {
                         }
                         ctl.close = true;
                     }
+                    });
                 }
             });
 
@@ -275,7 +289,7 @@ fn add_svg_button(ui: &mut egui::Ui, menu_body: impl FnOnce(&mut egui::Ui, &mut 
             .fixed_pos(resp.rect.left_bottom() + egui::vec2(0.0, 4.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(160.0);
+                    ui.set_min_width(260.0);
                     menu_body(ui, &mut ctl);
                 });
             });

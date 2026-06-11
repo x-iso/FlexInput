@@ -787,11 +787,14 @@ fn show_output_section(
     let panel_w = ui.available_width();
     let inner_w = (panel_w - 2.0 * PANEL_PADDING).max(120.0);
     let pair_card_w = (inner_w - CARD_GAP) / 2.0;
+    // ViGEmBus backs both XInput and DS4 outputs; when it's absent the
+    // cards stay visible but disabled, with an inline link to install it.
+    let vigem_ok = flexinput_virtual::driver_availability::vigem_available();
     ui.horizontal(|ui| {
         ui.add_space(PANEL_PADDING);
         let (xi_click, xi_rect) = gamepad_card(ui, "xinput",
             remapper_icons::virtual_device_card_svg(KIND_XINPUT),
-            xinput_on, pair_card_w);
+            xinput_on, !vigem_ok, pair_card_w);
         if xi_click {
             if xinput_on {
                 remove_sinks_of_kind(canvas, KIND_XINPUT);
@@ -806,7 +809,7 @@ fn show_output_section(
         ui.add_space(CARD_GAP);
         let (ds_click, ds_rect) = gamepad_card(ui, "DS4",
             remapper_icons::virtual_device_card_svg(KIND_DS4),
-            ds4_on, pair_card_w);
+            ds4_on, !vigem_ok, pair_card_w);
         if ds_click {
             if ds4_on {
                 remove_sinks_of_kind(canvas, KIND_DS4);
@@ -859,25 +862,75 @@ fn gamepad_card(
     label: &str,
     icon: &'static [u8],
     is_active: bool,
+    driver_missing: bool,
     width: f32,
 ) -> (bool, egui::Rect) {
+    // When the backing driver (ViGEmBus) is absent the card can't be
+    // toggled on. The card body senses hover only; a small corner warning
+    // badge (painted + hit-tested separately below) carries the click that
+    // opens the install page, so the badge never participates in the card's
+    // centered icon/label layout (which would squeeze the text into a
+    // single-glyph-wide column and wrap it vertically).
+    let sense = if driver_missing { egui::Sense::hover() } else { egui::Sense::click() };
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, OUTPUT_PAIR_CARD_H),
-        egui::Sense::click(),
+        sense,
     );
-    let (bg, stroke, stroke_w) = card_colors(ui, is_active, resp.hovered());
+    let hovered = resp.hovered() && !driver_missing;
+    let (bg, stroke, stroke_w) = card_colors(ui, is_active, hovered);
     ui.painter().rect(rect, CARD_ROUND, bg,
         egui::Stroke::new(stroke_w, stroke), egui::StrokeKind::Inside);
     ui.scope_builder(egui::UiBuilder::new()
         .max_rect(rect.shrink(8.0)), |ui|
     {
+        // Dim the icon/label when the driver is missing.
+        if driver_missing {
+            ui.disable();
+        }
         ui.vertical_centered(|ui| {
             render_device_icon(ui, icon, OUTPUT_CARD_ICON_H);
             ui.add_space(4.0);
             ui.label(egui::RichText::new(label).size(13.0).strong());
         });
     });
-    (resp.clicked(), rect)
+
+    let mut card_clicked = resp.clicked() && !driver_missing;
+    if driver_missing {
+        // Corner warning badge: a small interactive rect in the card's
+        // top-right. Painted directly so it sits above the (disabled) body.
+        let badge = warning_badge(ui, rect);
+        if badge.clicked() {
+            let _ = open::that("https://github.com/nefarius/ViGEmBus/releases/latest");
+        }
+        // A click anywhere on the (disabled) card surfaces the same hint
+        // rather than silently doing nothing — but only the badge opens the
+        // link. Keep card_clicked false so no sink is created.
+        let _ = &mut card_clicked;
+    }
+    (card_clicked, rect)
+}
+
+/// Paint a small amber ⚠ badge in the top-right corner of `card_rect` and
+/// return an interactive response for it (click → open install page,
+/// hover → tooltip). Kept out of the card's flow layout so the warning can
+/// never reflow the icon/label.
+fn warning_badge(ui: &mut egui::Ui, card_rect: egui::Rect) -> egui::Response {
+    const BADGE: f32 = 22.0;
+    let center = egui::pos2(card_rect.right() - 4.0 - BADGE * 0.5,
+                            card_rect.top()   + 4.0 + BADGE * 0.5);
+    let hit = egui::Rect::from_center_size(center, egui::vec2(BADGE, BADGE));
+    let resp = ui.interact(hit, ui.id().with(("vigem_warn", card_rect.left() as i32)),
+        egui::Sense::click());
+    let amber = egui::Color32::from_rgb(220, 160, 40);
+    let glyph_color = if resp.hovered() { egui::Color32::from_rgb(255, 200, 80) } else { amber };
+    ui.painter().text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        "⚠",
+        egui::FontId::proportional(BADGE * 0.8),
+        glyph_color,
+    );
+    resp.on_hover_text("Requires ViGEmBus — click to install")
 }
 
 fn keymouse_card(
