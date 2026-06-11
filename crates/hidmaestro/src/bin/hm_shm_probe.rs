@@ -41,6 +41,7 @@ fn main() {
         "preset" => run_preset(&args[2..]),
         "create" => run_create(&args[2..]),
         "destroy" => run_destroy(&args[2..]),
+        "info" => run_info(),
         _ => {
             eprintln!(
                 "usage:\n  \
@@ -143,12 +144,34 @@ fn run_create_input(args: &[String]) {
     }
 }
 
+/// Report driver availability + discovered INF path (no elevation needed).
+fn run_info() {
+    let avail = flexinput_hidmaestro::hidmaestro_available();
+    let inf = flexinput_hidmaestro::installed_inf_path();
+    println!("hidmaestro_available = {avail}");
+    match inf {
+        Some(p) => println!("installed_inf_path   = {}", p.display()),
+        None => println!("installed_inf_path   = (not found)"),
+    }
+}
+
 /// Phase-3a gate: create a DS4-v2 device node from Rust (elevated). Pre-creates
 /// the input section first (so the driver can open it), creates the devnode,
 /// binds the driver, and prints the instance id for teardown.
 fn run_create(args: &[String]) {
     let index = parse_index(args);
-    let inf = arg(args, "--inf").unwrap_or(r"C:\Windows\INF\oem62.inf");
+    // Prefer an explicit --inf; otherwise discover the published HIDMaestro INF.
+    let discovered = flexinput_hidmaestro::installed_inf_path();
+    let inf: String = match arg(args, "--inf") {
+        Some(s) => s.to_string(),
+        None => match &discovered {
+            Some(p) => p.display().to_string(),
+            None => {
+                eprintln!("no HIDMaestro INF found in %SystemRoot%\\INF; pass --inf or install the driver");
+                std::process::exit(1);
+            }
+        },
+    };
     let profile = Profile::from_json(DUALSHOCK_4_V2_JSON).expect("DS4v2 profile");
 
     // Pre-create the Global\ sections (elevated) so the driver can OpenFileMapping
@@ -159,7 +182,7 @@ fn run_create(args: &[String]) {
     });
     let _output = OutputSection::create(index);
 
-    match create_device_node(&profile, inf, index) {
+    match create_device_node(&profile, &inf, index) {
         Ok(dev) => {
             println!("CREATED instance_id={} controller_index={}", dev.instance_id, dev.controller_index);
             println!("(keeping section handles alive; Ctrl-C after verifying. inf={inf})");
