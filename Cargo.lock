@@ -1289,6 +1289,8 @@ version = "0.9.7"
 dependencies = [
  "enigo",
  "flexinput-core",
+ "flexinput-hidmaestro",
+ "glam",
  "vigem-client",
 ]
 

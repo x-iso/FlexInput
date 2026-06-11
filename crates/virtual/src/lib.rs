@@ -50,6 +50,9 @@ pub trait VirtualDevice: Send {
 #[cfg(windows)]
 pub mod windows;
 
+#[cfg(windows)]
+pub mod hidmaestro_device;
+
 /// List available virtual device *types* — no connections are made.
 pub fn available_device_kinds() -> &'static [DeviceKind] {
     #[cfg(windows)]

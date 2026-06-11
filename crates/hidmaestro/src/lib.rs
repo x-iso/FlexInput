@@ -28,7 +28,7 @@ pub mod profile;
 pub mod shm;
 
 pub use descriptor::{parse_descriptor, InputField, InputReport};
-pub use encode::{encode_report, encode_report_into, GamepadState, Hat};
+pub use encode::{encode_report, encode_report_into, GamepadState, Hat, PinState};
 pub use orchestrator::{create_device_node, remove_device_node, CreatedDevice, OrchestratorError};
 pub use profile::{Profile, ProfileError};
 pub use shm::{InputSection, OutputFrame, OutputSection, ShmError};

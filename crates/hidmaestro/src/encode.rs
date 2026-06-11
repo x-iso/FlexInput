@@ -259,6 +259,125 @@ fn is_axis_usage(u: u16) -> bool {
     )
 }
 
+/// Accumulates FlexInput sink-pin writes into a [`GamepadState`].
+///
+/// Bridges FlexInput's signal conventions to the encoder's:
+/// - Sticks arrive as `-1.0..1.0` (0 = center) and are mapped to `0.0..1.0`
+///   (0.5 = center). Y is **inverted** — FlexInput up is +1, HID up is the low
+///   end of the axis (matches the ViGEm DS4 backend's `float_to_*` convention).
+/// - Triggers arrive as `0.0..1.0` (0 = released) and pass through.
+/// - Buttons and d-pad directions are booleans.
+///
+/// Call [`set`](Self::set) per pin during `VirtualDevice::send`, then
+/// [`state`](Self::state) in `flush` to get the encodable snapshot.
+#[derive(Debug, Clone)]
+pub struct PinState {
+    lx: f32,
+    ly: f32,
+    rx: f32,
+    ry: f32,
+    lt: f32,
+    rt: f32,
+    buttons: u32,
+    dpad_up: bool,
+    dpad_down: bool,
+    dpad_left: bool,
+    dpad_right: bool,
+}
+
+impl Default for PinState {
+    fn default() -> Self {
+        // Centered sticks, released triggers, nothing pressed.
+        PinState {
+            lx: 0.0,
+            ly: 0.0,
+            rx: 0.0,
+            ry: 0.0,
+            lt: 0.0,
+            rt: 0.0,
+            buttons: 0,
+            dpad_up: false,
+            dpad_down: false,
+            dpad_left: false,
+            dpad_right: false,
+        }
+    }
+}
+
+impl PinState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset to neutral (sticks centered, triggers released, no buttons).
+    pub fn reset(&mut self) {
+        *self = PinState::default();
+    }
+
+    /// Apply one FlexInput pin write. `f` is the float view of the signal
+    /// (`as_float`), `b` the bool view (`as_bool`) — callers pass both so the
+    /// pin decides which to use. Vec2 pins are decomposed by the caller into
+    /// the `_x`/`_y` variants. Unknown pins are ignored.
+    pub fn set(&mut self, pin: &str, f: f32, b: bool) {
+        match pin {
+            "left_stick_x" => self.lx = f,
+            "left_stick_y" => self.ly = f,
+            "right_stick_x" => self.rx = f,
+            "right_stick_y" => self.ry = f,
+            "left_trigger" => self.lt = f,
+            "right_trigger" => self.rt = f,
+            "dpad_up" => self.dpad_up = b,
+            "dpad_down" => self.dpad_down = b,
+            "dpad_left" => self.dpad_left = b,
+            "dpad_right" => self.dpad_right = b,
+            _ => {
+                if let Some(bit) = ds_button_bit(pin) {
+                    if b {
+                        self.buttons |= bit;
+                    } else {
+                        self.buttons &= !bit;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Snapshot as an encodable [`GamepadState`]. Maps stick `-1..1` → `0..1`
+    /// (Y inverted) and folds d-pad booleans into the hat.
+    pub fn state(&self) -> GamepadState {
+        let to_unsigned = |v: f32| ((v.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0);
+        GamepadState {
+            left_stick_x: to_unsigned(self.lx),
+            left_stick_y: to_unsigned(-self.ly),
+            right_stick_x: to_unsigned(self.rx),
+            right_stick_y: to_unsigned(-self.ry),
+            left_trigger: self.lt.clamp(0.0, 1.0),
+            right_trigger: self.rt.clamp(0.0, 1.0),
+            buttons: self.buttons,
+            hat: Hat::from_dpad(self.dpad_up, self.dpad_down, self.dpad_left, self.dpad_right),
+        }
+    }
+}
+
+/// FlexInput DS4/DualSense button pin id → HMButton bit.
+pub fn ds_button_bit(pin: &str) -> Option<u32> {
+    Some(match pin {
+        "btn_south" => button::A,
+        "btn_east" => button::B,
+        "btn_west" => button::X,
+        "btn_north" => button::Y,
+        "btn_lb" => button::LEFT_BUMPER,
+        "btn_rb" => button::RIGHT_BUMPER,
+        "btn_back" => button::BACK,
+        "btn_start" => button::START,
+        "btn_ls" => button::LEFT_STICK,
+        "btn_rs" => button::RIGHT_STICK,
+        "btn_guide" => button::GUIDE,
+        "btn_touchpad" => button::TOUCHPAD,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +430,47 @@ mod tests {
         let rep = encode_report(&p, &st);
         // bit 37 → byte (37/8=4)+RID=5, bit (37%8=5).
         assert_eq!(rep[5] & (1 << 5), 1 << 5, "Cross should set Btn2 (bit 37)");
+    }
+
+    #[test]
+    fn pinstate_neutral_is_centered() {
+        let ps = PinState::new();
+        let st = ps.state();
+        assert!((st.left_stick_x - 0.5).abs() < 1e-6);
+        assert!((st.left_stick_y - 0.5).abs() < 1e-6);
+        assert_eq!(st.left_trigger, 0.0);
+        assert_eq!(st.buttons, 0);
+        assert_eq!(st.hat, Hat::Neutral);
+    }
+
+    #[test]
+    fn pinstate_maps_sticks_and_inverts_y() {
+        let mut ps = PinState::new();
+        ps.set("left_stick_x", 1.0, true); // full right
+        ps.set("left_stick_y", 1.0, true); // FlexInput "up" (+1)
+        let st = ps.state();
+        assert!((st.left_stick_x - 1.0).abs() < 1e-6, "x full right → 1.0");
+        // Y inverted: FlexInput up (+1) → HID low end (0.0).
+        assert!((st.left_stick_y - 0.0).abs() < 1e-6, "y up → 0.0 (inverted)");
+    }
+
+    #[test]
+    fn pinstate_buttons_and_dpad() {
+        let mut ps = PinState::new();
+        ps.set("btn_south", 1.0, true);
+        ps.set("dpad_up", 1.0, true);
+        let st = ps.state();
+        assert_eq!(st.buttons, button::A);
+        assert_eq!(st.hat, Hat::North);
+    }
+
+    #[test]
+    fn pinstate_encodes_through_profile() {
+        // End-to-end: pin writes → state → DS4 report bytes.
+        let p = ds4();
+        let mut ps = PinState::new();
+        ps.set("left_stick_x", 1.0, true); // full right → X = 0xFF
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(rep[1], 255, "left_stick_x=+1 should drive X to max");
     }
 }
