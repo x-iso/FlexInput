@@ -1,0 +1,20 @@
+[package]
+name    = "flexinput-hidmaestro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flexinput-core = { workspace = true }
+
+# Standalone protocol-proof binary (Phase 1 verification gate). Opens a
+# section created by HIDMaestro's C# test app and drives a known pattern.
+[[bin]]
+name = "hm_shm_probe"
+path = "src/bin/hm_shm_probe.rs"
+required-features = ["probe-bin"]
+
+[features]
+# The probe bin is gated so a normal `cargo build` of the workspace doesn't
+# require it; build with `--features probe-bin` for the Phase-1 gate.
+probe-bin = []

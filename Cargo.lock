@@ -1239,6 +1239,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "flexinput-hidmaestro"
+version = "0.9.7"
+dependencies = [
+ "flexinput-core",
+]
+
+[[package]]
 name = "flexinput-modules"
 version = "0.9.7"
 dependencies = [

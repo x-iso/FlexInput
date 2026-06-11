@@ -1,0 +1,190 @@
+//! Phase-1 verification probe for the HIDMaestro shared-memory client.
+//!
+//! This is throwaway scaffolding for the Phase-1 gate — it deliberately does
+//! NOT reimplement HIDMaestro's report encoder (that's Phase 2). Instead it
+//! replays a **captured raw input report** (bytes you grab from HIDMaestro's own
+//! C# app for a known controller state) and optionally ramps one byte, so the
+//! gate exercises *only* the Rust SHM transport: does our seqlock writer deliver
+//! frames the driver accepts as cleanly as the C# writer does?
+//!
+//! Workflow for the gate:
+//!   1. Run HIDMaestro's C# test app to CREATE a device (it owns the section).
+//!      e.g. `HIDMaestroTest emulate xbox-360-wired` (keep it running, or use a
+//!      build that creates the device then idles without writing).
+//!   2. Capture one report's bytes from the C# side (a tiny dump patch in
+//!      WriteInputFrame, or known from the descriptor) for, say, sticks centered.
+//!   3. Run this probe to OPEN that section and drive it:
+//!      `hm_shm_probe input  --index 0 --report <hex> [--ramp-offset N]`
+//!      `hm_shm_probe output --index 0`
+//!   4. Watch a gamepad tester (joy.cpl / Gamepad Tester): the ramped axis must
+//!      move smoothly with NO jitter/tearing over 60+ seconds.
+//!
+//! Build: `cargo run -p flexinput-hidmaestro --features probe-bin --bin hm_shm_probe -- ...`
+
+use std::time::{Duration, Instant};
+
+use flexinput_hidmaestro::{InputSection, OutputSection};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(String::as_str).unwrap_or("");
+
+    match mode {
+        "input" => run_input(&args[2..]),
+        "output" => run_output(&args[2..]),
+        "create-input" => run_create_input(&args[2..]),
+        "dump" => run_dump(&args[2..]),
+        _ => {
+            eprintln!(
+                "usage:\n  \
+                 hm_shm_probe input  --index <N> --report <hexbytes> [--ramp-offset <byte>] [--rate-hz <hz>]\n  \
+                 hm_shm_probe output --index <N>\n  \
+                 hm_shm_probe create-input --index <N> --report <hexbytes>   (elevated; creates the section itself)\n\n\
+                 <hexbytes>: a captured raw input report, e.g. 00800080800000  (no 0x, no spaces or with).\n\
+                 --ramp-offset: index into the report whose byte is swept 0..255 to make motion visible."
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn arg<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
+    args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+fn parse_index(args: &[String]) -> u32 {
+    arg(args, "--index").and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn parse_report(args: &[String]) -> Vec<u8> {
+    let hex = arg(args, "--report").unwrap_or("00800080800000");
+    let cleaned: String = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if !cleaned.len().is_multiple_of(2) {
+        eprintln!("--report must have an even number of hex digits");
+        std::process::exit(2);
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn run_input(args: &[String]) {
+    let index = parse_index(args);
+    let base = parse_report(args);
+    let ramp_offset: Option<usize> = arg(args, "--ramp-offset").and_then(|s| s.parse().ok());
+    let rate_hz: f64 = arg(args, "--rate-hz").and_then(|s| s.parse().ok()).unwrap_or(250.0);
+    let period = Duration::from_secs_f64(1.0 / rate_hz);
+
+    let mut section = match InputSection::open(index) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("open input section {index} failed: {e}");
+            eprintln!("(is HIDMaestro's C# app running and did it create this controller index?)");
+            std::process::exit(1);
+        }
+    };
+
+    println!(
+        "driving input section {index} @ {rate_hz} Hz, {}-byte report{}. Ctrl-C to stop.",
+        base.len(),
+        match ramp_offset {
+            Some(o) => format!(", ramping byte[{o}] 0..255"),
+            None => " (static)".into(),
+        }
+    );
+
+    let start = Instant::now();
+    let mut report = base.clone();
+    let mut last_log = Instant::now();
+    let mut frames: u64 = 0;
+    loop {
+        if let Some(o) = ramp_offset {
+            if o < report.len() {
+                // Triangle ramp ~0.5 Hz so motion is obvious but not frantic.
+                let t = start.elapsed().as_secs_f64() * 0.5;
+                let tri = (t.fract() * 2.0 - 1.0).abs(); // 0..1..0
+                report[o] = (tri * 255.0) as u8;
+            }
+        }
+        section.write_frame(&report, None);
+        frames += 1;
+
+        if last_log.elapsed() >= Duration::from_secs(2) {
+            println!("  {frames} frames written ({}s elapsed)", start.elapsed().as_secs());
+            last_log = Instant::now();
+        }
+        std::thread::sleep(period);
+    }
+}
+
+fn run_create_input(args: &[String]) {
+    let index = parse_index(args);
+    let base = parse_report(args);
+    let mut section = match InputSection::create(index) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("create input section {index} failed: {e}");
+            eprintln!("(creating Global\\ sections needs elevation — run as Administrator)");
+            std::process::exit(1);
+        }
+    };
+    println!("created input section {index}; writing static report. Ctrl-C to stop.");
+    loop {
+        section.write_frame(&base, None);
+        std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
+/// Poll the input section and print the Data bytes whenever they change — used
+/// to CAPTURE the exact report layout the C# app writes (run the C# emulate
+/// pattern, watch what bytes correspond to a known stick position).
+fn run_dump(args: &[String]) {
+    let index = parse_index(args);
+    let section = match InputSection::open(index) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("open input section {index} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("dumping input section {index} on change (run the C# emulate pattern). Ctrl-C to stop.");
+    let mut last: Vec<u8> = Vec::new();
+    loop {
+        let (seq, len, data, ext) = section.debug_snapshot();
+        if data != last {
+            println!("  seq={seq} len={len} ext={ext} data={data:02x?}");
+            last = data;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn run_output(args: &[String]) {
+    let index = parse_index(args);
+    let mut section = match OutputSection::open(index) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("open output section {index} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("polling output ring {index} every 8ms. Trigger rumble in a tester. Ctrl-C to stop.");
+    loop {
+        let mut drained = 0;
+        while let Some(f) = section.try_read() {
+            println!(
+                "  output: source={} report_id={:#04x} len={} data={:02x?}",
+                f.source,
+                f.report_id,
+                f.data.len(),
+                &f.data[..f.data.len().min(16)]
+            );
+            drained += 1;
+            if drained > 256 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+}

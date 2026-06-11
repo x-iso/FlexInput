@@ -4,6 +4,7 @@ members = [
     "crates/engine",
     "crates/devices",
     "crates/virtual",
+    "crates/hidmaestro",
     "crates/modules",
     "crates/ui",
     "app",
@@ -20,6 +21,7 @@ flexinput-core    = { path = "crates/core" }
 flexinput-engine  = { path = "crates/engine" }
 flexinput-devices = { path = "crates/devices" }
 flexinput-virtual = { path = "crates/virtual" }
+flexinput-hidmaestro = { path = "crates/hidmaestro" }
 flexinput-modules = { path = "crates/modules" }
 flexinput-ui      = { path = "crates/ui" }
 
