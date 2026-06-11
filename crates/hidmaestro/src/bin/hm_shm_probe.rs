@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 
 use flexinput_hidmaestro::encode::{encode_report, GamepadState};
 use flexinput_hidmaestro::profile::presets::DUALSHOCK_4_V2_JSON;
-use flexinput_hidmaestro::{InputSection, OutputSection, Profile};
+use flexinput_hidmaestro::{
+    create_device_node, remove_device_node, InputSection, OutputSection, Profile,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -37,6 +39,8 @@ fn main() {
         "create-input" => run_create_input(&args[2..]),
         "dump" => run_dump(&args[2..]),
         "preset" => run_preset(&args[2..]),
+        "create" => run_create(&args[2..]),
+        "destroy" => run_destroy(&args[2..]),
         _ => {
             eprintln!(
                 "usage:\n  \
@@ -136,6 +140,57 @@ fn run_create_input(args: &[String]) {
     loop {
         section.write_frame(&base, None);
         std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
+/// Phase-3a gate: create a DS4-v2 device node from Rust (elevated). Pre-creates
+/// the input section first (so the driver can open it), creates the devnode,
+/// binds the driver, and prints the instance id for teardown.
+fn run_create(args: &[String]) {
+    let index = parse_index(args);
+    let inf = arg(args, "--inf").unwrap_or(r"C:\Windows\INF\oem62.inf");
+    let profile = Profile::from_json(DUALSHOCK_4_V2_JSON).expect("DS4v2 profile");
+
+    // Pre-create the Global\ sections (elevated) so the driver can OpenFileMapping
+    // them once it binds.
+    let _input = InputSection::create(index).unwrap_or_else(|e| {
+        eprintln!("create input section failed: {e} (run elevated)");
+        std::process::exit(1);
+    });
+    let _output = OutputSection::create(index);
+
+    match create_device_node(&profile, inf, index) {
+        Ok(dev) => {
+            println!("CREATED instance_id={} controller_index={}", dev.instance_id, dev.controller_index);
+            println!("(keeping section handles alive; Ctrl-C after verifying. inf={inf})");
+            // Keep the process (and section handles) alive so the device stays
+            // bound and the section mapped while we verify externally.
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        Err(e) => {
+            eprintln!("CREATE FAILED: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Phase-3a teardown: remove a device node by instance id (elevated).
+fn run_destroy(args: &[String]) {
+    let id = match arg(args, "--id") {
+        Some(s) => s,
+        None => {
+            eprintln!("usage: hm_shm_probe destroy --id <ROOT\\HIDClass\\NNNN>");
+            std::process::exit(2);
+        }
+    };
+    match remove_device_node(id) {
+        Ok(gone) => println!("REMOVE {id} -> gone={gone}"),
+        Err(e) => {
+            eprintln!("REMOVE FAILED: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
