@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 flexinput-core = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
 
 # Standalone protocol-proof binary (Phase 1 verification gate). Opens a
 # section created by HIDMaestro's C# test app and drives a known pattern.

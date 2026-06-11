@@ -23,7 +23,9 @@
 
 use std::time::{Duration, Instant};
 
-use flexinput_hidmaestro::{InputSection, OutputSection};
+use flexinput_hidmaestro::encode::{encode_report, GamepadState};
+use flexinput_hidmaestro::profile::presets::DUALSHOCK_4_V2_JSON;
+use flexinput_hidmaestro::{InputSection, OutputSection, Profile};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -34,6 +36,7 @@ fn main() {
         "output" => run_output(&args[2..]),
         "create-input" => run_create_input(&args[2..]),
         "dump" => run_dump(&args[2..]),
+        "preset" => run_preset(&args[2..]),
         _ => {
             eprintln!(
                 "usage:\n  \
@@ -132,6 +135,45 @@ fn run_create_input(args: &[String]) {
     println!("created input section {index}; writing static report. Ctrl-C to stop.");
     loop {
         section.write_frame(&base, None);
+        std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
+/// Drive a DS4-v2 device using the REAL Phase-2 encoder, sweeping left-stick X.
+/// Proves the descriptor parser + encoder produce bytes the driver accepts as a
+/// correct DS4 report (plain-HID `Data[]` path — no XUSB companion).
+fn run_preset(args: &[String]) {
+    let index = parse_index(args);
+    let what = arg(args, "--sweep").unwrap_or("lx"); // lx|ly|rx|ry|lt|rt
+    let profile = Profile::from_json(DUALSHOCK_4_V2_JSON).expect("DS4v2 profile");
+    let mut section = match InputSection::open(index) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("open input section {index} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Print the neutral report once so it can be diffed against the C# capture.
+    let neutral = encode_report(&profile, &GamepadState::neutral());
+    println!("DS4v2 neutral report ({} bytes): {:02x?}", neutral.len(), neutral);
+    println!("sweeping '{what}' on section {index}. Ctrl-C to stop.");
+
+    let start = Instant::now();
+    loop {
+        let t = start.elapsed().as_secs_f64() * 0.5;
+        let tri = (t.fract() * 2.0 - 1.0).abs() as f32; // 0..1..0
+        let mut st = GamepadState::neutral();
+        match what {
+            "lx" => st.left_stick_x = tri,
+            "ly" => st.left_stick_y = tri,
+            "rx" => st.right_stick_x = tri,
+            "ry" => st.right_stick_y = tri,
+            "lt" => st.left_trigger = tri,
+            "rt" => st.right_trigger = tri,
+            _ => st.left_stick_x = tri,
+        }
+        let rep = encode_report(&profile, &st);
+        section.write_frame(&rep, None);
         std::thread::sleep(Duration::from_millis(4));
     }
 }
