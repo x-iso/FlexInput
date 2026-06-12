@@ -246,9 +246,9 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                     state.teardown_tracked();
                 }
                 let n = remove_all_hidmaestro_devices();
-                if n > 0 {
-                    diag_log(&format!("[helper] hello: cleaned up {n} leftover device(s) (persist off)"));
-                }
+                diag_log(&format!(
+                    "[helper] hello: persist off; cleaned up {n} leftover device(s)/orphan child(ren)"
+                ));
             }
             (Response::ok(), false)
         }

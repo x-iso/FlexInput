@@ -135,6 +135,10 @@ extern "system" {
 extern "system" {
     fn CM_Locate_DevNodeW(dev_inst: *mut u32, device_id: *const u16, flags: u32) -> u32;
     fn CM_Get_Child(child: *mut u32, dev_inst: u32, flags: u32) -> u32;
+    fn CM_Get_Parent(parent: *mut u32, dev_inst: u32, flags: u32) -> u32;
+    fn CM_Get_Sibling(sibling: *mut u32, dev_inst: u32, flags: u32) -> u32;
+    fn CM_Get_Device_ID_Size(len: *mut u32, dev_inst: u32, flags: u32) -> u32;
+    fn CM_Get_Device_IDW(dev_inst: u32, buffer: *mut u16, buffer_len: u32, flags: u32) -> u32;
     fn CM_Set_DevNode_PropertyW(
         dev_inst: u32,
         property_key: *const DevPropKey,
@@ -143,6 +147,50 @@ extern "system" {
         property_buffer_size: u32,
         flags: u32,
     ) -> u32;
+}
+
+/// The instance id string of a devnode (`CM_Get_Device_IDW`).
+fn devnode_instance_id(dev_inst: u32) -> Option<String> {
+    unsafe {
+        let mut len: u32 = 0;
+        if CM_Get_Device_ID_Size(&mut len, dev_inst, 0) != CR_SUCCESS {
+            return None;
+        }
+        // len excludes the NUL; allocate +1.
+        let mut buf = vec![0u16; len as usize + 1];
+        if CM_Get_Device_IDW(dev_inst, buf.as_mut_ptr(), buf.len() as u32, 0) != CR_SUCCESS {
+            return None;
+        }
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..end]))
+    }
+}
+
+/// All immediate child device-instance ids of `parent_inst`
+/// (`CM_Get_Child` + `CM_Get_Sibling` loop). Port of
+/// `DeviceManager.GetAllChildDeviceIds`. These are the HID PDOs that must be
+/// removed explicitly — `DIF_REMOVE` on the root parent does NOT cascade them,
+/// so they survive as orphaned `HID\HIDCLASS\...` "game controller" nodes bound
+/// to the generic input.inf driver (the device-leak bug).
+fn child_device_ids(parent_inst: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut child: u32 = 0;
+        if CM_Get_Child(&mut child, parent_inst, 0) != CR_SUCCESS {
+            return out;
+        }
+        loop {
+            if let Some(id) = devnode_instance_id(child) {
+                out.push(id);
+            }
+            let mut sib: u32 = 0;
+            if CM_Get_Sibling(&mut sib, child, 0) != CR_SUCCESS {
+                break;
+            }
+            child = sib;
+        }
+    }
+    out
 }
 
 /// DEVPROPKEY — `{ fmtid: GUID, pid: u32 }`.
@@ -562,22 +610,120 @@ pub fn remove_all_hidmaestro_devices() -> usize {
             removed += 1;
         }
     }
+    // Sweep up any HID children whose parent is already gone (orphans from a
+    // prior build that didn't remove children, or a force-kill). Counts toward
+    // the total so callers see real cleanup progress.
+    removed += remove_orphan_hid_children();
+    removed
+}
+
+/// Scan `HKLM\...\Enum\HID` for orphaned HIDMaestro HID children — those whose
+/// `HardwareID` carries the "HIDMaestro" ownership tag but whose parent devnode
+/// no longer exists — and `DIF_REMOVE` each. Returns the count removed.
+///
+/// Port of `DeviceManager.RemoveOrphanHidChildren`. This is what reclaims the
+/// `HID\HIDCLASS\...` "game controller" ghosts that accumulated one-per-run
+/// before [`remove_device_node`] learned to remove children. The "HIDMaestro"
+/// tag in the **child's own** HardwareID is the ownership proof — it survives
+/// even after the parent is gone — so this never touches a real generic pad.
+pub fn remove_orphan_hid_children() -> usize {
+    use registry::*;
+    let mut removed = 0;
+    let base = r"SYSTEM\CurrentControlSet\Enum\HID";
+    let Some(devices) = enum_subkeys(HKLM, base) else {
+        return 0;
+    };
+    for device_name in devices {
+        let dev_path = format!(r"{base}\{device_name}");
+        for instance_name in enum_subkeys(HKLM, &dev_path).unwrap_or_default() {
+            let inst_path = format!(r"{dev_path}\{instance_name}");
+            // Ownership: HardwareID multi-sz contains "HIDMaestro".
+            let owned = match read_multi_sz(HKLM, &inst_path, "HardwareID") {
+                Some(ids) => ids.iter().any(|s| s.contains("HIDMaestro")),
+                None => false,
+            };
+            if !owned {
+                continue;
+            }
+            let hid_instance_id = format!(r"HID\{device_name}\{instance_name}");
+            // Is the parent gone? Locate the child devnode, get its parent, and
+            // check the parent isn't locatable (normal or phantom).
+            let orphaned = unsafe {
+                let w = to_wide(&hid_instance_id);
+                let mut child_inst: u32 = 0;
+                let located = CM_Locate_DevNodeW(&mut child_inst, w.as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+                    == CR_SUCCESS
+                    || CM_Locate_DevNodeW(&mut child_inst, w.as_ptr(), CM_LOCATE_DEVNODE_PHANTOM)
+                        == CR_SUCCESS;
+                if !located {
+                    // Child devnode itself is gone (registry residue only) —
+                    // treat as orphan to clear the stale key.
+                    true
+                } else {
+                    let mut parent_inst: u32 = 0;
+                    if CM_Get_Parent(&mut parent_inst, child_inst, 0) != CR_SUCCESS {
+                        true // no parent at all → orphan
+                    } else {
+                        // Parent exists in the tree; only orphaned if it can't
+                        // be located by id. Get its id, then locate.
+                        match devnode_instance_id(parent_inst) {
+                            Some(pid) => {
+                                let wp = to_wide(&pid);
+                                CM_Locate_DevNodeW(&mut 0u32, wp.as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+                                    != CR_SUCCESS
+                                    && CM_Locate_DevNodeW(
+                                        &mut 0u32,
+                                        wp.as_ptr(),
+                                        CM_LOCATE_DEVNODE_PHANTOM,
+                                    ) != CR_SUCCESS
+                            }
+                            None => true,
+                        }
+                    }
+                }
+            };
+            if orphaned {
+                if let Ok(true) = unsafe { dif_remove(&hid_instance_id) } {
+                    removed += 1;
+                }
+            }
+        }
+    }
     removed
 }
 
 /// Remove a plain-HID device node previously created here. Port of the non-SWD
-/// branch of `DeviceManager.RemoveDevice`: `DIF_REMOVE` the parent (root-
-/// enumerated HID devices cascade their single HID child). Returns true if the
-/// node is gone (or was never present). Requires elevation.
+/// branch of `DeviceManager.RemoveDevice`.
+///
+/// **Children first, then parent.** `DIF_REMOVE` on the root parent does NOT
+/// cascade-remove its HID child PDO — the child survives as an orphaned
+/// `HID\HIDCLASS\...` "HID-compliant game controller" bound to the generic
+/// `input.inf`, with no VID/PID and no HIDMaestro ownership tag, so it can't be
+/// found or cleaned up later and accumulates one-per-run (the device-leak bug).
+/// We enumerate the children (`CM_Get_Child`/`CM_Get_Sibling`) and `DIF_REMOVE`
+/// each before removing the parent — exactly as HIDMaestro's C# `RemoveDevice`
+/// does ("prevents ghost HID children from surviving"). Returns true if the
+/// parent node is gone (or was never present). Requires elevation.
 pub fn remove_device_node(instance_id: &str) -> Result<bool, OrchestratorError> {
     unsafe {
         let w_id = to_wide(instance_id);
-        // Already gone?
-        if CM_Locate_DevNodeW(&mut 0u32, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS
-            && CM_Locate_DevNodeW(&mut 0u32, w_id.as_ptr(), CM_LOCATE_DEVNODE_PHANTOM) != CR_SUCCESS
-        {
+        // Locate the parent (normal or phantom). Already gone → nothing to do,
+        // but we still don't know its children, so just return.
+        let mut parent_inst: u32 = 0;
+        let present = CM_Locate_DevNodeW(&mut parent_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+            == CR_SUCCESS
+            || CM_Locate_DevNodeW(&mut parent_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_PHANTOM)
+                == CR_SUCCESS;
+        if !present {
             return Ok(true);
         }
+
+        // Step 1: remove every HID child PDO first (these don't cascade).
+        for child_id in child_device_ids(parent_inst) {
+            let _ = dif_remove(&child_id);
+        }
+
+        // Step 2: remove the parent.
         dif_remove(instance_id)
     }
 }
