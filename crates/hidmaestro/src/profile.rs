@@ -40,6 +40,98 @@ struct RawProfile {
     /// HMButton bit index → descriptor button index (1-based in the descriptor).
     #[serde(rename = "buttonMap")]
     button_map: Option<Vec<i32>>,
+    /// The real device's full input-report layout (byte-addressed). Carries the
+    /// gyro/accel/touchpad regions the HID *descriptor* exposes only as opaque
+    /// vendor blobs, so the encoder can drive IMU + neutralize the touchpad.
+    #[serde(rename = "extendedReport")]
+    extended_report: Option<RawExtendedReport>,
+    /// The real device's output report layout — used to locate the rumble motor
+    /// bytes (which differ between DS4 and DualSense) for feedback decode.
+    #[serde(rename = "extendedOutputReport")]
+    extended_output_report: Option<RawExtendedReport>,
+}
+
+/// Raw `extendedReport` shape (subset). Byte offsets are 1-based in the JSON
+/// (byte 0 is the report ID), matching the on-wire report including the RID.
+#[derive(Debug, Deserialize)]
+struct RawExtendedReport {
+    fields: Vec<RawExtField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawExtField {
+    byte: Option<usize>,
+    #[serde(rename = "type")]
+    ty: Option<String>,
+    semantic: Option<String>,
+}
+
+/// Byte offsets (into the on-wire report, RID included at byte 0) for the IMU
+/// and touchpad regions the descriptor doesn't expose as drivable fields.
+/// A field the profile doesn't declare is `None`; offsets address the low byte
+/// of each little-endian int16.
+#[derive(Debug, Clone, Default)]
+pub struct ExtendedLayout {
+    pub gyro_pitch: Option<usize>,
+    pub gyro_yaw: Option<usize>,
+    pub gyro_roll: Option<usize>,
+    pub accel_x: Option<usize>,
+    pub accel_y: Option<usize>,
+    pub accel_z: Option<usize>,
+    /// First byte of each touchpad finger record (the active-flag/counter byte).
+    /// A real device sets bit 7 of this byte when the finger is NOT touching.
+    pub touch_fingers: Vec<usize>,
+    /// Output-report byte of the strong/left (large) rumble motor, RID-inclusive.
+    pub out_left_motor: Option<usize>,
+    /// Output-report byte of the weak/right (small) rumble motor, RID-inclusive.
+    pub out_right_motor: Option<usize>,
+}
+
+impl ExtendedLayout {
+    fn from_raw(input: Option<&RawExtendedReport>, output: Option<&RawExtendedReport>) -> Self {
+        let mut out = ExtendedLayout::default();
+        if let Some(raw) = input {
+            for f in &raw.fields {
+                let (Some(byte), Some(sem)) = (f.byte, f.semantic.as_deref()) else {
+                    continue;
+                };
+                match sem {
+                    "gyroPitch" => out.gyro_pitch = Some(byte),
+                    "gyroYaw" => out.gyro_yaw = Some(byte),
+                    "gyroRoll" => out.gyro_roll = Some(byte),
+                    "accelX" => out.accel_x = Some(byte),
+                    "accelY" => out.accel_y = Some(byte),
+                    "accelZ" => out.accel_z = Some(byte),
+                    _ => {}
+                }
+                if f.ty.as_deref() == Some("touchpad-finger") {
+                    out.touch_fingers.push(byte);
+                }
+            }
+        }
+        if let Some(raw) = output {
+            for f in &raw.fields {
+                let (Some(byte), Some(sem)) = (f.byte, f.semantic.as_deref()) else {
+                    continue;
+                };
+                match sem {
+                    "leftMotor" => out.out_left_motor = Some(byte),
+                    "rightMotor" => out.out_right_motor = Some(byte),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// True if the profile declares a gyro region (all three axes present).
+    pub fn has_gyro(&self) -> bool {
+        self.gyro_pitch.is_some() && self.gyro_yaw.is_some() && self.gyro_roll.is_some()
+    }
+    /// True if the profile declares an accelerometer region.
+    pub fn has_accel(&self) -> bool {
+        self.accel_x.is_some() && self.accel_y.is_some() && self.accel_z.is_some()
+    }
 }
 
 /// A loaded, descriptor-parsed controller profile ready to encode reports for.
@@ -67,6 +159,10 @@ pub struct Profile {
     pub axis_map: std::collections::HashMap<String, String>,
     /// HMButton bit index → 1-based descriptor button index.
     pub button_map: Option<Vec<i32>>,
+    /// Byte-addressed IMU + touchpad layout from `extendedReport` (the regions
+    /// the HID descriptor exposes only as opaque vendor blobs). Empty when the
+    /// profile declares no `extendedReport`.
+    pub extended: ExtendedLayout,
 }
 
 #[derive(Debug)]
@@ -114,6 +210,10 @@ impl Profile {
         let descriptor = decode_hex(&raw.descriptor)?;
         let report = parse_descriptor(&descriptor);
         let input_report_size = raw.input_report_size.unwrap_or_else(|| report.byte_size());
+        let extended = ExtendedLayout::from_raw(
+            raw.extended_report.as_ref(),
+            raw.extended_output_report.as_ref(),
+        );
         Ok(Profile {
             id: raw.id,
             name: raw.name,
@@ -127,6 +227,7 @@ impl Profile {
             report,
             axis_map: raw.axis_map.unwrap_or_default(),
             button_map: raw.button_map,
+            extended,
         })
     }
 

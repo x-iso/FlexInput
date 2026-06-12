@@ -72,6 +72,16 @@ pub struct GamepadState {
     pub right_trigger: f32,
     pub buttons: u32,
     pub hat: Hat,
+    /// Gyro (pitch, yaw, roll) and accel (x, y, z), normalized to the signal
+    /// graph reference: `±1.0` = `±GYRO_REF_DPS` / `±ACCEL_REF_G` (see
+    /// `flexinput_devices::gyro`). The encoder rescales to the device's int16
+    /// LSB range when the profile declares an IMU region.
+    pub gyro_pitch: f32,
+    pub gyro_yaw: f32,
+    pub gyro_roll: f32,
+    pub accel_x: f32,
+    pub accel_y: f32,
+    pub accel_z: f32,
 }
 
 impl GamepadState {
@@ -250,6 +260,62 @@ pub fn encode_report_into(profile: &Profile, state: &GamepadState, report: &mut 
             write_bits(report, f.bit_offset + id_offset, f.bit_size, 1);
         }
     }
+
+    // IMU + touchpad: byte-addressed regions the HID descriptor exposes only as
+    // opaque vendor blobs, driven from the profile's `extendedReport` layout.
+    encode_extended(profile, state, report);
+}
+
+/// Write the int16-LE little-endian value `v` at byte `off` (RID-inclusive
+/// offset into the on-wire report), if in bounds.
+fn write_i16_le(report: &mut [u8], off: usize, v: i16) {
+    if off + 1 < report.len() {
+        let b = v.to_le_bytes();
+        report[off] = b[0];
+        report[off + 1] = b[1];
+    }
+}
+
+/// Encode the gyro/accel/touchpad regions from `state` into `report` using the
+/// profile's byte-addressed `extendedReport` layout.
+///
+/// Gyro/accel arrive normalized (`±1.0` = `±GYRO_REF_DPS` / `±ACCEL_REF_G`).
+/// DS4/DualSense run factory ±2000 dps / ±8 G over the full int16 range, and the
+/// signal-graph reference is exactly those values, so `±1.0 → ±32767`.
+///
+/// Touchpad: a real Sony pad sets bit 7 of each finger's first byte when that
+/// finger is NOT touching. A zeroed report reads as "finger down at (0,0)",
+/// which Steam shows as a stuck touch — so we stamp the inactive sentinel for
+/// every declared finger (we don't synthesize touch input on virtual pads).
+fn encode_extended(profile: &Profile, state: &GamepadState, report: &mut [u8]) {
+    let ext = &profile.extended;
+    let to_i16 = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+
+    if let Some(o) = ext.gyro_pitch {
+        write_i16_le(report, o, to_i16(state.gyro_pitch));
+    }
+    if let Some(o) = ext.gyro_yaw {
+        write_i16_le(report, o, to_i16(state.gyro_yaw));
+    }
+    if let Some(o) = ext.gyro_roll {
+        write_i16_le(report, o, to_i16(state.gyro_roll));
+    }
+    if let Some(o) = ext.accel_x {
+        write_i16_le(report, o, to_i16(state.accel_x));
+    }
+    if let Some(o) = ext.accel_y {
+        write_i16_le(report, o, to_i16(state.accel_y));
+    }
+    if let Some(o) = ext.accel_z {
+        write_i16_le(report, o, to_i16(state.accel_z));
+    }
+
+    // Touchpad inactive sentinel: bit 7 set = finger not touching.
+    for &finger_off in &ext.touch_fingers {
+        if finger_off < report.len() {
+            report[finger_off] |= 0x80;
+        }
+    }
 }
 
 fn is_axis_usage(u: u16) -> bool {
@@ -283,6 +349,12 @@ pub struct PinState {
     dpad_down: bool,
     dpad_left: bool,
     dpad_right: bool,
+    gyro_x: f32,
+    gyro_y: f32,
+    gyro_z: f32,
+    accel_x: f32,
+    accel_y: f32,
+    accel_z: f32,
 }
 
 impl Default for PinState {
@@ -300,6 +372,12 @@ impl Default for PinState {
             dpad_down: false,
             dpad_left: false,
             dpad_right: false,
+            gyro_x: 0.0,
+            gyro_y: 0.0,
+            gyro_z: 0.0,
+            accel_x: 0.0,
+            accel_y: 0.0,
+            accel_z: 0.0,
         }
     }
 }
@@ -330,6 +408,12 @@ impl PinState {
             "dpad_down" => self.dpad_down = b,
             "dpad_left" => self.dpad_left = b,
             "dpad_right" => self.dpad_right = b,
+            "gyro_x" => self.gyro_x = f,
+            "gyro_y" => self.gyro_y = f,
+            "gyro_z" => self.gyro_z = f,
+            "accel_x" => self.accel_x = f,
+            "accel_y" => self.accel_y = f,
+            "accel_z" => self.accel_z = f,
             _ => {
                 if let Some(bit) = ds_button_bit(pin) {
                     if b {
@@ -355,6 +439,19 @@ impl PinState {
             right_trigger: self.rt.clamp(0.0, 1.0),
             buttons: self.buttons,
             hat: Hat::from_dpad(self.dpad_up, self.dpad_down, self.dpad_left, self.dpad_right),
+            // Inverse of the physical DS4/DualSense IMU decode (see
+            // flexinput_devices::gyro::build): the physical side reads wire
+            // (pitch,yaw,roll)/(side,vertical,fwd) and remaps to the standard
+            // signal-graph (roll,pitch,yaw)/(side,fwd,vertical). We invert so a
+            // virtual pad's wire report matches what a real pad would emit:
+            //   gyroPitch = gyro_y, gyroYaw = -gyro_z, gyroRoll = gyro_x
+            //   accelX = accel_x, accelY(vertical) = accel_z, accelZ(fwd) = accel_y
+            gyro_pitch: self.gyro_y,
+            gyro_yaw: -self.gyro_z,
+            gyro_roll: self.gyro_x,
+            accel_x: self.accel_x,
+            accel_y: self.accel_z,
+            accel_z: self.accel_y,
         }
     }
 }
@@ -462,6 +559,65 @@ mod tests {
         let st = ps.state();
         assert_eq!(st.buttons, button::A);
         assert_eq!(st.hat, Hat::North);
+    }
+
+    #[test]
+    fn dualsense_parses_imu_and_touch_layout() {
+        let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        let e = &p.extended;
+        assert!(e.has_gyro(), "DualSense declares gyro");
+        assert!(e.has_accel(), "DualSense declares accel");
+        // From the preset: gyroPitch@16, gyroYaw@18, gyroRoll@20, accelX@22…
+        assert_eq!(e.gyro_pitch, Some(16));
+        assert_eq!(e.gyro_yaw, Some(18));
+        assert_eq!(e.gyro_roll, Some(20));
+        assert_eq!(e.accel_x, Some(22));
+        // Two touchpad fingers at bytes 33 and 37.
+        assert_eq!(e.touch_fingers, vec![33, 37]);
+    }
+
+    #[test]
+    fn motor_offsets_differ_ds4_vs_dualsense() {
+        // DS4 output report (RID 0x05): rightMotor@4, leftMotor@5.
+        let ds4 = ds4();
+        assert_eq!(ds4.extended.out_right_motor, Some(4));
+        assert_eq!(ds4.extended.out_left_motor, Some(5));
+        // DualSense output report (RID 0x02): rightMotor@3, leftMotor@4.
+        let ds = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        assert_eq!(ds.extended.out_right_motor, Some(3));
+        assert_eq!(ds.extended.out_left_motor, Some(4));
+    }
+
+    #[test]
+    fn dualsense_neutral_stamps_touchpad_inactive() {
+        let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        let rep = encode_report(&p, &GamepadState::neutral());
+        // Inactive sentinel: bit 7 set on each finger's first byte.
+        assert_eq!(rep[33] & 0x80, 0x80, "finger 0 marked inactive");
+        assert_eq!(rep[37] & 0x80, 0x80, "finger 1 marked inactive");
+    }
+
+    #[test]
+    fn dualsense_gyro_accel_encode_to_int16() {
+        let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        let mut st = GamepadState::neutral();
+        // Full positive pitch → gyroPitch@16 = +32767 (0x7FFF LE).
+        st.gyro_pitch = 1.0;
+        // Full positive accel x → accelX@22 = +32767.
+        st.accel_x = 1.0;
+        let rep = encode_report(&p, &st);
+        assert_eq!(i16::from_le_bytes([rep[16], rep[17]]), 32767, "gyro pitch max");
+        assert_eq!(i16::from_le_bytes([rep[22], rep[23]]), 32767, "accel x max");
+    }
+
+    #[test]
+    fn pinstate_gyro_remaps_to_wire_semantics() {
+        let mut ps = PinState::new();
+        ps.set("gyro_x", 0.5, true); // roll
+        ps.set("gyro_z", 0.25, true); // yaw
+        let st = ps.state();
+        assert_eq!(st.gyro_roll, 0.5, "gyro_x → wire roll");
+        assert_eq!(st.gyro_yaw, -0.25, "gyro_z → wire yaw (negated)");
     }
 
     #[test]

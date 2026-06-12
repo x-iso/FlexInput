@@ -201,6 +201,80 @@ struct DevPropKey {
 }
 
 const DEVPROP_TYPE_GUID: u32 = 0x0000_000D;
+const DEVPROP_TYPE_STRING: u32 = 0x0000_0012;
+
+/// `DEVPKEY_Device_DeviceDesc` = `{a45c254e-df1c-4efd-8020-67d146a850e0}, 2`.
+const DEVPKEY_DEVICE_DESC: DevPropKey = DevPropKey {
+    fmtid: Guid {
+        data1: 0xa45c_254e,
+        data2: 0xdf1c,
+        data3: 0x4efd,
+        data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
+    },
+    pid: 2,
+};
+
+/// `DEVPKEY_Device_FriendlyName` = same fmtid, pid 14.
+const DEVPKEY_DEVICE_FRIENDLY_NAME: DevPropKey = DevPropKey {
+    fmtid: Guid {
+        data1: 0xa45c_254e,
+        data2: 0xdf1c,
+        data3: 0x4efd,
+        data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
+    },
+    pid: 14,
+};
+
+/// `DEVPKEY_Device_BusReportedDeviceDesc` =
+/// `{540b947e-8b40-45bc-a8a2-6a0b894cbda2}, 4`.
+const DEVPKEY_BUS_REPORTED_DEVICE_DESC: DevPropKey = DevPropKey {
+    fmtid: Guid {
+        data1: 0x540b_947e,
+        data2: 0x8b40,
+        data3: 0x45bc,
+        data4: [0xa8, 0xa2, 0x6a, 0x0b, 0x89, 0x4c, 0xbd, 0xa2],
+    },
+    pid: 4,
+};
+
+/// Set FriendlyName + DeviceDesc + BusReportedDeviceDesc to `name` on the node
+/// at `instance_id` and its first HID child. Port of
+/// `DeviceProperties.SetAllNamingProperties` — this is what makes the device
+/// show as e.g. "Wireless Controller" instead of the generic "HID-compliant
+/// game controller" in Device Manager / joy.cpl. Best-effort.
+fn set_all_naming_properties(instance_id: &str, name: &str) {
+    // DEVPROP string value = UTF-16 + terminating NUL, as bytes.
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes: Vec<u8> = wide.iter().flat_map(|w| w.to_le_bytes()).collect();
+    unsafe {
+        let w_id = to_wide(instance_id);
+        let mut dev_inst: u32 = 0;
+        if CM_Locate_DevNodeW(&mut dev_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS {
+            return;
+        }
+        let stamp = |inst: u32| {
+            for key in [
+                &DEVPKEY_DEVICE_FRIENDLY_NAME,
+                &DEVPKEY_DEVICE_DESC,
+                &DEVPKEY_BUS_REPORTED_DEVICE_DESC,
+            ] {
+                CM_Set_DevNode_PropertyW(
+                    inst,
+                    key,
+                    DEVPROP_TYPE_STRING,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    0,
+                );
+            }
+        };
+        stamp(dev_inst);
+        let mut child: u32 = 0;
+        if CM_Get_Child(&mut child, dev_inst, 0) == CR_SUCCESS {
+            stamp(child);
+        }
+    }
+}
 
 /// `DEVPKEY_Device_BusTypeGuid` = `{a45c254e-df1c-4efd-8020-67d146a850e0}, 21`.
 const DEVPKEY_DEVICE_BUS_TYPE_GUID: DevPropKey = DevPropKey {
@@ -427,6 +501,15 @@ pub fn create_device_node(
         // wrap it as a virtual XInput pad. Poll up to ~3s.
         wait_for_hid_child(&instance_id, 3000);
         set_bus_type_usb(&instance_id);
+
+        // Friendly name on root + HID child (e.g. "Wireless Controller") so the
+        // device doesn't show as a generic "HID-compliant game controller".
+        let display_name = profile
+            .device_description
+            .as_deref()
+            .or(profile.product_string.as_deref())
+            .unwrap_or(&profile.name);
+        set_all_naming_properties(&instance_id, display_name);
 
         Ok(CreatedDevice { instance_id, controller_index })
     }

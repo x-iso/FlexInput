@@ -232,15 +232,24 @@ impl crate::VirtualDevice for HidMaestroDevice {
 
     fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> {
         // Drain the output ring; keep the latest rumble report we recognize.
+        // Motor byte offsets differ between DS4 (right@4/left@5) and DualSense
+        // (right@3/left@4), so we read them from the profile's
+        // `extendedOutputReport` rather than hardcoding. Those offsets are
+        // RID-inclusive; the ring strips the report id, so within `data` a motor
+        // at byte `o` sits at index `o-1`.
+        let (left_idx, right_idx) = (
+            self.profile.extended.out_left_motor.map(|o| o.saturating_sub(1)),
+            self.profile.extended.out_right_motor.map(|o| o.saturating_sub(1)),
+        );
         if let Some(output) = self.output.as_mut() {
             while let Some(frame) = output.try_read() {
-                // DS4 USB output report (id 0x05): byte[3] = weak (right/small),
-                // byte[4] = strong (left/large) motor. The ring strips the
-                // report-id, so within `data` the motors sit at [2]/[3]. Be
-                // defensive about length; ignore unrecognized reports.
-                if frame.data.len() >= 4 {
-                    let weak = frame.data[2] as f32 / 255.0;
-                    let strong = frame.data[3] as f32 / 255.0;
+                let strong = left_idx
+                    .and_then(|i| frame.data.get(i))
+                    .map(|b| *b as f32 / 255.0);
+                let weak = right_idx
+                    .and_then(|i| frame.data.get(i))
+                    .map(|b| *b as f32 / 255.0);
+                if let (Some(strong), Some(weak)) = (strong, weak) {
                     self.rumble = (strong, weak);
                 }
             }
