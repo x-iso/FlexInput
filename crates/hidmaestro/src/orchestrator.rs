@@ -134,6 +134,74 @@ extern "system" {
 #[link(name = "cfgmgr32")]
 extern "system" {
     fn CM_Locate_DevNodeW(dev_inst: *mut u32, device_id: *const u16, flags: u32) -> u32;
+    fn CM_Get_Child(child: *mut u32, dev_inst: u32, flags: u32) -> u32;
+    fn CM_Set_DevNode_PropertyW(
+        dev_inst: u32,
+        property_key: *const DevPropKey,
+        property_type: u32,
+        property_buffer: *const u8,
+        property_buffer_size: u32,
+        flags: u32,
+    ) -> u32;
+}
+
+/// DEVPROPKEY — `{ fmtid: GUID, pid: u32 }`.
+#[repr(C)]
+struct DevPropKey {
+    fmtid: Guid,
+    pid: u32,
+}
+
+const DEVPROP_TYPE_GUID: u32 = 0x0000_000D;
+
+/// `DEVPKEY_Device_BusTypeGuid` = `{a45c254e-df1c-4efd-8020-67d146a850e0}, 21`.
+const DEVPKEY_DEVICE_BUS_TYPE_GUID: DevPropKey = DevPropKey {
+    fmtid: Guid {
+        data1: 0xa45c_254e,
+        data2: 0xdf1c,
+        data3: 0x4efd,
+        data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
+    },
+    pid: 21,
+};
+
+/// `GUID_BUS_TYPE_USB` = `{9d7debbc-c85d-11d1-9eb4-006008c3a19a}` as raw bytes.
+const GUID_BUS_TYPE_USB_BYTES: [u8; 16] = [
+    0xbc, 0xeb, 0x7d, 0x9d, // data1 LE
+    0x5d, 0xc8, // data2 LE
+    0xd1, 0x11, // data3 LE
+    0x9e, 0xb4, 0x00, 0x60, 0x08, 0xc3, 0xa1, 0x9a, // data4
+];
+
+/// Stamp `DEVPKEY_Device_BusTypeGuid = GUID_BUS_TYPE_USB` onto the devnode at
+/// `instance_id` and its first child. Port of `SetBusTypeGuidUsb` (restricted to
+/// our just-created node). **This is what makes the HID stack report the device
+/// as a USB HID device with proper VID/PID** — without it the HID child
+/// enumerates as a bare `HID\HIDCLASS` generic gamepad (no Sony identity), which
+/// then gets XInput-translated by Steam/etc.
+fn set_bus_type_usb(instance_id: &str) {
+    unsafe {
+        let w_id = to_wide(instance_id);
+        let mut dev_inst: u32 = 0;
+        if CM_Locate_DevNodeW(&mut dev_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS {
+            return;
+        }
+        let stamp = |inst: u32| {
+            CM_Set_DevNode_PropertyW(
+                inst,
+                &DEVPKEY_DEVICE_BUS_TYPE_GUID,
+                DEVPROP_TYPE_GUID,
+                GUID_BUS_TYPE_USB_BYTES.as_ptr(),
+                GUID_BUS_TYPE_USB_BYTES.len() as u32,
+                0,
+            );
+        };
+        stamp(dev_inst);
+        let mut child: u32 = 0;
+        if CM_Get_Child(&mut child, dev_inst, 0) == CR_SUCCESS {
+            stamp(child);
+        }
+    }
 }
 
 #[link(name = "kernel32")]
@@ -209,6 +277,12 @@ pub fn create_device_node(
     let enumerator = "HIDClass";
     let hw_id = format!("root\\VID_{vid}&PID_{pid}");
     let desc = &profile.name;
+
+    // Per-instance driver config (VID/PID/descriptor/etc.). The UMDF driver reads
+    // this at startup to know what identity to report; WITHOUT it the driver
+    // falls back to the Microsoft default VID_045E and the device presents as an
+    // Xbox pad instead of the profile's real (Sony/etc.) identity.
+    write_instance_config(profile, controller_index);
 
     unsafe {
         let class_guid = HID_CLASS_GUID;
@@ -297,7 +371,39 @@ pub fn create_device_node(
             }
         }
 
+        // Wait for the HID child PDO to arrive (async PnP install), then stamp
+        // the USB bus-type GUID on the node + child. Without this the HID child
+        // enumerates as a bare generic `HID\HIDCLASS` gamepad with no VID/PID, so
+        // apps don't recognize the Sony identity and XInput-translation layers
+        // wrap it as a virtual XInput pad. Poll up to ~3s.
+        wait_for_hid_child(&instance_id, 3000);
+        set_bus_type_usb(&instance_id);
+
         Ok(CreatedDevice { instance_id, controller_index })
+    }
+}
+
+/// Poll until the devnode at `instance_id` has a child (its HID PDO), or
+/// `timeout_ms` elapses. Returns true if a child appeared.
+fn wait_for_hid_child(instance_id: &str, timeout_ms: u64) -> bool {
+    let w_id = to_wide(instance_id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        unsafe {
+            let mut dev_inst: u32 = 0;
+            if CM_Locate_DevNodeW(&mut dev_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+                == CR_SUCCESS
+            {
+                let mut child: u32 = 0;
+                if CM_Get_Child(&mut child, dev_inst, 0) == CR_SUCCESS {
+                    return true;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -346,6 +452,51 @@ fn node_is_hidmaestro_owned(instance_id: &str) -> bool {
         Some(ids) => ids.iter().any(|s| s.contains("HIDMaestro")),
         None => false,
     }
+}
+
+/// Write the per-instance driver config under
+/// `HKLM\SOFTWARE\HIDMaestro\Controller{index}`. The UMDF driver reads VID/PID/
+/// descriptor/etc. from here at startup to report the device's identity. Port of
+/// the plain-HID-relevant subset of `DeviceOrchestrator.WriteInstanceConfig`
+/// (omits the FunctionMode/XUSB bits, which are Xbox-only).
+fn write_instance_config(profile: &Profile, controller_index: u32) {
+    use registry::*;
+    let path = format!(r"SOFTWARE\HIDMaestro\Controller{controller_index}");
+    let instance_suffix = format!("\\{controller_index:04}");
+    let device_instance_id = format!(
+        "ROOT\\VID_{:04X}&PID_{:04X}&IG_00{instance_suffix}",
+        profile.vid, profile.pid
+    );
+    let display_name = profile
+        .device_description
+        .as_deref()
+        .or(profile.product_string.as_deref())
+        .unwrap_or("HIDMaestro Controller");
+
+    // Best-effort: each write is independent; a failure on one shouldn't abort
+    // creation (the driver tolerates some missing optional values).
+    let _ = write_string(HKLM, &path, "DeviceInstanceId", &device_instance_id);
+    let _ = write_dword(HKLM, &path, "FunctionMode", 0); // plain HID, no XUSB
+    let _ = write_binary(HKLM, &path, "ReportDescriptor", &profile.descriptor);
+    let _ = write_dword(HKLM, &path, "VendorId", profile.vid as u32);
+    let _ = write_dword(HKLM, &path, "ProductId", profile.pid as u32);
+    let _ = write_dword(HKLM, &path, "VersionNumber", profile.version_number);
+    if let Some(ps) = profile.product_string.as_deref() {
+        let _ = write_string(HKLM, &path, "ProductString", ps);
+    }
+    if profile.input_report_size > 0 {
+        let _ = write_dword(HKLM, &path, "InputReportByteLength", profile.input_report_size as u32);
+    }
+    let _ = write_string(HKLM, &path, "DeviceDescription", display_name);
+
+    // Joystick OEM display name (HKLM; joy.cpl reads it). Non-destructive — HKCU
+    // wins for joy.cpl, so we only touch HKLM (the C# routes HKCU through a
+    // capture/restore mechanism we don't replicate yet).
+    let oem_path = format!(
+        r"SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_{:04X}&PID_{:04X}",
+        profile.vid, profile.pid
+    );
+    let _ = write_string(HKLM, &oem_path, "OEMName", display_name);
 }
 
 /// Remove a plain-HID device node previously created here. Port of the non-SWD
@@ -417,6 +568,8 @@ mod registry {
     const KEY_READ: u32 = 0x2_0019;
     const KEY_SET_VALUE: u32 = 0x0002;
     const KEY_CREATE_SUB_KEY: u32 = 0x0004;
+    const REG_SZ: u32 = 1;
+    const REG_BINARY: u32 = 3;
     const REG_DWORD: u32 = 4;
     const REG_MULTI_SZ: u32 = 7;
     const ERROR_SUCCESS: i32 = 0;
@@ -496,6 +649,41 @@ mod registry {
         } else {
             None
         }
+    }
+
+    pub fn write_string(root: *mut c_void, path: &str, name: &str, value: &str) -> Result<(), u32> {
+        let h = create(root, path)?;
+        let wn = wide(name);
+        let wv = wide(value); // includes terminating NUL
+        let bytes: Vec<u8> = wv.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let rc = unsafe {
+            RegSetValueExW(h, wn.as_ptr(), 0, REG_SZ, bytes.as_ptr(), bytes.len() as u32)
+        };
+        unsafe { RegCloseKey(h) };
+        if rc == ERROR_SUCCESS { Ok(()) } else { Err(rc as u32) }
+    }
+
+    pub fn write_binary(root: *mut c_void, path: &str, name: &str, value: &[u8]) -> Result<(), u32> {
+        let h = create(root, path)?;
+        let wn = wide(name);
+        let rc = unsafe {
+            RegSetValueExW(h, wn.as_ptr(), 0, REG_BINARY, value.as_ptr(), value.len() as u32)
+        };
+        unsafe { RegCloseKey(h) };
+        if rc == ERROR_SUCCESS { Ok(()) } else { Err(rc as u32) }
+    }
+
+    /// Create-or-open a key for writing.
+    fn create(root: *mut c_void, path: &str) -> Result<*mut c_void, u32> {
+        let mut h: *mut c_void = std::ptr::null_mut();
+        let w = wide(path);
+        let rc = unsafe {
+            RegCreateKeyExW(
+                root, w.as_ptr(), 0, std::ptr::null(), 0,
+                KEY_SET_VALUE | KEY_CREATE_SUB_KEY, std::ptr::null_mut(), &mut h, std::ptr::null_mut(),
+            )
+        };
+        if rc != ERROR_SUCCESS { Err(rc as u32) } else { Ok(h) }
     }
 
     pub fn write_dword(root: *mut c_void, path: &str, name: &str, value: u32) -> Result<(), u32> {

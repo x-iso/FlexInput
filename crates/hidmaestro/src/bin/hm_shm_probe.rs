@@ -162,10 +162,13 @@ fn run_helper_call(args: &[String]) {
     let req = match op {
         "ping" => Request::Ping,
         "ensure" => Request::EnsureDriver,
-        "create" => Request::Create {
-            profile_json: DUALSHOCK_4_V2_JSON.to_string(),
-            index,
-        },
+        "create" => {
+            let profile_json = match arg(args, "--profile").unwrap_or("ds4") {
+                "dualsense" => flexinput_hidmaestro::profile::presets::DUALSENSE_JSON,
+                _ => DUALSHOCK_4_V2_JSON,
+            };
+            Request::Create { profile_json: profile_json.to_string(), index }
+        }
         "destroy" => Request::Destroy {
             instance_id: arg(args, "--id").unwrap_or(r"ROOT\HIDClass\0000").to_string(),
         },

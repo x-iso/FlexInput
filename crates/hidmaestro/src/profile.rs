@@ -26,6 +26,12 @@ struct RawProfile {
     pid: String,
     #[serde(rename = "inputReportSize")]
     input_report_size: Option<usize>,
+    #[serde(rename = "productString")]
+    product_string: Option<String>,
+    #[serde(rename = "deviceDescription")]
+    device_description: Option<String>,
+    #[serde(rename = "versionNumber")]
+    version_number: Option<u32>,
     /// HID report descriptor as a hex string.
     descriptor: String,
     /// Usage (hex string, e.g. "0x32") → semantic role (e.g. "rightStickX").
@@ -46,6 +52,13 @@ pub struct Profile {
     /// On-wire input report size in bytes (from JSON; falls back to the parsed
     /// descriptor's byte size when the JSON omits it).
     pub input_report_size: usize,
+    /// USB product string (e.g. "Wireless Controller"). Used for the device's
+    /// registry config + friendly name.
+    pub product_string: Option<String>,
+    /// Optional device description (defaults to `product_string`).
+    pub device_description: Option<String>,
+    /// USB bcdDevice version (defaults to 0x0100, the Sony USB convention).
+    pub version_number: u32,
     /// Raw descriptor bytes (hex-decoded).
     pub descriptor: Vec<u8>,
     /// Parsed first-input-report layout.
@@ -107,6 +120,9 @@ impl Profile {
             vid: parse_hex_u16(&raw.vid)?,
             pid: parse_hex_u16(&raw.pid)?,
             input_report_size,
+            product_string: raw.product_string,
+            device_description: raw.device_description,
+            version_number: raw.version_number.unwrap_or(0x0100),
             descriptor,
             report,
             axis_map: raw.axis_map.unwrap_or_default(),
@@ -126,6 +142,10 @@ pub mod presets {
     /// as the Phase-2 validation target because its legacy `Data[]` report IS
     /// the wire report (no XUSB companion, unlike Xbox360).
     pub const DUALSHOCK_4_V2_JSON: &str = include_str!("../profiles/dualshock-4-v2.json");
+
+    /// DualSense (CFI-ZCT1), USB — plain-HID Sony pad, `VID_054C&PID_0CE6`. The
+    /// HIDMaestro capability ViGEm can't provide.
+    pub const DUALSENSE_JSON: &str = include_str!("../profiles/dualsense.json");
 }
 
 #[cfg(test)]

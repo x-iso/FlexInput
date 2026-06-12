@@ -21,12 +21,10 @@ pub static DEVICE_KINDS: &[DeviceKind] = &[
 
 /// Profile JSON for each HIDMaestro kind (vendored presets in flexinput-hidmaestro).
 fn hm_profile_json(kind_id: &str) -> Option<&'static str> {
+    use flexinput_hidmaestro::profile::presets;
     match kind_id {
-        // DualSense reuses the DS4 preset for now (a DualSense preset can be
-        // vendored later); both are plain-HID Sony pads with the same pin set.
-        "virtual.hm.ds4" | "virtual.hm.dualsense" => {
-            Some(flexinput_hidmaestro::profile::presets::DUALSHOCK_4_V2_JSON)
-        }
+        "virtual.hm.ds4"       => Some(presets::DUALSHOCK_4_V2_JSON),
+        "virtual.hm.dualsense" => Some(presets::DUALSENSE_JSON),
         _ => None,
     }
 }
