@@ -170,6 +170,15 @@ pub struct AppSettings {
     /// chip in the top panel.
     #[serde(default)]
     pub show_own_virtuals_as_physical: bool,
+    /// When true, HIDMaestro virtual controllers persist in the system after
+    /// FlexInput closes (or crashes), and are reclaimed/reused on the next
+    /// launch instead of re-created. Desirable when a game is running and must
+    /// not lose its gamepad across an app restart/update. When false (default),
+    /// virtual devices are removed on app close/crash and any orphans are
+    /// cleaned up on startup. Only affects the HIDMaestro backend; ViGEm pads
+    /// are always transient.
+    #[serde(default)]
+    pub persist_virtual_devices: bool,
     /// What to do with the camera when a patch is loaded into a tab.
     #[serde(default)]
     pub on_patch_load: OnPatchLoad,
@@ -264,6 +273,7 @@ impl Default for AppSettings {
             focus_flip_flop: true,
             pin_guide_chord: None,
             show_own_virtuals_as_physical: false,
+            persist_virtual_devices: false,
             on_patch_load: OnPatchLoad::Off,
             profiler_enabled: false,
             ui_mode: UiMode::Easy,

@@ -499,6 +499,65 @@ fn write_instance_config(profile: &Profile, controller_index: u32) {
     let _ = write_string(HKLM, &oem_path, "OEMName", display_name);
 }
 
+/// One HIDMaestro-owned device discovered in the registry.
+#[derive(Debug, Clone)]
+pub struct ExistingDevice {
+    pub instance_id: String,
+    pub index: u32,
+    pub vid: u16,
+    pub pid: u16,
+}
+
+/// Enumerate HIDMaestro-owned device nodes currently present under
+/// `ROOT\HIDClass`. Used for reclaim-on-startup (persistence on) and for
+/// orphan cleanup (persistence off). A node counts if it's present *and*
+/// HIDMaestro-owned (its HardwareID multi-sz carries the ownership tag).
+///
+/// The `index`/`vid`/`pid` are read back from the node's `ControllerIndex` and
+/// its per-instance `HKLM\SOFTWARE\HIDMaestro\Controller{index}` config so the
+/// app can re-attach the right profile to the right section.
+pub fn list_hidmaestro_devices() -> Vec<ExistingDevice> {
+    use registry::*;
+    let enumerator = "HIDClass";
+    let base = format!(r"SYSTEM\CurrentControlSet\Enum\ROOT\{enumerator}");
+    let mut out = Vec::new();
+    for inst in enum_subkeys(HKLM, &base).unwrap_or_default() {
+        let instance_id = format!(r"ROOT\{enumerator}\{inst}");
+        // Present?
+        if unsafe {
+            CM_Locate_DevNodeW(&mut 0u32, to_wide(&instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+        } != CR_SUCCESS
+        {
+            continue;
+        }
+        if !node_is_hidmaestro_owned(&instance_id) {
+            continue;
+        }
+        let dp = format!(r"{base}\{inst}\Device Parameters");
+        let index = read_dword(HKLM, &dp, "ControllerIndex").unwrap_or(u32::MAX);
+        // VID/PID from the per-instance config (best-effort).
+        let cfg = format!(r"SOFTWARE\HIDMaestro\Controller{index}");
+        let vid = read_dword(HKLM, &cfg, "VendorId").unwrap_or(0) as u16;
+        let pid = read_dword(HKLM, &cfg, "ProductId").unwrap_or(0) as u16;
+        out.push(ExistingDevice { instance_id, index, vid, pid });
+    }
+    out
+}
+
+/// Remove every HIDMaestro-owned device node currently present. Returns the
+/// number of nodes removed. Used for orphan cleanup when persistence is off
+/// (on startup, and on parent-death teardown). Best-effort: a failure on one
+/// node doesn't stop the others.
+pub fn remove_all_hidmaestro_devices() -> usize {
+    let mut removed = 0;
+    for dev in list_hidmaestro_devices() {
+        if matches!(remove_device_node(&dev.instance_id), Ok(true)) {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Remove a plain-HID device node previously created here. Port of the non-SWD
 /// branch of `DeviceManager.RemoveDevice`: `DIF_REMOVE` the parent (root-
 /// enumerated HID devices cascade their single HID child). Returns true if the

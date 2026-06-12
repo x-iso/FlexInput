@@ -45,56 +45,101 @@ impl std::error::Error for HelperError {}
 
 struct Manager {
     client: Option<HelperClient>,
-    /// Override for the helper exe path (tests / non-standard layouts).
+    /// Override for the helper exe path (tests / standalone-helper layouts). When
+    /// `None` (the shipping default) the app re-execs **itself** with
+    /// `--hidmaestro-helper` so a single binary ships — no sibling exe.
     exe_override: Option<PathBuf>,
+    /// Whether virtual devices should persist beyond the app's lifetime. Sent to
+    /// the helper in `Hello`; drives parent-death teardown + orphan cleanup.
+    persist: bool,
+    /// True once `Hello` has been delivered on the current connection.
+    greeted: bool,
 }
 
 fn manager() -> &'static Mutex<Manager> {
     static M: OnceLock<Mutex<Manager>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(Manager { client: None, exe_override: None }))
+    M.get_or_init(|| {
+        Mutex::new(Manager { client: None, exe_override: None, persist: false, greeted: false })
+    })
 }
 
-/// Point the manager at a specific `hidmaestro_helper.exe` (otherwise it's
-/// discovered next to the current executable). Call once at startup if needed.
+/// Point the manager at a specific standalone `hidmaestro_helper.exe` instead of
+/// re-execing the current binary. For tests / the Phase-4 gate only.
 pub fn set_helper_exe(path: PathBuf) {
     if let Ok(mut m) = manager().lock() {
         m.exe_override = Some(path);
     }
 }
 
-/// Locate `hidmaestro_helper.exe` next to the running executable.
-fn discover_helper_exe(m: &Manager) -> Result<PathBuf, HelperError> {
+/// Set whether virtual devices persist beyond the app's lifetime. Call at
+/// startup (from the persistence setting) before creating devices. Re-sends
+/// `Hello` on the next call if already connected.
+pub fn set_persist(persist: bool) {
+    if let Ok(mut m) = manager().lock() {
+        if m.persist != persist {
+            m.persist = persist;
+            m.greeted = false; // force a fresh Hello to update the helper
+        }
+    }
+}
+
+/// CLI flag the app re-execs itself with to become the elevated helper.
+pub const HELPER_FLAG: &str = "--hidmaestro-helper";
+
+/// Resolve the command (exe + args) to spawn elevated. Default: the current
+/// executable with `--hidmaestro-helper --parent-pid <us>`. An `exe_override`
+/// runs that standalone helper exe instead (still passing the parent pid).
+fn helper_command(m: &Manager) -> Result<(PathBuf, String), HelperError> {
+    let pid = std::process::id();
     if let Some(p) = &m.exe_override {
-        return Ok(p.clone());
+        return Ok((p.clone(), format!("--parent-pid {pid}")));
     }
     let exe = std::env::current_exe().map_err(|e| HelperError::Io(e.to_string()))?;
-    let dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let candidate = dir.join("hidmaestro_helper.exe");
-    if candidate.exists() {
-        Ok(candidate)
-    } else {
-        Err(HelperError::HelperMissing(candidate))
-    }
+    Ok((exe, format!("{HELPER_FLAG} --parent-pid {pid}")))
 }
 
 /// Ensure the helper is spawned (elevated) and connected, returning a live
 /// client guard. Spawns + connects on first use; reuses thereafter. If a prior
-/// connection died, it re-spawns.
+/// connection died, it re-spawns. Sends `Hello` (parent pid + persistence) once
+/// per connection.
 fn ensure_connected(m: &mut Manager) -> Result<(), HelperError> {
     // Fast path: an existing client that still answers Ping.
     if let Some(client) = m.client.as_mut() {
         if client.call(&Request::Ping).is_ok() {
+            send_hello_if_needed(m)?;
             return Ok(());
         }
         m.client = None; // stale; fall through to respawn
+        m.greeted = false;
     }
 
-    let exe = discover_helper_exe(m)?;
-    crate::helper_ipc::spawn_elevated_helper(&exe).map_err(|e| HelperError::Spawn(e.to_string()))?;
+    let (exe, args) = helper_command(m)?;
+    crate::helper_ipc::spawn_elevated_helper_with_args(&exe, &args)
+        .map_err(|e| HelperError::Spawn(e.to_string()))?;
     // The helper takes a moment to accept UAC + start listening.
-    let client = HelperClient::connect(8000).map_err(|e| HelperError::Connect(e.to_string()))?;
+    let client = HelperClient::connect(60_000).map_err(|e| HelperError::Connect(e.to_string()))?;
     m.client = Some(client);
+    m.greeted = false;
+    send_hello_if_needed(m)?;
     Ok(())
+}
+
+/// Deliver the `Hello` handshake (parent pid + persistence) once per connection.
+fn send_hello_if_needed(m: &mut Manager) -> Result<(), HelperError> {
+    if m.greeted {
+        return Ok(());
+    }
+    let persist = m.persist;
+    let client = m.client.as_mut().expect("connected");
+    let hello = Request::Hello { parent_pid: std::process::id(), persist };
+    match client.call(&hello).map_err(|e| HelperError::Io(e.to_string()))? {
+        Response::Ok { .. } => {
+            m.greeted = true;
+            Ok(())
+        }
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to Hello".into())),
+    }
 }
 
 fn call(m: &mut Manager, req: &Request) -> Result<Response, HelperError> {
@@ -132,6 +177,17 @@ pub fn create(profile_json: &str, index: u32) -> Result<String, HelperError> {
         Response::Created { instance_id, .. } => Ok(instance_id),
         Response::Error { message } => Err(HelperError::Helper(message)),
         _ => Err(HelperError::Helper("unexpected response to Create".into())),
+    }
+}
+
+/// Enumerate HIDMaestro devices currently present (for reclaim-on-startup).
+/// Spawns the helper if needed. Returns `(instance_id, index, vid, pid)`.
+pub fn list_devices() -> Result<Vec<crate::helper_ipc::DeviceInfo>, HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    match call(&mut m, &Request::ListDevices)? {
+        Response::Devices { devices } => Ok(devices),
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to ListDevices".into())),
     }
 }
 

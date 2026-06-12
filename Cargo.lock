@@ -1195,6 +1195,7 @@ name = "flexinput"
 version = "0.9.7"
 dependencies = [
  "eframe",
+ "flexinput-hidmaestro",
  "flexinput-ui",
  "wgpu",
  "winresource",
@@ -1267,6 +1268,7 @@ dependencies = [
  "flexinput-core",
  "flexinput-devices",
  "flexinput-engine",
+ "flexinput-hidmaestro",
  "flexinput-modules",
  "flexinput-virtual",
  "glam",

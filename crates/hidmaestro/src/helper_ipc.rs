@@ -18,6 +18,13 @@ pub const PIPE_NAME: &str = r"\\.\pipe\flexinput-hidmaestro-helper";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
+    /// First message after connect: tells the helper which process to watch
+    /// (`parent_pid`) so it can self-destruct if the app dies, and whether
+    /// virtual devices should `persist` beyond the app's lifetime. When
+    /// `persist` is false the helper removes any leftover HIDMaestro devices it
+    /// finds at this point (orphans from a previous crash) and arms parent-death
+    /// teardown. Idempotent; the app sends it once per connection.
+    Hello { parent_pid: u32, persist: bool },
     /// Liveness/handshake; helper replies `Status`.
     Ping,
     /// Ensure the HIDMaestro driver is installed (idempotent).
@@ -28,6 +35,10 @@ pub enum Request {
     Create { profile_json: String, index: u32 },
     /// Tear down the device at `instance_id` and release its sections.
     Destroy { instance_id: String },
+    /// Enumerate HIDMaestro devices currently present in the system (for
+    /// reclaim-on-startup when persistence is on). Includes devices created by a
+    /// previous app run that this helper instance isn't tracking yet.
+    ListDevices,
     /// Ask the helper to exit (releases everything).
     Shutdown,
 }
@@ -42,8 +53,23 @@ pub enum Response {
     Status { driver_installed: bool, version: String },
     /// A device was created.
     Created { instance_id: String, index: u32 },
+    /// Enumerated HIDMaestro devices currently present (reply to `ListDevices`).
+    Devices { devices: Vec<DeviceInfo> },
     /// An error occurred handling the request.
     Error { message: String },
+}
+
+/// One HIDMaestro device the helper knows about (present in the system).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    /// Full PnP instance id, e.g. `ROOT\HIDClass\0001`.
+    pub instance_id: String,
+    /// `ControllerIndex` stamped on the node's Device Parameters.
+    pub index: u32,
+    /// USB vendor id from the node's per-instance config (0 if unknown).
+    pub vid: u16,
+    /// USB product id from the node's per-instance config (0 if unknown).
+    pub pid: u16,
 }
 
 impl Response {
@@ -220,21 +246,33 @@ mod client {
         }
     }
 
-    /// Spawn `helper_exe` elevated via ShellExecuteW("runas"). Triggers one UAC
-    /// prompt. The helper then listens on [`PIPE_NAME`]; connect with
-    /// [`HelperClient::connect`].
+    /// Spawn `helper_exe` elevated via ShellExecuteW("runas") with no args.
+    /// Triggers one UAC prompt.
     pub fn spawn_elevated_helper(helper_exe: &std::path::Path) -> std::io::Result<()> {
+        spawn_elevated_helper_with_args(helper_exe, "")
+    }
+
+    /// Spawn `helper_exe` elevated via ShellExecuteW("runas") with `args` (a
+    /// command-line string). Triggers one UAC prompt. Used to re-exec the app
+    /// itself as the helper (`--hidmaestro-helper --parent-pid N`). The helper
+    /// then listens on [`PIPE_NAME`]; connect with [`HelperClient::connect`].
+    pub fn spawn_elevated_helper_with_args(
+        helper_exe: &std::path::Path,
+        args: &str,
+    ) -> std::io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         let verb = wide("runas");
         let file: Vec<u16> = helper_exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let params = wide(args);
+        // SW_HIDE (0): the helper is a console-less worker; don't flash a window.
         let result = unsafe {
             ShellExecuteW(
                 std::ptr::null_mut(),
                 verb.as_ptr(),
                 file.as_ptr(),
+                if args.is_empty() { std::ptr::null() } else { params.as_ptr() },
                 std::ptr::null(),
-                std::ptr::null(),
-                1, // SW_SHOWNORMAL
+                0, // SW_HIDE
             )
         };
         // ShellExecuteW returns >32 on success.
@@ -254,7 +292,9 @@ mod client {
 }
 
 #[cfg(windows)]
-pub use client::{spawn_elevated_helper, HelperClient, PipeStream};
+pub use client::{
+    spawn_elevated_helper, spawn_elevated_helper_with_args, HelperClient, PipeStream,
+};
 
 #[cfg(test)]
 mod tests {

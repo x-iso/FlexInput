@@ -46,7 +46,43 @@ fn install_gpu_panic_hook() {
     }));
 }
 
+/// If launched as the elevated HIDMaestro helper (`--hidmaestro-helper`), run
+/// the named-pipe server and exit *before* touching the GPU / window. The app
+/// re-execs itself with this flag (see `flexinput_hidmaestro::helper`) so a
+/// single binary ships instead of a separate helper exe.
+///
+/// Returns true if this process was the helper (caller should exit).
+#[cfg(windows)]
+fn run_as_helper_if_requested() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    if !args.iter().any(|a| a == flexinput_hidmaestro::helper::HELPER_FLAG) {
+        return false;
+    }
+    let mut parent_pid: Option<u32> = None;
+    let mut persist = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--parent-pid" => parent_pid = it.next().and_then(|s| s.parse().ok()),
+            "--persist" => persist = true,
+            _ => {}
+        }
+    }
+    flexinput_hidmaestro::run_helper_server(parent_pid, persist);
+    true
+}
+
+#[cfg(not(windows))]
+fn run_as_helper_if_requested() -> bool {
+    false
+}
+
 fn main() -> eframe::Result<()> {
+    // Helper mode short-circuits everything else (no GPU, no window).
+    if run_as_helper_if_requested() {
+        return Ok(());
+    }
+
     install_gpu_panic_hook();
 
     // Window / taskbar icon — decoded from the pre-baked 256px logo PNG

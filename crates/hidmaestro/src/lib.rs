@@ -30,11 +30,16 @@ pub mod helper_ipc;
 pub mod install;
 pub mod orchestrator;
 pub mod profile;
+pub mod server;
 pub mod shm;
 
 pub use descriptor::{parse_descriptor, InputField, InputReport};
 pub use encode::{encode_report, encode_report_into, GamepadState, Hat, PinState};
 pub use install::{hidmaestro_available, installed_inf_path};
-pub use orchestrator::{create_device_node, remove_device_node, CreatedDevice, OrchestratorError};
+pub use orchestrator::{
+    create_device_node, list_hidmaestro_devices, remove_all_hidmaestro_devices, remove_device_node,
+    CreatedDevice, ExistingDevice, OrchestratorError,
+};
+pub use server::run_helper_server;
 pub use profile::{Profile, ProfileError};
 pub use shm::{InputSection, OutputFrame, OutputSection, ShmError};

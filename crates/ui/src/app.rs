@@ -284,6 +284,27 @@ fn snarl_virtual_device_ids(snarl: &Snarl<NodeData>) -> Vec<String> {
         .collect()
 }
 
+/// The physical-device `ControllerKind` that one of FlexInput's own virtual
+/// devices enumerates as, used to filter our own pads out of the physical list
+/// (and exclude them from nav). Returns `None` for backends that don't appear
+/// in the gilrs physical list. Matches on the full virtual-device id (not the
+/// 2-segment prefix) so the HIDMaestro variants — `virtual.hm.ds4`,
+/// `virtual.hm.dualsense` — are classified correctly; the old prefix-only match
+/// collapsed both to `virtual.hm` and let them leak into the physical panel.
+fn own_virtual_kind(dev_id: &str) -> Option<flexinput_devices::ControllerKind> {
+    use flexinput_devices::ControllerKind;
+    // Strip any `.N` instance suffix by matching on the leading kind segments.
+    if dev_id.starts_with("virtual.xinput") {
+        Some(ControllerKind::XInput)
+    } else if dev_id.starts_with("virtual.hm.dualsense") {
+        Some(ControllerKind::DualSense)
+    } else if dev_id.starts_with("virtual.hm.ds4") || dev_id.starts_with("virtual.ds4") {
+        Some(ControllerKind::DualShock4)
+    } else {
+        None
+    }
+}
+
 /// Insert virtual devices into the shared pool for every id in
 /// `needed_ids` that doesn't already exist. Pre-existing devices are
 /// reused — never duplicated. Devices the pool has but `needed_ids`
@@ -643,6 +664,12 @@ impl FlexInputApp {
         // ── Settings ──────────────────────────────────────────────────────
         // Loaded before threads spawn so the engine starts at the user's rate.
         let app_settings = settings::load_settings();
+        // Seed the HIDMaestro helper's persistence policy *before* any device is
+        // created, so the helper's first `Hello` (and its orphan-cleanup
+        // decision) reflects the user's setting. Off → helper removes leftovers
+        // and tears down on app death; on → devices persist for reclaim.
+        #[cfg(windows)]
+        flexinput_hidmaestro::helper::set_persist(app_settings.persist_virtual_devices);
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
 
@@ -2124,13 +2151,7 @@ impl eframe::App for FlexInputApp {
             {
                 let pool = self.shared_virtual_devices.lock().unwrap();
                 for d in pool.iter() {
-                    let prefix = flexinput_virtual::kind_prefix(d.id());
-                    let kind = match prefix.as_str() {
-                        "virtual.xinput" => Some(flexinput_devices::ControllerKind::XInput),
-                        "virtual.ds4"    => Some(flexinput_devices::ControllerKind::DualShock4),
-                        _ => None,
-                    };
-                    if let Some(k) = kind {
+                    if let Some(k) = own_virtual_kind(d.id()) {
                         *to_skip.entry(k).or_insert(0) += 1;
                     }
                 }
@@ -6858,12 +6879,7 @@ impl FlexInputApp {
         {
             let pool = self.shared_virtual_devices.lock().unwrap();
             for d in pool.iter() {
-                let kind = match flexinput_virtual::kind_prefix(d.id()).as_str() {
-                    "virtual.xinput" => Some(flexinput_devices::ControllerKind::XInput),
-                    "virtual.ds4"    => Some(flexinput_devices::ControllerKind::DualShock4),
-                    _ => None,
-                };
-                if let Some(k) = kind { *to_skip.entry(k).or_insert(0) += 1; }
+                if let Some(k) = own_virtual_kind(d.id()) { *to_skip.entry(k).or_insert(0) += 1; }
             }
         }
         let mut owned = std::collections::HashSet::new();
@@ -7401,6 +7417,21 @@ impl FlexInputApp {
                 }
                 ui.label(egui::RichText::new(
                     "Off by default. Turn on to test patches against your own virtual output (loopback).",
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(6.0);
+                if ui.checkbox(
+                    &mut self.settings.persist_virtual_devices,
+                    "Keep virtual controllers alive after FlexInput closes",
+                ).changed() {
+                    dirty = true;
+                    #[cfg(windows)]
+                    flexinput_hidmaestro::helper::set_persist(self.settings.persist_virtual_devices);
+                }
+                ui.label(egui::RichText::new(
+                    "Off by default: virtual pads are removed when the app closes or crashes. \
+                     Turn on so a running game keeps its gamepad across an app restart or update \
+                     \u{2014} FlexInput reclaims the existing device on next launch. (HIDMaestro only.)",
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(6.0);

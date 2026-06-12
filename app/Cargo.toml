@@ -7,6 +7,12 @@ build   = "build.rs"
 [dependencies]
 flexinput-ui = { workspace = true }
 eframe       = { workspace = true }
+
+# The bundled elevated helper: when launched with `--hidmaestro-helper` the app
+# re-execs itself elevated and runs the HIDMaestro named-pipe server, so a
+# single binary ships (no sibling helper exe).
+[target.'cfg(windows)'.dependencies]
+flexinput-hidmaestro = { workspace = true }
 # Direct dep so wgpu's backend features (dx12/vulkan/metal) reach
 # the final binary. Without this, wgpu compiles with zero backends
 # and panics at runtime when eframe tries to create an Instance.

@@ -36,6 +36,9 @@ puffin             = { workspace = true }
 puffin_http        = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+# Direct access to the HIDMaestro helper for the persistence setting + the
+# reclaim-on-startup path (already a transitive dep via flexinput-virtual).
+flexinput-hidmaestro = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
