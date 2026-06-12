@@ -21,7 +21,10 @@ const CHIP_H: f32 = 28.0;
 pub type SharedDevicePool = Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>;
 
 fn kind_prefix_of(dev_id: &str) -> String {
-    dev_id.split('.').take(2).collect::<Vec<_>>().join(".")
+    // HIDMaestro kinds live in a 3-segment namespace (`virtual.hm.ds4`); all
+    // other kinds are 2-segment (`virtual.xinput`).
+    let segs = if dev_id.starts_with("virtual.hm.") { 3 } else { 2 };
+    dev_id.split('.').take(segs).collect::<Vec<_>>().join(".")
 }
 
 /// Stateless renderer for the top virtual-devices panel. The actual device
@@ -149,7 +152,7 @@ impl VirtualDevicePanel {
                     let mut devs = pool.lock().unwrap();
                     let removed = devs.remove(i);
                     let id = removed.id().to_string();
-                    let prefix = id.split('.').take(2).collect::<Vec<_>>().join(".");
+                    let prefix = kind_prefix_of(&id);
                     (id, prefix)
                 };
 
@@ -323,7 +326,7 @@ fn circular_ghost_button(ui: &mut egui::Ui, glyph: &str, size: f32) -> egui::Res
 
 fn chip_name(active: &[Box<dyn VirtualDevice>], i: usize) -> String {
     let dev = &active[i];
-    let kind_prefix = dev.id().split('.').take(2).collect::<Vec<_>>().join(".");
+    let kind_prefix = kind_prefix_of(dev.id());
     let total = active.iter().filter(|d| d.id().starts_with(&kind_prefix)).count();
     let rank  = active[..i].iter().filter(|d| d.id().starts_with(&kind_prefix)).count();
     let base = kind_base_name(&kind_prefix);
@@ -332,10 +335,12 @@ fn chip_name(active: &[Box<dyn VirtualDevice>], i: usize) -> String {
 
 fn kind_base_name(kind_prefix: &str) -> &'static str {
     match kind_prefix {
-        "virtual.xinput"    => "Virtual XInput",
-        "virtual.ds4"       => "Virtual DualShock 4",
-        "virtual.keymouse"  => "Virtual Keyboard & Mouse",
-        _                   => "Virtual Device",
+        "virtual.xinput"        => "Virtual XInput",
+        "virtual.ds4"           => "Virtual DualShock 4",
+        "virtual.keymouse"      => "Virtual Keyboard & Mouse",
+        "virtual.hm.ds4"        => "Virtual DualShock 4",
+        "virtual.hm.dualsense"  => "Virtual DualSense",
+        _                       => "Virtual Device",
     }
 }
 

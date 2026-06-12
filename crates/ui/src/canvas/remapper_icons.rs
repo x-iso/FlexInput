@@ -334,6 +334,9 @@ pub fn virtual_device_card_svg(kind_prefix: &str) -> &'static [u8] {
         "virtual.xinput"   => DEV_XBOX,
         "virtual.ds4"      => DEV_PS4,
         "virtual.keymouse" => DEV_KBM,
+        // HIDMaestro Sony pads reuse the PlayStation glyph.
+        "virtual.hm"       => DEV_PS4,
+        _ if kind_prefix.starts_with("virtual.hm") => DEV_PS4,
         _                  => DEV_XBOX,
     }
 }

@@ -10,12 +10,53 @@ use flexinput_core::Signal;
 use crate::{layouts, DeviceKind, SinkPin, SourcePin, VirtualDevice};
 
 pub static DEVICE_KINDS: &[DeviceKind] = &[
-    DeviceKind { kind_id: "virtual.xinput",    display_name: "Virtual XInput Controller",       allows_multiple: true },
-    DeviceKind { kind_id: "virtual.ds4",       display_name: "Virtual DualShock 4 (ViGEmBus)", allows_multiple: true },
-    DeviceKind { kind_id: "virtual.keymouse",  display_name: "Virtual Keyboard & Mouse",        allows_multiple: false },
+    DeviceKind { kind_id: "virtual.xinput",       display_name: "Virtual XInput Controller",         allows_multiple: true },
+    DeviceKind { kind_id: "virtual.ds4",          display_name: "Virtual DualShock 4 (ViGEmBus)",    allows_multiple: true },
+    DeviceKind { kind_id: "virtual.keymouse",     display_name: "Virtual Keyboard & Mouse",          allows_multiple: false },
+    // HIDMaestro-backed kinds (user-mode driver, no ViGEmBus). DualSense is a
+    // HIDMaestro-only capability ViGEm can't provide.
+    DeviceKind { kind_id: "virtual.hm.ds4",       display_name: "Virtual DualShock 4 (HIDMaestro)",  allows_multiple: true },
+    DeviceKind { kind_id: "virtual.hm.dualsense", display_name: "Virtual DualSense (HIDMaestro)",    allows_multiple: true },
 ];
 
+/// Profile JSON for each HIDMaestro kind (vendored presets in flexinput-hidmaestro).
+fn hm_profile_json(kind_id: &str) -> Option<&'static str> {
+    match kind_id {
+        // DualSense reuses the DS4 preset for now (a DualSense preset can be
+        // vendored later); both are plain-HID Sony pads with the same pin set.
+        "virtual.hm.ds4" | "virtual.hm.dualsense" => {
+            Some(flexinput_hidmaestro::profile::presets::DUALSHOCK_4_V2_JSON)
+        }
+        _ => None,
+    }
+}
+
+/// Friendly display name for a HIDMaestro kind id.
+fn hm_display_name(kind_id: &str) -> &'static str {
+    match kind_id {
+        "virtual.hm.ds4" => "Virtual DualShock 4",
+        "virtual.hm.dualsense" => "Virtual DualSense",
+        _ => "Virtual Controller",
+    }
+}
+
 pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
+    if let Some(profile_json) = hm_profile_json(kind_id) {
+        // HIDMaestro device: the helper creates the node + sections (one UAC on
+        // first use). `instance` is the controller index. If creation fails the
+        // device comes back disconnected (surfaced like a missing-driver state).
+        let dev = crate::hidmaestro_device::HidMaestroDevice::create(
+            kind_id,
+            hm_display_name(kind_id),
+            profile_json,
+            instance as u32,
+        );
+        // open()/create() only return None on an invalid bundled preset (a build
+        // bug) — fall back to a disconnected device so the UI never panics.
+        if let Some(d) = dev {
+            return Box::new(d);
+        }
+    }
     match kind_id {
         "virtual.xinput"   => Box::new(VirtualXInput::new(instance)),
         "virtual.ds4"      => Box::new(VirtualDS4::new(instance)),

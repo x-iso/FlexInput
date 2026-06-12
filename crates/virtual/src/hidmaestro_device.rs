@@ -16,7 +16,7 @@
 
 use flexinput_core::Signal;
 use flexinput_hidmaestro::encode::{encode_report_into, PinState};
-use flexinput_hidmaestro::{InputSection, OutputSection, Profile};
+use flexinput_hidmaestro::{helper, InputSection, OutputSection, Profile};
 
 use crate::{layouts, SinkPin, SourcePin};
 
@@ -25,6 +25,9 @@ pub struct HidMaestroDevice {
     id: String,
     display_name: String,
     profile: Profile,
+    /// Original profile JSON, kept verbatim so the helper re-parses the exact
+    /// same source (avoids any lossy reconstruction from parsed fields).
+    profile_json: String,
     pins: PinState,
     /// Reused report buffer (profile.input_report_size bytes).
     report_buf: Vec<u8>,
@@ -35,34 +38,68 @@ pub struct HidMaestroDevice {
     output: Option<OutputSection>,
     /// Latest decoded rumble (strong, weak) in 0.0..1.0.
     rumble: (f32, f32),
+    /// Helper-managed device instance id (`ROOT\HIDClass\NNNN`). `Some` when
+    /// this device was created via the helper and must be destroyed on drop.
+    helper_instance_id: Option<String>,
 }
 
 impl HidMaestroDevice {
-    /// Open a HIDMaestro device for `controller_index` using `profile`. The
+    /// Open a HIDMaestro device for `controller_index` from `profile_json`. The
     /// device node + sections must already exist (created by the elevated
-    /// helper); this opens the input/output sections to drive them.
+    /// helper); this parses the profile and opens the sections to drive them.
     ///
-    /// `id`/`display_name` follow FlexInput's virtual-device id scheme
-    /// (e.g. `virtual.ds4`, "Virtual DualShock 4").
+    /// Returns `None` if `profile_json` is invalid. `id`/`display_name` follow
+    /// FlexInput's virtual-device id scheme (e.g. `virtual.ds4`).
     pub fn open(
         id: impl Into<String>,
         display_name: impl Into<String>,
-        profile: Profile,
+        profile_json: &str,
         controller_index: u32,
-    ) -> Self {
+    ) -> Option<Self> {
+        let profile = Profile::from_json(profile_json).ok()?;
         let report_buf = vec![0u8; profile.input_report_size];
         let input = InputSection::open(controller_index).ok();
         let output = OutputSection::open(controller_index).ok();
-        HidMaestroDevice {
+        Some(HidMaestroDevice {
             id: id.into(),
             display_name: display_name.into(),
             profile,
+            profile_json: profile_json.to_string(),
             pins: PinState::new(),
             report_buf,
             input,
             output,
             rumble: (0.0, 0.0),
+            helper_instance_id: None,
+        })
+    }
+
+    /// Create a HIDMaestro device end-to-end: ask the elevated helper to create
+    /// the device node + `Global\` sections (spawning the helper on first use,
+    /// one UAC), then open the sections here to drive it.
+    ///
+    /// Returns `None` if `profile_json` is invalid. On a helper/creation failure
+    /// the device is returned "disconnected" (no input section) with the error
+    /// logged — adding a device never panics the UI thread.
+    pub fn create(
+        id: impl Into<String>,
+        display_name: impl Into<String>,
+        profile_json: &str,
+        controller_index: u32,
+    ) -> Option<Self> {
+        let mut dev = Self::open(id, display_name, profile_json, controller_index)?;
+        match helper::create(&dev.profile_json, controller_index) {
+            Ok(instance_id) => {
+                // (Re)open the sections now that the helper created them.
+                dev.input = InputSection::open(controller_index).ok();
+                dev.output = OutputSection::open(controller_index).ok();
+                dev.helper_instance_id = Some(instance_id);
+            }
+            Err(e) => {
+                eprintln!("[hidmaestro] create via helper failed: {e}");
+            }
         }
+        Some(dev)
     }
 
     /// Which static sink-pin layout to advertise for `profile`. DS4 / DualSense
@@ -165,6 +202,21 @@ impl crate::VirtualDevice for HidMaestroDevice {
     }
 }
 
+impl Drop for HidMaestroDevice {
+    fn drop(&mut self) {
+        // If this device was created via the helper, ask it to tear the node
+        // down. Drop the section handles first so the helper's removal isn't
+        // blocked by our mapped views.
+        if let Some(id) = self.helper_instance_id.take() {
+            self.input = None;
+            self.output = None;
+            if let Err(e) = helper::destroy(&id) {
+                eprintln!("[hidmaestro] destroy via helper failed for {id}: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,10 +226,11 @@ mod tests {
     use glam::Vec2;
 
     fn ds4_device() -> HidMaestroDevice {
-        let profile = Profile::from_json(DUALSHOCK_4_V2_JSON).unwrap();
         // controller index that almost certainly has no live section in CI →
         // input/output open as None; we test the pin→encode path, not the SHM.
-        HidMaestroDevice::open("virtual.ds4", "Virtual DualShock 4", profile, 250)
+        // open() (not create()) so no helper is spawned.
+        HidMaestroDevice::open("virtual.ds4", "Virtual DualShock 4", DUALSHOCK_4_V2_JSON, 250)
+            .expect("valid DS4 profile")
     }
 
     #[test]

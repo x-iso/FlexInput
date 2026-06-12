@@ -24,6 +24,8 @@
 pub mod deploy;
 pub mod descriptor;
 pub mod encode;
+#[cfg(windows)]
+pub mod helper;
 pub mod helper_ipc;
 pub mod install;
 pub mod orchestrator;
