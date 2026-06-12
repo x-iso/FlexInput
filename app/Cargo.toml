@@ -3,6 +3,11 @@ name    = "flexinput"
 version.workspace = true
 edition.workspace = true
 build   = "build.rs"
+# `cargo run` at the workspace root resolves here (the GUI app). Without this it
+# errors as ambiguous because the test-only `hidmaestro_helper` / `hm_shm_probe`
+# bins also register as named binaries. The elevated HIDMaestro helper is NOT a
+# separate run target — the app re-execs itself with `--hidmaestro-helper`.
+default-run = "flexinput"
 
 [dependencies]
 flexinput-ui = { workspace = true }

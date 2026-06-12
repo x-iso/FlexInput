@@ -9,6 +9,12 @@ members = [
     "crates/ui",
     "app",
 ]
+# `cargo run` / `cargo build` at the workspace root default to the GUI app.
+# Without this, the root sees binaries across all members (flexinput,
+# hidmaestro_helper, hm_shm_probe) and `cargo run` errors as ambiguous. The
+# elevated HIDMaestro helper is bundled into `flexinput` (self re-exec), not a
+# separate run target.
+default-members = ["app"]
 resolver = "2"
 
 [workspace.package]
