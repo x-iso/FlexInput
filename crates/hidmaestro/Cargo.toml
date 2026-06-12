@@ -16,7 +16,15 @@ name = "hm_shm_probe"
 path = "src/bin/hm_shm_probe.rs"
 required-features = ["probe-bin"]
 
+[[bin]]
+name = "hidmaestro_helper"
+path = "src/bin/hidmaestro_helper.rs"
+required-features = ["helper-bin"]
+
 [features]
 # The probe bin is gated so a normal `cargo build` of the workspace doesn't
 # require it; build with `--features probe-bin` for the Phase-1 gate.
 probe-bin = []
+# The elevated helper binary (named-pipe server). Built for distribution and
+# the Phase-4 gate; gated so a plain workspace build doesn't require it.
+helper-bin = []

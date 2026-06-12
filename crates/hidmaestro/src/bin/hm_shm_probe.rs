@@ -42,6 +42,7 @@ fn main() {
         "create" => run_create(&args[2..]),
         "destroy" => run_destroy(&args[2..]),
         "info" => run_info(),
+        "helper-call" => run_helper_call(&args[2..]),
         _ => {
             eprintln!(
                 "usage:\n  \
@@ -141,6 +142,50 @@ fn run_create_input(args: &[String]) {
     loop {
         section.write_frame(&base, None);
         std::thread::sleep(Duration::from_millis(4));
+    }
+}
+
+/// Phase-4 client: talk to an already-running elevated helper over the named
+/// pipe. `--op ping|ensure|create|destroy`. For create, uses the DS4-v2 preset.
+/// (Unelevated — the helper does the privileged work.)
+fn run_helper_call(args: &[String]) {
+    use flexinput_hidmaestro::helper_ipc::{HelperClient, Request, Response};
+    let op = arg(args, "--op").unwrap_or("ping");
+    let index = parse_index(args);
+    let mut client = match HelperClient::connect(3000) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("connect to helper failed: {e} (is hidmaestro_helper running elevated?)");
+            std::process::exit(1);
+        }
+    };
+    let req = match op {
+        "ping" => Request::Ping,
+        "ensure" => Request::EnsureDriver,
+        "create" => Request::Create {
+            profile_json: DUALSHOCK_4_V2_JSON.to_string(),
+            index,
+        },
+        "destroy" => Request::Destroy {
+            instance_id: arg(args, "--id").unwrap_or(r"ROOT\HIDClass\0000").to_string(),
+        },
+        "shutdown" => Request::Shutdown,
+        other => {
+            eprintln!("unknown --op {other}");
+            std::process::exit(2);
+        }
+    };
+    match client.call(&req) {
+        Ok(resp) => {
+            println!("RESP: {resp:?}");
+            if let Response::Error { .. } = resp {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("call failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

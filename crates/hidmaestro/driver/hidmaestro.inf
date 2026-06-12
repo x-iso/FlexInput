@@ -1,0 +1,119 @@
+﻿;
+; HIDMaestro â€” UMDF2 Virtual HID Minidriver INF
+;
+; Installs HIDMaestro.dll as a UMDF2 lower filter under MsHidUmdf.sys.
+;
+; Windows 10 compatible: uses explicit AddService directives (not Include/Needs
+; for MsHidUmdf.inf, which only exists on build 22000+).
+;
+; Install: devcon install hidmaestro.inf root\HIDMaestro
+;      or: pnputil /add-driver hidmaestro.inf /install
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %ProviderName%
+CatalogFile = hidmaestro.cat
+DriverVer   = 06/11/2026,1.3.17.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir  = 13
+UMDriverCopy    = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+HIDMaestro.dll = 1
+
+; ----------------------------------------------------------------
+;  Manufacturer / Models
+; ----------------------------------------------------------------
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = HIDMaestro_Install, root\HIDMaestro
+
+; ----------------------------------------------------------------
+;  Install sections (Windows 10 compatible â€” explicit AddService)
+; ----------------------------------------------------------------
+
+[HIDMaestro_Install.NT]
+CopyFiles = UMDriverCopy
+
+[UMDriverCopy]
+HIDMaestro.dll
+
+[HIDMaestro_Install.NT.HW]
+AddReg = HIDMaestro_HW_AddReg
+
+[HIDMaestro_HW_AddReg]
+; Lower filters: WUDFRd (UMDF reflector) loads our UMDF2 driver
+HKR,,"LowerFilters",0x00010008,"WUDFRd"
+; NOTE: no "xinputhid" UpperFilter here at the INF level â€” this INF is shared
+; by every profile. The tripwire is only desired for profiles that have an
+; HIDMAESTRO XUSB companion (Xbox 360 wired family). For non-companion
+; profiles (DualSense, Xbox Series BT, Switch Pro, etc.) the HID path IS the
+; only WGI Gamepad source, and blocking it with xinputhid would produce zero
+; Gamepads. DeviceOrchestrator writes this UpperFilter value per-instance
+; after device creation, gated on profile.HasXusbCompanion.
+; Security: allow all users access (needed for WGI/GameInput non-elevated discovery)
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)"
+
+[HIDMaestro_Install.NT.Services]
+; MsHidUmdf is the HID pass-through function driver
+AddService = mshidumdf,0x000001fa,mshidumdf_Service
+; WUDFRd is the UMDF reflector that hosts our DLL
+AddService = WUDFRd,0x000001f8,WUDFRD_Service
+
+[mshidumdf_Service]
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %10%\System32\Drivers\mshidumdf.sys
+
+[WUDFRD_Service]
+DisplayName    = %WudfRdDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %10%\System32\Drivers\WUDFRd.sys
+
+; ----------------------------------------------------------------
+;  WDF / UMDF section
+; ----------------------------------------------------------------
+
+[HIDMaestro_Install.NT.Wdf]
+UmdfService                 = HIDMaestro, HIDMaestro_UmdfService
+UmdfServiceOrder            = HIDMaestro
+UmdfKernelModeClientPolicy  = AllowKernelModeClients
+UmdfFileObjectPolicy        = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction     = Copy
+UmdfFsContextUsePolicy      = CanUseFsContext2
+; Each virtual gets its own WUDFHost process. Without this, UMDF2 pools
+; multiple HIDMaestro virtuals (and adjacent xinputhid-bound devices) into
+; one shared WUDFHost and contention between writer threads + concurrent
+; XInputGetState reader threads causes non-linear CPU saturation when
+; 2+ virtuals co-exist with a real xinputhid device in the same host. See
+; issue #3 and docs/investigations/issue3-dual-xinputhid-saturation-2026-04/.
+UmdfHostProcessSharing      = ProcessSharingDisabled
+
+[HIDMaestro_UmdfService]
+UmdfLibraryVersion = 2.15.0
+ServiceBinary      = %13%\HIDMaestro.dll
+
+; ----------------------------------------------------------------
+;  Strings
+; ----------------------------------------------------------------
+
+[Strings]
+ProviderName     = "HIDMaestro"
+ManufacturerName = "HIDMaestro"
+DeviceDesc       = "Game Controller"
+DiskName         = "HIDMaestro Installation Disk"
+WudfRdDesc       = "Windows Driver Foundation - User-mode Driver Framework Reflector"
