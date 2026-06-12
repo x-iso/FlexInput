@@ -29,10 +29,16 @@ pub enum Request {
     Ping,
     /// Ensure the HIDMaestro driver is installed (idempotent).
     EnsureDriver,
-    /// Create a virtual device for `profile_json` at `index`, pre-creating its
-    /// `Global\` shared sections. Helper holds the section + device alive until
-    /// `Destroy` (or helper exit).
-    Create { profile_json: String, index: u32 },
+    /// Create (or reclaim) a virtual device for `device_id` from `profile_json`.
+    /// The helper allocates a **globally-unique** controller index — the app no
+    /// longer guesses one (different device kinds previously both passed index 0
+    /// and collided on `Global\HIDMaestroInput0`). If a device for `device_id`
+    /// already exists (live this session, or persisted from a prior run), the
+    /// helper returns that existing index instead of creating a duplicate
+    /// (reclaim). The chosen index comes back in `Created.index`; the app opens
+    /// its sections there. `index_hint` is the app's legacy per-kind instance
+    /// number, used only as a tiebreaker / for migration.
+    Create { device_id: String, profile_json: String, index_hint: u32 },
     /// Tear down the device at `instance_id` and release its sections.
     Destroy { instance_id: String },
     /// Enumerate HIDMaestro devices currently present in the system (for
@@ -70,6 +76,11 @@ pub struct DeviceInfo {
     pub vid: u16,
     /// USB product id from the node's per-instance config (0 if unknown).
     pub pid: u16,
+    /// FlexInput device id that owns this controller (e.g. `virtual.hm.ds4`),
+    /// recorded in the per-instance config so the app can reclaim the right
+    /// device across runs. Empty if unknown (created by an older build).
+    #[serde(default)]
+    pub device_id: String,
 }
 
 impl Response {
@@ -302,12 +313,19 @@ mod tests {
 
     #[test]
     fn request_roundtrips_json() {
-        let req = Request::Create { profile_json: "{}".into(), index: 2 };
+        let req = Request::Create {
+            device_id: "virtual.hm.ds4".into(),
+            profile_json: "{}".into(),
+            index_hint: 2,
+        };
         let line = encode_line(&req);
         assert!(line.ends_with('\n'));
         let back: Request = serde_json::from_str(line.trim()).unwrap();
         match back {
-            Request::Create { index, .. } => assert_eq!(index, 2),
+            Request::Create { index_hint, device_id, .. } => {
+                assert_eq!(index_hint, 2);
+                assert_eq!(device_id, "virtual.hm.ds4");
+            }
             _ => panic!("wrong variant"),
         }
     }

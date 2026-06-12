@@ -230,7 +230,7 @@ fn run_create(args: &[String]) {
     });
     let _output = OutputSection::create(index);
 
-    match create_device_node(&profile, &inf, index) {
+    match create_device_node(&profile, &inf, index, "probe") {
         Ok(dev) => {
             println!("CREATED instance_id={} controller_index={}", dev.instance_id, dev.controller_index);
             println!("(keeping section handles alive; Ctrl-C after verifying. inf={inf})");

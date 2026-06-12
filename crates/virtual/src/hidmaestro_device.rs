@@ -20,6 +20,22 @@ use flexinput_hidmaestro::{helper, InputSection, OutputSection, Profile};
 
 use crate::{layouts, SinkPin, SourcePin};
 
+/// Append a one-line diagnostic to `flexinput-hidmaestro.log` next to the exe.
+/// Temporary instrumentation for the input-path investigation; works in the
+/// console-less release build where `eprintln!` goes nowhere.
+fn diag_log(line: &str) {
+    use std::io::Write;
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("flexinput-hidmaestro.log")));
+    if let Some(path) = path {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+    eprintln!("{line}");
+}
+
 /// A HIDMaestro-backed virtual controller (plain-HID path: DS4 / DualSense).
 pub struct HidMaestroDevice {
     id: String,
@@ -41,6 +57,10 @@ pub struct HidMaestroDevice {
     /// Helper-managed device instance id (`ROOT\HIDClass\NNNN`). `Some` when
     /// this device was created via the helper and must be destroyed on drop.
     helper_instance_id: Option<String>,
+    /// Controller index this device opened (for diagnostics).
+    controller_index: u32,
+    /// One-shot diagnostic: log the first non-neutral frame we write.
+    diag_logged: bool,
 }
 
 impl HidMaestroDevice {
@@ -71,6 +91,8 @@ impl HidMaestroDevice {
             output,
             rumble: (0.0, 0.0),
             helper_instance_id: None,
+            controller_index,
+            diag_logged: false,
         })
     }
 
@@ -85,18 +107,32 @@ impl HidMaestroDevice {
         id: impl Into<String>,
         display_name: impl Into<String>,
         profile_json: &str,
-        controller_index: u32,
+        index_hint: u32,
     ) -> Option<Self> {
-        let mut dev = Self::open(id, display_name, profile_json, controller_index)?;
-        match helper::create(&dev.profile_json, controller_index) {
-            Ok(instance_id) => {
-                // (Re)open the sections now that the helper created them.
-                dev.input = InputSection::open(controller_index).ok();
-                dev.output = OutputSection::open(controller_index).ok();
-                dev.helper_instance_id = Some(instance_id);
+        // open() with the hint first; the real index comes back from the helper
+        // (it allocates a globally-unique one, or reclaims the existing device).
+        let mut dev = Self::open(id, display_name, profile_json, index_hint)?;
+        let device_id = dev.id.clone();
+        match helper::create(&device_id, &dev.profile_json, index_hint) {
+            Ok((instance_id, allocated_index)) => {
+                // Open the sections at the index the helper actually used — NOT
+                // the hint. (Opening the wrong index was the no-input bug: two
+                // devices both guessed index 0 and collided.)
+                dev.controller_index = allocated_index;
+                dev.input = InputSection::open(allocated_index).ok();
+                dev.output = OutputSection::open(allocated_index).ok();
+                dev.helper_instance_id = Some(instance_id.clone());
+                diag_log(&format!(
+                    "[hidmaestro] create id={} hint={} alloc_idx={} instance={} input_open={} output_open={}",
+                    dev.id, index_hint, allocated_index, instance_id,
+                    dev.input.is_some(), dev.output.is_some()
+                ));
             }
             Err(e) => {
-                eprintln!("[hidmaestro] create via helper failed: {e}");
+                diag_log(&format!(
+                    "[hidmaestro] create via helper FAILED id={} hint={}: {e}",
+                    dev.id, index_hint
+                ));
             }
         }
         Some(dev)
@@ -153,6 +189,13 @@ impl crate::VirtualDevice for HidMaestroDevice {
 
     fn flush(&mut self) {
         let Some(input) = self.input.as_mut() else {
+            if !self.diag_logged {
+                diag_log(&format!(
+                    "[hidmaestro] flush NO-OP (input section not open) id={} idx={}",
+                    self.id, self.controller_index
+                ));
+                self.diag_logged = true;
+            }
             return;
         };
         let state = self.pins.state();
@@ -164,6 +207,13 @@ impl crate::VirtualDevice for HidMaestroDevice {
         } else {
             &self.report_buf[..]
         };
+        if !self.diag_logged {
+            diag_log(&format!(
+                "[hidmaestro] first flush id={} idx={} data[0..6]={:02x?}",
+                self.id, self.controller_index, &data[..data.len().min(6)]
+            ));
+            self.diag_logged = true;
+        }
         input.write_frame(data, None);
     }
 

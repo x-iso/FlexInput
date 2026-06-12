@@ -265,6 +265,7 @@ pub fn create_device_node(
     profile: &Profile,
     inf_path: &str,
     controller_index: u32,
+    device_id: &str,
 ) -> Result<CreatedDevice, OrchestratorError> {
     if !is_plain_hid(profile) {
         return Err(OrchestratorError::Unsupported(
@@ -282,7 +283,7 @@ pub fn create_device_node(
     // this at startup to know what identity to report; WITHOUT it the driver
     // falls back to the Microsoft default VID_045E and the device presents as an
     // Xbox pad instead of the profile's real (Sony/etc.) identity.
-    write_instance_config(profile, controller_index);
+    write_instance_config(profile, controller_index, device_id);
 
     unsafe {
         let class_guid = HID_CLASS_GUID;
@@ -459,7 +460,7 @@ fn node_is_hidmaestro_owned(instance_id: &str) -> bool {
 /// descriptor/etc. from here at startup to report the device's identity. Port of
 /// the plain-HID-relevant subset of `DeviceOrchestrator.WriteInstanceConfig`
 /// (omits the FunctionMode/XUSB bits, which are Xbox-only).
-fn write_instance_config(profile: &Profile, controller_index: u32) {
+fn write_instance_config(profile: &Profile, controller_index: u32, device_id: &str) {
     use registry::*;
     let path = format!(r"SOFTWARE\HIDMaestro\Controller{controller_index}");
     let instance_suffix = format!("\\{controller_index:04}");
@@ -476,6 +477,9 @@ fn write_instance_config(profile: &Profile, controller_index: u32) {
     // Best-effort: each write is independent; a failure on one shouldn't abort
     // creation (the driver tolerates some missing optional values).
     let _ = write_string(HKLM, &path, "DeviceInstanceId", &device_instance_id);
+    // FlexInput's own ownership tag: which app-side device id owns this index, so
+    // we can reclaim the right device across runs (and which index is free).
+    let _ = write_string(HKLM, &path, "FlexInputDeviceId", device_id);
     let _ = write_dword(HKLM, &path, "FunctionMode", 0); // plain HID, no XUSB
     let _ = write_binary(HKLM, &path, "ReportDescriptor", &profile.descriptor);
     let _ = write_dword(HKLM, &path, "VendorId", profile.vid as u32);
@@ -506,6 +510,8 @@ pub struct ExistingDevice {
     pub index: u32,
     pub vid: u16,
     pub pid: u16,
+    /// FlexInput device id that owns this controller (empty if unknown).
+    pub device_id: String,
 }
 
 /// Enumerate HIDMaestro-owned device nodes currently present under
@@ -535,11 +541,12 @@ pub fn list_hidmaestro_devices() -> Vec<ExistingDevice> {
         }
         let dp = format!(r"{base}\{inst}\Device Parameters");
         let index = read_dword(HKLM, &dp, "ControllerIndex").unwrap_or(u32::MAX);
-        // VID/PID from the per-instance config (best-effort).
+        // VID/PID + owning FlexInput device id from the per-instance config.
         let cfg = format!(r"SOFTWARE\HIDMaestro\Controller{index}");
         let vid = read_dword(HKLM, &cfg, "VendorId").unwrap_or(0) as u16;
         let pid = read_dword(HKLM, &cfg, "ProductId").unwrap_or(0) as u16;
-        out.push(ExistingDevice { instance_id, index, vid, pid });
+        let device_id = read_string(HKLM, &cfg, "FlexInputDeviceId").unwrap_or_default();
+        out.push(ExistingDevice { instance_id, index, vid, pid, device_id });
     }
     out
 }
@@ -708,6 +715,35 @@ mod registry {
         } else {
             None
         }
+    }
+
+    pub fn read_string(root: *mut c_void, path: &str, name: &str) -> Option<String> {
+        let h = open(root, path, KEY_READ)?;
+        let wn = wide(name);
+        let mut ty = 0u32;
+        let mut len = 0u32;
+        // Size query.
+        let rc = unsafe {
+            RegQueryValueExW(h, wn.as_ptr(), std::ptr::null_mut(), &mut ty, std::ptr::null_mut(), &mut len)
+        };
+        if (rc != ERROR_SUCCESS && rc != ERROR_MORE_DATA) || ty != REG_SZ || len == 0 {
+            unsafe { RegCloseKey(h) };
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        let rc = unsafe {
+            RegQueryValueExW(h, wn.as_ptr(), std::ptr::null_mut(), &mut ty, buf.as_mut_ptr(), &mut len)
+        };
+        unsafe { RegCloseKey(h) };
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        let u16s: Vec<u16> = buf[..len as usize]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&w| w != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&u16s))
     }
 
     pub fn write_string(root: *mut c_void, path: &str, name: &str, value: &str) -> Result<(), u32> {

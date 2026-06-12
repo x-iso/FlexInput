@@ -34,11 +34,29 @@ use crate::orchestrator::{
 use crate::shm::{InputSection, OutputSection};
 use crate::Profile;
 
-/// A live device the helper is keeping alive: its sections (mapped) + index.
+/// Append a one-line diagnostic to `flexinput-hidmaestro.log` next to the exe.
+/// Temporary instrumentation for the input-path investigation. The helper runs
+/// from the same exe path as the app, so both write the same file.
+fn diag_log(line: &str) {
+    use std::io::Write;
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("flexinput-hidmaestro.log")));
+    if let Some(path) = path {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+    eprintln!("{line}");
+}
+
+/// A live device the helper is keeping alive: its sections (mapped) + index +
+/// the FlexInput device id that owns it (for in-session reclaim).
 struct LiveDevice {
     _input: InputSection,
     _output: Option<OutputSection>,
     index: u32,
+    device_id: String,
 }
 
 /// Process-wide helper state shared between the client loop and the
@@ -217,14 +235,19 @@ fn handle_client(pipe: NamedPipeServer, state: &Arc<HelperState>) -> bool {
 fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
     match req {
         Request::Hello { parent_pid: _, persist } => {
-            state.persist.store(persist, Ordering::SeqCst);
-            // When persistence is off, remove any orphans present right now
-            // (devices a previous crashed run left behind) before the app
-            // starts creating fresh ones.
+            let was = state.persist.swap(persist, Ordering::SeqCst);
+            // When persistence is off, remove any leftovers present right now —
+            // orphans from a previous crashed run, AND devices left behind by a
+            // prior persist-ON run (the persist→off transition). Drop our held
+            // section handles first so the removal isn't blocked by mapped views.
             if !persist {
+                if was {
+                    // Transition on→off: release tracked sections before removal.
+                    state.teardown_tracked();
+                }
                 let n = remove_all_hidmaestro_devices();
                 if n > 0 {
-                    eprintln!("[hidmaestro-helper] cleaned up {n} orphan device(s) on hello");
+                    diag_log(&format!("[helper] hello: cleaned up {n} leftover device(s) (persist off)"));
                 }
             }
             (Response::ok(), false)
@@ -249,7 +272,9 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
             ),
             Err(e) => (Response::err(format!("driver install failed: {e}")), false),
         },
-        Request::Create { profile_json, index } => (handle_create(&profile_json, index, state), false),
+        Request::Create { device_id, profile_json, index_hint } => {
+            (handle_create(&device_id, &profile_json, index_hint, state), false)
+        }
         Request::Destroy { instance_id } => (handle_destroy(&instance_id, state), false),
         Request::ListDevices => {
             let devices = list_hidmaestro_devices()
@@ -259,6 +284,7 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                     index: d.index,
                     vid: d.vid,
                     pid: d.pid,
+                    device_id: d.device_id,
                 })
                 .collect();
             (Response::Devices { devices }, false)
@@ -267,7 +293,12 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
     }
 }
 
-fn handle_create(profile_json: &str, index: u32, state: &Arc<HelperState>) -> Response {
+fn handle_create(
+    device_id: &str,
+    profile_json: &str,
+    index_hint: u32,
+    state: &Arc<HelperState>,
+) -> Response {
     let profile = match Profile::from_json(profile_json) {
         Ok(p) => p,
         Err(e) => return Response::err(format!("bad profile: {e}")),
@@ -280,24 +311,95 @@ fn handle_create(profile_json: &str, index: u32, state: &Arc<HelperState>) -> Re
         None => return Response::err("HIDMaestro INF not found after install"),
     };
 
+    // RECLAIM (in-session): if we already track a device for this device_id,
+    // return it — never create a duplicate.
+    if let Ok(devs) = state.devices.lock() {
+        if let Some((inst, live)) = devs.iter().find(|(_, d)| d.device_id == device_id) {
+            diag_log(&format!(
+                "[helper] reclaim (session) device_id={device_id} idx={} instance={inst}",
+                live.index
+            ));
+            return Response::Created { instance_id: inst.clone(), index: live.index };
+        }
+    }
+
+    // RECLAIM (cross-run): a persisted node in the system already owns this
+    // device_id. Re-attach by mapping its sections at the recorded index — don't
+    // create a second node.
+    let existing = list_hidmaestro_devices();
+    if let Some(found) = existing.iter().find(|d| d.device_id == device_id && !device_id.is_empty())
+    {
+        let input = match InputSection::create(found.index).or_else(|_| InputSection::open(found.index)) {
+            Ok(s) => s,
+            Err(e) => return Response::err(format!("reclaim input section idx={}: {e}", found.index)),
+        };
+        let output = OutputSection::create(found.index)
+            .or_else(|_| OutputSection::open(found.index))
+            .ok();
+        if let Ok(mut devs) = state.devices.lock() {
+            devs.insert(
+                found.instance_id.clone(),
+                LiveDevice { _input: input, _output: output, index: found.index, device_id: device_id.to_string() },
+            );
+        }
+        diag_log(&format!(
+            "[helper] reclaim (cross-run) device_id={device_id} idx={} instance={}",
+            found.index, found.instance_id
+        ));
+        return Response::Created { instance_id: found.instance_id.clone(), index: found.index };
+    }
+
+    // ALLOCATE a globally-unique index: lowest free, considering both nodes
+    // present in the system and indices we already hold this session.
+    let index = allocate_index(&existing, state, index_hint);
+
     let input = match InputSection::create(index) {
         Ok(s) => s,
-        Err(e) => return Response::err(format!("create input section: {e}")),
+        Err(e) => return Response::err(format!("create input section idx={index}: {e}")),
     };
     let output = OutputSection::create(index).ok();
 
-    match create_device_node(&profile, &inf.display().to_string(), index) {
+    match create_device_node(&profile, &inf.display().to_string(), index, device_id) {
         Ok(dev) => {
             if let Ok(mut devs) = state.devices.lock() {
                 devs.insert(
                     dev.instance_id.clone(),
-                    LiveDevice { _input: input, _output: output, index },
+                    LiveDevice { _input: input, _output: output, index, device_id: device_id.to_string() },
                 );
             }
+            diag_log(&format!(
+                "[helper] created device_id={device_id} vid={:04x} pid={:04x} idx={index} instance={}",
+                profile.vid, profile.pid, dev.instance_id
+            ));
             Response::Created { instance_id: dev.instance_id, index }
         }
-        Err(e) => Response::err(format!("create device node: {e}")),
+        Err(e) => {
+            diag_log(&format!("[helper] create FAILED device_id={device_id} idx={index}: {e}"));
+            Response::err(format!("create device node: {e}"))
+        }
     }
+}
+
+/// Pick the lowest controller index not in use — neither present in the system
+/// (`existing`) nor held by us this session. `index_hint` is the app's legacy
+/// per-kind number, used only to bias toward a stable choice when free.
+fn allocate_index(
+    existing: &[crate::orchestrator::ExistingDevice],
+    state: &Arc<HelperState>,
+    index_hint: u32,
+) -> u32 {
+    use std::collections::HashSet;
+    let mut used: HashSet<u32> = existing.iter().map(|d| d.index).collect();
+    if let Ok(devs) = state.devices.lock() {
+        for d in devs.values() {
+            used.insert(d.index);
+        }
+    }
+    // Prefer the hint if it happens to be free (keeps single-device patches at 0).
+    if !used.contains(&index_hint) {
+        return index_hint;
+    }
+    (0u32..).find(|i| !used.contains(i)).unwrap_or(index_hint)
 }
 
 fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {

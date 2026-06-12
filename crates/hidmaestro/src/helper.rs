@@ -168,13 +168,27 @@ pub fn ensure_driver() -> Result<(), HelperError> {
     }
 }
 
-/// Create a device for `profile_json` at `index` via the helper. Returns the
-/// device instance id (used for [`destroy`]).
-pub fn create(profile_json: &str, index: u32) -> Result<String, HelperError> {
+/// Create (or reclaim) a device for `device_id` from `profile_json` via the
+/// helper. The helper allocates a globally-unique controller index (or returns
+/// the existing one if `device_id` is already present). `index_hint` is the
+/// app's legacy per-kind instance number, used only as a tiebreaker.
+///
+/// Returns `(instance_id, allocated_index)`. The app must open its SHM sections
+/// at `allocated_index` — NOT at `index_hint` (that mismatch was the
+/// devices-collide-on-index-0 bug).
+pub fn create(
+    device_id: &str,
+    profile_json: &str,
+    index_hint: u32,
+) -> Result<(String, u32), HelperError> {
     let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
-    let req = Request::Create { profile_json: profile_json.to_string(), index };
+    let req = Request::Create {
+        device_id: device_id.to_string(),
+        profile_json: profile_json.to_string(),
+        index_hint,
+    };
     match call(&mut m, &req)? {
-        Response::Created { instance_id, .. } => Ok(instance_id),
+        Response::Created { instance_id, index } => Ok((instance_id, index)),
         Response::Error { message } => Err(HelperError::Helper(message)),
         _ => Err(HelperError::Helper("unexpected response to Create".into())),
     }
