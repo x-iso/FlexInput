@@ -100,34 +100,43 @@ impl DeviceBackend for GilrsBackend {
 
         let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
+        let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut result = Vec::new();
 
         for (_id, pad) in self.gilrs.gamepads() {
-            if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
-                // Only dedup when ViGEmBus is confirmed to have a virtual for this
-                // VID/PID. Without that, SetupAPI's USB-format HW-ID search would
-                // return 0 for Bluetooth devices and incorrectly drop them.
-                if *self.vigem_present.get(&vp).unwrap_or(&false) {
-                    let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
-                    let seen = gilrs_seen.entry(vp).or_insert(0);
-                    if *seen >= phys {
-                        continue; // extra beyond physical count → ViGEmBus virtual
+            // Our OWN emulated HIDMaestro devices are identified by name marker and
+            // handled by gilrs_device_id (distinct `vN` instance) — skip the
+            // count-based ViGEm dedup for them (it would otherwise drop them as
+            // "extra beyond physical count", since has_vigem_for_vid_pid is true
+            // whenever any HIDMaestro device for that VID/PID exists).
+            if !is_own_virtual(&pad) {
+                if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
+                    // Only dedup when ViGEmBus is confirmed to have a virtual for this
+                    // VID/PID. Without that, SetupAPI's USB-format HW-ID search would
+                    // return 0 for Bluetooth devices and incorrectly drop them.
+                    if *self.vigem_present.get(&vp).unwrap_or(&false) {
+                        let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
+                        let seen = gilrs_seen.entry(vp).or_insert(0);
+                        if *seen >= phys {
+                            continue; // extra beyond physical count → ViGEmBus virtual
+                        }
+                        *seen += 1;
                     }
-                    *seen += 1;
                 }
             }
 
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
-            let inst = *kind_seen.get(&kind).unwrap_or(&0);
-            kind_seen.insert(kind, inst + 1);
+            let (dev_id, _inst, is_virt) =
+                gilrs_device_id(&pad, kind, &mut kind_seen, &mut virt_seen);
 
             let display_name = if kind == ControllerKind::Generic {
                 pad.name().to_string()
+            } else if is_virt {
+                format!("{} (virtual)", kind.display_name())
             } else {
                 kind.display_name().to_string()
             };
 
-            let dev_id = format!("gilrs:{}:{}", kind.id_slug(), inst);
             result.push(PhysicalDevice {
                 id: dev_id,
                 display_name,
@@ -180,6 +189,7 @@ impl DeviceBackend for GilrsBackend {
         let mut out = Vec::new();
         let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
+        let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
         // Track per-(VID,PID) instance index for gyro correlation.
         let mut gyro_idx: HashMap<(u16, u16), usize> = HashMap::new();
         // Rebuild the gilrs-id → device-id map this frame so event counts
@@ -195,28 +205,31 @@ impl DeviceBackend for GilrsBackend {
         {
         puffin::profile_scope!("gilrs_gamepads_walk");
         for (gilrs_id, pad) in self.gilrs.gamepads() {
-            // Apply the same ViGEmBus filter as enumerate() so IDs stay in sync.
-            if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
-                if *self.vigem_present.get(&vp).unwrap_or(&false) {
-                    let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
-                    let seen = gilrs_seen.entry(vp).or_insert(0);
-                    if *seen >= phys {
-                        continue;
+            // Apply the same ViGEmBus filter as enumerate() so IDs stay in sync —
+            // but never to our own marked emulated devices (handled below).
+            if !is_own_virtual(&pad) {
+                if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
+                    if *self.vigem_present.get(&vp).unwrap_or(&false) {
+                        let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
+                        let seen = gilrs_seen.entry(vp).or_insert(0);
+                        if *seen >= phys {
+                            continue;
+                        }
+                        *seen += 1;
                     }
-                    *seen += 1;
                 }
             }
 
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
-            let inst = *kind_seen.get(&kind).unwrap_or(&0);
-            kind_seen.insert(kind, inst + 1);
-            let dev = format!("gilrs:{}:{}", kind.id_slug(), inst);
+            let (dev, inst, is_virt) =
+                gilrs_device_id(&pad, kind, &mut kind_seen, &mut virt_seen);
             self.id_to_dev.insert(usize::from(gilrs_id), dev.clone());
 
             // Record XInput slot: inst is the 0-based kind_seen index, which matches
             // the XInput user index on Windows (gilrs enumerates XInput controllers
-            // in slot order 0-3).
-            if kind == ControllerKind::XInput {
+            // in slot order 0-3). Only real XInput pads (ViGEm virtuals are filtered
+            // and our HIDMaestro pads aren't XInput), so the marker case never hits.
+            if kind == ControllerKind::XInput && !is_virt {
                 self.xinput_idx.insert(dev.clone(), inst as u32);
             }
 
@@ -519,22 +532,24 @@ impl GilrsBackend {
     fn lookup_phys(&self, device_id: &str) -> Option<(u16, u16, usize)> {
         let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
+        let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut vp_seen: HashMap<(u16, u16), usize> = HashMap::new();
         for (_id, pad) in self.gilrs.gamepads() {
-            if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
-                if *self.vigem_present.get(&vp).unwrap_or(&false) {
-                    let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
-                    let seen = gilrs_seen.entry(vp).or_insert(0);
-                    if *seen >= phys {
-                        continue;
+            if !is_own_virtual(&pad) {
+                if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
+                    if *self.vigem_present.get(&vp).unwrap_or(&false) {
+                        let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
+                        let seen = gilrs_seen.entry(vp).or_insert(0);
+                        if *seen >= phys {
+                            continue;
+                        }
+                        *seen += 1;
                     }
-                    *seen += 1;
                 }
             }
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
-            let inst = *kind_seen.get(&kind).unwrap_or(&0);
-            kind_seen.insert(kind, inst + 1);
-            let dev = format!("gilrs:{}:{}", kind.id_slug(), inst);
+            let (dev, _inst, _is_virt) =
+                gilrs_device_id(&pad, kind, &mut kind_seen, &mut virt_seen);
             let vp = pad.vendor_id().zip(pad.product_id());
             if dev == device_id {
                 let (v, p) = vp?;
@@ -551,6 +566,39 @@ impl GilrsBackend {
 
 fn axis_val(pad: &gilrs::Gamepad, axis: Axis) -> f32 {
     pad.axis_data(axis).map_or(0.0, |d| d.value())
+}
+
+/// True if `pad` is one of FlexInput's OWN emulated HIDMaestro devices, detected
+/// by the marker we append to its Windows naming (see
+/// `flexinput_hidmaestro::orchestrator::NAME_MARKER`). gilrs reports the marked
+/// FriendlyName, so a real same-VID/PID controller (clean name) is excluded.
+/// This is the only reliable discriminator: a real and an emulated DualSense
+/// share VID/PID 054C:0CE6 and WGI exposes no per-instance device path.
+fn is_own_virtual(pad: &gilrs::Gamepad) -> bool {
+    pad.name().contains(flexinput_core::VIRTUAL_DEVICE_NAME_MARKER)
+}
+
+/// Compute the stable `gilrs:` device id for a pad. Own emulated devices get a
+/// `v`-prefixed instance (`gilrs:dualsense:v0`) counted independently of real
+/// devices, so a real controller keeps a contiguous `gilrs:dualsense:0` index
+/// regardless of plug order — fixing the collision where the dedup dropped the
+/// real device when a virtual of the same model already existed. `kind_seen`
+/// tracks real-device instances per kind; `virt_seen` tracks emulated ones.
+fn gilrs_device_id(
+    pad: &gilrs::Gamepad,
+    kind: ControllerKind,
+    kind_seen: &mut std::collections::HashMap<ControllerKind, usize>,
+    virt_seen: &mut std::collections::HashMap<ControllerKind, usize>,
+) -> (String, usize, bool) {
+    if is_own_virtual(pad) {
+        let inst = *virt_seen.get(&kind).unwrap_or(&0);
+        virt_seen.insert(kind, inst + 1);
+        (format!("gilrs:{}:v{}", kind.id_slug(), inst), inst, true)
+    } else {
+        let inst = *kind_seen.get(&kind).unwrap_or(&0);
+        kind_seen.insert(kind, inst + 1);
+        (format!("gilrs:{}:{}", kind.id_slug(), inst), inst, false)
+    }
 }
 
 fn axis_map(kind: ControllerKind) -> &'static [(Axis, &'static str)] {

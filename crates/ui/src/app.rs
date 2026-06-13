@@ -284,26 +284,18 @@ fn snarl_virtual_device_ids(snarl: &Snarl<NodeData>) -> Vec<String> {
         .collect()
 }
 
-/// The physical-device `ControllerKind` that one of FlexInput's own virtual
-/// devices enumerates as, used to filter our own pads out of the physical list
-/// (and exclude them from nav). Returns `None` for backends that don't appear
-/// in the gilrs physical list. Matches on the full virtual-device id (not the
-/// 2-segment prefix) so the HIDMaestro variants — `virtual.hm.ds4`,
-/// `virtual.hm.dualsense` — are classified correctly; the old prefix-only match
-/// collapsed both to `virtual.hm` and let them leak into the physical panel.
-fn own_virtual_kind(dev_id: &str) -> Option<flexinput_devices::ControllerKind> {
-    use flexinput_devices::ControllerKind;
-    // Strip any `.N` instance suffix by matching on the leading kind segments.
-    if dev_id.starts_with("virtual.xinput") {
-        Some(ControllerKind::XInput)
-    } else if dev_id.starts_with("virtual.hm.dualsense") {
-        Some(ControllerKind::DualSense)
-    } else if dev_id.starts_with("virtual.hm.ds4") || dev_id.starts_with("virtual.ds4") {
-        Some(ControllerKind::DualShock4)
-    } else {
-        None
-    }
+/// True if a `gilrs:<kind>:<inst>` PHYSICAL device id is one of FlexInput's own
+/// emulated HIDMaestro pads — the input enumerator tags those with a `v`-prefixed
+/// instance (`gilrs:dualsense:v0`). Used to filter the loopback devices out of
+/// the physical list deterministically (vs the old plug-order heuristic).
+fn is_own_virtual_gilrs_id(gilrs_id: &str) -> bool {
+    gilrs_id
+        .rsplit(':')
+        .next()
+        .map(|inst| inst.starts_with('v'))
+        .unwrap_or(false)
 }
+
 
 /// Insert virtual devices into the shared pool for every id in
 /// `needed_ids` that doesn't already exist. Pre-existing devices are
@@ -2259,31 +2251,15 @@ impl eframe::App for FlexInputApp {
         let devices: &[PhysicalDevice] = if self.settings.show_own_virtuals_as_physical {
             &self.devices
         } else {
-            let mut to_skip: HashMap<flexinput_devices::ControllerKind, usize> = HashMap::new();
-            {
-                let pool = self.shared_virtual_devices.lock().unwrap();
-                for d in pool.iter() {
-                    if let Some(k) = own_virtual_kind(d.id()) {
-                        *to_skip.entry(k).or_insert(0) += 1;
-                    }
-                }
-            }
-            // Walk in reverse so we drop the *last* N entries of each
-            // matching kind — gilrs lists in plug order so a real
-            // controller plugged before our virtual stays visible.
-            let mut keep: Vec<bool> = vec![true; self.devices.len()];
-            for (k, n) in to_skip.iter() {
-                let mut remaining = *n;
-                for i in (0..self.devices.len()).rev() {
-                    if remaining == 0 { break; }
-                    if keep[i] && self.devices[i].kind == *k {
-                        keep[i] = false;
-                        remaining -= 1;
-                    }
-                }
-            }
-            devices_owned = self.devices.iter().enumerate()
-                .filter_map(|(i, d)| if keep[i] { Some(d.clone()) } else { None })
+            // Drop FlexInput's OWN emulated devices — now identified precisely by
+            // the `:v` instance marker in the gilrs id (see
+            // gilrs_backend::gilrs_device_id), so a real controller is never
+            // dropped regardless of plug order (the old count-by-kind heuristic
+            // dropped the real device when a virtual of the same model existed and
+            // was plugged first).
+            devices_owned = self.devices.iter()
+                .filter(|d| !is_own_virtual_gilrs_id(&d.id))
+                .cloned()
                 .collect::<Vec<_>>();
             &devices_owned
         };
@@ -7201,26 +7177,13 @@ impl FlexInputApp {
     /// real). Returns ids regardless of the `show_own_virtuals_as_physical`
     /// setting — the exclusion applies whenever such a device is visible.
     fn own_virtual_device_ids(&self) -> std::collections::HashSet<String> {
-        use std::collections::HashMap;
-        let mut to_skip: HashMap<flexinput_devices::ControllerKind, usize> = HashMap::new();
-        {
-            let pool = self.shared_virtual_devices.lock().unwrap();
-            for d in pool.iter() {
-                if let Some(k) = own_virtual_kind(d.id()) { *to_skip.entry(k).or_insert(0) += 1; }
-            }
-        }
-        let mut owned = std::collections::HashSet::new();
-        for (k, n) in to_skip.iter() {
-            let mut remaining = *n;
-            for i in (0..self.devices.len()).rev() {
-                if remaining == 0 { break; }
-                if self.devices[i].kind == *k && !owned.contains(&self.devices[i].id) {
-                    owned.insert(self.devices[i].id.clone());
-                    remaining -= 1;
-                }
-            }
-        }
-        owned
+        // Our emulated pads are tagged with a `v`-prefixed gilrs instance
+        // (`gilrs:dualsense:v0`), so identify them directly — no plug-order
+        // guessing, and a real device is never mistaken for ours.
+        self.devices.iter()
+            .filter(|d| is_own_virtual_gilrs_id(&d.id))
+            .map(|d| d.id.clone())
+            .collect()
     }
 
     /// Resolve the active Easy sub-patch outer node id (the `subpatch` node in

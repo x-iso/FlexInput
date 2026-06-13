@@ -22,6 +22,12 @@ use std::ffi::c_void;
 
 use crate::profile::Profile;
 
+/// Re-export of the shared marker appended to a virtual device's Windows naming
+/// so FlexInput can recognize its own emulated pad (see
+/// [`flexinput_core::VIRTUAL_DEVICE_NAME_MARKER`]). Defined in `core` so the
+/// input-enumeration side (`flexinput-devices`) shares one definition.
+pub use flexinput_core::VIRTUAL_DEVICE_NAME_MARKER as NAME_MARKER;
+
 /// HID class GUID — every virtual controller is created in this class.
 /// `{745a17a0-74d3-11d0-b6fe-00a0c90f57da}` (verbatim from DeviceNodeCreator).
 const HID_CLASS_GUID: Guid = Guid {
@@ -504,13 +510,20 @@ pub fn create_device_node(
         set_bus_type_usb(&instance_id);
 
         // Friendly name on root + HID child (e.g. "Wireless Controller") so the
-        // device doesn't show as a generic "HID-compliant game controller".
-        let display_name = profile
+        // device doesn't show as a generic "HID-compliant game controller". We
+        // append a marker (`NAME_MARKER`) so FlexInput can tell its OWN emulated
+        // pad apart from a real same-VID/PID controller — Windows/gilrs can't
+        // distinguish them otherwise (identical VID/PID, no instance path via
+        // WGI), which made the dedup drop the real device. The USB *product*
+        // string stays clean ("Wireless Controller") so games still see a
+        // faithful DualSense/DS4 — only the Windows naming carries the marker.
+        let base_name = profile
             .device_description
             .as_deref()
             .or(profile.product_string.as_deref())
             .unwrap_or(&profile.name);
-        set_all_naming_properties(&instance_id, display_name);
+        let display_name = format!("{base_name}{NAME_MARKER}");
+        set_all_naming_properties(&instance_id, &display_name);
 
         // Block until the driver has actually started on the HID child, so the
         // app's first writes land on a listening driver (else the device looks
