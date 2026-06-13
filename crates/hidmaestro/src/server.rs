@@ -68,6 +68,12 @@ struct HelperState {
     persist: AtomicBool,
     /// Set when the parent process dies; the accept loop notices and exits.
     parent_gone: AtomicBool,
+    /// True once the helper has run its one-time startup orphan cleanup. The app
+    /// reconnects (and re-sends `Hello`) several times per session — the pipe is
+    /// per-connection but this helper process persists — so the cleanup must run
+    /// only on the FIRST hello, never on reconnects, or it would wipe the very
+    /// devices the app just created earlier in the session.
+    did_startup_cleanup: AtomicBool,
 }
 
 impl HelperState {
@@ -76,6 +82,7 @@ impl HelperState {
             devices: Mutex::new(HashMap::new()),
             persist: AtomicBool::new(false),
             parent_gone: AtomicBool::new(false),
+            did_startup_cleanup: AtomicBool::new(false),
         }
     }
 
@@ -240,14 +247,26 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
             // orphans from a previous crashed run, AND devices left behind by a
             // prior persist-ON run (the persist→off transition). Drop our held
             // section handles first so the removal isn't blocked by mapped views.
-            if !persist {
-                if was {
-                    // Transition on→off: release tracked sections before removal.
-                    state.teardown_tracked();
-                }
+            //
+            // CRITICAL: only clean up on the FIRST hello of this helper's life.
+            // The app reconnects + re-greets several times per session (pipe is
+            // per-connection, helper persists), and a per-hello wipe would delete
+            // the devices created earlier this session — observed as "DS4 created
+            // then vanished, only DualSense survived". Reconnect hellos just
+            // refresh the persist flag.
+            let first = !state.did_startup_cleanup.swap(true, Ordering::SeqCst);
+            if first && !persist {
                 let n = remove_all_hidmaestro_devices();
                 diag_log(&format!(
-                    "[helper] hello: persist off; cleaned up {n} leftover device(s)/orphan child(ren)"
+                    "[helper] hello (startup): persist off; cleaned up {n} leftover device(s)/orphan child(ren)"
+                ));
+            } else if !persist && was != persist {
+                // Persist toggled on→off mid-session (settings change): drop our
+                // tracked sections and remove everything so the policy takes hold.
+                state.teardown_tracked();
+                let n = remove_all_hidmaestro_devices();
+                diag_log(&format!(
+                    "[helper] hello (persist on->off): cleaned up {n} device(s)"
                 ));
             }
             (Response::ok(), false)

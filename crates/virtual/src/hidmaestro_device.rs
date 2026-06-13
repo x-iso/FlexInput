@@ -263,23 +263,25 @@ impl crate::VirtualDevice for HidMaestroDevice {
         );
         if let Some(output) = self.output.as_mut() {
             while let Some(frame) = output.try_read() {
-                // One-shot diagnostic: prove the driver→ring path delivers
-                // output reports at all, and show the raw bytes so we can verify
-                // the motor offsets.
-                if !self.diag_out_logged {
-                    diag_log(&format!(
-                        "[hidmaestro] first output frame id={} rid={:#x} len={} data={:02x?}",
-                        self.id, frame.report_id, frame.data.len(),
-                        &frame.data[..frame.data.len().min(12)]
-                    ));
-                    self.diag_out_logged = true;
-                }
                 let strong = left_idx
                     .and_then(|i| frame.data.get(i))
                     .map(|b| *b as f32 / 255.0);
                 let weak = right_idx
                     .and_then(|i| frame.data.get(i))
                     .map(|b| *b as f32 / 255.0);
+                // Diagnostic: log frames that actually carry rumble (non-zero
+                // motor bytes), not just the init/LED packet, so we can confirm
+                // the game's rumble reaches us and which bytes carry it.
+                if !self.diag_out_logged
+                    && (strong.unwrap_or(0.0) > 0.0 || weak.unwrap_or(0.0) > 0.0)
+                {
+                    diag_log(&format!(
+                        "[hidmaestro] RUMBLE frame id={} rid={:#x} L_idx={:?} R_idx={:?} data={:02x?}",
+                        self.id, frame.report_id, left_idx, right_idx,
+                        &frame.data[..frame.data.len().min(12)]
+                    ));
+                    self.diag_out_logged = true;
+                }
                 if let (Some(strong), Some(weak)) = (strong, weak) {
                     self.rumble = (strong, weak);
                 }
