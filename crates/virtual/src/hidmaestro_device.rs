@@ -61,6 +61,8 @@ pub struct HidMaestroDevice {
     controller_index: u32,
     /// One-shot diagnostic: log the first non-neutral frame we write.
     diag_logged: bool,
+    /// One-shot diagnostic: log the first output (rumble) frame we read.
+    diag_out_logged: bool,
 }
 
 impl HidMaestroDevice {
@@ -93,6 +95,7 @@ impl HidMaestroDevice {
             helper_instance_id: None,
             controller_index,
             diag_logged: false,
+            diag_out_logged: false,
         })
     }
 
@@ -122,6 +125,23 @@ impl HidMaestroDevice {
                 dev.input = InputSection::open(allocated_index).ok();
                 dev.output = OutputSection::open(allocated_index).ok();
                 dev.helper_instance_id = Some(instance_id.clone());
+
+                // First-launch readiness: on a fresh create the UMDF driver opens
+                // its side of the section AFTER it binds. The helper now waits for
+                // the HID child to reach the "Started" state before returning (see
+                // orchestrator::wait_for_hid_child_started), so by here the driver
+                // is listening. Prime a neutral frame so the driver's first
+                // observed SeqNo transition is unambiguously ours.
+                if let Some(input) = dev.input.as_mut() {
+                    let state = dev.pins.state();
+                    encode_report_into(&dev.profile, &state, &mut dev.report_buf);
+                    let data = if dev.profile.report.report_id != 0 {
+                        &dev.report_buf[1..]
+                    } else {
+                        &dev.report_buf[..]
+                    };
+                    input.write_frame(data, None);
+                }
                 diag_log(&format!(
                     "[hidmaestro] create id={} hint={} alloc_idx={} instance={} input_open={} output_open={}",
                     dev.id, index_hint, allocated_index, instance_id,
@@ -243,6 +263,17 @@ impl crate::VirtualDevice for HidMaestroDevice {
         );
         if let Some(output) = self.output.as_mut() {
             while let Some(frame) = output.try_read() {
+                // One-shot diagnostic: prove the driver→ring path delivers
+                // output reports at all, and show the raw bytes so we can verify
+                // the motor offsets.
+                if !self.diag_out_logged {
+                    diag_log(&format!(
+                        "[hidmaestro] first output frame id={} rid={:#x} len={} data={:02x?}",
+                        self.id, frame.report_id, frame.data.len(),
+                        &frame.data[..frame.data.len().min(12)]
+                    ));
+                    self.diag_out_logged = true;
+                }
                 let strong = left_idx
                     .and_then(|i| frame.data.get(i))
                     .map(|b| *b as f32 / 255.0);

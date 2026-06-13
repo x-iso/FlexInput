@@ -562,6 +562,28 @@ mod tests {
     }
 
     #[test]
+    fn ds4_dpad_encodes_standard_hat_octants() {
+        // Regression: d-pad → hat must produce the standard DS4 octant codes
+        // (neutral=8, up=0, right=2, down=4, left=6) at the hat nibble.
+        let p = ds4();
+        let hat = p.report.field(0x01, 0x39).unwrap();
+        let byte = ((hat.bit_offset + 8) / 8) as usize; // RID-inclusive
+        let octant = |up, down, left, right| {
+            let mut ps = PinState::new();
+            ps.set("dpad_up", 0.0, up);
+            ps.set("dpad_down", 0.0, down);
+            ps.set("dpad_left", 0.0, left);
+            ps.set("dpad_right", 0.0, right);
+            encode_report(&p, &ps.state())[byte] & 0x0F
+        };
+        assert_eq!(octant(false, false, false, false), 8, "neutral");
+        assert_eq!(octant(true, false, false, false), 0, "up");
+        assert_eq!(octant(false, false, false, true), 2, "right");
+        assert_eq!(octant(false, true, false, false), 4, "down");
+        assert_eq!(octant(false, false, true, false), 6, "left");
+    }
+
+    #[test]
     fn dualsense_parses_imu_and_touch_layout() {
         let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
         let e = &p.extended;

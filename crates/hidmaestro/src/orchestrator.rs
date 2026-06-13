@@ -137,6 +137,7 @@ extern "system" {
     fn CM_Get_Child(child: *mut u32, dev_inst: u32, flags: u32) -> u32;
     fn CM_Get_Parent(parent: *mut u32, dev_inst: u32, flags: u32) -> u32;
     fn CM_Get_Sibling(sibling: *mut u32, dev_inst: u32, flags: u32) -> u32;
+    fn CM_Get_DevNode_Status(status: *mut u32, problem: *mut u32, dev_inst: u32, flags: u32) -> u32;
     fn CM_Get_Device_ID_Size(len: *mut u32, dev_inst: u32, flags: u32) -> u32;
     fn CM_Get_Device_IDW(dev_inst: u32, buffer: *mut u16, buffer_len: u32, flags: u32) -> u32;
     fn CM_Set_DevNode_PropertyW(
@@ -511,7 +512,52 @@ pub fn create_device_node(
             .unwrap_or(&profile.name);
         set_all_naming_properties(&instance_id, display_name);
 
+        // Block until the driver has actually started on the HID child, so the
+        // app's first writes land on a listening driver (else the device looks
+        // dead until relaunch). Best-effort with a generous budget.
+        wait_for_hid_child_started(&instance_id, 5000);
+
         Ok(CreatedDevice { instance_id, controller_index })
+    }
+}
+
+/// `DN_STARTED` bit in the devnode status word (the device is started and its
+/// driver is running). When set with problem code 0 the UMDF driver has bound
+/// and opened its side of the shared section.
+const DN_STARTED: u32 = 0x0000_0008;
+
+/// Poll until the HID child of `instance_id` reaches the **started** state (its
+/// driver is running and reading the section), or `timeout_ms` elapses. Returns
+/// true if it started. This is stronger than [`wait_for_hid_child`], which only
+/// waits for the child PDO to exist — the section isn't actually being read
+/// until the driver is *started*, and writing before then is what made a
+/// freshly-created device look dead until the app was relaunched.
+fn wait_for_hid_child_started(instance_id: &str, timeout_ms: u64) -> bool {
+    let w_id = to_wide(instance_id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        unsafe {
+            let mut dev_inst: u32 = 0;
+            if CM_Locate_DevNodeW(&mut dev_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+                == CR_SUCCESS
+            {
+                let mut child: u32 = 0;
+                if CM_Get_Child(&mut child, dev_inst, 0) == CR_SUCCESS {
+                    let mut status: u32 = 0;
+                    let mut problem: u32 = 0;
+                    if CM_Get_DevNode_Status(&mut status, &mut problem, child, 0) == CR_SUCCESS
+                        && (status & DN_STARTED) != 0
+                        && problem == 0
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

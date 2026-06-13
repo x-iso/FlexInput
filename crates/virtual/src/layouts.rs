@@ -161,6 +161,13 @@ pub static DS4_SINK_PINS: &[SinkPin] = &[
     sp!("accel_x",       "Accel X",              SignalType::Float),
     sp!("accel_y",       "Accel Y",              SignalType::Float),
     sp!("accel_z",       "Accel Z",              SignalType::Float),
+    // Touchpad axes — accepted; forwarding is deferred (see DualSense).
+    sp!("touch1_x",      "Touch 1 X",            SignalType::Float),
+    sp!("touch1_y",      "Touch 1 Y",            SignalType::Float),
+    sp!("touch1_active", "Touch 1 Active",       SignalType::Bool),
+    sp!("touch2_x",      "Touch 2 X",            SignalType::Float),
+    sp!("touch2_y",      "Touch 2 Y",            SignalType::Float),
+    sp!("touch2_active", "Touch 2 Active",       SignalType::Bool),
     // Auto-map bus port — always last to avoid shifting existing pin indices.
     sp!("automap_in",    "Auto-Map",             SignalType::AutoMap),
 ];
