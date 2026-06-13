@@ -2048,21 +2048,9 @@ pub fn eval_graph_tick(
                         let Some(&sig) = dev_sigs.get(&(virt_dev.clone(), virt_out_pin.to_string())) else {
                             continue;
                         };
-                        let dst = flexinput_core::automap::resolve_feedback_pin(virt_out_pin, &dst_pins);
-                        // Diagnostic: when FLEXINPUT_DEBUG_RUMBLE is set, log
-                        // feedback routing for non-zero rumble so we can see if
-                        // the virtual pad's value reaches the physical sink and
-                        // which dst pin it resolves to (or that it doesn't).
-                        if std::env::var_os("FLEXINPUT_DEBUG_RUMBLE").is_some()
-                            && matches!(virt_out_pin, &"rumble_strong" | &"rumble_weak")
-                            && sig.as_float().abs() > 0.01
-                        {
-                            eprintln!(
-                                "[fb] {virt_dev} {virt_out_pin}={:.2} -> {} dst={:?} dst_pins={:?}",
-                                sig.as_float(), st.device_id, dst, dst_pins
-                            );
-                        }
-                        let Some(dst_pin) = dst else { continue; };
+                        let Some(dst_pin) = flexinput_core::automap::resolve_feedback_pin(
+                            virt_out_pin, &dst_pins
+                        ) else { continue; };
                         if directly_wired.contains(dst_pin) { continue; }
                         sink_outputs
                             .entry((st.device_id.clone(), dst_pin.to_string()))

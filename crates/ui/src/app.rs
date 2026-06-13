@@ -7963,34 +7963,44 @@ fn spawn_io_thread(
                     }
                 }
 
-                // Diagnostic: each tick, report whether the switch_pro HD rumble
-                // key is present in the sink_outputs the SEND loop actually reads,
-                // and the bypass state — to see if it's a bypass gate or a
-                // sink_bus pipeline gap (value computed by eval but not in the
-                // map this I/O tick reads).
-                if std::env::var_os("FLEXINPUT_DEBUG_RUMBLE").is_some() {
-                    let hd = sink_outputs.iter()
-                        .find(|((d, p), _)| d.starts_with("gilrs:") && (p == "hd_l_amp" || p == "hd_r_amp"))
-                        .map(|((d, p), s)| format!("{d}/{p}={:.2}", s.as_float()));
-                    if let Some(hd) = hd {
-                        eprintln!("[send-check] bypass={bypass} present: {hd}");
+                // Physical device outputs (rumble, lightbar) to gilrs pads run
+                // regardless of bypass: these carry *incoming* feedback the game
+                // sends back to a virtual pad (rumble/FFB), routed to a physical
+                // pad via AutoMap — not FlexInput's own mapped input, which is
+                // what bypass suppresses. Gating these on !bypass meant a game's
+                // rumble never reached the physical pad whenever FlexInput was
+                // unfocused (bypass stale-true). HD-rumble amplitude pins get a
+                // default frequency injected below so they're audible on Switch
+                // Pro (whose HD motors need a non-zero frequency).
+                for ((device_id, pin_id), &signal) in &sink_outputs {
+                    if device_id.starts_with("gilrs:") {
+                        for backend in &mut backends {
+                            backend.send(device_id, pin_id, signal);
+                        }
                     }
                 }
-                if !bypass {
-                    // Physical device outputs (rumble, lightbar).
+                // Default HD-rumble frequency: when AutoMap feedback drives an
+                // hd_*_amp pin (amplitude only) without a paired hd_*_freq, the
+                // Switch Pro stays silent (its voice-coil needs a frequency). If
+                // a side's amp is non-zero and no explicit freq was routed this
+                // tick, inject ~320 Hz (0.6) so the rumble is audible — matching
+                // what the manual ping pulse does.
+                for (amp_pin, freq_pin) in [("hd_l_amp", "hd_l_freq"), ("hd_r_amp", "hd_r_freq")] {
                     for ((device_id, pin_id), &signal) in &sink_outputs {
-                        if device_id.starts_with("gilrs:") {
-                            if std::env::var_os("FLEXINPUT_DEBUG_RUMBLE").is_some()
-                                && (pin_id == "hd_l_amp" || pin_id == "hd_r_amp")
-                                && signal.as_float().abs() > 0.01
-                            {
-                                eprintln!("[send] {device_id} {pin_id}={:.2}", signal.as_float());
-                            }
+                        if !device_id.starts_with("gilrs:") || pin_id != amp_pin { continue; }
+                        let amp = signal.as_float();
+                        let has_freq = sink_outputs
+                            .get(&(device_id.clone(), freq_pin.to_string()))
+                            .map(|s| s.as_float() > 0.0)
+                            .unwrap_or(false);
+                        if amp > 0.01 && !has_freq {
                             for backend in &mut backends {
-                                backend.send(device_id, pin_id, signal);
+                                backend.send(device_id, freq_pin, Signal::Float(0.6));
                             }
                         }
                     }
+                }
+                if !bypass {
                     // MIDI output — only send on change to avoid flooding the bus.
                     if let Ok(mut mg) = midi.try_lock() {
                         if let Some(m) = mg.as_mut() {

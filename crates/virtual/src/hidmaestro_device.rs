@@ -20,22 +20,6 @@ use flexinput_hidmaestro::{helper, InputSection, OutputSection, Profile};
 
 use crate::{layouts, SinkPin, SourcePin};
 
-/// Append a one-line diagnostic to `flexinput-hidmaestro.log` next to the exe.
-/// Temporary instrumentation for the input-path investigation; works in the
-/// console-less release build where `eprintln!` goes nowhere.
-fn diag_log(line: &str) {
-    use std::io::Write;
-    let path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("flexinput-hidmaestro.log")));
-    if let Some(path) = path {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{line}");
-        }
-    }
-    eprintln!("{line}");
-}
-
 /// A HIDMaestro-backed virtual controller (plain-HID path: DS4 / DualSense).
 pub struct HidMaestroDevice {
     id: String,
@@ -57,12 +41,6 @@ pub struct HidMaestroDevice {
     /// Helper-managed device instance id (`ROOT\HIDClass\NNNN`). `Some` when
     /// this device was created via the helper and must be destroyed on drop.
     helper_instance_id: Option<String>,
-    /// Controller index this device opened (for diagnostics).
-    controller_index: u32,
-    /// One-shot diagnostic: log the first non-neutral frame we write.
-    diag_logged: bool,
-    /// Throttle timestamp for the rumble diagnostic.
-    diag_last_rumble: Option<std::time::Instant>,
     /// True when last tick published a peak that exceeded the real value; the
     /// next tick settles `rumble` to the latest actual frame value so a held
     /// peak doesn't buzz forever after a one-shot ping.
@@ -99,9 +77,6 @@ impl HidMaestroDevice {
             output,
             rumble: (0.0, 0.0),
             helper_instance_id: None,
-            controller_index,
-            diag_logged: false,
-            diag_last_rumble: None,
             rumble_settle_pending: false,
             rumble_latest: (0.0, 0.0),
         })
@@ -129,7 +104,6 @@ impl HidMaestroDevice {
                 // Open the sections at the index the helper actually used — NOT
                 // the hint. (Opening the wrong index was the no-input bug: two
                 // devices both guessed index 0 and collided.)
-                dev.controller_index = allocated_index;
                 dev.input = InputSection::open(allocated_index).ok();
                 dev.output = OutputSection::open(allocated_index).ok();
                 dev.helper_instance_id = Some(instance_id.clone());
@@ -150,17 +124,9 @@ impl HidMaestroDevice {
                     };
                     input.write_frame(data, None);
                 }
-                diag_log(&format!(
-                    "[hidmaestro] create id={} hint={} alloc_idx={} instance={} input_open={} output_open={}",
-                    dev.id, index_hint, allocated_index, instance_id,
-                    dev.input.is_some(), dev.output.is_some()
-                ));
             }
             Err(e) => {
-                diag_log(&format!(
-                    "[hidmaestro] create via helper FAILED id={} hint={}: {e}",
-                    dev.id, index_hint
-                ));
+                eprintln!("[hidmaestro] create via helper failed for {}: {e}", dev.id);
             }
         }
         Some(dev)
@@ -217,13 +183,6 @@ impl crate::VirtualDevice for HidMaestroDevice {
 
     fn flush(&mut self) {
         let Some(input) = self.input.as_mut() else {
-            if !self.diag_logged {
-                diag_log(&format!(
-                    "[hidmaestro] flush NO-OP (input section not open) id={} idx={}",
-                    self.id, self.controller_index
-                ));
-                self.diag_logged = true;
-            }
             return;
         };
         let state = self.pins.state();
@@ -235,13 +194,6 @@ impl crate::VirtualDevice for HidMaestroDevice {
         } else {
             &self.report_buf[..]
         };
-        if !self.diag_logged {
-            diag_log(&format!(
-                "[hidmaestro] first flush id={} idx={} data[0..6]={:02x?}",
-                self.id, self.controller_index, &data[..data.len().min(6)]
-            ));
-            self.diag_logged = true;
-        }
         input.write_frame(data, None);
     }
 
@@ -278,7 +230,6 @@ impl crate::VirtualDevice for HidMaestroDevice {
         // linger. We publish the peak for one tick, then settle to the latest
         // actual value so a held peak doesn't buzz forever once frames stop.
         let mut peak: Option<(f32, f32)> = None;
-        let mut got_frame = false;
         if let Some(output) = self.output.as_mut() {
             while let Some(frame) = output.try_read() {
                 let strong = left_idx.and_then(|i| frame.data.get(i)).map(|b| *b as f32 / 255.0);
@@ -287,35 +238,18 @@ impl crate::VirtualDevice for HidMaestroDevice {
                     let (ps, pw) = peak.unwrap_or((0.0, 0.0));
                     peak = Some((s.max(ps), w.max(pw)));
                     self.rumble_latest = (s, w);
-                    got_frame = true;
                 }
             }
         }
-        let publish = if let Some((pk_s, pk_w)) = peak {
+        if let Some((pk_s, pk_w)) = peak {
             let (lt_s, lt_w) = self.rumble_latest;
             // Hold the peak one tick when it exceeds the settled value.
             self.rumble_settle_pending = pk_s > lt_s + 0.01 || pk_w > lt_w + 0.01;
-            Some((pk_s, pk_w))
+            self.rumble = (pk_s, pk_w);
         } else if self.rumble_settle_pending {
             // No new frames, but we owe a settle from a prior peak.
             self.rumble_settle_pending = false;
-            Some(self.rumble_latest)
-        } else {
-            None
-        };
-        if let Some((strong, weak)) = publish {
-            let changed = (strong - self.rumble.0).abs() > 0.01 || (weak - self.rumble.1).abs() > 0.01;
-            if changed && (strong > 0.0 || weak > 0.0 || self.rumble.0 > 0.0 || self.rumble.1 > 0.0) {
-                let now = std::time::Instant::now();
-                if self.diag_last_rumble.map(|t| now.duration_since(t).as_millis() >= 300).unwrap_or(true) {
-                    diag_log(&format!(
-                        "[hidmaestro] rumble id={} strong={strong:.2} weak={weak:.2} got_frame={got_frame}",
-                        self.id
-                    ));
-                    self.diag_last_rumble = Some(now);
-                }
-            }
-            self.rumble = (strong, weak);
+            self.rumble = self.rumble_latest;
         }
         vec![
             ("rumble_strong", Signal::Float(self.rumble.0)),

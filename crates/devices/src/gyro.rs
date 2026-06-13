@@ -525,26 +525,11 @@ impl GyroManager {
                     }
                 }
                 DeviceKind::SwitchPro { initialized, packet_counter, .. } => {
-                    if !*initialized {
-                        if std::env::var_os("FLEXINPUT_DEBUG_RUMBLE").is_some()
-                            && (out.hd_l_amp > 0 || out.hd_r_amp > 0)
-                        {
-                            eprintln!("[sw-rumble] SKIP: Switch Pro not initialized (amp L={} R={})", out.hd_l_amp, out.hd_r_amp);
-                        }
-                        continue;
-                    }
+                    if !*initialized { continue; }
                     let left  = switch_rumble_encode(out.hd_l_amp as f32 / 255.0, out.hd_l_freq as f32 / 255.0);
                     let right = switch_rumble_encode(out.hd_r_amp as f32 / 255.0, out.hd_r_freq as f32 / 255.0);
                     let pkt = build_switch_rumble_only(*packet_counter, left, right);
                     *packet_counter = packet_counter.wrapping_add(1);
-                    if std::env::var_os("FLEXINPUT_DEBUG_RUMBLE").is_some()
-                        && (out.hd_l_amp > 0 || out.hd_r_amp > 0)
-                    {
-                        eprintln!(
-                            "[sw-rumble] WRITE amp L={} R={} freq L={} R={} -> {} bytes",
-                            out.hd_l_amp, out.hd_r_amp, out.hd_l_freq, out.hd_r_freq, pkt.len()
-                        );
-                    }
                     hid_write(device, &pkt);
                 }
             }

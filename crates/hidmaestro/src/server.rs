@@ -35,18 +35,9 @@ use crate::shm::{InputSection, OutputSection};
 use crate::Profile;
 
 /// Append a one-line diagnostic to `flexinput-hidmaestro.log` next to the exe.
-/// Temporary instrumentation for the input-path investigation. The helper runs
-/// from the same exe path as the app, so both write the same file.
+/// One-line helper diagnostic. Fires per device create/cleanup (not per frame),
+/// so it goes to the elevated helper's stderr only — no file spam.
 fn diag_log(line: &str) {
-    use std::io::Write;
-    let path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("flexinput-hidmaestro.log")));
-    if let Some(path) = path {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{line}");
-        }
-    }
     eprintln!("{line}");
 }
 
