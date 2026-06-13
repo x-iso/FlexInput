@@ -455,6 +455,83 @@ const PIPE_WAIT: u32 = 0x0000_0000;
 const PIPE_UNLIMITED_INSTANCES: u32 = 255;
 const INVALID_HANDLE_VALUE: isize = -1;
 
+/// SECURITY_ATTRIBUTES layout (matches Win32; only the pointer matters here).
+#[repr(C)]
+struct SecurityAttributes {
+    n_length: u32,
+    lp_security_descriptor: *mut c_void,
+    b_inherit_handle: i32,
+}
+
+const SDDL_REVISION_1: u32 = 1;
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string_sd: *const u16,
+        revision: u32,
+        sd: *mut *mut c_void,
+        sd_size: *mut u32,
+    ) -> i32;
+}
+#[link(name = "kernel32")]
+extern "system" {
+    fn LocalFree(h: *mut c_void) -> *mut c_void;
+}
+
+/// Self-freeing security descriptor + the `SECURITY_ATTRIBUTES` that points at
+/// it. Built from an SDDL string. The helper runs elevated, so a pipe created
+/// with the *default* DACL is only openable by other high-integrity / admin
+/// processes — the unelevated app then fails `CreateFileW` with ERROR_ACCESS_
+/// DENIED (os error 5), which is exactly the "dead devices on a normal launch"
+/// bug. We instead grant the pipe to all authenticated users and label it Low
+/// integrity so a medium-IL (normal) client can connect.
+struct PipeSecurity {
+    sd: *mut c_void,
+    attrs: SecurityAttributes,
+}
+
+impl PipeSecurity {
+    /// Build from SDDL. Returns `None` if the conversion fails (caller then
+    /// falls back to a null/default descriptor — admin-launched still works).
+    fn from_sddl(sddl: &str) -> Option<Self> {
+        let w = wide(sddl);
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                w.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || sd.is_null() {
+            return None;
+        }
+        let attrs = SecurityAttributes {
+            n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: sd,
+            b_inherit_handle: 0,
+        };
+        Some(PipeSecurity { sd, attrs })
+    }
+
+    fn as_ptr(&mut self) -> *mut c_void {
+        &mut self.attrs as *mut SecurityAttributes as *mut c_void
+    }
+}
+
+impl Drop for PipeSecurity {
+    fn drop(&mut self) {
+        if !self.sd.is_null() {
+            unsafe { LocalFree(self.sd) };
+        }
+    }
+}
+
+/// Pipe security: DACL grants GENERIC_ALL to Authenticated Users (AU) and the
+/// local SYSTEM (SY); SACL sets a Low mandatory label (LW) so a medium-IL
+/// client isn't blocked by the integrity check. This lets the normally-launched
+/// (unelevated) app talk to the elevated helper.
+const PIPE_SDDL: &str = "D:(A;;GA;;;AU)(A;;GA;;;SY)S:(ML;;NW;;;LW)";
+
 #[link(name = "kernel32")]
 extern "system" {
     fn CreateNamedPipeW(
@@ -490,6 +567,11 @@ impl NamedPipeServer {
     /// exits the loop instead of handling a phantom client).
     fn create_and_wait(name: &str, state: &Arc<HelperState>) -> std::io::Result<Option<Self>> {
         let w = wide(name);
+        // Grant access to the unelevated app (see PIPE_SDDL). If building the SD
+        // fails for any reason, fall back to the default (null) descriptor — an
+        // admin-launched app still connects, matching the old behavior.
+        let mut sec = PipeSecurity::from_sddl(PIPE_SDDL);
+        let sec_ptr = sec.as_mut().map(|s| s.as_ptr()).unwrap_or(std::ptr::null_mut());
         let h = unsafe {
             CreateNamedPipeW(
                 w.as_ptr(),
@@ -499,7 +581,7 @@ impl NamedPipeServer {
                 64 * 1024,
                 64 * 1024,
                 0,
-                std::ptr::null_mut(),
+                sec_ptr,
             )
         };
         if h as isize == INVALID_HANDLE_VALUE {
