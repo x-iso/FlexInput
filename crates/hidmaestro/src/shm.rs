@@ -56,11 +56,25 @@ const OUTPUT_SLOT_OFFSET_REPORT_ID: usize = 5;
 const OUTPUT_SLOT_OFFSET_SIZE: usize = 6;
 const OUTPUT_SLOT_OFFSET_DATA: usize = 8;
 
-/// SDDL granting Local System, Builtin Admins, and LocalService full access plus
-/// World read. LocalService is what WUDFHost runs as for UMDF2, so the
-/// driver/companion need full access; World read is for diagnostic tools.
-/// Verbatim from `SharedMemoryIO.cs`.
-const SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GR;;;WD)";
+/// SDDL for the `Global\` sections + events shared between the elevated helper
+/// (which CREATES them) and the normally-launched, unelevated app (which OPENS
+/// them read/write to drive the device and wait on the event).
+///
+/// DACL grants GENERIC_ALL to Local System, Builtin Admins, LocalService
+/// (WUDFHost runs as LocalService for UMDF2, so the driver companion needs full
+/// access) AND to Authenticated Users — the unelevated app opens with
+/// FILE_MAP_READ|FILE_MAP_WRITE / EVENT_MODIFY_STATE|SYNCHRONIZE, which the old
+/// `(A;;GR;;;WD)` World-READ-only entry denied (write/modify), so on a standard
+/// (non-admin) account the app's `open()` failed and the virtual device showed
+/// offline while the driver still presented HID.
+///
+/// The SACL sets a Low mandatory label (`ML;;NW;;;LW`): a `Global\` object made
+/// by the high-IL helper otherwise inherits a High label with NO_WRITE_UP, which
+/// blocks a medium-IL (normal) process from writing even with DACL access. The
+/// label lets the unelevated app write down to it. (The original was verbatim
+/// from HIDMaestro's `SharedMemoryIO.cs`, which assumed same-IL create+open.)
+const SDDL: &str =
+    "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;AU)S:(ML;;NW;;;LW)";
 
 // ── Win32 constants ─────────────────────────────────────────────────────────
 const PAGE_READWRITE: u32 = 0x04;

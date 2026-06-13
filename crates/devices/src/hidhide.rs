@@ -477,8 +477,6 @@ pub fn has_vigem_for_vid_pid(vid: u16, pid: u16) -> bool {
             // HIDMaestro: any active SWD\HIDMAESTRO device means we have a virtual
             // controller with this VID/PID (we wrote it to the registry slot).
             if instance_id.to_uppercase().contains("SWD\\HIDMAESTRO") {
-                #[cfg(debug_assertions)]
-                eprintln!("[hidhide] has_vigem: found HIDMaestro device: {}", instance_id);
                 found = true; break;
             }
 

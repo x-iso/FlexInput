@@ -545,12 +545,10 @@ impl GyroManager {
 }
 
 fn hid_write(device: &HidDevice, data: &[u8]) {
-    let res = device.write(data);
-    #[cfg(debug_assertions)]
-    if let Err(e) = &res {
-        eprintln!("[hid-write] failed ({} bytes): {:?}", data.len(), e);
-    }
-    let _ = res;
+    // A failed write is expected and benign when the device is unplugged mid-flush
+    // (the flush loop keeps running until the next enumerate drops the handle), so
+    // it's silently swallowed — logging here spammed once per write on disconnect.
+    let _ = device.write(data);
 }
 
 // ── Switch Pro initialisation ─────────────────────────────────────────────────
