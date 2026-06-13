@@ -871,16 +871,57 @@ fn parse_ds4(buf: &[u8]) -> Option<HidReading> {
     // Layout reference: Linux drivers/hid/hid-sony.c, struct dualshock4_input_report_common.
     //   payload offsets: lx,ly(0,1) rx,ry(2,3) buttons[3](4-6) l2,r2(7,8)
     //                    timestamp(9,10) battery(11) gyro[3](12-17) accel[3](18-23)
+    //   buttons[0] (payload 4): dpad(3:0) square(4) cross(5) circle(6) triangle(7)
+    //   buttons[1] (payload 5): l1(0) r1(1) l2(2) r2(3) share(4) options(5) l3(6) r3(7)
     //   buttons[2] (payload 6): bit 0 = PS, bit 1 = Touchpad click, bits 2-7 = counter.
-    // USB: report 0x01, payload starts at byte 1 → gyro 13, accel 19, btn2 byte 7.
-    // BT:  report 0x11, BT prefix is 2 bytes, payload starts at byte 3 → gyro 15, accel 21, btn2 byte 9.
-    let (go, ao, btn2) = match buf[0] {
-        0x01 if buf.len() >= 25 => (13, 19, 7),
-        0x11 if buf.len() >= 77 => (15, 21, 9),
+    // USB: report 0x01, payload starts at byte 1 → gyro 13, accel 19, buttons 5/6/7.
+    // BT:  report 0x11, BT prefix is 2 bytes, payload starts at byte 3 → gyro 15, accel 21, buttons 7/8/9.
+    let (po, go, ao) = match buf[0] {
+        0x01 if buf.len() >= 25 => (1usize, 13, 19),
+        0x11 if buf.len() >= 77 => (3usize, 15, 21),
         _ => return None,
     };
+    let btn0 = buf[po + 4];
+    let btn1 = buf[po + 5];
+    let btn2 = buf[po + 6];
+    let dpad = btn0 & 0x0F;
+
+    // Populate the full input state from the raw report so the gilrs backend can
+    // OVERRIDE gilrs's WGI axis/button mapping (which mis-orders PS-family axes,
+    // landing L2/R2 where the right stick should be). DualSense already does this;
+    // without it, our emulated DS4 read-back falls through to the broken WGI path.
+    let ds = DualSenseState {
+        lx:  (buf[po]     as f32 - 128.0) / 128.0,
+        ly: -(buf[po + 1] as f32 - 128.0) / 128.0, // HID Y down → +Y up
+        rx:  (buf[po + 2] as f32 - 128.0) / 128.0,
+        ry: -(buf[po + 3] as f32 - 128.0) / 128.0,
+        l2: buf[po + 7] as f32 / 255.0,
+        r2: buf[po + 8] as f32 / 255.0,
+        btn_west:    btn0 & 0x10 != 0, // Square
+        btn_south:   btn0 & 0x20 != 0, // Cross
+        btn_east:    btn0 & 0x40 != 0, // Circle
+        btn_north:   btn0 & 0x80 != 0, // Triangle
+        btn_l1:      btn1 & 0x01 != 0,
+        btn_r1:      btn1 & 0x02 != 0,
+        btn_l2:      btn1 & 0x04 != 0,
+        btn_r2:      btn1 & 0x08 != 0,
+        btn_create:  btn1 & 0x10 != 0, // Share
+        btn_options: btn1 & 0x20 != 0,
+        btn_ls:      btn1 & 0x40 != 0,
+        btn_rs:      btn1 & 0x80 != 0,
+        btn_ps:      btn2 & 0x01 != 0,
+        dpad_up:    matches!(dpad, 0 | 1 | 7),
+        dpad_right: matches!(dpad, 1 | 2 | 3),
+        dpad_down:  matches!(dpad, 3 | 4 | 5),
+        dpad_left:  matches!(dpad, 5 | 6 | 7),
+    };
+
     let mut r = build(buf, go, ao, DS4_GYRO_DPS_PER_LSB, DS4_ACCEL_G_PER_LSB);
-    r.touchpad_click = buf[btn2] & 0x02 != 0;
+    // Note: DS4 has a physical touchpad, but parse_ds4 doesn't decode the touch
+    // points yet (different layout from DualSense), so leave has_touchpad=false —
+    // forwarding (0,0) would be worse than nothing. Touchpad fwd is deferred.
+    r.touchpad_click = btn2 & 0x02 != 0;
+    r.dualsense      = Some(ds);
     Some(r)
 }
 
@@ -1445,6 +1486,40 @@ fn preferred_interface(kind: &KindTag) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // parse_ds4 must populate `dualsense` so the gilrs backend's raw-HID override
+    // fires for DS4 the same way it does for DualSense. Without it, our emulated
+    // DS4 read-back falls through to gilrs's WGI axis mapping, which mis-orders the
+    // PS-family axes (L2/R2 land where the right stick should be) and scrambles the
+    // shoulder/menu/stick-click buttons. Regression guard for that asymmetry.
+    #[test]
+    fn parse_ds4_populates_override_state() {
+        // USB report 0x01, payload base 1. Build a 25-byte report:
+        //   [1]=LX [2]=LY [3]=RX [4]=RY [5]=btn0 [6]=btn1 [7]=btn2 [8]=L2 [9]=R2
+        let mut buf = [0u8; 25];
+        buf[0] = 0x01;
+        buf[1] = 255;   // LX full right → +1
+        buf[2] = 128;   // LY center
+        buf[3] = 128;   // RX center
+        buf[4] = 0;     // RY raw 0 → +1 after inversion (HID up)
+        buf[5] = 0x20 | 0x08; // btn0: Cross (bit5) + dpad nibble 8 (neutral)
+        buf[6] = 0x04 | 0x20; // btn1: L2 digital (bit2) + Options (bit5)
+        buf[7] = 0x01;  // btn2: PS
+        buf[8] = 255;   // L2 analog full
+        buf[9] = 0;     // R2 analog
+
+        let r = parse_ds4(&buf).expect("valid DS4 report");
+        let ds = r.dualsense.expect("DS4 must populate dualsense override state");
+        assert!((ds.lx - 1.0).abs() < 0.02, "LX full right, got {}", ds.lx);
+        assert!((ds.ly - 0.0).abs() < 0.02, "LY center, got {}", ds.ly);
+        assert!((ds.ry - 1.0).abs() < 0.02, "RY raw 0 → +1 (inverted), got {}", ds.ry);
+        assert!(ds.btn_south, "Cross/south set");
+        assert!(ds.btn_l2, "L2 digital set");
+        assert!(ds.btn_options, "Options set");
+        assert!(ds.btn_ps, "PS set");
+        assert!((ds.l2 - 1.0).abs() < 0.01, "L2 analog full");
+        assert!(!ds.btn_north && !ds.btn_east && !ds.btn_west, "no other faces");
+    }
 
     /// Reflected IEEE CRC32 of the empty input is 0 (the canonical identity).
     /// `dualsense_bt_crc32` mixes the 0xA2 seed byte first, so the result for
