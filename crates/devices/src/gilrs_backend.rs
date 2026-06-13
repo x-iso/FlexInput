@@ -59,6 +59,12 @@ pub struct GilrsBackend {
     /// Last signature of the enumerated pad set logged by the `FLEXINPUT_PAD_DIAG`
     /// diagnostic, so it prints only when the set changes (not every enumerate).
     diag_last_sig: Option<String>,
+    /// Cached own-virtual classification for PS-family pads, keyed by
+    /// `(vid, pid, vp_idx)`. Rebuilt by `refresh_virtual_classification()` during
+    /// `enumerate()` (which does the hidapi path lookup) and read without I/O by
+    /// `poll()` / `lookup_phys()` at full rate. See those methods for why the
+    /// HID instance path is the discriminator (gilrs name/uuid are unusable).
+    virt_cache: HashMap<(u16, u16, usize), bool>,
 }
 
 impl GilrsBackend {
@@ -75,6 +81,7 @@ impl GilrsBackend {
             event_counts: HashMap::new(),
             id_to_dev: HashMap::new(),
             diag_last_sig: None,
+            virt_cache: HashMap::new(),
         })
     }
 
@@ -95,6 +102,86 @@ impl GilrsBackend {
     }
 }
 
+/// Per-pad disposition resolved from cached classification via
+/// [`GilrsBackend::disposition_for`]. Replaces the old inline name-marker +
+/// ViGEm-count heuristic with a direct, path-based virtual/real decision.
+#[derive(Clone, Copy)]
+enum PadDisposition {
+    /// Keep this pad. `is_virt` = it's one of FlexInput's own emulated devices.
+    Keep { is_virt: bool },
+    /// Drop this pad: a ViGEmBus virtual (Xbox `IG_`) beyond the physical count,
+    /// which has no hidapi gamepad-interface path to classify directly.
+    Drop,
+}
+
+impl GilrsBackend {
+    /// Refresh the own-virtual classification cache for PS-family pads. Does the
+    /// expensive part (hidapi `refresh_devices` + per-instance path lookup) and
+    /// is therefore called only from `enumerate()` (every ~2 s), NOT from the
+    /// 500 Hz `poll()`. The cache maps `(vid, pid, vp_idx) → is_own_virtual`,
+    /// where `vp_idx` is the Nth-device index per VID/PID in gilrs walk order —
+    /// the same index the gyro layer uses, keeping them correlated.
+    ///
+    /// Structured in two passes so `self.gilrs` (immutably borrowed by the walk)
+    /// and `self.gyro` (mutably borrowed by the classifier) are never borrowed at
+    /// the same time.
+    fn refresh_virtual_classification(&mut self) {
+        // Pass 1: snapshot PS-family (vid, pid) per pad, assigning vp_idx — ends
+        // the gilrs borrow before the mutable gyro borrow below.
+        let mut keys: Vec<(u16, u16, usize)> = Vec::new();
+        let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
+        for (_, pad) in self.gilrs.gamepads() {
+            if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
+                let idx = *vp_idx.entry(vp).or_insert(0);
+                *vp_idx.get_mut(&vp).unwrap() += 1;
+                if is_ps_family(vp.0, vp.1) {
+                    keys.push((vp.0, vp.1, idx));
+                }
+            }
+        }
+        // Pass 2: classify each PS instance by HID path via the gyro layer.
+        self.virt_cache.clear();
+        for (vid, pid, idx) in keys {
+            let is_virt = self.gyro.is_own_virtual_instance(vid, pid, idx);
+            self.virt_cache.insert((vid, pid, idx), is_virt);
+        }
+    }
+
+    /// Per-pad disposition from cached state only (no I/O) — safe to call at
+    /// 500 Hz. `gilrs_seen` accumulates the per-VID/PID kept-count for the
+    /// ViGEm dedup; `vp_idx` accumulates the per-VID/PID running index for the
+    /// own-virtual cache lookup. Both are threaded through the caller's walk.
+    fn disposition_for(
+        &self,
+        vp: Option<(u16, u16)>,
+        vp_idx: &mut HashMap<(u16, u16), usize>,
+        gilrs_seen: &mut HashMap<(u16, u16), usize>,
+    ) -> PadDisposition {
+        let Some(vp) = vp else {
+            return PadDisposition::Keep { is_virt: false };
+        };
+        let idx = *vp_idx.entry(vp).or_insert(0);
+        *vp_idx.get_mut(&vp).unwrap() += 1;
+
+        // PS-family: own-virtual decided by cached HID-path classification.
+        if is_ps_family(vp.0, vp.1) {
+            let is_virt = self.virt_cache.get(&(vp.0, vp.1, idx)).copied().unwrap_or(false);
+            return PadDisposition::Keep { is_virt };
+        }
+
+        // Non-PS (Xbox/XInput/generic): legacy ViGEmBus count-dedup.
+        if *self.vigem_present.get(&vp).unwrap_or(&false) {
+            let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
+            let seen = gilrs_seen.entry(vp).or_insert(0);
+            if *seen >= phys {
+                return PadDisposition::Drop; // virtual ViGEm beyond real count
+            }
+            *seen += 1;
+        }
+        PadDisposition::Keep { is_virt: false }
+    }
+}
+
 impl DeviceBackend for GilrsBackend {
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
         puffin::profile_function!();
@@ -102,58 +189,64 @@ impl DeviceBackend for GilrsBackend {
             self.refresh_phys_counts();
         }
 
+        // Rebuild the own-virtual cache (does the hidapi path lookup) — only here,
+        // at the ~2 s enumerate cadence, not in the 500 Hz poll().
+        self.refresh_virtual_classification();
+
+        // Per-pad keep/virtual decision (path-based for PS devices, ViGEm-count
+        // dedup for Xbox). Snapshot VID/PID first (drops the gilrs borrow), then
+        // resolve dispositions from caches so it can't drift between walks.
+        let disp: Vec<PadDisposition> = {
+            let vps: Vec<Option<(u16, u16)>> = self
+                .gilrs
+                .gamepads()
+                .map(|(_, pad)| pad.vendor_id().zip(pad.product_id()))
+                .collect();
+            let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
+            let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
+            vps.into_iter()
+                .map(|vp| self.disposition_for(vp, &mut vp_idx, &mut gilrs_seen))
+                .collect()
+        };
+
         // One-shot pad-identity diagnostic (set FLEXINPUT_PAD_DIAG=1). Prints the
-        // raw gilrs view of every pad — `name()` (which on Windows is the USB
-        // product string via WGI DisplayName), VID/PID, and whether our marker
-        // matched — so we can see exactly what string an emulated pad presents.
+        // raw gilrs view of every pad — `name()` (the USB product string via WGI
+        // DisplayName on Windows), VID/PID, and the resolved own-virtual flag —
+        // so we can confirm the path-based classifier picked the right pad.
         // Logged only when the pad set changes, to honor the ≤1 Hz log policy.
         if std::env::var("FLEXINPUT_PAD_DIAG").is_ok() {
             let mut sig = String::new();
-            for (id, pad) in self.gilrs.gamepads() {
+            for (i, (id, pad)) in self.gilrs.gamepads().enumerate() {
+                let (keep, is_virt) = match disp.get(i) {
+                    Some(PadDisposition::Keep { is_virt }) => (true, *is_virt),
+                    _ => (false, false),
+                };
                 sig.push_str(&format!(
-                    "[{id:?}] name={:?} vid={:?} pid={:?} own_virtual={}\n",
+                    "[{id:?}] name={:?} vid={:?} pid={:?} keep={keep} own_virtual={is_virt}\n",
                     pad.name(),
                     pad.vendor_id().map(|v| format!("{v:04X}")),
                     pad.product_id().map(|p| format!("{p:04X}")),
-                    is_own_virtual(&pad),
                 ));
             }
             if self.diag_last_sig.as_deref() != Some(sig.as_str()) {
-                eprintln!("[pad-diag] marker={:?}\n{sig}", flexinput_core::VIRTUAL_DEVICE_NAME_MARKER);
+                eprintln!("[pad-diag]\n{sig}");
                 self.diag_last_sig = Some(sig);
             }
         }
 
-        let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut result = Vec::new();
 
-        for (_id, pad) in self.gilrs.gamepads() {
-            // Our OWN emulated HIDMaestro devices are identified by name marker and
-            // handled by gilrs_device_id (distinct `vN` instance) — skip the
-            // count-based ViGEm dedup for them (it would otherwise drop them as
-            // "extra beyond physical count", since has_vigem_for_vid_pid is true
-            // whenever any HIDMaestro device for that VID/PID exists).
-            if !is_own_virtual(&pad) {
-                if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
-                    // Only dedup when ViGEmBus is confirmed to have a virtual for this
-                    // VID/PID. Without that, SetupAPI's USB-format HW-ID search would
-                    // return 0 for Bluetooth devices and incorrectly drop them.
-                    if *self.vigem_present.get(&vp).unwrap_or(&false) {
-                        let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
-                        let seen = gilrs_seen.entry(vp).or_insert(0);
-                        if *seen >= phys {
-                            continue; // extra beyond physical count → ViGEmBus virtual
-                        }
-                        *seen += 1;
-                    }
-                }
-            }
+        for (i, (_id, pad)) in self.gilrs.gamepads().enumerate() {
+            let is_virt = match disp.get(i) {
+                Some(PadDisposition::Keep { is_virt }) => *is_virt,
+                _ => continue, // Drop (ViGEm virtual beyond real count) or missing
+            };
 
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
             let (dev_id, _inst, is_virt) =
-                gilrs_device_id(&pad, kind, &mut kind_seen, &mut virt_seen);
+                gilrs_device_id(is_virt, kind, &mut kind_seen, &mut virt_seen);
 
             let display_name = if kind == ControllerKind::Generic {
                 pad.name().to_string()
@@ -213,7 +306,6 @@ impl DeviceBackend for GilrsBackend {
         }
 
         let mut out = Vec::new();
-        let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
         // Track per-(VID,PID) instance index for gyro correlation.
@@ -221,6 +313,22 @@ impl DeviceBackend for GilrsBackend {
         // Rebuild the gilrs-id → device-id map this frame so event counts
         // can be resolved to per-device polling rates.
         self.id_to_dev.clear();
+
+        // Resolve per-pad dispositions from caches (no I/O) before the walk, so
+        // `disposition_for(&self)` doesn't conflict with `&mut self.id_to_dev`
+        // inside the loop. Uses the same cached classification enumerate() built.
+        let disp: Vec<PadDisposition> = {
+            let vps: Vec<Option<(u16, u16)>> = self
+                .gilrs
+                .gamepads()
+                .map(|(_, pad)| pad.vendor_id().zip(pad.product_id()))
+                .collect();
+            let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
+            let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
+            vps.into_iter()
+                .map(|vp| self.disposition_for(vp, &mut vp_idx, &mut gilrs_seen))
+                .collect()
+        };
 
         // Wrap the gamepads() walk in an explicit block so the profile
         // scope's RAII guard ends with the for loop — NOT with the function.
@@ -230,25 +338,17 @@ impl DeviceBackend for GilrsBackend {
         // for-loop closing brace, with an extra `}` to close this wrapper.
         {
         puffin::profile_scope!("gilrs_gamepads_walk");
-        for (gilrs_id, pad) in self.gilrs.gamepads() {
-            // Apply the same ViGEmBus filter as enumerate() so IDs stay in sync —
-            // but never to our own marked emulated devices (handled below).
-            if !is_own_virtual(&pad) {
-                if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
-                    if *self.vigem_present.get(&vp).unwrap_or(&false) {
-                        let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
-                        let seen = gilrs_seen.entry(vp).or_insert(0);
-                        if *seen >= phys {
-                            continue;
-                        }
-                        *seen += 1;
-                    }
-                }
-            }
+        for (i, (gilrs_id, pad)) in self.gilrs.gamepads().enumerate() {
+            // Keep/virtual decided up front (path-based for PS, ViGEm-count for
+            // Xbox) so IDs stay in sync with enumerate().
+            let is_virt = match disp.get(i) {
+                Some(PadDisposition::Keep { is_virt }) => *is_virt,
+                _ => continue, // Drop (ViGEm virtual beyond real count) or missing
+            };
 
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
             let (dev, inst, is_virt) =
-                gilrs_device_id(&pad, kind, &mut kind_seen, &mut virt_seen);
+                gilrs_device_id(is_virt, kind, &mut kind_seen, &mut virt_seen);
             self.id_to_dev.insert(usize::from(gilrs_id), dev.clone());
 
             // Record XInput slot: inst is the 0-based kind_seen index, which matches
@@ -552,31 +652,27 @@ impl DeviceBackend for GilrsBackend {
 }
 
 impl GilrsBackend {
-    /// Resolve a `gilrs:<kind>:<inst>` device id to the (vid, pid, instance index) tuple
-    /// that GyroManager keys its open HID handles by. Applies the same ViGEmBus filter
-    /// and kind-based instance counting as `enumerate()` / `poll()`.
+    /// Resolve a `gilrs:<kind>:<inst>` device id to the (vid, pid, instance index)
+    /// tuple that GyroManager keys its open HID handles by. Uses the same cached
+    /// keep/own-virtual disposition and per-VID/PID indexing as `enumerate()` /
+    /// `poll()`, so the gyro idx returned here matches the one those use. Read-
+    /// only (no I/O); relies on the cache `enumerate()` last refreshed.
     fn lookup_phys(&self, device_id: &str) -> Option<(u16, u16, usize)> {
-        let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
+        let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
+        let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();
+        // gyro idx counts kept pads per VID/PID (matches poll's `gyro_idx`).
         let mut vp_seen: HashMap<(u16, u16), usize> = HashMap::new();
         for (_id, pad) in self.gilrs.gamepads() {
-            if !is_own_virtual(&pad) {
-                if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
-                    if *self.vigem_present.get(&vp).unwrap_or(&false) {
-                        let phys = *self.phys_counts.get(&vp).unwrap_or(&0);
-                        let seen = gilrs_seen.entry(vp).or_insert(0);
-                        if *seen >= phys {
-                            continue;
-                        }
-                        *seen += 1;
-                    }
-                }
-            }
+            let vp = pad.vendor_id().zip(pad.product_id());
+            let is_virt = match self.disposition_for(vp, &mut vp_idx, &mut gilrs_seen) {
+                PadDisposition::Keep { is_virt } => is_virt,
+                PadDisposition::Drop => continue,
+            };
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
             let (dev, _inst, _is_virt) =
-                gilrs_device_id(&pad, kind, &mut kind_seen, &mut virt_seen);
-            let vp = pad.vendor_id().zip(pad.product_id());
+                gilrs_device_id(is_virt, kind, &mut kind_seen, &mut virt_seen);
             if dev == device_id {
                 let (v, p) = vp?;
                 let idx = *vp_seen.get(&(v, p)).unwrap_or(&0);
@@ -594,29 +690,30 @@ fn axis_val(pad: &gilrs::Gamepad, axis: Axis) -> f32 {
     pad.axis_data(axis).map_or(0.0, |d| d.value())
 }
 
-/// True if `pad` is one of FlexInput's OWN emulated HIDMaestro devices, detected
-/// by the marker we append to its Windows naming (see
-/// `flexinput_hidmaestro::orchestrator::NAME_MARKER`). gilrs reports the marked
-/// FriendlyName, so a real same-VID/PID controller (clean name) is excluded.
-/// This is the only reliable discriminator: a real and an emulated DualSense
-/// share VID/PID 054C:0CE6 and WGI exposes no per-instance device path.
-fn is_own_virtual(pad: &gilrs::Gamepad) -> bool {
-    pad.name().contains(flexinput_core::VIRTUAL_DEVICE_NAME_MARKER)
+/// True if this VID/PID is a PlayStation-family controller (DS4 / DualSense)
+/// that the gyro/HID layer opens by path and can therefore classify as
+/// virtual-vs-real directly. Switch Pro shares the same hidapi addressing but
+/// has no virtual counterpart (we don't emulate it), so it's harmless either
+/// way; including the PS PIDs is what matters for the own-virtual decision.
+fn is_ps_family(vid: u16, pid: u16) -> bool {
+    vid == 0x054C
+        && matches!(pid, 0x05C4 | 0x09CC | 0x0BA0 | 0x0CE6 | 0x0DF2)
 }
 
-/// Compute the stable `gilrs:` device id for a pad. Own emulated devices get a
-/// `v`-prefixed instance (`gilrs:dualsense:v0`) counted independently of real
-/// devices, so a real controller keeps a contiguous `gilrs:dualsense:0` index
-/// regardless of plug order — fixing the collision where the dedup dropped the
-/// real device when a virtual of the same model already existed. `kind_seen`
+/// Compute the stable `gilrs:` device id for a pad given its pre-computed
+/// own-virtual flag (from [`GilrsBackend::disposition_for`]). Own emulated devices
+/// get a `v`-prefixed instance (`gilrs:dualsense:v0`) counted independently of
+/// real devices, so a real controller keeps a contiguous `gilrs:dualsense:0`
+/// index regardless of plug order — fixing the collision where the dedup dropped
+/// the real device when a virtual of the same model already existed. `kind_seen`
 /// tracks real-device instances per kind; `virt_seen` tracks emulated ones.
 fn gilrs_device_id(
-    pad: &gilrs::Gamepad,
+    is_virt: bool,
     kind: ControllerKind,
     kind_seen: &mut std::collections::HashMap<ControllerKind, usize>,
     virt_seen: &mut std::collections::HashMap<ControllerKind, usize>,
 ) -> (String, usize, bool) {
-    if is_own_virtual(pad) {
+    if is_virt {
         let inst = *virt_seen.get(&kind).unwrap_or(&0);
         virt_seen.insert(kind, inst + 1);
         (format!("gilrs:{}:v{}", kind.id_slug(), inst), inst, true)

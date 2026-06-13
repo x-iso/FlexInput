@@ -319,9 +319,17 @@ impl GyroManager {
             .unwrap_or(0)
     }
 
-    fn open_device(&self, vid: u16, pid: u16, idx: usize) -> Option<HidEntry> {
-        let api = self.api.as_ref()?;
-        let kind_tag = classify(vid, pid)?;
+    /// Ordered device-info list for the Nth-device addressing scheme used
+    /// throughout this module: the gamepad interface for `(vid, pid)`, with the
+    /// same primary/fallback selection as [`open_device`]. Shared so the
+    /// virtual/real path classifier (`is_own_virtual_instance`) and `open_device`
+    /// index into an identical ordering and can never drift apart.
+    fn gamepad_device_list(&self, vid: u16, pid: u16) -> Vec<&hidapi::DeviceInfo> {
+        let api = match self.api.as_ref() {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        let kind_tag = classify(vid, pid);
 
         // Primary filter: usage_page + usage (correct, but returns 0 when HidHide
         // intercepts enumeration on Windows even for whitelisted apps).
@@ -338,15 +346,17 @@ impl GyroManager {
         // Fallback: if usage fields came back as 0 (HidHide / Windows quirk),
         // use known interface numbers for each controller instead.
         if paths.is_empty() {
-            let iface = preferred_interface(&kind_tag);
-            paths = api
-                .device_list()
-                .filter(|d| {
-                    d.vendor_id() == vid
-                        && d.product_id() == pid
-                        && d.interface_number() == iface
-                })
-                .collect();
+            if let Some(kind_tag) = &kind_tag {
+                let iface = preferred_interface(kind_tag);
+                paths = api
+                    .device_list()
+                    .filter(|d| {
+                        d.vendor_id() == vid
+                            && d.product_id() == pid
+                            && d.interface_number() == iface
+                    })
+                    .collect();
+            }
         }
 
         // Last resort: accept any interface with the right VID/PID (e.g. BT
@@ -357,6 +367,38 @@ impl GyroManager {
                 .filter(|d| d.vendor_id() == vid && d.product_id() == pid)
                 .collect();
         }
+        paths
+    }
+
+    /// True if the Nth physical device with this VID/PID is one of FlexInput's
+    /// OWN emulated HIDMaestro controllers, judged by its device instance path.
+    ///
+    /// This is the discriminator that finally works where the name/uuid markers
+    /// failed: gilrs's WGI backend reports a generic name ("HID-compliant game
+    /// controller") and a nil uuid for both a real and an emulated same-VID/PID
+    /// pad, but the underlying HID **instance path** differs — a real controller
+    /// enumerates as `HID\VID_054C&PID_0CE6&MI_..` (USB) or under `BTHENUM`,
+    /// while a HIDMaestro device is ROOT-enumerated and appears as
+    /// `HID\HIDCLASS\..` (its path has no `VID_`/`PID_` tokens). `idx` is the
+    /// same Nth-device index the gilrs walk derives per VID/PID, so the two
+    /// stay correlated. Returns false for non-PS devices and out-of-range idx.
+    pub fn is_own_virtual_instance(&mut self, vid: u16, pid: u16, idx: usize) -> bool {
+        // hidapi's cached list must be current or a freshly (un)plugged device
+        // would be mis-indexed; refresh is cheap relative to enumeration cadence.
+        if let Some(api) = self.api.as_mut() {
+            let _ = api.refresh_devices();
+        }
+        let paths = self.gamepad_device_list(vid, pid);
+        match paths.get(idx) {
+            Some(info) => instance_path_is_virtual(&info.path().to_string_lossy()),
+            None => false,
+        }
+    }
+
+    fn open_device(&self, vid: u16, pid: u16, idx: usize) -> Option<HidEntry> {
+        let api = self.api.as_ref()?;
+        let kind_tag = classify(vid, pid)?; // bail early for non-PS/Switch VID/PID
+        let paths = self.gamepad_device_list(vid, pid);
 
         #[cfg(debug_assertions)]
         eprintln!("[gyro] open_device vid={:04X} pid={:04X} idx={} iface={} path={:?}",
@@ -542,6 +584,26 @@ impl GyroManager {
             entry.last_sent_at = Some(now);
         }
     }
+}
+
+/// Classify a hidapi device instance path as a FlexInput-emulated (virtual)
+/// HIDMaestro device vs a real controller.
+///
+/// HIDMaestro devices are root-enumerated, so their HID PDO path looks like
+/// `\\?\HID#HIDCLASS#1&...` — note the `HIDCLASS` enumerator token and the
+/// absence of a `VID_xxxx&PID_xxxx` hardware token. A real USB controller's
+/// path is `\\?\HID#VID_054C&PID_0CE6&MI_03#...` and a Bluetooth one carries a
+/// `{bth-guid}` / `BTHENUM` segment. We key on the positive virtual signal
+/// (`HIDCLASS` without a `VID_` token) so a real device is never mis-flagged.
+fn instance_path_is_virtual(path: &str) -> bool {
+    let up = path.to_ascii_uppercase();
+    // Explicit HIDMaestro SWD form (belt-and-suspenders; the HID child usually
+    // shows as HIDCLASS rather than SWD\HIDMAESTRO).
+    if up.contains("HIDMAESTRO") {
+        return true;
+    }
+    // Root-enumerated HID child: HIDCLASS enumerator and no real USB VID token.
+    up.contains("HIDCLASS") && !up.contains("VID_")
 }
 
 fn hid_write(device: &HidDevice, data: &[u8]) {
@@ -1577,6 +1639,29 @@ mod tests {
         let usb = build_dualsense_usb_out(&out);
         assert_eq!(usb[3], 0xAA, "motor_right (rumble_weak) at USB byte 3");
         assert_eq!(usb[4], 0xBB, "motor_left  (rumble_strong) at USB byte 4");
+    }
+
+    /// The own-virtual discriminator: a root-enumerated HIDMaestro device's HID
+    /// instance path (`HIDCLASS`, no `VID_` token) is virtual; a real USB or BT
+    /// controller path (which carries `VID_`) is not. This is what replaced the
+    /// failed name/uuid markers — gilrs reports a generic name and nil uuid for
+    /// both a real and an emulated same-VID/PID pad, but their HID paths differ.
+    #[test]
+    fn instance_path_classifies_virtual_vs_real() {
+        // Real DualSense (USB) — from FLEXINPUT_PAD_DIAG on the target machine.
+        assert!(!instance_path_is_virtual(
+            r"\\?\HID#VID_054C&PID_0CE6&MI_03#7&2fc679c4&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
+        // Emulated DualSense / DS4 (root-enumerated HIDMaestro child).
+        assert!(instance_path_is_virtual(
+            r"\\?\HID#HIDCLASS#1&2d595ca7&45&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
+        // Explicit HIDMaestro SWD form is also virtual.
+        assert!(instance_path_is_virtual(r"\\?\HID#SWD\HIDMAESTRO\0001#..."));
+        // A real Bluetooth controller path (carries VID_) must NOT be virtual.
+        assert!(!instance_path_is_virtual(
+            r"\\?\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&02054C_PID&0CE6#..."
+        ));
     }
 
     /// Sanity-check the CRC32 routine against a known-good vector. The reflected

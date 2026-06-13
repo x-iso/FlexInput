@@ -22,12 +22,6 @@ use std::ffi::c_void;
 
 use crate::profile::Profile;
 
-/// Re-export of the shared marker appended to a virtual device's Windows naming
-/// so FlexInput can recognize its own emulated pad (see
-/// [`flexinput_core::VIRTUAL_DEVICE_NAME_MARKER`]). Defined in `core` so the
-/// input-enumeration side (`flexinput-devices`) shares one definition.
-pub use flexinput_core::VIRTUAL_DEVICE_NAME_MARKER as NAME_MARKER;
-
 /// HID class GUID — every virtual controller is created in this class.
 /// `{745a17a0-74d3-11d0-b6fe-00a0c90f57da}` (verbatim from DeviceNodeCreator).
 const HID_CLASS_GUID: Guid = Guid {
@@ -673,15 +667,14 @@ fn write_instance_config(profile: &Profile, controller_index: u32, device_id: &s
     let _ = write_dword(HKLM, &path, "ProductId", profile.pid as u32);
     let _ = write_dword(HKLM, &path, "VersionNumber", profile.version_number);
     if let Some(ps) = profile.product_string.as_deref() {
-        // Append the own-virtual marker to the USB product string. This is the
-        // ONLY device-supplied field gilrs's WGI backend surfaces (via
-        // RawGameController.DisplayName → `pad.name()`), so it's the only place a
-        // marker reliably reaches the input enumerator to tell our emulated pad
-        // apart from a real same-VID/PID controller. The Windows FriendlyName /
-        // DeviceDesc stay clean (WGI ignores them). The driver reads this value
-        // and reports it as the HID product string descriptor.
-        let marked = format!("{ps}{NAME_MARKER}");
-        let _ = write_string(HKLM, &path, "ProductString", &marked);
+        // Clean product string ("Wireless Controller") so games see a faithful
+        // DualSense/DS4. We do NOT mark it: the input enumerator distinguishes our
+        // own emulated pad from a real same-VID/PID one by HID *instance path*
+        // (root-enumerated `HID\HIDCLASS\..` vs `HID\VID_..`), not by any string —
+        // gilrs's WGI backend reports a generic name and nil uuid for both, and
+        // even the product string comes back as the generic class name, so no
+        // string marker reaches it. See `gyro::is_own_virtual_instance`.
+        let _ = write_string(HKLM, &path, "ProductString", ps);
     }
     if profile.input_report_size > 0 {
         let _ = write_dword(HKLM, &path, "InputReportByteLength", profile.input_report_size as u32);
