@@ -56,6 +56,9 @@ pub struct GilrsBackend {
     /// `poll()` so the I/O thread can convert event counts to per-device
     /// rates.
     id_to_dev: HashMap<usize, String>,
+    /// Last signature of the enumerated pad set logged by the `FLEXINPUT_PAD_DIAG`
+    /// diagnostic, so it prints only when the set changes (not every enumerate).
+    diag_last_sig: Option<String>,
 }
 
 impl GilrsBackend {
@@ -71,6 +74,7 @@ impl GilrsBackend {
             xinput_rumble: HashMap::new(),
             event_counts: HashMap::new(),
             id_to_dev: HashMap::new(),
+            diag_last_sig: None,
         })
     }
 
@@ -96,6 +100,28 @@ impl DeviceBackend for GilrsBackend {
         puffin::profile_function!();
         if self.phys_counts_at.elapsed() > Duration::from_secs(2) {
             self.refresh_phys_counts();
+        }
+
+        // One-shot pad-identity diagnostic (set FLEXINPUT_PAD_DIAG=1). Prints the
+        // raw gilrs view of every pad — `name()` (which on Windows is the USB
+        // product string via WGI DisplayName), VID/PID, and whether our marker
+        // matched — so we can see exactly what string an emulated pad presents.
+        // Logged only when the pad set changes, to honor the ≤1 Hz log policy.
+        if std::env::var("FLEXINPUT_PAD_DIAG").is_ok() {
+            let mut sig = String::new();
+            for (id, pad) in self.gilrs.gamepads() {
+                sig.push_str(&format!(
+                    "[{id:?}] name={:?} vid={:?} pid={:?} own_virtual={}\n",
+                    pad.name(),
+                    pad.vendor_id().map(|v| format!("{v:04X}")),
+                    pad.product_id().map(|p| format!("{p:04X}")),
+                    is_own_virtual(&pad),
+                ));
+            }
+            if self.diag_last_sig.as_deref() != Some(sig.as_str()) {
+                eprintln!("[pad-diag] marker={:?}\n{sig}", flexinput_core::VIRTUAL_DEVICE_NAME_MARKER);
+                self.diag_last_sig = Some(sig);
+            }
         }
 
         let mut gilrs_seen: HashMap<(u16, u16), usize> = HashMap::new();

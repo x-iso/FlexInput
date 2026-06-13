@@ -510,20 +510,17 @@ pub fn create_device_node(
         set_bus_type_usb(&instance_id);
 
         // Friendly name on root + HID child (e.g. "Wireless Controller") so the
-        // device doesn't show as a generic "HID-compliant game controller". We
-        // append a marker (`NAME_MARKER`) so FlexInput can tell its OWN emulated
-        // pad apart from a real same-VID/PID controller — Windows/gilrs can't
-        // distinguish them otherwise (identical VID/PID, no instance path via
-        // WGI), which made the dedup drop the real device. The USB *product*
-        // string stays clean ("Wireless Controller") so games still see a
-        // faithful DualSense/DS4 — only the Windows naming carries the marker.
-        let base_name = profile
+        // device doesn't show as a generic "HID-compliant game controller".
+        // This is the Windows DeviceDesc/FriendlyName and is kept CLEAN — gilrs's
+        // WGI backend does NOT read it (it reads the USB product string via
+        // RawGameController.DisplayName), so the own-virtual marker lives on the
+        // product string instead (see `write_instance_config`), not here.
+        let display_name = profile
             .device_description
             .as_deref()
             .or(profile.product_string.as_deref())
             .unwrap_or(&profile.name);
-        let display_name = format!("{base_name}{NAME_MARKER}");
-        set_all_naming_properties(&instance_id, &display_name);
+        set_all_naming_properties(&instance_id, display_name);
 
         // Block until the driver has actually started on the HID child, so the
         // app's first writes land on a listening driver (else the device looks
@@ -676,7 +673,15 @@ fn write_instance_config(profile: &Profile, controller_index: u32, device_id: &s
     let _ = write_dword(HKLM, &path, "ProductId", profile.pid as u32);
     let _ = write_dword(HKLM, &path, "VersionNumber", profile.version_number);
     if let Some(ps) = profile.product_string.as_deref() {
-        let _ = write_string(HKLM, &path, "ProductString", ps);
+        // Append the own-virtual marker to the USB product string. This is the
+        // ONLY device-supplied field gilrs's WGI backend surfaces (via
+        // RawGameController.DisplayName → `pad.name()`), so it's the only place a
+        // marker reliably reaches the input enumerator to tell our emulated pad
+        // apart from a real same-VID/PID controller. The Windows FriendlyName /
+        // DeviceDesc stay clean (WGI ignores them). The driver reads this value
+        // and reports it as the HID product string descriptor.
+        let marked = format!("{ps}{NAME_MARKER}");
+        let _ = write_string(HKLM, &path, "ProductString", &marked);
     }
     if profile.input_report_size > 0 {
         let _ = write_dword(HKLM, &path, "InputReportByteLength", profile.input_report_size as u32);
