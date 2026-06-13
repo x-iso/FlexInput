@@ -113,6 +113,8 @@ pub mod button {
     pub const RIGHT_STICK: u32 = 1 << 9; // R3
     pub const GUIDE: u32 = 1 << 10; // PS
     pub const TOUCHPAD: u32 = 1 << 11;
+    pub const LT_DIGITAL: u32 = 1 << 12; // L2 digital click
+    pub const RT_DIGITAL: u32 = 1 << 13; // R2 digital click
 }
 
 /// HID usage (page 0x01 Generic Desktop) for the standard axes.
@@ -414,6 +416,21 @@ impl PinState {
             "accel_x" => self.accel_x = f,
             "accel_y" => self.accel_y = f,
             "accel_z" => self.accel_z = f,
+            // Digital L2/R2: set the descriptor's digital-trigger button bit. A
+            // real DS4 also drives the analog axis to full on a digital press, so
+            // mirror it to the analog trigger *only* when no analog source already
+            // drove it (the AutoMap digital→analog bridge, or a real analog
+            // trigger, sets `lt`/`rt` first). Without the mirror a digital-only
+            // upstream (Switch Pro ZL/ZR) would click the button but leave the
+            // analog axis at rest.
+            "btn_lt_dig" => {
+                if b { self.buttons |= button::LT_DIGITAL; } else { self.buttons &= !button::LT_DIGITAL; }
+                if b && self.lt == 0.0 { self.lt = 1.0; }
+            }
+            "btn_rt_dig" => {
+                if b { self.buttons |= button::RT_DIGITAL; } else { self.buttons &= !button::RT_DIGITAL; }
+                if b && self.rt == 0.0 { self.rt = 1.0; }
+            }
             _ => {
                 if let Some(bit) = ds_button_bit(pin) {
                     if b {
@@ -482,6 +499,51 @@ mod tests {
 
     fn ds4() -> Profile {
         Profile::from_json(DUALSHOCK_4_V2_JSON).unwrap()
+    }
+
+    // Switch Pro → DS4 over AutoMap drives the DS4 sink's digital trigger pins
+    // (`btn_lt_dig`/`btn_rt_dig`) because Switch Pro's ZL/ZR are digital-only.
+    // The DS4 descriptor carries an L2/R2 *digital* button bit (descriptor button
+    // 6/7 → byte 6 bits 2/3) AND a separate L2/R2 *analog* axis (byte 8/9). A real
+    // pad asserts both on a full press, so the virtual one must too — otherwise the
+    // press lands on neither (the dead-end this guards against).
+    #[test]
+    fn ds4_digital_triggers_set_button_bit_and_analog() {
+        let p = ds4();
+        let neutral = encode_report(&p, &GamepadState::neutral());
+
+        let mut ps = PinState::new();
+        ps.set("btn_lt_dig", 0.0, true);
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(rep[6] & 0x04, 0x04, "L2 digital → byte6 bit2");
+        assert_eq!(rep[8], 0xff, "L2 digital mirrors analog L2 → byte8 full");
+
+        let mut ps = PinState::new();
+        ps.set("btn_rt_dig", 0.0, true);
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(rep[6] & 0x08, 0x08, "R2 digital → byte6 bit3");
+        assert_eq!(rep[9], 0xff, "R2 digital mirrors analog R2 → byte9 full");
+
+        // Released digital trigger leaves both at rest.
+        let mut ps = PinState::new();
+        ps.set("btn_lt_dig", 0.0, false);
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(rep[6], neutral[6], "released → byte6 unchanged");
+        assert_eq!(rep[8], neutral[8], "released → analog L2 at rest");
+    }
+
+    // When a real analog trigger value is present, the digital press must NOT
+    // clobber it — the analog source wins, the digital bit still asserts.
+    #[test]
+    fn ds4_analog_trigger_survives_digital_press() {
+        let p = ds4();
+        let mut ps = PinState::new();
+        ps.set("left_trigger", 0.5, true); // real analog half-press
+        ps.set("btn_lt_dig", 0.0, true);   // digital also pressed
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(rep[6] & 0x04, 0x04, "digital bit still set");
+        // 0.5 over [0,255] → ~127/128, not 255.
+        assert!((rep[8] as i32 - 128).abs() <= 2, "analog half-press preserved, got {}", rep[8]);
     }
 
     #[test]
