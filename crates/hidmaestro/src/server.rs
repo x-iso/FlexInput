@@ -282,6 +282,17 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
             ),
             Err(e) => (Response::err(format!("driver install failed: {e}")), false),
         },
+        Request::ReinstallDriver => {
+            // Live nodes can pin the driver and make /delete-driver fail, so tear
+            // them all down first (the app re-creates them after this returns).
+            state.teardown_tracked();
+            let n = remove_all_hidmaestro_devices();
+            diag_log(&format!("[helper] reinstall: removed {n} device(s) before driver swap"));
+            match crate::deploy::reinstall_driver_force() {
+                Ok(()) => (Response::Ok { detail: Some("driver reinstalled".into()) }, false),
+                Err(e) => (Response::err(format!("driver reinstall failed: {e}")), false),
+            }
+        }
         Request::Create { device_id, profile_json, index_hint } => {
             (handle_create(&device_id, &profile_json, index_hint, state), false)
         }

@@ -29,6 +29,12 @@ pub enum Request {
     Ping,
     /// Ensure the HIDMaestro driver is installed (idempotent).
     EnsureDriver,
+    /// Force a clean driver reinstall: remove every installed HIDMaestro package
+    /// then install fresh. Tears down all live HIDMaestro device nodes first (a
+    /// bound driver can refuse removal). Unlike `EnsureDriver` this runs even
+    /// when the driver is already present — the "Reinstall drivers" recovery
+    /// path. The app re-creates its devices afterward.
+    ReinstallDriver,
     /// Create (or reclaim) a virtual device for `device_id` from `profile_json`.
     /// The helper allocates a **globally-unique** controller index — the app no
     /// longer guesses one (different device kinds previously both passed index 0

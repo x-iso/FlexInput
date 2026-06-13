@@ -1,5 +1,6 @@
 mod app;
 mod canvas;
+mod device_ops;
 mod easy;
 mod gamepad_nav;
 mod kbm_picker;

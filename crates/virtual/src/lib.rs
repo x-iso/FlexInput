@@ -70,6 +70,18 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
     panic!("No virtual devices on this platform: {kind_id} #{instance}")
 }
 
+/// Static pin metadata (sink pins, source pins, display name) for a kind without
+/// building the device or touching any OS resource. Lets the UI add a canvas
+/// sink node instantly; the device itself is built asynchronously and installed
+/// into the pool by the device-ops worker. `None` for an unknown kind.
+#[cfg(windows)]
+pub fn kind_pin_metadata(
+    kind_id: &str,
+    instance: usize,
+) -> Option<(&'static [SinkPin], &'static [SourcePin], String)> {
+    windows::kind_pin_metadata(kind_id, instance)
+}
+
 /// Best-effort: extract the kind prefix (e.g. "virtual.xinput") from a
 /// full device id like "virtual.xinput.2". Used by the UI to identify
 /// FlexInput's own virtuals when filtering the physical-devices list.

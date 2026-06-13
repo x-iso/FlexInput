@@ -83,6 +83,46 @@ pub fn ensure_driver_installed() -> Result<bool, DeployError> {
     Ok(true)
 }
 
+/// Force a clean reinstall: remove every installed HIDMaestro driver package
+/// from the DriverStore, then run a fresh install. Unlike
+/// [`ensure_driver_installed`] this does NOT short-circuit when the driver is
+/// present — it's the "Reinstall drivers" path for recovering from a corrupt or
+/// mismatched package. **Requires elevation.** Callers must tear down any live
+/// virtual device nodes first (a bound driver can refuse removal).
+///
+/// Returns `Ok(())` on a verified fresh install. The uninstall step is
+/// best-effort (a package that's already gone, or pinned by a node we missed, is
+/// logged-but-not-fatal); the post-install DriverStore check is authoritative.
+pub fn reinstall_driver_force() -> Result<(), DeployError> {
+    uninstall_all_hidmaestro_packages();
+    // Re-add the cert + INFs unconditionally (the cert add is idempotent).
+    trust_signer_cert()?;
+    let dir = stage_payload()?;
+    install_inf(&dir.join("hidmaestro.inf"))?;
+    install_inf(&dir.join("hidmaestro_xusb.inf"))?;
+    if !hidmaestro_available() {
+        return Err(DeployError::InstallUnverified);
+    }
+    Ok(())
+}
+
+/// `pnputil /delete-driver <oemNN.inf> /uninstall /force` for every published
+/// HIDMaestro package. Best-effort: discovers the published `oemNN.inf` names by
+/// scanning `%SystemRoot%\INF` (same content sniff as `installed_inf_path`) and
+/// deletes each. Errors are swallowed — a missing/locked package shouldn't abort
+/// the reinstall (the post-install verify catches a real failure).
+fn uninstall_all_hidmaestro_packages() {
+    let pnputil = system32().join("pnputil.exe");
+    for inf in crate::install::installed_inf_names() {
+        let _ = std::process::Command::new(&pnputil)
+            .arg("/delete-driver")
+            .arg(&inf)
+            .arg("/uninstall")
+            .arg("/force")
+            .status();
+    }
+}
+
 /// Stage the embedded driver payload into a temp dir and return it. pnputil
 /// needs the INF, its referenced DLL, and the `.cat` to sit together.
 fn stage_payload() -> Result<PathBuf, DeployError> {

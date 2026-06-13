@@ -168,6 +168,19 @@ pub fn ensure_driver() -> Result<(), HelperError> {
     }
 }
 
+/// Force a clean driver reinstall via the helper (delete every HIDMaestro
+/// package, then install fresh). The helper tears down all live device nodes
+/// first; the caller must re-create its devices afterward. Blocking — run off
+/// the UI thread (see `device_ops`). One UAC if the helper isn't already up.
+pub fn reinstall_driver() -> Result<(), HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    match call(&mut m, &Request::ReinstallDriver)? {
+        Response::Ok { .. } => Ok(()),
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to ReinstallDriver".into())),
+    }
+}
+
 /// Create (or reclaim) a device for `device_id` from `profile_json` via the
 /// helper. The helper allocates a globally-unique controller index (or returns
 /// the existing one if `device_id` is already present). `index_hint` is the

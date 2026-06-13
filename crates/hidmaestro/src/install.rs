@@ -67,6 +67,31 @@ pub fn installed_inf_path() -> Option<PathBuf> {
     None
 }
 
+/// All published HIDMaestro OEM INF **names** (e.g. `["oem83.inf",
+/// "oem84.inf"]`) found under `%SystemRoot%\INF`. These are the names
+/// `pnputil /delete-driver <name> /uninstall` expects (not full paths). Used by
+/// the force-reinstall path to remove every installed package. Empty when none
+/// are present.
+pub fn installed_inf_names() -> Vec<String> {
+    let inf_dir = windir().join("INF");
+    let Ok(entries) = std::fs::read_dir(&inf_dir) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file = entry.file_name();
+        let lower = file.to_string_lossy().to_ascii_lowercase();
+        if !(lower.starts_with("oem") && lower.ends_with(".inf")) {
+            continue;
+        }
+        if inf_is_hidmaestro(&path) {
+            names.push(file.to_string_lossy().into_owned());
+        }
+    }
+    names
+}
+
 /// Cheap content sniff: an INF belongs to HIDMaestro if its (ASCII-ish) text
 /// mentions the provider/driver. INF files are small; a substring scan is fine.
 fn inf_is_hidmaestro(path: &Path) -> bool {

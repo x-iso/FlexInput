@@ -1307,39 +1307,64 @@ impl Canvas {
         default_collapsed: bool,
         defaults: DeviceParamDefaults,
     ) {
+        self.add_virtual_sink_static(
+            device.id(),
+            &device.display_name().to_string(),
+            device.sink_pins(),
+            device.source_pins(),
+            default_collapsed,
+            defaults,
+        );
+    }
+
+    /// Add a virtual-device sink node from static pin metadata, without needing a
+    /// live `VirtualDevice` instance. Lets the UI place the node immediately while
+    /// the device itself is built asynchronously by the device-ops worker (whose
+    /// result lands in the shared pool). No-op if a node for `device_id` already
+    /// exists. `sink_pins`/`source_pins` are the kind's static layouts (see
+    /// `flexinput_virtual::kind_pin_metadata`).
+    pub fn add_virtual_sink_static(
+        &mut self,
+        device_id: &str,
+        display_name: &str,
+        sink_pins: &[SinkPin],
+        source_pins: &[SourcePin],
+        default_collapsed: bool,
+        defaults: DeviceParamDefaults,
+    ) {
         let already_present = self.snarl.nodes_ids_data().any(|(_, n)| {
             n.value.module_id == "device.sink"
-                && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(device.id())
+                && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(device_id)
         });
         if already_present { return; }
 
-        let fixed_count = device.sink_pins().len();
-        let inputs = device.sink_pins().iter()
+        let fixed_count = sink_pins.len();
+        let inputs = sink_pins.iter()
             .map(|p: &SinkPin| PinDescriptor::new(p.display_name, p.signal_type))
             .collect();
-        let outputs = device.source_pins().iter()
+        let outputs = source_pins.iter()
             .map(|p: &SourcePin| PinDescriptor::new(p.display_name, p.signal_type))
             .collect();
 
         let mut params = HashMap::new();
-        params.insert("device_id".to_string(), Value::String(device.id().to_string()));
+        params.insert("device_id".to_string(), Value::String(device_id.to_string()));
         params.insert("fixed_input_count".to_string(), Value::Number(fixed_count.into()));
         params.insert("input_pin_ids".to_string(), Value::Array(
-            device.sink_pins().iter().map(|p| Value::String(p.id.to_string())).collect(),
+            sink_pins.iter().map(|p| Value::String(p.id.to_string())).collect(),
         ));
         params.insert("output_pin_ids".to_string(), Value::Array(
-            device.source_pins().iter().map(|p| Value::String(p.id.to_string())).collect(),
+            source_pins.iter().map(|p| Value::String(p.id.to_string())).collect(),
         ));
         // Mouse sensitivity is keymouse-only; harmless on other virtual sinks
         // since their header doesn't surface a slider for it.
-        if device.id().starts_with("virtual.keymouse") {
+        if device_id.starts_with("virtual.keymouse") {
             params.insert("mouse_sensitivity".to_string(),
                 Value::from(defaults.mouse_sensitivity as f64));
         }
 
         let node = NodeData {
             module_id: "device.sink".to_string(),
-            display_name: device.display_name().to_string(),
+            display_name: display_name.to_string(),
             category: "Device".to_string(),
             inputs,
             outputs,

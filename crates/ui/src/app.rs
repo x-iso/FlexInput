@@ -309,43 +309,94 @@ fn own_virtual_kind(dev_id: &str) -> Option<flexinput_devices::ControllerKind> {
 /// `needed_ids` that doesn't already exist. Pre-existing devices are
 /// reused — never duplicated. Devices the pool has but `needed_ids`
 /// doesn't list are left alone (pruning is a separate operation).
+/// Enqueue async `Create` ops for any needed device id that isn't already in the
+/// pool and isn't already in flight. Non-blocking: the worker builds each device
+/// (blocking helper IPC happens there) and the UI installs it into `pool` when
+/// the result arrives (see `drain_device_op_results`). `pending` tracks in-flight
+/// ids so we never enqueue a duplicate before the first lands.
 fn reconcile_shared_devices(
-    pool: &mut Vec<Box<dyn VirtualDevice>>,
+    pool: &Mutex<Vec<Box<dyn VirtualDevice>>>,
+    pending: &mut HashSet<String>,
+    failed: &HashSet<String>,
+    tx: &std::sync::mpsc::Sender<crate::device_ops::DeviceOp>,
     needed_ids: &[String],
 ) {
+    let existing: HashSet<String> = {
+        let pool = pool.lock().unwrap();
+        pool.iter().map(|d| d.id().to_string()).collect()
+    };
     for id in needed_ids {
-        if !pool.iter().any(|d| d.id() == id.as_str()) {
-            if let Some(dev) = try_create_virtual_device(id) {
-                pool.push(dev);
-            }
+        // Skip what's already built, in flight, or known-failed (failed ids are
+        // only retried after the node is removed + re-added — see drain).
+        if existing.contains(id) || pending.contains(id) || failed.contains(id) {
+            continue;
+        }
+        // Only enqueue ids we can actually build (known kinds).
+        if try_create_virtual_device_known(id) {
+            pending.insert(id.clone());
+            let _ = tx.send(crate::device_ops::DeviceOp::Create { device_id: id.clone() });
         }
     }
 }
 
-/// Drop devices from the shared pool whose id is not referenced by any
-/// open tab's canvas. Called after closing a tab. Returns the dropped ids
-/// (informational).
-fn prune_shared_devices(
-    pool: &mut Vec<Box<dyn VirtualDevice>>,
+/// True if `id` names a known virtual device kind (mirrors the kind/instance
+/// split in `try_create_virtual_device` without building anything).
+fn try_create_virtual_device_known(id: &str) -> bool {
+    let kind_id = match id.rfind('.') {
+        Some(dot) => match id[dot + 1..].parse::<usize>() {
+            Ok(_) => &id[..dot],
+            Err(_) => id,
+        },
+        None => id,
+    };
+    flexinput_virtual::available_device_kinds()
+        .iter()
+        .any(|k| k.kind_id == kind_id)
+}
+
+/// Remove devices from the shared pool whose id is not referenced by any open
+/// tab's canvas, and **return the removed `Box`es** so the caller can drop them
+/// off the UI thread (a HIDMaestro device's `Drop` calls `helper::destroy`,
+/// which blocks). Called after closing a tab / reloading a workspace. The pool
+/// lock is acquired internally and released before returning.
+fn take_unreferenced_devices(
+    pool: &Mutex<Vec<Box<dyn VirtualDevice>>>,
     tabs: &[PatchTab],
-) -> Vec<String> {
+) -> Vec<Box<dyn VirtualDevice>> {
     let mut keep: HashSet<String> = HashSet::new();
     for tab in tabs {
         for id in snarl_virtual_device_ids(&tab.canvas.snarl) {
             keep.insert(id);
         }
     }
-    let mut dropped = Vec::new();
-    pool.retain(|d| {
-        let id = d.id().to_string();
-        if keep.contains(&id) {
-            true
+    let mut pool = pool.lock().unwrap();
+    let mut removed = Vec::new();
+    let mut i = 0;
+    while i < pool.len() {
+        if keep.contains(pool[i].id()) {
+            i += 1;
         } else {
-            dropped.push(id);
-            false
+            removed.push(pool.remove(i));
         }
-    });
-    dropped
+    }
+    removed
+}
+
+/// Take every device no longer referenced by the open tabs out of the pool and
+/// hand it to the worker for off-thread teardown (so `helper::destroy` doesn't
+/// block the UI). Also clears any matching in-flight `pending` create. No-op
+/// when nothing needs removing.
+fn prune_devices_async(
+    pool: &Mutex<Vec<Box<dyn VirtualDevice>>>,
+    pending: &mut HashSet<String>,
+    tx: &std::sync::mpsc::Sender<crate::device_ops::DeviceOp>,
+    tabs: &[PatchTab],
+) {
+    for dev in take_unreferenced_devices(pool, tabs) {
+        let device_id = dev.id().to_string();
+        pending.remove(&device_id);
+        let _ = tx.send(crate::device_ops::DeviceOp::Destroy { device_id, device: dev });
+    }
 }
 
 // ── Sub-patch editor windows ──────────────────────────────────────────────────
@@ -444,6 +495,22 @@ pub struct FlexInputApp {
     /// Membership is reconciled on workspace restore, patch load, and tab
     /// close (pruning).
     shared_virtual_devices: SharedDevicePool,
+    /// Background worker for blocking device lifecycle ops (create / destroy /
+    /// driver reinstall). Keeps the elevated-helper IPC off the UI thread so the
+    /// app never freezes during device deploy/remove/install. See `device_ops`.
+    device_ops: crate::device_ops::DeviceOpHandle,
+    /// Device ids with an in-flight `Create` on the worker — so `reconcile`
+    /// doesn't enqueue a duplicate before the first one lands in the pool.
+    pending_device_ids: HashSet<String>,
+    /// Device ids whose last `Create` failed — suppresses the per-frame reconcile
+    /// from retrying every frame (which would spam the worker). Cleared when the
+    /// device's canvas node goes away, so removing + re-adding retries.
+    failed_device_ids: HashSet<String>,
+    /// Set when the "Reinstall HIDMaestro drivers" button is clicked; shows the
+    /// confirm dialog. Cleared on confirm/cancel.
+    reinstall_confirm_open: bool,
+    /// Last device-op error, shown briefly in Settings. Cleared on next op.
+    last_device_op_error: Option<String>,
     /// Set of virtual device IDs referenced by the *active tab's* canvas.
     /// The I/O thread routes signals only to devices whose id is in this
     /// set; devices owned by background tabs receive `reset_outputs()` each
@@ -749,11 +816,26 @@ impl FlexInputApp {
         // instance per device id).
         let shared_virtual_devices: SharedDevicePool =
             Arc::new(Mutex::new(Vec::<Box<dyn VirtualDevice>>::new()));
+
+        // Background worker for device lifecycle ops — spawned before the first
+        // reconcile so even startup device creation runs off the UI thread (the
+        // window appears immediately; pads pop in as the worker finishes them).
+        let device_ops = crate::device_ops::spawn(cc.egui_ctx.clone());
+        let mut pending_device_ids: HashSet<String> = HashSet::new();
         {
-            let mut pool = shared_virtual_devices.lock().unwrap();
+            // Enqueue (don't build inline) every device the restored tabs need.
+            let mut needed: Vec<String> = Vec::new();
             for tab in &tabs {
-                let ids = snarl_virtual_device_ids(&tab.canvas.snarl);
-                reconcile_shared_devices(&mut pool, &ids);
+                for id in snarl_virtual_device_ids(&tab.canvas.snarl) {
+                    if !needed.contains(&id) {
+                        needed.push(id);
+                    }
+                }
+            }
+            for id in needed {
+                if pending_device_ids.insert(id.clone()) {
+                    let _ = device_ops.tx.send(crate::device_ops::DeviceOp::Create { device_id: id });
+                }
             }
         }
 
@@ -882,6 +964,11 @@ impl FlexInputApp {
             proc_device_signals,
             proc_outputs,
             shared_virtual_devices,
+            device_ops,
+            pending_device_ids,
+            failed_device_ids: HashSet::new(),
+            reinstall_confirm_open: false,
+            last_device_op_error: None,
             active_tab_device_ids,
             io_bypass,
             ui_nav_suppress,
@@ -950,6 +1037,11 @@ impl eframe::App for FlexInputApp {
             settings::save_settings(&self.settings);
             crate::relaunch_self_and_exit();
         }
+
+        // ── Apply finished device-ops worker results ─────────────────────
+        // Pushes freshly-built virtual devices into the shared pool (and clears
+        // in-flight markers). Done before anything reads the pool this frame.
+        self.drain_device_op_results();
 
         // ── Visibility / focus state ────────────────────────────────────
         // Tracked here, consumed by the repaint-scheduling code at the
@@ -1868,6 +1960,10 @@ impl eframe::App for FlexInputApp {
         self.draw_gp_settings_panel(ctx);
         self.draw_kbm_picker(ctx);
         self.draw_press_mode_picker(ctx);
+        self.draw_reinstall_confirm(ctx);
+        // Modal device-op overlay — painted last so it sits above everything and
+        // swallows input while a create/remove/reinstall is in flight.
+        self.draw_device_op_overlay(ctx);
         if self.settings_dirty {
             settings::save_settings(&self.settings);
             self.settings_dirty = false;
@@ -1892,12 +1988,14 @@ impl eframe::App for FlexInputApp {
             self.refresh_active_tab_device_ids();
             self.set_active_tab(new_idx);
             // Prune the shared pool: drop any device no remaining tab
-            // references. The Drop impl on each VirtualDevice releases
-            // the underlying OS resource (ViGEm target, enigo handles).
-            {
-                let mut pool = self.shared_virtual_devices.lock().unwrap();
-                let _ = prune_shared_devices(&mut pool, &self.tabs);
-            }
+            // references. Teardown runs on the worker (off the UI thread) since
+            // a HIDMaestro device's Drop calls the blocking helper destroy.
+            prune_devices_async(
+                &self.shared_virtual_devices,
+                &mut self.pending_device_ids,
+                &self.device_ops.tx,
+                &self.tabs,
+            );
         }
 
         // Switch active tab — manual tab click disengages auto mode.
@@ -2017,19 +2115,24 @@ impl eframe::App for FlexInputApp {
                         needed.push(cv);
                     }
                 }
-                {
-                    let mut pool = self.shared_virtual_devices.lock().unwrap();
-                    reconcile_shared_devices(&mut pool, &needed);
-                }
+                reconcile_shared_devices(
+                    &self.shared_virtual_devices,
+                    &mut self.pending_device_ids,
+                    &self.failed_device_ids,
+                    &self.device_ops.tx,
+                    &needed,
+                );
                 // Active-tab canvas changed — refresh the I/O filter so the
                 // new tab's devices start receiving signals this frame.
                 self.refresh_active_tab_device_ids();
                 // Prune any devices the previous canvas needed but the new
                 // one (and no other tab) does.
-                {
-                    let mut pool = self.shared_virtual_devices.lock().unwrap();
-                    prune_shared_devices(&mut pool, &self.tabs);
-                }
+                prune_devices_async(
+                    &self.shared_virtual_devices,
+                    &mut self.pending_device_ids,
+                    &self.device_ops.tx,
+                    &self.tabs,
+                );
             }
         }
 
@@ -2100,18 +2203,27 @@ impl eframe::App for FlexInputApp {
                         self.tabs = new_tabs;
                         self.active_tab = ws.active_tab.min(self.tabs.len() - 1);
                         // Rebuild the shared virtual-device pool from the new
-                        // tab set; prune what's no longer needed.
-                        {
-                            let mut pool = self.shared_virtual_devices.lock().unwrap();
-                            let mut needed: Vec<String> = Vec::new();
-                            for tab in &self.tabs {
-                                for v in snarl_virtual_device_ids(&tab.canvas.snarl) {
-                                    if !needed.iter().any(|x| x == &v) { needed.push(v); }
-                                }
+                        // tab set; prune what's no longer needed. Both go through
+                        // the worker so the reload never blocks on helper IPC.
+                        let mut needed: Vec<String> = Vec::new();
+                        for tab in &self.tabs {
+                            for v in snarl_virtual_device_ids(&tab.canvas.snarl) {
+                                if !needed.iter().any(|x| x == &v) { needed.push(v); }
                             }
-                            reconcile_shared_devices(&mut pool, &needed);
-                            let _ = prune_shared_devices(&mut pool, &self.tabs);
                         }
+                        reconcile_shared_devices(
+                            &self.shared_virtual_devices,
+                            &mut self.pending_device_ids,
+                            &self.failed_device_ids,
+                            &self.device_ops.tx,
+                            &needed,
+                        );
+                        prune_devices_async(
+                            &self.shared_virtual_devices,
+                            &mut self.pending_device_ids,
+                            &self.device_ops.tx,
+                            &self.tabs,
+                        );
                         self.refresh_active_tab_device_ids();
                     }
                 } else {
@@ -2677,14 +2789,31 @@ impl eframe::App for FlexInputApp {
         // Cheap; catches sink-node adds/removes that happened anywhere
         // this frame (panel "+", panel "X", canvas drop, right-click
         // delete, undo/redo, paste). Runs once per frame at the end so
-        // every edit path converges on a consistent pool.
+        // every edit path converges on a consistent pool. Both reconcile and
+        // prune enqueue work on the device-ops worker — never blocking IPC on
+        // the UI thread. `pending_device_ids` keeps the per-frame reconcile from
+        // re-enqueueing a create that's still in flight; prune only fires for
+        // devices actually present in the pool, so it can't double-send either.
         {
             let needed: Vec<String> = self.tabs.iter()
                 .flat_map(|t| snarl_virtual_device_ids(&t.canvas.snarl))
                 .collect();
-            let mut pool = self.shared_virtual_devices.lock().unwrap();
-            reconcile_shared_devices(&mut pool, &needed);
-            let _ = prune_shared_devices(&mut pool, &self.tabs);
+            // A failed id whose node was removed should be retryable on re-add:
+            // drop it from the failed set once it's no longer referenced.
+            self.failed_device_ids.retain(|id| needed.iter().any(|n| n == id));
+            reconcile_shared_devices(
+                &self.shared_virtual_devices,
+                &mut self.pending_device_ids,
+                &self.failed_device_ids,
+                &self.device_ops.tx,
+                &needed,
+            );
+            prune_devices_async(
+                &self.shared_virtual_devices,
+                &mut self.pending_device_ids,
+                &self.device_ops.tx,
+                &self.tabs,
+            );
         }
         // Refresh the I/O thread's active-tab device id filter.
         self.refresh_active_tab_device_ids();
@@ -6031,6 +6160,204 @@ impl FlexInputApp {
         *self.active_tab_device_ids.write().unwrap() = ids;
     }
 
+    /// Drain completed device-ops worker results and apply them to the shared
+    /// pool. Called once at the top of `update()`. Devices only enter the pool
+    /// here — after they're fully built — which is what keeps the I/O thread from
+    /// ever `flush()`ing a half-initialized section (the startup-race wedge).
+    fn drain_device_op_results(&mut self) {
+        use crate::device_ops::DeviceOpResult;
+        // Collect first so we don't hold the pool lock across the channel drain.
+        let results: Vec<DeviceOpResult> = self.device_ops.rx.try_iter().collect();
+        if results.is_empty() {
+            return;
+        }
+        let mut pool = self.shared_virtual_devices.lock().unwrap();
+        for res in results {
+            match res {
+                DeviceOpResult::Created { device } => {
+                    let id = device.id().to_string();
+                    self.pending_device_ids.remove(&id);
+                    // Guard against a duplicate (e.g. two enqueues raced): replace
+                    // any existing entry with the same id rather than doubling up.
+                    if !pool.iter().any(|d| d.id() == id) {
+                        pool.push(device);
+                    }
+                }
+                DeviceOpResult::Removed { device_id } => {
+                    self.pending_device_ids.remove(&device_id);
+                }
+                DeviceOpResult::Reinstalled { devices, errors } => {
+                    for device in devices {
+                        let id = device.id().to_string();
+                        self.pending_device_ids.remove(&id);
+                        if !pool.iter().any(|d| d.id() == id) {
+                            pool.push(device);
+                        }
+                    }
+                    if !errors.is_empty() {
+                        let msg = errors.join("; ");
+                        eprintln!("[device-ops] reinstall completed with issues: {msg}");
+                        self.last_device_op_error = Some(msg);
+                    } else {
+                        self.last_device_op_error = None;
+                    }
+                }
+                DeviceOpResult::Failed { device_id, error } => {
+                    self.pending_device_ids.remove(&device_id);
+                    // Don't auto-retry a failed build every frame; require a
+                    // remove+re-add (or driver reinstall) to try again.
+                    self.failed_device_ids.insert(device_id.clone());
+                    eprintln!("[device-ops] create '{device_id}' failed: {error}");
+                    self.last_device_op_error = Some(error);
+                }
+            }
+        }
+    }
+
+    /// Paint the full-window modal overlay while a device op is in flight. Dims
+    /// the background, swallows all input (so no conflicting action can start),
+    /// and shows a spinner + the worker's current label/detail. No-op when idle.
+    fn draw_device_op_overlay(&self, ctx: &egui::Context) {
+        let progress = match self.device_ops.progress.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => None,
+        };
+        let Some(progress) = progress else { return };
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("device_op_modal"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                // Cover the whole window: paint a dim scrim and consume input so
+                // nothing underneath is interactable.
+                let resp = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                ui.painter().rect_filled(
+                    screen,
+                    egui::CornerRadius::ZERO,
+                    egui::Color32::from_black_alpha(160),
+                );
+                // Centered card.
+                let painter = ui.painter();
+                let card_w = 320.0_f32.min(screen.width() - 40.0);
+                let card_h = 110.0;
+                let card = egui::Rect::from_center_size(
+                    screen.center(),
+                    egui::vec2(card_w, card_h),
+                );
+                painter.rect_filled(card, egui::CornerRadius::same(10), egui::Color32::from_gray(32));
+                painter.rect_stroke(
+                    card,
+                    egui::CornerRadius::same(10),
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                    egui::StrokeKind::Inside,
+                );
+                // Spinner + text laid out inside the card.
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(card.shrink(16.0))
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                child.add_space(4.0);
+                child.add(egui::Spinner::new().size(22.0));
+                child.add_space(8.0);
+                child.label(egui::RichText::new(&progress.label).strong());
+                if let Some(detail) = &progress.detail {
+                    child.label(egui::RichText::new(detail).small().color(egui::Color32::from_gray(170)));
+                }
+                // Keep the spinner animating while visible.
+                ui.ctx().request_repaint();
+                let _ = resp;
+            });
+    }
+
+    /// The "Reinstall HIDMaestro drivers" confirm dialog. On confirm, collects
+    /// the HIDMaestro virtual devices currently on any canvas, removes them from
+    /// the pool, and enqueues a `Reinstall` op carrying them (the worker drops
+    /// them off-thread, reinstalls, and rebuilds them).
+    fn draw_reinstall_confirm(&mut self, ctx: &egui::Context) {
+        if !self.reinstall_confirm_open {
+            return;
+        }
+        let mut do_reinstall = false;
+        let mut cancel = false;
+        egui::Window::new("Reinstall HIDMaestro drivers")
+            .id(egui::Id::new("reinstall_hm_confirm"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    "This removes and reinstalls the HIDMaestro driver, then re-deploys the \
+                     virtual controllers on your canvas.",
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Virtual controllers disconnect briefly — a running game may lose input \
+                         for a few seconds. You'll be prompted for admin once.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(170)),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Reinstall").clicked() {
+                        do_reinstall = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if do_reinstall {
+            self.reinstall_confirm_open = false;
+            self.start_driver_reinstall();
+        } else if cancel {
+            self.reinstall_confirm_open = false;
+        }
+    }
+
+    /// Collect the HIDMaestro virtual devices on every open canvas, pull them out
+    /// of the shared pool, and enqueue a `Reinstall` op. The worker tears them
+    /// down, reinstalls the driver, and rebuilds them; results land back through
+    /// `drain_device_op_results`.
+    fn start_driver_reinstall(&mut self) {
+        // All HIDMaestro device ids referenced anywhere (dedup).
+        let mut device_ids: Vec<String> = Vec::new();
+        for tab in &self.tabs {
+            for id in snarl_virtual_device_ids(&tab.canvas.snarl) {
+                if id.starts_with("virtual.hm.") && !device_ids.contains(&id) {
+                    device_ids.push(id);
+                }
+            }
+        }
+        // Remove those devices from the pool now (so the I/O thread stops driving
+        // them) and move them into the op for off-thread teardown.
+        let current: Vec<Box<dyn VirtualDevice>> = {
+            let mut pool = self.shared_virtual_devices.lock().unwrap();
+            let mut taken = Vec::new();
+            let mut i = 0;
+            while i < pool.len() {
+                if device_ids.iter().any(|id| id == pool[i].id()) {
+                    taken.push(pool.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            taken
+        };
+        for id in &device_ids {
+            self.pending_device_ids.insert(id.clone());
+            self.failed_device_ids.remove(id); // give them a fresh chance
+        }
+        let _ = self.device_ops.tx.send(crate::device_ops::DeviceOp::Reinstall {
+            device_ids,
+            current,
+        });
+    }
+
     /// Flip the always-on-top pin state. Sends the matching `WindowLevel`
     /// viewport command, persists to settings, and runs the optional focus
     /// flip-flop:
@@ -7435,6 +7762,20 @@ impl FlexInputApp {
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(6.0);
+                if ui.button("Reinstall HIDMaestro drivers").clicked() {
+                    self.reinstall_confirm_open = true;
+                }
+                ui.label(egui::RichText::new(
+                    "Removes and reinstalls the driver, then re-deploys the virtual controllers \
+                     on your canvas. Prompts for admin once. Use this if virtual DS4/DualSense \
+                     stop working after a Windows or app update.",
+                ).small().color(egui::Color32::from_gray(140)));
+                if let Some(err) = &self.last_device_op_error {
+                    ui.label(egui::RichText::new(format!("Last device error: {err}"))
+                        .small().color(egui::Color32::from_rgb(220, 120, 120)));
+                }
+
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label("On patch load:");
                     let cur = self.settings.on_patch_load;
@@ -8173,23 +8514,6 @@ fn spawn_midi_watch_thread(
             }
         })
         .expect("failed to spawn MIDI watch thread");
-}
-
-/// Recreate a virtual device from its saved ID string.
-/// Handles both `"virtual.xinput"` (instance 0, no suffix) and `"virtual.xinput.1"` (instance N).
-fn try_create_virtual_device(id: &str) -> Option<Box<dyn flexinput_virtual::VirtualDevice>> {
-    let (kind_id, instance) = match id.rfind('.') {
-        Some(dot) => match id[dot + 1..].parse::<usize>() {
-            Ok(n) => (&id[..dot], n),
-            Err(_) => (id, 0),  // no numeric suffix → instance 0 (e.g. "virtual.xinput")
-        },
-        None => (id, 0),
-    };
-    let known = flexinput_virtual::available_device_kinds()
-        .iter()
-        .any(|k| k.kind_id == kind_id);
-    if !known { return None; }
-    Some(flexinput_virtual::create_device(kind_id, instance))
 }
 
 // ── Signal routing ────────────────────────────────────────────────────────────

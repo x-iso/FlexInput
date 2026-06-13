@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, RichText};
 use flexinput_virtual::{
-    available_device_kinds, create_device,
+    available_device_kinds,
     driver_availability::vigem_available,
     VirtualDevice,
 };
@@ -25,6 +25,41 @@ fn kind_prefix_of(dev_id: &str) -> String {
     // other kinds are 2-segment (`virtual.xinput`).
     let segs = if dev_id.starts_with("virtual.hm.") { 3 } else { 2 };
     dev_id.split('.').take(segs).collect::<Vec<_>>().join(".")
+}
+
+/// Lowest instance index for `kind_id` not already taken by a device in the pool
+/// or a sink node on `canvas`. The device id is `kind_id` for instance 0 and
+/// `kind_id.N` for N>0; this parses that suffix back out. Considering the canvas
+/// (not just the pool) matters because a freshly-added device may still be a
+/// pending async-create that hasn't landed in the pool yet.
+fn next_free_instance(pool: &SharedDevicePool, canvas: &Canvas, kind_id: &str) -> usize {
+    let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut note = |id: &str| {
+        if id == kind_id {
+            used.insert(0);
+        } else if let Some(rest) = id.strip_prefix(kind_id) {
+            // rest looks like ".N"; only count an exact kind match (avoid
+            // "virtual.ds4" matching "virtual.ds4x" — kinds never collide that
+            // way today, but be precise).
+            if let Some(n) = rest.strip_prefix('.').and_then(|s| s.parse::<usize>().ok()) {
+                used.insert(n);
+            }
+        }
+    };
+    {
+        let devs = pool.lock().unwrap();
+        for d in devs.iter() {
+            note(d.id());
+        }
+    }
+    for (_, n) in canvas.snarl.nodes_ids_data() {
+        if n.value.module_id == "device.sink" {
+            if let Some(id) = n.value.params.get("device_id").and_then(|v| v.as_str()) {
+                note(id);
+            }
+        }
+    }
+    (0..).find(|i| !used.contains(i)).unwrap_or(0)
 }
 
 /// Stateless renderer for the top virtual-devices panel. The actual device
@@ -68,7 +103,7 @@ impl VirtualDevicePanel {
             .auto_shrink([false, false])
             .show(ui, |ui| {
         ui.horizontal_top(|ui| {
-            let mut to_remove: Option<usize> = None;
+            let mut to_remove: Option<String> = None;
             for (i, (dev_id, chip_label, connected)) in chips.iter().enumerate() {
                 let chip = egui::Frame::default()
                     .inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 0 })
@@ -140,47 +175,24 @@ impl VirtualDevicePanel {
                                 resp.on_hover_text("Remove")
                             };
                             if !other_tab_uses_it && resp.clicked() {
-                                to_remove = Some(i);
+                                to_remove = Some(dev_id.clone());
                             }
                         },
                     );
                 });
             }
 
-            if let Some(i) = to_remove {
-                let (removed_id, kind_prefix) = {
-                    let mut devs = pool.lock().unwrap();
-                    let removed = devs.remove(i);
-                    let id = removed.id().to_string();
-                    let prefix = kind_prefix_of(&id);
-                    (id, prefix)
-                };
-
-                // Remove the canvas sink node for the removed device.
+            if let Some(removed_id) = to_remove {
+                // Only remove the canvas sink node here. The actual pool removal +
+                // device teardown is done off the UI thread by the app's per-frame
+                // `prune_devices_async` (a HIDMaestro device's Drop blocks on the
+                // helper) — keyed on canvas membership, so dropping the node is the
+                // trigger. This keeps remove from freezing the UI.
                 if let Some((nid, _)) = canvas.snarl.nodes_ids_data().find(|(_, n)| {
                     n.value.module_id == "device.sink"
                         && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(&removed_id)
                 }) {
                     canvas.snarl.remove_node(nid);
-                }
-
-                // Re-sync canvas node display names for remaining same-kind devices.
-                let renames: Vec<(String, String)> = {
-                    let devs = pool.lock().unwrap();
-                    devs.iter().enumerate()
-                        .filter(|(_, d)| d.id().starts_with(&kind_prefix))
-                        .map(|(j, d)| (d.id().to_string(), chip_name(&devs, j)))
-                        .collect()
-                };
-                for (did, new_name) in renames {
-                    if let Some((nid, _)) = canvas.snarl.nodes_ids_data().find(|(_, n)| {
-                        n.value.module_id == "device.sink"
-                            && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(&did)
-                    }) {
-                        if let Some(node) = canvas.snarl.get_node_mut(nid) {
-                            node.display_name = new_name;
-                        }
-                    }
                 }
             }
 
@@ -224,26 +236,26 @@ impl VirtualDevicePanel {
                             );
                         }
                     } else if ui.button(kind.display_name).clicked() {
-                        let instance = {
-                            let devs = pool.lock().unwrap();
-                            devs.iter().filter(|d| d.id().starts_with(kind.kind_id)).count()
+                        // Allocate the next free instance index for this kind by
+                        // scanning ids already present in the pool OR referenced on
+                        // any open canvas (a pending async-create may not be in the
+                        // pool yet). The device id encodes the instance.
+                        let instance = next_free_instance(pool, canvas, kind.kind_id);
+                        let device_id = if instance == 0 {
+                            kind.kind_id.to_string()
+                        } else {
+                            format!("{}.{}", kind.kind_id, instance)
                         };
-
-                        let dev = create_device(kind.kind_id, instance);
-                        canvas.add_virtual_sink(dev.as_ref(), default_collapsed, defaults);
-                        let mut devs = pool.lock().unwrap();
-                        devs.push(dev);
-                        let j = devs.len() - 1;
-                        let new_name = chip_name(&devs, j);
-                        let dev_id = devs[j].id().to_string();
-                        drop(devs);
-                        if let Some((nid, _)) = canvas.snarl.nodes_ids_data().find(|(_, n)| {
-                            n.value.module_id == "device.sink"
-                                && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(&dev_id)
-                        }) {
-                            if let Some(node) = canvas.snarl.get_node_mut(nid) {
-                                node.display_name = new_name;
-                            }
+                        // Add the canvas node NOW from static pin metadata — no
+                        // blocking device build. The per-frame reconcile sees the
+                        // new sink node and enqueues the real (async) create; the
+                        // device-ops worker installs it into the pool when ready.
+                        if let Some((sink, source, name)) =
+                            flexinput_virtual::kind_pin_metadata(kind.kind_id, instance)
+                        {
+                            canvas.add_virtual_sink_static(
+                                &device_id, &name, sink, source, default_collapsed, defaults,
+                            );
                         }
                         ctl.close = true;
                     }

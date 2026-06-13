@@ -38,6 +38,32 @@ fn hm_display_name(kind_id: &str) -> &'static str {
     }
 }
 
+/// Static pin metadata for a virtual device kind — the sink/source pin layouts
+/// and display name — WITHOUT constructing the device or touching any OS
+/// resource (no helper IPC, no ViGEm). Lets the UI add a canvas sink node
+/// instantly; the real device is built asynchronously by the device-ops worker
+/// and installed into the pool when ready. `instance` only affects the display
+/// name suffix. Returns `None` for an unknown kind.
+pub fn kind_pin_metadata(
+    kind_id: &str,
+    instance: usize,
+) -> Option<(&'static [SinkPin], &'static [SourcePin], String)> {
+    let (sink, source, base_name): (&'static [SinkPin], &'static [SourcePin], &str) = match kind_id {
+        "virtual.xinput"   => (layouts::XINPUT_SINK_PINS,    layouts::XINPUT_SOURCE_PINS, "Virtual XInput Controller"),
+        "virtual.ds4"      => (layouts::DS4_SINK_PINS,       layouts::DS4_SOURCE_PINS,    "Virtual DualShock 4"),
+        "virtual.keymouse" => (layouts::KEYMOUSE_DEFAULT_PINS, &[],                       "Virtual Keyboard & Mouse"),
+        "virtual.hm.ds4"       => (layouts::DS4_SINK_PINS,       layouts::DS4_SOURCE_PINS, "Virtual DualShock 4"),
+        "virtual.hm.dualsense" => (layouts::DUALSENSE_SINK_PINS, layouts::DS4_SOURCE_PINS, "Virtual DualSense"),
+        _ => return None,
+    };
+    let name = if instance == 0 {
+        base_name.to_string()
+    } else {
+        format!("{base_name} #{}", instance + 1)
+    };
+    Some((sink, source, name))
+}
+
 pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
     if let Some(profile_json) = hm_profile_json(kind_id) {
         // HIDMaestro device: the helper creates the node + sections (one UAC on
@@ -112,7 +138,6 @@ impl VirtualXInput {
             let rumble2 = Arc::clone(&rumble);
             if let Ok(req) = t.request_notification() {
                 notif_thread = Some(req.spawn_thread(move |_, data| {
-                    eprintln!("[xinput-notif] large={} small={}", data.large_motor, data.small_motor);
                     if let Ok(mut r) = rumble2.lock() {
                         r.large = data.large_motor;
                         r.small = data.small_motor;
