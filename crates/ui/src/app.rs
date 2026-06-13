@@ -7932,33 +7932,50 @@ fn spawn_io_thread(
                         // Flush every device (silenced ones still need a
                         // flush to commit their zeroed state to the OS).
                         for dev in devs.iter_mut() { dev.flush(); }
+                    }
 
-                        // Poll rumble/feedback signals back only from active-tab
-                        // devices — background-tab feedback would route into the
-                        // wrong graph.
-                        let mut virt_sigs: Vec<((String, String), Signal)> = Vec::new();
-                        for dev in devs.iter_mut() {
-                            let id = dev.id().to_string();
-                            if !active_ids.contains(&id) { continue; }
-                            for (pin_id, sig) in dev.poll_outputs() {
-                                virt_sigs.push(((id.clone(), pin_id.to_string()), sig));
-                            }
+                    // Poll rumble/feedback signals back from active-tab devices —
+                    // ALWAYS, even under bypass. Bypass suppresses *outgoing*
+                    // mapped input to the virtual pad; it must NOT stop us
+                    // draining *incoming* rumble/FFB the game sends back. The
+                    // HIDMaestro backend decodes rumble *inside* poll_outputs (it
+                    // drains the SHM output ring), so gating poll_outputs on
+                    // !bypass meant a game's rumble never reached the physical pad
+                    // whenever FlexInput was unfocused (bypass true). The ViGEm
+                    // backends update rumble on a separate notification thread, so
+                    // they were unaffected — which is why XInput rumble worked but
+                    // HIDMaestro's didn't. Background-tab devices are still
+                    // skipped so their feedback can't route into the wrong graph.
+                    let mut virt_sigs: Vec<((String, String), Signal)> = Vec::new();
+                    for dev in devs.iter_mut() {
+                        let id = dev.id().to_string();
+                        if !active_ids.contains(&id) { continue; }
+                        for (pin_id, sig) in dev.poll_outputs() {
+                            virt_sigs.push(((id.clone(), pin_id.to_string()), sig));
                         }
-                        if !virt_sigs.is_empty() {
-                            // ArcSwap is publish-only — to merge into the
-                            // currently-published map we load it, clone
-                            // into an owned mutable copy, apply the merge,
-                            // and store the result. Cost = one map clone
-                            // (was already paid before by the RwLock
-                            // write path, which serialized vs readers).
-                            let cur = proc_device_signals.load_full();
-                            let mut merged: HashMap<(String, String), Signal> = (*cur).clone();
-                            for (k, v) in virt_sigs { merged.insert(k, v); }
-                            proc_device_signals.store(std::sync::Arc::new(merged));
-                        }
+                    }
+                    if !virt_sigs.is_empty() {
+                        // ArcSwap is publish-only — load, clone, merge, store.
+                        let cur = proc_device_signals.load_full();
+                        let mut merged: HashMap<(String, String), Signal> = (*cur).clone();
+                        for (k, v) in virt_sigs { merged.insert(k, v); }
+                        proc_device_signals.store(std::sync::Arc::new(merged));
                     }
                 }
 
+                // Diagnostic: each tick, report whether the switch_pro HD rumble
+                // key is present in the sink_outputs the SEND loop actually reads,
+                // and the bypass state — to see if it's a bypass gate or a
+                // sink_bus pipeline gap (value computed by eval but not in the
+                // map this I/O tick reads).
+                if std::env::var_os("FLEXINPUT_DEBUG_RUMBLE").is_some() {
+                    let hd = sink_outputs.iter()
+                        .find(|((d, p), _)| d.starts_with("gilrs:") && (p == "hd_l_amp" || p == "hd_r_amp"))
+                        .map(|((d, p), s)| format!("{d}/{p}={:.2}", s.as_float()));
+                    if let Some(hd) = hd {
+                        eprintln!("[send-check] bypass={bypass} present: {hd}");
+                    }
+                }
                 if !bypass {
                     // Physical device outputs (rumble, lightbar).
                     for ((device_id, pin_id), &signal) in &sink_outputs {
