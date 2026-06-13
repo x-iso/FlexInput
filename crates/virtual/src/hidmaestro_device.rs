@@ -61,8 +61,14 @@ pub struct HidMaestroDevice {
     controller_index: u32,
     /// One-shot diagnostic: log the first non-neutral frame we write.
     diag_logged: bool,
-    /// One-shot diagnostic: log the first output (rumble) frame we read.
-    diag_out_logged: bool,
+    /// Throttle timestamp for the rumble diagnostic.
+    diag_last_rumble: Option<std::time::Instant>,
+    /// True when last tick published a peak that exceeded the real value; the
+    /// next tick settles `rumble` to the latest actual frame value so a held
+    /// peak doesn't buzz forever after a one-shot ping.
+    rumble_settle_pending: bool,
+    /// Latest actual (non-peak) rumble frame value, used to settle after a peak.
+    rumble_latest: (f32, f32),
 }
 
 impl HidMaestroDevice {
@@ -95,7 +101,9 @@ impl HidMaestroDevice {
             helper_instance_id: None,
             controller_index,
             diag_logged: false,
-            diag_out_logged: false,
+            diag_last_rumble: None,
+            rumble_settle_pending: false,
+            rumble_latest: (0.0, 0.0),
         })
     }
 
@@ -261,31 +269,53 @@ impl crate::VirtualDevice for HidMaestroDevice {
             self.profile.extended.out_left_motor.map(|o| o.saturating_sub(1)),
             self.profile.extended.out_right_motor.map(|o| o.saturating_sub(1)),
         );
+        // Drain all frames queued since the last tick, keeping the PEAK rumble
+        // seen this tick — not just the last frame. A short ping enqueues an ON
+        // frame immediately followed by an OFF frame; if we kept only the last,
+        // one poll drains both and publishes (0,0), so the consumer (a physical
+        // pad via AutoMap feedback) never sees the pulse. This is the divergence
+        // from the XInput backend, whose async notification lets the ON value
+        // linger. We publish the peak for one tick, then settle to the latest
+        // actual value so a held peak doesn't buzz forever once frames stop.
+        let mut peak: Option<(f32, f32)> = None;
+        let mut got_frame = false;
         if let Some(output) = self.output.as_mut() {
             while let Some(frame) = output.try_read() {
-                let strong = left_idx
-                    .and_then(|i| frame.data.get(i))
-                    .map(|b| *b as f32 / 255.0);
-                let weak = right_idx
-                    .and_then(|i| frame.data.get(i))
-                    .map(|b| *b as f32 / 255.0);
-                // Diagnostic: log frames that actually carry rumble (non-zero
-                // motor bytes), not just the init/LED packet, so we can confirm
-                // the game's rumble reaches us and which bytes carry it.
-                if !self.diag_out_logged
-                    && (strong.unwrap_or(0.0) > 0.0 || weak.unwrap_or(0.0) > 0.0)
-                {
-                    diag_log(&format!(
-                        "[hidmaestro] RUMBLE frame id={} rid={:#x} L_idx={:?} R_idx={:?} data={:02x?}",
-                        self.id, frame.report_id, left_idx, right_idx,
-                        &frame.data[..frame.data.len().min(12)]
-                    ));
-                    self.diag_out_logged = true;
-                }
-                if let (Some(strong), Some(weak)) = (strong, weak) {
-                    self.rumble = (strong, weak);
+                let strong = left_idx.and_then(|i| frame.data.get(i)).map(|b| *b as f32 / 255.0);
+                let weak = right_idx.and_then(|i| frame.data.get(i)).map(|b| *b as f32 / 255.0);
+                if let (Some(s), Some(w)) = (strong, weak) {
+                    let (ps, pw) = peak.unwrap_or((0.0, 0.0));
+                    peak = Some((s.max(ps), w.max(pw)));
+                    self.rumble_latest = (s, w);
+                    got_frame = true;
                 }
             }
+        }
+        let publish = if let Some((pk_s, pk_w)) = peak {
+            let (lt_s, lt_w) = self.rumble_latest;
+            // Hold the peak one tick when it exceeds the settled value.
+            self.rumble_settle_pending = pk_s > lt_s + 0.01 || pk_w > lt_w + 0.01;
+            Some((pk_s, pk_w))
+        } else if self.rumble_settle_pending {
+            // No new frames, but we owe a settle from a prior peak.
+            self.rumble_settle_pending = false;
+            Some(self.rumble_latest)
+        } else {
+            None
+        };
+        if let Some((strong, weak)) = publish {
+            let changed = (strong - self.rumble.0).abs() > 0.01 || (weak - self.rumble.1).abs() > 0.01;
+            if changed && (strong > 0.0 || weak > 0.0 || self.rumble.0 > 0.0 || self.rumble.1 > 0.0) {
+                let now = std::time::Instant::now();
+                if self.diag_last_rumble.map(|t| now.duration_since(t).as_millis() >= 300).unwrap_or(true) {
+                    diag_log(&format!(
+                        "[hidmaestro] rumble id={} strong={strong:.2} weak={weak:.2} got_frame={got_frame}",
+                        self.id
+                    ));
+                    self.diag_last_rumble = Some(now);
+                }
+            }
+            self.rumble = (strong, weak);
         }
         vec![
             ("rumble_strong", Signal::Float(self.rumble.0)),
