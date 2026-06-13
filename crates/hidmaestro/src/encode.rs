@@ -660,6 +660,40 @@ mod tests {
         assert_eq!(e.touch_fingers, vec![33, 37]);
     }
 
+    // The DS4 IMU/touchpad byte offsets MUST match the real DualShock 4 USB report
+    // 0x01 layout that Steam (and our own parse_ds4 read-back) decode at:
+    //   timestamp@10-11, battery@12, gyro@13-18, accel@19-24, touch fingers@35,39.
+    // The vendored profile originally had these +2 (IMU) / +3 (touch) too high,
+    // which shifted every IMU value one int16 slot — pitch landed on yaw, yaw on
+    // roll, roll on accelX, etc., and the first slot read empty. Cross-checked
+    // against parse_ds4's go=13/ao=19 in flexinput_devices::gyro.
+    #[test]
+    fn ds4_imu_offsets_match_real_report() {
+        let e = &ds4().extended;
+        assert_eq!(e.gyro_pitch, Some(13), "gyroPitch@13 (was wrongly 15)");
+        assert_eq!(e.gyro_yaw,   Some(15));
+        assert_eq!(e.gyro_roll,  Some(17));
+        assert_eq!(e.accel_x,    Some(19));
+        assert_eq!(e.accel_y,    Some(21));
+        assert_eq!(e.accel_z,    Some(23));
+        assert_eq!(e.touch_fingers, vec![35, 39], "touch fingers@35,39 (were 38,42)");
+    }
+
+    // End-to-end: a wire gyro signal must encode into the exact byte the real DS4
+    // carries that axis at, so Steam reads it on the right axis. gyro_y(wire pitch)
+    // → raw gyroPitch slot → byte 13.
+    #[test]
+    fn ds4_gyro_pitch_encodes_to_byte_13() {
+        let p = ds4();
+        let mut ps = PinState::new();
+        ps.set("gyro_y", 1.0, true); // wire pitch = full
+        let rep = encode_report(&p, &ps.state());
+        // PinState maps wire gyro_y → raw gyro_pitch; +1.0 → +32767 at byte 13.
+        assert_eq!(i16::from_le_bytes([rep[13], rep[14]]), 32767, "wire pitch → byte13");
+        // The old (wrong) slot 15 must now be untouched by pitch alone.
+        assert_eq!(i16::from_le_bytes([rep[15], rep[16]]), 0, "byte15 (yaw slot) stays 0");
+    }
+
     #[test]
     fn motor_offsets_differ_ds4_vs_dualsense() {
         // DS4 output report (RID 0x05): rightMotor@4, leftMotor@5.
