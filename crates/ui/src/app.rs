@@ -7963,6 +7963,12 @@ fn spawn_io_thread(
                     // Physical device outputs (rumble, lightbar).
                     for ((device_id, pin_id), &signal) in &sink_outputs {
                         if device_id.starts_with("gilrs:") {
+                            if std::env::var_os("FLEXINPUT_DEBUG_RUMBLE").is_some()
+                                && (pin_id == "hd_l_amp" || pin_id == "hd_r_amp")
+                                && signal.as_float().abs() > 0.01
+                            {
+                                eprintln!("[send] {device_id} {pin_id}={:.2}", signal.as_float());
+                            }
                             for backend in &mut backends {
                                 backend.send(device_id, pin_id, signal);
                             }
