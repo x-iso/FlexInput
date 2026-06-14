@@ -568,24 +568,8 @@ impl GyroManager {
                 }
                 DeviceKind::SwitchPro { initialized, packet_counter, .. } => {
                     if !*initialized { continue; }
-                    // Per-side amplitude: prefer explicit HD pins, but fall back to
-                    // the classic rumble_strong/weak pins so a DIRECT rumble wire
-                    // (or generic feedback that only carries rumble_strong/weak)
-                    // still drives the Switch Pro. Without this, the Switch Pro
-                    // flush ignored classic rumble entirely: the signal showed on
-                    // the oscilloscope but never reached the controller.
-                    // strong (low-freq, heavy) → left motor; weak (high-freq) → right.
-                    let l_amp = if out.hd_l_amp != 0 { out.hd_l_amp } else { out.rumble_strong };
-                    let r_amp = if out.hd_r_amp != 0 { out.hd_r_amp } else { out.rumble_weak };
-                    // Frequency: explicit hd_*_freq wins; else a default ~320 Hz
-                    // carrier (0.6) whenever that side has amplitude — the HD voice
-                    // coil is silent at 0 Hz, so classic rumble needs a carrier.
-                    let l_freq = if out.hd_l_freq != 0 { out.hd_l_freq }
-                                 else if l_amp != 0 { 153 } else { 0 }; // 153/255 ≈ 0.6
-                    let r_freq = if out.hd_r_freq != 0 { out.hd_r_freq }
-                                 else if r_amp != 0 { 153 } else { 0 };
-                    let left  = switch_rumble_encode(l_amp as f32 / 255.0, l_freq as f32 / 255.0);
-                    let right = switch_rumble_encode(r_amp as f32 / 255.0, r_freq as f32 / 255.0);
+                    let left  = switch_rumble_encode(out.hd_l_amp as f32 / 255.0, out.hd_l_freq as f32 / 255.0);
+                    let right = switch_rumble_encode(out.hd_r_amp as f32 / 255.0, out.hd_r_freq as f32 / 255.0);
                     let pkt = build_switch_rumble_only(*packet_counter, left, right);
                     *packet_counter = packet_counter.wrapping_add(1);
                     hid_write(device, &pkt);

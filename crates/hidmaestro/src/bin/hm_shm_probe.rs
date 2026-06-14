@@ -167,14 +167,7 @@ fn run_helper_call(args: &[String]) {
                 "dualsense" => flexinput_hidmaestro::profile::presets::DUALSENSE_JSON,
                 _ => DUALSHOCK_4_V2_JSON,
             };
-            let device_id = arg(args, "--device-id")
-                .unwrap_or(if arg(args, "--profile") == Some("dualsense") {
-                    "virtual.hm.dualsense"
-                } else {
-                    "virtual.hm.ds4"
-                })
-                .to_string();
-            Request::Create { device_id, profile_json: profile_json.to_string(), index_hint: index }
+            Request::Create { profile_json: profile_json.to_string(), index }
         }
         "destroy" => Request::Destroy {
             instance_id: arg(args, "--id").unwrap_or(r"ROOT\HIDClass\0000").to_string(),
@@ -337,23 +330,14 @@ fn run_dump(args: &[String]) {
 
 fn run_output(args: &[String]) {
     let index = parse_index(args);
-    // Replay mode: start at last_seq=0 so any frames the driver has EVER written
-    // to this ring are shown, not just ones after we attached.
-    let mut section = match OutputSection::open_replay(index) {
+    let mut section = match OutputSection::open(index) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("open output section {index} failed: {e}");
-            eprintln!("(is the virtual device deployed at THIS index? try --index 1)");
             std::process::exit(1);
         }
     };
-    let (head0, _) = section.debug_head();
     println!("polling output ring {index} every 8ms. Trigger rumble in a tester. Ctrl-C to stop.");
-    println!("  [diag] initial ring Head = {head0}  \
-              (0 = driver has NEVER written output to this section)");
-    let mut last_head = head0;
-    let mut last_tick = Instant::now();
-    let mut total = 0u64;
     loop {
         let mut drained = 0;
         while let Some(f) = section.try_read() {
@@ -364,24 +348,10 @@ fn run_output(args: &[String]) {
                 f.data.len(),
                 &f.data[..f.data.len().min(16)]
             );
-            total += 1;
             drained += 1;
             if drained > 256 {
                 break;
             }
-        }
-        // Heartbeat: report Head movement even when try_read is conservative, so
-        // silence is interpretable. Head climbing = driver IS writing.
-        if last_tick.elapsed() >= Duration::from_secs(2) {
-            let (head, _) = section.debug_head();
-            if head != last_head {
-                println!("  [diag] ring Head {last_head} -> {head} (driver wrote {} frame(s); {total} shown)",
-                    head.wrapping_sub(last_head));
-                last_head = head;
-            } else {
-                println!("  [diag] ring Head unchanged at {head} (no driver output in last 2s)");
-            }
-            last_tick = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(8));
     }
