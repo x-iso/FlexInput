@@ -8,6 +8,44 @@ use serde_json::Value;
 use crate::graph::{NodeSnap, ProcessingGraph};
 use crate::state::NodeState;
 
+/// Perceptual boost for HD voice-coil amplitude on the AutoMap feedback path.
+///
+/// Maps a 0..1 input to 0 (when zero) or `floor + (1-floor) * v^exp` (when
+/// non-zero). With the defaults a weak game rumble becomes clearly felt:
+///   0.09 -> ~0.49, 0.21 -> ~0.60, 1.0 -> 1.0; exactly 0 stays 0 (silent).
+/// `exp < 1` boosts the low end (the felt range), opposite to the encoder's
+/// internal power-law that was crushing it.
+///
+/// Tunable live (no rebuild) via env for in-game dial-in:
+///   FLEXINPUT_HD_FB_FLOOR (default 0.35), FLEXINPUT_HD_FB_EXP (default 0.6).
+/// Set FLEXINPUT_HD_FB_FLOOR=0 to disable the boost (pass-through).
+fn boost_hd_feedback(sig: Signal) -> Signal {
+    let v = match sig {
+        Signal::Float(f) => f,
+        Signal::Bool(b) => if b { 1.0 } else { 0.0 },
+        _ => return sig,
+    };
+    if v <= 0.0 {
+        return Signal::Float(0.0);
+    }
+    // Cached once (env read per-call would be too costly on the engine tick).
+    // Restart to change during dial-in. FLEXINPUT_HD_FB_FLOOR=0 = pass-through.
+    use std::sync::OnceLock;
+    static PARAMS: OnceLock<(f32, f32)> = OnceLock::new();
+    let (floor, exp) = *PARAMS.get_or_init(|| {
+        let floor = std::env::var("FLEXINPUT_HD_FB_FLOOR").ok()
+            .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.35).clamp(0.0, 1.0);
+        let exp = std::env::var("FLEXINPUT_HD_FB_EXP").ok()
+            .and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.6).max(0.01);
+        (floor, exp)
+    });
+    if floor <= 0.0 {
+        return Signal::Float(v); // boost disabled
+    }
+    let boosted = floor + (1.0 - floor) * v.clamp(0.0, 1.0).powf(exp);
+    Signal::Float(boosted.clamp(0.0, 1.0))
+}
+
 // ── Public output type ────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -2052,9 +2090,23 @@ pub fn eval_graph_tick(
                             virt_out_pin, &dst_pins
                         ) else { continue; };
                         if directly_wired.contains(dst_pin) { continue; }
+                        // Perceptual gain for HD voice-coil amplitude pins only.
+                        // A game's classic rumble is often weak (0.1–0.3); mapped
+                        // straight onto a Switch Pro / DualSense HD coil — which is
+                        // then run through a power-law amp curve in the encoder —
+                        // it's below the perceptible threshold and can't be felt.
+                        // Boost ONLY the feedback path to the HD amp pins (direct
+                        // knob wiring and ERM `rumble_strong`/lightbar are
+                        // untouched): map 0 -> 0 but any non-zero into a felt
+                        // floor..1 band with a low-end-boosting exponent.
+                        let routed = if matches!(dst_pin, "hd_l_amp" | "hd_r_amp") {
+                            boost_hd_feedback(sig)
+                        } else {
+                            sig
+                        };
                         sink_outputs
                             .entry((st.device_id.clone(), dst_pin.to_string()))
-                            .or_insert(sig);
+                            .or_insert(routed);
                     }
                 }
             }

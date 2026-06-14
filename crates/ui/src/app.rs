@@ -1035,6 +1035,16 @@ impl eframe::App for FlexInputApp {
         // in-flight markers). Done before anything reads the pool this frame.
         self.drain_device_op_results();
 
+        // Keep the I/O thread's active-tab device-id filter current every frame.
+        // This set gates which virtual devices have their feedback (rumble/FFB)
+        // routed into the graph. It was previously refreshed only on canvas
+        // events, so for a device acting purely as a feedback SOURCE the set
+        // could stay stale and its rumble never reached the physical pad. The
+        // refresh is change-guarded internally (cheap when nothing changed), so
+        // a per-frame call doesn't contend with the I/O thread in the steady
+        // state.
+        self.refresh_active_tab_device_ids();
+
         // ── Visibility / focus state ────────────────────────────────────
         // Tracked here, consumed by the repaint-scheduling code at the
         // tail of update(). When minimized OR unfocused, we cap the
@@ -6148,6 +6158,16 @@ impl FlexInputApp {
         let ids: HashSet<String> = snarl_virtual_device_ids(
             &self.tabs[self.active_tab].canvas.snarl,
         ).into_iter().collect();
+        // Write only when the set actually changed. This is called once per
+        // frame (so a feedback-source device's id is reliably present for the
+        // I/O thread's output routing — it used to be refreshed only on canvas
+        // events, leaving the set stale so HIDMaestro rumble never routed to the
+        // physical pad). The change-guard keeps the steady state to a cheap
+        // read-lock + compare, avoiding write-lock contention with the I/O
+        // thread that reads this set every tick.
+        if *self.active_tab_device_ids.read().unwrap() == ids {
+            return;
+        }
         *self.active_tab_device_ids.write().unwrap() = ids;
     }
 
@@ -8126,6 +8146,15 @@ fn spawn_io_thread(
             }
             let mut last_enum = Instant::now() - Duration::from_secs(10);
             let mut last_midi_out: HashMap<(String, String), Signal> = HashMap::new();
+            // Latest virtual-device feedback (rumble/FFB from poll_outputs),
+            // carried ACROSS ticks. Merged into the published signal map at the
+            // START of each tick so the engine — which reads proc_device_signals
+            // on its own thread, asynchronously — always sees the current
+            // feedback. Without this, the per-tick "publish physical, then
+            // re-merge virtual later" sequence left a window where the engine
+            // sampled physical-only signals and read a virtual pad's rumble as 0,
+            // so a game's rumble never routed back to the physical pad.
+            let mut last_virt_sigs: HashMap<(String, String), Signal> = HashMap::new();
             // Measured I/O rate EMA. Updated each iteration; published via
             // `flexinput_engine::set_io_rate` so the UI can show the actual
             // poll rate (separate from the engine's sample rate).
@@ -8234,6 +8263,16 @@ fn spawn_io_thread(
 
                 {
                     puffin::profile_scope!("publish_signals");
+                    // Fold the most recent virtual-device feedback into this
+                    // tick's physical signals BEFORE publishing, so the engine
+                    // (async reader on its own thread) never sees a window with
+                    // the feedback missing. Physical signals for the same key win
+                    // (a real device's live value overrides stale feedback); the
+                    // current tick's fresh virtual poll is merged again below and
+                    // refreshes last_virt_sigs for the next tick.
+                    for (k, v) in &last_virt_sigs {
+                        signals.entry(k.clone()).or_insert(*v);
+                    }
                     // ArcSwap publish — consumers (proc thread, UI) read
                     // via `load_full()`, a refcount bump rather than a
                     // map clone under a RwLock.
@@ -8296,7 +8335,7 @@ fn spawn_io_thread(
                         for dev in devs.iter_mut() { dev.flush(); }
                     }
 
-                    // Poll rumble/feedback signals back from active-tab devices —
+                    // Poll rumble/feedback signals back from virtual devices —
                     // ALWAYS, even under bypass. Bypass suppresses *outgoing*
                     // mapped input to the virtual pad; it must NOT stop us
                     // draining *incoming* rumble/FFB the game sends back. The
@@ -8306,22 +8345,40 @@ fn spawn_io_thread(
                     // whenever FlexInput was unfocused (bypass true). The ViGEm
                     // backends update rumble on a separate notification thread, so
                     // they were unaffected — which is why XInput rumble worked but
-                    // HIDMaestro's didn't. Background-tab devices are still
-                    // skipped so their feedback can't route into the wrong graph.
-                    let mut virt_sigs: Vec<((String, String), Signal)> = Vec::new();
+                    // HIDMaestro's didn't.
+                    //
+                    // CRITICAL: poll_outputs() must run on EVERY device every
+                    // tick, NOT just active-tab ones. For HIDMaestro it *drains
+                    // the SHM output ring* as a side effect — gating it on
+                    // active_ids let frames pile up until the 64-slot ring was
+                    // full, then one eventual poll dumped a 64-frame backlog with
+                    // ~minute latency (the rumble never reached the physical pad
+                    // in time). Draining is cleanup and must be continuous;
+                    // routing is what gets gated. So we always drain, but only
+                    // *publish* an active-tab device's feedback into the signal
+                    // map so background-tab feedback can't leak into the wrong
+                    // graph. (active_ids isn't reliably populated for a pure
+                    // feedback-source device anyway — it's refreshed only on
+                    // canvas events, not per frame.)
+                    // Always drain every device's output ring (cleanup, prevents
+                    // the 64-slot backlog), but only RECORD active-tab devices'
+                    // feedback into `last_virt_sigs`. The actual publish into
+                    // proc_device_signals happens at the TOP of the next tick
+                    // (single merge), so we do NOT clone+store the whole signal
+                    // map here. Previously this block load_full+cloned+stored the
+                    // entire map EVERY tick (poll_outputs always returns the two
+                    // rumble pins, so it never short-circuited) — a full-map clone
+                    // + ArcSwap store at up to 4 kHz that added real I/O-thread
+                    // load. Recording into last_virt_sigs and letting the
+                    // top-of-tick merge publish is equivalent (sub-ms latency at
+                    // these rates) and far cheaper.
                     for dev in devs.iter_mut() {
                         let id = dev.id().to_string();
-                        if !active_ids.contains(&id) { continue; }
-                        for (pin_id, sig) in dev.poll_outputs() {
-                            virt_sigs.push(((id.clone(), pin_id.to_string()), sig));
+                        let sigs = dev.poll_outputs(); // always drain the ring
+                        if !active_ids.contains(&id) { continue; } // gate routing only
+                        for (pin_id, sig) in sigs {
+                            last_virt_sigs.insert((id.clone(), pin_id.to_string()), sig);
                         }
-                    }
-                    if !virt_sigs.is_empty() {
-                        // ArcSwap is publish-only — load, clone, merge, store.
-                        let cur = proc_device_signals.load_full();
-                        let mut merged: HashMap<(String, String), Signal> = (*cur).clone();
-                        for (k, v) in virt_sigs { merged.insert(k, v); }
-                        proc_device_signals.store(std::sync::Arc::new(merged));
                     }
                 }
 
