@@ -568,8 +568,35 @@ impl GyroManager {
                 }
                 DeviceKind::SwitchPro { initialized, packet_counter, .. } => {
                     if !*initialized { continue; }
-                    let left  = switch_rumble_encode(out.hd_l_amp as f32 / 255.0, out.hd_l_freq as f32 / 255.0);
-                    let right = switch_rumble_encode(out.hd_r_amp as f32 / 255.0, out.hd_r_freq as f32 / 255.0);
+                    // The Switch Pro voice coil is driven by amplitude+frequency
+                    // (HD rumble). It has no classic ERM motors, so a value wired
+                    // to the legacy `rumble_strong/weak` pins would otherwise be
+                    // silent. When no explicit HD amplitude is set, synthesize it
+                    // from the legacy pins (strong→left, weak→right) so legacy
+                    // rumble — and the game's classic rumble routed via AutoMap —
+                    // is audible. Explicit HD wiring always wins: if either
+                    // hd_*_amp is non-zero we use the HD pins verbatim and ignore
+                    // legacy, so the two paths never fight.
+                    let hd_set = out.hd_l_amp != 0 || out.hd_r_amp != 0;
+                    let (l_amp, l_freq, r_amp, r_freq) = if hd_set {
+                        (
+                            out.hd_l_amp as f32 / 255.0, out.hd_l_freq as f32 / 255.0,
+                            out.hd_r_amp as f32 / 255.0, out.hd_r_freq as f32 / 255.0,
+                        )
+                    } else {
+                        // Legacy fallback: classic amplitude with a default ~320 Hz
+                        // carrier (0.6) — the firmware default and the same carrier
+                        // injected for HD-amp-only feedback in the I/O loop.
+                        const DEFAULT_FREQ: f32 = 0.6;
+                        let l = out.rumble_strong as f32 / 255.0;
+                        let r = out.rumble_weak as f32 / 255.0;
+                        (
+                            l, if l > 0.0 { DEFAULT_FREQ } else { 0.0 },
+                            r, if r > 0.0 { DEFAULT_FREQ } else { 0.0 },
+                        )
+                    };
+                    let left  = switch_rumble_encode(l_amp, l_freq);
+                    let right = switch_rumble_encode(r_amp, r_freq);
                     let pkt = build_switch_rumble_only(*packet_counter, left, right);
                     *packet_counter = packet_counter.wrapping_add(1);
                     hid_write(device, &pkt);
