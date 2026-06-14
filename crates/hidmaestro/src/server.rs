@@ -35,11 +35,37 @@ use crate::orchestrator::{
 use crate::shm::{InputSection, OutputSection};
 use crate::Profile;
 
-/// Append a one-line diagnostic to `flexinput-hidmaestro.log` next to the exe.
-/// One-line helper diagnostic. Fires per device create/cleanup (not per frame),
-/// so it goes to the elevated helper's stderr only — no file spam.
+/// One-line helper diagnostic. Fires per device create/cleanup and lifecycle
+/// transition (NOT per frame), so it's safe to persist. The helper runs
+/// ELEVATED in a separate process, so its stderr never reaches the app's
+/// console — without a file the lifecycle is unobservable. Append to
+/// `flexinput-hidmaestro.log` next to the exe (best-effort) AND echo to stderr.
 fn diag_log(line: &str) {
     eprintln!("{line}");
+    if let Some(path) = log_file_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "[{}] {line}", now_stamp());
+        }
+    }
+}
+
+/// `flexinput-hidmaestro.log` next to the current exe (the elevated helper).
+fn log_file_path() -> Option<std::path::PathBuf> {
+    let mut p = std::env::current_exe().ok()?;
+    p.set_file_name("flexinput-hidmaestro.log");
+    Some(p)
+}
+
+/// Coarse local timestamp (seconds since process start) for log correlation —
+/// no chrono dependency; just enough to order events within a session.
+fn now_stamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
 }
 
 /// A live device the helper is keeping alive: its sections (mapped) + index +
@@ -130,14 +156,14 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     // Exit cleanup: if persistence is off, ensure nothing is left behind —
     // remove everything HIDMaestro-owned, not just what we tracked (covers
     // sections the app reopened across reconnects).
-    if !state.persist.load(Ordering::SeqCst) {
+    let persist_at_exit = state.persist.load(Ordering::SeqCst);
+    diag_log(&format!("[helper] exit: persist={persist_at_exit}"));
+    if !persist_at_exit {
         state.teardown_tracked();
         let n = remove_all_hidmaestro_devices();
-        if n > 0 {
-            eprintln!("[hidmaestro-helper] cleaned up {n} device(s) on exit (persist off)");
-        }
+        diag_log(&format!("[helper] exit cleanup (persist off): removed {n} device(s)"));
     }
-    eprintln!("[hidmaestro-helper] stopped");
+    diag_log("[helper] stopped");
 }
 
 /// Poll the parent process handle; when it exits, react per persistence and
@@ -157,14 +183,24 @@ fn watch_parent(parent_pid: u32, state: Arc<HelperState>) {
     loop {
         let r = unsafe { WaitForSingleObject(handle, 1000) };
         if r == WAIT_OBJECT_0 {
-            // Parent exited.
-            eprintln!("[hidmaestro-helper] parent {parent_pid} exited");
-            if !state.persist.load(Ordering::SeqCst) {
+            // Parent exited. CRITICAL ORDERING: mark `parent_gone` FIRST, before
+            // any teardown. The teardown below (remove_all_hidmaestro_devices) is
+            // the slow part — it enumerates and removes device nodes over several
+            // seconds. If we set the flag only AFTER teardown (as before), there
+            // was a multi-second window where this dying helper still answered the
+            // fast-path Ping and serviced a NEW app instance's Create — building a
+            // device it was about to abandon on exit. A rapid relaunch hit exactly
+            // that window: the new app's DS4 was created on the dying helper, then
+            // orphaned. Setting the flag first makes the accept loop's race guard
+            // reject new work immediately, so the new app respawns a clean helper.
+            let persist_now = state.persist.load(Ordering::SeqCst);
+            state.parent_gone.store(true, Ordering::SeqCst);
+            diag_log(&format!("[helper] parent {parent_pid} exited; persist={persist_now}"));
+            if !persist_now {
                 state.teardown_tracked();
                 let n = remove_all_hidmaestro_devices();
-                eprintln!("[hidmaestro-helper] removed {n} device(s) after parent death");
+                diag_log(&format!("[helper] removed {n} device(s) after parent death"));
             }
-            state.parent_gone.store(true, Ordering::SeqCst);
             // Nudge the accept loop: connect to our own pipe so a blocked
             // ConnectNamedPipe returns and the loop re-checks `parent_gone`.
             wake_accept_loop();
@@ -223,6 +259,26 @@ fn handle_client(pipe: NamedPipeServer, state: &Arc<HelperState>) -> bool {
             }
         };
 
+        // RACE GUARD: the parent may have died while we were blocked in
+        // read_line above. If this helper has entered its death sequence
+        // (parent_gone set by watch_parent), it is about to exit and tear down —
+        // it must NOT service new work, or it would accept a Create, build the
+        // device, then immediately abandon it on exit. That happened on a rapid
+        // relaunch: the NEW app connected to the OLD (dying) helper via the
+        // fast-path Ping, its DS4 was created on the dying helper and then swept,
+        // leaving only DualSense (created on the respawned helper). Reject the
+        // request so the client's connection breaks and it respawns a clean
+        // helper. (Re-checked here, not just at the loop top, because the wait is
+        // inside read_line.)
+        if state.parent_gone.load(Ordering::SeqCst) {
+            let _ = write_response(
+                &mut writer,
+                &Response::err("helper shutting down; reconnect"),
+            );
+            diag_log("[helper] rejected request after parent death (race guard)");
+            return true;
+        }
+
         let (resp, shutdown) = handle_request(req, state);
         let _ = write_response(&mut writer, &resp);
         if shutdown {
@@ -247,20 +303,22 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
             // then vanished, only DualSense survived". Reconnect hellos just
             // refresh the persist flag.
             let first = !state.did_startup_cleanup.swap(true, Ordering::SeqCst);
+            diag_log(&format!(
+                "[helper] hello: persist={persist} (was={was}) first={first}"
+            ));
             if first && !persist {
                 let n = remove_all_hidmaestro_devices();
                 diag_log(&format!(
                     "[helper] hello (startup): persist off; cleaned up {n} leftover device(s)/orphan child(ren)"
                 ));
-            } else if !persist && was != persist {
-                // Persist toggled on→off mid-session (settings change): drop our
-                // tracked sections and remove everything so the policy takes hold.
-                state.teardown_tracked();
-                let n = remove_all_hidmaestro_devices();
-                diag_log(&format!(
-                    "[helper] hello (persist on->off): cleaned up {n} device(s)"
-                ));
             }
+            // A live toggle changes only the EXIT policy (read at exit /
+            // parent-death). It must NOT tear down a device the user is using
+            // right now — toggling persist off mid-session keeps live devices and
+            // simply removes them when the app closes; toggling on flips the exit
+            // policy to "keep". The previous on->off teardown here yanked a live
+            // controller out from under a running game, so it was removed.
+            let _ = was;
             (Response::ok(), false)
         }
         Request::Ping => (

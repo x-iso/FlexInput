@@ -71,14 +71,39 @@ pub fn set_helper_exe(path: PathBuf) {
     }
 }
 
-/// Set whether virtual devices persist beyond the app's lifetime. Call at
-/// startup (from the persistence setting) before creating devices. Re-sends
-/// `Hello` on the next call if already connected.
+/// Set whether virtual devices persist beyond the app's lifetime.
+///
+/// Two call sites: at startup (seeding from the saved setting, before any
+/// device — and before the helper is even spawned), and on a live settings
+/// toggle. The new value MUST reach an already-running helper *immediately*:
+/// merely flagging it for "the next Hello" was a bug — toggling the checkbox
+/// performs no device op, so no later `call()` happened, the re-Hello never
+/// went out, and the helper kept its startup `persist` value. Result: turning
+/// persistence OFF mid-session left the devices alive on exit (the helper's
+/// parent-death teardown saw stale `persist=true`).
+///
+/// So: if a client is already connected, push a fresh `Hello` right now. If
+/// not connected yet (startup seeding), just record it — we must NOT spawn the
+/// elevated helper here (that would trigger UAC on launch); the first real
+/// Hello will carry the correct value.
 pub fn set_persist(persist: bool) {
-    if let Ok(mut m) = manager().lock() {
-        if m.persist != persist {
-            m.persist = persist;
-            m.greeted = false; // force a fresh Hello to update the helper
+    let mut m = match manager().lock() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if m.persist == persist {
+        return;
+    }
+    m.persist = persist;
+    m.greeted = false; // a fresh Hello must carry the new value
+    // Push immediately only if the helper is already up — never spawn here.
+    if m.client.is_some() {
+        if let Err(e) = send_hello_if_needed(&mut m) {
+            // Connection may be stale; drop it so the next real op respawns and
+            // re-greets with the correct persist value.
+            eprintln!("[hidmaestro] set_persist: live Hello push failed: {e}; dropping client");
+            m.client = None;
+            m.greeted = false;
         }
     }
 }
@@ -143,6 +168,28 @@ fn send_hello_if_needed(m: &mut Manager) -> Result<(), HelperError> {
 }
 
 fn call(m: &mut Manager, req: &Request) -> Result<Response, HelperError> {
+    ensure_connected(m)?;
+    let client = m.client.as_mut().expect("connected");
+    let first = client.call(req).map_err(|e| HelperError::Io(e.to_string()));
+
+    // Retry-once on a stale/dying helper. The fast-path health check in
+    // ensure_connected can reuse a helper that has already begun shutting down
+    // (e.g. a rapid relaunch where the new app's Ping reached the OLD helper
+    // mid-teardown). That helper either drops the connection (I/O error) or, with
+    // the server-side race guard, replies "helper shutting down; reconnect".
+    // Either way, drop the client, respawn a fresh one, and try the request again
+    // exactly once so the caller doesn't see a spurious failure (which manifested
+    // as "DS4 failed to deploy on the second launch").
+    let needs_retry = match &first {
+        Err(_) => true,
+        Ok(Response::Error { message }) => message.contains("shutting down"),
+        Ok(_) => false,
+    };
+    if !needs_retry {
+        return first;
+    }
+    m.client = None;
+    m.greeted = false;
     ensure_connected(m)?;
     let client = m.client.as_mut().expect("connected");
     client.call(req).map_err(|e| HelperError::Io(e.to_string()))
