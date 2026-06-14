@@ -7765,7 +7765,7 @@ impl FlexInputApp {
                 ui.add_space(6.0);
                 if ui.checkbox(
                     &mut self.settings.persist_virtual_devices,
-                    "Keep virtual controllers alive after FlexInput closes",
+                    "Keep HIDMaestro virtual controllers alive after FlexInput closes",
                 ).changed() {
                     dirty = true;
                     #[cfg(windows)]
@@ -7773,10 +7773,13 @@ impl FlexInputApp {
                 }
                 ui.label(egui::RichText::new(
                     "Off by default: virtual pads are removed when the app closes or crashes. \
-                     Turn on to keep the controller registered across an app restart or update, so \
-                     a game doesn't lose the device \u{2014} FlexInput reclaims it on next launch. \
-                     Note: while FlexInput is closed the pad sends no input (it resumes when the \
-                     app reopens). (HIDMaestro only.)",
+                     Turn on to keep a HIDMaestro controller (DualShock 4 / DualSense) registered \
+                     across an app restart or update, so a game doesn't lose the device \u{2014} \
+                     FlexInput reclaims it on next launch. While FlexInput is closed the pad sends \
+                     no input (it resumes when the app reopens).\n\
+                     Does not apply to ViGEm devices (Virtual Xbox / DualShock 4 (ViGEmBus)): \
+                     ViGEmBus removes those automatically when FlexInput exits and they can't be \
+                     reclaimed — they're re-created fresh on next launch.",
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(6.0);
