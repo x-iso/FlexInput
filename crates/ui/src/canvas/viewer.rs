@@ -552,6 +552,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 }
             }
 
+            // Rumble-feedback shaping for virtual gamepad sinks (everything but
+            // keymouse). A two-handle range slider (floor..max) + a compact
+            // Curve box. Rendered in the header — like the keymouse Mouse ×
+            // slider — and above the "← Auto-Map" label. Shapes ONLY the
+            // game/app rumble this virtual pad forwards to a physical pad via
+            // Auto-Map; the user's own direct rumble wiring is sent full-scale.
+            if is_device_sink && !is_keymouse_sink && dev_id_str.starts_with("virtual.") {
+                if let Some(n) = snarl.get_node_mut(node) {
+                    crate::canvas::header_controls::render_rumble_feedback_controls(ui, &mut n.params);
+                }
+            }
+
             // device.sink: "Auto-Map" label anchored to the bottom of the
             // header. The AutoMap pin's Y is derived from this label's
             // absolute screen Y combined with a per-frame pin-row Y anchor
@@ -2890,6 +2902,9 @@ fn show_sink_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &
         .to_string();
 
     if device_id != "virtual.keymouse" {
+        // Virtual gamepad sinks have no body controls — the rumble-feedback
+        // shaping (floor/max/curve) lives in the node header alongside the
+        // keymouse Mouse × slider (see show_header).
         return;
     }
 
@@ -2954,6 +2969,10 @@ fn show_sink_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &
     }
 }
 
+/// Per-device rumble-feedback shaping controls on a virtual gamepad's sink node.
+/// Floor/Max/Curve shape ONLY the game/app rumble forwarded back to a physical
+/// pad via AutoMap (see `shape_hd_feedback`); direct rumble wiring is untouched.
+/// Defaults (floor 0.35, max 1.0, exp 0.6) match the original tuned boost.
 fn show_constant_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let value = snarl
         .get_node(node_id)

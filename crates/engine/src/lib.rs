@@ -14,7 +14,7 @@ pub use eval::{
     envelope_flags, eval_graph_tick, eval_pure, get_b, get_f, namespaced_uid, osc_sample,
     read_scale_t, sample_curve, sig_to_f32,
 };
-pub use graph::{InlineSubgraph, NodeSnap, ProcessingGraph};
+pub use graph::{FeedbackSource, InlineSubgraph, NodeSnap, ProcessingGraph};
 pub use router::InputRouter;
 pub use state::NodeState;
 pub use thread::{spawn_processing_thread, current_sample_rate, current_io_rate, set_io_rate, new_device_rates, new_scope_taps, new_arc_graph, new_arc_signals, ArcGraph, ArcSignals, DeviceRates, ProcessingOutput, ScopeTaps, ScopeTapRing, SinkBus, DEFAULT_SAMPLE_RATE, SCOPE_TAP_PINS, SCOPE_TAP_RETAIN_MS, SCOPE_TAP_MAX_LEN};

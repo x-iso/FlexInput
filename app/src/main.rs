@@ -21,8 +21,25 @@ fn install_gpu_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let msg = info.to_string();
+        // Device-reset signatures. When another app (usually a fullscreen game)
+        // resets the graphics device, wgpu objects created against the old
+        // device become invalid; the next frame's egui texture upload then
+        // panics from a context our in-renderer GPU_LOST guard didn't cover.
+        // Match those signatures here so the *last-ditch* net still relaunches
+        // instead of dumping a backtrace.
+        //   - "Failed to create staging buffer" / "GPU device lost": older paths.
+        //   - egui_texid_Managed(N) ... is invalid: a managed egui texture
+        //     whose backing texture was orphaned by the reset (seen as
+        //     `Texture::create_view` / bind-group validation errors).
+        //   - "Device is lost" / "device was lost": wgpu's own DeviceLost text.
+        // We intentionally do NOT treat every "Validation Error" as device
+        // loss — only ones carrying a managed-egui-texture-invalid or
+        // device-lost signature — so a genuine logic bug can't loop-relaunch.
         let gpu_lost = msg.contains("Failed to create staging buffer")
-            || msg.contains("GPU device lost");
+            || msg.contains("GPU device lost")
+            || msg.contains("Device is lost")
+            || msg.contains("device was lost")
+            || (msg.contains("egui_texid_Managed") && msg.contains("is invalid"));
         if gpu_lost {
             // The release build is `windows_subsystem = "windows"` with no
             // logger surfaced to a console, so drop a breadcrumb next to the
@@ -40,6 +57,19 @@ fn install_gpu_panic_hook() {
             // recovery snapshot the child restores from was written by the
             // app's autosave-on-settle (and forced on the GPU_LOST path); we
             // do NOT delete it here — the child consumes it on boot.
+            //
+            // If we were NOT the foreground window, a game owns the GPU. We
+            // can't resume a panicked frame, so we must relaunch — but the
+            // fresh process must not render against the game-held device (it'd
+            // lose it again and loop). Boot it straight into the GUI stall; it
+            // keeps input/engine alive and rebuilds the UI once FlexInput is
+            // foreground again.
+            #[cfg(windows)]
+            {
+                if flexinput_ui::process_list::foreground_exe().is_some() {
+                    flexinput_ui::relaunch_self_stalled_and_exit();
+                }
+            }
             flexinput_ui::relaunch_self_and_exit();
         }
         default_hook(info);

@@ -16,6 +16,23 @@ pub struct InlineSubgraph {
     pub outlet_locs: Vec<Option<(usize, usize)>>,
 }
 
+/// A virtual feedback source feeding a physical device's haptic inputs, plus the
+/// per-device rumble shaping configured on that virtual device's sink node. The
+/// shaping applies ONLY to AutoMap feedback (game/app rumble forwarded back to a
+/// physical pad) — the user's own direct rumble wiring is never reshaped.
+#[derive(Clone)]
+pub struct FeedbackSource {
+    /// The virtual device id whose output (rumble/lightbar) flows back.
+    pub device_id: String,
+    /// HD voice-coil amplitude floor: the min output for any non-zero feedback
+    /// (lifts faint game rumble to a perceptible level). 0 = no floor.
+    pub rumble_floor: f32,
+    /// HD voice-coil amplitude ceiling: output is remapped into floor..max.
+    pub rumble_max: f32,
+    /// Low-end boost exponent for the floor..max remap (`v^exp`); <1 boosts.
+    pub rumble_exp: f32,
+}
+
 /// Routing metadata for device.sink nodes: how to dispatch computed signals to a device.
 #[derive(Clone)]
 pub struct SinkTarget {
@@ -31,11 +48,12 @@ pub struct SinkTarget {
     /// When automap_source is a collector, this holds the upstream real device ID
     /// used as fallback for pins the collector does not override.
     pub automap_fallback_dev: Option<String>,
-    /// Virtual sink device IDs that auto-map FROM this physical device, used to pull
+    /// Virtual sink devices that auto-map FROM this physical device, used to pull
     /// feedback signals (rumble, lightbar) backward along the AutoMap wire.
     /// When this device is itself a sink (has haptic inputs), the engine looks up
     /// matching feedback signals (per FEEDBACK_PAIRS) from these virtual devices.
-    pub feedback_sources: Vec<String>,
+    /// Each carries the source's per-device rumble shaping (floor/max/exp).
+    pub feedback_sources: Vec<FeedbackSource>,
     /// True for device.source nodes whose feedback-input wires loop back to
     /// their own source-half (directly or through Splitter/Math chain). Eval
     /// defers the multi_sources read to a post-pass so the chain has produced

@@ -503,6 +503,11 @@ pub struct FlexInputApp {
     reinstall_confirm_open: bool,
     /// Last device-op error, shown briefly in Settings. Cleared on next op.
     last_device_op_error: Option<String>,
+    /// One-shot: on a GPU-recovery relaunch we seed helper persistence ON so the
+    /// reclaimed devices aren't wiped; once they've been reclaimed AND a grace
+    /// window has passed (so reconcile has surely run), restore the user's real
+    /// setting. `Some((real_persist, armed_at))` until done.
+    gpu_recovery_restore_persist: Option<(bool, std::time::Instant)>,
     /// Set of virtual device IDs referenced by the *active tab's* canvas.
     /// The I/O thread routes signals only to devices whose id is in this
     /// set; devices owned by background tabs receive `reset_outputs()` each
@@ -641,6 +646,12 @@ pub struct FlexInputApp {
     /// rewrite identical values. `None` means "never applied", which
     /// forces the first frame to push the initial style.
     theme_applied_for: Option<(crate::settings::Theme, u32, bool, u32)>,
+    /// True once the GPU device was lost while FlexInput was NOT the foreground
+    /// window. In this state the GUI is stalled (renders nothing) so we don't
+    /// thrash relaunches against a game that owns the GPU; the input/engine
+    /// threads keep running. Cleared by relaunching once FlexInput returns to
+    /// the foreground. See the GPU-loss block at the top of `update`.
+    gpu_stalled: bool,
 }
 
 /// Keyboard-only shortcut for panic mode. Modifiers + non-modifier key.
@@ -727,8 +738,19 @@ impl FlexInputApp {
         // created, so the helper's first `Hello` (and its orphan-cleanup
         // decision) reflects the user's setting. Off → helper removes leftovers
         // and tears down on app death; on → devices persist for reclaim.
+        //
+        // GPU-recovery boot: the prior (dead-GPU) process flipped the helper to
+        // persist=on and left the virtual devices alive for us to reclaim. If we
+        // seeded the real setting here and it's OFF, our first Hello would run the
+        // startup wipe and destroy exactly those devices before reclaim. So on a
+        // recovery boot we seed persist=ON now (no wipe, reclaim succeeds) and
+        // restore the user's real setting once devices are reclaimed (below).
         #[cfg(windows)]
-        flexinput_hidmaestro::helper::set_persist(app_settings.persist_virtual_devices);
+        {
+            let gpu_recovery = std::env::var(crate::GPU_RECOVERY_ENV).is_ok();
+            let seed_persist = gpu_recovery || app_settings.persist_virtual_devices;
+            flexinput_hidmaestro::helper::set_persist(seed_persist);
+        }
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
 
@@ -961,6 +983,14 @@ impl FlexInputApp {
             failed_device_ids: HashSet::new(),
             reinstall_confirm_open: false,
             last_device_op_error: None,
+            gpu_recovery_restore_persist: {
+                #[cfg(windows)]
+                { if std::env::var(crate::GPU_RECOVERY_ENV).is_ok() {
+                    Some((app_settings.persist_virtual_devices, std::time::Instant::now()))
+                } else { None } }
+                #[cfg(not(windows))]
+                { None }
+            },
             active_tab_device_ids,
             io_bypass,
             ui_nav_suppress,
@@ -995,6 +1025,10 @@ impl FlexInputApp {
             #[cfg(debug_assertions)]
             last_logged_repaint_hz: None,
             theme_applied_for: None,
+            // If the panic hook relaunched us because the GPU was lost while a
+            // game owned it (FlexInput backgrounded), boot straight into the
+            // stall so we don't render against the game-held device and loop.
+            gpu_stalled: std::env::var(crate::GPU_STALL_ENV).is_ok(),
         };
         // Seed the recovery dirty-signal from the restored tabs so the first
         // frame doesn't immediately rewrite the snapshot we may have just
@@ -1015,25 +1049,90 @@ impl eframe::App for FlexInputApp {
         // The vendored egui-wgpu raises this flag (instead of panicking) when
         // the graphics device is lost mid-frame — a fullscreen game resetting
         // the device, a driver TDR, or VRAM exhaustion. eframe 0.33 can't
-        // rebuild the device in place, so we recover by relaunching a fresh
-        // process. Our latest work is already on disk via the always-on
-        // recovery snapshot, so the new instance restores it seamlessly. This
-        // is the graceful path; the panic hook in `app/src/main.rs` is the
-        // last-ditch net for any loss we didn't convert. Checked first thing so
-        // we never try to render another frame on the dead device.
+        // rebuild the device in place, so the ultimate fix is to relaunch a
+        // fresh process; the recovery snapshot makes that seamless.
+        //
+        // BUT relaunching *while a game owns the GPU* is futile and harmful:
+        // the game holds the device (fullscreen flip / exclusive), so every
+        // fresh process loses it again immediately and we thrash — the UI only
+        // becomes usable once the game exits, and each teardown briefly
+        // interrupts input forwarding. The input + engine pipeline runs on
+        // independent threads (device-io / processing) that DON'T need the GPU,
+        // so when FlexInput isn't the foreground window we instead STALL the
+        // GUI: render nothing, keep those threads (and virtual devices / rumble
+        // forwarding) alive, and defer the relaunch until FlexInput is
+        // foreground again (user alt-tabbed back, or the game exited). GUI
+        // latency while backgrounded doesn't matter; uninterrupted input does.
+        if self.gpu_stalled {
+            // Already stalled. If we're back in foreground, rebuild the UI now;
+            // otherwise keep idling (don't render — see below).
+            let foreground = crate::process_list::foreground_exe().is_none();
+            // The device may re-latch the flag on each polled present; clear it
+            // so a future genuine loss is still observable.
+            eframe::egui_wgpu::GPU_LOST.store(false, std::sync::atomic::Ordering::SeqCst);
+            if foreground {
+                eprintln!("GPU stall: FlexInput foreground again — relaunching to rebuild UI.");
+                settings::save_recovery(&self.build_persisted_workspace());
+                settings::save_settings(&self.settings);
+                crate::relaunch_self_and_exit();
+            }
+            // Stay stalled: poll a few times a second for foreground return.
+            // Returning here builds no UI this frame, so egui emits no shapes
+            // and no texture deltas — the present is a safe no-op on the dead
+            // device (the buffer-staging guards skip; the texture path isn't
+            // reached because nothing changed).
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        }
         if eframe::egui_wgpu::GPU_LOST.load(std::sync::atomic::Ordering::SeqCst) {
-            eprintln!("GPU device lost — saving recovery snapshot and relaunching.");
-            // Force a final snapshot regardless of the dirty signal, then hand
-            // off to a fresh process and exit this one.
+            let foreground = crate::process_list::foreground_exe().is_none();
+            if foreground {
+                // We're the focused window — the user is looking at the UI, so
+                // rebuild it immediately via relaunch.
+                eprintln!("GPU device lost (foreground) — saving recovery snapshot and relaunching.");
+                settings::save_recovery(&self.build_persisted_workspace());
+                settings::save_settings(&self.settings);
+                crate::relaunch_self_and_exit();
+            }
+            // A game (or other app) owns the GPU. Enter the stall instead of
+            // relaunching into a loop. Persist a snapshot once so a hard crash
+            // during the stall still recovers, then idle the GUI.
+            eprintln!("GPU device lost (backgrounded) — stalling GUI; input/engine keep running.");
             settings::save_recovery(&self.build_persisted_workspace());
             settings::save_settings(&self.settings);
-            crate::relaunch_self_and_exit();
+            eframe::egui_wgpu::GPU_LOST.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.gpu_stalled = true;
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
         }
 
         // ── Apply finished device-ops worker results ─────────────────────
         // Pushes freshly-built virtual devices into the shared pool (and clears
         // in-flight markers). Done before anything reads the pool this frame.
         self.drain_device_op_results();
+
+        // GPU-recovery one-shot: we seeded helper persistence ON so the devices
+        // kept alive across the relaunch wouldn't be wiped before reclaim. Once
+        // the pool has them back, restore the user's real persistence setting so
+        // normal exit teardown resumes.
+        #[cfg(windows)]
+        if let Some((real_persist, armed_at)) = self.gpu_recovery_restore_persist {
+            // Restore once reclaim has had time to run. A grace window ensures the
+            // startup reconcile (which enqueues the reclaim creates) has executed
+            // before we decide "nothing to reclaim", avoiding a premature restore
+            // that would wipe devices. After the window: restore when a device is
+            // back in the pool, or when nothing is pending (empty patch).
+            let elapsed = armed_at.elapsed() >= std::time::Duration::from_secs(3);
+            if elapsed {
+                let pool_has = !self.shared_virtual_devices.lock().unwrap().is_empty();
+                let settled = pool_has || self.pending_device_ids.is_empty();
+                if settled {
+                    flexinput_hidmaestro::helper::set_persist(real_persist);
+                    self.gpu_recovery_restore_persist = None;
+                    eprintln!("[gpu-recovery] reclaim settled; restored persist={real_persist}");
+                }
+            }
+        }
 
         // Keep the I/O thread's active-tab device-id filter current every frame.
         // This set gates which virtual devices have their feedback (rumble/FFB)
@@ -9581,7 +9680,7 @@ fn build_processing_graph_rec(
     // Pre-pass: collect, for each physical device_id used as an AutoMap source,
     // the list of virtual sink device_ids that auto-map from it. Used to wire
     // feedback signals (rumble, lightbar) backward along AutoMap connections.
-    let mut feedback_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut feedback_map: HashMap<String, Vec<flexinput_engine::FeedbackSource>> = HashMap::new();
     for (node_id, node) in &node_list {
         let is_sink = node.module_id == "device.sink"
             || (node.module_id == "device.source" && !node.inputs.is_empty());
@@ -9610,7 +9709,18 @@ fn build_processing_graph_rec(
         let sink_dev = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
         // Only track virtual sinks (their feedback flows back to physical sources).
         if sink_dev.starts_with("virtual.") {
-            feedback_map.entry(src_dev).or_default().push(sink_dev.to_string());
+            // Per-device rumble shaping from the virtual sink node's params.
+            // Defaults match the previous env-var boost (floor 0.35, max 1.0,
+            // exp 0.6) so existing patches feel identical until tuned.
+            let p = |k: &str, d: f32| {
+                node.params.get(k).and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(d)
+            };
+            feedback_map.entry(src_dev).or_default().push(flexinput_engine::FeedbackSource {
+                device_id: sink_dev.to_string(),
+                rumble_floor: p("rumble_floor", 0.35).clamp(0.0, 1.0),
+                rumble_max:   p("rumble_max", 1.0).clamp(0.0, 1.0),
+                rumble_exp:   p("rumble_exp", 0.6).max(0.01),
+            });
         }
     }
 
