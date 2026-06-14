@@ -550,6 +550,26 @@ impl OutputSection {
         Ok(OutputSection { section, last_seq })
     }
 
+    /// Diagnostic open that starts at `last_seq = 0`, so the first polls replay
+    /// any frames already in the ring (capped to the last 64 by the skip-ahead in
+    /// `try_read`). Used by the probe to reveal whether the driver has *ever*
+    /// written output, not just since attach. Not for the live app.
+    pub fn open_replay(controller_index: u32) -> Result<Self, ShmError> {
+        let section = MappedSection::open(
+            &format!(r"Global\HIDMaestroOutput{controller_index}"),
+            SHARED_OUTPUT_SIZE,
+        )?;
+        Ok(OutputSection { section, last_seq: 0 })
+    }
+
+    /// Current ring `Head` (monotonic count of total writes by the driver) and
+    /// the reader's `last_seq`. Diagnostic only: lets a probe distinguish "ring
+    /// alive but driver never wrote" (Head==0, frozen) from "driver wrote N
+    /// frames but not since we attached" (Head>0, frozen at the same value).
+    pub fn debug_head(&self) -> (u32, u32) {
+        (unsafe { self.section.read_u32(0) }, self.last_seq)
+    }
+
     /// Read the next ring packet if one was published since the last call.
     /// Returns `None` when nothing new. Mirrors `TryReadOutputFrame`.
     pub fn try_read(&mut self) -> Option<OutputFrame> {
