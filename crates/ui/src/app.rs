@@ -2808,6 +2808,22 @@ impl eframe::App for FlexInputApp {
         // starts fresh. It only survives an *abnormal* exit (GPU-loss relaunch
         // or hard crash), which is exactly when we want to restore from it.
         settings::delete_recovery();
+
+        // "Keep virtual controllers alive": before the device pool is dropped,
+        // tell each device to relinquish its OS node so Drop won't tear it down.
+        // Without this, HidMaestroDevice::drop unconditionally calls
+        // helper::destroy on a clean exit — removing the very nodes the persist
+        // setting promises to keep for reclaim next launch. The helper's own
+        // parent-death/exit teardown already respects persist; this closes the
+        // app-side Drop path that bypassed it.
+        #[cfg(windows)]
+        if self.settings.persist_virtual_devices {
+            if let Ok(mut pool) = self.shared_virtual_devices.lock() {
+                for dev in pool.iter_mut() {
+                    dev.persist_on_drop();
+                }
+            }
+        }
     }
 
     /// Override of the default eframe clear color (which is a 70%-opaque
@@ -7757,8 +7773,10 @@ impl FlexInputApp {
                 }
                 ui.label(egui::RichText::new(
                     "Off by default: virtual pads are removed when the app closes or crashes. \
-                     Turn on so a running game keeps its gamepad across an app restart or update \
-                     \u{2014} FlexInput reclaims the existing device on next launch. (HIDMaestro only.)",
+                     Turn on to keep the controller registered across an app restart or update, so \
+                     a game doesn't lose the device \u{2014} FlexInput reclaims it on next launch. \
+                     Note: while FlexInput is closed the pad sends no input (it resumes when the \
+                     app reopens). (HIDMaestro only.)",
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(6.0);

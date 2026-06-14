@@ -210,6 +210,16 @@ impl crate::VirtualDevice for HidMaestroDevice {
         layouts::DS4_SOURCE_PINS
     }
 
+    fn persist_on_drop(&mut self) {
+        // Forget the helper-created node so Drop won't call helper::destroy:
+        // the node stays alive past app exit and is reclaimed (by device_id)
+        // on next launch. Closing the section handles here is fine — the helper
+        // keeps the node; we reopen on reclaim.
+        self.helper_instance_id = None;
+        self.input = None;
+        self.output = None;
+    }
+
     fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> {
         // Drain the output ring; keep the latest rumble report we recognize.
         // Motor byte offsets differ between DS4 (right@4/left@5) and DualSense

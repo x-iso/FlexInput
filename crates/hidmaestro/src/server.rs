@@ -30,6 +30,7 @@ use crate::helper_ipc::{DeviceInfo, Request, Response, PIPE_NAME};
 use crate::install::{hidmaestro_available, installed_inf_path};
 use crate::orchestrator::{
     create_device_node, list_hidmaestro_devices, remove_all_hidmaestro_devices, remove_device_node,
+    wait_for_hid_child_started,
 };
 use crate::shm::{InputSection, OutputSection};
 use crate::Profile;
@@ -363,6 +364,12 @@ fn handle_create(
                 LiveDevice { _input: input, _output: output, index: found.index, device_id: device_id.to_string() },
             );
         }
+        // The surviving node's driver lost its section handle when the previous
+        // helper exited; we just re-created the section above. Wait for the HID
+        // child to be Started again before returning so the app's first writes
+        // land on a listening driver — otherwise the reclaimed device can look
+        // dead until another relaunch (the "fails to redeploy some" symptom).
+        wait_for_hid_child_started(&found.instance_id, 5000);
         diag_log(&format!(
             "[helper] reclaim (cross-run) device_id={device_id} idx={} instance={}",
             found.index, found.instance_id

@@ -45,6 +45,17 @@ pub trait VirtualDevice: Send {
     /// Poll latest output values from the OS/game (e.g. rumble motor speeds).
     /// Returns (pin_id, signal) pairs; called each I/O frame after flush().
     fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> { vec![] }
+
+    /// Relinquish OS ownership so this device's `Drop` does NOT tear the
+    /// underlying virtual node down — the node is intentionally left alive past
+    /// app exit for reclaim on next launch. Called on a clean shutdown when the
+    /// user enabled "keep virtual controllers alive".
+    ///
+    /// Default: no-op. Only HIDMaestro devices override it (they own a
+    /// helper-created PnP node that survives the helper process). ViGEmBus
+    /// targets (XInput/DS4) cannot persist — ViGEmBus auto-removes them when the
+    /// creating process exits — so they ignore this and are recreated next run.
+    fn persist_on_drop(&mut self) {}
 }
 
 #[cfg(windows)]

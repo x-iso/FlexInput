@@ -536,7 +536,12 @@ const DN_STARTED: u32 = 0x0000_0008;
 /// waits for the child PDO to exist — the section isn't actually being read
 /// until the driver is *started*, and writing before then is what made a
 /// freshly-created device look dead until the app was relaunched.
-fn wait_for_hid_child_started(instance_id: &str, timeout_ms: u64) -> bool {
+///
+/// Public so the cross-run reclaim path (server.rs) can wait for a *surviving*
+/// node's driver to re-bind to the freshly re-created section before returning —
+/// otherwise the app's first writes race the driver and the reclaimed device
+/// looks dead until yet another relaunch.
+pub fn wait_for_hid_child_started(instance_id: &str, timeout_ms: u64) -> bool {
     let w_id = to_wide(instance_id);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
