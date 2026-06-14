@@ -2247,28 +2247,27 @@ impl eframe::App for FlexInputApp {
         // the displayed list for up to that window. Filter by kind here
         // using the shared pool as authoritative for "ours": one
         // virtual.xinput → drop one ControllerKind::XInput entry, etc.
+        // Device ids that are FlexInput's own virtual pads. Two-tier: HIDMaestro
+        // (PS) pads via the path-classified `:v` gilrs id, plus ViGEm
+        // (xinput/ds4) pads via the pool-count fallback (no HID path) — see
+        // `own_virtual_device_ids`. Used both to filter the physical list (below)
+        // and to gray out their nav toggle (loopback feedback guard).
+        let nav_excluded_ids = self.own_virtual_device_ids();
         let devices_owned;
         let devices: &[PhysicalDevice] = if self.settings.show_own_virtuals_as_physical {
             &self.devices
         } else {
-            // Drop FlexInput's OWN emulated devices — now identified precisely by
-            // the `:v` instance marker in the gilrs id (see
-            // gilrs_backend::gilrs_device_id), so a real controller is never
-            // dropped regardless of plug order (the old count-by-kind heuristic
-            // dropped the real device when a virtual of the same model existed and
-            // was plugged first).
+            // Drop FlexInput's OWN emulated devices so they don't clutter the
+            // physical list. A real controller is never dropped: PS pads are
+            // path-classified (not plug-order), and the ViGEm fallback only
+            // claims as many as we actually created.
             devices_owned = self.devices.iter()
-                .filter(|d| !is_own_virtual_gilrs_id(&d.id))
+                .filter(|d| !nav_excluded_ids.contains(&d.id))
                 .cloned()
                 .collect::<Vec<_>>();
             &devices_owned
         };
         let bottom_panel_height = self.bottom_panel_height;
-        // Device ids that are FlexInput's own virtual pads (visible in the
-        // physical list via `show_own_virtuals_as_physical`). Their nav toggle is
-        // grayed + forced off so navigating from our own loopback output can't
-        // create a feedback loop. Computed before the panel borrows below.
-        let nav_excluded_ids = self.own_virtual_device_ids();
         // Belt-and-suspenders: ensure any excluded device is OFF in the nav map
         // (covers the case where the global default flipped it on before the
         // device was recognized as a loopback virtual).
@@ -7177,13 +7176,51 @@ impl FlexInputApp {
     /// real). Returns ids regardless of the `show_own_virtuals_as_physical`
     /// setting — the exclusion applies whenever such a device is visible.
     fn own_virtual_device_ids(&self) -> std::collections::HashSet<String> {
-        // Our emulated pads are tagged with a `v`-prefixed gilrs instance
-        // (`gilrs:dualsense:v0`), so identify them directly — no plug-order
-        // guessing, and a real device is never mistaken for ours.
-        self.devices.iter()
-            .filter(|d| is_own_virtual_gilrs_id(&d.id))
-            .map(|d| d.id.clone())
-            .collect()
+        use std::collections::{HashMap, HashSet};
+        let mut owned: HashSet<String> = HashSet::new();
+
+        // Tier 1 — HIDMaestro (PS-family) pads are tagged with a `v`-prefixed
+        // gilrs instance (`gilrs:dualsense:v0`) by the path-based classifier in
+        // the devices backend. Identify them directly: no plug-order guessing,
+        // and a real same-VID/PID controller is never mistaken for ours.
+        for d in &self.devices {
+            if is_own_virtual_gilrs_id(&d.id) {
+                owned.insert(d.id.clone());
+            }
+        }
+
+        // Tier 2 — ViGEmBus pads (`virtual.xinput`, `virtual.ds4`) have NO HID
+        // instance path (they're bus-enumerated XUSB/DS4 targets), so the path
+        // classifier can't see them. Fall back to the pool-count match the app
+        // used before the classifier existed: for each ViGEm kind in our shared
+        // pool, mark that many physical devices of the matching kind as ours,
+        // walking from the end (virtuals enumerate after reals). Scoped to ViGEm
+        // kinds and skips anything Tier 1 already claimed, so it never disturbs
+        // the robust PS-family decision.
+        let mut to_skip: HashMap<flexinput_devices::ControllerKind, usize> = HashMap::new();
+        {
+            let pool = self.shared_virtual_devices.lock().unwrap();
+            for d in pool.iter() {
+                let kind = match flexinput_virtual::kind_prefix(d.id()).as_str() {
+                    "virtual.xinput" => Some(flexinput_devices::ControllerKind::XInput),
+                    "virtual.ds4"    => Some(flexinput_devices::ControllerKind::DualShock4),
+                    _ => None, // virtual.hm.* handled by Tier 1
+                };
+                if let Some(k) = kind { *to_skip.entry(k).or_insert(0) += 1; }
+            }
+        }
+        for (k, n) in to_skip.iter() {
+            let mut remaining = *n;
+            for i in (0..self.devices.len()).rev() {
+                if remaining == 0 { break; }
+                let d = &self.devices[i];
+                if d.kind == *k && !owned.contains(&d.id) {
+                    owned.insert(d.id.clone());
+                    remaining -= 1;
+                }
+            }
+        }
+        owned
     }
 
     /// Resolve the active Easy sub-patch outer node id (the `subpatch` node in
