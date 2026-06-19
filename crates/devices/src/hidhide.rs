@@ -540,17 +540,27 @@ pub fn physical_count_for_vid_pid(vid: u16, pid: u16) -> usize {
             if ok == 0 { continue; }
             let hw_words: Vec<u16> = hw_buf[..hw_size as usize]
                 .chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-            if !from_wide_multi(&hw_words).iter().any(|id| {
+            let hw_ids = from_wide_multi(&hw_words);
+            if !hw_ids.iter().any(|id| {
                 let up = id.to_uppercase();
                 up.contains(&needle_usb) || up.contains(&needle_bt)
             }) { continue; }
+            // Exclude our own HIDMaestro pad from the REAL-controller count on
+            // EITHER signal: the `SWD\HIDMAESTRO` instance-id marker
+            // (`is_virtual_instance_id`, the form `SwDeviceCreate` produces) OR the
+            // `root\HIDMaestro` HardwareID tag. The HardwareID check is the robust
+            // one — it catches our pad regardless of SWD-vs-ROOT enumeration (so it
+            // still excludes any legacy ROOT\… node from before the SWD migration).
+            // Without it we'd count our own virtual pad as a real controller.
+            let hw_is_hidmaestro = hw_ids.iter().any(|id| id.to_uppercase().contains("HIDMAESTRO"));
             let mut id_buf = vec![0u16; 512];
             let mut id_size = 0u32;
             if unsafe { SetupDiGetDeviceInstanceIdW(
                 hdevinfo, &mut info, id_buf.as_mut_ptr(), id_buf.len() as u32, &mut id_size) } != 0
             {
                 let len = (id_size as usize).saturating_sub(1);
-                if !is_virtual_instance_id(&String::from_utf16_lossy(&id_buf[..len])) {
+                let instance_id = String::from_utf16_lossy(&id_buf[..len]);
+                if !is_virtual_instance_id(&instance_id) && !hw_is_hidmaestro {
                     count += 1;
                 }
             }

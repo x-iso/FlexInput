@@ -268,6 +268,100 @@ pub fn encode_report_into(profile: &Profile, state: &GamepadState, report: &mut 
     encode_extended(profile, state, report);
 }
 
+/// The HIDMaestro companion's GIP button-word bit flags — **NOT** `XINPUT_GAMEPAD`
+/// `wButtons` order. Mapped empirically against `XInputGetState` (verified live
+/// 2026-06-15): setting GIP-word bit `B` produced the XInput button on the right
+/// (the binary driver gives no spec). The face/shoulder/stick/menu buttons form a clean
+/// dense block 0x0001..0x0200; the d-pad sits in the high nibble (Up confirmed at
+/// 0x0400; the remaining directions are a 4-bit hat — see `gip_dpad`).
+mod gip_button {
+    pub const A: u16 = 0x0001;
+    pub const B: u16 = 0x0002;
+    pub const X: u16 = 0x0004;
+    pub const Y: u16 = 0x0008;
+    pub const LEFT_SHOULDER: u16 = 0x0010;
+    pub const RIGHT_SHOULDER: u16 = 0x0020;
+    pub const LEFT_THUMB: u16 = 0x0040;
+    pub const RIGHT_THUMB: u16 = 0x0080;
+    pub const BACK: u16 = 0x0100;
+    pub const START: u16 = 0x0200;
+    /// The d-pad is an HMHat octant (0 = neutral, 1 = N … 8 = NW) packed into
+    /// bits 10..14 of the GIP button word, NOT four independent direction bits.
+    /// Verified live: 0x0400 (octant 1) → Up; 0x1000 (octant 4) → Down+Right (SE);
+    /// 0x2000 (octant 8) → Up+Left (NW). Shift the octant left by `DPAD_SHIFT`.
+    pub const DPAD_SHIFT: u32 = 10;
+}
+
+/// Build the 14-byte GIP input payload from `state`, for the HIDMaestro XUSB
+/// companion (Xbox360/XInput pad), written into the SHM input section's
+/// `GipData[14]` region (offset 264).
+///
+/// **The HIDMaestro companion's GIP layout is NOT `XINPUT_GAMEPAD` order** — it
+/// was mapped empirically against `XInputGetState` (the binary driver gives no
+/// spec). Verified layout (live against `XInputGetState`, 2026-06-15):
+/// ```text
+/// [0..2]   LX (u16 LE; 0x0000 = full left, 0x8000 = center, 0xFFFF = full right)
+/// [2..4]   LY (u16 LE; INVERTED vs X: 0x0000 = full UP, 0x8000 = center, 0xFFFF = down)
+/// [4..6]   RX (u16 LE; like LX)
+/// [6..8]   RY (u16 LE; INVERTED like LY)
+/// [8]      LT (u8; companion rescales to XInput's 0..63, so 255 → LT=63)
+/// [10]     RT (u8; same)          [9],[11] unused
+/// [12..14] buttons (u16 LE, the companion's OWN order — see `gip_button`)
+/// ```
+/// Sticks are UNSIGNED here (center = 0x8000), unlike `XINPUT_GAMEPAD`'s signed
+/// i16. Input arrives normalized `0.0..1.0` (0.5 = center); Y is already in
+/// up-from-1.0 sense from `PinState::state` (it inverts once), and the unsigned
+/// 0xFFFF = up mapping matches that without a second flip. The button word is the
+/// companion's own bit order (A=0x0001, …, d-pad in the high nibble), NOT
+/// XINPUT_GAMEPAD's; d-pad comes from `state.hat`.
+pub fn gip_from_state(state: &GamepadState) -> [u8; 14] {
+    let mut g = [0u8; 14];
+
+    // Sticks: normalized 0..1 → unsigned 0..65535 (0.5 → 0x8000 center). All four
+    // axes pass straight through: `GamepadState` Y already counts up (PinState's
+    // state() inverts Y once), and the companion's GIP Y maps high→up, so no
+    // second flip is needed (a second flip re-inverts Y — the observed bug).
+    let to_u16 = |n: f32| -> u16 { (n.clamp(0.0, 1.0) * 65535.0).round() as u16 };
+    let lx = to_u16(state.left_stick_x);
+    let ly = to_u16(state.left_stick_y);
+    let rx = to_u16(state.right_stick_x);
+    let ry = to_u16(state.right_stick_y);
+    g[0..2].copy_from_slice(&lx.to_le_bytes());
+    g[2..4].copy_from_slice(&ly.to_le_bytes());
+    g[4..6].copy_from_slice(&rx.to_le_bytes());
+    g[6..8].copy_from_slice(&ry.to_le_bytes());
+
+    // Triggers: u16 LE at [8..10] (LT) and [10..12] (RT). The companion scales the
+    // u16 down by ~4 to XInput's 0..255, so the LOW byte alone tops out at LT=63
+    // (≈0.25 — the cap symptom); full scale needs ~1020. Verified live: u16 0x03FC
+    // (1020) → LT=254, 0x0FFF → 255. Write trigger * 1020.
+    let trig_u16 = |n: f32| -> u16 { (n.clamp(0.0, 1.0) * 1020.0).round() as u16 };
+    g[8..10].copy_from_slice(&trig_u16(state.left_trigger).to_le_bytes());
+    g[10..12].copy_from_slice(&trig_u16(state.right_trigger).to_le_bytes());
+
+    // Buttons (u16 LE @ 12): the companion's own GIP button order (mapped live,
+    // NOT XINPUT_GAMEPAD). Guide has no slot in the confirmed block (it aliased
+    // into the d-pad nibble during probing), so it's intentionally omitted — XInput
+    // treats Guide as undocumented anyway.
+    let mut w: u16 = 0;
+    let b = state.buttons;
+    if b & button::A != 0 { w |= gip_button::A; }
+    if b & button::B != 0 { w |= gip_button::B; }
+    if b & button::X != 0 { w |= gip_button::X; }
+    if b & button::Y != 0 { w |= gip_button::Y; }
+    if b & button::LEFT_BUMPER != 0 { w |= gip_button::LEFT_SHOULDER; }
+    if b & button::RIGHT_BUMPER != 0 { w |= gip_button::RIGHT_SHOULDER; }
+    if b & button::BACK != 0 { w |= gip_button::BACK; }
+    if b & button::START != 0 { w |= gip_button::START; }
+    if b & button::LEFT_STICK != 0 { w |= gip_button::LEFT_THUMB; }
+    if b & button::RIGHT_STICK != 0 { w |= gip_button::RIGHT_THUMB; }
+    // D-pad: HMHat octant (0..8) packed into bits 10..14 (verified live).
+    w |= (state.hat.octant() as u16) << gip_button::DPAD_SHIFT;
+    g[12..14].copy_from_slice(&w.to_le_bytes());
+
+    g
+}
+
 /// Write the int16-LE little-endian value `v` at byte `off` (RID-inclusive
 /// offset into the on-wire report), if in bounds.
 fn write_i16_le(report: &mut [u8], off: usize, v: i16) {
@@ -736,6 +830,96 @@ mod tests {
         let st = ps.state();
         assert_eq!(st.gyro_roll, 0.5, "gyro_x → wire roll");
         assert_eq!(st.gyro_yaw, -0.25, "gyro_z → wire yaw (negated)");
+    }
+
+    // Locks the GIP layout mapped live against XInputGetState (2026-06-15). If
+    // someone "fixes" gip_from_state to XINPUT_GAMEPAD order, these break.
+    #[test]
+    fn gip_neutral_centers_sticks_and_clears_rest() {
+        let g = gip_from_state(&GamepadState::neutral());
+        // Sticks centered at 0x8000 (unsigned).
+        assert_eq!(u16::from_le_bytes([g[0], g[1]]), 0x8000, "LX center");
+        assert_eq!(u16::from_le_bytes([g[2], g[3]]), 0x8000, "LY center");
+        assert_eq!(u16::from_le_bytes([g[4], g[5]]), 0x8000, "RX center");
+        assert_eq!(u16::from_le_bytes([g[6], g[7]]), 0x8000, "RY center");
+        assert_eq!(g[8], 0, "LT released");
+        assert_eq!(g[10], 0, "RT released");
+        assert_eq!(u16::from_le_bytes([g[12], g[13]]), 0, "no buttons");
+    }
+
+    #[test]
+    fn gip_buttons_use_companion_order() {
+        let bit = |b: u32| {
+            let mut st = GamepadState::neutral();
+            st.buttons = b;
+            let g = gip_from_state(&st);
+            u16::from_le_bytes([g[12], g[13]])
+        };
+        assert_eq!(bit(button::A), 0x0001);
+        assert_eq!(bit(button::B), 0x0002);
+        assert_eq!(bit(button::X), 0x0004);
+        assert_eq!(bit(button::Y), 0x0008);
+        assert_eq!(bit(button::LEFT_BUMPER), 0x0010);
+        assert_eq!(bit(button::RIGHT_BUMPER), 0x0020);
+        assert_eq!(bit(button::LEFT_STICK), 0x0040);
+        assert_eq!(bit(button::RIGHT_STICK), 0x0080);
+        assert_eq!(bit(button::BACK), 0x0100);
+        assert_eq!(bit(button::START), 0x0200);
+    }
+
+    // Triggers are a u16 the companion scales by ~1/4: full press → 1020 (0x03FC),
+    // so its >>2 yields ~255. (Live-verified: 0x03FC→LT=254, 0x0FFF→255.)
+    #[test]
+    fn gip_triggers_are_u16_full_scale() {
+        let mut st = GamepadState::neutral();
+        st.left_trigger = 1.0;
+        st.right_trigger = 1.0;
+        let g = gip_from_state(&st);
+        assert_eq!(u16::from_le_bytes([g[8], g[9]]), 1020, "LT full → 1020");
+        assert_eq!(u16::from_le_bytes([g[10], g[11]]), 1020, "RT full → 1020");
+        // Half press ~510.
+        let mut st = GamepadState::neutral();
+        st.left_trigger = 0.5;
+        let g = gip_from_state(&st);
+        assert_eq!(u16::from_le_bytes([g[8], g[9]]), 510, "LT half → 510");
+    }
+
+    #[test]
+    fn gip_dpad_is_octant_nibble() {
+        let oct = |h: Hat| {
+            let mut st = GamepadState::neutral();
+            st.hat = h;
+            let g = gip_from_state(&st);
+            u16::from_le_bytes([g[12], g[13]]) >> 10
+        };
+        assert_eq!(oct(Hat::Neutral), 0);
+        assert_eq!(oct(Hat::North), 1, "Up → octant 1 (0x0400)");
+        assert_eq!(oct(Hat::SouthEast), 4, "Down+Right → octant 4 (0x1000)");
+        assert_eq!(oct(Hat::NorthWest), 8, "Up+Left → octant 8 (0x2000)");
+    }
+
+    #[test]
+    fn gip_full_right_stick_is_max() {
+        let mut st = GamepadState::neutral();
+        st.left_stick_x = 1.0;
+        let g = gip_from_state(&st);
+        assert_eq!(u16::from_le_bytes([g[0], g[1]]), 0xFFFF, "LX full right → 0xFFFF");
+    }
+
+    // All four stick axes pass straight through (GamepadState Y is already
+    // up-counting from PinState's single flip; no second flip in the GIP encoder).
+    #[test]
+    fn gip_axes_pass_straight_through() {
+        let mut st = GamepadState::neutral();
+        st.left_stick_y = 1.0; // up
+        st.right_stick_y = 1.0;
+        let g = gip_from_state(&st);
+        assert_eq!(u16::from_le_bytes([g[2], g[3]]), 0xFFFF, "LY up → 0xFFFF");
+        assert_eq!(u16::from_le_bytes([g[6], g[7]]), 0xFFFF, "RY up → 0xFFFF");
+        st = GamepadState::neutral();
+        st.left_stick_x = 1.0;
+        let g = gip_from_state(&st);
+        assert_eq!(u16::from_le_bytes([g[0], g[1]]), 0xFFFF, "LX right → 0xFFFF");
     }
 
     #[test]

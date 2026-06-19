@@ -352,6 +352,7 @@ fn kind_base_name(kind_prefix: &str) -> &'static str {
         "virtual.keymouse"      => "Virtual Keyboard & Mouse",
         "virtual.hm.ds4"        => "Virtual DualShock 4",
         "virtual.hm.dualsense"  => "Virtual DualSense",
+        "virtual.hm.xinput"     => "Virtual Xbox 360",
         _                       => "Virtual Device",
     }
 }

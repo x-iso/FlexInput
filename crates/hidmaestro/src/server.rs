@@ -27,10 +27,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::deploy::ensure_driver_installed;
 use crate::helper_ipc::{DeviceInfo, Request, Response, PIPE_NAME};
-use crate::install::{hidmaestro_available, installed_inf_path};
+use crate::install::{hidmaestro_available, installed_inf_path, installed_xusb_inf_path};
 use crate::orchestrator::{
-    create_device_node, list_hidmaestro_devices, remove_all_hidmaestro_devices, remove_device_node,
-    wait_for_hid_child_started,
+    create_device_node, create_xusb_companion_node, list_hidmaestro_devices,
+    remove_all_hidmaestro_devices, remove_device_node, wait_for_hid_child_started,
 };
 use crate::shm::{InputSection, OutputSection};
 use crate::Profile;
@@ -75,6 +75,14 @@ struct LiveDevice {
     _output: Option<OutputSection>,
     index: u32,
     device_id: String,
+    /// For Xbox360/XInput pads: the XUSB companion node's instance id (under
+    /// `SWD\HIDMAESTRO`), created alongside the HID node. `None` for plain-HID pads.
+    companion_instance_id: Option<String>,
+    /// Owning handle for the SWD XUSB companion. Dropping it REMOVES the node
+    /// (default `Handle` lifetime) — this is the reliable teardown on Win10 19045
+    /// (the reconnect-and-downgrade path is a cosmetic no-op there). A helper crash
+    /// drops it too, so nodes never leak as un-removable ParentPresent orphans.
+    _companion_handle: Option<crate::orchestrator::SwdHandle>,
 }
 
 /// Process-wide helper state shared between the client loop and the
@@ -108,7 +116,15 @@ impl HelperState {
     /// persistence is off). Best-effort.
     fn teardown_tracked(&self) {
         if let Ok(mut devs) = self.devices.lock() {
-            for (id, _) in devs.drain() {
+            for (id, dev) in devs.drain() {
+                // Drop the SWD companion's held handle FIRST — that's what removes
+                // the companion node (default Handle lifetime). Do it explicitly so
+                // the companion is gone before we remove the HID node.
+                drop(dev._companion_handle);
+                // Fallback for a companion with no live handle (legacy/reclaimed).
+                if let Some(cid) = &dev.companion_instance_id {
+                    let _ = remove_device_node(cid);
+                }
                 let _ = remove_device_node(&id);
             }
         }
@@ -407,7 +423,11 @@ fn handle_create(
     // device_id. Re-attach by mapping its sections at the recorded index — don't
     // create a second node.
     let existing = list_hidmaestro_devices();
-    if let Some(found) = existing.iter().find(|d| d.device_id == device_id && !device_id.is_empty())
+    // Match the HID gamepad node (it drives the SHM section); the XUSB companion
+    // shares the same device_id/index but is a separate System-class node.
+    if let Some(found) = existing
+        .iter()
+        .find(|d| d.device_id == device_id && !device_id.is_empty() && !d.is_companion)
     {
         let input = match InputSection::create(found.index).or_else(|_| InputSection::open(found.index)) {
             Ok(s) => s,
@@ -416,10 +436,26 @@ fn handle_create(
         let output = OutputSection::create(found.index)
             .or_else(|_| OutputSection::open(found.index))
             .ok();
+        // Re-discover any surviving XUSB companion at this index (best-effort).
+        // NOTE: with the held-handle lifetime model, SWD companions are removed
+        // when the creating helper exits, so a cross-session survivor is not
+        // expected here; we can't re-acquire its owning handle either. Kept for
+        // the in-session case + any legacy ROOT companion.
+        let companion_instance_id = existing
+            .iter()
+            .find(|d| d.is_companion && d.index == found.index)
+            .map(|d| d.instance_id.clone());
         if let Ok(mut devs) = state.devices.lock() {
             devs.insert(
                 found.instance_id.clone(),
-                LiveDevice { _input: input, _output: output, index: found.index, device_id: device_id.to_string() },
+                LiveDevice {
+                    _input: input,
+                    _output: output,
+                    index: found.index,
+                    device_id: device_id.to_string(),
+                    companion_instance_id,
+                    _companion_handle: None,
+                },
             );
         }
         // The surviving node's driver lost its section handle when the previous
@@ -447,10 +483,41 @@ fn handle_create(
 
     match create_device_node(&profile, &inf.display().to_string(), index, device_id) {
         Ok(dev) => {
+            // For XInput/Xbox360 profiles, also create the XUSB companion node at
+            // the SAME index. The companion is the ONE XInput identity; its sibling
+            // HID node carries a non-Xbox HardwareID so it doesn't publish a second
+            // XInput face. Non-fatal: if the companion fails the HID gamepad still
+            // works (just not via XInput).
+            let mut companion_instance_id = None;
+            let mut companion_handle = None;
+            if profile.requires_xusb_companion {
+                match installed_xusb_inf_path() {
+                    Some(xusb_inf) => {
+                        match create_xusb_companion_node(&profile, &xusb_inf.display().to_string(), index) {
+                            Ok((cid, handle)) => {
+                                diag_log(&format!("[helper] created XUSB companion idx={index} instance={cid}"));
+                                companion_instance_id = Some(cid);
+                                companion_handle = Some(handle);
+                            }
+                            Err(e) => diag_log(&format!(
+                                "[helper] XUSB companion create FAILED idx={index}: {e} (XInput off; HID pad still works)"
+                            )),
+                        }
+                    }
+                    None => diag_log("[helper] XUSB companion INF not found; XInput off"),
+                }
+            }
             if let Ok(mut devs) = state.devices.lock() {
                 devs.insert(
                     dev.instance_id.clone(),
-                    LiveDevice { _input: input, _output: output, index, device_id: device_id.to_string() },
+                    LiveDevice {
+                        _input: input,
+                        _output: output,
+                        index,
+                        device_id: device_id.to_string(),
+                        companion_instance_id,
+                        _companion_handle: companion_handle,
+                    },
                 );
             }
             diag_log(&format!(
@@ -489,15 +556,21 @@ fn allocate_index(
 }
 
 fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
+    // Pull the tracked device first so we can also remove its XUSB companion.
+    let tracked = state.devices.lock().ok().and_then(|mut devs| devs.remove(instance_id));
+    if let Some(mut dev) = tracked {
+        // Drop the SWD companion's held handle — that removes the companion node
+        // (default Handle lifetime). Fallback to an explicit remove for a
+        // legacy/reclaimed companion with no live handle.
+        dev._companion_handle.take();
+        if let Some(cid) = &dev.companion_instance_id {
+            let _ = remove_device_node(cid);
+        }
+    }
     let removed = match remove_device_node(instance_id) {
         Ok(g) => g,
         Err(e) => return Response::err(format!("remove device: {e}")),
     };
-    if let Ok(mut devs) = state.devices.lock() {
-        if let Some(dev) = devs.remove(instance_id) {
-            let _ = dev.index;
-        }
-    }
     Response::Ok { detail: Some(format!("removed={removed}")) }
 }
 

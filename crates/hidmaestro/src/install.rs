@@ -60,7 +60,31 @@ pub fn installed_inf_path() -> Option<PathBuf> {
         if !(name.starts_with("oem") && name.ends_with(".inf")) {
             continue;
         }
-        if inf_is_hidmaestro(&path) {
+        // The plain-HID node binds the MAIN INF; exclude the XUSB companion INF
+        // (both contain "hidmaestro", so the generic sniff alone is ambiguous).
+        if inf_is_hidmaestro(&path) && !inf_is_hidmaestro_xusb(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Discover the published OEM INF path for the HIDMaestro **XUSB companion**
+/// driver (`hidmaestro_xusb.inf`), used by
+/// `orchestrator::create_xusb_companion_node` to bind the XInput companion node.
+/// Identified by markers unique to the companion INF (`HMXInput.dll` /
+/// `XusbMode`). Returns the first match, or `None`.
+pub fn installed_xusb_inf_path() -> Option<PathBuf> {
+    let inf_dir = windir().join("INF");
+    let entries = std::fs::read_dir(&inf_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        if !(name.starts_with("oem") && name.ends_with(".inf")) {
+            continue;
+        }
+        if inf_is_hidmaestro_xusb(&path) {
             return Some(path);
         }
     }
@@ -102,6 +126,18 @@ fn inf_is_hidmaestro(path: &Path) -> bool {
     let text = decode_inf(&bytes);
     let lower = text.to_ascii_lowercase();
     lower.contains("hidmaestro")
+}
+
+/// Stronger sniff for the XUSB companion INF specifically. The main and
+/// companion INFs both mention "hidmaestro", so we key off markers unique to the
+/// companion: its UMDF binary (`HMXInput.dll`) or the `XusbMode` AddReg value.
+fn inf_is_hidmaestro_xusb(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let text = decode_inf(&bytes);
+    let lower = text.to_ascii_lowercase();
+    lower.contains("hidmaestro") && (lower.contains("hmxinput.dll") || lower.contains("xusbmode"))
 }
 
 /// Decode an INF's bytes to a String, handling the common UTF-16LE (BOM) and

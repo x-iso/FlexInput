@@ -373,12 +373,16 @@ pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
     if dev_id.starts_with("midi_in")  { return Some(NodeIconSpec::Single(DEV_MIDI_IN));  }
     if dev_id.starts_with("midi_out") { return Some(NodeIconSpec::Single(DEV_MIDI_OUT)); }
     if let Some(rest) = dev_id.strip_prefix("virtual.") {
-        let kind = rest.split(':').next()?;
+        // `rest` is e.g. "xinput", "ds4.1", "hm.dualsense", "hm.xinput.1".
+        let kind = rest.split(':').next().unwrap_or(rest);
         return match kind {
-            "xinput"   => Some(NodeIconSpec::Single(DEV_XBOX)),
-            "ds4"      => Some(NodeIconSpec::Single(DEV_PS4)),
-            "keymouse" => Some(NodeIconSpec::Single(DEV_KBM)),
-            _          => None,
+            "xinput"          => Some(NodeIconSpec::Single(DEV_XBOX)),
+            "ds4"             => Some(NodeIconSpec::Single(DEV_PS4)),
+            "keymouse"        => Some(NodeIconSpec::Single(DEV_KBM)),
+            _ if kind.starts_with("hm.xinput")    => Some(NodeIconSpec::Single(DEV_XBOX)),
+            _ if kind.starts_with("hm.dualsense") => Some(NodeIconSpec::Single(DEV_PS5)),
+            _ if kind.starts_with("hm.ds4")       => Some(NodeIconSpec::Single(DEV_PS4)),
+            _                 => None,
         };
     }
     None

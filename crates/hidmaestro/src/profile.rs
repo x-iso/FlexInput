@@ -49,6 +49,15 @@ struct RawProfile {
     /// bytes (which differ between DS4 and DualSense) for feedback decode.
     #[serde(rename = "extendedOutputReport")]
     extended_output_report: Option<RawExtendedReport>,
+    /// True for Xbox360/XInput profiles that need an XUSB companion devnode
+    /// (created alongside the HID node so `xinput`/Steam discover the pad).
+    #[serde(rename = "requiresXusbCompanion")]
+    requires_xusb_companion: Option<bool>,
+    /// HIDMaestro driver `FunctionMode`: 0 = plain HID, 1 = XUSB/XInput. Defaults
+    /// to 1 when `requiresXusbCompanion`, else 0. An explicit value overrides
+    /// (lets us test the mode independently of companion creation).
+    #[serde(rename = "functionMode")]
+    function_mode: Option<u32>,
 }
 
 /// Raw `extendedReport` shape (subset). Byte offsets are 1-based in the JSON
@@ -163,6 +172,10 @@ pub struct Profile {
     /// the HID descriptor exposes only as opaque vendor blobs). Empty when the
     /// profile declares no `extendedReport`.
     pub extended: ExtendedLayout,
+    /// True if this profile needs an XUSB/XInput companion devnode (Xbox360).
+    pub requires_xusb_companion: bool,
+    /// HIDMaestro driver `FunctionMode` (0 = plain HID, 1 = XUSB).
+    pub function_mode: u32,
 }
 
 #[derive(Debug)]
@@ -214,6 +227,10 @@ impl Profile {
             raw.extended_report.as_ref(),
             raw.extended_output_report.as_ref(),
         );
+        let requires_xusb_companion = raw.requires_xusb_companion.unwrap_or(false);
+        let function_mode = raw
+            .function_mode
+            .unwrap_or(if requires_xusb_companion { 1 } else { 0 });
         Ok(Profile {
             id: raw.id,
             name: raw.name,
@@ -228,6 +245,8 @@ impl Profile {
             axis_map: raw.axis_map.unwrap_or_default(),
             button_map: raw.button_map,
             extended,
+            requires_xusb_companion,
+            function_mode,
         })
     }
 
@@ -247,6 +266,11 @@ pub mod presets {
     /// DualSense (CFI-ZCT1), USB — plain-HID Sony pad, `VID_054C&PID_0CE6`. The
     /// HIDMaestro capability ViGEm can't provide.
     pub const DUALSENSE_JSON: &str = include_str!("../profiles/dualsense.json");
+
+    /// Xbox 360 / XInput (`VID_045E&PID_028E`). Needs the XUSB companion node;
+    /// input flows through the SHM `GipData[]` (XINPUT_GAMEPAD) region, not the
+    /// HID descriptor. This is the capability that lets FlexInput drop ViGEm.
+    pub const XBOX360_JSON: &str = include_str!("../profiles/xbox360.json");
 }
 
 #[cfg(test)]
@@ -261,6 +285,34 @@ mod tests {
         assert_eq!(p.pid, 0x09CC);
         assert_eq!(p.input_report_size, 64);
         assert_eq!(p.report.report_id, 0x01);
+        // Plain-HID Sony pad: no XUSB companion, FunctionMode 0.
+        assert!(!p.requires_xusb_companion);
+        assert_eq!(p.function_mode, 0);
+    }
+
+    #[test]
+    fn loads_xbox360_preset() {
+        let p = Profile::from_json(presets::XBOX360_JSON).expect("load xbox360");
+        assert_eq!(p.id, "xbox360");
+        assert_eq!(p.vid, 0x045E);
+        // PID is 0x02FF (Xbox One wired family), deliberately != the real 360's
+        // 0x028E so the read side can distinguish our virtual from a physical Xbox
+        // 360; VID stays 045E so it still classifies + works as XInput.
+        assert_eq!(p.pid, 0x02FF);
+        // XUSB companion + FunctionMode 1 (defaulted from requiresXusbCompanion).
+        assert!(p.requires_xusb_companion);
+        assert_eq!(p.function_mode, 1);
+        // Descriptor must parse to a usable gamepad layout: the standard axes
+        // and at least the face/shoulder buttons present.
+        let r = &p.report;
+        assert!(r.field(0x01, 0x30).is_some(), "X (left stick X)");
+        assert!(r.field(0x01, 0x31).is_some(), "Y (left stick Y)");
+        assert!(r.field(0x01, 0x32).is_some(), "Z (right stick X)");
+        assert!(r.field(0x01, 0x35).is_some(), "Rz (right stick Y)");
+        assert!(r.field(0x01, 0x33).is_some(), "Rx (left trigger)");
+        assert!(r.field(0x01, 0x34).is_some(), "Ry (right trigger)");
+        assert!(r.field(0x09, 0x01).is_some(), "button 1");
+        assert!(r.field(0x09, 0x08).is_some(), "button 8");
     }
 
     /// Golden: our parser must reproduce the exact field layout HIDMaestro's C#

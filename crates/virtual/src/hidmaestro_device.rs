@@ -15,7 +15,7 @@
 //! how `VirtualXInput` behaves when ViGEmBus is absent.
 
 use flexinput_core::Signal;
-use flexinput_hidmaestro::encode::{encode_report_into, PinState};
+use flexinput_hidmaestro::encode::{encode_report_into, gip_from_state, PinState};
 use flexinput_hidmaestro::{helper, InputSection, OutputSection, Profile};
 
 use crate::{layouts, SinkPin, SourcePin};
@@ -116,13 +116,24 @@ impl HidMaestroDevice {
                 // observed SeqNo transition is unambiguously ours.
                 if let Some(input) = dev.input.as_mut() {
                     let state = dev.pins.state();
-                    encode_report_into(&dev.profile, &state, &mut dev.report_buf);
-                    let data = if dev.profile.report.report_id != 0 {
-                        &dev.report_buf[1..]
-                    } else {
+                    // Mirror flush(): for the XUSB companion send an empty HID
+                    // Data[] (GIP is the sole source); otherwise encode the report.
+                    let gip = dev
+                        .profile
+                        .requires_xusb_companion
+                        .then(|| gip_from_state(&state));
+                    let data: &[u8] = if gip.is_some() {
+                        dev.report_buf.fill(0);
                         &dev.report_buf[..]
+                    } else {
+                        encode_report_into(&dev.profile, &state, &mut dev.report_buf);
+                        if dev.profile.report.report_id != 0 {
+                            &dev.report_buf[1..]
+                        } else {
+                            &dev.report_buf[..]
+                        }
                     };
-                    input.write_frame(data, None);
+                    input.write_frame(data, gip.as_ref());
                 }
             }
             Err(e) => {
@@ -132,11 +143,13 @@ impl HidMaestroDevice {
         Some(dev)
     }
 
-    /// Which static sink-pin layout to advertise for `profile`. DS4 / DualSense
-    /// share the DS4 pin set (sticks, triggers, face/shoulder buttons, d-pad,
-    /// touchpad). Falls back to DS4 pins for any plain-HID gamepad.
+    /// Which static sink-pin layout to advertise for `profile`. Xbox360/XInput
+    /// uses the XInput pin set (no gyro/touchpad/lightbar); DualSense uses its
+    /// full Sony set; everything else falls back to DS4 pins.
     fn sink_pins_for(&self) -> &'static [SinkPin] {
-        if self.profile.id.contains("dualsense") {
+        if self.profile.requires_xusb_companion {
+            layouts::XINPUT_SINK_PINS
+        } else if self.profile.id.contains("dualsense") {
             layouts::DUALSENSE_SINK_PINS
         } else {
             layouts::DS4_SINK_PINS
@@ -186,15 +199,32 @@ impl crate::VirtualDevice for HidMaestroDevice {
             return;
         };
         let state = self.pins.state();
-        encode_report_into(&self.profile, &state, &mut self.report_buf);
-        // The SHM input frame carries the report with its Report-ID byte
-        // stripped (the driver re-prepends it). DS4 has Report ID 0x01 at byte 0.
-        let data = if self.profile.report.report_id != 0 {
-            &self.report_buf[1..]
-        } else {
+        // For XInput/Xbox360 pads the XUSB companion derives state SOLELY from the
+        // GipData[14] region — and it ALSO reads the HID Data[] for its sibling
+        // node. If we publish a populated HID report there too, the descriptor's
+        // (different) byte layout bleeds into XInput state (symptom: only the first
+        // axis tracks, everything else garbage, stick deflection clipped square).
+        // So for the companion path send an EMPTY Data[] and let GIP be the only
+        // source — exactly what the validated self-test does (`[0u8; N]` report).
+        let gip = self
+            .profile
+            .requires_xusb_companion
+            .then(|| gip_from_state(&state));
+        let data: &[u8] = if gip.is_some() {
+            // Neutral HID payload: zeros. (Length is cosmetic for the companion;
+            // keep it the report size so the sibling node sees a sane frame.)
+            self.report_buf.fill(0);
             &self.report_buf[..]
+        } else {
+            encode_report_into(&self.profile, &state, &mut self.report_buf);
+            // The SHM frame strips the Report-ID byte (driver re-prepends it).
+            if self.profile.report.report_id != 0 {
+                &self.report_buf[1..]
+            } else {
+                &self.report_buf[..]
+            }
         };
-        input.write_frame(data, None);
+        input.write_frame(data, gip.as_ref());
     }
 
     fn reset_outputs(&mut self) {
@@ -207,7 +237,12 @@ impl crate::VirtualDevice for HidMaestroDevice {
     }
 
     fn source_pins(&self) -> &'static [SourcePin] {
-        layouts::DS4_SOURCE_PINS
+        if self.profile.requires_xusb_companion {
+            // XInput feedback is rumble strong/weak only (no lightbar).
+            layouts::XINPUT_SOURCE_PINS
+        } else {
+            layouts::DS4_SOURCE_PINS
+        }
     }
 
     fn persist_on_drop(&mut self) {
@@ -221,6 +256,19 @@ impl crate::VirtualDevice for HidMaestroDevice {
     }
 
     fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> {
+        // XInput/Xbox360 rumble-in is NOT YET MAPPED. The XUSB companion's output
+        // ring layout is unknown (the offsets tried were a guess), and reading
+        // unmapped bytes produced a STUCK nonzero rumble that AutoMap forwarded to
+        // the physical pad (constant buzz, x360 ports never lit because it was a
+        // synthesized garbage value, not a real frame). Until the ring layout is
+        // mapped empirically (same treatment as the input GIP), report NO rumble
+        // for the companion path — silence beats a phantom constant buzz.
+        if self.profile.requires_xusb_companion {
+            return vec![
+                ("rumble_strong", Signal::Float(0.0)),
+                ("rumble_weak", Signal::Float(0.0)),
+            ];
+        }
         // Drain the output ring; keep the latest rumble report we recognize.
         // Motor byte offsets differ between DS4 (right@4/left@5) and DualSense
         // (right@3/left@4), so we read them from the profile's

@@ -31,6 +31,15 @@ const HID_CLASS_GUID: Guid = Guid {
     data4: [0xb6, 0xfe, 0x00, 0xa0, 0xc9, 0x0f, 0x57, 0xda],
 };
 
+/// `GUID_DEVINTERFACE_XUSB` = `{EC87F1E3-C13B-4100-B5F7-8B84D54260CB}` — the device
+/// interface `xinput1_x.dll` enumerates to discover XInput controllers.
+const GUID_DEVINTERFACE_XUSB: Guid = Guid {
+    data1: 0xec87_f1e3,
+    data2: 0xc13b,
+    data3: 0x4100,
+    data4: [0xb5, 0xf7, 0x8b, 0x84, 0xd5, 0x42, 0x60, 0xcb],
+};
+
 // SetupAPI / CfgMgr constants.
 const DICD_GENERATE_ID: u32 = 0x0000_0001;
 const SPDRP_HARDWAREID: u32 = 0x0000_0001;
@@ -49,6 +58,12 @@ pub enum OrchestratorError {
     NodeNotFound,
     /// 3a only supports the plain-HID path; this profile needs 3b.
     Unsupported(&'static str),
+    /// A container-GUID string couldn't be parsed for `SwDeviceCreate`.
+    SwdBadGuid,
+    /// `SwDeviceCreate` (or its async callback) returned a failure HRESULT.
+    SwdCreate(u32),
+    /// `SwDeviceCreate` neither fired its callback nor reached DN_STARTED in time.
+    SwdTimeout,
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -57,6 +72,9 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::Win32(s, e) => write!(f, "{s} failed (err {e})"),
             OrchestratorError::NodeNotFound => write!(f, "created node not found in registry"),
             OrchestratorError::Unsupported(s) => write!(f, "unsupported profile path: {s}"),
+            OrchestratorError::SwdBadGuid => write!(f, "invalid container GUID for SwDeviceCreate"),
+            OrchestratorError::SwdCreate(hr) => write!(f, "SwDeviceCreate failed (hr 0x{hr:08X})"),
+            OrchestratorError::SwdTimeout => write!(f, "SwDeviceCreate timed out"),
         }
     }
 }
@@ -146,6 +164,27 @@ extern "system" {
         property_type: u32,
         property_buffer: *const u8,
         property_buffer_size: u32,
+        flags: u32,
+    ) -> u32;
+    fn CM_Get_DevNode_PropertyW(
+        dev_inst: u32,
+        property_key: *const DevPropKey,
+        property_type: *mut u32,
+        property_buffer: *mut u8,
+        property_buffer_size: *mut u32,
+        flags: u32,
+    ) -> u32;
+    fn CM_Get_Device_Interface_List_SizeW(
+        len: *mut u32,
+        interface_class: *const Guid,
+        device_id: *const u16,
+        flags: u32,
+    ) -> u32;
+    fn CM_Get_Device_Interface_ListW(
+        interface_class: *const Guid,
+        device_id: *const u16,
+        buffer: *mut u16,
+        buffer_len: u32,
         flags: u32,
     ) -> u32;
 }
@@ -352,20 +391,17 @@ fn multi_sz_bytes(items: &[&str]) -> Vec<u8> {
     bytes
 }
 
-fn new_devinfo() -> SpDevinfoData {
+fn new_devinfo_for(class_guid: Guid) -> SpDevinfoData {
     SpDevinfoData {
         cb_size: std::mem::size_of::<SpDevinfoData>() as u32,
-        class_guid: HID_CLASS_GUID,
+        class_guid,
         dev_inst: 0,
         reserved: 0,
     }
 }
 
-/// True when the profile is on the plain-HID path this module handles.
-fn is_plain_hid(profile: &Profile) -> bool {
-    // Plain HID = not Microsoft (Xbox/XUSB) and (we don't model upper-filter
-    // profiles yet, so anything non-0x045E here is treated as plain HID).
-    profile.vid != 0x045E
+fn new_devinfo() -> SpDevinfoData {
+    new_devinfo_for(HID_CLASS_GUID)
 }
 
 /// Outcome of [`create_device_node`].
@@ -390,23 +426,32 @@ pub fn create_device_node(
     controller_index: u32,
     device_id: &str,
 ) -> Result<CreatedDevice, OrchestratorError> {
-    if !is_plain_hid(profile) {
-        return Err(OrchestratorError::Unsupported(
-            "VID 0x045E (Xbox/XUSB) needs the Phase 3b companion path",
-        ));
-    }
-
-    let vid = format!("{:04X}", profile.vid);
-    let pid = format!("{:04X}", profile.pid);
-    let enumerator = "HIDClass";
-    let hw_id = format!("root\\VID_{vid}&PID_{pid}");
     let desc = &profile.name;
+    // The main HID node is the gamepad's HID identity. For an Xbox360-family
+    // profile (XUSB companion) it follows the shipping HIDMaestro layout
+    // (DeviceNodeCreator, Xbox-legacy path): the HardwareID carries the **`&IG_00`**
+    // suffix — which makes HIDAPI/SDL3 skip it (gamecontroller blocklist) so they
+    // fall back to XInput — and the enumerator matches that form. The XInput
+    // identity itself comes from the separate XUSB companion (create_xusb_companion_
+    // node); this node just supplies the HID/WGI gamepad face with FunctionMode=1.
+    // Plain-HID profiles (DS4/DualSense) keep the standard HIDClass enumerator.
+    let (enumerator, hw_id) = if profile.requires_xusb_companion {
+        let e = format!("VID_{:04X}&PID_{:04X}&IG_00", profile.vid, profile.pid);
+        let h = format!("root\\{e}");
+        (e, h)
+    } else {
+        (
+            "HIDClass".to_string(),
+            format!("root\\VID_{:04X}&PID_{:04X}", profile.vid, profile.pid),
+        )
+    };
+    let enumerator = enumerator.as_str();
 
     // Per-instance driver config (VID/PID/descriptor/etc.). The UMDF driver reads
     // this at startup to know what identity to report; WITHOUT it the driver
     // falls back to the Microsoft default VID_045E and the device presents as an
     // Xbox pad instead of the profile's real (Sony/etc.) identity.
-    write_instance_config(profile, controller_index, device_id);
+    write_instance_config(profile, controller_index, device_id, profile.function_mode);
 
     unsafe {
         let class_guid = HID_CLASS_GUID;
@@ -451,6 +496,19 @@ pub fn create_device_node(
                 GetLastError(),
             ));
         }
+
+        // NOTE: we deliberately do NOT set the `USB\MS_COMP_XUSB10` compatible IDs
+        // on the main HID node, even though upstream's Xbox-legacy path does. Those
+        // compat IDs cause Windows to attach the inbox `xinputhid` upper filter to
+        // the HID node, which makes the HID node publish its OWN XInput face — a
+        // SECOND xinput1_4 slot, serving the EMPTY HID Data[] that XInput profiles
+        // write (the stuck/garbage virtual pad that tangled with a real one). The
+        // SWD companion is the SOLE XInput identity (it publishes {EC87F1E3}); the
+        // main node is only the HID/WGI gamepad face. Upstream tolerates the dual
+        // face because their consumer (WGI) dedups two faces sharing the HIDMAESTRO
+        // name — but xinput1_4 (what FlexInput's gilrs reads) does NOT dedup, so it
+        // would see two slots. Keeping just the &IG_00 hardware id still makes
+        // SDL/HIDAPI defer the HID face to XInput.
 
         // DIF_REGISTERDEVICE creates the PnP node (admin-only).
         if SetupDiCallClassInstaller(DIF_REGISTERDEVICE, dis, &mut devinfo) == 0 {
@@ -523,6 +581,450 @@ pub fn create_device_node(
 
         Ok(CreatedDevice { instance_id, controller_index })
     }
+}
+
+/// Per-controller deterministic ContainerID = `{48494430-4D41-4553-5452-4F000000XXXX}`
+/// (ASCII "HIDMAESTRO" + 16-bit controller index). Verbatim from upstream
+/// `SwdDeviceFactory.ContainerIdFor`. A **non-sentinel** ContainerID on the XUSB
+/// companion is the actual fix for xinput1_4's slot-0-skip (a null-sentinel
+/// container made the allocator treat the pad as embedded/primary and skip slot 0).
+/// Formatted as a registry GUID string `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`.
+fn container_id_for(controller_index: u32) -> String {
+    let idx = controller_index as u16;
+    // Guid {0x48494430, 0x4D41, 0x4553, [0x54,0x52,0x4F,0x00,0x00,0x00, hi, lo]}.
+    // Registry string form splits data4 as [0..2]="5452" then [2..8]=
+    // "4F 00 00 00 hi lo" → the final 12-hex segment is 4F000000<hi><lo>.
+    format!(
+        "{{48494430-4D41-4553-5452-4F000000{:02X}{:02X}}}",
+        (idx >> 8) & 0xFF,
+        idx & 0xFF
+    )
+}
+
+/// Monotonic per-process sequence so every `SwDeviceCreate` gets a UNIQUE
+/// instance-id suffix. Required: Windows keeps a sticky per-(container+suffix)
+/// record after teardown; a subsequent create with an identical tuple takes a
+/// fast "re-enumerate" path that leaves the devnode an EMPTY SHELL (no driver
+/// bound, no XUSB interface). A fresh suffix every create dodges it.
+static SWD_CREATE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Build the unique SWD instance-id suffix: `<pidhex><seqhex>_<ctrlidx:04>`
+/// (mirrors upstream `DeviceOrchestrator.NextSwdSuffix` intent — a session-unique
+/// prefix + per-create counter + the controller index for human-readable teardown
+/// matching). The companion is found by `ControllerIndex` in Device Parameters, not
+/// by suffix, so varying the suffix per call is transparent to teardown.
+fn next_swd_suffix(controller_index: u32) -> String {
+    let pid = std::process::id();
+    let seq = SWD_CREATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{pid:08X}{seq:04X}_{controller_index:04}")
+}
+
+/// Create the XUSB/XInput **companion** devnode for an Xbox360-family profile via
+/// in-process [`swd_create`] (`SwDeviceCreate`), matching the shipping HIDMaestro
+/// design (`DeviceOrchestrator.CreateXusbCompanion`). Requires elevation.
+///
+/// This is the node that publishes `GUID_DEVINTERFACE_XUSB` (via `HMXInput.dll`/
+/// UMDF) so `xinput1_4.dll` discovers an XInput controller. It is created under the
+/// **SWD** enumerator `HIDMAESTRO` with an explicit **non-sentinel ContainerID**
+/// ([`container_id_for`]) — the actual slot-0-skip fix. `hidmaestro_xusb.inf`
+/// (installed by `deploy.rs` into the DriverStore) binds via `DriverRequired`,
+/// applying its `.NT.Wdf` UMDF binding, `XusbMode=1`, `UpperFilters=xinputhid`, and
+/// the `{EC87F1E3}` AddInterface.
+///
+/// **Lifetime: the returned [`SwdHandle`] OWNS the node.** `SwDeviceCreate` is called
+/// with the DEFAULT (`Handle`) lifetime, so the node lives exactly as long as the
+/// handle is held — dropping it removes the node (synchronous, reliable). This is the
+/// ONLY teardown that actually works on Win10 19045: the `ParentPresent` +
+/// reconnect-and-downgrade path is a cosmetic no-op there (every reconnect/
+/// SetLifetime/Close returns hr=0 yet the node survives). Holding the handle in the
+/// long-lived elevated helper also makes a helper crash auto-remove the nodes (no
+/// zombies).
+///
+/// The `_xusb_inf_path` is unused (the INF binds from the DriverStore); kept for
+/// signature stability. Returns `(instance_id, owning handle)`.
+pub fn create_xusb_companion_node(
+    profile: &Profile,
+    _xusb_inf_path: &str,
+    controller_index: u32,
+) -> Result<(String, SwdHandle), OrchestratorError> {
+    let vid = format!("{:04X}", profile.vid);
+    let pid = format!("{:04X}", profile.pid);
+    let desc = format!("{} (XInput)", profile.name);
+
+    // Exact hardware/compat IDs from upstream CreateXusbCompanion. The XI alias +
+    // generic `root\HIDMaestroXUSB` are the INF [Models] match keys; the XUSB
+    // compat IDs are what WGI/GameInputSvc recognize as an Xbox gamepad.
+    let xi_alias = format!("root\\VID_{vid}&PID_{pid}&XI_00");
+    let hw_ids: [&str; 2] = [&xi_alias, "root\\HIDMaestroXUSB"];
+    let compat_ids: [&str; 4] = [
+        "USB\\MS_COMP_XUSB10",
+        "USB\\Class_FF&SubClass_5D&Prot_01",
+        "USB\\Class_FF&SubClass_5D",
+        "USB\\Class_FF",
+    ];
+    let container = container_id_for(controller_index);
+    let suffix = next_swd_suffix(controller_index);
+
+    let (instance_id, handle) =
+        swd_create("HIDMAESTRO", &suffix, &container, &hw_ids, &compat_ids, &desc)?;
+
+    // The driver reads ControllerIndex from Device Parameters at startup to attach
+    // to the right shared section (Global\HIDMaestroInput<N>).
+    {
+        use registry::*;
+        let dp = format!(r"SYSTEM\CurrentControlSet\Enum\{instance_id}\Device Parameters");
+        let _ = write_dword(HKLM, &dp, "ControllerIndex", controller_index);
+    }
+
+    // SwDeviceCreate(DriverRequired) binds the INF synchronously, but the XUSB
+    // interface coinstaller can lag a few seconds after the callback. Wait for the
+    // {EC87F1E3} interface to actually publish on this node before returning.
+    for _ in 0..30 {
+        if count_xusb_interfaces(Some(&instance_id)) >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    Ok((instance_id, handle))
+}
+
+// ── In-process SwDeviceCreate (cfgmgr32!SwDevice*, link SwDevice.lib) ─────────
+//
+// `SwDeviceCreate` is the only user-mode API that can set a real ContainerID. We
+// call it IN-PROCESS (not via a child exe) specifically so the elevated helper can
+// HOLD the resulting HSWDEVICE for the node's lifetime — the only reliable teardown
+// on Win10 19045. (.NET's loader bug that forced upstream's native helper does not
+// apply to Rust — no managed loader in the call path.)
+
+/// `SW_DEVICE_CREATE_INFO` — EXACT layout from swdevicedef.h (9 fields, ends at
+/// pSecurityDescriptor — there are NO trailing property fields; getting cbSize
+/// wrong makes SwDeviceCreate return E_INVALIDARG 0x80070057).
+#[repr(C)]
+struct SwDeviceCreateInfo {
+    cb_size: u32,
+    pszz_instance_id: *const u16,
+    pszz_hardware_ids: *const u16,
+    pszz_compatible_ids: *const u16,
+    p_container_id: *const Guid,
+    capability_flags: u32,
+    psz_device_description: *const u16,
+    psz_device_location: *const u16,
+    p_security_descriptor: *const c_void,
+}
+
+const SW_DEVICE_CAPABILITIES_SILENT_INSTALL: u32 = 0x0000_0002;
+const SW_DEVICE_CAPABILITIES_DRIVER_REQUIRED: u32 = 0x0000_0008;
+const SW_DEVICE_CAPABILITIES_NO_DISPLAY_IN_UI: u32 = 0x0000_0004;
+
+#[link(name = "SwDevice")]
+extern "system" {
+    fn SwDeviceCreate(
+        psz_enumerator_name: *const u16,
+        psz_parent_device_instance: *const u16,
+        p_create_info: *const SwDeviceCreateInfo,
+        c_property_count: u32,
+        p_properties: *const c_void,
+        pf_callback: extern "system" fn(*mut c_void, i32, *mut c_void, *const u16),
+        p_context: *mut c_void,
+        ph_sw_device: *mut *mut c_void,
+    ) -> i32;
+    fn SwDeviceClose(h_sw_device: *mut c_void);
+}
+
+/// Owning handle to an SWD-created devnode. Default (`Handle`) lifetime means the
+/// node exists exactly while this is alive; `Drop` closes it → the node is removed.
+pub struct SwdHandle(*mut c_void);
+// The HSWDEVICE is just an opaque kernel handle; moving it across threads is safe
+// (the helper creates on one thread, may drop on another during teardown).
+unsafe impl Send for SwdHandle {}
+unsafe impl Sync for SwdHandle {}
+impl Drop for SwdHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { SwDeviceClose(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Shared state for the create callback (the callback runs on a PnP worker thread).
+struct SwdCbState {
+    done: std::sync::Mutex<Option<(i32, String)>>,
+    cv: std::sync::Condvar,
+}
+
+extern "system" fn swd_create_callback(
+    _h: *mut c_void,
+    create_result: i32,
+    context: *mut c_void,
+    instance_id: *const u16,
+) {
+    if context.is_null() {
+        return;
+    }
+    let state = unsafe { &*(context as *const SwdCbState) };
+    let id = if instance_id.is_null() {
+        String::new()
+    } else {
+        let mut len = 0usize;
+        unsafe {
+            while *instance_id.add(len) != 0 {
+                len += 1;
+            }
+        }
+        let slice = unsafe { std::slice::from_raw_parts(instance_id, len) };
+        String::from_utf16_lossy(slice)
+    };
+    *state.done.lock().unwrap() = Some((create_result, id));
+    state.cv.notify_all();
+}
+
+/// In-process `SwDeviceCreate` with DEFAULT (`Handle`) lifetime. Returns the
+/// instance id + the owning handle. Waits for the create callback (or the
+/// DN_STARTED fast-path) up to ~30s. The node persists only while the returned
+/// handle is held.
+fn swd_create(
+    enumerator: &str,
+    suffix: &str,
+    container_guid: &str,
+    hw_ids: &[&str],
+    compat_ids: &[&str],
+    description: &str,
+) -> Result<(String, SwdHandle), OrchestratorError> {
+    let w_enum = to_wide(enumerator);
+    let w_parent = to_wide("HTREE\\ROOT\\0");
+    let w_suffix = to_wide(suffix);
+    let w_hw = multi_sz_wide(hw_ids);
+    let w_compat = multi_sz_wide(compat_ids);
+    let w_desc = to_wide(description);
+    let container = parse_guid_str(container_guid).ok_or(OrchestratorError::SwdBadGuid)?;
+
+    let info = SwDeviceCreateInfo {
+        cb_size: std::mem::size_of::<SwDeviceCreateInfo>() as u32,
+        pszz_instance_id: w_suffix.as_ptr(),
+        pszz_hardware_ids: w_hw.as_ptr(),
+        pszz_compatible_ids: w_compat.as_ptr(),
+        p_container_id: &container,
+        capability_flags: SW_DEVICE_CAPABILITIES_SILENT_INSTALL
+            | SW_DEVICE_CAPABILITIES_NO_DISPLAY_IN_UI
+            | SW_DEVICE_CAPABILITIES_DRIVER_REQUIRED,
+        psz_device_description: w_desc.as_ptr(),
+        psz_device_location: std::ptr::null(),
+        p_security_descriptor: std::ptr::null(),
+    };
+
+    let state = std::sync::Arc::new(SwdCbState {
+        done: std::sync::Mutex::new(None),
+        cv: std::sync::Condvar::new(),
+    });
+    let ctx = std::sync::Arc::as_ptr(&state) as *mut c_void;
+
+    let mut h: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe {
+        SwDeviceCreate(
+            w_enum.as_ptr(),
+            w_parent.as_ptr(),
+            &info,
+            0,
+            std::ptr::null(),
+            swd_create_callback,
+            ctx,
+            &mut h,
+        )
+    };
+    if hr < 0 {
+        return Err(OrchestratorError::SwdCreate(hr as u32));
+    }
+    // Own the handle immediately so any early return still closes it.
+    let handle = SwdHandle(h);
+
+    // Wait for the callback OR the DN_STARTED fast path (the callback sometimes
+    // never fires on the reuse path even though the node is live).
+    let expected_id = format!(r"SWD\{enumerator}\{suffix}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        {
+            let guard = state.done.lock().unwrap();
+            if let Some((cb_hr, id)) = guard.as_ref() {
+                if *cb_hr < 0 {
+                    return Err(OrchestratorError::SwdCreate(*cb_hr as u32));
+                }
+                let id = if id.is_empty() { expected_id.clone() } else { id.clone() };
+                return Ok((id, handle));
+            }
+        }
+        // DN_STARTED fast-path probe.
+        let mut dev_inst = 0u32;
+        if unsafe {
+            CM_Locate_DevNodeW(
+                &mut dev_inst,
+                to_wide(&expected_id).as_ptr(),
+                CM_LOCATE_DEVNODE_NORMAL,
+            )
+        } == CR_SUCCESS
+        {
+            let mut status = 0u32;
+            let mut problem = 0u32;
+            if unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, dev_inst, 0) }
+                == CR_SUCCESS
+                && status & DN_STARTED != 0
+            {
+                return Ok((expected_id, handle));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(OrchestratorError::SwdTimeout);
+        }
+        // Wait a slice for the callback; loop re-checks DN_STARTED.
+        let guard = state.done.lock().unwrap();
+        let _ = state
+            .cv
+            .wait_timeout(guard, std::time::Duration::from_millis(100));
+    }
+}
+
+/// Build a UTF-16 double-NUL-terminated multi-sz (`PCZZWSTR`) from a string list.
+fn multi_sz_wide(items: &[&str]) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::new();
+    for it in items {
+        out.extend(it.encode_utf16());
+        out.push(0);
+    }
+    out.push(0); // final terminator
+    out
+}
+
+/// Parse `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (braces optional) into a `Guid`.
+fn parse_guid_str(s: &str) -> Option<Guid> {
+    let s = s.trim().trim_start_matches('{').trim_end_matches('}');
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let data1 = u32::from_str_radix(parts[0], 16).ok()?;
+    let data2 = u16::from_str_radix(parts[1], 16).ok()?;
+    let data3 = u16::from_str_radix(parts[2], 16).ok()?;
+    let d4hi = u16::from_str_radix(parts[3], 16).ok()?;
+    let d4lo = u64::from_str_radix(parts[4], 16).ok()?;
+    let mut data4 = [0u8; 8];
+    data4[0] = (d4hi >> 8) as u8;
+    data4[1] = (d4hi & 0xFF) as u8;
+    let lo_bytes = d4lo.to_be_bytes(); // 8 bytes, low 6 are the node
+    data4[2..8].copy_from_slice(&lo_bytes[2..8]);
+    Some(Guid { data1, data2, data3, data4 })
+}
+
+/// `DEVPKEY_Device_DriverInfPath` = `{a8b865dd-2e3d-4094-ad97-e593a70c75d6}, 5`.
+const DEVPKEY_DEVICE_DRIVER_INF_PATH: DevPropKey = DevPropKey {
+    fmtid: Guid { data1: 0xa8b8_65dd, data2: 0x2e3d, data3: 0x4094, data4: [0xad, 0x97, 0xe5, 0x93, 0xa7, 0x0c, 0x75, 0xd6] },
+    pid: 5,
+};
+
+/// Read a string DEVPKEY off a devnode (for `node_diag`). `None` if absent.
+fn read_devnode_string_prop(dev_inst: u32, key: &DevPropKey) -> Option<String> {
+    unsafe {
+        let mut ty = 0u32;
+        let mut len = 0u32;
+        let _ = CM_Get_DevNode_PropertyW(dev_inst, key, &mut ty, std::ptr::null_mut(), &mut len, 0);
+        if len == 0 { return None; }
+        let mut buf = vec![0u8; len as usize];
+        if CM_Get_DevNode_PropertyW(dev_inst, key, &mut ty, buf.as_mut_ptr(), &mut len, 0) != CR_SUCCESS { return None; }
+        let u16s: Vec<u16> = buf[..len as usize].chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&w| w != 0).collect();
+        Some(String::from_utf16_lossy(&u16s))
+    }
+}
+
+/// Count present `GUID_DEVINTERFACE_XUSB` interfaces, optionally filtered to a
+/// single device instance id (`None` = system-wide). For the validation probe.
+fn count_xusb_interfaces(device_id: Option<&str>) -> usize {
+    // CfgMgr32 flag (NOT the SetupDi DIGCF_PRESENT 0x100 — that's a different API
+    // and an invalid value here, which made this always return 0 even when the
+    // interface existed). CM_GET_DEVICE_INTERFACE_LIST_PRESENT = 0 (present-only
+    // is the default).
+    const CM_GET_DEVICE_INTERFACE_LIST_PRESENT: u32 = 0x0000_0000;
+    let w_id = device_id.map(to_wide);
+    let id_ptr = w_id.as_ref().map(|v| v.as_ptr()).unwrap_or(std::ptr::null());
+    unsafe {
+        let mut len = 0u32;
+        if CM_Get_Device_Interface_List_SizeW(
+            &mut len,
+            &GUID_DEVINTERFACE_XUSB,
+            id_ptr,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        ) == CR_SUCCESS
+            && len > 1
+        {
+            let mut buf = vec![0u16; len as usize];
+            if CM_Get_Device_Interface_ListW(
+                &GUID_DEVINTERFACE_XUSB,
+                id_ptr,
+                buf.as_mut_ptr(),
+                len,
+                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+            ) == CR_SUCCESS
+            {
+                return buf.split(|&c| c == 0).filter(|s| !s.is_empty()).count();
+            }
+        }
+    }
+    0
+}
+
+/// Diagnostic snapshot of a node for the validation probe.
+#[derive(Debug, Clone)]
+pub struct NodeDiag {
+    pub status: Option<u32>,
+    pub problem: u32,
+    pub started: bool,
+    /// XUSB interfaces on this node, its child PDO, and system-wide.
+    pub xusb_interfaces: usize,
+    pub xusb_interfaces_child: usize,
+    pub xusb_interfaces_global: usize,
+    pub driver_inf: Option<String>,
+}
+
+/// Read status/problem/started + XUSB interface counts + bound INF for a node.
+pub fn node_diag(instance_id: &str) -> NodeDiag {
+    let w_id = to_wide(instance_id);
+    let mut status = None;
+    let mut problem = 0u32;
+    let mut started = false;
+    let mut driver_inf = None;
+    unsafe {
+        let mut dev_inst: u32 = 0;
+        if CM_Locate_DevNodeW(&mut dev_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS {
+            let mut st = 0u32;
+            let mut pr = 0u32;
+            if CM_Get_DevNode_Status(&mut st, &mut pr, dev_inst, 0) == CR_SUCCESS {
+                status = Some(st);
+                problem = pr;
+                started = (st & DN_STARTED) != 0;
+            }
+            driver_inf = read_devnode_string_prop(dev_inst, &DEVPKEY_DEVICE_DRIVER_INF_PATH);
+            let mut child: u32 = 0;
+            if CM_Get_Child(&mut child, dev_inst, 0) == CR_SUCCESS {
+                let mut cst = 0u32;
+                let mut cpr = 0u32;
+                if CM_Get_DevNode_Status(&mut cst, &mut cpr, child, 0) == CR_SUCCESS && (cst & DN_STARTED) != 0 {
+                    started = true;
+                }
+            }
+        }
+    }
+    let xusb_interfaces = count_xusb_interfaces(Some(instance_id));
+    let xusb_interfaces_global = count_xusb_interfaces(None);
+    let xusb_interfaces_child = unsafe {
+        let mut di: u32 = 0;
+        let mut child: u32 = 0;
+        if CM_Locate_DevNodeW(&mut di, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS
+            && CM_Get_Child(&mut child, di, 0) == CR_SUCCESS
+        {
+            devnode_instance_id(child).map(|c| count_xusb_interfaces(Some(&c))).unwrap_or(0)
+        } else { 0 }
+    };
+    NodeDiag { status, problem, started, xusb_interfaces, xusb_interfaces_child, xusb_interfaces_global, driver_inf }
 }
 
 /// `DN_STARTED` bit in the devnode status word (the device is started and its
@@ -630,6 +1132,9 @@ fn claim_new_node(enumerator: &str, controller_index: u32) -> Result<String, Orc
     Err(OrchestratorError::NodeNotFound)
 }
 
+/// Find the freshly-created XUSB companion node under `ROOT\System` and stamp its
+/// `ControllerIndex`. Like [`claim_new_node`] but scoped to System + nodes whose
+/// HardwareID carries the XUSB tag, so it never collides with the HIDClass claim.
 /// True if the node's HardwareID multi-sz contains the "HIDMaestro" ownership
 /// tag. Port of the conservative `DeviceManager.IsHidMaestroOwned` check.
 fn node_is_hidmaestro_owned(instance_id: &str) -> bool {
@@ -643,10 +1148,20 @@ fn node_is_hidmaestro_owned(instance_id: &str) -> bool {
 
 /// Write the per-instance driver config under
 /// `HKLM\SOFTWARE\HIDMaestro\Controller{index}`. The UMDF driver reads VID/PID/
-/// descriptor/etc. from here at startup to report the device's identity. Port of
-/// the plain-HID-relevant subset of `DeviceOrchestrator.WriteInstanceConfig`
-/// (omits the FunctionMode/XUSB bits, which are Xbox-only).
-fn write_instance_config(profile: &Profile, controller_index: u32, device_id: &str) {
+/// descriptor/`FunctionMode`/etc. from here at startup to report the device's
+/// identity AND whether to behave as a plain-HID device (`function_mode = 0`) or
+/// an XUSB/XInput device (`function_mode = 1`). Port of the relevant subset of
+/// `DeviceOrchestrator.WriteInstanceConfig`.
+///
+/// Public so the Xbox360/XUSB path (and the validation probe) can stamp the config
+/// the companion driver reads — without it, a stale config left at the same index
+/// makes the companion think it's a plain-HID pad and it never brings up XUSB.
+pub fn write_instance_config(
+    profile: &Profile,
+    controller_index: u32,
+    device_id: &str,
+    function_mode: u32,
+) {
     use registry::*;
     let path = format!(r"SOFTWARE\HIDMaestro\Controller{controller_index}");
     let instance_suffix = format!("\\{controller_index:04}");
@@ -666,7 +1181,7 @@ fn write_instance_config(profile: &Profile, controller_index: u32, device_id: &s
     // FlexInput's own ownership tag: which app-side device id owns this index, so
     // we can reclaim the right device across runs (and which index is free).
     let _ = write_string(HKLM, &path, "FlexInputDeviceId", device_id);
-    let _ = write_dword(HKLM, &path, "FunctionMode", 0); // plain HID, no XUSB
+    let _ = write_dword(HKLM, &path, "FunctionMode", function_mode);
     let _ = write_binary(HKLM, &path, "ReportDescriptor", &profile.descriptor);
     let _ = write_dword(HKLM, &path, "VendorId", profile.vid as u32);
     let _ = write_dword(HKLM, &path, "ProductId", profile.pid as u32);
@@ -705,24 +1220,84 @@ pub struct ExistingDevice {
     pub pid: u16,
     /// FlexInput device id that owns this controller (empty if unknown).
     pub device_id: String,
+    /// True if this is the XUSB/XInput companion node (System class, under
+    /// `ROOT\System`) rather than the HID gamepad node (`ROOT\HIDClass`). A single
+    /// Xbox360 device yields TWO entries with the same `index`: the HID node
+    /// (`false`) and the companion (`true`). The SHM/reclaim path uses the HID
+    /// node; teardown removes both.
+    pub is_companion: bool,
 }
 
-/// Enumerate HIDMaestro-owned device nodes currently present under
-/// `ROOT\HIDClass`. Used for reclaim-on-startup (persistence on) and for
-/// orphan cleanup (persistence off). A node counts if it's present *and*
-/// HIDMaestro-owned (its HardwareID multi-sz carries the ownership tag).
-///
-/// The `index`/`vid`/`pid` are read back from the node's `ControllerIndex` and
-/// its per-instance `HKLM\SOFTWARE\HIDMaestro\Controller{index}` config so the
-/// app can re-attach the right profile to the right section.
+/// Enumerate HIDMaestro-owned device nodes currently present, across BOTH the HID
+/// gamepad enumerator (`ROOT\HIDClass`) and the XUSB companion enumerator
+/// (`ROOT\System`). Used for reclaim-on-startup (persistence on) and orphan
+/// cleanup (persistence off). A node counts if present *and* HIDMaestro-owned
+/// (HardwareID multi-sz carries the tag — `root\HIDMaestroXUSB` satisfies the
+/// companion too).
 pub fn list_hidmaestro_devices() -> Vec<ExistingDevice> {
+    let mut out = scan_enumerator("HIDClass");
+    out.extend(scan_enumerator("System"));
+    // The XUSB companions live under SWD\HIDMAESTRO (created via SwDeviceCreate),
+    // NOT ROOT\System. Scanning this subtree is what lets cleanup find + remove
+    // orphaned companion shells from prior runs (live ones are torn down by dropping
+    // their owning SwdHandle; orphans with no live handle are removed via the
+    // pnputil path that remove_device_node routes SWD ids to).
+    out.extend(scan_swd_companions());
+    out
+}
+
+/// Scan `SWD\HIDMAESTRO` for present, HIDMaestro-owned companion nodes (the XUSB
+/// companions). Mirrors [`scan_enumerator`] but for the SWD enumerator path.
+fn scan_swd_companions() -> Vec<ExistingDevice> {
     use registry::*;
-    let enumerator = "HIDClass";
+    let base = r"SYSTEM\CurrentControlSet\Enum\SWD\HIDMAESTRO";
+    let mut out = Vec::new();
+    for inst in enum_subkeys(HKLM, base).unwrap_or_default() {
+        let instance_id = format!(r"SWD\HIDMAESTRO\{inst}");
+        // Include phantom/failed nodes too (CM_LOCATE either normal or phantom):
+        // orphaned FAILEDINSTALL shells may not locate "normal" but still need
+        // tearing down via the pnputil remove path.
+        let present = unsafe {
+            CM_Locate_DevNodeW(&mut 0u32, to_wide(&instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+                == CR_SUCCESS
+                || CM_Locate_DevNodeW(
+                    &mut 0u32,
+                    to_wide(&instance_id).as_ptr(),
+                    CM_LOCATE_DEVNODE_PHANTOM,
+                ) == CR_SUCCESS
+        };
+        if !present {
+            continue;
+        }
+        if !node_is_hidmaestro_owned(&instance_id) {
+            continue;
+        }
+        let dp = format!(r"{base}\{inst}\Device Parameters");
+        let index = read_dword(HKLM, &dp, "ControllerIndex").unwrap_or(u32::MAX);
+        let cfg = format!(r"SOFTWARE\HIDMaestro\Controller{index}");
+        let vid = read_dword(HKLM, &cfg, "VendorId").unwrap_or(0) as u16;
+        let pid = read_dword(HKLM, &cfg, "ProductId").unwrap_or(0) as u16;
+        let device_id = read_string(HKLM, &cfg, "FlexInputDeviceId").unwrap_or_default();
+        out.push(ExistingDevice {
+            instance_id,
+            index,
+            vid,
+            pid,
+            device_id,
+            is_companion: true,
+        });
+    }
+    out
+}
+
+/// Scan one `ROOT\{enumerator}` subtree for present, HIDMaestro-owned nodes.
+fn scan_enumerator(enumerator: &str) -> Vec<ExistingDevice> {
+    use registry::*;
+    let is_companion = enumerator == "System";
     let base = format!(r"SYSTEM\CurrentControlSet\Enum\ROOT\{enumerator}");
     let mut out = Vec::new();
     for inst in enum_subkeys(HKLM, &base).unwrap_or_default() {
         let instance_id = format!(r"ROOT\{enumerator}\{inst}");
-        // Present?
         if unsafe {
             CM_Locate_DevNodeW(&mut 0u32, to_wide(&instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
         } != CR_SUCCESS
@@ -734,12 +1309,11 @@ pub fn list_hidmaestro_devices() -> Vec<ExistingDevice> {
         }
         let dp = format!(r"{base}\{inst}\Device Parameters");
         let index = read_dword(HKLM, &dp, "ControllerIndex").unwrap_or(u32::MAX);
-        // VID/PID + owning FlexInput device id from the per-instance config.
         let cfg = format!(r"SOFTWARE\HIDMaestro\Controller{index}");
         let vid = read_dword(HKLM, &cfg, "VendorId").unwrap_or(0) as u16;
         let pid = read_dword(HKLM, &cfg, "ProductId").unwrap_or(0) as u16;
         let device_id = read_string(HKLM, &cfg, "FlexInputDeviceId").unwrap_or_default();
-        out.push(ExistingDevice { instance_id, index, vid, pid, device_id });
+        out.push(ExistingDevice { instance_id, index, vid, pid, device_id, is_companion });
     }
     out
 }
@@ -850,6 +1424,36 @@ pub fn remove_orphan_hid_children() -> usize {
 /// does ("prevents ghost HID children from surviving"). Returns true if the
 /// parent node is gone (or was never present). Requires elevation.
 pub fn remove_device_node(instance_id: &str) -> Result<bool, OrchestratorError> {
+    // SWD\ companions WE create are owned by a held HSWDEVICE handle (default
+    // `Handle` lifetime) — the helper removes them by DROPPING that handle, not
+    // through this function. This branch only runs for ORPHAN SWD nodes with no
+    // live handle (leftover shells from earlier code revs). On Win10 19045 the
+    // SwDeviceCreate-reconnect teardown is a cosmetic no-op (proven), so the best
+    // available cleanup for an orphan is pnputil /remove-device /force +
+    // /subtree. Best-effort: if it doesn't take (ParentPresent shells can survive
+    // until reboot) we still report progress so callers move on.
+    if instance_id.to_ascii_uppercase().starts_with("SWD\\") {
+        let pnputil = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+            .join("System32")
+            .join("pnputil.exe");
+        let _ = std::process::Command::new(&pnputil)
+            .arg("/remove-device")
+            .arg(instance_id)
+            .arg("/subtree")
+            .arg("/force")
+            .status();
+        // Report removed only if it's actually gone now.
+        let gone = unsafe {
+            CM_Locate_DevNodeW(
+                &mut 0u32,
+                to_wide(instance_id).as_ptr(),
+                CM_LOCATE_DEVNODE_NORMAL,
+            ) != CR_SUCCESS
+        };
+        return Ok(gone);
+    }
     unsafe {
         let w_id = to_wide(instance_id);
         // Locate the parent (normal or phantom). Already gone → nothing to do,
@@ -1132,5 +1736,53 @@ mod registry {
             out.push(String::from_utf16_lossy(part));
         }
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_id_layout_matches_upstream() {
+        // ASCII "HIDMAESTRO" base + 16-bit controller index in the last 2 bytes.
+        // Verbatim from SwdDeviceFactory.ContainerIdFor — a wrong nibble here
+        // silently re-breaks the xinput slot-0-skip fix.
+        assert_eq!(
+            container_id_for(0),
+            "{48494430-4D41-4553-5452-4F0000000000}"
+        );
+        assert_eq!(
+            container_id_for(1),
+            "{48494430-4D41-4553-5452-4F0000000001}"
+        );
+        assert_eq!(
+            container_id_for(0x0102),
+            "{48494430-4D41-4553-5452-4F0000000102}"
+        );
+        assert_eq!(
+            container_id_for(0xFFFF),
+            "{48494430-4D41-4553-5452-4F000000FFFF}"
+        );
+    }
+
+    #[test]
+    fn container_id_is_per_controller() {
+        // Distinct indices → distinct containers (so multi-controller setups
+        // don't collapse into one PnP container).
+        assert_ne!(container_id_for(0), container_id_for(1));
+        assert_ne!(container_id_for(2), container_id_for(3));
+    }
+
+    #[test]
+    fn swd_suffix_is_unique_and_well_formed() {
+        // Fresh suffix every call (sticky-container fast-path dodge) and the
+        // controller index is preserved in the human-readable tail.
+        let a = next_swd_suffix(0);
+        let b = next_swd_suffix(0);
+        assert_ne!(a, b, "consecutive suffixes must differ");
+        assert!(a.ends_with("_0000"), "suffix tail encodes ctrl index: {a}");
+        let c = next_swd_suffix(3);
+        assert!(c.ends_with("_0003"), "suffix tail encodes ctrl index: {c}");
     }
 }

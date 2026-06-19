@@ -211,6 +211,7 @@ fn friendly(id: &str) -> &str {
     match id {
         _ if id.starts_with("virtual.hm.dualsense") => "DualSense",
         _ if id.starts_with("virtual.hm.ds4") => "DualShock 4",
+        _ if id.starts_with("virtual.hm.xinput") => "Xbox 360 controller",
         _ if id.starts_with("virtual.ds4") => "DualShock 4",
         _ if id.starts_with("virtual.xinput") => "Xbox controller",
         _ if id.starts_with("virtual.keymouse") => "keyboard/mouse",

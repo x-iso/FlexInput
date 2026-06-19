@@ -17,6 +17,9 @@ pub static DEVICE_KINDS: &[DeviceKind] = &[
     // HIDMaestro-only capability ViGEm can't provide.
     DeviceKind { kind_id: "virtual.hm.ds4",       display_name: "Virtual DualShock 4 (HIDMaestro)",  allows_multiple: true },
     DeviceKind { kind_id: "virtual.hm.dualsense", display_name: "Virtual DualSense (HIDMaestro)",    allows_multiple: true },
+    // Xbox 360 / XInput via HIDMaestro's XUSB companion — the capability that
+    // lets FlexInput drop ViGEm for XInput output.
+    DeviceKind { kind_id: "virtual.hm.xinput",    display_name: "Virtual Xbox 360 (HIDMaestro XInput)", allows_multiple: true },
 ];
 
 /// Profile JSON for each HIDMaestro kind (vendored presets in flexinput-hidmaestro).
@@ -25,6 +28,7 @@ fn hm_profile_json(kind_id: &str) -> Option<&'static str> {
     match kind_id {
         "virtual.hm.ds4"       => Some(presets::DUALSHOCK_4_V2_JSON),
         "virtual.hm.dualsense" => Some(presets::DUALSENSE_JSON),
+        "virtual.hm.xinput"    => Some(presets::XBOX360_JSON),
         _ => None,
     }
 }
@@ -34,6 +38,7 @@ fn hm_display_name(kind_id: &str) -> &'static str {
     match kind_id {
         "virtual.hm.ds4" => "Virtual DualShock 4",
         "virtual.hm.dualsense" => "Virtual DualSense",
+        "virtual.hm.xinput" => "Virtual Xbox 360",
         _ => "Virtual Controller",
     }
 }
@@ -54,6 +59,7 @@ pub fn kind_pin_metadata(
         "virtual.keymouse" => (layouts::KEYMOUSE_DEFAULT_PINS, &[],                       "Virtual Keyboard & Mouse"),
         "virtual.hm.ds4"       => (layouts::DS4_SINK_PINS,       layouts::DS4_SOURCE_PINS, "Virtual DualShock 4"),
         "virtual.hm.dualsense" => (layouts::DUALSENSE_SINK_PINS, layouts::DS4_SOURCE_PINS, "Virtual DualSense"),
+        "virtual.hm.xinput"    => (layouts::XINPUT_SINK_PINS,    layouts::XINPUT_SOURCE_PINS, "Virtual Xbox 360"),
         _ => return None,
     };
     let name = if instance == 0 {
