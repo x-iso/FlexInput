@@ -30,7 +30,7 @@ use crate::helper_ipc::{DeviceInfo, Request, Response, PIPE_NAME};
 use crate::install::{hidmaestro_available, installed_inf_path, installed_xusb_inf_path};
 use crate::orchestrator::{
     clear_hidmaestro_devices_and_wait, create_device_node, create_xusb_companion_node,
-    list_hidmaestro_devices, remove_all_hidmaestro_devices, remove_device_node,
+    list_hidmaestro_devices, remove_all_hidmaestro_devices, remove_device_node, RemovalBatch,
     wait_for_hid_child_started,
 };
 use crate::shm::{InputSection, OutputSection};
@@ -126,6 +126,11 @@ impl HelperState {
     /// persistence is off). Best-effort.
     fn teardown_tracked(&self) {
         if let Ok(mut devs) = self.devices.lock() {
+            // One shared ALLCLASSES info set for the whole teardown — removing
+            // several tracked pads (each a HID node + maybe a companion, each
+            // with a HID child) otherwise re-enumerated every device in the
+            // system per node, which was the bulk of the exit hang.
+            let batch = RemovalBatch::new();
             for (id, dev) in devs.drain() {
                 // Drop the SWD companion's held handle FIRST — that's what removes
                 // the companion node (default Handle lifetime). Do it explicitly so
@@ -133,9 +138,9 @@ impl HelperState {
                 drop(dev._companion_handle);
                 // Fallback for a companion with no live handle (legacy/reclaimed).
                 if let Some(cid) = &dev.companion_instance_id {
-                    let _ = remove_device_node(cid);
+                    let _ = batch.remove(cid);
                 }
-                let _ = remove_device_node(&id);
+                let _ = batch.remove(&id);
             }
         }
     }

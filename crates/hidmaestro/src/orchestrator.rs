@@ -1365,15 +1365,53 @@ fn scan_enumerator(enumerator: &str) -> Vec<ExistingDevice> {
 /// node doesn't stop the others.
 pub fn remove_all_hidmaestro_devices() -> usize {
     let mut removed = 0;
-    for dev in list_hidmaestro_devices() {
-        if matches!(remove_device_node(&dev.instance_id), Ok(true)) {
+    let devices = list_hidmaestro_devices();
+
+    // SWD companion orphans are removed by an out-of-process `pnputil
+    // /remove-device` each — a ~100-300ms subprocess. Kick them ALL off
+    // concurrently up front (independent processes; no shared state) so their
+    // latency overlaps the in-proc ROOT work below instead of serializing.
+    let swd_children: Vec<_> = devices
+        .iter()
+        .filter(|d| d.instance_id.to_ascii_uppercase().starts_with("SWD\\"))
+        .filter_map(|d| spawn_swd_removal(&d.instance_id).map(|c| (d.instance_id.clone(), c)))
+        .collect();
+
+    // Build the ALLCLASSES info set ONCE for the whole pass. Every ROOT-node and
+    // orphan-child removal reuses it via `*_in`, so a teardown of N nodes (each
+    // with a HID child) plus orphan sweeps performs ONE system-wide device
+    // enumeration instead of one per removal — the bulk of the old exit hang.
+    let set = unsafe { open_allclasses_set() };
+    for dev in devices.iter().filter(|d| !d.instance_id.to_ascii_uppercase().starts_with("SWD\\")) {
+        let r = match &set {
+            Ok(g) => remove_device_node_in(g.0, &dev.instance_id),
+            Err(_) => remove_device_node(&dev.instance_id),
+        };
+        if matches!(r, Ok(true)) {
             removed += 1;
         }
     }
     // Sweep up any HID children whose parent is already gone (orphans from a
     // prior build that didn't remove children, or a force-kill). Counts toward
-    // the total so callers see real cleanup progress.
-    removed += remove_orphan_hid_children();
+    // the total so callers see real cleanup progress. Reuses the same set.
+    removed += match &set {
+        Ok(g) => remove_orphan_hid_children_in(g.0),
+        Err(_) => remove_orphan_hid_children(),
+    };
+
+    // Now join the pnputil children we launched earlier — by now most/all have
+    // finished while we did the ROOT work. Count one removed per node that's
+    // actually gone afterwards.
+    for (instance_id, mut child) in swd_children {
+        let _ = child.wait();
+        let gone = unsafe {
+            CM_Locate_DevNodeW(&mut 0u32, to_wide(&instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+                != CR_SUCCESS
+        };
+        if gone {
+            removed += 1;
+        }
+    }
     removed
 }
 
@@ -1421,6 +1459,22 @@ pub fn clear_hidmaestro_devices_and_wait(timeout: std::time::Duration) -> bool {
 /// tag in the **child's own** HardwareID is the ownership proof — it survives
 /// even after the parent is gone — so this never touches a real generic pad.
 pub fn remove_orphan_hid_children() -> usize {
+    match unsafe { open_allclasses_set() } {
+        Ok(g) => remove_orphan_hid_children_in(g.0),
+        // Set failed to open — fall back to per-removal one-off sets inside the
+        // sweep (dif_remove builds its own).
+        Err(_) => remove_orphan_hid_children_with(None),
+    }
+}
+
+/// As [`remove_orphan_hid_children`], reusing a caller-provided ALLCLASSES set.
+fn remove_orphan_hid_children_in(dis: *mut c_void) -> usize {
+    remove_orphan_hid_children_with(Some(dis))
+}
+
+/// Shared body: when `dis` is `Some`, each orphan removal reuses that set via
+/// `dif_remove_in`; when `None`, falls back to a one-off set per removal.
+fn remove_orphan_hid_children_with(dis: Option<*mut c_void>) -> usize {
     use registry::*;
     let mut removed = 0;
     let base = r"SYSTEM\CurrentControlSet\Enum\HID";
@@ -1477,7 +1531,11 @@ pub fn remove_orphan_hid_children() -> usize {
                 }
             };
             if orphaned {
-                if let Ok(true) = unsafe { dif_remove(&hid_instance_id) } {
+                let r = match dis {
+                    Some(d) => unsafe { dif_remove_in(d, &hid_instance_id) },
+                    None => unsafe { dif_remove(&hid_instance_id) },
+                };
+                if let Ok(true) = r {
                     removed += 1;
                 }
             }
@@ -1499,62 +1557,101 @@ pub fn remove_orphan_hid_children() -> usize {
 /// does ("prevents ghost HID children from surviving"). Returns true if the
 /// parent node is gone (or was never present). Requires elevation.
 pub fn remove_device_node(instance_id: &str) -> Result<bool, OrchestratorError> {
-    // SWD\ companions WE create are owned by a held HSWDEVICE handle (default
-    // `Handle` lifetime) — the helper removes them by DROPPING that handle, not
-    // through this function. This branch only runs for ORPHAN SWD nodes with no
-    // live handle (leftover shells from earlier code revs). On Win10 19045 the
-    // SwDeviceCreate-reconnect teardown is a cosmetic no-op (proven), so the best
-    // available cleanup for an orphan is pnputil /remove-device /force +
-    // /subtree. Best-effort: if it doesn't take (ParentPresent shells can survive
-    // until reboot) we still report progress so callers move on.
+    // SWD companions go through pnputil (no info set needed); ROOT nodes build a
+    // one-off set. Bulk paths use `remove_device_node_in` to share one set.
     if instance_id.to_ascii_uppercase().starts_with("SWD\\") {
-        let pnputil = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
-            .join("System32")
-            .join("pnputil.exe");
-        let _ = std::process::Command::new(&pnputil)
-            .arg("/remove-device")
-            .arg(instance_id)
-            .arg("/subtree")
-            .arg("/force")
-            .status();
-        // Report removed only if it's actually gone now.
-        let gone = unsafe {
-            CM_Locate_DevNodeW(
-                &mut 0u32,
-                to_wide(instance_id).as_ptr(),
-                CM_LOCATE_DEVNODE_NORMAL,
-            ) != CR_SUCCESS
-        };
-        return Ok(gone);
+        return remove_swd_node(instance_id);
     }
-    unsafe {
-        let w_id = to_wide(instance_id);
-        // Locate the parent (normal or phantom). Already gone → nothing to do,
-        // but we still don't know its children, so just return.
-        let mut parent_inst: u32 = 0;
-        let present = CM_Locate_DevNodeW(&mut parent_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
-            == CR_SUCCESS
-            || CM_Locate_DevNodeW(&mut parent_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_PHANTOM)
-                == CR_SUCCESS;
-        if !present {
-            return Ok(true);
-        }
-
-        // Step 1: remove every HID child PDO first (these don't cascade).
-        for child_id in child_device_ids(parent_inst) {
-            let _ = dif_remove(&child_id);
-        }
-
-        // Step 2: remove the parent.
-        dif_remove(instance_id)
-    }
+    let guard = unsafe { open_allclasses_set()? };
+    unsafe { remove_root_node_in(guard.0, instance_id) }
 }
 
-/// `DIF_REMOVE` a single device by instance id via a fresh ALLCLASSES info set.
-/// Port of `DeviceManager.DifRemoveDevice`.
-unsafe fn dif_remove(instance_id: &str) -> Result<bool, OrchestratorError> {
+/// Remove a HIDMaestro node, reusing a caller-provided ALLCLASSES info set for
+/// the ROOT (plain-HID) path so a bulk teardown pays the system enumeration once.
+/// SWD companions ignore `dis` (they use the pnputil path).
+fn remove_device_node_in(dis: *mut c_void, instance_id: &str) -> Result<bool, OrchestratorError> {
+    if instance_id.to_ascii_uppercase().starts_with("SWD\\") {
+        return remove_swd_node(instance_id);
+    }
+    unsafe { remove_root_node_in(dis, instance_id) }
+}
+
+/// SWD\ companions WE create are owned by a held HSWDEVICE handle (default
+/// `Handle` lifetime) — the helper removes them by DROPPING that handle, not
+/// through this function. This path only runs for ORPHAN SWD nodes with no live
+/// handle (leftover shells from earlier code revs). On Win10 19045 the
+/// SwDeviceCreate-reconnect teardown is a cosmetic no-op (proven), so the best
+/// available cleanup for an orphan is pnputil /remove-device /force + /subtree.
+/// Best-effort: if it doesn't take (ParentPresent shells can survive until
+/// reboot) we still report progress so callers move on.
+fn remove_swd_node(instance_id: &str) -> Result<bool, OrchestratorError> {
+    // Single-node path: spawn + wait. Bulk teardown uses `spawn_swd_removal`
+    // directly to run all companions' pnputil concurrently.
+    if let Some(mut child) = spawn_swd_removal(instance_id) {
+        let _ = child.wait();
+    }
+    // Report removed only if it's actually gone now.
+    let gone = unsafe {
+        CM_Locate_DevNodeW(
+            &mut 0u32,
+            to_wide(instance_id).as_ptr(),
+            CM_LOCATE_DEVNODE_NORMAL,
+        ) != CR_SUCCESS
+    };
+    Ok(gone)
+}
+
+/// Launch `pnputil /remove-device <id> /subtree /force` WITHOUT waiting, so a
+/// bulk teardown can run every companion's removal concurrently and join later.
+/// Returns the spawned child (None if pnputil couldn't be launched at all).
+fn spawn_swd_removal(instance_id: &str) -> Option<std::process::Child> {
+    let pnputil = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("pnputil.exe");
+    std::process::Command::new(&pnputil)
+        .arg("/remove-device")
+        .arg(instance_id)
+        .arg("/subtree")
+        .arg("/force")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Children-first, then-parent `DIF_REMOVE` for a ROOT (plain-HID) node, all
+/// against the shared `dis` info set. See [`remove_device_node`] for why the HID
+/// child PDOs must be removed explicitly (they don't cascade).
+unsafe fn remove_root_node_in(dis: *mut c_void, instance_id: &str) -> Result<bool, OrchestratorError> {
+    let w_id = to_wide(instance_id);
+    // Locate the parent (normal or phantom). Already gone → nothing to do,
+    // but we still don't know its children, so just return.
+    let mut parent_inst: u32 = 0;
+    let present = CM_Locate_DevNodeW(&mut parent_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
+        == CR_SUCCESS
+        || CM_Locate_DevNodeW(&mut parent_inst, w_id.as_ptr(), CM_LOCATE_DEVNODE_PHANTOM)
+            == CR_SUCCESS;
+    if !present {
+        return Ok(true);
+    }
+
+    // Step 1: remove every HID child PDO first (these don't cascade).
+    for child_id in child_device_ids(parent_inst) {
+        let _ = dif_remove_in(dis, &child_id);
+    }
+
+    // Step 2: remove the parent.
+    dif_remove_in(dis, instance_id)
+}
+
+/// Build an empty `DIGCF_ALLCLASSES` device-info set once. This enumerates every
+/// device in the system, which is the single most expensive step in teardown
+/// (hundreds of ms on a populated machine) — so a bulk removal pass builds ONE
+/// set and reuses it across all `dif_remove_in` calls instead of paying this per
+/// node + per child. Returns a guard that destroys the set on drop.
+unsafe fn open_allclasses_set() -> Result<DisGuard, OrchestratorError> {
     const DIGCF_ALLCLASSES: u32 = 0x0000_0004;
     let dis = SetupDiGetClassDevsW(
         std::ptr::null(),
@@ -1565,8 +1662,14 @@ unsafe fn dif_remove(instance_id: &str) -> Result<bool, OrchestratorError> {
     if dis as isize == INVALID_HANDLE_VALUE {
         return Err(OrchestratorError::Win32("SetupDiGetClassDevs", GetLastError()));
     }
-    let _guard = DisGuard(dis);
+    Ok(DisGuard(dis))
+}
 
+/// `DIF_REMOVE` a single device by instance id using a CALLER-PROVIDED info set.
+/// `SetupDiOpenDeviceInfoW` adds the node to the given set by id (the set need
+/// not already contain it), so one shared ALLCLASSES set serves an entire
+/// teardown pass — avoiding a fresh system-wide enumeration per removal.
+unsafe fn dif_remove_in(dis: *mut c_void, instance_id: &str) -> Result<bool, OrchestratorError> {
     let mut devinfo = new_devinfo();
     let w_id = to_wide(instance_id);
     if SetupDiOpenDeviceInfoW(dis, w_id.as_ptr(), std::ptr::null_mut(), 0, &mut devinfo) == 0 {
@@ -1582,6 +1685,53 @@ unsafe fn dif_remove(instance_id: &str) -> Result<bool, OrchestratorError> {
     // Confirm it's gone (NORMAL locate fails).
     let gone = CM_Locate_DevNodeW(&mut 0u32, w_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS;
     Ok(gone)
+}
+
+/// `DIF_REMOVE` a single device by instance id via a fresh ALLCLASSES info set.
+/// One-off wrapper around [`dif_remove_in`] for standalone callers; bulk paths
+/// build one set and call `dif_remove_in` directly. Port of
+/// `DeviceManager.DifRemoveDevice`.
+unsafe fn dif_remove(instance_id: &str) -> Result<bool, OrchestratorError> {
+    let guard = open_allclasses_set()?;
+    dif_remove_in(guard.0, instance_id)
+}
+
+/// A teardown session that holds ONE `DIGCF_ALLCLASSES` info set for its lifetime
+/// so every [`RemovalBatch::remove`] reuses it instead of re-enumerating every
+/// device in the system per call. Use this when removing several nodes (e.g. the
+/// helper's exit teardown of its tracked devices) — it turns N system-wide
+/// enumerations into one, which is the bulk of the old exit hang.
+///
+/// If the set can't be opened, `remove` transparently falls back to a one-off set
+/// per call (i.e. behaves like [`remove_device_node`]), so callers never need to
+/// special-case the failure.
+pub struct RemovalBatch {
+    set: Option<DisGuard>,
+}
+
+impl RemovalBatch {
+    /// Open the shared info set for a teardown session. Never fails to construct;
+    /// a set-open failure just degrades to per-call sets inside `remove`.
+    pub fn new() -> Self {
+        RemovalBatch {
+            set: unsafe { open_allclasses_set().ok() },
+        }
+    }
+
+    /// Remove one node (SWD companion → pnputil; ROOT plain-HID → shared set,
+    /// children-first). Same semantics/return as [`remove_device_node`].
+    pub fn remove(&self, instance_id: &str) -> Result<bool, OrchestratorError> {
+        match &self.set {
+            Some(g) => remove_device_node_in(g.0, instance_id),
+            None => remove_device_node(instance_id),
+        }
+    }
+}
+
+impl Default for RemovalBatch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// RAII guard that destroys a SetupDi device-info-list handle.
@@ -1859,5 +2009,27 @@ mod tests {
         assert!(a.ends_with("_0000"), "suffix tail encodes ctrl index: {a}");
         let c = next_swd_suffix(3);
         assert!(c.ends_with("_0003"), "suffix tail encodes ctrl index: {c}");
+    }
+
+    #[test]
+    fn removal_batch_removes_absent_node_as_noop() {
+        // A RemovalBatch must construct (it opens a shared ALLCLASSES set, or
+        // degrades gracefully if that fails) and removing a node that doesn't
+        // exist is a safe no-op reporting "gone" — the same contract as
+        // remove_device_node. Uses a bogus-but-well-formed ROOT id so no real
+        // device is touched and no elevation is needed. This guards the shared-
+        // set reuse path (the exit-hang fix) against regressions.
+        let batch = RemovalBatch::new();
+        let bogus = r"ROOT\HIDMAESTRO_TEST_DOES_NOT_EXIST\0000";
+        assert!(
+            matches!(batch.remove(bogus), Ok(true)),
+            "absent ROOT node must report removed (no-op)"
+        );
+        // A second removal on the same batch must reuse the set and behave
+        // identically — proving the set stays usable across calls.
+        assert!(
+            matches!(batch.remove(bogus), Ok(true)),
+            "batch set must remain usable for repeated removals"
+        );
     }
 }

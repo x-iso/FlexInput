@@ -39,7 +39,8 @@ pub use install::{hidmaestro_available, installed_inf_path, installed_xusb_inf_p
 pub use orchestrator::{
     create_device_node, create_xusb_companion_node, list_hidmaestro_devices, node_diag,
     remove_all_hidmaestro_devices, remove_device_node, remove_orphan_hid_children,
-    write_instance_config, CreatedDevice, ExistingDevice, NodeDiag, OrchestratorError, SwdHandle,
+    write_instance_config, CreatedDevice, ExistingDevice, NodeDiag, OrchestratorError,
+    RemovalBatch, SwdHandle,
 };
 pub use server::run_helper_server;
 pub use profile::{Profile, ProfileError};
