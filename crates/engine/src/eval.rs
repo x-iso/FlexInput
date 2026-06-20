@@ -38,6 +38,25 @@ fn shape_hd_feedback(sig: Signal, floor: f32, max: f32, exp: f32) -> Signal {
     Signal::Float(shaped.clamp(0.0, 1.0))
 }
 
+/// Combine two feedback values targeting the same physical haptic pin from
+/// different virtual sources. Haptics are level-triggered, so "any source active
+/// wins" = take the larger magnitude (Float) / logical-or (Bool). Used so two
+/// virtual pads fed by one physical device both reach its rumble/LED, instead of
+/// the first-seen silently winning. Mixed/other signal types keep the existing
+/// value (no meaningful combine).
+fn combine_feedback_max(a: Signal, b: Signal) -> Signal {
+    match (a, b) {
+        (Signal::Float(x), Signal::Float(y)) => Signal::Float(if x.abs() >= y.abs() { x } else { y }),
+        (Signal::Bool(x), Signal::Bool(y)) => Signal::Bool(x || y),
+        // Float vs Bool: coerce the bool to 0/1 and compare magnitudes.
+        (Signal::Float(x), Signal::Bool(y)) | (Signal::Bool(y), Signal::Float(x)) => {
+            let yb = if y { 1.0 } else { 0.0 };
+            Signal::Float(if x.abs() >= yb { x } else { yb })
+        }
+        (a, _) => a,
+    }
+}
+
 // ── Public output type ────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -2096,8 +2115,20 @@ pub fn eval_graph_tick(
                         } else {
                             sig
                         };
+                        // COMBINE, don't first-wins. Multiple virtual sinks can
+                        // auto-map FROM the same physical device (e.g. a virtual
+                        // DS4 AND a virtual DualSense both fed by one Switch Pro);
+                        // each contributes feedback to the same physical haptic
+                        // pin. A plain `or_insert` kept only whichever source the
+                        // `feedback_sources` iteration hit first — so only ONE
+                        // virtual's rumble/ping reached the physical, and which one
+                        // flipped across restarts as graph/enumeration order
+                        // changed (the "only one passes ping" flakiness). Take the
+                        // max so any active source drives the pad (haptics are
+                        // level-triggered; loudest wins, matching rumble peak).
                         sink_outputs
                             .entry((st.device_id.clone(), dst_pin.to_string()))
+                            .and_modify(|cur| *cur = combine_feedback_max(*cur, routed))
                             .or_insert(routed);
                     }
                 }
@@ -4907,6 +4938,37 @@ fn sig_scalar(s: Signal) -> f32 {
 mod trigger_tests {
     use super::*;
     use crate::graph::SinkTarget;
+
+    // Two virtual sinks feeding back to one physical pad must COMBINE (max), not
+    // first-wins — the "only one virtual passes ping after restart" bug.
+    #[test]
+    fn combine_feedback_takes_max_not_first() {
+        // Loud + quiet → loud, regardless of order.
+        assert_eq!(
+            combine_feedback_max(Signal::Float(0.2), Signal::Float(0.9)),
+            Signal::Float(0.9)
+        );
+        assert_eq!(
+            combine_feedback_max(Signal::Float(0.9), Signal::Float(0.2)),
+            Signal::Float(0.9)
+        );
+        // One source idle (0.0), the other active → active wins (the exact bug:
+        // an idle virtual must not mask an active one).
+        assert_eq!(
+            combine_feedback_max(Signal::Float(0.0), Signal::Float(0.7)),
+            Signal::Float(0.7)
+        );
+        // Bool OR.
+        assert_eq!(
+            combine_feedback_max(Signal::Bool(false), Signal::Bool(true)),
+            Signal::Bool(true)
+        );
+        // Float vs Bool coercion.
+        assert_eq!(
+            combine_feedback_max(Signal::Float(0.3), Signal::Bool(true)),
+            Signal::Float(1.0)
+        );
+    }
 
     fn canonical_pins() -> Vec<String> {
         automap::ALL_PINS.iter().map(|p| p.id.to_string()).collect()
