@@ -10338,6 +10338,13 @@ fn resolve_automap_glow_output(
                 .and_then(|v| v.as_array())?;
             let mut max_i = 0.0_f32;
             for pid in pin_ids.iter().filter_map(|v| v.as_str()) {
+                // Battery is a steady-state status readout (always ~full on
+                // virtuals, a slowly-changing level on physicals), not input
+                // activity — pooling it would pin the whole AutoMap bus glow on
+                // permanently. Its own pin glow is suppressed too (output_pin_glow).
+                if pid == "battery" {
+                    continue;
+                }
                 // Exclude raw touch X/Y axes from AutoMap bus glow unless the
                 // corresponding Touch Active flag is present and true. These
                 // axes are only meaningful when Touch Active is asserted;
@@ -10486,7 +10493,10 @@ fn output_pin_glow(
             .and_then(|a| a.get(out_idx))
             .and_then(|v| v.as_str())?;
         let sig = live_signals.get(&(dev_id.to_string(), pin_id.to_string()))?;
-        let intensity = signal_intensity(sig);
+        // Battery is a steady-state status readout, not activity — keep its own
+        // pin/wire glow dark (matches its exclusion from the AutoMap bus pool).
+        // The value still renders; only the activity glow is suppressed.
+        let intensity = if pin_id == "battery" { 0.0 } else { signal_intensity(sig) };
         let [r, g, b] = sig.signal_type().color_rgb();
         return Some((Color32::from_rgb(r, g, b), intensity));
     }
