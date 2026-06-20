@@ -423,16 +423,18 @@ fn encode_extended(profile: &Profile, state: &GamepadState, report: &mut [u8]) {
         write_i16_le(report, o, to_i16(state.accel_z));
     }
 
-    // Battery: always report a full/healthy charge. A virtual pad has no real
-    // battery, and a low/critical reading makes some hosts disable haptics (and
-    // shows an alarming "controller low" prompt). Both Sony families pack the
-    // level in the low nibble: DualSense 0..8 (8 = full); DS4 0..10 (cabled-full
-    // reports ~11). Writing low-nibble 0x08 reads as full on DualSense and
-    // comfortably "not low" on DS4 — enough to keep haptics enabled — while
-    // leaving the high-nibble charge/cable status untouched.
+    // Battery: ALWAYS report 100% / full, regardless of any physical source. A
+    // virtual pad has no real battery, and a low/critical reading makes some
+    // hosts disable haptics or show a "controller low" prompt — and a physical
+    // pad with a failing battery (reporting ~5%) must never drag the virtual down.
+    // Both Sony families pack the charge LEVEL in the low nibble and a status
+    // (charging/full) in the high nibble. The standard host formula treats level
+    // as a 0..10 capacity → `min(level*10 + 5, 100)`, so we write level 0x0A (10)
+    // for a clean 100%, and clear the high nibble to "discharging" (steady full,
+    // no charging animation). DS4 byte 12 uses the same low-nibble capacity.
     if let Some(o) = ext.battery_level {
         if o < report.len() {
-            report[o] = (report[o] & 0xF0) | 0x08;
+            report[o] = 0x0A;
         }
     }
 
@@ -925,23 +927,25 @@ mod tests {
         assert_eq!(rep[37] & 0x80, 0x80, "finger 1 marked inactive");
     }
 
-    // The virtual pad must always report a full/healthy battery so hosts keep
-    // haptics enabled. DualSense battery byte 53 low nibble = level (8 = full).
+    // The virtual pad must always report 100% battery so hosts keep haptics
+    // enabled and a failing physical pad can't drag it down. Level 0x0A (10) →
+    // 100% under the standard `min(level*10+5,100)` host formula; high nibble
+    // (charge status) cleared = steady "discharging full".
     #[test]
     fn dualsense_reports_full_battery() {
         let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
         assert_eq!(p.extended.battery_level, Some(53), "battery@53 parsed");
         let rep = encode_report(&p, &GamepadState::neutral());
-        assert_eq!(rep[53] & 0x0F, 0x08, "battery level = full (8)");
+        assert_eq!(rep[53], 0x0A, "battery = level 10 (100%), status clear");
     }
 
-    // DS4 carries battery at byte 12 (plain uint8). Same full-charge stamp.
+    // DS4 carries battery at byte 12 (plain uint8). Same full stamp.
     #[test]
     fn ds4_reports_full_battery() {
         let p = ds4();
         assert_eq!(p.extended.battery_level, Some(12), "battery@12 parsed");
         let rep = encode_report(&p, &GamepadState::neutral());
-        assert_eq!(rep[12] & 0x0F, 0x08, "battery level healthy/full");
+        assert_eq!(rep[12], 0x0A, "battery = level 10 (100%)");
     }
 
     /// Decode a 4-byte DualSense touch block back to (active, raw_x, raw_y) — the
