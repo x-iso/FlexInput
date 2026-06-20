@@ -11760,19 +11760,40 @@ fn show_subpatch_editors(
 
         // Pre-sync: pull pinned-body param changes from the parent snarl so that
         // sliders/knobs on the sub-patch body remain interactive.
+        //
+        // Gated on the PARENT canvas's mutation generation. The pre-sync exists
+        // only to catch changes made to this sub-patch's contents from OUTSIDE
+        // the editor — e.g. an Easy-mode pinned widget on the parent body writing
+        // into `node.subpatch` (those edits bump the parent canvas's
+        // `mutation_gen` via `track_value_edits`). When the parent hasn't changed
+        // since we last synced, the editor's own snarl is the authority and we
+        // must NOT overwrite it: doing so every frame reverted in-progress inner
+        // gestures (node drags, knob/curve-point drags) because those don't bump
+        // `mutation_gen` until they settle on pointer-release, so the write-back
+        // below was skipped mid-gesture and this pre-sync clobbered the
+        // un-written change next frame. Net effect was "modules won't move and
+        // param handles can't be edited inside a sub-patch". (Regression from the
+        // write-back gating in e224eab.)
+        //
         // Skip when a child editor is open: the child will write-back into this
         // editor's canvas this same frame (reverse loop order), and pre-sync would
         // overwrite those changes with the stale parent state.
         let has_active_child = app.sub_patch_editors.iter().enumerate().any(|(j, e)| {
             j != i && e.tab_idx == active && e.parent_editor_idx == Some(i)
         });
-        if !has_active_child {
+        let parent_gen = match parent_editor_idx {
+            None    => app.tabs[active].canvas.mutation_gen,
+            Some(p) => app.sub_patch_editors[p].canvas.mutation_gen,
+        };
+        let parent_changed = app.sub_patch_editors[i].last_synced_parent_gen != Some(parent_gen);
+        if !has_active_child && parent_changed {
             puffin::profile_scope!("editor_presync");
             let outer_inner = match parent_editor_idx {
                 None    => app.tabs[active].canvas.snarl.get_node(node_id),
                 Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
             }.and_then(|n| n.subpatch.as_ref()).map(|sp| *sp.snarl.clone());
             if let Some(snarl) = outer_inner { inner_canvas.snarl = snarl; }
+            app.sub_patch_editors[i].last_synced_parent_gen = Some(parent_gen);
         }
 
         // Pinned IDs from parent.
