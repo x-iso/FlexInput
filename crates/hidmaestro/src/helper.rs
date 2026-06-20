@@ -134,8 +134,27 @@ fn ensure_connected(m: &mut Manager) -> Result<(), HelperError> {
             send_hello_if_needed(m)?;
             return Ok(());
         }
-        m.client = None; // stale; fall through to respawn
+        m.client = None; // stale; fall through to adopt/respawn
         m.greeted = false;
+    }
+
+    // ADOPT a live helper before spawning a new one. On a fresh app launch we
+    // have no cached client, but a helper from a still-running prior app (overlap)
+    // may be alive on the pipe. The old code unconditionally spawned here, so two
+    // helpers could co-exist and fight over device nodes — the proven root of the
+    // intermittent "virtual failed to deploy" / physical-pad-dropped flakiness.
+    // Probe the pipe; if a helper answers Ping, adopt it (our `Hello` re-targets
+    // its parent watch to us, so it follows this app and won't tear down when the
+    // prior parent dies). Only spawn when nothing answers. A helper that's already
+    // shutting down (parent_gone) replies "shutting down" → not adoptable → we
+    // fall through to spawn a clean one (the existing race guard handles that).
+    if let Ok(mut client) = HelperClient::connect(1_500) {
+        if matches!(client.call(&Request::Ping), Ok(Response::Status { .. })) {
+            m.client = Some(client);
+            m.greeted = false;
+            send_hello_if_needed(m)?;
+            return Ok(());
+        }
     }
 
     let (exe, args) = helper_command(m)?;

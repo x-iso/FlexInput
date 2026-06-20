@@ -101,6 +101,14 @@ struct HelperState {
     /// only on the FIRST hello, never on reconnects, or it would wipe the very
     /// devices the app just created earlier in the session.
     did_startup_cleanup: AtomicBool,
+    /// The pid this helper currently serves. Updated by every `Hello` so a helper
+    /// ADOPTED by a newer app (see `helper::ensure_connected`) follows that app
+    /// instead of tearing down when the original parent dies. The watch thread
+    /// reads this: when its watched handle signals, it only tears down if the pid
+    /// that died is STILL the one we serve; otherwise it re-opens the watch for
+    /// the new pid. `0` = no parent (watch idles). Guarantees ONE helper across a
+    /// close→reopen / overlap instead of two fighting over device nodes.
+    parent_pid: std::sync::atomic::AtomicU32,
 }
 
 impl HelperState {
@@ -110,6 +118,7 @@ impl HelperState {
             persist: AtomicBool::new(false),
             parent_gone: AtomicBool::new(false),
             did_startup_cleanup: AtomicBool::new(false),
+            parent_pid: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -153,9 +162,14 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
 
     let state = Arc::new(HelperState::new());
     state.persist.store(initial_persist, Ordering::SeqCst);
+    if let Some(pid) = parent_pid {
+        state.parent_pid.store(pid, Ordering::SeqCst);
+    }
 
     // Watch the parent: if it exits and persistence is off, tear everything
-    // down and flip `parent_gone` so the accept loop unblocks and exits.
+    // down and flip `parent_gone` so the accept loop unblocks and exits. The
+    // watch follows `state.parent_pid`, which a later `Hello` can re-target if a
+    // newer app adopts this helper (keeps it a single shared helper).
     if let Some(pid) = parent_pid {
         let st = state.clone();
         std::thread::spawn(move || watch_parent(pid, st));
@@ -193,55 +207,92 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     diag_log("[helper] stopped");
 }
 
-/// Poll the parent process handle; when it exits, react per persistence and
-/// signal the accept loop to stop.
-fn watch_parent(parent_pid: u32, state: Arc<HelperState>) {
+/// Watch the CURRENT parent process; when it dies, tear down (per persistence)
+/// and stop the accept loop — UNLESS the helper was meanwhile adopted by a newer
+/// app (a `Hello` updated `state.parent_pid`), in which case re-target to the new
+/// pid instead of exiting. This is what guarantees a SINGLE helper across a
+/// close→reopen / overlap: a newer app adopts the live helper and re-points it,
+/// so the old parent's death never strands the new app's devices, and we never
+/// spawn a second helper to fight the first.
+fn watch_parent(initial_pid: u32, state: Arc<HelperState>) {
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const WAIT_OBJECT_0: u32 = 0;
-    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, parent_pid) };
+
+    let mut cur_pid = initial_pid;
+    let mut handle = unsafe { OpenProcess(SYNCHRONIZE, 0, cur_pid) };
     if handle.is_null() {
-        // Can't observe the parent (already gone, or access denied). If we
-        // can't watch it, fail safe: when persistence is off, don't strand
-        // devices — but we also can't loop forever, so just return and rely on
-        // explicit Shutdown / pipe-break.
-        eprintln!("[hidmaestro-helper] could not open parent pid {parent_pid} to watch");
+        eprintln!("[hidmaestro-helper] could not open parent pid {cur_pid} to watch");
         return;
     }
     loop {
-        let r = unsafe { WaitForSingleObject(handle, 1000) };
-        if r == WAIT_OBJECT_0 {
-            // Parent exited. CRITICAL ORDERING: mark `parent_gone` FIRST, before
-            // any teardown. The teardown below (remove_all_hidmaestro_devices) is
-            // the slow part — it enumerates and removes device nodes over several
-            // seconds. If we set the flag only AFTER teardown (as before), there
-            // was a multi-second window where this dying helper still answered the
-            // fast-path Ping and serviced a NEW app instance's Create — building a
-            // device it was about to abandon on exit. A rapid relaunch hit exactly
-            // that window: the new app's DS4 was created on the dying helper, then
-            // orphaned. Setting the flag first makes the accept loop's race guard
-            // reject new work immediately, so the new app respawns a clean helper.
-            let persist_now = state.persist.load(Ordering::SeqCst);
-            state.parent_gone.store(true, Ordering::SeqCst);
-            diag_log(&format!("[helper] parent {parent_pid} exited; persist={persist_now}"));
-            if !persist_now {
-                // Remove ONLY this helper's own tracked devices — NOT a system-wide
-                // remove_all. On a rapid relaunch the new app may already have spawned
-                // a fresh helper and created new nodes by the time we get here; a
-                // system-wide sweep would nuke those (they're HIDMaestro-owned too).
-                // Orphans from an abrupt prior exit are instead reclaimed by the NEXT
-                // helper's startup `clear_hidmaestro_devices_and_wait`, which sweeps +
-                // verifies clear before the app deploys. Scoping teardown to our own
-                // tracked nodes keeps a surviving old helper from clobbering a new one.
-                state.teardown_tracked();
-                diag_log("[helper] removed tracked device(s) after parent death");
-            }
-            // Nudge the accept loop: connect to our own pipe so a blocked
-            // ConnectNamedPipe returns and the loop re-checks `parent_gone`.
-            wake_accept_loop();
+        // Re-target if a newer app adopted us (Hello changed the served pid).
+        let served = state.parent_pid.load(Ordering::SeqCst);
+        if served != 0 && served != cur_pid {
+            diag_log(&format!("[helper] re-targeting parent {cur_pid} -> {served} (adopted)"));
             unsafe { CloseHandle(handle) };
-            return;
+            cur_pid = served;
+            handle = unsafe { OpenProcess(SYNCHRONIZE, 0, cur_pid) };
+            if handle.is_null() {
+                // New parent already gone — loop will treat it as dead below via
+                // a null handle: re-check served pid; if still this, tear down.
+                eprintln!("[hidmaestro-helper] could not open adopted parent {cur_pid}");
+                // Fall through: if served is still cur_pid and unopenable, exit
+                // like a dead parent. Re-open attempt next iteration covers a
+                // transient race.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if state.parent_pid.load(Ordering::SeqCst) == cur_pid {
+                    handle_parent_death(cur_pid, &state);
+                    return;
+                }
+                continue;
+            }
         }
+
+        let r = unsafe { WaitForSingleObject(handle, 1000) };
+        if r != WAIT_OBJECT_0 {
+            continue; // timeout: still alive, re-check re-target + wait again
+        }
+        // The watched handle signalled (cur_pid exited). But if we were adopted in
+        // the meantime, the death we just saw is the OLD parent's — don't tear
+        // down; loop re-targets to the new served pid.
+        let served_now = state.parent_pid.load(Ordering::SeqCst);
+        if served_now != 0 && served_now != cur_pid {
+            diag_log(&format!("[helper] watched {cur_pid} died but adopted by {served_now}; not tearing down"));
+            unsafe { CloseHandle(handle) };
+            cur_pid = served_now;
+            handle = unsafe { OpenProcess(SYNCHRONIZE, 0, cur_pid) };
+            if handle.is_null() {
+                eprintln!("[hidmaestro-helper] could not open adopted parent {cur_pid}");
+                if state.parent_pid.load(Ordering::SeqCst) == cur_pid {
+                    handle_parent_death(cur_pid, &state);
+                    return;
+                }
+            }
+            continue;
+        }
+        // The app we actually serve died → tear down and stop.
+        handle_parent_death(cur_pid, &state);
+        unsafe { CloseHandle(handle) };
+        return;
     }
+}
+
+/// React to the served parent's death: mark `parent_gone` FIRST (so the accept
+/// loop's race guard rejects new work immediately — a multi-second teardown must
+/// not service a new app's Create on this dying helper), then tear down our own
+/// tracked devices when persistence is off, and nudge the accept loop to exit.
+fn handle_parent_death(parent_pid: u32, state: &Arc<HelperState>) {
+    let persist_now = state.persist.load(Ordering::SeqCst);
+    state.parent_gone.store(true, Ordering::SeqCst);
+    diag_log(&format!("[helper] parent {parent_pid} exited; persist={persist_now}"));
+    if !persist_now {
+        // Remove ONLY this helper's own tracked devices — NOT a system-wide
+        // remove_all. Orphans from an abrupt prior exit are reclaimed by the next
+        // helper's startup `clear_hidmaestro_devices_and_wait`.
+        state.teardown_tracked();
+        diag_log("[helper] removed tracked device(s) after parent death");
+    }
+    wake_accept_loop();
 }
 
 /// Connect-then-close our own pipe to unblock a `ConnectNamedPipe` that's
@@ -323,7 +374,20 @@ fn handle_client(pipe: NamedPipeServer, state: &Arc<HelperState>) -> bool {
 
 fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
     match req {
-        Request::Hello { parent_pid: _, persist } => {
+        Request::Hello { parent_pid, persist } => {
+            // Re-target the parent watch to whoever is greeting us now. On the
+            // first Hello this just confirms the spawn-time pid; on a later Hello
+            // from a NEWER app (adoption — see helper::ensure_connected) it
+            // re-points the watch so this single helper follows the current app
+            // and won't tear down when the original parent later dies. (The race
+            // guard above means we only get here while still alive — parent_gone
+            // unset — so adoption can't collide with our own teardown.)
+            if parent_pid != 0 {
+                let prev = state.parent_pid.swap(parent_pid, Ordering::SeqCst);
+                if prev != parent_pid {
+                    diag_log(&format!("[helper] hello: now serving parent {parent_pid} (was {prev})"));
+                }
+            }
             let was = state.persist.swap(persist, Ordering::SeqCst);
             // When persistence is off, remove any leftovers present right now —
             // orphans from a previous crashed run, AND devices left behind by a
