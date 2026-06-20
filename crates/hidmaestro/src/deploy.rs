@@ -31,7 +31,15 @@ pub mod payload {
     pub const HMXINPUT_DLL: &[u8] = include_bytes!("../driver/HMXInput.dll");
     pub const HIDMAESTRO_XUSB_INF: &[u8] = include_bytes!("../driver/hidmaestro_xusb.inf");
     pub const HIDMAESTRO_XUSB_CAT: &[u8] = include_bytes!("../driver/hidmaestro_xusb.cat");
+    /// Signs the MAIN HID driver package (`hidmaestro.cat` / `HIDMaestro.dll`),
+    /// vendored as-is from upstream (`CN=HIDMaestroTestCert`).
     pub const SIGNER_CERT: &[u8] = include_bytes!("../driver/HIDMaestroTestCert.cer");
+    /// Signs the XUSB COMPANION package (`hidmaestro_xusb.cat` / `HMXInput.dll`),
+    /// which FlexInput rebuilds from source (to make the input-pump period
+    /// configurable via `PollIntervalMs`) and re-signs with its own self-signed
+    /// cert. Trusted alongside [`SIGNER_CERT`] at install. `CN=FlexInput
+    /// HIDMaestro Driver`.
+    pub const COMPANION_SIGNER_CERT: &[u8] = include_bytes!("../driver/FlexInputHIDMaestroDriver.cer");
 }
 
 #[derive(Debug)]
@@ -157,12 +165,20 @@ fn install_inf(inf: &Path) -> Result<(), DeployError> {
     Ok(())
 }
 
-/// Add the vendored signer cert to LocalMachine `Root` + `TrustedPublisher` so
-/// Windows accepts the catalog-signed driver package. Idempotent (adding an
+/// Add the vendored signer cert(s) to LocalMachine `Root` + `TrustedPublisher`
+/// so Windows accepts the catalog-signed driver packages. Idempotent (adding an
 /// existing cert is a no-op / benign).
+///
+/// Two certs because the package is signed by two: the upstream
+/// `HIDMaestroTestCert` over the main HID driver, and FlexInput's own cert over
+/// the rebuilt XUSB companion (see [`payload::COMPANION_SIGNER_CERT`]). Both must
+/// be trusted or one of the two `pnputil /add-driver` calls would fail catalog
+/// validation.
 fn trust_signer_cert() -> Result<(), DeployError> {
     add_cert_to_store("ROOT", payload::SIGNER_CERT)?;
     add_cert_to_store("TrustedPublisher", payload::SIGNER_CERT)?;
+    add_cert_to_store("ROOT", payload::COMPANION_SIGNER_CERT)?;
+    add_cert_to_store("TrustedPublisher", payload::COMPANION_SIGNER_CERT)?;
     Ok(())
 }
 
@@ -246,6 +262,7 @@ mod tests {
         assert!(payload::HIDMAESTRO_INF.windows(4).any(|w| w == b".dll" || w == b".DLL")
             || !payload::HIDMAESTRO_INF.is_empty());
         assert!(payload::SIGNER_CERT.len() > 100);
+        assert!(payload::COMPANION_SIGNER_CERT.len() > 100);
         assert!(payload::HMXINPUT_DLL.len() > 10_000);
     }
 }

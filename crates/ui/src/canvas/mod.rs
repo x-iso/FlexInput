@@ -36,13 +36,45 @@ impl Default for DeviceParamDefaults {
     }
 }
 
-/// Bring a loaded `Snarl` up to date with the current module descriptors for
-/// pin-layout changes that can't be expressed through `#[serde(default)]`.
+/// Map a legacy ViGEm virtual-device id to its HIDMaestro equivalent, preserving
+/// the instance suffix. Returns `None` when `id` isn't a migratable ViGEm id (so
+/// the caller leaves it untouched).
 ///
-/// Currently: Map Action gained a second output (`out_analog`, Float) in
-/// addition to its original Bool `out`. Patches saved before that have a single
-/// serialized output pin; append the missing pin so the node renders and wires
-/// correctly. The original wire stays on pin 0 (`out`), exactly as before.
+/// `virtual.xinput` → `virtual.hm.xinput`, `virtual.ds4` → `virtual.hm.ds4`
+/// (and `virtual.xinput.2` → `virtual.hm.xinput.2`, etc.). The HIDMaestro kinds
+/// expose the SAME sink/source pin layouts (XINPUT_* / DS4_*), so only the id
+/// string changes — every wire stays connected to its pin. `virtual.keymouse`
+/// and any already-HIDMaestro id are not ViGEm and return `None`.
+pub fn migrate_vigem_device_id(id: &str) -> Option<String> {
+    // Only the kind prefix is swapped; `rest` (either "" or ".N") is preserved.
+    for (old, new) in [("virtual.xinput", "virtual.hm.xinput"), ("virtual.ds4", "virtual.hm.ds4")] {
+        if let Some(rest) = id.strip_prefix(old) {
+            // Guard against a longer kind that merely starts with the same text
+            // (e.g. a hypothetical "virtual.ds4x"): the remainder must be empty
+            // or a dotted instance suffix.
+            if rest.is_empty() || rest.starts_with('.') {
+                return Some(format!("{new}{rest}"));
+            }
+        }
+    }
+    None
+}
+
+/// Bring a loaded `Snarl` up to date with the current module descriptors for
+/// pin-layout changes that can't be expressed through `#[serde(default)]`, and
+/// migrate legacy ViGEm device ids to their HIDMaestro equivalents.
+///
+/// - Map Action gained a second output (`out_analog`, Float) in addition to its
+///   original Bool `out`. Patches saved before that have a single serialized
+///   output pin; append the missing pin so the node renders and wires correctly.
+///   The original wire stays on pin 0 (`out`), exactly as before.
+/// - ViGEm → HIDMaestro: rewrite `device_id` on `device.sink` / `device.source`
+///   nodes (`virtual.xinput*` → `virtual.hm.xinput*`, `virtual.ds4*` →
+///   `virtual.hm.ds4*`). Pin layouts are identical between the two backends, so
+///   wires are preserved; the migrated id then deploys via the HIDMaestro path
+///   (which prompts to install the driver if needed). Idempotent — already-
+///   HIDMaestro ids are left alone.
+///
 /// Recurses into sub-patches.
 pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
     for (_, node) in snarl.nodes_ids_data_mut() {
@@ -52,9 +84,103 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
                 PinDescriptor::new("Analog", SignalType::Float),
             ];
         }
+        if matches!(node.value.module_id.as_str(), "device.sink" | "device.source") {
+            if let Some(new_id) = node
+                .value
+                .params
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .and_then(migrate_vigem_device_id)
+            {
+                node.value.params.insert("device_id".to_string(), Value::from(new_id));
+            }
+        }
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::canvas::node::{UiSubPatch, NodeData};
+    use std::collections::HashMap;
+
+    #[test]
+    fn vigem_id_maps_to_hidmaestro_preserving_instance() {
+        assert_eq!(migrate_vigem_device_id("virtual.xinput").as_deref(), Some("virtual.hm.xinput"));
+        assert_eq!(migrate_vigem_device_id("virtual.ds4").as_deref(), Some("virtual.hm.ds4"));
+        assert_eq!(migrate_vigem_device_id("virtual.xinput.2").as_deref(), Some("virtual.hm.xinput.2"));
+        assert_eq!(migrate_vigem_device_id("virtual.ds4.3").as_deref(), Some("virtual.hm.ds4.3"));
+    }
+
+    #[test]
+    fn non_vigem_ids_are_left_alone() {
+        // Already HIDMaestro → no double-migration (idempotent).
+        assert_eq!(migrate_vigem_device_id("virtual.hm.xinput"), None);
+        assert_eq!(migrate_vigem_device_id("virtual.hm.ds4.1"), None);
+        // Other kinds untouched.
+        assert_eq!(migrate_vigem_device_id("virtual.keymouse"), None);
+        assert_eq!(migrate_vigem_device_id("gilrs:dualsense:0"), None);
+        // Prefix-only false positive guard: a longer kind that merely starts
+        // with "virtual.ds4" must NOT match.
+        assert_eq!(migrate_vigem_device_id("virtual.ds4x"), None);
+    }
+
+    /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,
+    /// and the migration recurses into sub-patches.
+    #[test]
+    fn migrate_loaded_snarl_rewrites_device_nodes_and_subpatches() {
+        fn device_node(module_id: &str, device_id: &str) -> NodeData {
+            let mut params = HashMap::new();
+            params.insert("device_id".to_string(), Value::from(device_id));
+            NodeData {
+                module_id: module_id.to_string(),
+                display_name: "Dev".to_string(),
+                category: "Device".to_string(),
+                inputs: vec![],
+                outputs: vec![],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            }
+        }
+
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        snarl.insert_node(egui::Pos2::ZERO, device_node("device.sink", "virtual.xinput"));
+        snarl.insert_node(egui::pos2(10.0, 0.0), device_node("device.source", "virtual.ds4.1"));
+        // Untouched kinds.
+        snarl.insert_node(egui::pos2(20.0, 0.0), device_node("device.sink", "virtual.keymouse"));
+
+        // A sub-patch holding a nested ViGEm sink — must also migrate.
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        inner.insert_node(egui::Pos2::ZERO, device_node("device.sink", "virtual.ds4"));
+        let mut sp = UiSubPatch::default();
+        sp.snarl = Box::new(inner);
+        let mut host = device_node("subpatch", "");
+        host.subpatch = Some(Box::new(sp));
+        let host_id = snarl.insert_node(egui::pos2(30.0, 0.0), host);
+
+        migrate_loaded_snarl(&mut snarl);
+
+        let ids: Vec<String> = snarl
+            .nodes_ids_data()
+            .filter_map(|(_, n)| n.value.params.get("device_id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(ids.contains(&"virtual.hm.xinput".to_string()), "xinput sink migrated");
+        assert!(ids.contains(&"virtual.hm.ds4.1".to_string()), "ds4 source migrated w/ instance");
+        assert!(ids.contains(&"virtual.keymouse".to_string()), "keymouse untouched");
+
+        // Nested sub-patch sink migrated.
+        let host_node = snarl.get_node(host_id).expect("host present");
+        let inner_sp = host_node.subpatch.as_ref().expect("subpatch present");
+        let inner_id = inner_sp
+            .snarl
+            .nodes_ids_data()
+            .find_map(|(_, n)| n.value.params.get("device_id").and_then(|v| v.as_str()).map(String::from))
+            .expect("inner device node present");
+        assert_eq!(inner_id, "virtual.hm.ds4", "nested ds4 sink migrated");
     }
 }
 
@@ -1498,9 +1624,20 @@ impl Canvas {
         canvas.snarl = patch.snarl;
         migrate_ds4_pin_ids(&mut canvas);
         migrate_loaded_snarl(&mut canvas.snarl);
+        // Migrate the legacy device-id list the same way as the snarl, so the
+        // caller (which seeds the deploy set from it) doesn't spin up a ViGEm
+        // pad alongside the migrated HIDMaestro one. Dedup in case both the old
+        // and new id were already present.
+        let mut virtual_device_ids: Vec<String> = Vec::new();
+        for id in patch.virtual_device_ids {
+            let migrated = migrate_vigem_device_id(&id).unwrap_or(id);
+            if !virtual_device_ids.contains(&migrated) {
+                virtual_device_ids.push(migrated);
+            }
+        }
         Some((
             canvas,
-            patch.virtual_device_ids,
+            virtual_device_ids,
             patch.bound_exes,
             patch.auto_bypass,
             path,

@@ -1211,6 +1211,20 @@ pub fn write_instance_config(
     let _ = write_string(HKLM, &oem_path, "OEMName", display_name);
 }
 
+/// Write the XUSB companion's input-pump period (ms) to
+/// `HKLM\SOFTWARE\HIDMaestro\Controller{index}` `PollIntervalMs`. The companion
+/// driver reads this at `CompanionDeviceAdd` and re-reads it periodically, so it
+/// pumps XInput at the app's configured polling rate. `interval_ms` is clamped to
+/// 1..8 (1000..125 Hz); values outside make no sense (the WDF timer is whole-ms
+/// and >125Hz..1000Hz is the supported band). Requires elevation (called from the
+/// helper). Best-effort: a failed write just leaves the driver on its default.
+pub fn write_poll_interval(index: u32, interval_ms: u32) {
+    use registry::*;
+    let ms = interval_ms.clamp(1, 8);
+    let path = format!(r"SOFTWARE\HIDMaestro\Controller{index}");
+    let _ = write_dword(HKLM, &path, "PollIntervalMs", ms);
+}
+
 /// One HIDMaestro-owned device discovered in the registry.
 #[derive(Debug, Clone)]
 pub struct ExistingDevice {
@@ -1235,14 +1249,33 @@ pub struct ExistingDevice {
 /// (HardwareID multi-sz carries the tag — `root\HIDMaestroXUSB` satisfies the
 /// companion too).
 pub fn list_hidmaestro_devices() -> Vec<ExistingDevice> {
-    let mut out = scan_enumerator("HIDClass");
-    out.extend(scan_enumerator("System"));
+    // Scan EVERY ROOT\* enumerator subkey, not just HIDClass/System. Our plain-HID
+    // gamepad node actually enumerates under `ROOT\VID_<vid>&PID_<pid>&IG_00`
+    // (e.g. `ROOT\VID_045E&PID_02FF&IG_00`), NOT `ROOT\HIDClass` — so the old
+    // two-enumerator scan never found an ORPHANED HID node left by a force-killed
+    // helper / crash, and startup cleanup leaked it. The `node_is_hidmaestro_owned`
+    // gate (HardwareID must carry "HIDMaestro") makes scanning all ROOT subkeys
+    // safe: it can never match a physical device. (Normal teardown removes the HID
+    // node by its tracked instance_id, so this path is purely orphan recovery.)
+    let mut out = scan_all_root_enumerators();
     // The XUSB companions live under SWD\HIDMAESTRO (created via SwDeviceCreate),
     // NOT ROOT\System. Scanning this subtree is what lets cleanup find + remove
     // orphaned companion shells from prior runs (live ones are torn down by dropping
     // their owning SwdHandle; orphans with no live handle are removed via the
     // pnputil path that remove_device_node routes SWD ids to).
     out.extend(scan_swd_companions());
+    out
+}
+
+/// Scan every `ROOT\*` enumerator subkey for present-or-phantom, HIDMaestro-owned
+/// nodes. Generalizes the old hardcoded HIDClass/System scan so an orphaned HID
+/// gamepad node under `ROOT\VID_..&PID_..&IG_00` is found and cleaned up.
+fn scan_all_root_enumerators() -> Vec<ExistingDevice> {
+    use registry::*;
+    let mut out = Vec::new();
+    for enumerator in enum_subkeys(HKLM, r"SYSTEM\CurrentControlSet\Enum\ROOT").unwrap_or_default() {
+        out.extend(scan_enumerator(&enumerator));
+    }
     out
 }
 
@@ -1298,10 +1331,18 @@ fn scan_enumerator(enumerator: &str) -> Vec<ExistingDevice> {
     let mut out = Vec::new();
     for inst in enum_subkeys(HKLM, &base).unwrap_or_default() {
         let instance_id = format!(r"ROOT\{enumerator}\{inst}");
-        if unsafe {
+        // Present (normal) OR phantom — an orphaned node whose creating helper
+        // died may be phantom, and we still want to tear it down.
+        let located = unsafe {
             CM_Locate_DevNodeW(&mut 0u32, to_wide(&instance_id).as_ptr(), CM_LOCATE_DEVNODE_NORMAL)
-        } != CR_SUCCESS
-        {
+                == CR_SUCCESS
+                || CM_Locate_DevNodeW(
+                    &mut 0u32,
+                    to_wide(&instance_id).as_ptr(),
+                    CM_LOCATE_DEVNODE_PHANTOM,
+                ) == CR_SUCCESS
+        };
+        if !located {
             continue;
         }
         if !node_is_hidmaestro_owned(&instance_id) {

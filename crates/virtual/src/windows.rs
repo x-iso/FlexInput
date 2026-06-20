@@ -9,17 +9,17 @@ use vigem_client::{Client, XButtons, XGamepad, Xbox360Wired};
 use flexinput_core::Signal;
 use crate::{layouts, DeviceKind, SinkPin, SourcePin, VirtualDevice};
 
+// All virtual gamepads are HIDMaestro-backed (user-mode driver, no ViGEmBus).
+// The legacy ViGEm kinds `virtual.xinput` / `virtual.ds4` are no longer offered
+// here — patches that referenced them are migrated to the `virtual.hm.*`
+// equivalents on load (see canvas::migrate_vigem_device_id). The ViGEm device
+// implementations remain compiled (dormant) as a fallback; `create_device` still
+// builds them if an un-migrated id ever reaches it.
 pub static DEVICE_KINDS: &[DeviceKind] = &[
-    DeviceKind { kind_id: "virtual.xinput",       display_name: "Virtual XInput Controller",         allows_multiple: true },
-    DeviceKind { kind_id: "virtual.ds4",          display_name: "Virtual DualShock 4 (ViGEmBus)",    allows_multiple: true },
-    DeviceKind { kind_id: "virtual.keymouse",     display_name: "Virtual Keyboard & Mouse",          allows_multiple: false },
-    // HIDMaestro-backed kinds (user-mode driver, no ViGEmBus). DualSense is a
-    // HIDMaestro-only capability ViGEm can't provide.
-    DeviceKind { kind_id: "virtual.hm.ds4",       display_name: "Virtual DualShock 4 (HIDMaestro)",  allows_multiple: true },
-    DeviceKind { kind_id: "virtual.hm.dualsense", display_name: "Virtual DualSense (HIDMaestro)",    allows_multiple: true },
-    // Xbox 360 / XInput via HIDMaestro's XUSB companion — the capability that
-    // lets FlexInput drop ViGEm for XInput output.
-    DeviceKind { kind_id: "virtual.hm.xinput",    display_name: "Virtual Xbox 360 (HIDMaestro XInput)", allows_multiple: true },
+    DeviceKind { kind_id: "virtual.hm.xinput",    display_name: "Virtual Xbox 360",          allows_multiple: true },
+    DeviceKind { kind_id: "virtual.hm.ds4",       display_name: "Virtual DualShock 4",       allows_multiple: true },
+    DeviceKind { kind_id: "virtual.hm.dualsense", display_name: "Virtual DualSense",         allows_multiple: true },
+    DeviceKind { kind_id: "virtual.keymouse",     display_name: "Virtual Keyboard & Mouse",  allows_multiple: false },
 ];
 
 /// Profile JSON for each HIDMaestro kind (vendored presets in flexinput-hidmaestro).
@@ -73,11 +73,17 @@ pub fn kind_pin_metadata(
 pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
     if let Some(profile_json) = hm_profile_json(kind_id) {
         // HIDMaestro device: the helper creates the node + sections (one UAC on
-        // first use). `instance` is the controller index. If creation fails the
-        // device comes back disconnected (surfaced like a missing-driver state).
+        // first use). `instance` is BOTH the index hint and the per-instance
+        // disambiguator. Pass the INSTANCE-QUALIFIED id (e.g.
+        // `virtual.hm.xinput.1`) — NOT the bare kind_id — as the device_id, so
+        // a second pad of the same kind gets its own helper record. The helper
+        // reclaims by device_id; passing the bare kind_id made the 2nd x360
+        // reclaim the 1st's node (no new pad, and both fought over one index).
+        let (device_id, display_name) =
+            instance_label(kind_id, hm_display_name(kind_id), instance);
         let dev = crate::hidmaestro_device::HidMaestroDevice::create(
-            kind_id,
-            hm_display_name(kind_id),
+            device_id,
+            display_name,
             profile_json,
             instance as u32,
         );
@@ -1368,5 +1374,47 @@ impl UiKeyTapper {
         if let (Some(e), Some(k)) = (&mut self.enigo, egui_key_name_to_enigo(name)) {
             let _ = e.key(k, Direction::Click);
         }
+    }
+}
+
+#[cfg(test)]
+mod instance_id_tests {
+    use super::*;
+
+    /// Mirror of `device_ops::build_device`'s split: device_id -> (kind, instance).
+    /// The id `instance_label` produces MUST parse back to the same instance, or
+    /// the helper keys two same-kind pads onto one record (the multi-x360 bug:
+    /// the 2nd pad reclaimed the 1st's node). This locks producer/consumer
+    /// agreement on the `kind_id[.N]` format.
+    fn split(id: &str) -> (&str, usize) {
+        match id.rfind('.') {
+            Some(dot) => match id[dot + 1..].parse::<usize>() {
+                Ok(n) => (&id[..dot], n),
+                Err(_) => (id, 0),
+            },
+            None => (id, 0),
+        }
+    }
+
+    #[test]
+    fn instance_label_id_round_trips_through_split() {
+        // 3-segment kind (HIDMaestro) is the regression case.
+        for kind in ["virtual.hm.xinput", "virtual.hm.ds4", "virtual.hm.dualsense"] {
+            for inst in 0..4usize {
+                let (id, _name) = instance_label(kind, "X", inst);
+                let (k, n) = split(&id);
+                assert_eq!((k, n), (kind, inst), "id {id:?} must split back to ({kind}, {inst})");
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_instances_yield_distinct_ids() {
+        // The whole point: two pads of the same kind get different device_ids.
+        let (id0, _) = instance_label("virtual.hm.xinput", "X", 0);
+        let (id1, _) = instance_label("virtual.hm.xinput", "X", 1);
+        assert_ne!(id0, id1);
+        assert_eq!(id0, "virtual.hm.xinput");
+        assert_eq!(id1, "virtual.hm.xinput.1");
     }
 }

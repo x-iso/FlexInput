@@ -2,6 +2,35 @@ pub mod layouts;
 pub mod driver_availability;
 
 use flexinput_core::{Signal, SignalType};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// App-wide desired polling rate (Hz), mirrored from the UI's `polling_hz`
+/// setting. HIDMaestro XInput devices read this at create time to set the XUSB
+/// companion's input-pump period (`PollIntervalMs = round(1000/hz)`), so the
+/// virtual Xbox pad delivers XInput at the configured rate instead of the
+/// driver's fixed 125Hz default. A global (not a `create_device` parameter)
+/// because the device-build path is deep and signature-stable. 0 = unset =>
+/// devices fall back to the driver default. See `requested_poll_interval_ms`.
+pub static REQUESTED_POLL_HZ: AtomicU32 = AtomicU32::new(0);
+
+/// Set the desired polling rate (Hz) read by HIDMaestro XInput device creation.
+/// Called by the UI at startup and whenever the polling-rate setting changes.
+pub fn set_requested_poll_hz(hz: u32) {
+    REQUESTED_POLL_HZ.store(hz, Ordering::Relaxed);
+}
+
+/// The XUSB companion input-pump period in ms derived from [`REQUESTED_POLL_HZ`],
+/// clamped to 1..=8 (1000..125 Hz). Returns 0 when unset, meaning "use the
+/// driver default" — the create IPC treats 0 as "don't write PollIntervalMs".
+pub fn requested_poll_interval_ms() -> u32 {
+    let hz = REQUESTED_POLL_HZ.load(Ordering::Relaxed);
+    if hz == 0 {
+        return 0;
+    }
+    // round(1000/hz), clamped to the supported whole-ms band.
+    let ms = ((1000.0 / hz as f32).round() as u32).clamp(1, 8);
+    ms
+}
 
 pub struct SinkPin {
     pub id: &'static str,
@@ -93,9 +122,13 @@ pub fn kind_pin_metadata(
     windows::kind_pin_metadata(kind_id, instance)
 }
 
-/// Best-effort: extract the kind prefix (e.g. "virtual.xinput") from a
-/// full device id like "virtual.xinput.2". Used by the UI to identify
-/// FlexInput's own virtuals when filtering the physical-devices list.
+/// Best-effort: extract the kind prefix (e.g. "virtual.xinput",
+/// "virtual.hm.ds4") from a full device id like "virtual.xinput.2" or
+/// "virtual.hm.ds4.1". HIDMaestro kinds live in a 3-segment namespace
+/// (`virtual.hm.<model>`); all other kinds are 2-segment. Used by the UI to
+/// identify which kind a device id belongs to (output-card toggles, physical-list
+/// filtering, etc.).
 pub fn kind_prefix(dev_id: &str) -> String {
-    dev_id.split('.').take(2).collect::<Vec<_>>().join(".")
+    let segs = if dev_id.starts_with("virtual.hm.") { 3 } else { 2 };
+    dev_id.split('.').take(segs).collect::<Vec<_>>().join(".")
 }

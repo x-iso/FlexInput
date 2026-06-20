@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, Color32, RichText};
 use flexinput_virtual::{
     available_device_kinds,
-    driver_availability::vigem_available,
+    driver_availability::hidmaestro_available,
+    kind_prefix,
     VirtualDevice,
 };
 
@@ -19,13 +20,6 @@ const CHIP_H: f32 = 28.0;
 /// devices — the pool is shared across all open tabs so the same
 /// `virtual.xinput.0` instance is reused if multiple patches reference it.
 pub type SharedDevicePool = Arc<Mutex<Vec<Box<dyn VirtualDevice>>>>;
-
-fn kind_prefix_of(dev_id: &str) -> String {
-    // HIDMaestro kinds live in a 3-segment namespace (`virtual.hm.ds4`); all
-    // other kinds are 2-segment (`virtual.xinput`).
-    let segs = if dev_id.starts_with("virtual.hm.") { 3 } else { 2 };
-    dev_id.split('.').take(segs).collect::<Vec<_>>().join(".")
-}
 
 /// Lowest instance index for `kind_id` not already taken by a device in the pool
 /// or a sink node on `canvas`. The device id is `kind_id` for instance 0 and
@@ -116,7 +110,7 @@ impl VirtualDevicePanel {
                     ui.with_layout(
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            let kind_prefix = kind_prefix_of(dev_id);
+                            let kind_prefix = kind_prefix(dev_id);
                             {
                                 render_device_icon(
                                     ui,
@@ -201,7 +195,7 @@ impl VirtualDevicePanel {
                 ui.label(RichText::new("Add virtual output").strong());
                 ui.separator();
 
-                let vigem_ok = vigem_available();
+                let hidmaestro_ok = hidmaestro_available();
                 for kind in available_device_kinds() {
                     let already = if kind.allows_multiple {
                         false
@@ -210,31 +204,27 @@ impl VirtualDevicePanel {
                         devs.iter().any(|a| a.id().starts_with(kind.kind_id))
                     };
 
-                    // ViGEmBus-backed kinds (XInput / DS4) can't be created
-                    // until the driver is installed; show an inline warning +
-                    // install link next to the relevant option.
-                    let needs_vigem = matches!(kind.kind_id, "virtual.xinput" | "virtual.ds4");
-                    let blocked_by_driver = needs_vigem && !vigem_ok;
+                    // HIDMaestro-backed gamepad kinds need the user-mode driver.
+                    // When it (and the bundled helper) is absent, disable the
+                    // option with a hint — the first deploy installs it via the
+                    // elevated helper, so this only blocks when nothing's bundled.
+                    let needs_hidmaestro = kind.kind_id.starts_with("virtual.hm.");
+                    let blocked_by_driver = needs_hidmaestro && !hidmaestro_ok;
 
                     ui.horizontal(|ui| {
                     if already {
                         ui.add_enabled(false, egui::Button::new(kind.display_name));
                     } else if blocked_by_driver {
                         ui.add_enabled(false, egui::Button::new(kind.display_name));
-                        let warn = ui
-                            .add(egui::Label::new(
-                                RichText::new("⚠ missing driver")
-                                    .small()
-                                    .color(Color32::from_rgb(220, 160, 40)),
-                            ).sense(egui::Sense::click()))
-                            .on_hover_text(
-                                "Requires ViGEmBus — click to install",
-                            );
-                        if warn.clicked() {
-                            let _ = open::that(
-                                "https://github.com/nefarius/ViGEmBus/releases/latest",
-                            );
-                        }
+                        ui.add(egui::Label::new(
+                            RichText::new("⚠ driver unavailable")
+                                .small()
+                                .color(Color32::from_rgb(220, 160, 40)),
+                        ))
+                        .on_hover_text(
+                            "The HIDMaestro driver isn't installed and the bundled \
+                             helper wasn't found next to the app.",
+                        );
                     } else if ui.button(kind.display_name).clicked() {
                         // Allocate the next free instance index for this kind by
                         // scanning ids already present in the pool OR referenced on
@@ -338,7 +328,7 @@ fn circular_ghost_button(ui: &mut egui::Ui, glyph: &str, size: f32) -> egui::Res
 
 fn chip_name(active: &[Box<dyn VirtualDevice>], i: usize) -> String {
     let dev = &active[i];
-    let kind_prefix = kind_prefix_of(dev.id());
+    let kind_prefix = kind_prefix(dev.id());
     let total = active.iter().filter(|d| d.id().starts_with(&kind_prefix)).count();
     let rank  = active[..i].iter().filter(|d| d.id().starts_with(&kind_prefix)).count();
     let base = kind_base_name(&kind_prefix);

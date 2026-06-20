@@ -15,6 +15,36 @@ pub const POLLING_HZ_MIN: u32 = 125;
 pub const POLLING_HZ_MAX: u32 = 1000;
 pub const POLLING_HZ_DEFAULT: u32 = 500;
 
+/// The only polling rates we expose: each is exactly 1000/N for N = 1..8 ms,
+/// because the HIDMaestro XUSB companion's input-pump period is whole-ms (so the
+/// virtual Xbox 360 delivers XInput at exactly these rates; anything in between
+/// would round to one of them on the driver side). Descending = ms ascending.
+pub const POLLING_HZ_STEPS: [u32; 8] = [1000, 500, 333, 250, 200, 167, 143, 125];
+
+/// Snap an arbitrary Hz to the nearest exposed step in [`POLLING_HZ_STEPS`].
+/// Used to migrate older saved values to a valid step on load.
+pub fn snap_polling_hz(hz: u32) -> u32 {
+    POLLING_HZ_STEPS[polling_hz_to_index(hz)]
+}
+
+/// Index into [`POLLING_HZ_STEPS`] of the step nearest `hz`. The settings
+/// slider drives this index (0..=7) rather than the raw Hz, so the handle is
+/// evenly spaced and snaps to a valid step *while* dragging instead of only on
+/// release. `POLLING_HZ_STEPS` is descending, so index 0 = fastest (1000 Hz).
+pub fn polling_hz_to_index(hz: u32) -> usize {
+    POLLING_HZ_STEPS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &step)| step.abs_diff(hz))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Hz value for a (clamped) step index. Inverse of [`polling_hz_to_index`].
+pub fn polling_hz_from_index(idx: usize) -> u32 {
+    POLLING_HZ_STEPS[idx.min(POLLING_HZ_STEPS.len() - 1)]
+}
+
 pub const SAMPLE_RATE_HZ_MIN: u32 = 500;
 pub const SAMPLE_RATE_HZ_MAX: u32 = 8000;
 pub const SAMPLE_RATE_HZ_DEFAULT: u32 = 2000;
@@ -473,5 +503,37 @@ pub fn load_recovery() -> Option<PersistedWorkspace> {
 pub fn delete_recovery() {
     if let Some(p) = recovery_path() {
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod polling_step_tests {
+    use super::*;
+
+    #[test]
+    fn every_step_round_trips_through_index() {
+        for (i, &hz) in POLLING_HZ_STEPS.iter().enumerate() {
+            assert_eq!(polling_hz_to_index(hz), i, "hz {hz} should map to index {i}");
+            assert_eq!(polling_hz_from_index(i), hz);
+            assert_eq!(snap_polling_hz(hz), hz, "an exact step must snap to itself");
+        }
+    }
+
+    #[test]
+    fn arbitrary_values_snap_to_nearest_step() {
+        // Between 250 and 333 -> nearer 250 (idx 3) below the midpoint (~291).
+        assert_eq!(snap_polling_hz(280), 250);
+        // Just above the 333/500 midpoint (~416) -> 500.
+        assert_eq!(snap_polling_hz(450), 500);
+        // A legacy saved value of 300 -> nearest step.
+        assert_eq!(snap_polling_hz(300), 333);
+        // Out-of-range clamps to the ends.
+        assert_eq!(snap_polling_hz(50), 125);
+        assert_eq!(snap_polling_hz(5000), 1000);
+    }
+
+    #[test]
+    fn from_index_clamps_out_of_bounds() {
+        assert_eq!(polling_hz_from_index(99), 125); // last step
     }
 }

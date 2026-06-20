@@ -174,7 +174,7 @@ fn run_helper_call(args: &[String]) {
                     "virtual.hm.ds4"
                 })
                 .to_string();
-            Request::Create { device_id, profile_json: profile_json.to_string(), index_hint: index }
+            Request::Create { device_id, profile_json: profile_json.to_string(), index_hint: index, poll_interval_ms: 0 }
         }
         "destroy" => Request::Destroy {
             instance_id: arg(args, "--id").unwrap_or(r"ROOT\HIDClass\0000").to_string(),

@@ -44,7 +44,14 @@ pub enum Request {
     /// (reclaim). The chosen index comes back in `Created.index`; the app opens
     /// its sections there. `index_hint` is the app's legacy per-kind instance
     /// number, used only as a tiebreaker / for migration.
-    Create { device_id: String, profile_json: String, index_hint: u32 },
+    Create { device_id: String, profile_json: String, index_hint: u32,
+        /// XUSB-companion input-pump period in ms (1..8 => 1000..125 Hz),
+        /// derived from the app's polling-rate setting and written to the
+        /// device's config key so the companion driver pumps XInput at that rate.
+        /// Ignored for plain-HID profiles. `#[serde(default)]` so an older app
+        /// that omits it still deserializes (0 => helper uses the driver default).
+        #[serde(default)]
+        poll_interval_ms: u32 },
     /// Tear down the device at `instance_id` and release its sections.
     Destroy { instance_id: String },
     /// Enumerate HIDMaestro devices currently present in the system (for
@@ -323,6 +330,7 @@ mod tests {
             device_id: "virtual.hm.ds4".into(),
             profile_json: "{}".into(),
             index_hint: 2,
+            poll_interval_ms: 2,
         };
         let line = encode_line(&req);
         assert!(line.ends_with('\n'));

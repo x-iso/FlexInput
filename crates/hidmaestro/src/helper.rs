@@ -240,12 +240,14 @@ pub fn create(
     device_id: &str,
     profile_json: &str,
     index_hint: u32,
+    poll_interval_ms: u32,
 ) -> Result<(String, u32), HelperError> {
     let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
     let req = Request::Create {
         device_id: device_id.to_string(),
         profile_json: profile_json.to_string(),
         index_hint,
+        poll_interval_ms,
     };
     match call(&mut m, &req)? {
         Response::Created { instance_id, index } => Ok((instance_id, index)),

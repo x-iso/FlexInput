@@ -40,6 +40,33 @@ fn install_gpu_panic_hook() {
             || msg.contains("Device is lost")
             || msg.contains("device was lost")
             || (msg.contains("egui_texid_Managed") && msg.contains("is invalid"));
+
+        // Monitor hot-plug: when a display disconnects/reconnects (e.g. a monitor
+        // briefly drops, a KVM switch, or a GPU re-scan), winit's monitor
+        // enumeration can `unwrap()` an `Invalid monitor handle` (Win32 err 1461)
+        // on a stale `HMONITOR` from inside its own event loop — a context we
+        // can't wrap in `catch_unwind`. It's transient: a fresh process
+        // re-enumerates monitors cleanly. So relaunch + restore from the recovery
+        // snapshot rather than dying. Match the OS error text (stable across winit
+        // patch versions) and, defensively, the winit monitor source path.
+        let monitor_lost = msg.contains("Invalid monitor handle")
+            || (msg.contains("monitor.rs") && msg.contains("1461"));
+        if monitor_lost && !gpu_lost {
+            let note = "A display was disconnected/reconnected and the windowing \
+                 layer hit an invalid monitor handle. FlexInput is relaunching to \
+                 recover; your patch is restored from the crash-recovery snapshot.";
+            eprintln!("{note}");
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    let _ = std::fs::write(dir.join("flexinput-monitor-lost.log"), note);
+                }
+            }
+            // Unlike GPU loss, no game owns the device here — a plain relaunch is
+            // correct (the fresh process enumerates monitors fine and rebuilds the
+            // window immediately).
+            flexinput_ui::relaunch_self_and_exit();
+        }
+
         if gpu_lost {
             // The release build is `windows_subsystem = "windows"` with no
             // logger surfaced to a console, so drop a breadcrumb next to the

@@ -733,7 +733,7 @@ impl FlexInputApp {
 
         // ── Settings ──────────────────────────────────────────────────────
         // Loaded before threads spawn so the engine starts at the user's rate.
-        let app_settings = settings::load_settings();
+        let mut app_settings = settings::load_settings();
         // Seed the HIDMaestro helper's persistence policy *before* any device is
         // created, so the helper's first `Hello` (and its orphan-cleanup
         // decision) reflects the user's setting. Off → helper removes leftovers
@@ -751,8 +751,15 @@ impl FlexInputApp {
             let seed_persist = gpu_recovery || app_settings.persist_virtual_devices;
             flexinput_hidmaestro::helper::set_persist(seed_persist);
         }
+        // Migrate any previously-saved arbitrary polling rate to a valid step
+        // (the slider is now quantized to whole-ms periods).
+        app_settings.polling_hz = settings::snap_polling_hz(app_settings.polling_hz);
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
+        // Mirror the polling rate to flexinput-virtual so HIDMaestro XInput pads
+        // set their XUSB companion's pump period to match (see
+        // requested_poll_interval_ms). Pushed again on every slider change.
+        flexinput_virtual::set_requested_poll_hz(app_settings.polling_hz);
 
         let proc_graph          = flexinput_engine::new_arc_graph();
         let proc_device_signals = flexinput_engine::new_arc_signals();
@@ -5020,9 +5027,10 @@ impl FlexInputApp {
         if has {
             remove_kind(canvas, kind);
         } else {
-            // xinput and ds4 are mutually exclusive.
-            if kind == "virtual.xinput" { remove_kind(canvas, "virtual.ds4"); }
-            if kind == "virtual.ds4" { remove_kind(canvas, "virtual.xinput"); }
+            // The Xbox and DS4 gamepad outputs are mutually exclusive (Easy mode
+            // drives a single pad). Kinds are HIDMaestro now; clear the other one.
+            if kind == "virtual.hm.xinput" { remove_kind(canvas, "virtual.hm.ds4"); }
+            if kind == "virtual.hm.ds4" { remove_kind(canvas, "virtual.hm.xinput"); }
             let defaults = self.nav_device_defaults();
             let collapsed = self.settings.device_nodes_default_collapsed;
             let pool = std::sync::Arc::clone(&self.shared_virtual_devices);
@@ -6639,10 +6647,12 @@ impl FlexInputApp {
         use GpSettingKey::*;
         match key {
             PollingHz => {
-                let v = (val.round() as u32)
-                    .clamp(settings::POLLING_HZ_MIN, settings::POLLING_HZ_MAX);
+                // Snap to a valid whole-ms step (same quantization as the
+                // Settings slider) and retune the virtual Xbox 360's pump.
+                let v = settings::snap_polling_hz(val.round() as u32);
                 self.settings.polling_hz = v;
                 self.polling_hz.store(v, Ordering::Relaxed);
+                flexinput_virtual::set_requested_poll_hz(v);
             }
             SampleRateHz => {
                 let v = (val.round() as u32)
@@ -7527,18 +7537,36 @@ impl FlexInputApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Max polling rate")
-                        .on_hover_text("Upper bound for the I/O loop. Actual per-device rate depends on the device — see the live Hz on each device's header in the canvas.");
-                    let resp = ui.add(egui::Slider::new(
-                        &mut self.settings.polling_hz,
-                        settings::POLLING_HZ_MIN..=settings::POLLING_HZ_MAX,
-                    ).suffix(" Hz"));
+                        .on_hover_text("Upper bound for the I/O loop, and the rate the virtual Xbox 360 (HIDMaestro XInput) delivers to games. Steps are whole-millisecond periods (the driver's resolution): 1000=1ms … 125=8ms. Actual per-device input rate depends on the device — see the live Hz on each device header.");
+                    // The slider drives the STEP INDEX (0..=7), not the raw Hz, so
+                    // the handle is evenly spaced and snaps to a valid whole-ms
+                    // period *while* dragging (an in-between rate would just round
+                    // on the driver side anyway). The custom formatter shows the Hz
+                    // for the current step instead of the bare index.
+                    //
+                    // POLLING_HZ_STEPS is DESCENDING (index 0 = 1000 Hz), but the
+                    // slider should read low→high left→right. So the slider drives
+                    // a POSITION = last - index; 125 Hz lands at the left, 1000 Hz
+                    // at the right. Convert back to an index with the same mirror.
+                    let last = settings::POLLING_HZ_STEPS.len() - 1;
+                    let idx = settings::polling_hz_to_index(self.settings.polling_hz);
+                    let mut pos = (last - idx) as i64;
+                    let resp = ui.add(egui::Slider::new(&mut pos, 0..=last as i64)
+                        .integer()
+                        .custom_formatter(move |n, _| {
+                            let i = last - (n as usize).min(last);
+                            format!("{} Hz", settings::polling_hz_from_index(i))
+                        }));
                     if resp.changed() {
+                        let i = last - (pos as usize).min(last);
+                        self.settings.polling_hz = settings::polling_hz_from_index(i);
                         self.polling_hz.store(self.settings.polling_hz, Ordering::Relaxed);
+                        flexinput_virtual::set_requested_poll_hz(self.settings.polling_hz);
                         dirty = true;
                     }
                 });
                 ui.label(egui::RichText::new(
-                    "How often the I/O thread polls gamepads and MIDI devices."
+                    "How often the I/O thread polls gamepads and MIDI devices, and how fast the virtual Xbox 360 reports to games."
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(8.0);

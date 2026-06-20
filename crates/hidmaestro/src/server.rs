@@ -368,8 +368,8 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                 Err(e) => (Response::err(format!("driver reinstall failed: {e}")), false),
             }
         }
-        Request::Create { device_id, profile_json, index_hint } => {
-            (handle_create(&device_id, &profile_json, index_hint, state), false)
+        Request::Create { device_id, profile_json, index_hint, poll_interval_ms } => {
+            (handle_create(&device_id, &profile_json, index_hint, poll_interval_ms, state), false)
         }
         Request::Destroy { instance_id } => (handle_destroy(&instance_id, state), false),
         Request::ListDevices => {
@@ -393,6 +393,7 @@ fn handle_create(
     device_id: &str,
     profile_json: &str,
     index_hint: u32,
+    poll_interval_ms: u32,
     state: &Arc<HelperState>,
 ) -> Response {
     let profile = match Profile::from_json(profile_json) {
@@ -474,6 +475,16 @@ fn handle_create(
     // ALLOCATE a globally-unique index: lowest free, considering both nodes
     // present in the system and indices we already hold this session.
     let index = allocate_index(&existing, state, index_hint);
+
+    // Stamp the XUSB companion's input-pump period (PollIntervalMs) into the
+    // device's config key BEFORE the node is created, so the companion driver
+    // reads it at CompanionDeviceAdd. Derived from the app's polling-rate
+    // setting; clamped 1..8 ms (1000..125 Hz). 0 (older app / non-XInput) =>
+    // leave unset so the driver keeps its 8ms (125Hz) default. Only meaningful
+    // for XInput profiles, but harmless to write otherwise.
+    if profile.requires_xusb_companion && poll_interval_ms > 0 {
+        crate::orchestrator::write_poll_interval(index, poll_interval_ms);
+    }
 
     let input = match InputSection::create(index) {
         Ok(s) => s,

@@ -98,7 +98,11 @@ pub fn reposition_io_nodes_with_ctx(canvas: &mut Canvas, ctx: Option<&egui::Cont
                 let prefix = kind_prefix(did);
                 if prefix == "virtual.keymouse" {
                     keymouse_sink_id = Some(id);
-                } else if prefix == "virtual.xinput" || prefix == "virtual.ds4" {
+                } else if matches!(prefix.as_str(),
+                    "virtual.hm.xinput" | "virtual.hm.ds4"
+                    // Legacy ViGEm kinds kept for un-migrated ids (dormant).
+                    | "virtual.xinput" | "virtual.ds4")
+                {
                     gamepad_sink_id = Some(id);
                 }
             }

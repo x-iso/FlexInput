@@ -331,13 +331,15 @@ pub fn device_card_svg(kind: flexinput_devices::ControllerKind) -> &'static [u8]
 /// Resolve a virtual-device card icon by `kind_prefix` (e.g. `"virtual.xinput"`).
 pub fn virtual_device_card_svg(kind_prefix: &str) -> &'static [u8] {
     match kind_prefix {
-        "virtual.xinput"   => DEV_XBOX,
-        "virtual.ds4"      => DEV_PS4,
-        "virtual.keymouse" => DEV_KBM,
-        // HIDMaestro Sony pads reuse the PlayStation glyph.
-        "virtual.hm"       => DEV_PS4,
+        "virtual.xinput"       => DEV_XBOX,
+        "virtual.ds4"          => DEV_PS4,
+        "virtual.keymouse"     => DEV_KBM,
+        // HIDMaestro Xbox 360 uses the Xbox glyph; the Sony pads use PlayStation.
+        "virtual.hm.xinput"    => DEV_XBOX,
+        "virtual.hm.ds4"       => DEV_PS4,
+        "virtual.hm.dualsense" => DEV_PS5,
         _ if kind_prefix.starts_with("virtual.hm") => DEV_PS4,
-        _                  => DEV_XBOX,
+        _                      => DEV_XBOX,
     }
 }
 

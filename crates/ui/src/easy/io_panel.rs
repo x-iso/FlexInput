@@ -51,8 +51,10 @@ const OUTPUT_PAIR_CARD_H:    f32 = 76.0;
 // ~18 + 18 + 14 + small gaps + insets ≈ 76 px.
 const OUTPUT_KBM_CARD_H:     f32 = 78.0;
 
-const KIND_XINPUT:   &str = "virtual.xinput";
-const KIND_DS4:      &str = "virtual.ds4";
+// Easy-mode gamepad outputs are HIDMaestro-backed (ViGEm removed). Old patches
+// that used the ViGEm kinds are migrated to these on load.
+const KIND_XINPUT:   &str = "virtual.hm.xinput";
+const KIND_DS4:      &str = "virtual.hm.ds4";
 const KIND_KEYMOUSE: &str = "virtual.keymouse";
 
 pub fn show(
@@ -787,14 +789,14 @@ fn show_output_section(
     let panel_w = ui.available_width();
     let inner_w = (panel_w - 2.0 * PANEL_PADDING).max(120.0);
     let pair_card_w = (inner_w - CARD_GAP) / 2.0;
-    // ViGEmBus backs both XInput and DS4 outputs; when it's absent the
-    // cards stay visible but disabled, with an inline link to install it.
-    let vigem_ok = flexinput_virtual::driver_availability::vigem_available();
+    // HIDMaestro backs both the Xbox 360 and DS4 outputs; when its driver (and
+    // bundled helper) is absent the cards stay visible but disabled.
+    let gamepad_ok = flexinput_virtual::driver_availability::hidmaestro_available();
     ui.horizontal(|ui| {
         ui.add_space(PANEL_PADDING);
         let (xi_click, xi_rect) = gamepad_card(ui, "xinput",
             remapper_icons::virtual_device_card_svg(KIND_XINPUT),
-            xinput_on, !vigem_ok, pair_card_w);
+            xinput_on, !gamepad_ok, pair_card_w);
         if xi_click {
             if xinput_on {
                 remove_sinks_of_kind(canvas, KIND_XINPUT);
@@ -809,7 +811,7 @@ fn show_output_section(
         ui.add_space(CARD_GAP);
         let (ds_click, ds_rect) = gamepad_card(ui, "DS4",
             remapper_icons::virtual_device_card_svg(KIND_DS4),
-            ds4_on, !vigem_ok, pair_card_w);
+            ds4_on, !gamepad_ok, pair_card_w);
         if ds_click {
             if ds4_on {
                 remove_sinks_of_kind(canvas, KIND_DS4);
@@ -865,12 +867,11 @@ fn gamepad_card(
     driver_missing: bool,
     width: f32,
 ) -> (bool, egui::Rect) {
-    // When the backing driver (ViGEmBus) is absent the card can't be
+    // When the backing driver (HIDMaestro) is unavailable the card can't be
     // toggled on. The card body senses hover only; a small corner warning
-    // badge (painted + hit-tested separately below) carries the click that
-    // opens the install page, so the badge never participates in the card's
-    // centered icon/label layout (which would squeeze the text into a
-    // single-glyph-wide column and wrap it vertically).
+    // badge (painted + hit-tested separately below) carries the hint, so it
+    // never participates in the card's centered icon/label layout (which would
+    // squeeze the text into a single-glyph-wide column and wrap it vertically).
     let sense = if driver_missing { egui::Sense::hover() } else { egui::Sense::click() };
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, OUTPUT_PAIR_CARD_H),
@@ -894,33 +895,27 @@ fn gamepad_card(
         });
     });
 
-    let mut card_clicked = resp.clicked() && !driver_missing;
+    let card_clicked = resp.clicked() && !driver_missing;
     if driver_missing {
-        // Corner warning badge: a small interactive rect in the card's
-        // top-right. Painted directly so it sits above the (disabled) body.
-        let badge = warning_badge(ui, rect);
-        if badge.clicked() {
-            let _ = open::that("https://github.com/nefarius/ViGEmBus/releases/latest");
-        }
-        // A click anywhere on the (disabled) card surfaces the same hint
-        // rather than silently doing nothing — but only the badge opens the
-        // link. Keep card_clicked false so no sink is created.
-        let _ = &mut card_clicked;
+        // Corner warning badge: a small hover-only rect in the card's top-right,
+        // painted above the (disabled) body. HIDMaestro has no external download
+        // (it's installed by the bundled helper on first deploy), so the badge
+        // only explains why the card is disabled — it doesn't link anywhere.
+        let _ = warning_badge(ui, rect);
     }
     (card_clicked, rect)
 }
 
 /// Paint a small amber ⚠ badge in the top-right corner of `card_rect` and
-/// return an interactive response for it (click → open install page,
-/// hover → tooltip). Kept out of the card's flow layout so the warning can
-/// never reflow the icon/label.
+/// return its response (hover → tooltip explaining the disabled state). Kept out
+/// of the card's flow layout so the warning can never reflow the icon/label.
 fn warning_badge(ui: &mut egui::Ui, card_rect: egui::Rect) -> egui::Response {
     const BADGE: f32 = 22.0;
     let center = egui::pos2(card_rect.right() - 4.0 - BADGE * 0.5,
                             card_rect.top()   + 4.0 + BADGE * 0.5);
     let hit = egui::Rect::from_center_size(center, egui::vec2(BADGE, BADGE));
-    let resp = ui.interact(hit, ui.id().with(("vigem_warn", card_rect.left() as i32)),
-        egui::Sense::click());
+    let resp = ui.interact(hit, ui.id().with(("hm_warn", card_rect.left() as i32)),
+        egui::Sense::hover());
     let amber = egui::Color32::from_rgb(220, 160, 40);
     let glyph_color = if resp.hovered() { egui::Color32::from_rgb(255, 200, 80) } else { amber };
     ui.painter().text(
@@ -930,7 +925,7 @@ fn warning_badge(ui: &mut egui::Ui, card_rect: egui::Rect) -> egui::Response {
         egui::FontId::proportional(BADGE * 0.8),
         glyph_color,
     );
-    resp.on_hover_text("Requires ViGEmBus — click to install")
+    resp.on_hover_text("HIDMaestro driver unavailable (bundled helper not found)")
 }
 
 fn keymouse_card(
