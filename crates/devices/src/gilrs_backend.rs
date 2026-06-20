@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 use glam::Vec2;
-use gilrs::{Axis, Button, Gilrs, GilrsBuilder};
+use gilrs::{Axis, Button, EventType, Gilrs, GilrsBuilder};
 
 use flexinput_core::Signal;
 
@@ -34,13 +33,6 @@ mod xinput_ffi {
 
 pub struct GilrsBackend {
     gilrs: Gilrs,
-    /// Cached count of non-ViGEmBus physical instances per (VID, PID).
-    /// Rebuilt at most once every 2 s to avoid calling SetupAPI every frame.
-    phys_counts: HashMap<(u16, u16), usize>,
-    /// Whether ViGEmBus has at least one virtual device for each (VID, PID).
-    /// Only pairs with vigem_present=true need the physical-count dedup filter.
-    vigem_present: HashMap<(u16, u16), bool>,
-    phys_counts_at: Instant,
     gyro: GyroManager,
     /// XInput user index (0-3) for each `gilrs:<kind>:<inst>` device_id string.
     /// Rebuilt at the start of each poll() call from the same kind_seen counter
@@ -62,40 +54,30 @@ pub struct GilrsBackend {
     /// `poll()` / `lookup_phys()` at full rate. See those methods for why the
     /// HID instance path is the discriminator (gilrs name/uuid are unusable).
     virt_cache: HashMap<(u16, u16, usize), bool>,
+    /// Set when a gilrs Connected/Disconnected/Dropped event is seen in `poll()`,
+    /// and on first run. `enumerate()` only re-runs the own-virtual classification
+    /// (the ~200 ms hidapi `refresh_devices`) when this is set, then clears it.
+    /// The virtual/real disposition can only change when a device is plugged or
+    /// unplugged, so re-classifying every 2 s in steady state was pure cost — and
+    /// that hidapi refresh ran ON the real-time I/O loop, freezing ALL input for
+    /// ~200 ms each time (the periodic-gap bug). See `refresh_virtual_classification`.
+    dev_set_dirty: bool,
 }
 
 impl GilrsBackend {
     pub fn try_new() -> Option<Self> {
         GilrsBuilder::new().with_default_filters(false).build().ok().map(|gilrs| Self {
             gilrs,
-            phys_counts: HashMap::new(),
-            vigem_present: HashMap::new(),
-            // force refresh on first enumerate()
-            phys_counts_at: Instant::now() - Duration::from_secs(10),
             gyro: GyroManager::new(),
             xinput_idx: HashMap::new(),
             xinput_rumble: HashMap::new(),
             event_counts: HashMap::new(),
             id_to_dev: HashMap::new(),
             virt_cache: HashMap::new(),
+            dev_set_dirty: true, // force classification on first enumerate
         })
     }
 
-    fn refresh_phys_counts(&mut self) {
-        self.phys_counts.clear();
-        self.vigem_present.clear();
-        for (_, pad) in self.gilrs.gamepads() {
-            if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
-                self.vigem_present.entry(vp).or_insert_with(|| {
-                    crate::hidhide::has_vigem_for_vid_pid(vp.0, vp.1)
-                });
-                self.phys_counts.entry(vp).or_insert_with(|| {
-                    crate::hidhide::physical_count_for_vid_pid(vp.0, vp.1)
-                });
-            }
-        }
-        self.phys_counts_at = Instant::now();
-    }
 }
 
 /// Per-pad disposition resolved from cached classification via
@@ -137,6 +119,10 @@ impl GilrsBackend {
             }
         }
         // Pass 2: classify each PS instance by HID path via the gyro layer.
+        // Refresh hidapi's device list ONCE up front (the ~200 ms Windows call),
+        // then classify every instance from that one cached snapshot — previously
+        // `is_own_virtual_instance` refreshed per instance, so N PS pads cost N×.
+        self.gyro.refresh_device_list();
         self.virt_cache.clear();
         for (vid, pid, idx) in keys {
             let is_virt = self.gyro.is_own_virtual_instance(vid, pid, idx);
@@ -193,13 +179,17 @@ impl GilrsBackend {
 impl DeviceBackend for GilrsBackend {
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
         puffin::profile_function!();
-        if self.phys_counts_at.elapsed() > Duration::from_secs(2) {
-            self.refresh_phys_counts();
+        // Rebuild the own-virtual cache (the ~200 ms hidapi path lookup) ONLY when
+        // the device set actually changed since last time (`dev_set_dirty`, set by
+        // poll() on a Connected/Disconnected/Dropped event, and true on first run).
+        // In steady state the classification can't change, so skipping it keeps the
+        // expensive refresh_devices off the I/O loop — the fix for the ~2 s periodic
+        // input freeze. The device LIST below is still rebuilt every call from gilrs's
+        // (cheap, cached) gamepad walk; only the virtual/real CLASSIFICATION is cached.
+        if self.dev_set_dirty {
+            self.refresh_virtual_classification();
+            self.dev_set_dirty = false;
         }
-
-        // Rebuild the own-virtual cache (does the hidapi path lookup) — only here,
-        // at the ~2 s enumerate cadence, not in the 500 Hz poll().
-        self.refresh_virtual_classification();
 
         // Per-pad keep/virtual decision (path-based for PS, correlation-based for
         // XInput). Snapshot VID/PID first (drops the gilrs borrow), then resolve
@@ -269,6 +259,12 @@ impl DeviceBackend for GilrsBackend {
                 // device data typically produces several events together, which
                 // matches what users see as "device polled this frame".
                 *self.event_counts.entry(usize::from(ev.id)).or_insert(0) += 1;
+                // A device was plugged/unplugged → the own-virtual classification
+                // may have changed, so let the next enumerate() re-run it (the only
+                // time the ~200 ms hidapi refresh is worth paying). See `dev_set_dirty`.
+                if matches!(ev.event, EventType::Connected | EventType::Disconnected | EventType::Dropped) {
+                    self.dev_set_dirty = true;
+                }
                 self.gilrs.update(&ev);
                 ev_count += 1;
             }

@@ -370,6 +370,17 @@ impl GyroManager {
         paths
     }
 
+    /// Refresh hidapi's cached device list. On Windows this is the SLOW call
+    /// (~200 ms here — hidapi opens each HID device to read its capabilities),
+    /// so it must NOT run on the 500 Hz I/O loop. Call it only when the device
+    /// set actually changed (a controller was plugged/unplugged), then read the
+    /// cached list via `is_own_virtual_instance` / `gamepad_device_list`.
+    pub fn refresh_device_list(&mut self) {
+        if let Some(api) = self.api.as_mut() {
+            let _ = api.refresh_devices();
+        }
+    }
+
     /// True if the Nth physical device with this VID/PID is one of FlexInput's
     /// OWN emulated HIDMaestro controllers, judged by its device instance path.
     ///
@@ -382,12 +393,10 @@ impl GyroManager {
     /// `HID\HIDCLASS\..` (its path has no `VID_`/`PID_` tokens). `idx` is the
     /// same Nth-device index the gilrs walk derives per VID/PID, so the two
     /// stay correlated. Returns false for non-PS devices and out-of-range idx.
-    pub fn is_own_virtual_instance(&mut self, vid: u16, pid: u16, idx: usize) -> bool {
-        // hidapi's cached list must be current or a freshly (un)plugged device
-        // would be mis-indexed; refresh is cheap relative to enumeration cadence.
-        if let Some(api) = self.api.as_mut() {
-            let _ = api.refresh_devices();
-        }
+    ///
+    /// Reads hidapi's CACHED list (no refresh) — callers must call
+    /// `refresh_device_list()` first whenever the device set may have changed.
+    pub fn is_own_virtual_instance(&self, vid: u16, pid: u16, idx: usize) -> bool {
         let paths = self.gamepad_device_list(vid, pid);
         match paths.get(idx) {
             Some(info) => instance_path_is_virtual(&info.path().to_string_lossy()),
