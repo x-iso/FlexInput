@@ -37,8 +37,10 @@ const SUBPATCH_BODY_PAD_H: f32 = 120.0; // header + footer chrome
 // See `try_measured_width` for the key shape.
 
 /// Read snarl's per-node measured size from egui temp data. egui-snarl
-/// keys node state by `parent_ui_id.with("flexinput_canvas").with(("snarl-node", NodeId))`
-/// inside `NodeState::load`. We don't know the parent_ui_id here
+/// keys node state by
+/// `parent_ui_id.with(("flexinput_canvas", canvas.view_salt)).with(("snarl-node", NodeId))`
+/// inside `NodeState::load` (the salt is now per-canvas so each tab /
+/// sub-patch has its own pan/zoom). We don't know the parent_ui_id here
 /// (the snarl call site is deep inside the canvas show flow), so we
 /// can't reproduce the exact key; instead we fall back to the
 /// caller-supplied constants. A future enhancement could stash a

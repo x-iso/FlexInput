@@ -111,6 +111,10 @@ pub struct PatchTab {
     /// Ephemeral Easy-mode UI state for this tab. Recomputed from the
     /// canvas on activation, not serialized to `.fxp`.
     pub easy_state: EasyState,
+    /// Stable salt keying this tab's canvas pan/zoom, kept in sync with
+    /// `canvas.view_salt`. Persisted via `PersistedTab.view_salt` so each tab
+    /// keeps its own independent view across tab switches and restarts.
+    pub view_salt: u64,
 }
 
 /// Per-tab transient state used only when Easy mode is active. Holds the
@@ -134,15 +138,19 @@ pub struct EasyState {
 
 impl PatchTab {
     fn new_untitled(n: u32) -> Self {
+        let view_salt = crate::canvas::next_canvas_salt();
+        let mut canvas = Canvas::new();
+        canvas.set_view_salt(view_salt);
         Self {
             title: if n == 1 { "Untitled".to_string() } else { format!("Untitled {}", n) },
             file_path: None,
             bound_exes: vec![],
-            canvas: Canvas::new(),
+            canvas,
             virtual_panel: VirtualDevicePanel::new(),
             bypassed: false,
             auto_bypass: false,
             easy_state: EasyState::default(),
+            view_salt,
         }
     }
 }
@@ -814,6 +822,11 @@ impl FlexInputApp {
             // on-patch-load camera setting so the saved view's
             // arbitrary pan/zoom doesn't strand the user off-canvas.
             canvas.pending_view_action = on_load_view;
+            // Restore this tab's stable view salt (keys its pan/zoom). `0`
+            // means a pre-existing workspace without the field — allocate a
+            // fresh unique salt so old tabs don't all collapse onto one key.
+            let view_salt = if pt.view_salt != 0 { pt.view_salt } else { crate::canvas::next_canvas_salt() };
+            canvas.set_view_salt(view_salt);
             let easy_state = EasyState {
                 loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
                 ..EasyState::default()
@@ -827,6 +840,7 @@ impl FlexInputApp {
                 bypassed: false,
                 auto_bypass: pt.auto_bypass,
                 easy_state,
+                view_salt,
             }
         };
         // A crash-recovery snapshot takes precedence over the opt-in workspace:
@@ -835,20 +849,29 @@ impl FlexInputApp {
         // seamless. It's consumed exactly once — deleted immediately after we
         // read it — and is honored regardless of `keep_workspace`. If absent,
         // we fall back to the opt-in workspace, then to one empty tab.
-        let tabs = if let Some(ws) = settings::load_recovery().filter(|ws| !ws.tabs.is_empty()) {
-            eprintln!("Restoring {} tab(s) from crash-recovery snapshot.", ws.tabs.len());
-            settings::delete_recovery();
-            ws.tabs.into_iter().map(persisted_tab_to_patch).collect()
-        } else if app_settings.keep_workspace {
-            match settings::load_workspace() {
-                Some(ws) if !ws.tabs.is_empty() => {
-                    ws.tabs.into_iter().map(persisted_tab_to_patch).collect()
+        //
+        // Each arm yields `(tabs, active_tab)` so we reopen on the tab the user
+        // left rather than always snapping back to tab 0. The persisted
+        // `active_tab` is clamped against the restored tab count below.
+        let (tabs, restored_active_tab): (Vec<PatchTab>, usize) =
+            if let Some(ws) = settings::load_recovery().filter(|ws| !ws.tabs.is_empty()) {
+                eprintln!("Restoring {} tab(s) from crash-recovery snapshot.", ws.tabs.len());
+                settings::delete_recovery();
+                let active = ws.active_tab;
+                (ws.tabs.into_iter().map(persisted_tab_to_patch).collect(), active)
+            } else if app_settings.keep_workspace {
+                match settings::load_workspace() {
+                    Some(ws) if !ws.tabs.is_empty() => {
+                        let active = ws.active_tab;
+                        (ws.tabs.into_iter().map(persisted_tab_to_patch).collect(), active)
+                    }
+                    _ => (vec![PatchTab::new_untitled(1)], 0),
                 }
-                _ => vec![PatchTab::new_untitled(1)],
-            }
-        } else {
-            vec![PatchTab::new_untitled(1)]
-        };
+            } else {
+                (vec![PatchTab::new_untitled(1)], 0)
+            };
+        // `tabs` is guaranteed non-empty here (every arm yields ≥1 tab).
+        let active_tab = restored_active_tab.min(tabs.len() - 1);
         let shared_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
         let shared_midi_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
         let pinned_midi_ids = Arc::new(RwLock::new(HashSet::<String>::new()));
@@ -885,9 +908,11 @@ impl FlexInputApp {
         }
 
         // Active-tab device id filter — I/O thread only ticks devices
-        // whose id is in this set. Seeded from tab 0's canvas.
+        // whose id is in this set. Seeded from the *restored* active tab's
+        // canvas (not tab 0) so its virtual pads are live immediately on
+        // launch, before any manual tab interaction.
         let active_tab_device_ids: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(
-            snarl_virtual_device_ids(&tabs[0].canvas.snarl).into_iter().collect(),
+            snarl_virtual_device_ids(&tabs[active_tab].canvas.snarl).into_iter().collect(),
         ));
 
         let device_rates = flexinput_engine::new_device_rates();
@@ -974,7 +999,7 @@ impl FlexInputApp {
         let mut app = Self {
             engine: Engine::new(),
             tabs,
-            active_tab: 0,
+            active_tab,
             next_untitled,
             descriptors,
             midi_backend,
@@ -2286,6 +2311,7 @@ impl eframe::App for FlexInputApp {
                     auto_bypass: t.auto_bypass,
                     snarl: t.canvas.snarl.clone(),
                     easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
+                    view_salt: t.view_salt,
                 }).collect();
                 let ws = PersistedWorkspace {
                     version: 1,
@@ -2316,6 +2342,10 @@ impl eframe::App for FlexInputApp {
                         crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
                         clear_canvas_capture_state(&mut canvas);
                         canvas.pending_view_action = on_load_view;
+                        // Keep each tab's view independent; allocate a fresh
+                        // salt for legacy (`0`) workspaces. See startup loader.
+                        let view_salt = if pt.view_salt != 0 { pt.view_salt } else { crate::canvas::next_canvas_salt() };
+                        canvas.set_view_salt(view_salt);
                         let easy_state = EasyState {
                             loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
                             ..EasyState::default()
@@ -2329,6 +2359,7 @@ impl eframe::App for FlexInputApp {
                             bypassed: false,
                             auto_bypass: pt.auto_bypass,
                             easy_state,
+                            view_salt,
                         }
                     }).collect();
                     if !new_tabs.is_empty() {
@@ -8202,6 +8233,7 @@ impl FlexInputApp {
             auto_bypass: t.auto_bypass,
             snarl: t.canvas.snarl.clone(),
             easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
+            view_salt: t.view_salt,
         }).collect();
         PersistedWorkspace {
             version: 1,
@@ -11747,6 +11779,13 @@ fn show_subpatch_editors(
             let mut editor_canvas = Canvas::new();
             editor_canvas.snarl = inner_snarl;
             editor_canvas.is_inner = true;
+            // Derive a STABLE view salt from the owning tab's salt + this
+            // sub-patch node's id, so the editor's pan/zoom is remembered
+            // across close→reopen and stays distinct from every tab and other
+            // sub-patch. (Top-level editor → parent is the tab canvas.)
+            editor_canvas.set_view_salt(
+                flexinput_engine::namespaced_uid(app.tabs[active].view_salt as usize, node_id.0) as u64,
+            );
             app.sub_patch_editors.push(SubPatchEditor {
                 tab_idx: active,
                 node_id,
@@ -12117,6 +12156,15 @@ fn show_subpatch_editors(
             let mut editor_canvas = Canvas::new();
             editor_canvas.snarl = inner_snarl;
             editor_canvas.is_inner = true;
+            // Stable salt folded through the PARENT editor's salt + this child
+            // node id, so nested editors are remembered and never collide with
+            // their parent, sibling sub-patches, or any tab.
+            editor_canvas.set_view_salt(
+                flexinput_engine::namespaced_uid(
+                    app.sub_patch_editors[parent_idx].canvas.view_salt() as usize,
+                    child_node_id.0,
+                ) as u64,
+            );
             app.sub_patch_editors.push(SubPatchEditor {
                 tab_idx: active,
                 node_id: child_node_id,

@@ -409,6 +409,13 @@ pub struct PersistedTab {
     /// workspace round-trip restores the preset link.
     #[serde(default)]
     pub easy_preset_path: Option<std::path::PathBuf>,
+    /// Stable salt that keys this tab's canvas pan/zoom (see
+    /// `Canvas::set_view_salt`). Persisted so the view stays tied to the same
+    /// tab across restarts and never cross-contaminates other tabs. `0` (the
+    /// `serde` default for pre-existing workspaces) means "unassigned" — the
+    /// loader allocates a fresh unique salt instead.
+    #[serde(default)]
+    pub view_salt: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -20,6 +20,23 @@ use crate::app::request_repaint_throttled;
 
 const MAX_UNDO: usize = 50;
 
+/// Allocate a fresh, process-unique salt for a `Canvas`'s snarl id. Each
+/// `Canvas` (tab canvas or sub-patch editor inner canvas) gets a distinct
+/// salt so its pan/zoom (`SnarlState.to_global`, stored in egui temp memory
+/// keyed by the snarl id) is independent from every other canvas's — they no
+/// longer share one transform via the old constant `"flexinput_canvas"` id.
+/// Callers with a *stable* identity (a tab, or a sub-patch node) overwrite the
+/// default with a derived salt via `set_view_salt`, so the view persists across
+/// tab switches / sub-patch reopen rather than resetting each time.
+pub(crate) fn next_canvas_salt() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Start high so a fresh per-instance salt never collides with a small
+    // derived tab/sub-patch salt (those are folded through splitmix64 and
+    // effectively random, but the offset keeps the spaces visibly distinct).
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Per-device param seeds applied when a device node is first added to the
 /// canvas. Sourced from `AppSettings` so users can set workspace-wide defaults
 /// in Settings → Device defaults.
@@ -277,6 +294,12 @@ pub struct Canvas {
     /// they were inserted. The viewer paints a fading outline halo around
     /// these nodes for ~400 ms.
     spawn_glow: std::collections::HashMap<egui_snarl::NodeId, std::time::Instant>,
+    /// Salt mixed into this canvas's snarl id so its pan/zoom is keyed
+    /// independently of every other canvas (see `next_canvas_salt`). Defaults
+    /// to a process-unique value; tab canvases and sub-patch editors overwrite
+    /// it with a *stable* derived salt (`set_view_salt`) so the view survives
+    /// tab switches and sub-patch close→reopen.
+    view_salt: u64,
 }
 
 impl Canvas {
@@ -341,7 +364,22 @@ impl Canvas {
             last_view_center_canvas: None,
             pending_view_action: None,
             spawn_glow: std::collections::HashMap::new(),
+            view_salt: next_canvas_salt(),
         }
+    }
+
+    /// Pin this canvas's snarl-id salt to a stable, caller-derived value so its
+    /// pan/zoom is remembered across re-creation (tab switches, sub-patch
+    /// editor close→reopen). Without this a fresh `Canvas` gets a new unique
+    /// salt each time and would re-frame on every open.
+    pub fn set_view_salt(&mut self, salt: u64) {
+        self.view_salt = salt;
+    }
+
+    /// This canvas's view salt — used to derive a *nested* sub-patch editor's
+    /// stable salt from its parent editor's salt + the child node id.
+    pub fn view_salt(&self) -> u64 {
+        self.view_salt
     }
 
     pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
@@ -859,12 +897,15 @@ impl Canvas {
             ping_requests,
         };
         // Capture the snarl_id BEFORE show so we can manipulate SnarlState
-        // (zoom / pan) from the zoom-control overlay below.
-        let snarl_id = ui.make_persistent_id("flexinput_canvas");
+        // (zoom / pan) from the zoom-control overlay below. The salt is
+        // per-canvas (`view_salt`) so each tab / sub-patch keeps its own
+        // pan/zoom instead of sharing one transform via a constant id.
+        let id_salt = ("flexinput_canvas", self.view_salt);
+        let snarl_id = ui.make_persistent_id(id_salt);
         let snarl_rect = ui.available_rect_before_wrap();
         {
             puffin::profile_scope!("snarl_show");
-            self.snarl.show(&mut viewer, &self.style, "flexinput_canvas", ui);
+            self.snarl.show(&mut viewer, &self.style, id_salt, ui);
         }
         let calibrate_request = viewer.calibrate_request;
 
@@ -1126,8 +1167,10 @@ impl Canvas {
         }
 
         // ── Keyboard shortcuts and modifier tooltip ────────────────────────────
-        // Get selected nodes from snarl's egui state.
-        let snarl_id = ui.make_persistent_id("flexinput_canvas");
+        // Get selected nodes from snarl's egui state. Must use the same
+        // per-canvas salt as the `show` pass above so selection resolves
+        // against this canvas's snarl id.
+        let snarl_id = ui.make_persistent_id(("flexinput_canvas", self.view_salt));
         let selected = get_selected_nodes(snarl_id, ui.ctx());
 
         // Group triggered via node right-click menu (viewer sets group_from_menu).
