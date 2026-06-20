@@ -26,6 +26,32 @@ pub static DS4_SOURCE_PINS: &[SourcePin] = &[
     op!("lightbar_b",    "Lightbar B",     SignalType::Float),
 ];
 
+/// DualSense feedback OUTPUTS a game can drive on the virtual pad: classic rumble
+/// + lightbar (as DS4) PLUS the player/mic LEDs and both adaptive triggers. Pin
+/// IDs match the physical DualSense's haptic INPUT pins (see
+/// `flexinput_devices::layouts::dualsense_inputs`) so AutoMap / FEEDBACK_PAIRS
+/// route each straight through to a real pad. All Float, normalized 0–1 the same
+/// way the physical input pins expect (the read side rescales per pin).
+pub static DUALSENSE_SOURCE_PINS: &[SourcePin] = &[
+    op!("rumble_strong",      "Rumble Strong",            SignalType::Float),
+    op!("rumble_weak",        "Rumble Weak",              SignalType::Float),
+    op!("lightbar_r",         "Lightbar R",               SignalType::Float),
+    op!("lightbar_g",         "Lightbar G",               SignalType::Float),
+    op!("lightbar_b",         "Lightbar B",               SignalType::Float),
+    op!("player_led",         "Player LED",               SignalType::Float),
+    op!("mic_led",            "Mic LED",                  SignalType::Float),
+    op!("trigger_r_mode",     "R.Trigger Mode",           SignalType::Float),
+    op!("trigger_r_start",    "R.Trigger Start",          SignalType::Float),
+    op!("trigger_r_end",      "R.Trigger End",            SignalType::Float),
+    op!("trigger_r_strength", "R.Trigger Strength",       SignalType::Float),
+    op!("trigger_r_freq",     "R.Trigger Freq",           SignalType::Float),
+    op!("trigger_l_mode",     "L.Trigger Mode",           SignalType::Float),
+    op!("trigger_l_start",    "L.Trigger Start",          SignalType::Float),
+    op!("trigger_l_end",      "L.Trigger End",            SignalType::Float),
+    op!("trigger_l_strength", "L.Trigger Strength",       SignalType::Float),
+    op!("trigger_l_freq",     "L.Trigger Freq",           SignalType::Float),
+];
+
 pub static KEYMOUSE_DEFAULT_PINS: &[SinkPin] = &[
     // Modifier / special keys — always present, non-removable
     sp!("key_escape",  "Escape",  SignalType::Bool),

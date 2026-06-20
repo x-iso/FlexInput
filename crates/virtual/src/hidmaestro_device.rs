@@ -108,6 +108,50 @@ pub struct HidMaestroDevice {
     rumble_settle_pending: bool,
     /// Latest actual (non-peak) rumble frame value, used to settle after a peak.
     rumble_latest: (f32, f32),
+    /// Most recent FULL output frame from the game (kept so non-rumble feedback —
+    /// lightbar/LEDs/triggers — can be decoded from a level-held report rather
+    /// than peak-held like rumble). `None` until the game sends one.
+    last_out_frame: Option<Vec<u8>>,
+    /// Latest decoded non-rumble feedback (lightbar/LEDs/adaptive triggers).
+    fb: DsFeedback,
+}
+
+/// Decoded non-rumble DualSense/DS4 feedback the game wrote to the virtual pad,
+/// normalized to the 0–1 source-pin convention so it routes straight to a
+/// physical pad's matching haptic input pins. All-zero = nothing driven.
+#[derive(Clone, Copy, Default)]
+struct DsFeedback {
+    lightbar: (f32, f32, f32),
+    player_led: f32,
+    mic_led: f32,
+    /// (mode, start, end, strength, freq) per trigger, each 0–1.
+    trig_r: (f32, f32, f32, f32, f32),
+    trig_l: (f32, f32, f32, f32, f32),
+}
+
+impl DsFeedback {
+    /// Flatten to source-pin (id, Signal) pairs. Pins whose underlying field the
+    /// profile doesn't declare still report 0.0 — harmless (a physical pad that
+    /// lacks the pin drops it, and 0 = "off" otherwise).
+    fn as_pins(&self) -> Vec<(&'static str, Signal)> {
+        vec![
+            ("lightbar_r", Signal::Float(self.lightbar.0)),
+            ("lightbar_g", Signal::Float(self.lightbar.1)),
+            ("lightbar_b", Signal::Float(self.lightbar.2)),
+            ("player_led", Signal::Float(self.player_led)),
+            ("mic_led", Signal::Float(self.mic_led)),
+            ("trigger_r_mode", Signal::Float(self.trig_r.0)),
+            ("trigger_r_start", Signal::Float(self.trig_r.1)),
+            ("trigger_r_end", Signal::Float(self.trig_r.2)),
+            ("trigger_r_strength", Signal::Float(self.trig_r.3)),
+            ("trigger_r_freq", Signal::Float(self.trig_r.4)),
+            ("trigger_l_mode", Signal::Float(self.trig_l.0)),
+            ("trigger_l_start", Signal::Float(self.trig_l.1)),
+            ("trigger_l_end", Signal::Float(self.trig_l.2)),
+            ("trigger_l_strength", Signal::Float(self.trig_l.3)),
+            ("trigger_l_freq", Signal::Float(self.trig_l.4)),
+        ]
+    }
 }
 
 impl HidMaestroDevice {
@@ -141,6 +185,8 @@ impl HidMaestroDevice {
             rumble_settle_pending: false,
             rumble_latest: (0.0, 0.0),
             last_rumble_cmd: None,
+            last_out_frame: None,
+            fb: DsFeedback::default(),
         })
     }
 
@@ -306,6 +352,10 @@ impl crate::VirtualDevice for HidMaestroDevice {
         if self.profile.requires_xusb_companion {
             // XInput feedback is rumble strong/weak only (no lightbar).
             layouts::XINPUT_SOURCE_PINS
+        } else if self.profile.id.contains("dualsense") {
+            // DualSense adds player/mic LEDs + both adaptive triggers on top of
+            // the DS4 rumble+lightbar set.
+            layouts::DUALSENSE_SOURCE_PINS
         } else {
             layouts::DS4_SOURCE_PINS
         }
@@ -392,6 +442,10 @@ impl crate::VirtualDevice for HidMaestroDevice {
                     peak = Some((s.max(ps), w.max(pw)));
                     self.rumble_latest = (s, w);
                 }
+                // Keep the latest full frame for non-rumble feedback decode
+                // (lightbar/LEDs/triggers are level-held, so the most recent
+                // report is authoritative — no peak-holding needed).
+                self.last_out_frame = Some(frame.data.clone());
             }
         }
         if let Some((pk_s, pk_w)) = peak {
@@ -404,10 +458,18 @@ impl crate::VirtualDevice for HidMaestroDevice {
             self.rumble_settle_pending = false;
             self.rumble = self.rumble_latest;
         }
-        vec![
+        let mut out = vec![
             ("rumble_strong", Signal::Float(self.rumble.0)),
             ("rumble_weak", Signal::Float(self.rumble.1)),
-        ]
+        ];
+        // Non-rumble feedback (lightbar / LEDs / adaptive triggers). The game's
+        // last output report is the authoritative state for these LEVEL-held
+        // fields (unlike rumble, which needs peak-holding because a ping's
+        // on→off pair can drain in one tick). We keep the most recent decoded
+        // values in `self.fb` and refresh them from `last_out_frame` here.
+        self.decode_nonrumble_feedback();
+        out.extend(self.fb.as_pins());
+        out
     }
 
     fn inject_rumble_ping(&mut self, strong: f32, weak: f32) {
@@ -421,6 +483,102 @@ impl crate::VirtualDevice for HidMaestroDevice {
         // frame, which is fine for a momentary ping.
         self.rumble = (strong, weak);
         self.last_rumble_cmd = None;
+    }
+}
+
+impl HidMaestroDevice {
+    /// Decode the game's latest output report into `self.fb` (lightbar / LEDs /
+    /// adaptive triggers), using the profile's RID-inclusive output offsets. The
+    /// ring strips the report id, so an offset `o` sits at `data[o-1]`. Fields the
+    /// profile doesn't declare stay at their default (0 = off). Called from
+    /// `poll_outputs` after the rumble drain so `last_out_frame` is fresh.
+    fn decode_nonrumble_feedback(&mut self) {
+        let Some(data) = self.last_out_frame.as_deref() else { return };
+        let ext = &self.profile.extended;
+        let at = |o: Option<usize>| o.and_then(|o| o.checked_sub(1)).filter(|&i| i < data.len());
+
+        if let Some(i) = at(ext.out_lightbar_r) {
+            // rgb24: R@i, G@i+1, B@i+2.
+            let g = |k: usize| data.get(k).copied().unwrap_or(0) as f32 / 255.0;
+            self.fb.lightbar = (g(i), g(i + 1), g(i + 2));
+        }
+        if let Some(i) = at(ext.out_player_led) {
+            self.fb.player_led = decode_player_led(data[i]);
+        }
+        if let Some(i) = at(ext.out_mic_led) {
+            // DualSense mute-LED byte: 0=off, 1=on(solid), 2=pulse → 0 / 0.5 / 1.
+            self.fb.mic_led = (data[i] as f32 / 2.0).clamp(0.0, 1.0);
+        }
+        if let Some(i) = at(ext.out_trigger_r) {
+            self.fb.trig_r = decode_trigger_effect(&data[i..]);
+        }
+        if let Some(i) = at(ext.out_trigger_l) {
+            self.fb.trig_l = decode_trigger_effect(&data[i..]);
+        }
+    }
+}
+
+/// Map a DualSense player-indicator bitmask byte back to the 0–1 `player_led`
+/// convention (0=off, 0.25=P1 … 1=P4). The pad lights 1–4 of its 5 front LEDs in
+/// fixed symmetric patterns per player number; we recognise those, and fall back
+/// to "scale by lit-count" for anything non-standard. Low 5 bits are the LEDs.
+fn decode_player_led(b: u8) -> f32 {
+    match b & 0x1F {
+        0x00 => 0.0,        // off
+        0x04 => 0.25,       // P1: centre
+        0x0A => 0.5,        // P2: inner pair
+        0x15 => 0.75,       // P3: centre + outer pair
+        0x1B => 1.0,        // P4: two pairs
+        other => {
+            // Non-standard: approximate by how many LEDs are lit (1..5 → ~0.25..1).
+            let n = other.count_ones() as f32;
+            (n / 4.0).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Decode one 11-byte DualSense adaptive-trigger effect block back into
+/// `(mode, start, end, strength, freq)`, each normalized 0–1 — the inverse of
+/// `flexinput_devices::gyro::encode_trigger_effect`. `mode` 0/0.33/0.66/1 maps to
+/// Off/Feedback(0x21)/Weapon(0x25)/Vibration(0x26); `start`/`end` are zone 0–9
+/// (→ /9); `strength` is force 0–7 (→ /7); `freq` is 0–255 (→ /255, Vibration).
+/// A short/empty block decodes as Off. This is intentionally the rough inverse —
+/// it recovers the parameters the encoder packs, enough to forward the effect to
+/// a physical DualSense (which re-encodes them).
+fn decode_trigger_effect(block: &[u8]) -> (f32, f32, f32, f32, f32) {
+    let off = (0.0, 0.0, 0.0, 0.0, 0.0);
+    if block.len() < 7 {
+        return off;
+    }
+    // Lowest set bit of the 10-bit active-zone field (params byte 1..3) → start.
+    let active = (block[1] as u16) | ((block[2] as u16) << 8);
+    let start_zone: f32 = if active == 0 { 0.0 } else { active.trailing_zeros() as f32 };
+    // Force is a 3-bit value repeated per active zone (params byte 3..7). Read the
+    // 3 bits at the start zone's slot.
+    let force_bits = (block[3] as u32)
+        | ((block[4] as u32) << 8)
+        | ((block[5] as u32) << 16)
+        | ((block[6] as u32) << 24);
+    let force_at = |zone: u32| ((force_bits >> (zone * 3)) & 0x7) as f32;
+
+    match block[0] {
+        0x21 => {
+            // Feedback: constant resistance from start zone, force = strength.
+            (0.33, (start_zone / 9.0).clamp(0.0, 1.0), 0.0, (force_at(start_zone as u32) / 7.0).clamp(0.0, 1.0), 0.0)
+        }
+        0x25 => {
+            // Weapon: two set bits in start_end (byte1..3) = start, end; byte3 = strength.
+            let lo = if active == 0 { 0 } else { active.trailing_zeros() };
+            let hi = if active == 0 { 0 } else { 15 - active.leading_zeros() };
+            let strength = block.get(3).copied().unwrap_or(0).min(7) as f32;
+            ((0.66), (lo as f32 / 9.0).clamp(0.0, 1.0), (hi as f32 / 9.0).clamp(0.0, 1.0), (strength / 7.0).clamp(0.0, 1.0), 0.0)
+        }
+        0x26 => {
+            // Vibration: like Feedback + frequency at params byte 9 (block[9]).
+            let freq = block.get(9).copied().unwrap_or(0) as f32 / 255.0;
+            (1.0, (start_zone / 9.0).clamp(0.0, 1.0), 0.0, (force_at(start_zone as u32) / 7.0).clamp(0.0, 1.0), freq.clamp(0.0, 1.0))
+        }
+        _ => off, // 0x00 / 0x05 (off) and anything unrecognized.
     }
 }
 
@@ -467,6 +625,82 @@ mod tests {
         let pins = dev.sink_pins();
         assert!(pins.iter().any(|p| p.id == "left_stick"));
         assert!(pins.iter().any(|p| p.id == "btn_south"));
+    }
+
+    fn dualsense_device() -> HidMaestroDevice {
+        HidMaestroDevice::open(
+            "virtual.dualsense", "Virtual DualSense",
+            flexinput_hidmaestro::profile::presets::DUALSENSE_JSON, 251,
+        ).expect("valid DualSense profile")
+    }
+
+    // The DualSense virtual exposes LED + adaptive-trigger feedback source pins
+    // (so a game driving the virtual can route them to a physical pad). DS4 does
+    // not (no such hardware).
+    #[test]
+    fn dualsense_exposes_led_and_trigger_source_pins() {
+        let ds = dualsense_device();
+        let ids: Vec<&str> = ds.source_pins().iter().map(|p| p.id).collect();
+        for want in ["player_led", "mic_led", "trigger_r_mode", "trigger_l_freq", "lightbar_r"] {
+            assert!(ids.contains(&want), "DualSense source pins missing {want}");
+        }
+        // DS4 stays rumble + lightbar only.
+        let ds4_ids: Vec<&str> = ds4_device().source_pins().iter().map(|p| p.id).collect();
+        assert!(!ds4_ids.contains(&"player_led"), "DS4 must not expose player_led");
+        assert!(!ds4_ids.contains(&"trigger_r_mode"), "DS4 must not expose triggers");
+    }
+
+    #[test]
+    fn dualsense_parses_output_feedback_offsets() {
+        let ds = dualsense_device();
+        let e = &ds.profile.extended;
+        // From the DualSense output report: lightbar@45, playerIndicator@44,
+        // muteLed@9, trigger effects @11 / @22.
+        assert_eq!(e.out_lightbar_r, Some(45));
+        assert_eq!(e.out_player_led, Some(44));
+        assert_eq!(e.out_mic_led, Some(9));
+        assert_eq!(e.out_trigger_r, Some(11));
+        assert_eq!(e.out_trigger_l, Some(22));
+    }
+
+    // Replicate the physical-side `encode_trigger_effect` bit-packing exactly so
+    // `decode_trigger_effect` is verified against the real wire format. (Encoder
+    // lives in flexinput-devices, so we re-encode here rather than cross-call.)
+    fn encode_feedback(start: u8, strength: u8) -> [u8; 11] {
+        let mut p = [0u8; 11];
+        p[0] = 0x21;
+        let s = start.min(9) as u16;
+        let f = strength.min(7) as u32;
+        let active: u16 = if s < 10 { ((1u16 << (10 - s)) - 1) << s } else { 0 };
+        let mut force = 0u32;
+        for z in s..10 { force |= f << (z * 3); }
+        p[1] = (active & 0xFF) as u8;
+        p[2] = ((active >> 8) & 0xFF) as u8;
+        p[3] = (force & 0xFF) as u8;
+        p[4] = ((force >> 8) & 0xFF) as u8;
+        p[5] = ((force >> 16) & 0xFF) as u8;
+        p[6] = ((force >> 24) & 0xFF) as u8;
+        p
+    }
+
+    #[test]
+    fn decode_trigger_feedback_recovers_params() {
+        // Feedback mode, start zone 3, strength 5.
+        let block = encode_feedback(3, 5);
+        let (mode, start, _end, strength, freq) = decode_trigger_effect(&block);
+        assert!((mode - 0.33).abs() < 0.01, "mode = Feedback");
+        assert!((start - 3.0 / 9.0).abs() < 0.02, "start zone 3, got {start}");
+        assert!((strength - 5.0 / 7.0).abs() < 0.02, "strength 5, got {strength}");
+        assert_eq!(freq, 0.0, "feedback has no freq");
+        // Off block decodes to all-zero.
+        assert_eq!(decode_trigger_effect(&[0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), (0.0, 0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn decode_player_led_known_patterns() {
+        assert_eq!(decode_player_led(0x00), 0.0);
+        assert_eq!(decode_player_led(0x04), 0.25); // P1
+        assert_eq!(decode_player_led(0x1B), 1.0);  // P4
     }
 
     #[test]

@@ -36,6 +36,22 @@ pub const FEEDBACK_PAIRS: &[(&str, &[&str])] = &[
     ("lightbar_r",    &["lightbar_r"]),
     ("lightbar_g",    &["lightbar_g"]),
     ("lightbar_b",    &["lightbar_b"]),
+    // DualSense LEDs + adaptive triggers: a virtual DualSense surfaces these in
+    // its output report decode (`poll_outputs`); forward each to the same-named
+    // physical haptic input pin. Direct id match — the destination is another
+    // DualSense (DS4 lacks these pins, so they're silently dropped there).
+    ("player_led",         &["player_led"]),
+    ("mic_led",            &["mic_led"]),
+    ("trigger_r_mode",     &["trigger_r_mode"]),
+    ("trigger_r_start",    &["trigger_r_start"]),
+    ("trigger_r_end",      &["trigger_r_end"]),
+    ("trigger_r_strength", &["trigger_r_strength"]),
+    ("trigger_r_freq",     &["trigger_r_freq"]),
+    ("trigger_l_mode",     &["trigger_l_mode"]),
+    ("trigger_l_start",    &["trigger_l_start"]),
+    ("trigger_l_end",      &["trigger_l_end"]),
+    ("trigger_l_strength", &["trigger_l_strength"]),
+    ("trigger_l_freq",     &["trigger_l_freq"]),
 ];
 
 /// Resolve feedback pin-id mapping for the AutoMap reverse-flow channel.

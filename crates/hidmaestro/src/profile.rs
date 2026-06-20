@@ -70,9 +70,24 @@ struct RawExtendedReport {
 #[derive(Debug, Deserialize)]
 struct RawExtField {
     byte: Option<usize>,
+    /// Range form, e.g. "45-47" for an rgb24 lightbar. We only need its start.
+    bytes: Option<String>,
     #[serde(rename = "type")]
     ty: Option<String>,
     semantic: Option<String>,
+}
+
+impl RawExtField {
+    /// The field's starting byte offset, from either `byte` (scalar) or the start
+    /// of a `bytes:"lo-hi"` range.
+    fn start_byte(&self) -> Option<usize> {
+        if let Some(b) = self.byte {
+            return Some(b);
+        }
+        let r = self.bytes.as_deref()?;
+        let lo = r.split('-').next()?.trim();
+        lo.parse().ok()
+    }
 }
 
 /// Byte offsets (into the on-wire report, RID included at byte 0) for the IMU
@@ -99,6 +114,20 @@ pub struct ExtendedLayout {
     /// hosts disable haptics, and there's nothing to gain from a virtual pad
     /// reporting anything else. `None` when the profile declares no battery field.
     pub battery_level: Option<usize>,
+    /// OUTPUT-report byte of the lightbar's first (R) channel, RID-inclusive; G/B
+    /// follow at +1/+2 (the report packs them as a contiguous rgb24). DS4 +
+    /// DualSense. Lets `poll_outputs` surface the game's lightbar colour so it can
+    /// route to a physical pad's light bar. `None` when the profile has no lightbar.
+    pub out_lightbar_r: Option<usize>,
+    /// OUTPUT-report byte of the DualSense player-indicator LED field (RID-inclusive).
+    pub out_player_led: Option<usize>,
+    /// OUTPUT-report byte of the DualSense mic-mute LED field (RID-inclusive).
+    pub out_mic_led: Option<usize>,
+    /// OUTPUT-report byte where the DualSense RIGHT adaptive-trigger effect block
+    /// begins (RID-inclusive). The block is 11 bytes: `[mode, params..]`.
+    pub out_trigger_r: Option<usize>,
+    /// OUTPUT-report byte where the LEFT adaptive-trigger effect block begins.
+    pub out_trigger_l: Option<usize>,
 }
 
 impl ExtendedLayout {
@@ -126,12 +155,17 @@ impl ExtendedLayout {
         }
         if let Some(raw) = output {
             for f in &raw.fields {
-                let (Some(byte), Some(sem)) = (f.byte, f.semantic.as_deref()) else {
+                let (Some(byte), Some(sem)) = (f.start_byte(), f.semantic.as_deref()) else {
                     continue;
                 };
                 match sem {
                     "leftMotor" => out.out_left_motor = Some(byte),
                     "rightMotor" => out.out_right_motor = Some(byte),
+                    "lightbar" => out.out_lightbar_r = Some(byte),
+                    "playerIndicator" => out.out_player_led = Some(byte),
+                    "muteLed" => out.out_mic_led = Some(byte),
+                    "rightTriggerEffect" => out.out_trigger_r = Some(byte),
+                    "leftTriggerEffect" => out.out_trigger_l = Some(byte),
                     _ => {}
                 }
             }
