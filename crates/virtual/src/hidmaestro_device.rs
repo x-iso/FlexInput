@@ -14,11 +14,66 @@
 //! created), the device is "disconnected" and silently drops writes — matching
 //! how `VirtualXInput` behaves when ViGEmBus is absent.
 
+use std::time::Instant;
+
 use flexinput_core::Signal;
 use flexinput_hidmaestro::encode::{encode_report_into, gip_from_state, PinState};
 use flexinput_hidmaestro::{helper, InputSection, OutputSection, Profile};
 
 use crate::{layouts, SinkPin, SourcePin};
+
+/// Classification of one XUSB-companion output-ring frame for rumble purposes.
+enum RumbleFrame {
+    /// A real vibration command: latch these `(strong, weak)` amplitudes.
+    Command(f32, f32),
+    /// WGI's idle keep-alive heartbeat (`[00 00 00 00 02 01 01 00 00]`): the
+    /// driver republishes it continuously between commands. It must NOT change
+    /// the latched rumble (treating it as a stop made continuous vibration
+    /// collapse to one short pulse per ~1 s command re-send).
+    Idle,
+    /// Not a vibration frame at all (e.g. the LED `…01` frame, or malformed).
+    Other,
+}
+
+/// Classify an Xbox 360 vibration packet from the XUSB companion's output ring.
+///
+/// Layout confirmed empirically 2026-06-20 by sending known motor values through
+/// BOTH rumble APIs and reading the forwarded bytes. **Motors are always at
+/// `data[2]` (LEFT = strong/low-frequency) and `data[3]` (RIGHT = weak/high-
+/// frequency), each already 0..255** (the high byte of the 16-bit
+/// `wLeftMotorSpeed`/`wRightMotorSpeed`), with a `0x02` packet marker at
+/// `data[4]`. Two frame lengths carry this same layout:
+///   * **5-byte** `[00, 00, L, R, 02]` — the legacy XInput / `XInputSetState`
+///     (and Steam) path via `IOCTL_XUSB_SET_STATE`. Always a real command.
+///   * **9-byte** `[00, XX, L, R, 02, 01, 01, 00, 00]` — the WGI
+///     `Gamepad.Vibration` (`put_Vibration`, browsers/UWP/web testers) path.
+///     `XX` (data[1]) is a command marker (≠0 on a real set, incl. an explicit
+///     stop like `00 F7 00 00 02…`), NOT a motor value. WGI also republishes an
+///     **idle heartbeat** `[00 00 00 00 02 01 01 00 00]` (data[1]==0, motors==0)
+///     continuously — that is keep-alive, not a stop.
+///
+/// So: a 9-byte frame with `data[1]==0` AND both motors 0 is [`RumbleFrame::Idle`]
+/// (ignore); everything else with the `0x02` marker is a [`RumbleFrame::Command`]
+/// to latch (a 5-byte frame is always a command — that path has no heartbeat).
+fn classify_rumble_frame(data: &[u8]) -> RumbleFrame {
+    if data.len() < 5 || data[4] != 0x02 {
+        return RumbleFrame::Other;
+    }
+    let (strong, weak) = (data[2], data[3]);
+    if data.len() >= 9 && data[1] == 0 && strong == 0 && weak == 0 {
+        return RumbleFrame::Idle;
+    }
+    RumbleFrame::Command(strong as f32 / 255.0, weak as f32 / 255.0)
+}
+
+/// How long a non-zero XInput/WGI rumble level is held without a fresh non-zero
+/// command before it decays to zero. WGI (`Gamepad.Vibration`) has NO explicit
+/// stop — it conveys "off" by ceasing to re-send the command (~every 700 ms while
+/// active) and reverting to an idle heartbeat. So we hold the level a bit longer
+/// than that re-send gap, then decay. Long enough to ride out a missed re-send;
+/// short enough that release feels responsive. (Steam's legacy path DOES send an
+/// explicit `Command(0,0)`, which stops immediately regardless of this.)
+const RUMBLE_HOLD: std::time::Duration = std::time::Duration::from_millis(900);
 
 /// A HIDMaestro-backed virtual controller (plain-HID path: DS4 / DualSense).
 pub struct HidMaestroDevice {
@@ -38,6 +93,12 @@ pub struct HidMaestroDevice {
     output: Option<OutputSection>,
     /// Latest decoded rumble (strong, weak) in 0.0..1.0.
     rumble: (f32, f32),
+    /// When the last NON-ZERO XInput/WGI rumble command was seen. The XUSB path
+    /// has no reliable explicit "stop" for WGI (it just stops re-sending the
+    /// command and reverts to an idle heartbeat), so a non-zero `rumble` decays
+    /// to zero if no fresh non-zero command arrives within `RUMBLE_HOLD`. `None`
+    /// once rumble is zero. Companion (XInput) path only.
+    last_rumble_cmd: Option<Instant>,
     /// Helper-managed device instance id (`ROOT\HIDClass\NNNN`). `Some` when
     /// this device was created via the helper and must be destroyed on drop.
     helper_instance_id: Option<String>,
@@ -79,6 +140,7 @@ impl HidMaestroDevice {
             helper_instance_id: None,
             rumble_settle_pending: false,
             rumble_latest: (0.0, 0.0),
+            last_rumble_cmd: None,
         })
     }
 
@@ -260,17 +322,46 @@ impl crate::VirtualDevice for HidMaestroDevice {
     }
 
     fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> {
-        // XInput/Xbox360 rumble-in is NOT YET MAPPED. The XUSB companion's output
-        // ring layout is unknown (the offsets tried were a guess), and reading
-        // unmapped bytes produced a STUCK nonzero rumble that AutoMap forwarded to
-        // the physical pad (constant buzz, x360 ports never lit because it was a
-        // synthesized garbage value, not a real frame). Until the ring layout is
-        // mapped empirically (same treatment as the input GIP), report NO rumble
-        // for the companion path — silence beats a phantom constant buzz.
         if self.profile.requires_xusb_companion {
+            // XInput (Xbox 360) rumble-in. The driver forwards the game's
+            // vibration packet to the output ring as Source=XINPUT(2).
+            // `classify_rumble_frame` parses it (layout confirmed empirically).
+            //
+            // Rumble is LEVEL-triggered, latched with a TIMEOUT, because the two
+            // APIs signal "stop" differently:
+            //   * A non-zero `Command` latches the level AND refreshes a hold
+            //     timer. WGI re-sends the command ~every 700 ms while active, so
+            //     the timer keeps refreshing → sustained vibration.
+            //   * Steam's legacy path sends an explicit `Command(0,0)` on release
+            //     → we zero immediately.
+            //   * WGI has NO explicit stop: it just CEASES re-sending and reverts
+            //     to the idle heartbeat. `Idle` is therefore ignored here (it must
+            //     not refresh the timer), and a non-zero level that goes
+            //     un-refreshed for `RUMBLE_HOLD` decays to zero — that's how WGI
+            //     "off" is detected.
+            if let Some(output) = self.output.as_mut() {
+                while let Some(frame) = output.try_read() {
+                    match classify_rumble_frame(&frame.data) {
+                        RumbleFrame::Command(s, w) => {
+                            self.rumble = (s, w);
+                            self.last_rumble_cmd =
+                                if s > 0.0 || w > 0.0 { Some(Instant::now()) } else { None };
+                        }
+                        RumbleFrame::Idle | RumbleFrame::Other => {}
+                    }
+                }
+            }
+            // Decay a stale non-zero level to zero once the hold window lapses
+            // with no fresh non-zero command (covers WGI's implicit stop).
+            if let Some(t) = self.last_rumble_cmd {
+                if t.elapsed() >= RUMBLE_HOLD {
+                    self.rumble = (0.0, 0.0);
+                    self.last_rumble_cmd = None;
+                }
+            }
             return vec![
-                ("rumble_strong", Signal::Float(0.0)),
-                ("rumble_weak", Signal::Float(0.0)),
+                ("rumble_strong", Signal::Float(self.rumble.0)),
+                ("rumble_weak", Signal::Float(self.rumble.1)),
             ];
         }
         // Drain the output ring; keep the latest rumble report we recognize.
@@ -317,6 +408,19 @@ impl crate::VirtualDevice for HidMaestroDevice {
             ("rumble_strong", Signal::Float(self.rumble.0)),
             ("rumble_weak", Signal::Float(self.rumble.1)),
         ]
+    }
+
+    fn inject_rumble_ping(&mut self, strong: f32, weak: f32) {
+        // Set the level directly so the next poll_outputs() reports it. The ping
+        // handler drives this each tick (level while active, 0 when done), so we
+        // must NOT arm the auto-decay timer — that's only for real game commands
+        // whose "stop" is implicit. Clearing last_rumble_cmd also prevents the
+        // companion path's decay from fighting the ping. For an xinput-companion
+        // device this feeds the same `self.rumble` poll_outputs returns; for a
+        // plain-HID (DS4/DS) device it likewise overrides until the next real
+        // frame, which is fine for a momentary ping.
+        self.rumble = (strong, weak);
+        self.last_rumble_cmd = None;
     }
 }
 
@@ -389,5 +493,53 @@ mod tests {
         dev.send("left_stick", Signal::Vec2(Vec2::new(0.5, -0.5)));
         dev.flush();
         dev.reset_outputs();
+    }
+
+    // ── XInput rumble decode (layout verified live 2026-06-20) ────────────────
+
+    fn cmd(data: &[u8]) -> Option<(f32, f32)> {
+        match classify_rumble_frame(data) {
+            RumbleFrame::Command(s, w) => Some((s, w)),
+            _ => None,
+        }
+    }
+    fn is_idle(data: &[u8]) -> bool {
+        matches!(classify_rumble_frame(data), RumbleFrame::Idle)
+    }
+    fn is_other(data: &[u8]) -> bool {
+        matches!(classify_rumble_frame(data), RumbleFrame::Other)
+    }
+
+    #[test]
+    fn xinput_5byte_frame_is_command() {
+        // 5-byte legacy XInput/XInputSetState (Steam) path: [00 00 L R 02].
+        // Observed live for (L,R) = (0xFFFF,0), (0,0xFFFF), (0x1111,0x8888).
+        assert_eq!(cmd(&[0, 0, 255, 0, 2]), Some((1.0, 0.0)));
+        assert_eq!(cmd(&[0, 0, 0, 255, 2]), Some((0.0, 1.0)));
+        let (s, w) = cmd(&[0, 0, 0x11, 0x88, 2]).unwrap();
+        assert!((s - 17.0 / 255.0).abs() < 1e-6);
+        assert!((w - 136.0 / 255.0).abs() < 1e-6);
+        // A 5-byte all-zero frame IS a real stop command (no heartbeat on this path).
+        assert_eq!(cmd(&[0, 0, 0, 0, 2]), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn wgi_9byte_command_vs_idle_heartbeat() {
+        // Real WGI command: [00 XX L R 02 01 01 00 00], motors at [2]/[3], data[1]
+        // is a command marker (≠0), NOT a motor. Observed `00 67 FF FF ...`.
+        assert_eq!(cmd(&[0, 0x67, 0xFF, 0xFF, 2, 1, 1, 0, 0]), Some((1.0, 1.0)));
+        // Explicit WGI stop (data[1]≠0, motors 0) IS a command (clears rumble).
+        assert_eq!(cmd(&[0, 0xF7, 0, 0, 2, 1, 1, 0, 0]), Some((0.0, 0.0)));
+        // Idle keep-alive heartbeat (data[1]==0, motors 0): IGNORED, not a stop.
+        assert!(is_idle(&[0, 0, 0, 0, 2, 1, 1, 0, 0]));
+    }
+
+    #[test]
+    fn rejects_non_vibration_frames() {
+        // Gate is the 0x02 marker at data[4]. An LED/other frame (`…01` marker)
+        // and malformed/short frames are Other (ignored).
+        assert!(is_other(&[0, 6, 0, 0, 1])); // marker 0x01
+        assert!(is_other(&[0, 0, 255])); // too short
+        assert!(is_other(&[]));
     }
 }

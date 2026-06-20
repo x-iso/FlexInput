@@ -296,6 +296,30 @@ fn is_own_virtual_gilrs_id(gilrs_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Map an own-virtual loopback id (`gilrs:<kind>:v<N>`) to the matching virtual
+/// pool device: its `kind_prefix` (e.g. `virtual.hm.xinput`) and the `N`th
+/// own-virtual of that kind. Returns `None` for a real physical id. Used by the
+/// rumble "ping" to inject into the virtual's feedback rather than a backend
+/// (which has no motor for our own virtual). The `v<N>` index matches pool order
+/// because the read-side tags own-virtuals (`gilrs_device_id`) in the same
+/// enumeration order the pool lists them.
+fn own_virtual_pool_target(gilrs_id: &str) -> Option<(&'static str, usize)> {
+    let mut parts = gilrs_id.split(':');
+    if parts.next()? != "gilrs" {
+        return None;
+    }
+    let slug = parts.next()?;
+    let inst = parts.next()?;
+    let n: usize = inst.strip_prefix('v')?.parse().ok()?; // own-virtuals only
+    let kind_prefix = match slug {
+        "xinput" => "virtual.hm.xinput",
+        "ds4" => "virtual.hm.ds4",
+        "dualsense" => "virtual.hm.dualsense",
+        _ => return None,
+    };
+    Some((kind_prefix, n))
+}
+
 
 /// Insert virtual devices into the shared pool for every id in
 /// `needed_ids` that doesn't already exist. Pre-existing devices are
@@ -8581,6 +8605,30 @@ fn spawn_io_thread(
                         for (dev_id, deadline) in ping_until.iter() {
                             let active = now < *deadline;
                             let amp = if active { Signal::Float(1.0) } else { Signal::Float(0.0) };
+                            let amp_f = if active { 1.0 } else { 0.0 };
+                            // Pinging an OWN-VIRTUAL pad (its loopback shown as a
+                            // physical `gilrs:<kind>:v<N>`) can't go through a
+                            // backend — those rumble a real device, and our virtual
+                            // has no motor. Instead inject the rumble into the
+                            // matching virtual device's feedback, so it flows
+                            // poll_outputs → AutoMap → the mapped physical pad,
+                            // exactly as a game's rumble would. (Restores the ViGEm
+                            // behavior where pinging the virtual buzzed whatever it
+                            // mapped to.)
+                            if let Some((kind_prefix, vidx)) = own_virtual_pool_target(dev_id) {
+                                let mut pool = shared_virtual_devices.lock().unwrap();
+                                if let Some(dev) = pool
+                                    .iter_mut()
+                                    .filter(|d| {
+                                        flexinput_virtual::kind_prefix(d.id()).as_str() == kind_prefix
+                                    })
+                                    .nth(vidx)
+                                {
+                                    dev.inject_rumble_ping(amp_f, amp_f);
+                                }
+                                if !active { expired.push(dev_id.clone()); }
+                                continue;
+                            }
                             // Drive every rumble pin family so the ping works
                             // regardless of controller type — each backend ignores
                             // pins it doesn't recognise:

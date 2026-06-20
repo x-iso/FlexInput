@@ -75,6 +75,15 @@ pub trait VirtualDevice: Send {
     /// Returns (pin_id, signal) pairs; called each I/O frame after flush().
     fn poll_outputs(&mut self) -> Vec<(&'static str, Signal)> { vec![] }
 
+    /// Inject a synthetic rumble level so the NEXT `poll_outputs` reports it —
+    /// used by the UI "ping" on an own-virtual pad to make its feedback flow
+    /// through AutoMap to the mapped physical pad exactly as a game's rumble
+    /// would. The caller controls duration (it sets the level each tick while
+    /// the ping is active and `(0,0)` when it ends), so this sets the level
+    /// directly without any auto-decay. Default: no-op (devices with no feedback
+    /// don't ping). Only the HIDMaestro companion (XInput) path implements it.
+    fn inject_rumble_ping(&mut self, _strong: f32, _weak: f32) {}
+
     /// Relinquish OS ownership so this device's `Drop` does NOT tear the
     /// underlying virtual node down — the node is intentionally left alive past
     /// app exit for reclaim on next launch. Called on a clean shutdown when the
