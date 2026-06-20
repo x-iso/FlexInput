@@ -1015,9 +1015,22 @@ fn parse_ds4(buf: &[u8]) -> Option<HidReading> {
     };
 
     let mut r = build(buf, go, ao, DS4_GYRO_DPS_PER_LSB, DS4_ACCEL_G_PER_LSB);
-    // Note: DS4 has a physical touchpad, but parse_ds4 doesn't decode the touch
-    // points yet (different layout from DualSense), so leave has_touchpad=false —
-    // forwarding (0,0) would be worse than nothing. Touchpad fwd is deferred.
+    // DS4 touchpad: the two `dualshock4_touch_point` records use the SAME 4-byte
+    // packing as the DualSense (`[id/active, x_lo, (y_lo<<4)|x_hi, y_hi]`, 1920×1080
+    // sensor), so `parse_dualsense_touch` decodes them directly. Offsets are
+    // RID-inclusive: USB report 0x01 → fingers @35/@39 (matches the profile's
+    // `touch_fingers`); BT report 0x11 → +2 for the BT prefix (@37/@41). Guard the
+    // length separately from the IMU read (a short report still yields IMU).
+    let (t1, t2) = match buf[0] {
+        0x01 => (35usize, 39usize),
+        0x11 => (37usize, 41usize),
+        _    => (usize::MAX, usize::MAX),
+    };
+    if t2 != usize::MAX && buf.len() >= t2 + 4 {
+        r.has_touchpad = true;
+        r.touch1 = parse_dualsense_touch(buf, t1);
+        r.touch2 = parse_dualsense_touch(buf, t2);
+    }
     r.touchpad_click = btn2 & 0x02 != 0;
     r.dualsense      = Some(ds);
     Some(r)
@@ -1629,6 +1642,47 @@ mod tests {
         assert!(ds.btn_ps, "PS set");
         assert!((ds.l2 - 1.0).abs() < 0.01, "L2 analog full");
         assert!(!ds.btn_north && !ds.btn_east && !ds.btn_west, "no other faces");
+    }
+
+    // DS4 physical touchpad must decode (it was previously deferred, so the
+    // physical DS4's touch1/touch2 source pins emitted nothing). USB report 0x01
+    // carries the two touch fingers at RID-inclusive bytes 35 and 39, packed
+    // identically to the DualSense. A finger with bit 7 clear is active.
+    #[test]
+    fn parse_ds4_decodes_touchpad() {
+        let mut buf = [0u8; 64]; // full-length DS4 USB report
+        buf[0] = 0x01;
+        buf[2] = 128; buf[3] = 128; buf[4] = 128; // sticks centred-ish (avoid panics)
+        buf[5] = 0x08; // dpad neutral
+
+        // Finger 0 @35: active (bit7 clear), centre of pad → raw (960, 540).
+        // pack: [id, x_lo, (y_lo<<4)|x_hi, y_hi] with raw_x=960 (0x3C0), raw_y=540 (0x21C)
+        let (rx, ry) = (960u16, 540u16);
+        buf[35] = 0x00; // active, id 0
+        buf[36] = (rx & 0xFF) as u8;
+        buf[37] = (((ry & 0x0F) << 4) | ((rx >> 8) & 0x0F)) as u8;
+        buf[38] = ((ry >> 4) & 0xFF) as u8;
+        // Finger 1 @39: inactive (bit7 set).
+        buf[39] = 0x80;
+
+        let r = parse_ds4(&buf).expect("valid DS4 report");
+        assert!(r.has_touchpad, "DS4 now reports a touchpad");
+        assert!(r.touch1.active, "finger 0 active");
+        // Centre maps to ≈0 on both axes (within one LSB of the normalisation).
+        assert!(r.touch1.x.abs() < 0.01, "finger 0 x≈0 at centre, got {}", r.touch1.x);
+        assert!(r.touch1.y.abs() < 0.01, "finger 0 y≈0 at centre, got {}", r.touch1.y);
+        assert!(!r.touch2.active, "finger 1 inactive");
+    }
+
+    // A short DS4 report (no touch bytes) must NOT claim a touchpad — IMU/buttons
+    // still parse, but touch stays absent rather than reading garbage.
+    #[test]
+    fn parse_ds4_short_report_has_no_touch() {
+        let mut buf = [0u8; 25];
+        buf[0] = 0x01;
+        buf[5] = 0x08; // dpad neutral
+        let r = parse_ds4(&buf).expect("valid short DS4 report");
+        assert!(!r.has_touchpad, "short report → no touchpad claimed");
     }
 
     /// Reflected IEEE CRC32 of the empty input is 0 (the canonical identity).
