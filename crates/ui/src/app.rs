@@ -536,9 +536,12 @@ pub struct FlexInputApp {
     /// Last device-op error, shown briefly in Settings. Cleared on next op.
     last_device_op_error: Option<String>,
     /// One-shot: on a GPU-recovery relaunch we seed helper persistence ON so the
-    /// reclaimed devices aren't wiped; once they've been reclaimed AND a grace
-    /// window has passed (so reconcile has surely run), restore the user's real
-    /// setting. `Some((real_persist, armed_at))` until done.
+    /// reclaimed devices aren't wiped; we then restore the user's real setting
+    /// once reclaim settles (after a grace window so reconcile has surely run),
+    /// or unconditionally after a hard deadline so the temporary override can
+    /// never stick (handled at the top of `update`, even while GPU-stalled).
+    /// Runtime-only — never writes the saved setting. `Some((real_persist,
+    /// armed_at))` until restored.
     gpu_recovery_restore_persist: Option<(bool, std::time::Instant)>,
     /// Set of virtual device IDs referenced by the *active tab's* canvas.
     /// The I/O thread routes signals only to devices whose id is in this
@@ -1101,6 +1104,39 @@ impl eframe::App for FlexInputApp {
         puffin::GlobalProfiler::lock().new_frame();
         puffin::profile_function!();
 
+        // ── GPU-recovery persist safety net ──────────────────────────────
+        // On a GPU-loss relaunch the helper's persistence was forced ON so the
+        // devices kept alive across the relaunch aren't wiped before reclaim.
+        // This is a TEMPORARY RUNTIME override (`set_persist`) — it never writes
+        // the saved `persist_virtual_devices` setting. Hand the helper back the
+        // user's REAL setting as soon as reclaim settles, OR — as a hard backstop
+        // — after a bounded deadline even if it never settles (failed reclaim,
+        // empty-but-pending, or a stall/crash boot). Runs FIRST, ahead of the
+        // stall early-return below, so a stalled child still reverts instead of
+        // stranding persist=on and leaking the virtual devices on close. It only
+        // ever restores to the user's setting; it does not change it.
+        #[cfg(windows)]
+        if let Some((real_persist, armed_at)) = self.gpu_recovery_restore_persist {
+            let elapsed = armed_at.elapsed();
+            // Grace before deciding "nothing to reclaim" (startup reconcile must
+            // have enqueued its reclaim creates first); hard deadline is the
+            // backstop so the override can never stick.
+            const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+            const HARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+            let settled = elapsed >= GRACE && {
+                let pool_has = !self.shared_virtual_devices.lock().unwrap().is_empty();
+                pool_has || self.pending_device_ids.is_empty()
+            };
+            if settled || elapsed >= HARD_DEADLINE {
+                flexinput_hidmaestro::helper::set_persist(real_persist);
+                self.gpu_recovery_restore_persist = None;
+                eprintln!(
+                    "[gpu-recovery] restored persist={real_persist} ({})",
+                    if settled { "reclaim settled" } else { "hard deadline" }
+                );
+            }
+        }
+
         // ── GPU-loss recovery ────────────────────────────────────────────
         // The vendored egui-wgpu raises this flag (instead of panicking) when
         // the graphics device is lost mid-frame — a fullscreen game resetting
@@ -1166,29 +1202,6 @@ impl eframe::App for FlexInputApp {
         // Pushes freshly-built virtual devices into the shared pool (and clears
         // in-flight markers). Done before anything reads the pool this frame.
         self.drain_device_op_results();
-
-        // GPU-recovery one-shot: we seeded helper persistence ON so the devices
-        // kept alive across the relaunch wouldn't be wiped before reclaim. Once
-        // the pool has them back, restore the user's real persistence setting so
-        // normal exit teardown resumes.
-        #[cfg(windows)]
-        if let Some((real_persist, armed_at)) = self.gpu_recovery_restore_persist {
-            // Restore once reclaim has had time to run. A grace window ensures the
-            // startup reconcile (which enqueues the reclaim creates) has executed
-            // before we decide "nothing to reclaim", avoiding a premature restore
-            // that would wipe devices. After the window: restore when a device is
-            // back in the pool, or when nothing is pending (empty patch).
-            let elapsed = armed_at.elapsed() >= std::time::Duration::from_secs(3);
-            if elapsed {
-                let pool_has = !self.shared_virtual_devices.lock().unwrap().is_empty();
-                let settled = pool_has || self.pending_device_ids.is_empty();
-                if settled {
-                    flexinput_hidmaestro::helper::set_persist(real_persist);
-                    self.gpu_recovery_restore_persist = None;
-                    eprintln!("[gpu-recovery] reclaim settled; restored persist={real_persist}");
-                }
-            }
-        }
 
         // Keep the I/O thread's active-tab device-id filter current every frame.
         // This set gates which virtual devices have their feedback (rumble/FFB)
