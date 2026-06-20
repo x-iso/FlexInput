@@ -82,6 +82,21 @@ pub struct GamepadState {
     pub accel_x: f32,
     pub accel_y: f32,
     pub accel_z: f32,
+    /// Touchpad fingers. Normalized X/Y in roughly `[-1, 1]` (centre = 0), matching
+    /// the physical-side read range (`flexinput_devices::gyro::parse_dualsense_touch`),
+    /// so a real DualSense's touch can be mapped straight onto a virtual one. Only
+    /// emitted when the profile declares `touch_fingers`; `active=false` writes the
+    /// "finger not touching" sentinel.
+    pub touch1: TouchOut,
+    pub touch2: TouchOut,
+}
+
+/// One touchpad finger for encoding into a virtual DS4/DualSense report.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TouchOut {
+    pub active: bool,
+    pub x: f32,
+    pub y: f32,
 }
 
 impl GamepadState {
@@ -115,6 +130,7 @@ pub mod button {
     pub const TOUCHPAD: u32 = 1 << 11;
     pub const LT_DIGITAL: u32 = 1 << 12; // L2 digital click
     pub const RT_DIGITAL: u32 = 1 << 13; // R2 digital click
+    pub const MUTE: u32 = 1 << 14; // DualSense mic-mute button
 }
 
 /// HID usage (page 0x01 Generic Desktop) for the standard axes.
@@ -379,10 +395,11 @@ fn write_i16_le(report: &mut [u8], off: usize, v: i16) {
 /// DS4/DualSense run factory ±2000 dps / ±8 G over the full int16 range, and the
 /// signal-graph reference is exactly those values, so `±1.0 → ±32767`.
 ///
-/// Touchpad: a real Sony pad sets bit 7 of each finger's first byte when that
-/// finger is NOT touching. A zeroed report reads as "finger down at (0,0)",
-/// which Steam shows as a stuck touch — so we stamp the inactive sentinel for
-/// every declared finger (we don't synthesize touch input on virtual pads).
+/// Touchpad: each active finger's normalized X/Y is packed into its declared
+/// 4-byte block (reverse of the physical-side parse); an inactive finger gets
+/// bit 7 set on its first byte ("finger not touching"), which is what a real
+/// Sony pad sends and what Steam expects (a zeroed block reads as a stuck touch
+/// at 0,0). See `write_dualsense_touch`.
 fn encode_extended(profile: &Profile, state: &GamepadState, report: &mut [u8]) {
     let ext = &profile.extended;
     let to_i16 = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
@@ -406,12 +423,57 @@ fn encode_extended(profile: &Profile, state: &GamepadState, report: &mut [u8]) {
         write_i16_le(report, o, to_i16(state.accel_z));
     }
 
-    // Touchpad inactive sentinel: bit 7 set = finger not touching.
-    for &finger_off in &ext.touch_fingers {
-        if finger_off < report.len() {
-            report[finger_off] |= 0x80;
+    // Battery: always report a full/healthy charge. A virtual pad has no real
+    // battery, and a low/critical reading makes some hosts disable haptics (and
+    // shows an alarming "controller low" prompt). Both Sony families pack the
+    // level in the low nibble: DualSense 0..8 (8 = full); DS4 0..10 (cabled-full
+    // reports ~11). Writing low-nibble 0x08 reads as full on DualSense and
+    // comfortably "not low" on DS4 — enough to keep haptics enabled — while
+    // leaving the high-nibble charge/cable status untouched.
+    if let Some(o) = ext.battery_level {
+        if o < report.len() {
+            report[o] = (report[o] & 0xF0) | 0x08;
         }
     }
+
+    // Touchpad: the first two declared fingers carry touch1 / touch2. Pack an
+    // active finger's normalized X/Y into its 4-byte block (the exact reverse of
+    // the physical-side `parse_dualsense_touch`); an inactive finger gets bit 7
+    // set on its first byte ("finger not touching"), which is what a real Sony
+    // pad sends and what Steam expects (a zeroed block reads as a stuck touch at
+    // 0,0). Any fingers beyond the two we model stay inactive.
+    let touches = [&state.touch1, &state.touch2];
+    for (i, &finger_off) in ext.touch_fingers.iter().enumerate() {
+        let t = touches.get(i).copied();
+        match t {
+            Some(t) if t.active => write_dualsense_touch(report, finger_off, t.x, t.y, i as u8),
+            _ => {
+                if finger_off < report.len() {
+                    report[finger_off] |= 0x80;
+                }
+            }
+        }
+    }
+}
+
+/// Pack one active touchpad finger into the 4-byte `dualsense_touch_point` block
+/// at `off` — the inverse of `flexinput_devices::gyro::parse_dualsense_touch`.
+/// Byte layout: `[contact, x_lo, (y_lo<<4)|x_hi, y_hi]`, X 12-bit 0..1919, Y
+/// 12-bit 0..1079. `contact` low 7 bits carry a finger id; bit 7 = inactive (we
+/// clear it for an active finger). `x`/`y` are normalized roughly `[-1, 1]` with
+/// centre 0 (matching the read side), `+y` = up (touchpad Y increases downward).
+fn write_dualsense_touch(report: &mut [u8], off: usize, x: f32, y: f32, id: u8) {
+    if off + 4 > report.len() {
+        return;
+    }
+    const HALF_W: f32 = 1920.0 / 2.0;
+    const HALF_H: f32 = 1080.0 / 2.0;
+    let raw_x = (x * HALF_W + HALF_W).round().clamp(0.0, 1919.0) as u16;
+    let raw_y = (-y * HALF_H + HALF_H).round().clamp(0.0, 1079.0) as u16;
+    report[off] = id & 0x7F; // active: bit 7 clear; low bits = finger id
+    report[off + 1] = (raw_x & 0xFF) as u8; // x_lo
+    report[off + 2] = (((raw_y & 0x0F) << 4) | ((raw_x >> 8) & 0x0F)) as u8; // y_lo|x_hi
+    report[off + 3] = ((raw_y >> 4) & 0xFF) as u8; // y_hi
 }
 
 fn is_axis_usage(u: u16) -> bool {
@@ -451,6 +513,12 @@ pub struct PinState {
     accel_x: f32,
     accel_y: f32,
     accel_z: f32,
+    t1x: f32,
+    t1y: f32,
+    t1_active: bool,
+    t2x: f32,
+    t2y: f32,
+    t2_active: bool,
 }
 
 impl Default for PinState {
@@ -474,6 +542,12 @@ impl Default for PinState {
             accel_x: 0.0,
             accel_y: 0.0,
             accel_z: 0.0,
+            t1x: 0.0,
+            t1y: 0.0,
+            t1_active: false,
+            t2x: 0.0,
+            t2y: 0.0,
+            t2_active: false,
         }
     }
 }
@@ -510,6 +584,12 @@ impl PinState {
             "accel_x" => self.accel_x = f,
             "accel_y" => self.accel_y = f,
             "accel_z" => self.accel_z = f,
+            "touch1_x" => self.t1x = f,
+            "touch1_y" => self.t1y = f,
+            "touch1_active" => self.t1_active = b,
+            "touch2_x" => self.t2x = f,
+            "touch2_y" => self.t2y = f,
+            "touch2_active" => self.t2_active = b,
             // Digital L2/R2: set the descriptor's digital-trigger button bit. A
             // real DS4 also drives the analog axis to full on a digital press, so
             // mirror it to the analog trigger *only* when no analog source already
@@ -563,6 +643,10 @@ impl PinState {
             accel_x: self.accel_x,
             accel_y: self.accel_z,
             accel_z: self.accel_y,
+            // Touchpad passes through unchanged (already in the read-side's
+            // normalized [-1,1] range); the encoder packs it into finger bytes.
+            touch1: TouchOut { active: self.t1_active, x: self.t1x, y: self.t1y },
+            touch2: TouchOut { active: self.t2_active, x: self.t2x, y: self.t2y },
         }
     }
 }
@@ -582,6 +666,7 @@ pub fn ds_button_bit(pin: &str) -> Option<u32> {
         "btn_rs" => button::RIGHT_STICK,
         "btn_guide" => button::GUIDE,
         "btn_touchpad" => button::TOUCHPAD,
+        "btn_mute" => button::MUTE,
         _ => return None,
     })
 }
@@ -800,6 +885,37 @@ mod tests {
         assert_eq!(ds.extended.out_left_motor, Some(4));
     }
 
+    // The DualSense mic-mute button must reach the report on its own descriptor
+    // button (Button 15 / buttons[14]) without disturbing the touchpad-click
+    // button (Button 14). Both are real buttons a game/Steam reads; before this
+    // fix `btn_mute` was silently dropped (no HMButton bit, no buttonMap entry).
+    #[test]
+    fn dualsense_mute_button_sets_its_own_bit() {
+        let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        let buttons: Vec<_> = p.report.fields.iter().filter(|f| f.usage_page == 0x09).collect();
+        assert!(buttons.len() >= 15, "DualSense descriptor declares 15 buttons");
+        let mute_f = buttons[14]; // Button 15
+        let touch_f = buttons[13]; // Button 14 (touchpad click)
+
+        // Mute alone → its bit set, touchpad-click bit clear.
+        let mut ps = PinState::new();
+        ps.set("btn_mute", 0.0, true);
+        let rep = encode_report(&p, &ps.state());
+        let bit = |f: &InputField, r: &[u8]| {
+            let byte = (f.bit_offset as usize + 8) / 8; // RID-inclusive
+            (r[byte] >> ((f.bit_offset as usize + 8) % 8)) & 1
+        };
+        assert_eq!(bit(mute_f, &rep), 1, "mute sets Button 15");
+        assert_eq!(bit(touch_f, &rep), 0, "mute does not set touchpad-click");
+
+        // Touchpad-click alone → touchpad bit set, mute clear (no cross-talk).
+        let mut ps = PinState::new();
+        ps.set("btn_touchpad", 0.0, true);
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(bit(touch_f, &rep), 1, "touchpad sets Button 14");
+        assert_eq!(bit(mute_f, &rep), 0, "touchpad does not set mute");
+    }
+
     #[test]
     fn dualsense_neutral_stamps_touchpad_inactive() {
         let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
@@ -807,6 +923,75 @@ mod tests {
         // Inactive sentinel: bit 7 set on each finger's first byte.
         assert_eq!(rep[33] & 0x80, 0x80, "finger 0 marked inactive");
         assert_eq!(rep[37] & 0x80, 0x80, "finger 1 marked inactive");
+    }
+
+    // The virtual pad must always report a full/healthy battery so hosts keep
+    // haptics enabled. DualSense battery byte 53 low nibble = level (8 = full).
+    #[test]
+    fn dualsense_reports_full_battery() {
+        let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        assert_eq!(p.extended.battery_level, Some(53), "battery@53 parsed");
+        let rep = encode_report(&p, &GamepadState::neutral());
+        assert_eq!(rep[53] & 0x0F, 0x08, "battery level = full (8)");
+    }
+
+    // DS4 carries battery at byte 12 (plain uint8). Same full-charge stamp.
+    #[test]
+    fn ds4_reports_full_battery() {
+        let p = ds4();
+        assert_eq!(p.extended.battery_level, Some(12), "battery@12 parsed");
+        let rep = encode_report(&p, &GamepadState::neutral());
+        assert_eq!(rep[12] & 0x0F, 0x08, "battery level healthy/full");
+    }
+
+    /// Decode a 4-byte DualSense touch block back to (active, raw_x, raw_y) — the
+    /// exact inverse used by the physical-side parser — to verify the encoder's
+    /// bit packing round-trips.
+    fn decode_touch(block: &[u8]) -> (bool, u16, u16) {
+        let active = (block[0] & 0x80) == 0;
+        let x_lo = block[1] as u16;
+        let mid = block[2] as u16;
+        let y_hi = block[3] as u16;
+        let raw_x = ((mid & 0x0F) << 8) | x_lo;
+        let raw_y = (y_hi << 4) | ((mid & 0xF0) >> 4);
+        (active, raw_x, raw_y)
+    }
+
+    #[test]
+    fn dualsense_active_touch_packs_and_round_trips() {
+        let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        let mut ps = PinState::new();
+        // Finger 1 at centre (0,0); finger 2 near top-right (+0.5, +0.5).
+        ps.set("touch1_active", 0.0, true);
+        ps.set("touch1_x", 0.0, false);
+        ps.set("touch1_y", 0.0, false);
+        ps.set("touch2_active", 0.0, true);
+        ps.set("touch2_x", 0.5, false);
+        ps.set("touch2_y", 0.5, false);
+        let rep = encode_report(&p, &ps.state());
+
+        // Finger 1 @33: active, centre → raw (960, 540).
+        let (a1, x1, y1) = decode_touch(&rep[33..37]);
+        assert!(a1, "finger 1 active (bit7 clear)");
+        assert_eq!((x1, y1), (960, 540), "centre maps to mid-sensor");
+
+        // Finger 2 @37: active, (+0.5,+0.5). raw_x = 0.5*960+960 = 1440;
+        // raw_y = -0.5*540+540 = 270 (Y inverted: +y is up).
+        let (a2, x2, y2) = decode_touch(&rep[37..41]);
+        assert!(a2, "finger 2 active");
+        assert_eq!((x2, y2), (1440, 270));
+    }
+
+    #[test]
+    fn dualsense_inactive_finger_ignores_position() {
+        // A finger with active=false must stamp the sentinel regardless of x/y.
+        let p = Profile::from_json(crate::profile::presets::DUALSENSE_JSON).unwrap();
+        let mut ps = PinState::new();
+        ps.set("touch1_x", 0.9, false);
+        ps.set("touch1_y", -0.9, false);
+        // active left false
+        let rep = encode_report(&p, &ps.state());
+        assert_eq!(rep[33] & 0x80, 0x80, "inactive finger 1 keeps sentinel");
     }
 
     #[test]

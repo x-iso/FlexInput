@@ -824,8 +824,19 @@ fn drain_reports(entry: &mut HidEntry) -> bool {
             Ok(0) => break,
             Err(_) => return false,
             Ok(n) => {
-                if let Some(r) = parse_report(&buf[..n], &mut entry.kind) {
+                if let Some(mut r) = parse_report(&buf[..n], &mut entry.kind) {
                     entry.event_count = entry.event_count.saturating_add(1);
+                    // Touchpad hold-last: when a finger lifts, a real pad keeps
+                    // bit 7 set but the X/Y bytes go stale/garbage (often reading
+                    // ~max → normalized ≈ +1, a visible jump). Freeze the inactive
+                    // finger at its last reported position instead so the pin
+                    // doesn't snap — it stays where the finger left and reads 0
+                    // before any touch (TouchPoint default). Active fingers pass
+                    // through untouched.
+                    if r.has_touchpad {
+                        hold_inactive_touch(&mut r.touch1, &entry.last.touch1);
+                        hold_inactive_touch(&mut r.touch2, &entry.last.touch2);
+                    }
                     // Filter at the device-poll boundary. Each parsed `r`
                     // is one true device sample (no engine upsampling),
                     // so the snap-back rule sees a clean device-rate
@@ -1070,6 +1081,18 @@ fn parse_dualsense(buf: &[u8], connection: &mut Option<Connection>) -> Option<Hi
     r.mic_button      = btn2 & 0x04 != 0;
     r.dualsense       = Some(ds);
     Some(r)
+}
+
+/// Freeze an inactive touch finger at the previous frame's position. A real pad
+/// stops updating the X/Y bytes once a finger lifts (they go stale or read near
+/// max → a visible jump to ≈+1); holding the last position keeps the downstream
+/// pin steady where the finger left it. Before any touch, `prev` is the default
+/// (0,0) so the pin rests at 0. Active fingers are left exactly as parsed.
+fn hold_inactive_touch(cur: &mut TouchPoint, prev: &TouchPoint) {
+    if !cur.active {
+        cur.x = prev.x;
+        cur.y = prev.y;
+    }
 }
 
 /// Parse one DualSense `dualsense_touch_point` (4 bytes). Coordinates are

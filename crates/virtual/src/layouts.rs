@@ -116,14 +116,17 @@ pub static DUALSENSE_SINK_PINS: &[SinkPin] = &[
     sp!("accel_x",       "Accel X",              SignalType::Float),
     sp!("accel_y",       "Accel Y",              SignalType::Float),
     sp!("accel_z",       "Accel Z",              SignalType::Float),
-    // Touchpad axes — accepted but not forwarded (no touchpad in raw report yet).
+    // Touchpad axes — forwarded into the report when `active` is set (encoder
+    // packs X/Y into the finger bytes; see hidmaestro encode_extended).
     sp!("touch1_x",      "Touch 1 X",            SignalType::Float),
     sp!("touch1_y",      "Touch 1 Y",            SignalType::Float),
     sp!("touch1_active", "Touch 1 Active",       SignalType::Bool),
     sp!("touch2_x",      "Touch 2 X",            SignalType::Float),
     sp!("touch2_y",      "Touch 2 Y",            SignalType::Float),
     sp!("touch2_active", "Touch 2 Active",       SignalType::Bool),
-    sp!("battery",       "Battery (0–1)",         SignalType::Float),
+    // No battery sink: the virtual pad always reports full charge (a low
+    // reported battery makes some hosts disable haptics). Battery remains a
+    // SOURCE pin on physical devices.
     sp!("automap_in",    "Auto-Map",             SignalType::AutoMap),
 ];
 
@@ -161,7 +164,8 @@ pub static DS4_SINK_PINS: &[SinkPin] = &[
     sp!("accel_x",       "Accel X",              SignalType::Float),
     sp!("accel_y",       "Accel Y",              SignalType::Float),
     sp!("accel_z",       "Accel Z",              SignalType::Float),
-    // Touchpad axes — accepted; forwarding is deferred (see DualSense).
+    // Touchpad axes — forwarded into the report when `active` is set (encoder
+    // packs X/Y into the finger bytes; see hidmaestro encode_extended).
     sp!("touch1_x",      "Touch 1 X",            SignalType::Float),
     sp!("touch1_y",      "Touch 1 Y",            SignalType::Float),
     sp!("touch1_active", "Touch 1 Active",       SignalType::Bool),

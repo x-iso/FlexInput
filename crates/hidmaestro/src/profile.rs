@@ -94,6 +94,11 @@ pub struct ExtendedLayout {
     pub out_left_motor: Option<usize>,
     /// Output-report byte of the weak/right (small) rumble motor, RID-inclusive.
     pub out_right_motor: Option<usize>,
+    /// Input-report byte carrying the battery level (RID-inclusive). The virtual
+    /// pad stamps this to "full" every frame — a low reported battery makes some
+    /// hosts disable haptics, and there's nothing to gain from a virtual pad
+    /// reporting anything else. `None` when the profile declares no battery field.
+    pub battery_level: Option<usize>,
 }
 
 impl ExtendedLayout {
@@ -111,6 +116,7 @@ impl ExtendedLayout {
                     "accelX" => out.accel_x = Some(byte),
                     "accelY" => out.accel_y = Some(byte),
                     "accelZ" => out.accel_z = Some(byte),
+                    "batteryLevel" => out.battery_level = Some(byte),
                     _ => {}
                 }
                 if f.ty.as_deref() == Some("touchpad-finger") {
