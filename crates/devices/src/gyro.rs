@@ -109,6 +109,12 @@ pub struct HidReading {
     pub switch_buttons: Option<SwitchProButtons>,
     /// DualSense full input state, parsed from raw HID. None for non-DualSense devices.
     pub dualsense: Option<DualSenseState>,
+    /// Battery charge as a fraction 0.0..1.0, decoded from the DS4/DualSense
+    /// report (`None` for devices we don't decode battery for, e.g. Switch Pro).
+    /// Surfaced as the `battery` source pin so FlexInput can show the PHYSICAL
+    /// pad's real charge. (Virtual pads always report 100% — see encode.rs — so
+    /// this read path is purely informational and never feeds a virtual report.)
+    pub battery: Option<f32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1041,6 +1047,9 @@ fn parse_ds4(buf: &[u8]) -> Option<HidReading> {
         r.touch2 = parse_dualsense_touch(buf, t2);
     }
     r.touchpad_click = btn2 & 0x02 != 0;
+    // Battery: report byte 12 (USB) / 14 (BT, +2 prefix) — `po + 11`. Bounds-
+    // checked; informational only (never feeds a virtual report).
+    r.battery = buf.get(po + 11).map(|&b| decode_battery(b));
     r.dualsense      = Some(ds);
     Some(r)
 }
@@ -1101,8 +1110,30 @@ fn parse_dualsense(buf: &[u8], connection: &mut Option<Connection>) -> Option<Hi
     r.touch2          = parse_dualsense_touch(buf, t2);
     r.touchpad_click  = btn2 & 0x02 != 0;
     r.mic_button      = btn2 & 0x04 != 0;
+    // Battery: report byte 53 (USB) / 54 (BT, +1 for the BT prefix). Bounds-
+    // checked separately from the parse guard above (a short report still yields
+    // sticks/buttons without a battery reading).
+    let bat_off = if conn == Connection::Usb { 53 } else { 54 };
+    r.battery = buf.get(bat_off).map(|&b| decode_battery(b));
     r.dualsense       = Some(ds);
     Some(r)
+}
+
+/// Decode a Sony battery status byte into a 0.0..1.0 charge fraction. Both DS4
+/// and DualSense pack the capacity in the low nibble (0..10 per hid-playstation)
+/// and a charging status in the high nibble. We map capacity → percent with the
+/// standard `min(level*10 + 5, 100)` and report charging-complete as full. This
+/// is informational only (FlexInput's representation); it never feeds a virtual
+/// pad's report — virtual pads always emit 100%.
+fn decode_battery(b: u8) -> f32 {
+    let level = (b & 0x0F) as f32;
+    let status = (b >> 4) & 0x0F;
+    // status 0x2 = charging complete on DualSense → full. Otherwise treat the
+    // low nibble as a 0..10 capacity.
+    if status == 0x2 {
+        return 1.0;
+    }
+    ((level * 10.0 + 5.0) / 100.0).clamp(0.0, 1.0)
 }
 
 /// Freeze an inactive touch finger at the previous frame's position. A real pad
@@ -1681,6 +1712,29 @@ mod tests {
         assert!(r.touch1.x.abs() < 0.01, "finger 0 x≈0 at centre, got {}", r.touch1.x);
         assert!(r.touch1.y.abs() < 0.01, "finger 0 y≈0 at centre, got {}", r.touch1.y);
         assert!(!r.touch2.active, "finger 1 inactive");
+    }
+
+    #[test]
+    fn decode_battery_maps_capacity_and_full() {
+        // Discharging: low nibble = capacity 0..10 → min(level*10+5,100).
+        assert!((decode_battery(0x00) - 0.05).abs() < 0.001, "empty-ish");
+        assert!((decode_battery(0x05) - 0.55).abs() < 0.001, "mid");
+        assert!((decode_battery(0x0A) - 1.0).abs() < 0.001, "level 10 → 100%");
+        // Charging-complete status (high nibble 0x2) → full regardless of level.
+        assert_eq!(decode_battery(0x20), 1.0);
+    }
+
+    // DS4 report carries battery at byte 12 (USB). A full-length report with a
+    // known battery byte decodes to the expected fraction.
+    #[test]
+    fn parse_ds4_decodes_battery() {
+        let mut buf = [0u8; 64];
+        buf[0] = 0x01;
+        buf[5] = 0x08; // dpad neutral
+        buf[12] = 0x05; // battery capacity 5 → 55%
+        let r = parse_ds4(&buf).expect("valid DS4 report");
+        assert!(r.battery.is_some(), "DS4 battery decoded");
+        assert!((r.battery.unwrap() - 0.55).abs() < 0.01, "got {:?}", r.battery);
     }
 
     // A short DS4 report (no touch bytes) must NOT claim a touchpad — IMU/buttons

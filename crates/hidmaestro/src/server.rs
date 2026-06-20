@@ -518,10 +518,21 @@ fn handle_create(
         .iter()
         .find(|d| d.device_id == device_id && !device_id.is_empty() && !d.is_companion)
     {
-        let input = match InputSection::create(found.index).or_else(|_| InputSection::open(found.index)) {
+        let mut input = match InputSection::create(found.index).or_else(|_| InputSection::open(found.index)) {
             Ok(s) => s,
             Err(e) => return Response::err(format!("reclaim input section idx={}: {e}", found.index)),
         };
+        // Seed a neutral, full-battery frame (same rationale as the create path)
+        // so a host reading right after reclaim doesn't catch a zeroed section.
+        {
+            let neutral = crate::encode::encode_report(&profile, &crate::encode::GamepadState::neutral());
+            let gip = if profile.requires_xusb_companion {
+                Some(crate::encode::gip_from_state(&crate::encode::GamepadState::neutral()))
+            } else {
+                None
+            };
+            input.write_frame(&neutral, gip.as_ref());
+        }
         let output = OutputSection::create(found.index)
             .or_else(|_| OutputSection::open(found.index))
             .ok();
@@ -574,10 +585,25 @@ fn handle_create(
         crate::orchestrator::write_poll_interval(index, poll_interval_ms);
     }
 
-    let input = match InputSection::create(index) {
+    let mut input = match InputSection::create(index) {
         Ok(s) => s,
         Err(e) => return Response::err(format!("create input section idx={index}: {e}")),
     };
+    // Seed an initial NEUTRAL frame BEFORE the device node enumerates, so the very
+    // first report a host can read already has centered sticks and a FULL battery.
+    // The section is zeroed at create, and a zeroed Sony report decodes as battery
+    // = 0 (critical) — if a host (Steam) read in the window between node-create and
+    // FlexInput's first flush(), it flashed a spurious "low battery" warning. The
+    // neutral encode runs `encode_extended`, which stamps battery to 100%.
+    {
+        let neutral = crate::encode::encode_report(&profile, &crate::encode::GamepadState::neutral());
+        let gip = if profile.requires_xusb_companion {
+            Some(crate::encode::gip_from_state(&crate::encode::GamepadState::neutral()))
+        } else {
+            None
+        };
+        input.write_frame(&neutral, gip.as_ref());
+    }
     let output = OutputSection::create(index).ok();
 
     match create_device_node(&profile, &inf.display().to_string(), index, device_id) {

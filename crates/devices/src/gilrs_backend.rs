@@ -453,6 +453,14 @@ impl DeviceBackend for GilrsBackend {
                     if matches!(kind, ControllerKind::DualSense) {
                         out.push((dev.clone(), "btn_mute".into(), Signal::Bool(g.mic_button)));
                     }
+                    // Physical battery charge (DS4/DualSense), surfaced on the
+                    // `battery` source pin so FlexInput's representation can show
+                    // the real pad's level. Virtual pads always report 100% (the
+                    // encode side), so this is informational and never loops into
+                    // a virtual report.
+                    if let Some(bat) = g.battery {
+                        out.push((dev.clone(), "battery".into(), Signal::Float(bat)));
+                    }
                     // DualSense: override all axes and buttons with raw HID values.
                     // gilrs on Windows HID maps the 6 axes by USB Usage ID order rather than
                     // logical gamepad position, placing L2/R2 where RightStickX/Y should be
