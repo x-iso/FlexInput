@@ -29,8 +29,9 @@ use crate::deploy::ensure_driver_installed;
 use crate::helper_ipc::{DeviceInfo, Request, Response, PIPE_NAME};
 use crate::install::{hidmaestro_available, installed_inf_path, installed_xusb_inf_path};
 use crate::orchestrator::{
-    create_device_node, create_xusb_companion_node, list_hidmaestro_devices,
-    remove_all_hidmaestro_devices, remove_device_node, wait_for_hid_child_started,
+    clear_hidmaestro_devices_and_wait, create_device_node, create_xusb_companion_node,
+    list_hidmaestro_devices, remove_all_hidmaestro_devices, remove_device_node,
+    wait_for_hid_child_started,
 };
 use crate::shm::{InputSection, OutputSection};
 use crate::Profile;
@@ -141,6 +142,15 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     eprintln!(
         "[hidmaestro-helper] starting; pipe={PIPE_NAME} parent={parent_pid:?} persist={initial_persist}"
     );
+
+    // Cross-process single-helper lock. Block until any prior helper has fully
+    // exited (or died) before we touch any device — so a rapid relaunch after a
+    // crash/force-kill can't run two helpers concurrently and clobber each
+    // other's nodes. Held for this whole function (released on return). 10s is
+    // generous vs the worst-case prior teardown; on timeout we proceed (the
+    // startup clear-and-wait + per-Create reclaim are backstops).
+    let _singleton = HelperSingleton::acquire(10_000);
+
     let state = Arc::new(HelperState::new());
     state.persist.store(initial_persist, Ordering::SeqCst);
 
@@ -169,15 +179,16 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
         }
     }
 
-    // Exit cleanup: if persistence is off, ensure nothing is left behind —
-    // remove everything HIDMaestro-owned, not just what we tracked (covers
-    // sections the app reopened across reconnects).
+    // Exit cleanup: if persistence is off, remove this helper's OWN tracked
+    // devices. (Was a system-wide remove_all; scoped to tracked for the same
+    // reason as parent-death teardown — a concurrently-spawned new helper's
+    // fresh nodes must not be clobbered. Untracked orphans are reclaimed by the
+    // next helper's startup `clear_hidmaestro_devices_and_wait`.)
     let persist_at_exit = state.persist.load(Ordering::SeqCst);
     diag_log(&format!("[helper] exit: persist={persist_at_exit}"));
     if !persist_at_exit {
         state.teardown_tracked();
-        let n = remove_all_hidmaestro_devices();
-        diag_log(&format!("[helper] exit cleanup (persist off): removed {n} device(s)"));
+        diag_log("[helper] exit cleanup (persist off): removed tracked device(s)");
     }
     diag_log("[helper] stopped");
 }
@@ -213,9 +224,16 @@ fn watch_parent(parent_pid: u32, state: Arc<HelperState>) {
             state.parent_gone.store(true, Ordering::SeqCst);
             diag_log(&format!("[helper] parent {parent_pid} exited; persist={persist_now}"));
             if !persist_now {
+                // Remove ONLY this helper's own tracked devices — NOT a system-wide
+                // remove_all. On a rapid relaunch the new app may already have spawned
+                // a fresh helper and created new nodes by the time we get here; a
+                // system-wide sweep would nuke those (they're HIDMaestro-owned too).
+                // Orphans from an abrupt prior exit are instead reclaimed by the NEXT
+                // helper's startup `clear_hidmaestro_devices_and_wait`, which sweeps +
+                // verifies clear before the app deploys. Scoping teardown to our own
+                // tracked nodes keeps a surviving old helper from clobbering a new one.
                 state.teardown_tracked();
-                let n = remove_all_hidmaestro_devices();
-                diag_log(&format!("[helper] removed {n} device(s) after parent death"));
+                diag_log("[helper] removed tracked device(s) after parent death");
             }
             // Nudge the accept loop: connect to our own pipe so a blocked
             // ConnectNamedPipe returns and the loop re-checks `parent_gone`.
@@ -323,9 +341,15 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                 "[helper] hello: persist={persist} (was={was}) first={first}"
             ));
             if first && !persist {
-                let n = remove_all_hidmaestro_devices();
+                // Sweep leftovers AND wait until the system is verified clear
+                // before returning Ok — so the app's first Create can't race a
+                // prior (force-killed/crashed) helper that's still mid-teardown
+                // and orphan a half-removed node. Idempotent vs the old helper's
+                // own sweep. Bounded so a stuck node can't hang startup; an
+                // un-cleared node falls to the per-Create reclaim path.
+                let clear = clear_hidmaestro_devices_and_wait(std::time::Duration::from_secs(5));
                 diag_log(&format!(
-                    "[helper] hello (startup): persist off; cleaned up {n} leftover device(s)/orphan child(ren)"
+                    "[helper] hello (startup): persist off; swept leftovers, clear={clear}"
                 ));
             }
             // A live toggle changes only the EXIT policy (read at exit /
@@ -704,6 +728,58 @@ extern "system" {
     ) -> *mut c_void;
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
     fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+    fn CreateMutexW(sec: *mut c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+    fn ReleaseMutex(h: *mut c_void) -> i32;
+}
+
+/// Cross-process single-helper lock. Only one helper may perform device
+/// operations at a time; a freshly-spawned helper BLOCKS here until any prior
+/// helper has fully exited (releasing the mutex) or died (Windows marks the
+/// mutex abandoned, which still grants ownership). This is what makes an abrupt
+/// prior exit safe regardless of timing: without it, `PIPE_UNLIMITED_INSTANCES`
+/// lets a dying old helper and a new one run concurrently, so the old helper's
+/// late teardown (or a reused ROOT-node index) could clobber the new helper's
+/// freshly-created devices. Acquired before any sweep/create; released on drop.
+struct HelperSingleton {
+    handle: *mut c_void,
+}
+
+impl HelperSingleton {
+    /// Acquire the global helper lock, waiting up to `wait_ms` for a prior holder
+    /// to release. Returns `None` only if the mutex can't be created at all
+    /// (should never happen); a timeout still returns the guard (we proceed
+    /// rather than strand the user — the startup `clear_and_wait` + per-Create
+    /// reclaim remain as backstops). `Global\` so it spans sessions/elevation.
+    fn acquire(wait_ms: u32) -> Option<Self> {
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_ABANDONED: u32 = 0x0000_0080;
+        let name = wide(r"Global\FlexInputHIDMaestroHelperLock");
+        let h = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+        if h.is_null() {
+            eprintln!("[hidmaestro-helper] CreateMutexW failed: {}", unsafe { GetLastError() });
+            return None;
+        }
+        let r = unsafe { WaitForSingleObject(h, wait_ms) };
+        match r {
+            WAIT_OBJECT_0 => diag_log("[helper] acquired singleton lock"),
+            WAIT_ABANDONED => diag_log("[helper] acquired singleton lock (prior holder died)"),
+            _ => diag_log(&format!(
+                "[helper] singleton lock wait timed out (r={r:#x}); proceeding anyway"
+            )),
+        }
+        Some(HelperSingleton { handle: h })
+    }
+}
+
+impl Drop for HelperSingleton {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                ReleaseMutex(self.handle);
+                CloseHandle(self.handle);
+            }
+        }
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {

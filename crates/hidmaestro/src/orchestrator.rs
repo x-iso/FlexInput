@@ -1377,6 +1377,40 @@ pub fn remove_all_hidmaestro_devices() -> usize {
     removed
 }
 
+/// Sweep leftover HIDMaestro nodes, then BLOCK until none remain (or `timeout`
+/// elapses), retrying the sweep each round. Returns `true` if the system is
+/// verified clear, `false` if nodes persisted past the timeout.
+///
+/// This is the startup gate that makes an abrupt prior exit (force-kill, crash,
+/// GPU-loss relaunch) safe: a too-soon relaunch can spawn THIS helper while the
+/// previous helper is still mid-teardown (its `remove_all_hidmaestro_devices`
+/// runs for several seconds after parent death). If the app's first `Create`
+/// raced that, it built on a half-removed node and orphaned it (the "virtual
+/// failed to redeploy" / stuck-representation symptom). By sweeping-and-waiting
+/// here before we report startup-ready, the app only ever deploys onto a
+/// confirmed-clean system. Removal is idempotent, so racing the old helper's
+/// own sweep is harmless — whichever removes a node first, both then observe it
+/// gone. A node we don't manage to clear within the timeout is left for the
+/// per-`Create` reclaim path rather than blocking startup forever.
+pub fn clear_hidmaestro_devices_and_wait(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let n = remove_all_hidmaestro_devices();
+        // Re-enumerate AFTER removing: removal/CM teardown can lag, and the old
+        // helper may still be releasing handles, so a node can linger one round.
+        let remaining = list_hidmaestro_devices().len();
+        if remaining == 0 {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        // Short backoff; CM device removal settles on the order of ~100s of ms.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = n;
+    }
+}
+
 /// Scan `HKLM\...\Enum\HID` for orphaned HIDMaestro HID children — those whose
 /// `HardwareID` carries the "HIDMaestro" ownership tag but whose parent devnode
 /// no longer exists — and `DIF_REMOVE` each. Returns the count removed.
