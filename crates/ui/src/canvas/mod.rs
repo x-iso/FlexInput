@@ -298,8 +298,9 @@ pub struct Canvas {
     /// independently of every other canvas (see `next_canvas_salt`). Defaults
     /// to a process-unique value; tab canvases and sub-patch editors overwrite
     /// it with a *stable* derived salt (`set_view_salt`) so the view survives
-    /// tab switches and sub-patch close→reopen.
-    view_salt: u64,
+    /// tab switches and sub-patch close→reopen. `pub(crate)` so `easy::layout`
+    /// can key the measured-node-rect stash (`viewer::final_node_rect`).
+    pub(crate) view_salt: u64,
 }
 
 impl Canvas {
@@ -895,6 +896,7 @@ impl Canvas {
             calibrate_request: None,
             automap_parent,
             ping_requests,
+            view_salt: self.view_salt,
         };
         // Capture the snarl_id BEFORE show so we can manipulate SnarlState
         // (zoom / pan) from the zoom-control overlay below. The salt is

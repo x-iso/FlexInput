@@ -2796,6 +2796,14 @@ impl eframe::App for FlexInputApp {
                         &mut favorites_for_easy,
                         gamepad_nav,
                     );
+                    // Keep the Easy I/O nodes arranged against the sub-patch using
+                    // its REAL rendered size (just measured by the canvas show
+                    // above via final_node_rect). Re-running each frame lets a
+                    // freshly-deployed node converge to its measured size, and
+                    // reflows automatically when the Layout editor resizes the
+                    // sub-patch. Easy-mode only (this branch); Advanced never runs
+                    // it, so manual node drags there are preserved.
+                    crate::easy::layout::reposition_io_nodes_with_ctx(canvas, Some(ui.ctx()));
                 });
                 if favorites_for_easy != favorites_before {
                     self.settings.favorite_presets = favorites_for_easy;
@@ -5021,6 +5029,9 @@ impl FlexInputApp {
             LeftNavAction::ToggleOutput { kind } => {
                 self.nav_toggle_output_sink(&kind);
             }
+            LeftNavAction::CycleGamepadOutput => {
+                self.nav_cycle_gamepad_output();
+            }
             LeftNavAction::ToggleParam { node, key } => {
                 let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
                 let cur = self.get_node_param_bool(node, &key).unwrap_or(false);
@@ -5105,6 +5116,30 @@ impl FlexInputApp {
             let canvas = &mut self.tabs[self.active_tab].canvas;
             crate::easy::io_panel::nav_ensure_sink(
                 canvas, kind, &pool, collapsed, defaults);
+        }
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        crate::easy::wiring::rewire(canvas);
+    }
+
+    /// Cycle the single gamepad output to the next model (Xbox 360 → DS4 →
+    /// DualSense → None → …). Mirrors the Easy output card's selector so the
+    /// gamepad-nav cursor and the mouse agree. Deploying a model removes any
+    /// other gamepad sink first (Easy mode drives one pad).
+    fn nav_cycle_gamepad_output(&mut self) {
+        let next = {
+            let canvas = &self.tabs[self.active_tab].canvas;
+            crate::easy::io_panel::next_gamepad_kind(canvas)
+        };
+        // Remove every gamepad sink, then add the next model (None → add none).
+        let collapsed = self.settings.device_nodes_default_collapsed;
+        let defaults = self.nav_device_defaults();
+        let pool = std::sync::Arc::clone(&self.shared_virtual_devices);
+        {
+            let canvas = &mut self.tabs[self.active_tab].canvas;
+            crate::easy::io_panel::remove_all_gamepad_sinks(canvas);
+            if let Some(kind) = next {
+                crate::easy::io_panel::nav_ensure_sink(canvas, kind, &pool, collapsed, defaults);
+            }
         }
         let canvas = &mut self.tabs[self.active_tab].canvas;
         crate::easy::wiring::rewire(canvas);

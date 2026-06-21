@@ -70,7 +70,21 @@ pub struct FlexViewer<'a> {
     /// device's id here for the I/O thread to pulse. `None` on inner sub-patch
     /// canvases (no physical device sources to ping).
     pub ping_requests: Option<&'a crate::easy::io_panel::PingRequests>,
+    /// This canvas's per-view salt (mirrors `Canvas::view_salt`). Used to key the
+    /// stash of measured node rects (`final_node_rect`) so the Easy-mode I/O
+    /// layout can position nodes against the sub-patch's REAL rendered size
+    /// instead of guessed constants.
+    pub view_salt: u64,
 }
+
+/// egui temp-data key for this canvas's measured node rects, in CANVAS space.
+/// Written by `final_node_rect` each frame, read by `easy::layout`.
+pub fn node_rects_id(view_salt: u64) -> egui::Id {
+    egui::Id::new(("flexinput_node_rects", view_salt))
+}
+
+/// The measured node-rect map: NodeId.0 → canvas-space [x, y, w, h].
+pub type NodeRectMap = std::collections::HashMap<usize, [f32; 4]>;
 
 impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     fn title(&mut self, node: &NodeData) -> String {
@@ -957,6 +971,27 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         _ui: &mut egui::Ui,
         _snarl: &mut Snarl<NodeData>,
     ) {}
+
+    /// Snarl reports each node's final rendered rect here. Snarl draws nodes in
+    /// a layer that carries the pan/zoom as a registered transform
+    /// (`set_transform_layer`), so widget rects inside it are already in the
+    /// layer's LOCAL = CANVAS space — the SAME space as `info.pos`. So we store
+    /// the rect's size as-is (NO zoom division), letting `easy::layout` position
+    /// the I/O nodes against the sub-patch's real size (and reflow after the
+    /// Layout editor resizes it) instead of guessing.
+    fn final_node_rect(
+        &mut self,
+        node: NodeId,
+        rect: egui::Rect,
+        ui: &mut egui::Ui,
+        _snarl: &mut Snarl<NodeData>,
+    ) {
+        let salt = self.view_salt;
+        ui.ctx().data_mut(|d| {
+            let map = d.get_temp_mut_or_default::<NodeRectMap>(node_rects_id(salt));
+            map.insert(node.0, [rect.min.x, rect.min.y, rect.width(), rect.height()]);
+        });
+    }
 
     // ── Graph context menu ───────────────────────────────────────────────────
 

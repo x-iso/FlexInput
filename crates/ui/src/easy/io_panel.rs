@@ -6,10 +6,11 @@
 //! (inactive cards preview the defaults disabled) for visual
 //! stability.
 //!
-//! Bottom section ("Choose output devices"): XInput / DS4 cards as a
-//! horizontal pair (mutually exclusive), then a full-width
-//! "Keyboard and Mouse" card with the Mouse speed slider inline.
-//! Active outputs are highlighted; clicks toggle them on/off.
+//! Bottom section ("Choose output devices"): a single gamepad output
+//! card with a model selector (None / Xbox 360 / DualShock 4 /
+//! DualSense) and, when a pad is active, its Rumble-range control;
+//! then a full-width "Keyboard and Mouse" card with the Mouse speed
+//! slider inline. All gamepad models are HIDMaestro-backed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -45,17 +46,35 @@ const INPUT_CARD_ICON_H: f32 = 48.0;
 
 // Output card geometry
 const OUTPUT_CARD_ICON_H:    f32 = 36.0;
-// Compact gamepad-pair card: just icon + short label below.
-const OUTPUT_PAIR_CARD_H:    f32 = 76.0;
+// Single gamepad output card: title row + selector row + Rumble-range row, with
+// an icon in the left accent column. ~2 + 18 + 4 + 24 + 6 + 24 + insets ≈ 92 px.
+// Sized for the active (rumble-visible) case so the layout stays stable whether
+// or not a pad is deployed.
+const OUTPUT_GAMEPAD_CARD_H: f32 = 92.0;
 // Keymouse: title row + Mouse speed (label+value) row + slider row.
 // ~18 + 18 + 14 + small gaps + insets ≈ 76 px.
 const OUTPUT_KBM_CARD_H:     f32 = 78.0;
 
 // Easy-mode gamepad outputs are HIDMaestro-backed (ViGEm removed). Old patches
 // that used the ViGEm kinds are migrated to these on load.
-const KIND_XINPUT:   &str = "virtual.hm.xinput";
-const KIND_DS4:      &str = "virtual.hm.ds4";
-const KIND_KEYMOUSE: &str = "virtual.keymouse";
+const KIND_XINPUT:    &str = "virtual.hm.xinput";
+const KIND_DS4:       &str = "virtual.hm.ds4";
+const KIND_DUALSENSE: &str = "virtual.hm.dualsense";
+const KIND_KEYMOUSE:  &str = "virtual.keymouse";
+
+/// The selectable gamepad output models, in dropdown order: `(kind id, label)`.
+/// One single gamepad output card cycles between these (and "None"); picking a
+/// model deploys it and replaces any other gamepad already active.
+const GAMEPAD_KINDS: &[(&str, &str)] = &[
+    (KIND_XINPUT,    "Xbox 360"),
+    (KIND_DS4,       "DualShock 4"),
+    (KIND_DUALSENSE, "DualSense"),
+];
+
+/// Display label for a gamepad kind id (falls back to a generic name).
+fn gamepad_label(kind_id: &str) -> &'static str {
+    GAMEPAD_KINDS.iter().find(|(k, _)| *k == kind_id).map(|(_, l)| *l).unwrap_or("Gamepad")
+}
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -81,7 +100,7 @@ pub fn show(
     // section height is the sum of the two card heights + spacing +
     // section header.
     let total = ui.available_rect_before_wrap();
-    let output_h = OUTPUT_PAIR_CARD_H + CARD_GAP + OUTPUT_KBM_CARD_H
+    let output_h = OUTPUT_GAMEPAD_CARD_H + CARD_GAP + OUTPUT_KBM_CARD_H
         + 28.0 /* header */ + SECTION_GAP + PANEL_PADDING;
     let top_h = (total.height() - output_h).max(120.0);
     let top_rect = egui::Rect::from_min_size(
@@ -781,48 +800,23 @@ fn show_output_section(
     });
     ui.add_space(CARD_GAP);
 
-    let xinput_on   = has_sink_of_kind(canvas, KIND_XINPUT);
-    let ds4_on      = has_sink_of_kind(canvas, KIND_DS4);
     let keymouse_on = has_sink_of_kind(canvas, KIND_KEYMOUSE);
 
-    // Gamepad pair row: XInput | DS4 (mutually exclusive).
+    // Single gamepad output card: a model selector (Xbox 360 / DS4 / DualSense /
+    // None) plus the Rumble-range control for whichever pad is active.
     let panel_w = ui.available_width();
     let inner_w = (panel_w - 2.0 * PANEL_PADDING).max(120.0);
-    let pair_card_w = (inner_w - CARD_GAP) / 2.0;
-    // HIDMaestro backs both the Xbox 360 and DS4 outputs; when its driver (and
-    // bundled helper) is absent the cards stay visible but disabled.
+    // HIDMaestro backs every gamepad output; when its driver (and bundled
+    // helper) is absent the card stays visible but disabled.
     let gamepad_ok = flexinput_virtual::driver_availability::hidmaestro_available();
     ui.horizontal(|ui| {
         ui.add_space(PANEL_PADDING);
-        let (xi_click, xi_rect) = gamepad_card(ui, "xinput",
-            remapper_icons::virtual_device_card_svg(KIND_XINPUT),
-            xinput_on, !gamepad_ok, pair_card_w);
-        if xi_click {
-            if xinput_on {
-                remove_sinks_of_kind(canvas, KIND_XINPUT);
-            } else {
-                remove_sinks_of_kind(canvas, KIND_DS4);
-                ensure_sink_of_kind(canvas, KIND_XINPUT, shared_pool, default_collapsed, defaults);
-            }
-            super::wiring::rewire(canvas);
-        }
-        nav_targets.push(LeftNavTarget { rect: xi_rect,
-            action: LeftNavAction::ToggleOutput { kind: KIND_XINPUT.into() } });
-        ui.add_space(CARD_GAP);
-        let (ds_click, ds_rect) = gamepad_card(ui, "DS4",
-            remapper_icons::virtual_device_card_svg(KIND_DS4),
-            ds4_on, !gamepad_ok, pair_card_w);
-        if ds_click {
-            if ds4_on {
-                remove_sinks_of_kind(canvas, KIND_DS4);
-            } else {
-                remove_sinks_of_kind(canvas, KIND_XINPUT);
-                ensure_sink_of_kind(canvas, KIND_DS4, shared_pool, default_collapsed, defaults);
-            }
-            super::wiring::rewire(canvas);
-        }
-        nav_targets.push(LeftNavTarget { rect: ds_rect,
-            action: LeftNavAction::ToggleOutput { kind: KIND_DS4.into() } });
+        let sel_rect = gamepad_selector_card(
+            ui, canvas, shared_pool, default_collapsed, defaults, !gamepad_ok, inner_w);
+        // Nav target cycles the selector to the NEXT model (wrapping through
+        // None) — a single actionable rect for the RS/gyro cursor.
+        nav_targets.push(LeftNavTarget { rect: sel_rect,
+            action: LeftNavAction::CycleGamepadOutput });
         ui.add_space(PANEL_PADDING);
     });
 
@@ -859,51 +853,136 @@ fn show_output_section(
     });
 }
 
-fn gamepad_card(
+/// The single gamepad output card: an icon, a model selector (None / Xbox 360 /
+/// DualShock 4 / DualSense), and — when a pad is active — the Rumble-range
+/// control for that pad. Picking a model deploys it and removes any other
+/// gamepad sink (Easy mode drives one pad). Returns the card rect (for the nav
+/// target). All gamepad models are HIDMaestro-backed; when the driver is absent
+/// the selector is disabled and a corner warning badge explains why.
+fn gamepad_selector_card(
     ui: &mut egui::Ui,
-    label: &str,
-    icon: &'static [u8],
-    is_active: bool,
+    canvas: &mut Canvas,
+    shared_pool: &SharedDevicePool,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
     driver_missing: bool,
     width: f32,
-) -> (bool, egui::Rect) {
-    // When the backing driver (HIDMaestro) is unavailable the card can't be
-    // toggled on. The card body senses hover only; a small corner warning
-    // badge (painted + hit-tested separately below) carries the hint, so it
-    // never participates in the card's centered icon/label layout (which would
-    // squeeze the text into a single-glyph-wide column and wrap it vertically).
-    let sense = if driver_missing { egui::Sense::hover() } else { egui::Sense::click() };
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(width, OUTPUT_PAIR_CARD_H),
-        sense,
+) -> egui::Rect {
+    let active = active_gamepad_kind(canvas);
+    let icon_col_w = OUTPUT_CARD_ICON_H + 16.0;
+    let card_h = OUTPUT_GAMEPAD_CARD_H;
+
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, card_h), egui::Sense::hover());
+
+    // ── bg + (if a pad is active) LEFT-half accent fill ──
+    let is_active = active.is_some();
+    let stroke_col = if is_active { ui.visuals().selection.stroke.color } else { CARD_STROKE_INACTIVE };
+    let stroke_w = if is_active { 1.5 } else { 1.0 };
+    ui.painter().rect(rect, CARD_ROUND, CARD_FILL_INACTIVE,
+        egui::Stroke::new(stroke_w, stroke_col), egui::StrokeKind::Inside);
+    if is_active {
+        let left_rect = egui::Rect::from_min_size(rect.min, egui::vec2(icon_col_w, rect.height()));
+        let mut cr = egui::CornerRadius::ZERO;
+        cr.nw = CARD_ROUND as u8;
+        cr.sw = CARD_ROUND as u8;
+        ui.painter().with_clip_rect(rect).rect_filled(left_rect, cr, active_accent_fill(ui));
+    }
+
+    // Left column: icon for the active model (or the Xbox icon as a neutral
+    // placeholder when nothing is deployed), vertically centered.
+    let icon_kind = active.unwrap_or(KIND_XINPUT);
+    let left_rect = egui::Rect::from_min_size(rect.min, egui::vec2(icon_col_w, rect.height()));
+    let mut left_ui = ui.new_child(egui::UiBuilder::new()
+        .max_rect(left_rect.shrink(6.0))
+        .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)));
+    if driver_missing { left_ui.disable(); }
+    render_device_icon(&mut left_ui, remapper_icons::virtual_device_card_svg(icon_kind), OUTPUT_CARD_ICON_H);
+
+    // Right column: title + selector row, then (if active) the rumble row.
+    let right_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + icon_col_w, rect.top()),
+        egui::vec2(rect.width() - icon_col_w, rect.height()),
     );
-    let hovered = resp.hovered() && !driver_missing;
-    let (bg, stroke, stroke_w) = card_colors(ui, is_active, hovered);
-    ui.painter().rect(rect, CARD_ROUND, bg,
-        egui::Stroke::new(stroke_w, stroke), egui::StrokeKind::Inside);
-    ui.scope_builder(egui::UiBuilder::new()
-        .max_rect(rect.shrink(8.0)), |ui|
-    {
-        // Dim the icon/label when the driver is missing.
-        if driver_missing {
-            ui.disable();
+    let mut right_ui = ui.new_child(egui::UiBuilder::new()
+        .max_rect(right_rect.shrink2(egui::vec2(8.0, 6.0)))
+        .layout(egui::Layout::top_down(egui::Align::Min)));
+    right_ui.scope(|ui| {
+        if driver_missing { ui.disable(); }
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Gamepad output").size(13.0).strong());
+        ui.add_space(4.0);
+
+        // Model selector. The current selection is the active kind, or "None".
+        let cur_label = active.map(gamepad_label).unwrap_or("None");
+        let mut pick: Option<Option<&'static str>> = None; // outer Some = changed; inner = kind/None
+        egui::ComboBox::from_id_salt("easy_gamepad_output_select")
+            .selected_text(cur_label)
+            .width((ui.available_width() - 4.0).clamp(120.0, 240.0))
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(active.is_none(), "None").clicked() {
+                    pick = Some(None);
+                }
+                for (kind, label) in GAMEPAD_KINDS {
+                    if ui.selectable_label(active == Some(*kind), *label).clicked() {
+                        pick = Some(Some(*kind));
+                    }
+                }
+            });
+        if let Some(choice) = pick {
+            // Deploying any model replaces whatever gamepad is active; "None"
+            // tears all of them down.
+            remove_all_gamepad_sinks(canvas);
+            if let Some(kind) = choice {
+                ensure_sink_of_kind(canvas, kind, shared_pool, default_collapsed, defaults);
+            }
+            super::wiring::rewire(canvas);
         }
-        ui.vertical_centered(|ui| {
-            render_device_icon(ui, icon, OUTPUT_CARD_ICON_H);
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(label).size(13.0).strong());
-        });
+
+        // Rumble range — only when a pad is active (it acts on that sink node).
+        if let Some(kind) = active_gamepad_kind(canvas) {
+            if let Some(node) = sink_node_of_kind(canvas, kind) {
+                ui.add_space(6.0);
+                if let Some(params) = canvas.snarl.get_node_mut(node).map(|n| &mut n.params) {
+                    header_controls::render_rumble_feedback_controls(ui, params);
+                }
+            }
+        }
     });
 
-    let card_clicked = resp.clicked() && !driver_missing;
     if driver_missing {
-        // Corner warning badge: a small hover-only rect in the card's top-right,
-        // painted above the (disabled) body. HIDMaestro has no external download
-        // (it's installed by the bundled helper on first deploy), so the badge
-        // only explains why the card is disabled — it doesn't link anywhere.
+        // Corner warning badge (painted above the disabled body) explaining the
+        // selector is unavailable. HIDMaestro has no external download — it's
+        // installed by the bundled helper on first deploy — so it doesn't link.
         let _ = warning_badge(ui, rect);
     }
-    (card_clicked, rect)
+    rect
+}
+
+/// The HIDMaestro gamepad kind currently deployed as a sink (Easy mode keeps at
+/// most one), or `None`. Checked in `GAMEPAD_KINDS` order.
+fn active_gamepad_kind(canvas: &Canvas) -> Option<&'static str> {
+    GAMEPAD_KINDS.iter().map(|(k, _)| *k).find(|k| has_sink_of_kind(canvas, k))
+}
+
+/// Remove every HIDMaestro gamepad sink (all models). Used when switching the
+/// selector or tearing the gamepad output down.
+pub fn remove_all_gamepad_sinks(canvas: &mut Canvas) {
+    for (kind, _) in GAMEPAD_KINDS {
+        remove_sinks_of_kind(canvas, kind);
+    }
+}
+
+/// Next model for the gamepad-nav cycle: Xbox 360 → DS4 → DualSense → None → …
+/// `None` means "deploy nothing" (the off state). Wraps from the last model
+/// through None back to the first.
+pub fn next_gamepad_kind(canvas: &Canvas) -> Option<&'static str> {
+    match active_gamepad_kind(canvas) {
+        None => Some(GAMEPAD_KINDS[0].0),
+        Some(cur) => {
+            let idx = GAMEPAD_KINDS.iter().position(|(k, _)| *k == cur).unwrap_or(0);
+            GAMEPAD_KINDS.get(idx + 1).map(|(k, _)| *k) // past the last → None (off)
+        }
+    }
 }
 
 /// Paint a small amber ⚠ badge in the top-right corner of `card_rect` and

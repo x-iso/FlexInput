@@ -372,6 +372,10 @@ fn show_preset_picker(
                 if let Some(n) = canvas.snarl.get_node_mut(oid) {
                     n.extra.layout_unlocked = !layout_unlocked;
                 }
+                // (The Easy I/O nodes reflow to the sub-patch's new size on the
+                // next frame via the per-frame reposition in app.rs, which reads
+                // the freshly-measured rects — including after a Layout-editor
+                // resize, so no explicit call is needed here.)
             }
         }
         if ui.add_sized([28.0, 28.0],

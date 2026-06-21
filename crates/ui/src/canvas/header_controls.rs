@@ -142,25 +142,41 @@ pub fn render_rumble_feedback_controls(
     ui.horizontal(|ui| {
         // Size the label cell to the actual text width so the slider sits right
         // after it (matches the tight label→control gap of the Mouse × row).
+        // Short label ("Rumble") so the slider + curve box fit even on the
+        // narrow Easy-mode output card; the hover text carries the full meaning.
         let cell_w = ui.painter()
             .layout_no_wrap(
-                "Rumble range".to_owned(),
+                "Rumble".to_owned(),
                 egui::TextStyle::Small.resolve(ui.style()),
                 egui::Color32::WHITE,
             )
             .size().x + 2.0;
-        slider_label(ui, "Rumble range", cell_w);
-        range_slider(ui, &mut floor, &mut max, RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX)
-            .on_hover_text(
-                "Rumble a game/app sends to this virtual pad, when forwarded to a \
-                 physical pad via Auto-Map. Left handle = floor (lifts faint rumble \
-                 so it's felt); right handle = ceiling on output. Double-click to \
-                 reset. Your own direct rumble wiring is sent at full scale.",
-            );
-        // Compact Curve box on the side: a mini graph whose line bends with the
-        // response exponent. Drag to adjust; Ctrl+click to type a number;
-        // double-click to reset. No label needed — the shape speaks for itself.
-        curve_box(ui, &mut exp, RUMBLE_DEF_EXP);
+        slider_label(ui, "Rumble", cell_w);
+        // Lay the rest out RIGHT-TO-LEFT so the curve box is allocated against
+        // the row's right edge FIRST and can never overflow the card, then the
+        // slider fills exactly the gap between the label and the curve box (so
+        // they sit tight together, not with a wide gap). Compact-cap the slider
+        // so it doesn't balloon on the wide canvas-node header.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Small right inset so the curve box sits a few px inside the row's
+            // right edge instead of butting against it (right-to-left, so this
+            // space is consumed at the far right first).
+            ui.add_space(5.0);
+            // Compact Curve box: a mini graph whose line bends with the response
+            // exponent. Drag to adjust; Ctrl+click to type; double-click resets.
+            curve_box(ui, &mut exp, RUMBLE_DEF_EXP);
+            ui.add_space(4.0);
+            // `available_width()` here is the space left between the label and the
+            // curve box; fill it (capped so the canvas-node slider stays compact).
+            let slider_w = ui.available_width().clamp(40.0, 150.0);
+            range_slider(ui, &mut floor, &mut max, RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX, slider_w)
+                .on_hover_text(
+                    "Rumble a game/app sends to this virtual pad, when forwarded to a \
+                     physical pad via Auto-Map. Left handle = floor (lifts faint rumble \
+                     so it's felt); right handle = ceiling on output. Double-click to \
+                     reset. Your own direct rumble wiring is sent at full scale.",
+                );
+        });
     });
 
     if max < floor { max = floor; }
@@ -189,6 +205,7 @@ fn range_slider(
     hi: &mut f32,
     def_lo: f32,
     def_hi: f32,
+    width: f32,
 ) -> egui::Response {
     // Match egui's slider metrics so this reads as a native slider. egui's
     // round handle has radius ≈ interact_size.y / 2.5; size our rectangular
@@ -203,8 +220,9 @@ fn range_slider(
     let handle_w = 7.0_f32;
     let rounding = 2.0_f32;
 
-    // Shorter than a full-width slider so it doesn't dominate the header.
-    let desired = egui::vec2(ui.available_width().clamp(70.0, 110.0), row_h);
+    // Caller-supplied width (it reserves room for the curve box + gap first, so
+    // the slider fills exactly the space between the label and the curve box).
+    let desired = egui::vec2(width.max(40.0), row_h);
     let (rect, mut resp) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
     let visuals = ui.style().visuals.clone();
 

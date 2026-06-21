@@ -76,6 +76,9 @@ pub enum LeftNavAction {
     SelectInput { device_id: String },
     /// Toggle a virtual output sink on/off by kind prefix.
     ToggleOutput { kind: String },
+    /// Cycle the single gamepad output card to the next model (Xbox 360 → DS4 →
+    /// DualSense → None → …). One nav target for the whole selector card.
+    CycleGamepadOutput,
     /// Adjust a numeric param on a node (slider/drag-value): deadzone,
     /// gyro_multiplier, or mouse_speed. `(lo, hi, step)` bound the edit.
     AdjustParam {
