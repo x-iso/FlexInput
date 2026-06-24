@@ -567,6 +567,9 @@ pub struct FlexInputApp {
     /// the I/O thread's shared_devices each enum cycle so the UI sees a
     /// unified gilrs + MIDI list without ever touching the MIDI lock.
     shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
+    /// Set true to ask the MIDI watch thread to re-enumerate ports (manual refresh;
+    /// we no longer poll periodically, to avoid disturbing the audio stack).
+    midi_refresh_requested: Arc<AtomicBool>,
     // ── Panic mode ────────────────────────────────────────────────────────────
     /// User-configurable global shortcut to toggle all virtual output off.
     panic_shortcut: PanicShortcut,
@@ -878,6 +881,9 @@ impl FlexInputApp {
         let shared_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
         let shared_midi_devices = Arc::new(RwLock::new(Vec::<PhysicalDevice>::new()));
         let pinned_midi_ids = Arc::new(RwLock::new(HashSet::<String>::new()));
+        // Set by the "Refresh MIDI" button to ask the watch thread to re-enumerate
+        // (we no longer poll, to avoid periodic wdmaud/audio disruption).
+        let midi_refresh_requested = Arc::new(AtomicBool::new(false));
         let io_bypass      = Arc::new(AtomicBool::new(false));
         let ui_nav_suppress = Arc::new(AtomicBool::new(false));
 
@@ -945,6 +951,7 @@ impl FlexInputApp {
             Arc::clone(&midi_backend),
             Arc::clone(&pinned_midi_ids),
             Arc::clone(&shared_midi_devices),
+            Arc::clone(&midi_refresh_requested),
         );
 
         // ── Panic-mode state ──────────────────────────────────────────────
@@ -1055,6 +1062,7 @@ impl FlexInputApp {
             ui_nav_suppress,
             pinned_midi_ids,
             shared_midi_devices,
+            midi_refresh_requested,
             panic_shortcut: panic_shortcut.clone(),
             panic_active: false,
             panic_learning: false,
@@ -7675,6 +7683,21 @@ impl FlexInputApp {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
+                    ui.label("MIDI devices");
+                    if ui.button("Refresh MIDI").clicked() {
+                        self.midi_refresh_requested.store(true, Ordering::Release);
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "MIDI ports are scanned once at startup and on demand. \
+                     Auto-scanning is disabled because the Windows MIDI API periodically \
+                     disrupts the audio stack (stream skips, Bluetooth noise). \
+                     Click after plugging in or creating a MIDI/loopMIDI port."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
                     ui.label("Processing sample rate");
                     let resp = ui.add(egui::Slider::new(
                         &mut self.settings.sample_rate_hz,
@@ -8815,15 +8838,26 @@ fn spawn_midi_watch_thread(
     midi: Arc<Mutex<Option<MidiBackend>>>,
     pinned_midi_ids: Arc<RwLock<HashSet<String>>>,
     shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
+    refresh_requested: Arc<AtomicBool>,
 ) {
     use std::time::Duration;
     std::thread::Builder::new()
         .name("midi-watch".into())
         .spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(2));
-
-                // 1+2: release non-canvas-pinned handles so the OS can free them.
+            // MANUAL REFRESH (no periodic poll). MIDI port enumeration goes through
+            // Windows' legacy `wdmaud.drv` (WinMM), which is part of the audio stack.
+            // Calling it on a timer (we used to, every 2s) periodically disturbs the
+            // WHOLE audio engine: listeners on a Discord/desktop stream hear a skip,
+            // and Bluetooth headsets audibly pulse their noise floor, every couple of
+            // seconds — even with no game and no virtual device. It can also hang
+            // (>1.5s) or fault inside wdmaud when a composite USB-audio device (our
+            // virtual DualSense) is present. So we DON'T poll: enumerate once at
+            // startup, then only when the user explicitly asks (a "Refresh MIDI"
+            // button sets `refresh_requested`). The thread otherwise just sleeps,
+            // never touching wdmaud, so it can't disturb audio.
+            let do_enumerate = |label: &str| {
+                // Release non-canvas-pinned handles so the OS can free them, then the
+                // slow enum without the lock, then apply the diff + publish.
                 {
                     let pinned = pinned_midi_ids.read().unwrap().clone();
                     if let Ok(mut mg) = midi.lock() {
@@ -8832,17 +8866,30 @@ fn spawn_midi_watch_thread(
                         }
                     }
                 }
-
-                // 3: slow enum without the lock.
+                let t0 = std::time::Instant::now();
                 let (live_in, live_out) = MidiBackend::list_live_ports();
-
-                // 4: apply diff + publish device list for the UI.
+                let took = t0.elapsed();
+                if took > Duration::from_millis(200) {
+                    eprintln!("[midi] {label} enumerate took {took:?} (wdmaud)");
+                }
                 if let Ok(mut mg) = midi.lock() {
                     if let Some(m) = mg.as_mut() {
                         m.apply_port_diff(&live_in, &live_out);
                         let devs = m.enumerate();
                         *shared_midi_devices.write().unwrap() = devs;
                     }
+                }
+            };
+
+            // One enumeration at startup so existing MIDI ports show up.
+            do_enumerate("startup");
+
+            // Then wait for explicit refresh requests. Cheap idle wakeups (250ms) just
+            // to poll the flag — these do NOT touch wdmaud/audio.
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                if refresh_requested.swap(false, Ordering::AcqRel) {
+                    do_enumerate("manual-refresh");
                 }
             }
         })
