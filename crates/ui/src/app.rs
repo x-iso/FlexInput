@@ -9477,6 +9477,45 @@ fn apply_display_state(
     }
 }
 
+/// Copy live display state (`NodeData.extra`) from `src` snarl into `dst` snarl,
+/// matching nodes by `NodeId`, recursing through sub-patches.
+///
+/// `extra` is `#[serde(skip)]` runtime-only data — scope history, last-signal
+/// readouts, meter values — refreshed each frame by `apply_display_state` on the
+/// tab canvas (and its nested `node.subpatch.snarl` copies). The sub-patch editor
+/// renders a SEPARATE clone of that inner snarl, so its nodes' `extra` would
+/// otherwise be frozen at the moment the editor opened. This pushes the fresh
+/// `extra` across the boundary every frame WITHOUT touching positions, params,
+/// wires, or the node set (all owned by the editor), so live visuals animate in
+/// the editor without reverting in-progress edits. NodeIds line up because the
+/// editor was seeded from a clone of `sp.snarl` and writes its full snarl back,
+/// keeping the slab slots aligned.
+fn sync_display_state_into(dst: &mut Snarl<NodeData>, src: &Snarl<NodeData>) {
+    let ids: Vec<NodeId> = dst.nodes_ids_data().map(|(id, _)| id).collect();
+    for id in ids {
+        if let Some(src_node) = src.get_node(id) {
+            let src_extra = src_node.extra.clone();
+            if let Some(dst_node) = dst.get_node_mut(id) {
+                dst_node.extra = src_extra;
+            }
+        }
+        // Recurse into matching sub-patch nodes so nested editors (and pinned
+        // bodies showing nested scopes) also receive fresh display state.
+        let is_sub = dst.get_node(id).map(|n| n.module_id == "subpatch").unwrap_or(false);
+        if is_sub {
+            // Take the source child snarl out by reborrow to avoid aliasing dst.
+            let src_child = src.get_node(id).and_then(|n| n.subpatch.as_ref()).map(|sp| &sp.snarl);
+            if let Some(src_child) = src_child {
+                if let Some(dst_node) = dst.get_node_mut(id) {
+                    if let Some(dst_sp) = dst_node.subpatch.as_mut() {
+                        sync_display_state_into(&mut dst_sp.snarl, src_child);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Walk an AutoMap wire chain from `src` back to the originating device.source.
 /// Returns (source_dev_id, source_pin_ids, fallback_dev_id).
 /// - For device.source: (real_dev_id, output_pins, None).
@@ -12008,6 +12047,27 @@ fn show_subpatch_editors(
             }.and_then(|n| n.subpatch.as_ref()).map(|sp| *sp.snarl.clone());
             if let Some(snarl) = outer_inner { inner_canvas.snarl = snarl; }
             app.sub_patch_editors[i].last_synced_parent_gen = Some(parent_gen);
+        }
+
+        // Live display state (`extra`) is refreshed on the parent's `sp.snarl`
+        // every frame by `apply_display_state`, but the editor renders a separate
+        // snarl, so its scopes/readouts would freeze at open-time. Push just the
+        // `extra` across each frame — independent of the structural-presync gate
+        // above, which only fires when the parent's editable state changed. (When
+        // a child editor is open the parent's display state may be one frame
+        // stale; that self-corrects next frame and is imperceptible.)
+        {
+            puffin::profile_scope!("editor_display_sync");
+            // Borrow the parent's inner snarl directly (no clone): `inner_canvas`
+            // was `mem::replace`d out of `app.sub_patch_editors[i].canvas`, so it
+            // doesn't alias the tab canvas nor any OTHER editor (parent index p≠i).
+            let src_snarl: Option<&Snarl<NodeData>> = match parent_editor_idx {
+                None    => app.tabs[active].canvas.snarl.get_node(node_id),
+                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
+            }.and_then(|n| n.subpatch.as_ref()).map(|sp| &*sp.snarl);
+            if let Some(src_snarl) = src_snarl {
+                sync_display_state_into(&mut inner_canvas.snarl, src_snarl);
+            }
         }
 
         // Pinned IDs from parent.
