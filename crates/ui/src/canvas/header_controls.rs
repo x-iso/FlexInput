@@ -199,7 +199,7 @@ pub fn render_rumble_feedback_controls(
 /// its right edge, their inner (facing) edges square. The handles cannot
 /// cross. Double-clicking the track resets both to `(def_lo, def_hi)`. Returns
 /// the combined `Response` for hover-text / change detection.
-fn range_slider(
+pub(crate) fn range_slider(
     ui: &mut egui::Ui,
     lo: &mut f32,
     hi: &mut f32,
@@ -330,7 +330,7 @@ fn range_slider(
 ///   - **Ctrl+click**: switch to an inline numeric edit (a `DragValue`) for
 ///     precise entry; it reverts to the graph when it loses focus.
 ///   - **Double-click**: reset to `def`.
-fn curve_box(ui: &mut egui::Ui, exp: &mut f32, def: f32) {
+pub(crate) fn curve_box(ui: &mut egui::Ui, exp: &mut f32, def: f32) {
     const LO: f32 = 0.2;
     const HI: f32 = 3.0;
     *exp = exp.clamp(LO, HI);

@@ -12,6 +12,10 @@ midir          = "0.10"
 # See engine/Cargo.toml — instrumentation is unconditional; emission is
 # gated by the runtime puffin::set_scopes_on() flag.
 puffin         = { workspace = true }
+# FFT for the Audio Stream Haptics spectrum view + multi-band engine. Pure Rust,
+# no system deps and no `windows` crate, so it can't reintroduce the COM-major
+# conflict the wasapi pin guards against.
+rustfft        = "6"
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI access for DualSense HD haptics (channels 3/4 of the controller's
@@ -27,3 +31,13 @@ puffin         = { workspace = true }
 # install COM apartment hooks, and the result is that accesskit's
 # `SetPropW` calls in subclass.rs panic on startup with ERROR_NOT_ENOUGH_MEMORY.
 wasapi = "=0.18"
+# Process enumeration for the Audio Stream Haptics module: list running
+# processes (Toolhelp32 snapshot), resolve a chosen exe name → live PID, and
+# read the foreground window's PID. Bindings-only (no COM runtime), windows-sys
+# 0.61 to match engine/ui — does NOT conflict with wasapi's `windows` major.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_WindowsAndMessaging",
+] }

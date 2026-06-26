@@ -20,6 +20,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<RemapperModule>(),
         reg::<MapActionModule>(),
         reg::<FeedbackControlModule>(),
+        reg::<AudioStreamHapticsModule>(),
     ]
 }
 
@@ -230,6 +231,40 @@ impl Module for AutoMapCollectModule {
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
         // Signals injected into collector_sigs by eval_graph_tick in eval.rs.
+        SmallVec::new()
+    }
+}
+
+// ── Audio Stream Haptics ───────────────────────────────────────────────────────
+
+/// Derives rumble from an application's (or the system's) audio and injects it
+/// into the AutoMap bus passing through it, so a gamepad wired in→out feels the
+/// game's audio as haptics — no driver required (WASAPI loopback).
+///
+/// A gamepad routes THROUGH this node (AutoMap in → AutoMap out). The proc thread
+/// runs a WASAPI loopback capture for the configured target (a picked process,
+/// the focused app, or the system mix) and the eval block blends the resulting
+/// per-side (amp, freq) with any standard rumble already on the bus per the
+/// `asth_modulator` slider, then injects HD-rumble feedback into the outgoing bus.
+/// All real work is in eval.rs (`module.audio_stream_haptics`); params:
+///   `asth_mode` (process|focused|system), `asth_target_name`, `asth_include_tree`,
+///   `asth_modulator` (0=gate by std rumble, 0.5=boost, 1=replace).
+#[derive(Default)]
+pub struct AudioStreamHapticsModule;
+
+impl Module for AudioStreamHapticsModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.audio_stream_haptics",
+            display_name: "Audio Stream Haptics",
+            category: "AutoMap",
+            inputs: vec![PinDescriptor::new("Device", SignalType::AutoMap)],
+            outputs: vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        // Haptics injected into the AutoMap bus by eval_graph_tick in eval.rs;
+        // the capture itself is owned by the processing thread's LoopbackManager.
         SmallVec::new()
     }
 }

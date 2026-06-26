@@ -39,8 +39,11 @@ const DRIVE_CEILING: f32 = 0.7;
 /// Shared atomic state between the I/O thread (writer) and the audio render
 /// thread (reader). Packed into 32 bits so updates are lock-free.
 struct Shared {
-    /// Bytes: [l_amp, l_freq, r_amp, r_freq], each 0–255.
+    /// Carrier 1 (LF) bytes: [l_amp, l_freq, r_amp, r_freq], each 0–255.
     targets: AtomicU32,
+    /// Carrier 2 (HF) bytes: [l_amp, l_freq, r_amp, r_freq], each 0–255. The two
+    /// carriers are summed per LRA so the actuator plays both bands at once.
+    targets2: AtomicU32,
     /// Cleared from `Drop` to ask the render thread to exit.
     running: AtomicBool,
 }
@@ -57,6 +60,7 @@ impl HapticStream {
     pub fn open() -> Option<Self> {
         let shared = Arc::new(Shared {
             targets: AtomicU32::new(0),
+            targets2: AtomicU32::new(0),
             running: AtomicBool::new(true),
         });
         let shared_for_thread = shared.clone();
@@ -75,15 +79,28 @@ impl HapticStream {
         Some(Self { shared, thread: Some(thread) })
     }
 
-    /// Update per-side amplitude (0–1) and frequency (0–1, mapped to 80–500 Hz).
-    /// Lock-free and safe to call from any thread.
+    /// Update per-side amplitude (0–1) and frequency (0–1, mapped to 80–500 Hz)
+    /// for carrier 1 only (carrier 2 left silent). Lock-free.
     pub fn set_targets(&self, l_amp: f32, l_freq: f32, r_amp: f32, r_freq: f32) {
-        let pack = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
-        let packed = pack(l_amp)
-            | (pack(l_freq) << 8)
-            | (pack(r_amp)  << 16)
-            | (pack(r_freq) << 24);
-        self.shared.targets.store(packed, Ordering::Release);
+        self.set_targets_dual(l_amp, l_freq, 0.0, 0.0, r_amp, r_freq, 0.0, 0.0);
+    }
+
+    /// Update BOTH carriers per side: carrier 1 (LF) and carrier 2 (HF), each an
+    /// (amp, freq) pair in 0–1. The render thread sums the two sines per LRA so the
+    /// actuator plays both bands simultaneously (matching the Switch Pro's HF+LF
+    /// capability). Lock-free; safe from any thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_targets_dual(
+        &self,
+        l_lf_amp: f32, l_lf_freq: f32, l_hf_amp: f32, l_hf_freq: f32,
+        r_lf_amp: f32, r_lf_freq: f32, r_hf_amp: f32, r_hf_freq: f32,
+    ) {
+        let pack = |a: f32, af: f32, b: f32, bf: f32| -> u32 {
+            let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+            q(a) | (q(af) << 8) | (q(b) << 16) | (q(bf) << 24)
+        };
+        self.shared.targets.store(pack(l_lf_amp, l_lf_freq, r_lf_amp, r_lf_freq), Ordering::Release);
+        self.shared.targets2.store(pack(l_hf_amp, l_hf_freq, r_hf_amp, r_hf_freq), Ordering::Release);
     }
 }
 
@@ -114,9 +131,11 @@ fn render_loop(shared: Arc<Shared>) -> Result<(), String> {
 
     client.start_stream().map_err(|e| format!("start: {e}"))?;
 
-    // Continuous-phase sine oscillators per side.
-    let mut phase_l: f32 = 0.0;
-    let mut phase_r: f32 = 0.0;
+    // Continuous-phase sine oscillators per side, per carrier (LF + HF).
+    let mut phase_l: f32 = 0.0;   // carrier 1 (LF) left
+    let mut phase_r: f32 = 0.0;   // carrier 1 (LF) right
+    let mut phase_l2: f32 = 0.0;  // carrier 2 (HF) left
+    let mut phase_r2: f32 = 0.0;  // carrier 2 (HF) right
     let two_pi = std::f32::consts::TAU;
 
     let mut scratch: Vec<u8> = Vec::new();
@@ -137,27 +156,36 @@ fn render_loop(shared: Arc<Shared>) -> Result<(), String> {
         let needed = frames * bytes_per_frame;
         if scratch.len() != needed { scratch.resize(needed, 0); }
 
-        // Latest amp/freq snapshot for this period.
-        let packed = shared.targets.load(Ordering::Acquire);
-        let l_amp  = (packed         & 0xFF) as f32 / 255.0;
-        let l_freq = ((packed >>  8) & 0xFF) as f32 / 255.0;
-        let r_amp  = ((packed >> 16) & 0xFF) as f32 / 255.0;
-        let r_freq = ((packed >> 24) & 0xFF) as f32 / 255.0;
+        // Latest amp/freq snapshot for this period — both carriers.
+        let unpack = |packed: u32| {
+            (
+                (packed         & 0xFF) as f32 / 255.0, // l_amp
+                ((packed >>  8) & 0xFF) as f32 / 255.0, // l_freq
+                ((packed >> 16) & 0xFF) as f32 / 255.0, // r_amp
+                ((packed >> 24) & 0xFF) as f32 / 255.0, // r_freq
+            )
+        };
+        let (l1_amp, l1_freq, r1_amp, r1_freq) = unpack(shared.targets.load(Ordering::Acquire));
+        let (l2_amp, l2_freq, r2_amp, r2_freq) = unpack(shared.targets2.load(Ordering::Acquire));
 
-        let l_hz = FREQ_MIN_HZ + l_freq * (FREQ_MAX_HZ - FREQ_MIN_HZ);
-        let r_hz = FREQ_MIN_HZ + r_freq * (FREQ_MAX_HZ - FREQ_MIN_HZ);
-        let l_step = two_pi * l_hz / sample_rate;
-        let r_step = two_pi * r_hz / sample_rate;
-        let l_drive = l_amp * DRIVE_CEILING;
-        let r_drive = r_amp * DRIVE_CEILING;
+        let hz = |f: f32| FREQ_MIN_HZ + f * (FREQ_MAX_HZ - FREQ_MIN_HZ);
+        let step = |f: f32| two_pi * hz(f) / sample_rate;
+        let l1_step = step(l1_freq); let r1_step = step(r1_freq);
+        let l2_step = step(l2_freq); let r2_step = step(r2_freq);
+        // Each carrier is driven independently; we sum then keep the LRA within the
+        // drive ceiling (so two loud carriers don't clip past the safe amplitude).
+        let l1_d = l1_amp * DRIVE_CEILING; let r1_d = r1_amp * DRIVE_CEILING;
+        let l2_d = l2_amp * DRIVE_CEILING; let r2_d = r2_amp * DRIVE_CEILING;
 
         for f in 0..frames {
-            let sl  = l_drive * phase_l.sin();
-            let sr  = r_drive * phase_r.sin();
-            phase_l += l_step;
-            phase_r += r_step;
-            if phase_l > two_pi { phase_l -= two_pi; }
-            if phase_r > two_pi { phase_r -= two_pi; }
+            let sl = (l1_d * phase_l.sin() + l2_d * phase_l2.sin()).clamp(-1.0, 1.0);
+            let sr = (r1_d * phase_r.sin() + r2_d * phase_r2.sin()).clamp(-1.0, 1.0);
+            phase_l  += l1_step; phase_r  += r1_step;
+            phase_l2 += l2_step; phase_r2 += r2_step;
+            if phase_l  > two_pi { phase_l  -= two_pi; }
+            if phase_r  > two_pi { phase_r  -= two_pi; }
+            if phase_l2 > two_pi { phase_l2 -= two_pi; }
+            if phase_r2 > two_pi { phase_r2 -= two_pi; }
 
             let off = f * bytes_per_frame;
             write_frame(&mut scratch[off..off + bytes_per_frame], channels, &sample_type, sl, sr);

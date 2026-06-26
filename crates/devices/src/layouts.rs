@@ -201,6 +201,19 @@ fn dualsense_inputs() -> Vec<DevicePin> {
         fl("ds_l_freq", "DS Haptic L: Frequency (USB only, 0=80Hz 1=500Hz)"),
         fl("ds_r_amp",  "DS Haptic R: Amplitude (USB only, 0–1)"),
         fl("ds_r_freq", "DS Haptic R: Frequency (USB only, 0=80Hz 1=500Hz)"),
+        // Device-agnostic HD-rumble carriers (same pins as Switch Pro). A USB
+        // DualSense synthesizes these as PCM sines on its LRAs — carrier 1 (hd_*)
+        // = low band, carrier 2 (hd2_*) = high band, summed per actuator. This is
+        // what the Audio Stream Haptics module drives, so one patch works on both
+        // Switch Pro and DualSense. (ds_* above are kept as carrier-1 aliases.)
+        fl("hd_l_amp",   "HD Haptic L: Amplitude (USB only, 0–1)"),
+        fl("hd_l_freq",  "HD Haptic L: Frequency (USB only)"),
+        fl("hd_r_amp",   "HD Haptic R: Amplitude (USB only, 0–1)"),
+        fl("hd_r_freq",  "HD Haptic R: Frequency (USB only)"),
+        fl("hd2_l_amp",  "HD Haptic L: Amp (HF carrier, USB only)"),
+        fl("hd2_l_freq", "HD Haptic L: Freq (HF carrier, USB only)"),
+        fl("hd2_r_amp",  "HD Haptic R: Amp (HF carrier, USB only)"),
+        fl("hd2_r_freq", "HD Haptic R: Freq (HF carrier, USB only)"),
         // LEDs. All accept Float 0–1.
         // player_led: 0=off, 0.25=P1, 0.5=P2, 0.75=P3, 1.0=P4
         fl("player_led", "Player LED (0=off 0.25=P1 0.5=P2 0.75=P3 1=P4)"),
@@ -235,6 +248,12 @@ fn switch_pro_inputs() -> Vec<DevicePin> {
         fl("hd_l_freq", "HD Rumble L: Frequency (0=82Hz 0.5=320Hz 1=626Hz)"),
         fl("hd_r_amp",  "HD Rumble R: Amplitude (perceptual 0–1)"),
         fl("hd_r_freq", "HD Rumble R: Frequency (0=82Hz 0.5=320Hz 1=626Hz)"),
+        // Second simultaneous carrier (HF band). The Switch Pro packs carrier 1
+        // (hd_*) + carrier 2 (hd2_*) into one dual-band HD-rumble packet.
+        fl("hd2_l_amp",  "HD Rumble L: Amp (HF carrier)"),
+        fl("hd2_l_freq", "HD Rumble L: Freq (HF carrier)"),
+        fl("hd2_r_amp",  "HD Rumble R: Amp (HF carrier)"),
+        fl("hd2_r_freq", "HD Rumble R: Freq (HF carrier)"),
         // Legacy single-pin aliases kept for patch backward compatibility.
         fl("hd_rumble_l", "HD Rumble L (legacy — use hd_l_amp)"),
         fl("hd_rumble_r", "HD Rumble R (legacy — use hd_r_amp)"),

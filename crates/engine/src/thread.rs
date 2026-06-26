@@ -16,6 +16,42 @@ use crate::state::NodeState;
 /// reads via `load()` which is a cheap refcount bump — no clone needed.
 pub type ArcGraph = Arc<ArcSwap<ProcessingGraph>>;
 
+/// Recursively collect WASAPI loopback capture requests for every Audio Stream
+/// Haptics node in the graph, descending into inline sub-patches. Each request is
+/// keyed by the node's EFFECTIVE uid — `node_uid` at the top level, or
+/// `namespaced_uid(outer, node_uid)` inside a sub-patch — so it matches the uid
+/// `audio_stream_haptics_publish` uses to read the capture's latest params/spectrum.
+#[cfg(windows)]
+fn collect_loopback_reqs(
+    nodes: &[crate::graph::NodeSnap],
+    outer_uid: usize,
+    nested: bool,
+    out: &mut Vec<(usize, flexinput_devices::loopback_manager::CaptureRequest, f32, f32, f32)>,
+) {
+    for node in nodes {
+        let uid = if nested {
+            crate::eval::namespaced_uid(outer_uid, node.node_uid)
+        } else {
+            node.node_uid
+        };
+        if node.module_id == crate::eval::AUDIO_STREAM_HAPTICS_ID {
+            if let Some(req) = crate::eval::loopback_request_from_params(&node.params) {
+                let release_ms = node.params.get("asth_release")
+                    .and_then(|v| v.as_f64()).unwrap_or(30.0) as f32;
+                let volume = node.params.get("asth_volume")
+                    .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let crossover_hz = node.params.get("asth_crossover")
+                    .and_then(|v| v.as_f64()).unwrap_or(250.0) as f32;
+                let crossover_pos = crate::eval::crossover_hz_to_pos(crossover_hz);
+                out.push((uid, req, release_ms, volume, crossover_pos));
+            }
+        }
+        if let Some(ref sg) = node.inline_subgraph {
+            collect_loopback_reqs(&sg.graph.nodes, uid, true, out);
+        }
+    }
+}
+
 /// Type alias for the atomically-swappable device-signal map. Same
 /// pattern as `ArcGraph` — the I/O thread publishes a fresh map per poll
 /// cycle; consumers (proc thread, UI) read by refcount bump.
@@ -161,6 +197,13 @@ pub fn spawn_processing_thread(
 
         let mut next_tick = Instant::now();
         let mut state: HashMap<usize, NodeState> = HashMap::new();
+        // Owns the per-node WASAPI loopback captures for Audio Stream Haptics
+        // nodes. Reconciled once per wakeup against the live graph; eval reads the
+        // published params. Windows-only (loopback is a WASAPI feature).
+        #[cfg(windows)]
+        let mut loopback_mgr = flexinput_devices::loopback_manager::LoopbackManager::new();
+        #[cfg(windows)]
+        let mut loopback_reqs: Vec<(usize, flexinput_devices::loopback_manager::CaptureRequest, f32, f32, f32)> = Vec::new();
         // Persistent scratch reused across ticks (cleared in-place at the
         // top of every `eval_graph_tick` call). Avoids 5 HashMap reallocs
         // per tick — significant at 2 kHz with an empty graph.
@@ -204,6 +247,22 @@ pub fn spawn_processing_thread(
                     puffin::profile_scope!("dev_sigs_load");
                     device_signals.load_full()
                 };
+
+                // Reconcile WASAPI loopback captures for Audio Stream Haptics
+                // nodes once per wakeup (before the eval ticks read their params).
+                #[cfg(windows)]
+                {
+                    puffin::profile_scope!("loopback_reconcile");
+                    loopback_reqs.clear();
+                    // Collect ASTH capture requests across the WHOLE graph, recursing
+                    // into inline sub-patches. Each request is keyed by the node's
+                    // EFFECTIVE uid (raw at top level, namespaced inside a sub-patch),
+                    // matching what `audio_stream_haptics_publish` reads via
+                    // `latest_params(uid)`. Without recursion, ASTH nested in a
+                    // sub-patch never got a capture → it was silent there.
+                    collect_loopback_reqs(&graph_snap.nodes, 0, false, &mut loopback_reqs);
+                    loopback_mgr.reconcile(&loopback_reqs);
+                }
 
                 scope_acc.clear();
 

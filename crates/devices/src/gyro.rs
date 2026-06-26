@@ -36,6 +36,11 @@ const SWITCH_ACCEL_G_PER_LSB: f32  = 8.0   / 32767.0;
 // Retry open no more than once per N seconds to avoid hammering HidHide.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Monotonic epoch for the Switch HD-rumble amplitude-modulation phase. Set on the
+/// first rumble flush; the AM flutter phase is `elapsed_secs * 2π·rate_hz` so it
+/// stays smooth and continuous regardless of when individual packets are sent.
+static SWITCH_AM_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct TouchPoint {
     /// Active flag — touchpad currently sees this finger.
@@ -223,21 +228,23 @@ struct OutputState {
     player_led: u8,
     // mic_led: 0=off, 1=on(orange), 2=pulsing
     mic_led:    u8,
-    // Switch Pro HD Rumble — per-side amplitude + frequency (0–255 each, mapped at encode).
+    // HD Rumble carrier 1 (LF) — per-side amplitude + frequency (0–255 each, mapped at encode).
     // hd_l/r_amp:  0=silent, 255=max safe; perceptual power-law curve applied at encode.
     // hd_l/r_freq: 0–255 mapped logarithmically over safe range 82–1253 Hz (indices 32–159).
+    // Device-agnostic: a Switch Pro packs this into its HD-rumble packet; a USB
+    // DualSense synthesizes it as a PCM sine on the LRA.
     hd_l_amp:  u8,
     hd_l_freq: u8,
     hd_r_amp:  u8,
     hd_r_freq: u8,
-    // DualSense HD haptics — per-side amplitude + frequency (0–255 each).
-    // Driven through the controller's USB audio endpoint (channels 3/4 = left/right
-    // LRA). Bluetooth has no audio endpoint, so these fields are silently ignored
-    // when the connection is BT; rumble_strong/weak still drive the classic motors.
-    ds_l_amp:  u8,
-    ds_l_freq: u8,
-    ds_r_amp:  u8,
-    ds_r_freq: u8,
+    // HD Rumble carrier 2 (HF) — the SECOND simultaneous carrier per actuator.
+    // Both LRA families play two carriers at once that mix on the actuator. Zero
+    // amplitude ⇒ single-carrier behavior (carrier 1 only). The legacy ds_*_amp/freq
+    // pins are routed to carrier 1 (hd_*) in set_output_byte.
+    hd2_l_amp:  u8,
+    hd2_l_freq: u8,
+    hd2_r_amp:  u8,
+    hd2_r_freq: u8,
 }
 
 pub struct GyroManager {
@@ -483,16 +490,23 @@ impl GyroManager {
             // Legacy amplitude-only HD rumble pins — route to per-side amp field.
             "hd_rumble_l" => { entry.out.hd_l_amp = byte; true }
             "hd_rumble_r" => { entry.out.hd_r_amp = byte; true }
-            // Switch Pro HD rumble — amplitude + frequency per side
+            // HD rumble carrier 1 (LF) — amplitude + frequency per side. Shared by
+            // Switch Pro (table encode) and DualSense (PCM synth).
             "hd_l_amp"  => { entry.out.hd_l_amp  = byte; true }
             "hd_l_freq" => { entry.out.hd_l_freq  = byte; true }
             "hd_r_amp"  => { entry.out.hd_r_amp   = byte; true }
             "hd_r_freq" => { entry.out.hd_r_freq  = byte; true }
-            // DualSense HD haptics — amplitude + frequency per side (USB only).
-            "ds_l_amp"  => { entry.out.ds_l_amp  = byte; true }
-            "ds_l_freq" => { entry.out.ds_l_freq = byte; true }
-            "ds_r_amp"  => { entry.out.ds_r_amp  = byte; true }
-            "ds_r_freq" => { entry.out.ds_r_freq = byte; true }
+            // HD rumble carrier 2 (HF) — the second simultaneous carrier.
+            "hd2_l_amp"  => { entry.out.hd2_l_amp  = byte; true }
+            "hd2_l_freq" => { entry.out.hd2_l_freq = byte; true }
+            "hd2_r_amp"  => { entry.out.hd2_r_amp  = byte; true }
+            "hd2_r_freq" => { entry.out.hd2_r_freq = byte; true }
+            // DualSense HD haptics legacy aliases — amplitude + frequency per side
+            // (USB only). Route to carrier 1 so old patches keep working.
+            "ds_l_amp"  => { entry.out.hd_l_amp  = byte; true }
+            "ds_l_freq" => { entry.out.hd_l_freq = byte; true }
+            "ds_r_amp"  => { entry.out.hd_r_amp  = byte; true }
+            "ds_r_freq" => { entry.out.hd_r_freq = byte; true }
             "lightbar_r"    => { entry.out.lightbar_r = byte; true }
             "lightbar_g"    => { entry.out.lightbar_g = byte; true }
             "lightbar_b"    => { entry.out.lightbar_b = byte; true }
@@ -544,6 +558,11 @@ impl GyroManager {
             // Snapshot the output state we're about to send so we can stamp
             // `last_sent` after the match without re-borrowing `entry`.
             let to_send = entry.out;
+            // Set by the Switch arm when amplitude modulation is active: the emitted
+            // packet then changes every tick even with steady inputs, so we must NOT
+            // let the unchanged-skip suppress the next packet (it would freeze the
+            // flutter). Stamping `last_sent = None` forces a resend next tick.
+            let mut force_continuous = false;
             let HidEntry { device, kind, out, .. } = entry;
             match kind {
                 DeviceKind::Ds4 => {
@@ -562,19 +581,21 @@ impl GyroManager {
                             hid_write(device, &build_dualsense_usb_out(out));
                             #[cfg(windows)]
                             {
-                                let want_haptic = out.ds_l_amp != 0
-                                    || out.ds_l_freq != 0
-                                    || out.ds_r_amp != 0
-                                    || out.ds_r_freq != 0;
+                                // HD haptics over the USB audio endpoint: synthesize
+                                // BOTH carriers (LF = hd_*, HF = hd2_*) as PCM sines
+                                // on the LRAs. Open the stream lazily the first time
+                                // any carrier is non-zero.
+                                let want_haptic = out.hd_l_amp != 0 || out.hd_r_amp != 0
+                                    || out.hd2_l_amp != 0 || out.hd2_r_amp != 0;
                                 if want_haptic && haptic.is_none() {
                                     *haptic = dualsense_haptic::HapticStream::open();
                                 }
                                 if let Some(h) = haptic.as_mut() {
-                                    h.set_targets(
-                                        out.ds_l_amp as f32 / 255.0,
-                                        out.ds_l_freq as f32 / 255.0,
-                                        out.ds_r_amp as f32 / 255.0,
-                                        out.ds_r_freq as f32 / 255.0,
+                                    h.set_targets_dual(
+                                        out.hd_l_amp  as f32 / 255.0, out.hd_l_freq  as f32 / 255.0,
+                                        out.hd2_l_amp as f32 / 255.0, out.hd2_l_freq as f32 / 255.0,
+                                        out.hd_r_amp  as f32 / 255.0, out.hd_r_freq  as f32 / 255.0,
+                                        out.hd2_r_amp as f32 / 255.0, out.hd2_r_freq as f32 / 255.0,
                                     );
                                 }
                             }
@@ -592,29 +613,47 @@ impl GyroManager {
                     // is audible. Explicit HD wiring always wins: if either
                     // hd_*_amp is non-zero we use the HD pins verbatim and ignore
                     // legacy, so the two paths never fight.
-                    let hd_set = out.hd_l_amp != 0 || out.hd_r_amp != 0;
-                    let (l_amp, l_freq, r_amp, r_freq) = if hd_set {
+                    // Both carriers count as "HD set" — carrier 2 (hd2_*) alone is
+                    // enough to take the HD path.
+                    let hd_set = out.hd_l_amp != 0 || out.hd_r_amp != 0
+                        || out.hd2_l_amp != 0 || out.hd2_r_amp != 0;
+                    // Per side: carrier 1 (LF) + carrier 2 (HF). In legacy fallback
+                    // (no HD wiring) the classic rumble pins drive carrier 1 only at
+                    // the firmware-default ~320 Hz, with carrier 2 silent.
+                    let (l_lf_a, l_lf_f, l_hf_a, l_hf_f,
+                         r_lf_a, r_lf_f, r_hf_a, r_hf_f) = if hd_set {
                         (
-                            out.hd_l_amp as f32 / 255.0, out.hd_l_freq as f32 / 255.0,
-                            out.hd_r_amp as f32 / 255.0, out.hd_r_freq as f32 / 255.0,
+                            out.hd_l_amp  as f32 / 255.0, out.hd_l_freq  as f32 / 255.0,
+                            out.hd2_l_amp as f32 / 255.0, out.hd2_l_freq as f32 / 255.0,
+                            out.hd_r_amp  as f32 / 255.0, out.hd_r_freq  as f32 / 255.0,
+                            out.hd2_r_amp as f32 / 255.0, out.hd2_r_freq as f32 / 255.0,
                         )
                     } else {
-                        // Legacy fallback: classic amplitude with a default ~320 Hz
-                        // carrier (0.6) — the firmware default and the same carrier
-                        // injected for HD-amp-only feedback in the I/O loop.
                         const DEFAULT_FREQ: f32 = 0.6;
                         let l = out.rumble_strong as f32 / 255.0;
                         let r = out.rumble_weak as f32 / 255.0;
                         (
-                            l, if l > 0.0 { DEFAULT_FREQ } else { 0.0 },
-                            r, if r > 0.0 { DEFAULT_FREQ } else { 0.0 },
+                            l, if l > 0.0 { DEFAULT_FREQ } else { 0.0 }, 0.0, 0.0,
+                            r, if r > 0.0 { DEFAULT_FREQ } else { 0.0 }, 0.0, 0.0,
                         )
                     };
-                    let left  = switch_rumble_encode(l_amp, l_freq);
-                    let right = switch_rumble_encode(r_amp, r_freq);
+                    // HF "texture" = amplitude modulation of the LF carrier. Advance
+                    // each side's modulator phase from a monotonic process clock (so
+                    // the flutter is smooth regardless of when packets actually go
+                    // out): phase = elapsed_secs * (2π · mod_rate_hz). hd2_*_amp is the
+                    // mod DEPTH, hd2_*_freq the mod RATE.
+                    let t = SWITCH_AM_EPOCH.get_or_init(std::time::Instant::now)
+                        .elapsed().as_secs_f32();
+                    let l_phase = t * am_rate_rad_per_sec(l_hf_f);
+                    let r_phase = t * am_rate_rad_per_sec(r_hf_f);
+                    let left  = switch_rumble_encode_am(l_lf_a, l_lf_f, l_hf_a, l_hf_f, l_phase);
+                    let right = switch_rumble_encode_am(r_lf_a, r_lf_f, r_hf_a, r_hf_f, r_phase);
                     let pkt = build_switch_rumble_only(*packet_counter, left, right);
                     *packet_counter = packet_counter.wrapping_add(1);
                     hid_write(device, &pkt);
+                    // When AM is active the packet changes every tick even with steady
+                    // inputs, so force continuous re-send (bypass the unchanged-skip).
+                    force_continuous = l_hf_a > 0.0 || r_hf_a > 0.0;
                 }
             }
             // Record what we just wrote so the next iteration can skip
@@ -622,7 +661,7 @@ impl GyroManager {
             // it; release silently swallows) we still record — re-trying
             // every 2 ms buys nothing, and the heartbeat will re-send
             // within a second anyway.
-            entry.last_sent = Some(to_send);
+            entry.last_sent = if force_continuous { None } else { Some(to_send) };
             entry.last_sent_at = Some(now);
         }
     }
@@ -1313,18 +1352,12 @@ fn build_switch_rumble_only(counter: u8, left: [u8; 4], right: [u8; 4]) -> [u8; 
 /// A single freq input drives both bands simultaneously, which is how the Switch
 /// OS and kernel driver work by default.
 ///
-/// Encoding from Linux drivers/hid/nintendo.c joycon_encode_rumble():
-///   data[0] = (freq.high >> 8) & 0xFF
-///   data[1] = (freq.high & 0xFF) + amp.high
-///   data[2] =  freq.low          + ((amp.low >> 8) & 0xFF)
-///   data[3] =  amp.low & 0xFF
-fn switch_rumble_encode(amp: f32, freq: f32) -> [u8; 4] {
-    // joycon_rumble_frequencies[] from drivers/hid/hid-nintendo.c.
-    // Each entry: (high: u16, low: u8) for the given Hz.
-    // 160 entries, 41 Hz (index 0) → 1253 Hz (index 159).
-    // Index 96 = 320 Hz (firmware default).
-    #[rustfmt::skip]
-    const FREQ_TABLE: &[(u16, u8)] = &[
+// joycon_rumble_frequencies[] from drivers/hid/hid-nintendo.c.
+// Each entry: (high: u16, low: u8) for the given Hz. 160 entries, 41 Hz (index 0)
+// → 1253 Hz (index 159). Index 96 = 320 Hz (firmware default). Module-level so both
+// the single-carrier and dual-carrier encoders share the SAME validated table.
+#[rustfmt::skip]
+const SWITCH_FREQ_TABLE: &[(u16, u8)] = &[
         (0x0000,0x01),(0x0000,0x02),(0x0000,0x03),(0x0000,0x04),(0x0000,0x05),
         (0x0000,0x06),(0x0000,0x07),(0x0000,0x08),(0x0000,0x09),(0x0000,0x0a),
         (0x0000,0x0b),(0x0000,0x0c),(0x0000,0x0d),(0x0000,0x0e),(0x0000,0x0f),
@@ -1360,12 +1393,12 @@ fn switch_rumble_encode(amp: f32, freq: f32) -> [u8; 4] {
         (0xd001,0x00),(0xd401,0x00),(0xd801,0x00),(0xdc01,0x00),(0xe001,0x00),
         (0xe401,0x00),(0xe801,0x00),(0xec01,0x00),(0xf001,0x00),(0xf401,0x00),
         (0xf801,0x00),(0xfc01,0x00), // index 159 = 1253 Hz
-    ];
-    // joycon_rumble_amplitudes[] safe range (0–1003 units) from drivers/hid/hid-nintendo.c.
-    // (high: u8, low: u16) — added into frequency bytes per joycon_encode_rumble().
-    // 101 entries: index 0 = silent (0 units), index 100 = max safe (1003 units).
-    #[rustfmt::skip]
-    const AMP_TABLE: &[(u8, u16)] = &[
+];
+// joycon_rumble_amplitudes[] safe range (0–1003 units) from drivers/hid/hid-nintendo.c.
+// (high: u8, low: u16) — added into frequency bytes per joycon_encode_rumble().
+// 101 entries: index 0 = silent (0 units), index 100 = max safe (1003 units).
+#[rustfmt::skip]
+const SWITCH_AMP_TABLE: &[(u8, u16)] = &[
         (0x00,0x0040),
         (0x02,0x8040),(0x04,0x0041),(0x06,0x8041),(0x08,0x0042),(0x0a,0x8042),
         (0x0c,0x0043),(0x0e,0x8043),(0x10,0x0044),(0x12,0x8044),(0x14,0x0045),
@@ -1387,37 +1420,121 @@ fn switch_rumble_encode(amp: f32, freq: f32) -> [u8; 4] {
         (0xac,0x006b),(0xae,0x806b),(0xb0,0x006c),(0xb2,0x806c),(0xb4,0x006d),
         (0xb6,0x806d),(0xb8,0x006e),(0xba,0x806e),(0xbc,0x006f),(0xbe,0x806f),
         (0xc0,0x0070),(0xc2,0x8070),(0xc4,0x0071),(0xc6,0x8071),(0xc8,0x0072),
-    ];
+];
 
-    // FREQ_TABLE has 159 entries (valid indices 0–158).
-    // Safe range: indices 32–127 (~82–626 Hz) — these have both HF and LF fields non-zero.
-    // Indices 128–158 have fl=0x00 (above LF range); capped at 127 to avoid firmware glitches.
-    // The fh field is NOT a linear numeric encoding — it wraps at index 95→96 — so we must
-    // use it as an opaque lookup key and never interpolate between entries.
+/// Look up the proven Switch FREQ/AMP table fields for one (amp, freq) carrier.
+/// Returns `(fh, fl, ah, al)`: `fh`(u16)/`fl`(u8) the frequency fields, `ah`(u8)/
+/// `al`(u16) the amplitude fields, exactly as the Linux joycon_encode_rumble does
+/// (this is the encoding that's actually FELT on real pads). The dual encoder uses
+/// the HF carrier's (fh, ah) for bytes 0/1 and the LF carrier's (fl, al) for bytes
+/// 2/3 — both via this same validated table.
+fn switch_carrier_fields(amp: f32, freq: f32) -> (u16, u8, u8, u16) {
+    // FREQ_TABLE valid indices 0–158. Safe range 32–127 (~82–626 Hz) — both HF and
+    // LF fields non-zero. The fh field is NOT linear (wraps at 95→96), so it's an
+    // opaque lookup key — never interpolate between entries.
     const FREQ_LO: usize = 32;  // ~82 Hz
     const FREQ_HI: usize = 127; // ~626 Hz
     let f_idx = ((FREQ_LO as f32 + freq.clamp(0.0, 1.0) * (FREQ_HI - FREQ_LO) as f32)
         .round() as usize)
         .clamp(FREQ_LO, FREQ_HI);
-    let (fh, fl) = FREQ_TABLE[f_idx];
-
-    // Perceptual amplitude: input 0–1 → power-law curve (exponent 1.8).
-    // Skips index 0 (silence) for any non-zero input so amp responds from the very start.
+    let (fh, fl) = SWITCH_FREQ_TABLE[f_idx];
+    // Perceptual amplitude: 0–1 → power-law (exp 1.8); skip index 0 for any non-zero
+    // input so amp responds from the very start.
     let amp_c = amp.clamp(0.0, 1.0);
     let a_idx = if amp_c == 0.0 {
         0
     } else {
         let linear = amp_c.powf(1.8);
-        (1 + (linear * (AMP_TABLE.len() - 2) as f32).round() as usize).min(AMP_TABLE.len() - 1)
+        (1 + (linear * (SWITCH_AMP_TABLE.len() - 2) as f32).round() as usize)
+            .min(SWITCH_AMP_TABLE.len() - 1)
     };
+    let (ah, al) = SWITCH_AMP_TABLE[a_idx];
+    (fh, fl, ah, al)
+}
 
-    let (ah, al) = AMP_TABLE[a_idx];
+/// Reference single-carrier encoder (Linux joycon_encode_rumble): drives both the
+/// HF and LF amplitude fields from one (amp, freq). Kept for tests / legacy callers.
+#[allow(dead_code)]
+fn switch_rumble_encode(amp: f32, freq: f32) -> [u8; 4] {
+    let (fh, fl, ah, al) = switch_carrier_fields(amp, freq);
     [
         ((fh >> 8) & 0xFF) as u8,
         ((fh & 0xFF) as u8).wrapping_add(ah),
         fl.wrapping_add(((al >> 8) & 0xFF) as u8),
         (al & 0xFF) as u8,
     ]
+}
+
+/// Map a band's 0..1 freq onto a FREQ_TABLE index window, returning the table's
+/// normalized 0..1 freq for [`switch_carrier_fields`]. Keeps both carriers inside
+/// the LRA's felt range (the actuators resonate ~150–200 Hz and roll off above
+/// ~300 Hz): LF → idx 32..=64 (~82–180 Hz), HF → idx 64..=96 (~180–320 Hz).
+fn band_freq_norm(freq01: f32, high_band: bool) -> f32 {
+    let (lo, hi) = if high_band { (64.0, 96.0) } else { (32.0, 64.0) };
+    let idx = lo + freq01.clamp(0.0, 1.0) * (hi - lo);
+    ((idx - 32.0) / (127.0 - 32.0)).clamp(0.0, 1.0)
+}
+
+/// AM mod-rate window (Hz) the HF "carrier" maps onto when used as an amplitude
+/// modulator for the LF rumble. A 40–150 Hz flutter on the LF amplitude reads as
+/// "texture/sizzle" even though the felt carrier stays low.
+const AM_RATE_MIN_HZ: f32 = 40.0;
+const AM_RATE_MAX_HZ: f32 = 150.0;
+
+/// Encode a Switch Pro HD rumble packet for one actuator.
+///
+/// The Switch packet's "HF carrier" doesn't produce a felt high-frequency tone on
+/// these (clone-LRA) pads — verified live across several attempts. So instead of a
+/// second carrier, we synthesize HF *texture* by AMPLITUDE-MODULATING the single
+/// felt LF carrier: the LF rumble's amplitude pulses at a rate set by the HF
+/// content, which the body perceives as roughness/sizzle.
+///   * `lf_amp` / `lf_freq` — the base carrier (its frequency is what's felt).
+///   * `hf_amp`  — AM modulation DEPTH (0 = steady rumble, 1 = full pulse to ~0).
+///   * `hf_freq` — AM modulation RATE, mapped onto [AM_RATE_MIN_HZ, AM_RATE_MAX_HZ].
+///   * `mod_phase` — current modulator phase in RADIANS (advanced by the caller
+///     from a monotonic clock so the flutter is smooth regardless of packet timing).
+///
+/// The emitted packet is a SINGLE carrier (LF) whose amplitude = lf_amp * AM
+/// envelope. Bytes 0/1 hold the LF freq high/low + amp high; bytes 2/3 the LF
+/// freq low field + amp low — exactly the proven [`switch_carrier_fields`] layout
+/// (the encoding that's actually felt). `_` params kept for signature stability.
+fn switch_rumble_encode_dual(lf_amp: f32, lf_freq: f32, hf_amp: f32, hf_freq: f32) -> [u8; 4] {
+    switch_rumble_encode_am(lf_amp, lf_freq, hf_amp, hf_freq, 0.0)
+}
+
+fn switch_rumble_encode_am(
+    lf_amp: f32, lf_freq: f32, mod_depth: f32, mod_rate: f32, mod_phase: f32,
+) -> [u8; 4] {
+    let lf_a = lf_amp.clamp(0.0, 1.0);
+    let depth = mod_depth.clamp(0.0, 1.0);
+
+    // AM envelope: 1.0 at the wave peak, (1 - depth) at the trough. |sin| gives a
+    // unipolar pulse so the rumble never inverts, only dips. mod_rate selects the
+    // flutter frequency; the actual sin() uses the phase the caller advances.
+    let env = if depth > 0.0 {
+        let s = mod_phase.sin().abs();      // 0..1
+        (1.0 - depth) + depth * s           // (1-depth)..1
+    } else {
+        1.0
+    };
+    let _ = mod_rate; // rate is applied by the caller when advancing mod_phase
+    let amp = (lf_a * env).clamp(0.0, 1.0);
+
+    // Single felt carrier at the LF band frequency, amplitude-modulated.
+    let (fh, fl, ah, al) = switch_carrier_fields(amp, band_freq_norm(lf_freq, false));
+    [
+        ((fh >> 8) & 0xFF) as u8,
+        ((fh & 0xFF) as u8).wrapping_add(ah),
+        fl.wrapping_add(((al >> 8) & 0xFF) as u8),
+        (al & 0xFF) as u8,
+    ]
+}
+
+/// Map the HF "mod rate" 0..1 control to an angular increment (radians per second)
+/// for the AM phase. Used by the Switch sink to advance `mod_phase` from wall time.
+fn am_rate_rad_per_sec(mod_rate01: f32) -> f32 {
+    let hz = AM_RATE_MIN_HZ + mod_rate01.clamp(0.0, 1.0) * (AM_RATE_MAX_HZ - AM_RATE_MIN_HZ);
+    hz * std::f32::consts::TAU
 }
 
 /// Encode one DualSense adaptive trigger effect into 11 bytes:
@@ -1649,6 +1766,62 @@ fn preferred_interface(kind: &KindTag) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn am_full_amp_at_phase_peak() {
+        // At the modulation peak (|sin| = 1, phase = π/2), ANY mod depth leaves the LF
+        // amplitude at full — the envelope tops out at 1.0. So a full-depth packet at
+        // the peak must equal the unmodulated (depth 0) packet.
+        let peak = std::f32::consts::FRAC_PI_2;
+        let unmod = switch_rumble_encode_am(1.0, 0.4, 0.0, 0.5, peak);
+        let modd  = switch_rumble_encode_am(1.0, 0.4, 1.0, 0.5, peak);
+        assert_eq!(unmod, modd, "AM peak must equal unmodulated: unmod={unmod:?} mod={modd:?}");
+    }
+
+    #[test]
+    fn am_dips_amplitude_at_phase_trough() {
+        // At the modulation trough (sin = 0, phase = 0) with full depth, the envelope
+        // is (1 - depth) = 0 → the LF amplitude collapses to silence. So byte3 (LF amp
+        // low) must drop well below the unmodulated peak.
+        let trough = 0.0;
+        let peak = std::f32::consts::FRAC_PI_2;
+        let at_peak   = switch_rumble_encode_am(1.0, 0.4, 1.0, 0.5, peak);
+        let at_trough = switch_rumble_encode_am(1.0, 0.4, 1.0, 0.5, trough);
+        assert!(at_trough[3] < at_peak[3],
+            "full-depth trough must dip amplitude vs peak: peak={at_peak:?} trough={at_trough:?}");
+    }
+
+    #[test]
+    fn am_depth_zero_is_steady() {
+        // With mod depth 0 the envelope is always 1.0, so the packet is independent of
+        // phase — a steady rumble, regardless of where in the cycle we sample.
+        let a = switch_rumble_encode_am(0.7, 0.5, 0.0, 0.5, 0.0);
+        let b = switch_rumble_encode_am(0.7, 0.5, 0.0, 0.5, 1.234);
+        let c = switch_rumble_encode_am(0.7, 0.5, 0.0, 0.5, 3.1);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn am_rate_maps_into_flutter_window() {
+        // The HF "mod rate" control maps 0..1 onto the AM_RATE_MIN/MAX Hz window.
+        let tau = std::f32::consts::TAU;
+        assert!((am_rate_rad_per_sec(0.0) - AM_RATE_MIN_HZ * tau).abs() < 1.0);
+        assert!((am_rate_rad_per_sec(1.0) - AM_RATE_MAX_HZ * tau).abs() < 1.0);
+        assert!(am_rate_rad_per_sec(1.0) > am_rate_rad_per_sec(0.0));
+    }
+
+    #[test]
+    fn silent_lf_is_silent_regardless_of_modulation() {
+        // No base rumble → modulating nothing is still nothing: the packet must match
+        // the unmodulated silent packet at every phase (the AM envelope multiplies a
+        // zero amplitude, which stays zero).
+        let unmod_silent = switch_rumble_encode_am(0.0, 0.5, 0.0, 0.5, 0.0);
+        for phase in [0.0, std::f32::consts::FRAC_PI_2, 1.234, 3.1] {
+            let p = switch_rumble_encode_am(0.0, 0.5, 1.0, 0.5, phase);
+            assert_eq!(p, unmod_silent, "silent LF must stay silent under AM @{phase}: {p:?}");
+        }
+    }
 
     // parse_ds4 must populate `dualsense` so the gilrs backend's raw-HID override
     // fires for DS4 the same way it does for DualSense. Without it, our emulated

@@ -9539,7 +9539,13 @@ pub fn find_automap_device_id_for_viewer(
                 .iter().map(|p| p.id.to_string()).collect();
             return Some((collector_id, canonical_pins, None));
         }
-        if node.module_id == "module.automap_collect" {
+        // automap_collect AND audio_stream_haptics both re-publish the AutoMap bus
+        // into their OWN `collector:{uid}` key (the ASTH eval block mirrors the
+        // Collector's phase-1 copy), so a node downstream of either must read from
+        // that collector key — not recurse past it like feedback_control does.
+        if node.module_id == "module.automap_collect"
+            || node.module_id == "module.audio_stream_haptics"
+        {
             let upstream_dev_id = node.inputs.iter()
                 .position(|p| p.signal_type == SignalType::AutoMap)
                 .and_then(|am_idx| {
@@ -9627,7 +9633,7 @@ pub fn find_automap_device_id_for_viewer(
 }
 
 // Helper to reconstruct the fold_outer_uid value for the viewer parent chain.
-fn fold_outer_uid_app(p: &crate::canvas::viewer::AutomapGlowParent<'_>) -> usize {
+pub(crate) fn fold_outer_uid_app(p: &crate::canvas::viewer::AutomapGlowParent<'_>) -> usize {
     match p.prev {
         None => p.subpatch_node_id.0,
         Some(prev) => flexinput_engine::namespaced_uid(fold_outer_uid_app(prev), p.subpatch_node_id.0),
@@ -9669,7 +9675,14 @@ fn find_automap_device_rec(
             .iter().map(|p| p.id.to_string()).collect();
         return Some((collector_id, canonical_pins, None));
     }
-    if node.module_id == "module.automap_collect" {
+    // automap_collect AND audio_stream_haptics both re-publish the AutoMap bus into
+    // their own `collector:{uid}` key (ASTH's eval block mirrors the Collector's
+    // phase-1 copy), so a downstream node must read from that collector key. Without
+    // this arm, ASTH fell through unhandled → its AutoMap output resolved to nothing
+    // → the port produced no signal.
+    if node.module_id == "module.automap_collect"
+        || node.module_id == "module.audio_stream_haptics"
+    {
         let upstream_dev_id = node.inputs.iter()
             .position(|p| p.signal_type == SignalType::AutoMap)
             .and_then(|am_idx| {
@@ -10022,7 +10035,7 @@ fn build_processing_graph_rec(
             "processing.gyro_3dof" | "module.automap_split"
             | "module.automap_fork" | "module.automap_selector"
             | "module.remapper" | "module.map_action"
-            | "module.automap_collect")
+            | "module.automap_collect" | "module.audio_stream_haptics")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {
@@ -10155,6 +10168,25 @@ fn build_processing_graph_rec(
                 .iter().map(|p| serde_json::Value::String(p.id.to_string())).collect();
             params.insert("_fb_inlet_ids".to_string(), serde_json::Value::Array(inlet_ids));
             params.insert("_fb_outlet_ids".to_string(), serde_json::Value::Array(outlet_ids));
+        }
+
+        // Audio Stream Haptics: stamp the physical pad the audio-derived rumble is
+        // injected into — the upstream physical source on AutoMap input 0 (same
+        // resolution as Feedback Control's `_fb_source_dev`). The eval block keys
+        // `feedback_inject:{_asth_dest_dev}`, drained by the feedback post-pass.
+        if node.module_id == "module.audio_stream_haptics" {
+            let dest_dev = {
+                let pin = snarl.in_pin(InPinId { node: *node_id, input: 0 });
+                pin.remotes.first()
+                    .and_then(|&src| find_automap_device_rec(snarl, src, parents))
+                    .map(|(dev_id, _, fallback)| {
+                        if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
+                    })
+                    .filter(|d| is_real_device_id(d))
+            };
+            if let Some(d) = dest_dev {
+                params.insert("_asth_dest_dev".to_string(), serde_json::Value::String(d));
+            }
         }
 
         // For subpatch nodes: recursively build the inner graph and locate outlet nodes.

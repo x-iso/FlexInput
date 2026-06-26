@@ -8,6 +8,36 @@ use serde_json::Value;
 use crate::graph::{NodeSnap, ProcessingGraph};
 use crate::state::NodeState;
 
+/// Stable module id for the Audio Stream Haptics node (audio-loopback → rumble).
+pub const AUDIO_STREAM_HAPTICS_ID: &str = "module.audio_stream_haptics";
+
+/// Build a loopback [`CaptureRequest`](flexinput_devices::loopback_manager::CaptureRequest)
+/// from an Audio Stream Haptics node's params. Schema:
+///   `asth_mode`         = "process" | "focused" | "system" (default "system")
+///   `asth_target_name`  = exe name (process mode)
+///   `asth_include_tree` = bool (default true)
+/// Returns `None` for process mode with no target name set yet.
+#[cfg(windows)]
+pub fn loopback_request_from_params(
+    params: &HashMap<String, Value>,
+) -> Option<flexinput_devices::loopback_manager::CaptureRequest> {
+    use flexinput_devices::loopback_manager::CaptureRequest;
+    let mode = params.get("asth_mode").and_then(|v| v.as_str()).unwrap_or("system");
+    let include_tree = params.get("asth_include_tree").and_then(|v| v.as_bool()).unwrap_or(true);
+    match mode {
+        "process" => {
+            let name = params.get("asth_target_name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                None
+            } else {
+                Some(CaptureRequest::ProcessName { name: name.to_string(), include_tree })
+            }
+        }
+        "focused" => Some(CaptureRequest::Focused { include_tree }),
+        _ => Some(CaptureRequest::System),
+    }
+}
+
 /// Perceptual shaping for HD voice-coil amplitude on the AutoMap feedback path,
 /// using the source virtual device's per-device floor/max/exp.
 ///
@@ -1054,6 +1084,255 @@ fn feedback_control_publish(
     out
 }
 
+/// Audio Stream Haptics: pass the AutoMap bus through (so the gamepad's forward
+/// signals continue downstream), then derive HD rumble from the node's WASAPI
+/// loopback capture, blend it with any standard rumble already on the bus per the
+/// `asth_modulator` slider, and inject the result into the target pad's feedback
+/// channel (`feedback_inject:{_asth_dest_dev}`), drained by the feedback post-pass.
+///
+/// Modulator (`asth_modulator`, 0..1):
+///   1.0  → audio amplitude REPLACES standard rumble (pure audio haptics).
+///   0.0  → audio is GATED by standard-rumble amplitude (rumble decides *when*,
+///          audio decides the *texture*): out = audio_amp * std_rumble.
+///   0.5  → lighter audio, BOOSTED by standard-rumble events:
+///          out = audio_amp * (base + (1-base) * std_rumble).
+/// Linearly interpolated between those anchors.
+fn audio_stream_haptics_publish(
+    snap: &NodeSnap,
+    uid: usize,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    // `uid` is this node's effective publishing id: `snap.node_uid` at the top level,
+    // the namespaced uid inside a sub-patch. It keys the collector pass-through AND
+    // the loopback capture lookup (both must match what the capture manager + the
+    // downstream sink resolver use), so ASTH works identically nested or not.
+    // ── 1. AutoMap pass-through (mirror the Collector's phase-1 copy). ─────────
+    let uid_key = format!("collector:{}", uid);
+    let upstream_dev = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let upstream_collector = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !upstream_collector.is_empty() {
+        let copies: Vec<(String, Signal)> = collector_sigs.iter()
+            .filter(|((dev, _), _)| dev == &upstream_collector)
+            .map(|((_, pin), sig)| (pin.clone(), *sig))
+            .collect();
+        for (pin, sig) in copies {
+            collector_sigs.insert((uid_key.clone(), pin), sig);
+        }
+        if !upstream_dev.is_empty() {
+            for pin in flexinput_core::automap::ALL_PINS {
+                let key = (uid_key.clone(), pin.id.to_string());
+                if collector_sigs.contains_key(&key) { continue; }
+                if let Some(&sig) = dev_sigs.get(&(upstream_dev.clone(), pin.id.to_string())) {
+                    collector_sigs.insert(key, sig);
+                }
+            }
+        }
+    } else if !upstream_dev.is_empty() {
+        for pin in flexinput_core::automap::ALL_PINS {
+            if let Some(&sig) = dev_sigs.get(&(upstream_dev.clone(), pin.id.to_string())) {
+                collector_sigs.insert((uid_key.clone(), pin.id.to_string()), sig);
+            }
+        }
+    }
+
+    // ── 2. Latest audio-derived haptics for this node. ────────────────────────
+    // (l_amp, l_freq, r_amp, r_freq) — zeros on non-Windows (no WASAPI loopback).
+    #[cfg(windows)]
+    let audio = {
+        let p = flexinput_devices::loopback_manager::latest_params(uid);
+        (p.l_amp, p.l_freq, p.r_amp, p.r_freq)
+    };
+    #[cfg(not(windows))]
+    let audio = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let (audio_l_amp, mut audio_l_freq, audio_r_amp, mut audio_r_freq) = audio;
+
+    // ── 2b. Two-band engine (HF + LF carriers from the EQ-gained spectrum). ───
+    // The Switch Pro / DualSense LRAs play TWO carriers at once (LF + HF) that mix
+    // on the actuator. We split the spectrum at a crossover and collapse each side
+    // to its own (carrier_freq, energy): LF from the sub-crossover bins, HF from the
+    // super-crossover bins. The per-band ENERGY fractions weight how the per-side
+    // loudness splits across the two carriers (so a bass-heavy moment drives mostly
+    // the LF carrier, a sizzly one the HF). `lf_carrier`/`hf_carrier` are 0..1 freqs;
+    // `lf_frac`/`hf_frac` sum to ≤1. Defaults (no EQ / no spectrum): single LF
+    // carrier from the autocorrelation pitch, HF silent.
+    let mut lf_carrier = audio_l_freq; // both sides share the mono spectrum carrier
+    let mut hf_carrier = 0.0f32;
+    let mut lf_frac = 1.0f32;
+    let mut hf_frac = 0.0f32;
+    let crossover_hz = snap.params.get("asth_crossover").and_then(|v| v.as_f64()).unwrap_or(250.0) as f32;
+    #[cfg(windows)]
+    {
+        // Flat unity EQ if none configured, so the two-band split still applies.
+        let eq_pts = curve_points_from_params_keyed(&snap.params, "asth_eq_points")
+            .unwrap_or_else(|| vec![[0.0, 0.5], [1.0, 0.5]]);
+        let spectrum = flexinput_devices::loopback_manager::latest_spectrum(uid);
+        let xpos = crossover_hz_to_pos(crossover_hz);
+        let lf = multiband_collapse_band(&spectrum, &eq_pts, 0.0, xpos);
+        let hf = multiband_collapse_band(&spectrum, &eq_pts, xpos, 1.0);
+        let lf_e = lf.map(|(_, e)| e).unwrap_or(0.0);
+        let hf_e = hf.map(|(_, e)| e).unwrap_or(0.0);
+        let total = lf_e + hf_e;
+        if total > 1.0e-4 {
+            lf_frac = lf_e / total;
+            hf_frac = hf_e / total;
+            if let Some((c, _)) = lf { lf_carrier = c; }
+            if let Some((c, _)) = hf { hf_carrier = c; }
+        }
+    }
+    let _ = &mut audio_l_freq; let _ = &mut audio_r_freq; // superseded by lf/hf_carrier
+
+    // ── 3. Standard rumble already on the bus (for the modulator). ────────────
+    let bus_f = |pin: &str| -> f32 {
+        sig_to_f32(collector_sigs.get(&(uid_key.clone(), pin.to_string())).copied()).unwrap_or(0.0)
+    };
+    // A tiny floor so residual/quantization noise on the rumble bus doesn't keep
+    // the gate open when the game isn't actually rumbling.
+    const STD_GATE_FLOOR: f32 = 0.02;
+    let gate_std = |v: f32| if v <= STD_GATE_FLOOR { 0.0 } else { v };
+    let std_l = gate_std(bus_f("rumble_strong").max(bus_f("hd_l_amp")));
+    let std_r = gate_std(bus_f("rumble_weak").max(bus_f("hd_r_amp")));
+
+    // ── 4. Amplitude calibration + frequency-bias, then the modulator blend. ──
+    // (Volume is applied as INPUT GAIN in the capture thread, before detection, so
+    //  it's already baked into the loudness here — lowering it restores headroom on
+    //  a hot source instead of squashing.)
+    // Curve  (asth_curve, 0.3..3, default 1): response exponent — >1 expands the
+    //        quiet range (more dynamics), <1 compresses it (everything strong).
+    // Amp min/max (asth_amp_min/max, 0..1): remap the shaped loudness onto a usable
+    //        slice of the Switch Pro range — lift `min` above the actuator's dead
+    //        zone (so weak audio is still felt) and cap `max`. Applied only when a
+    //        side actually has signal, so silence stays silent (no floor on zero).
+    // Band balance (asth_freq_bias, -1..1, default 0): tilts how the loudness splits
+    //        across the two carriers. -1 = all energy to the LF carrier, +1 = all to
+    //        HF, 0 = the natural spectral split. Visibly reshapes the LF/HF envelope.
+    let curve     = (snap.params.get("asth_curve").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32).clamp(0.3, 3.0);
+    let amp_min   = (snap.params.get("asth_amp_min").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).clamp(0.0, 1.0);
+    let amp_max   = (snap.params.get("asth_amp_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32).clamp(0.0, 1.0);
+    let amp_lo = amp_min.min(amp_max);
+    let amp_hi = amp_min.max(amp_max);
+    let band_balance = (snap.params.get("asth_freq_bias").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32)
+        .clamp(-1.0, 1.0);
+
+    // Apply the band balance. This is a CREATIVE control, not a passive spectral
+    // reweight: a pure energy reweight can't move amplitude into a band the source
+    // has no content in (bass-heavy audio → hf_frac≈0 → balance→HF did nothing, the
+    // reported "only LF ever applies"). So balance does two things that always have
+    // an audible effect regardless of source spectrum:
+    //   1. Migrates the felt-amplitude SPLIT toward the chosen band by mixing the
+    //      natural spectral fraction with a forced target (all-LF at -1, all-HF at
+    //      +1). At the extremes the split is fully forced, so HF gets amplitude even
+    //      from bass-only audio.
+    //   2. Biases each carrier's FREQUENCY toward the band edge so the felt pitch
+    //      actually rises/falls with the slider (the Switch path collapses to one
+    //      carrier, so this frequency shift IS the felt "texture").
+    // NOTE: Balance is applied LATER, as the modulation DEPTH only — it must NOT
+    // touch the carrier's amplitude (an earlier version reweighted lf_frac/hf_frac by
+    // Balance, which drained the carrier band to silence at the modulator extreme).
+    // Here lf_frac/hf_frac stay the NATURAL spectral fractions; the carrier always
+    // plays at the full felt loudness regardless of Balance.
+
+    // Curve only (Volume already applied pre-detection); range remap comes after the
+    // blend so the floor is applied to the final felt amplitude, not pre-modulation.
+    let shape_amp = |a: f32| a.clamp(0.0, 1.0).powf(curve);
+    let audio_l_amp = shape_amp(audio_l_amp);
+    let audio_r_amp = shape_amp(audio_r_amp);
+
+    let modulator = snap.params.get("asth_modulator").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    let blend = |audio_amp: f32, std: f32| -> f32 {
+        // anchors: gate(0) = audio*std ; boost(0.5) = audio*(0.5 + 0.5*std) ;
+        // replace(1) = audio. Lerp between the two relevant anchors.
+        let gate  = audio_amp * std;
+        let boost = audio_amp * (0.5 + 0.5 * std);
+        let out = if modulator <= 0.5 {
+            let t = modulator / 0.5;          // 0..1 across gate→boost
+            gate + (boost - gate) * t
+        } else {
+            let t = (modulator - 0.5) / 0.5;  // 0..1 across boost→replace
+            boost + (audio_amp - boost) * t
+        };
+        out.clamp(0.0, 1.0)
+    };
+    // Remap a non-zero blended amplitude onto [amp_lo, amp_hi]; pass zero through
+    // untouched so silence never gets lifted to the floor.
+    let range_remap = |a: f32| if a <= 0.0 { 0.0 } else { (amp_lo + a * (amp_hi - amp_lo)).clamp(0.0, 1.0) };
+    let l_amp = range_remap(blend(audio_l_amp, std_l));
+    let r_amp = range_remap(blend(audio_r_amp, std_r));
+
+    // Two independent envelope followers, one per band: each band's share of the
+    // felt loudness = the side amplitude times that band's NATURAL spectral fraction.
+    // These are the LF EF and HF EF — both keep their own amplitude (scope traces).
+    let l_lf_ef = l_amp * lf_frac;
+    let l_hf_ef = l_amp * hf_frac;
+    let r_lf_ef = r_amp * lf_frac;
+    let r_hf_ef = r_amp * hf_frac;
+
+    // Carrier vs modulator. `asth_swap` flips which band is the felt carrier vs the
+    // texture modulator. Default: LF carrier, HF modulator.
+    //
+    // CRITICAL (the "extreme of Balance goes silent" fix): the CARRIER amplitude is
+    // the FULL felt loudness `l_amp` — it does NOT depend on Balance or on the band
+    // split, so the rumble never drops out as you sweep Balance. Balance maps ONLY to
+    // the modulation DEPTH:
+    //   * at the CARRIER end of Balance → depth 0 (pure carrier, no flutter),
+    //   * at the MODULATOR end → depth = the modulator band's EF (max texture).
+    // So one extreme = clean carrier (unaffected), the other = fully-textured carrier
+    // — exactly the expected behaviour, with no amplitude loss at either end.
+    let swap = snap.params.get("asth_swap").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Balance −1..+1 → 0..1 "toward the modulator". Default (LF carrier, HF modulator):
+    // +1 (HF) is the modulator end. Swapped (HF carrier, LF modulator): −1 (LF) is the
+    // modulator end. `toward_mod` is 0 at the carrier end, 1 at the modulator end.
+    let toward_mod = if swap {
+        (-band_balance).clamp(0.0, 1.0) // LF end (−1) drives the LF modulator
+    } else {
+        band_balance.clamp(0.0, 1.0)    // HF end (+1) drives the HF modulator
+    };
+    let (l_carrier_amp, l_carrier_freq, l_mod_ef, l_mod_freq,
+         r_carrier_amp, r_carrier_freq, r_mod_ef, r_mod_freq) = if swap {
+        (l_amp, hf_carrier, l_lf_ef, lf_carrier,
+         r_amp, hf_carrier, r_lf_ef, lf_carrier)
+    } else {
+        (l_amp, lf_carrier, l_hf_ef, hf_carrier,
+         r_amp, lf_carrier, r_hf_ef, hf_carrier)
+    };
+    // Carrier amplitude = full felt loudness (Balance-independent). Modulation depth =
+    // modulator-band EF scaled by how far Balance is toward the modulator end; gated
+    // so a silent carrier stays silent.
+    let l_lf_amp = l_carrier_amp;
+    let r_lf_amp = r_carrier_amp;
+    let l_hf_amp = if l_carrier_amp > 0.0 { (l_mod_ef * toward_mod).clamp(0.0, 1.0) } else { 0.0 };
+    let r_hf_amp = if r_carrier_amp > 0.0 { (r_mod_ef * toward_mod).clamp(0.0, 1.0) } else { 0.0 };
+
+    // ── 5. Inject into the target pad's feedback channel. ──
+    let dest_dev = snap.params.get("_asth_dest_dev").and_then(|v| v.as_str()).unwrap_or("");
+    if dest_dev.is_empty() { return; }
+    let key = format!("feedback_inject:{dest_dev}");
+    // `force` distinguishes the amplitude pins (always written, even at 0.0, so the
+    // feedback post-pass actively drives the pad's rumble back to zero on silence —
+    // otherwise a skipped injection leaves the pad holding its last value and it
+    // buzzes forever) from the frequency pins (only meaningful when amp > 0).
+    let mut put = |pin: &str, v: f32, force: bool| {
+        if v <= 0.0 && !force { return; }
+        use std::collections::hash_map::Entry;
+        match collector_sigs.entry((key.clone(), pin.to_string())) {
+            Entry::Occupied(mut o) => { *o.get_mut() = combine_signals(*o.get(), Signal::Float(v)); }
+            Entry::Vacant(e)       => { e.insert(Signal::Float(v)); }
+        }
+    };
+    // hd_* = carrier amplitude (always written so the pad zeroes on silence);
+    // hd2_* = modulator depth.
+    put("hd_l_amp", l_lf_amp, true);
+    put("hd_r_amp", r_lf_amp, true);
+    put("hd2_l_amp", l_hf_amp, true);
+    put("hd2_r_amp", r_hf_amp, true);
+    // hd_*_freq = carrier pitch (the felt frequency); hd2_*_freq = modulator pitch =
+    // AM mod rate (Switch) / second-sine pitch (DualSense). Both follow the swap.
+    if l_lf_amp > 0.0 { put("hd_l_freq", l_carrier_freq, false); }
+    if r_lf_amp > 0.0 { put("hd_r_freq", r_carrier_freq, false); }
+    if l_hf_amp > 0.0 { put("hd2_l_freq", l_mod_freq, false); }
+    if r_hf_amp > 0.0 { put("hd2_r_freq", r_mod_freq, false); }
+}
+
 fn automap_fork_publish(
     snap: &NodeSnap,
     key_uid: usize,
@@ -1666,6 +1945,16 @@ fn eval_subgraph(
             computed[idx] = out;
             continue;
         }
+        // Audio Stream Haptics inside a sub-patch. Publish under the NAMESPACED uid
+        // (ns_uid) so it matches both the capture manager's nested registration and
+        // the downstream sink's collector lookup. Without this arm ASTH did nothing
+        // when nested — the reported "doesn't work inside a sub-patch".
+        if snap.module_id == AUDIO_STREAM_HAPTICS_ID {
+            audio_stream_haptics_publish(snap, ns_uid, dev_sigs, collector_sigs);
+            computed[idx] = vec![None];
+            last_outputs.insert(ns_uid, computed[idx].clone());
+            continue;
+        }
 
         let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
             .map(|src| src.and_then(|(si, op)| {
@@ -1915,6 +2204,13 @@ pub fn eval_graph_tick(
             let out = feedback_control_publish(snap, &computed, dev_sigs, &mut collector_sigs);
             last_outputs.insert(snap.node_uid, out.clone());
             computed[idx] = out;
+            continue;
+        }
+        // ── module.audio_stream_haptics: pass the AutoMap bus through, then
+        //    inject audio-derived HD rumble into the target pad's feedback. ────
+        if snap.module_id == AUDIO_STREAM_HAPTICS_ID {
+            audio_stream_haptics_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
+            computed[idx] = vec![None]; // AutoMap passthrough: no scalar value
             continue;
         }
         // ── device.sink: collect combined inputs, populate sink_outputs ──────
@@ -4885,6 +5181,60 @@ pub fn biases_from_params(params: &HashMap<String, Value>) -> Vec<f32> {
     params.get("biases").and_then(|v| v.as_array()).map(|arr| {
         arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect()
     }).unwrap_or_default()
+}
+
+/// Read curve points from a CUSTOM params key (the standard helper is fixed to
+/// `"points"`). Used by the Audio Stream Haptics band EQ, which lives under
+/// `"asth_eq_points"` so it doesn't collide with any `"points"` key. Returns
+/// `None` when the key is absent (→ EQ disabled, single-carrier path), or the
+/// `[[x,y],…]` control points (x = band position 0..1, y = gain 0..1) otherwise.
+pub fn curve_points_from_params_keyed(params: &HashMap<String, Value>, key: &str) -> Option<Vec<[f32; 2]>> {
+    let arr = params.get(key)?.as_array()?;
+    let pts: Vec<[f32; 2]> = arr.iter().filter_map(|pt| {
+        let a = pt.as_array()?;
+        Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+    }).collect();
+    if pts.len() >= 2 { Some(pts) } else { None }
+}
+
+/// Collapse an EQ-gained log-band spectrum to a single carrier (used by the
+/// single-carrier path / the UI's carrier marker). Applies the per-band gain curve
+/// (`eq_pts`, x = band position 0..1, y = gain 0..1) and returns the amplitude-
+/// weighted **centroid** band position as the carrier. `None` when silent.
+pub fn multiband_collapse_carrier(spectrum: &[f32], eq_pts: &[[f32; 2]]) -> Option<f32> {
+    multiband_collapse_band(spectrum, eq_pts, 0.0, 1.0).map(|(carrier, _)| carrier)
+}
+
+/// Collapse one sub-band `[lo, hi]` (band positions 0..1) of an EQ-gained spectrum
+/// to a single carrier. Returns `(carrier_pos, energy)` where `carrier_pos` is the
+/// gain-weighted centroid WITHIN the sub-band remapped back to 0..1 over the full
+/// range (so it's a normal carrier value), and `energy` is the summed gained
+/// magnitude in the sub-band (used to weight the band's amplitude). `None` when the
+/// sub-band is essentially silent.
+pub fn multiband_collapse_band(spectrum: &[f32], eq_pts: &[[f32; 2]], lo: f32, hi: f32) -> Option<(f32, f32)> {
+    let n = spectrum.len();
+    if n == 0 || hi <= lo { return None; }
+    let mut num = 0.0f32; // Σ gained * position
+    let mut den = 0.0f32; // Σ gained
+    for (i, &m) in spectrum.iter().enumerate() {
+        let pos = (i as f32 + 0.5) / n as f32;
+        if pos < lo || pos >= hi { continue; }
+        let gain = sample_curve(eq_pts, pos, &[]).clamp(0.0, 4.0);
+        let gained = m.max(0.0).sqrt() * gain; // perceptual weight, matches the view
+        num += gained * pos;
+        den += gained;
+    }
+    if den <= 1.0e-4 { return None; }
+    Some(((num / den).clamp(0.0, 1.0), den))
+}
+
+/// Convert a crossover frequency (Hz) to a band position 0..1 on the log-spaced
+/// spectrum range (40 Hz–1253 Hz), matching `flexinput_devices::spectrum`'s bands.
+pub fn crossover_hz_to_pos(hz: f32) -> f32 {
+    const MIN: f32 = 40.0;
+    const MAX: f32 = 1253.0;
+    let hz = hz.clamp(MIN, MAX);
+    ((hz / MIN).ln() / (MAX / MIN).ln()).clamp(0.0, 1.0)
 }
 
 pub fn read_scale_t(params: &HashMap<String, Value>) -> f32 {

@@ -5,6 +5,11 @@ edition.workspace = true
 
 [dependencies]
 flexinput-core = { workspace = true }
+# Audio Stream Haptics: the proc thread reconciles per-node WASAPI loopback
+# captures (devices::loopback_haptic) and eval reads their latest params. The
+# manager API takes primitives (node uid + LoopbackTarget), so devices stays a
+# leaf — no cycle. devices is a sibling leaf crate (core/glam/hid/wasapi only).
+flexinput-devices = { workspace = true }
 uuid           = { workspace = true }
 serde_json     = { workspace = true }
 glam           = { workspace = true }

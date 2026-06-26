@@ -1,13 +1,21 @@
 pub mod gamepad;
 pub mod gilrs_backend;
 pub mod gyro;
+pub mod haptic_pcm;
 pub mod hidhide;
 pub mod identification;
 pub mod layouts;
 pub mod midi;
+pub mod spectrum;
 
 #[cfg(windows)]
 mod dualsense_haptic;
+
+#[cfg(windows)]
+pub mod loopback_haptic;
+
+#[cfg(windows)]
+pub mod loopback_manager;
 
 use flexinput_core::{Signal, SignalType};
 

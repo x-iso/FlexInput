@@ -33,6 +33,13 @@ const SEMANTIC_GROUPS: &[&[&str]] = &[
 pub const FEEDBACK_PAIRS: &[(&str, &[&str])] = &[
     ("rumble_strong", &["rumble_strong", "hd_l_amp", "hd_rumble_l"]),
     ("rumble_weak",   &["rumble_weak",   "hd_r_amp", "hd_rumble_r"]),
+    // HD-rumble second carrier (HF). Direct id match — only pads that expose the
+    // hd2_* inputs (Switch Pro, DualSense) receive it; others drop it silently and
+    // play carrier 1 alone.
+    ("hd2_l_amp",  &["hd2_l_amp"]),
+    ("hd2_l_freq", &["hd2_l_freq"]),
+    ("hd2_r_amp",  &["hd2_r_amp"]),
+    ("hd2_r_freq", &["hd2_r_freq"]),
     ("lightbar_r",    &["lightbar_r"]),
     ("lightbar_g",    &["lightbar_g"]),
     ("lightbar_b",    &["lightbar_b"]),
@@ -96,13 +103,25 @@ pub const FEEDBACK_INLET_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "lightbar_r",    display_name: "Light Bar R",             signal_type: SignalType::Float },
     AutoMapPin { id: "lightbar_g",    display_name: "Light Bar G",             signal_type: SignalType::Float },
     AutoMapPin { id: "lightbar_b",    display_name: "Light Bar B",             signal_type: SignalType::Float },
-    // ── Switch Pro HD rumble (per-side amp + carrier freq) ────────────────────
+    // ── HD rumble carrier 1 (LF) — per-side amp + carrier freq ────────────────
+    // Device-agnostic: a Switch Pro renders this via its HD-rumble table; a
+    // DualSense renders it as a PCM sine on the LRA. "carrier 1" = the low band.
     AutoMapPin { id: "hd_l_amp",      display_name: "HD Rumble L: Amplitude",  signal_type: SignalType::Float },
     AutoMapPin { id: "hd_l_freq",     display_name: "HD Rumble L: Frequency",  signal_type: SignalType::Float },
     AutoMapPin { id: "hd_r_amp",      display_name: "HD Rumble R: Amplitude",  signal_type: SignalType::Float },
     AutoMapPin { id: "hd_r_freq",     display_name: "HD Rumble R: Frequency",  signal_type: SignalType::Float },
     AutoMapPin { id: "hd_rumble_l",   display_name: "HD Rumble L (legacy)",    signal_type: SignalType::Float },
     AutoMapPin { id: "hd_rumble_r",   display_name: "HD Rumble R (legacy)",    signal_type: SignalType::Float },
+    // ── HD rumble carrier 2 (HF) — the SECOND simultaneous carrier ────────────
+    // The Switch Pro / DualSense LRAs each play two carriers at once (HF + LF)
+    // that mix on the actuator. Carrier 1 (hd_*) is the low band; these hd2_*
+    // pins are the high band. Device-agnostic, same as carrier 1: Switch Pro packs
+    // both into one HD-rumble packet (table encode); a DualSense sums two PCM
+    // sines per LRA. A sink that ignores carrier 2 simply plays carrier 1 alone.
+    AutoMapPin { id: "hd2_l_amp",     display_name: "HD Rumble L: Amp (HF)",   signal_type: SignalType::Float },
+    AutoMapPin { id: "hd2_l_freq",    display_name: "HD Rumble L: Freq (HF)",  signal_type: SignalType::Float },
+    AutoMapPin { id: "hd2_r_amp",     display_name: "HD Rumble R: Amp (HF)",   signal_type: SignalType::Float },
+    AutoMapPin { id: "hd2_r_freq",    display_name: "HD Rumble R: Freq (HF)",  signal_type: SignalType::Float },
     // ── DualSense HD haptics (USB only) ───────────────────────────────────────
     AutoMapPin { id: "ds_l_amp",      display_name: "DS Haptic L: Amplitude",  signal_type: SignalType::Float },
     AutoMapPin { id: "ds_l_freq",     display_name: "DS Haptic L: Frequency",  signal_type: SignalType::Float },
