@@ -209,6 +209,17 @@ pub struct AppSettings {
     /// are always transient.
     #[serde(default)]
     pub persist_virtual_devices: bool,
+    /// Master switch for HidHide masking. When on, FlexInput hides every physical
+    /// HID controller currently remapped to a virtual output, so games see only the
+    /// virtual pad (not the original). `None` = auto = **on when the HidHide driver
+    /// is installed** (the requested default), off otherwise; `Some(x)` is an
+    /// explicit user choice. Only masks HID-class pads (DS4 / DualSense / Switch) —
+    /// the XInput/XUSB face of Xbox controllers can't be hidden. The elevated helper
+    /// applies it and always clears it on app exit, so a closed app never leaves
+    /// controllers hidden. Resolve the effective value with
+    /// `hide_originals.unwrap_or(hidhide_installed)`.
+    #[serde(default)]
+    pub hide_originals: Option<bool>,
     /// What to do with the camera when a patch is loaded into a tab.
     #[serde(default)]
     pub on_patch_load: OnPatchLoad,
@@ -304,6 +315,7 @@ impl Default for AppSettings {
             pin_guide_chord: None,
             show_own_virtuals_as_physical: false,
             persist_virtual_devices: false,
+            hide_originals: None,
             on_patch_load: OnPatchLoad::Off,
             profiler_enabled: false,
             ui_mode: UiMode::Easy,

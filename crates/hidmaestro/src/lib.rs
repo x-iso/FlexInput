@@ -26,6 +26,8 @@ pub mod descriptor;
 pub mod encode;
 #[cfg(windows)]
 pub mod helper;
+#[cfg(windows)]
+pub mod hidhide;
 pub mod helper_ipc;
 pub mod install;
 pub mod orchestrator;

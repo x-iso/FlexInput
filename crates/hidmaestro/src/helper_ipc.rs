@@ -62,6 +62,26 @@ pub enum Request {
     /// reclaim-on-startup when persistence is on). Includes devices created by a
     /// previous app run that this helper instance isn't tracking yet.
     ListDevices,
+    /// Apply a HidHide masking configuration (elevated). HidHide's config IOCTLs
+    /// write HKLM-backed driver state, so only the elevated helper can change
+    /// them — this is why the in-app `HidHideClient` is read-only.
+    ///
+    /// Semantics: the helper ensures every path in `whitelist` is present (so
+    /// FlexInput keeps seeing the hidden pads), MERGES `blacklist` into the
+    /// driver's blacklist (dropping only the entries WE added on a prior apply, so
+    /// a user's own HidHide entries from other tools are preserved), and sets the
+    /// master `active` flag. `blacklist` is OUR desired set, not the whole list.
+    /// The helper tracks what it applied and clears exactly that on parent-death /
+    /// shutdown so a closed app never leaves controllers hidden. Note: HidHide only
+    /// masks HID-class devices — it cannot hide the XInput/XUSB face of Xbox pads.
+    HidHideApply {
+        /// Device instance ids FlexInput wants hidden (merged with third-party entries).
+        blacklist: Vec<String>,
+        /// App exe paths that must keep seeing the hidden devices (FlexInput + helper).
+        whitelist: Vec<String>,
+        /// Master on/off.
+        active: bool,
+    },
     /// Ask the helper to exit (releases everything).
     Shutdown,
 }
@@ -78,6 +98,14 @@ pub enum Response {
     Created { instance_id: String, index: u32 },
     /// Enumerated HIDMaestro devices currently present (reply to `ListDevices`).
     Devices { devices: Vec<DeviceInfo> },
+    /// Result of a `HidHideApply`. `present` is false when the HidHide driver
+    /// isn't installed (the app then prompts the user to install it). `active`
+    /// and `hidden` are read back from the driver after applying.
+    HidHideState {
+        present: bool,
+        active: bool,
+        hidden: Vec<String>,
+    },
     /// An error occurred handling the request.
     Error { message: String },
 }

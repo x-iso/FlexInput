@@ -463,7 +463,25 @@ pub struct FlexInputApp {
     last_signals: HashMap<(String, String), Signal>,
     eval_cache: HashMap<(NodeId, usize), Option<Signal>>,
     logo_texture: Option<egui::TextureHandle>,
+    /// Transient HidHide control handle — opened only while the legacy HidHide
+    /// window is in use, then released. Never held persistently (that blocks the
+    /// elevated helper from opening the exclusive control device).
     hidhide: Option<HidHideClient>,
+    /// Whether the HidHide driver is installed (detected once at startup without
+    /// holding the handle). Gates the "Hide originals" toggle.
+    hidhide_installed: bool,
+    /// Debounce for HidHide reconcile: the (active, sorted vid/pid targets) last
+    /// sent to the helper, so we don't re-apply identical state.
+    hidhide_last_active: Option<bool>,
+    hidhide_last_targets: Vec<(u16, u16)>,
+    /// Force a HidHide reconcile next frame (set by the toggle and at startup).
+    hidhide_dirty: bool,
+    /// Order-independent hash of the connected device-id set; the reconcile's
+    /// snarl walk only runs when this changes (plug/unplug), the dirty flag is set,
+    /// or the slow fallback interval elapses — never every frame.
+    hidhide_last_device_sig: u64,
+    /// Last time the reconcile walk ran (throttle for patch-wiring edits).
+    hidhide_last_reconcile: std::time::Instant,
     last_update: std::time::Instant,
     bottom_panel_height: f32,
     /// Summed `mutation_gen` across all tabs as of the last crash-recovery
@@ -743,7 +761,14 @@ impl FlexInputApp {
         let descriptors = all_modules().into_iter().map(|r| r.descriptor).collect();
         let backends    = init_backends();
         let midi_backend = Arc::new(Mutex::new(Some(MidiBackend::new())));
-        // HidHide integration disabled pending a proper rewrite.
+        // Detect HidHide presence WITHOUT holding the control-device handle. A
+        // persistently-held handle blocks the elevated helper from opening
+        // HidHide's (exclusive) control device — observed as the helper reporting
+        // "driver not present" even though detection here succeeds. So open
+        // transiently, record presence, and drop the handle immediately. All WRITES
+        // go through the helper; `self.hidhide` is opened on demand only while the
+        // legacy HidHide window is in use (released when it closes).
+        let hidhide_installed = HidHideClient::try_open().is_some();
         let hidhide: Option<HidHideClient> = None;
         // Title-bar logo tile. Loaded from a pre-baked 256px PNG (rendered
         // from icon_v2.svg at build time) rather than rasterizing the SVG
@@ -1022,6 +1047,12 @@ impl FlexInputApp {
             eval_cache: HashMap::new(),
             logo_texture,
             hidhide,
+            hidhide_installed,
+            hidhide_last_active: None,
+            hidhide_last_targets: Vec::new(),
+            hidhide_dirty: true, // reconcile once at startup (apply default-on masking)
+            hidhide_last_device_sig: 0,
+            hidhide_last_reconcile: std::time::Instant::now(),
             last_update: std::time::Instant::now(),
             bottom_panel_height: 220.0,
             // Seeded below from the restored tabs so the first frame doesn't
@@ -1311,6 +1342,10 @@ impl eframe::App for FlexInputApp {
             puffin::profile_scope!("read_devices_clone");
             self.devices = self.shared_devices.read().unwrap().clone();
         }
+
+        // Keep HidHide masking in sync with the live patch + device set. Cheap and
+        // debounced (only acts when the remapped-physical set actually changes).
+        self.reconcile_hidhide();
 
         // Gamepad UI navigation: consume the active nav device's input and
         // drive FlexInput's own UI. Must run after `last_signals` is refreshed
@@ -1716,6 +1751,9 @@ impl eframe::App for FlexInputApp {
             self.hidhide_window_open = true;
             self.hidhide_filter.clear();
             self.hidhide_proc_list = crate::process_list::enumerate_processes_full();
+            // Open a transient handle for the window's lifetime (released when it
+            // closes — see the release guard before the window render).
+            self.hidhide = HidHideClient::try_open();
             if let Some(hh) = &self.hidhide {
                 self.hidhide_whitelist = hh.whitelist();
             }
@@ -1861,6 +1899,12 @@ impl eframe::App for FlexInputApp {
             if !open {
                 self.bind_window_open = false;
             }
+        }
+
+        // Release the transient HidHide handle whenever the window isn't open —
+        // holding it would block the elevated helper from opening the control device.
+        if !self.hidhide_window_open && self.hidhide.is_some() {
+            self.hidhide = None;
         }
 
         // ── HidHide configuration window ──────────────────────────────────────────
@@ -7832,6 +7876,136 @@ impl FlexInputApp {
         Some(t)
     }
 
+    /// Recompute and apply HidHide masking for the active patch. Cheap to call
+    /// every frame: a last-applied snapshot debounces redundant applies, and the
+    /// slow SetupAPI instance-id lookup + blocking helper IPC run on a spawned
+    /// thread. Never spawns the elevated helper just to apply/clear *nothing*
+    /// (avoids a spurious UAC when the feature is on but nothing is mapped yet).
+    #[cfg(windows)]
+    fn reconcile_hidhide(&mut self) {
+        // Only do real work on a relevant change: an explicit dirty (toggle /
+        // startup), a device plug/unplug, or a slow fallback that catches patch
+        // wiring edits. This replaces the per-frame walk.
+        let device_sig: u64 = self.devices.iter().fold(0u64, |acc, d| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            d.id.hash(&mut h);
+            acc ^ h.finish() // XOR: order-independent
+        });
+        let due = self.hidhide_dirty
+            || device_sig != self.hidhide_last_device_sig
+            || self.hidhide_last_reconcile.elapsed() >= std::time::Duration::from_millis(750);
+        if !due {
+            return;
+        }
+        self.hidhide_dirty = false;
+        self.hidhide_last_device_sig = device_sig;
+        self.hidhide_last_reconcile = std::time::Instant::now();
+
+        let installed = self.hidhide_installed;
+        let active = self.settings.hide_originals.unwrap_or(installed);
+        let mut targets: Vec<(u16, u16)> = if active && installed {
+            self.remapped_physical_hid_targets()
+        } else {
+            Vec::new()
+        };
+        targets.sort_unstable();
+        targets.dedup();
+
+        let prev_targets = std::mem::take(&mut self.hidhide_last_targets);
+        if self.hidhide_last_active == Some(active) && prev_targets == targets {
+            self.hidhide_last_targets = prev_targets; // unchanged: restore + bail
+            return;
+        }
+        self.hidhide_last_active = Some(active);
+        self.hidhide_last_targets = targets.clone();
+        // Don't spawn the helper (UAC) just to apply or clear an empty set.
+        if targets.is_empty() && prev_targets.is_empty() {
+            return;
+        }
+
+        // FlexInput's own exe stays whitelisted so it keeps reading the hidden pads.
+        let whitelist: Vec<String> = HidHideClient::current_exe_path().into_iter().collect();
+        std::thread::spawn(move || {
+            // (vid,pid) → HID instance id (slow SetupAPI; safe off the UI/IO thread).
+            let blacklist: Vec<String> = targets
+                .iter()
+                .filter_map(|(vid, pid)| {
+                    let id = flexinput_devices::hidhide::instance_id_for_vid_pid(*vid, *pid);
+                    eprintln!(
+                        "[hidhide] target {:04X}:{:04X} -> instance {:?}",
+                        vid, pid, id
+                    );
+                    id
+                })
+                .collect();
+            match flexinput_hidmaestro::helper::hidhide_apply(&blacklist, &whitelist, active) {
+                Ok(st) if !st.present => eprintln!("[hidhide] driver not present at apply time"),
+                Ok(st) => eprintln!(
+                    "[hidhide] applied: active={} hidden={} (requested {})",
+                    st.active, st.hidden.len(), blacklist.len()
+                ),
+                Err(e) => eprintln!("[hidhide] apply failed: {e}"),
+            }
+        });
+    }
+
+    #[cfg(not(windows))]
+    fn reconcile_hidhide(&mut self) {}
+
+    /// (vid,pid) of physical HID controllers in the active patch that feed a
+    /// `virtual.*` output. XInput (Xbox) pads are excluded — HidHide can't hide
+    /// their XUSB face — as are MIDI devices.
+    #[cfg(windows)]
+    fn remapped_physical_hid_targets(&self) -> Vec<(u16, u16)> {
+        use std::collections::HashSet;
+        let snarl = &self.tabs[self.active_tab].canvas.snarl;
+        // Physical device ids that feed a virtual.* sink (via an AutoMap wire).
+        let mut phys_ids: HashSet<String> = HashSet::new();
+        for (node_id, node_ref) in snarl.nodes_ids_data() {
+            let node = &node_ref.value;
+            if node.module_id != "device.sink" {
+                continue;
+            }
+            let sink_dev = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+            if !sink_dev.starts_with("virtual.") {
+                continue;
+            }
+            for i in 0..node.inputs.len() {
+                if node.inputs.get(i).map(|p| p.signal_type) != Some(SignalType::AutoMap) {
+                    continue;
+                }
+                let in_pin = snarl.in_pin(InPinId { node: node_id, input: i });
+                for &src in &in_pin.remotes {
+                    if let Some(dev_id) = find_automap_device_id_for_viewer(snarl, src, None) {
+                        if dev_id.starts_with("gilrs:") {
+                            phys_ids.insert(dev_id);
+                        }
+                    }
+                }
+            }
+        }
+        // Map device ids → (vid,pid), keeping HID-class pads only.
+        let mut out = Vec::new();
+        for dev in &self.devices {
+            if !phys_ids.contains(&dev.id) {
+                continue;
+            }
+            if matches!(
+                dev.kind,
+                flexinput_devices::ControllerKind::XInput
+                    | flexinput_devices::ControllerKind::MidiIn
+                    | flexinput_devices::ControllerKind::MidiOut
+            ) {
+                continue; // Xbox/XInput can't be hidden; MIDI has no vid/pid
+            }
+            if let (Some(vid), Some(pid)) = (dev.vid, dev.pid) {
+                out.push((vid, pid));
+            }
+        }
+        out
+    }
+
     fn draw_settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open { return; }
         let mut open = true;
@@ -8273,6 +8447,41 @@ impl FlexInputApp {
                      ViGEmBus removes those automatically when FlexInput exits and they can't be \
                      reclaimed — they're re-created fresh on next launch.",
                 ).small().color(egui::Color32::from_gray(140)));
+
+                // ── Hide originals from games (HidHide) ──────────────────
+                ui.add_space(6.0);
+                let hidhide_installed = self.hidhide_installed;
+                // Effective value: explicit user choice, else default ON when the
+                // HidHide driver is installed (the requested default), OFF otherwise.
+                let mut hide_effective = self.settings.hide_originals.unwrap_or(hidhide_installed);
+                let resp = ui.add_enabled(
+                    hidhide_installed,
+                    egui::Checkbox::new(
+                        &mut hide_effective,
+                        "Hide original controllers from games (HidHide)",
+                    ),
+                );
+                if resp.changed() {
+                    self.settings.hide_originals = Some(hide_effective);
+                    dirty = true;
+                    self.hidhide_dirty = true; // apply on the next frame's reconcile
+                }
+                if hidhide_installed {
+                    ui.label(egui::RichText::new(
+                        "Defaults ON because HidHide is installed. When on, any physical controller \
+                         you remap to a virtual output is hidden from games, so the game sees only \
+                         the virtual pad. FlexInput stays whitelisted so it still reads the original. \
+                         Masking is cleared automatically when FlexInput closes. \u{2014} Note: only \
+                         HID controllers (DualShock 4 / DualSense / Switch) can be hidden; the \
+                         XInput/XUSB face of Xbox controllers cannot.",
+                    ).small().color(egui::Color32::from_gray(140)));
+                } else {
+                    ui.label(egui::RichText::new(
+                        "HidHide driver not installed. Install HidHide (nefarius/HidHide) to hide \
+                         original controllers from games. Without it, games may see both the physical \
+                         pad and the virtual one.",
+                    ).small().color(egui::Color32::from_rgb(210, 150, 90)));
+                }
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -11616,7 +11825,9 @@ fn show_title_bar(
     let text_pad_right = 12.0_f32 * TITLE_SCALE;   // pill padding after the text
 
     let font_id = egui::FontId::proportional(text_px);
-    let galley = ui.painter().layout_no_wrap("FlexInput".to_string(), font_id, base_color);
+    // Trailing gear marks the title as the Settings button (it opens Settings on
+    // click). The glyph ships in egui's bundled emoji font.
+    let galley = ui.painter().layout_no_wrap("FlexInput ⚙".to_string(), font_id, base_color);
     let text_size = galley.size();
 
     // The pill spans from a few px inside the tile's left to the right of

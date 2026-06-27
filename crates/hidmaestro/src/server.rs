@@ -86,10 +86,23 @@ struct LiveDevice {
     _companion_handle: Option<crate::orchestrator::SwdHandle>,
 }
 
+/// The HidHide masking the helper applied for the app, retained so teardown can
+/// undo exactly what we changed: remove only the device ids WE added to the
+/// blacklist (leaving any a user set via other tools) and, if our apply switched
+/// HidHide on, switch it back off. Cleared on parent-death / shutdown so a closed
+/// app never leaves a user's controllers hidden.
+#[derive(Default, Clone)]
+struct HidHideApplied {
+    our_blacklist: Vec<String>,
+    we_activated: bool,
+}
+
 /// Process-wide helper state shared between the client loop and the
 /// parent-watch thread.
 struct HelperState {
     devices: Mutex<HashMap<String, LiveDevice>>,
+    /// HidHide masking applied on the app's behalf; `None` until first apply.
+    hidhide_applied: Mutex<Option<HidHideApplied>>,
     /// True once persistence has been resolved (via `Hello`). When false the
     /// helper removes all devices on parent death / shutdown.
     persist: AtomicBool,
@@ -115,6 +128,7 @@ impl HelperState {
     fn new() -> Self {
         HelperState {
             devices: Mutex::new(HashMap::new()),
+            hidhide_applied: Mutex::new(None),
             persist: AtomicBool::new(false),
             parent_gone: AtomicBool::new(false),
             did_startup_cleanup: AtomicBool::new(false),
@@ -143,6 +157,34 @@ impl HelperState {
                 let _ = batch.remove(&id);
             }
         }
+    }
+
+    /// Undo any HidHide masking we applied: drop the device ids WE added from the
+    /// blacklist (keeping any a user set elsewhere) and, if our apply switched
+    /// HidHide on, switch it back off. Best-effort; runs on parent-death and clean
+    /// exit (always — masking physical pads must never outlive the app, regardless
+    /// of the device-persist setting).
+    fn clear_hidhide(&self) {
+        let applied = self.hidhide_applied.lock().ok().and_then(|mut g| g.take());
+        let Some(applied) = applied else { return };
+        if applied.our_blacklist.is_empty() && !applied.we_activated {
+            return;
+        }
+        let Some(hh) = crate::hidhide::HidHide::open() else { return };
+        if !applied.our_blacklist.is_empty() {
+            let ours: std::collections::HashSet<String> =
+                applied.our_blacklist.iter().map(|s| s.to_uppercase()).collect();
+            let kept: Vec<String> = hh
+                .blacklist()
+                .into_iter()
+                .filter(|s| !ours.contains(&s.to_uppercase()))
+                .collect();
+            hh.set_blacklist(&kept);
+        }
+        if applied.we_activated {
+            hh.set_active(false);
+        }
+        diag_log("[helper] cleared HidHide masking on teardown");
     }
 }
 
@@ -209,6 +251,8 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
         state.teardown_tracked();
         diag_log("[helper] exit cleanup (persist off): removed tracked device(s)");
     }
+    // Always undo HidHide masking on exit (independent of device persistence).
+    state.clear_hidhide();
     diag_log("[helper] stopped");
 }
 
@@ -297,6 +341,9 @@ fn handle_parent_death(parent_pid: u32, state: &Arc<HelperState>) {
         state.teardown_tracked();
         diag_log("[helper] removed tracked device(s) after parent death");
     }
+    // Always undo HidHide masking — physical pads must never stay hidden once the
+    // app is gone, independent of the device-persist policy.
+    state.clear_hidhide();
     wake_accept_loop();
 }
 
@@ -489,8 +536,74 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                 .collect();
             (Response::Devices { devices }, false)
         }
+        Request::HidHideApply { blacklist, whitelist, active } => {
+            (handle_hidhide_apply(blacklist, whitelist, active, state), false)
+        }
         Request::Shutdown => (Response::ok(), true),
     }
+}
+
+/// Apply a HidHide masking config elevated, and record what we changed so
+/// teardown can undo it. Returns the read-back state (or `present: false` when
+/// the HidHide driver isn't installed).
+fn handle_hidhide_apply(
+    blacklist: Vec<String>,
+    whitelist: Vec<String>,
+    active: bool,
+    state: &Arc<HelperState>,
+) -> Response {
+    let Some(hh) = crate::hidhide::HidHide::open() else {
+        diag_log("[helper] hidhide apply: driver not present");
+        return Response::HidHideState { present: false, active: false, hidden: vec![] };
+    };
+    let was_active = hh.is_active();
+    // Keep FlexInput (+ the helper) able to see the pads it hides.
+    if !whitelist.is_empty() {
+        hh.ensure_whitelisted(&whitelist);
+    }
+    // MERGE rather than replace: a user may run HidHide with their own blacklist
+    // entries from other tools. Drop only OUR previous entries, then add our new
+    // ones — never clobber third-party entries. (`blacklist` is our desired set,
+    // not the whole list.)
+    let prev_ours: Vec<String> = state
+        .hidhide_applied
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|a| a.our_blacklist.clone()))
+        .unwrap_or_default();
+    let prev_set: std::collections::HashSet<String> =
+        prev_ours.iter().map(|s| s.to_uppercase()).collect();
+    let new_set: std::collections::HashSet<String> =
+        blacklist.iter().map(|s| s.to_uppercase()).collect();
+    let mut merged: Vec<String> = hh
+        .blacklist()
+        .into_iter()
+        // keep entries that are neither a stale one of ours nor a fresh one of ours
+        // (fresh ones are re-added below to dedup)
+        .filter(|s| {
+            let up = s.to_uppercase();
+            !prev_set.contains(&up) && !new_set.contains(&up)
+        })
+        .collect();
+    merged.extend(blacklist.iter().cloned());
+    hh.set_blacklist(&merged);
+    hh.set_active(active);
+    // Record what we applied (sticky `we_activated`: once we switched it on, we own
+    // switching it off at teardown even if a later apply leaves it on).
+    if let Ok(mut g) = state.hidhide_applied.lock() {
+        let prev_activated = g.as_ref().map(|a| a.we_activated).unwrap_or(false);
+        *g = Some(HidHideApplied {
+            our_blacklist: blacklist.clone(),
+            we_activated: prev_activated || (active && !was_active),
+        });
+    }
+    let hidden = hh.blacklist();
+    let active_now = hh.is_active();
+    diag_log(&format!(
+        "[helper] hidhide apply: active={active_now} hidden={} (was_active={was_active})",
+        hidden.len()
+    ));
+    Response::HidHideState { present: true, active: active_now, hidden }
 }
 
 fn handle_create(

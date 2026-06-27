@@ -298,6 +298,42 @@ pub fn list_devices() -> Result<Vec<crate::helper_ipc::DeviceInfo>, HelperError>
     }
 }
 
+/// Outcome of a HidHide apply via the helper.
+pub struct HidHideStatus {
+    /// False when the HidHide driver isn't installed (app should prompt to install it).
+    pub present: bool,
+    /// Master active flag, read back after applying.
+    pub active: bool,
+    /// Device instance ids currently in the blacklist, read back after applying.
+    pub hidden: Vec<String>,
+}
+
+/// Apply a HidHide masking config via the elevated helper: ensure the `whitelist`
+/// apps stay able to see hidden pads, REPLACE the device blacklist with
+/// `blacklist`, and set the master `active` flag. The helper records what it
+/// changed and undoes it on app exit / parent death, so a closed app never leaves
+/// controllers hidden. Blocking — run off the UI thread; reuses the already-spawned
+/// helper (no extra UAC when a virtual device is already deployed).
+pub fn hidhide_apply(
+    blacklist: &[String],
+    whitelist: &[String],
+    active: bool,
+) -> Result<HidHideStatus, HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    let req = Request::HidHideApply {
+        blacklist: blacklist.to_vec(),
+        whitelist: whitelist.to_vec(),
+        active,
+    };
+    match call(&mut m, &req)? {
+        Response::HidHideState { present, active, hidden } => {
+            Ok(HidHideStatus { present, active, hidden })
+        }
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to HidHideApply".into())),
+    }
+}
+
 /// Destroy a previously-created device by instance id via the helper.
 pub fn destroy(instance_id: &str) -> Result<(), HelperError> {
     let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
