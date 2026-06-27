@@ -17,9 +17,39 @@ use crate::{
 #[cfg(windows)]
 mod xinput_ffi {
     #[repr(C)]
+    #[derive(Clone, Copy, Default)]
     pub struct XINPUT_VIBRATION {
         pub w_left_motor_speed:  u16,
         pub w_right_motor_speed: u16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct XINPUT_GAMEPAD {
+        pub w_buttons:       u16,
+        pub b_left_trigger:  u8,
+        pub b_right_trigger: u8,
+        pub s_thumb_lx:      i16,
+        pub s_thumb_ly:      i16,
+        pub s_thumb_rx:      i16,
+        pub s_thumb_ry:      i16,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct XINPUT_STATE {
+        pub dw_packet_number: u32,
+        pub gamepad:          XINPUT_GAMEPAD,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct XINPUT_CAPABILITIES {
+        pub b_type:    u8,
+        pub b_sub_type: u8,
+        pub w_flags:   u16,
+        pub gamepad:   XINPUT_GAMEPAD,
+        pub vibration: XINPUT_VIBRATION,
     }
 
     #[link(name = "xinput")]
@@ -28,6 +58,81 @@ mod xinput_ffi {
         /// Returns 0 on success, ERROR_DEVICE_NOT_CONNECTED (1167) if the
         /// controller is disconnected.
         pub fn XInputSetState(dw_user_index: u32, p_vibration: *const XINPUT_VIBRATION) -> u32;
+        /// Reads the live state of an XInput slot (0-3). Returns 0 when a
+        /// controller occupies the slot, ERROR_DEVICE_NOT_CONNECTED (1167) when empty.
+        pub fn XInputGetState(dw_user_index: u32, p_state: *mut XINPUT_STATE) -> u32;
+        /// Reads static capabilities (type/subtype/flags) for an XInput slot.
+        pub fn XInputGetCapabilities(
+            dw_user_index: u32,
+            dw_flags: u32,
+            p_capabilities: *mut XINPUT_CAPABILITIES,
+        ) -> u32;
+    }
+}
+
+/// One XInput user-index slot's live state, from a direct `XInputGetState` probe.
+///
+/// XInput exposes a fixed 4-slot model (indices 0-3) and assigns slots by device
+/// arrival order — there is no API to *set* a slot. `connected` marks an occupied
+/// slot; `packet` is XInput's change counter, which advances whenever that slot's
+/// input changes. The packet delta is the key correlation signal: the slot the
+/// user is physically pressing advances on its own, while the slot FlexInput drives
+/// (its own virtual companion) advances in lockstep with our writes. Off Windows
+/// every slot reports empty.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct XInputSlotInfo {
+    pub index:     u32,
+    pub connected: bool,
+    pub packet:    u32,
+    pub buttons:   u16,
+    /// XINPUT_CAPABILITIES subtype (e.g. 1 = GAMEPAD). 0 when unknown/empty.
+    pub sub_type:  u8,
+}
+
+/// Probe all four XInput user-index slots. Pure read via the XInput API (no
+/// SetupAPI / hidapi enumeration), so it is cheap enough to call periodically and
+/// safe off the device-io hot path. Off Windows returns four empty slots.
+pub fn probe_xinput_slots() -> [XInputSlotInfo; 4] {
+    let mut out = [XInputSlotInfo::default(); 4];
+    for i in 0..4u32 {
+        out[i as usize].index = i;
+        #[cfg(windows)]
+        unsafe {
+            use xinput_ffi::*;
+            let mut st: XINPUT_STATE = Default::default();
+            if XInputGetState(i, &mut st) == 0 {
+                let slot = &mut out[i as usize];
+                slot.connected = true;
+                slot.packet = st.dw_packet_number;
+                slot.buttons = st.gamepad.w_buttons;
+                let mut caps: XINPUT_CAPABILITIES = Default::default();
+                if XInputGetCapabilities(i, 0, &mut caps) == 0 {
+                    slot.sub_type = caps.b_sub_type;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Log the current XInput slot occupancy. Called on device-set changes (connect /
+/// disconnect) so we can see, on real hardware, whether our virtual XUSB companion
+/// actually acquires a slot when a physical XInput pad is present — the open
+/// question behind "Steam doesn't see the virtual when a physical is connected".
+#[cfg(windows)]
+fn log_xinput_slots() {
+    let slots = probe_xinput_slots();
+    let n = slots.iter().filter(|s| s.connected).count();
+    eprintln!("[xinput-slots] {n} slot(s) connected");
+    for s in &slots {
+        if s.connected {
+            eprintln!(
+                "[xinput-slots]   slot {} CONNECTED subtype={} packet={} buttons=0x{:04X}",
+                s.index, s.sub_type, s.packet, s.buttons
+            );
+        } else {
+            eprintln!("[xinput-slots]   slot {} empty", s.index);
+        }
     }
 }
 
@@ -189,6 +294,11 @@ impl DeviceBackend for GilrsBackend {
         if self.dev_set_dirty {
             self.refresh_virtual_classification();
             self.dev_set_dirty = false;
+            // Snapshot XInput slot occupancy on every device-set change so the log
+            // shows whether the virtual XUSB companion acquired a slot alongside any
+            // physical XInput pad (the slot-acquisition question for the 4-slot work).
+            #[cfg(windows)]
+            log_xinput_slots();
         }
 
         // Per-pad keep/virtual decision (path-based for PS, correlation-based for
@@ -233,6 +343,10 @@ impl DeviceBackend for GilrsBackend {
                 outputs: layouts::outputs_for(kind),
                 inputs: layouts::inputs_for(kind),
                 instance_path: None,
+                // Cheap (already read for `kind`); the slow HID-instance-id lookup
+                // for HidHide is deferred to an off-thread reconcile that reads these.
+                vid: pad.vendor_id(),
+                pid: pad.product_id(),
             });
         }
         result
@@ -417,7 +531,18 @@ impl DeviceBackend for GilrsBackend {
                 out.push((dev.clone(), r_pin.into(), Signal::Float(rt)));
             }
 
-            // Gyro via raw HID for DS4 / DualSense.
+            // Gyro via raw HID for DS4 / DualSense. Only REAL pads carry a HID
+            // handle worth reading; our own virtual (is_virt) is excluded from the
+            // gyro index space entirely so a real pad's idx can never land on the
+            // virtual's hidapi entry. The gilrs/WGI walk order and hidapi
+            // device_list order diverge once a same-VID/PID virtual is present (the
+            // ROOT-enumerated virtual jumps position on a physical reconnect), so a
+            // shared positional index crossed them — the DualSense override below
+            // then overwrote a real pad's live sticks/buttons with the virtual's
+            // neutral report (the post-reconnect freeze bug). Counting + reading
+            // reals only keeps both index spaces stable. See gyro::open_device
+            // (real-only list) and lookup_phys (real-only output index).
+            if !is_virt {
             if let Some((vid, pid)) = pad.vendor_id().zip(pad.product_id()) {
                 let vp = (vid, pid);
                 let idx = *gyro_idx.entry(vp).or_insert(0);
@@ -548,6 +673,7 @@ impl DeviceBackend for GilrsBackend {
                     }
                 }
             }
+            } // close `if !is_virt` gyro guard
         }
         } // end gilrs_gamepads_walk profile_scope block
 
@@ -644,12 +770,18 @@ impl GilrsBackend {
         let mut kind_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut virt_seen: HashMap<ControllerKind, usize> = HashMap::new();
         let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
-        // gyro idx counts kept pads per VID/PID (matches poll's `gyro_idx`).
+        // REAL-only gyro idx (matches poll's `gyro_idx`, which now skips is_virt):
+        // our own virtual is excluded from the HID handle index space (see
+        // gyro::open_device), so count and match real pads only. `disposition_for`
+        // is still called for every pad so its classification index (`vp_idx`)
+        // advances over the full list; a virtual `device_id` has no gyro handle and
+        // falls through to None.
         let mut vp_seen: HashMap<(u16, u16), usize> = HashMap::new();
         for (_id, pad) in self.gilrs.gamepads() {
             let vp = pad.vendor_id().zip(pad.product_id());
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
             let PadDisposition::Keep { is_virt } = self.disposition_for(vp, pad.name(), &mut vp_idx);
+            if is_virt { continue; } // own virtual: never a gyro/HID target
             let (dev, _inst, _is_virt) =
                 gilrs_device_id(is_virt, kind, &mut kind_seen, &mut virt_seen);
             if dev == device_id {

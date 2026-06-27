@@ -420,7 +420,17 @@ impl GyroManager {
     fn open_device(&self, vid: u16, pid: u16, idx: usize) -> Option<HidEntry> {
         let api = self.api.as_ref()?;
         let kind_tag = classify(vid, pid)?; // bail early for non-PS/Switch VID/PID
-        let paths = self.gamepad_device_list(vid, pid);
+        // Real devices only: our own virtual (ROOT-enumerated `HIDCLASS`/`HIDMAESTRO`
+        // path) must never be a gyro/HID target. Excluding it here — combined with the
+        // real-only index the gilrs walk now produces (poll skips is_virt) and
+        // lookup_phys — keeps the (vid,pid,idx) handle selection stable even when a
+        // same-VID/PID virtual shares the bus, where the raw list order is not. The
+        // virtual/real CLASSIFIER (`is_own_virtual_instance`) still reads the full list.
+        let paths: Vec<&hidapi::DeviceInfo> = self
+            .gamepad_device_list(vid, pid)
+            .into_iter()
+            .filter(|d| !instance_path_is_virtual(&d.path().to_string_lossy()))
+            .collect();
 
         #[cfg(debug_assertions)]
         eprintln!("[gyro] open_device vid={:04X} pid={:04X} idx={} iface={} path={:?}",

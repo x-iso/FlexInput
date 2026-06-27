@@ -218,6 +218,8 @@ impl DeviceBackend for MidiBackend {
                 outputs: vec![],
                 inputs: vec![],
                 instance_path: None,
+                vid: None,
+                pid: None,
             })
             .collect();
         devs.extend(self.out_entries.iter().map(|e| PhysicalDevice {
@@ -227,6 +229,8 @@ impl DeviceBackend for MidiBackend {
             outputs: vec![],
             inputs: vec![],
             instance_path: None,
+            vid: None,
+            pid: None,
         }));
         devs
     }

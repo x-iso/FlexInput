@@ -19,7 +19,7 @@ pub mod loopback_manager;
 
 use flexinput_core::{Signal, SignalType};
 
-pub use gilrs_backend::GilrsBackend;
+pub use gilrs_backend::{probe_xinput_slots, GilrsBackend, XInputSlotInfo};
 pub use hidhide::HidHideClient;
 pub use identification::ControllerKind;
 pub use midi::MidiBackend;
@@ -41,6 +41,11 @@ pub struct PhysicalDevice {
     /// Windows device instance path (e.g. `HID\VID_054C&PID_09CC\5&...`),
     /// used for HidHide blacklist operations. None if unavailable.
     pub instance_path: Option<String>,
+    /// USB vendor/product id for a gamepad (gilrs pads). `None` for devices
+    /// without one (MIDI). Used to resolve the HID instance id off-thread for
+    /// HidHide masking, so a slow SetupAPI lookup never runs on the I/O loop.
+    pub vid: Option<u16>,
+    pub pid: Option<u16>,
 }
 
 pub trait DeviceBackend: Send {
