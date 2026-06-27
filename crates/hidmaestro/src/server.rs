@@ -461,6 +461,17 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                 Err(e) => (Response::err(format!("driver reinstall failed: {e}")), false),
             }
         }
+        Request::UninstallDriver => {
+            // Live nodes pin the driver and make /delete-driver fail; tear them all
+            // down first, then remove the package(s).
+            state.teardown_tracked();
+            let n = remove_all_hidmaestro_devices();
+            diag_log(&format!("[helper] uninstall: removed {n} device(s) before driver removal"));
+            match crate::deploy::uninstall_driver() {
+                Ok(()) => (Response::Ok { detail: Some("driver uninstalled".into()) }, false),
+                Err(e) => (Response::err(format!("driver uninstall failed: {e}")), false),
+            }
+        }
         Request::Create { device_id, profile_json, index_hint, poll_interval_ms } => {
             (handle_create(&device_id, &profile_json, index_hint, poll_interval_ms, state), false)
         }

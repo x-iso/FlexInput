@@ -3,6 +3,42 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.2] - 2026-06-27
+
+Touchpad output bindings for Remapper/Lean, a combiner mapping fix, and a
+HIDMaestro driver-uninstall path with on-demand install from Easy mode.
+
+### Added
+
+- **Touchpad / swipe / mic output bindings** in the Remapper and Lean (3DOF→2D)
+  "Special" picker. The picker is now a button (mouse-clickable cells + gamepad
+  nav, same popup for both) offering the three DualSense touch zones, touchpad
+  click, horizontal/vertical analog swipe (gated to analog inputs), and the
+  DualSense mic button. The engine synthesizes real touch points from these
+  bindings, stacking up to the two the hardware supports.
+- **Uninstall HIDMaestro driver** path: tears down all live virtual device nodes,
+  then removes every installed driver package via the elevated helper (new
+  `UninstallDriver` IPC request + `deploy::uninstall_driver`, with an
+  `Uninstall`/`Uninstalling` device-op and progress state).
+- Easy mode gamepad output card stays **enabled when the driver is absent** —
+  selecting a model installs HIDMaestro on demand (one admin prompt) via the
+  normal create path, with a hint shown.
+
+### Fixed
+
+- **Combiner SORT** now picks the first *asserted* port (with fallback to the
+  first port), so a Remapper's mapped output is no longer clobbered by a raw
+  pass-through bus port — fixes broken gamepad button→button remapping inside a
+  sub-patch (you'd get neither button, or both lighting up).
+- **Touchpad combo logic:** buttons in a touch combo only *gate* the finger
+  (activate it), while analog inputs drive the swipe axes — no longer "stuck at
+  full value." Opposite cardinals of one axis cover both halves; a combo can map
+  e.g. button + left-stick (all directions) to both touchpad-point axes.
+- **Gate-button suppression for multi-axis touch combos:** a combo mixing
+  opposite cardinals of one axis (which can never be simultaneously held) now
+  correctly consumes its gate button from pass-through while active, instead of
+  leaking it through.
+
 ## [0.10.0] - 2026-06-26
 
 This release replaces the ViGEm backend with a pure-Rust HIDMaestro virtual-device

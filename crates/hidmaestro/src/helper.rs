@@ -247,6 +247,18 @@ pub fn reinstall_driver() -> Result<(), HelperError> {
     }
 }
 
+/// Remove the HIDMaestro driver package via the helper (tears down all live
+/// HIDMaestro device nodes first, then deletes every package). Nothing is
+/// reinstalled. Blocking — run off the UI thread. One UAC if the helper isn't up.
+pub fn uninstall_driver() -> Result<(), HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    match call(&mut m, &Request::UninstallDriver)? {
+        Response::Ok { .. } => Ok(()),
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to UninstallDriver".into())),
+    }
+}
+
 /// Create (or reclaim) a device for `device_id` from `profile_json` via the
 /// helper. The helper allocates a globally-unique controller index (or returns
 /// the existing one if `device_id` is already present). `index_hint` is the

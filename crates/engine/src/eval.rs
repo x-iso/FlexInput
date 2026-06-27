@@ -1528,7 +1528,24 @@ fn automap_combiner_publish(
         }
         if raw.is_empty() { continue; }
         let resolved: Option<Signal> = match policy {
-            "SORT" => raw.into_iter().next(),
+            // Priority merge: the first ASSERTED (non-default) value wins,
+            // falling back to the highest-priority port when none is asserted.
+            // A port that explicitly carries an "off" value (Bool(false), 0.0,
+            // zero Vec2) must NOT mask a lower-priority port that is actually
+            // contributing — otherwise a raw passthrough port (which reports
+            // every button as false each tick) clobbers an upstream Remapper's
+            // mapped OUTPUT pin (the output side carries no `consumed` marker,
+            // so it doesn't take the hierarchy-suppression branch above).
+            "SORT" => {
+                let asserted = raw.iter().copied().find(|s| match s {
+                    Signal::Bool(b) => *b,
+                    Signal::Int(i)  => *i != 0,
+                    Signal::Float(f) => *f != 0.0,
+                    Signal::Vec2(v) => *v != glam::Vec2::ZERO,
+                    _ => false,
+                });
+                asserted.or_else(|| raw.into_iter().next())
+            }
             "OR" => match pin.signal_type {
                 flexinput_core::SignalType::Bool => {
                     let any = raw.iter().any(|s| matches!(s, Signal::Bool(true)));
@@ -4053,6 +4070,15 @@ fn eval_remapper_node(
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
                 if in_pins.is_empty() { return false; }
+                // Touch-output combos can mix opposite cardinals of one axis
+                // (left+right), which can never be "simultaneously held"; use the
+                // touch-combo activation rule so their gate buttons + sticks get
+                // consumed whenever the combo is active (gate buttons held, analog
+                // deflection optional). Otherwise the generic all-held check below
+                // would never fire and the buttons would leak through.
+                if mapping_targets_touch(m) {
+                    return eval_touch_combo(&in_pins, &upstream).active;
+                }
                 in_pins.iter().all(|p| {
                     if analog_axis_for_cardinal(p).is_some() {
                         analog_cardinal_input_value(&upstream, p) > 0.0
@@ -4208,6 +4234,9 @@ fn eval_remapper_node(
                 // is longer.
                 let n = in_pins.len().min(out_pins.len());
                 for (in_p, out_p) in in_pins[..n].iter().zip(out_pins[..n].iter()) {
+                    // Touchpad zone/swipe outputs are handled by the touchpad
+                    // synthesis pass below, not as axis/trigger/button writes.
+                    if touchpad_out_kind(out_p).is_some() { continue; }
                     analog_out_pins.insert(out_p.clone());
                     let in_is_cardinal  = analog_axis_for_cardinal(in_p).is_some();
                     let out_axis_opt    = analog_axis_for_cardinal(out_p);
@@ -4286,6 +4315,7 @@ fn eval_remapper_node(
                 if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
                     for v in arr {
                         if let Some(s) = v.as_str() {
+                            if touchpad_out_kind(s).is_some() { continue; } // synthesized below
                             digital_all_out_pins.insert(s.to_string());
                         }
                     }
@@ -4294,7 +4324,10 @@ fn eval_remapper_node(
             let mut digital_asserted: HashSet<String> = HashSet::new();
             for (_, out_pins, is_analog, _) in &triggered {
                 if *is_analog { continue; }
-                for p in out_pins { digital_asserted.insert(p.clone()); }
+                for p in out_pins {
+                    if touchpad_out_kind(p).is_some() { continue; } // synthesized below
+                    digital_asserted.insert(p.clone());
+                }
             }
             for out_pin in &digital_all_out_pins {
                 let sig_type = automap::ALL_PINS.iter()
@@ -4348,6 +4381,7 @@ fn eval_remapper_node(
                             // release pass or it would clobber the analog value.
                             if analog_axis_for_cardinal(s).is_none()
                                 && analog_trigger_out(s).is_none()
+                                && touchpad_out_kind(s).is_none()
                             {
                                 analog_button_pins.insert(s.to_string());
                             }
@@ -4380,6 +4414,53 @@ fn eval_remapper_node(
                     };
                     collector_sigs.insert((key.clone(), out_pin.clone()), sig);
                 }
+            }
+
+            // ── Touchpad output synthesis (zones + analog swipe) ──────────
+            //
+            // If ANY mapping targets a touchpad zone/swipe pin, the Remapper owns
+            // the virtual touchpad. Each touch mapping yields ONE finger; stack up
+            // to the 2 hardware touch points (original mapping order). Plain
+            // `btn_touchpad` (click) / `btn_mute` are canonical and handled above.
+            //
+            // Input roles within a touch mapping (this is NOT index-zip):
+            //   • BUTTONS gate the finger — all must be held for it to be active;
+            //     they never contribute a value (fixes the "stuck at full" bug).
+            //   • ANALOG inputs (stick cardinals / triggers) drive the swipe axes,
+            //     routed by orientation: horizontal cardinals → swipe_x, vertical
+            //     → swipe_y. Both directions of an axis cover both halves (e.g.
+            //     left_stick_left AND left_stick_right → full −1..+1 on X).
+            //   • A mapping with buttons + analog: the buttons gate (finger down
+            //     while held, even centered) and the analog drives the position.
+            //   • Analog-only: deflection both activates and positions.
+            let has_touch_mappings = mappings.iter().any(mapping_targets_touch);
+            if has_touch_mappings {
+                let mut fingers: Vec<(f32, f32)> = Vec::new();
+                for m in &mappings {
+                    if fingers.len() >= 2 { break; }
+                    if !mapping_targets_touch(m) { continue; }
+                    let out_pins: Vec<&str> = m.get("out").and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                    let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+
+                    // Evaluate inputs by role (buttons gate, analog drives axes).
+                    let ev = eval_touch_combo(&in_pins, &upstream);
+                    if !ev.active { continue; }
+
+                    let mut fx = 0.0f32;
+                    let mut fy = 0.0f32;
+                    for p in &out_pins {
+                        match touchpad_out_kind(p) {
+                            Some(TouchOutKind::Zone(zx)) => { fx = zx; }
+                            Some(TouchOutKind::SwipeX) => { fx += ev.axis_x; }
+                            Some(TouchOutKind::SwipeY) => { fy += ev.axis_y; }
+                            None => {}
+                        }
+                    }
+                    fingers.push((fx.clamp(-1.0, 1.0), fy.clamp(-1.0, 1.0)));
+                }
+                publish_touch_points(&key, &fingers, collector_sigs);
             }
 }
 
@@ -4683,6 +4764,137 @@ fn analog_cardinal_input_value(upstream: &HashMap<String, Signal>, pin_id: &str)
     signed.max(0.0).min(1.0)
 }
 
+/// True when a pin id is an analog INPUT source — a stick cardinal or an analog
+/// trigger. The Remapper/Lean UI uses this to gate analog-only outputs (e.g. the
+/// touchpad swipe bindings) so they're only offered once an analog input chord
+/// has been captured.
+pub fn pin_is_analog_input(pin_id: &str) -> bool {
+    analog_axis_for_cardinal(pin_id).is_some()
+        || matches!(pin_id, "left_trigger" | "right_trigger")
+}
+
+/// Synthetic Remapper/Lean OUTPUT pins that drive the virtual touchpad rather
+/// than a canonical sink pin. `touch_left/center/right` place a finger TOUCH at a
+/// fixed X zone; `touch_swipe_x/_y` move a finger along an axis by the input's
+/// signed analog magnitude (absolute-position model). These are translated into
+/// canonical `touch1_*`/`touch2_*` points by [`publish_touch_points`]; the plain
+/// `btn_touchpad` (click) and `btn_mute` outputs are canonical and need no
+/// translation.
+#[derive(Clone, Copy, PartialEq)]
+enum TouchOutKind { Zone(f32), SwipeX, SwipeY }
+
+/// Horizontal offset of the left/right touch zones (center = 0). Matches the
+/// input-side `zone_of_x` thresholds (±1/3) comfortably.
+const TOUCH_ZONE_X: f32 = 0.66;
+
+fn touchpad_out_kind(pin_id: &str) -> Option<TouchOutKind> {
+    match pin_id {
+        "touch_left"   => Some(TouchOutKind::Zone(-TOUCH_ZONE_X)),
+        "touch_center" => Some(TouchOutKind::Zone(0.0)),
+        "touch_right"  => Some(TouchOutKind::Zone(TOUCH_ZONE_X)),
+        "touch_swipe_x" => Some(TouchOutKind::SwipeX),
+        "touch_swipe_y" => Some(TouchOutKind::SwipeY),
+        _ => None,
+    }
+}
+
+/// True when any of a mapping's `out` pins drives the touchpad (zone or swipe).
+fn mapping_targets_touch(m: &serde_json::Value) -> bool {
+    m.get("out").and_then(|v| v.as_array()).map(|a| a.iter().any(|v|
+        v.as_str().map(|s| touchpad_out_kind(s).is_some()).unwrap_or(false)
+    )).unwrap_or(false)
+}
+
+/// Result of evaluating a touch-output combo's inputs by role.
+struct TouchComboEval {
+    /// Whether the finger should be down this tick.
+    active: bool,
+    /// Signed horizontal contribution (sum of `*_x` cardinals + triggers, ±1 range).
+    axis_x: f32,
+    /// Signed vertical contribution (sum of `*_y` cardinals, ±1 range).
+    axis_y: f32,
+}
+
+/// Evaluate a touch-output combo's inputs by ROLE — the single source of truth
+/// shared by the synthesis pass (positions the finger) and the suppression pass
+/// (`held_now`, decides when to consume the combo's inputs from pass-through).
+///
+/// Inputs split into:
+///   • BUTTONS — gate the finger: ALL must be held for it to activate; they
+///     contribute no axis value.
+///   • ANALOG cardinals / triggers — drive the axes, routed by orientation
+///     (`*_x` → axis_x, `*_y` → axis_y; triggers → axis_x). Opposite cardinals
+///     of one axis (left+right) sum with their signs to cover both halves.
+///
+/// Activation: gate buttons held AND (a gate button present → always; else any
+/// analog deflected). This must NOT require every cardinal at once — a combo
+/// mixing left+right of one axis can never be "simultaneously held", which is
+/// exactly why a generic all-held check would never suppress its gate buttons.
+fn eval_touch_combo(in_pins: &[&str], upstream: &HashMap<String, Signal>) -> TouchComboEval {
+    let mut gate_buttons_held = true;
+    let mut has_gate_button = false;
+    let mut has_analog = false;
+    let mut any_analog_active = false;
+    let mut axis_x = 0.0f32;
+    let mut axis_y = 0.0f32;
+    for ip in in_pins {
+        if let Some((axis, sign)) = analog_axis_for_cardinal(ip) {
+            has_analog = true;
+            let v = analog_cardinal_input_value(upstream, ip); // 0..1
+            if v > 0.0 { any_analog_active = true; }
+            if axis.ends_with("_x") { axis_x += sign * v; } else { axis_y += sign * v; }
+        } else if matches!(*ip, "left_trigger" | "right_trigger") {
+            has_analog = true;
+            let v = upstream.get(*ip).map(|s| sig_scalar(*s)).unwrap_or(0.0).clamp(0.0, 1.0);
+            if v > 0.0 { any_analog_active = true; }
+            axis_x += v; // one-sided; drives the positive side
+        } else {
+            has_gate_button = true;
+            if !upstream.get(*ip).map(|s| s.as_bool()).unwrap_or(false) {
+                gate_buttons_held = false;
+            }
+        }
+    }
+    let active = if !gate_buttons_held {
+        false
+    } else if has_gate_button {
+        true // buttons gate: finger down while held (analog only positions)
+    } else if has_analog {
+        any_analog_active // analog-only: deflection activates
+    } else {
+        false
+    };
+    TouchComboEval { active, axis_x, axis_y }
+}
+
+/// Publish up to TWO synthesized touch points (`fingers`, ordered, in -1..1) into
+/// `collector_sigs[(key, "touch{1,2}_{x,y,active}")]`. Extra requests beyond the
+/// hardware's 2 simultaneous points are dropped. Unused slots publish
+/// `*_active = false` so a released synthesized touch doesn't latch on the
+/// virtual pad. Callers gate this on the patch actually having touchpad-output
+/// mappings, so a patch that never targets the touchpad leaves the pass-through
+/// touch pins untouched.
+fn publish_touch_points(
+    key: &str,
+    fingers: &[(f32, f32)],
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) {
+    for (i, (xk, yk, ak)) in [
+        ("touch1_x", "touch1_y", "touch1_active"),
+        ("touch2_x", "touch2_y", "touch2_active"),
+    ].iter().enumerate() {
+        if let Some((x, y)) = fingers.get(i) {
+            collector_sigs.insert((key.to_string(), xk.to_string()),
+                Signal::Float(x.clamp(-1.0, 1.0)));
+            collector_sigs.insert((key.to_string(), yk.to_string()),
+                Signal::Float(y.clamp(-1.0, 1.0)));
+            collector_sigs.insert((key.to_string(), ak.to_string()), Signal::Bool(true));
+        } else {
+            collector_sigs.insert((key.to_string(), ak.to_string()), Signal::Bool(false));
+        }
+    }
+}
+
 
 /// Apply axis-side suppression to a stick axis Float value. `(neg, pos)` —
 /// when `neg` is true, clamp negative values to 0; when `pos` is true,
@@ -4733,6 +4945,7 @@ fn lean_dispatch_into_collector_sigs(
         if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
             for v in arr {
                 if let Some(s) = v.as_str() {
+                    if touchpad_out_kind(s).is_some() { continue; } // synthesized below
                     all_out_pins.insert(s.to_string());
                     if let Some((axis_pin, _)) = analog_axis_for_cardinal(s) {
                         all_out_pins.insert(axis_pin.to_string());
@@ -4784,6 +4997,9 @@ fn lean_dispatch_into_collector_sigs(
 
             let is_analog_mode = mode_s == "analog";
             for p in &out_pins {
+                // Touchpad zone/swipe outputs are synthesized into touch points
+                // after this loop, not emitted as axis/button pins.
+                if touchpad_out_kind(p).is_some() { continue; }
                 // Cardinal → analog-axis remap (all press modes):
                 // A stick-cardinal like `left_stick_right` represents the
                 // user's INTENT to drive that axis in that direction. The
@@ -4859,6 +5075,48 @@ fn lean_dispatch_into_collector_sigs(
             }
         });
         collector_sigs.insert((key.clone(), p.clone()), sig);
+    }
+
+    // ── Touchpad output synthesis (zones + analog swipe) ──────────────────
+    // Mirror of the Remapper's pass: if any lean mapping targets a touchpad
+    // zone/swipe pin, synthesize up to 2 touch points from the ACTIVE side's
+    // mappings (left side = negative X swipe, right side = positive).
+    let has_touch_mappings = lean_left.iter().chain(lean_right.iter()).any(|m| {
+        m.get("out").and_then(|v| v.as_array()).map(|a| a.iter().any(|v|
+            v.as_str().map(|s| touchpad_out_kind(s).is_some()).unwrap_or(false)
+        )).unwrap_or(false)
+    });
+    if has_touch_mappings {
+        let mut fingers: Vec<(f32, f32)> = Vec::new();
+        'sides: for (side_idx, (active, mappings)) in [
+            (left_active, &lean_left), (right_active, &lean_right),
+        ].iter().enumerate() {
+            if !*active { continue; }
+            let swipe_sign = if side_idx == 0 { -1.0 } else { 1.0 };
+            for m in *mappings {
+                if fingers.len() >= 2 { break 'sides; }
+                let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let mut fx = 0.0f32;
+                let mut fy = 0.0f32;
+                let mut has = false;
+                let mut needs_mag = false;
+                for out_p in &out_pins {
+                    match touchpad_out_kind(out_p) {
+                        Some(TouchOutKind::Zone(zx)) => { fx = zx; has = true; }
+                        Some(TouchOutKind::SwipeX) => { fx += swipe_sign * lean_mag; has = true; needs_mag = true; }
+                        Some(TouchOutKind::SwipeY) => { fy += swipe_sign * lean_mag; has = true; needs_mag = true; }
+                        None => {}
+                    }
+                }
+                if has {
+                    if needs_mag && fx.abs() < 1e-3 && fy.abs() < 1e-3 { continue; }
+                    fingers.push((fx, fy));
+                }
+            }
+        }
+        publish_touch_points(&key, &fingers, collector_sigs);
     }
 }
 
@@ -5456,6 +5714,306 @@ mod trigger_tests {
             .and_then(|s| if let Signal::Vec2(v) = s { Some(v.y) } else { None });
         let y = ly.or(lstick).unwrap_or(-1.0);
         assert!((y - 1.0).abs() < 0.05, "stick output should be preserved, got left_stick_y={y}");
+    }
+
+    // A Remapper's mapped OUTPUT pin must survive a downstream Combiner whose
+    // higher-priority port carries the raw device bus. Regression for the
+    // "General purpose preset" button→button bug: a real controller reports
+    // every button each tick (false when up), so the raw-bus Collector on port 0
+    // explicitly carries `btn_rb = false`. With the old SORT (`first port wins`)
+    // that false value clobbered the Remapper's `btn_rb = true` on port 1 — so a
+    // single mapped button produced nothing, yet pressing both swapped buttons
+    // lit both (those pins ARE consumed and take the hierarchy branch).
+    //
+    // Topology:  device → Collector (port 0) ┐
+    //            device → Remapper  (port 1) ├→ Combiner → sink
+    #[test]
+    fn remapped_output_survives_combiner_raw_bus_priority() {
+        let dev = "gilrs:switch_pro:0";
+        let src = source_node(1, dev, 0.0);
+
+        let mut collect = empty_node(2, "module.automap_collect");
+        collect.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        collect.input_sources = vec![Some((0, 0))];
+        collect.n_outputs = 1;
+
+        let mut remap = empty_node(3, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["btn_east"] },
+            { "in": ["btn_east"],  "out": ["btn_rb"]   },
+            { "in": ["btn_rb"],    "out": ["btn_east"] }
+        ]));
+        remap.input_sources = vec![Some((0, 0))];
+        remap.n_outputs = 1;
+
+        let mut combiner = empty_node(4, "module.automap_combiner");
+        combiner.params.insert("_automap_input_devs".into(), Value::Array(vec![
+            Value::String(String::new()), Value::String(String::new()),
+        ]));
+        combiner.params.insert("_automap_input_collectors".into(), Value::Array(vec![
+            Value::String("collector:2".into()), Value::String("remap:3".into()),
+        ]));
+        combiner.input_sources = vec![Some((2, 0)), Some((3, 0))];
+        combiner.n_outputs = 1;
+
+        let sink = sink_node(20, "virtual.xinput:0", "combiner:4", true);
+        let graph = ProcessingGraph { nodes: vec![src, collect, remap, combiner, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let getb = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+        // A real controller reports EVERY button each tick (false when up).
+        let press = |pins: &[&str]| {
+            let mut m = HashMap::new();
+            for p in ["btn_south", "btn_east", "btn_rb", "btn_west", "btn_north", "btn_lb"] {
+                m.insert((dev.to_string(), p.to_string()), Signal::Bool(pins.contains(&p)));
+            }
+            m
+        };
+        let tick = |graph: &ProcessingGraph, state: &mut HashMap<usize, NodeState>,
+                    out: &mut TickOutput, pins: &[&str]| {
+            // Settle (release) between presses so press-mode edges are clean.
+            eval_graph_tick(graph, state, &press(&[]), 0.016, out);
+            eval_graph_tick(graph, state, &press(pins), 0.016, out);
+        };
+
+        // south → east
+        tick(&graph, &mut state, &mut out, &["btn_south"]);
+        assert!(getb(&out, "btn_east"), "south→east must fire btn_east");
+        assert!(!getb(&out, "btn_south"), "consumed btn_south must be suppressed");
+
+        // east → rb
+        tick(&graph, &mut state, &mut out, &["btn_east"]);
+        assert!(getb(&out, "btn_rb"), "east→rb must fire btn_rb");
+        assert!(!getb(&out, "btn_east"), "consumed btn_east must be suppressed");
+
+        // rb → east
+        tick(&graph, &mut state, &mut out, &["btn_rb"]);
+        assert!(getb(&out, "btn_east"), "rb→east must fire btn_east");
+        assert!(!getb(&out, "btn_rb"), "consumed btn_rb must be suppressed");
+
+        // Pressing the swapped pair leaves both asserted (east↔rb swap).
+        tick(&graph, &mut state, &mut out, &["btn_east", "btn_rb"]);
+        assert!(getb(&out, "btn_east") && getb(&out, "btn_rb"),
+            "east+rb swap should leave both asserted");
+    }
+
+    // Touchpad zone outputs synthesize finger touch points on the virtual pad,
+    // and two simultaneous zone mappings stack onto the 2 hardware touch points.
+    #[test]
+    fn remapper_touch_zones_synthesize_and_stack() {
+        let dev = "gilrs:switch_pro:0";
+        let remap_uid = 1usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["touch_left"]  },
+            { "in": ["btn_east"],  "out": ["touch_right"] }
+        ]));
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let getf = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_float());
+        let getb = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+
+        // South only → one finger at the left zone.
+        let mut dev_sigs = HashMap::new();
+        dev_sigs.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(true));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(getb(&out, "touch1_active"), "south→touch_left must activate a touch point");
+        assert!((getf(&out, "touch1_x").unwrap_or(0.0) - (-0.66)).abs() < 0.05,
+            "left zone x≈-0.66, got {:?}", getf(&out, "touch1_x"));
+        assert!(!getb(&out, "touch2_active"), "only one finger for a single zone mapping");
+
+        // South + East → two stacked fingers (left + right).
+        dev_sigs.insert((dev.to_string(), "btn_east".to_string()), Signal::Bool(true));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(getb(&out, "touch1_active") && getb(&out, "touch2_active"),
+            "two zone mappings must stack onto 2 touch points");
+        assert!((getf(&out, "touch2_x").unwrap_or(0.0) - 0.66).abs() < 0.05,
+            "right zone x≈+0.66, got {:?}", getf(&out, "touch2_x"));
+
+        // Release → both points report inactive (no latch).
+        eval_graph_tick(&graph, &mut state, &HashMap::new(), 0.016, &mut out);
+        assert!(!getb(&out, "touch1_active") && !getb(&out, "touch2_active"),
+            "released zone mappings must release the touch points");
+    }
+
+    // Analog swipe drives a finger coordinate continuously (absolute position).
+    #[test]
+    fn remapper_swipe_tracks_analog_input() {
+        let dev = "gilrs:switch_pro:0";
+        let remap_uid = 1usize;
+        let src = source_node(3, dev, 0.0);
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_right"], "out": ["touch_swipe_x"], "mode": "analog" }
+        ]));
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let getf = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_float());
+        let getb = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+
+        // Half deflection → finger at ~+0.5.
+        let mut dev_sigs = HashMap::new();
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.5));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(getb(&out, "touch1_active"), "deflected swipe must activate the finger");
+        assert!((getf(&out, "touch1_x").unwrap_or(0.0) - 0.5).abs() < 0.05,
+            "swipe finger x should track deflection ~0.5, got {:?}", getf(&out, "touch1_x"));
+
+        // Neutral stick → finger released.
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.0));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(!getb(&out, "touch1_active"), "neutral swipe must release the finger");
+    }
+
+    // Combo: a BUTTON gates the finger, the LS axes drive both swipe axes (routed
+    // by orientation). Buttons must NOT contribute a value (regression for the
+    // "stuck at full" bug). Both directions of an axis cover both halves.
+    #[test]
+    fn remapper_swipe_button_gate_with_two_axis_inputs() {
+        let dev = "gilrs:switch_pro:0";
+        let remap_uid = 1usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        // Button gate + LS in all 4 directions → swipe X + swipe Y.
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_lb", "left_stick_left", "left_stick_right",
+                     "left_stick_up", "left_stick_down"],
+              "out": ["touch_swipe_x", "touch_swipe_y"], "mode": "analog" }
+        ]));
+        // Zero-deadzone source so the test measures the mapping, not the curve.
+        let src = source_node(3, dev, 0.0);
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let getf = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
+        let getb = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+
+        // Stick deflected but button UP → no finger (button gates).
+        let mut dev_sigs = HashMap::new();
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.6));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(!getb(&out, "touch1_active"), "button not held → no finger");
+
+        // Button held, stick centered → finger DOWN at center (button gates,
+        // analog at rest → NOT stuck at full).
+        dev_sigs.insert((dev.to_string(), "btn_lb".to_string()), Signal::Bool(true));
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.0));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(getb(&out, "touch1_active"), "button held → finger active even centered");
+        assert!(getf(&out, "touch1_x").abs() < 0.05 && getf(&out, "touch1_y").abs() < 0.05,
+            "centered stick → finger at center, got ({},{})", getf(&out,"touch1_x"), getf(&out,"touch1_y"));
+
+        // Button held + stick right → X tracks; right uses the positive half.
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.6));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!((getf(&out, "touch1_x") - 0.6).abs() < 0.05,
+            "stick right → swipe x ~+0.6, got {}", getf(&out, "touch1_x"));
+
+        // Button held + stick left → negative half of the SAME axis.
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(-0.8));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!((getf(&out, "touch1_x") - (-0.8)).abs() < 0.05,
+            "stick left → swipe x ~-0.8, got {}", getf(&out, "touch1_x"));
+
+        // Vertical axis drives swipe Y independently (stick up = +Y).
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.0));
+        dev_sigs.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(0.5));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!((getf(&out, "touch1_y") - 0.5).abs() < 0.05,
+            "stick up → swipe y ~+0.5, got {}", getf(&out, "touch1_y"));
+    }
+
+    // A touch combo that mixes opposite cardinals of one axis (left+right) can
+    // never be "all held at once", so the generic suppression test would never
+    // consume its gate button — the button would leak through to pass-through.
+    // The touch-combo activation rule must drive suppression: while the combo is
+    // active, the gate button (and the driving stick) are consumed.
+    #[test]
+    fn remapper_touch_combo_suppresses_gate_button_with_multi_axis() {
+        let dev = "gilrs:switch_pro:0";
+        let remap_uid = 1usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        // Gate button + LS in all 4 directions → swipe X + swipe Y.
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_lb", "left_stick_left", "left_stick_right",
+                     "left_stick_up", "left_stick_down"],
+              "out": ["touch_swipe_x", "touch_swipe_y"], "mode": "analog" }
+        ]));
+        let src = source_node(3, dev, 0.0);
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let getf = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
+        let getb = |out: &TickOutput, pin: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+
+        // Button up: combo inactive → button passes through normally.
+        let mut dev_sigs = HashMap::new();
+        dev_sigs.insert((dev.to_string(), "btn_lb".to_string()), Signal::Bool(false));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(!getb(&out, "btn_lb"), "button up → nothing to pass through");
+
+        // Button held + stick deflected (one direction, combo active): the finger
+        // is down AND the gate button is suppressed from pass-through, even though
+        // the opposite cardinal of the same axis is also in the combo.
+        dev_sigs.insert((dev.to_string(), "btn_lb".to_string()), Signal::Bool(true));
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.6));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(getb(&out, "touch1_active"), "combo active → finger down");
+        assert!((getf(&out, "touch1_x") - 0.6).abs() < 0.05, "stick drives swipe x");
+        assert!(!getb(&out, "btn_lb"),
+            "active touch combo must suppress its gate button (was leaking with multi-axis)");
+
+        // Button held, stick centered: finger down at center, button still consumed.
+        dev_sigs.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.0));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(getb(&out, "touch1_active"), "button held → finger active even centered");
+        assert!(!getb(&out, "btn_lb"), "gate button stays suppressed while combo held");
+
+        // Button released → combo inactive → finger up, button no longer consumed.
+        dev_sigs.insert((dev.to_string(), "btn_lb".to_string()), Signal::Bool(false));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(!getb(&out, "touch1_active"), "button released → finger up");
+    }
+
+    // The DualSense mic button is a canonical pin: a normal button→btn_mute map
+    // reaches the sink with no special handling.
+    #[test]
+    fn remapper_mic_button_reaches_sink() {
+        let dev = "gilrs:switch_pro:0";
+        let remap_uid = 1usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["btn_mute"] }
+        ]));
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let mut dev_sigs = HashMap::new();
+        dev_sigs.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(true));
+        eval_graph_tick(&graph, &mut state, &dev_sigs, 0.016, &mut out);
+        assert!(out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_mute".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false), "btn_south→btn_mute must reach the sink");
     }
 
     // The implicit digital→analog bridge must RELEASE: pressing then releasing

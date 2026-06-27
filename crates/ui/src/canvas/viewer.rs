@@ -5972,45 +5972,22 @@ fn show_gyro_lean_mapping_section(
             }
         }
 
-        // Special dropdown — appends pins that can't be press-captured (mouse
-        // buttons / scroll / explicit modifiers) directly to the Lean output
-        // draft. Available BEFORE Learn (idle) and during learning, so a gamepad
-        // user can pick a mouse/keyboard action. Gamepad South (via
-        // `_nav_act_special_<side>`) opens it / the KB/M picker.
+        // Special button — opens the shared KB/M + touchpad picker (mouse OR
+        // gamepad South via `_nav_act_special_<side>`). The picker writes into
+        // this section's `_lean_<side>_draft`. Lean inputs are always analog (the
+        // lean gesture), so the swipe bindings are always available here.
         {
-            let combo_id = egui::Id::new((node_id, "lean_special", side));
-            if act_special {
-                ui.memory_mut(|m| m.open_popup(combo_id));
-            }
-            let mut to_append: Option<&'static str> = None;
-            let combo = egui::ComboBox::from_id_salt((node_id, "lean_special", side))
-                .selected_text(egui::RichText::new("Special…").size(13.0))
-                .width(120.0)
-                .show_ui(ui, |ui| {
-                    for (label, id) in REMAPPER_SPECIAL_PINS {
-                        if new_draft.iter().any(|p| p == id) { continue; }
-                        if ui.selectable_label(false, egui::RichText::new(*label).size(13.0)).clicked() {
-                            to_append = Some(id);
-                        }
-                    }
-                });
-            special_rect = combo.response.rect;
-            if let Some(id) = to_append {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    let mut arr = new_draft.clone();
-                    arr.push(id.to_string());
-                    remapper_write_str_array(node, draft_key, &arr);
-                    new_draft.push(id.to_string());
-                    // Picking a Special pin moves to "ready" (NOT "learning"):
-                    // the draft shows and Add is enabled, but the gamepad capture
-                    // machine does NOT tick — so the South used to navigate the
-                    // picker isn't swept into the chord and Learn stays "Learn".
-                    node.params.insert(phase_key.to_string(), Value::String("ready".to_string()));
-                    new_phase = "ready".to_string();
-                    // Picking via Special also disarms any pending nav capture.
-                    node.params.insert(armed_key.to_string(), Value::from(false));
-                    node.params.insert(arm_idle_key.to_string(), Value::from(false));
-                }
+            let special_btn = ui.add(egui::Button::new(
+                egui::RichText::new("Special…").size(13.0)));
+            special_rect = special_btn.rect;
+            if special_btn.clicked() || act_special {
+                crate::canvas::viewer::request_special_picker(ui.ctx(),
+                    crate::canvas::viewer::SpecialPickerRequest {
+                        inner: node_id,
+                        outer: crate::canvas::viewer::root_subpatch_id(automap_parent),
+                        draft_key: draft_key.to_string(),
+                        phase_key: Some(phase_key.to_string()),
+                    });
             }
         }
 
@@ -6043,6 +6020,10 @@ fn show_gyro_lean_mapping_section(
                 let out_arr: Vec<Value> = new_draft.iter().map(|s| Value::String(s.clone())).collect();
                 let mut entry = serde_json::Map::new();
                 entry.insert("out".to_string(), Value::Array(out_arr));
+                // Touchpad swipe outputs are continuous → analog mode.
+                if new_draft.iter().any(|p| remapper_out_is_swipe(p)) {
+                    entry.insert("mode".to_string(), Value::String("analog".to_string()));
+                }
                 let mut all = mappings.clone();
                 all.push(Value::Object(entry));
                 node.params.insert(key.to_string(), Value::Array(all));
@@ -10727,6 +10708,50 @@ const LAYOUT_PENDING_KEY: &str = "fxi_layout_pending";
 
 pub fn set_layout_mode_active(ctx: &egui::Context, active: bool) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(LAYOUT_ACTIVE_KEY), active));
+}
+
+/// A request from a Remapper/Lean "Special…" button (mouse click) to open the
+/// shared KB/M + touchpad picker. The viewer supplies the inner node + its draft
+/// and phase param keys; `app.rs` resolves the containing sub-patch (or top
+/// level) at the `Canvas::show` call site and opens the picker.
+#[derive(Clone)]
+pub struct SpecialPickerRequest {
+    /// The Remapper/Lean node id (within its own snarl).
+    pub inner: NodeId,
+    // (Default impl below — egui's `remove_temp` requires `Default`.)
+    /// The containing sub-patch node in the TAB canvas, or `None` when the node
+    /// sits directly on the tab canvas. Derived from the AutoMap parent chain.
+    pub outer: Option<NodeId>,
+    pub draft_key: String,
+    /// Phase param key for Lean sections (`_lean_<side>_phase`); `None` for the
+    /// Remapper (which uses `ui_phase`).
+    pub phase_key: Option<String>,
+}
+
+/// Outermost (tab-canvas-level) sub-patch node id for an AutoMap parent chain,
+/// or `None` at the top level. Used to address a Special-picker target.
+pub fn root_subpatch_id(parent: Option<&AutomapGlowParent<'_>>) -> Option<NodeId> {
+    let mut cur = parent?;
+    while let Some(prev) = cur.prev { cur = prev; }
+    Some(cur.subpatch_node_id)
+}
+
+impl Default for SpecialPickerRequest {
+    fn default() -> Self {
+        Self { inner: NodeId(0), outer: None, draft_key: String::new(), phase_key: None }
+    }
+}
+
+const SPECIAL_PICKER_REQ_KEY: &str = "fxi_special_picker_request";
+
+/// Set from a Special button click; consumed by `app.rs` after the canvas/editor
+/// `show()` returns (which is where the sub-patch `outer` context is known).
+pub fn request_special_picker(ctx: &egui::Context, req: SpecialPickerRequest) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(SPECIAL_PICKER_REQ_KEY), req));
+}
+
+pub fn take_special_picker_request(ctx: &egui::Context) -> Option<SpecialPickerRequest> {
+    ctx.data_mut(|d| d.remove_temp::<SpecialPickerRequest>(egui::Id::new(SPECIAL_PICKER_REQ_KEY)))
 }
 
 pub fn layout_mode_active(ctx: &egui::Context) -> bool {
@@ -16577,23 +16602,10 @@ fn remapper_resolve_skin(
     }
 }
 
-/// Pins offered in the Special… dropdown during Learn. These can't be
-/// press-captured (mouse buttons would trigger on the Add click; scroll fires
-/// once per wheel tick, never as a held combo), so the user picks them by
-/// name. Labels are shown to the user; ids are the canonical AutoMap pin ids.
-const REMAPPER_SPECIAL_PINS: &[(&str, &str)] = &[
-    ("Mouse: LMB",         "mouse_left"),
-    ("Mouse: RMB",         "mouse_right"),
-    ("Mouse: MMB",         "mouse_middle"),
-    ("Mouse: Back",        "mouse_back"),
-    ("Mouse: Forward",     "mouse_forward"),
-    ("Mouse: Scroll Up",   "scroll_up"),
-    ("Mouse: Scroll Down", "scroll_down"),
-    // Auto-captured zone variants would otherwise auto-chord with every
-    // specific-zone click. Opt-in here for users who want a "click anywhere"
-    // mapping that fires alongside their specific-zone mappings.
-    ("Touchpad: Click (Any)", "touchpad_any"),
-];
+/// True for the synthetic touchpad-swipe output pins (continuous → analog mode).
+fn remapper_out_is_swipe(pin_id: &str) -> bool {
+    matches!(pin_id, "touch_swipe_x" | "touch_swipe_y")
+}
 
 /// Canonical pin id for an arbitrary egui Key. Modifiers and Escape get their
 /// canonical short names so they round-trip with am_canon::ALL_PINS. Anything
@@ -16640,6 +16652,8 @@ fn remapper_pin_display(pin_id: &str) -> String {
         "touch_left"        => return "Touchpad Left (Touch)".into(),
         "touch_center"      => return "Touchpad Center (Touch)".into(),
         "touch_right"       => return "Touchpad Right (Touch)".into(),
+        "touch_swipe_x"     => return "Touchpad Swipe ↔".into(),
+        "touch_swipe_y"     => return "Touchpad Swipe ↕".into(),
         _ => {}
     }
     // Fall back to a humanised form of the raw id. `key_space` → "Space",
@@ -17192,41 +17206,23 @@ fn show_remapper_body(
                 let _ = need_input_arm;
             }
 
-            // Special dropdown — appends pins that can't be press-captured (mouse
-            // buttons / scroll / explicit modifiers) directly to draft_output.
-            // Available once input is latched (ready_to_learn) AND during output
-            // learning, so a gamepad user can pick a mouse action BEFORE (or
-            // instead of) learning a gamepad output chord. Gamepad South (via
-            // `_nav_act_special`) opens the popup.
+            // Special button — opens the shared KB/M + touchpad picker (mouse OR
+            // gamepad South via `_nav_act_special`). Available once input is
+            // latched (ready_to_learn) AND during output learning, so the user
+            // can pick a mouse/keyboard/touchpad action BEFORE (or instead of)
+            // learning a gamepad output chord.
             if in_learning || learn_enabled {
-                let combo_id = egui::Id::new((node_id, "remapper_special"));
-                if act_special {
-                    ui.memory_mut(|m| m.open_popup(combo_id));
-                }
-                let mut to_append: Option<&'static str> = None;
-                let combo = egui::ComboBox::from_id_salt((node_id, "remapper_special"))
-                    .selected_text(egui::RichText::new("Special…").size(13.0))
-                    .width(130.0)
-                    .show_ui(ui, |ui| {
-                        for (label, id) in REMAPPER_SPECIAL_PINS {
-                            if new_draft_output.iter().any(|p| p == id) { continue; }
-                            if ui.selectable_label(false, egui::RichText::new(*label).size(13.0)).clicked() {
-                                to_append = Some(id);
-                            }
-                        }
-                    });
-                special_rect = combo.response.rect;
-                if let Some(id) = to_append {
-                    if let Some(node) = snarl.get_node_mut(node_id) {
-                        let mut arr = new_draft_output.clone();
-                        arr.push(id.to_string());
-                        remapper_write_str_array(node, "draft_output", &arr);
-                        // Picking an output from ready_to_learn moves us into the
-                        // learning phase so the chosen output is shown + Add-able.
-                        if learn_enabled {
-                            node.params.insert("ui_phase".to_string(), Value::String("learning".to_string()));
-                        }
-                    }
+                let special_btn = ui.add(egui::Button::new(
+                    egui::RichText::new("Special…").size(13.0)));
+                special_rect = special_btn.rect;
+                if special_btn.clicked() || act_special {
+                    crate::canvas::viewer::request_special_picker(ui.ctx(),
+                        crate::canvas::viewer::SpecialPickerRequest {
+                            inner: node_id,
+                            outer: crate::canvas::viewer::root_subpatch_id(automap_parent),
+                            draft_key: "draft_output".to_string(),
+                            phase_key: None,
+                        });
                 }
             }
 
@@ -17261,6 +17257,11 @@ fn show_remapper_body(
                     let mut entry = serde_json::Map::new();
                     entry.insert("in".to_string(), Value::Array(in_arr));
                     entry.insert("out".to_string(), Value::Array(out_arr));
+                    // A touchpad swipe output is continuous → force analog mode so
+                    // the engine drives the finger by the input's magnitude.
+                    if new_draft_output.iter().any(|p| remapper_out_is_swipe(p)) {
+                        entry.insert("mode".to_string(), Value::String("analog".to_string()));
+                    }
                     let mut all = mappings.clone();
                     all.push(Value::Object(entry));
                     node.params.insert("mappings".to_string(), Value::Array(all));

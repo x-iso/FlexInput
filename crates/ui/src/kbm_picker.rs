@@ -30,19 +30,28 @@ pub struct KbmCell {
     pub x: f32,
     pub y: f32,
     pub width: f32,
+    /// When true, the cell only applies to mappings whose captured INPUT is
+    /// analog (stick / trigger). The picker greys it out and ignores activation
+    /// otherwise. Used by the touchpad swipe bindings.
+    pub analog_only: bool,
 }
 
 const fn c(pin: &'static str, x: f32, y: f32) -> KbmCell {
-    KbmCell { pin, x, y, width: 1.0 }
+    KbmCell { pin, x, y, width: 1.0, analog_only: false }
 }
 const fn cw(pin: &'static str, x: f32, y: f32, width: f32) -> KbmCell {
-    KbmCell { pin, x, y, width }
+    KbmCell { pin, x, y, width, analog_only: false }
+}
+/// Analog-only cell (width 1).
+const fn ca(pin: &'static str, x: f32, y: f32) -> KbmCell {
+    KbmCell { pin, x, y, width: 1.0, analog_only: true }
 }
 
 // Cluster x-origins. The main block spans x≈0..15. The nav cluster sits just
 // right of it, the mouse cluster further right again.
 const NAV_X: f32 = 15.5; // Insert/Home/PgUp column start
 const MOUSE_X: f32 = 19.5; // mouse cluster column start
+const TOUCH_X: f32 = 23.5; // touchpad cluster column start (right of the mouse cluster)
 
 /// The full keyboard + mouse layout as absolutely-positioned cells. Pin ids
 /// match `remapper_icons::pin_svg` so every cell resolves to an SVG icon.
@@ -106,6 +115,14 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     c("mouse_left", MOUSE_X, 1.0), c("mouse_middle", MOUSE_X + 1.0, 1.0), c("mouse_right", MOUSE_X + 2.0, 1.0),
     c("mouse_back", MOUSE_X, 2.0), c("mouse_forward", MOUSE_X + 1.0, 2.0),
     c("scroll_up", MOUSE_X, 3.0), c("scroll_down", MOUSE_X + 1.0, 3.0),
+
+    // ── Touchpad cluster (DualSense/DualShock) ────────────────────────────
+    // Row 1: the three touch zones (finger touch, no click).
+    c("touch_left", TOUCH_X, 1.0), c("touch_center", TOUCH_X + 1.0, 1.0), c("touch_right", TOUCH_X + 2.0, 1.0),
+    // Row 2: touchpad click + DualSense mic (mute) button.
+    c("btn_touchpad", TOUCH_X, 2.0), c("btn_mute", TOUCH_X + 1.0, 2.0),
+    // Row 3: analog swipes — only usable when an analog input is captured.
+    ca("touch_swipe_x", TOUCH_X, 3.0), ca("touch_swipe_y", TOUCH_X + 1.0, 3.0),
 ];
 
 /// Width of the layout in grid units (for sizing the window).

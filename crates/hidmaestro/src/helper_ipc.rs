@@ -35,6 +35,10 @@ pub enum Request {
     /// when the driver is already present — the "Reinstall drivers" recovery
     /// path. The app re-creates its devices afterward.
     ReinstallDriver,
+    /// Remove every installed HIDMaestro driver package. Tears down all live
+    /// HIDMaestro device nodes first (a bound driver can refuse removal). Nothing
+    /// is reinstalled — the "Uninstall drivers" path. Replies `Ok`.
+    UninstallDriver,
     /// Create (or reclaim) a virtual device for `device_id` from `profile_json`.
     /// The helper allocates a **globally-unique** controller index — the app no
     /// longer guesses one (different device kinds previously both passed index 0

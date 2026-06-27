@@ -205,27 +205,25 @@ impl VirtualDevicePanel {
                     };
 
                     // HIDMaestro-backed gamepad kinds need the user-mode driver.
-                    // When it (and the bundled helper) is absent, disable the
-                    // option with a hint — the first deploy installs it via the
-                    // elevated helper, so this only blocks when nothing's bundled.
+                    // When it's absent we DON'T disable the option — the create path
+                    // installs it on demand via the elevated helper (one UAC), with
+                    // the progress overlay. We just show an inline hint so the user
+                    // knows the first add will prompt to install the driver.
                     let needs_hidmaestro = kind.kind_id.starts_with("virtual.hm.");
-                    let blocked_by_driver = needs_hidmaestro && !hidmaestro_ok;
+                    let will_install_driver = needs_hidmaestro && !hidmaestro_ok;
 
                     ui.horizontal(|ui| {
                     if already {
                         ui.add_enabled(false, egui::Button::new(kind.display_name));
-                    } else if blocked_by_driver {
-                        ui.add_enabled(false, egui::Button::new(kind.display_name));
-                        ui.add(egui::Label::new(
-                            RichText::new("⚠ driver unavailable")
-                                .small()
-                                .color(Color32::from_rgb(220, 160, 40)),
-                        ))
-                        .on_hover_text(
-                            "The HIDMaestro driver isn't installed and the bundled \
-                             helper wasn't found next to the app.",
-                        );
-                    } else if ui.button(kind.display_name).clicked() {
+                    } else if {
+                        let mut resp = ui.button(kind.display_name);
+                        if will_install_driver {
+                            resp = resp.on_hover_text(
+                                "First add installs the HIDMaestro driver (one Windows \
+                                 elevation prompt), then creates the controller.");
+                        }
+                        resp.clicked()
+                    } {
                         // Allocate the next free instance index for this kind by
                         // scanning ids already present in the pool OR referenced on
                         // any open canvas (a pending async-create may not be in the
@@ -248,6 +246,17 @@ impl VirtualDevicePanel {
                             );
                         }
                         ctl.close = true;
+                    }
+                    if will_install_driver && !already {
+                        ui.add(egui::Label::new(
+                            RichText::new("installs driver")
+                                .small()
+                                .color(Color32::from_rgb(220, 160, 40)),
+                        ))
+                        .on_hover_text(
+                            "The HIDMaestro driver isn't installed yet; adding this \
+                             controller installs it (one Windows elevation prompt).",
+                        );
                     }
                     });
                 }

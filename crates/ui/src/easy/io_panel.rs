@@ -806,19 +806,30 @@ fn show_output_section(
     // None) plus the Rumble-range control for whichever pad is active.
     let panel_w = ui.available_width();
     let inner_w = (panel_w - 2.0 * PANEL_PADDING).max(120.0);
-    // HIDMaestro backs every gamepad output; when its driver (and bundled
-    // helper) is absent the card stays visible but disabled.
+    // HIDMaestro backs every gamepad output. When its driver is absent we keep the
+    // card ENABLED — selecting a model installs the driver on demand via the
+    // elevated helper (one UAC) through the normal create path — and show a hint.
     let gamepad_ok = flexinput_virtual::driver_availability::hidmaestro_available();
     ui.horizontal(|ui| {
         ui.add_space(PANEL_PADDING);
         let sel_rect = gamepad_selector_card(
-            ui, canvas, shared_pool, default_collapsed, defaults, !gamepad_ok, inner_w);
+            ui, canvas, shared_pool, default_collapsed, defaults, false, inner_w);
         // Nav target cycles the selector to the NEXT model (wrapping through
         // None) — a single actionable rect for the RS/gyro cursor.
         nav_targets.push(LeftNavTarget { rect: sel_rect,
             action: LeftNavAction::CycleGamepadOutput });
         ui.add_space(PANEL_PADDING);
     });
+    if !gamepad_ok {
+        ui.horizontal(|ui| {
+            ui.add_space(PANEL_PADDING + 4.0);
+            ui.add(egui::Label::new(
+                egui::RichText::new("Selecting a gamepad installs the HIDMaestro driver (one admin prompt).")
+                    .small()
+                    .color(egui::Color32::from_rgb(220, 160, 40)),
+            ));
+        });
+    }
 
     ui.add_space(CARD_GAP);
 

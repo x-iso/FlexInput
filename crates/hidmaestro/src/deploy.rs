@@ -114,6 +114,24 @@ pub fn reinstall_driver_force() -> Result<(), DeployError> {
     Ok(())
 }
 
+/// Remove the HIDMaestro driver entirely: delete every installed package from the
+/// DriverStore. Unlike [`reinstall_driver_force`] nothing is reinstalled. The
+/// trusted signer certs are intentionally LEFT in place — they're harmless and a
+/// later reinstall reuses them. **Requires elevation.** Callers must tear down any
+/// live virtual device nodes first (a bound driver can refuse removal).
+///
+/// Returns `Ok(())` once no HIDMaestro package remains in the DriverStore;
+/// `Err(InstallUnverified)` if a package is still present (e.g. pinned by a node we
+/// missed). Per-`pnputil` errors are best-effort/logged; the DriverStore check is
+/// authoritative.
+pub fn uninstall_driver() -> Result<(), DeployError> {
+    uninstall_all_hidmaestro_packages();
+    if hidmaestro_available() {
+        return Err(DeployError::InstallUnverified);
+    }
+    Ok(())
+}
+
 /// `pnputil /delete-driver <oemNN.inf> /uninstall /force` for every published
 /// HIDMaestro package. Best-effort: discovers the published `oemNN.inf` names by
 /// scanning `%SystemRoot%\INF` (same content sniff as `installed_inf_path`) and

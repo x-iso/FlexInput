@@ -533,6 +533,9 @@ pub struct FlexInputApp {
     /// Set when the "Reinstall HIDMaestro drivers" button is clicked; shows the
     /// confirm dialog. Cleared on confirm/cancel.
     reinstall_confirm_open: bool,
+    /// Set when the "Uninstall HIDMaestro drivers" button is clicked; shows the
+    /// confirm dialog. Cleared on confirm/cancel.
+    uninstall_confirm_open: bool,
     /// Last device-op error, shown briefly in Settings. Cleared on next op.
     last_device_op_error: Option<String>,
     /// One-shot: on a GPU-recovery relaunch we seed helper persistence ON so the
@@ -1048,6 +1051,7 @@ impl FlexInputApp {
             pending_device_ids,
             failed_device_ids: HashSet::new(),
             reinstall_confirm_open: false,
+            uninstall_confirm_open: false,
             last_device_op_error: None,
             gpu_recovery_restore_persist: {
                 #[cfg(windows)]
@@ -2139,6 +2143,7 @@ impl eframe::App for FlexInputApp {
         self.draw_kbm_picker(ctx);
         self.draw_press_mode_picker(ctx);
         self.draw_reinstall_confirm(ctx);
+        self.draw_uninstall_confirm(ctx);
         // Modal device-op overlay — painted last so it sits above everything and
         // swallows input while a create/remove/reinstall is in flight.
         self.draw_device_op_overlay(ctx);
@@ -2883,6 +2888,15 @@ impl eframe::App for FlexInputApp {
             }
         }
         self.app_clipboard_from_inner = false;
+
+        // A Special… button on a top-level (or main-canvas sub-patch) Remapper/
+        // Lean body requested the shared picker. The request carries its own
+        // `outer` addressing; editor-viewport requests are handled inside
+        // show_subpatch_editors. Deferred to here so the `canvas` borrow above
+        // has ended before this `&mut self` call.
+        if let Some(req) = crate::canvas::viewer::take_special_picker_request(ctx) {
+            self.open_special_picker(req);
+        }
 
         // ── Sub-patch editor windows ──────────────────────────────────────────
         {
@@ -4165,35 +4179,23 @@ impl FlexInputApp {
         };
         self.gamepad_nav.kbm_picker_idx = idx;
 
-        let Some(outer) = self.gamepad_nav.kbm_picker_outer else {
-            self.gamepad_nav.kbm_picker_open = false; return; };
+        // `outer = None` is valid (top-level node); only `inner` is required.
+        let outer = self.gamepad_nav.kbm_picker_outer;
         let Some(inner) = self.gamepad_nav.kbm_picker_node else {
             self.gamepad_nav.kbm_picker_open = false; return; };
         let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
-        let phase_key = self.gamepad_nav.kbm_picker_phase_key.clone();
 
         // North resets the output chord.
         if nav.is_rising("btn_north") {
-            self.set_subpatch_param_str_array(outer, inner, &draft_key, &[]);
+            self.picker_set_draft(outer, inner, &draft_key, &[]);
             return;
         }
         // South appends the focused pin (de-duped) + flips the widget into the
         // phase that shows the draft + enables Add, WITHOUT running the gamepad
         // capture machine (so the South used to pick isn't swept into the chord).
+        // Analog-only cells (swipe) are ignored when the input isn't analog.
         if nav.is_rising("btn_south") {
-            let pin = KBM_LAYOUT[idx].pin.to_string();
-            let mut out = self.nav_remap_draft_vec(outer, inner, &draft_key);
-            if !out.iter().any(|p| *p == pin) { out.push(pin); }
-            self.set_subpatch_param_str_array(outer, inner, &draft_key, &out);
-            // Lean uses `_lean_<side>_phase` → "ready" (non-capturing display).
-            // Remapper uses `ui_phase` → "learning" (its Add-able output state);
-            // its capture machine is gated by `capture_ok` (armed&&idle), and we
-            // did NOT arm here, so picking via the picker never sweeps gamepad
-            // presses into the output chord.
-            match phase_key.as_deref() {
-                Some(pk) => self.set_subpatch_param_str(outer, inner, pk, "ready"),
-                None => self.set_subpatch_param_str(outer, inner, "ui_phase", "learning"),
-            }
+            self.picker_append_pin(KBM_LAYOUT[idx].pin);
         }
     }
 
@@ -4251,6 +4253,100 @@ impl FlexInputApp {
             let arr: Vec<serde_json::Value> = vals.iter()
                 .map(|s| serde_json::Value::String(s.clone())).collect();
             node.params.insert(key.to_string(), serde_json::Value::Array(arr));
+        }
+    }
+
+    // ── KB/M picker addressing (top-level OR sub-patch) ───────────────────
+    // The Special picker can target a Remapper/Lean node sitting directly on the
+    // tab canvas (`outer = None`) or one level deep inside a sub-patch
+    // (`outer = Some(subpatch_node_id)`). These wrappers branch on that so the
+    // same picker code serves both mouse and gamepad opens.
+
+    /// Read a string-array param as a Vec, from a top-level or sub-patch node.
+    fn picker_draft_vec(&self, outer: Option<egui_snarl::NodeId>,
+        inner: egui_snarl::NodeId, key: &str) -> Vec<String>
+    {
+        match outer {
+            Some(o) => self.nav_remap_draft_vec(o, inner, key),
+            None => self.tabs[self.active_tab].canvas.snarl.get_node(inner)
+                .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Write a string-array param on a top-level or sub-patch node.
+    fn picker_set_draft(&mut self, outer: Option<egui_snarl::NodeId>,
+        inner: egui_snarl::NodeId, key: &str, vals: &[String])
+    {
+        match outer {
+            Some(o) => self.set_subpatch_param_str_array(o, inner, key, vals),
+            None => {
+                if let Some(node) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(inner) {
+                    let arr: Vec<serde_json::Value> = vals.iter()
+                        .map(|s| serde_json::Value::String(s.clone())).collect();
+                    node.params.insert(key.to_string(), serde_json::Value::Array(arr));
+                }
+            }
+        }
+    }
+
+    /// Write a string param on a top-level or sub-patch node.
+    fn picker_set_param_str(&mut self, outer: Option<egui_snarl::NodeId>,
+        inner: egui_snarl::NodeId, key: &str, val: &str)
+    {
+        match outer {
+            Some(o) => self.set_subpatch_param_str(o, inner, key, val),
+            None => {
+                if let Some(node) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(inner) {
+                    node.params.insert(key.to_string(), serde_json::Value::String(val.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Open the shared KB/M + touchpad picker for a mouse-driven Special click.
+    fn open_special_picker(&mut self, req: crate::canvas::viewer::SpecialPickerRequest) {
+        self.gamepad_nav.kbm_picker_open = true;
+        self.gamepad_nav.kbm_picker_idx = 0;
+        self.gamepad_nav.kbm_picker_node = Some(req.inner);
+        self.gamepad_nav.kbm_picker_outer = req.outer;
+        self.gamepad_nav.kbm_picker_draft_key = req.draft_key;
+        self.gamepad_nav.kbm_picker_phase_key = req.phase_key;
+    }
+
+    /// Whether the picker's current target accepts analog-only outputs (swipe).
+    /// Lean sections are always analog (the lean gesture is the input); Remapper
+    /// is analog only when its captured `draft_input` holds an analog source.
+    fn picker_analog_input_ok(&self) -> bool {
+        let outer = self.gamepad_nav.kbm_picker_outer;
+        let Some(inner) = self.gamepad_nav.kbm_picker_node else { return false; };
+        if self.gamepad_nav.kbm_picker_phase_key.is_some() {
+            return true; // Lean: the gesture itself is analog.
+        }
+        self.picker_draft_vec(outer, inner, "draft_input").iter()
+            .any(|p| flexinput_engine::pin_is_analog_input(p))
+    }
+
+    /// Append one picked pin to the picker's draft chord (de-duped) and flip the
+    /// target into the draft-visible phase. Shared by gamepad South and mouse
+    /// click. Analog-only pins (swipe) are ignored unless the input is analog.
+    fn picker_append_pin(&mut self, pin: &str) {
+        // Gate analog-only outputs.
+        let analog_only = matches!(pin, "touch_swipe_x" | "touch_swipe_y");
+        if analog_only && !self.picker_analog_input_ok() { return; }
+        let outer = self.gamepad_nav.kbm_picker_outer;
+        let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
+        let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
+        let phase_key = self.gamepad_nav.kbm_picker_phase_key.clone();
+        let mut out = self.picker_draft_vec(outer, inner, &draft_key);
+        if !out.iter().any(|p| p == pin) { out.push(pin.to_string()); }
+        self.picker_set_draft(outer, inner, &draft_key, &out);
+        // Swipe outputs require analog mode; the viewer's Add detects a swipe pin
+        // in the draft and stamps `mode = "analog"` on the committed mapping.
+        match phase_key.as_deref() {
+            Some(pk) => self.picker_set_param_str(outer, inner, pk, "ready"),
+            None => self.picker_set_param_str(outer, inner, "ui_phase", "learning"),
         }
     }
 
@@ -6431,6 +6527,15 @@ impl FlexInputApp {
                         self.last_device_op_error = None;
                     }
                 }
+                DeviceOpResult::Uninstalled { errors } => {
+                    if !errors.is_empty() {
+                        let msg = errors.join("; ");
+                        eprintln!("[device-ops] uninstall completed with issues: {msg}");
+                        self.last_device_op_error = Some(msg);
+                    } else {
+                        self.last_device_op_error = None;
+                    }
+                }
                 DeviceOpResult::Failed { device_id, error } => {
                     self.pending_device_ids.remove(&device_id);
                     // Don't auto-retry a failed build every frame; require a
@@ -6585,6 +6690,89 @@ impl FlexInputApp {
             device_ids,
             current,
         });
+    }
+
+    /// The "Uninstall HIDMaestro drivers" confirm dialog. On confirm, tears down
+    /// every HIDMaestro virtual device and removes the driver package — gamepads
+    /// stop working until reinstalled.
+    fn draw_uninstall_confirm(&mut self, ctx: &egui::Context) {
+        if !self.uninstall_confirm_open {
+            return;
+        }
+        let mut do_uninstall = false;
+        let mut cancel = false;
+        egui::Window::new("Uninstall HIDMaestro drivers")
+            .id(egui::Id::new("uninstall_hm_confirm"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    "This removes the HIDMaestro driver and all of its virtual controllers \
+                     (DualShock 4 / DualSense / Xbox 360).",
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Those controllers will stop working until you add one again (which \
+                         reinstalls the driver). You'll be prompted for admin once.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(170)),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Uninstall").clicked() {
+                        do_uninstall = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if do_uninstall {
+            self.uninstall_confirm_open = false;
+            self.start_driver_uninstall();
+        } else if cancel {
+            self.uninstall_confirm_open = false;
+        }
+    }
+
+    /// Collect the HIDMaestro virtual devices on every open canvas, pull them out
+    /// of the shared pool, and enqueue an `Uninstall` op. The worker tears them
+    /// down then removes the driver package; nothing is rebuilt.
+    fn start_driver_uninstall(&mut self) {
+        let mut device_ids: Vec<String> = Vec::new();
+        for tab in &self.tabs {
+            for id in snarl_virtual_device_ids(&tab.canvas.snarl) {
+                if id.starts_with("virtual.hm.") && !device_ids.contains(&id) {
+                    device_ids.push(id);
+                }
+            }
+        }
+        // Remove them from the pool now and move them into the op for off-thread
+        // teardown (their Drop releases the device nodes before driver removal).
+        let current: Vec<Box<dyn VirtualDevice>> = {
+            let mut pool = self.shared_virtual_devices.lock().unwrap();
+            let mut taken = Vec::new();
+            let mut i = 0;
+            while i < pool.len() {
+                if device_ids.iter().any(|id| id == pool[i].id()) {
+                    taken.push(pool.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            taken
+        };
+        // These ids are intentionally NOT marked pending — we are NOT rebuilding
+        // them. They stay as canvas nodes (showing "installs driver" again) so the
+        // user can re-add later.
+        for id in &device_ids {
+            self.pending_device_ids.remove(id);
+        }
+        let _ = self.device_ops.tx.send(crate::device_ops::DeviceOp::Uninstall { current });
     }
 
     /// Flip the always-on-top pin state. Sends the matching `WindowLevel`
@@ -7141,13 +7329,15 @@ impl FlexInputApp {
         let accent = ctx.style().visuals.selection.stroke.color;
 
         // Current output chord for the header preview (read from whichever draft
-        // param this picker session targets).
+        // param this picker session targets — top-level or sub-patch).
         let dk = self.gamepad_nav.kbm_picker_draft_key.clone();
-        let chord: Vec<String> = match (self.gamepad_nav.kbm_picker_outer,
-                                        self.gamepad_nav.kbm_picker_node) {
-            (Some(o), Some(i)) => self.nav_remap_draft_vec(o, i, &dk),
-            _ => Vec::new(),
+        let outer = self.gamepad_nav.kbm_picker_outer;
+        let chord: Vec<String> = match self.gamepad_nav.kbm_picker_node {
+            Some(i) => self.picker_draft_vec(outer, i, &dk),
+            None => Vec::new(),
         };
+        // Whether analog-only (swipe) cells are usable for this target.
+        let analog_ok = self.picker_analog_input_ok();
 
         const UNIT: f32 = 30.0; // px per grid unit
         const GAP: f32 = 3.0;   // gap between adjacent keys
@@ -7156,15 +7346,24 @@ impl FlexInputApp {
         let board_h = ext_y * (UNIT + GAP);
         let skin = crate::canvas::remapper_icons::Skin::Kbm;
 
-        egui::Window::new("⌨ KB/M picker")
+        // Collected from the closure (no &mut self inside the egui window body).
+        let mut clicked_pin: Option<&'static str> = None;
+        let mut done = false;
+
+        egui::Window::new("⌨ KB/M + touchpad picker")
             .id(egui::Id::new("gp_kbm_picker"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(
-                    "LS/D-pad: move   South: add   North: clear   East: done")
-                    .small().color(egui::Color32::from_gray(150)));
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(
+                        "Click or LS/D-pad: move   South: add   North: clear   East/Done: close")
+                        .small().color(egui::Color32::from_gray(150)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(egui::RichText::new("Done").size(13.0)).clicked() { done = true; }
+                    });
+                });
                 ui.add_space(4.0);
                 // Output chord preview.
                 ui.horizontal(|ui| {
@@ -7182,24 +7381,36 @@ impl FlexInputApp {
                 ui.separator();
                 ui.add_space(6.0);
 
-                // Absolute-positioned keyboard: allocate one canvas sized to the
-                // layout extent, then place each cell at its (x,y)*unit origin so
-                // the nav cluster + arrows + mouse sit in their own clusters to
-                // the right of the main block.
-                let (canvas, _) = ui.allocate_exact_size(
+                // Absolute-positioned board: allocate one area sized to the layout
+                // extent, then place each cell at its (x,y)*unit origin. Cells are
+                // individually clickable (mouse) AND highlight the gamepad focus.
+                let (board, _) = ui.allocate_exact_size(
                     egui::vec2(board_w, board_h), egui::Sense::hover());
-                let painter = ui.painter_at(canvas);
                 for (i, cell) in KBM_LAYOUT.iter().enumerate() {
-                    let min = canvas.min + egui::vec2(
+                    let min = board.min + egui::vec2(
                         cell.x * (UNIT + GAP), cell.y * (UNIT + GAP));
                     let size = egui::vec2(
                         cell.width * UNIT + (cell.width - 1.0) * GAP, UNIT);
                     let rect = egui::Rect::from_min_size(min, size);
+                    // Analog-only cells (swipe) are disabled unless the input is analog.
+                    let disabled = cell.analog_only && !analog_ok;
+                    let resp = if disabled {
+                        ui.interact(rect, egui::Id::new(("kbm_cell", i)), egui::Sense::hover())
+                    } else {
+                        let r = ui.interact(rect, egui::Id::new(("kbm_cell", i)), egui::Sense::click());
+                        if r.clicked() { clicked_pin = Some(cell.pin); }
+                        r
+                    };
                     let focused = i == sel;
-                    // Cell background + focus highlight.
-                    let bg = if focused {
+                    let hovered = resp.hovered() && !disabled;
+                    let painter = ui.painter_at(rect);
+                    let bg = if disabled {
+                        egui::Color32::from_gray(28)
+                    } else if focused {
                         let [rr, gg, bb, _] = accent.to_array();
                         egui::Color32::from_rgba_unmultiplied(rr, gg, bb, 60)
+                    } else if hovered {
+                        egui::Color32::from_gray(60)
                     } else {
                         egui::Color32::from_gray(40)
                     };
@@ -7208,6 +7419,7 @@ impl FlexInputApp {
                         painter.rect_stroke(rect, 4.0,
                             egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
                     }
+                    let tint = if disabled { egui::Color32::from_gray(110) } else { egui::Color32::WHITE };
                     // Icon (or text fallback), centered.
                     if let Some(tex) = kbm_cell_texture(ctx, skin, cell.pin) {
                         let s = (UNIT - 6.0).min(size.x - 6.0).max(8.0);
@@ -7215,15 +7427,22 @@ impl FlexInputApp {
                             rect.center(), egui::vec2(s, s));
                         painter.image(tex.id(), img_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE);
+                            tint);
                     } else {
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
                             kbm_pin_label(cell.pin),
                             egui::FontId::proportional(11.0),
-                            ui.visuals().text_color());
+                            if disabled { egui::Color32::from_gray(110) } else { ui.visuals().text_color() });
                     }
                 }
             });
+
+        if let Some(pin) = clicked_pin {
+            self.picker_append_pin(pin);
+        }
+        if done {
+            self.gamepad_nav.kbm_picker_open = false;
+        }
         ctx.request_repaint();
     }
 
@@ -8056,13 +8275,20 @@ impl FlexInputApp {
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(6.0);
-                if ui.button("Reinstall HIDMaestro drivers").clicked() {
-                    self.reinstall_confirm_open = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Reinstall HIDMaestro drivers").clicked() {
+                        self.reinstall_confirm_open = true;
+                    }
+                    if ui.button("Uninstall HIDMaestro drivers").clicked() {
+                        self.uninstall_confirm_open = true;
+                    }
+                });
                 ui.label(egui::RichText::new(
-                    "Removes and reinstalls the driver, then re-deploys the virtual controllers \
-                     on your canvas. Prompts for admin once. Use this if virtual DS4/DualSense \
-                     stop working after a Windows or app update.",
+                    "Reinstall: removes and reinstalls the driver, then re-deploys the virtual \
+                     controllers on your canvas — use this if virtual DS4/DualSense stop working \
+                     after a Windows or app update. Uninstall: removes the HIDMaestro driver and \
+                     all its virtual controllers (gamepads will need a reinstall to work again). \
+                     Both prompt for admin once.",
                 ).small().color(egui::Color32::from_gray(140)));
                 if let Some(err) = &self.last_device_op_error {
                     ui.label(egui::RichText::new(format!("Last device error: {err}"))
@@ -11787,6 +12013,13 @@ fn kbm_pin_label(pin: &str) -> String {
         "key_arrowdown" => "↓".into(),
         "key_arrowleft" => "←".into(),
         "key_arrowright" => "→".into(),
+        "touch_left" => "TP◧".into(),
+        "touch_center" => "TP▣".into(),
+        "touch_right" => "TP◨".into(),
+        "btn_touchpad" => "TP Click".into(),
+        "btn_mute" => "Mic".into(),
+        "touch_swipe_x" => "Swipe↔".into(),
+        "touch_swipe_y" => "Swipe↕".into(),
         _ => {
             let s = pin.strip_prefix("key_").or_else(|| pin.strip_prefix("mouse_"))
                 .unwrap_or(pin);
@@ -12102,6 +12335,11 @@ fn show_subpatch_editors(
         // Snapshot gen before show() so we can detect a real user copy after.
         let gen_before = inner_canvas.clipboard_gen;
 
+        // Captured from the editor viewport's own context if a Special… button
+        // inside this editor requested the shared picker (opened after the
+        // viewport closure returns, where `app` is mutably available again).
+        let mut special_req: Option<crate::canvas::viewer::SpecialPickerRequest> = None;
+
         let viewport_id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
         // Build breadcrumb: "Parent Name > This Name" for nested editors.
         let window_title = if let Some(p) = parent_editor_idx {
@@ -12186,11 +12424,21 @@ fn show_subpatch_editors(
                 if let Some((inner_uid, eid, size)) = crate::canvas::viewer::take_layout_pending(vctx) {
                     inner_canvas.pending_expose_module = Some((NodeId(inner_uid), eid, size));
                 }
+                special_req = crate::canvas::viewer::take_special_picker_request(vctx);
                 crate::canvas::viewer::set_layout_mode_active(vctx, false);
             },
         );
 
         if close_self { open = false; }
+
+        // A Special… button inside this editor requested the picker. Only
+        // first-level sub-patches (parented to the tab canvas) can be addressed
+        // by the picker's tab-canvas helpers; deeper nesting degrades to no-op.
+        if let Some(req) = special_req {
+            if parent_editor_idx.is_none() {
+                app.open_special_picker(req);
+            }
+        }
 
         // Collect nested edit request before putting inner_canvas back.
         if let Some(child_id) = inner_canvas.pending_edit_subpatch.take() {

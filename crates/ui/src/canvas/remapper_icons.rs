@@ -125,6 +125,9 @@ const PS_TP_CLICK:    &[u8] = a!("Playstation/playstation5_touchpad_swipe_down.s
 const PS_TP_LEFT:     &[u8] = a!("Playstation/playstation5_touchpad_press_left.svg");
 const PS_TP_CENTER:   &[u8] = a!("Playstation/playstation5_touchpad_press_center.svg");
 const PS_TP_RIGHT:    &[u8] = a!("Playstation/playstation5_touchpad_press_right.svg");
+// Analog swipe gestures (touchpad), used by the Remapper/Lean swipe outputs.
+const PS_TP_SWIPE_H:  &[u8] = a!("Playstation/playstation5_touchpad_swipe_horizontal.svg");
+const PS_TP_SWIPE_V:  &[u8] = a!("Playstation/playstation5_touchpad_swipe_vertical.svg");
 const PS_DPAD_U:   &[u8] = a!("Playstation/playstation_dpad_up.svg");
 const PS_DPAD_D:   &[u8] = a!("Playstation/playstation_dpad_down.svg");
 const PS_DPAD_L:   &[u8] = a!("Playstation/playstation_dpad_left.svg");
@@ -474,6 +477,17 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "mouse_forward" => return Some(M_SIDE_FORWARD),
         "scroll_up"     => return Some(M_SCROLL_U),
         "scroll_down"   => return Some(M_SCROLL_D),
+
+        // Touchpad + DualSense-specific pins are family-agnostic (no Xbox
+        // equivalent): always resolve to the PS asset so they render in the
+        // KB/M picker (Skin::Kbm) and on non-PS skins too.
+        "touch_swipe_x" => return Some(PS_TP_SWIPE_H),
+        "touch_swipe_y" => return Some(PS_TP_SWIPE_V),
+        "touch_left"   | "touchpad_left"   => return Some(PS_TP_LEFT),
+        "touch_center" | "touchpad_center" => return Some(PS_TP_CENTER),
+        "touch_right"  | "touchpad_right"  => return Some(PS_TP_RIGHT),
+        "btn_touchpad" | "touchpad_any"    => return Some(PS_TP_CLICK),
+        "btn_mute"                         => return Some(PS_MUTE),
         _ => {}
     }
     // Gamepad pins. Auto falls back to Xbox; Kbm has no gamepad equivalents.

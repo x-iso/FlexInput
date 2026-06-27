@@ -38,6 +38,11 @@ pub enum DeviceOp {
     /// holds the live HIDMaestro devices to tear down first (moved here so their
     /// Drop runs on the worker, before the driver swap). Replies `Reinstalled`.
     Reinstall { device_ids: Vec<String>, current: Vec<Box<dyn VirtualDevice>> },
+    /// Remove the HIDMaestro driver package entirely. `current` holds the live
+    /// HIDMaestro devices to tear down first (moved here so their Drop runs on the
+    /// worker, before the package is removed). Nothing is rebuilt. Replies
+    /// `Uninstalled`.
+    Uninstall { current: Vec<Box<dyn VirtualDevice>> },
 }
 
 /// Result of a [`DeviceOp`], consumed by the UI thread.
@@ -49,6 +54,8 @@ pub enum DeviceOpResult {
     /// A reinstall completed: `devices` are the rebuilt pads to install into the
     /// pool; `errors` collects any per-step failures to surface to the user.
     Reinstalled { devices: Vec<Box<dyn VirtualDevice>>, errors: Vec<String> },
+    /// An uninstall completed. `errors` collects any per-step failures.
+    Uninstalled { errors: Vec<String> },
     /// A `Create` failed; the id is no longer in-flight.
     Failed { device_id: String, error: String },
 }
@@ -60,6 +67,7 @@ pub enum ProgressKind {
     Deploying,
     Removing,
     Reinstalling,
+    Uninstalling,
 }
 
 /// Live progress for the modal overlay. `None` = no op in flight.
@@ -180,6 +188,27 @@ fn worker_loop(
 
                 set(None);
                 let _ = res_tx.send(DeviceOpResult::Reinstalled { devices, errors });
+                ctx.request_repaint();
+            }
+            DeviceOp::Uninstall { current } => {
+                let mut errors = Vec::new();
+                // 1. Tear down current HM devices first (Drop releases the nodes).
+                set(Some(DeviceOpProgress::new(
+                    ProgressKind::Uninstalling,
+                    "Removing virtual controllers…",
+                )));
+                drop(current);
+                // 2. Remove the driver package (blocking; one UAC if helper is down).
+                set(Some(DeviceOpProgress::new(
+                    ProgressKind::Uninstalling,
+                    "Uninstalling HIDMaestro driver…",
+                )));
+                #[cfg(windows)]
+                if let Err(e) = flexinput_hidmaestro::helper::uninstall_driver() {
+                    errors.push(format!("driver uninstall: {e}"));
+                }
+                set(None);
+                let _ = res_tx.send(DeviceOpResult::Uninstalled { errors });
                 ctx.request_repaint();
             }
         }
