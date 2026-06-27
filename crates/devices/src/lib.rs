@@ -19,7 +19,9 @@ pub mod loopback_manager;
 
 use flexinput_core::{Signal, SignalType};
 
-pub use gilrs_backend::{probe_xinput_slots, GilrsBackend, XInputSlotInfo};
+pub use gilrs_backend::{
+    probe_xinput_slots, probe_xinput_slots_cached, GilrsBackend, XInputSlotInfo,
+};
 pub use hidhide::HidHideClient;
 pub use identification::ControllerKind;
 pub use midi::MidiBackend;

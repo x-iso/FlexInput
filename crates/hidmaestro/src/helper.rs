@@ -334,6 +334,20 @@ pub fn hidhide_apply(
     }
 }
 
+/// Re-arrive our own virtual XInput device's XUSB companion (disable+re-enable)
+/// so it re-acquires an XInput slot — claiming the lowest free one. Used by the
+/// player-slot UI. Blocking (~0.5 s while the devnode restarts); run off the UI
+/// thread. Only touches our own device, never physical controllers.
+pub fn rearrive_xinput(device_id: &str) -> Result<(), HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    let req = Request::RearriveXInput { device_id: device_id.to_string() };
+    match call(&mut m, &req)? {
+        Response::Ok { .. } => Ok(()),
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to RearriveXInput".into())),
+    }
+}
+
 /// Destroy a previously-created device by instance id via the helper.
 pub fn destroy(instance_id: &str) -> Result<(), HelperError> {
     let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;

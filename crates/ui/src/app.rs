@@ -1347,6 +1347,25 @@ impl eframe::App for FlexInputApp {
         // debounced (only acts when the remapped-physical set actually changes).
         self.reconcile_hidhide();
 
+        // Dispatch XInput player-slot requests from the slot circles. Re-arriving
+        // our own virtual companion makes it re-claim the lowest free slot
+        // (typically slot 0). Runs off the UI thread (blocking helper IPC).
+        #[cfg(windows)]
+        for (card, _slot) in crate::easy::io_panel::drain_xinput_slot_requests() {
+            if card == crate::easy::io_panel::XINPUT_CARD_OUTPUT {
+                if let Some(dev_id) = self.active_virtual_xinput_device_id() {
+                    std::thread::spawn(move || {
+                        match flexinput_hidmaestro::helper::rearrive_xinput(&dev_id) {
+                            Ok(()) => eprintln!("[xinput-slot] re-arrived virtual {dev_id}"),
+                            Err(e) => eprintln!("[xinput-slot] re-arrive failed: {e}"),
+                        }
+                    });
+                } else {
+                    eprintln!("[xinput-slot] no virtual XInput output deployed to move");
+                }
+            }
+        }
+
         // Gamepad UI navigation: consume the active nav device's input and
         // drive FlexInput's own UI. Must run after `last_signals` is refreshed
         // (above) and before the Easy panel renders so selection/edit changes
@@ -7881,6 +7900,24 @@ impl FlexInputApp {
     /// slow SetupAPI instance-id lookup + blocking helper IPC run on a spawned
     /// thread. Never spawns the elevated helper just to apply/clear *nothing*
     /// (avoids a spurious UAC when the feature is on but nothing is mapped yet).
+    /// Device id of a deployed virtual XInput (Virtual Xbox) sink in the active
+    /// patch, if any — the target for a player-slot re-arrive.
+    fn active_virtual_xinput_device_id(&self) -> Option<String> {
+        let snarl = &self.tabs[self.active_tab].canvas.snarl;
+        for (_id, node_ref) in snarl.nodes_ids_data() {
+            let node = &node_ref.value;
+            if node.module_id != "device.sink" {
+                continue;
+            }
+            if let Some(dev) = node.params.get("device_id").and_then(|v| v.as_str()) {
+                if dev.starts_with("virtual.xinput") {
+                    return Some(dev.to_string());
+                }
+            }
+        }
+        None
+    }
+
     #[cfg(windows)]
     fn reconcile_hidhide(&mut self) {
         // Only do real work on a relevant change: an explicit dirty (toggle /

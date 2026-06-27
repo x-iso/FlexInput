@@ -22,6 +22,31 @@ use flexinput_virtual::{create_device, kind_prefix};
 use serde_json::Value;
 
 use crate::canvas::remapper_icons;
+
+/// Card key for the virtual gamepad-output card's slot requests.
+pub const XINPUT_CARD_OUTPUT: &str = "output";
+
+/// Pending XInput slot-assignment requests from the slot circles, as
+/// `(card_key, target_slot)`. The app drains these each frame
+/// ([`drain_xinput_slot_requests`]) and dispatches them to the elevated helper's
+/// reorder engine. A static avoids threading a request channel through the whole
+/// Easy-panel render call chain (the circles are drawn deep inside it).
+static XINPUT_SLOT_REQUESTS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+
+/// Queue a request to move `card_key` to player `slot`.
+pub fn request_xinput_slot(card_key: &str, slot: usize) {
+    if let Ok(mut q) = XINPUT_SLOT_REQUESTS.lock() {
+        q.push((card_key.to_string(), slot));
+    }
+}
+
+/// Drain queued slot-assignment requests (called by the app each frame).
+pub fn drain_xinput_slot_requests() -> Vec<(String, usize)> {
+    XINPUT_SLOT_REQUESTS
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
 use crate::canvas::{header_controls, Canvas, DeviceParamDefaults};
 use crate::panels::device_icon::{ping_device_icon, render_device_icon};
 use crate::panels::virtual_devices::SharedDevicePool;
@@ -870,6 +895,104 @@ fn show_output_section(
 /// gamepad sink (Easy mode drives one pad). Returns the card rect (for the nav
 /// target). All gamepad models are HIDMaestro-backed; when the driver is absent
 /// the selector is disabled and a corner warning badge explains why.
+/// Four XInput **player-slot** circles, right-aligned so their right edge meets
+/// `right_edge_x`. Three visual states per circle:
+///   * **free** — hollow (no XInput device on that slot),
+///   * **occupied by another device** — dark green fill,
+///   * **this card's slot** (`this_slot`) — bright green fill + an outer glow ring.
+/// Live occupancy comes from the throttled XInput probe. Returns `Some(slot)` if a
+/// circle was clicked (a request to move this card to that player slot).
+#[must_use]
+fn xinput_slot_circles(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    center_y: f32,
+    right_edge_x: f32,
+    id_salt: &str,
+    this_slot: Option<usize>,
+) -> Option<usize> {
+    let slots = flexinput_devices::probe_xinput_slots_cached();
+    let dot_d = 14.0_f32;
+    let gap = 5.0_f32;
+    let total_w = 4.0 * dot_d + 3.0 * gap;
+    let start_x = right_edge_x - total_w;
+    let mut clicked: Option<usize> = None;
+    for i in 0..4usize {
+        let center = egui::pos2(start_x + i as f32 * (dot_d + gap) + dot_d / 2.0, center_y);
+        let rect = egui::Rect::from_center_size(center, egui::vec2(dot_d, dot_d));
+        let resp = ui.interact(rect, ui.id().with((id_salt, i)), egui::Sense::click());
+        let occupied = slots[i].connected;
+        let is_mine = this_slot == Some(i);
+
+        // Glow ring for this card's own slot (drawn first, under the dot).
+        if is_mine {
+            painter.circle_filled(center, dot_d / 2.0 + 3.0, egui::Color32::from_rgba_unmultiplied(90, 230, 150, 60));
+            painter.circle_filled(center, dot_d / 2.0 + 1.5, egui::Color32::from_rgba_unmultiplied(90, 230, 150, 90));
+        }
+
+        let (fill, base_stroke, text_c) = if is_mine {
+            (egui::Color32::from_rgb(80, 200, 130), egui::Color32::from_rgb(170, 255, 200), egui::Color32::WHITE)
+        } else if occupied {
+            // Occupied by some OTHER XInput device — dark green.
+            (egui::Color32::from_rgb(34, 74, 50), egui::Color32::from_rgb(70, 130, 95), egui::Color32::from_gray(210))
+        } else {
+            // Free slot — hollow.
+            (egui::Color32::from_gray(38), egui::Color32::from_gray(85), egui::Color32::from_gray(135))
+        };
+        let (stroke_w, stroke_c) = if resp.hovered() {
+            (2.0, egui::Color32::from_white_alpha(220))
+        } else if is_mine {
+            (1.5, base_stroke)
+        } else {
+            (1.0, base_stroke)
+        };
+        painter.circle(center, dot_d / 2.0, fill, egui::Stroke::new(stroke_w, stroke_c));
+        painter.text(center, egui::Align2::CENTER_CENTER, format!("{}", i + 1),
+            egui::FontId::proportional(9.0), text_c);
+
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let state = if is_mine { "this device" } else if occupied { "in use by another device" } else { "free" };
+        let resp = resp.on_hover_text(format!("Player slot {} — {state}\nClick to assign this card here", i + 1));
+        if resp.clicked() {
+            clicked = Some(i);
+        }
+    }
+    clicked
+}
+
+/// A `label` row with the four slot circles right-aligned to the dropdown width
+/// below it. Returns the clicked slot, if any.
+#[must_use]
+fn xinput_slot_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    dropdown_w: f32,
+    id_salt: &str,
+    this_slot: Option<usize>,
+) -> Option<usize> {
+    let dot_d = 14.0_f32;
+    let (row_rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), dot_d + 2.0), egui::Sense::hover());
+    let painter = ui.painter().clone();
+    painter.text(
+        egui::pos2(row_rect.left(), row_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        ui.visuals().strong_text_color(),
+    );
+    xinput_slot_circles(
+        ui,
+        &painter,
+        row_rect.center().y,
+        row_rect.left() + dropdown_w,
+        id_salt,
+        this_slot,
+    )
+}
+
 fn gamepad_selector_card(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
@@ -920,7 +1043,23 @@ fn gamepad_selector_card(
     right_ui.scope(|ui| {
         if driver_missing { ui.disable(); }
         ui.add_space(2.0);
-        ui.label(egui::RichText::new("Gamepad output").size(13.0).strong());
+        // XInput player-slot circles apply only to an XInput (Virtual Xbox) output;
+        // DualShock/DualSense virtuals have no XInput slot, so show a plain label.
+        if active == Some(KIND_XINPUT) {
+            let dropdown_w = (ui.available_width() - 4.0).clamp(120.0, 240.0);
+            // Best-effort "this device's slot": when our Virtual Xbox is the only
+            // XInput device present, the single occupied slot is ours (the common
+            // case with a DualSense/other-HID physical). Multi-device correlation
+            // becomes authoritative once the reorder engine has assigned a slot.
+            let slots = flexinput_devices::probe_xinput_slots_cached();
+            let connected: Vec<usize> = (0..4).filter(|&i| slots[i].connected).collect();
+            let this_slot = if connected.len() == 1 { Some(connected[0]) } else { None };
+            if let Some(slot) = xinput_slot_row(ui, "Gamepad output", dropdown_w, "xi_slot_out", this_slot) {
+                request_xinput_slot(XINPUT_CARD_OUTPUT, slot);
+            }
+        } else {
+            ui.label(egui::RichText::new("Gamepad output").size(13.0).strong());
+        }
         ui.add_space(4.0);
 
         // Model selector. The current selection is the active kind, or "None".

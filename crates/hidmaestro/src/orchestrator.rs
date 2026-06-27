@@ -187,6 +187,40 @@ extern "system" {
         buffer_len: u32,
         flags: u32,
     ) -> u32;
+    /// Disable a devnode (transient — flags 0 does NOT persist across reboot, so a
+    /// reboot re-enables it as a safety net on top of our own watchdog).
+    fn CM_Disable_DevNode(dev_inst: u32, flags: u32) -> u32;
+    /// Re-enable a previously-disabled devnode.
+    fn CM_Enable_DevNode(dev_inst: u32, flags: u32) -> u32;
+}
+
+/// Set a devnode (by PnP instance id) enabled or disabled. This is the
+/// programmatic "reconnect" primitive behind XInput slot reordering: disabling a
+/// devnode drops the device (freeing its XInput slot); enabling it makes it
+/// re-arrive and claim the lowest free slot. **Transient** (flags 0): the disable
+/// does not persist across a reboot, so a reboot is an automatic last-resort
+/// recovery if our watchdog ever fails to re-enable.
+pub fn set_devnode_enabled(instance_id: &str, enabled: bool) -> Result<(), OrchestratorError> {
+    unsafe {
+        let mut dev_inst: u32 = 0;
+        let wide: Vec<u16> = instance_id.encode_utf16().chain(std::iter::once(0)).collect();
+        let r = CM_Locate_DevNodeW(&mut dev_inst, wide.as_ptr(), CM_LOCATE_DEVNODE_NORMAL);
+        if r != CR_SUCCESS {
+            return Err(OrchestratorError::Win32("CM_Locate_DevNode (set_enabled)", r));
+        }
+        let r = if enabled {
+            CM_Enable_DevNode(dev_inst, 0)
+        } else {
+            CM_Disable_DevNode(dev_inst, 0)
+        };
+        if r != CR_SUCCESS {
+            return Err(OrchestratorError::Win32(
+                if enabled { "CM_Enable_DevNode" } else { "CM_Disable_DevNode" },
+                r,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The instance id string of a devnode (`CM_Get_Device_IDW`).

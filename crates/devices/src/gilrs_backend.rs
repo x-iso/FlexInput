@@ -115,6 +115,28 @@ pub fn probe_xinput_slots() -> [XInputSlotInfo; 4] {
     out
 }
 
+/// Throttled cache over [`probe_xinput_slots`]. `XInputGetState` on an *empty*
+/// slot is comparatively expensive, so polling all four every UI frame would add
+/// latency; this refreshes at most every ~200 ms and returns the cached snapshot
+/// otherwise. Safe to call from per-frame UI code (e.g. the slot indicator).
+pub fn probe_xinput_slots_cached() -> [XInputSlotInfo; 4] {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, [XInputSlotInfo; 4])>> = Mutex::new(None);
+    let mut guard = match CACHE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some((t, slots)) = guard.as_ref() {
+        if t.elapsed() < Duration::from_millis(200) {
+            return *slots;
+        }
+    }
+    let slots = probe_xinput_slots();
+    *guard = Some((Instant::now(), slots));
+    slots
+}
+
 /// Log the current XInput slot occupancy. Called on device-set changes (connect /
 /// disconnect) so we can see, on real hardware, whether our virtual XUSB companion
 /// actually acquires a slot when a physical XInput pad is present — the open

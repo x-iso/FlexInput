@@ -82,6 +82,13 @@ pub enum Request {
         /// Master on/off.
         active: bool,
     },
+    /// Re-arrive (disable then re-enable) the XUSB companion devnode of our own
+    /// virtual XInput device `device_id`, so it drops and re-acquires an XInput
+    /// user slot — claiming the lowest free one. Used by the player-slot UI to push
+    /// our virtual pad onto a free slot (typically slot 0). Touches ONLY our own
+    /// device, never the user's physical controllers, so it's the safe slot
+    /// operation; the re-enable is guaranteed even on error.
+    RearriveXInput { device_id: String },
     /// Ask the helper to exit (releases everything).
     Shutdown,
 }

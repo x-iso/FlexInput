@@ -539,6 +539,7 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
         Request::HidHideApply { blacklist, whitelist, active } => {
             (handle_hidhide_apply(blacklist, whitelist, active, state), false)
         }
+        Request::RearriveXInput { device_id } => (handle_rearrive_xinput(&device_id, state), false),
         Request::Shutdown => (Response::ok(), true),
     }
 }
@@ -807,6 +808,50 @@ fn allocate_index(
         return index_hint;
     }
     (0u32..).find(|i| !used.contains(i)).unwrap_or(index_hint)
+}
+
+/// Re-arrive our own virtual XInput device's XUSB companion so it re-acquires an
+/// XInput slot (lowest free). Disables then re-enables the companion devnode; the
+/// re-enable is guaranteed (a disabled companion is useless to us). Only ever
+/// touches our own SWD companion node — never the user's physical controllers.
+fn handle_rearrive_xinput(device_id: &str, state: &Arc<HelperState>) -> Response {
+    let companion = state.devices.lock().ok().and_then(|devs| {
+        devs.values()
+            .find(|d| d.device_id == device_id)
+            .and_then(|d| d.companion_instance_id.clone())
+    });
+    let Some(companion) = companion else {
+        return Response::err(format!(
+            "no XUSB companion tracked for device_id={device_id} (not an XInput pad, or not ours)"
+        ));
+    };
+    // Disable, brief settle, then ALWAYS re-enable (even if disable failed, the
+    // enable is a harmless no-op; if disable succeeded the enable is mandatory).
+    if let Err(e) = crate::orchestrator::set_devnode_enabled(&companion, false) {
+        diag_log(&format!("[helper] rearrive: disable {companion} failed: {e}"));
+        // Try to ensure it's enabled and bail.
+        let _ = crate::orchestrator::set_devnode_enabled(&companion, true);
+        return Response::err(format!("disable failed: {e}"));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    match crate::orchestrator::set_devnode_enabled(&companion, true) {
+        Ok(()) => {
+            diag_log(&format!("[helper] rearrived XInput companion {companion} (device_id={device_id})"));
+            Response::ok()
+        }
+        Err(e) => {
+            diag_log(&format!("[helper] rearrive: RE-ENABLE {companion} FAILED: {e} — retrying"));
+            // Retry the re-enable a few times; leaving our own companion disabled
+            // would silently kill the virtual pad.
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if crate::orchestrator::set_devnode_enabled(&companion, true).is_ok() {
+                    return Response::ok();
+                }
+            }
+            Response::err(format!("re-enable failed: {e}"))
+        }
+    }
 }
 
 fn handle_destroy(instance_id: &str, state: &Arc<HelperState>) -> Response {
