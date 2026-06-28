@@ -47,6 +47,30 @@ pub fn drain_xinput_slot_requests() -> Vec<(String, usize)> {
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default()
 }
+
+/// Optimistic record of which player slot each XInput device was last assigned to,
+/// keyed by `device_id`. The reorder engine places a device at the slot the user
+/// clicked, so we remember that immediately on dispatch and use it to draw the
+/// "this device's slot" glow even when several XInput devices are present (XInput
+/// exposes only slot→state, so we cannot otherwise correlate instance→slot). An
+/// entry is trusted only while that slot is actually occupied.
+static XINPUT_SLOT_ASSIGNMENTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+/// Remember that `device_id` was assigned to `slot` (called by the app when it
+/// dispatches a slot request to the reorder engine).
+pub fn record_xinput_slot_assignment(device_id: &str, slot: usize) {
+    if let Ok(mut g) = XINPUT_SLOT_ASSIGNMENTS.lock() {
+        g.get_or_insert_with(HashMap::new).insert(device_id.to_string(), slot);
+    }
+}
+
+/// The slot `device_id` was last assigned to, if any.
+fn assigned_xinput_slot(device_id: &str) -> Option<usize> {
+    XINPUT_SLOT_ASSIGNMENTS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(device_id).copied()))
+}
 use crate::canvas::{header_controls, Canvas, DeviceParamDefaults};
 use crate::panels::device_icon::{ping_device_icon, render_device_icon};
 use crate::panels::virtual_devices::SharedDevicePool;
@@ -962,6 +986,60 @@ fn xinput_slot_circles(
     clicked
 }
 
+/// True if `device_id` names an XInput (Xbox) card — a physical Xbox source
+/// (`gilrs:xinput:*`) or one of our Virtual Xbox sinks (`virtual.xinput*` /
+/// `virtual.hm.xinput*`). Only these carry an XInput player slot.
+pub fn device_id_is_xinput(device_id: &str) -> bool {
+    if let Some(rest) = device_id.strip_prefix("gilrs:") {
+        return rest.split(':').next() == Some("xinput");
+    }
+    device_id.starts_with("virtual.xinput") || device_id.starts_with("virtual.hm.xinput")
+}
+
+/// Best-effort "which slot is this XInput device on" for the glow indicator.
+/// Priority:
+///   1. an explicit assignment the user made via the reorder engine (trusted only
+///      while that slot is still occupied), then
+///   2. the single-occupied fallback — when exactly one XInput slot is filled it
+///      must be this device (the common case: one Virtual Xbox or one physical
+///      Xbox against non-XInput peers).
+/// With several XInput devices present and no recorded assignment we return `None`
+/// (occupancy still shows, just no "mine" glow), since XInput exposes only
+/// slot→state and we can't passively correlate instance→slot.
+fn this_device_slot(device_id: &str) -> Option<usize> {
+    let slots = flexinput_devices::probe_xinput_slots_cached();
+    if let Some(s) = assigned_xinput_slot(device_id) {
+        if s < 4 && slots[s].connected {
+            return Some(s);
+        }
+    }
+    let connected: Vec<usize> = (0..4).filter(|&i| slots[i].connected).collect();
+    if connected.len() == 1 { Some(connected[0]) } else { None }
+}
+
+/// Inline XInput player-slot circles for a canvas device node (physical Xbox
+/// `device.source` or a Virtual Xbox `device.sink`). Allocates a short row at the
+/// cursor and draws the four circles left-aligned. A click queues a slot request
+/// keyed by `device_id` — the app drains it and routes to the reorder engine
+/// (virtual → re-arrive our companion; physical → displacement reorder). No-op
+/// for any non-XInput device id.
+pub fn canvas_node_xinput_slots(ui: &mut egui::Ui, device_id: &str) {
+    if !device_id_is_xinput(device_id) { return; }
+    let this_slot = this_device_slot(device_id);
+    let dot_d = 14.0_f32;
+    let gap = 5.0_f32;
+    let total_w = 4.0 * dot_d + 3.0 * gap;
+    let (row_rect, _) =
+        ui.allocate_exact_size(egui::vec2(total_w, dot_d + 4.0), egui::Sense::hover());
+    let painter = ui.painter().clone();
+    let salt = format!("xi_node_{device_id}");
+    if let Some(slot) =
+        xinput_slot_circles(ui, &painter, row_rect.center().y, row_rect.right(), &salt, this_slot)
+    {
+        request_xinput_slot(device_id, slot);
+    }
+}
+
 /// A `label` row with the four slot circles right-aligned to the dropdown width
 /// below it. Returns the clicked slot, if any.
 #[must_use]
@@ -1047,13 +1125,15 @@ fn gamepad_selector_card(
         // DualShock/DualSense virtuals have no XInput slot, so show a plain label.
         if active == Some(KIND_XINPUT) {
             let dropdown_w = (ui.available_width() - 4.0).clamp(120.0, 240.0);
-            // Best-effort "this device's slot": when our Virtual Xbox is the only
-            // XInput device present, the single occupied slot is ours (the common
-            // case with a DualSense/other-HID physical). Multi-device correlation
-            // becomes authoritative once the reorder engine has assigned a slot.
-            let slots = flexinput_devices::probe_xinput_slots_cached();
-            let connected: Vec<usize> = (0..4).filter(|&i| slots[i].connected).collect();
-            let this_slot = if connected.len() == 1 { Some(connected[0]) } else { None };
+            // "This device's slot" glow: keyed by the active Virtual Xbox sink's
+            // device_id so a recorded assignment (set when the user clicks a slot)
+            // wins; otherwise the single-occupied fallback applies. Keeping the key
+            // identical to the app's dispatch resolution keeps the glow consistent
+            // across the Easy card and the canvas node for the same device.
+            let dev_id = sink_node_of_kind(canvas, KIND_XINPUT)
+                .and_then(|n| canvas.snarl.get_node(n))
+                .and_then(|n| n.params.get("device_id").and_then(|v| v.as_str()).map(str::to_string));
+            let this_slot = this_device_slot(dev_id.as_deref().unwrap_or(""));
             if let Some(slot) = xinput_slot_row(ui, "Gamepad output", dropdown_w, "xi_slot_out", this_slot) {
                 request_xinput_slot(XINPUT_CARD_OUTPUT, slot);
             }

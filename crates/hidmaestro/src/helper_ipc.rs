@@ -89,6 +89,24 @@ pub enum Request {
     /// device, never the user's physical controllers, so it's the safe slot
     /// operation; the re-enable is guaranteed even on error.
     RearriveXInput { device_id: String },
+    /// Force an XInput device onto an exact player `slot` (0-based) via an ordered
+    /// re-arrival of EVERY present XInput devnode. The helper disables all of them,
+    /// then re-enables them one at a time with the target at ordinal `slot` so it
+    /// claims that user index; the rest fill the remaining slots. Unlike
+    /// `RearriveXInput` (which only nudges our own companion to the lowest free
+    /// slot), this can DISPLACE a physical controller, so it is gated by a
+    /// persisted watchdog: the disabled set is written to disk before the sequence
+    /// and every devnode is re-enabled on completion, on error, and on the next
+    /// helper startup if a crash interrupted it (the transient `CM_Disable` flag is
+    /// also reboot-recoverable). The target is resolved from `device_id` (our
+    /// virtual, via its tracked companion) or, failing that, from `vid`/`pid` (a
+    /// physical Xbox's XUSB devnode).
+    AssignXInputSlot {
+        device_id: String,
+        vid: Option<u16>,
+        pid: Option<u16>,
+        slot: usize,
+    },
     /// Ask the helper to exit (releases everything).
     Shutdown,
 }

@@ -537,6 +537,15 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 }
             });
 
+            // XInput player-slot circles for XInput device nodes (a physical Xbox
+            // `device.source` or our Virtual Xbox `device.sink`). The widget is a
+            // no-op for every other device/module, so this call is safe to make
+            // for any device node. Clicking a circle queues a slot request keyed
+            // by this node's device_id; the app routes it to the reorder engine.
+            if is_device_source || is_device_sink {
+                crate::easy::io_panel::canvas_node_xinput_slots(ui, dev_id_str);
+            }
+
             // Mouse-sensitivity slider for the virtual keyboard+mouse sink.
             // Rendered ABOVE the "Auto-Map" label so the AutoMap pin (Y =
             // bottom-of-header) sits in line with the label, not crowded

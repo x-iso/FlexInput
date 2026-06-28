@@ -348,6 +348,33 @@ pub fn rearrive_xinput(device_id: &str) -> Result<(), HelperError> {
     }
 }
 
+/// Force an XInput device onto an exact player `slot` (0-based) via the helper's
+/// ordered-reorder engine. Resolves the target from `device_id` (our virtual, via
+/// its tracked companion) or from `vid`/`pid` (a physical Xbox). Unlike
+/// [`rearrive_xinput`] this can displace a physical controller to free the slot;
+/// the helper's watchdog guarantees every devnode is re-enabled afterward.
+/// Blocking (seconds — it restarts several devnodes in sequence); run off the UI
+/// thread.
+pub fn assign_xinput_slot(
+    device_id: &str,
+    vid: Option<u16>,
+    pid: Option<u16>,
+    slot: usize,
+) -> Result<(), HelperError> {
+    let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;
+    let req = Request::AssignXInputSlot {
+        device_id: device_id.to_string(),
+        vid,
+        pid,
+        slot,
+    };
+    match call(&mut m, &req)? {
+        Response::Ok { .. } => Ok(()),
+        Response::Error { message } => Err(HelperError::Helper(message)),
+        _ => Err(HelperError::Helper("unexpected response to AssignXInputSlot".into())),
+    }
+}
+
 /// Destroy a previously-created device by instance id via the helper.
 pub fn destroy(instance_id: &str) -> Result<(), HelperError> {
     let mut m = manager().lock().map_err(|_| HelperError::Io("poisoned".into()))?;

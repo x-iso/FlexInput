@@ -1347,22 +1347,48 @@ impl eframe::App for FlexInputApp {
         // debounced (only acts when the remapped-physical set actually changes).
         self.reconcile_hidhide();
 
-        // Dispatch XInput player-slot requests from the slot circles. Re-arriving
-        // our own virtual companion makes it re-claim the lowest free slot
-        // (typically slot 0). Runs off the UI thread (blocking helper IPC).
+        // Dispatch XInput player-slot requests from the slot circles. Each request
+        // is routed to the helper's ordered-reorder engine, which places the named
+        // device at the exact clicked slot (displacing peers as needed, with a
+        // crash-safe watchdog). The card key identifies the device:
+        //   * "output"        — the Easy-mode card → resolve the active virtual id,
+        //   * "virtual.*"      — a Virtual Xbox sink node (key IS its device_id),
+        //   * "gilrs:xinput:*" — a physical Xbox source node (key IS its device_id;
+        //                        we look up its VID/PID so the helper can find the
+        //                        physical XUSB devnode).
+        // Runs off the UI thread (blocking, multi-second helper IPC).
         #[cfg(windows)]
-        for (card, _slot) in crate::easy::io_panel::drain_xinput_slot_requests() {
-            if card == crate::easy::io_panel::XINPUT_CARD_OUTPUT {
-                if let Some(dev_id) = self.active_virtual_xinput_device_id() {
+        for (card, slot) in crate::easy::io_panel::drain_xinput_slot_requests() {
+            // Resolve (device_id, vid, pid) for the request.
+            let resolved: Option<(String, Option<u16>, Option<u16>)> =
+                if card == crate::easy::io_panel::XINPUT_CARD_OUTPUT {
+                    self.active_virtual_xinput_device_id().map(|id| (id, None, None))
+                } else if card.starts_with("gilrs:") {
+                    // Physical source — find its VID/PID from the live device list.
+                    let vp = self.devices.iter()
+                        .find(|d| d.id == card)
+                        .map(|d| (d.vid, d.pid))
+                        .unwrap_or((None, None));
+                    Some((card.clone(), vp.0, vp.1))
+                } else {
+                    // Virtual sink node — the card key is the device_id itself.
+                    Some((card.clone(), None, None))
+                };
+            match resolved {
+                Some((dev_id, vid, pid)) => {
+                    // Optimistically record the assignment so the "this device's
+                    // slot" glow is correct immediately (and stays correct with
+                    // multiple XInput devices present, which we can't otherwise
+                    // correlate). The engine places the device at this slot.
+                    crate::easy::io_panel::record_xinput_slot_assignment(&dev_id, slot);
                     std::thread::spawn(move || {
-                        match flexinput_hidmaestro::helper::rearrive_xinput(&dev_id) {
-                            Ok(()) => eprintln!("[xinput-slot] re-arrived virtual {dev_id}"),
-                            Err(e) => eprintln!("[xinput-slot] re-arrive failed: {e}"),
+                        match flexinput_hidmaestro::helper::assign_xinput_slot(&dev_id, vid, pid, slot) {
+                            Ok(()) => eprintln!("[xinput-slot] assigned {dev_id} to slot {slot}"),
+                            Err(e) => eprintln!("[xinput-slot] assign {dev_id} → slot {slot} failed: {e}"),
                         }
                     });
-                } else {
-                    eprintln!("[xinput-slot] no virtual XInput output deployed to move");
                 }
+                None => eprintln!("[xinput-slot] no XInput device resolved for card '{card}'"),
             }
         }
 

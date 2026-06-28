@@ -64,6 +64,8 @@ pub enum OrchestratorError {
     SwdCreate(u32),
     /// `SwDeviceCreate` neither fired its callback nor reached DN_STARTED in time.
     SwdTimeout,
+    /// An XInput slot reorder could not be carried out (free-form detail).
+    Reorder(String),
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -75,6 +77,7 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::SwdBadGuid => write!(f, "invalid container GUID for SwDeviceCreate"),
             OrchestratorError::SwdCreate(hr) => write!(f, "SwDeviceCreate failed (hr 0x{hr:08X})"),
             OrchestratorError::SwdTimeout => write!(f, "SwDeviceCreate timed out"),
+            OrchestratorError::Reorder(s) => write!(f, "xinput reorder: {s}"),
         }
     }
 }
@@ -221,6 +224,199 @@ pub fn set_devnode_enabled(instance_id: &str, enabled: bool) -> Result<(), Orche
         }
     }
     Ok(())
+}
+
+/// Re-enable a devnode, retrying a few times. Used by the reorder engine and its
+/// crash-recovery path: leaving a controller (ours or the user's) disabled is the
+/// one outcome we must never allow, so the re-enable is always insistent.
+fn ensure_devnode_enabled(instance_id: &str) -> bool {
+    for attempt in 0..6 {
+        if set_devnode_enabled(instance_id, true).is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150 + attempt * 100));
+    }
+    false
+}
+
+/// Path of the reorder watchdog file. Holds one devnode instance id per line — the
+/// set of XInput devnodes a reorder disabled. Written BEFORE the disable sequence
+/// and deleted only once every node is confirmed re-enabled. On helper startup
+/// [`recover_xinput_reorder`] re-enables anything still listed (a crash mid-reorder
+/// would otherwise leave a controller disabled until the next reboot).
+fn reorder_watchdog_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("flexinput_xinput_reorder.watchdog")
+}
+
+fn write_reorder_watchdog(nodes: &[String]) {
+    let _ = std::fs::write(reorder_watchdog_path(), nodes.join("\n"));
+}
+
+fn clear_reorder_watchdog() {
+    let _ = std::fs::remove_file(reorder_watchdog_path());
+}
+
+/// On helper startup, re-enable any devnodes a previous (crashed) reorder left
+/// disabled, then clear the watchdog. Safe to call unconditionally — a missing or
+/// empty file is a no-op.
+pub fn recover_xinput_reorder() {
+    let path = reorder_watchdog_path();
+    let Ok(contents) = std::fs::read_to_string(&path) else { return };
+    let mut recovered = 0u32;
+    for line in contents.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if ensure_devnode_enabled(line) {
+            recovered += 1;
+        }
+    }
+    if recovered > 0 {
+        eprintln!("[reorder] startup watchdog re-enabled {recovered} devnode(s) from a prior interrupted reorder");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Instance ids of every present devnode whose PnP id contains `marker` (matched
+/// case-insensitively). Walks the live device tree from the root via CfgMgr32
+/// child/sibling links — no SetupAPI enumeration set required. Used to find all
+/// present XInput devnodes (their ids carry the `&IG_` interface tag).
+fn present_devnodes_matching(marker: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let marker_up = marker.to_ascii_uppercase();
+    unsafe {
+        let mut root: u32 = 0;
+        if CM_Locate_DevNodeW(&mut root, std::ptr::null(), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS {
+            return out;
+        }
+        // Iterative DFS. For each node we enumerate its full child list (first
+        // child + that child's sibling chain) and push them; popped nodes then
+        // contribute their own children. The root id itself never matches.
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let mut child: u32 = 0;
+            if CM_Get_Child(&mut child, node, 0) == CR_SUCCESS {
+                stack.push(child);
+                let mut cur = child;
+                loop {
+                    let mut sib: u32 = 0;
+                    if CM_Get_Sibling(&mut sib, cur, 0) != CR_SUCCESS {
+                        break;
+                    }
+                    stack.push(sib);
+                    cur = sib;
+                }
+            }
+            if let Some(id) = devnode_instance_id(node) {
+                if id.to_ascii_uppercase().contains(&marker_up) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// All present XInput devnode instance ids (ids carrying the `&IG_` XInput
+/// interface tag — this covers both physical Xbox XUSB nodes and our own virtual
+/// companions, which enumerate under `ROOT\VID_..&PID_..&IG_00`).
+pub fn present_xinput_devnodes() -> Vec<String> {
+    present_devnodes_matching("&IG_")
+}
+
+/// Resolve a physical Xbox XInput devnode by USB `vid`/`pid` — the present `&IG_`
+/// node whose id carries `VID_xxxx&PID_yyyy` and is NOT a `ROOT\` node (those are
+/// our virtual companions). Returns the first match.
+pub fn physical_xinput_devnode_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
+    let needle = format!("VID_{vid:04X}&PID_{pid:04X}");
+    present_xinput_devnodes().into_iter().find(|id| {
+        let up = id.to_ascii_uppercase();
+        up.contains(&needle) && !up.starts_with("ROOT\\")
+    })
+}
+
+/// Force `target_instance` onto ordinal `slot` (0-based) by an ordered re-arrival
+/// of EVERY present XInput devnode. Disables all of them, then re-enables them one
+/// at a time — the target at index `slot`, the others filling the remaining
+/// positions in their existing order — with a settle delay so each claims the next
+/// XInput user index in turn.
+///
+/// Safety: the full disabled set is persisted to the watchdog file before the
+/// disable sequence and cleared only after every node is confirmed re-enabled; a
+/// crash mid-sequence is recovered by [`recover_xinput_reorder`] on the next helper
+/// start, and the transient `CM_Disable` flag means a reboot also re-enables
+/// everything. Every node is re-enabled on completion AND on any error path.
+pub fn reorder_xinput_slots(target_instance: &str, slot: usize) -> Result<(), OrchestratorError> {
+    let nodes = present_xinput_devnodes();
+    if nodes.is_empty() {
+        return Err(OrchestratorError::Reorder("no present XInput devnodes".into()));
+    }
+    if !nodes.iter().any(|n| n.eq_ignore_ascii_case(target_instance)) {
+        return Err(OrchestratorError::Reorder(format!(
+            "target {target_instance} not among {} present XInput devnode(s)",
+            nodes.len()
+        )));
+    }
+    // Build the desired re-enable order: others before `slot`, target, others after.
+    let others: Vec<String> = nodes
+        .iter()
+        .filter(|n| !n.eq_ignore_ascii_case(target_instance))
+        .cloned()
+        .collect();
+    let slot = slot.min(others.len());
+    let mut order: Vec<String> = Vec::with_capacity(nodes.len());
+    order.extend_from_slice(&others[..slot]);
+    order.push(target_instance.to_string());
+    order.extend_from_slice(&others[slot..]);
+
+    // Single device that's already our target → identical to a plain re-arrive; the
+    // ordered path still works, but skip the watchdog churn.
+    eprintln!(
+        "[reorder] placing {target_instance} at slot {slot} among {} XInput devnode(s)",
+        nodes.len()
+    );
+
+    // Persist the watchdog FIRST so a crash between here and the re-enable loop is
+    // recoverable.
+    write_reorder_watchdog(&nodes);
+
+    // Phase 1: disable every XInput devnode. Tolerate individual failures (a
+    // policy-locked controller may refuse) — those simply keep their slot.
+    for n in &nodes {
+        if let Err(e) = set_devnode_enabled(n, false) {
+            eprintln!("[reorder] disable {n} failed: {e} (leaving it in place)");
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    // Phase 2: re-enable in the desired order, settling between each so the XInput
+    // stack assigns user indices in arrival order.
+    let mut failed: Vec<String> = Vec::new();
+    for n in &order {
+        if !ensure_devnode_enabled(n) {
+            eprintln!("[reorder] re-enable {n} FAILED");
+            failed.push(n.clone());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(600));
+    }
+
+    // Phase 3 (belt-and-suspenders): make sure EVERY node we touched is enabled,
+    // even any not in `order`, before clearing the watchdog.
+    for n in &nodes {
+        if !order.iter().any(|o| o.eq_ignore_ascii_case(n)) {
+            let _ = ensure_devnode_enabled(n);
+        }
+    }
+
+    if failed.is_empty() {
+        clear_reorder_watchdog();
+        eprintln!("[reorder] done; {target_instance} should now hold slot {slot}");
+        Ok(())
+    } else {
+        // Leave the watchdog in place so startup recovery retries the stragglers.
+        Err(OrchestratorError::Reorder(format!(
+            "re-enable failed for {} devnode(s): {}",
+            failed.len(),
+            failed.join(", ")
+        )))
+    }
 }
 
 /// The instance id string of a devnode (`CM_Get_Device_IDW`).

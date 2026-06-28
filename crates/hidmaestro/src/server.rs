@@ -207,6 +207,11 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     // startup clear-and-wait + per-Create reclaim are backstops).
     let _singleton = HelperSingleton::acquire(10_000);
 
+    // Crash-recovery: if a prior reorder was interrupted (helper killed mid-
+    // sequence), re-enable any XInput devnodes it left disabled before we do
+    // anything else, so a user's controller can never stay dark across restarts.
+    crate::orchestrator::recover_xinput_reorder();
+
     let state = Arc::new(HelperState::new());
     state.persist.store(initial_persist, Ordering::SeqCst);
     if let Some(pid) = parent_pid {
@@ -540,6 +545,9 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
             (handle_hidhide_apply(blacklist, whitelist, active, state), false)
         }
         Request::RearriveXInput { device_id } => (handle_rearrive_xinput(&device_id, state), false),
+        Request::AssignXInputSlot { device_id, vid, pid, slot } => {
+            (handle_assign_xinput_slot(&device_id, vid, pid, slot, state), false)
+        }
         Request::Shutdown => (Response::ok(), true),
     }
 }
@@ -851,6 +859,50 @@ fn handle_rearrive_xinput(device_id: &str, state: &Arc<HelperState>) -> Response
             }
             Response::err(format!("re-enable failed: {e}"))
         }
+    }
+}
+
+/// Force an XInput device onto an exact player `slot` via the ordered-reorder
+/// engine. Resolves the target devnode from `device_id` (our virtual, via its
+/// tracked XUSB companion) or, failing that, from `vid`/`pid` (a physical Xbox's
+/// XUSB node). Unlike [`handle_rearrive_xinput`] this can DISPLACE a physical
+/// controller, so it relies on the engine's persisted watchdog (every devnode is
+/// re-enabled on completion, on error, and on the next helper startup).
+fn handle_assign_xinput_slot(
+    device_id: &str,
+    vid: Option<u16>,
+    pid: Option<u16>,
+    slot: usize,
+    state: &Arc<HelperState>,
+) -> Response {
+    // Prefer our own tracked companion (virtual output / loopback). Fall back to a
+    // physical Xbox XUSB node located by VID/PID.
+    let target = state
+        .devices
+        .lock()
+        .ok()
+        .and_then(|devs| {
+            devs.values()
+                .find(|d| d.device_id == device_id)
+                .and_then(|d| d.companion_instance_id.clone())
+        })
+        .or_else(|| match (vid, pid) {
+            (Some(v), Some(p)) => crate::orchestrator::physical_xinput_devnode_for_vid_pid(v, p),
+            _ => None,
+        });
+
+    let Some(target) = target else {
+        return Response::err(format!(
+            "could not resolve an XInput devnode for device_id={device_id} (vid={vid:?} pid={pid:?})"
+        ));
+    };
+
+    match crate::orchestrator::reorder_xinput_slots(&target, slot) {
+        Ok(()) => {
+            diag_log(&format!("[helper] assigned {target} to XInput slot {slot} (device_id={device_id})"));
+            Response::ok()
+        }
+        Err(e) => Response::err(format!("assign slot {slot} for {device_id}: {e}")),
     }
 }
 
