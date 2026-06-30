@@ -313,6 +313,11 @@ impl DeviceBackend for GilrsBackend {
         // expensive refresh_devices off the I/O loop — the fix for the ~2 s periodic
         // input freeze. The device LIST below is still rebuilt every call from gilrs's
         // (cheap, cached) gamepad walk; only the virtual/real CLASSIFICATION is cached.
+        // Log the gilrs walk (names, vid/pid, virtual flag, assigned device id) once
+        // per device-set change so we can see exactly which dev_id the physical Xbox
+        // gets and whether a virtual XInput face is stealing its index — the read-side
+        // half of "physical XInput never reaches the virtual pad".
+        let log_walk = self.dev_set_dirty;
         if self.dev_set_dirty {
             self.refresh_virtual_classification();
             self.dev_set_dirty = false;
@@ -349,6 +354,13 @@ impl DeviceBackend for GilrsBackend {
                 }
                 _ => continue, // Drop (ViGEm virtual beyond real count) or missing
             };
+
+            if log_walk {
+                eprintln!(
+                    "[gilrs-walk] #{i} name={:?} vid={:04X?} pid={:04X?} kind={:?} is_virt={is_virt} -> dev_id={dev_id}",
+                    pad.name(), pad.vendor_id(), pad.product_id(), kind,
+                );
+            }
 
             let display_name = if kind == ControllerKind::Generic {
                 pad.name().to_string()

@@ -333,26 +333,37 @@ pub fn physical_xinput_devnode_for_vid_pid(vid: u16, pid: u16) -> Option<String>
 }
 
 /// Force `target_instance` onto ordinal `slot` (0-based) by an ordered re-arrival
-/// of EVERY present XInput devnode. Disables all of them, then re-enables them one
-/// at a time — the target at index `slot`, the others filling the remaining
+/// of the given XInput `participants`. Disables all of them, then re-enables them
+/// one at a time — the target at index `slot`, the others filling the remaining
 /// positions in their existing order — with a settle delay so each claims the next
 /// XInput user index in turn.
+///
+/// `participants` is supplied by the caller because the slot-holding devnode is
+/// NOT uniformly discoverable: a physical Xbox's holder carries the `&IG_` tag
+/// (see [`present_xinput_devnodes`]), but our own virtual's holder is its
+/// `SWD\HIDMAESTRO` XUSB companion, which has no such tag and is known only to the
+/// helper. The caller unions both and passes the target alongside.
 ///
 /// Safety: the full disabled set is persisted to the watchdog file before the
 /// disable sequence and cleared only after every node is confirmed re-enabled; a
 /// crash mid-sequence is recovered by [`recover_xinput_reorder`] on the next helper
 /// start, and the transient `CM_Disable` flag means a reboot also re-enables
 /// everything. Every node is re-enabled on completion AND on any error path.
-pub fn reorder_xinput_slots(target_instance: &str, slot: usize) -> Result<(), OrchestratorError> {
-    let nodes = present_xinput_devnodes();
-    if nodes.is_empty() {
-        return Err(OrchestratorError::Reorder("no present XInput devnodes".into()));
+pub fn reorder_xinput_slots(
+    participants: &[String],
+    target_instance: &str,
+    slot: usize,
+) -> Result<(), OrchestratorError> {
+    // De-dup participants case-insensitively, preserving order, and guarantee the
+    // target is included even if the caller forgot it.
+    let mut nodes: Vec<String> = Vec::new();
+    for p in participants.iter().chain(std::iter::once(&target_instance.to_string())) {
+        if !nodes.iter().any(|n: &String| n.eq_ignore_ascii_case(p)) {
+            nodes.push(p.clone());
+        }
     }
-    if !nodes.iter().any(|n| n.eq_ignore_ascii_case(target_instance)) {
-        return Err(OrchestratorError::Reorder(format!(
-            "target {target_instance} not among {} present XInput devnode(s)",
-            nodes.len()
-        )));
+    if nodes.is_empty() {
+        return Err(OrchestratorError::Reorder("no XInput participants".into()));
     }
     // Build the desired re-enable order: others before `slot`, target, others after.
     let others: Vec<String> = nodes

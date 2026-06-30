@@ -875,8 +875,18 @@ fn handle_assign_xinput_slot(
     slot: usize,
     state: &Arc<HelperState>,
 ) -> Response {
-    // Prefer our own tracked companion (virtual output / loopback). Fall back to a
-    // physical Xbox XUSB node located by VID/PID.
+    // Our own tracked virtual companions (SWD\HIDMAESTRO XUSB nodes) — these hold
+    // an XInput slot but carry no `&IG_` tag, so the device-tree scan can't find
+    // them; we must add them to the participant set explicitly.
+    let companions: Vec<String> = state
+        .devices
+        .lock()
+        .ok()
+        .map(|devs| devs.values().filter_map(|d| d.companion_instance_id.clone()).collect())
+        .unwrap_or_default();
+
+    // Resolve the target slot-holder devnode. Prefer our own tracked companion for
+    // `device_id`; otherwise locate a physical Xbox XUSB node by VID/PID.
     let target = state
         .devices
         .lock()
@@ -897,7 +907,23 @@ fn handle_assign_xinput_slot(
         ));
     };
 
-    match crate::orchestrator::reorder_xinput_slots(&target, slot) {
+    // Participant set = physical XInput devnodes (the `&IG_`-tagged USB nodes, with
+    // our own ROOT/HIDMaestro nodes filtered out) ∪ our tracked companions. The
+    // reorder de-dups and guarantees the target is present.
+    let physicals: Vec<String> = crate::orchestrator::present_xinput_devnodes()
+        .into_iter()
+        .filter(|id| {
+            let up = id.to_ascii_uppercase();
+            !up.starts_with("ROOT\\") && !up.contains("HIDMAESTRO")
+        })
+        .collect();
+    let mut participants = physicals;
+    participants.extend(companions);
+
+    diag_log(&format!(
+        "[helper] reorder participants={participants:?} target={target} slot={slot}"
+    ));
+    match crate::orchestrator::reorder_xinput_slots(&participants, &target, slot) {
         Ok(()) => {
             diag_log(&format!("[helper] assigned {target} to XInput slot {slot} (device_id={device_id})"));
             Response::ok()
