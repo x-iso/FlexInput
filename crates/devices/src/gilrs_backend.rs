@@ -195,6 +195,14 @@ pub struct GilrsBackend {
     /// (physical Xbox) — if the Xbox never logs an edge, gilrs isn't delivering its
     /// input values to us at all.
     dbg_btn_mask: HashMap<String, u64>,
+    /// Resolved XInput user-index slot per physical-XInput `dev_id`, used for the
+    /// focus-independent `XInputGetState` read. XInput exposes no device identity,
+    /// so we correlate each gilrs XInput pad to a slot by matching live state
+    /// (buttons + sticks) while the app is focused, then CACHE it so the mapping
+    /// survives focus loss. This is what makes the direct read land on the pad's
+    /// actually-allocated slot rather than its mere arrival index — correct even
+    /// when the virtual was deployed first or the slots were reordered.
+    xinput_slot_for: HashMap<String, u32>,
 }
 
 impl GilrsBackend {
@@ -209,6 +217,7 @@ impl GilrsBackend {
             virt_cache: HashMap::new(),
             dev_set_dirty: true, // force classification on first enumerate
             dbg_btn_mask: HashMap::new(),
+            xinput_slot_for: HashMap::new(),
         })
     }
 
@@ -327,6 +336,10 @@ impl DeviceBackend for GilrsBackend {
         let log_walk = self.dev_set_dirty;
         if self.dev_set_dirty {
             self.refresh_virtual_classification();
+            // Drop cached XInput slot correlations: a connect/disconnect/reorder can
+            // move a pad to a different slot, so the mapping must be re-learned from
+            // live state rather than trusted across a device-set change.
+            self.xinput_slot_for.clear();
             self.dev_set_dirty = false;
             // Snapshot XInput slot occupancy on every device-set change so the log
             // shows whether the virtual XUSB companion acquired a slot alongside any
@@ -473,6 +486,10 @@ impl DeviceBackend for GilrsBackend {
             if due { *g = Some(Instant::now()); }
             due
         };
+
+        // Per-XInput-pad live gilrs state (dev_id, button mask, lx, ly), collected
+        // during the walk and correlated to actual XInput slots afterward.
+        let mut xi_corr: Vec<(String, u16, f32, f32)> = Vec::new();
 
         // Wrap the gamepads() walk in an explicit block so the profile
         // scope's RAII guard ends with the for loop — NOT with the function.
@@ -763,11 +780,28 @@ impl DeviceBackend for GilrsBackend {
             // for rumble routing); for the common single-physical layout it is the
             // occupied slot. (After a manual slot reorder the index can diverge —
             // tracked as a follow-up.)
+            // Correlation sample for EVERY XInput pad (physical and our own
+            // virtual): its live gilrs state, matched to an actual XInput slot in
+            // the post-walk pass below. Virtual pads are sampled only so their slot
+            // gets CLAIMED and excluded from physical assignment — we never read a
+            // virtual slot as an input source (that would loop our output back in).
+            if kind == ControllerKind::XInput {
+                xi_corr.push((
+                    dev.clone(),
+                    gilrs_xinput_button_mask(&pad),
+                    axis_val(&pad, Axis::LeftStickX),
+                    axis_val(&pad, Axis::LeftStickY),
+                ));
+            }
+
             #[cfg(windows)]
             if kind == ControllerKind::XInput && !is_virt {
                 use xinput_ffi::*;
+                // Land on the pad's correlated slot (falls back to the arrival index
+                // until live state resolves it — see `xinput_slot_for`).
+                let slot = self.xinput_slot_for.get(&dev).copied().unwrap_or(inst as u32);
                 let mut st: XINPUT_STATE = Default::default();
-                if unsafe { XInputGetState(inst as u32, &mut st) } == 0 {
+                if unsafe { XInputGetState(slot, &mut st) } == 0 {
                     let gp = st.gamepad;
                     let b = gp.w_buttons;
                     let has = |mask: u16| (b & mask) != 0;
@@ -832,6 +866,69 @@ impl DeviceBackend for GilrsBackend {
             }
         }
         } // end gilrs_gamepads_walk profile_scope block
+
+        // ── Correlate XInput pads to their actual slots (focus-tolerant) ────────
+        // XInput has no device-identity API, so we match each gilrs XInput pad to
+        // the connected slot whose live state (buttons + stick signs) agrees, then
+        // cache it. We only (re)assign a pad while it shows activity (a neutral pad
+        // is ambiguous), so the mapping is learned the first time the user touches
+        // the pad WHILE FOCUSED and then persists through focus loss. Virtual pads
+        // are matched too — solely to claim their slot so a physical never resolves
+        // onto our own virtual (which would feed our output back as input).
+        #[cfg(windows)]
+        if !xi_corr.is_empty() {
+            use xinput_ffi::*;
+            // Snapshot all four slots once: (connected, buttons, lx, ly).
+            let mut slots = [(false, 0u16, 0i16, 0i16); 4];
+            for i in 0..4u32 {
+                let mut st: XINPUT_STATE = Default::default();
+                if unsafe { XInputGetState(i, &mut st) } == 0 {
+                    slots[i as usize] =
+                        (true, st.gamepad.w_buttons, st.gamepad.s_thumb_lx, st.gamepad.s_thumb_ly);
+                }
+            }
+            let mut claimed = [false; 4];
+            // Re-claim slots already cached + still consistent so an active pad
+            // can't steal a slot another pad is correctly resolved to.
+            for (dev, xmask, _, _) in &xi_corr {
+                if let Some(&s) = self.xinput_slot_for.get(dev) {
+                    let s = s as usize;
+                    if s < 4 && slots[s].0 && slots[s].1 == *xmask {
+                        claimed[s] = true;
+                    }
+                }
+            }
+            // Coarse stick-sign agreement (a slot in deadzone matches a centered pad).
+            let sign_ok = |a: f32, b: i16| {
+                (a > 0.3 && b > 8000) || (a < -0.3 && b < -8000) || (a.abs() <= 0.3 && b.abs() <= 12000)
+            };
+            for (dev, xmask, lx, ly) in &xi_corr {
+                let active = *xmask != 0 || lx.abs() > 0.3 || ly.abs() > 0.3;
+                if !active { continue; }
+                // Keep an already-consistent cached slot.
+                if let Some(&s) = self.xinput_slot_for.get(dev) {
+                    let s = s as usize;
+                    if s < 4 && slots[s].0 && slots[s].1 == *xmask { continue; }
+                }
+                let candidates: Vec<usize> = (0..4)
+                    .filter(|&s| {
+                        !claimed[s]
+                            && slots[s].0
+                            && slots[s].1 == *xmask
+                            && sign_ok(*lx, slots[s].2)
+                            && sign_ok(*ly, slots[s].3)
+                    })
+                    .collect();
+                if candidates.len() == 1 {
+                    let s = candidates[0];
+                    claimed[s] = true;
+                    if self.xinput_slot_for.get(dev).copied() != Some(s as u32) {
+                        self.xinput_slot_for.insert(dev.clone(), s as u32);
+                        eprintln!("[xinput-slot-map] {dev} -> slot {s}");
+                    }
+                }
+            }
+        }
 
         out
     }
@@ -1001,6 +1098,31 @@ fn gilrs_device_id(
         kind_seen.insert(kind, inst + 1);
         (format!("gilrs:{}:{}", kind.id_slug(), inst), inst, false)
     }
+}
+
+/// gilrs button state of `pad` packed into the XInput `wButtons` bit layout, so it
+/// can be compared directly against an `XINPUT_GAMEPAD.w_buttons` for slot
+/// correlation. Best-effort: D-Pad reads the discrete buttons (the WGI path FlexInput
+/// uses for Xbox pads reports them as buttons).
+fn gilrs_xinput_button_mask(pad: &gilrs::Gamepad) -> u16 {
+    let p = |b: Button| pad.button_data(b).map_or(false, |d| d.is_pressed());
+    let mut m = 0u16;
+    if p(Button::DPadUp)       { m |= 0x0001; }
+    if p(Button::DPadDown)     { m |= 0x0002; }
+    if p(Button::DPadLeft)     { m |= 0x0004; }
+    if p(Button::DPadRight)    { m |= 0x0008; }
+    if p(Button::Start)        { m |= 0x0010; }
+    if p(Button::Select)       { m |= 0x0020; }
+    if p(Button::LeftThumb)    { m |= 0x0040; }
+    if p(Button::RightThumb)   { m |= 0x0080; }
+    if p(Button::LeftTrigger)  { m |= 0x0100; } // LB
+    if p(Button::RightTrigger) { m |= 0x0200; } // RB
+    if p(Button::Mode)         { m |= 0x0400; } // Guide
+    if p(Button::South)        { m |= 0x1000; }
+    if p(Button::East)         { m |= 0x2000; }
+    if p(Button::West)         { m |= 0x4000; }
+    if p(Button::North)        { m |= 0x8000; }
+    m
 }
 
 fn axis_map(kind: ControllerKind) -> &'static [(Axis, &'static str)] {
