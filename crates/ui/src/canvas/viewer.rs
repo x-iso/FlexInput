@@ -2744,12 +2744,13 @@ fn asth_slider_and_box(
 /// to a stable `element_id` (so it can be pinned to a sub-patch body individually)
 /// and is rendered by the SAME code inline (in the node body) and when pinned.
 #[derive(Clone, Copy, PartialEq)]
-enum AsthRow { Volume, Release, Crossover, Amplitude, Balance, Swap, RumbleMix }
+enum AsthRow { Mode, Volume, Release, Crossover, Amplitude, Balance, Swap, RumbleMix }
 
 impl AsthRow {
     /// Stable element id used for pinning + the pinned-element dispatch.
     fn element_id(self) -> &'static str {
         match self {
+            AsthRow::Mode      => "asth_mode_row",
             AsthRow::Volume    => "asth_volume",
             AsthRow::Release   => "asth_release",
             AsthRow::Crossover => "asth_crossover",
@@ -2759,11 +2760,16 @@ impl AsthRow {
             AsthRow::RumbleMix => "asth_rumble_mix",
         }
     }
+    /// Calibration rows drawn by the shared `asth_draw_row` slider renderer. The
+    /// capture-mode block (`Mode`) is drawn separately by `asth_draw_mode_block` and
+    /// is therefore NOT in this list — but it is still a recognized pinnable element.
     const ALL: [AsthRow; 7] = [
         AsthRow::Volume, AsthRow::Release, AsthRow::Crossover, AsthRow::Amplitude,
         AsthRow::Balance, AsthRow::Swap, AsthRow::RumbleMix,
     ];
+    /// Recognize any pinnable ASTH element id (the calibration rows plus the mode block).
     fn from_element_id(id: &str) -> Option<AsthRow> {
+        if id == AsthRow::Mode.element_id() { return Some(AsthRow::Mode); }
         AsthRow::ALL.into_iter().find(|r| r.element_id() == id)
     }
 }
@@ -2781,6 +2787,13 @@ fn asth_draw_row(
     let label_w = 64.0 * scale;
     let mut changed = false;
     let rect = match row {
+        // The mode block is drawn by `asth_draw_mode_block`, not as a slider row;
+        // delegate here so this match stays exhaustive and any stray dispatch is safe.
+        AsthRow::Mode => {
+            let (ch, rect) = asth_draw_mode_block(ui, a, body_w, ui.id().with("asth_mode_fallback"));
+            changed |= ch;
+            rect
+        }
         AsthRow::Volume => {
             let mut v = a.volume;
             let rect = asth_value_row(ui, "Volume", label_w, body_w, scale, &mut changed,
@@ -2923,6 +2936,78 @@ fn asth_write_params(snarl: &mut Snarl<NodeData>, node_id: NodeId, a: &AsthParam
     }
 }
 
+/// Draw the capture-mode block (App/Focused/System selector + process picker +
+/// include-tree checkbox + live status line), mutating `a`. Returns `(changed, rect)`.
+/// `salt` namespaces the process ComboBox so the body and a pinned copy don't collide.
+/// Shared by the node body (inline) and the pinned-element renderer so the mode block
+/// is pinnable like the calibration rows.
+fn asth_draw_mode_block(
+    ui: &mut egui::Ui,
+    a: &mut AsthParams,
+    body_w: f32,
+    salt: egui::Id,
+) -> (bool, egui::Rect) {
+    let mut changed = false;
+    let resp = ui.vertical(|ui| {
+        ui.set_max_width(body_w);
+        ui.label("Capture from:");
+        ui.horizontal(|ui| {
+            changed |= ui.selectable_value(&mut a.mode, "process".to_string(), "App").changed();
+            changed |= ui.selectable_value(&mut a.mode, "focused".to_string(), "Focused").changed();
+            changed |= ui.selectable_value(&mut a.mode, "system".to_string(), "System").changed();
+        });
+        if a.mode == "process" {
+            let label = if a.target_name.is_empty() { "Pick app…".to_string() } else { a.target_name.clone() };
+            egui::ComboBox::from_id_salt(("asth_proc", salt))
+                .selected_text(label)
+                .width((body_w - 4.0).clamp(120.0, 400.0))
+                .show_ui(ui, |ui| {
+                    for (exe, title) in crate::process_list::enumerate_windows() {
+                        let item = if title.is_empty() {
+                            exe.clone()
+                        } else {
+                            format!("{title}\n{exe}")
+                        };
+                        if ui.selectable_label(a.target_name.eq_ignore_ascii_case(&exe), item).clicked() {
+                            a.target_name = exe.clone();
+                            changed = true;
+                        }
+                    }
+                });
+            changed |= ui.checkbox(&mut a.include_tree, "Include child processes").changed();
+        }
+        if a.mode == "focused" {
+            changed |= ui.checkbox(&mut a.include_tree, "Include child processes").changed();
+        }
+        let status = current_capture_status(&a.mode, &a.target_name);
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(status).small().weak());
+    });
+    (changed, resp.response.rect)
+}
+
+/// Render the ASTH capture-mode block pinned to a sub-patch body, sized to `container`.
+fn render_asth_pinned_mode(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let mut a = asth_params_from_node(snarl, inner_id);
+    ui.set_max_width(container.x);
+    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 96.0);
+    let _ = scale; // height-scale applies to text/spacing via the style mutation above
+    let body_w = container.x.clamp(120.0, 1200.0);
+    let (changed, _rect) = asth_draw_mode_block(ui, &mut a, body_w, ui.id().with(inner_id));
+    if changed {
+        if let Some(n) = snarl.get_node_mut(inner_id) {
+            n.params.insert("asth_mode".into(), serde_json::Value::String(a.mode));
+            n.params.insert("asth_target_name".into(), serde_json::Value::String(a.target_name));
+            n.params.insert("asth_include_tree".into(), serde_json::Value::Bool(a.include_tree));
+        }
+    }
+}
+
 /// Render a single ASTH row pinned to a sub-patch body, sized to `container`:
 /// WIDTH scales the slider rail, HEIGHT scales the text + control size.
 fn render_asth_pinned_row(
@@ -3032,44 +3117,13 @@ fn show_audio_stream_haptics_body(
         ui.set_max_width(body_w);
 
         // ── Capture mode ──────────────────────────────────────────────────────
-        ui.label("Capture from:");
-        ui.horizontal(|ui| {
-            changed |= ui.selectable_value(&mut a.mode, "process".to_string(), "App").changed();
-            changed |= ui.selectable_value(&mut a.mode, "focused".to_string(), "Focused").changed();
-            changed |= ui.selectable_value(&mut a.mode, "system".to_string(), "System").changed();
-        });
-
-        // ── Process picker (App mode only) ────────────────────────────────────
-        // Reuse the auto-mode app-binding design: the live visible-window list
-        // (exe + window title), the same source the per-tab process binder uses.
-        if a.mode == "process" {
-            let label = if a.target_name.is_empty() { "Pick app…".to_string() } else { a.target_name.clone() };
-            egui::ComboBox::from_id_salt(("asth_proc", node_id))
-                .selected_text(label)
-                .width(190.0)
-                .show_ui(ui, |ui| {
-                    for (exe, title) in crate::process_list::enumerate_windows() {
-                        let item = if title.is_empty() {
-                            exe.clone()
-                        } else {
-                            format!("{title}\n{exe}")
-                        };
-                        if ui.selectable_label(a.target_name.eq_ignore_ascii_case(&exe), item).clicked() {
-                            a.target_name = exe.clone();
-                            changed = true;
-                        }
-                    }
-                });
-            changed |= ui.checkbox(&mut a.include_tree, "Include child processes").changed();
-        }
-        if a.mode == "focused" {
-            changed |= ui.checkbox(&mut a.include_tree, "Include child processes").changed();
-        }
-
-        // ── Status row: what's actually being captured right now ──────────────
-        let status = current_capture_status(&a.mode, &a.target_name);
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new(status).small().weak());
+        // Drawn by the SHARED `asth_draw_mode_block` (so it renders identically
+        // inline and when pinned to a sub-patch body). Registered as a pinnable
+        // element in Layout mode. Includes the App/Focused/System selector, the
+        // process picker (App mode), the include-tree checkbox, and the live status.
+        let (mode_ch, mode_rect) = asth_draw_mode_block(ui, &mut a, body_w, egui::Id::new(("asth_mode", node_id)));
+        changed |= mode_ch;
+        register_exposable_element(ui, node_id, AsthRow::Mode.element_id(), mode_rect);
 
         // ── Calibration rows. Each row is drawn by the SHARED `asth_draw_row` (so it
         //    renders identically inline and when pinned to a sub-patch body) and is
@@ -8098,6 +8152,10 @@ fn render_pinned_element(
         // Audio Stream Haptics — the scope widget, or any single calibration row.
         ("module.audio_stream_haptics", "asth_scope") => {
             render_asth_pinned_scope(inner_id, ui, inner_snarl, container_size, bridged_parent);
+            return;
+        }
+        ("module.audio_stream_haptics", "asth_mode_row") => {
+            render_asth_pinned_mode(inner_id, ui, inner_snarl, container_size);
             return;
         }
         ("module.audio_stream_haptics", eid) if AsthRow::from_element_id(eid).is_some() => {

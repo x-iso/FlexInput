@@ -1102,7 +1102,7 @@ fn audio_stream_haptics_publish(
     uid: usize,
     dev_sigs: &HashMap<(String, String), Signal>,
     collector_sigs: &mut HashMap<(String, String), Signal>,
-) {
+) -> Vec<Option<Signal>> {
     // `uid` is this node's effective publishing id: `snap.node_uid` at the top level,
     // the namespaced uid inside a sub-patch. It keys the collector pass-through AND
     // the loopback capture lookup (both must match what the capture manager + the
@@ -1238,6 +1238,21 @@ fn audio_stream_haptics_publish(
     let audio_l_amp = shape_amp(audio_l_amp);
     let audio_r_amp = shape_amp(audio_r_amp);
 
+    // ── Raw band envelope followers (exposed output pins). ────────────────────
+    // These are the per-band share of the curve-shaped loudness BEFORE the
+    // carrier/modulator (AM/RM) blend, the range remap, and the Balance depth
+    // mapping — i.e. the "clean" two-band decomposition of the audio analysis.
+    // The felt-output path below derives its own EFs from `l_amp` (post-blend);
+    // these stay independent so a scope/readout on these pins shows the source.
+    let raw_l_lf_ef = (audio_l_amp * lf_frac).clamp(0.0, 1.0);
+    let raw_l_hf_ef = (audio_l_amp * hf_frac).clamp(0.0, 1.0);
+    let raw_r_lf_ef = (audio_r_amp * lf_frac).clamp(0.0, 1.0);
+    let raw_r_hf_ef = (audio_r_amp * hf_frac).clamp(0.0, 1.0);
+    // Band carrier frequencies, converted from the engine's 0..1 spectral position
+    // to Hz (log scale 40–1253, matching the spectrum/crossover mapping).
+    let raw_lf_hz = band_pos_to_hz(lf_carrier);
+    let raw_hf_hz = if hf_frac > 0.0 { band_pos_to_hz(hf_carrier) } else { 0.0 };
+
     let modulator = snap.params.get("asth_modulator").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
     let blend = |audio_amp: f32, std: f32| -> f32 {
         // anchors: gate(0) = audio*std ; boost(0.5) = audio*(0.5 + 0.5*std) ;
@@ -1303,9 +1318,25 @@ fn audio_stream_haptics_publish(
     let l_hf_amp = if l_carrier_amp > 0.0 { (l_mod_ef * toward_mod).clamp(0.0, 1.0) } else { 0.0 };
     let r_hf_amp = if r_carrier_amp > 0.0 { (r_mod_ef * toward_mod).clamp(0.0, 1.0) } else { 0.0 };
 
+    // ── Scalar output pins: raw band EFs + band carrier freqs (Hz). ──────────
+    // Built BEFORE injection so the analysis outputs are still produced even when
+    // no feedback destination is configured (early return below). Order MUST match
+    // the descriptor's outputs: [AutoMap, LF EF L, HF EF L, LF EF R, HF EF R,
+    // LF Hz, HF Hz]. output[0] (AutoMap) carries no scalar.
+    let mut out: Vec<Option<Signal>> = vec![None; snap.n_outputs.max(1)];
+    {
+        let mut set = |i: usize, v: f32| { if let Some(slot) = out.get_mut(i) { *slot = Some(Signal::Float(v)); } };
+        set(1, raw_l_lf_ef);
+        set(2, raw_l_hf_ef);
+        set(3, raw_r_lf_ef);
+        set(4, raw_r_hf_ef);
+        set(5, raw_lf_hz);
+        set(6, raw_hf_hz);
+    }
+
     // ── 5. Inject into the target pad's feedback channel. ──
     let dest_dev = snap.params.get("_asth_dest_dev").and_then(|v| v.as_str()).unwrap_or("");
-    if dest_dev.is_empty() { return; }
+    if dest_dev.is_empty() { return out; }
     let key = format!("feedback_inject:{dest_dev}");
     // `force` distinguishes the amplitude pins (always written, even at 0.0, so the
     // feedback post-pass actively drives the pad's rumble back to zero on silence —
@@ -1331,6 +1362,18 @@ fn audio_stream_haptics_publish(
     if r_lf_amp > 0.0 { put("hd_r_freq", r_carrier_freq, false); }
     if l_hf_amp > 0.0 { put("hd2_l_freq", l_mod_freq, false); }
     if r_hf_amp > 0.0 { put("hd2_r_freq", r_mod_freq, false); }
+
+    out
+}
+
+/// Inverse of [`crossover_hz_to_pos`]: map a 0..1 spectral band position back to Hz
+/// on the same log scale (40 Hz–1253 Hz). Used to expose the band carrier frequencies
+/// as Hz on the Audio Stream Haptics output pins.
+fn band_pos_to_hz(pos: f32) -> f32 {
+    const MIN: f32 = 40.0;
+    const MAX: f32 = 1253.0;
+    let pos = pos.clamp(0.0, 1.0);
+    MIN * (MAX / MIN).powf(pos)
 }
 
 fn automap_fork_publish(
@@ -1967,9 +2010,10 @@ fn eval_subgraph(
         // the downstream sink's collector lookup. Without this arm ASTH did nothing
         // when nested — the reported "doesn't work inside a sub-patch".
         if snap.module_id == AUDIO_STREAM_HAPTICS_ID {
-            audio_stream_haptics_publish(snap, ns_uid, dev_sigs, collector_sigs);
-            computed[idx] = vec![None];
-            last_outputs.insert(ns_uid, computed[idx].clone());
+            // output[0] = AutoMap passthrough; output[1..] = raw band EFs + freqs.
+            let out = audio_stream_haptics_publish(snap, ns_uid, dev_sigs, collector_sigs);
+            computed[idx] = out.clone();
+            last_outputs.insert(ns_uid, out);
             continue;
         }
 
@@ -2226,8 +2270,11 @@ pub fn eval_graph_tick(
         // ── module.audio_stream_haptics: pass the AutoMap bus through, then
         //    inject audio-derived HD rumble into the target pad's feedback. ────
         if snap.module_id == AUDIO_STREAM_HAPTICS_ID {
-            audio_stream_haptics_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
-            computed[idx] = vec![None]; // AutoMap passthrough: no scalar value
+            // output[0] = AutoMap passthrough (no scalar); output[1..] = raw band
+            // EFs + band carrier freqs (Hz), see audio_stream_haptics_publish.
+            let out = audio_stream_haptics_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
+            last_outputs.insert(snap.node_uid, out.clone());
+            computed[idx] = out;
             continue;
         }
         // ── device.sink: collect combined inputs, populate sink_outputs ──────

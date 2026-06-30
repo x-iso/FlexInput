@@ -259,7 +259,21 @@ impl Module for AudioStreamHapticsModule {
             display_name: "Audio Stream Haptics",
             category: "AutoMap",
             inputs: vec![PinDescriptor::new("Device", SignalType::AutoMap)],
-            outputs: vec![PinDescriptor::new("AutoMap", SignalType::AutoMap)],
+            // output[0] = AutoMap pass-through (unchanged). The remaining Float pins
+            // expose the RAW two-band decomposition BEFORE the carrier/modulator
+            // (AM/RM) blend: per-band envelope followers (one per side) and each
+            // band's collapsed carrier frequency in Hz. Wire them to scopes/readouts
+            // or drive other modules from the audio analysis. Computed in
+            // `eval::audio_stream_haptics_publish`.
+            outputs: vec![
+                PinDescriptor::new("AutoMap", SignalType::AutoMap),
+                PinDescriptor::new("LF EF L", SignalType::Float),
+                PinDescriptor::new("HF EF L", SignalType::Float),
+                PinDescriptor::new("LF EF R", SignalType::Float),
+                PinDescriptor::new("HF EF R", SignalType::Float),
+                PinDescriptor::new("LF Hz",   SignalType::Float),
+                PinDescriptor::new("HF Hz",   SignalType::Float),
+            ],
         }
     }
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {

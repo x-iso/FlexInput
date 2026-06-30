@@ -101,6 +101,24 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
                 PinDescriptor::new("Analog", SignalType::Float),
             ];
         }
+        // Audio Stream Haptics gained raw-analysis output pins (band EFs + band
+        // carrier freqs in Hz) after output[0] (AutoMap). Patches saved before that
+        // only have the AutoMap pin — append the missing Floats so the new pins
+        // appear. output[0] stays put, so any existing AutoMap wire is preserved.
+        if node.value.module_id == "module.audio_stream_haptics" && node.value.outputs.len() < 7 {
+            let want = [
+                ("AutoMap", SignalType::AutoMap),
+                ("LF EF L", SignalType::Float),
+                ("HF EF L", SignalType::Float),
+                ("LF EF R", SignalType::Float),
+                ("HF EF R", SignalType::Float),
+                ("LF Hz",   SignalType::Float),
+                ("HF Hz",   SignalType::Float),
+            ];
+            node.value.outputs = want.iter()
+                .map(|(name, ty)| PinDescriptor::new(*name, *ty))
+                .collect();
+        }
         if matches!(node.value.module_id.as_str(), "device.sink" | "device.source") {
             if let Some(new_id) = node
                 .value
