@@ -189,6 +189,12 @@ pub struct GilrsBackend {
     /// that hidapi refresh ran ON the real-time I/O loop, freezing ALL input for
     /// ~200 ms each time (the periodic-gap bug). See `refresh_virtual_classification`.
     dev_set_dirty: bool,
+    /// DIAGNOSTIC: last button bitmask logged per device_id, so poll() can print a
+    /// line only on a button edge (press/release) instead of spamming at 500 Hz.
+    /// Used to compare a working source (DualSense) against a non-working one
+    /// (physical Xbox) — if the Xbox never logs an edge, gilrs isn't delivering its
+    /// input values to us at all.
+    dbg_btn_mask: HashMap<String, u64>,
 }
 
 impl GilrsBackend {
@@ -202,6 +208,7 @@ impl GilrsBackend {
             id_to_dev: HashMap::new(),
             virt_cache: HashMap::new(),
             dev_set_dirty: true, // force classification on first enumerate
+            dbg_btn_mask: HashMap::new(),
         })
     }
 
@@ -497,9 +504,20 @@ impl DeviceBackend for GilrsBackend {
             } else {
                 button_map(kind)
             };
-            for (button, pin_id) in btn_map {
+            let mut dbg_mask: u64 = 0;
+            for (bi, (button, pin_id)) in btn_map.iter().enumerate() {
                 let pressed = pad.button_data(*button).map_or(false, |d| d.is_pressed());
+                if pressed && bi < 64 { dbg_mask |= 1u64 << bi; }
                 out.push((dev.clone(), pin_id.to_string(), Signal::Bool(pressed)));
+            }
+            // DIAGNOSTIC: log a line on any button edge so we can see whether gilrs
+            // is actually delivering this pad's input. Compare the physical Xbox
+            // against the (working) DualSense: if pressing Xbox buttons logs nothing,
+            // gilrs isn't feeding us its values (the read side is dead), not the
+            // engine/output. Only logs on change, so it's quiet at rest.
+            if self.dbg_btn_mask.get(&dev).copied().unwrap_or(0) != dbg_mask {
+                self.dbg_btn_mask.insert(dev.clone(), dbg_mask);
+                eprintln!("[input-edge] dev={dev} kind={kind:?} is_virt={is_virt} btn_mask=0x{dbg_mask:04X}");
             }
 
             // Universal DPad discrete outputs: combine axis_data (HAT/USB path) and
