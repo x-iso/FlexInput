@@ -5,6 +5,41 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-07-01
+
+HidHide masking of remapped physical controllers, exact XInput player-slot
+control, same-family physical/virtual pad fixes, Audio Stream Haptics raw
+analysis outputs, and mixed-output smoothing.
+
+### Added
+
+- **HidHide masking** of remapped physical controllers via the elevated
+  HIDMaestro helper, so a game sees only the virtual pad and not the physical
+  device behind it. Masking is reconciled on device/patch changes and toggleable
+  from Settings.
+- **Exact XInput player-slot control:** a slot-reorder engine plus on-canvas and
+  Easy-mode slot indicators, with safe virtual re-arrival so a re-created pad
+  reclaims its slot. Resolves physical pads reading from the wrong slot after
+  focus loss.
+- **Audio Stream Haptics — raw analysis output pins.** Six new Float outputs
+  after the AutoMap passthrough expose the raw two-band decomposition *before*
+  the carrier/modulator (AM/RM) blend: per-band/per-side envelope followers
+  (`LF/HF EF L/R`) and each band's carrier frequency in Hz (`LF/HF Hz`). Wire
+  them to scopes/readouts or drive other modules from the audio analysis.
+- **Audio Stream Haptics — pinnable capture-mode block.** The App/Focused/System
+  selector (with its process picker and status line) can now be pinned to a
+  sub-patch body like the calibration rows.
+- **Braid mixed output (experimental):** optional Settings toggle that makes the
+  virtual-gamepad and keyboard/mouse outputs **submit in strict alternation** (a
+  shared turn token) so a gamepad HID report and a mouse `SendInput` never land
+  in the same instant. Neither stream is muted or zeroed — the mouse accumulates
+  between its turns (no motion lost) and an idle mouse just passes its turn, so it
+  never chops the pad. Pacing is a per-lane rate: **Real-time** (fastest, lowest
+  latency — limited only by the polling/mouse rate) or 500 / 250 / 125 Hz. For
+  empirically probing games whose input arbiter behaves differently under
+  simultaneous mixed output (confirmed to recover a game that lost mouse input
+  intermittently under FlexInput). Off by default; effect is game-specific.
+
 ### Changed
 
 - **Smoother virtual mouse with mixed output:** the Virtual Keyboard & Mouse
@@ -22,18 +57,13 @@ All notable changes to FlexInput are documented here. This project adheres to
   motion is clamped to ≤4 ms of travel, so an occasional scheduler gap no longer
   discharges as a single cursor jump under heavy game load.
 
-### Added
+### Fixed
 
-- **Braid mixed output (experimental):** optional Settings toggle that makes the
-  virtual-gamepad and keyboard/mouse outputs **submit in strict alternation** (a
-  shared turn token) so a gamepad HID report and a mouse `SendInput` never land
-  in the same instant. Neither stream is muted or zeroed — the mouse accumulates
-  between its turns (no motion lost) and an idle mouse just passes its turn, so it
-  never chops the pad. Pacing is a per-lane rate: **Real-time** (fastest, lowest
-  latency — limited only by the polling/mouse rate) or 500 / 250 / 125 Hz. For
-  empirically probing games whose input arbiter behaves differently under
-  simultaneous mixed output (confirmed to recover a game that lost mouse input
-  intermittently under FlexInput). Off by default; effect is game-specific.
+- **Physical/virtual same-family pad crossing.** A physical controller no longer
+  freezes or reads from the wrong device when a virtual pad of the same family is
+  present (DualSense gilrs-walk vs hidapi index crossing; XInput slot/Steam
+  consolidation). Physical XInput is now read directly via `XInputGetState` so it
+  survives focus loss, and the physical pad is correlated to its real slot.
 
 ## [0.10.2] - 2026-06-27
 
