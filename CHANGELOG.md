@@ -3,6 +3,38 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Smoother virtual mouse with mixed output:** the Virtual Keyboard & Mouse
+  emission loop now scales motion by the *real* elapsed time each tick instead of
+  assuming a perfect interval, so cursor speed no longer lurches under scheduler
+  jitter when a virtual gamepad is flushing concurrently. The loop also runs at
+  1 kHz (was 500 Hz), halving the integer-pixel stair-step so slow stick-aim
+  reads smoother.
+- **Physical-mouse suppression is now configurable and game-aware.** It is
+  automatically forced OFF in "mixed mode" (a virtual gamepad active alongside
+  the keyboard/mouse), since games that warp/recenter the cursor each frame would
+  otherwise make virtual mouse aim stutter. New Settings: a master on/off toggle
+  and an adjustable release window (50–2000 ms, default 500).
+- The virtual-mouse emission thread now runs at `TIME_CRITICAL`, and its per-tick
+  motion is clamped to ≤4 ms of travel, so an occasional scheduler gap no longer
+  discharges as a single cursor jump under heavy game load.
+
+### Added
+
+- **Braid mixed output (experimental):** optional Settings toggle that makes the
+  virtual-gamepad and keyboard/mouse outputs **submit in strict alternation** (a
+  shared turn token) so a gamepad HID report and a mouse `SendInput` never land
+  in the same instant. Neither stream is muted or zeroed — the mouse accumulates
+  between its turns (no motion lost) and an idle mouse just passes its turn, so it
+  never chops the pad. Pacing is a per-lane rate: **Real-time** (fastest, lowest
+  latency — limited only by the polling/mouse rate) or 500 / 250 / 125 Hz. For
+  empirically probing games whose input arbiter behaves differently under
+  simultaneous mixed output (confirmed to recover a game that lost mouse input
+  intermittently under FlexInput). Off by default; effect is game-specific.
+
 ## [0.10.2] - 2026-06-27
 
 Touchpad output bindings for Remapper/Lean, a combiner mapping fix, and a

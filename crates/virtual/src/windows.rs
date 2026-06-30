@@ -881,6 +881,19 @@ impl VirtualDevice for VirtualDS4 {
 #[repr(C)]
 struct CursorPoint { x: i32, y: i32 }
 extern "system" { fn GetCursorPos(lp: *mut CursorPoint) -> i32; }
+
+// Thread-priority FFI (no windows-sys dep in this crate; matches the raw
+// `extern "system"` style already used here). HANDLE is pointer-sized.
+extern "system" {
+    fn GetCurrentThread() -> isize;
+    fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+}
+/// THREAD_PRIORITY_TIME_CRITICAL — the mouse emission loop is the hard
+/// real-time leg of mouse output: a tight bounded sleep loop that yields the
+/// CPU every iteration, so it can't starve other threads, but while runnable it
+/// must preempt the game's render/worker threads or it gets periodically
+/// descheduled and motion tears.
+const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
 fn cursor_pos() -> Option<(i32, i32)> {
     let mut p = CursorPoint { x: 0, y: 0 };
     (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y))
@@ -892,29 +905,42 @@ struct MouseButtons { lmb: bool, rmb: bool, mmb: bool, mb4: bool, mb5: bool }
 #[derive(Default, Clone, Copy)]
 struct KeysHeld { escape: bool, shift: bool, ctrl: bool, alt: bool, win: bool }
 
-// ── Shared state between UI thread and the 500 Hz mouse thread ───────────────
+// ── Shared state between UI thread and the 1 kHz mouse thread ────────────────
 
 #[derive(Default, Clone)]
 struct MouseShared {
     /// Desired velocity in "pixels per 60 Hz reference frame".
-    /// The mouse thread converts: px_per_tick = vel * (60 / 500).
+    /// The mouse thread converts to pixels via the REAL elapsed dt each tick.
     vel_x: f32,
     vel_y: f32,
     /// Accumulated scroll clicks — consumed (zeroed) by the mouse thread.
     scroll_pending: i32,
     buttons: MouseButtons,
     muted: bool,
-    suppression_enabled: bool,
     /// Set to true when VirtualKeyMouse is dropped — signals the thread to exit.
     stop: bool,
 }
 
-// ── 500 Hz mouse thread ───────────────────────────────────────────────────────
+// ── 1 kHz mouse thread ──────────────────────────────────────────────────────
 
 fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
-    const HZ: f32    = 500.0;
-    const REF: f32   = 60.0;
-    const SCALE: f32 = REF / HZ; // velocity → per-tick pixels
+    // Run the emission loop at 1 kHz: smaller per-tick deltas mean the integer
+    // mickey quantization (SendInput only takes whole pixels) steps twice as
+    // often, so slow stick-aim reads noticeably smoother than at 500 Hz.
+    const HZ: f32  = 1000.0;
+    const REF: f32 = 60.0; // velocity unit = pixels per 60 Hz reference frame
+    // Ticks after our OWN move during which a cursor mismatch is attributed to
+    // us (GetCursorPos can lag the SendInput) rather than to a physical mouse.
+    // ~16 ms regardless of HZ.
+    const SELF_MOVE_COOLDOWN: u16 = (HZ * 0.016) as u16;
+
+    // Raise this thread above the game's render/worker threads. Without it the
+    // 1 kHz loop runs at default priority and a busy game periodically
+    // deschedules it; with dt-scaling the missed time is then delivered as one
+    // large jump on resume — the periodic "tearing" mouse motion.
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
 
     let mut enigo = Enigo::new(&Settings::default()).ok();
     let mut carry_x = 0.0f32;
@@ -922,12 +948,34 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
     let mut os_buttons = MouseButtons::default();
     let mut last_cursor  = cursor_pos();
     let mut blocked_until: Option<Instant> = None;
-    let mut suppress_cooldown = 0u8;
+    let mut suppress_cooldown = 0u16;
 
     let tick = Duration::from_micros((1_000_000.0 / HZ) as u64);
+    // Wall-clock time of the previous emission, used to scale velocity by the
+    // REAL elapsed interval instead of assuming a perfect tick. Under load
+    // (e.g. a virtual gamepad flushing concurrently) the OS scheduler stretches
+    // ticks to 1.5–3 ms; a fixed per-tick distance then makes cursor speed
+    // lurch with scheduling jitter. dt-scaling keeps motion wall-clock-correct.
+    let mut last_emit = Instant::now();
 
     loop {
         let t0 = Instant::now();
+
+        // Real elapsed time since the previous tick, used to scale velocity so
+        // average cursor speed is wall-clock-correct. CRITICAL: clamp it small.
+        //
+        // Windows `thread::sleep` at 1 kHz is jittery — even a TIME_CRITICAL
+        // thread is occasionally descheduled 5–30 ms by a busy game. If we
+        // applied the full gap, the accumulated distance would be emitted as one
+        // large `move_mouse` jump → the periodic "tearing". Clamping the applied
+        // dt to MAX_DT means a gap can move at most MAX_DT worth in one tick:
+        // common sub-MAX_DT jitter still applies at correct speed, while a rare
+        // big gap loses a sliver of distance (imperceptible for relative aim)
+        // instead of lurching. carry_x/y stays sub-pixel as a result, so no
+        // banked backlog can build up and discharge as a jump later.
+        const MAX_DT: f32 = 0.004; // 4 ms = 4× the nominal 1 kHz tick
+        let dt = (t0 - last_emit).as_secs_f32().min(MAX_DT);
+        last_emit = t0;
 
         // Snapshot desired state; consume scroll atomically.
         let state = {
@@ -938,18 +986,36 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             snap
         };
 
+        // Effective suppression: user setting AND not "mixed mode" (a virtual
+        // gamepad active alongside us). Read every tick so settings/mode apply
+        // live. The block window (ms) is user-configurable.
+        let (suppression_on, release_ms) = crate::mouse_suppression_effective();
+
+        // Mixed-output braiding: when active, emit the accumulated mouse motion
+        // only when the shared turn token says it's the mouse's turn (so a mouse
+        // SendInput never coincides with a gamepad HID submit). Between turns we
+        // keep accumulating carry below but skip the SendInput — no motion lost.
+        // Only braid while mixed mode is on; otherwise emit every tick as normal.
+        // Buttons/scroll are unaffected (sporadic, not the continuous stream
+        // that drives the game's input-mode arbiter).
+        let emit_move = if crate::MOUSE_MIXED_MODE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::braid_try_mouse()
+        } else {
+            true
+        };
+
         if let Some(ref mut e) = enigo {
             let now = Instant::now();
 
             // Physical mouse suppression
             let cur = cursor_pos();
-            let suppressed = if state.suppression_enabled {
+            let suppressed = if suppression_on {
                 if let (Some(pos), Some(last)) = (cur, last_cursor) {
                     if pos != last {
                         if suppress_cooldown > 0 {
                             suppress_cooldown -= 1;
                         } else {
-                            blocked_until = Some(now + Duration::from_millis(500));
+                            blocked_until = Some(now + Duration::from_millis(release_ms as u64));
                         }
                     }
                 }
@@ -957,6 +1023,7 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
                 blocked_until.map_or(false, |t| now < t)
             } else {
                 last_cursor = cur;
+                blocked_until = None;
                 false
             };
 
@@ -975,19 +1042,25 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             }
 
             if !state.muted && !suppressed {
-                carry_x += state.vel_x * SCALE;
-                carry_y += state.vel_y * SCALE;
-                let dx = carry_x.trunc() as i32;
-                let dy = carry_y.trunc() as i32;
-                carry_x -= dx as f32;
-                carry_y -= dy as f32;
-                if dx != 0 || dy != 0 {
-                    let _ = e.move_mouse(dx, dy, Coordinate::Rel);
-                    if let Some(ref mut last) = last_cursor {
-                        last.0 += dx;
-                        last.1 += dy;
+                // Scale by REAL elapsed time, not a fixed per-tick constant, so
+                // cursor speed stays wall-clock-correct under scheduler jitter.
+                // Always accumulate the true desired distance so braiding never
+                // loses motion — only the SendInput timing is gated by emit_move.
+                carry_x += state.vel_x * REF * dt;
+                carry_y += state.vel_y * REF * dt;
+                if emit_move {
+                    let dx = carry_x.trunc() as i32;
+                    let dy = carry_y.trunc() as i32;
+                    carry_x -= dx as f32;
+                    carry_y -= dy as f32;
+                    if dx != 0 || dy != 0 {
+                        let _ = e.move_mouse(dx, dy, Coordinate::Rel);
+                        if let Some(ref mut last) = last_cursor {
+                            last.0 += dx;
+                            last.1 += dy;
+                        }
+                        suppress_cooldown = SELF_MOVE_COOLDOWN; // re-arm window after our own move
                     }
-                    suppress_cooldown = 8; // ~16 ms at 500 Hz before suppression re-arms
                 }
                 if state.scroll_pending != 0 {
                     let _ = e.scroll(state.scroll_pending, Axis::Vertical);
@@ -1018,7 +1091,6 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
 // ── VirtualKeyMouse ───────────────────────────────────────────────────────────
 
 pub struct VirtualKeyMouse {
-    pub suppression_enabled: bool,
     pub muted: bool,
 
     // Desired per-frame velocity / state set by send()
@@ -1049,20 +1121,16 @@ pub struct VirtualKeyMouse {
 
 impl VirtualKeyMouse {
     pub fn new() -> Self {
-        let shared = Arc::new(Mutex::new(MouseShared {
-            suppression_enabled: true,
-            ..Default::default()
-        }));
+        let shared = Arc::new(Mutex::new(MouseShared::default()));
         let shared2 = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
-            .name("keymouse-500hz".into())
+            .name("keymouse-1khz".into())
             .spawn(move || mouse_thread(shared2))
             .expect("failed to spawn mouse thread");
 
         let enigo_keys = Enigo::new(&Settings::default()).ok();
         let ok = enigo_keys.is_some();
         Self {
-            suppression_enabled: true,
             muted: false,
             mouse_vel_x: 0.0,
             mouse_vel_y: 0.0,
@@ -1127,7 +1195,6 @@ impl VirtualDevice for VirtualKeyMouse {
             s.scroll_pending     += std::mem::take(&mut self.scroll_delta);
             s.buttons             = self.buttons;
             s.muted               = self.muted;
-            s.suppression_enabled = self.suppression_enabled;
         }
 
         // ── Keyboard on the UI thread (60 Hz is plenty for keys) ─────────────

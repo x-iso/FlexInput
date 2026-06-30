@@ -587,6 +587,18 @@ fn input_card(
         digital_trigger_toggle(&mut bot_ui, &mut preview, d.kind, false);
     }
 
+    // XInput physical input cards carry the player-slot circles too: a physical
+    // Xbox can be forced onto a chosen slot (e.g. so a single-player game that
+    // only reads slot 0 sees this controller). No-op for non-XInput pads.
+    if device_id_is_xinput(&d.id) {
+        bot_ui.add_space(3.0);
+        bot_ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Player slot").size(11.0).weak());
+            ui.add_space(4.0);
+            canvas_node_xinput_slots(ui, &d.id);
+        });
+    }
+
     // ── Publish gamepad-nav targets for this card ──────────────────────
     // Card top-half = "select this input device". Active card also exposes
     // its sliders + digital-triggers checkbox as edit targets. Rects mirror

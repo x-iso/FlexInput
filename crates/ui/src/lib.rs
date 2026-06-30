@@ -14,6 +14,43 @@ mod settings;
 pub use app::{render_app_icon, FlexInputApp};
 pub use canvas::UiPatch;
 
+/// Append a timestamped crash/diagnostic entry to `%APPDATA%\FlexInput\crash.log`
+/// — the same directory that holds `settings.json` and the recovery snapshot.
+///
+/// Used by the last-ditch panic hook in `app/src/main.rs` so any panic (GPU
+/// loss, monitor hot-plug, or an unexpected one) leaves a durable breadcrumb the
+/// user/support can read, instead of vanishing — the release build is
+/// `windows_subsystem = "windows"` with no console attached. Writing to AppData
+/// rather than next to the exe matters because the install dir is often
+/// read-only (Program Files); AppData is always user-writable.
+///
+/// Best-effort and panic-safe: it must never itself panic from inside a panic
+/// hook, so every step is fallible and silently ignored on error. The log is
+/// appended (not truncated) and capped so it can't grow without bound.
+pub fn log_crash(kind: &str, detail: &str) {
+    let Some(dir) = settings::appdata_dir() else { return; };
+    let path = dir.join("crash.log");
+
+    // Cap the log: if it's grown past ~256 KiB, start fresh so a relaunch loop
+    // can't fill the disk. (We can't easily rotate from a panic hook.)
+    if std::fs::metadata(&path).map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+        let _ = std::fs::remove_file(&path);
+    }
+
+    use std::io::Write;
+    // Wall-clock time without pulling in a date crate: seconds since the Unix
+    // epoch is enough to correlate a crash with what the user was doing.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry = format!("[unix:{secs}] {kind}\n{detail}\n\n");
+
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(entry.as_bytes());
+    }
+}
+
 /// Spawn a fresh copy of this executable, then exit the current process.
 ///
 /// Used to recover from an unrecoverable GPU device loss: eframe 0.33 owns the

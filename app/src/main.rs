@@ -21,6 +21,12 @@ fn install_gpu_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let msg = info.to_string();
+        // Source location of the panic (file:line:col), when the std runtime
+        // provides it — included in the AppData crash log for diagnosis.
+        let location = info
+            .location()
+            .map(|l| format!(" at {}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_default();
         // Device-reset signatures. When another app (usually a fullscreen game)
         // resets the graphics device, wgpu objects created against the old
         // device become invalid; the next frame's egui texture upload then
@@ -56,11 +62,10 @@ fn install_gpu_panic_hook() {
                  layer hit an invalid monitor handle. FlexInput is relaunching to \
                  recover; your patch is restored from the crash-recovery snapshot.";
             eprintln!("{note}");
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    let _ = std::fs::write(dir.join("flexinput-monitor-lost.log"), note);
-                }
-            }
+            flexinput_ui::log_crash(
+                "monitor-lost (relaunching)",
+                &format!("{note}\n\npanic: {msg}{location}"),
+            );
             // Unlike GPU loss, no game owns the device here — a plain relaunch is
             // correct (the fresh process enumerates monitors fine and rebuilds the
             // window immediately).
@@ -69,17 +74,17 @@ fn install_gpu_panic_hook() {
 
         if gpu_lost {
             // The release build is `windows_subsystem = "windows"` with no
-            // logger surfaced to a console, so drop a breadcrumb next to the
-            // exe for the user/support to see why FlexInput blinked mid-game.
+            // logger surfaced to a console, so drop a breadcrumb in AppData
+            // (next to settings.json) for the user/support to see why FlexInput
+            // blinked mid-game.
             let note = "GPU device was lost (another app, likely a fullscreen game, \
                  reset the graphics device). FlexInput is relaunching to recover; \
                  your patch is restored from the crash-recovery snapshot.";
             eprintln!("{note}");
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    let _ = std::fs::write(dir.join("flexinput-gpu-lost.log"), note);
-                }
-            }
+            flexinput_ui::log_crash(
+                "gpu-lost (relaunching)",
+                &format!("{note}\n\npanic: {msg}{location}"),
+            );
             // Spawn a fresh instance and exit this dead-GPU process. The
             // recovery snapshot the child restores from was written by the
             // app's autosave-on-settle (and forced on the GPU_LOST path); we
@@ -99,6 +104,14 @@ fn install_gpu_panic_hook() {
             }
             flexinput_ui::relaunch_self_and_exit();
         }
+        // Any other panic: we don't relaunch (it's not a known-recoverable
+        // device-loss signature), but still leave a durable breadcrumb in
+        // AppData before the default hook prints the backtrace and the process
+        // unwinds/aborts. Note this does NOT catch native faults like a
+        // STATUS_ACCESS_VIOLATION (0xc0000005) — those bypass the panic
+        // machinery entirely; the in-renderer GPU_LOST guards are what prevent
+        // the device-loss AV from being reached in the first place.
+        flexinput_ui::log_crash("panic (unhandled)", &format!("{msg}{location}"));
         default_hook(info);
     }));
 }
@@ -169,7 +182,32 @@ fn main() -> eframe::Result<()> {
     // blast radius, which is the worst case for the recovery path — the best
     // way to keep that path honest. The plain default config preserves
     // `present_mode: AutoVsync` and the surface-error handler.
-    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    // Defense-in-depth for device loss. The default handler treats every
+    // SurfaceError except `Outdated` as a skipped frame and logs a warning —
+    // including `SurfaceError::Lost`, the case where the swapchain *does* report
+    // the device went away. Skipping the frame alone isn't enough: the device is
+    // gone and the next frame faults again. Raise the same process-global
+    // GPU_LOST flag the renderer's buffer-staging guards use, so `update()`
+    // sees it and relaunches/stalls. The in-renderer GPU_LOST short-circuit
+    // (vendor/egui-wgpu/src/winit.rs) handles the common Windows case where
+    // get_current_texture() returns Ok with a stale frame and this handler
+    // never fires; this covers the case where it *does* fire.
+    wgpu_options.on_surface_error = std::sync::Arc::new(|err| {
+        use eframe::egui_wgpu::SurfaceErrorAction;
+        match err {
+            wgpu::SurfaceError::Outdated => {
+                // App minimized on Windows — benign, don't spam the log.
+            }
+            wgpu::SurfaceError::Lost | wgpu::SurfaceError::OutOfMemory => {
+                eframe::egui_wgpu::GPU_LOST
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                eprintln!("Surface error {err:?} — signalling GPU_LOST.");
+            }
+            _ => eprintln!("Dropped frame with surface error: {err}"),
+        }
+        SurfaceErrorAction::SkipFrame
+    });
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

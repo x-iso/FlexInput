@@ -429,6 +429,24 @@ impl Painter {
             return vsync_sec;
         };
 
+        // FlexInput vendor patch: once GPU_LOST is latched (device reset by a
+        // fullscreen game / driver TDR), the entire present pipeline below —
+        // update_texture, create_view, begin_render_pass, queue.submit, and
+        // surface.present — operates on resources orphaned by the reset. On
+        // Windows/DXGI, get_current_texture() can still return Ok with a stale
+        // frame right after device removal, so the on_surface_error path never
+        // fires; submit/present then fault inside the driver with a
+        // STATUS_ACCESS_VIOLATION (0xc0000005). That AV is *below* Rust's panic
+        // machinery, so the host's panic hook can't catch it to relaunch. The
+        // buffer-staging guards in renderer.rs only cover update_buffers, not
+        // this entry point — which the GUI-stall path (host returns early but
+        // eframe still paints/presents) reaches every frame. Skip the whole
+        // frame while lost; the host app's update() sees the flag and
+        // relaunches (foreground) or stalls (backgrounded) cleanly.
+        if crate::GPU_LOST.load(std::sync::atomic::Ordering::SeqCst) {
+            return vsync_sec;
+        }
+
         let mut encoder =
             render_state
                 .device

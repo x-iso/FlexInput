@@ -36,6 +36,7 @@ use crate::{
 /// that would otherwise call `request_repaint()` unconditionally.
 pub(crate) static REPAINT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
+
 /// Renderer-internal repaint request that honors `REPAINT_SUPPRESSED`.
 /// Replaces bare `ctx.request_repaint()` in widget code so the
 /// throttle / background-cap can actually take effect.
@@ -826,6 +827,15 @@ impl FlexInputApp {
         // set their XUSB companion's pump period to match (see
         // requested_poll_interval_ms). Pushed again on every slider change.
         flexinput_virtual::set_requested_poll_hz(app_settings.polling_hz);
+        // Mirror the virtual-mouse physical-suppression settings to the
+        // flexinput-virtual globals the keymouse thread reads. Pushed again on
+        // every Settings change (see the Settings panel handlers).
+        flexinput_virtual::set_mouse_suppression_enabled(app_settings.mouse_suppression_enabled);
+        flexinput_virtual::set_mouse_suppression_release_ms(app_settings.mouse_suppress_release_ms);
+        // Experimental mixed-output braiding (read by both the I/O thread and the
+        // keymouse thread via the shared phase clock in flexinput-virtual).
+        flexinput_virtual::set_braid_enabled(app_settings.mixed_braid_enabled);
+        flexinput_virtual::set_braid_rate_hz(app_settings.mixed_braid_rate_hz);
 
         let proc_graph          = flexinput_engine::new_arc_graph();
         let proc_device_signals = flexinput_engine::new_arc_signals();
@@ -7936,7 +7946,9 @@ impl FlexInputApp {
                 continue;
             }
             if let Some(dev) = node.params.get("device_id").and_then(|v| v.as_str()) {
-                if dev.starts_with("virtual.xinput") {
+                // Accept every Virtual Xbox kind id — both the legacy
+                // `virtual.xinput*` and the Easy-mode HIDMaestro `virtual.hm.xinput*`.
+                if crate::easy::io_panel::device_id_is_xinput(dev) {
                     return Some(dev.to_string());
                 }
             }
@@ -8182,6 +8194,77 @@ impl FlexInputApp {
                 });
                 ui.label(egui::RichText::new(
                     "How often the UI repaints while FlexInput sits in the background. Lower = less CPU while you play a game, higher = smoother glanceable visuals. Has no effect when the window is focused."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(8.0);
+                if ui.checkbox(&mut self.settings.mouse_suppression_enabled,
+                    "Pause virtual mouse when you move a physical mouse")
+                    .on_hover_text(
+                        "When on, the virtual mouse briefly yields if it detects the real \
+                         cursor moving on its own, so a stick-driven cursor doesn't fight a \
+                         physical mouse on the desktop. Automatically disabled while a virtual \
+                         gamepad is also active (mixed mode), since games that warp the cursor \
+                         would otherwise make virtual mouse aim stutter.")
+                    .changed()
+                {
+                    flexinput_virtual::set_mouse_suppression_enabled(self.settings.mouse_suppression_enabled);
+                    dirty = true;
+                }
+                ui.add_enabled_ui(self.settings.mouse_suppression_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Release after");
+                        let resp = ui.add(egui::Slider::new(
+                            &mut self.settings.mouse_suppress_release_ms,
+                            settings::MOUSE_SUPPRESS_RELEASE_MS_MIN..=settings::MOUSE_SUPPRESS_RELEASE_MS_MAX,
+                        ).suffix(" ms"));
+                        if resp.changed() {
+                            flexinput_virtual::set_mouse_suppression_release_ms(self.settings.mouse_suppress_release_ms);
+                            dirty = true;
+                        }
+                    });
+                });
+                ui.label(egui::RichText::new(
+                    "How long the virtual mouse stays paused after a physical-mouse move. Lower = recovers faster."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(8.0);
+                if ui.checkbox(&mut self.settings.mixed_braid_enabled,
+                    "Braid mixed output (experimental)")
+                    .on_hover_text(
+                        "Phase-offset WHEN the virtual gamepad and keyboard/mouse packets \
+                         land, so they interleave instead of co-occurring — without muting \
+                         either stream (an idle mouse won't chop the pad). For probing games \
+                         whose input arbiter behaves differently under simultaneous mixed \
+                         output. Effect is game-specific; leave off unless experimenting.")
+                    .changed()
+                {
+                    flexinput_virtual::set_braid_enabled(self.settings.mixed_braid_enabled);
+                    dirty = true;
+                }
+                ui.add_enabled_ui(self.settings.mixed_braid_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Braid pacing");
+                        // Stepped slider over BRAID_RATE_STEPS (left = Real-time /
+                        // fastest, right = 125 Hz / slowest). The slider drives an
+                        // index; the formatter shows the step label.
+                        let last = settings::BRAID_RATE_STEPS.len() - 1;
+                        let mut idx = settings::braid_rate_to_index(self.settings.mixed_braid_rate_hz) as i64;
+                        let resp = ui.add(egui::Slider::new(&mut idx, 0..=last as i64)
+                            .integer()
+                            .custom_formatter(move |n, _| {
+                                let i = (n as usize).min(last);
+                                settings::braid_rate_label(settings::BRAID_RATE_STEPS[i])
+                            }));
+                        if resp.changed() {
+                            let i = (idx as usize).min(last);
+                            self.settings.mixed_braid_rate_hz = settings::BRAID_RATE_STEPS[i];
+                            flexinput_virtual::set_braid_rate_hz(self.settings.mixed_braid_rate_hz);
+                            dirty = true;
+                        }
+                    });
+                });
+                ui.label(egui::RichText::new(
+                    "Gamepad and mouse packets strictly alternate (never coincident). Real-time = fastest/lowest latency; lower rates pace the alternation. Sweep to probe the game."
                 ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(10.0);
@@ -9066,6 +9149,39 @@ fn spawn_io_thread(
                 {
                     puffin::profile_scope!("route_virtual_devices");
                     let mut devs = shared_virtual_devices.lock().unwrap();
+                    // Mixed mode: a virtual gamepad active alongside the
+                    // keyboard/mouse device. Forces physical-mouse suppression
+                    // off so stick-driven aim stays smooth (the suppression
+                    // heuristic misfires on games that warp the cursor). Recomputed
+                    // each tick; cleared under bypass (no output flowing).
+                    let mut km_active = false;
+                    let mut pad_active = false;
+                    for dev in devs.iter() {
+                        if !active_ids.contains(dev.id()) { continue; }
+                        if dev.id() == "virtual.keymouse" { km_active = true; }
+                        else { pad_active = true; }
+                    }
+                    let mixed = !bypass && km_active && pad_active;
+                    flexinput_virtual::set_mouse_mixed_mode_active(mixed);
+
+                    // ── Mixed-output braiding (experimental) ───────────────────
+                    // When a virtual gamepad AND keyboard/mouse are both active,
+                    // braiding makes the gamepad and mouse SUBMIT in strict
+                    // alternation (shared turn token in flexinput-virtual) so a
+                    // gamepad HID flush never coincides with a mouse SendInput. We
+                    // always `send` the latest gamepad state every tick (send sets
+                    // the report buffer; flush submits it), so holding the flush
+                    // until the gamepad's turn never drops input — it just controls
+                    // submit timing. An idle mouse passes its turn, so it can't
+                    // chop the pad. The keymouse thread reads the SAME token, so
+                    // the two interleave. When braiding is off `braid_try_gamepad`
+                    // returns true every tick → flush every tick as before.
+                    let flush_gamepad = if mixed {
+                        flexinput_virtual::braid_try_gamepad()
+                    } else {
+                        true
+                    };
+
                     if bypass {
                         for dev in devs.iter_mut() { dev.reset_outputs(); }
                     } else {
@@ -9075,16 +9191,26 @@ fn spawn_io_thread(
                                 dev.reset_outputs();
                             }
                         }
-                        // Route signals to active-tab devices only.
+                        // Route signals to active-tab devices only (every tick —
+                        // braiding gates the FLUSH timing below, not the state).
                         for ((device_id, pin_id), &signal) in &sink_outputs {
                             if !active_ids.contains(device_id) { continue; }
                             if let Some(dev) = devs.iter_mut().find(|d| d.id() == device_id) {
                                 dev.send(pin_id, signal);
                             }
                         }
-                        // Flush every device (silenced ones still need a
-                        // flush to commit their zeroed state to the OS).
-                        for dev in devs.iter_mut() { dev.flush(); }
+                        // Flush: background + keymouse devices every tick; the
+                        // active-tab gamepad is braid-gated (see flush_gamepad).
+                        // Background devices must flush to commit reset_outputs;
+                        // the keymouse flush only updates its shared velocity (the
+                        // OS mouse packet timing is braided on the keymouse thread).
+                        for dev in devs.iter_mut() {
+                            let active = active_ids.contains(dev.id());
+                            let is_km = dev.id() == "virtual.keymouse";
+                            if !active || is_km || flush_gamepad {
+                                dev.flush();
+                            }
+                        }
                     }
 
                     // Poll rumble/feedback signals back from virtual devices —

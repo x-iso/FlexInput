@@ -263,6 +263,59 @@ pub struct AppSettings {
     /// Focused window always paints at vsync. Range BG_REPAINT_HZ_MIN..=MAX.
     #[serde(default = "default_bg_repaint_hz")]
     pub bg_repaint_hz: u32,
+    /// Master switch for the Virtual Keyboard & Mouse "physical mouse
+    /// suppression" heuristic: when on, the virtual mouse briefly yields if it
+    /// sees the real cursor move on its own, so a stick-driven cursor doesn't
+    /// fight a physical mouse on the desktop. Default on. Note: suppression is
+    /// ALWAYS forced off in "mixed mode" (a virtual gamepad active alongside the
+    /// keyboard/mouse) regardless of this setting, since the heuristic misfires
+    /// in games that warp the cursor. See `flexinput_virtual` suppression globals.
+    #[serde(default = "default_true")]
+    pub mouse_suppression_enabled: bool,
+    /// How long (ms) a detected physical-mouse move blocks the virtual mouse.
+    /// Lower = faster recovery after a stray cursor event. Range 50..=2000.
+    #[serde(default = "default_mouse_suppress_release_ms")]
+    pub mouse_suppress_release_ms: u32,
+    /// EXPERIMENTAL: braid virtual gamepad vs keyboard/mouse output — phase-
+    /// offset WHEN each side's packet lands (gamepad slot / mouse slot per
+    /// period) instead of muting either, to probe games whose input arbiter
+    /// behaves differently under simultaneous mixed output. Neither stream is
+    /// zeroed, so an idle mouse never chops the pad. Off by default. See the I/O
+    /// thread's `route_virtual_devices` block + flexinput-virtual braid clock.
+    #[serde(default)]
+    pub mixed_braid_enabled: bool,
+    /// Braid pacing as a per-lane submit rate (Hz). `0` = real-time (alternate
+    /// as fast as the output threads tick; packets still never coincide). Other
+    /// values throttle each lane: 500 / 250 / 125 Hz. See `BRAID_RATE_STEPS`.
+    #[serde(default = "default_mixed_braid_rate_hz")]
+    pub mixed_braid_rate_hz: u32,
+}
+
+pub const MOUSE_SUPPRESS_RELEASE_MS_MIN: u32 = 50;
+pub const MOUSE_SUPPRESS_RELEASE_MS_MAX: u32 = 2000;
+pub const MOUSE_SUPPRESS_RELEASE_MS_DEFAULT: u32 = 500;
+fn default_mouse_suppress_release_ms() -> u32 { MOUSE_SUPPRESS_RELEASE_MS_DEFAULT }
+
+/// Braid pacing steps shown by the slider, left→right. `0` is the "Real-time"
+/// step (fastest, lowest latency — limited only by the polling/mouse rate); the
+/// rest are explicit per-lane submit rates. ~10 ms latency is the practical
+/// playability limit, so the slowest step is 125 Hz (8 ms cycle).
+pub const BRAID_RATE_STEPS: [u32; 4] = [0, 500, 250, 125];
+pub const MIXED_BRAID_RATE_HZ_DEFAULT: u32 = 0; // real-time
+fn default_mixed_braid_rate_hz() -> u32 { MIXED_BRAID_RATE_HZ_DEFAULT }
+
+/// Index into [`BRAID_RATE_STEPS`] of the step nearest `hz` (0 matches the
+/// real-time step exactly). Used to drive the stepped slider.
+pub fn braid_rate_to_index(hz: u32) -> usize {
+    BRAID_RATE_STEPS
+        .iter()
+        .position(|&s| s == hz)
+        .unwrap_or(0)
+}
+
+/// Label for a braid step value: "Real-time" for 0, else "<hz> Hz".
+pub fn braid_rate_label(hz: u32) -> String {
+    if hz == 0 { "Real-time".to_string() } else { format!("{hz} Hz") }
 }
 
 /// Camera behavior immediately after a patch is loaded into a tab.
@@ -325,6 +378,10 @@ impl Default for AppSettings {
             panic_chord: None,
             gamepad_chords_nav_only: true,
             bg_repaint_hz: BG_REPAINT_HZ_DEFAULT,
+            mouse_suppression_enabled: true,
+            mouse_suppress_release_ms: MOUSE_SUPPRESS_RELEASE_MS_DEFAULT,
+            mixed_braid_enabled: false,
+            mixed_braid_rate_hz: MIXED_BRAID_RATE_HZ_DEFAULT,
         }
     }
 }
@@ -371,7 +428,7 @@ pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
 }
 
 
-fn appdata_dir() -> Option<std::path::PathBuf> {
+pub fn appdata_dir() -> Option<std::path::PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     let mut p = std::path::PathBuf::from(appdata);
     p.push("FlexInput");
