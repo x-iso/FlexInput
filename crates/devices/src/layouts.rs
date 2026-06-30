@@ -51,6 +51,11 @@ fn xinput_outputs() -> Vec<DevicePin> {
         // Shoulder / trigger digital
         bo("btn_lb",       "LB"),
         bo("btn_rb",       "RB"),
+        // Digital trigger pins — poll() emits these for XInput (thresholded
+        // LT/RT) just like the PlayStation layouts; without them declared here a
+        // sink could never receive the Xbox's digital-trigger mapping.
+        bo("btn_lt_dig",   "LT (digital)"),
+        bo("btn_rt_dig",   "RT (digital)"),
         // Stick clicks
         bo("btn_ls",       "LS (L.Stick Click)"),
         bo("btn_rs",       "RS (R.Stick Click)"),

@@ -460,6 +460,20 @@ impl DeviceBackend for GilrsBackend {
                 .collect()
         };
 
+        // DIAGNOSTIC: ~1 Hz dump of each physical pad's live values + raw event
+        // count, so we can tell whether gilrs is actually delivering the Xbox's
+        // input. A frozen left-stick at (0,0) with event_count=0 while the
+        // DualSense shows movement means gilrs isn't feeding us the Xbox at all.
+        let dbg_dump_due = {
+            use std::sync::Mutex;
+            use std::time::{Duration, Instant};
+            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+            let mut g = LAST.lock().unwrap();
+            let due = g.map_or(true, |t| t.elapsed() > Duration::from_millis(1000));
+            if due { *g = Some(Instant::now()); }
+            due
+        };
+
         // Wrap the gamepads() walk in an explicit block so the profile
         // scope's RAII guard ends with the for loop — NOT with the function.
         // Bare profile_scope! at this depth would falsely include the
@@ -518,6 +532,15 @@ impl DeviceBackend for GilrsBackend {
             if self.dbg_btn_mask.get(&dev).copied().unwrap_or(0) != dbg_mask {
                 self.dbg_btn_mask.insert(dev.clone(), dbg_mask);
                 eprintln!("[input-edge] dev={dev} kind={kind:?} is_virt={is_virt} btn_mask=0x{dbg_mask:04X}");
+            }
+            // ~1 Hz live-value + event-count dump for physical pads (see dbg_dump_due).
+            if dbg_dump_due && !is_virt {
+                let lx = pad.axis_data(Axis::LeftStickX).map_or(0.0, |d| d.value());
+                let ly = pad.axis_data(Axis::LeftStickY).map_or(0.0, |d| d.value());
+                let evc = self.event_counts.get(&usize::from(gilrs_id)).copied().unwrap_or(0);
+                eprintln!(
+                    "[input-dump] dev={dev} kind={kind:?} l_stick=({lx:+.3},{ly:+.3}) btn_mask=0x{dbg_mask:04X} raw_events={evc}"
+                );
             }
 
             // Universal DPad discrete outputs: combine axis_data (HAT/USB path) and
