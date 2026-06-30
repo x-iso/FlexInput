@@ -749,6 +749,87 @@ impl DeviceBackend for GilrsBackend {
                 }
             }
             } // close `if !is_virt` gyro guard
+
+            // ── Physical XInput: authoritative read via XInputGetState ──────────
+            // gilrs reads Xbox pads through its WGI backend, which only delivers
+            // input while FlexInput holds window focus — so the moment the user
+            // tabs to their game, the gilrs values freeze and the mapped virtual
+            // pad stops moving. XInputGetState is NOT focus-gated (it polls device
+            // state directly), so we re-read the pad here and push the values LAST,
+            // overriding the (possibly stale) gilrs pushes in the IO-thread HashMap.
+            // This mirrors the DualSense/Switch raw-HID override above — same
+            // "bypass gilrs's WGI limitations by reading the device directly" idea.
+            // `inst` is this physical pad's XInput user index (the same value used
+            // for rumble routing); for the common single-physical layout it is the
+            // occupied slot. (After a manual slot reorder the index can diverge —
+            // tracked as a follow-up.)
+            #[cfg(windows)]
+            if kind == ControllerKind::XInput && !is_virt {
+                use xinput_ffi::*;
+                let mut st: XINPUT_STATE = Default::default();
+                if unsafe { XInputGetState(inst as u32, &mut st) } == 0 {
+                    let gp = st.gamepad;
+                    let b = gp.w_buttons;
+                    let has = |mask: u16| (b & mask) != 0;
+                    // XInput button bitmasks.
+                    const DPAD_UP: u16 = 0x0001; const DPAD_DOWN: u16 = 0x0002;
+                    const DPAD_LEFT: u16 = 0x0004; const DPAD_RIGHT: u16 = 0x0008;
+                    const START: u16 = 0x0010; const BACK: u16 = 0x0020;
+                    const LTHUMB: u16 = 0x0040; const RTHUMB: u16 = 0x0080;
+                    const LSHOULDER: u16 = 0x0100; const RSHOULDER: u16 = 0x0200;
+                    const GUIDE: u16 = 0x0400;
+                    const A: u16 = 0x1000; const BTN_B: u16 = 0x2000;
+                    const X: u16 = 0x4000; const Y: u16 = 0x8000;
+                    // Sticks: i16 → -1..1 (XInput Y is up-positive, matching gilrs).
+                    let norm = |v: i16| (v as f32 / 32767.0).clamp(-1.0, 1.0);
+                    let lx = norm(gp.s_thumb_lx); let ly = norm(gp.s_thumb_ly);
+                    let rx = norm(gp.s_thumb_rx); let ry = norm(gp.s_thumb_ry);
+                    let lt = gp.b_left_trigger as f32 / 255.0;
+                    let rt = gp.b_right_trigger as f32 / 255.0;
+                    // XINPUT_GAMEPAD_TRIGGER_THRESHOLD = 30.
+                    let lt_dig = gp.b_left_trigger > 30;
+                    let rt_dig = gp.b_right_trigger > 30;
+                    let du = has(DPAD_UP); let dd = has(DPAD_DOWN);
+                    let dl = has(DPAD_LEFT); let dr = has(DPAD_RIGHT);
+                    let dx = if dr { 1.0f32 } else if dl { -1.0 } else { 0.0 };
+                    let dy = if du { 1.0f32 } else if dd { -1.0 } else { 0.0 };
+                    let (ndx, ndy) = if dx != 0.0 && dy != 0.0 {
+                        (dx * std::f32::consts::FRAC_1_SQRT_2, dy * std::f32::consts::FRAC_1_SQRT_2)
+                    } else { (dx, dy) };
+                    let push_f = |out: &mut Vec<(String, String, Signal)>, p: &str, v: f32|
+                        out.push((dev.clone(), p.into(), Signal::Float(v)));
+                    let push_b = |out: &mut Vec<(String, String, Signal)>, p: &str, v: bool|
+                        out.push((dev.clone(), p.into(), Signal::Bool(v)));
+                    push_f(&mut out, "left_stick_x", lx);
+                    push_f(&mut out, "left_stick_y", ly);
+                    push_f(&mut out, "right_stick_x", rx);
+                    push_f(&mut out, "right_stick_y", ry);
+                    out.push((dev.clone(), "left_stick".into(),  Signal::Vec2(Vec2::new(lx, ly))));
+                    out.push((dev.clone(), "right_stick".into(), Signal::Vec2(Vec2::new(rx, ry))));
+                    push_f(&mut out, "left_trigger", lt);
+                    push_f(&mut out, "right_trigger", rt);
+                    push_b(&mut out, "btn_south", has(A));
+                    push_b(&mut out, "btn_east",  has(BTN_B));
+                    push_b(&mut out, "btn_west",  has(X));
+                    push_b(&mut out, "btn_north", has(Y));
+                    push_b(&mut out, "btn_lb", has(LSHOULDER));
+                    push_b(&mut out, "btn_rb", has(RSHOULDER));
+                    push_b(&mut out, "btn_lt_dig", lt_dig);
+                    push_b(&mut out, "btn_rt_dig", rt_dig);
+                    push_b(&mut out, "btn_ls", has(LTHUMB));
+                    push_b(&mut out, "btn_rs", has(RTHUMB));
+                    push_b(&mut out, "btn_start", has(START));
+                    push_b(&mut out, "btn_back",  has(BACK));
+                    push_b(&mut out, "btn_guide", has(GUIDE));
+                    push_b(&mut out, "dpad_up", du);
+                    push_b(&mut out, "dpad_down", dd);
+                    push_b(&mut out, "dpad_left", dl);
+                    push_b(&mut out, "dpad_right", dr);
+                    push_f(&mut out, "dpad_x", ndx);
+                    push_f(&mut out, "dpad_y", ndy);
+                    out.push((dev.clone(), "dpad".into(), Signal::Vec2(Vec2::new(ndx, ndy))));
+                }
+            }
         }
         } // end gilrs_gamepads_walk profile_scope block
 
