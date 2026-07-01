@@ -1,27 +1,27 @@
 # Cargo build configuration for FlexInput.
 #
-# ── Why this file exists: SDL3 builds from source ───────────────────────────────
+# ── SDL3 builds from source — CMake is required ─────────────────────────────────
 # `flexinput-devices` depends on `sdl3` with the `build-from-source-static`
 # feature, so `sdl3-sys` compiles the SDL C library at build time via CMake and
-# links it statically (no SDL3.dll to ship). CMake needs to be found; on Windows
-# it ships bundled with Visual Studio but is NOT on the default PATH, so a plain
-# `cargo build` / `cargo run` would otherwise fail with a CMake-not-found error
-# unless run from a "Developer PowerShell for VS" shell.
+# links it statically (no SDL3.dll to ship). The build therefore needs `cmake`
+# (plus a C compiler — MSVC on Windows). Nothing else is required: CMake's
+# default Visual Studio generator locates cl.exe, the Windows SDK headers, and
+# libs on its own.
 #
-# The `cmake` build-script crate honors a `CMAKE` env var pointing straight at
-# cmake.exe. Setting it here makes `cargo build` / `cargo run` work from ANY
-# shell — CMake then auto-selects its default Visual Studio generator, which
-# locates the MSVC compiler (cl.exe), Windows SDK headers, and libs on its own.
-# That's why we only need this one variable — not PATH, INCLUDE, LIB, or ninja.
+# This file intentionally sets NO `CMAKE`/PATH override. Baking an absolute path
+# here breaks any environment whose layout differs (CI runners, other
+# contributors' machines) — see below. Instead, make CMake discoverable in ONE of
+# these ways:
 #
-# ── If this path is wrong on your machine ───────────────────────────────────────
-# The path below is the CMake bundled with Visual Studio 2026 Community. If you
-# have a different VS edition/version, or a standalone CMake, update it (or delete
-# this file and build from a "Developer PowerShell for VS" instead — that shell
-# puts cmake on PATH and this override becomes unnecessary). To find your bundled
-# CMake:
-#   & "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe" `
-#       -latest -find "**\CMake\bin\cmake.exe"
-# A standalone CMake (https://cmake.org) on PATH also works — then remove this.
-[env]
-CMAKE = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe"
+#   • CI / most setups: ensure `cmake` is on PATH. GitHub's `windows-latest`
+#     runner already ships CMake, so `cargo build` works with no extra config.
+#
+#   • Windows with Visual Studio but CMake not on PATH: either build from a
+#     "Developer PowerShell for VS" (puts the VS-bundled cmake on PATH), or set
+#     `CMAKE` to the VS-bundled cmake.exe in your USER-GLOBAL cargo config
+#     (`~/.cargo/config.toml`) so it applies to your machine only and never
+#     leaks into this repo. Find the path with:
+#       & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+#           -latest -find "**\CMake\bin\cmake.exe"
+#
+#   • Any OS: a standalone CMake (https://cmake.org) on PATH also works.
