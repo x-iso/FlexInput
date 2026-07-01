@@ -34,7 +34,7 @@ use crate::{
 use sdl3::gamepad::{Axis, Button, Gamepad};
 use sdl3::joystick::JoystickId;
 use sdl3::sensor::SensorType;
-use sdl3::{EventPump, GamepadSubsystem, Sdl};
+use sdl3::{GamepadSubsystem, Sdl};
 
 /// Device-id prefix for SDL pads. Kept distinct from gilrs's `gilrs:` prefix so
 /// ids never collide and `send()` routing (which keys off the prefix) is
@@ -80,9 +80,6 @@ struct SdlState {
     /// so it must outlive them — declared first, dropped last.
     _sdl: Sdl,
     gamepad_subsystem: GamepadSubsystem,
-    /// Pumped each poll so gamepad axis/button/sensor state updates. At most one
-    /// event pump may exist at a time.
-    event_pump: EventPump,
     /// Opened generic pads, keyed by SDL joystick instance id.
     pads: HashMap<JoystickId, OpenPad>,
 }
@@ -166,11 +163,18 @@ impl SdlBackend {
     fn try_init() -> Option<SdlState> {
         let sdl = sdl3::init().ok()?;
         let gamepad_subsystem = sdl.gamepad().ok()?;
-        let event_pump = sdl.event_pump().ok()?;
+        // Do NOT create an EventPump / pump the SDL event queue. This backend
+        // lives on the real-time device-io loop (up to 4 kHz); pumping the whole
+        // SDL event system there is expensive (it drives window messages + full
+        // hotplug detection) and was throttling the loop to a crawl on some PCs.
+        // Instead we disable gamepad event processing and call
+        // `gamepad_subsystem.update()` per poll, which refreshes only gamepad
+        // state — SDL explicitly supports this: "If gamepad events are disabled,
+        // you must call SDL_UpdateGamepads() yourself."
+        gamepad_subsystem.set_events_processing_state(false);
         Some(SdlState {
             _sdl: sdl,
             gamepad_subsystem,
-            event_pump,
             pads: HashMap::new(),
         })
     }
@@ -296,13 +300,14 @@ impl DeviceBackend for SdlBackend {
         if !self.ensure_init() {
             return Vec::new();
         }
-        // Pump SDL events so gamepad axis/button/sensor state is current. Must run
-        // on this (device-io) thread; the pump borrow ends before we read pads.
-        if let Some(state) = self.state.as_mut() {
-            state.event_pump.pump_events();
+        // Refresh gamepad state only (NOT the full event pump). Cheap enough for
+        // the real-time loop; see try_init for why we don't pump_events here.
+        // Device open/close (sync_open_pads) is done in enumerate() on its slow
+        // ~2 s cadence, NOT per poll — hotplug scanning is too heavy for the hot
+        // path and was part of the loop-throttling regression.
+        if let Some(state) = self.state.as_ref() {
+            state.gamepad_subsystem.update();
         }
-        // Keep the open set in sync with connect/disconnect between enumerations.
-        self.sync_open_pads();
 
         let mut out = Vec::new();
         // Collect the change-detection hashes to update after the borrow of pads ends.
