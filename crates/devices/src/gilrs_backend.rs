@@ -137,27 +137,6 @@ pub fn probe_xinput_slots_cached() -> [XInputSlotInfo; 4] {
     slots
 }
 
-/// Log the current XInput slot occupancy. Called on device-set changes (connect /
-/// disconnect) so we can see, on real hardware, whether our virtual XUSB companion
-/// actually acquires a slot when a physical XInput pad is present — the open
-/// question behind "Steam doesn't see the virtual when a physical is connected".
-#[cfg(windows)]
-fn log_xinput_slots() {
-    let slots = probe_xinput_slots();
-    let n = slots.iter().filter(|s| s.connected).count();
-    eprintln!("[xinput-slots] {n} slot(s) connected");
-    for s in &slots {
-        if s.connected {
-            eprintln!(
-                "[xinput-slots]   slot {} CONNECTED subtype={} packet={} buttons=0x{:04X}",
-                s.index, s.sub_type, s.packet, s.buttons
-            );
-        } else {
-            eprintln!("[xinput-slots]   slot {} empty", s.index);
-        }
-    }
-}
-
 pub struct GilrsBackend {
     gilrs: Gilrs,
     gyro: GyroManager,
@@ -189,12 +168,6 @@ pub struct GilrsBackend {
     /// that hidapi refresh ran ON the real-time I/O loop, freezing ALL input for
     /// ~200 ms each time (the periodic-gap bug). See `refresh_virtual_classification`.
     dev_set_dirty: bool,
-    /// DIAGNOSTIC: last button bitmask logged per device_id, so poll() can print a
-    /// line only on a button edge (press/release) instead of spamming at 500 Hz.
-    /// Used to compare a working source (DualSense) against a non-working one
-    /// (physical Xbox) — if the Xbox never logs an edge, gilrs isn't delivering its
-    /// input values to us at all.
-    dbg_btn_mask: HashMap<String, u64>,
     /// Resolved XInput user-index slot per physical-XInput `dev_id`, used for the
     /// focus-independent `XInputGetState` read. XInput exposes no device identity,
     /// so we correlate each gilrs XInput pad to a slot by matching live state
@@ -216,7 +189,6 @@ impl GilrsBackend {
             id_to_dev: HashMap::new(),
             virt_cache: HashMap::new(),
             dev_set_dirty: true, // force classification on first enumerate
-            dbg_btn_mask: HashMap::new(),
             xinput_slot_for: HashMap::new(),
         })
     }
@@ -329,11 +301,6 @@ impl DeviceBackend for GilrsBackend {
         // expensive refresh_devices off the I/O loop — the fix for the ~2 s periodic
         // input freeze. The device LIST below is still rebuilt every call from gilrs's
         // (cheap, cached) gamepad walk; only the virtual/real CLASSIFICATION is cached.
-        // Log the gilrs walk (names, vid/pid, virtual flag, assigned device id) once
-        // per device-set change so we can see exactly which dev_id the physical Xbox
-        // gets and whether a virtual XInput face is stealing its index — the read-side
-        // half of "physical XInput never reaches the virtual pad".
-        let log_walk = self.dev_set_dirty;
         if self.dev_set_dirty {
             self.refresh_virtual_classification();
             // Drop cached XInput slot correlations: a connect/disconnect/reorder can
@@ -341,11 +308,6 @@ impl DeviceBackend for GilrsBackend {
             // live state rather than trusted across a device-set change.
             self.xinput_slot_for.clear();
             self.dev_set_dirty = false;
-            // Snapshot XInput slot occupancy on every device-set change so the log
-            // shows whether the virtual XUSB companion acquired a slot alongside any
-            // physical XInput pad (the slot-acquisition question for the 4-slot work).
-            #[cfg(windows)]
-            log_xinput_slots();
         }
 
         // Per-pad keep/virtual decision (path-based for PS, correlation-based for
@@ -374,13 +336,6 @@ impl DeviceBackend for GilrsBackend {
                 }
                 _ => continue, // Drop (ViGEm virtual beyond real count) or missing
             };
-
-            if log_walk {
-                eprintln!(
-                    "[gilrs-walk] #{i} name={:?} vid={:04X?} pid={:04X?} kind={:?} is_virt={is_virt} -> dev_id={dev_id}",
-                    pad.name(), pad.vendor_id(), pad.product_id(), kind,
-                );
-            }
 
             let display_name = if kind == ControllerKind::Generic {
                 pad.name().to_string()
@@ -473,20 +428,6 @@ impl DeviceBackend for GilrsBackend {
                 .collect()
         };
 
-        // DIAGNOSTIC: ~1 Hz dump of each physical pad's live values + raw event
-        // count, so we can tell whether gilrs is actually delivering the Xbox's
-        // input. A frozen left-stick at (0,0) with event_count=0 while the
-        // DualSense shows movement means gilrs isn't feeding us the Xbox at all.
-        let dbg_dump_due = {
-            use std::sync::Mutex;
-            use std::time::{Duration, Instant};
-            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-            let mut g = LAST.lock().unwrap();
-            let due = g.map_or(true, |t| t.elapsed() > Duration::from_millis(1000));
-            if due { *g = Some(Instant::now()); }
-            due
-        };
-
         // Per-XInput-pad live gilrs state (dev_id, button mask, lx, ly), collected
         // during the walk and correlated to actual XInput slots afterward.
         let mut xi_corr: Vec<(String, u16, f32, f32)> = Vec::new();
@@ -535,29 +476,9 @@ impl DeviceBackend for GilrsBackend {
             } else {
                 button_map(kind)
             };
-            let mut dbg_mask: u64 = 0;
-            for (bi, (button, pin_id)) in btn_map.iter().enumerate() {
+            for (button, pin_id) in btn_map.iter() {
                 let pressed = pad.button_data(*button).map_or(false, |d| d.is_pressed());
-                if pressed && bi < 64 { dbg_mask |= 1u64 << bi; }
                 out.push((dev.clone(), pin_id.to_string(), Signal::Bool(pressed)));
-            }
-            // DIAGNOSTIC: log a line on any button edge so we can see whether gilrs
-            // is actually delivering this pad's input. Compare the physical Xbox
-            // against the (working) DualSense: if pressing Xbox buttons logs nothing,
-            // gilrs isn't feeding us its values (the read side is dead), not the
-            // engine/output. Only logs on change, so it's quiet at rest.
-            if self.dbg_btn_mask.get(&dev).copied().unwrap_or(0) != dbg_mask {
-                self.dbg_btn_mask.insert(dev.clone(), dbg_mask);
-                eprintln!("[input-edge] dev={dev} kind={kind:?} is_virt={is_virt} btn_mask=0x{dbg_mask:04X}");
-            }
-            // ~1 Hz live-value + event-count dump for physical pads (see dbg_dump_due).
-            if dbg_dump_due && !is_virt {
-                let lx = pad.axis_data(Axis::LeftStickX).map_or(0.0, |d| d.value());
-                let ly = pad.axis_data(Axis::LeftStickY).map_or(0.0, |d| d.value());
-                let evc = self.event_counts.get(&usize::from(gilrs_id)).copied().unwrap_or(0);
-                eprintln!(
-                    "[input-dump] dev={dev} kind={kind:?} l_stick=({lx:+.3},{ly:+.3}) btn_mask=0x{dbg_mask:04X} raw_events={evc}"
-                );
             }
 
             // Universal DPad discrete outputs: combine axis_data (HAT/USB path) and
@@ -924,7 +845,6 @@ impl DeviceBackend for GilrsBackend {
                     claimed[s] = true;
                     if self.xinput_slot_for.get(dev).copied() != Some(s as u32) {
                         self.xinput_slot_for.insert(dev.clone(), s as u32);
-                        eprintln!("[xinput-slot-map] {dev} -> slot {s}");
                     }
                 }
             }

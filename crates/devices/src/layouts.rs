@@ -170,8 +170,39 @@ fn switch_pro_outputs() -> Vec<DevicePin> {
 // ── Generic fallback ──────────────────────────────────────────────────────────
 
 fn generic_outputs() -> Vec<DevicePin> {
-    // Re-use the old generic list from gamepad.rs for anything unrecognised.
-    crate::gamepad::standard_outputs()
+    // Base generic list (sticks/buttons/dpad) shared with the gilrs path.
+    let mut pins = crate::gamepad::standard_outputs();
+    // Extended capabilities the SDL backend relays for pads FlexInput doesn't
+    // parse natively (Steam Controller, third-party): gyro/accel (SDL sensor
+    // API), touchpad fingers (raw SDL_GetGamepadTouchpadFinger), and the extra
+    // paddles/misc buttons SDL exposes. These pins are declared here so a sink
+    // can map them; the SDL backend only emits the ones a given pad actually
+    // reports (gilrs `Generic` pads simply never drive them). Names/units match
+    // the raw-HID path (imu_pins + DS4 touch pins) so gyro→aim mappings and
+    // touch routing behave identically regardless of source.
+    pins.extend(imu_pins());
+    pins.extend(vec![
+        fl("touch1_x",      "Touch 1 X"),
+        fl("touch1_y",      "Touch 1 Y"),
+        bo("touch1_active", "Touch 1 Active"),
+        fl("touch2_x",      "Touch 2 X"),
+        fl("touch2_y",      "Touch 2 Y"),
+        bo("touch2_active", "Touch 2 Active"),
+        bo("btn_touchpad",  "Touchpad Click"),
+        // Extra buttons (rear paddles / misc) reported by SDL. Icons/labels can
+        // be refined later; the signals are live and mappable now.
+        bo("btn_paddle_l1", "Left Paddle 1 (P3)"),
+        bo("btn_paddle_r1", "Right Paddle 1 (P1)"),
+        bo("btn_paddle_l2", "Left Paddle 2 (P4)"),
+        bo("btn_paddle_r2", "Right Paddle 2 (P2)"),
+        bo("btn_misc1",     "Misc 1 (Share/Capture)"),
+        bo("btn_misc2",     "Misc 2"),
+        bo("btn_misc3",     "Misc 3"),
+        bo("btn_misc4",     "Misc 4"),
+        bo("btn_misc5",     "Misc 5"),
+        bo("btn_misc6",     "Misc 6"),
+    ]);
+    pins
 }
 
 // ── Haptic inputs ─────────────────────────────────────────────────────────────
