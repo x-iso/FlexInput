@@ -5,6 +5,28 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-07-01
+
+SDL3 gamepad support for controllers FlexInput doesn't handle natively, and the
+extra rear-paddle / misc buttons those pads expose, mappable through the AutoMap
+system.
+
+### Added
+
+- **SDL3 gamepad backend** for controllers FlexInput doesn't parse natively
+  (Steam Controller, 8BitDo, arcade sticks, third-party pads). gilrs and the
+  raw-HID path keep the pads they handle well (Xbox/XInput, DualShock 4,
+  DualSense, Switch Pro) with their tuned gyro/touchpad/HD-haptic overrides; SDL
+  is enumerated only for pads that classify as generic, filtered by VID/PID so no
+  controller is surfaced twice. For those pads it relays sticks, buttons, analog
+  triggers, gyro/accel, touchpad, and the extra paddle/misc buttons. SDL is built
+  from source and linked statically — no extra DLL to ship.
+- **Extra buttons in the AutoMap system.** Rear paddles (`btn_paddle_l1/r1/l2/r2`)
+  and misc buttons (`btn_misc1..6`) are now part of the canonical AutoMap pin set,
+  so they can be mapped to anything via Remapper and other AutoMap modules. Rear
+  paddles render a generic labeled icon (PL1/PR1/PL2/PR2); labels are
+  device-agnostic for now.
+
 ## [0.10.4] - 2026-07-01
 
 HidHide masking of remapped physical controllers, exact XInput player-slot
