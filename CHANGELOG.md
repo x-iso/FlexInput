@@ -5,6 +5,21 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-07-02
+
+Gamepad navigation now reaches every Audio Stream Haptics control in Easy mode.
+
+### Fixed
+
+- **Audio Stream Haptics pinned elements are now editable via gamepad
+  navigation.** The module was missing from the Easy-mode nav dispatch, so its
+  pinned rows were selectable but not editable. All calibration rows (Volume,
+  Release, Crossover, Amplitude floor/ceiling/curve, Balance, Swap, Rumble mix)
+  and the capture-mode block (App/Focused/System + include-children) now route
+  through the unified multi-field editor. The scope's EQ points are dot-editable
+  through the same curve-dot path as Response Curve widgets (South enters,
+  LS/dpad highlights a dot, RT/LT add/remove at the cursor, South edits a dot).
+
 ## [0.10.5] - 2026-07-01
 
 SDL3 gamepad support for controllers FlexInput doesn't handle natively, and the

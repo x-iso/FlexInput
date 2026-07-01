@@ -5046,6 +5046,8 @@ impl FlexInputApp {
             ("module.response_curve", "curve")
             | ("module.vec_response_curve", "curve")
             | ("module.twoway_response_curve", "curve") => true,
+            // ASTH scope's EQ is dot-editable via the shared curve-dot path.
+            ("module.audio_stream_haptics", "asth_scope") => true,
             // Remapper-family mapping widgets (filter cycle + in-body capture).
             ("module.remapper", _) | ("module.map_action", _)
             | ("module.automap_combiner", _) => true,
@@ -5086,6 +5088,14 @@ impl FlexInputApp {
             | ("module.twoway_response_curve", "hyst_row") | ("module.twoway_response_curve", "interp_row")
             | ("module.twoway_response_curve", "lane_toggle")
             | ("display.oscilloscope", "controls")
+            | ("module.audio_stream_haptics", "asth_mode_row")
+            | ("module.audio_stream_haptics", "asth_volume")
+            | ("module.audio_stream_haptics", "asth_release")
+            | ("module.audio_stream_haptics", "asth_crossover")
+            | ("module.audio_stream_haptics", "asth_amplitude")
+            | ("module.audio_stream_haptics", "asth_balance")
+            | ("module.audio_stream_haptics", "asth_swap_row")
+            | ("module.audio_stream_haptics", "asth_rumble_mix")
         )
     }
 
@@ -5587,6 +5597,29 @@ impl FlexInputApp {
                 f!("Auto", Toggle{key:"osc_auto"}),
                 f!("Uni", Toggle{key:"osc_uni"}),
             ],
+            // Audio Stream Haptics calibration rows + mode block. Ranges/defaults
+            // mirror the sliders in viewer.rs `asth_draw_row` / `asth_draw_mode_block`.
+            ("module.audio_stream_haptics", "asth_mode_row") => vec![
+                f!("Capture", Enum{key:"asth_mode",opts:&["process","focused","system"]}),
+                f!("Children", Toggle{key:"asth_include_tree"}),
+            ],
+            ("module.audio_stream_haptics", "asth_volume") =>
+                vec![f!("Volume", v("asth_volume",0.0,2.0,1.0,Linear))],
+            ("module.audio_stream_haptics", "asth_release") =>
+                vec![f!("Release", v("asth_release",1.0,500.0,30.0,Decade))],
+            ("module.audio_stream_haptics", "asth_crossover") =>
+                vec![f!("Crossover", v("asth_crossover",60.0,800.0,250.0,Decade))],
+            ("module.audio_stream_haptics", "asth_amplitude") => vec![
+                f!("Floor", v("asth_amp_min",0.0,1.0,0.0,Linear)),
+                f!("Ceiling", v("asth_amp_max",0.0,1.0,1.0,Linear)),
+                f!("Curve", v("asth_curve",0.3,3.0,1.0,Linear)),
+            ],
+            ("module.audio_stream_haptics", "asth_balance") =>
+                vec![f!("Balance", v("asth_freq_bias",-1.0,1.0,0.0,Linear))],
+            ("module.audio_stream_haptics", "asth_swap_row") =>
+                vec![f!("Swap", Toggle{key:"asth_swap"})],
+            ("module.audio_stream_haptics", "asth_rumble_mix") =>
+                vec![f!("Rumble mix", v("asth_modulator",0.0,1.0,1.0,Linear))],
             // Selector mirrors counter's controls.
             ("module.selector", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
             ("module.selector", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
@@ -5622,6 +5655,10 @@ impl FlexInputApp {
             | Some("module.vec_response_curve")
             | Some("module.twoway_response_curve")
                 if elem.as_deref() == Some("curve") => NavWidgetKind::Curve,
+            // Audio Stream Haptics scope: its EQ points are dot-editable exactly
+            // like a response curve (shared curve-dot nav path).
+            Some("module.audio_stream_haptics")
+                if elem.as_deref() == Some("asth_scope") => NavWidgetKind::Curve,
             Some("module.remapper") | Some("module.map_action")
             | Some("module.automap_combiner") => NavWidgetKind::Remapper,
             // Gyro lean sections are remapper-family mapping rows (Learn/capture +
@@ -5822,17 +5859,24 @@ impl FlexInputApp {
     /// switched by its `active_lane` param; the driver edits whichever is active
     /// so it matches the lane shown (and glowed) in the body. Other curves only
     /// have `points`.
+    /// (points_key, Option<biases_key>) for the selected curve-like element. The
+    /// Audio Stream Haptics EQ shares the curve-dot nav machinery but stores its
+    /// points under `asth_eq_points` and has NO per-segment biases (linear EQ).
     fn nav_curve_keys(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
-        -> (&'static str, &'static str)
+        -> (&'static str, Option<&'static str>)
     {
         let canvas = &self.tabs[self.active_tab].canvas;
-        let lane_dn = canvas.snarl.get_node(outer_id)
+        let node = canvas.snarl.get_node(outer_id)
             .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|sp| sp.snarl.get_node(inner));
+        if node.map(|n| n.module_id.as_str()) == Some("module.audio_stream_haptics") {
+            return ("asth_eq_points", None);
+        }
+        let lane_dn = node
             .filter(|node| node.module_id == "module.twoway_response_curve")
             .and_then(|node| node.params.get("active_lane").and_then(|v| v.as_str()))
             == Some("dn");
-        if lane_dn { ("points_dn", "biases_dn") } else { ("points", "biases") }
+        if lane_dn { ("points_dn", Some("biases_dn")) } else { ("points", Some("biases")) }
     }
 
     fn nav_curve_points(&self, outer_id: egui_snarl::NodeId)
@@ -5843,7 +5887,8 @@ impl FlexInputApp {
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         let node = sp.snarl.get_node(inner)?;
         if !matches!(node.module_id.as_str(),
-            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve")
+            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
+            | "module.audio_stream_haptics")
         { return None; }
         let (pts_key, _) = self.nav_curve_keys(outer_id, inner);
         let pts: Vec<[f32; 2]> = node.params.get(pts_key)?.as_array()?
@@ -5868,7 +5913,8 @@ impl FlexInputApp {
         let arr: Vec<serde_json::Value> = pts.iter()
             .map(|p| serde_json::json!([p[0] as f64, p[1] as f64])).collect();
         node.params.insert(pts_key.into(), serde_json::Value::Array(arr));
-        // biases: one per segment (points-1).
+        // biases: one per segment (points-1). Curve-less EQ (ASTH) has no biases.
+        let Some(bias_key) = bias_key else { return; };
         let want = pts.len().saturating_sub(1);
         let mut biases: Vec<f64> = node.params.get(bias_key)
             .and_then(|v| v.as_array())
@@ -5976,6 +6022,8 @@ impl FlexInputApp {
     fn nav_curve_adjust_bias(&mut self, outer_id: egui_snarl::NodeId, i: usize, db: f32) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let (pts_key, bias_key) = self.nav_curve_keys(outer_id, inner);
+        // No per-segment biases (ASTH EQ) → nothing to adjust.
+        let Some(bias_key) = bias_key else { return; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
         let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
         let Some(node) = sp.snarl.get_node_mut(inner) else { return; };

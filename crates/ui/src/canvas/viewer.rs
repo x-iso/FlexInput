@@ -3063,7 +3063,7 @@ fn render_asth_pinned_scope(
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
         draw_asth_ef_scope_sized(uid, ui, &a, egui::vec2(container.x, ef_h));
-        changed = draw_asth_spectrum_eq_sized(uid, ui, &mut eq, &a, egui::vec2(container.x, spec_h));
+        changed = draw_asth_spectrum_eq_sized(inner_id, uid, ui, &mut eq, &a, egui::vec2(container.x, spec_h));
     });
     if changed {
         if let Some(n) = snarl.get_node_mut(inner_id) {
@@ -3155,7 +3155,7 @@ fn show_audio_stream_haptics_body(
                     draw_asth_ef_scope(uid, ui, &a);
                 });
                 ui.add_space(3.0);
-                let ch = draw_asth_spectrum_eq(uid, ui, &mut asth_eq_points, &a);
+                let ch = draw_asth_spectrum_eq(node_id, uid, ui, &mut asth_eq_points, &a);
                 changed_inner.set(changed_inner.get() || ch);
                 ui.min_rect().size()
             });
@@ -3305,12 +3305,12 @@ fn draw_asth_ef_scope_sized(uid: usize, ui: &mut egui::Ui, params: &AsthParams, 
 /// Interaction (mirrors the response-curve editor): drag a point to reshape,
 /// double-click to add a point, right-click a point to remove it. Mutates
 /// `eq_points` in place and returns whether it changed.
-fn draw_asth_spectrum_eq(uid: usize, ui: &mut egui::Ui, eq_points: &mut Vec<[f32; 2]>, params: &AsthParams) -> bool {
-    draw_asth_spectrum_eq_sized(uid, ui, eq_points, params,
+fn draw_asth_spectrum_eq(node_id: NodeId, uid: usize, ui: &mut egui::Ui, eq_points: &mut Vec<[f32; 2]>, params: &AsthParams) -> bool {
+    draw_asth_spectrum_eq_sized(node_id, uid, ui, eq_points, params,
         egui::vec2(ui.available_width().max(140.0), ui.available_height().max(50.0)))
 }
 
-fn draw_asth_spectrum_eq_sized(uid: usize, ui: &mut egui::Ui, eq_points: &mut Vec<[f32; 2]>, params: &AsthParams, size: egui::Vec2) -> bool {
+fn draw_asth_spectrum_eq_sized(node_id: NodeId, uid: usize, ui: &mut egui::Ui, eq_points: &mut Vec<[f32; 2]>, params: &AsthParams, size: egui::Vec2) -> bool {
     let size = egui::vec2(size.x.max(80.0), size.y.max(40.0));
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -3423,11 +3423,47 @@ fn draw_asth_spectrum_eq_sized(uid: usize, ui: &mut egui::Ui, eq_points: &mut Ve
             if best.0 < 10.0 { drag_idx = Some(best.1); }
         }
     }
+    // Gamepad-nav: which dot the driver highlighted (and whether it's in dot-move
+    // mode). Published under ("gp_nav_curve_sel", node) — the SAME channel the
+    // response-curve bodies use, so the EQ reuses the whole curve-dot nav path.
+    let nav_sel: Option<(u64, usize, bool)> = ui.ctx().data(|d|
+        d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+    let nav_sel = nav_sel.filter(|(pass, _, _)| *pass == ui.ctx().cumulative_pass_nr());
     for (i, pt) in eq_points.iter().enumerate() {
         let c = egui::pos2(x_of(pt[0]), y_of(pt[1]));
         let hot = drag_idx == Some(i);
         painter.circle_filled(c, if hot { 4.5 } else { 3.0 },
             if hot { visuals.selection.stroke.color } else { curve_col });
+        if let Some((_, sel_i, editing_dot)) = nav_sel {
+            if sel_i == i {
+                let accent = visuals.selection.stroke.color;
+                let [r8, g8, b8, _] = accent.to_array();
+                for k in 0..5 {
+                    let t = (k as f32 + 1.0) / 5.0;
+                    let rr = (if editing_dot { 16.0 } else { 12.0 }) * t;
+                    let a = ((if editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
+                    if a == 0 { continue; }
+                    painter.circle_stroke(c, rr,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                }
+                painter.circle_filled(c, if editing_dot { 6.0 } else { 5.0 }, accent);
+                painter.circle_stroke(c, if editing_dot { 6.0 } else { 5.0 },
+                    egui::Stroke::new(1.5, egui::Color32::WHITE));
+            }
+        }
+    }
+
+    // Gamepad-nav: publish EQ graph geometry (rect + axis bounds, in GLOBAL screen
+    // space) so the driver maps graph↔screen for dot stepping / cursor / moves.
+    // Bounds are X 0..1 (band position) and Y 0..1 (EQ gain).
+    {
+        let pass = ui.ctx().cumulative_pass_nr();
+        let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+            .unwrap_or(egui::emath::TSTransform::IDENTITY);
+        let screen_rect = to_global * rect;
+        ui.ctx().data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_curve_geom", node_id.0)),
+            (pass, screen_rect, 0.0f32, 1.0f32, 0.0f32, 1.0f32)));
     }
 
     // Drag a point (endpoints keep their x fixed; middle points move freely).
