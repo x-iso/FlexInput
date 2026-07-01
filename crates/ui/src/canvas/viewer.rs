@@ -15344,13 +15344,38 @@ fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_i
                 Some(handle)
             });
         if let Some(tex) = tex {
-            ui.add(egui::Image::new(&tex)
+            let resp = ui.add(egui::Image::new(&tex)
                 .fit_to_exact_size(egui::vec2(CHIP_H, CHIP_H))
                 .tint(Color32::WHITE));
+            // Overlay the extra-button label (e.g. "PL1") so one generic paddle
+            // glyph can stand for both paddle rows on a side.
+            if let Some(label) = remapper_icons::extra_button_label(pin_id) {
+                paint_icon_label(ui, resp.rect, label);
+            }
             return;
         }
     }
     ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong());
+}
+
+/// Paint a short label centered over an icon rect (used for extra-button
+/// paddle glyphs). Draws a thin dark outline behind the text so it stays legible
+/// over the white glyph regardless of the underlying shape.
+fn paint_icon_label(ui: &egui::Ui, rect: egui::Rect, label: &str) {
+    let painter = ui.painter_at(rect);
+    let font = egui::FontId::proportional((rect.height() * 0.34).max(9.0));
+    let center = rect.center();
+    // Cheap outline: draw the text offset in dark, then the bright text on top.
+    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+        painter.text(
+            center + egui::vec2(dx, dy),
+            egui::Align2::CENTER_CENTER,
+            label,
+            font.clone(),
+            Color32::from_black_alpha(200),
+        );
+    }
+    painter.text(center, egui::Align2::CENTER_CENTER, label, font, Color32::WHITE);
 }
 
 // ── Mapping-list display filter ───────────────────────────────────────────────
@@ -16536,6 +16561,18 @@ fn paint_chord_chip_to_rect(
             painter.image(tex.id(), rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 tint);
+            // Extra-button label overlay (e.g. "PL1") — same outline-then-fill as
+            // paint_icon_label, inlined since we have a bare painter here.
+            if let Some(label) = remapper_icons::extra_button_label(pin_id) {
+                let font = egui::FontId::proportional((chip_h * 0.34).max(9.0));
+                let c = rect.center();
+                let fg = if dim { Color32::from_rgba_unmultiplied(255, 255, 255, 95) } else { Color32::WHITE };
+                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                    painter.text(c + egui::vec2(dx, dy), egui::Align2::CENTER_CENTER,
+                        label, font.clone(), Color32::from_black_alpha(200));
+                }
+                painter.text(c, egui::Align2::CENTER_CENTER, label, font, fg);
+            }
             return chip_h;
         }
     }
@@ -16579,9 +16616,12 @@ fn remapper_render_chip_scaled(
                 Some(handle)
             });
         if let Some(tex) = tex {
-            ui.add(egui::Image::new(&tex)
+            let resp = ui.add(egui::Image::new(&tex)
                 .fit_to_exact_size(egui::vec2(chip_h, chip_h))
                 .tint(Color32::WHITE));
+            if let Some(label) = remapper_icons::extra_button_label(pin_id) {
+                paint_icon_label(ui, resp.rect, label);
+            }
             return;
         }
     }

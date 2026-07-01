@@ -250,6 +250,33 @@ fn generic_outputs_expose_sdl_relayed_pins() {
     }
 }
 
+/// The SDL extra buttons must be present in the AutoMap canonical bus
+/// (`ALL_PINS`), not only in the Generic device layout — otherwise they show on
+/// the device node but can't be selected inside a Remapper / AutoMap Splitter,
+/// which only carry pins listed in ALL_PINS. Mirror of the feedback-inlet union
+/// guard; catches a layout pin added without a matching ALL_PINS entry.
+#[test]
+fn all_pins_covers_generic_extra_buttons() {
+    use flexinput_core::automap::ALL_PINS;
+    let bus: std::collections::HashSet<&str> = ALL_PINS.iter().map(|p| p.id).collect();
+    for pin in [
+        "btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2",
+        "btn_misc1", "btn_misc2", "btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6",
+    ] {
+        // Present in the Generic device layout (source side)…
+        assert!(
+            layouts::outputs_for(ControllerKind::Generic).iter().any(|p| p.id == pin),
+            "Generic layout must expose `{pin}`",
+        );
+        // …and in the AutoMap bus so a Remapper can address it.
+        assert!(
+            bus.contains(pin),
+            "extra-button pin `{pin}` is in the Generic layout but missing from \
+             automap::ALL_PINS — add it there or it can't be used in a Remapper",
+        );
+    }
+}
+
 #[test]
 fn all_supported_kinds_have_sensor_outputs() {
     for kind in [
