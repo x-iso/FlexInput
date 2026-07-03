@@ -5,7 +5,28 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
-## [0.10.6] - 2026-07-02
+## [0.10.7] - 2026-07-03
+
+A new Vec Reshaper module for fighting analog-stick "diagonal stickiness" —
+directional reshaping of a Vec2 with a visual editor.
+
+### Added
+
+- **Vec Reshaper module** (Processing category, Vec2 → Vec2). Reshapes a stick
+  vector as a function of DIRECTION, which the radially-symmetric Vec Response
+  Curve cannot do. Two orthogonal controls: a per-direction **Boundary** that
+  sets the reachable output envelope (1.0 = circle, √2 = the square's corner, so
+  a round stick can be expanded to fill a square for games that expect square
+  response), and a per-direction **Gain** that accelerates/decelerates within
+  that envelope (push diagonals faster to kill diagonal stickiness). One quadrant
+  is edited; the rest mirror it (4-way, or X-mirror for asymmetric up/down).
+- **Visual editor** on the node body: a direction→value curve (grid + snap on
+  both axes) with a Gain/Boundary toggle, plus a live 2D pad showing the unit
+  circle, the reshaped envelope, and a smooth **stretch-field gradient** (blue =
+  accelerated, red = decelerated, transparent at neutral) so the internal shaping
+  is visible without moving the stick. Live input→output dots trace the current
+  deflection. Presets: Circle, Square, Diag+. Every element is individually
+  pinnable in Easy mode and gamepad-navigable.
 
 Gamepad navigation now reaches every Audio Stream Haptics control in Easy mode.
 

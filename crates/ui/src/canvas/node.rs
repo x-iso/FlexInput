@@ -466,6 +466,15 @@ pub fn exposable_elements(module_id: &str) -> &'static [(&'static str, &'static 
             ("range_row", "In max + Out max"),
             ("grid_row",  "Grid + Trail"),
         ],
+        "module.vec_reshape" => &[
+            ("curve",       "Direction curve (radius/gain)"),
+            ("pad",         "2D preview pad"),
+            ("target_row",  "Edit target (Gain/Boundary)"),
+            ("options_row", "Symmetry + Renorm"),
+            ("range_row",   "In max + Out max"),
+            ("grid_row",    "Grid + Snap + Trail"),
+            ("preset_row",  "Presets"),
+        ],
         "display.readout"           => &[("value", "Live value display")],
         "processing.gyro_3dof"      => &[
             ("pointer_mode",   "Pointer mode (Pitch+Yaw/Pitch+Roll/Player/World)"),

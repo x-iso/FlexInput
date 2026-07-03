@@ -5045,6 +5045,7 @@ impl FlexInputApp {
             // Curves: the dot graph plus every editable option row.
             ("module.response_curve", "curve")
             | ("module.vec_response_curve", "curve")
+            | ("module.vec_reshape", "curve")
             | ("module.twoway_response_curve", "curve") => true,
             // ASTH scope's EQ is dot-editable via the shared curve-dot path.
             ("module.audio_stream_haptics", "asth_scope") => true,
@@ -5083,6 +5084,9 @@ impl FlexInputApp {
             | ("module.response_curve", "grid_row") | ("module.response_curve", "grid_options_row")
             | ("module.vec_response_curve", "scale_row") | ("module.vec_response_curve", "range_row")
             | ("module.vec_response_curve", "grid_row") | ("module.vec_response_curve", "grid_options_row")
+            | ("module.vec_reshape", "target_row") | ("module.vec_reshape", "options_row")
+            | ("module.vec_reshape", "range_row") | ("module.vec_reshape", "grid_row")
+            | ("module.vec_reshape", "preset_row")
             | ("module.twoway_response_curve", "scale_row") | ("module.twoway_response_curve", "range_row")
             | ("module.twoway_response_curve", "grid_row") | ("module.twoway_response_curve", "grid_options_row")
             | ("module.twoway_response_curve", "hyst_row") | ("module.twoway_response_curve", "interp_row")
@@ -5569,6 +5573,24 @@ impl FlexInputApp {
                 f!("In max", v("in_max",-100.0,100.0,1.0,Linear)),
                 f!("Out max", v("out_max",-100.0,100.0,1.0,Linear)),
             ],
+            // ── Vec Reshaper option rows ──
+            ("module.vec_reshape", "target_row") => vec![
+                f!("Edit", Enum{key:"edit_target",opts:&["gain","boundary"]}),
+            ],
+            ("module.vec_reshape", "options_row") => vec![
+                f!("Symmetry", Enum{key:"symmetry",opts:&["quad4","xmirror"]}),
+                f!("Renorm", Toggle{key:"renorm"}),
+            ],
+            ("module.vec_reshape", "range_row") => vec![
+                f!("In max", v("in_max",0.05,2.0,1.0,Linear)),
+                f!("Out max", v("out_max",0.05,2.0,1.0,Linear)),
+            ],
+            ("module.vec_reshape", "grid_row") => vec![
+                f!("Grid H", v("grid_x",1.0,16.0,4.0,Linear)),
+                f!("Grid V", v("grid_y",1.0,16.0,4.0,Linear)),
+                f!("Snap", Toggle{key:"snap"}),
+                f!("Trail ms", v("trail_ms",0.0,1000.0,300.0,Decade)),
+            ],
             ("module.response_curve", "grid_row") | ("module.vec_response_curve", "grid_row")
             | ("module.twoway_response_curve", "grid_row") => vec![
                 f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
@@ -5653,6 +5675,7 @@ impl FlexInputApp {
             Some("module.switch") => NavWidgetKind::Toggle,
             Some("module.response_curve")
             | Some("module.vec_response_curve")
+            | Some("module.vec_reshape")
             | Some("module.twoway_response_curve")
                 if elem.as_deref() == Some("curve") => NavWidgetKind::Curve,
             // Audio Stream Haptics scope: its EQ points are dot-editable exactly
@@ -5872,6 +5895,12 @@ impl FlexInputApp {
         if node.map(|n| n.module_id.as_str()) == Some("module.audio_stream_haptics") {
             return ("asth_eq_points", None);
         }
+        if node.map(|n| n.module_id.as_str()) == Some("module.vec_reshape") {
+            // Nav edits whichever curve the body's Edit toggle has active.
+            let gain = node.and_then(|n| n.params.get("edit_target").and_then(|v| v.as_str()))
+                != Some("boundary");
+            return if gain { ("gain_pts", Some("gain_biases")) } else { ("boundary_pts", None) };
+        }
         let lane_dn = node
             .filter(|node| node.module_id == "module.twoway_response_curve")
             .and_then(|node| node.params.get("active_lane").and_then(|v| v.as_str()))
@@ -5888,7 +5917,7 @@ impl FlexInputApp {
         let node = sp.snarl.get_node(inner)?;
         if !matches!(node.module_id.as_str(),
             "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
-            | "module.audio_stream_haptics")
+            | "module.audio_stream_haptics" | "module.vec_reshape")
         { return None; }
         let (pts_key, _) = self.nav_curve_keys(outer_id, inner);
         let pts: Vec<[f32; 2]> = node.params.get(pts_key)?.as_array()?
@@ -10013,6 +10042,31 @@ fn eval_module(id: &str, out_idx: usize, inputs: &[Option<Signal>], node: &NodeD
             let out_max = node.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             let out_mag = apply_curve(mag, &pts, &biases, true, 0.0, in_max, 0.0, out_max, read_scale_t(node));
             Some(Signal::Vec2(vec / mag * out_mag))
+        }
+        "module.vec_reshape" => {
+            if out_idx >= node.outputs.len() { return None; }
+            let vec = match inputs.get(out_idx).and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => v,
+                _ => return Some(Signal::Vec2(glam::Vec2::ZERO)),
+            };
+            let read_pts = |key: &str, default: &[[f32; 2]]| -> Vec<[f32; 2]> {
+                node.params.get(key).and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter().filter_map(|p| {
+                        let a = p.as_array()?;
+                        Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+                    }).collect::<Vec<_>>()
+                }).filter(|v: &Vec<[f32; 2]>| v.len() >= 2).unwrap_or_else(|| default.to_vec())
+            };
+            let boundary = read_pts("boundary_pts", flexinput_engine::VEC_RESHAPE_BOUNDARY_DEFAULT);
+            let gain     = read_pts("gain_pts", flexinput_engine::VEC_RESHAPE_GAIN_DEFAULT);
+            let gbiases: Vec<f32> = node.params.get("gain_biases").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+                .unwrap_or_default();
+            let sym     = node.params.get("symmetry").and_then(|v| v.as_str()).unwrap_or("quad4");
+            let renorm  = node.params.get("renorm").and_then(|v| v.as_bool()).unwrap_or(true);
+            let in_max  = node.params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let out_max = node.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            Some(Signal::Vec2(flexinput_engine::vec_reshape_apply(vec, &boundary, &gain, &gbiases, sym, renorm, in_max, out_max)))
         }
         "module.vec_to_axis" => {
             let vec = match inputs.first().and_then(|s| *s) {

@@ -2068,7 +2068,7 @@ fn eval_subgraph(
                 scope_samples.push((ns_uid, sample));
                 last_inputs.insert(ns_uid, inputs.clone());
             }
-            "module.response_curve" | "module.vec_response_curve" => {
+            "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
                 last_inputs.insert(ns_uid, inputs.clone());
             }
             "module.twoway_response_curve" => {
@@ -2583,7 +2583,7 @@ pub fn eval_graph_tick(
                 scope_samples.push((snap.node_uid, sample));
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
-            "module.response_curve" | "module.vec_response_curve" => {
+            "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
             "module.twoway_response_curve" => {
@@ -2897,7 +2897,7 @@ fn compute_node(
             state.last_signals = out.clone();
             out
         }
-        "module.response_curve" | "module.vec_response_curve" => {
+        "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
             state.last_signals = inputs.to_vec();
             (0..snap.n_outputs).map(|out_idx| {
                 eval_pure(&snap.module_id, out_idx, inputs, &snap.params, snap.n_outputs)
@@ -3123,6 +3123,23 @@ pub fn eval_pure(
             let out_max = params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             let out_mag = apply_curve(mag, &pts, &biases, true, 0.0, in_max, 0.0, out_max, read_scale_t(params));
             Some(Signal::Vec2(vec / mag * out_mag))
+        }
+        "module.vec_reshape" => {
+            if out_idx >= n_outputs { return None; }
+            let vec = match inputs.get(out_idx).and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => v,
+                _ => return Some(Signal::Vec2(glam::Vec2::ZERO)),
+            };
+            let boundary = reshape_pts(params, "boundary_pts", VEC_RESHAPE_BOUNDARY_DEFAULT);
+            let gain     = reshape_pts(params, "gain_pts",     VEC_RESHAPE_GAIN_DEFAULT);
+            let gbiases: Vec<f32> = params.get("gain_biases").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+                .unwrap_or_default();
+            let sym     = params.get("symmetry").and_then(|v| v.as_str()).unwrap_or("quad4");
+            let renorm  = params.get("renorm").and_then(|v| v.as_bool()).unwrap_or(true);
+            let in_max  = params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let out_max = params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            Some(Signal::Vec2(vec_reshape_apply(vec, &boundary, &gain, &gbiases, sym, renorm, in_max, out_max)))
         }
         "module.vec_to_axis" => {
             let vec = match inputs.first().and_then(|s| *s) {
@@ -5500,6 +5517,111 @@ pub fn curve_points_from_params_keyed(params: &HashMap<String, Value>, key: &str
         Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
     }).collect();
     if pts.len() >= 2 { Some(pts) } else { None }
+}
+
+// ── Vec Reshaper (directional Vec2 reshaping) ─────────────────────────────────
+
+/// Default boundary control points for `module.vec_reshape`: a flat unit circle
+/// (radius 1 at every angle) → identity gate. `angle01`: 0 = nearest cardinal
+/// axis, 1 = diagonal. `radius`: gate distance in that direction (1.0 = circle).
+pub const VEC_RESHAPE_BOUNDARY_DEFAULT: &[[f32; 2]] = &[[0.0, 1.0], [1.0, 1.0]];
+/// Default gain curve: unity gain at every angle → no directional acceleration.
+pub const VEC_RESHAPE_GAIN_DEFAULT: &[[f32; 2]] = &[[0.0, 1.0], [1.0, 1.0]];
+
+/// Parse an `[[x,y],…]` control-point array from a params key, falling back to
+/// `default` when absent/short (need ≥2 points to interpolate).
+fn reshape_pts(params: &HashMap<String, Value>, key: &str, default: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    params.get(key).and_then(|v| v.as_array()).map(|arr| {
+        arr.iter().filter_map(|p| {
+            let a = p.as_array()?;
+            Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+        }).collect::<Vec<_>>()
+    }).filter(|v| v.len() >= 2).unwrap_or_else(|| default.to_vec())
+}
+
+/// Fold a raw direction angle (radians, atan2 convention) into the single edited
+/// quadrant and return `angle01` where 0 = nearest cardinal axis and 1 = the
+/// diagonal, honouring the symmetry mode.
+///
+/// `quad4` — full 4-way symmetry: every 90° octant mirrors, so we fold into
+///   0..45° measured from the nearest axis.
+/// `xmirror` — left/right mirror only (top and bottom halves may differ): fold
+///   about the vertical axis, then measure 0..90° from the +X axis so the whole
+///   upper/lower semicircle is editable as one quadrant-parameterised curve.
+fn reshape_angle01(theta: f32, symmetry: &str) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+    match symmetry {
+        "xmirror" => {
+            // Left/right mirror only: measure absolute elevation from the
+            // horizontal plane, 0 at ±X, 1 at ±Y. Top and bottom halves are NOT
+            // folded together, so an asymmetric up-vs-down feel is expressible
+            // (the caller edits the full 0..1 elevation as one curve).
+            theta.sin().abs().clamp(0.0, 1.0).asin() / FRAC_PI_2
+        }
+        _ => {
+            // quad4: angle within the current 90° sector, folded about its 45°
+            // bisector so both halves of the octant share one curve.
+            let s = theta.rem_euclid(FRAC_PI_2);   // 0..90°
+            let d = (s - FRAC_PI_4).abs();          // 0 at diagonal, 45° at axis
+            1.0 - (d / FRAC_PI_4)                   // 1 at diagonal, 0 at axis
+        }
+    }
+}
+
+/// The pure Vec Reshaper transform, shared by the engine (`eval_pure`) and the
+/// UI preview so the on-node dots exactly match the routed signal.
+///
+/// The two controls are ORTHOGONAL:
+///
+///   • **Boundary** `boundary(a01)` sets the reachable OUTPUT ENVELOPE radius per
+///     direction, in units where 1.0 = the unit circle and √2 ≈ 1.414 = the
+///     corner of the full square. It is what lets the output ESCAPE the circle:
+///     a boundary that rises to √2 on the diagonal turns a round input gate into
+///     a full square (`renorm` on). This is the circle→square use case.
+///   • **Gain** `gain(a01)` redistributes the deflection *within* 0..envelope
+///     (accelerate/decelerate along a direction) WITHOUT changing how far the
+///     envelope reaches. Unity (1.0) = linear, >1 = reach the edge sooner
+///     (stretch), <1 = later (squeeze).
+///
+/// Pipeline: `frac = clamp(norm · gain, 0..1)` is the fraction of the envelope
+/// reached; output magnitude = `frac · envelope · out_max`, where
+/// `envelope = boundary` when `renorm` else 1.0 (boundary becomes display-only,
+/// output stays circular). Direction is preserved.
+#[allow(clippy::too_many_arguments)]
+pub fn vec_reshape_apply(
+    v: glam::Vec2,
+    boundary_pts: &[[f32; 2]],
+    gain_pts: &[[f32; 2]],
+    gain_biases: &[f32],
+    symmetry: &str,
+    renorm: bool,
+    in_max: f32,
+    out_max: f32,
+) -> glam::Vec2 {
+    let mag = v.length();
+    if mag < f32::EPSILON { return glam::Vec2::ZERO; }
+    let dir = v / mag;
+    let in_max = in_max.max(f32::EPSILON);
+
+    let a01 = reshape_angle01(v.y.atan2(v.x), symmetry);
+
+    // Deflection as a 0..1 fraction of the ROUND input gate in this direction.
+    let norm = (mag / in_max).clamp(0.0, 1.0);
+
+    // Gain redistributes WITHIN the envelope (does not change its reach).
+    let gain = sample_curve(gain_pts, a01, gain_biases).max(0.0);
+    let frac = (norm * gain).clamp(0.0, 1.0);
+
+    // Envelope radius: >1 on the diagonal lets the vector reach the square's
+    // corner. When renorm is off the envelope stays circular (boundary is a
+    // display-only reference) so only gain shapes the feel.
+    let envelope = if renorm {
+        sample_curve(boundary_pts, a01, &[]).clamp(0.05, std::f32::consts::SQRT_2)
+    } else {
+        1.0
+    };
+
+    dir * (frac * envelope * out_max)
 }
 
 /// Collapse an EQ-gained log-band spectrum to a single carrier (used by the
