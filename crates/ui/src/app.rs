@@ -8967,7 +8967,7 @@ impl FlexInputApp {
                 ui.label(egui::RichText::new("Links").strong());
                 ui.add_space(4.0);
                 ui.hyperlink_to("FlexInput repository",      "https://github.com/x-iso/FlexInput");
-                ui.hyperlink_to("ViGEm Bus — latest release","https://github.com/nefarius/ViGEmBus/releases/latest");
+                ui.hyperlink_to("HIDMaestro — virtual HID driver", "https://github.com/hifihedgehog/HIDMaestro");
                 ui.hyperlink_to("HidHide — latest release",  "https://github.com/nefarius/HidHide/releases/latest");
 
                 ui.add_space(10.0);
@@ -8978,8 +8978,16 @@ impl FlexInputApp {
                 ui.label(egui::RichText::new("Credits").strong());
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(
-                    "Built with egui, eframe, egui-snarl, egui_extras, gilrs, midir, rfd, serde, ViGEmBus, HidHide."
+                    "Built with egui, eframe, egui-snarl, egui_extras, gilrs, SDL, midir, rfd, serde, HidHide."
                 ).small());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Virtual devices powered by").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("HIDMaestro").small(),
+                        "https://github.com/hifihedgehog/HIDMaestro",
+                    );
+                    ui.label(egui::RichText::new("by hifihedgehog (MIT).").small());
+                });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Input prompt SVG icons by Kenney —").small());
                     ui.hyperlink_to(
