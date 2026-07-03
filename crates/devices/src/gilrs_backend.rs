@@ -427,19 +427,18 @@ impl DeviceBackend for GilrsBackend {
         if self.gyro.take_refresh_wanted() {
             self.dev_set_dirty = true;
         }
-        if self.dev_set_dirty {
+        if self.dev_set_dirty && self.last_enum.is_empty() {
+            // First run (nothing served yet): kick eagerly so the bounded wait
+            // below can catch the result — the first list should not misfile
+            // virtuals from an empty cache.
             self.kick_classification();
-            // Drop cached XInput slot correlations: a connect/disconnect/reorder can
-            // move a pad to a different slot, so the mapping must be re-learned from
-            // live state rather than trusted across a device-set change.
-            self.xinput_slot_for.clear();
             self.dev_set_dirty = false;
         }
         if self.class_done_gen < self.class_req_gen {
             // Rebuild in flight. On the very first enumerate give the worker a
             // bounded window so startup doesn't show an empty device list; after
             // that, serve the previous stable list and pick the result up next
-            // cycle (≤2 s) — classifying new pads from a stale list could
+            // cycle (≤2 s) — classifying new pads from a stale cache could
             // misfile a virtual as physical.
             if self.last_enum.is_empty() {
                 if let Some(rx) = &self.class_rx {
@@ -455,6 +454,16 @@ impl DeviceBackend for GilrsBackend {
                 return self.last_enum.clone();
             }
         }
+        // NOTE: the deferred `kick_classification()` happens at the END of this
+        // function, after the walk below. Kicking here and then checking
+        // "in flight → serve last_enum" made every call that observed a dirty
+        // pad set serve the STALE list — and a pad whose gyro open keeps
+        // failing sets `refresh_wanted` every RETRY_INTERVAL, so a disconnected
+        // Switch Pro never left the list (its stale entry kept the gyro retry
+        // alive, which kept the list stale: a feedback loop). Building the walk
+        // first means disconnects drop out immediately (gilrs stops yielding
+        // the pad); only virtual/real classification lags one worker round,
+        // guarded by the hotplug re-kick below.
 
         // Per-pad keep/virtual decision (path-based for PS, correlation-based for
         // XInput). Snapshot VID/PID first (drops the gilrs borrow), then resolve
@@ -520,6 +529,18 @@ impl DeviceBackend for GilrsBackend {
                     }
                 }
             }
+        }
+
+        // Deferred kick (see note at the top of this function): runs after the
+        // walk so the list served this cycle reflects the CURRENT pad set even
+        // when it just changed; the fresh classification lands next cycle.
+        if self.dev_set_dirty {
+            self.kick_classification();
+            // Drop cached XInput slot correlations: a connect/disconnect/reorder can
+            // move a pad to a different slot, so the mapping must be re-learned from
+            // live state rather than trusted across a device-set change.
+            self.xinput_slot_for.clear();
+            self.dev_set_dirty = false;
         }
 
         self.last_enum = result.clone();
