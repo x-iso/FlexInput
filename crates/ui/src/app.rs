@@ -755,6 +755,17 @@ impl PanicShortcut {
 
 impl FlexInputApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Permanent breadcrumb: which GPU adapter + wgpu backend this instance
+        // rendered on. Window-compositor symptoms (slow resize, stale frames on
+        // restore) are backend/driver-specific, so the first diagnostic question
+        // is always "what did wgpu pick?" — answer it in the log up front.
+        if let Some(rs) = &cc.wgpu_render_state {
+            let info = rs.adapter.get_info();
+            eprintln!(
+                "[gpu] adapter=\"{}\" backend={:?} type={:?} driver=\"{}\"",
+                info.name, info.backend, info.device_type, info.driver_info
+            );
+        }
         setup_fonts(&cc.egui_ctx);
         // Install egui_extras image loaders so SVG images render inside nodes
         // and pinned sub-patch widgets. The svg feature pulls in resvg/usvg.
