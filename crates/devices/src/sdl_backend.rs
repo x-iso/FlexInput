@@ -123,6 +123,13 @@ pub struct SdlBackend {
     /// True once we've tried (and failed) to init SDL, so we don't spam init
     /// attempts every poll on a machine where SDL can't start.
     init_failed: bool,
+    /// Joystick ids already probed and REJECTED (non-gamepad, or a kind gilrs
+    /// owns). The probe requires `SDL_OpenGamepad`, which does device I/O —
+    /// ~140 ms on a cold Bluetooth pad — so re-probing every 2 s enumerate
+    /// was a periodic io-thread stall for as long as the open stayed slow.
+    /// Ids are per-connection: a reconnect gets a fresh id and a fresh probe.
+    /// Pruned alongside `pads` when a device disappears.
+    rejected_ids: std::collections::HashSet<JoystickId>,
 }
 
 impl SdlBackend {
@@ -133,6 +140,7 @@ impl SdlBackend {
             event_counts: HashMap::new(),
             last_sig: HashMap::new(),
             init_failed: false,
+            rejected_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -191,38 +199,49 @@ impl SdlBackend {
         let gs = &state.gamepad_subsystem;
         let pads = &mut state.pads;
         let next_inst = &mut self.next_inst;
+        let rejected = &mut self.rejected_ids;
 
         let ids = match gs.gamepads() {
             Ok(ids) => ids,
             Err(_) => return,
         };
 
-        // Drop pads no longer present (disconnected).
+        // Drop pads no longer present (disconnected), and forget rejection
+        // verdicts for departed ids so the set can't grow unbounded.
         let present: std::collections::HashSet<JoystickId> = ids.iter().copied().collect();
         pads.retain(|id, _| present.contains(id));
+        rejected.retain(|id| present.contains(id));
 
         for id in ids {
-            if pads.contains_key(&id) {
+            if pads.contains_key(&id) || rejected.contains(&id) {
                 continue;
             }
             // Only SDL-classified GAMEPADS (have a mapping); raw joysticks without
             // a gamepad mapping are skipped — FlexInput's pin model is gamepad-shaped.
             if !gs.is_gamepad(id) {
+                rejected.insert(id);
                 continue;
             }
             let gamepad = match gs.open(id) {
                 Ok(g) => g,
+                // Open failures are NOT remembered: they can be transient
+                // (device busy mid-arrival) and a stuck-unopenable pad is rarer
+                // than a reconnect; the id vanishes with the device anyway.
                 Err(_) => continue,
             };
             // Dedup gate: if this pad is a kind gilrs already owns (Xbox / DS4 /
             // DualSense / Switch Pro), skip it so it isn't surfaced twice. Only
-            // `Generic` pads belong to SDL.
+            // `Generic` pads belong to SDL. REMEMBER the verdict: the probe
+            // above costs an SDL_OpenGamepad (device I/O, ~140 ms on a cold BT
+            // pad), and re-probing the same id every 2 s enumerate was a
+            // periodic io-thread stall.
             let vid = gamepad.vendor_id();
             let pid = gamepad.product_id();
             let name = gamepad.name().unwrap_or_default();
             let kind = ControllerKind::detect(&name, vid, pid);
             if kind != ControllerKind::Generic {
                 // Close (drop) and leave it to gilrs.
+                rejected.insert(id);
                 continue;
             }
 

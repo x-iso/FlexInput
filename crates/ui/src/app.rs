@@ -9085,10 +9085,39 @@ fn spawn_io_thread(
             let mut ping_until: HashMap<String, Instant> = HashMap::new();
             const PING_RUMBLE_MS: u64 = 200;
 
+            // ── I/O stall diagnostics ─────────────────────────────────────
+            // Cheap per-iteration section timing (a handful of Instant::now
+            // calls, no allocation in steady state); prints ONE stderr line
+            // when an iteration's BUSY time (sleep excluded) overruns
+            // STALL_LOG_MS. Purpose: a periodic input freeze in the field
+            // names its guilty section without attaching a profiler — the
+            // every-few-seconds gap class of bug has now hidden in three
+            // different sections (enumerate classification, gyro open retry,
+            // and counting), so keep this permanently.
+            const STALL_LOG_MS: u128 = 25;
+            let io_started = Instant::now();
+            let mut sect_marks: Vec<(&'static str, Duration)> = Vec::with_capacity(12);
+            let mut backend_marks: Vec<Duration> = Vec::with_capacity(4);
+
             loop {
                 puffin::GlobalProfiler::lock().new_frame();
                 puffin::profile_scope!("io_thread_iter");
                 let t0 = Instant::now();
+                sect_marks.clear();
+                backend_marks.clear();
+                let mut sect_t = t0;
+                macro_rules! mark {
+                    ($name:literal) => {{
+                        let now = Instant::now();
+                        sect_marks.push(($name, now - sect_t));
+                        // The write after the LAST mark of an iteration is
+                        // intentionally dead (next iteration resets from t0).
+                        #[allow(unused_assignments)]
+                        {
+                            sect_t = now;
+                        }
+                    }};
+                }
                 // Re-read polling rate each iteration so live retunes apply.
                 let hz = polling_hz.load(Ordering::Relaxed).clamp(60, 4000);
                 let interval = Duration::from_nanos(1_000_000_000 / hz as u64);
@@ -9106,20 +9135,24 @@ fn spawn_io_thread(
                         }
                     }
                 }
+                mark!("spike_filter");
 
                 // ── Poll physical inputs ──────────────────────────────────────
                 let mut signals: HashMap<(String, String), Signal> = HashMap::new();
                 {
                     puffin::profile_scope!("backends_poll");
                     for backend in &mut backends {
+                        let bt = Instant::now();
                         for (dev, pin, sig) in backend.poll() {
                             signals.insert((dev, pin), sig);
                         }
                         for (dev, n) in backend.take_event_counts() {
                             *dev_event_acc.entry(dev).or_insert(0) += n;
                         }
+                        backend_marks.push(bt.elapsed());
                     }
                 }
+                mark!("backends_poll");
                 {
                     puffin::profile_scope!("midi_poll");
                     if let Ok(mut mg) = midi.try_lock() {
@@ -9133,6 +9166,7 @@ fn spawn_io_thread(
                         }
                     }
                 }
+                mark!("midi_poll");
                 // Tap gyro/accel samples into the per-pin scope rings so the
                 // calibration window can render at true polling Hz rather than
                 // UI repaint Hz. We do this BEFORE moving `signals` into the
@@ -9172,6 +9206,7 @@ fn spawn_io_thread(
                         }
                     }
                 }
+                mark!("scope_taps");
 
                 {
                     puffin::profile_scope!("publish_signals");
@@ -9190,6 +9225,7 @@ fn spawn_io_thread(
                     // map clone under a RwLock.
                     proc_device_signals.store(std::sync::Arc::new(signals));
                 }
+                mark!("publish");
 
                 // ── Enumerate gilrs devices periodically ──────────────────────
                 // MIDI enumeration is handled by spawn_midi_watch_thread() so
@@ -9198,14 +9234,23 @@ fn spawn_io_thread(
                 if last_enum.elapsed() > Duration::from_secs(2) {
                     puffin::profile_scope!("enumerate_devices");
                     let mut devs: Vec<PhysicalDevice> = Vec::new();
-                    for backend in &mut backends {
+                    // Per-backend rows in the stall report (absolute durations,
+                    // alongside the "enumerate" section total): a stall here has
+                    // hidden in both backends already (gilrs classification,
+                    // SDL's open-probe), so name the culprit directly.
+                    for (bi, backend) in backends.iter_mut().enumerate() {
+                        let bt = Instant::now();
                         devs.extend(backend.enumerate());
+                        let name: &'static str =
+                            match bi { 0 => "enum_b0", 1 => "enum_b1", _ => "enum_bN" };
+                        sect_marks.push((name, bt.elapsed()));
                     }
                     // Append MIDI device list maintained by the MIDI watch thread.
                     devs.extend(shared_midi_devices.read().unwrap().iter().cloned());
                     *shared_devices.write().unwrap() = devs;
                     last_enum = Instant::now();
                 }
+                mark!("enumerate");
 
                 // ── Get latest sink outputs from processing thread ─────────────
                 // Uses a separate RwLock so this read never contends on proc_outputs.
@@ -9213,6 +9258,7 @@ fn spawn_io_thread(
                     puffin::profile_scope!("read_sink_bus");
                     sink_bus.read().unwrap().clone()
                 };
+                mark!("sink_bus");
 
                 // ── Drive virtual & physical devices ──────────────────────────
                 // Shared pool holds ALL virtual devices across every open
@@ -9336,6 +9382,7 @@ fn spawn_io_thread(
                         }
                     }
                 }
+                mark!("virtual_route");
 
                 // Physical device outputs (rumble, lightbar) to gilrs pads run
                 // regardless of bypass: these carry *incoming* feedback the game
@@ -9454,6 +9501,30 @@ fn spawn_io_thread(
                         }
                         for dev_id in expired { ping_until.remove(&dev_id); }
                     }
+                }
+                mark!("outputs_misc");
+
+                // ── Stall report (see I/O stall diagnostics above) ────────────
+                // Checked BEFORE the sleep so only busy time counts. Formats
+                // lazily: nothing allocates unless a stall actually happened.
+                let busy = t0.elapsed();
+                if busy.as_millis() >= STALL_LOG_MS {
+                    let mut line = format!(
+                        "[io-stall] +{:.1}s busy {:.1}ms:",
+                        io_started.elapsed().as_secs_f32(),
+                        busy.as_secs_f32() * 1e3,
+                    );
+                    for (name, d) in &sect_marks {
+                        if d.as_micros() >= 500 {
+                            line.push_str(&format!(" {}={:.1}ms", name, d.as_secs_f32() * 1e3));
+                        }
+                    }
+                    for (i, d) in backend_marks.iter().enumerate() {
+                        if d.as_micros() >= 500 {
+                            line.push_str(&format!(" backend{}={:.1}ms", i, d.as_secs_f32() * 1e3));
+                        }
+                    }
+                    eprintln!("{line}");
                 }
 
                 let elapsed = t0.elapsed();

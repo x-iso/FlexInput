@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use hidapi::{HidApi, HidDevice};
 
@@ -248,16 +249,147 @@ struct OutputState {
 }
 
 pub struct GyroManager {
-    api: Option<HidApi>,
+    /// Shared with the gilrs backend's background classification worker — the
+    /// ONLY place allowed to call the slow (~110-200 ms on Windows)
+    /// `refresh_devices()`. Everything on the I/O thread reads the cached list
+    /// under a short lock and never refreshes inline.
+    api: Option<Arc<Mutex<HidApi>>>,
     // key: (vid, pid, instance_index)
     devices: HashMap<(u16, u16, usize), HidEntry>,
     // tracks the last failed open attempt to rate-limit retries
     failed_opens: HashMap<(u16, u16, usize), Instant>,
+    /// Set when an open retry would previously have refreshed the device list
+    /// inline (a ~110-200 ms stall ON the 500 Hz I/O loop, every RETRY_INTERVAL
+    /// while a gyro-capable pad persistently failed to open — the "variable
+    /// gaps" polling freeze). Drained by the gilrs backend, which turns it into
+    /// an async refresh+reclassify job on the worker instead.
+    refresh_wanted: bool,
+    /// Job side of the "hid-open" worker: device opens AND the Switch Pro init
+    /// handshake run off-thread. The handshake is the ~600 ms io-stall
+    /// fingerprint over Bluetooth (100 ms USB-probe timeout + subcommand acks
+    /// + four 50 ms×N SPI calibration reads) — a BT pad that hiccups every few
+    /// seconds used to freeze ALL input for that long on every reopen.
+    open_tx: Option<mpsc::Sender<(u16, u16, usize)>>,
+    /// Result side: `(key, opened)` — `None` payload = open/init failed
+    /// (stamped into `failed_opens` for the normal rate-limited retry).
+    open_rx: Option<mpsc::Receiver<((u16, u16, usize), Option<OpenedDevice>)>>,
+    /// Keys with an open in flight, so `read()` doesn't re-request every tick.
+    opens_pending: HashSet<(u16, u16, usize)>,
+}
+
+/// The `Send`-safe parts of a freshly opened device, produced by the
+/// "hid-open" worker. `HidEntry` itself is assembled on the I/O thread because
+/// `DeviceKind::DualSense`'s lazily-created WASAPI haptic stream must never
+/// cross threads — the worker only ever ships the raw handle + init results.
+struct OpenedDevice {
+    device: HidDevice,
+    kind_tag: KindTag,
+    /// Switch Pro only: SPI calibration + subcommand counter from the init
+    /// handshake (run to completion on the worker).
+    calib: Option<SwitchProCalib>,
+    packet_counter: u8,
+}
+
+/// Background worker loop: performs `open_and_init` (device-list read + open
+/// under a short api lock, then the slow Switch Pro handshake with the lock
+/// RELEASED) and ships the result back. One job at a time — opens are rare
+/// (connect/reconnect) and ordering doesn't matter.
+fn open_worker(
+    api: Arc<Mutex<HidApi>>,
+    jobs: mpsc::Receiver<(u16, u16, usize)>,
+    done: mpsc::Sender<((u16, u16, usize), Option<OpenedDevice>)>,
+) {
+    while let Ok((vid, pid, idx)) = jobs.recv() {
+        let opened = open_and_init(&api, vid, pid, idx);
+        if done.send(((vid, pid, idx), opened)).is_err() {
+            break; // manager dropped — exit the thread
+        }
+    }
 }
 
 impl GyroManager {
     pub fn new() -> Self {
-        Self { api: HidApi::new().ok(), devices: HashMap::new(), failed_opens: HashMap::new() }
+        let api = HidApi::new().ok().map(|a| Arc::new(Mutex::new(a)));
+        let mut open_tx = None;
+        let mut open_rx = None;
+        if let Some(api) = api.clone() {
+            let (jtx, jrx) = mpsc::channel();
+            let (dtx, drx) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("hid-open".into())
+                .spawn(move || open_worker(api, jrx, dtx))
+                .is_ok();
+            if spawned {
+                open_tx = Some(jtx);
+                open_rx = Some(drx);
+            }
+        }
+        Self {
+            api,
+            devices: HashMap::new(),
+            failed_opens: HashMap::new(),
+            refresh_wanted: false,
+            open_tx,
+            open_rx,
+            opens_pending: HashSet::new(),
+        }
+    }
+
+    /// Adopt finished opens from the worker: successes become live entries
+    /// (unless the key raced back in), failures get the normal rate-limited
+    /// retry stamp.
+    fn drain_finished_opens(&mut self) {
+        let Some(rx) = &self.open_rx else { return };
+        while let Ok((key, opened)) = rx.try_recv() {
+            self.opens_pending.remove(&key);
+            match opened {
+                Some(o) if !self.devices.contains_key(&key) => {
+                    let kind = match o.kind_tag {
+                        KindTag::Ds4 => DeviceKind::Ds4,
+                        KindTag::DualSense => DeviceKind::DualSense {
+                            connection: None,
+                            bt_seq: 0,
+                            #[cfg(windows)]
+                            haptic: None,
+                        },
+                        KindTag::SwitchPro => DeviceKind::SwitchPro {
+                            initialized: true, // handshake ran on the worker
+                            packet_counter: o.packet_counter,
+                            calib: o.calib,
+                        },
+                    };
+                    self.devices.insert(key, HidEntry {
+                        device: o.device,
+                        kind,
+                        last: HidReading::default(),
+                        out: OutputState::default(),
+                        last_sent: None,
+                        last_sent_at: None,
+                        output_active: false,
+                        event_count: 0,
+                        spike_enabled: true,
+                        spike_sensitivity: 50.0,
+                        spike_anchor: None,
+                        spike_pending: None,
+                    });
+                }
+                Some(_) => {} // key already live again — drop the duplicate handle
+                None => { self.failed_opens.insert(key, Instant::now()); }
+            }
+        }
+    }
+
+    /// Handle to the shared hidapi instance for the background refresh/classify
+    /// worker. `None` when hidapi failed to initialize (classification then
+    /// stays empty and gyro reads are unavailable, same as before).
+    pub(crate) fn shared_api(&self) -> Option<Arc<Mutex<HidApi>>> {
+        self.api.clone()
+    }
+
+    /// True once per request: an open retry wanted a fresh device list. The
+    /// gilrs backend drains this in `enumerate()` and kicks the async worker.
+    pub(crate) fn take_refresh_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_wanted)
     }
 
     /// Returns the latest IMU + touchpad reading for the Nth physical device with this VID/PID.
@@ -268,28 +400,36 @@ impl GyroManager {
         }
 
         if !self.devices.contains_key(&(vid, pid, idx)) {
+            // Opens run on the "hid-open" worker: open_path on a flaky BT link
+            // plus the Switch Pro init handshake cost ~600 ms, and doing them
+            // here froze ALL input on every reconnect. Adopt any finished
+            // opens, then (rate-limited) request one if the key is still dark.
+            self.drain_finished_opens();
             let key = (vid, pid, idx);
-            let should_try = self.failed_opens.get(&key)
-                .map_or(true, |t| t.elapsed() >= RETRY_INTERVAL);
-            if should_try {
-                // Refresh device list so newly-plugged devices are visible.
-                if let Some(api) = &mut self.api {
-                    let _ = api.refresh_devices();
+            if !self.devices.contains_key(&key) {
+                let should_try = !self.opens_pending.contains(&key)
+                    && self.failed_opens.get(&key)
+                        .map_or(true, |t| t.elapsed() >= RETRY_INTERVAL);
+                if should_try {
+                    // Also ask the classify worker for a fresh device list —
+                    // never inline (the ~110-200 ms call). The open job uses
+                    // the current cached list; if the device only shows up in
+                    // the fresh one, the next retry picks it up.
+                    self.refresh_wanted = true;
+                    match &self.open_tx {
+                        Some(tx) if tx.send(key).is_ok() => {
+                            self.opens_pending.insert(key);
+                        }
+                        _ => { self.failed_opens.insert(key, Instant::now()); }
+                    }
                 }
-                match self.open_device(vid, pid, idx) {
-                    Some(entry) => { self.devices.insert(key, entry); }
-                    None        => { self.failed_opens.insert(key, Instant::now()); }
-                }
+                return None; // nothing to read until the worker delivers
             }
         }
 
         let entry = self.devices.get_mut(&(vid, pid, idx))?;
-
-        if let DeviceKind::SwitchPro { initialized, packet_counter, calib } = &mut entry.kind {
-            if !*initialized {
-                *initialized = init_switch_pro(&entry.device, packet_counter, calib);
-            }
-        }
+        // (Switch Pro init used to run lazily right here, blocking the I/O
+        // thread — it now completes on the worker before the entry exists.)
 
         // If reading fails (device disconnected), drop and retry next cycle.
         let ok = drain_reports(entry);
@@ -332,159 +472,6 @@ impl GyroManager {
             .unwrap_or(0)
     }
 
-    /// Ordered device-info list for the Nth-device addressing scheme used
-    /// throughout this module: the gamepad interface for `(vid, pid)`, with the
-    /// same primary/fallback selection as [`open_device`]. Shared so the
-    /// virtual/real path classifier (`is_own_virtual_instance`) and `open_device`
-    /// index into an identical ordering and can never drift apart.
-    fn gamepad_device_list(&self, vid: u16, pid: u16) -> Vec<&hidapi::DeviceInfo> {
-        let api = match self.api.as_ref() {
-            Some(a) => a,
-            None => return Vec::new(),
-        };
-        let kind_tag = classify(vid, pid);
-
-        // Primary filter: usage_page + usage (correct, but returns 0 when HidHide
-        // intercepts enumeration on Windows even for whitelisted apps).
-        let mut paths: Vec<_> = api
-            .device_list()
-            .filter(|d| {
-                d.vendor_id() == vid
-                    && d.product_id() == pid
-                    && d.usage_page() == USAGE_PAGE_GENERIC_DESKTOP
-                    && d.usage() == USAGE_GAMEPAD
-            })
-            .collect();
-
-        // Fallback: if usage fields came back as 0 (HidHide / Windows quirk),
-        // use known interface numbers for each controller instead.
-        if paths.is_empty() {
-            if let Some(kind_tag) = &kind_tag {
-                let iface = preferred_interface(kind_tag);
-                paths = api
-                    .device_list()
-                    .filter(|d| {
-                        d.vendor_id() == vid
-                            && d.product_id() == pid
-                            && d.interface_number() == iface
-                    })
-                    .collect();
-            }
-        }
-
-        // Last resort: accept any interface with the right VID/PID (e.g. BT
-        // connections that only expose a single interface).
-        if paths.is_empty() {
-            paths = api
-                .device_list()
-                .filter(|d| d.vendor_id() == vid && d.product_id() == pid)
-                .collect();
-        }
-        paths
-    }
-
-    /// Refresh hidapi's cached device list. On Windows this is the SLOW call
-    /// (~200 ms here — hidapi opens each HID device to read its capabilities),
-    /// so it must NOT run on the 500 Hz I/O loop. Call it only when the device
-    /// set actually changed (a controller was plugged/unplugged), then read the
-    /// cached list via `is_own_virtual_instance` / `gamepad_device_list`.
-    pub fn refresh_device_list(&mut self) {
-        if let Some(api) = self.api.as_mut() {
-            let _ = api.refresh_devices();
-        }
-    }
-
-    /// True if the Nth physical device with this VID/PID is one of FlexInput's
-    /// OWN emulated HIDMaestro controllers, judged by its device instance path.
-    ///
-    /// This is the discriminator that finally works where the name/uuid markers
-    /// failed: gilrs's WGI backend reports a generic name ("HID-compliant game
-    /// controller") and a nil uuid for both a real and an emulated same-VID/PID
-    /// pad, but the underlying HID **instance path** differs — a real controller
-    /// enumerates as `HID\VID_054C&PID_0CE6&MI_..` (USB) or under `BTHENUM`,
-    /// while a HIDMaestro device is ROOT-enumerated and appears as
-    /// `HID\HIDCLASS\..` (its path has no `VID_`/`PID_` tokens). `idx` is the
-    /// same Nth-device index the gilrs walk derives per VID/PID, so the two
-    /// stay correlated. Returns false for non-PS devices and out-of-range idx.
-    ///
-    /// Reads hidapi's CACHED list (no refresh) — callers must call
-    /// `refresh_device_list()` first whenever the device set may have changed.
-    pub fn is_own_virtual_instance(&self, vid: u16, pid: u16, idx: usize) -> bool {
-        let paths = self.gamepad_device_list(vid, pid);
-        match paths.get(idx) {
-            Some(info) => instance_path_is_virtual(&info.path().to_string_lossy()),
-            None => false,
-        }
-    }
-
-    fn open_device(&self, vid: u16, pid: u16, idx: usize) -> Option<HidEntry> {
-        let api = self.api.as_ref()?;
-        let kind_tag = classify(vid, pid)?; // bail early for non-PS/Switch VID/PID
-        // Real devices only: our own virtual (ROOT-enumerated `HIDCLASS`/`HIDMAESTRO`
-        // path) must never be a gyro/HID target. Excluding it here — combined with the
-        // real-only index the gilrs walk now produces (poll skips is_virt) and
-        // lookup_phys — keeps the (vid,pid,idx) handle selection stable even when a
-        // same-VID/PID virtual shares the bus, where the raw list order is not. The
-        // virtual/real CLASSIFIER (`is_own_virtual_instance`) still reads the full list.
-        let paths: Vec<&hidapi::DeviceInfo> = self
-            .gamepad_device_list(vid, pid)
-            .into_iter()
-            .filter(|d| !instance_path_is_virtual(&d.path().to_string_lossy()))
-            .collect();
-
-        #[cfg(debug_assertions)]
-        eprintln!("[gyro] open_device vid={:04X} pid={:04X} idx={} iface={} path={:?}",
-            vid, pid, idx,
-            paths.get(idx).map_or(-1, |p| p.interface_number()),
-            paths.get(idx).map(|p| p.path()));
-
-        let info = paths.get(idx)?;
-        let device = match api.open_path(info.path()) {
-            Ok(d) => d,
-            Err(e) => {
-                #[cfg(debug_assertions)]
-                eprintln!("[gyro] open_path failed: {e}");
-                return None;
-            }
-        };
-        device.set_blocking_mode(false).ok()?;
-
-        // On Windows, DualSense/DS4 LED output (report 0x02) is only processed by
-        // the firmware when sent to interface 0 — but that interface is owned
-        // exclusively by the Windows HID class driver and cannot be opened from
-        // userspace. All LED/lightbar control is therefore unavailable on Windows
-        // unless a WinRT (Windows.Gaming.Input) path is implemented in the future.
-        // Trigger effects and rumble go to interface 3 (the accessible IMU interface)
-        // and the firmware processes those fields on that interface.
-        let kind = match kind_tag {
-            KindTag::Ds4       => DeviceKind::Ds4,
-            KindTag::DualSense => DeviceKind::DualSense {
-                connection: None,
-                bt_seq: 0,
-                #[cfg(windows)]
-                haptic: None,
-            },
-            KindTag::SwitchPro => DeviceKind::SwitchPro {
-                initialized: false,
-                packet_counter: 0,
-                calib: None,
-            },
-        };
-        Some(HidEntry {
-            device,
-            kind,
-            last: HidReading::default(),
-            out: OutputState::default(),
-            last_sent: None,
-            last_sent_at: None,
-            output_active: false,
-            event_count: 0,
-            spike_enabled: true,
-            spike_sensitivity: 50.0,
-            spike_anchor: None,
-            spike_pending: None,
-        })
-    }
 
     /// Stage one byte of an output report (rumble/lightbar) for the Nth physical
     /// device with this VID/PID. Has no effect if the device isn't open. Call
@@ -686,6 +673,141 @@ impl GyroManager {
 /// path is `\\?\HID#VID_054C&PID_0CE6&MI_03#...` and a Bluetooth one carries a
 /// `{bth-guid}` / `BTHENUM` segment. We key on the positive virtual signal
 /// (`HIDCLASS` without a `VID_` token) so a real device is never mis-flagged.
+/// Ordered device-info list for the Nth-device addressing scheme used
+/// throughout this module: the gamepad interface for `(vid, pid)`, with the
+/// same primary/fallback selection as `open_device`. A free function over a
+/// caller-held `&HidApi` so the I/O-thread readers (short lock on the shared
+/// api) and the background refresh/classify worker (holds the lock across its
+/// `refresh_devices()`) index into an identical ordering and can never drift.
+pub(crate) fn gamepad_device_list_of(api: &HidApi, vid: u16, pid: u16) -> Vec<hidapi::DeviceInfo> {
+    let kind_tag = classify(vid, pid);
+
+    // Primary filter: usage_page + usage (correct, but returns 0 when HidHide
+    // intercepts enumeration on Windows even for whitelisted apps).
+    let mut paths: Vec<hidapi::DeviceInfo> = api
+        .device_list()
+        .filter(|d| {
+            d.vendor_id() == vid
+                && d.product_id() == pid
+                && d.usage_page() == USAGE_PAGE_GENERIC_DESKTOP
+                && d.usage() == USAGE_GAMEPAD
+        })
+        .cloned()
+        .collect();
+
+    // Fallback: if usage fields came back as 0 (HidHide / Windows quirk),
+    // use known interface numbers for each controller instead.
+    if paths.is_empty() {
+        if let Some(kind_tag) = &kind_tag {
+            let iface = preferred_interface(kind_tag);
+            paths = api
+                .device_list()
+                .filter(|d| {
+                    d.vendor_id() == vid
+                        && d.product_id() == pid
+                        && d.interface_number() == iface
+                })
+                .cloned()
+                .collect();
+        }
+    }
+
+    // Last resort: accept any interface with the right VID/PID (e.g. BT
+    // connections that only expose a single interface).
+    if paths.is_empty() {
+        paths = api
+            .device_list()
+            .filter(|d| d.vendor_id() == vid && d.product_id() == pid)
+            .cloned()
+            .collect();
+    }
+    paths
+}
+
+/// Open the Nth physical `(vid, pid)` gamepad and run any per-device init —
+/// the WORKER side of the open path ("hid-open" thread). The device list read
+/// and `open_path` hold the shared api lock only briefly; the Switch Pro init
+/// handshake (~600 ms worst case over Bluetooth: USB-probe timeout +
+/// subcommand acks + four SPI calibration reads) runs with the lock RELEASED
+/// so nothing else queues behind it. Returns `None` on open failure or a
+/// failed handshake — callers treat both as a rate-limited retry.
+fn open_and_init(api: &Arc<Mutex<HidApi>>, vid: u16, pid: u16, idx: usize) -> Option<OpenedDevice> {
+    let kind_tag = classify(vid, pid)?; // bail early for non-PS/Switch VID/PID
+    let device = {
+        let guard = api.lock().ok()?;
+        // Real devices only: our own virtual (ROOT-enumerated `HIDCLASS`/
+        // `HIDMAESTRO` path) must never be a gyro/HID target. Excluding it here
+        // — combined with the real-only index the gilrs walk produces (poll
+        // skips is_virt) and lookup_phys — keeps the (vid,pid,idx) handle
+        // selection stable even when a same-VID/PID virtual shares the bus,
+        // where the raw list order is not. The virtual/real CLASSIFIER
+        // (`classify_own_virtual`) still reads the full list.
+        let paths: Vec<hidapi::DeviceInfo> = gamepad_device_list_of(&guard, vid, pid)
+            .into_iter()
+            .filter(|d| !instance_path_is_virtual(&d.path().to_string_lossy()))
+            .collect();
+
+        #[cfg(debug_assertions)]
+        eprintln!("[gyro] open_and_init vid={:04X} pid={:04X} idx={} iface={} path={:?}",
+            vid, pid, idx,
+            paths.get(idx).map_or(-1, |p| p.interface_number()),
+            paths.get(idx).map(|p| p.path()));
+
+        let info = paths.get(idx)?;
+        match guard.open_path(info.path()) {
+            Ok(d) => d,
+            Err(e) => {
+                #[cfg(debug_assertions)]
+                eprintln!("[gyro] open_path failed: {e}");
+                return None;
+            }
+        }
+    };
+    device.set_blocking_mode(false).ok()?;
+
+    // On Windows, DualSense/DS4 LED output (report 0x02) is only processed by
+    // the firmware when sent to interface 0 — but that interface is owned
+    // exclusively by the Windows HID class driver and cannot be opened from
+    // userspace. All LED/lightbar control is therefore unavailable on Windows
+    // unless a WinRT (Windows.Gaming.Input) path is implemented in the future.
+    // Trigger effects and rumble go to interface 3 (the accessible IMU interface)
+    // and the firmware processes those fields on that interface.
+    let mut packet_counter = 0u8;
+    let mut calib = None;
+    if matches!(kind_tag, KindTag::SwitchPro) {
+        // Run the handshake to completion HERE (lock released). A failed init
+        // is a failed open: the entry never ships half-initialized, and the
+        // rate-limited retry gets a clean attempt — the old lazy re-init that
+        // ran on every read() from the I/O thread is gone.
+        if !init_switch_pro(&device, &mut packet_counter, &mut calib) {
+            return None;
+        }
+    }
+    Some(OpenedDevice { device, kind_tag, calib, packet_counter })
+}
+
+/// True if the Nth physical device with this VID/PID is one of FlexInput's
+/// OWN emulated HIDMaestro controllers, judged by its device instance path.
+///
+/// This is the discriminator that finally works where the name/uuid markers
+/// failed: gilrs's WGI backend reports a generic name ("HID-compliant game
+/// controller") and a nil uuid for both a real and an emulated same-VID/PID
+/// pad, but the underlying HID **instance path** differs — a real controller
+/// enumerates as `HID\VID_054C&PID_0CE6&MI_..` (USB) or under `BTHENUM`,
+/// while a HIDMaestro device is ROOT-enumerated and appears as
+/// `HID\HIDCLASS\..` (its path has no `VID_`/`PID_` tokens). `idx` is the
+/// same Nth-device index the gilrs walk derives per VID/PID, so the two
+/// stay correlated. Returns false for non-PS devices and out-of-range idx.
+///
+/// Reads the list as-is (no refresh) — the classify worker refreshes the
+/// shared api first, then calls this against the same locked instance.
+pub(crate) fn classify_own_virtual(api: &HidApi, vid: u16, pid: u16, idx: usize) -> bool {
+    match gamepad_device_list_of(api, vid, pid).get(idx) {
+        Some(info) => instance_path_is_virtual(&info.path().to_string_lossy()),
+        None => false,
+    }
+}
+
 fn instance_path_is_virtual(path: &str) -> bool {
     let up = path.to_ascii_uppercase();
     // Explicit HIDMaestro SWD form (belt-and-suspenders; the HID child usually
