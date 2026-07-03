@@ -9140,8 +9140,12 @@ fn spawn_io_thread(
             // names its guilty section without attaching a profiler — the
             // every-few-seconds gap class of bug has now hidden in three
             // different sections (enumerate classification, gyro open retry,
-            // and counting), so keep this permanently.
+            // and counting), so the instrumentation stays permanently. The
+            // stderr report is opt-in (FLEXINPUT_IO_STALL_LOG=1): with the
+            // known causes fixed, remaining hits are benign one-shots
+            // (hotplug arrivals) that would only add log noise.
             const STALL_LOG_MS: u128 = 25;
+            let stall_log = std::env::var("FLEXINPUT_IO_STALL_LOG").map_or(false, |v| v == "1");
             let io_started = Instant::now();
             let mut sect_marks: Vec<(&'static str, Duration)> = Vec::with_capacity(12);
             let mut backend_marks: Vec<Duration> = Vec::with_capacity(4);
@@ -9555,7 +9559,7 @@ fn spawn_io_thread(
                 // Checked BEFORE the sleep so only busy time counts. Formats
                 // lazily: nothing allocates unless a stall actually happened.
                 let busy = t0.elapsed();
-                if busy.as_millis() >= STALL_LOG_MS {
+                if stall_log && busy.as_millis() >= STALL_LOG_MS {
                     let mut line = format!(
                         "[io-stall] +{:.1}s busy {:.1}ms:",
                         io_started.elapsed().as_secs_f32(),
