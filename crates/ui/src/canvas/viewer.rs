@@ -2662,7 +2662,7 @@ fn asth_slider_row(
         ui.spacing_mut().item_spacing.x = 0.0;
         slider_label(ui, label, label_w);
         // Rail extends to the SHARED right edge so every row's control lines up.
-        let w = (asth_row_right_edge(body_w, scale) - label_w).max(40.0);
+        let w = (asth_row_right_edge(body_w, scale) - label_w).max(40.0 * scale);
         ui.spacing_mut().slider_width = w;
         *changed |= add(ui, w).changed();
     }).response.rect
@@ -2717,7 +2717,7 @@ fn asth_value_row(
         // Value box right edge = the shared row right edge; rail fills the space
         // between the label and the box.
         let right_edge = asth_row_right_edge(body_w, scale);
-        let rail_w = (right_edge - val_box_w - gap - label_w).max(40.0);
+        let rail_w = (right_edge - val_box_w - gap - label_w).max(40.0 * scale);
         ui.spacing_mut().slider_width = rail_w;
         *changed |= draw(ui, rail_w, val_box_w);
     }).response.rect
@@ -2838,7 +2838,7 @@ fn asth_draw_row(
             // Range slider stops short of the shared edge to leave room for the curve
             // box, which fills the trailing slot and reaches the shared edge — so the
             // curve box's right edge lines up with the value boxes above.
-            let sw = (asth_amp_slider_right(body_w, scale) - label_w).clamp(40.0, 800.0);
+            let sw = (asth_amp_slider_right(body_w, scale) - label_w).clamp(40.0 * scale, 800.0 * scale);
             let mut lo = a.amp_min; let mut hi = a.amp_max;
             let r = crate::canvas::header_controls::range_slider(ui, &mut lo, &mut hi, 0.0, 1.0, sw)
                 .on_hover_text("Floor (lift weak audio off the dead zone) … ceiling (cap). Curve box reshapes the response.");
@@ -2883,8 +2883,36 @@ fn asth_draw_row(
 /// authored height. Returns the applied scale so the caller can scale the row's fixed
 /// cell widths (label / value box) by the SAME factor — otherwise the grown text
 /// overflows those fixed cells (the overlap/crop the user saw).
-fn apply_asth_row_height_scale(ui: &mut egui::Ui, container_h: f32, natural_h: f32) -> f32 {
-    let scale = (container_h / natural_h.max(1.0)).clamp(0.6, 4.0);
+/// Analytic minimum row width at scale 1.0: fixed cells (label / value box /
+/// curve box / inset) plus the flexible rail collapsed to its 40px minimum.
+/// Used to cap the height-driven scale by the available WIDTH — without it a
+/// short-and-narrow pin grows its text until nothing is left for the slider.
+fn asth_row_min_w(row: AsthRow) -> f32 {
+    match row {
+        // Capture-mode block: App/Focused/System selector + caption.
+        AsthRow::Mode => 240.0,
+        // label 64 + rail 40 + gap 4 + value box 50 + inset 6.
+        AsthRow::Volume | AsthRow::Release | AsthRow::Crossover => 164.0,
+        // label 64 + rail 40 + gap 4 + curve box 34 + inset 6.
+        AsthRow::Amplitude => 148.0,
+        // label 64 + rail 40 + inset 6.
+        AsthRow::Balance | AsthRow::RumbleMix => 110.0,
+        // label cell + "HF carrier / LF texture" checkbox.
+        AsthRow::Swap => 230.0,
+    }
+}
+
+/// Publish an ASTH pin's analytic natural size into the shared per-pin cache
+/// (same one the measured row widgets use), so the layout resize handle can
+/// constrain the frame to the no-crop envelope via `clamp_pin_frame_to_content`.
+fn asth_seed_pin_natural(ui: &egui::Ui, natural: egui::Vec2) {
+    if let Some(k) = ui.ctx().data(|d| d.get_temp::<egui::Id>(pin_ws_key_scratch())) {
+        ui.ctx().data_mut(|d| d.insert_temp(k, natural));
+    }
+}
+
+fn apply_asth_row_height_scale(ui: &mut egui::Ui, container_h: f32, natural_h: f32, max_scale: f32) -> f32 {
+    let scale = (container_h / natural_h.max(1.0)).min(max_scale).clamp(0.5, 4.0);
     if (scale - 1.0).abs() < 0.02 { return 1.0; }
     let style = ui.style_mut();
     for (_, font_id) in style.text_styles.iter_mut() {
@@ -3000,7 +3028,10 @@ fn render_asth_pinned_mode(
 ) {
     let mut a = asth_params_from_node(snarl, inner_id);
     ui.set_max_width(container.x);
-    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 96.0);
+    let min_w = asth_row_min_w(AsthRow::Mode);
+    asth_seed_pin_natural(ui, egui::vec2(min_w, 96.0));
+    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 96.0,
+        container.x / min_w);
     let _ = scale; // height-scale applies to text/spacing via the style mutation above
     let body_w = container.x.clamp(120.0, 1200.0);
     let (changed, _rect) = asth_draw_mode_block(ui, &mut a, body_w, ui.id().with(inner_id));
@@ -3025,11 +3056,15 @@ fn render_asth_pinned_row(
     let Some(row) = AsthRow::from_element_id(element_id) else { return; };
     let mut a = asth_params_from_node(snarl, inner_id);
     ui.set_max_width(container.x);
-    // Height drives text/control scale; width drives the slider (via body_w below).
-    // The returned scale also grows the row's fixed cells (label / value box) so the
-    // enlarged text doesn't overflow them (no overlap/crop).
-    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 22.0);
-    let body_w = container.x.clamp(120.0, 1200.0);
+    // Height drives text/control scale; width drives the slider (via body_w
+    // below). The returned scale also grows the row's fixed cells (label /
+    // value box) so the enlarged text doesn't overflow them, and is capped by
+    // the width so those cells never squeeze the rail below its minimum.
+    let min_w = asth_row_min_w(row);
+    asth_seed_pin_natural(ui, egui::vec2(min_w, 22.0));
+    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 22.0,
+        container.x / min_w);
+    let body_w = container.x.clamp(40.0, 1200.0);
     let (changed, _rect) = asth_draw_row(ui, row, &mut a, body_w, scale);
     if changed { asth_write_params(snarl, inner_id, &a); }
 }
@@ -5485,6 +5520,8 @@ fn render_envelope_sustain_row(
     let mut fr: Vec<egui::Rect> = Vec::with_capacity(2);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Sustain").small().weak());
+        // Flexible element: the slider absorbs surplus container width.
+        ui.spacing_mut().slider_width = pin_flex_width(ui, container, 70.0);
         let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
             .show_value(false)
             .clamp_to_range(true);
@@ -6884,7 +6921,9 @@ pub(crate) fn show_subpatch_body(
         if snap_enabled && snap_grid > 0.5 { (v / snap_grid).round() * snap_grid } else { v }
     };
     let shift_held = ui.input(|i| i.modifiers.shift);
-    const RESIZE_HANDLE: f32 = 18.0;
+    // Kept small: the handle sits inside the item's corner, so its footprint
+    // is effectively the smallest frame you can still comfortably resize.
+    const RESIZE_HANDLE: f32 = 14.0;
     const MIN_W: f32 = 32.0;
     const MIN_H: f32 = 18.0;
 
@@ -7407,6 +7446,7 @@ pub(crate) fn show_subpatch_body(
                     ui.ctx().data_mut(|d| d.insert_temp(drag_size_id(idx), [prev[0], prev[1], ax, ay]));
                     let tw = snap(prev[0] + ax).max(MIN_W.min(8.0));
                     let th = snap(prev[1] + ay).max(MIN_H.min(8.0));
+                    let (tw, th) = clamp_pin_frame_to_content(ui, outer_id, it, tw, th);
                     new_size[idx] = Some([tw, th]);
                 }
             } else {
@@ -7875,6 +7915,35 @@ fn layout_item_context_menu(
     if ui.button("Unpin").clicked() { *delete_idx = Some(idx); ui.close_menu(); }
 }
 
+/// Clamp a layout-resize candidate size for a Module pin to its no-crop
+/// envelope, derived from the cached natural (scale-1.0, minimum-flex-width)
+/// content size: width can't go below what the scale floor needs for the
+/// text, and height can't demand a larger text scale than the width can hold.
+/// This makes the resize handle itself respect "contents never crop out of
+/// frame" — to get a taller row (bigger text) you first have to give it
+/// enough width for the enlarged labels plus the flexible parts' minimum.
+/// Pins without a cached natural (graphs, whole-module) are unconstrained.
+fn clamp_pin_frame_to_content(
+    ui: &egui::Ui,
+    outer_id: NodeId,
+    it: &LayoutItem,
+    w: f32,
+    h: f32,
+) -> (f32, f32) {
+    let LayoutItem::Module(m) = it else { return (w, h) };
+    let ws_key = egui::Id::new(("pin_ws_nat", outer_id.0, m.inner_node_id, m.element_id.as_str()));
+    let Some(nat) = ui.ctx().data(|d| d.get_temp::<egui::Vec2>(ws_key)) else { return (w, h) };
+    if nat.x < 1.0 || nat.y < 1.0 { return (w, h); }
+    // 0.5 is the scale floor in `apply_widget_scale`: any narrower and the
+    // text can no longer shrink to fit the frame.
+    let w = w.max(nat.x * 0.5);
+    // The largest text scale this width can hold (4.0 = the global ceiling —
+    // taller than that only adds empty space).
+    let s_max = (w / nat.x).min(4.0);
+    let h = h.clamp(nat.y * 0.5, nat.y * s_max);
+    (w, h)
+}
+
 /// Apply a Z-order action against a `Vec<LayoutItem>` (paint order).
 fn apply_zorder_action_items(items: &mut Vec<LayoutItem>, idx: usize, act: &str, n: usize) {
     match act {
@@ -7892,11 +7961,68 @@ fn sp_module_id(sp: Option<&crate::canvas::node::UiSubPatch>, inner_node_id: usi
         .map(|n| n.module_id.clone())
 }
 
-/// Dispatches to the appropriate per-element renderer for a pinned element.
-/// `element_id == "default"` renders the whole module body (back-compat path,
-/// for legacy patches that pinned entire bodies); other ids render just one
-/// UI element of the module sized to fit the user-chosen container.
+/// Dispatches to the appropriate per-element renderer for a pinned element,
+/// wrapping the dispatch with content-size measurement: after the element
+/// renders, its content size (normalized back to scale 1.0) is cached per pin
+/// so the next frame's `apply_widget_scale` fits the ACTUAL content to the
+/// container instead of a hard-coded estimate. This is what keeps row widgets
+/// scaling coherently with their frame and never cropping out of it.
 fn render_pinned_element(
+    inner_id: egui_snarl::NodeId,
+    module_id: &str,
+    element_id: &str,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    outer_snapshot: Option<&Snarl<NodeData>>,
+    outer_id: NodeId,
+    is_layout_mode: bool,
+    graph_override: Option<crate::canvas::node::PinGraphOverride>,
+) {
+    // Stable identity for this pin's natural-size cache: (outer node, inner
+    // node, element). Two pins of the same element share one entry, which is
+    // fine — they render identical content.
+    let ws_key = egui::Id::new(("pin_ws_nat", outer_id.0, inner_id.0, element_id));
+    ui.ctx().data_mut(|d| d.insert_temp(pin_ws_key_scratch(), ws_key));
+
+    render_pinned_element_impl(
+        inner_id, module_id, element_id, ui, inner_snarl, container_size,
+        live_signals, panic_shortcut, automap_parent, outer_snapshot,
+        outer_id, is_layout_mode, graph_override,
+    );
+
+    // `applied` is only present when the renderer routed through
+    // `apply_widget_scale` (row-style widgets). Graphs / whole-module pins
+    // size themselves to the container and are skipped.
+    let applied: Option<f32> = ui.ctx().data(|d| d.get_temp(pin_ws_applied_scratch()));
+    let stretch: f32 = ui.ctx().data(|d| d.get_temp(pin_ws_flex_scratch())).unwrap_or(0.0);
+    ui.ctx().data_mut(|d| {
+        d.remove::<egui::Id>(pin_ws_key_scratch());
+        d.remove::<f32>(pin_ws_applied_scratch());
+        d.remove::<egui::Vec2>(pin_ws_resolved_scratch());
+        d.remove::<f32>(pin_ws_flex_scratch());
+    });
+    if let Some(scale) = applied {
+        let measured = ui.min_rect().size();
+        if measured.x > 4.0 && measured.y > 4.0 && scale > 0.0 {
+            // Normalize back to scale 1.0, with any flexible-element stretch
+            // removed so the cache holds the row's MINIMUM width.
+            let nat = egui::vec2((measured.x - stretch).max(1.0), measured.y) / scale;
+            let prev: Option<egui::Vec2> = ui.ctx().data(|d| d.get_temp(ws_key));
+            // ~1px dead-band: font rasterization rounds a little differently
+            // at each scale; without it the fit oscillates while resizing.
+            if prev.map_or(true, |p| (p - nat).abs().max_elem() > 1.0) {
+                ui.ctx().data_mut(|d| d.insert_temp(ws_key, nat));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_pinned_element_impl(
     inner_id: egui_snarl::NodeId,
     module_id: &str,
     element_id: &str,
@@ -8905,9 +9031,18 @@ fn render_constant_value(
         .and_then(|n| n.params.get("value").and_then(|v| v.as_f64()))
         .unwrap_or(0.0) as f32;
     let mut v = value;
-    // Use the full container width for the dragvalue.
+    // Use the full container for the dragvalue; the box IS the whole pin, so
+    // (like the readout) its text scales with the container height rather
+    // than staying at theme size inside an ever-larger box.
     ui.set_max_width(container.x);
-    if ui.add_sized([container.x, 24.0], egui::DragValue::new(&mut v).speed(0.01)).changed() {
+    let h = container.y.max(18.0);
+    let font_scale = (h / 24.0).clamp(0.6, 3.5);
+    if (font_scale - 1.0).abs() > 0.02 {
+        for (_, font_id) in ui.style_mut().text_styles.iter_mut() {
+            font_id.size = (font_id.size * font_scale).max(6.0);
+        }
+    }
+    if ui.add_sized([container.x, h], egui::DragValue::new(&mut v).speed(0.01)).changed() {
         if let Some(node) = inner_snarl.get_node_mut(inner_id) {
             if let Some(n) = Number::from_f64(v as f64) {
                 node.params.insert("value".to_string(), Value::Number(n));
@@ -9523,11 +9658,63 @@ fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, scope: &str, 
     }
 }
 
+/// Ctx-data scratch: the natural-size cache key of the pin currently being
+/// rendered. Set by `render_pinned_element` before dispatch, read here so the
+/// measured content size (cached under that key) replaces the caller's guess.
+fn pin_ws_key_scratch() -> egui::Id { egui::Id::new("pin_ws_key_scratch") }
+/// Ctx-data scratch: the scale this pass actually applied, so
+/// `render_pinned_element` can normalize its post-render measurement.
+fn pin_ws_applied_scratch() -> egui::Id { egui::Id::new("pin_ws_applied_scratch") }
+/// Ctx-data scratch: the natural size `apply_widget_scale` resolved for the
+/// current pin (measured cache or fallback), read by `pin_flex_width`.
+fn pin_ws_resolved_scratch() -> egui::Id { egui::Id::new("pin_ws_resolved_scratch") }
+/// Ctx-data scratch: how much width the row's flexible element stretched
+/// beyond its minimum this pass. `render_pinned_element` subtracts it from the
+/// measured width so the cached natural always describes the row at MINIMUM
+/// flexible width (otherwise the fill would feed back into the measurement).
+fn pin_ws_flex_scratch() -> egui::Id { egui::Id::new("pin_ws_flex_scratch") }
+
+/// Width for the ONE width-flexible element of a pinned row (a slider rail):
+/// its minimum scaled width plus all of the container's surplus width. This is
+/// the ASTH row model — text scales with the frame HEIGHT, the slider absorbs
+/// extra WIDTH. Call after `apply_widget_scale`, at most once per row.
+fn pin_flex_width(ui: &egui::Ui, container: egui::Vec2, min_w: f32) -> f32 {
+    let scale: f32 = ui.ctx().data(|d| d.get_temp(pin_ws_applied_scratch())).unwrap_or(1.0);
+    let nat: Option<egui::Vec2> = ui.ctx().data(|d| d.get_temp(pin_ws_resolved_scratch()));
+    let surplus = match nat {
+        // `nat.x` is the row width with the flexible element at `min_w`.
+        Some(n) => (container.x - n.x * scale - 2.0).max(0.0),
+        None => 0.0,
+    };
+    ui.ctx().data_mut(|d| d.insert_temp(pin_ws_flex_scratch(), surplus));
+    min_w * scale + surplus
+}
+
 fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::Vec2) -> f32 {
-    // Settings widgets scale by the container WIDTH so they grow to fill the
-    // space as the pinned element is widened (height follows the content).
-    let scale = (container.x / natural.x.max(1.0)).clamp(0.5, 4.0);
-    if (scale - 1.0).abs() < 0.02 { return 1.0; }
+    // Text/controls scale with the container HEIGHT, capped by what the WIDTH
+    // can hold, so a pinned row grows with its frame but never crops out of
+    // it: when the frame is too narrow for the height-scaled text (plus the
+    // minimum width of any flexible element), the width cap wins and the text
+    // shrinks to keep the whole row inside the frame.
+    // `natural` is only a first-frame estimate: once the row has rendered
+    // once, `render_pinned_element` caches the measured content size (at
+    // minimum flexible width) and that replaces the estimate — so a
+    // snugly-framed row sits at ~1.0 and grows in lockstep with the frame.
+    let key: Option<egui::Id> = ui.ctx().data(|d| d.get_temp(pin_ws_key_scratch()));
+    let natural = key
+        .and_then(|k| ui.ctx().data(|d| d.get_temp::<egui::Vec2>(k)))
+        .unwrap_or(natural);
+    let mut scale = (container.y / natural.y.max(1.0))
+        .min(container.x / natural.x.max(1.0))
+        .clamp(0.5, 4.0);
+    if (scale - 1.0).abs() < 0.02 { scale = 1.0; }
+    if key.is_some() {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(pin_ws_applied_scratch(), scale);
+            d.insert_temp(pin_ws_resolved_scratch(), natural);
+        });
+    }
+    if scale == 1.0 { return 1.0; }
 
     // Scale all named text styles uniformly so labels, buttons, and DragValues
     // all grow together. Egui clones the style on edit, so this only affects
@@ -9542,6 +9729,8 @@ fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::V
     sp.interact_size.y = (sp.interact_size.y * scale).max(12.0);
     sp.icon_width      = (sp.icon_width * scale).max(8.0);
     sp.icon_width_inner = (sp.icon_width_inner * scale).max(6.0);
+    sp.slider_width    *= scale;
+    sp.combo_width     *= scale;
     scale
 }
 
@@ -9564,16 +9753,17 @@ fn render_dragvalue_param(
         .unwrap_or(default as f64) as f32;
     let mut v = cur;
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(160.0, 22.0));
+    apply_widget_scale(ui, container, egui::vec2(120.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).weak());
         let mut dv = egui::DragValue::new(&mut v).speed(speed).range(range);
         if let Some(d) = max_decimals { dv = dv.max_decimals(d); }
-        let label_w = ui.available_width() * 0.0; // available_width is now post-label
-        let _ = label_w;
-        let avail_w = ui.available_width().max(40.0);
-        let h = container.y.max(ui.spacing().interact_size.y);
-        if ui.add_sized([avail_w, h], dv).changed() {
+        // The value box is the row's flexible element: it fills the surplus
+        // width while its height (and text) tracks the scaled row metrics —
+        // sizing it to the container gave a huge box with tiny text in it.
+        let w = pin_flex_width(ui, container, 64.0);
+        let h = ui.spacing().interact_size.y;
+        if ui.add_sized([w, h], dv).changed() {
             if let (Some(node), Some(n)) = (
                 snarl.get_node_mut(inner_id),
                 Number::from_f64(v as f64),
@@ -9981,6 +10171,8 @@ fn render_oscilloscope_controls(
     apply_widget_scale(ui, container, egui::vec2(360.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Win").weak());
+        // Flexible element: the Win slider absorbs surplus container width.
+        ui.spacing_mut().slider_width = pin_flex_width(ui, container, 70.0);
         let r = ui.add(egui::Slider::new(&mut win_ms, 10.0f32..=10_000.0)
             .logarithmic(true).show_value(false));
         fr[0] = r.rect; changed |= r.changed();
@@ -10180,14 +10372,17 @@ fn render_response_curve_scale_row(
     }).unwrap_or((0.0, true, false));
 
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let s = apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     let mut changed = false;
     let mut fr: Vec<egui::Rect> = Vec::with_capacity(3);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Log").weak());
-        // Slider takes a portion of available width so it scales with the row.
-        let slider_w = (ui.available_width() * 0.45).clamp(40.0, 200.0);
-        let slider_h = ui.spacing().interact_size.y.min(20.0).max(10.0);
+        // ASTH row model: the slider is the row's flexible element — it takes
+        // its minimum scaled width plus ALL surplus container width, so the
+        // labels/checkboxes scale with the frame height while widening the
+        // frame lengthens the slider.
+        let slider_w = pin_flex_width(ui, container, 60.0);
+        let slider_h = (16.0 * s).max(10.0);
         let (slider_rect, slider_resp) =
             ui.allocate_exact_size(egui::vec2(slider_w, slider_h), egui::Sense::click_and_drag());
         fr.push(slider_rect);
@@ -12582,6 +12777,8 @@ fn render_trigscope_controls(
     apply_widget_scale(ui, container, egui::vec2(360.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Win").weak());
+        // Flexible element: the Win slider absorbs surplus container width.
+        ui.spacing_mut().slider_width = pin_flex_width(ui, container, 70.0);
         let r = ui.add(egui::Slider::new(&mut win_ms, 10.0f32..=10_000.0)
             .logarithmic(true).show_value(false));
         fr[0] = r.rect; changed |= r.changed();
@@ -14724,12 +14921,12 @@ fn render_vec_reshape_options_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &m
         n.params.get("renorm").and_then(|v| v.as_bool()).unwrap_or(true),
     )).unwrap_or(("quad4".into(), true));
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(210.0, 22.0));
+    let s = apply_widget_scale(ui, container, egui::vec2(210.0, 22.0));
     let mut changed = false;
     let mut fr: Vec<egui::Rect> = Vec::with_capacity(2);
     ui.horizontal(|ui| {
         let cb = egui::ComboBox::from_id_salt(("vrs_sym_pin", inner_id))
-            .width(80.0)
+            .width(80.0 * s)
             .selected_text(match sym.as_str() { "xmirror" => "X-mirror", _ => "4-way" })
             .show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut sym, "quad4".into(),   "4-way").changed();
