@@ -316,7 +316,7 @@ fn present_devnodes_matching(marker: &str) -> Vec<String> {
 
 /// All present XInput devnode instance ids (ids carrying the `&IG_` XInput
 /// interface tag — this covers both physical Xbox XUSB nodes and our own virtual
-/// companions, which enumerate under `ROOT\VID_..&PID_..&IG_00`).
+/// companions, which enumerate under `ROOT\VID_..&PID_..&IG_01`).
 pub fn present_xinput_devnodes() -> Vec<String> {
     present_devnodes_matching("&IG_")
 }
@@ -670,14 +670,26 @@ pub fn create_device_node(
     let desc = &profile.name;
     // The main HID node is the gamepad's HID identity. For an Xbox360-family
     // profile (XUSB companion) it follows the shipping HIDMaestro layout
-    // (DeviceNodeCreator, Xbox-legacy path): the HardwareID carries the **`&IG_00`**
+    // (DeviceNodeCreator, Xbox-legacy path): the HardwareID carries an **`&IG_`**
     // suffix — which makes HIDAPI/SDL3 skip it (gamecontroller blocklist) so they
     // fall back to XInput — and the enumerator matches that form. The XInput
     // identity itself comes from the separate XUSB companion (create_xusb_companion_
     // node); this node just supplies the HID/WGI gamepad face with FunctionMode=1.
     // Plain-HID profiles (DS4/DualSense) keep the standard HIDClass enumerator.
+    //
+    // The tag is `IG_01`, NOT the upstream `IG_00`: Windows 11's inbox
+    // xinputhid.inf (seen on 26H1, 10.0.28000) gained an exact hardware-id model
+    // entry `HID\VID_045E&PID_02FF&IG_00` ("XINPUT compatible HID device" — the
+    // GIP compat id real Xbox One wired pads expose). With IG_00 it binds
+    // xinputhid.sys to our identity node's HID child, which publishes a SECOND
+    // XUSB ({EC87F1E3}) interface → a phantom xinput1_4 slot (at index 0, ahead
+    // of the live companion) serving empty data. All consumers that care about
+    // the tag (SDL/HIDAPI blocklist, DirectInput's XInput detection, our own
+    // scans) substring-match on `IG_`, so IG_01 keeps every intended behavior
+    // while never matching the INF's exact-id entries. Win10 lacks the entry,
+    // which is why the phantom only appeared on Win11.
     let (enumerator, hw_id) = if profile.requires_xusb_companion {
-        let e = format!("VID_{:04X}&PID_{:04X}&IG_00", profile.vid, profile.pid);
+        let e = format!("VID_{:04X}&PID_{:04X}&IG_01", profile.vid, profile.pid);
         let h = format!("root\\{e}");
         (e, h)
     } else {
@@ -748,8 +760,11 @@ pub fn create_device_node(
         // main node is only the HID/WGI gamepad face. Upstream tolerates the dual
         // face because their consumer (WGI) dedups two faces sharing the HIDMAESTRO
         // name — but xinput1_4 (what FlexInput's gilrs reads) does NOT dedup, so it
-        // would see two slots. Keeping just the &IG_00 hardware id still makes
-        // SDL/HIDAPI defer the HID face to XInput.
+        // would see two slots. Keeping just the &IG_ hardware id still makes
+        // SDL/HIDAPI defer the HID face to XInput. (Omitting the compat ids is
+        // no longer sufficient on its own: Win11 26H1's xinputhid.inf matches
+        // the hardware id HID\VID_045E&PID_02FF&IG_00 directly — that's why the
+        // tag above is IG_01.)
 
         // DIF_REGISTERDEVICE creates the PnP node (admin-only).
         if SetupDiCallClassInstaller(DIF_REGISTERDEVICE, dis, &mut devinfo) == 0 {
@@ -1407,7 +1422,9 @@ pub fn write_instance_config(
     let path = format!(r"SOFTWARE\HIDMaestro\Controller{controller_index}");
     let instance_suffix = format!("\\{controller_index:04}");
     let device_instance_id = format!(
-        "ROOT\\VID_{:04X}&PID_{:04X}&IG_00{instance_suffix}",
+        // Must mirror the enumerator string create_device_node builds (IG_01 —
+        // see the xinputhid.inf note there).
+        "ROOT\\VID_{:04X}&PID_{:04X}&IG_01{instance_suffix}",
         profile.vid, profile.pid
     );
     let display_name = profile
@@ -1491,8 +1508,9 @@ pub struct ExistingDevice {
 /// companion too).
 pub fn list_hidmaestro_devices() -> Vec<ExistingDevice> {
     // Scan EVERY ROOT\* enumerator subkey, not just HIDClass/System. Our plain-HID
-    // gamepad node actually enumerates under `ROOT\VID_<vid>&PID_<pid>&IG_00`
-    // (e.g. `ROOT\VID_045E&PID_02FF&IG_00`), NOT `ROOT\HIDClass` — so the old
+    // gamepad node actually enumerates under `ROOT\VID_<vid>&PID_<pid>&IG_xx`
+    // (e.g. `ROOT\VID_045E&PID_02FF&IG_01`; IG_00 in builds before the xinputhid
+    // phantom-slot fix), NOT `ROOT\HIDClass` — so the old
     // two-enumerator scan never found an ORPHANED HID node left by a force-killed
     // helper / crash, and startup cleanup leaked it. The `node_is_hidmaestro_owned`
     // gate (HardwareID must carry "HIDMaestro") makes scanning all ROOT subkeys
@@ -1510,7 +1528,7 @@ pub fn list_hidmaestro_devices() -> Vec<ExistingDevice> {
 
 /// Scan every `ROOT\*` enumerator subkey for present-or-phantom, HIDMaestro-owned
 /// nodes. Generalizes the old hardcoded HIDClass/System scan so an orphaned HID
-/// gamepad node under `ROOT\VID_..&PID_..&IG_00` is found and cleaned up.
+/// gamepad node under `ROOT\VID_..&PID_..&IG_xx` is found and cleaned up.
 fn scan_all_root_enumerators() -> Vec<ExistingDevice> {
     use registry::*;
     let mut out = Vec::new();
