@@ -96,7 +96,21 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
     match kind_id {
         "virtual.xinput"   => Box::new(VirtualXInput::new(instance)),
         "virtual.ds4"      => Box::new(VirtualDS4::new(instance)),
-        "virtual.keymouse" => Box::new(VirtualKeyMouse::new()),
+        "virtual.keymouse" => {
+            // Prefer the HIDMaestro-backed implementation when the driver is
+            // installed: output lands as real HID reports (kernel-side), immune
+            // to the SendInput-eating hook stacks that leave the enigo backend
+            // silently dead (see keymouse_hm module docs). Only attempted when
+            // the driver is already present so adding a keyboard/mouse device
+            // never surprise-elevates a user who has never used HIDMaestro.
+            if flexinput_hidmaestro::hidmaestro_available() {
+                if let Some(hm) = crate::keymouse_hm::VirtualKeyMouseHm::create() {
+                    return Box::new(hm);
+                }
+                eprintln!("[keymouse] HIDMaestro nodes unavailable — falling back to SendInput backend");
+            }
+            Box::new(VirtualKeyMouse::new())
+        }
         _ => panic!("Unknown virtual device kind: {kind_id}"),
     }
 }
@@ -894,7 +908,7 @@ extern "system" {
 /// must preempt the game's render/worker threads or it gets periodically
 /// descheduled and motion tears.
 const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
-fn cursor_pos() -> Option<(i32, i32)> {
+pub(crate) fn cursor_pos() -> Option<(i32, i32)> {
     let mut p = CursorPoint { x: 0, y: 0 };
     (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y))
 }

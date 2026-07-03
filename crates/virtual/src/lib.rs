@@ -227,6 +227,9 @@ pub mod windows;
 #[cfg(windows)]
 pub mod hidmaestro_device;
 
+#[cfg(windows)]
+pub mod keymouse_hm;
+
 /// List available virtual device *types* — no connections are made.
 pub fn available_device_kinds() -> &'static [DeviceKind] {
     #[cfg(windows)]

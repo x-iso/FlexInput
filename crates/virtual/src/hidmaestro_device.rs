@@ -255,6 +255,18 @@ impl HidMaestroDevice {
         Some(dev)
     }
 
+    /// Publish a raw, pre-built input report to the SHM frame, bypassing the
+    /// gamepad PinState/encode path. For profiles whose reports the gamepad
+    /// model doesn't describe — the virtual keyboard/mouse (see
+    /// `keymouse_hm`). `data` must be `input_report_size` bytes of RID-less
+    /// payload, exactly as the profile descriptor lays it out. No-op while
+    /// disconnected (no input section), matching `flush()`.
+    pub fn write_raw_input(&mut self, data: &[u8]) {
+        if let Some(input) = self.input.as_mut() {
+            input.write_frame(data, None);
+        }
+    }
+
     /// Which static sink-pin layout to advertise for `profile`. Xbox360/XInput
     /// uses the XInput pin set (no gyro/touchpad/lightbar); DualSense uses its
     /// full Sony set; everything else falls back to DS4 pins.
