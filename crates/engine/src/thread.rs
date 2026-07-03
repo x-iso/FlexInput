@@ -160,8 +160,9 @@ pub struct ProcessingOutput {
     pub scope_pending: Vec<(usize, Vec<Option<f32>>)>,
 }
 
-/// Separate lock for sink routing outputs — read by the I/O thread at 500 Hz,
-/// written by the processing thread at 2 kHz. Kept apart from ProcessingOutput
+/// Separate lock for sink routing outputs — read by the I/O thread at the
+/// polling rate (default 500 Hz), written by the processing thread at the
+/// sample rate (default 2 kHz). Kept apart from ProcessingOutput
 /// so the I/O thread never contends on the UI/processing mutex.
 pub type SinkBus = Arc<RwLock<HashMap<(String, String), Signal>>>;
 
@@ -181,8 +182,9 @@ pub fn spawn_processing_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Raise this thread above the UI/render threads. The engine ticks at
-        // 2 kHz and feeds the I/O thread's sink bus; if a busy render frame
-        // delays the tick, fresh output is late and the user feels input lag.
+        // the sample rate (default 2 kHz) and feeds the I/O thread's sink bus;
+        // if a busy render frame delays the tick, fresh output is late and
+        // the user feels input lag.
         // ABOVE_NORMAL (not TIME_CRITICAL): the loop runs near-continuously,
         // so TIME_CRITICAL could starve the UI — we want input ahead of
         // rendering, not the UI frozen. The I/O thread (TIME_CRITICAL) remains
@@ -206,7 +208,7 @@ pub fn spawn_processing_thread(
         let mut loopback_reqs: Vec<(usize, flexinput_devices::loopback_manager::CaptureRequest, f32, f32, f32)> = Vec::new();
         // Persistent scratch reused across ticks (cleared in-place at the
         // top of every `eval_graph_tick` call). Avoids 5 HashMap reallocs
-        // per tick — significant at 2 kHz with an empty graph.
+        // per tick — significant at 2 kHz+ tick rates with an empty graph.
         let mut tick_out: TickOutput = TickOutput::default();
         // Persistent scope-sample accumulator across the catchup loop.
         // Pre-allocated outside the hot loop so it grows once and is
@@ -314,7 +316,7 @@ pub fn spawn_processing_thread(
 
             // Sleep until the next tick deadline, capped at 1 ms so we still
             // respond to a sample-rate change within ~1 ms. The old fixed
-            // 200 µs spin was a major CPU sink: at 2 kHz target (500 µs
+            // 200 µs spin was a major CPU sink: at the default 2 kHz target (500 µs
             // interval), waking every 200 µs to find 0 or 1 ticks pending
             // burned ~5k wake-ups/sec for almost no real work.
             //

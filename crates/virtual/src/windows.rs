@@ -1115,7 +1115,7 @@ pub struct VirtualKeyMouse {
     keys: KeysHeld,
     learned_keys: HashMap<String, bool>,
 
-    // Keyboard output on the UI thread (no need for 500 Hz)
+    // Keyboard output on the UI thread (no need for the I/O polling rate)
     enigo_keys: Option<Enigo>,
     os_keys: KeysHeld,
     os_learned_keys: HashMap<String, bool>,
@@ -1180,7 +1180,7 @@ impl VirtualDevice for VirtualKeyMouse {
 
     fn send(&mut self, pin: &str, value: Signal) {
         match pin {
-            // Velocity pins — the mouse thread spreads these at 500 Hz.
+            // Velocity pins — the dedicated mouse thread spreads these at 1 kHz.
             // Semantics: value = pixels per 60 Hz reference frame (unchanged from before).
             "mouse" => { if let Signal::Vec2(v) = value { self.mouse_vel_x += v.x; self.mouse_vel_y += -v.y; } }
             "mouse_x"       => { if let Signal::Float(f) = value { self.mouse_vel_x += f; } }

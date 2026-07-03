@@ -171,8 +171,8 @@ struct HidEntry {
     out: OutputState,
     /// Output state at the time of the last successful HID write. If `out`
     /// matches this, the controller already has the current state and we
-    /// can skip the USB write entirely — the I/O thread runs at 500 Hz
-    /// but real-world rumble / lightbar / trigger updates happen at
+    /// can skip the USB write entirely — the I/O thread runs at hundreds
+    /// of Hz but real-world rumble / lightbar / trigger updates happen at
     /// dozens of Hz at most, so 99 %+ of writes are redundant. Sending
     /// only on change drops gyro_flush_outputs from ~8 ms/iter to a few
     /// microseconds when nothing's changing. Also kinder to USB bandwidth.
@@ -259,7 +259,7 @@ pub struct GyroManager {
     // tracks the last failed open attempt to rate-limit retries
     failed_opens: HashMap<(u16, u16, usize), Instant>,
     /// Set when an open retry would previously have refreshed the device list
-    /// inline (a ~110-200 ms stall ON the 500 Hz I/O loop, every RETRY_INTERVAL
+    /// inline (a ~110-200 ms stall ON the I/O loop, every RETRY_INTERVAL
     /// while a gyro-capable pad persistently failed to open — the "variable
     /// gaps" polling freeze). Drained by the gilrs backend, which turns it into
     /// an async refresh+reclassify job on the worker instead.
@@ -544,9 +544,10 @@ impl GyroManager {
             if !entry.output_active { continue; }
             // Skip the USB write when the output state hasn't changed since
             // the last successful write AND we're within the heartbeat
-            // window. At 500 Hz I/O loop, this turns 500 redundant writes
-            // per second per device into ~1 — gyro_flush_outputs goes from
-            // ~8 ms/iter to a few µs in the steady state.
+            // window. This turns polling-rate-many redundant writes per
+            // second per device (500/s at the default rate) into ~1 —
+            // gyro_flush_outputs goes from ~8 ms/iter to a few µs in the
+            // steady state.
             let unchanged = entry.last_sent == Some(entry.out);
             let within_heartbeat = entry.last_sent_at
                 .map(|t| now.duration_since(t) < HEARTBEAT)

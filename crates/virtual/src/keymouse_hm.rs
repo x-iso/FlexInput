@@ -154,7 +154,8 @@ struct KeysHeld {
 const SELF_MOVE_WINDOW: Duration = Duration::from_millis(16);
 /// Clamp on the dt applied per flush, so a scheduler gap moves at most this
 /// much worth of distance in one report instead of lurching (see the enigo
-/// thread's MAX_DT rationale). 4× the nominal 500 Hz tick.
+/// thread's MAX_DT rationale). 4× the default 500 Hz tick — note this equals
+/// ONE tick at the 125 Hz minimum polling setting, where the clamp is a no-op.
 const MAX_DT: f32 = 0.008;
 /// Velocity unit: pixels per 60 Hz reference frame (unchanged pin semantics).
 const REF: f32 = 60.0;

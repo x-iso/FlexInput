@@ -214,7 +214,7 @@ struct ClassifyDone {
 /// Background worker loop: owns the slow side of the shared hidapi instance.
 /// Coalesces queued jobs to the newest (a burst of device-set changes needs
 /// only the final classification), refreshes the device list (~110-200 ms on
-/// Windows — the exact call that used to stall the 500 Hz I/O loop), and
+/// Windows — the exact call that used to stall the I/O loop), and
 /// classifies under the same lock so the list can't change between refresh and
 /// classification.
 fn classify_worker(
@@ -303,7 +303,7 @@ impl GilrsBackend {
     /// Replaces the old synchronous `refresh_virtual_classification()`: the
     /// expensive part (hidapi `refresh_devices` + per-instance path lookup, ~110-
     /// 200 ms on Windows) now runs on the "hid-classify" worker, so `enumerate()`
-    /// never blocks the 500 Hz I/O loop. The cache maps `(vid, pid, vp_idx) →
+    /// never blocks the I/O loop. The cache maps `(vid, pid, vp_idx) →
     /// is_own_virtual`, where `vp_idx` is the Nth-device index per VID/PID in
     /// gilrs walk order — the same index the gyro layer uses, keeping them
     /// correlated.
@@ -356,7 +356,7 @@ impl GilrsBackend {
     }
 
     /// Per-pad disposition from cached state only (no I/O) — safe to call at
-    /// 500 Hz. `vp_idx` accumulates the per-VID/PID running index for the PS-family
+    /// the polling rate. `vp_idx` accumulates the per-VID/PID running index for the PS-family
     /// own-virtual cache lookup, threaded through the caller's walk. (XInput pads
     /// are resolved separately by `find_own_virtual_gilrs_idx`, so they don't use
     /// `vp_idx` and the old ViGEm kept-count is gone.)

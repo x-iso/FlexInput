@@ -106,7 +106,7 @@ pub struct TickOutput {
 impl TickOutput {
     /// Clear all containers in-place. Preserves allocated capacity so the
     /// proc thread can reuse the same `TickOutput` across ticks instead of
-    /// dropping and reallocating five HashMaps per call (was hot at 2 kHz).
+    /// dropping and reallocating five HashMaps per call (was hot at the default 2 kHz rate).
     pub fn clear(&mut self) {
         self.outputs.clear();
         self.scope_samples.clear();
@@ -2097,8 +2097,8 @@ fn eval_subgraph(
 /// Evaluate one tick into `out`. The caller owns `out` and is expected to
 /// reuse the same `TickOutput` across ticks — we `.clear()` at the top so
 /// the HashMaps keep their allocated capacity between calls instead of
-/// being dropped and reallocated. At 2 kHz this was a non-trivial source
-/// of allocator pressure even on empty graphs.
+/// being dropped and reallocated. At the default 2 kHz rate this was a
+/// non-trivial source of allocator pressure even on empty graphs.
 pub fn eval_graph_tick(
     graph: &ProcessingGraph,
     state: &mut HashMap<usize, NodeState>,

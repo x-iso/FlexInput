@@ -11555,7 +11555,7 @@ fn signal_intensity(sig: &Signal) -> f32 {
 
 /// Read prior glow intensity for this pin (memory-cached), lerp toward `target`
 /// at a fixed rate, store back, and return the smoothed value. Smoothing
-/// prevents the 500 Hz raw signal from strobing the visual.
+/// prevents the polling-rate raw signal from strobing the visual.
 fn pin_glow_smoothed(ctx: &egui::Context, node: egui_snarl::NodeId, pin_idx: usize, is_input: bool, target: f32) -> f32 {
     let key = egui::Id::new(("pin_glow", node.0, pin_idx, is_input));
     let prev = ctx.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);

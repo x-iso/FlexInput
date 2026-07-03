@@ -460,7 +460,7 @@ pub struct FlexInputApp {
     /// Physical device list refreshed by the I/O thread; UI reads for display.
     devices: Vec<PhysicalDevice>,
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
-    /// Latest raw device signals (written by I/O thread at 500 Hz); used for canvas display.
+    /// Latest raw device signals (written by I/O thread at the polling rate); used for canvas display.
     last_signals: HashMap<(String, String), Signal>,
     eval_cache: HashMap<(NodeId, usize), Option<Signal>>,
     logo_texture: Option<egui::TextureHandle>,
@@ -1346,7 +1346,7 @@ impl eframe::App for FlexInputApp {
             ));
         }
 
-        // Read the latest device signals written by the I/O thread (500 Hz).
+        // Read the latest device signals written by the I/O thread (polling rate).
         // `load_full()` returns the current `Arc<HashMap>` — a refcount
         // bump, no map clone. Deref-cloning the map only happens at the
         // few `.last_signals = …` sites that need an owned map.
@@ -1357,7 +1357,7 @@ impl eframe::App for FlexInputApp {
         }
         // Refresh device list from I/O thread. Both gilrs and MIDI device
         // listings are populated there, so the UI never contends with the
-        // 500 Hz MIDI poll lock (which used to cause MIDI cards to flicker
+        // I/O-rate MIDI poll lock (which used to cause MIDI cards to flicker
         // in/out whenever the lock was held during a paint).
         {
             puffin::profile_scope!("read_devices_clone");
@@ -1698,7 +1698,7 @@ impl eframe::App for FlexInputApp {
         }
         } // end pull_outputs_and_display scope
 
-        // Signal routing and device flushing are handled by the 500 Hz I/O thread.
+        // Signal routing and device flushing are handled by the I/O thread.
         // panic_active is already folded into effective_bypass above so the
         // tab-bar indicator and the I/O thread stay in sync from the same source.
         self.io_bypass.store(effective_bypass[self.active_tab], Ordering::Relaxed);
@@ -6641,8 +6641,8 @@ impl FlexInputApp {
         self.refresh_active_tab_device_ids();
         // Silence everything not referenced by the new active tab. The I/O
         // thread will keep silencing them each tick; this immediate pass
-        // matters because the I/O thread runs at 500 Hz and the UI thread
-        // controls flush ordering on tab switch.
+        // matters because the I/O thread runs at the polling rate (default
+        // 500 Hz) and the UI thread controls flush ordering on tab switch.
         let active_ids = self.active_tab_device_ids.read().unwrap().clone();
         let mut devs = self.shared_virtual_devices.lock().unwrap();
         for dev in devs.iter_mut() {
@@ -9055,7 +9055,7 @@ impl FlexInputApp {
     }
 }
 
-// ── 500 Hz device I/O thread ──────────────────────────────────────────────────
+// ── Device I/O thread (polling-rate setting, default 500 Hz) ──────────────────
 
 fn spawn_io_thread(
     mut backends: Vec<Box<dyn DeviceBackend>>,
@@ -9234,7 +9234,7 @@ fn spawn_io_thread(
                 // Skip the write-lock acquisition entirely when no taped pin
                 // names appear in this iteration's signals — the common case
                 // when no gyro-capable device is connected. Saves a contended
-                // RwLock write per loop iteration (500 Hz) on idle setups.
+                // RwLock write per loop iteration (polling rate) on idle setups.
                 let has_taped_pin = signals.keys()
                     .any(|(_, pin)| flexinput_engine::SCOPE_TAP_PINS.iter().any(|p| *p == pin.as_str()));
                 if has_taped_pin {
@@ -9289,7 +9289,7 @@ fn spawn_io_thread(
                 // ── Enumerate gilrs devices periodically ──────────────────────
                 // MIDI enumeration is handled by spawn_midi_watch_thread() so
                 // the slow Win32 MIDI calls (60–70 ms with loopMIDI loaded)
-                // don't stall this 500 Hz I/O loop.
+                // don't stall this I/O loop.
                 if last_enum.elapsed() > Duration::from_secs(2) {
                     puffin::profile_scope!("enumerate_devices");
                     let mut devs: Vec<PhysicalDevice> = Vec::new();
@@ -9597,7 +9597,8 @@ fn spawn_io_thread(
                 let dt = now.duration_since(last_loop_t).as_secs_f32().max(1e-4);
                 last_loop_t = now;
                 let inst_hz = 1.0 / dt;
-                // ~1 s time constant at 500 Hz loop = alpha ≈ 0.002
+                // EMA time constant scales with the loop rate: alpha 0.02
+                // ≈ 0.1 s at the default 500 Hz, ≈ 0.4 s at the 125 Hz floor.
                 let alpha = 0.02_f32;
                 if measured_hz_ema == 0.0 {
                     measured_hz_ema = inst_hz;
@@ -9653,7 +9654,7 @@ fn spawn_io_thread(
 
 // ── MIDI watch thread ────────────────────────────────────────────────────────
 //
-// Runs the (slow, Windows-blocking) MIDI port enumeration off the 500 Hz I/O
+// Runs the (slow, Windows-blocking) MIDI port enumeration off the I/O
 // loop so it never stalls device polling. Cycle every 2 s:
 //
 //  1. Read pinned_midi_ids (set of midi_in:N / midi_out:N the canvas uses).

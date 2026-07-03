@@ -168,7 +168,7 @@ fn read_invert3(canvas: &Canvas, node: NodeId, key: &str) -> [bool; 3] {
 /// bottom regardless of UI repaint rate. Set to 1 s so a quick controller
 /// motion (~0.5–1 s) fits in-frame with room to read its shape.
 const SCOPE_WIN_MS: f32 = 1000.0;
-const GYRO_SAMPLE_FRAMES: u32 = 250; // ~0.5 s of stable data at 500 Hz polling
+const GYRO_SAMPLE_FRAMES: u32 = 250; // ~0.5 s of stable data at the default 500 Hz polling (duration scales with the polling-rate setting)
 
 #[derive(Clone)]
 struct ScopeBuffer {
@@ -232,9 +232,10 @@ struct OrientSession {
     accel_n:   [u32; 3],
 }
 
-/// Frames to collect for one orientation-axis sampling pass. ~0.5 s at
-/// 500 Hz polling — fewer is plenty given PCA only needs ~30 samples
-/// in different directions to recover an axis confidently.
+/// Frames to collect for one orientation-axis sampling pass. ~0.5 s at the
+/// default 500 Hz polling (longer at lower settings) — fewer is plenty given
+/// PCA only needs ~30 samples in different directions to recover an axis
+/// confidently.
 const ORIENT_SAMPLE_FRAMES: u32 = 250;
 
 const STICK_BUCKETS: usize = 72; // 5° per bucket
@@ -601,7 +602,7 @@ fn gyro_section(
     });
 
     // Push the maximum repaint rate during sampling so the scope captures as
-    // many of the I/O thread's 500 Hz samples as the UI can deliver.
+    // many of the I/O thread's polling-rate samples as the UI can deliver.
     if sampling_now { ui.ctx().request_repaint(); }
 
     // Hoist the skip-accel flag so both the inner UI and gyro_scope can see it.
