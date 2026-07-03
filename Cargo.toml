@@ -68,6 +68,7 @@ egui_extras = { version = "0.33", features = ["svg"] }
 # Vulkan is sufficient and gives us Linux parity without a second
 # backend to maintain.
 wgpu       = { version = "27", default-features = false, features = [
+    "gles",
     "metal",
     "vulkan",
 ] }

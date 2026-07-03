@@ -8881,6 +8881,42 @@ impl FlexInputApp {
                         ui.end_row();
                     });
 
+                // ── Renderer ─────────────────────────────────────────────
+                // Backend is fixed at startup (the wgpu instance/surface can't
+                // be swapped live), so changes here take effect on restart.
+                // Auto steers AMD GPUs on Windows to OpenGL — their Vulkan
+                // swapchain stalls for seconds on window resize/restore
+                // (see `auto_backends` in app/src/main.rs).
+                {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.label(egui::RichText::new("Renderer").strong());
+                    ui.add_space(4.0);
+                    let mut choice = self.settings.renderer;
+                    egui::ComboBox::from_id_salt("renderer_choice")
+                        .selected_text(choice.label())
+                        .show_ui(ui, |ui| {
+                            for c in [
+                                settings::RendererChoice::Auto,
+                                settings::RendererChoice::Vulkan,
+                                settings::RendererChoice::OpenGl,
+                            ] {
+                                ui.selectable_value(&mut choice, c, c.label());
+                            }
+                        });
+                    if choice != self.settings.renderer {
+                        self.settings.renderer = choice;
+                        dirty = true;
+                    }
+                    ui.label(egui::RichText::new(
+                        "Takes effect after restarting FlexInput. Auto picks Vulkan, \
+                         except AMD GPUs on Windows get OpenGL (their Vulkan driver \
+                         stalls on window resize/restore)."
+                    ).small().weak());
+                }
+
                 // ── Profiler (dev tool, debug builds only) ──────────────
                 // Toggle flips `puffin::set_scopes_on()` and starts/stops
                 // a `puffin_http` server on 127.0.0.1:8585 so the
