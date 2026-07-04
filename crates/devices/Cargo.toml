@@ -8,6 +8,16 @@ flexinput-core = { workspace = true }
 glam           = { workspace = true }
 gilrs          = "0.10"
 hidapi         = "2"
+# SDL3 for gamepads FlexInput doesn't already parse natively (Steam Controller,
+# third-party pads). gilrs + the raw-HID path keep the controllers they handle
+# well (Xbox/DS4/DualSense/Switch Pro); SDL is enumerated ONLY for pads that
+# `ControllerKind::detect` classifies as `Generic`, so no device surfaces twice.
+# `build-from-source-static` compiles SDL from source and links it statically —
+# no SDL3.dll to ship, matching how the project keeps `flexinput.exe` self-
+# contained. `hidapi` lets SDL read gyro/touchpad over HID for those pads.
+# Requires cmake + a C compiler at build time (VS-bundled cmake/ninja/cl —
+# build from a VS Developer shell so they're on PATH).
+sdl3           = { version = "0.18", features = ["build-from-source-static", "hidapi"] }
 midir          = "0.10"
 # See engine/Cargo.toml — instrumentation is unconditional; emission is
 # gated by the runtime puffin::set_scopes_on() flag.

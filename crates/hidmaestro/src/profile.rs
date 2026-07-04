@@ -311,6 +311,17 @@ pub mod presets {
     /// input flows through the SHM `GipData[]` (XINPUT_GAMEPAD) region, not the
     /// HID descriptor. This is the capability that lets FlexInput drop ViGEm.
     pub const XBOX360_JSON: &str = include_str!("../profiles/xbox360.json");
+
+    /// Virtual keyboard — plain-HID 8-byte boot-style report (modifiers +
+    /// 6KRO array). Driven with raw reports by `flexinput-virtual`'s
+    /// keymouse_hm, NOT the gamepad encode path. Exists because SendInput-based
+    /// synthetic input is silently eaten on some systems (ASUS hook stack /
+    /// hardened Win11) — a kernel-level HID device is immune.
+    pub const KEYBOARD_JSON: &str = include_str!("../profiles/keyboard.json");
+
+    /// Virtual relative mouse — plain-HID 6-byte report (5 buttons, int16 X/Y
+    /// mickeys, int8 wheel). Same raw-report path + rationale as KEYBOARD_JSON.
+    pub const MOUSE_JSON: &str = include_str!("../profiles/mouse.json");
 }
 
 #[cfg(test)]
@@ -342,17 +353,62 @@ mod tests {
         // XUSB companion + FunctionMode 1 (defaulted from requiresXusbCompanion).
         assert!(p.requires_xusb_companion);
         assert_eq!(p.function_mode, 1);
-        // Descriptor must parse to a usable gamepad layout: the standard axes
-        // and at least the face/shoulder buttons present.
+        // The identity HID face is a VENDOR-DEFINED usage page on purpose: game
+        // APIs (WGI/GameInput, DirectInput, SDL, Steam) must never enumerate it
+        // as a gamepad — the SWD XUSB companion is the sole game-visible
+        // identity. A gamepad TLC here resurfaces the Win11 double-pad bugs
+        // (xinputhid.inf phantom slot / 26H1 GameInput second controller); see
+        // the profile JSON notes.
         let r = &p.report;
-        assert!(r.field(0x01, 0x30).is_some(), "X (left stick X)");
-        assert!(r.field(0x01, 0x31).is_some(), "Y (left stick Y)");
-        assert!(r.field(0x01, 0x32).is_some(), "Z (right stick X)");
-        assert!(r.field(0x01, 0x35).is_some(), "Rz (right stick Y)");
-        assert!(r.field(0x01, 0x33).is_some(), "Rx (left trigger)");
-        assert!(r.field(0x01, 0x34).is_some(), "Ry (right trigger)");
-        assert!(r.field(0x09, 0x01).is_some(), "button 1");
-        assert!(r.field(0x09, 0x08).is_some(), "button 8");
+        assert!(
+            !r.fields.iter().any(|f| f.usage_page == 0x01 || f.usage_page == 0x09),
+            "identity face must expose NO Generic Desktop/Button usages"
+        );
+        assert!(
+            r.fields.iter().all(|f| f.usage_page == 0xFF00),
+            "identity face fields must live on the vendor-defined page"
+        );
+        // Wire size must stay 12 (inputReportSize / SHM frame contract).
+        assert_eq!(p.input_report_size, 12);
+        assert_eq!(r.byte_size(), 12);
+        assert_eq!(r.report_id, 0);
+    }
+
+    #[test]
+    fn loads_keyboard_preset() {
+        let p = Profile::from_json(presets::KEYBOARD_JSON).expect("load keyboard");
+        assert_eq!(p.id, "hm-keyboard");
+        // Plain HID: no companion, FunctionMode 0.
+        assert!(!p.requires_xusb_companion);
+        assert_eq!(p.function_mode, 0);
+        // Standard boot-style keyboard report: 8 bytes, no Report ID, keyboard
+        // usage page fields only (modifiers bitfield + 6KRO array).
+        assert_eq!(p.input_report_size, 8);
+        assert_eq!(p.report.byte_size(), 8);
+        assert_eq!(p.report.report_id, 0);
+        assert!(p.report.fields.iter().all(|f| f.usage_page == 0x07));
+    }
+
+    #[test]
+    fn loads_mouse_preset() {
+        let p = Profile::from_json(presets::MOUSE_JSON).expect("load mouse");
+        assert_eq!(p.id, "hm-mouse");
+        assert!(!p.requires_xusb_companion);
+        assert_eq!(p.function_mode, 0);
+        // [buttons, X lo/hi, Y lo/hi, wheel] = 6 bytes, no Report ID.
+        assert_eq!(p.input_report_size, 6);
+        assert_eq!(p.report.byte_size(), 6);
+        assert_eq!(p.report.report_id, 0);
+        // X/Y must parse as 16-bit signed relative axes at the layout the
+        // report builder in keymouse_hm hardcodes (bytes 1..5 after buttons).
+        let x = p.report.field(0x01, 0x30).expect("X axis");
+        let y = p.report.field(0x01, 0x31).expect("Y axis");
+        assert_eq!((x.bit_offset, x.bit_size), (8, 16));
+        assert_eq!((y.bit_offset, y.bit_size), (24, 16));
+        assert!(x.logical_min < 0, "X is signed/relative");
+        // Wheel: int8 at byte 5.
+        let w = p.report.field(0x01, 0x38).expect("wheel");
+        assert_eq!((w.bit_offset, w.bit_size), (40, 8));
     }
 
     /// Golden: our parser must reproduce the exact field layout HIDMaestro's C#

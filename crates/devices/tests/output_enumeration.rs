@@ -191,6 +191,92 @@ fn generic_outputs_do_not_panic() {
 // ── Sensor outputs cross-check ─────────────────────────────────────────────────
 // Verify that the sensor output side (buttons/axes) is not accidentally empty.
 
+// ── SDL backend dedup + extended Generic pins ──────────────────────────────────
+// The SDL backend enumerates ONLY pads that `ControllerKind::detect` classifies
+// as `Generic`; every kind gilrs owns must therefore detect as non-`Generic` so
+// SDL drops it and no controller is surfaced twice. These are the exact VID/PIDs
+// the SDL open path runs `detect` on. Pure — no SDL device needed.
+
+#[test]
+fn sdl_dedup_gilrs_owned_pads_detect_non_generic() {
+    // (vendor, product, label) for controllers gilrs + the raw-HID path own.
+    let owned: &[(u16, u16, &str)] = &[
+        (0x045E, 0x028E, "Xbox 360"),
+        (0x045E, 0x02FF, "Xbox One / HIDMaestro companion"),
+        (0x054C, 0x05C4, "DualShock 4 v1"),
+        (0x054C, 0x09CC, "DualShock 4 v2"),
+        (0x054C, 0x0CE6, "DualSense"),
+        (0x054C, 0x0DF2, "DualSense Edge"),
+        (0x057E, 0x2009, "Switch Pro"),
+    ];
+    for (vid, pid, label) in owned {
+        let kind = ControllerKind::detect("", Some(*vid), Some(*pid));
+        assert_ne!(
+            kind,
+            ControllerKind::Generic,
+            "{label} ({vid:04X}:{pid:04X}) must NOT detect as Generic, or the SDL \
+             backend would surface it as a duplicate of the gilrs/raw-HID device",
+        );
+    }
+}
+
+#[test]
+fn sdl_generic_pad_actually_detects_generic() {
+    // A third-party pad SDL should own (8BitDo VID, arbitrary PID) — the SDL
+    // filter keeps it precisely because it is Generic.
+    let kind = ControllerKind::detect("8BitDo Pro 2", Some(0x2DC8), Some(0x6003));
+    assert_eq!(
+        kind,
+        ControllerKind::Generic,
+        "an unrecognized third-party pad must detect as Generic so SDL enumerates it",
+    );
+}
+
+#[test]
+fn generic_outputs_expose_sdl_relayed_pins() {
+    // The SDL backend relays gyro/accel, touchpad, and extra buttons for Generic
+    // pads; those pins must be declared in the Generic layout or a sink could
+    // never map them. Guards against dropping the layout extension.
+    let outputs = layouts::outputs_for(ControllerKind::Generic);
+    let has = |id: &str| outputs.iter().any(|p| p.id == id);
+    for pin in [
+        "gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z",
+        "touch1_x", "touch1_y", "touch1_active",
+        "touch2_x", "touch2_y", "touch2_active", "btn_touchpad",
+        "btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2",
+        "btn_misc1", "btn_misc2",
+    ] {
+        assert!(has(pin), "Generic outputs must expose `{pin}` for the SDL backend");
+    }
+}
+
+/// The SDL extra buttons must be present in the AutoMap canonical bus
+/// (`ALL_PINS`), not only in the Generic device layout — otherwise they show on
+/// the device node but can't be selected inside a Remapper / AutoMap Splitter,
+/// which only carry pins listed in ALL_PINS. Mirror of the feedback-inlet union
+/// guard; catches a layout pin added without a matching ALL_PINS entry.
+#[test]
+fn all_pins_covers_generic_extra_buttons() {
+    use flexinput_core::automap::ALL_PINS;
+    let bus: std::collections::HashSet<&str> = ALL_PINS.iter().map(|p| p.id).collect();
+    for pin in [
+        "btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2",
+        "btn_misc1", "btn_misc2", "btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6",
+    ] {
+        // Present in the Generic device layout (source side)…
+        assert!(
+            layouts::outputs_for(ControllerKind::Generic).iter().any(|p| p.id == pin),
+            "Generic layout must expose `{pin}`",
+        );
+        // …and in the AutoMap bus so a Remapper can address it.
+        assert!(
+            bus.contains(pin),
+            "extra-button pin `{pin}` is in the Generic layout but missing from \
+             automap::ALL_PINS — add it there or it can't be used in a Remapper",
+        );
+    }
+}
+
 #[test]
 fn all_supported_kinds_have_sensor_outputs() {
     for kind in [

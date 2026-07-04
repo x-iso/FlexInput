@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use flexinput_core::{Module, Patch, Signal};
+use flexinput_core::{Module, Patch};
 use uuid::Uuid;
 
 pub mod eval;
@@ -14,6 +14,7 @@ pub use eval::{
     curve_scale, curve_scale_inv, envelope_flags, eval_graph_tick, eval_pure, get_b, get_f,
     crossover_hz_to_pos, multiband_collapse_band, multiband_collapse_carrier, namespaced_uid,
     osc_sample, pin_is_analog_input, read_scale_t, sample_curve, sig_to_f32,
+    vec_reshape_apply, VEC_RESHAPE_BOUNDARY_DEFAULT, VEC_RESHAPE_GAIN_DEFAULT,
 };
 pub use graph::{FeedbackSource, InlineSubgraph, NodeSnap, ProcessingGraph};
 pub use router::InputRouter;
@@ -25,7 +26,6 @@ pub struct Engine {
     patch: Patch,
     router: InputRouter,
     pub pass_through_outputs: bool,
-    last_outputs: HashMap<(Uuid, String), Signal>,
 }
 
 impl Engine {
@@ -35,7 +35,6 @@ impl Engine {
             patch: Patch::default(),
             router: InputRouter::new(),
             pass_through_outputs: false,
-            last_outputs: HashMap::new(),
         }
     }
 

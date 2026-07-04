@@ -96,7 +96,21 @@ pub fn create_device(kind_id: &str, instance: usize) -> Box<dyn VirtualDevice> {
     match kind_id {
         "virtual.xinput"   => Box::new(VirtualXInput::new(instance)),
         "virtual.ds4"      => Box::new(VirtualDS4::new(instance)),
-        "virtual.keymouse" => Box::new(VirtualKeyMouse::new()),
+        "virtual.keymouse" => {
+            // Prefer the HIDMaestro-backed implementation when the driver is
+            // installed: output lands as real HID reports (kernel-side), immune
+            // to the SendInput-eating hook stacks that leave the enigo backend
+            // silently dead (see keymouse_hm module docs). Only attempted when
+            // the driver is already present so adding a keyboard/mouse device
+            // never surprise-elevates a user who has never used HIDMaestro.
+            if flexinput_hidmaestro::hidmaestro_available() {
+                if let Some(hm) = crate::keymouse_hm::VirtualKeyMouseHm::create() {
+                    return Box::new(hm);
+                }
+                eprintln!("[keymouse] HIDMaestro nodes unavailable — falling back to SendInput backend");
+            }
+            Box::new(VirtualKeyMouse::new())
+        }
         _ => panic!("Unknown virtual device kind: {kind_id}"),
     }
 }
@@ -349,6 +363,11 @@ mod vigem_ioctl {
         pub buf: [u8; 63],
     }
 
+    // RESERVED: setters for the extended (gyro/accel/touchpad) DS4 report.
+    // The `IOCTL_DS4_SUBMIT_REPORT_EX` path is scaffolded but never enabled —
+    // `VirtualDS4::has_extended` is hardwired false pending bus-version
+    // detection — so the basic `DS4Report` submit is the only live path today.
+    #[allow(dead_code)]
     impl DS4ReportEx {
         pub fn set_lx(&mut self, v: u8) { self.buf[0] = v; }
         pub fn set_ly(&mut self, v: u8) { self.buf[1] = v; }
@@ -442,6 +461,11 @@ mod vigem_ioctl {
 
     /// Non-blocking poll of a pending overlapped operation.
     /// Returns Some(()) if completed, None if still pending, Err(code) on error/abort.
+    ///
+    /// RESERVED: the notification thread currently blocks on
+    /// `GetOverlappedResult(bWait=TRUE)` with its own duplicated handle;
+    /// this poll variant is kept for a possible non-blocking redesign.
+    #[allow(dead_code)]
     pub unsafe fn poll_overlapped(
         device:     *mut c_void,
         overlapped: *mut Overlapped,
@@ -580,6 +604,10 @@ impl VirtualDS4 {
         })
     }
 
+    // RESERVED: overlapped-struct builder for the non-blocking notification
+    // design (pairs with `vigem_ioctl::poll_overlapped`); the current
+    // notification thread blocks with its own handle and doesn't need it.
+    #[allow(dead_code)]
     fn make_notif_ovl() -> Box<vigem_ioctl::Overlapped> {
         Box::new(vigem_ioctl::Overlapped {
             internal: 0, internal_high: 0, offset: 0, offset_high: 0,
@@ -829,7 +857,6 @@ impl VirtualDevice for VirtualDS4 {
         if self.dev.is_null() { return; }
         let dpad    = encode_dpad(self.dpad[0], self.dpad[1], self.dpad[2], self.dpad[3]);
         let buttons = (self.buttons & !0xF) | dpad;
-        let tp_pressed = self.special & ds4_btn::TOUCHPAD != 0;
 
         let sub = vigem_ioctl::DS4Submit {
             size:   std::mem::size_of::<vigem_ioctl::DS4Submit>() as u32,
@@ -894,7 +921,7 @@ extern "system" {
 /// must preempt the game's render/worker threads or it gets periodically
 /// descheduled and motion tears.
 const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
-fn cursor_pos() -> Option<(i32, i32)> {
+pub(crate) fn cursor_pos() -> Option<(i32, i32)> {
     let mut p = CursorPoint { x: 0, y: 0 };
     (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y))
 }
@@ -1101,7 +1128,7 @@ pub struct VirtualKeyMouse {
     keys: KeysHeld,
     learned_keys: HashMap<String, bool>,
 
-    // Keyboard output on the UI thread (no need for 500 Hz)
+    // Keyboard output on the UI thread (no need for the I/O polling rate)
     enigo_keys: Option<Enigo>,
     os_keys: KeysHeld,
     os_learned_keys: HashMap<String, bool>,
@@ -1166,7 +1193,7 @@ impl VirtualDevice for VirtualKeyMouse {
 
     fn send(&mut self, pin: &str, value: Signal) {
         match pin {
-            // Velocity pins — the mouse thread spreads these at 500 Hz.
+            // Velocity pins — the dedicated mouse thread spreads these at 1 kHz.
             // Semantics: value = pixels per 60 Hz reference frame (unchanged from before).
             "mouse" => { if let Signal::Vec2(v) = value { self.mouse_vel_x += v.x; self.mouse_vel_y += -v.y; } }
             "mouse_x"       => { if let Signal::Float(f) = value { self.mouse_vel_x += f; } }

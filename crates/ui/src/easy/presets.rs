@@ -19,6 +19,9 @@ pub struct PresetInfo {
     /// from disk via `path` at load time).
     pub embedded_bytes: Option<&'static [u8]>,
     /// Optional sibling `<name>.png` for the chip thumbnail.
+    /// RESERVED: probed and populated at index time, but chip-thumbnail
+    /// rendering hasn't been implemented yet — no reader exists.
+    #[allow(dead_code)]
     pub icon_path: Option<PathBuf>,
     /// FNV-1a hash of the preset bytes. Used for dirty detection.
     pub content_hash: u64,

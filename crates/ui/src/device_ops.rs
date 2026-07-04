@@ -73,6 +73,9 @@ pub enum ProgressKind {
 /// Live progress for the modal overlay. `None` = no op in flight.
 #[derive(Clone)]
 pub struct DeviceOpProgress {
+    /// RESERVED: set by every constructor but the overlay renders only
+    /// `label`/`detail` today; kept so the modal can branch per-op later.
+    #[allow(dead_code)]
     pub kind: ProgressKind,
     pub label: String,
     pub detail: Option<String>,

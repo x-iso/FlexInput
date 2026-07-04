@@ -11,7 +11,7 @@ use flexinput_modules::all_modules;
 use flexinput_virtual::VirtualDevice;
 
 use crate::{
-    canvas::{sample_curve, Canvas, NodeData},
+    canvas::{Canvas, NodeData},
     canvas::node::{ExposedModule, UiSubPatch},
     canvas::ClipboardData,
     guide_watcher::{spawn_guide_watcher, GuideWatchConfig},
@@ -124,8 +124,6 @@ pub struct PatchTab {
 /// from the on-disk preset. None of this is persisted.
 #[derive(Default)]
 pub struct EasyState {
-    /// Preset chip the user is hovering, used to highlight the chip.
-    pub hovered_preset: Option<std::path::PathBuf>,
     /// Pending preset-switch confirmation. When set, the center panel
     /// shows a "discard your tweaks?" modal; on confirm the preset at
     /// this path is applied.
@@ -460,7 +458,7 @@ pub struct FlexInputApp {
     /// Physical device list refreshed by the I/O thread; UI reads for display.
     devices: Vec<PhysicalDevice>,
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
-    /// Latest raw device signals (written by I/O thread at 500 Hz); used for canvas display.
+    /// Latest raw device signals (written by I/O thread at the polling rate); used for canvas display.
     last_signals: HashMap<(String, String), Signal>,
     eval_cache: HashMap<(NodeId, usize), Option<Signal>>,
     logo_texture: Option<egui::TextureHandle>,
@@ -483,7 +481,6 @@ pub struct FlexInputApp {
     hidhide_last_device_sig: u64,
     /// Last time the reconcile walk ran (throttle for patch-wiring edits).
     hidhide_last_reconcile: std::time::Instant,
-    last_update: std::time::Instant,
     bottom_panel_height: f32,
     /// Summed `mutation_gen` across all tabs as of the last crash-recovery
     /// snapshot write. The recovery snapshot (`recovery.json`) is rewritten
@@ -585,10 +582,6 @@ pub struct FlexInputApp {
     /// thread reads this to decide which OS handles to keep open vs release.
     /// UI rebuilds it each frame from the current canvas state.
     pinned_midi_ids: Arc<RwLock<HashSet<String>>>,
-    /// MIDI device list maintained by the MIDI watch thread. Appended into
-    /// the I/O thread's shared_devices each enum cycle so the UI sees a
-    /// unified gilrs + MIDI list without ever touching the MIDI lock.
-    shared_midi_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     /// Set true to ask the MIDI watch thread to re-enumerate ports (manual refresh;
     /// we no longer poll periodically, to avoid disturbing the audio stack).
     midi_refresh_requested: Arc<AtomicBool>,
@@ -755,6 +748,17 @@ impl PanicShortcut {
 
 impl FlexInputApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Permanent breadcrumb: which GPU adapter + wgpu backend this instance
+        // rendered on. Window-compositor symptoms (slow resize, stale frames on
+        // restore) are backend/driver-specific, so the first diagnostic question
+        // is always "what did wgpu pick?" — answer it in the log up front.
+        if let Some(rs) = &cc.wgpu_render_state {
+            let info = rs.adapter.get_info();
+            eprintln!(
+                "[gpu] adapter=\"{}\" backend={:?} type={:?} driver=\"{}\"",
+                info.name, info.backend, info.device_type, info.driver_info
+            );
+        }
         setup_fonts(&cc.egui_ctx);
         // Install egui_extras image loaders so SVG images render inside nodes
         // and pinned sub-patch widgets. The svg feature pulls in resvg/usvg.
@@ -1063,7 +1067,6 @@ impl FlexInputApp {
             hidhide_dirty: true, // reconcile once at startup (apply default-on masking)
             hidhide_last_device_sig: 0,
             hidhide_last_reconcile: std::time::Instant::now(),
-            last_update: std::time::Instant::now(),
             bottom_panel_height: 220.0,
             // Seeded below from the restored tabs so the first frame doesn't
             // pointlessly rewrite the recovery snapshot we may have just loaded.
@@ -1106,7 +1109,6 @@ impl FlexInputApp {
             io_bypass,
             ui_nav_suppress,
             pinned_midi_ids,
-            shared_midi_devices,
             midi_refresh_requested,
             panic_shortcut: panic_shortcut.clone(),
             panic_active: false,
@@ -1335,7 +1337,7 @@ impl eframe::App for FlexInputApp {
             ));
         }
 
-        // Read the latest device signals written by the I/O thread (500 Hz).
+        // Read the latest device signals written by the I/O thread (polling rate).
         // `load_full()` returns the current `Arc<HashMap>` — a refcount
         // bump, no map clone. Deref-cloning the map only happens at the
         // few `.last_signals = …` sites that need an owned map.
@@ -1346,7 +1348,7 @@ impl eframe::App for FlexInputApp {
         }
         // Refresh device list from I/O thread. Both gilrs and MIDI device
         // listings are populated there, so the UI never contends with the
-        // 500 Hz MIDI poll lock (which used to cause MIDI cards to flicker
+        // I/O-rate MIDI poll lock (which used to cause MIDI cards to flicker
         // in/out whenever the lock was held during a paint).
         {
             puffin::profile_scope!("read_devices_clone");
@@ -1687,7 +1689,7 @@ impl eframe::App for FlexInputApp {
         }
         } // end pull_outputs_and_display scope
 
-        // Signal routing and device flushing are handled by the 500 Hz I/O thread.
+        // Signal routing and device flushing are handled by the I/O thread.
         // panic_active is already folded into effective_bypass above so the
         // tab-bar indicator and the I/O thread stay in sync from the same source.
         self.io_bypass.store(effective_bypass[self.active_tab], Ordering::Relaxed);
@@ -2563,7 +2565,6 @@ impl eframe::App for FlexInputApp {
                 .collect::<Vec<_>>();
             &devices_owned
         };
-        let bottom_panel_height = self.bottom_panel_height;
         // Belt-and-suspenders: ensure any excluded device is OFF in the nav map
         // (covers the case where the global default flipped it on before the
         // device was recognized as a loopback virtual).
@@ -3054,7 +3055,7 @@ impl eframe::App for FlexInputApp {
         // maximized so the window snaps cleanly to monitor edges.
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         if !maximized {
-            let rect = ctx.input(|i| i.screen_rect());
+            let rect = ctx.content_rect();
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 egui::Id::new("app_window_border"),
@@ -3250,6 +3251,10 @@ enum GpSettingKind {
     /// underlying value is stored as `f32` (matching IntSlider) but the
     /// display string comes from the label. Used for enum settings where
     /// a slider doesn't make sense (e.g. Repaint rate: Monitor / 60 / 30 / 15 Hz).
+    /// RESERVED: no settings row constructs this yet (the planned "Repaint
+    /// rate" row was never added), but the nav/step/format handlers below
+    /// fully support it — construct a row with it and it works.
+    #[allow(dead_code)]
     Cycle { key: GpSettingKey, opts: &'static [(f32, &'static str)] },
     /// Gamepad shortcut chord: South closes the panel and starts a chord
     /// capture for `target` (so the user can press the combo with the panel
@@ -5045,7 +5050,10 @@ impl FlexInputApp {
             // Curves: the dot graph plus every editable option row.
             ("module.response_curve", "curve")
             | ("module.vec_response_curve", "curve")
+            | ("module.vec_reshape", "curve")
             | ("module.twoway_response_curve", "curve") => true,
+            // ASTH scope's EQ is dot-editable via the shared curve-dot path.
+            ("module.audio_stream_haptics", "asth_scope") => true,
             // Remapper-family mapping widgets (filter cycle + in-body capture).
             ("module.remapper", _) | ("module.map_action", _)
             | ("module.automap_combiner", _) => true,
@@ -5081,11 +5089,22 @@ impl FlexInputApp {
             | ("module.response_curve", "grid_row") | ("module.response_curve", "grid_options_row")
             | ("module.vec_response_curve", "scale_row") | ("module.vec_response_curve", "range_row")
             | ("module.vec_response_curve", "grid_row") | ("module.vec_response_curve", "grid_options_row")
+            | ("module.vec_reshape", "target_row") | ("module.vec_reshape", "options_row")
+            | ("module.vec_reshape", "range_row") | ("module.vec_reshape", "grid_row")
+            | ("module.vec_reshape", "preset_row")
             | ("module.twoway_response_curve", "scale_row") | ("module.twoway_response_curve", "range_row")
             | ("module.twoway_response_curve", "grid_row") | ("module.twoway_response_curve", "grid_options_row")
             | ("module.twoway_response_curve", "hyst_row") | ("module.twoway_response_curve", "interp_row")
             | ("module.twoway_response_curve", "lane_toggle")
             | ("display.oscilloscope", "controls")
+            | ("module.audio_stream_haptics", "asth_mode_row")
+            | ("module.audio_stream_haptics", "asth_volume")
+            | ("module.audio_stream_haptics", "asth_release")
+            | ("module.audio_stream_haptics", "asth_crossover")
+            | ("module.audio_stream_haptics", "asth_amplitude")
+            | ("module.audio_stream_haptics", "asth_balance")
+            | ("module.audio_stream_haptics", "asth_swap_row")
+            | ("module.audio_stream_haptics", "asth_rumble_mix")
         )
     }
 
@@ -5559,6 +5578,24 @@ impl FlexInputApp {
                 f!("In max", v("in_max",-100.0,100.0,1.0,Linear)),
                 f!("Out max", v("out_max",-100.0,100.0,1.0,Linear)),
             ],
+            // ── Vec Reshaper option rows ──
+            ("module.vec_reshape", "target_row") => vec![
+                f!("Edit", Enum{key:"edit_target",opts:&["gain","boundary"]}),
+            ],
+            ("module.vec_reshape", "options_row") => vec![
+                f!("Symmetry", Enum{key:"symmetry",opts:&["quad4","xmirror"]}),
+                f!("Renorm", Toggle{key:"renorm"}),
+            ],
+            ("module.vec_reshape", "range_row") => vec![
+                f!("In max", v("in_max",0.05,2.0,1.0,Linear)),
+                f!("Out max", v("out_max",0.05,2.0,1.0,Linear)),
+            ],
+            ("module.vec_reshape", "grid_row") => vec![
+                f!("Grid H", v("grid_x",1.0,16.0,4.0,Linear)),
+                f!("Grid V", v("grid_y",1.0,16.0,4.0,Linear)),
+                f!("Snap", Toggle{key:"snap"}),
+                f!("Trail ms", v("trail_ms",0.0,1000.0,300.0,Decade)),
+            ],
             ("module.response_curve", "grid_row") | ("module.vec_response_curve", "grid_row")
             | ("module.twoway_response_curve", "grid_row") => vec![
                 f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
@@ -5587,6 +5624,29 @@ impl FlexInputApp {
                 f!("Auto", Toggle{key:"osc_auto"}),
                 f!("Uni", Toggle{key:"osc_uni"}),
             ],
+            // Audio Stream Haptics calibration rows + mode block. Ranges/defaults
+            // mirror the sliders in viewer.rs `asth_draw_row` / `asth_draw_mode_block`.
+            ("module.audio_stream_haptics", "asth_mode_row") => vec![
+                f!("Capture", Enum{key:"asth_mode",opts:&["process","focused","system"]}),
+                f!("Children", Toggle{key:"asth_include_tree"}),
+            ],
+            ("module.audio_stream_haptics", "asth_volume") =>
+                vec![f!("Volume", v("asth_volume",0.0,2.0,1.0,Linear))],
+            ("module.audio_stream_haptics", "asth_release") =>
+                vec![f!("Release", v("asth_release",1.0,500.0,30.0,Decade))],
+            ("module.audio_stream_haptics", "asth_crossover") =>
+                vec![f!("Crossover", v("asth_crossover",60.0,800.0,250.0,Decade))],
+            ("module.audio_stream_haptics", "asth_amplitude") => vec![
+                f!("Floor", v("asth_amp_min",0.0,1.0,0.0,Linear)),
+                f!("Ceiling", v("asth_amp_max",0.0,1.0,1.0,Linear)),
+                f!("Curve", v("asth_curve",0.3,3.0,1.0,Linear)),
+            ],
+            ("module.audio_stream_haptics", "asth_balance") =>
+                vec![f!("Balance", v("asth_freq_bias",-1.0,1.0,0.0,Linear))],
+            ("module.audio_stream_haptics", "asth_swap_row") =>
+                vec![f!("Swap", Toggle{key:"asth_swap"})],
+            ("module.audio_stream_haptics", "asth_rumble_mix") =>
+                vec![f!("Rumble mix", v("asth_modulator",0.0,1.0,1.0,Linear))],
             // Selector mirrors counter's controls.
             ("module.selector", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
             ("module.selector", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
@@ -5620,8 +5680,13 @@ impl FlexInputApp {
             Some("module.switch") => NavWidgetKind::Toggle,
             Some("module.response_curve")
             | Some("module.vec_response_curve")
+            | Some("module.vec_reshape")
             | Some("module.twoway_response_curve")
                 if elem.as_deref() == Some("curve") => NavWidgetKind::Curve,
+            // Audio Stream Haptics scope: its EQ points are dot-editable exactly
+            // like a response curve (shared curve-dot nav path).
+            Some("module.audio_stream_haptics")
+                if elem.as_deref() == Some("asth_scope") => NavWidgetKind::Curve,
             Some("module.remapper") | Some("module.map_action")
             | Some("module.automap_combiner") => NavWidgetKind::Remapper,
             // Gyro lean sections are remapper-family mapping rows (Learn/capture +
@@ -5770,11 +5835,9 @@ impl FlexInputApp {
         }
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let popup_id = egui::Id::new(("dropdown_pinned_popup", inner.0));
-        ctx.memory_mut(|m| {
-            let is_open = m.is_popup_open(popup_id);
-            if open && !is_open { m.open_popup(popup_id); }
-            else if !open && is_open { m.close_popup(popup_id); }
-        });
+        let is_open = egui::Popup::is_id_open(ctx, popup_id);
+        if open && !is_open { egui::Popup::open_id(ctx, popup_id); }
+        else if !open && is_open { egui::Popup::close_id(ctx, popup_id); }
     }
 
     /// Cycle the selected dropdown by `dir` (+1/-1), wrapping. No-op otherwise.
@@ -5822,17 +5885,30 @@ impl FlexInputApp {
     /// switched by its `active_lane` param; the driver edits whichever is active
     /// so it matches the lane shown (and glowed) in the body. Other curves only
     /// have `points`.
+    /// (points_key, Option<biases_key>) for the selected curve-like element. The
+    /// Audio Stream Haptics EQ shares the curve-dot nav machinery but stores its
+    /// points under `asth_eq_points` and has NO per-segment biases (linear EQ).
     fn nav_curve_keys(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
-        -> (&'static str, &'static str)
+        -> (&'static str, Option<&'static str>)
     {
         let canvas = &self.tabs[self.active_tab].canvas;
-        let lane_dn = canvas.snarl.get_node(outer_id)
+        let node = canvas.snarl.get_node(outer_id)
             .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|sp| sp.snarl.get_node(inner));
+        if node.map(|n| n.module_id.as_str()) == Some("module.audio_stream_haptics") {
+            return ("asth_eq_points", None);
+        }
+        if node.map(|n| n.module_id.as_str()) == Some("module.vec_reshape") {
+            // Nav edits whichever curve the body's Edit toggle has active.
+            let gain = node.and_then(|n| n.params.get("edit_target").and_then(|v| v.as_str()))
+                != Some("boundary");
+            return if gain { ("gain_pts", Some("gain_biases")) } else { ("boundary_pts", None) };
+        }
+        let lane_dn = node
             .filter(|node| node.module_id == "module.twoway_response_curve")
             .and_then(|node| node.params.get("active_lane").and_then(|v| v.as_str()))
             == Some("dn");
-        if lane_dn { ("points_dn", "biases_dn") } else { ("points", "biases") }
+        if lane_dn { ("points_dn", Some("biases_dn")) } else { ("points", Some("biases")) }
     }
 
     fn nav_curve_points(&self, outer_id: egui_snarl::NodeId)
@@ -5843,7 +5919,8 @@ impl FlexInputApp {
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         let node = sp.snarl.get_node(inner)?;
         if !matches!(node.module_id.as_str(),
-            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve")
+            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
+            | "module.audio_stream_haptics" | "module.vec_reshape")
         { return None; }
         let (pts_key, _) = self.nav_curve_keys(outer_id, inner);
         let pts: Vec<[f32; 2]> = node.params.get(pts_key)?.as_array()?
@@ -5868,7 +5945,8 @@ impl FlexInputApp {
         let arr: Vec<serde_json::Value> = pts.iter()
             .map(|p| serde_json::json!([p[0] as f64, p[1] as f64])).collect();
         node.params.insert(pts_key.into(), serde_json::Value::Array(arr));
-        // biases: one per segment (points-1).
+        // biases: one per segment (points-1). Curve-less EQ (ASTH) has no biases.
+        let Some(bias_key) = bias_key else { return; };
         let want = pts.len().saturating_sub(1);
         let mut biases: Vec<f64> = node.params.get(bias_key)
             .and_then(|v| v.as_array())
@@ -5956,7 +6034,6 @@ impl FlexInputApp {
         // Bounds from the node: absolute → 0..1 ; bipolar → -1..1. Infer from
         // the existing endpoints' x.
         let x_lo = pts.first().map(|p| p[0]).unwrap_or(0.0);
-        let x_hi = pts.last().map(|p| p[0]).unwrap_or(1.0);
         let (y_lo, y_hi) = if x_lo < 0.0 { (-1.0, 1.0) } else { (0.0, 1.0) };
         let is_end = i == 0 || i == pts.len() - 1;
         let new_x = if is_end {
@@ -5976,6 +6053,8 @@ impl FlexInputApp {
     fn nav_curve_adjust_bias(&mut self, outer_id: egui_snarl::NodeId, i: usize, db: f32) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let (pts_key, bias_key) = self.nav_curve_keys(outer_id, inner);
+        // No per-segment biases (ASTH EQ) → nothing to adjust.
+        let Some(bias_key) = bias_key else { return; };
         let canvas = &mut self.tabs[self.active_tab].canvas;
         let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
         let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
@@ -6480,7 +6559,7 @@ impl FlexInputApp {
         // Gyro values are normalized dps/2000 (GYRO_REF_DPS), so a ~200°/s turn
         // is ≈0.1. Scale so that maps to a gentle ~150 px/s fine nudge.
         const GYRO_FINE: f32 = 3000.0; // px/s per normalized-gyro unit, while visible
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let gn = &mut self.gamepad_nav;
         if !gn.cursor_visible {
             // Seed at screen center on first appearance.
@@ -6553,8 +6632,8 @@ impl FlexInputApp {
         self.refresh_active_tab_device_ids();
         // Silence everything not referenced by the new active tab. The I/O
         // thread will keep silencing them each tick; this immediate pass
-        // matters because the I/O thread runs at 500 Hz and the UI thread
-        // controls flush ordering on tab switch.
+        // matters because the I/O thread runs at the polling rate (default
+        // 500 Hz) and the UI thread controls flush ordering on tab switch.
         let active_ids = self.active_tab_device_ids.read().unwrap().clone();
         let mut devs = self.shared_virtual_devices.lock().unwrap();
         for dev in devs.iter_mut() {
@@ -6657,7 +6736,7 @@ impl FlexInputApp {
         };
         let Some(progress) = progress else { return };
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         egui::Area::new(egui::Id::new("device_op_modal"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen.min)
@@ -8793,6 +8872,42 @@ impl FlexInputApp {
                         ui.end_row();
                     });
 
+                // ── Renderer ─────────────────────────────────────────────
+                // Backend is fixed at startup (the wgpu instance/surface can't
+                // be swapped live), so changes here take effect on restart.
+                // Auto steers AMD GPUs on Windows to OpenGL — their Vulkan
+                // swapchain stalls for seconds on window resize/restore
+                // (see `auto_backends` in app/src/main.rs).
+                {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.label(egui::RichText::new("Renderer").strong());
+                    ui.add_space(4.0);
+                    let mut choice = self.settings.renderer;
+                    egui::ComboBox::from_id_salt("renderer_choice")
+                        .selected_text(choice.label())
+                        .show_ui(ui, |ui| {
+                            for c in [
+                                settings::RendererChoice::Auto,
+                                settings::RendererChoice::Vulkan,
+                                settings::RendererChoice::OpenGl,
+                            ] {
+                                ui.selectable_value(&mut choice, c, c.label());
+                            }
+                        });
+                    if choice != self.settings.renderer {
+                        self.settings.renderer = choice;
+                        dirty = true;
+                    }
+                    ui.label(egui::RichText::new(
+                        "Takes effect after restarting FlexInput. Auto picks Vulkan, \
+                         except AMD GPUs on Windows get OpenGL (their Vulkan driver \
+                         stalls on window resize/restore)."
+                    ).small().weak());
+                }
+
                 // ── Profiler (dev tool, debug builds only) ──────────────
                 // Toggle flips `puffin::set_scopes_on()` and starts/stops
                 // a `puffin_http` server on 127.0.0.1:8585 so the
@@ -8843,7 +8958,7 @@ impl FlexInputApp {
                 ui.label(egui::RichText::new("Links").strong());
                 ui.add_space(4.0);
                 ui.hyperlink_to("FlexInput repository",      "https://github.com/x-iso/FlexInput");
-                ui.hyperlink_to("ViGEm Bus — latest release","https://github.com/nefarius/ViGEmBus/releases/latest");
+                ui.hyperlink_to("HIDMaestro — virtual HID driver", "https://github.com/hifihedgehog/HIDMaestro");
                 ui.hyperlink_to("HidHide — latest release",  "https://github.com/nefarius/HidHide/releases/latest");
 
                 ui.add_space(10.0);
@@ -8854,8 +8969,16 @@ impl FlexInputApp {
                 ui.label(egui::RichText::new("Credits").strong());
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(
-                    "Built with egui, eframe, egui-snarl, egui_extras, gilrs, midir, rfd, serde, ViGEmBus, HidHide."
+                    "Built with egui, eframe, egui-snarl, egui_extras, gilrs, SDL, midir, rfd, serde, HidHide."
                 ).small());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Virtual devices powered by").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("HIDMaestro").small(),
+                        "https://github.com/hifihedgehog/HIDMaestro",
+                    );
+                    ui.label(egui::RichText::new("by hifihedgehog (MIT).").small());
+                });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Input prompt SVG icons by Kenney —").small());
                     ui.hyperlink_to(
@@ -8923,7 +9046,7 @@ impl FlexInputApp {
     }
 }
 
-// ── 500 Hz device I/O thread ──────────────────────────────────────────────────
+// ── Device I/O thread (polling-rate setting, default 500 Hz) ──────────────────
 
 fn spawn_io_thread(
     mut backends: Vec<Box<dyn DeviceBackend>>,
@@ -9008,10 +9131,43 @@ fn spawn_io_thread(
             let mut ping_until: HashMap<String, Instant> = HashMap::new();
             const PING_RUMBLE_MS: u64 = 200;
 
+            // ── I/O stall diagnostics ─────────────────────────────────────
+            // Cheap per-iteration section timing (a handful of Instant::now
+            // calls, no allocation in steady state); prints ONE stderr line
+            // when an iteration's BUSY time (sleep excluded) overruns
+            // STALL_LOG_MS. Purpose: a periodic input freeze in the field
+            // names its guilty section without attaching a profiler — the
+            // every-few-seconds gap class of bug has now hidden in three
+            // different sections (enumerate classification, gyro open retry,
+            // and counting), so the instrumentation stays permanently. The
+            // stderr report is opt-in (FLEXINPUT_IO_STALL_LOG=1): with the
+            // known causes fixed, remaining hits are benign one-shots
+            // (hotplug arrivals) that would only add log noise.
+            const STALL_LOG_MS: u128 = 25;
+            let stall_log = std::env::var("FLEXINPUT_IO_STALL_LOG").map_or(false, |v| v == "1");
+            let io_started = Instant::now();
+            let mut sect_marks: Vec<(&'static str, Duration)> = Vec::with_capacity(12);
+            let mut backend_marks: Vec<Duration> = Vec::with_capacity(4);
+
             loop {
                 puffin::GlobalProfiler::lock().new_frame();
                 puffin::profile_scope!("io_thread_iter");
                 let t0 = Instant::now();
+                sect_marks.clear();
+                backend_marks.clear();
+                let mut sect_t = t0;
+                macro_rules! mark {
+                    ($name:literal) => {{
+                        let now = Instant::now();
+                        sect_marks.push(($name, now - sect_t));
+                        // The write after the LAST mark of an iteration is
+                        // intentionally dead (next iteration resets from t0).
+                        #[allow(unused_assignments)]
+                        {
+                            sect_t = now;
+                        }
+                    }};
+                }
                 // Re-read polling rate each iteration so live retunes apply.
                 let hz = polling_hz.load(Ordering::Relaxed).clamp(60, 4000);
                 let interval = Duration::from_nanos(1_000_000_000 / hz as u64);
@@ -9029,20 +9185,24 @@ fn spawn_io_thread(
                         }
                     }
                 }
+                mark!("spike_filter");
 
                 // ── Poll physical inputs ──────────────────────────────────────
                 let mut signals: HashMap<(String, String), Signal> = HashMap::new();
                 {
                     puffin::profile_scope!("backends_poll");
                     for backend in &mut backends {
+                        let bt = Instant::now();
                         for (dev, pin, sig) in backend.poll() {
                             signals.insert((dev, pin), sig);
                         }
                         for (dev, n) in backend.take_event_counts() {
                             *dev_event_acc.entry(dev).or_insert(0) += n;
                         }
+                        backend_marks.push(bt.elapsed());
                     }
                 }
+                mark!("backends_poll");
                 {
                     puffin::profile_scope!("midi_poll");
                     if let Ok(mut mg) = midi.try_lock() {
@@ -9056,6 +9216,7 @@ fn spawn_io_thread(
                         }
                     }
                 }
+                mark!("midi_poll");
                 // Tap gyro/accel samples into the per-pin scope rings so the
                 // calibration window can render at true polling Hz rather than
                 // UI repaint Hz. We do this BEFORE moving `signals` into the
@@ -9064,7 +9225,7 @@ fn spawn_io_thread(
                 // Skip the write-lock acquisition entirely when no taped pin
                 // names appear in this iteration's signals — the common case
                 // when no gyro-capable device is connected. Saves a contended
-                // RwLock write per loop iteration (500 Hz) on idle setups.
+                // RwLock write per loop iteration (polling rate) on idle setups.
                 let has_taped_pin = signals.keys()
                     .any(|(_, pin)| flexinput_engine::SCOPE_TAP_PINS.iter().any(|p| *p == pin.as_str()));
                 if has_taped_pin {
@@ -9095,6 +9256,7 @@ fn spawn_io_thread(
                         }
                     }
                 }
+                mark!("scope_taps");
 
                 {
                     puffin::profile_scope!("publish_signals");
@@ -9113,22 +9275,32 @@ fn spawn_io_thread(
                     // map clone under a RwLock.
                     proc_device_signals.store(std::sync::Arc::new(signals));
                 }
+                mark!("publish");
 
                 // ── Enumerate gilrs devices periodically ──────────────────────
                 // MIDI enumeration is handled by spawn_midi_watch_thread() so
                 // the slow Win32 MIDI calls (60–70 ms with loopMIDI loaded)
-                // don't stall this 500 Hz I/O loop.
+                // don't stall this I/O loop.
                 if last_enum.elapsed() > Duration::from_secs(2) {
                     puffin::profile_scope!("enumerate_devices");
                     let mut devs: Vec<PhysicalDevice> = Vec::new();
-                    for backend in &mut backends {
+                    // Per-backend rows in the stall report (absolute durations,
+                    // alongside the "enumerate" section total): a stall here has
+                    // hidden in both backends already (gilrs classification,
+                    // SDL's open-probe), so name the culprit directly.
+                    for (bi, backend) in backends.iter_mut().enumerate() {
+                        let bt = Instant::now();
                         devs.extend(backend.enumerate());
+                        let name: &'static str =
+                            match bi { 0 => "enum_b0", 1 => "enum_b1", _ => "enum_bN" };
+                        sect_marks.push((name, bt.elapsed()));
                     }
                     // Append MIDI device list maintained by the MIDI watch thread.
                     devs.extend(shared_midi_devices.read().unwrap().iter().cloned());
                     *shared_devices.write().unwrap() = devs;
                     last_enum = Instant::now();
                 }
+                mark!("enumerate");
 
                 // ── Get latest sink outputs from processing thread ─────────────
                 // Uses a separate RwLock so this read never contends on proc_outputs.
@@ -9136,6 +9308,7 @@ fn spawn_io_thread(
                     puffin::profile_scope!("read_sink_bus");
                     sink_bus.read().unwrap().clone()
                 };
+                mark!("sink_bus");
 
                 // ── Drive virtual & physical devices ──────────────────────────
                 // Shared pool holds ALL virtual devices across every open
@@ -9259,6 +9432,7 @@ fn spawn_io_thread(
                         }
                     }
                 }
+                mark!("virtual_route");
 
                 // Physical device outputs (rumble, lightbar) to gilrs pads run
                 // regardless of bypass: these carry *incoming* feedback the game
@@ -9378,6 +9552,30 @@ fn spawn_io_thread(
                         for dev_id in expired { ping_until.remove(&dev_id); }
                     }
                 }
+                mark!("outputs_misc");
+
+                // ── Stall report (see I/O stall diagnostics above) ────────────
+                // Checked BEFORE the sleep so only busy time counts. Formats
+                // lazily: nothing allocates unless a stall actually happened.
+                let busy = t0.elapsed();
+                if stall_log && busy.as_millis() >= STALL_LOG_MS {
+                    let mut line = format!(
+                        "[io-stall] +{:.1}s busy {:.1}ms:",
+                        io_started.elapsed().as_secs_f32(),
+                        busy.as_secs_f32() * 1e3,
+                    );
+                    for (name, d) in &sect_marks {
+                        if d.as_micros() >= 500 {
+                            line.push_str(&format!(" {}={:.1}ms", name, d.as_secs_f32() * 1e3));
+                        }
+                    }
+                    for (i, d) in backend_marks.iter().enumerate() {
+                        if d.as_micros() >= 500 {
+                            line.push_str(&format!(" backend{}={:.1}ms", i, d.as_secs_f32() * 1e3));
+                        }
+                    }
+                    eprintln!("{line}");
+                }
 
                 let elapsed = t0.elapsed();
                 if elapsed < interval {
@@ -9390,7 +9588,8 @@ fn spawn_io_thread(
                 let dt = now.duration_since(last_loop_t).as_secs_f32().max(1e-4);
                 last_loop_t = now;
                 let inst_hz = 1.0 / dt;
-                // ~1 s time constant at 500 Hz loop = alpha ≈ 0.002
+                // EMA time constant scales with the loop rate: alpha 0.02
+                // ≈ 0.1 s at the default 500 Hz, ≈ 0.4 s at the 125 Hz floor.
                 let alpha = 0.02_f32;
                 if measured_hz_ema == 0.0 {
                     measured_hz_ema = inst_hz;
@@ -9446,7 +9645,7 @@ fn spawn_io_thread(
 
 // ── MIDI watch thread ────────────────────────────────────────────────────────
 //
-// Runs the (slow, Windows-blocking) MIDI port enumeration off the 500 Hz I/O
+// Runs the (slow, Windows-blocking) MIDI port enumeration off the I/O
 // loop so it never stalls device polling. Cycle every 2 s:
 //
 //  1. Read pinned_midi_ids (set of midi_in:N / midi_out:N the canvas uses).
@@ -9518,479 +9717,6 @@ fn spawn_midi_watch_thread(
             }
         })
         .expect("failed to spawn MIDI watch thread");
-}
-
-// ── Signal routing ────────────────────────────────────────────────────────────
-
-/// Combine two signals of the same type: Bool=OR, numeric/Vec2=sum.
-fn combine_signals(a: Signal, b: Signal) -> Signal {
-    match (a, b) {
-        (Signal::Bool(x),  Signal::Bool(y))  => Signal::Bool(x || y),
-        (Signal::Float(x), Signal::Float(y)) => Signal::Float(x + y),
-        (Signal::Vec2(x),  Signal::Vec2(y))  => Signal::Vec2(x + y),
-        (Signal::Int(x),   Signal::Int(y))   => Signal::Int(x + y),
-        (_, b) => b,
-    }
-}
-
-fn route_signals(
-    snarl: &Snarl<NodeData>,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    active: &mut Vec<Box<dyn VirtualDevice>>,
-    backends: &mut Vec<Box<dyn DeviceBackend>>,
-    cache: &mut HashMap<(NodeId, usize), Option<Signal>>,
-) {
-    // (device_id, pin_id) -> combined signal; multiple wires combine via combine_signals.
-    let mut route_map: HashMap<(String, String), Signal> = HashMap::new();
-
-    for (node_id, node_ref) in snarl.nodes_ids_data() {
-        let node = &node_ref.value;
-        if node.module_id != "device.sink" {
-            continue;
-        }
-
-        let sink_id = match node.params.get("device_id").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-
-        let pin_ids: Vec<String> = node.params
-            .get("input_pin_ids")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-            .unwrap_or_default();
-
-        // Track sink pin IDs that have any direct wire connected; these take
-        // priority over anything the auto-map bus would supply for the same pin.
-        // Wired = a connection exists in the graph, regardless of whether a signal
-        // is currently arriving (avoids auto-map filling pins mid-connection).
-        let mut directly_wired: HashSet<String> = HashSet::new();
-
-        // ── Normal (non-AutoMap) pins ────────────────────────────────────────
-        for in_idx in 0..node.inputs.len() {
-            if node.inputs[in_idx].signal_type == SignalType::AutoMap {
-                continue;
-            }
-            let dst_pin = match pin_ids.get(in_idx).filter(|s| !s.is_empty()) {
-                Some(s) => s.clone(),
-                None => continue,
-            };
-            let dst_stype = node.inputs[in_idx].signal_type;
-            let in_pin = snarl.in_pin(InPinId { node: node_id, input: in_idx });
-            if !in_pin.remotes.is_empty() {
-                directly_wired.insert(dst_pin.clone());
-            }
-            for &src in &in_pin.remotes {
-                if let Some(sig) = eval_output(snarl, src.node, src.output, dev_sigs, 0, cache) {
-                    let coerced = if dst_stype == SignalType::Any {
-                        sig
-                    } else {
-                        match sig.coerce_to(dst_stype) {
-                            Some(s) => s,
-                            None => continue,
-                        }
-                    };
-                    let key = (sink_id.clone(), dst_pin.clone());
-                    route_map.entry(key).and_modify(|e| *e = combine_signals(*e, coerced)).or_insert(coerced);
-                }
-            }
-        }
-
-        // ── AutoMap bus pins ─────────────────────────────────────────────────
-        for in_idx in 0..node.inputs.len() {
-            if node.inputs[in_idx].signal_type != SignalType::AutoMap {
-                continue;
-            }
-            let in_pin = snarl.in_pin(InPinId { node: node_id, input: in_idx });
-            for &src_out in &in_pin.remotes {
-                let src_node = match snarl.get_node(src_out.node) {
-                    Some(n) => n,
-                    None => continue,
-                };
-                if src_node.module_id != "device.source" {
-                    continue;
-                }
-                let src_dev_id = match src_node.params.get("device_id").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-
-                // Collect source output pin IDs/types, skipping the automap port itself.
-                let src_entries: Vec<(String, SignalType)> = src_node.params
-                    .get("output_pin_ids")
-                    .and_then(|v| v.as_array())
-                    .map(|ids| {
-                        ids.iter().enumerate().filter_map(|(i, v)| {
-                            let pid = v.as_str()?;
-                            if pid.is_empty() { return None; }
-                            let stype = src_node.outputs.get(i)?.signal_type;
-                            if stype == SignalType::AutoMap { return None; }
-                            Some((pid.to_string(), stype))
-                        }).collect()
-                    })
-                    .unwrap_or_default();
-
-                // Collect sink input pin IDs/types, skipping the automap port itself.
-                let dst_entries: Vec<(String, SignalType)> = pin_ids.iter().enumerate()
-                    .filter_map(|(i, id)| {
-                        if id.is_empty() { return None; }
-                        let stype = node.inputs.get(i)?.signal_type;
-                        if stype == SignalType::AutoMap { return None; }
-                        Some((id.clone(), stype))
-                    })
-                    .collect();
-
-                let src_ids: Vec<&str> = src_entries.iter().map(|(s, _)| s.as_str()).collect();
-                let dst_ids: Vec<&str> = dst_entries.iter().map(|(s, _)| s.as_str()).collect();
-
-                for (mapped_src, mapped_dst) in
-                    flexinput_core::automap::resolve_mapping(&src_ids, &dst_ids)
-                {
-                    // Direct wire on this sink pin takes priority.
-                    if directly_wired.contains(mapped_dst) {
-                        continue;
-                    }
-                    let dst_stype = dst_entries.iter()
-                        .find(|(id, _)| id.as_str() == mapped_dst)
-                        .map(|(_, t)| *t)
-                        .unwrap_or(SignalType::Float);
-
-                    if let Some(&raw) = dev_sigs.get(&(src_dev_id.clone(), mapped_src.to_string())) {
-                        if let Some(coerced) = raw.coerce_to(dst_stype) {
-                            let key = (sink_id.clone(), mapped_dst.to_string());
-                            route_map.entry(key).and_modify(|e| *e = combine_signals(*e, coerced)).or_insert(coerced);
-                        }
-                    }
-                }
-            }
-        }
-
-        // When both a Vec2 stick pin and its individual axis pins are present in
-        // route_map for the same device they write to the same hardware registers
-        // and fight. Resolve per direct-wire priority: axes win when directly
-        // wired and Vec2 is not; Vec2 wins in all other cases (including all-automap).
-        const STICK_GROUPS: &[(&str, &[&str])] = &[
-            ("left_stick",  &["left_stick_x", "left_stick_y"]),
-            ("right_stick", &["right_stick_x", "right_stick_y"]),
-            ("dpad",        &["dpad_x", "dpad_y"]),
-        ];
-        for &(vec2_pin, axis_pins) in STICK_GROUPS {
-            let has_vec2     = route_map.contains_key(&(sink_id.clone(), vec2_pin.to_string()));
-            let has_any_axis = axis_pins.iter().any(|p| route_map.contains_key(&(sink_id.clone(), p.to_string())));
-            if !has_vec2 || !has_any_axis { continue; }
-            let vec2_direct     = directly_wired.contains(vec2_pin);
-            let any_axis_direct = axis_pins.iter().any(|p| directly_wired.contains(*p));
-            if any_axis_direct && !vec2_direct {
-                route_map.remove(&(sink_id.clone(), vec2_pin.to_string()));
-            } else {
-                for &axis_pin in axis_pins {
-                    route_map.remove(&(sink_id.clone(), axis_pin.to_string()));
-                }
-            }
-        }
-    }
-
-    for ((device_id, pin_id), signal) in route_map {
-        if let Some(dev) = active.iter_mut().find(|d| d.id() == device_id) {
-            dev.send(&pin_id, signal);
-        } else if device_id.starts_with("gilrs:") {
-            // Physical-device sink (rumble / lightbar / future haptics).
-            // We dispatch to every backend and let each one filter on the id;
-            // currently only GilrsBackend recognises `gilrs:N`.
-            for backend in backends.iter_mut() {
-                backend.send(&device_id, &pin_id, signal);
-            }
-        }
-    }
-}
-
-fn route_midi_out(
-    snarl: &Snarl<NodeData>,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    midi: &mut flexinput_devices::MidiBackend,
-    cache: &mut HashMap<(NodeId, usize), Option<Signal>>,
-) {
-    let mut routes: Vec<(String, String, Signal)> = vec![];
-
-    for (node_id, node_ref) in snarl.nodes_ids_data() {
-        let node = &node_ref.value;
-        if node.module_id != "device.sink" { continue; }
-
-        let sink_id = match node.params.get("device_id").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        if !sink_id.starts_with("midi_out:") { continue; }
-
-        let pin_ids: Vec<String> = node.params
-            .get("input_pin_ids")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-            .unwrap_or_default();
-
-        for in_idx in 0..node.inputs.len() {
-            let dst_pin = match pin_ids.get(in_idx).filter(|s| !s.is_empty()) {
-                Some(s) => s.clone(),
-                None => continue,
-            };
-            let in_pin = snarl.in_pin(InPinId { node: node_id, input: in_idx });
-            for &src in &in_pin.remotes {
-                if let Some(sig) = eval_output(snarl, src.node, src.output, dev_sigs, 0, cache) {
-                    routes.push((sink_id.clone(), dst_pin.clone(), sig));
-                }
-            }
-        }
-    }
-
-    for (device_id, pin_id, signal) in routes {
-        midi.send(&device_id, &pin_id, signal);
-    }
-}
-
-/// Recursively evaluates the signal at a node's output pin.
-fn eval_output(
-    snarl: &Snarl<NodeData>,
-    node_id: NodeId,
-    out_idx: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    depth: u8,
-    cache: &mut HashMap<(NodeId, usize), Option<Signal>>,
-) -> Option<Signal> {
-    if depth > 16 {
-        return None; // prevent infinite recursion in cyclic graphs
-    }
-
-    let key = (node_id, out_idx);
-    if let Some(&cached) = cache.get(&key) {
-        return cached;
-    }
-
-    let node = snarl.get_node(node_id)?;
-
-    let result = match node.module_id.as_str() {
-        "device.source" => {
-            let dev_id = node.params.get("device_id")?.as_str()?;
-            let ids = node.params.get("output_pin_ids")?.as_array()?;
-            let pin_id = ids.get(out_idx)?.as_str()?;
-            dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
-        }
-        "module.constant" | "module.knob" => {
-            node.params.get("value")
-                .and_then(|v| v.as_f64())
-                .map(|f| Signal::Float(f as f32))
-        }
-        "module.switch" => {
-            node.params.get("active")
-                .and_then(|v| v.as_bool())
-                .map(Signal::Bool)
-        }
-        id => {
-            let n_inputs = node.inputs.len();
-            let mut inputs = Vec::with_capacity(n_inputs);
-            for i in 0..n_inputs {
-                let p = snarl.in_pin(InPinId { node: node_id, input: i });
-                let sig = p.remotes.first().and_then(|&src| {
-                    eval_output(snarl, src.node, src.output, dev_sigs, depth + 1, cache)
-                });
-                inputs.push(sig);
-            }
-            let node = snarl.get_node(node_id)?;
-            eval_module(id, out_idx, &inputs, node)
-        }
-    };
-
-    cache.insert(key, result);
-    result
-}
-
-fn get_f(inputs: &[Option<Signal>], i: usize, default: f32) -> f32 {
-    inputs.get(i).and_then(|s| *s)
-        .map(|s| s.as_float())
-        .unwrap_or(default)
-}
-
-fn get_b(inputs: &[Option<Signal>], i: usize, default: bool) -> bool {
-    inputs.get(i).and_then(|s| *s)
-        .map(|s| s.as_bool())
-        .unwrap_or(default)
-}
-
-/// Evaluates a pure module given its resolved inputs; also reads param defaults.
-fn eval_module(id: &str, out_idx: usize, inputs: &[Option<Signal>], node: &NodeData) -> Option<Signal> {
-    // For optional inputs, fall back to node params if no wire connected.
-    let param_f = |name: &str, default: f32| -> f32 {
-        node.params.get(name).and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(default)
-    };
-
-    match id {
-        "math.add" => {
-            Some(Signal::Float((0..inputs.len()).map(|i| get_f(inputs, i, 0.0)).sum()))
-        }
-        "math.subtract" => {
-            let first = get_f(inputs, 0, 0.0);
-            let rest: f32 = (1..inputs.len()).map(|i| get_f(inputs, i, 0.0)).sum();
-            Some(Signal::Float(first - rest))
-        }
-        "math.multiply" => {
-            let first = get_f(inputs, 0, 0.0);
-            let rest: f32 = (1..inputs.len()).map(|i| get_f(inputs, i, 1.0)).product();
-            Some(Signal::Float(first * rest))
-        }
-        "math.divide" => {
-            let mut v = get_f(inputs, 0, 0.0);
-            for i in 1..inputs.len() {
-                let d = get_f(inputs, i, 1.0);
-                v = if d == 0.0 { 0.0 } else { v / d };
-            }
-            Some(Signal::Float(v))
-        }
-        "math.abs"       => Some(Signal::Float(get_f(inputs, 0, 0.0).abs())),
-        "math.negate"    => Some(Signal::Float(-get_f(inputs, 0, 0.0))),
-        "math.clamp"     => {
-            let v   = get_f(inputs, 0, 0.0);
-            let min = if inputs.get(1).and_then(|s| *s).is_some() { get_f(inputs, 1, -1.0) } else { param_f("min", -1.0) };
-            let max = if inputs.get(2).and_then(|s| *s).is_some() { get_f(inputs, 2,  1.0) } else { param_f("max",  1.0) };
-            Some(Signal::Float(v.clamp(min, max)))
-        }
-        "math.map_range" => {
-            let v       = get_f(inputs, 0, 0.0);
-            let in_min  = if inputs.get(1).and_then(|s| *s).is_some() { get_f(inputs, 1, -1.0) } else { param_f("in_min",  -1.0) };
-            let in_max  = if inputs.get(2).and_then(|s| *s).is_some() { get_f(inputs, 2,  1.0) } else { param_f("in_max",   1.0) };
-            let out_min = if inputs.get(3).and_then(|s| *s).is_some() { get_f(inputs, 3, -1.0) } else { param_f("out_min", -1.0) };
-            let out_max = if inputs.get(4).and_then(|s| *s).is_some() { get_f(inputs, 4,  1.0) } else { param_f("out_max",  1.0) };
-            let t = if (in_max - in_min).abs() < f32::EPSILON { 0.0 }
-                    else { (v - in_min) / (in_max - in_min) };
-            Some(Signal::Float(out_min + t * (out_max - out_min)))
-        }
-        "logic.and"      => Some(Signal::Bool(get_b(inputs, 0, false) && get_b(inputs, 1, false))),
-        "logic.or"       => Some(Signal::Bool(get_b(inputs, 0, false) || get_b(inputs, 1, false))),
-        "logic.not"      => Some(Signal::Bool(!get_b(inputs, 0, false))),
-        "logic.xor"      => Some(Signal::Bool(get_b(inputs, 0, false) ^ get_b(inputs, 1, false))),
-        "logic.equal"     => Some(Signal::Bool(get_f(inputs, 0, 0.0) == get_f(inputs, 1, 0.0))),
-        "logic.not_equal" => Some(Signal::Bool(get_f(inputs, 0, 0.0) != get_f(inputs, 1, 0.0))),
-        "logic.greater_than" => {
-            let a = get_f(inputs, 0, 0.0);
-            let b = get_f(inputs, 1, 0.0);
-            let or_eq = node.params.get("or_equal").and_then(|v| v.as_bool()).unwrap_or(false);
-            Some(Signal::Bool(if or_eq { a >= b } else { a > b }))
-        }
-        "logic.less_than" => {
-            let a = get_f(inputs, 0, 0.0);
-            let b = get_f(inputs, 1, 0.0);
-            let or_eq = node.params.get("or_equal").and_then(|v| v.as_bool()).unwrap_or(false);
-            Some(Signal::Bool(if or_eq { a <= b } else { a < b }))
-        }
-        "module.selector" => {
-            if out_idx == 0 {
-                let n_inputs = inputs.len().saturating_sub(1);
-                let sel = get_f(inputs, 0, 0.0);
-                let interp = node.params.get("interpolate").and_then(|v| v.as_bool()).unwrap_or(false);
-                if interp && n_inputs >= 2 {
-                    let pos = sel.clamp(0.0, 1.0) * (n_inputs - 1) as f32;
-                    let lo = pos.floor() as usize;
-                    let hi = (lo + 1).min(n_inputs - 1);
-                    let t = pos.fract();
-                    let lo_v = inputs.get(lo + 1).and_then(|s| *s).map(|s| s.as_float()).unwrap_or(0.0);
-                    let hi_v = inputs.get(hi + 1).and_then(|s| *s).map(|s| s.as_float()).unwrap_or(0.0);
-                    Some(Signal::Float(lo_v * (1.0 - t) + hi_v * t))
-                } else {
-                    let n = n_inputs as f32;
-                    let idx = (sel.clamp(0.0, 1.0) * n).floor() as usize;
-                    let idx = idx.min(n_inputs.saturating_sub(1));
-                    inputs.get(idx + 1).and_then(|s| *s)
-                }
-            } else {
-                None
-            }
-        }
-        "module.split" => {
-            let n = node.outputs.len();
-            let sel = get_f(inputs, 0, 0.0);
-            let val = get_f(inputs, 1, 0.0);
-            let interp = node.params.get("interpolate").and_then(|v| v.as_bool()).unwrap_or(false);
-            if interp && n >= 2 {
-                let pos = sel.clamp(0.0, 1.0) * (n - 1) as f32;
-                let lo = pos.floor() as usize;
-                let hi = (lo + 1).min(n - 1);
-                let t = pos.fract();
-                let lo_w = 1.0 - t;
-                let hi_w = t;
-                if out_idx == lo && lo == hi {
-                    Some(Signal::Float(val))
-                } else if out_idx == lo {
-                    Some(Signal::Float(val * lo_w))
-                } else if out_idx == hi {
-                    Some(Signal::Float(val * hi_w))
-                } else {
-                    Some(Signal::Float(0.0))
-                }
-            } else {
-                let idx = (sel.clamp(0.0, 1.0) * n as f32).floor() as usize;
-                let idx = idx.min(n.saturating_sub(1));
-                if out_idx == idx { Some(Signal::Float(val)) } else { Some(Signal::Float(0.0)) }
-            }
-        }
-        // Stateful modules: output computed by update_stateful_nodes() each frame.
-        "logic.has_changed" | "logic.delay" | "logic.counter" | "generator.oscillator" | "generator.envelope" | "module.delay" | "processing.gyro_3dof" => {
-            node.extra.last_signals.get(out_idx).copied().flatten()
-        }
-        "module.average" | "module.dc_filter" => {
-            node.extra.last_signals.get(out_idx).copied().flatten()
-        }
-        "module.response_curve" => {
-            if out_idx >= node.outputs.len() { return None; }
-            let x        = get_f(inputs, out_idx, 0.0);
-            let pts      = curve_points_from_params(node);
-            let biases   = flexinput_engine::biases_from_params(&node.params);
-            let absolute = node.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true);
-            let in_max   = node.params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
-            let in_min   = node.params.get("in_min") .and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
-            let out_max  = node.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
-            let out_min  = node.params.get("out_min").and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
-            Some(Signal::Float(apply_curve(x, &pts, &biases, absolute, in_min, in_max, out_min, out_max, read_scale_t(node))))
-        }
-        "module.vec_response_curve" => {
-            if out_idx >= node.outputs.len() { return None; }
-            let vec = match inputs.get(out_idx).and_then(|s| *s) {
-                Some(Signal::Vec2(v)) => v,
-                _ => return Some(Signal::Vec2(glam::Vec2::ZERO)),
-            };
-            let mag = vec.length();
-            if mag < f32::EPSILON {
-                return Some(Signal::Vec2(glam::Vec2::ZERO));
-            }
-            let pts     = curve_points_from_params(node);
-            let biases  = flexinput_engine::biases_from_params(&node.params);
-            let in_max  = node.params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-            let out_max = node.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-            let out_mag = apply_curve(mag, &pts, &biases, true, 0.0, in_max, 0.0, out_max, read_scale_t(node));
-            Some(Signal::Vec2(vec / mag * out_mag))
-        }
-        "module.vec_to_axis" => {
-            let vec = match inputs.first().and_then(|s| *s) {
-                Some(Signal::Vec2(v)) => v,
-                _ => glam::Vec2::ZERO,
-            };
-            match out_idx {
-                0 => Some(Signal::Float(vec.x)),
-                1 => Some(Signal::Float(vec.y)),
-                _ => None,
-            }
-        }
-        "module.axis_to_vec" => {
-            if out_idx != 0 { return None; }
-            let x = match inputs.first().and_then(|s| *s) {
-                Some(Signal::Float(f)) => f,
-                _ => 0.0,
-            };
-            let y = match inputs.get(1).and_then(|s| *s) {
-                Some(Signal::Float(f)) => f,
-                _ => 0.0,
-            };
-            Some(Signal::Vec2(glam::Vec2::new(x, y)))
-        }
-        _ => None,
-    }
 }
 
 // ── Processing-thread graph snapshot builder ──────────────────────────────────
@@ -10138,17 +9864,6 @@ fn sync_display_state_into(dst: &mut Snarl<NodeData>, src: &Snarl<NodeData>) {
             }
         }
     }
-}
-
-/// Walk an AutoMap wire chain from `src` back to the originating device.source.
-/// Returns (source_dev_id, source_pin_ids, fallback_dev_id).
-/// - For device.source: (real_dev_id, output_pins, None).
-/// - For automap_split: transparent passthrough (result of upstream).
-/// - For automap_collect: ("collector:{uid}", canonical_pins, Some(upstream_real_dev_id)).
-/// - For subpatch: descends into the inner snarl through the matching outlet.
-/// - For subpatch.inlet (only reached during inner traversal): pops back to outer snarl.
-fn find_automap_device(snarl: &Snarl<NodeData>, src: OutPinId) -> Option<(String, Vec<String>, Option<String>)> {
-    find_automap_device_rec(snarl, src, None)
 }
 
 /// True when `id` names a real I/O device (physical pad, MIDI port, or virtual
@@ -10303,6 +10018,13 @@ pub(crate) fn fold_outer_uid_app(p: &crate::canvas::viewer::AutomapGlowParent<'_
     }
 }
 
+/// Walk an AutoMap wire chain from `src` back to the originating device.source.
+/// Returns (source_dev_id, source_pin_ids, fallback_dev_id).
+/// - For device.source: (real_dev_id, output_pins, None).
+/// - For automap_split: transparent passthrough (result of upstream).
+/// - For automap_collect: ("collector:{uid}", canonical_pins, Some(upstream_real_dev_id)).
+/// - For subpatch: descends into the inner snarl through the matching outlet.
+/// - For subpatch.inlet (only reached during inner traversal): pops back to outer snarl.
 fn find_automap_device_rec(
     snarl: &Snarl<NodeData>,
     src: OutPinId,
@@ -11122,146 +10844,9 @@ fn build_processing_graph_rec(
     (ProcessingGraph { nodes }, dirty_uids)
 }
 
-fn curve_points_from_params(node: &NodeData) -> Vec<[f32; 2]> {
-    let absolute = node.params.get("absolute").and_then(|v| v.as_bool()).unwrap_or(true);
-    node.params
-        .get("points")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|pt| {
-                    let a = pt.as_array()?;
-                    Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            if absolute { vec![[0.0, 0.0], [1.0, 1.0]] }
-            else        { vec![[-1.0, -1.0], [1.0, 1.0]] }
-        })
-}
-
-fn apply_curve(
-    x: f32,
-    pts: &[[f32; 2]],
-    biases: &[f32],
-    absolute: bool,
-    in_min: f32, in_max: f32,
-    out_min: f32, out_max: f32,
-    scale_t: f32,
-) -> f32 {
-    if absolute {
-        let sign      = if x < 0.0 { -1.0f32 } else { 1.0 };
-        let abs_max   = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
-        let abs_norm  = (x.abs() / abs_max).clamp(0.0, 1.0);
-        let scaled    = curve_scale(abs_norm, scale_t);
-        let curve_y   = sample_curve(pts, scaled, biases).clamp(0.0, 1.0);
-        let out_y     = curve_scale_inv(curve_y, scale_t);
-        let out_scale = out_max.abs().max(out_min.abs());
-        sign * out_y * out_scale
-    } else {
-        let in_range  = (in_max - in_min).abs().max(f32::EPSILON);
-        let out_range = out_max - out_min;
-        let norm      = ((x - in_min) / in_range * 2.0 - 1.0).clamp(-1.0, 1.0);
-        let sign      = if norm < 0.0 { -1.0f32 } else { 1.0 };
-        let scaled    = sign * curve_scale(norm.abs(), scale_t);
-        let curve_y   = sample_curve(pts, scaled, biases);
-        let sign_out  = if curve_y < 0.0 { -1.0f32 } else { 1.0 };
-        let out_y     = sign_out * curve_scale_inv(curve_y.abs(), scale_t);
-        out_min + (out_y.clamp(-1.0, 1.0) + 1.0) * 0.5 * out_range
-    }
-}
-
-/// Maps x ∈ [0,1] → [0,1] continuously. t=0 → linear; t<0 → log-like; t>0 → exp-like.
-/// Power law p = 2^(t*3): at t=±1, p=8 or 1/8 — far more extreme than the old log/exp modes.
-fn curve_scale(x: f32, t: f32) -> f32 {
-    if t.abs() < 1e-4 { return x; }
-    x.clamp(0.0, 1.0).powf(2.0f32.powf(t * 3.0))
-}
-
-fn curve_scale_inv(y: f32, t: f32) -> f32 {
-    if t.abs() < 1e-4 { return y; }
-    y.clamp(0.0, 1.0).powf(1.0 / 2.0f32.powf(t * 3.0))
-}
-
-fn read_scale_t(node: &NodeData) -> f32 {
-    node.params.get("scale_t")
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32)
-        .unwrap_or_else(|| match node.params.get("in_scale").and_then(|v| v.as_i64()).unwrap_or(0) {
-            1 => -0.5,
-            2 =>  0.5,
-            _ =>  0.0,
-        })
-}
-
 // ── Display node history update ───────────────────────────────────────────────
 
-const DISPLAY_IDS: &[&str] = &[
-    "display.readout",
-    "display.oscilloscope",
-    "display.vectorscope",
-    "display.trigscope",
-];
 const HISTORY_LEN: usize = 20000;
-
-fn update_display_nodes(
-    snarl: &mut Snarl<NodeData>,
-    dev_sigs: &HashMap<(String, String), Signal>,
-    cache: &mut HashMap<(NodeId, usize), Option<Signal>>,
-) {
-    let node_ids: Vec<NodeId> = snarl
-        .nodes_ids_data()
-        .filter(|(_, n)| DISPLAY_IDS.contains(&n.value.module_id.as_str()))
-        .map(|(id, _)| id)
-        .collect();
-
-    for node_id in node_ids {
-        let (n_inputs, module_id) = snarl.get_node(node_id)
-            .map(|n| (n.inputs.len(), n.module_id.clone()))
-            .unwrap_or_default();
-        let mut vals = Vec::with_capacity(n_inputs);
-        for i in 0..n_inputs {
-            let pin = snarl.in_pin(InPinId { node: node_id, input: i });
-            let sig = pin.remotes.first().and_then(|&src| {
-                eval_output(snarl, src.node, src.output, dev_sigs, 0, cache)
-            });
-            vals.push(sig);
-        }
-
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            // Store for readout body rendering
-            node.extra.last_signals = vals.clone();
-
-            // Append one sample to the history ring buffer.
-            // Vectorscope channels are Vec2: flatten each into [x, y] pairs.
-            let sample: Vec<Option<f32>> = if module_id == "display.vectorscope" {
-                vals.iter().flat_map(|sig| match sig {
-                    Some(Signal::Vec2(v)) => [Some(v.x), Some(v.y)],
-                    _ => [None, None],
-                }).collect()
-            } else {
-                (0..vals.len())
-                    .map(|i| sig_to_f32(vals.get(i).copied().flatten()))
-                    .collect()
-            };
-            if node.extra.history.len() >= HISTORY_LEN {
-                node.extra.history.pop_front();
-            }
-            node.extra.history.push_back(sample);
-        }
-    }
-}
-
-fn sig_to_f32(s: Option<Signal>) -> Option<f32> {
-    match s {
-        Some(Signal::Float(f)) => Some(f),
-        Some(Signal::Bool(b))  => Some(if b { 1.0 } else { 0.0 }),
-        Some(Signal::Vec2(v))  => Some(v.length()),
-        Some(Signal::Int(i))   => Some(i as f32),
-        None => None,
-    }
-}
 
 // ── Tab bar ───────────────────────────────────────────────────────────────────
 
@@ -11829,7 +11414,7 @@ fn show_title_bar(
             // SelectableLabel so the active state gets the standard egui
             // highlight, matching the see-through eye toggle's look.
             let pin_label = egui::RichText::new("📌").size(13.0);
-            let pin_resp = ui.add(egui::SelectableLabel::new(pin_active, pin_label));
+            let pin_resp = ui.add(egui::Button::selectable(pin_active, pin_label));
             let hover = if pin_active {
                 "Pinned: window stays on top of all others.\nClick to unpin."
             } else {
@@ -12143,9 +11728,6 @@ pub fn render_app_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: icon.rgba, width: icon.width, height: icon.height })
 }
 
-// Render height in logical pixels; SVGs are 28/30 px tall by design,
-// 22 is a comfortable shrunk title-bar size.
-const MODE_PILL_RENDER_H: f32 = 22.0;
 
 #[derive(Clone, Copy, Debug)]
 enum ModePillVariant { Wide, Short }
@@ -12161,7 +11743,7 @@ fn render_eye_toggle(ui: &mut egui::Ui, bar_h: f32) {
         .unwrap_or(false);
 
     let eye_label = egui::RichText::new("👁").size(14.0);
-    let eye_btn = egui::SelectableLabel::new(see_through_on, eye_label);
+    let eye_btn = egui::Button::selectable(see_through_on, eye_label);
     let eye_resp = ui.add_sized(egui::vec2(26.0, (bar_h - 6.0).max(18.0)), eye_btn);
     let hover = if see_through_on {
         "See-through: ON — click to make app fully opaque.\nHover to adjust opacity."
@@ -12374,8 +11956,6 @@ fn render_mode_pill(
 
 // ── Sub-patch editor windows ──────────────────────────────────────────────────
 
-// Auto-placement step for newly-pinned modules (viewer PINNED_MOD_H + gap).
-const PINNED_STEP: f32 = 108.0;
 const PINNED_PAD: f32  = 4.0;
 
 /// On-disk representation of a single sub-patch (.fxsp). Distinct from the

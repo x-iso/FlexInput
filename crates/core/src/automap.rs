@@ -203,6 +203,23 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "dpad_down",     display_name: "D-Pad Down",           signal_type: SignalType::Bool },
     AutoMapPin { id: "dpad_left",     display_name: "D-Pad Left",           signal_type: SignalType::Bool },
     AutoMapPin { id: "dpad_right",    display_name: "D-Pad Right",          signal_type: SignalType::Bool },
+    // ── Extra buttons: rear paddles + misc (SDL-reported on generic pads) ──────
+    // These must appear here (not just in layouts.rs `generic_outputs()`) or they
+    // can't be selected inside a Remapper/AutoMap Splitter — the AutoMap bus only
+    // carries pins listed in ALL_PINS. IDs are standard/portable (paddle L1/L2…);
+    // the display names are the generic on-icon labels (PL1/PR1/PL2/PR2, M1…M6),
+    // since SDL exposes no vendor-specific paddle names. Keep in sync with
+    // generic_outputs() — guarded by `all_pins_covers_generic_extra_buttons`.
+    AutoMapPin { id: "btn_paddle_l1", display_name: "Paddle L1",            signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_paddle_r1", display_name: "Paddle R1",            signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_paddle_l2", display_name: "Paddle L2",            signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_paddle_r2", display_name: "Paddle R2",            signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_misc1",     display_name: "Misc 1",               signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_misc2",     display_name: "Misc 2",               signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_misc3",     display_name: "Misc 3",               signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_misc4",     display_name: "Misc 4",               signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_misc5",     display_name: "Misc 5",               signal_type: SignalType::Bool },
+    AutoMapPin { id: "btn_misc6",     display_name: "Misc 6",               signal_type: SignalType::Bool },
     // ── Virtual Keyboard & Mouse static pins ──────────────────────────────────
     // IDs match KEYMOUSE_DEFAULT_PINS in crates/virtual/src/layouts.rs so they
     // direct-match through resolve_mapping when wired to a virtual KB/M sink.

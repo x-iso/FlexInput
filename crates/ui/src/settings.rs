@@ -220,6 +220,14 @@ pub struct AppSettings {
     /// `hide_originals.unwrap_or(hidhide_installed)`.
     #[serde(default)]
     pub hide_originals: Option<bool>,
+    /// Render backend selection, applied at startup in `app/src/main.rs`
+    /// (changing it requires an app restart). Auto = Vulkan except when the
+    /// machine's GPU is AMD on Windows, where the Vulkan swapchain stalls for
+    /// seconds on resize/restore-from-minimize (groundtruthed on Win11 26H1 +
+    /// Radeon, 2026-07) — those get OpenGL. The `WGPU_BACKEND` env var
+    /// overrides this setting (dev escape hatch).
+    #[serde(default)]
+    pub renderer: RendererChoice,
     /// What to do with the camera when a patch is loaded into a tab.
     #[serde(default)]
     pub on_patch_load: OnPatchLoad,
@@ -318,6 +326,38 @@ pub fn braid_rate_label(hz: u32) -> String {
     if hz == 0 { "Real-time".to_string() } else { format!("{hz} Hz") }
 }
 
+/// Render backend selection (see `AppSettings::renderer`). Read once at
+/// startup before the window exists; changing it requires a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RendererChoice {
+    /// Vulkan, except AMD GPUs on Windows get OpenGL (slow Vulkan swapchain
+    /// reconfigure: multi-second resize/restore stalls).
+    #[default]
+    Auto,
+    /// Force Vulkan.
+    Vulkan,
+    /// Force OpenGL.
+    OpenGl,
+}
+
+impl RendererChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Vulkan => "Vulkan",
+            Self::OpenGl => "OpenGL",
+        }
+    }
+}
+
+/// The renderer choice alone, for `app/src/main.rs` to pick wgpu backends
+/// before the window exists (the full settings load happens again later in
+/// `FlexInputApp::new`).
+pub fn startup_renderer_choice() -> RendererChoice {
+    load_settings().renderer
+}
+
 /// Camera behavior immediately after a patch is loaded into a tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum OnPatchLoad {
@@ -369,6 +409,7 @@ impl Default for AppSettings {
             show_own_virtuals_as_physical: false,
             persist_virtual_devices: false,
             hide_originals: None,
+            renderer: RendererChoice::Auto,
             on_patch_load: OnPatchLoad::Off,
             profiler_enabled: false,
             ui_mode: UiMode::Easy,

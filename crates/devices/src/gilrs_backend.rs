@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use glam::Vec2;
 use gilrs::{Axis, Button, EventType, Gilrs, GilrsBuilder};
+use hidapi::HidApi;
 
 use flexinput_core::Signal;
 
 use crate::{
-    gyro::GyroManager,
+    gyro::{self, GyroManager},
     identification::ControllerKind,
     layouts,
     DeviceBackend, PhysicalDevice,
@@ -137,27 +140,6 @@ pub fn probe_xinput_slots_cached() -> [XInputSlotInfo; 4] {
     slots
 }
 
-/// Log the current XInput slot occupancy. Called on device-set changes (connect /
-/// disconnect) so we can see, on real hardware, whether our virtual XUSB companion
-/// actually acquires a slot when a physical XInput pad is present — the open
-/// question behind "Steam doesn't see the virtual when a physical is connected".
-#[cfg(windows)]
-fn log_xinput_slots() {
-    let slots = probe_xinput_slots();
-    let n = slots.iter().filter(|s| s.connected).count();
-    eprintln!("[xinput-slots] {n} slot(s) connected");
-    for s in &slots {
-        if s.connected {
-            eprintln!(
-                "[xinput-slots]   slot {} CONNECTED subtype={} packet={} buttons=0x{:04X}",
-                s.index, s.sub_type, s.packet, s.buttons
-            );
-        } else {
-            eprintln!("[xinput-slots]   slot {} empty", s.index);
-        }
-    }
-}
-
 pub struct GilrsBackend {
     gilrs: Gilrs,
     gyro: GyroManager,
@@ -189,12 +171,6 @@ pub struct GilrsBackend {
     /// that hidapi refresh ran ON the real-time I/O loop, freezing ALL input for
     /// ~200 ms each time (the periodic-gap bug). See `refresh_virtual_classification`.
     dev_set_dirty: bool,
-    /// DIAGNOSTIC: last button bitmask logged per device_id, so poll() can print a
-    /// line only on a button edge (press/release) instead of spamming at 500 Hz.
-    /// Used to compare a working source (DualSense) against a non-working one
-    /// (physical Xbox) — if the Xbox never logs an edge, gilrs isn't delivering its
-    /// input values to us at all.
-    dbg_btn_mask: HashMap<String, u64>,
     /// Resolved XInput user-index slot per physical-XInput `dev_id`, used for the
     /// focus-independent `XInputGetState` read. XInput exposes no device identity,
     /// so we correlate each gilrs XInput pad to a slot by matching live state
@@ -203,24 +179,109 @@ pub struct GilrsBackend {
     /// actually-allocated slot rather than its mere arrival index — correct even
     /// when the virtual was deployed first or the slots were reordered.
     xinput_slot_for: HashMap<String, u32>,
+    /// Job side of the background refresh/classify worker ("hid-classify").
+    /// `None` when hidapi failed to init or the thread couldn't spawn —
+    /// classification then falls back to "nothing is virtual" (the old no-api
+    /// behavior).
+    class_tx: Option<mpsc::Sender<ClassifyJob>>,
+    /// Result side of the worker; drained (latest-wins) at the top of
+    /// `enumerate()`.
+    class_rx: Option<mpsc::Receiver<ClassifyDone>>,
+    /// Generation of the newest classification job sent / adopted. While
+    /// `class_done_gen < class_req_gen` a rebuild is in flight and `enumerate()`
+    /// serves the previous stable list instead of classifying from stale data.
+    class_req_gen: u64,
+    class_done_gen: u64,
+    /// The last device list `enumerate()` built — re-served while a
+    /// classification rebuild is in flight so the UI list never flickers and the
+    /// I/O thread never waits on hidapi.
+    last_enum: Vec<PhysicalDevice>,
+}
+
+/// Request to the "hid-classify" worker: refresh the shared hidapi list, then
+/// classify these `(vid, pid, vp_idx)` PS-family keys as own-virtual or real.
+struct ClassifyJob {
+    gen: u64,
+    keys: Vec<(u16, u16, usize)>,
+}
+
+/// Worker result: the freshly-computed own-virtual cache for `gen`'s key set.
+struct ClassifyDone {
+    gen: u64,
+    cache: HashMap<(u16, u16, usize), bool>,
+}
+
+/// Background worker loop: owns the slow side of the shared hidapi instance.
+/// Coalesces queued jobs to the newest (a burst of device-set changes needs
+/// only the final classification), refreshes the device list (~110-200 ms on
+/// Windows — the exact call that used to stall the I/O loop), and
+/// classifies under the same lock so the list can't change between refresh and
+/// classification.
+fn classify_worker(
+    api: Arc<Mutex<HidApi>>,
+    jobs: mpsc::Receiver<ClassifyJob>,
+    done: mpsc::Sender<ClassifyDone>,
+) {
+    while let Ok(mut job) = jobs.recv() {
+        while let Ok(newer) = jobs.try_recv() {
+            job = newer;
+        }
+        let cache = match api.lock() {
+            Ok(mut a) => {
+                let _ = a.refresh_devices();
+                job.keys
+                    .iter()
+                    .map(|&(v, p, i)| ((v, p, i), gyro::classify_own_virtual(&a, v, p, i)))
+                    .collect()
+            }
+            Err(_) => HashMap::new(),
+        };
+        if done.send(ClassifyDone { gen: job.gen, cache }).is_err() {
+            break; // backend dropped — exit the thread
+        }
+    }
 }
 
 impl GilrsBackend {
     pub fn try_new() -> Option<Self> {
-        GilrsBuilder::new().with_default_filters(false).build().ok().map(|gilrs| Self {
+        let gilrs = GilrsBuilder::new().with_default_filters(false).build().ok()?;
+        let gyro = GyroManager::new();
+
+        // Spawn the background refresh/classify worker. It shares the gyro
+        // layer's hidapi instance (single HidApi per process) and is the only
+        // code allowed to call the slow refresh_devices().
+        let mut class_tx = None;
+        let mut class_rx = None;
+        if let Some(api) = gyro.shared_api() {
+            let (jtx, jrx) = mpsc::channel::<ClassifyJob>();
+            let (dtx, drx) = mpsc::channel::<ClassifyDone>();
+            let spawned = std::thread::Builder::new()
+                .name("hid-classify".into())
+                .spawn(move || classify_worker(api, jrx, dtx))
+                .is_ok();
+            if spawned {
+                class_tx = Some(jtx);
+                class_rx = Some(drx);
+            }
+        }
+
+        Some(Self {
             gilrs,
-            gyro: GyroManager::new(),
+            gyro,
             xinput_idx: HashMap::new(),
             xinput_rumble: HashMap::new(),
             event_counts: HashMap::new(),
             id_to_dev: HashMap::new(),
             virt_cache: HashMap::new(),
             dev_set_dirty: true, // force classification on first enumerate
-            dbg_btn_mask: HashMap::new(),
             xinput_slot_for: HashMap::new(),
+            class_tx,
+            class_rx,
+            class_req_gen: 0,
+            class_done_gen: 0,
+            last_enum: Vec::new(),
         })
     }
-
 }
 
 /// Per-pad disposition resolved from cached classification via
@@ -231,25 +292,27 @@ enum PadDisposition {
     /// Keep this pad. `is_virt` = it's one of FlexInput's own emulated devices
     /// (our HIDMaestro virtual Xbox 360, or a path-classified PS-family virtual).
     Keep { is_virt: bool },
+    /// Hide this pad from the device list entirely: a redundant second face of a
+    /// device we already keep (the HIDMaestro identity HID node when the OS
+    /// surfaces it alongside the companion — see `disposition_for`).
+    Drop,
 }
 
 impl GilrsBackend {
-    /// Refresh the own-virtual classification cache for PS-family pads. Does the
-    /// expensive part (hidapi `refresh_devices` + per-instance path lookup) and
-    /// is therefore called only from `enumerate()` (every ~2 s), NOT from the
-    /// 500 Hz `poll()`. The cache maps `(vid, pid, vp_idx) → is_own_virtual`,
-    /// where `vp_idx` is the Nth-device index per VID/PID in gilrs walk order —
-    /// the same index the gyro layer uses, keeping them correlated.
-    ///
-    /// Structured in two passes so `self.gilrs` (immutably borrowed by the walk)
-    /// and `self.gyro` (mutably borrowed by the classifier) are never borrowed at
-    /// the same time.
-    fn refresh_virtual_classification(&mut self) {
-        // Pass 1: snapshot PS-family (vid, pid) per pad, assigning vp_idx — ends
-        // the gilrs borrow before the mutable gyro borrow below. (Only PS-family is
-        // path-classifiable: DS4/DualSense expose a real HID path hidapi can read.
-        // The HIDMaestro XInput companion is an XInput-API device with no matching
-        // hidapi HID entry, so it's handled by count-dedup in `disposition_for`.)
+    /// Kick an async own-virtual classification rebuild for the current pad set.
+    /// Replaces the old synchronous `refresh_virtual_classification()`: the
+    /// expensive part (hidapi `refresh_devices` + per-instance path lookup, ~110-
+    /// 200 ms on Windows) now runs on the "hid-classify" worker, so `enumerate()`
+    /// never blocks the I/O loop. The cache maps `(vid, pid, vp_idx) →
+    /// is_own_virtual`, where `vp_idx` is the Nth-device index per VID/PID in
+    /// gilrs walk order — the same index the gyro layer uses, keeping them
+    /// correlated.
+    fn kick_classification(&mut self) {
+        // Cheap pass: snapshot PS-family (vid, pid, vp_idx) keys from the gilrs
+        // walk. (Only PS-family is path-classifiable: DS4/DualSense expose a real
+        // HID path hidapi can read. The HIDMaestro XInput companion is an
+        // XInput-API device with no matching hidapi HID entry — `disposition_for`
+        // handles it by name/PID.)
         let mut keys: Vec<(u16, u16, usize)> = Vec::new();
         let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
         for (_, pad) in self.gilrs.gamepads() {
@@ -261,20 +324,39 @@ impl GilrsBackend {
                 }
             }
         }
-        // Pass 2: classify each PS instance by HID path via the gyro layer.
-        // Refresh hidapi's device list ONCE up front (the ~200 ms Windows call),
-        // then classify every instance from that one cached snapshot — previously
-        // `is_own_virtual_instance` refreshed per instance, so N PS pads cost N×.
-        self.gyro.refresh_device_list();
-        self.virt_cache.clear();
-        for (vid, pid, idx) in keys {
-            let is_virt = self.gyro.is_own_virtual_instance(vid, pid, idx);
-            self.virt_cache.insert((vid, pid, idx), is_virt);
+        self.class_req_gen += 1;
+        let sent = matches!(
+            &self.class_tx,
+            Some(tx) if tx.send(ClassifyJob { gen: self.class_req_gen, keys }).is_ok()
+        );
+        if !sent {
+            // No worker (hidapi unavailable or thread gone): fall back to
+            // "nothing is virtual", the same behavior the old code had with no
+            // hidapi — and mark the generation done so enumerate() proceeds.
+            self.virt_cache.clear();
+            self.class_done_gen = self.class_req_gen;
+        }
+    }
+
+    /// Adopt the newest finished classification from the worker, if any.
+    fn adopt_classification(&mut self) {
+        let Some(rx) = &self.class_rx else { return };
+        let mut latest: Option<ClassifyDone> = None;
+        while let Ok(d) = rx.try_recv() {
+            if latest.as_ref().map_or(true, |l| d.gen > l.gen) {
+                latest = Some(d);
+            }
+        }
+        if let Some(d) = latest {
+            if d.gen > self.class_done_gen {
+                self.virt_cache = d.cache;
+                self.class_done_gen = d.gen;
+            }
         }
     }
 
     /// Per-pad disposition from cached state only (no I/O) — safe to call at
-    /// 500 Hz. `vp_idx` accumulates the per-VID/PID running index for the PS-family
+    /// the polling rate. `vp_idx` accumulates the per-VID/PID running index for the PS-family
     /// own-virtual cache lookup, threaded through the caller's walk. (XInput pads
     /// are resolved separately by `find_own_virtual_gilrs_idx`, so they don't use
     /// `vp_idx` and the old ViGEm kept-count is gone.)
@@ -288,7 +370,7 @@ impl GilrsBackend {
             return PadDisposition::Keep { is_virt: false };
         };
 
-        // OUR HIDMaestro virtual Xbox 360 surfaces to gilrs's WGI backend as a single
+        // OUR HIDMaestro virtual Xbox 360 surfaces to gilrs's WGI backend as a
         // pad named "HIDMaestro XInput Companion" with the profile USB PID 0x02FF —
         // groundtruthed live: deploying the virtual with no physical pad shows exactly
         // that one pad and it drives Steam. So 0x02FF / the "HIDMaestro" name IS our
@@ -296,8 +378,20 @@ impl GilrsBackend {
         // correlation guessing needed. (Earlier sessions wrongly believed 0x02FF was a
         // dead sibling and the companion appeared as 0x028E — the opposite of reality;
         // that inversion is what made every previous read-side attempt fail.)
+        //
+        // Win10's WGI hid the sibling identity HID node, so the companion was the
+        // ONLY 02FF pad. Win11 26H1's GameInput-backed WGI surfaces that node too
+        // (as a second controller, named from the 02FF metadata — "Xbox One
+        // Controller"), so the same virtual showed up twice (groundtruthed live on
+        // 26H1 build 28000). The companion is the working pad; anything else that
+        // matches the 02FF signature but NOT the HIDMaestro name is the redundant
+        // face — hide it. On Win10, and once the face descriptor is vendor-usage
+        // (not a gamepad to WGI at all), the Drop arm simply never fires.
         if is_hidmaestro_virtual_xinput(vp.0, vp.1, name) {
-            return PadDisposition::Keep { is_virt: true };
+            if name.to_ascii_lowercase().contains("hidmaestro") {
+                return PadDisposition::Keep { is_virt: true };
+            }
+            return PadDisposition::Drop;
         }
 
         let idx = *vp_idx.entry(vp).or_insert(0);
@@ -322,31 +416,54 @@ impl GilrsBackend {
 impl DeviceBackend for GilrsBackend {
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
         puffin::profile_function!();
-        // Rebuild the own-virtual cache (the ~200 ms hidapi path lookup) ONLY when
-        // the device set actually changed since last time (`dev_set_dirty`, set by
-        // poll() on a Connected/Disconnected/Dropped event, and true on first run).
-        // In steady state the classification can't change, so skipping it keeps the
-        // expensive refresh_devices off the I/O loop — the fix for the ~2 s periodic
-        // input freeze. The device LIST below is still rebuilt every call from gilrs's
-        // (cheap, cached) gamepad walk; only the virtual/real CLASSIFICATION is cached.
-        // Log the gilrs walk (names, vid/pid, virtual flag, assigned device id) once
-        // per device-set change so we can see exactly which dev_id the physical Xbox
-        // gets and whether a virtual XInput face is stealing its index — the read-side
-        // half of "physical XInput never reaches the virtual pad".
-        let log_walk = self.dev_set_dirty;
-        if self.dev_set_dirty {
-            self.refresh_virtual_classification();
-            // Drop cached XInput slot correlations: a connect/disconnect/reorder can
-            // move a pad to a different slot, so the mapping must be re-learned from
-            // live state rather than trusted across a device-set change.
-            self.xinput_slot_for.clear();
-            self.dev_set_dirty = false;
-            // Snapshot XInput slot occupancy on every device-set change so the log
-            // shows whether the virtual XUSB companion acquired a slot alongside any
-            // physical XInput pad (the slot-acquisition question for the 4-slot work).
-            #[cfg(windows)]
-            log_xinput_slots();
+        // Own-virtual classification is rebuilt ONLY when the device set actually
+        // changed (`dev_set_dirty`, set by poll() on a Connected/Disconnected/
+        // Dropped event, by a gyro open retry wanting a fresh list, and on first
+        // run) — and the rebuild runs on the "hid-classify" WORKER, never here:
+        // both the old 2 s periodic freeze and its variable-gap successor (the
+        // gyro retry path refreshing inline every RETRY_INTERVAL while a pad
+        // failed to open) were this hidapi refresh running on the I/O loop.
+        self.adopt_classification();
+        if self.gyro.take_refresh_wanted() {
+            self.dev_set_dirty = true;
         }
+        if self.dev_set_dirty && self.last_enum.is_empty() {
+            // First run (nothing served yet): kick eagerly so the bounded wait
+            // below can catch the result — the first list should not misfile
+            // virtuals from an empty cache.
+            self.kick_classification();
+            self.dev_set_dirty = false;
+        }
+        if self.class_done_gen < self.class_req_gen {
+            // Rebuild in flight. On the very first enumerate give the worker a
+            // bounded window so startup doesn't show an empty device list; after
+            // that, serve the previous stable list and pick the result up next
+            // cycle (≤2 s) — classifying new pads from a stale cache could
+            // misfile a virtual as physical.
+            if self.last_enum.is_empty() {
+                if let Some(rx) = &self.class_rx {
+                    if let Ok(d) = rx.recv_timeout(Duration::from_millis(400)) {
+                        if d.gen > self.class_done_gen {
+                            self.virt_cache = d.cache;
+                            self.class_done_gen = d.gen;
+                        }
+                    }
+                }
+            }
+            if self.class_done_gen < self.class_req_gen {
+                return self.last_enum.clone();
+            }
+        }
+        // NOTE: the deferred `kick_classification()` happens at the END of this
+        // function, after the walk below. Kicking here and then checking
+        // "in flight → serve last_enum" made every call that observed a dirty
+        // pad set serve the STALE list — and a pad whose gyro open keeps
+        // failing sets `refresh_wanted` every RETRY_INTERVAL, so a disconnected
+        // Switch Pro never left the list (its stale entry kept the gyro retry
+        // alive, which kept the list stale: a feedback loop). Building the walk
+        // first means disconnects drop out immediately (gilrs stops yielding
+        // the pad); only virtual/real classification lags one worker round,
+        // guarded by the hotplug re-kick below.
 
         // Per-pad keep/virtual decision (path-based for PS, correlation-based for
         // XInput). Snapshot VID/PID first (drops the gilrs borrow), then resolve
@@ -375,13 +492,6 @@ impl DeviceBackend for GilrsBackend {
                 _ => continue, // Drop (ViGEm virtual beyond real count) or missing
             };
 
-            if log_walk {
-                eprintln!(
-                    "[gilrs-walk] #{i} name={:?} vid={:04X?} pid={:04X?} kind={:?} is_virt={is_virt} -> dev_id={dev_id}",
-                    pad.name(), pad.vendor_id(), pad.product_id(), kind,
-                );
-            }
-
             let display_name = if kind == ControllerKind::Generic {
                 pad.name().to_string()
             } else if is_virt {
@@ -403,6 +513,37 @@ impl DeviceBackend for GilrsBackend {
                 pid: pad.product_id(),
             });
         }
+
+        // Hotplug race guard: a PS-family pad missing from the cache means the
+        // pad set changed between the classify job's snapshot and this walk —
+        // its disposition defaulted to "real", which could misfile a virtual.
+        // Mark dirty so the next cycle re-kicks the worker with current keys.
+        {
+            let mut vp_idx: HashMap<(u16, u16), usize> = HashMap::new();
+            for (_, pad) in self.gilrs.gamepads() {
+                if let Some(vp) = pad.vendor_id().zip(pad.product_id()) {
+                    let idx = *vp_idx.entry(vp).or_insert(0);
+                    *vp_idx.get_mut(&vp).unwrap() += 1;
+                    if is_ps_family(vp.0, vp.1) && !self.virt_cache.contains_key(&(vp.0, vp.1, idx)) {
+                        self.dev_set_dirty = true;
+                    }
+                }
+            }
+        }
+
+        // Deferred kick (see note at the top of this function): runs after the
+        // walk so the list served this cycle reflects the CURRENT pad set even
+        // when it just changed; the fresh classification lands next cycle.
+        if self.dev_set_dirty {
+            self.kick_classification();
+            // Drop cached XInput slot correlations: a connect/disconnect/reorder can
+            // move a pad to a different slot, so the mapping must be re-learned from
+            // live state rather than trusted across a device-set change.
+            self.xinput_slot_for.clear();
+            self.dev_set_dirty = false;
+        }
+
+        self.last_enum = result.clone();
         result
     }
 
@@ -473,20 +614,6 @@ impl DeviceBackend for GilrsBackend {
                 .collect()
         };
 
-        // DIAGNOSTIC: ~1 Hz dump of each physical pad's live values + raw event
-        // count, so we can tell whether gilrs is actually delivering the Xbox's
-        // input. A frozen left-stick at (0,0) with event_count=0 while the
-        // DualSense shows movement means gilrs isn't feeding us the Xbox at all.
-        let dbg_dump_due = {
-            use std::sync::Mutex;
-            use std::time::{Duration, Instant};
-            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-            let mut g = LAST.lock().unwrap();
-            let due = g.map_or(true, |t| t.elapsed() > Duration::from_millis(1000));
-            if due { *g = Some(Instant::now()); }
-            due
-        };
-
         // Per-XInput-pad live gilrs state (dev_id, button mask, lx, ly), collected
         // during the walk and correlated to actual XInput slots afterward.
         let mut xi_corr: Vec<(String, u16, f32, f32)> = Vec::new();
@@ -535,29 +662,9 @@ impl DeviceBackend for GilrsBackend {
             } else {
                 button_map(kind)
             };
-            let mut dbg_mask: u64 = 0;
-            for (bi, (button, pin_id)) in btn_map.iter().enumerate() {
+            for (button, pin_id) in btn_map.iter() {
                 let pressed = pad.button_data(*button).map_or(false, |d| d.is_pressed());
-                if pressed && bi < 64 { dbg_mask |= 1u64 << bi; }
                 out.push((dev.clone(), pin_id.to_string(), Signal::Bool(pressed)));
-            }
-            // DIAGNOSTIC: log a line on any button edge so we can see whether gilrs
-            // is actually delivering this pad's input. Compare the physical Xbox
-            // against the (working) DualSense: if pressing Xbox buttons logs nothing,
-            // gilrs isn't feeding us its values (the read side is dead), not the
-            // engine/output. Only logs on change, so it's quiet at rest.
-            if self.dbg_btn_mask.get(&dev).copied().unwrap_or(0) != dbg_mask {
-                self.dbg_btn_mask.insert(dev.clone(), dbg_mask);
-                eprintln!("[input-edge] dev={dev} kind={kind:?} is_virt={is_virt} btn_mask=0x{dbg_mask:04X}");
-            }
-            // ~1 Hz live-value + event-count dump for physical pads (see dbg_dump_due).
-            if dbg_dump_due && !is_virt {
-                let lx = pad.axis_data(Axis::LeftStickX).map_or(0.0, |d| d.value());
-                let ly = pad.axis_data(Axis::LeftStickY).map_or(0.0, |d| d.value());
-                let evc = self.event_counts.get(&usize::from(gilrs_id)).copied().unwrap_or(0);
-                eprintln!(
-                    "[input-dump] dev={dev} kind={kind:?} l_stick=({lx:+.3},{ly:+.3}) btn_mask=0x{dbg_mask:04X} raw_events={evc}"
-                );
             }
 
             // Universal DPad discrete outputs: combine axis_data (HAT/USB path) and
@@ -924,7 +1031,6 @@ impl DeviceBackend for GilrsBackend {
                     claimed[s] = true;
                     if self.xinput_slot_for.get(dev).copied() != Some(s as u32) {
                         self.xinput_slot_for.insert(dev.clone(), s as u32);
-                        eprintln!("[xinput-slot-map] {dev} -> slot {s}");
                     }
                 }
             }
@@ -1033,7 +1139,13 @@ impl GilrsBackend {
         for (_id, pad) in self.gilrs.gamepads() {
             let vp = pad.vendor_id().zip(pad.product_id());
             let kind = ControllerKind::detect(pad.name(), pad.vendor_id(), pad.product_id());
-            let PadDisposition::Keep { is_virt } = self.disposition_for(vp, pad.name(), &mut vp_idx);
+            let is_virt = match self.disposition_for(vp, pad.name(), &mut vp_idx) {
+                PadDisposition::Keep { is_virt } => is_virt,
+                // Dropped face: not in the device-id space and never a gyro
+                // target; skip before vp_seen so real-pad indices stay aligned
+                // with poll()'s walk.
+                PadDisposition::Drop => continue,
+            };
             if is_virt { continue; } // own virtual: never a gyro/HID target
             let (dev, _inst, _is_virt) =
                 gilrs_device_id(is_virt, kind, &mut kind_seen, &mut virt_seen);

@@ -147,6 +147,44 @@ fn run_as_helper_if_requested() -> bool {
     false
 }
 
+/// Backend set for `RendererChoice::Auto`: Vulkan (eframe's default pick on
+/// Windows/Linux), EXCEPT when the GPU wgpu would land on is AMD on Windows —
+/// AMD's Windows Vulkan swapchain stalls for seconds on every reconfigure
+/// (window resize, restore-from-minimize presents a stale stretched frame),
+/// while its GL path is smooth, transparency included (groundtruthed on Win11
+/// 26H1 + Radeon, 2026-07; NVIDIA Vulkan is fine). The probe instance below is
+/// startup-only and cheap (~tens of ms). Wrong guess? Settings → Renderer
+/// forces either backend; `WGPU_BACKEND` overrides everything.
+#[cfg(windows)]
+fn auto_backends() -> wgpu::Backends {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN);
+    // Emulate the HighPerformance default: a discrete GPU wins over integrated.
+    let pick = adapters
+        .iter()
+        .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+        .or_else(|| adapters.first());
+    const VENDOR_AMD: u32 = 0x1002;
+    match pick {
+        Some(a) if a.get_info().vendor == VENDOR_AMD => {
+            eprintln!(
+                "[gpu] auto: AMD adapter \"{}\" — preferring OpenGL over Vulkan",
+                a.get_info().name
+            );
+            wgpu::Backends::GL
+        }
+        _ => wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+    }
+}
+
+#[cfg(not(windows))]
+fn auto_backends() -> wgpu::Backends {
+    wgpu::Backends::PRIMARY | wgpu::Backends::GL
+}
+
 fn main() -> eframe::Result<()> {
     // Helper mode short-circuits everything else (no GPU, no window).
     if run_as_helper_if_requested() {
@@ -183,6 +221,19 @@ fn main() -> eframe::Result<()> {
     // way to keep that path honest. The plain default config preserves
     // `present_mode: AutoVsync` and the surface-error handler.
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    // Backend pick, priority: `WGPU_BACKEND` env (dev escape hatch, matches
+    // plain wgpu behavior) > Settings → Renderer > Auto heuristic (Vulkan,
+    // except AMD-on-Windows → GL; see `auto_backends`).
+    let backends = wgpu::Backends::from_env().unwrap_or_else(|| {
+        match flexinput_ui::startup_renderer_choice() {
+            flexinput_ui::RendererChoice::Vulkan => wgpu::Backends::VULKAN,
+            flexinput_ui::RendererChoice::OpenGl => wgpu::Backends::GL,
+            flexinput_ui::RendererChoice::Auto => auto_backends(),
+        }
+    });
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        setup.instance_descriptor.backends = backends;
+    }
     // Defense-in-depth for device loss. The default handler treats every
     // SurfaceError except `Outdated` as a skipped frame and logs a warning —
     // including `SurfaceError::Lost`, the case where the swapchain *does* report

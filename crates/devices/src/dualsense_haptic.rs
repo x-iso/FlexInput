@@ -79,12 +79,6 @@ impl HapticStream {
         Some(Self { shared, thread: Some(thread) })
     }
 
-    /// Update per-side amplitude (0–1) and frequency (0–1, mapped to 80–500 Hz)
-    /// for carrier 1 only (carrier 2 left silent). Lock-free.
-    pub fn set_targets(&self, l_amp: f32, l_freq: f32, r_amp: f32, r_freq: f32) {
-        self.set_targets_dual(l_amp, l_freq, 0.0, 0.0, r_amp, r_freq, 0.0, 0.0);
-    }
-
     /// Update BOTH carriers per side: carrier 1 (LF) and carrier 2 (HF), each an
     /// (amp, freq) pair in 0–1. The render thread sums the two sines per LRA so the
     /// actuator plays both bands simultaneously (matching the Switch Pro's HF+LF

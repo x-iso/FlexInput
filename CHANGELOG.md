@@ -5,6 +5,64 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-07-03
+
+A new Vec Reshaper module for fighting analog-stick "diagonal stickiness" —
+directional reshaping of a Vec2 with a visual editor.
+
+### Added
+
+- **Vec Reshaper module** (Processing category, Vec2 → Vec2). Reshapes a stick
+  vector as a function of DIRECTION, which the radially-symmetric Vec Response
+  Curve cannot do. Two orthogonal controls: a per-direction **Boundary** that
+  sets the reachable output envelope (1.0 = circle, √2 = the square's corner, so
+  a round stick can be expanded to fill a square for games that expect square
+  response), and a per-direction **Gain** that accelerates/decelerates within
+  that envelope (push diagonals faster to kill diagonal stickiness). One quadrant
+  is edited; the rest mirror it (4-way, or X-mirror for asymmetric up/down).
+- **Visual editor** on the node body: a direction→value curve (grid + snap on
+  both axes) with a Gain/Boundary toggle, plus a live 2D pad showing the unit
+  circle, the reshaped envelope, and a smooth **stretch-field gradient** (blue =
+  accelerated, red = decelerated, transparent at neutral) so the internal shaping
+  is visible without moving the stick. Live input→output dots trace the current
+  deflection. Presets: Circle, Square, Diag+. Every element is individually
+  pinnable in Easy mode and gamepad-navigable.
+
+Gamepad navigation now reaches every Audio Stream Haptics control in Easy mode.
+
+### Fixed
+
+- **Audio Stream Haptics pinned elements are now editable via gamepad
+  navigation.** The module was missing from the Easy-mode nav dispatch, so its
+  pinned rows were selectable but not editable. All calibration rows (Volume,
+  Release, Crossover, Amplitude floor/ceiling/curve, Balance, Swap, Rumble mix)
+  and the capture-mode block (App/Focused/System + include-children) now route
+  through the unified multi-field editor. The scope's EQ points are dot-editable
+  through the same curve-dot path as Response Curve widgets (South enters,
+  LS/dpad highlights a dot, RT/LT add/remove at the cursor, South edits a dot).
+
+## [0.10.5] - 2026-07-01
+
+SDL3 gamepad support for controllers FlexInput doesn't handle natively, and the
+extra rear-paddle / misc buttons those pads expose, mappable through the AutoMap
+system.
+
+### Added
+
+- **SDL3 gamepad backend** for controllers FlexInput doesn't parse natively
+  (Steam Controller, 8BitDo, arcade sticks, third-party pads). gilrs and the
+  raw-HID path keep the pads they handle well (Xbox/XInput, DualShock 4,
+  DualSense, Switch Pro) with their tuned gyro/touchpad/HD-haptic overrides; SDL
+  is enumerated only for pads that classify as generic, filtered by VID/PID so no
+  controller is surfaced twice. For those pads it relays sticks, buttons, analog
+  triggers, gyro/accel, touchpad, and the extra paddle/misc buttons. SDL is built
+  from source and linked statically — no extra DLL to ship.
+- **Extra buttons in the AutoMap system.** Rear paddles (`btn_paddle_l1/r1/l2/r2`)
+  and misc buttons (`btn_misc1..6`) are now part of the canonical AutoMap pin set,
+  so they can be mapped to anything via Remapper and other AutoMap modules. Rear
+  paddles render a generic labeled icon (PL1/PR1/PL2/PR2); labels are
+  device-agnostic for now.
+
 ## [0.10.4] - 2026-07-01
 
 HidHide masking of remapped physical controllers, exact XInput player-slot

@@ -1,0 +1,27 @@
+# Cargo build configuration for FlexInput.
+#
+# ── SDL3 builds from source — CMake is required ─────────────────────────────────
+# `flexinput-devices` depends on `sdl3` with the `build-from-source-static`
+# feature, so `sdl3-sys` compiles the SDL C library at build time via CMake and
+# links it statically (no SDL3.dll to ship). The build therefore needs `cmake`
+# (plus a C compiler — MSVC on Windows). Nothing else is required: CMake's
+# default Visual Studio generator locates cl.exe, the Windows SDK headers, and
+# libs on its own.
+#
+# This file intentionally sets NO `CMAKE`/PATH override. Baking an absolute path
+# here breaks any environment whose layout differs (CI runners, other
+# contributors' machines) — see below. Instead, make CMake discoverable in ONE of
+# these ways:
+#
+#   • CI / most setups: ensure `cmake` is on PATH. GitHub's `windows-latest`
+#     runner already ships CMake, so `cargo build` works with no extra config.
+#
+#   • Windows with Visual Studio but CMake not on PATH: either build from a
+#     "Developer PowerShell for VS" (puts the VS-bundled cmake on PATH), or set
+#     `CMAKE` to the VS-bundled cmake.exe in your USER-GLOBAL cargo config
+#     (`~/.cargo/config.toml`) so it applies to your machine only and never
+#     leaks into this repo. Find the path with:
+#       & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+#           -latest -find "**\CMake\bin\cmake.exe"
+#
+#   • Any OS: a standalone CMake (https://cmake.org) on PATH also works.

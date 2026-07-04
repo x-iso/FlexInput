@@ -6,6 +6,7 @@ pub mod hidhide;
 pub mod identification;
 pub mod layouts;
 pub mod midi;
+pub mod sdl_backend;
 pub mod spectrum;
 
 #[cfg(windows)]
@@ -72,5 +73,11 @@ pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {
     if let Some(b) = GilrsBackend::try_new() {
         backends.push(Box::new(b));
     }
+    // SDL is a sibling source for pads gilrs/kind-detect classify as `Generic`
+    // (Steam Controller, 8BitDo, third-party). It self-inits lazily on the first
+    // poll (on the device-io thread, per SDL's threading rule) and enumerates
+    // ONLY `Generic` pads, so it never double-surfaces a controller gilrs owns.
+    // Pushed AFTER gilrs so gilrs's tuned paths take precedence in iteration.
+    backends.push(Box::new(sdl_backend::SdlBackend::new()));
     backends
 }

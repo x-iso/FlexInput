@@ -168,7 +168,7 @@ fn read_invert3(canvas: &Canvas, node: NodeId, key: &str) -> [bool; 3] {
 /// bottom regardless of UI repaint rate. Set to 1 s so a quick controller
 /// motion (~0.5–1 s) fits in-frame with room to read its shape.
 const SCOPE_WIN_MS: f32 = 1000.0;
-const GYRO_SAMPLE_FRAMES: u32 = 250; // ~0.5 s of stable data at 500 Hz polling
+const GYRO_SAMPLE_FRAMES: u32 = 250; // ~0.5 s of stable data at the default 500 Hz polling (duration scales with the polling-rate setting)
 
 #[derive(Clone)]
 struct ScopeBuffer {
@@ -232,9 +232,10 @@ struct OrientSession {
     accel_n:   [u32; 3],
 }
 
-/// Frames to collect for one orientation-axis sampling pass. ~0.5 s at
-/// 500 Hz polling — fewer is plenty given PCA only needs ~30 samples
-/// in different directions to recover an axis confidently.
+/// Frames to collect for one orientation-axis sampling pass. ~0.5 s at the
+/// default 500 Hz polling (longer at lower settings) — fewer is plenty given
+/// PCA only needs ~30 samples in different directions to recover an axis
+/// confidently.
 const ORIENT_SAMPLE_FRAMES: u32 = 250;
 
 const STICK_BUCKETS: usize = 72; // 5° per bucket
@@ -350,7 +351,7 @@ pub fn show_windows(
         let title = format!("{} Calibration", display_name);
         // Default size capped to ~85% of the host window so the cal window
         // always fits inside the main app frame even on smaller monitors.
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         // Default to a compact size matching the min, so the window opens
         // as small as it can go and the user can grow it if needed.
         let min_w = (screen.width()  * 0.40).clamp(480.0, 700.0);
@@ -601,7 +602,7 @@ fn gyro_section(
     });
 
     // Push the maximum repaint rate during sampling so the scope captures as
-    // many of the I/O thread's 500 Hz samples as the UI can deliver.
+    // many of the I/O thread's polling-rate samples as the UI can deliver.
     if sampling_now { ui.ctx().request_repaint(); }
 
     // Hoist the skip-accel flag so both the inner UI and gyro_scope can see it.
@@ -1673,11 +1674,11 @@ fn solve_orient_matrix(
                 for v in s { m[0] += v[0]; m[1] += v[1]; m[2] += v[2]; }
                 [m[0]/n, m[1]/n, m[2]/n]
             };
+            // Only Roll needs sign-aligning: Pitch is rebuilt below as
+            // Yaw × Roll, so its sign is fully determined by the other two.
             let m_roll  = mean_of(&samples[0]);
-            let m_pitch = mean_of(&samples[1]);
             let dot3 = |a: [f32;3], b: [f32;3]| a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
             if dot3(a_roll,  m_roll)  < 0.0 { a_roll  = [-a_roll[0],  -a_roll[1],  -a_roll[2]];  }
-            if dot3(a_pitch, m_pitch) < 0.0 { a_pitch = [-a_pitch[0], -a_pitch[1], -a_pitch[2]]; }
 
             // Gram-Schmidt: make Roll perpendicular to Yaw.
             let d = dot3(a_roll, a_yaw);

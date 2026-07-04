@@ -78,7 +78,6 @@ const XB_LT:      &[u8] = a!("Xbox/xbox_lt.svg");
 const XB_RT:      &[u8] = a!("Xbox/xbox_rt.svg");
 const XB_START:   &[u8] = a!("Xbox/xbox_button_start.svg");
 const XB_BACK:    &[u8] = a!("Xbox/xbox_button_back.svg");
-const XB_GUIDE:   &[u8] = a!("Xbox/xbox_guide.svg");
 const XB_SHARE:   &[u8] = a!("Xbox/xbox_button_share.svg");
 const XB_LOGO:    &[u8] = a!("Xbox/xbox_button_logo.svg");
 const XB_DPAD_U:  &[u8] = a!("Xbox/xbox_dpad_up.svg");
@@ -306,12 +305,19 @@ const DEV_PS5:      &[u8] = a!("Playstation/controller_playstation5.svg");
 const DEV_SWITCH:   &[u8] = a!("SwitchPro/controller_switch_pro.svg");
 const DEV_MIDI_IN:  &[u8] = a!("MIDI_in.svg");
 const DEV_MIDI_OUT: &[u8] = a!("MIDI_out.svg");
-const DEV_KBM_KEYBOARD: &[u8] = a!("KBM/keyboard.svg");
-const DEV_KBM_MOUSE:    &[u8] = a!("KBM/mouse.svg");
 /// Combined keyboard + mouse glyph — used wherever Virtual Keyboard
 /// & Mouse needs a single, compact icon (Easy mode card, virtual
 /// device panel chip, sub-patch node header).
 const DEV_KBM: &[u8] = a!("kbm.svg");
+
+// Generic (family-neutral) button glyphs for extra buttons SDL reports on pads
+// FlexInput doesn't skin natively (rear paddles). The same left/right glyph
+// serves both paddle rows (L1/L2 share GEN_PADDLE_L); the on-icon text label
+// (see `extra_button_label`) is what distinguishes them, painted over the icon
+// at the render site. Misc buttons have no dedicated glyph and fall through to
+// the text pill.
+const GEN_PADDLE_L: &[u8] = a!("general/generic_button_gl.svg");
+const GEN_PADDLE_R: &[u8] = a!("general/generic_button_gr.svg");
 
 /// Generic action icons used by panel chrome (add button, close button, …).
 pub const ADD_SVG:   &[u8] = a!("add.svg");
@@ -351,11 +357,10 @@ pub fn virtual_device_card_svg(kind_prefix: &str) -> &'static [u8] {
 /// device chip + any other single-icon call site.
 pub fn keymouse_svg() -> &'static [u8] { DEV_KBM }
 
-/// One or two SVGs to render in a canvas device-node header.
-/// `Pair` is used only for `virtual.keymouse` (keyboard + mouse glyphs).
+/// The SVG to render in a canvas device-node header. (Historically also
+/// carried a two-glyph `Pair` for `virtual.keymouse`, now a combined glyph.)
 pub enum NodeIconSpec {
     Single(&'static [u8]),
-    Pair(&'static [u8], &'static [u8]),
 }
 
 /// Resolve the canvas-node icon for any device id used by `device.source`
@@ -488,6 +493,11 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "touch_right"  | "touchpad_right"  => return Some(PS_TP_RIGHT),
         "btn_touchpad" | "touchpad_any"    => return Some(PS_TP_CLICK),
         "btn_mute"                         => return Some(PS_MUTE),
+        // Extra rear paddles (family-neutral generic glyph; left vs right by side).
+        // Both paddle rows on a side share one glyph — the label overlay tells
+        // L1/L2 apart. Misc buttons intentionally have no glyph → text pill.
+        "btn_paddle_l1" | "btn_paddle_l2" => return Some(GEN_PADDLE_L),
+        "btn_paddle_r1" | "btn_paddle_r2" => return Some(GEN_PADDLE_R),
         _ => {}
     }
     // Gamepad pins. Auto falls back to Xbox; Kbm has no gamepad equivalents.
@@ -618,6 +628,22 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         (Skin::SwitchPro, "right_stick_down")  => Some(SW_RSTICK_D),
         (Skin::SwitchPro, "right_stick_left")  => Some(SW_RSTICK_L),
         (Skin::SwitchPro, "right_stick_right") => Some(SW_RSTICK_R),
+        _ => None,
+    }
+}
+
+/// Short on-icon label for an extra button (rear paddle), or `None` for pins
+/// that aren't extra buttons. Painted over the generic paddle glyph so the same
+/// left/right glyph can represent both paddle rows. Generic (device-agnostic)
+/// naming — SDL exposes no vendor-specific paddle names; a per-device VID/PID
+/// label table can override this later. Misc buttons return `None` (they have no
+/// glyph and render as their text display name).
+pub fn extra_button_label(pin_id: &str) -> Option<&'static str> {
+    match pin_id {
+        "btn_paddle_l1" => Some("PL1"),
+        "btn_paddle_r1" => Some("PR1"),
+        "btn_paddle_l2" => Some("PL2"),
+        "btn_paddle_r2" => Some("PR2"),
         _ => None,
     }
 }

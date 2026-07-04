@@ -20,6 +20,13 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # sdl3 (build-from-source-static) compiles SDL via CMake. windows-latest
+      # ships CMake, but pin it explicitly so a future runner-image change can't
+      # silently break the SDL build. Puts cmake on PATH; CMake's default MSVC
+      # generator finds cl.exe/SDK on its own.
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+
       - name: Build release binary
         run: cargo build --release
 

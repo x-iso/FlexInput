@@ -318,19 +318,6 @@ fn show_input_section(
     paint_scroll_fades(ui, viewport, out.content_size.y, out.state.offset.y);
 }
 
-fn card_colors(ui: &egui::Ui, is_active: bool, hover: bool) -> (egui::Color32, egui::Color32, f32) {
-    if is_active {
-        let bg = ui.visuals().selection.bg_fill.gamma_multiply(0.35);
-        let stroke = ui.visuals().selection.stroke.color;
-        (bg, stroke, 1.5)
-    } else if hover {
-        let bg = CARD_FILL_INACTIVE.gamma_multiply(1.15);
-        (bg, CARD_STROKE_INACTIVE, 1.0)
-    } else {
-        (CARD_FILL_INACTIVE, CARD_STROKE_INACTIVE, 1.0)
-    }
-}
-
 /// Active accent fill applied to PART of a card (top half of input
 /// cards, left of keymouse card). The rest of the card stays on the
 /// inactive fill so sliders / controls read on the usual background.

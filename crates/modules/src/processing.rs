@@ -8,6 +8,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<DcFilterModule>(),
         reg::<ResponseCurveModule>(),
         reg::<VecResponseCurveModule>(),
+        reg::<VecReshapeModule>(),
         reg::<TwowayResponseCurveModule>(),
         reg::<VecToAxisModule>(),
         reg::<AxisToVecModule>(),
@@ -118,6 +119,43 @@ impl Module for VecResponseCurveModule {
         ModuleDescriptor {
             id: "module.vec_response_curve",
             display_name: "Vec Response Curve",
+            category: "Processing",
+            inputs: vec![PinDescriptor::new("In", SignalType::Vec2)],
+            outputs: vec![PinDescriptor::new("Out", SignalType::Vec2)],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Vec Reshaper ──────────────────────────────────────────────────────────────
+//
+// Directional (angle-dependent) reshaping of a Vec2 to fight games' broken
+// vector shaping — e.g. right sticks that need to deflect much farther on
+// diagonals than on cardinals to move the camera on both axes ("diagonal
+// stickiness"). Unlike `vec_response_curve` (which reshapes magnitude as a
+// function of magnitude, radially symmetric), this reshapes as a function of
+// DIRECTION:
+//   • a per-angle boundary radius that remaps the gate shape (circle↔square↔
+//     custom) and renormalises magnitude to it;
+//   • a per-angle gain curve that accelerates the vector on chosen directions
+//     (push diagonals faster than horizontal/vertical, or vice-versa).
+// The user edits one quadrant; the other three mirror it (4-way by default,
+// or X-mirror so top/bottom may differ). All math lives in eval.rs
+// (`vec_reshape_apply`, shared with the UI preview); params in `node.params`:
+//   boundary_pts: [[angle01, radius], ...]   angle 0=cardinal → 1=diagonal
+//   gain_pts:     [[angle01, gain],   ...]   directional multiplier curve
+//   gain_biases:  [f32]                       per-segment bias (curve smoothing)
+//   symmetry:     "quad4" | "xmirror"
+//   renorm:       bool                        remap magnitude to boundary
+//   in_max / out_max, grid_a, snap, trail_ms  (editor knobs)
+#[derive(Default)]
+pub struct VecReshapeModule;
+
+impl Module for VecReshapeModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.vec_reshape",
+            display_name: "Vec Reshaper",
             category: "Processing",
             inputs: vec![PinDescriptor::new("In", SignalType::Vec2)],
             outputs: vec![PinDescriptor::new("Out", SignalType::Vec2)],

@@ -9,10 +9,33 @@ use flexinput_engine::current_sample_rate;
 use serde_json::{Number, Value};
 
 use super::{
-    curve::sample_curve,
+    curve::{sample_curve, vec_reshape_apply, VEC_RESHAPE_BOUNDARY_DEFAULT, VEC_RESHAPE_GAIN_DEFAULT},
     node::{LayoutDecoration, LayoutItem, NodeData, TextAlign},
 };
 use crate::app::request_repaint_throttled;
+
+/// Drop-in replacement for the removed-in-spirit `egui::popup_below_widget`
+/// (deprecated in 0.33): a memory-toggled popup anchored under the widget.
+/// Mirrors egui's own `popup_above_or_below_widget` shim over `egui::Popup`.
+fn popup_below_widget<R>(
+    widget_response: &egui::Response,
+    popup_id: egui::Id,
+    close_behavior: egui::PopupCloseBehavior,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let response = egui::Popup::from_response(widget_response)
+        .layout(egui::Layout::top_down_justified(egui::Align::LEFT))
+        .open_memory(None)
+        .close_behavior(close_behavior)
+        .id(popup_id)
+        .align(egui::RectAlign::BOTTOM_START)
+        .width(widget_response.rect.width())
+        .show(|ui| {
+            ui.set_min_width(ui.available_width());
+            add_contents(ui)
+        })?;
+    Some(response.inner)
+}
 
 pub struct FlexViewer<'a> {
     pub descriptors: &'a [ModuleDescriptor],
@@ -163,7 +186,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let dev_id_owned: String = data.params.get("device_id")
             .and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
         let dev_id_str: &str = &dev_id_owned;
-        let (has_deadzone, has_gyro, has_sticks_cal) = device_source_caps(dev_id_str, is_device_source);
+        let (has_deadzone, has_gyro, _has_sticks_cal) = device_source_caps(dev_id_str, is_device_source);
         // Estimate the body width so the AutoMap chip can right-align to it.
         // Computed up-front (outside the closure that mutates the snarl) so
         // the `data` borrow doesn't outlive the snarl.get_node_mut calls.
@@ -216,10 +239,6 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             }
                         }
                         NodeIconSpec::Single(bytes) => render_device_icon(ui, bytes, ICON_H),
-                        NodeIconSpec::Pair(a, b) => {
-                            render_device_icon(ui, a, ICON_H);
-                            render_device_icon(ui, b, ICON_H);
-                        }
                     }
                 }
                 // Device source: dot + [title / (Calibrate + Hz)] stack,
@@ -399,10 +418,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
                         egui::StrokeKind::Inside);
                     if resp.clicked() {
-                        ui.memory_mut(|m| m.toggle_popup(id));
+                        egui::Popup::toggle_id(ui.ctx(), id);
                     }
                     let mut changed = false;
-                    egui::popup_below_widget(ui, id, &resp,
+                    popup_below_widget(&resp, id,
                         egui::PopupCloseBehavior::CloseOnClickOutside,
                         |ui| {
                             ui.set_min_width(220.0);
@@ -860,7 +879,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             node.module_id.as_str(),
             "device.sink" | "module.constant" | "module.switch" | "module.knob" | "module.label" | "module.svg"
                 | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
-                | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
+                | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
                 | "math.add" | "math.subtract" | "math.multiply" | "math.divide"
                 | "module.selector" | "module.split" | "module.dropdown"
                 | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
@@ -919,6 +938,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             }
             "module.vec_response_curve" => {
                 if show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl) {
+                    self.push_undo_request = true;
+                }
+            }
+            "module.vec_reshape" => {
+                if show_vec_reshape_body(node_id, inputs, outputs, ui, snarl) {
                     self.push_undo_request = true;
                 }
             }
@@ -1073,7 +1097,6 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         }
 
         let module_id = snarl.get_node(node).map(|n| n.module_id.as_str()).unwrap_or("").to_string();
-        let display_name = snarl.get_node(node).map(|n| n.display_name.clone()).unwrap_or_default();
 
         // Inner canvas only — show "Unpin from body" if the node has any pins.
         // Pinning happens exclusively through Layout mode + highlight click;
@@ -2657,7 +2680,7 @@ fn asth_slider_row(
         ui.spacing_mut().item_spacing.x = 0.0;
         slider_label(ui, label, label_w);
         // Rail extends to the SHARED right edge so every row's control lines up.
-        let w = (asth_row_right_edge(body_w, scale) - label_w).max(40.0);
+        let w = (asth_row_right_edge(body_w, scale) - label_w).max(40.0 * scale);
         ui.spacing_mut().slider_width = w;
         *changed |= add(ui, w).changed();
     }).response.rect
@@ -2712,7 +2735,7 @@ fn asth_value_row(
         // Value box right edge = the shared row right edge; rail fills the space
         // between the label and the box.
         let right_edge = asth_row_right_edge(body_w, scale);
-        let rail_w = (right_edge - val_box_w - gap - label_w).max(40.0);
+        let rail_w = (right_edge - val_box_w - gap - label_w).max(40.0 * scale);
         ui.spacing_mut().slider_width = rail_w;
         *changed |= draw(ui, rail_w, val_box_w);
     }).response.rect
@@ -2833,7 +2856,7 @@ fn asth_draw_row(
             // Range slider stops short of the shared edge to leave room for the curve
             // box, which fills the trailing slot and reaches the shared edge — so the
             // curve box's right edge lines up with the value boxes above.
-            let sw = (asth_amp_slider_right(body_w, scale) - label_w).clamp(40.0, 800.0);
+            let sw = (asth_amp_slider_right(body_w, scale) - label_w).clamp(40.0 * scale, 800.0 * scale);
             let mut lo = a.amp_min; let mut hi = a.amp_max;
             let r = crate::canvas::header_controls::range_slider(ui, &mut lo, &mut hi, 0.0, 1.0, sw)
                 .on_hover_text("Floor (lift weak audio off the dead zone) … ceiling (cap). Curve box reshapes the response.");
@@ -2878,8 +2901,36 @@ fn asth_draw_row(
 /// authored height. Returns the applied scale so the caller can scale the row's fixed
 /// cell widths (label / value box) by the SAME factor — otherwise the grown text
 /// overflows those fixed cells (the overlap/crop the user saw).
-fn apply_asth_row_height_scale(ui: &mut egui::Ui, container_h: f32, natural_h: f32) -> f32 {
-    let scale = (container_h / natural_h.max(1.0)).clamp(0.6, 4.0);
+/// Analytic minimum row width at scale 1.0: fixed cells (label / value box /
+/// curve box / inset) plus the flexible rail collapsed to its 40px minimum.
+/// Used to cap the height-driven scale by the available WIDTH — without it a
+/// short-and-narrow pin grows its text until nothing is left for the slider.
+fn asth_row_min_w(row: AsthRow) -> f32 {
+    match row {
+        // Capture-mode block: App/Focused/System selector + caption.
+        AsthRow::Mode => 240.0,
+        // label 64 + rail 40 + gap 4 + value box 50 + inset 6.
+        AsthRow::Volume | AsthRow::Release | AsthRow::Crossover => 164.0,
+        // label 64 + rail 40 + gap 4 + curve box 34 + inset 6.
+        AsthRow::Amplitude => 148.0,
+        // label 64 + rail 40 + inset 6.
+        AsthRow::Balance | AsthRow::RumbleMix => 110.0,
+        // label cell + "HF carrier / LF texture" checkbox.
+        AsthRow::Swap => 230.0,
+    }
+}
+
+/// Publish an ASTH pin's analytic natural size into the shared per-pin cache
+/// (same one the measured row widgets use), so the layout resize handle can
+/// constrain the frame to the no-crop envelope via `clamp_pin_frame_to_content`.
+fn asth_seed_pin_natural(ui: &egui::Ui, natural: egui::Vec2) {
+    if let Some(k) = ui.ctx().data(|d| d.get_temp::<egui::Id>(pin_ws_key_scratch())) {
+        ui.ctx().data_mut(|d| d.insert_temp(k, natural));
+    }
+}
+
+fn apply_asth_row_height_scale(ui: &mut egui::Ui, container_h: f32, natural_h: f32, max_scale: f32) -> f32 {
+    let scale = (container_h / natural_h.max(1.0)).min(max_scale).clamp(0.5, 4.0);
     if (scale - 1.0).abs() < 0.02 { return 1.0; }
     let style = ui.style_mut();
     for (_, font_id) in style.text_styles.iter_mut() {
@@ -2995,7 +3046,10 @@ fn render_asth_pinned_mode(
 ) {
     let mut a = asth_params_from_node(snarl, inner_id);
     ui.set_max_width(container.x);
-    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 96.0);
+    let min_w = asth_row_min_w(AsthRow::Mode);
+    asth_seed_pin_natural(ui, egui::vec2(min_w, 96.0));
+    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 96.0,
+        container.x / min_w);
     let _ = scale; // height-scale applies to text/spacing via the style mutation above
     let body_w = container.x.clamp(120.0, 1200.0);
     let (changed, _rect) = asth_draw_mode_block(ui, &mut a, body_w, ui.id().with(inner_id));
@@ -3020,11 +3074,15 @@ fn render_asth_pinned_row(
     let Some(row) = AsthRow::from_element_id(element_id) else { return; };
     let mut a = asth_params_from_node(snarl, inner_id);
     ui.set_max_width(container.x);
-    // Height drives text/control scale; width drives the slider (via body_w below).
-    // The returned scale also grows the row's fixed cells (label / value box) so the
-    // enlarged text doesn't overflow them (no overlap/crop).
-    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 22.0);
-    let body_w = container.x.clamp(120.0, 1200.0);
+    // Height drives text/control scale; width drives the slider (via body_w
+    // below). The returned scale also grows the row's fixed cells (label /
+    // value box) so the enlarged text doesn't overflow them, and is capped by
+    // the width so those cells never squeeze the rail below its minimum.
+    let min_w = asth_row_min_w(row);
+    asth_seed_pin_natural(ui, egui::vec2(min_w, 22.0));
+    let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 22.0,
+        container.x / min_w);
+    let body_w = container.x.clamp(40.0, 1200.0);
     let (changed, _rect) = asth_draw_row(ui, row, &mut a, body_w, scale);
     if changed { asth_write_params(snarl, inner_id, &a); }
 }
@@ -3063,7 +3121,7 @@ fn render_asth_pinned_scope(
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
         draw_asth_ef_scope_sized(uid, ui, &a, egui::vec2(container.x, ef_h));
-        changed = draw_asth_spectrum_eq_sized(uid, ui, &mut eq, &a, egui::vec2(container.x, spec_h));
+        changed = draw_asth_spectrum_eq_sized(inner_id, uid, ui, &mut eq, &a, egui::vec2(container.x, spec_h));
     });
     if changed {
         if let Some(n) = snarl.get_node_mut(inner_id) {
@@ -3155,7 +3213,7 @@ fn show_audio_stream_haptics_body(
                     draw_asth_ef_scope(uid, ui, &a);
                 });
                 ui.add_space(3.0);
-                let ch = draw_asth_spectrum_eq(uid, ui, &mut asth_eq_points, &a);
+                let ch = draw_asth_spectrum_eq(node_id, uid, ui, &mut asth_eq_points, &a);
                 changed_inner.set(changed_inner.get() || ch);
                 ui.min_rect().size()
             });
@@ -3305,12 +3363,12 @@ fn draw_asth_ef_scope_sized(uid: usize, ui: &mut egui::Ui, params: &AsthParams, 
 /// Interaction (mirrors the response-curve editor): drag a point to reshape,
 /// double-click to add a point, right-click a point to remove it. Mutates
 /// `eq_points` in place and returns whether it changed.
-fn draw_asth_spectrum_eq(uid: usize, ui: &mut egui::Ui, eq_points: &mut Vec<[f32; 2]>, params: &AsthParams) -> bool {
-    draw_asth_spectrum_eq_sized(uid, ui, eq_points, params,
+fn draw_asth_spectrum_eq(node_id: NodeId, uid: usize, ui: &mut egui::Ui, eq_points: &mut Vec<[f32; 2]>, params: &AsthParams) -> bool {
+    draw_asth_spectrum_eq_sized(node_id, uid, ui, eq_points, params,
         egui::vec2(ui.available_width().max(140.0), ui.available_height().max(50.0)))
 }
 
-fn draw_asth_spectrum_eq_sized(uid: usize, ui: &mut egui::Ui, eq_points: &mut Vec<[f32; 2]>, params: &AsthParams, size: egui::Vec2) -> bool {
+fn draw_asth_spectrum_eq_sized(node_id: NodeId, uid: usize, ui: &mut egui::Ui, eq_points: &mut Vec<[f32; 2]>, params: &AsthParams, size: egui::Vec2) -> bool {
     let size = egui::vec2(size.x.max(80.0), size.y.max(40.0));
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -3423,11 +3481,47 @@ fn draw_asth_spectrum_eq_sized(uid: usize, ui: &mut egui::Ui, eq_points: &mut Ve
             if best.0 < 10.0 { drag_idx = Some(best.1); }
         }
     }
+    // Gamepad-nav: which dot the driver highlighted (and whether it's in dot-move
+    // mode). Published under ("gp_nav_curve_sel", node) — the SAME channel the
+    // response-curve bodies use, so the EQ reuses the whole curve-dot nav path.
+    let nav_sel: Option<(u64, usize, bool)> = ui.ctx().data(|d|
+        d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+    let nav_sel = nav_sel.filter(|(pass, _, _)| *pass == ui.ctx().cumulative_pass_nr());
     for (i, pt) in eq_points.iter().enumerate() {
         let c = egui::pos2(x_of(pt[0]), y_of(pt[1]));
         let hot = drag_idx == Some(i);
         painter.circle_filled(c, if hot { 4.5 } else { 3.0 },
             if hot { visuals.selection.stroke.color } else { curve_col });
+        if let Some((_, sel_i, editing_dot)) = nav_sel {
+            if sel_i == i {
+                let accent = visuals.selection.stroke.color;
+                let [r8, g8, b8, _] = accent.to_array();
+                for k in 0..5 {
+                    let t = (k as f32 + 1.0) / 5.0;
+                    let rr = (if editing_dot { 16.0 } else { 12.0 }) * t;
+                    let a = ((if editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
+                    if a == 0 { continue; }
+                    painter.circle_stroke(c, rr,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                }
+                painter.circle_filled(c, if editing_dot { 6.0 } else { 5.0 }, accent);
+                painter.circle_stroke(c, if editing_dot { 6.0 } else { 5.0 },
+                    egui::Stroke::new(1.5, egui::Color32::WHITE));
+            }
+        }
+    }
+
+    // Gamepad-nav: publish EQ graph geometry (rect + axis bounds, in GLOBAL screen
+    // space) so the driver maps graph↔screen for dot stepping / cursor / moves.
+    // Bounds are X 0..1 (band position) and Y 0..1 (EQ gain).
+    {
+        let pass = ui.ctx().cumulative_pass_nr();
+        let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+            .unwrap_or(egui::emath::TSTransform::IDENTITY);
+        let screen_rect = to_global * rect;
+        ui.ctx().data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_curve_geom", node_id.0)),
+            (pass, screen_rect, 0.0f32, 1.0f32, 0.0f32, 1.0f32)));
     }
 
     // Drag a point (endpoints keep their x fixed; middle points move freely).
@@ -3639,23 +3733,23 @@ fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Node
                             edit_state.editing = Some(i);
                             edit_state.buf = options[i].clone();
                             edit_state.request_focus = true;
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if ui.add_enabled(i > 0, egui::Button::new("Move up")).clicked() {
                             row_move = -1;
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.add_enabled(i + 1 < options.len(),
                             egui::Button::new("Move down")).clicked()
                         {
                             row_move = 1;
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if ui.button("Delete").clicked() {
                             row_remove = true;
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 }
@@ -3821,11 +3915,11 @@ fn render_dropdown_selection(
     // Popup menu: open on click, close on selection or outside-click.
     let popup_id = egui::Id::new(("dropdown_pinned_popup", inner_id.0));
     if resp.clicked() {
-        ui.memory_mut(|m| m.toggle_popup(popup_id));
+        egui::Popup::toggle_id(ui.ctx(), popup_id);
     }
     let mut chosen: Option<usize> = None;
-    egui::popup_below_widget(
-        ui, popup_id, &resp,
+    popup_below_widget(
+        &resp, popup_id,
         egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
             ui.set_min_width(rect.width().max(80.0));
@@ -3838,7 +3932,7 @@ fn render_dropdown_selection(
         },
     );
     if chosen.is_some() {
-        ui.memory_mut(|m| m.close_popup(popup_id));
+        egui::Popup::close_id(ui.ctx(), popup_id);
     }
     if let Some(i) = chosen {
         if let Some(node) = inner_snarl.get_node_mut(inner_id) {
@@ -5158,7 +5252,7 @@ fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
             let sustain_active = hold;
             let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
                 .show_value(false)
-                .clamp_to_range(true);
+                .clamping(egui::SliderClamping::Always);
             let sr = ui.add_enabled(sustain_active, slider);
             if sr.changed() {
                 if !pts_x.is_empty() {
@@ -5444,9 +5538,11 @@ fn render_envelope_sustain_row(
     let mut fr: Vec<egui::Rect> = Vec::with_capacity(2);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Sustain").small().weak());
+        // Flexible element: the slider absorbs surplus container width.
+        ui.spacing_mut().slider_width = pin_flex_width(ui, container, 70.0);
         let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
             .show_value(false)
-            .clamp_to_range(true);
+            .clamping(egui::SliderClamping::Always);
         let r = ui.add_enabled(sustain_active, slider);
         fr.push(r.rect);
         if r.changed() {
@@ -5627,7 +5723,7 @@ fn show_gyro_3dof_body(
 
     // Helper that draws a 4-button mode picker. Returns true if a selection
     // change occurred; updates `family` and `axis` in place.
-    let mut draw_mode_row = |ui: &mut egui::Ui, label: &str, target_family: &str,
+    let draw_mode_row = |ui: &mut egui::Ui, label: &str, target_family: &str,
                               family: &mut String, axis: &mut String| -> bool {
         let mut row_changed = false;
         ui.horizontal(|ui| {
@@ -5858,7 +5954,7 @@ fn show_gyro_lean_mapping_section(
     }).unwrap_or(false);
     let nav_capture_armed = snarl.get_node(node_id)
         .and_then(|n| n.params.get(armed_key)).and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut nav_arm_idle = snarl.get_node(node_id)
+    let nav_arm_idle = snarl.get_node(node_id)
         .and_then(|n| n.params.get(arm_idle_key)).and_then(|v| v.as_bool()).unwrap_or(false);
     // Capture may proceed when not in nav mode, OR (nav mode) once armed AND the
     // device has gone idle once since arming (so the Learn press is released).
@@ -5886,7 +5982,6 @@ fn show_gyro_lean_mapping_section(
     let now_empty = pressed_now.is_empty();
     if nav_capture_armed && !nav_arm_idle && now_empty {
         set_arm_idle = Some(true);
-        nav_arm_idle = true;
     }
 
     let mut new_phase = phase.clone();
@@ -6766,10 +6861,6 @@ pub(crate) fn show_subpatch_body(
         .map(|sp| (sp.snap_enabled, sp.snap_grid_px.max(2) as f32))
         .unwrap_or((false, 8.0));
 
-    let selected_idx = snarl.get_node(outer_id)
-        .and_then(|n| n.subpatch.as_ref())
-        .and_then(|sp| sp.selected_item);
-
     // Per-item inner-module info (display name etc), for stale-pin cleanup
     // and right-click menu labels.
     let infos: Vec<(String, String, bool)> = items.iter().map(|it| {
@@ -6843,7 +6934,9 @@ pub(crate) fn show_subpatch_body(
         if snap_enabled && snap_grid > 0.5 { (v / snap_grid).round() * snap_grid } else { v }
     };
     let shift_held = ui.input(|i| i.modifiers.shift);
-    const RESIZE_HANDLE: f32 = 18.0;
+    // Kept small: the handle sits inside the item's corner, so its footprint
+    // is effectively the smallest frame you can still comfortably resize.
+    const RESIZE_HANDLE: f32 = 14.0;
     const MIN_W: f32 = 32.0;
     const MIN_H: f32 = 18.0;
 
@@ -6868,7 +6961,7 @@ pub(crate) fn show_subpatch_body(
                 let element_id = m.element_id.clone();
                 let graph_ov = m.graph_override.clone();
                 let outer_snap_ref = outer_snapshot.as_ref();
-                ui.allocate_ui_at_rect(element_rect, |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(element_rect), |ui| {
                     let new_clip = ui.clip_rect().intersect(element_rect);
                     ui.set_clip_rect(new_clip);
                     // Salt widget IDs by layout-item index so multiple pins of
@@ -7138,11 +7231,11 @@ pub(crate) fn show_subpatch_body(
     let _ = secondary_down;
     bg_resp.context_menu(|ui| {
         ui.menu_button("Add", |ui| {
-            if ui.button("Text").clicked()      { bg_add = Some("text");    ui.close_menu(); }
-            if ui.button("Rectangle").clicked() { bg_add = Some("rect");    ui.close_menu(); }
-            if ui.button("Ellipse").clicked()   { bg_add = Some("ellipse"); ui.close_menu(); }
-            if ui.button("Line").clicked()      { bg_add = Some("line");    ui.close_menu(); }
-            if ui.button("SVG").clicked()       { bg_add = Some("svg");     ui.close_menu(); }
+            if ui.button("Text").clicked()      { bg_add = Some("text");    ui.close(); }
+            if ui.button("Rectangle").clicked() { bg_add = Some("rect");    ui.close(); }
+            if ui.button("Ellipse").clicked()   { bg_add = Some("ellipse"); ui.close(); }
+            if ui.button("Line").clicked()      { bg_add = Some("line");    ui.close(); }
+            if ui.button("SVG").clicked()       { bg_add = Some("svg");     ui.close(); }
         });
     });
 
@@ -7366,6 +7459,7 @@ pub(crate) fn show_subpatch_body(
                     ui.ctx().data_mut(|d| d.insert_temp(drag_size_id(idx), [prev[0], prev[1], ax, ay]));
                     let tw = snap(prev[0] + ax).max(MIN_W.min(8.0));
                     let th = snap(prev[1] + ay).max(MIN_H.min(8.0));
+                    let (tw, th) = clamp_pin_frame_to_content(ui, outer_id, it, tw, th);
                     new_size[idx] = Some([tw, th]);
                 }
             } else {
@@ -7802,21 +7896,21 @@ fn layout_item_context_menu(
 ) {
     ui.label(egui::RichText::new(menu_header).small().strong());
     ui.separator();
-    if ui.button("Send to surface").clicked()   { *zaction = Some((idx, "top"));    ui.close_menu(); }
-    if ui.button("Step Up").clicked()           { *zaction = Some((idx, "up"));     ui.close_menu(); }
-    if ui.button("Step Down").clicked()         { *zaction = Some((idx, "down"));   ui.close_menu(); }
-    if ui.button("Send to background").clicked(){ *zaction = Some((idx, "bottom")); ui.close_menu(); }
+    if ui.button("Send to surface").clicked()   { *zaction = Some((idx, "top"));    ui.close(); }
+    if ui.button("Step Up").clicked()           { *zaction = Some((idx, "up"));     ui.close(); }
+    if ui.button("Step Down").clicked()         { *zaction = Some((idx, "down"));   ui.close(); }
+    if ui.button("Send to background").clicked(){ *zaction = Some((idx, "bottom")); ui.close(); }
     ui.separator();
     // Style copy/paste. Copy stashes THIS item's style; paste applies the
     // clipboard to the whole selection (or this item if nothing else selected).
-    if ui.button("Copy style").clicked() { *copy_style_from = Some(idx); ui.close_menu(); }
+    if ui.button("Copy style").clicked() { *copy_style_from = Some(idx); ui.close(); }
     ui.add_enabled_ui(has_style_clip, |ui| {
         let label = if n_selected > 1 {
             format!("Paste style to {} selected", n_selected)
         } else {
             "Paste style".to_string()
         };
-        if ui.button(label).clicked() { *paste_style = true; ui.close_menu(); }
+        if ui.button(label).clicked() { *paste_style = true; ui.close(); }
     });
     // Duplicate — decorations only (module widgets reference an inner node and
     // can't be cloned as standalone layout items). Duplicates the whole
@@ -7828,10 +7922,39 @@ fn layout_item_context_menu(
         } else {
             "Duplicate".to_string()
         };
-        if ui.button(dlabel).clicked() { *dup_request = true; ui.close_menu(); }
+        if ui.button(dlabel).clicked() { *dup_request = true; ui.close(); }
     }
     ui.separator();
-    if ui.button("Unpin").clicked() { *delete_idx = Some(idx); ui.close_menu(); }
+    if ui.button("Unpin").clicked() { *delete_idx = Some(idx); ui.close(); }
+}
+
+/// Clamp a layout-resize candidate size for a Module pin to its no-crop
+/// envelope, derived from the cached natural (scale-1.0, minimum-flex-width)
+/// content size: width can't go below what the scale floor needs for the
+/// text, and height can't demand a larger text scale than the width can hold.
+/// This makes the resize handle itself respect "contents never crop out of
+/// frame" — to get a taller row (bigger text) you first have to give it
+/// enough width for the enlarged labels plus the flexible parts' minimum.
+/// Pins without a cached natural (graphs, whole-module) are unconstrained.
+fn clamp_pin_frame_to_content(
+    ui: &egui::Ui,
+    outer_id: NodeId,
+    it: &LayoutItem,
+    w: f32,
+    h: f32,
+) -> (f32, f32) {
+    let LayoutItem::Module(m) = it else { return (w, h) };
+    let ws_key = egui::Id::new(("pin_ws_nat", outer_id.0, m.inner_node_id, m.element_id.as_str()));
+    let Some(nat) = ui.ctx().data(|d| d.get_temp::<egui::Vec2>(ws_key)) else { return (w, h) };
+    if nat.x < 1.0 || nat.y < 1.0 { return (w, h); }
+    // 0.5 is the scale floor in `apply_widget_scale`: any narrower and the
+    // text can no longer shrink to fit the frame.
+    let w = w.max(nat.x * 0.5);
+    // The largest text scale this width can hold (4.0 = the global ceiling —
+    // taller than that only adds empty space).
+    let s_max = (w / nat.x).min(4.0);
+    let h = h.clamp(nat.y * 0.5, nat.y * s_max);
+    (w, h)
 }
 
 /// Apply a Z-order action against a `Vec<LayoutItem>` (paint order).
@@ -7851,11 +7974,68 @@ fn sp_module_id(sp: Option<&crate::canvas::node::UiSubPatch>, inner_node_id: usi
         .map(|n| n.module_id.clone())
 }
 
-/// Dispatches to the appropriate per-element renderer for a pinned element.
-/// `element_id == "default"` renders the whole module body (back-compat path,
-/// for legacy patches that pinned entire bodies); other ids render just one
-/// UI element of the module sized to fit the user-chosen container.
+/// Dispatches to the appropriate per-element renderer for a pinned element,
+/// wrapping the dispatch with content-size measurement: after the element
+/// renders, its content size (normalized back to scale 1.0) is cached per pin
+/// so the next frame's `apply_widget_scale` fits the ACTUAL content to the
+/// container instead of a hard-coded estimate. This is what keeps row widgets
+/// scaling coherently with their frame and never cropping out of it.
 fn render_pinned_element(
+    inner_id: egui_snarl::NodeId,
+    module_id: &str,
+    element_id: &str,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    outer_snapshot: Option<&Snarl<NodeData>>,
+    outer_id: NodeId,
+    is_layout_mode: bool,
+    graph_override: Option<crate::canvas::node::PinGraphOverride>,
+) {
+    // Stable identity for this pin's natural-size cache: (outer node, inner
+    // node, element). Two pins of the same element share one entry, which is
+    // fine — they render identical content.
+    let ws_key = egui::Id::new(("pin_ws_nat", outer_id.0, inner_id.0, element_id));
+    ui.ctx().data_mut(|d| d.insert_temp(pin_ws_key_scratch(), ws_key));
+
+    render_pinned_element_impl(
+        inner_id, module_id, element_id, ui, inner_snarl, container_size,
+        live_signals, panic_shortcut, automap_parent, outer_snapshot,
+        outer_id, is_layout_mode, graph_override,
+    );
+
+    // `applied` is only present when the renderer routed through
+    // `apply_widget_scale` (row-style widgets). Graphs / whole-module pins
+    // size themselves to the container and are skipped.
+    let applied: Option<f32> = ui.ctx().data(|d| d.get_temp(pin_ws_applied_scratch()));
+    let stretch: f32 = ui.ctx().data(|d| d.get_temp(pin_ws_flex_scratch())).unwrap_or(0.0);
+    ui.ctx().data_mut(|d| {
+        d.remove::<egui::Id>(pin_ws_key_scratch());
+        d.remove::<f32>(pin_ws_applied_scratch());
+        d.remove::<egui::Vec2>(pin_ws_resolved_scratch());
+        d.remove::<f32>(pin_ws_flex_scratch());
+    });
+    if let Some(scale) = applied {
+        let measured = ui.min_rect().size();
+        if measured.x > 4.0 && measured.y > 4.0 && scale > 0.0 {
+            // Normalize back to scale 1.0, with any flexible-element stretch
+            // removed so the cache holds the row's MINIMUM width.
+            let nat = egui::vec2((measured.x - stretch).max(1.0), measured.y) / scale;
+            let prev: Option<egui::Vec2> = ui.ctx().data(|d| d.get_temp(ws_key));
+            // ~1px dead-band: font rasterization rounds a little differently
+            // at each scale; without it the fit oscillates while resizing.
+            if prev.map_or(true, |p| (p - nat).abs().max_elem() > 1.0) {
+                ui.ctx().data_mut(|d| d.insert_temp(ws_key, nat));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_pinned_element_impl(
     inner_id: egui_snarl::NodeId,
     module_id: &str,
     element_id: &str,
@@ -8049,6 +8229,35 @@ fn render_pinned_element(
             render_response_curve_grid_options_row(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        // Vec Reshaper — each element renders as its own scaled widget.
+        ("module.vec_reshape", "pad") => {
+            render_vec_reshape_pad(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.vec_reshape", "curve") => {
+            render_vec_reshape_curve(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.vec_reshape", "target_row") => {
+            render_vec_reshape_target_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.vec_reshape", "options_row") => {
+            render_vec_reshape_options_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.vec_reshape", "range_row") => {
+            render_vec_reshape_range_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.vec_reshape", "grid_row") => {
+            render_vec_reshape_grid_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        ("module.vec_reshape", "preset_row") => {
+            render_vec_reshape_preset_row(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Two-way Response Curve
         ("module.twoway_response_curve", "curve") => {
             render_twoway_curve_only(inner_id, ui, inner_snarl, container_size, graph_ov_ref);
@@ -8203,48 +8412,6 @@ fn render_pinned_element(
     let _ = module_id;
     let _ = element_id;
     ui.label(egui::RichText::new("Re-pin via Layout mode").small().weak());
-}
-
-fn dispatch_pinned_body(
-    inner_id: egui_snarl::NodeId,
-    module_id: &str,
-    ui: &mut egui::Ui,
-    inner_snarl: &mut Snarl<NodeData>,
-) {
-    // Cap width so modules that use available_width() (oscillator, response curve)
-    // don't expand to fill the 800px allocate_ui_at_rect max_rect.
-    // Knob uses egui::Resize (its own stored size) and is unaffected by this.
-    let cap = ui.available_width().min(450.0);
-    ui.set_max_width(cap);
-    match module_id {
-        "module.knob"       => show_knob_body(inner_id, ui, inner_snarl),
-        "module.constant"   => show_constant_body(inner_id, ui, inner_snarl),
-        "module.switch"     => show_switch_body(inner_id, ui, inner_snarl),
-        "module.label"      => show_label_body(inner_id, ui, inner_snarl),
-        "generator.oscillator" => show_oscillator_body(inner_id, &[], ui, inner_snarl),
-        "generator.envelope"   => show_envelope_body(inner_id, &[], ui, inner_snarl),
-        "module.selector"   => show_selector_body(inner_id, &[], ui, inner_snarl),
-        "module.dropdown"   => show_dropdown_body(inner_id, ui, inner_snarl),
-        "module.response_curve"     => { show_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
-        "module.vec_response_curve" => { show_vec_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
-        "processing.gyro_3dof"      => {
-            // Inner-snarl (layout-mode preview): Learn/capture not wired
-            // here since we lack live_signals / panic_shortcut. Mapping
-            // editing still works (Add/×/press-mode); capture is no-op.
-            let empty: std::collections::HashMap<(String, String), Signal>
-                = std::collections::HashMap::new();
-            let panic_dummy = crate::app::PanicShortcut::default();
-            show_gyro_3dof_body(inner_id, &[], ui, inner_snarl, &empty,
-                &panic_dummy, None);
-        }
-        "logic.greater_than" | "logic.less_than" => show_or_equal_body(inner_id, ui, inner_snarl),
-        "logic.delay"       => show_logic_delay_body(inner_id, ui, inner_snarl),
-        "logic.counter"     => show_counter_body(inner_id, &[], ui, inner_snarl),
-        "module.delay"      => show_delay_body(inner_id, &[], &[], ui, inner_snarl),
-        "module.average"    => show_average_body(inner_id, &[], &[], ui, inner_snarl),
-        "module.dc_filter"  => show_dc_filter_body(inner_id, &[], &[], ui, inner_snarl),
-        _ => { /* no body for this module type */ }
-    }
 }
 
 // ── Whole-module pinned renderers (Remapper / Map Action) ─────────────────────
@@ -8834,9 +9001,18 @@ fn render_constant_value(
         .and_then(|n| n.params.get("value").and_then(|v| v.as_f64()))
         .unwrap_or(0.0) as f32;
     let mut v = value;
-    // Use the full container width for the dragvalue.
+    // Use the full container for the dragvalue; the box IS the whole pin, so
+    // (like the readout) its text scales with the container height rather
+    // than staying at theme size inside an ever-larger box.
     ui.set_max_width(container.x);
-    if ui.add_sized([container.x, 24.0], egui::DragValue::new(&mut v).speed(0.01)).changed() {
+    let h = container.y.max(18.0);
+    let font_scale = (h / 24.0).clamp(0.6, 3.5);
+    if (font_scale - 1.0).abs() > 0.02 {
+        for (_, font_id) in ui.style_mut().text_styles.iter_mut() {
+            font_id.size = (font_id.size * font_scale).max(6.0);
+        }
+    }
+    if ui.add_sized([container.x, h], egui::DragValue::new(&mut v).speed(0.01)).changed() {
         if let Some(node) = inner_snarl.get_node_mut(inner_id) {
             if let Some(n) = Number::from_f64(v as f64) {
                 node.params.insert("value".to_string(), Value::Number(n));
@@ -8913,24 +9089,6 @@ fn render_switch_toggle(
             switch_handle_click(node, active);
         }
     }
-}
-
-/// Read-only label for the outer body. Editing happens only in the editor;
-/// the body shows static text at the chosen font size.
-fn render_label_text_readonly(
-    inner_id: NodeId,
-    ui: &mut egui::Ui,
-    inner_snarl: &mut Snarl<NodeData>,
-    container: egui::Vec2,
-) {
-    let (text, font_size, col) = inner_snarl.get_node(inner_id).map(|n| {
-        let t = n.params.get("text").and_then(|v| v.as_str()).unwrap_or("Label").to_string();
-        let f = n.params.get("font_size").and_then(|v| v.as_f64()).unwrap_or(14.0) as f32;
-        let c = read_label_color(n);
-        (t, f, c)
-    }).unwrap_or_else(|| ("Label".to_string(), 14.0, egui::Color32::from_rgb(220, 220, 220)));
-    ui.set_max_width(container.x);
-    ui.label(egui::RichText::new(text).size(font_size).color(col));
 }
 
 /// Pinned-Text renderer: scale by width, crop by height with scrollbar,
@@ -9452,11 +9610,63 @@ fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, scope: &str, 
     }
 }
 
+/// Ctx-data scratch: the natural-size cache key of the pin currently being
+/// rendered. Set by `render_pinned_element` before dispatch, read here so the
+/// measured content size (cached under that key) replaces the caller's guess.
+fn pin_ws_key_scratch() -> egui::Id { egui::Id::new("pin_ws_key_scratch") }
+/// Ctx-data scratch: the scale this pass actually applied, so
+/// `render_pinned_element` can normalize its post-render measurement.
+fn pin_ws_applied_scratch() -> egui::Id { egui::Id::new("pin_ws_applied_scratch") }
+/// Ctx-data scratch: the natural size `apply_widget_scale` resolved for the
+/// current pin (measured cache or fallback), read by `pin_flex_width`.
+fn pin_ws_resolved_scratch() -> egui::Id { egui::Id::new("pin_ws_resolved_scratch") }
+/// Ctx-data scratch: how much width the row's flexible element stretched
+/// beyond its minimum this pass. `render_pinned_element` subtracts it from the
+/// measured width so the cached natural always describes the row at MINIMUM
+/// flexible width (otherwise the fill would feed back into the measurement).
+fn pin_ws_flex_scratch() -> egui::Id { egui::Id::new("pin_ws_flex_scratch") }
+
+/// Width for the ONE width-flexible element of a pinned row (a slider rail):
+/// its minimum scaled width plus all of the container's surplus width. This is
+/// the ASTH row model — text scales with the frame HEIGHT, the slider absorbs
+/// extra WIDTH. Call after `apply_widget_scale`, at most once per row.
+fn pin_flex_width(ui: &egui::Ui, container: egui::Vec2, min_w: f32) -> f32 {
+    let scale: f32 = ui.ctx().data(|d| d.get_temp(pin_ws_applied_scratch())).unwrap_or(1.0);
+    let nat: Option<egui::Vec2> = ui.ctx().data(|d| d.get_temp(pin_ws_resolved_scratch()));
+    let surplus = match nat {
+        // `nat.x` is the row width with the flexible element at `min_w`.
+        Some(n) => (container.x - n.x * scale - 2.0).max(0.0),
+        None => 0.0,
+    };
+    ui.ctx().data_mut(|d| d.insert_temp(pin_ws_flex_scratch(), surplus));
+    min_w * scale + surplus
+}
+
 fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::Vec2) -> f32 {
-    // Settings widgets scale by the container WIDTH so they grow to fill the
-    // space as the pinned element is widened (height follows the content).
-    let scale = (container.x / natural.x.max(1.0)).clamp(0.5, 4.0);
-    if (scale - 1.0).abs() < 0.02 { return 1.0; }
+    // Text/controls scale with the container HEIGHT, capped by what the WIDTH
+    // can hold, so a pinned row grows with its frame but never crops out of
+    // it: when the frame is too narrow for the height-scaled text (plus the
+    // minimum width of any flexible element), the width cap wins and the text
+    // shrinks to keep the whole row inside the frame.
+    // `natural` is only a first-frame estimate: once the row has rendered
+    // once, `render_pinned_element` caches the measured content size (at
+    // minimum flexible width) and that replaces the estimate — so a
+    // snugly-framed row sits at ~1.0 and grows in lockstep with the frame.
+    let key: Option<egui::Id> = ui.ctx().data(|d| d.get_temp(pin_ws_key_scratch()));
+    let natural = key
+        .and_then(|k| ui.ctx().data(|d| d.get_temp::<egui::Vec2>(k)))
+        .unwrap_or(natural);
+    let mut scale = (container.y / natural.y.max(1.0))
+        .min(container.x / natural.x.max(1.0))
+        .clamp(0.5, 4.0);
+    if (scale - 1.0).abs() < 0.02 { scale = 1.0; }
+    if key.is_some() {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(pin_ws_applied_scratch(), scale);
+            d.insert_temp(pin_ws_resolved_scratch(), natural);
+        });
+    }
+    if scale == 1.0 { return 1.0; }
 
     // Scale all named text styles uniformly so labels, buttons, and DragValues
     // all grow together. Egui clones the style on edit, so this only affects
@@ -9471,6 +9681,8 @@ fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::V
     sp.interact_size.y = (sp.interact_size.y * scale).max(12.0);
     sp.icon_width      = (sp.icon_width * scale).max(8.0);
     sp.icon_width_inner = (sp.icon_width_inner * scale).max(6.0);
+    sp.slider_width    *= scale;
+    sp.combo_width     *= scale;
     scale
 }
 
@@ -9493,16 +9705,17 @@ fn render_dragvalue_param(
         .unwrap_or(default as f64) as f32;
     let mut v = cur;
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(160.0, 22.0));
+    apply_widget_scale(ui, container, egui::vec2(120.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).weak());
         let mut dv = egui::DragValue::new(&mut v).speed(speed).range(range);
         if let Some(d) = max_decimals { dv = dv.max_decimals(d); }
-        let label_w = ui.available_width() * 0.0; // available_width is now post-label
-        let _ = label_w;
-        let avail_w = ui.available_width().max(40.0);
-        let h = container.y.max(ui.spacing().interact_size.y);
-        if ui.add_sized([avail_w, h], dv).changed() {
+        // The value box is the row's flexible element: it fills the surplus
+        // width while its height (and text) tracks the scaled row metrics —
+        // sizing it to the container gave a huge box with tiny text in it.
+        let w = pin_flex_width(ui, container, 64.0);
+        let h = ui.spacing().interact_size.y;
+        if ui.add_sized([w, h], dv).changed() {
             if let (Some(node), Some(n)) = (
                 snarl.get_node_mut(inner_id),
                 Number::from_f64(v as f64),
@@ -9910,6 +10123,8 @@ fn render_oscilloscope_controls(
     apply_widget_scale(ui, container, egui::vec2(360.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Win").weak());
+        // Flexible element: the Win slider absorbs surplus container width.
+        ui.spacing_mut().slider_width = pin_flex_width(ui, container, 70.0);
         let r = ui.add(egui::Slider::new(&mut win_ms, 10.0f32..=10_000.0)
             .logarithmic(true).show_value(false));
         fr[0] = r.rect; changed |= r.changed();
@@ -10109,14 +10324,17 @@ fn render_response_curve_scale_row(
     }).unwrap_or((0.0, true, false));
 
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
+    let s = apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     let mut changed = false;
     let mut fr: Vec<egui::Rect> = Vec::with_capacity(3);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Log").weak());
-        // Slider takes a portion of available width so it scales with the row.
-        let slider_w = (ui.available_width() * 0.45).clamp(40.0, 200.0);
-        let slider_h = ui.spacing().interact_size.y.min(20.0).max(10.0);
+        // ASTH row model: the slider is the row's flexible element — it takes
+        // its minimum scaled width plus ALL surplus container width, so the
+        // labels/checkboxes scale with the frame height while widening the
+        // frame lengthens the slider.
+        let slider_w = pin_flex_width(ui, container, 60.0);
+        let slider_h = (16.0 * s).max(10.0);
         let (slider_rect, slider_resp) =
             ui.allocate_exact_size(egui::vec2(slider_w, slider_h), egui::Sense::click_and_drag());
         fr.push(slider_rect);
@@ -11192,18 +11410,6 @@ pub(crate) fn slider_label(ui: &mut egui::Ui, label: &str, cell_w: f32) {
     );
 }
 
-/// Small calibration button. `calibrated == true` flips the button's fill to
-/// a calm green so the visual state is conveyed without a separate ✓ label.
-fn cal_button(ui: &mut egui::Ui, label: &str, calibrated: bool) -> egui::Response {
-    let mut btn = egui::Button::new(egui::RichText::new(label).small());
-    if calibrated {
-        btn = btn
-            .fill(Color32::from_rgb(50, 130, 70))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(80, 200, 100)));
-    }
-    ui.add(btn)
-}
-
 /// Paint a soft circular halo via a triangle fan with per-vertex colors.
 /// Center color = `hot` premultiplied by intensity; edge color = transparent.
 /// Uses `Color32::TRANSPARENT` for the edge so the gradient is premultiplied-
@@ -11289,7 +11495,7 @@ fn signal_intensity(sig: &Signal) -> f32 {
 
 /// Read prior glow intensity for this pin (memory-cached), lerp toward `target`
 /// at a fixed rate, store back, and return the smoothed value. Smoothing
-/// prevents the 500 Hz raw signal from strobing the visual.
+/// prevents the polling-rate raw signal from strobing the visual.
 fn pin_glow_smoothed(ctx: &egui::Context, node: egui_snarl::NodeId, pin_idx: usize, is_input: bool, target: f32) -> f32 {
     let key = egui::Id::new(("pin_glow", node.0, pin_idx, is_input));
     let prev = ctx.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
@@ -11567,31 +11773,6 @@ fn automap_label_abs_y_key(node: egui_snarl::NodeId) -> egui::Id {
 fn automap_pin_row_y_key(node: egui_snarl::NodeId) -> egui::Id {
     egui::Id::new(("device_sink_automap_pin_row_y", node.0))
 }
-
-/// Per-node cache of the node's `open` bool. The pin-Y delta cache is only
-/// valid when this hasn't changed between frames; on a transition we fall
-/// back to using the stashed absolute label Y directly (1-frame stale but
-/// visibly steady) until both stashes are aligned to the new state.
-fn automap_open_state_key(node: egui_snarl::NodeId) -> egui::Id {
-    egui::Id::new(("device_automap_open_state", node.0))
-}
-
-/// Per-node cache of the input column's body-content X, stashed by
-/// `show_input` and consumed next frame by `show_header`. Combined with
-/// `automap_header_cursor_x_key` (the show_header cursor X stashed the
-/// same prior frame) to form a layout-stable delta that lets show_header
-/// resolve the node body left X each frame even when the node is moving
-/// or when the column pass is clipped (collapsed state).
-fn automap_label_x_key(node: egui_snarl::NodeId) -> egui::Id {
-    egui::Id::new(("device_sink_automap_label_x", node.0))
-}
-
-/// Companion of `automap_label_x_key`: show_header's post-chevron cursor X
-/// stashed each frame for next-frame delta resolution.
-fn automap_header_cursor_x_key(node: egui_snarl::NodeId) -> egui::Id {
-    egui::Id::new(("device_sink_automap_header_cursor_x", node.0))
-}
-
 enum WireDir {
     FromOutput { src: OutPinId, from_type: SignalType },
     FromInput  { dst: InPinId,  to_type:   SignalType },
@@ -11740,15 +11921,8 @@ fn graph_grid_colors(ov: Option<&crate::canvas::node::PinGraphOverride>) -> (Col
     (faint, axis)
 }
 
-const SCOPE_COLORS: [Color32; 4] = [
-    Color32::from_rgb(255, 80,  80),   // red
-    Color32::from_rgb(80,  220, 80),   // green
-    Color32::from_rgb(80,  140, 255),  // blue
-    Color32::from_rgb(255, 220, 50),   // yellow
-];
-
 // 12 perceptually-spread colors for multi-pin modules (selector inputs, split outputs, etc.).
-// The first four match SCOPE_COLORS so oscilloscope channels stay consistent.
+// The first four (red/green/blue/yellow) double as the oscilloscope channel colors.
 const MULTI_COLORS: [Color32; 12] = [
     Color32::from_rgb(255, 80,  80),   //  0 red
     Color32::from_rgb(80,  220, 80),   //  1 green
@@ -12511,6 +12685,8 @@ fn render_trigscope_controls(
     apply_widget_scale(ui, container, egui::vec2(360.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Win").weak());
+        // Flexible element: the Win slider absorbs surplus container width.
+        ui.spacing_mut().slider_width = pin_flex_width(ui, container, 70.0);
         let r = ui.add(egui::Slider::new(&mut win_ms, 10.0f32..=10_000.0)
             .logarithmic(true).show_value(false));
         fr[0] = r.rect; changed |= r.changed();
@@ -14003,6 +14179,762 @@ fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &[Ou
     false
 }
 
+// ── Vec Reshaper body ─────────────────────────────────────────────────────────
+//
+// Two coupled views:
+//   • a curve editor (X = direction, 0 = cardinal axis → 1 = diagonal;
+//     Y = boundary radius OR directional gain, selected by the Edit toggle),
+//     reusing the response-curve drag/add/remove/bias idiom; and
+//   • a live 2D pad showing the unit circle, the reshaped gate boundary, the
+//     gain field, and the live input → output dots computed with the exact
+//     engine transform (`vec_reshape_apply`).
+//
+// Params: boundary_pts / gain_pts (+ gain_biases), symmetry, renorm, in_max,
+// out_max, grid_a, snap, trail_ms. One quadrant is edited; the pad mirrors it.
+
+/// Read a reshaper control-point array from params, or a default when missing.
+fn reshape_read_pts(node: &NodeData, key: &str, default: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    node.params.get(key).and_then(|v| v.as_array()).map(|arr| {
+        arr.iter().filter_map(|p| {
+            let a = p.as_array()?;
+            Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
+        }).collect::<Vec<_>>()
+    }).filter(|v: &Vec<[f32; 2]>| v.len() >= 2).unwrap_or_else(|| default.to_vec())
+}
+
+/// All Vec Reshaper transform params, pulled from a node in one shot. Shared by
+/// the editor body and every pinned-element renderer so the pad/curve draw
+/// identically wherever they appear.
+struct ReshapeParams {
+    boundary: Vec<[f32; 2]>,
+    gain: Vec<[f32; 2]>,
+    gain_biases: Vec<f32>,
+    symmetry: String,
+    renorm: bool,
+    in_max: f32,
+    out_max: f32,
+    grid_x: usize,
+    grid_y: usize,
+    snap: bool,
+    trail_ms: i64,
+    edit_target: String,
+}
+
+impl ReshapeParams {
+    fn read(node: &NodeData) -> Self {
+        ReshapeParams {
+            boundary: reshape_read_pts(node, "boundary_pts", VEC_RESHAPE_BOUNDARY_DEFAULT),
+            gain: reshape_read_pts(node, "gain_pts", VEC_RESHAPE_GAIN_DEFAULT),
+            gain_biases: node.params.get("gain_biases").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()).unwrap_or_default(),
+            symmetry: node.params.get("symmetry").and_then(|v| v.as_str()).unwrap_or("quad4").to_string(),
+            renorm: node.params.get("renorm").and_then(|v| v.as_bool()).unwrap_or(true),
+            in_max: node.params.get("in_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+            out_max: node.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+            grid_x: node.params.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize,
+            grid_y: node.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4).max(1) as usize,
+            snap: node.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false),
+            trail_ms: node.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000),
+            edit_target: node.params.get("edit_target").and_then(|v| v.as_str()).unwrap_or("gain").to_string(),
+        }
+    }
+
+    /// Output magnitude for a full-deflection input in direction `theta` (rad),
+    /// normalised so 1.0 = the unit circle. This is the reachable ENVELOPE the
+    /// pad plots as the green outline — it exceeds 1.0 on the diagonal for a
+    /// square boundary.
+    fn envelope_at(&self, theta: f32) -> f32 {
+        let dir = glam::Vec2::new(theta.cos(), theta.sin());
+        let out = vec_reshape_apply(dir * self.in_max, &self.boundary, &self.gain,
+            &self.gain_biases, &self.symmetry, self.renorm, self.in_max, self.out_max);
+        out.length() / self.out_max.max(f32::EPSILON)
+    }
+
+    /// Local radial stretch at input point `v` (input-space, pre-normalised to
+    /// in_max): `(out_mag/in_mag) / (out_max/in_max)`. 1.0 = neutral, >1 =
+    /// accelerated (blue), <1 = decelerated (red). Used for the gradient field.
+    fn stretch_at(&self, v: glam::Vec2) -> f32 {
+        let m = v.length();
+        if m < 1e-4 { return 1.0; }
+        let out = vec_reshape_apply(v, &self.boundary, &self.gain, &self.gain_biases,
+            &self.symmetry, self.renorm, self.in_max, self.out_max);
+        let nominal = self.out_max / self.in_max.max(f32::EPSILON);
+        (out.length() / m) / nominal.max(f32::EPSILON)
+    }
+}
+
+/// Map a stretch factor (1.0 = neutral) to a hue: blue = accelerate (>1),
+/// red = decelerate (<1), transparent at neutral. `strength` scales the alpha.
+fn reshape_stretch_color(stretch: f32, strength: f32) -> Color32 {
+    // Log-symmetric so a 2× stretch and a ½× squeeze read equally strong.
+    let s = stretch.max(1e-3).ln() / std::f32::consts::LN_2; // ±1 ≈ 2×/½×
+    let t = (s.abs()).clamp(0.0, 1.0);
+    let a = (t * strength).clamp(0.0, 1.0);
+    let (r, g, b) = if s >= 0.0 {
+        (70.0, 150.0, 255.0)   // blue — accelerate / stretched
+    } else {
+        (255.0, 80.0, 70.0)    // red — decelerate / squeezed
+    };
+    Color32::from_rgba_unmultiplied((r * a) as u8, (g * a) as u8, (b * a) as u8, (200.0 * a) as u8)
+}
+
+/// Build (or fetch from cache) a smooth stretch-field texture for the pad. The
+/// field is computed at `RES`×`RES` in INPUT space over [-1,1]² and uploaded
+/// once per unique parameter set; LINEAR filtering then gives curved, smooth
+/// gradients at any pad size instead of a blocky per-vertex mesh. Cached in
+/// `ctx.data` keyed by a signature of the transform params, so it only
+/// recomputes when the curves/params actually change.
+fn reshape_field_texture(ui: &egui::Ui, salt: egui::Id, p: &ReshapeParams) -> egui::TextureHandle {
+    use std::hash::{Hash, Hasher};
+    // Signature: quantised params + curve points. Quantising floats keeps the
+    // key stable across sub-pixel repaint jitter while still busting on edits.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let q = |f: f32| (f * 4096.0).round() as i64;
+    for pt in &p.boundary { q(pt[0]).hash(&mut h); q(pt[1]).hash(&mut h); }
+    for pt in &p.gain     { q(pt[0]).hash(&mut h); q(pt[1]).hash(&mut h); }
+    for b in &p.gain_biases { q(*b).hash(&mut h); }
+    p.symmetry.hash(&mut h);
+    p.renorm.hash(&mut h);
+    q(p.in_max).hash(&mut h); q(p.out_max).hash(&mut h);
+    let sig = h.finish();
+
+    // One slot PER PAD (keyed by `salt`), holding (signature, handle). Only the
+    // latest field texture is retained; when the signature changes we replace it,
+    // dropping the previous handle so the GPU texture is freed — no per-edit leak.
+    let cache_key = salt.with("vrs_field_tex");
+    if let Some((cached_sig, t)) = ui.ctx().data(|d| d.get_temp::<(u64, egui::TextureHandle)>(cache_key)) {
+        if cached_sig == sig { return t; }
+    }
+
+    const RES: usize = 128;
+    let mut pixels = vec![Color32::TRANSPARENT; RES * RES];
+    for iy in 0..RES {
+        // Image row 0 = top = +Y; flip so math Y points up.
+        let fy = 1.0 - (iy as f32 + 0.5) / RES as f32 * 2.0;
+        for ix in 0..RES {
+            let fx = (ix as f32 + 0.5) / RES as f32 * 2.0 - 1.0;
+            let vin = glam::Vec2::new(fx, fy);
+            let len = vin.length();
+            if len > 1.32 { continue; }
+            // Soft edge past the unit circle so the disc doesn't hard-clip.
+            let disc = (1.0 - (len - 1.0).max(0.0) * 3.2).clamp(0.0, 1.0);
+            pixels[iy * RES + ix] = reshape_stretch_color(p.stretch_at(vin), 0.95 * disc);
+        }
+    }
+    let img = egui::ColorImage { size: [RES, RES], pixels, source_size: egui::Vec2::new(RES as f32, RES as f32) };
+    let handle = ui.ctx().load_texture(format!("vrs_field_{sig:x}"), img, egui::TextureOptions::LINEAR);
+    // Replace the slot; the previous handle drops here → its GPU texture frees.
+    ui.ctx().data_mut(|d| d.insert_temp(cache_key, (sig, handle.clone())));
+    handle
+}
+
+/// Draw the live 2D pad: gradient stretch field + reference circle + reshaped
+/// envelope outline + gain heat ring + live input→output dots. Shared by the
+/// body and the pinned "pad" renderer.
+fn draw_reshape_pad(ui: &egui::Ui, salt: egui::Id, rect: egui::Rect, p: &ReshapeParams, live_vec: Option<glam::Vec2>) {
+    let painter = ui.painter_at(rect);
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.5 - 2.0;
+    // Map a Vec2 in [-1,1]² (output-normalised) to screen (Y up).
+    let v2s = |v: glam::Vec2| egui::pos2(c.x + v.x * r, c.y - v.y * r);
+    painter.rect_filled(rect, 3.0, GRAPH_BG_DEFAULT);
+
+    // ── Gradient stretch field (smooth cached texture, bilinear) ──────────────
+    // Blue = accelerate/stretched, red = decelerate/squeezed, transparent at
+    // neutral. Sampled in INPUT space; the texture covers the [-1,1]² box so we
+    // paint it into the disc's bounding square.
+    let tex = reshape_field_texture(ui, salt, p);
+    let field_rect = egui::Rect::from_center_size(c, egui::vec2(r * 2.0, r * 2.0));
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    painter.image(tex.id(), field_rect, uv, Color32::WHITE);
+
+    // Reference unit circle + crosshair.
+    let refc = Color32::from_rgba_unmultiplied(150, 150, 150, 110);
+    painter.circle_stroke(c, r, egui::Stroke::new(1.0, refc));
+    painter.line_segment([egui::pos2(rect.left(), c.y), egui::pos2(rect.right(), c.y)], egui::Stroke::new(0.5, refc));
+    painter.line_segment([egui::pos2(c.x, rect.top()), egui::pos2(c.x, rect.bottom())], egui::Stroke::new(0.5, refc));
+    // Full-square reference (the √2 envelope target) so "how close to square" reads.
+    let sq = Color32::from_rgba_unmultiplied(150, 150, 150, 50);
+    painter.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(r * 2.0, r * 2.0)), 0.0,
+        egui::Stroke::new(0.75, sq), egui::StrokeKind::Inside);
+
+    // Reshaped envelope outline (the reachable output gate).
+    let nseg = 128usize;
+    let gate: Vec<egui::Pos2> = (0..=nseg).map(|i| {
+        let th = i as f32 / nseg as f32 * std::f32::consts::TAU;
+        v2s(glam::Vec2::new(th.cos(), th.sin()) * p.envelope_at(th))
+    }).collect();
+    for wv in gate.windows(2) {
+        painter.line_segment([wv[0], wv[1]], egui::Stroke::new(1.5, Color32::from_rgb(120, 220, 140)));
+    }
+
+    // Live input (blue) → output (green) dots.
+    if let Some(v) = live_vec {
+        let inp = v / p.in_max.max(f32::EPSILON);
+        painter.circle_filled(v2s(inp), 3.0, Color32::from_rgba_unmultiplied(120, 180, 255, 220));
+        let out = vec_reshape_apply(v, &p.boundary, &p.gain, &p.gain_biases, &p.symmetry, p.renorm, p.in_max, p.out_max) / p.out_max.max(f32::EPSILON);
+        painter.line_segment([v2s(inp), v2s(out)], egui::Stroke::new(0.75, Color32::from_rgba_unmultiplied(210, 210, 210, 130)));
+        painter.circle_filled(v2s(out), 4.0, Color32::from_rgb(140, 255, 170));
+        request_repaint_throttled(ui.ctx());
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn show_vec_reshape_body(node_id: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let _ = (inputs, outputs);
+    // ── Init params on first use ──────────────────────────────────────────────
+    let needs_init = snarl.get_node(node_id).map(|n| !n.params.contains_key("boundary_pts")).unwrap_or(false);
+    if needs_init {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("boundary_pts".into(),
+                serde_json::json!(VEC_RESHAPE_BOUNDARY_DEFAULT.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>()));
+            node.params.insert("gain_pts".into(),
+                serde_json::json!(VEC_RESHAPE_GAIN_DEFAULT.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>()));
+            node.params.insert("gain_biases".into(), serde_json::json!([0.0]));
+            node.params.insert("symmetry".into(),  Value::String("quad4".into()));
+            node.params.insert("renorm".into(),    Value::Bool(true));
+            node.params.insert("in_max".into(),    serde_json::json!(1.0f64));
+            node.params.insert("out_max".into(),   serde_json::json!(1.0f64));
+            node.params.insert("grid_x".into(),    serde_json::json!(4i64));
+            node.params.insert("grid_y".into(),    serde_json::json!(4i64));
+            node.params.insert("snap".into(),      Value::Bool(false));
+            node.params.insert("trail_ms".into(),  serde_json::json!(300i64));
+            node.params.insert("edit_target".into(), Value::String("gain".into()));
+        }
+    }
+
+    let p = snarl.get_node(node_id).map(ReshapeParams::read)
+        .unwrap_or_else(|| ReshapeParams {
+            boundary: VEC_RESHAPE_BOUNDARY_DEFAULT.to_vec(), gain: VEC_RESHAPE_GAIN_DEFAULT.to_vec(),
+            gain_biases: vec![], symmetry: "quad4".into(), renorm: true, in_max: 1.0, out_max: 1.0,
+            grid_x: 4, grid_y: 4, snap: false, trail_ms: 300, edit_target: "gain".into() });
+    let editing_gain = p.edit_target == "gain";
+    // Editor Y range: boundary radius tops out at the square corner (√2); gain
+    // ranges 0..3 (unity = 1). The curve stores REAL values; the editor draws in
+    // 0..1 graph space (value / y_max) so grid/snap math is uniform.
+    let y_max = if editing_gain { 3.0f32 } else { std::f32::consts::SQRT_2 };
+
+    let live_vec: Option<glam::Vec2> = snarl.get_node(node_id)
+        .and_then(|n| n.extra.last_signals.first().cloned().flatten())
+        .and_then(|s| match s { Signal::Vec2(v) => Some(v), _ => None });
+
+    let mut changed = false;   // any param mutated → request undo push
+    let changed_inner = std::cell::Cell::new(false); // set inside Resize closures
+    let mut pad_rect: Option<egui::Rect> = None;
+    let mut graph_rect: Option<egui::Rect> = None;
+
+    ui.vertical(|ui| {
+        // ── Edit-target toggle ────────────────────────────────────────────────
+        let mut new_target = p.edit_target.clone();
+        let tgt_resp = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Edit").small().weak());
+            if ui.selectable_label(editing_gain, egui::RichText::new("Gain").small())
+                .on_hover_text("Redistribute deflection WITHIN the boundary (accelerate / decelerate a direction). Does not change the outer shape.").clicked() { new_target = "gain".into(); }
+            if ui.selectable_label(!editing_gain, egui::RichText::new("Boundary").small())
+                .on_hover_text("Shape the OUTER reach per direction — expand the circle out toward the square's corners (needs Renorm on).").clicked() { new_target = "boundary".into(); }
+            ui.separator();
+            ui.label(egui::RichText::new(if editing_gain { "▲ stretch / ▼ squeeze" } else { "▲ toward square" })
+                .small().weak().color(Color32::from_gray(120)));
+        });
+        register_exposable_element(ui, node_id, "target_row", tgt_resp.response.rect);
+        if new_target != p.edit_target {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("edit_target".into(), Value::String(new_target.clone()));
+            }
+            changed = true;
+        }
+
+        // ── Curve editor (direction → radius / gain), grid + snap on BOTH axes ─
+        // The BODY owns the Resize handle; the editor draws into the allocated
+        // rect. (Pinned mirrors skip the Resize and pass their container rect.)
+        let g_size = read_widget_size(snarl, node_id, "vrs_graph_size", egui::vec2(190.0, 130.0));
+        let new_g = egui::Resize::default()
+            .id_salt(("vreshape_graph_rs", node_id))
+            .default_size(g_size)
+            .min_size(egui::vec2(90.0, 70.0))
+            .max_size(egui::vec2(600.0, 420.0))
+            .show(ui, |ui| {
+                let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+                graph_rect = Some(rect);
+                if draw_reshape_curve_editor(ui, node_id, snarl, &p, editing_gain, y_max, live_vec, rect) {
+                    changed_inner.set(true);
+                }
+                ui.min_rect().size()
+            });
+        if (new_g - g_size).length() > 0.5 { write_widget_size(snarl, node_id, "vrs_graph_size", new_g); }
+
+        // ── Live 2D preview pad (re-read params so edits above show instantly) ─
+        // Square widget, centred in a resizable square frame.
+        let p2 = snarl.get_node(node_id).map(ReshapeParams::read).unwrap_or(p);
+        let pad_sz = read_widget_size(snarl, node_id, "vrs_pad_size", egui::vec2(150.0, 150.0));
+        let new_pad = egui::Resize::default()
+            .id_salt(("vreshape_pad_rs", node_id))
+            .default_size(pad_sz)
+            .min_size(egui::vec2(80.0, 80.0))
+            .max_size(egui::vec2(420.0, 420.0))
+            .show(ui, |ui| {
+                let side = ui.available_size().min_elem().max(40.0);
+                let (frame, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                pad_rect = Some(frame);
+                draw_reshape_pad(ui, egui::Id::new(("vrs_pad", node_id.0)), frame, &p2, live_vec);
+                egui::vec2(side, side)
+            });
+        if (new_pad - pad_sz).length() > 0.5 { write_widget_size(snarl, node_id, "vrs_pad_size", new_pad); }
+
+        // ── Controls ──────────────────────────────────────────────────────────
+        let mut sym = p2.symmetry.clone();
+        let mut rn = p2.renorm;
+        let mut im = p2.in_max;
+        let mut om = p2.out_max;
+        let mut gx = p2.grid_x as f64;
+        let mut gy = p2.grid_y as f64;
+        let mut sn = p2.snap;
+        let mut tm = p2.trail_ms;
+
+        let opt_resp = ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt(("vrs_sym", node_id))
+                .width(78.0)
+                .selected_text(match sym.as_str() { "xmirror" => "X-mirror", _ => "4-way" })
+                .show_ui(ui, |ui| {
+                    changed |= ui.selectable_value(&mut sym, "quad4".into(),   "4-way").changed();
+                    changed |= ui.selectable_value(&mut sym, "xmirror".into(), "X-mirror").changed();
+                });
+            let rn_before = rn;
+            ui.checkbox(&mut rn, egui::RichText::new("Renorm").small())
+                .on_hover_text("On: expand output to the boundary shape (circle→square). Off: boundary is a display-only reference; only gain shapes the feel.");
+            changed |= rn != rn_before;
+        });
+        register_exposable_element(ui, node_id, "options_row", opt_resp.response.rect);
+
+        let range_resp = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("In max").small().weak());
+            changed |= ui.add(egui::DragValue::new(&mut im).speed(0.01).range(0.05..=2.0).max_decimals(2)).changed();
+            ui.separator();
+            ui.label(egui::RichText::new("Out max").small().weak());
+            changed |= ui.add(egui::DragValue::new(&mut om).speed(0.01).range(0.05..=2.0).max_decimals(2)).changed();
+        });
+        register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
+
+        let grid_resp = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Grid").small().weak());
+            changed |= ui.add(egui::DragValue::new(&mut gx).speed(0.25).range(1.0..=16.0).max_decimals(0).prefix("H ")).changed();
+            changed |= ui.add(egui::DragValue::new(&mut gy).speed(0.25).range(1.0..=16.0).max_decimals(0).prefix("V ")).changed();
+            let sn_before = sn;
+            ui.checkbox(&mut sn, egui::RichText::new("Snap").small());
+            changed |= sn != sn_before;
+            ui.separator();
+            ui.label(egui::RichText::new("Trail").small().weak());
+            changed |= ui.add(egui::DragValue::new(&mut tm).speed(5.0).range(0i64..=1000).suffix("ms")).changed();
+        });
+        register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
+
+        // Presets.
+        let preset_resp = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Preset").small().weak());
+            let mut apply: Option<(&[[f32; 2]], &[[f32; 2]])> = None;
+            if ui.small_button("Circle").on_hover_text("Identity — round gate, unity gain").clicked() {
+                apply = Some((&[[0.0, 1.0], [1.0, 1.0]], &[[0.0, 1.0], [1.0, 1.0]]));
+            }
+            if ui.small_button("Square").on_hover_text("Circle→square: the boundary reaches √2 on the diagonal so a round stick fills a square (Renorm on)").clicked() {
+                // Envelope follows sec(θ) across the octant → √2 at the diagonal.
+                apply = Some((&[[0.0, 1.0], [0.5, 1.08], [1.0, std::f32::consts::SQRT_2]], &[[0.0, 1.0], [1.0, 1.0]]));
+            }
+            if ui.small_button("Diag+").on_hover_text("Diagonal boost: accelerate the vector toward the corners to kill diagonal stickiness (gain only)").clicked() {
+                apply = Some((&[[0.0, 1.0], [1.0, 1.0]], &[[0.0, 1.0], [0.5, 1.25], [1.0, 1.6]]));
+            }
+            if let Some((b, g)) = apply {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("boundary_pts".into(), serde_json::json!(b.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>()));
+                    node.params.insert("gain_pts".into(),     serde_json::json!(g.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>()));
+                    node.params.insert("gain_biases".into(),  serde_json::json!([0.0]));
+                }
+                changed = true;
+            }
+        });
+        register_exposable_element(ui, node_id, "preset_row", preset_resp.response.rect);
+
+        if changed {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("symmetry".into(), Value::String(sym.clone()));
+                node.params.insert("renorm".into(),   Value::Bool(rn));
+                if let Some(n) = Number::from_f64(im as f64) { node.params.insert("in_max".into(),  Value::Number(n)); }
+                if let Some(n) = Number::from_f64(om as f64) { node.params.insert("out_max".into(), Value::Number(n)); }
+                node.params.insert("grid_x".into(),   serde_json::json!(gx as i64));
+                node.params.insert("grid_y".into(),   serde_json::json!(gy as i64));
+                node.params.insert("snap".into(),     Value::Bool(sn));
+                node.params.insert("trail_ms".into(), serde_json::json!(tm));
+            }
+        }
+    });
+
+    changed |= changed_inner.get();
+    if let Some(rect) = graph_rect { register_exposable_element(ui, node_id, "curve", rect); }
+    if let Some(rect) = pad_rect   { register_exposable_element(ui, node_id, "pad",   rect); }
+    changed
+}
+
+/// The direction→value curve editor (grid + snap on BOTH axes, draggable points,
+/// Alt-bias on gain, live-direction marker, gamepad-nav geom publish). Draws
+/// directly into the supplied `rect` (no inner Resize) so it fills whatever the
+/// caller sized — an egui::Resize in the body, or a pinned container. Returns
+/// true if any param changed.
+#[allow(clippy::too_many_arguments)]
+fn draw_reshape_curve_editor(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    snarl: &mut Snarl<NodeData>,
+    p: &ReshapeParams,
+    editing_gain: bool,
+    y_max: f32,
+    live_vec: Option<glam::Vec2>,
+    rect: egui::Rect,
+) -> bool {
+    let (x_lo, x_hi, y_lo, y_hi) = (0.0f32, 1.0f32, 0.0f32, 1.0f32);
+    let grid_x = p.grid_x;
+    let grid_y = p.grid_y;
+    let snap = p.snap;
+    let symmetry = p.symmetry.clone();
+
+    let mut pts = if editing_gain { p.gain.clone() } else { p.boundary.clone() };
+    for q in pts.iter_mut() { q[1] = (q[1] / y_max).clamp(0.0, 1.0); }   // → 0..1 graph space
+    let mut biases = if editing_gain { p.gain_biases.clone() } else { vec![] };
+    let mut pts_changed = false;
+    let mut bias_changed = false;
+
+    // Draws directly into `rect` — no inner Resize. The BODY wraps this in an
+    // egui::Resize (one handle there); a PINNED mirror passes its container rect
+    // so the graph fills the user-sized container exactly (no second handle).
+    {
+            let bg_resp = ui.interact(rect, ui.id().with(("vrs_graph_bg", node_id)), egui::Sense::click());
+            let painter = ui.painter_at(rect);
+            let c2s = |x: f32, y: f32| egui::pos2(
+                rect.left() + (x - x_lo) / (x_hi - x_lo) * rect.width(),
+                rect.bottom() - (y - y_lo) / (y_hi - y_lo) * rect.height(),
+            );
+            let s2c = |pos: egui::Pos2| -> [f32; 2] {[
+                (pos.x - rect.left()) / rect.width(),
+                (rect.bottom() - pos.y) / rect.height(),
+            ]};
+            painter.rect_filled(rect, 2.0, GRAPH_BG_DEFAULT);
+
+            let (grid_faint, grid_axis) = graph_grid_colors(None);
+            let gs = egui::Stroke::new(0.5, grid_faint);
+            // Vertical grid (direction).
+            for i in 1..grid_x { let x = i as f32 / grid_x as f32; painter.line_segment([c2s(x, y_lo), c2s(x, y_hi)], gs); }
+            // Horizontal grid (value) — the previously-missing Y axis.
+            for i in 1..grid_y { let y = i as f32 / grid_y as f32; painter.line_segment([c2s(x_lo, y), c2s(x_hi, y)], gs); }
+            // Unity reference line (radius/gain = 1) at 1/y_max.
+            let unity = (1.0 / y_max).clamp(0.0, 1.0);
+            painter.line_segment([c2s(x_lo, unity), c2s(x_hi, unity)], egui::Stroke::new(1.0, grid_axis));
+
+            // Corner labels: axis↔diagonal (X), and value extremes (Y).
+            let lbl = Color32::from_rgba_unmultiplied(170, 170, 170, 150);
+            let f = egui::FontId::proportional(8.5);
+            painter.text(egui::pos2(rect.left() + 2.0, rect.bottom() - 1.0), egui::Align2::LEFT_BOTTOM, "axis", f.clone(), lbl);
+            painter.text(egui::pos2(rect.right() - 2.0, rect.bottom() - 1.0), egui::Align2::RIGHT_BOTTOM, "diag", f.clone(), lbl);
+            painter.text(egui::pos2(rect.left() + 2.0, rect.top() + 1.0), egui::Align2::LEFT_TOP, &format!("{:.2}", y_max), f.clone(), lbl);
+
+            // Snap helper: both axes, to the grid divisions.
+            let do_snap = |x: f32, y: f32| -> (f32, f32) {
+                if !snap { return (x, y); }
+                let sx = (x * grid_x as f32).round() / grid_x as f32;
+                let sy = (y * grid_y as f32).round() / grid_y as f32;
+                (sx, sy)
+            };
+
+            // Curve polyline.
+            if pts.len() >= 2 {
+                let steps = 100usize;
+                let line: Vec<egui::Pos2> = (0..=steps).map(|i| {
+                    let x = i as f32 / steps as f32;
+                    let y = sample_curve(&pts, x, &biases).clamp(y_lo, y_hi);
+                    c2s(x, y)
+                }).collect();
+                let col = if editing_gain { Color32::from_rgb(120, 220, 140) } else { Color32::from_rgb(120, 180, 255) };
+                for w in line.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5, col)); }
+            }
+
+            // Bias handles (Alt) — gain curve only.
+            let alt_held = ui.input(|i| i.modifiers.alt);
+            if editing_gain && alt_held && pts.len() >= 2 {
+                while biases.len() < pts.len() - 1 { biases.push(0.0); }
+                for seg in 0..(pts.len() - 1) {
+                    let mid_x = (pts[seg][0] + pts[seg + 1][0]) * 0.5;
+                    let mid_y = sample_curve(&pts, mid_x, &biases).clamp(y_lo, y_hi);
+                    let hpos  = c2s(mid_x, mid_y);
+                    let hid   = ui.id().with(("vrs_bias", node_id, seg));
+                    let hr    = ui.interact(egui::Rect::from_center_size(hpos, egui::Vec2::splat(14.0)), hid, egui::Sense::click_and_drag());
+                    if hr.double_clicked() { biases[seg] = 0.0; bias_changed = true; }
+                    else if hr.dragged() { biases[seg] = (biases[seg] - hr.drag_delta().y / rect.height()).clamp(-2.0, 2.0); bias_changed = true; }
+                    painter.circle_filled(hpos, 3.5, Color32::from_rgb(255, 220, 50));
+                }
+            }
+
+            // Draggable points.
+            let mut remove_idx: Option<usize> = None;
+            for i in 0..pts.len() {
+                let [px, py] = pts[i];
+                let screen = c2s(px, py);
+                let pid = ui.id().with(("vrs_pt", node_id, i));
+                let r = ui.interact(egui::Rect::from_center_size(screen, egui::Vec2::splat(12.0)), pid, egui::Sense::click_and_drag());
+                if r.dragged() && !alt_held {
+                    let dd = r.drag_delta();
+                    let nx_raw = (px + dd.x / rect.width()).clamp(
+                        pts.get(i.wrapping_sub(1)).map(|q| q[0] + 0.001).unwrap_or(0.0),
+                        pts.get(i + 1).map(|q| q[0] - 0.001).unwrap_or(1.0));
+                    let ny_raw = (py - dd.y / rect.height()).clamp(0.0, 1.0);
+                    let (sx, sy) = do_snap(nx_raw, ny_raw);
+                    // Endpoints keep their angle pinned (0 / 1); only Y moves.
+                    let nx = if i == 0 { 0.0 } else if i == pts.len() - 1 { 1.0 } else { sx };
+                    pts[i] = [nx, sy];
+                    pts_changed = true;
+                }
+                if r.secondary_clicked() && pts.len() > 2 && i != 0 && i != pts.len() - 1 {
+                    remove_idx = Some(i); pts_changed = true;
+                }
+                let col = if r.hovered() || r.dragged() { Color32::WHITE } else { Color32::from_gray(200) };
+                painter.circle_filled(screen, 4.0, col);
+                painter.circle_stroke(screen, 4.0, egui::Stroke::new(1.0, Color32::from_gray(70)));
+            }
+            if let Some(idx) = remove_idx { pts.remove(idx); }
+            if bg_resp.double_clicked() {
+                if let Some(pos) = bg_resp.interact_pointer_pos() {
+                    let [gx, gy] = s2c(pos);
+                    let (gx, gy) = do_snap(gx.clamp(0.02, 0.98), gy.clamp(0.0, 1.0));
+                    let idx = pts.partition_point(|q| q[0] < gx);
+                    pts.insert(idx, [gx, gy]);
+                    pts_changed = true;
+                }
+            }
+
+            // Live direction marker.
+            if let Some(v) = live_vec {
+                if v.length() > 1e-4 {
+                    let a01 = reshape_angle01_ui(v.y.atan2(v.x), &symmetry);
+                    let y = sample_curve(&pts, a01, &biases).clamp(y_lo, y_hi);
+                    let head = if editing_gain { Color32::from_rgb(140, 255, 170) } else { Color32::from_rgb(150, 200, 255) };
+                    painter.line_segment([c2s(a01, y_lo), c2s(a01, y_hi)],
+                        egui::Stroke::new(0.75, Color32::from_rgba_unmultiplied(head.r(), head.g(), head.b(), 90)));
+                    painter.circle_filled(c2s(a01, y), 3.0, head);
+                    request_repaint_throttled(ui.ctx());
+                }
+            }
+
+            // Gamepad-nav geom publish (nav edits REAL values 0..y_max).
+            let pass = ui.ctx().cumulative_pass_nr();
+            let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+                .unwrap_or(egui::emath::TSTransform::IDENTITY);
+            let screen_rect = to_global * rect;
+            ui.ctx().data_mut(|d| d.insert_temp(
+                egui::Id::new(("gp_nav_curve_geom", node_id.0)),
+                (pass, screen_rect, x_lo, x_hi, 0.0f32, y_max)));
+            let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
+                .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+            if let Some((_, idx, editing)) = nav_sel.filter(|(pp, _, _)| *pp == pass) {
+                if let Some(&[px, py]) = pts.get(idx) {
+                    let ring = if editing { Color32::from_rgb(255, 210, 80) } else { Color32::from_rgb(120, 200, 255) };
+                    painter.circle_stroke(c2s(px, py), 7.0, egui::Stroke::new(1.5, ring));
+                }
+            }
+    }
+
+    // De-normalise and write back.
+    if pts_changed || bias_changed {
+        for q in pts.iter_mut() { q[1] = (q[1] * y_max).max(0.0); }
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            if pts_changed {
+                let arr: Vec<Value> = pts.iter().map(|q| serde_json::json!([q[0], q[1]])).collect();
+                node.params.insert(if editing_gain { "gain_pts" } else { "boundary_pts" }.into(), Value::Array(arr));
+            }
+            if editing_gain {
+                biases.resize(pts.len().saturating_sub(1), 0.0);
+                let bj: Vec<Value> = biases.iter().filter_map(|&b| Number::from_f64(b as f64).map(Value::Number)).collect();
+                node.params.insert("gain_biases".into(), Value::Array(bj));
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// UI-side mirror of `eval::reshape_angle01` (kept private in the engine). Folds
+/// a direction angle into the edited quadrant → 0 (cardinal) .. 1 (diagonal).
+fn reshape_angle01_ui(theta: f32, symmetry: &str) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+    match symmetry {
+        "xmirror" => theta.sin().abs().clamp(0.0, 1.0).asin() / FRAC_PI_2,
+        _ => {
+            let s = theta.rem_euclid(FRAC_PI_2);
+            let d = (s - FRAC_PI_4).abs();
+            1.0 - (d / FRAC_PI_4)
+        }
+    }
+}
+
+// ── Vec Reshaper pinned-element renderers ─────────────────────────────────────
+// Each renders ONE exposed element scaled to the pinned container, matching the
+// Audio-Stream-Haptics / response-curve pattern (no whole-body crop).
+
+/// Pinned live pad: the gradient field + envelope + dots. Fills the container
+/// exactly (no inner Resize); the pad disc is a centred square within it, so the
+/// widget stays 1:1 regardless of the container's aspect.
+fn render_vec_reshape_pad(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let p = match snarl.get_node(inner_id).map(ReshapeParams::read) { Some(p) => p, None => return };
+    let live_vec = snarl.get_node(inner_id)
+        .and_then(|n| n.extra.last_signals.first().cloned().flatten())
+        .and_then(|s| match s { Signal::Vec2(v) => Some(v), _ => None });
+    // Take the whole container, then centre a square inside it.
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(container.x.max(40.0), container.y.max(40.0)), egui::Sense::hover());
+    let side = rect.width().min(rect.height());
+    let square = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+    draw_reshape_pad(ui, egui::Id::new(("vrs_pad_pin", inner_id.0)), square, &p, live_vec);
+}
+
+/// Pinned curve editor: fully interactive, fills the container (no inner Resize).
+fn render_vec_reshape_curve(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let p = match snarl.get_node(inner_id).map(ReshapeParams::read) { Some(p) => p, None => return };
+    let editing_gain = p.edit_target == "gain";
+    let y_max = if editing_gain { 3.0f32 } else { std::f32::consts::SQRT_2 };
+    let live_vec = snarl.get_node(inner_id)
+        .and_then(|n| n.extra.last_signals.first().cloned().flatten())
+        .and_then(|s| match s { Signal::Vec2(v) => Some(v), _ => None });
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(container.x.max(60.0), container.y.max(50.0)), egui::Sense::hover());
+    draw_reshape_curve_editor(ui, inner_id, snarl, &p, editing_gain, y_max, live_vec, rect);
+}
+
+/// Pinned Edit-target toggle (Gain / Boundary).
+fn render_vec_reshape_target_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let cur = snarl.get_node(inner_id)
+        .and_then(|n| n.params.get("edit_target").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "gain".into());
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(160.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 2];
+    let mut set: Option<&str> = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Edit").weak());
+        let g = ui.selectable_label(cur == "gain", "Gain");     fr[0] = g.rect; if g.clicked() { set = Some("gain"); }
+        let b = ui.selectable_label(cur != "gain", "Boundary"); fr[1] = b.rect; if b.clicked() { set = Some("boundary"); }
+    });
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if let (Some(s), Some(node)) = (set, snarl.get_node_mut(inner_id)) {
+        node.params.insert("edit_target".into(), Value::String(s.into()));
+    }
+}
+
+/// Pinned Symmetry + Renorm row.
+fn render_vec_reshape_options_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let (mut sym, mut rn) = snarl.get_node(inner_id).map(|n| (
+        n.params.get("symmetry").and_then(|v| v.as_str()).unwrap_or("quad4").to_string(),
+        n.params.get("renorm").and_then(|v| v.as_bool()).unwrap_or(true),
+    )).unwrap_or(("quad4".into(), true));
+    ui.set_max_width(container.x);
+    let s = apply_widget_scale(ui, container, egui::vec2(210.0, 22.0));
+    let mut changed = false;
+    let mut fr: Vec<egui::Rect> = Vec::with_capacity(2);
+    ui.horizontal(|ui| {
+        let cb = egui::ComboBox::from_id_salt(("vrs_sym_pin", inner_id))
+            .width(80.0 * s)
+            .selected_text(match sym.as_str() { "xmirror" => "X-mirror", _ => "4-way" })
+            .show_ui(ui, |ui| {
+                changed |= ui.selectable_value(&mut sym, "quad4".into(),   "4-way").changed();
+                changed |= ui.selectable_value(&mut sym, "xmirror".into(), "X-mirror").changed();
+            });
+        fr.push(cb.response.rect);
+        let r = ui.checkbox(&mut rn, egui::RichText::new("Renorm"));
+        fr.push(r.rect); changed |= r.changed();
+    });
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("symmetry".into(), Value::String(sym));
+            node.params.insert("renorm".into(), Value::Bool(rn));
+        }
+    }
+}
+
+/// Pinned In max / Out max row.
+fn render_vec_reshape_range_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let (mut im, mut om) = snarl.get_node(inner_id).map(|n| (
+        n.params.get("in_max").and_then(|v| v.as_f64()).unwrap_or(1.0),
+        n.params.get("out_max").and_then(|v| v.as_f64()).unwrap_or(1.0),
+    )).unwrap_or((1.0, 1.0));
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(200.0, 22.0));
+    let mut changed = false;
+    let mut fr = [egui::Rect::NOTHING; 2];
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("In max").weak());
+        let a = ui.add(egui::DragValue::new(&mut im).speed(0.01).range(0.05..=2.0).max_decimals(2));
+        fr[0] = a.rect; changed |= a.changed();
+        ui.separator();
+        ui.label(egui::RichText::new("Out max").weak());
+        let b = ui.add(egui::DragValue::new(&mut om).speed(0.01).range(0.05..=2.0).max_decimals(2));
+        fr[1] = b.rect; changed |= b.changed();
+    });
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            if let Some(n) = Number::from_f64(im) { node.params.insert("in_max".into(), Value::Number(n)); }
+            if let Some(n) = Number::from_f64(om) { node.params.insert("out_max".into(), Value::Number(n)); }
+        }
+    }
+}
+
+/// Pinned Grid H/V + Snap + Trail row.
+fn render_vec_reshape_grid_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let (mut gx, mut gy, mut sn, mut tm) = snarl.get_node(inner_id).map(|n| (
+        n.params.get("grid_x").and_then(|v| v.as_i64()).unwrap_or(4) as f64,
+        n.params.get("grid_y").and_then(|v| v.as_i64()).unwrap_or(4) as f64,
+        n.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false),
+        n.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300),
+    )).unwrap_or((4.0, 4.0, false, 300));
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(300.0, 22.0));
+    let mut changed = false;
+    let mut fr = [egui::Rect::NOTHING; 4];
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Grid").weak());
+        let h = ui.add(egui::DragValue::new(&mut gx).speed(0.25).range(1.0..=16.0).max_decimals(0).prefix("H "));
+        fr[0] = h.rect; changed |= h.changed();
+        let v = ui.add(egui::DragValue::new(&mut gy).speed(0.25).range(1.0..=16.0).max_decimals(0).prefix("V "));
+        fr[1] = v.rect; changed |= v.changed();
+        let c = ui.checkbox(&mut sn, egui::RichText::new("Snap"));
+        fr[2] = c.rect; changed |= c.changed();
+        ui.separator();
+        ui.label(egui::RichText::new("Trail").weak());
+        let t = ui.add(egui::DragValue::new(&mut tm).speed(5.0).range(0i64..=1000).suffix("ms"));
+        fr[3] = t.rect; changed |= t.changed();
+    });
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("grid_x".into(), serde_json::json!(gx as i64));
+            node.params.insert("grid_y".into(), serde_json::json!(gy as i64));
+            node.params.insert("snap".into(), Value::Bool(sn));
+            node.params.insert("trail_ms".into(), serde_json::json!(tm));
+        }
+    }
+}
+
+/// Pinned preset buttons (Circle / Square / Diag+).
+fn render_vec_reshape_preset_row(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(200.0, 22.0));
+    let mut apply: Option<(&[[f32; 2]], &[[f32; 2]])> = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Preset").weak());
+        if ui.small_button("Circle").clicked() { apply = Some((&[[0.0, 1.0], [1.0, 1.0]], &[[0.0, 1.0], [1.0, 1.0]])); }
+        if ui.small_button("Square").clicked() { apply = Some((&[[0.0, 1.0], [0.5, 1.08], [1.0, std::f32::consts::SQRT_2]], &[[0.0, 1.0], [1.0, 1.0]])); }
+        if ui.small_button("Diag+").clicked()  { apply = Some((&[[0.0, 1.0], [1.0, 1.0]], &[[0.0, 1.0], [0.5, 1.25], [1.0, 1.6]])); }
+    });
+    if let (Some((b, g)), Some(node)) = (apply, snarl.get_node_mut(inner_id)) {
+        node.params.insert("boundary_pts".into(), serde_json::json!(b.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>()));
+        node.params.insert("gain_pts".into(),     serde_json::json!(g.iter().map(|p| serde_json::json!([p[0], p[1]])).collect::<Vec<_>>()));
+        node.params.insert("gain_biases".into(),  serde_json::json!([0.0]));
+    }
+}
+
 // ── Two-way Response Curve body ───────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -14236,7 +15168,7 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                 }
 
                 // Active lane (solid gray, same as float body)
-                let (edit_pts_r, edit_biases_r) = if lane_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
+                let edit_pts_r = if lane_up { &pts_up } else { &pts_dn };
                 let (new_edit_pts, new_edit_biases, pts_changed_ref, bias_changed_ref) = if lane_up {
                     (&mut new_pts_up, &mut new_biases_up, &mut pts_up_changed, &mut bias_up_changed)
                 } else {
@@ -14512,16 +15444,16 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
         register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
 
         let range_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).clamp_range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
-            ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).clamp_range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
+            ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
+            ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
             ui.label(egui::RichText::new("Grid").small().weak());
-            let (gxb,gyb)=(gx_f,gy_f); ui.add(egui::DragValue::new(&mut gx_f).speed(0.1).clamp_range(1usize..=32usize)); ui.label(egui::RichText::new("×").small()); ui.add(egui::DragValue::new(&mut gy_f).speed(0.1).clamp_range(1usize..=32usize)); if gx_f!=gxb||gy_f!=gyb{changed=true;}
+            let (gxb,gyb)=(gx_f,gy_f); ui.add(egui::DragValue::new(&mut gx_f).speed(0.1).range(1usize..=32usize)); ui.label(egui::RichText::new("×").small()); ui.add(egui::DragValue::new(&mut gy_f).speed(0.1).range(1usize..=32usize)); if gx_f!=gxb||gy_f!=gyb{changed=true;}
         });
         register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
 
         let grid_resp = ui.horizontal(|ui| {
             let snb=snap_on; ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small()); if snap_on!=snb{changed=true;}
-            ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).clamp_range(0i64..=1000i64).suffix("ms")); if tm!=tmb{changed=true;}
+            ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).range(0i64..=1000i64).suffix("ms")); if tm!=tmb{changed=true;}
         });
         register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
 
@@ -14534,14 +15466,14 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
         let hyst_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Hyst").small().weak());
             let (hpb,hmb)=(h_pct,h_ms);
-            ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%"));
-            ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms"));
+            ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).range(0.001f32..=10.0f32).suffix("%"));
+            ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).range(0.02f32..=50.0f32).suffix("ms"));
             if (h_pct-hpb).abs()>1e-5||(h_ms-hmb).abs()>1e-5{changed=true;}
         });
         register_exposable_element(ui, node_id, "hyst_row", hyst_resp.response.rect);
 
         let interp_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Interp").small().weak()); let imb=i_ms; ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).clamp_range(0.0f32..=500.0f32).suffix("ms")); if (i_ms-imb).abs()>1e-5{changed=true;}
+            ui.label(egui::RichText::new("Interp").small().weak()); let imb=i_ms; ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).range(0.0f32..=500.0f32).suffix("ms")); if (i_ms-imb).abs()>1e-5{changed=true;}
         });
         register_exposable_element(ui, node_id, "interp_row", interp_resp.response.rect);
 
@@ -14683,7 +15615,10 @@ fn paint_twoway_curve_graph(
     let snap       = node_data.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
     let trail_ms   = node_data.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
     let active_lane = node_data.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up").to_string();
-    let ssg        = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
+    // TODO: scaled-grid overlay (`show_scaled_grid`) is not implemented for
+    // this up/dn-lane renderer yet — the toggle exists and other curve
+    // renderers honor it; read kept underscored until the overlay is ported.
+    let _ssg       = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
     let sgl        = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let absolute_eff = absolute || vec_mode;
@@ -14986,9 +15921,9 @@ fn render_twoway_hyst_row(
     let mut fr = [egui::Rect::NOTHING; 2];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Hyst").weak());
-        let r = ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%"));
+        let r = ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).range(0.001f32..=10.0f32).suffix("%"));
         fr[0] = r.rect; changed |= r.changed();
-        let r = ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms"));
+        let r = ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).range(0.02f32..=50.0f32).suffix("ms"));
         fr[1] = r.rect; changed |= r.changed();
     });
     publish_nav_field_rects(ui, inner_id, &fr);
@@ -15013,7 +15948,7 @@ fn render_twoway_interp_row(
     apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Interp").weak());
-        if ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).clamp_range(0.0f32..=500.0f32).suffix("ms")).changed() {
+        if ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).range(0.0f32..=500.0f32).suffix("ms")).changed() {
             if let Some(node) = snarl.get_node_mut(inner_id) {
                 if let Some(n) = Number::from_f64(i_ms as f64) { node.params.insert("interp_ms".into(), Value::Number(n)); }
             }
@@ -15344,13 +16279,38 @@ fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_i
                 Some(handle)
             });
         if let Some(tex) = tex {
-            ui.add(egui::Image::new(&tex)
+            let resp = ui.add(egui::Image::new(&tex)
                 .fit_to_exact_size(egui::vec2(CHIP_H, CHIP_H))
                 .tint(Color32::WHITE));
+            // Overlay the extra-button label (e.g. "PL1") so one generic paddle
+            // glyph can stand for both paddle rows on a side.
+            if let Some(label) = remapper_icons::extra_button_label(pin_id) {
+                paint_icon_label(ui, resp.rect, label);
+            }
             return;
         }
     }
     ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(13.0).strong());
+}
+
+/// Paint a short label centered over an icon rect (used for extra-button
+/// paddle glyphs). Draws a thin dark outline behind the text so it stays legible
+/// over the white glyph regardless of the underlying shape.
+fn paint_icon_label(ui: &egui::Ui, rect: egui::Rect, label: &str) {
+    let painter = ui.painter_at(rect);
+    let font = egui::FontId::proportional((rect.height() * 0.34).max(9.0));
+    let center = rect.center();
+    // Cheap outline: draw the text offset in dark, then the bright text on top.
+    for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+        painter.text(
+            center + egui::vec2(dx, dy),
+            egui::Align2::CENTER_CENTER,
+            label,
+            font.clone(),
+            Color32::from_black_alpha(200),
+        );
+    }
+    painter.text(center, egui::Align2::CENTER_CENTER, label, font, Color32::WHITE);
 }
 
 // ── Mapping-list display filter ───────────────────────────────────────────────
@@ -15911,9 +16871,6 @@ struct MappingCardResult {
     delete_clicked: bool,
     /// True if the mapping object was modified by any header control.
     changed: bool,
-    /// Total card height (so caller can advance the cursor properly even
-    /// though we manage layout manually with painters + invisible buttons).
-    height: f32,
     /// Drag interaction on the card *body* (the area below the header strip).
     /// Used by the caller's reorder state machine. `None` when reordering is
     /// disabled for this card.
@@ -15963,7 +16920,6 @@ fn remapper_mapping_card_pixel(
     // is 358 wide at design scale; we scale all internal positions by the
     // ratio of actual to design width so the layout stays pixel-correct.
     const DESIGN_W: f32 = 358.0;
-    const CARD_H: f32 = 102.0;
     const RADIUS: f32 = 5.0;
     const TEXT_SIZE_HEADER: f32 = 13.0;
     const TEXT_SIZE_INOUT:  f32 = 11.0;
@@ -16130,10 +17086,10 @@ fn remapper_mapping_card_pixel(
         // lean section pushes (side, idx) — without this, Lean Left[0] and
         // Lean Right[0] popups collide on the same global id.
         let popup_id = ui.id().with(("fxi_press_mode_popup", mapping_idx));
-        if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
+        if resp.clicked() { egui::Popup::toggle_id(ui.ctx(), popup_id); }
         let mut picked: Option<&'static str> = None;
-        egui::popup_below_widget(
-            ui, popup_id, &resp,
+        popup_below_widget(
+            &resp, popup_id,
             egui::PopupCloseBehavior::CloseOnClickOutside,
             |ui| {
                 ui.set_min_width(140.0);
@@ -16166,7 +17122,7 @@ fn remapper_mapping_card_pixel(
                 }
             }
             changed = true;
-            ui.memory_mut(|m| m.close_popup(popup_id));
+            egui::Popup::close_id(ui.ctx(), popup_id);
         }
     }
 
@@ -16317,7 +17273,7 @@ fn remapper_mapping_card_pixel(
     let chord_y_out_first = 69.0 * s; // = label_y(72) - 3, center at y=82
 
     let chord_painter = painter.clone();
-    let mut render_chord_row_painter = |row_y_start: f32, pins: &[String]| {
+    let render_chord_row_painter = |row_y_start: f32, pins: &[String]| {
         let mut cur_x = chord_x_start;
         let mut row_y = row_y_start;
         let mut first = true;
@@ -16435,7 +17391,7 @@ fn remapper_mapping_card_pixel(
     }
 
     MappingCardResult {
-        delete_clicked, changed, height: card_h,
+        delete_clicked, changed,
         body_drag, rect: natural_rect,
     }
 }
@@ -16453,7 +17409,7 @@ fn remapper_render_chord(ui: &mut egui::Ui, pins: &[String], skin: super::remapp
     // Synthetic "click" chip rendered from the click-overlay SVG. Only
     // emitted when the chord actually contains click-zone pins.
     let mut first = true;
-    let mut emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
+    let emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
         if !*first {
             ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE));
         }
@@ -16536,6 +17492,18 @@ fn paint_chord_chip_to_rect(
             painter.image(tex.id(), rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 tint);
+            // Extra-button label overlay (e.g. "PL1") — same outline-then-fill as
+            // paint_icon_label, inlined since we have a bare painter here.
+            if let Some(label) = remapper_icons::extra_button_label(pin_id) {
+                let font = egui::FontId::proportional((chip_h * 0.34).max(9.0));
+                let c = rect.center();
+                let fg = if dim { Color32::from_rgba_unmultiplied(255, 255, 255, 95) } else { Color32::WHITE };
+                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                    painter.text(c + egui::vec2(dx, dy), egui::Align2::CENTER_CENTER,
+                        label, font.clone(), Color32::from_black_alpha(200));
+                }
+                painter.text(c, egui::Align2::CENTER_CENTER, label, font, fg);
+            }
             return chip_h;
         }
     }
@@ -16557,68 +17525,6 @@ fn paint_chord_chip_to_rect(
         dim_text,
     );
     pill_w
-}
-
-fn remapper_render_chip_scaled(
-    ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_icons::Skin, chip_h: f32,
-) {
-    use super::remapper_icons;
-    if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
-        let size_px = (chip_h * ui.ctx().pixels_per_point()).round() as u32;
-        let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
-        let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
-            .or_else(|| {
-                let text = std::str::from_utf8(bytes).ok()?;
-                let img = rasterize_svg_recolored(text, size_px, size_px, "override", Color32::TRANSPARENT)?;
-                let handle = ui.ctx().load_texture(
-                    format!("remapper_icon_{:p}", bytes.as_ptr()),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                );
-                ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
-                Some(handle)
-            });
-        if let Some(tex) = tex {
-            ui.add(egui::Image::new(&tex)
-                .fit_to_exact_size(egui::vec2(chip_h, chip_h))
-                .tint(Color32::WHITE));
-            return;
-        }
-    }
-    ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(chip_h * 0.5).strong());
-}
-
-/// Like `remapper_render_chord` but uses an explicit chip size for all chips.
-fn remapper_render_chord_scaled(
-    ui: &mut egui::Ui, pins: &[String], skin: super::remapper_icons::Skin, chip_h: f32,
-) {
-    use super::remapper_icons::Skin;
-    let click_zone = |p: &str| matches!(p,
-        "touchpad_left" | "touchpad_center" | "touchpad_right" | "touchpad_any");
-    let has_click = pins.iter().any(|p| click_zone(p));
-    let mut first = true;
-    let sep_size = (chip_h * 0.55).max(10.0);
-    let mut emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
-        if !*first {
-            ui.label(egui::RichText::new("+").size(sep_size).strong().color(Color32::WHITE));
-        }
-        *first = false;
-    };
-    if has_click && skin == Skin::Playstation {
-        emit_sep(ui, &mut first);
-        remapper_render_chip_scaled(ui, "touchpad_any", skin, chip_h);
-    }
-    for p in pins {
-        let render_id: &str = match p.as_str() {
-            "touchpad_left"   => "touch_left",
-            "touchpad_center" => "touch_center",
-            "touchpad_right"  => "touch_right",
-            "touchpad_any"    => continue,
-            other => other,
-        };
-        emit_sep(ui, &mut first);
-        remapper_render_chip_scaled(ui, render_id, skin, chip_h);
-    }
 }
 
 /// Render the long-arrow SVG glyph between a mapping's input chips and its
@@ -16859,7 +17765,7 @@ fn show_remapper_body(
     let nav_capture_armed = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_nav_capture_armed"))
         .and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut nav_arm_idle = snarl.get_node(node_id)
+    let nav_arm_idle = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_nav_arm_idle"))
         .and_then(|v| v.as_bool()).unwrap_or(false);
     let capture_ok = !nav_active_for_device || (nav_capture_armed && nav_arm_idle);
@@ -16941,19 +17847,6 @@ fn show_remapper_body(
     let mut new_draft_input = draft_input.clone();
     let mut new_draft_output = draft_output.clone();
 
-    // On the touchpad-click rising edge, evict every touch-only zone pin
-    // (touch_left/center/right) from the draft. Rationale: clicking
-    // promotes the touchpad interaction from "touch" to "click"; the
-    // touch-only captures that landed before the click should be replaced
-    // by click-variant captures. Anything else in the draft (gamepad
-    // buttons, modifiers, etc.) is preserved so chords with click+zone
-    // can still include them.
-    let click_prev = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("_tp_click_prev"))
-        .and_then(|v| v.as_bool()).unwrap_or(false);
-    let touch_click_now = upstream_dev_id.as_deref()
-        .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
-        .map(|s| s.as_bool()).unwrap_or(false);
     // Click latches the capture into "click mode" for the rest of the session.
     //
     // Rule: once btn_touchpad has been pressed during this capture, the
@@ -17015,7 +17908,6 @@ fn show_remapper_body(
     // empty (so the Learn press has been released). `capture_ok` next frame then
     // permits a capture. While armed-but-not-idle, no capture starts.
     if nav_capture_armed && !nav_arm_idle && now_empty {
-        nav_arm_idle = true;
         set_arm_idle = Some(true);
     }
 
@@ -17524,7 +18416,7 @@ fn show_map_action_body(
         .and_then(|v| v.as_bool()).unwrap_or(false);
     // Arm-idle handshake (see remapper body): capture only opens after the Learn
     // press has released and the device went idle once post-arm.
-    let mut nav_arm_idle = snarl.get_node(node_id)
+    let nav_arm_idle = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_nav_arm_idle"))
         .and_then(|v| v.as_bool()).unwrap_or(false);
     // Capture is allowed when nav isn't active, OR when armed AND idle-seen.
@@ -17619,7 +18511,6 @@ fn show_map_action_body(
     // Arm-idle: mark idle the first frame the device is empty after arming, so
     // the Learn press has released before capture opens.
     if nav_capture_armed && !nav_arm_idle && now_empty {
-        nav_arm_idle = true;
         set_arm_idle = Some(true);
     }
 
@@ -17942,7 +18833,6 @@ fn show_map_action_body(
 
 const DECO_DEFAULT_FILL:    [u8; 4] = [200, 200, 200, 220];
 const DECO_DEFAULT_STROKE:  [u8; 4] = [255, 255, 255, 220];
-const DECO_DEFAULT_OUTLINE: [u8; 4] = [0,   0,   0,   200];
 
 fn make_default_decoration(kind: &str) -> LayoutDecoration {
     match kind {

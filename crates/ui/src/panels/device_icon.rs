@@ -54,7 +54,7 @@ pub(crate) fn svg_icon_button(
     let resp = match tex {
         Some(tex) => ui.put(
             rect,
-            egui::ImageButton::new(
+            egui::Button::image(
                 egui::Image::new(&tex).fit_to_exact_size(size),
             )
             .frame(false),
