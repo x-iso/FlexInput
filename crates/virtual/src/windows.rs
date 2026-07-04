@@ -363,6 +363,11 @@ mod vigem_ioctl {
         pub buf: [u8; 63],
     }
 
+    // RESERVED: setters for the extended (gyro/accel/touchpad) DS4 report.
+    // The `IOCTL_DS4_SUBMIT_REPORT_EX` path is scaffolded but never enabled —
+    // `VirtualDS4::has_extended` is hardwired false pending bus-version
+    // detection — so the basic `DS4Report` submit is the only live path today.
+    #[allow(dead_code)]
     impl DS4ReportEx {
         pub fn set_lx(&mut self, v: u8) { self.buf[0] = v; }
         pub fn set_ly(&mut self, v: u8) { self.buf[1] = v; }
@@ -456,6 +461,11 @@ mod vigem_ioctl {
 
     /// Non-blocking poll of a pending overlapped operation.
     /// Returns Some(()) if completed, None if still pending, Err(code) on error/abort.
+    ///
+    /// RESERVED: the notification thread currently blocks on
+    /// `GetOverlappedResult(bWait=TRUE)` with its own duplicated handle;
+    /// this poll variant is kept for a possible non-blocking redesign.
+    #[allow(dead_code)]
     pub unsafe fn poll_overlapped(
         device:     *mut c_void,
         overlapped: *mut Overlapped,
@@ -594,6 +604,10 @@ impl VirtualDS4 {
         })
     }
 
+    // RESERVED: overlapped-struct builder for the non-blocking notification
+    // design (pairs with `vigem_ioctl::poll_overlapped`); the current
+    // notification thread blocks with its own handle and doesn't need it.
+    #[allow(dead_code)]
     fn make_notif_ovl() -> Box<vigem_ioctl::Overlapped> {
         Box::new(vigem_ioctl::Overlapped {
             internal: 0, internal_high: 0, offset: 0, offset_high: 0,
@@ -843,7 +857,6 @@ impl VirtualDevice for VirtualDS4 {
         if self.dev.is_null() { return; }
         let dpad    = encode_dpad(self.dpad[0], self.dpad[1], self.dpad[2], self.dpad[3]);
         let buttons = (self.buttons & !0xF) | dpad;
-        let tp_pressed = self.special & ds4_btn::TOUCHPAD != 0;
 
         let sub = vigem_ioctl::DS4Submit {
             size:   std::mem::size_of::<vigem_ioctl::DS4Submit>() as u32,

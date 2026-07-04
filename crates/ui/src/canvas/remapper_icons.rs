@@ -78,7 +78,6 @@ const XB_LT:      &[u8] = a!("Xbox/xbox_lt.svg");
 const XB_RT:      &[u8] = a!("Xbox/xbox_rt.svg");
 const XB_START:   &[u8] = a!("Xbox/xbox_button_start.svg");
 const XB_BACK:    &[u8] = a!("Xbox/xbox_button_back.svg");
-const XB_GUIDE:   &[u8] = a!("Xbox/xbox_guide.svg");
 const XB_SHARE:   &[u8] = a!("Xbox/xbox_button_share.svg");
 const XB_LOGO:    &[u8] = a!("Xbox/xbox_button_logo.svg");
 const XB_DPAD_U:  &[u8] = a!("Xbox/xbox_dpad_up.svg");
@@ -306,8 +305,6 @@ const DEV_PS5:      &[u8] = a!("Playstation/controller_playstation5.svg");
 const DEV_SWITCH:   &[u8] = a!("SwitchPro/controller_switch_pro.svg");
 const DEV_MIDI_IN:  &[u8] = a!("MIDI_in.svg");
 const DEV_MIDI_OUT: &[u8] = a!("MIDI_out.svg");
-const DEV_KBM_KEYBOARD: &[u8] = a!("KBM/keyboard.svg");
-const DEV_KBM_MOUSE:    &[u8] = a!("KBM/mouse.svg");
 /// Combined keyboard + mouse glyph — used wherever Virtual Keyboard
 /// & Mouse needs a single, compact icon (Easy mode card, virtual
 /// device panel chip, sub-patch node header).
@@ -360,11 +357,10 @@ pub fn virtual_device_card_svg(kind_prefix: &str) -> &'static [u8] {
 /// device chip + any other single-icon call site.
 pub fn keymouse_svg() -> &'static [u8] { DEV_KBM }
 
-/// One or two SVGs to render in a canvas device-node header.
-/// `Pair` is used only for `virtual.keymouse` (keyboard + mouse glyphs).
+/// The SVG to render in a canvas device-node header. (Historically also
+/// carried a two-glyph `Pair` for `virtual.keymouse`, now a combined glyph.)
 pub enum NodeIconSpec {
     Single(&'static [u8]),
-    Pair(&'static [u8], &'static [u8]),
 }
 
 /// Resolve the canvas-node icon for any device id used by `device.source`

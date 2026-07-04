@@ -1,13 +1,5 @@
 pub use flexinput_engine::sample_curve;
-pub use flexinput_engine::curve_scale;
-pub use flexinput_engine::curve_scale_inv;
-pub use flexinput_engine::apply_curve;
-pub use flexinput_engine::curve_points_from_params;
-pub use flexinput_engine::curve_points_from_params_keyed;
-pub use flexinput_engine::multiband_collapse_carrier;
 pub use flexinput_engine::multiband_collapse_band;
 pub use flexinput_engine::crossover_hz_to_pos;
-pub use flexinput_engine::biases_from_params;
-pub use flexinput_engine::read_scale_t;
 pub use flexinput_engine::vec_reshape_apply;
 pub use flexinput_engine::{VEC_RESHAPE_BOUNDARY_DEFAULT, VEC_RESHAPE_GAIN_DEFAULT};

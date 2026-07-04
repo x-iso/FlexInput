@@ -1585,7 +1585,6 @@ fn automap_combiner_publish(
                     Signal::Int(i)  => *i != 0,
                     Signal::Float(f) => *f != 0.0,
                     Signal::Vec2(v) => *v != glam::Vec2::ZERO,
-                    _ => false,
                 });
                 asserted.or_else(|| raw.into_iter().next())
             }

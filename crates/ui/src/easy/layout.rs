@@ -122,7 +122,7 @@ pub fn reposition_io_nodes_with_ctx(canvas: &mut Canvas, ctx: Option<&egui::Cont
     // node by its right edge EDGE_GAP px left of the sub-patch (sources) vs by
     // its left edge at `sink_x` (sinks). Per-node width is measured too, so a
     // wide source still ends EDGE_GAP from the sub-patch.
-    let mut place_column = |snarl: &mut egui_snarl::Snarl<crate::canvas::NodeData>,
+    let place_column = |snarl: &mut egui_snarl::Snarl<crate::canvas::NodeData>,
                             ids: &[NodeId], right_aligned: bool, fb_w: f32, fb_h: f32| {
         let mut y = subpatch_pos.y;
         for &id in ids {

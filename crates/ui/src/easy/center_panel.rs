@@ -222,7 +222,7 @@ fn show_preset_picker(
     let open_id = preset_dropdown_open_id();
     let is_open: bool = ui.ctx().data(|d| d.get_temp(open_id).unwrap_or(false));
 
-    let mut bar_rect_out: Option<egui::Rect> = None;
+    let bar_rect_out: Option<egui::Rect>;
 
     // Outer horizontal: pinned to a SINGLE-ROW height so the layout
     // above the sub-patch body doesn't expand to fill all remaining
@@ -358,7 +358,7 @@ fn show_preset_picker(
             .and_then(|id| canvas.snarl.get_node(id))
             .map(|n| n.extra.layout_unlocked)
             .unwrap_or(false);
-        let palette_btn = egui::SelectableLabel::new(
+        let palette_btn = egui::Button::selectable(
             layout_unlocked, egui::RichText::new("🎨").size(14.0));
         if ui.add_sized([28.0, 28.0], palette_btn)
             .on_hover_text(if layout_unlocked {
@@ -488,8 +488,6 @@ struct PresetBarResult {
     star_clicked: bool,
     name_double_clicked: bool,
     name_alt_clicked: bool,
-    /// Screen rect of the name text area.
-    name_rect: egui::Rect,
     /// When the bar is in edit mode and the user committed (Enter or
     /// focus loss), holds the final text. None means "no commit this
     /// frame".
@@ -676,7 +674,6 @@ fn preset_dropdown_bar(
         star_clicked: star_resp.clicked() && has_active_preset,
         name_double_clicked,
         name_alt_clicked,
-        name_rect,
         rename_commit,
         rename_cancel,
     }
@@ -1096,39 +1093,6 @@ fn apply_subpatch_inline(
     easy_state.loaded_preset = source_path.map(|p| (p, hash));
     super::wiring::rewire(canvas);
     super::layout::reposition_io_nodes(canvas);
-}
-
-fn preset_entry(
-    ui: &mut egui::Ui,
-    p: &PresetInfo,
-    canvas: &mut Canvas,
-    easy_state: &mut EasyState,
-    favorites: &mut Vec<PathBuf>,
-    presets: &[PresetInfo],
-) {
-    let is_fav = favorites.iter().any(|f| f == &p.path);
-    let star = if is_fav { "★" } else { "☆" };
-    let star_resp = ui.small_button(star)
-        .on_hover_text(if is_fav { "Remove from favorites" } else { "Add to favorites" });
-    if star_resp.clicked() {
-        if is_fav {
-            favorites.retain(|f| f != &p.path);
-        } else {
-            favorites.push(p.path.clone());
-        }
-    }
-
-    let active = easy_state.loaded_preset.as_ref().map(|(p2, _)| p2.as_path()) == Some(p.path.as_path());
-    let resp = ui.add(egui::SelectableLabel::new(active, &p.display_name))
-        .on_hover_text(p.path.display().to_string());
-    if resp.clicked() && !active {
-        if is_subpatch_dirty(canvas, easy_state, presets) {
-            easy_state.pending_preset_switch = Some(p.path.clone());
-        } else {
-            apply_preset(canvas, easy_state, p);
-        }
-        ui.close();
-    }
 }
 
 fn show_pending_modal(

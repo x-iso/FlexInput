@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use flexinput_core::{Module, Patch, Signal};
+use flexinput_core::{Module, Patch};
 use uuid::Uuid;
 
 pub mod eval;
@@ -26,7 +26,6 @@ pub struct Engine {
     patch: Patch,
     router: InputRouter,
     pub pass_through_outputs: bool,
-    last_outputs: HashMap<(Uuid, String), Signal>,
 }
 
 impl Engine {
@@ -36,7 +35,6 @@ impl Engine {
             patch: Patch::default(),
             router: InputRouter::new(),
             pass_through_outputs: false,
-            last_outputs: HashMap::new(),
         }
     }
 

@@ -369,8 +369,7 @@ pub fn read_nav_input(
     // `dpad_*` button pins. Synthesize the digital pins from the axis so nav
     // sees discrete d-pad presses regardless of device. +y = up (gilrs).
     {
-        let mut dx = 0.0;
-        let mut dy = 0.0;
+        let (dx, dy);
         let v = sig_vec2(signals, dev_id, "dpad");
         if v != egui::Vec2::ZERO {
             dx = v.x;

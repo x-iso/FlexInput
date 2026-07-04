@@ -14,6 +14,29 @@ use super::{
 };
 use crate::app::request_repaint_throttled;
 
+/// Drop-in replacement for the removed-in-spirit `egui::popup_below_widget`
+/// (deprecated in 0.33): a memory-toggled popup anchored under the widget.
+/// Mirrors egui's own `popup_above_or_below_widget` shim over `egui::Popup`.
+fn popup_below_widget<R>(
+    widget_response: &egui::Response,
+    popup_id: egui::Id,
+    close_behavior: egui::PopupCloseBehavior,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let response = egui::Popup::from_response(widget_response)
+        .layout(egui::Layout::top_down_justified(egui::Align::LEFT))
+        .open_memory(None)
+        .close_behavior(close_behavior)
+        .id(popup_id)
+        .align(egui::RectAlign::BOTTOM_START)
+        .width(widget_response.rect.width())
+        .show(|ui| {
+            ui.set_min_width(ui.available_width());
+            add_contents(ui)
+        })?;
+    Some(response.inner)
+}
+
 pub struct FlexViewer<'a> {
     pub descriptors: &'a [ModuleDescriptor],
     pub ctx: egui::Context,
@@ -163,7 +186,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let dev_id_owned: String = data.params.get("device_id")
             .and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
         let dev_id_str: &str = &dev_id_owned;
-        let (has_deadzone, has_gyro, has_sticks_cal) = device_source_caps(dev_id_str, is_device_source);
+        let (has_deadzone, has_gyro, _has_sticks_cal) = device_source_caps(dev_id_str, is_device_source);
         // Estimate the body width so the AutoMap chip can right-align to it.
         // Computed up-front (outside the closure that mutates the snarl) so
         // the `data` borrow doesn't outlive the snarl.get_node_mut calls.
@@ -216,10 +239,6 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             }
                         }
                         NodeIconSpec::Single(bytes) => render_device_icon(ui, bytes, ICON_H),
-                        NodeIconSpec::Pair(a, b) => {
-                            render_device_icon(ui, a, ICON_H);
-                            render_device_icon(ui, b, ICON_H);
-                        }
                     }
                 }
                 // Device source: dot + [title / (Calibrate + Hz)] stack,
@@ -399,10 +418,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
                         egui::StrokeKind::Inside);
                     if resp.clicked() {
-                        ui.memory_mut(|m| m.toggle_popup(id));
+                        egui::Popup::toggle_id(ui.ctx(), id);
                     }
                     let mut changed = false;
-                    egui::popup_below_widget(ui, id, &resp,
+                    popup_below_widget(&resp, id,
                         egui::PopupCloseBehavior::CloseOnClickOutside,
                         |ui| {
                             ui.set_min_width(220.0);
@@ -1078,7 +1097,6 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         }
 
         let module_id = snarl.get_node(node).map(|n| n.module_id.as_str()).unwrap_or("").to_string();
-        let display_name = snarl.get_node(node).map(|n| n.display_name.clone()).unwrap_or_default();
 
         // Inner canvas only — show "Unpin from body" if the node has any pins.
         // Pinning happens exclusively through Layout mode + highlight click;
@@ -3715,23 +3733,23 @@ fn show_dropdown_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Node
                             edit_state.editing = Some(i);
                             edit_state.buf = options[i].clone();
                             edit_state.request_focus = true;
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if ui.add_enabled(i > 0, egui::Button::new("Move up")).clicked() {
                             row_move = -1;
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.add_enabled(i + 1 < options.len(),
                             egui::Button::new("Move down")).clicked()
                         {
                             row_move = 1;
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if ui.button("Delete").clicked() {
                             row_remove = true;
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 }
@@ -3897,11 +3915,11 @@ fn render_dropdown_selection(
     // Popup menu: open on click, close on selection or outside-click.
     let popup_id = egui::Id::new(("dropdown_pinned_popup", inner_id.0));
     if resp.clicked() {
-        ui.memory_mut(|m| m.toggle_popup(popup_id));
+        egui::Popup::toggle_id(ui.ctx(), popup_id);
     }
     let mut chosen: Option<usize> = None;
-    egui::popup_below_widget(
-        ui, popup_id, &resp,
+    popup_below_widget(
+        &resp, popup_id,
         egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
             ui.set_min_width(rect.width().max(80.0));
@@ -3914,7 +3932,7 @@ fn render_dropdown_selection(
         },
     );
     if chosen.is_some() {
-        ui.memory_mut(|m| m.close_popup(popup_id));
+        egui::Popup::close_id(ui.ctx(), popup_id);
     }
     if let Some(i) = chosen {
         if let Some(node) = inner_snarl.get_node_mut(inner_id) {
@@ -5234,7 +5252,7 @@ fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snar
             let sustain_active = hold;
             let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
                 .show_value(false)
-                .clamp_to_range(true);
+                .clamping(egui::SliderClamping::Always);
             let sr = ui.add_enabled(sustain_active, slider);
             if sr.changed() {
                 if !pts_x.is_empty() {
@@ -5524,7 +5542,7 @@ fn render_envelope_sustain_row(
         ui.spacing_mut().slider_width = pin_flex_width(ui, container, 70.0);
         let slider = egui::Slider::new(&mut sustain, 0.0..=1.0)
             .show_value(false)
-            .clamp_to_range(true);
+            .clamping(egui::SliderClamping::Always);
         let r = ui.add_enabled(sustain_active, slider);
         fr.push(r.rect);
         if r.changed() {
@@ -5705,7 +5723,7 @@ fn show_gyro_3dof_body(
 
     // Helper that draws a 4-button mode picker. Returns true if a selection
     // change occurred; updates `family` and `axis` in place.
-    let mut draw_mode_row = |ui: &mut egui::Ui, label: &str, target_family: &str,
+    let draw_mode_row = |ui: &mut egui::Ui, label: &str, target_family: &str,
                               family: &mut String, axis: &mut String| -> bool {
         let mut row_changed = false;
         ui.horizontal(|ui| {
@@ -5936,7 +5954,7 @@ fn show_gyro_lean_mapping_section(
     }).unwrap_or(false);
     let nav_capture_armed = snarl.get_node(node_id)
         .and_then(|n| n.params.get(armed_key)).and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut nav_arm_idle = snarl.get_node(node_id)
+    let nav_arm_idle = snarl.get_node(node_id)
         .and_then(|n| n.params.get(arm_idle_key)).and_then(|v| v.as_bool()).unwrap_or(false);
     // Capture may proceed when not in nav mode, OR (nav mode) once armed AND the
     // device has gone idle once since arming (so the Learn press is released).
@@ -5964,7 +5982,6 @@ fn show_gyro_lean_mapping_section(
     let now_empty = pressed_now.is_empty();
     if nav_capture_armed && !nav_arm_idle && now_empty {
         set_arm_idle = Some(true);
-        nav_arm_idle = true;
     }
 
     let mut new_phase = phase.clone();
@@ -6844,10 +6861,6 @@ pub(crate) fn show_subpatch_body(
         .map(|sp| (sp.snap_enabled, sp.snap_grid_px.max(2) as f32))
         .unwrap_or((false, 8.0));
 
-    let selected_idx = snarl.get_node(outer_id)
-        .and_then(|n| n.subpatch.as_ref())
-        .and_then(|sp| sp.selected_item);
-
     // Per-item inner-module info (display name etc), for stale-pin cleanup
     // and right-click menu labels.
     let infos: Vec<(String, String, bool)> = items.iter().map(|it| {
@@ -6948,7 +6961,7 @@ pub(crate) fn show_subpatch_body(
                 let element_id = m.element_id.clone();
                 let graph_ov = m.graph_override.clone();
                 let outer_snap_ref = outer_snapshot.as_ref();
-                ui.allocate_ui_at_rect(element_rect, |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(element_rect), |ui| {
                     let new_clip = ui.clip_rect().intersect(element_rect);
                     ui.set_clip_rect(new_clip);
                     // Salt widget IDs by layout-item index so multiple pins of
@@ -7218,11 +7231,11 @@ pub(crate) fn show_subpatch_body(
     let _ = secondary_down;
     bg_resp.context_menu(|ui| {
         ui.menu_button("Add", |ui| {
-            if ui.button("Text").clicked()      { bg_add = Some("text");    ui.close_menu(); }
-            if ui.button("Rectangle").clicked() { bg_add = Some("rect");    ui.close_menu(); }
-            if ui.button("Ellipse").clicked()   { bg_add = Some("ellipse"); ui.close_menu(); }
-            if ui.button("Line").clicked()      { bg_add = Some("line");    ui.close_menu(); }
-            if ui.button("SVG").clicked()       { bg_add = Some("svg");     ui.close_menu(); }
+            if ui.button("Text").clicked()      { bg_add = Some("text");    ui.close(); }
+            if ui.button("Rectangle").clicked() { bg_add = Some("rect");    ui.close(); }
+            if ui.button("Ellipse").clicked()   { bg_add = Some("ellipse"); ui.close(); }
+            if ui.button("Line").clicked()      { bg_add = Some("line");    ui.close(); }
+            if ui.button("SVG").clicked()       { bg_add = Some("svg");     ui.close(); }
         });
     });
 
@@ -7883,21 +7896,21 @@ fn layout_item_context_menu(
 ) {
     ui.label(egui::RichText::new(menu_header).small().strong());
     ui.separator();
-    if ui.button("Send to surface").clicked()   { *zaction = Some((idx, "top"));    ui.close_menu(); }
-    if ui.button("Step Up").clicked()           { *zaction = Some((idx, "up"));     ui.close_menu(); }
-    if ui.button("Step Down").clicked()         { *zaction = Some((idx, "down"));   ui.close_menu(); }
-    if ui.button("Send to background").clicked(){ *zaction = Some((idx, "bottom")); ui.close_menu(); }
+    if ui.button("Send to surface").clicked()   { *zaction = Some((idx, "top"));    ui.close(); }
+    if ui.button("Step Up").clicked()           { *zaction = Some((idx, "up"));     ui.close(); }
+    if ui.button("Step Down").clicked()         { *zaction = Some((idx, "down"));   ui.close(); }
+    if ui.button("Send to background").clicked(){ *zaction = Some((idx, "bottom")); ui.close(); }
     ui.separator();
     // Style copy/paste. Copy stashes THIS item's style; paste applies the
     // clipboard to the whole selection (or this item if nothing else selected).
-    if ui.button("Copy style").clicked() { *copy_style_from = Some(idx); ui.close_menu(); }
+    if ui.button("Copy style").clicked() { *copy_style_from = Some(idx); ui.close(); }
     ui.add_enabled_ui(has_style_clip, |ui| {
         let label = if n_selected > 1 {
             format!("Paste style to {} selected", n_selected)
         } else {
             "Paste style".to_string()
         };
-        if ui.button(label).clicked() { *paste_style = true; ui.close_menu(); }
+        if ui.button(label).clicked() { *paste_style = true; ui.close(); }
     });
     // Duplicate — decorations only (module widgets reference an inner node and
     // can't be cloned as standalone layout items). Duplicates the whole
@@ -7909,10 +7922,10 @@ fn layout_item_context_menu(
         } else {
             "Duplicate".to_string()
         };
-        if ui.button(dlabel).clicked() { *dup_request = true; ui.close_menu(); }
+        if ui.button(dlabel).clicked() { *dup_request = true; ui.close(); }
     }
     ui.separator();
-    if ui.button("Unpin").clicked() { *delete_idx = Some(idx); ui.close_menu(); }
+    if ui.button("Unpin").clicked() { *delete_idx = Some(idx); ui.close(); }
 }
 
 /// Clamp a layout-resize candidate size for a Module pin to its no-crop
@@ -8399,49 +8412,6 @@ fn render_pinned_element_impl(
     let _ = module_id;
     let _ = element_id;
     ui.label(egui::RichText::new("Re-pin via Layout mode").small().weak());
-}
-
-fn dispatch_pinned_body(
-    inner_id: egui_snarl::NodeId,
-    module_id: &str,
-    ui: &mut egui::Ui,
-    inner_snarl: &mut Snarl<NodeData>,
-) {
-    // Cap width so modules that use available_width() (oscillator, response curve)
-    // don't expand to fill the 800px allocate_ui_at_rect max_rect.
-    // Knob uses egui::Resize (its own stored size) and is unaffected by this.
-    let cap = ui.available_width().min(450.0);
-    ui.set_max_width(cap);
-    match module_id {
-        "module.knob"       => show_knob_body(inner_id, ui, inner_snarl),
-        "module.constant"   => show_constant_body(inner_id, ui, inner_snarl),
-        "module.switch"     => show_switch_body(inner_id, ui, inner_snarl),
-        "module.label"      => show_label_body(inner_id, ui, inner_snarl),
-        "generator.oscillator" => show_oscillator_body(inner_id, &[], ui, inner_snarl),
-        "generator.envelope"   => show_envelope_body(inner_id, &[], ui, inner_snarl),
-        "module.selector"   => show_selector_body(inner_id, &[], ui, inner_snarl),
-        "module.dropdown"   => show_dropdown_body(inner_id, ui, inner_snarl),
-        "module.response_curve"     => { show_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
-        "module.vec_response_curve" => { show_vec_response_curve_body(inner_id, &[], &[], ui, inner_snarl); }
-        "module.vec_reshape"        => { show_vec_reshape_body(inner_id, &[], &[], ui, inner_snarl); }
-        "processing.gyro_3dof"      => {
-            // Inner-snarl (layout-mode preview): Learn/capture not wired
-            // here since we lack live_signals / panic_shortcut. Mapping
-            // editing still works (Add/×/press-mode); capture is no-op.
-            let empty: std::collections::HashMap<(String, String), Signal>
-                = std::collections::HashMap::new();
-            let panic_dummy = crate::app::PanicShortcut::default();
-            show_gyro_3dof_body(inner_id, &[], ui, inner_snarl, &empty,
-                &panic_dummy, None);
-        }
-        "logic.greater_than" | "logic.less_than" => show_or_equal_body(inner_id, ui, inner_snarl),
-        "logic.delay"       => show_logic_delay_body(inner_id, ui, inner_snarl),
-        "logic.counter"     => show_counter_body(inner_id, &[], ui, inner_snarl),
-        "module.delay"      => show_delay_body(inner_id, &[], &[], ui, inner_snarl),
-        "module.average"    => show_average_body(inner_id, &[], &[], ui, inner_snarl),
-        "module.dc_filter"  => show_dc_filter_body(inner_id, &[], &[], ui, inner_snarl),
-        _ => { /* no body for this module type */ }
-    }
 }
 
 // ── Whole-module pinned renderers (Remapper / Map Action) ─────────────────────
@@ -9119,24 +9089,6 @@ fn render_switch_toggle(
             switch_handle_click(node, active);
         }
     }
-}
-
-/// Read-only label for the outer body. Editing happens only in the editor;
-/// the body shows static text at the chosen font size.
-fn render_label_text_readonly(
-    inner_id: NodeId,
-    ui: &mut egui::Ui,
-    inner_snarl: &mut Snarl<NodeData>,
-    container: egui::Vec2,
-) {
-    let (text, font_size, col) = inner_snarl.get_node(inner_id).map(|n| {
-        let t = n.params.get("text").and_then(|v| v.as_str()).unwrap_or("Label").to_string();
-        let f = n.params.get("font_size").and_then(|v| v.as_f64()).unwrap_or(14.0) as f32;
-        let c = read_label_color(n);
-        (t, f, c)
-    }).unwrap_or_else(|| ("Label".to_string(), 14.0, egui::Color32::from_rgb(220, 220, 220)));
-    ui.set_max_width(container.x);
-    ui.label(egui::RichText::new(text).size(font_size).color(col));
 }
 
 /// Pinned-Text renderer: scale by width, crop by height with scrollbar,
@@ -11458,18 +11410,6 @@ pub(crate) fn slider_label(ui: &mut egui::Ui, label: &str, cell_w: f32) {
     );
 }
 
-/// Small calibration button. `calibrated == true` flips the button's fill to
-/// a calm green so the visual state is conveyed without a separate ✓ label.
-fn cal_button(ui: &mut egui::Ui, label: &str, calibrated: bool) -> egui::Response {
-    let mut btn = egui::Button::new(egui::RichText::new(label).small());
-    if calibrated {
-        btn = btn
-            .fill(Color32::from_rgb(50, 130, 70))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(80, 200, 100)));
-    }
-    ui.add(btn)
-}
-
 /// Paint a soft circular halo via a triangle fan with per-vertex colors.
 /// Center color = `hot` premultiplied by intensity; edge color = transparent.
 /// Uses `Color32::TRANSPARENT` for the edge so the gradient is premultiplied-
@@ -11833,31 +11773,6 @@ fn automap_label_abs_y_key(node: egui_snarl::NodeId) -> egui::Id {
 fn automap_pin_row_y_key(node: egui_snarl::NodeId) -> egui::Id {
     egui::Id::new(("device_sink_automap_pin_row_y", node.0))
 }
-
-/// Per-node cache of the node's `open` bool. The pin-Y delta cache is only
-/// valid when this hasn't changed between frames; on a transition we fall
-/// back to using the stashed absolute label Y directly (1-frame stale but
-/// visibly steady) until both stashes are aligned to the new state.
-fn automap_open_state_key(node: egui_snarl::NodeId) -> egui::Id {
-    egui::Id::new(("device_automap_open_state", node.0))
-}
-
-/// Per-node cache of the input column's body-content X, stashed by
-/// `show_input` and consumed next frame by `show_header`. Combined with
-/// `automap_header_cursor_x_key` (the show_header cursor X stashed the
-/// same prior frame) to form a layout-stable delta that lets show_header
-/// resolve the node body left X each frame even when the node is moving
-/// or when the column pass is clipped (collapsed state).
-fn automap_label_x_key(node: egui_snarl::NodeId) -> egui::Id {
-    egui::Id::new(("device_sink_automap_label_x", node.0))
-}
-
-/// Companion of `automap_label_x_key`: show_header's post-chevron cursor X
-/// stashed each frame for next-frame delta resolution.
-fn automap_header_cursor_x_key(node: egui_snarl::NodeId) -> egui::Id {
-    egui::Id::new(("device_sink_automap_header_cursor_x", node.0))
-}
-
 enum WireDir {
     FromOutput { src: OutPinId, from_type: SignalType },
     FromInput  { dst: InPinId,  to_type:   SignalType },
@@ -12006,15 +11921,8 @@ fn graph_grid_colors(ov: Option<&crate::canvas::node::PinGraphOverride>) -> (Col
     (faint, axis)
 }
 
-const SCOPE_COLORS: [Color32; 4] = [
-    Color32::from_rgb(255, 80,  80),   // red
-    Color32::from_rgb(80,  220, 80),   // green
-    Color32::from_rgb(80,  140, 255),  // blue
-    Color32::from_rgb(255, 220, 50),   // yellow
-];
-
 // 12 perceptually-spread colors for multi-pin modules (selector inputs, split outputs, etc.).
-// The first four match SCOPE_COLORS so oscilloscope channels stay consistent.
+// The first four (red/green/blue/yellow) double as the oscilloscope channel colors.
 const MULTI_COLORS: [Color32; 12] = [
     Color32::from_rgb(255, 80,  80),   //  0 red
     Color32::from_rgb(80,  220, 80),   //  1 green
@@ -15260,7 +15168,7 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
                 }
 
                 // Active lane (solid gray, same as float body)
-                let (edit_pts_r, edit_biases_r) = if lane_up { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
+                let edit_pts_r = if lane_up { &pts_up } else { &pts_dn };
                 let (new_edit_pts, new_edit_biases, pts_changed_ref, bias_changed_ref) = if lane_up {
                     (&mut new_pts_up, &mut new_biases_up, &mut pts_up_changed, &mut bias_up_changed)
                 } else {
@@ -15536,16 +15444,16 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
         register_exposable_element(ui, node_id, "scale_row", scale_resp.response.rect);
 
         let range_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).clamp_range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
-            ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).clamp_range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
+            ui.label(egui::RichText::new("In").small().weak()); let i1b = i1; ui.add(egui::DragValue::new(&mut i1).speed(0.01).range(0.001f32..=1000.0f32)); if (i1-i1b).abs()>1e-5{changed=true;}
+            ui.label(egui::RichText::new("Out").small().weak()); let o1b = o1; ui.add(egui::DragValue::new(&mut o1).speed(0.01).range(0.001f32..=1000.0f32)); if (o1-o1b).abs()>1e-5{changed=true;}
             ui.label(egui::RichText::new("Grid").small().weak());
-            let (gxb,gyb)=(gx_f,gy_f); ui.add(egui::DragValue::new(&mut gx_f).speed(0.1).clamp_range(1usize..=32usize)); ui.label(egui::RichText::new("×").small()); ui.add(egui::DragValue::new(&mut gy_f).speed(0.1).clamp_range(1usize..=32usize)); if gx_f!=gxb||gy_f!=gyb{changed=true;}
+            let (gxb,gyb)=(gx_f,gy_f); ui.add(egui::DragValue::new(&mut gx_f).speed(0.1).range(1usize..=32usize)); ui.label(egui::RichText::new("×").small()); ui.add(egui::DragValue::new(&mut gy_f).speed(0.1).range(1usize..=32usize)); if gx_f!=gxb||gy_f!=gyb{changed=true;}
         });
         register_exposable_element(ui, node_id, "range_row", range_resp.response.rect);
 
         let grid_resp = ui.horizontal(|ui| {
             let snb=snap_on; ui.checkbox(&mut snap_on, egui::RichText::new("Snap").small()); if snap_on!=snb{changed=true;}
-            ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).clamp_range(0i64..=1000i64).suffix("ms")); if tm!=tmb{changed=true;}
+            ui.label(egui::RichText::new("Trail").small().weak()); let tmb=tm; ui.add(egui::DragValue::new(&mut tm).speed(5).range(0i64..=1000i64).suffix("ms")); if tm!=tmb{changed=true;}
         });
         register_exposable_element(ui, node_id, "grid_row", grid_resp.response.rect);
 
@@ -15558,14 +15466,14 @@ fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin], outputs: &
         let hyst_resp = ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Hyst").small().weak());
             let (hpb,hmb)=(h_pct,h_ms);
-            ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%"));
-            ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms"));
+            ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).range(0.001f32..=10.0f32).suffix("%"));
+            ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).range(0.02f32..=50.0f32).suffix("ms"));
             if (h_pct-hpb).abs()>1e-5||(h_ms-hmb).abs()>1e-5{changed=true;}
         });
         register_exposable_element(ui, node_id, "hyst_row", hyst_resp.response.rect);
 
         let interp_resp = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Interp").small().weak()); let imb=i_ms; ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).clamp_range(0.0f32..=500.0f32).suffix("ms")); if (i_ms-imb).abs()>1e-5{changed=true;}
+            ui.label(egui::RichText::new("Interp").small().weak()); let imb=i_ms; ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).range(0.0f32..=500.0f32).suffix("ms")); if (i_ms-imb).abs()>1e-5{changed=true;}
         });
         register_exposable_element(ui, node_id, "interp_row", interp_resp.response.rect);
 
@@ -15707,7 +15615,10 @@ fn paint_twoway_curve_graph(
     let snap       = node_data.params.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
     let trail_ms   = node_data.params.get("trail_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(0, 1000);
     let active_lane = node_data.params.get("active_lane").and_then(|v| v.as_str()).unwrap_or("up").to_string();
-    let ssg        = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
+    // TODO: scaled-grid overlay (`show_scaled_grid`) is not implemented for
+    // this up/dn-lane renderer yet — the toggle exists and other curve
+    // renderers honor it; read kept underscored until the overlay is ported.
+    let _ssg       = node_data.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false);
     let sgl        = node_data.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let absolute_eff = absolute || vec_mode;
@@ -16010,9 +15921,9 @@ fn render_twoway_hyst_row(
     let mut fr = [egui::Rect::NOTHING; 2];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Hyst").weak());
-        let r = ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).clamp_range(0.001f32..=10.0f32).suffix("%"));
+        let r = ui.add(egui::DragValue::new(&mut h_pct).speed(0.01).range(0.001f32..=10.0f32).suffix("%"));
         fr[0] = r.rect; changed |= r.changed();
-        let r = ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).clamp_range(0.02f32..=50.0f32).suffix("ms"));
+        let r = ui.add(egui::DragValue::new(&mut h_ms).speed(0.1).range(0.02f32..=50.0f32).suffix("ms"));
         fr[1] = r.rect; changed |= r.changed();
     });
     publish_nav_field_rects(ui, inner_id, &fr);
@@ -16037,7 +15948,7 @@ fn render_twoway_interp_row(
     apply_widget_scale(ui, container, egui::vec2(220.0, 22.0));
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Interp").weak());
-        if ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).clamp_range(0.0f32..=500.0f32).suffix("ms")).changed() {
+        if ui.add(egui::DragValue::new(&mut i_ms).speed(1.0).range(0.0f32..=500.0f32).suffix("ms")).changed() {
             if let Some(node) = snarl.get_node_mut(inner_id) {
                 if let Some(n) = Number::from_f64(i_ms as f64) { node.params.insert("interp_ms".into(), Value::Number(n)); }
             }
@@ -16960,9 +16871,6 @@ struct MappingCardResult {
     delete_clicked: bool,
     /// True if the mapping object was modified by any header control.
     changed: bool,
-    /// Total card height (so caller can advance the cursor properly even
-    /// though we manage layout manually with painters + invisible buttons).
-    height: f32,
     /// Drag interaction on the card *body* (the area below the header strip).
     /// Used by the caller's reorder state machine. `None` when reordering is
     /// disabled for this card.
@@ -17012,7 +16920,6 @@ fn remapper_mapping_card_pixel(
     // is 358 wide at design scale; we scale all internal positions by the
     // ratio of actual to design width so the layout stays pixel-correct.
     const DESIGN_W: f32 = 358.0;
-    const CARD_H: f32 = 102.0;
     const RADIUS: f32 = 5.0;
     const TEXT_SIZE_HEADER: f32 = 13.0;
     const TEXT_SIZE_INOUT:  f32 = 11.0;
@@ -17179,10 +17086,10 @@ fn remapper_mapping_card_pixel(
         // lean section pushes (side, idx) — without this, Lean Left[0] and
         // Lean Right[0] popups collide on the same global id.
         let popup_id = ui.id().with(("fxi_press_mode_popup", mapping_idx));
-        if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
+        if resp.clicked() { egui::Popup::toggle_id(ui.ctx(), popup_id); }
         let mut picked: Option<&'static str> = None;
-        egui::popup_below_widget(
-            ui, popup_id, &resp,
+        popup_below_widget(
+            &resp, popup_id,
             egui::PopupCloseBehavior::CloseOnClickOutside,
             |ui| {
                 ui.set_min_width(140.0);
@@ -17215,7 +17122,7 @@ fn remapper_mapping_card_pixel(
                 }
             }
             changed = true;
-            ui.memory_mut(|m| m.close_popup(popup_id));
+            egui::Popup::close_id(ui.ctx(), popup_id);
         }
     }
 
@@ -17366,7 +17273,7 @@ fn remapper_mapping_card_pixel(
     let chord_y_out_first = 69.0 * s; // = label_y(72) - 3, center at y=82
 
     let chord_painter = painter.clone();
-    let mut render_chord_row_painter = |row_y_start: f32, pins: &[String]| {
+    let render_chord_row_painter = |row_y_start: f32, pins: &[String]| {
         let mut cur_x = chord_x_start;
         let mut row_y = row_y_start;
         let mut first = true;
@@ -17484,7 +17391,7 @@ fn remapper_mapping_card_pixel(
     }
 
     MappingCardResult {
-        delete_clicked, changed, height: card_h,
+        delete_clicked, changed,
         body_drag, rect: natural_rect,
     }
 }
@@ -17502,7 +17409,7 @@ fn remapper_render_chord(ui: &mut egui::Ui, pins: &[String], skin: super::remapp
     // Synthetic "click" chip rendered from the click-overlay SVG. Only
     // emitted when the chord actually contains click-zone pins.
     let mut first = true;
-    let mut emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
+    let emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
         if !*first {
             ui.label(egui::RichText::new("+").size(14.0).strong().color(Color32::WHITE));
         }
@@ -17618,71 +17525,6 @@ fn paint_chord_chip_to_rect(
         dim_text,
     );
     pill_w
-}
-
-fn remapper_render_chip_scaled(
-    ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_icons::Skin, chip_h: f32,
-) {
-    use super::remapper_icons;
-    if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
-        let size_px = (chip_h * ui.ctx().pixels_per_point()).round() as u32;
-        let cache_key = egui::Id::new(("remapper_icon", bytes.as_ptr() as usize, size_px));
-        let tex = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(cache_key))
-            .or_else(|| {
-                let text = std::str::from_utf8(bytes).ok()?;
-                let img = rasterize_svg_recolored(text, size_px, size_px, "override", Color32::TRANSPARENT)?;
-                let handle = ui.ctx().load_texture(
-                    format!("remapper_icon_{:p}", bytes.as_ptr()),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                );
-                ui.ctx().data_mut(|d| d.insert_temp(cache_key, handle.clone()));
-                Some(handle)
-            });
-        if let Some(tex) = tex {
-            let resp = ui.add(egui::Image::new(&tex)
-                .fit_to_exact_size(egui::vec2(chip_h, chip_h))
-                .tint(Color32::WHITE));
-            if let Some(label) = remapper_icons::extra_button_label(pin_id) {
-                paint_icon_label(ui, resp.rect, label);
-            }
-            return;
-        }
-    }
-    ui.label(egui::RichText::new(remapper_pin_display(pin_id)).size(chip_h * 0.5).strong());
-}
-
-/// Like `remapper_render_chord` but uses an explicit chip size for all chips.
-fn remapper_render_chord_scaled(
-    ui: &mut egui::Ui, pins: &[String], skin: super::remapper_icons::Skin, chip_h: f32,
-) {
-    use super::remapper_icons::Skin;
-    let click_zone = |p: &str| matches!(p,
-        "touchpad_left" | "touchpad_center" | "touchpad_right" | "touchpad_any");
-    let has_click = pins.iter().any(|p| click_zone(p));
-    let mut first = true;
-    let sep_size = (chip_h * 0.55).max(10.0);
-    let mut emit_sep = |ui: &mut egui::Ui, first: &mut bool| {
-        if !*first {
-            ui.label(egui::RichText::new("+").size(sep_size).strong().color(Color32::WHITE));
-        }
-        *first = false;
-    };
-    if has_click && skin == Skin::Playstation {
-        emit_sep(ui, &mut first);
-        remapper_render_chip_scaled(ui, "touchpad_any", skin, chip_h);
-    }
-    for p in pins {
-        let render_id: &str = match p.as_str() {
-            "touchpad_left"   => "touch_left",
-            "touchpad_center" => "touch_center",
-            "touchpad_right"  => "touch_right",
-            "touchpad_any"    => continue,
-            other => other,
-        };
-        emit_sep(ui, &mut first);
-        remapper_render_chip_scaled(ui, render_id, skin, chip_h);
-    }
 }
 
 /// Render the long-arrow SVG glyph between a mapping's input chips and its
@@ -17923,7 +17765,7 @@ fn show_remapper_body(
     let nav_capture_armed = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_nav_capture_armed"))
         .and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut nav_arm_idle = snarl.get_node(node_id)
+    let nav_arm_idle = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_nav_arm_idle"))
         .and_then(|v| v.as_bool()).unwrap_or(false);
     let capture_ok = !nav_active_for_device || (nav_capture_armed && nav_arm_idle);
@@ -18005,19 +17847,6 @@ fn show_remapper_body(
     let mut new_draft_input = draft_input.clone();
     let mut new_draft_output = draft_output.clone();
 
-    // On the touchpad-click rising edge, evict every touch-only zone pin
-    // (touch_left/center/right) from the draft. Rationale: clicking
-    // promotes the touchpad interaction from "touch" to "click"; the
-    // touch-only captures that landed before the click should be replaced
-    // by click-variant captures. Anything else in the draft (gamepad
-    // buttons, modifiers, etc.) is preserved so chords with click+zone
-    // can still include them.
-    let click_prev = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("_tp_click_prev"))
-        .and_then(|v| v.as_bool()).unwrap_or(false);
-    let touch_click_now = upstream_dev_id.as_deref()
-        .and_then(|dev| live_signals.get(&(dev.to_string(), "btn_touchpad".to_string())))
-        .map(|s| s.as_bool()).unwrap_or(false);
     // Click latches the capture into "click mode" for the rest of the session.
     //
     // Rule: once btn_touchpad has been pressed during this capture, the
@@ -18079,7 +17908,6 @@ fn show_remapper_body(
     // empty (so the Learn press has been released). `capture_ok` next frame then
     // permits a capture. While armed-but-not-idle, no capture starts.
     if nav_capture_armed && !nav_arm_idle && now_empty {
-        nav_arm_idle = true;
         set_arm_idle = Some(true);
     }
 
@@ -18588,7 +18416,7 @@ fn show_map_action_body(
         .and_then(|v| v.as_bool()).unwrap_or(false);
     // Arm-idle handshake (see remapper body): capture only opens after the Learn
     // press has released and the device went idle once post-arm.
-    let mut nav_arm_idle = snarl.get_node(node_id)
+    let nav_arm_idle = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_nav_arm_idle"))
         .and_then(|v| v.as_bool()).unwrap_or(false);
     // Capture is allowed when nav isn't active, OR when armed AND idle-seen.
@@ -18683,7 +18511,6 @@ fn show_map_action_body(
     // Arm-idle: mark idle the first frame the device is empty after arming, so
     // the Learn press has released before capture opens.
     if nav_capture_armed && !nav_arm_idle && now_empty {
-        nav_arm_idle = true;
         set_arm_idle = Some(true);
     }
 
@@ -19006,7 +18833,6 @@ fn show_map_action_body(
 
 const DECO_DEFAULT_FILL:    [u8; 4] = [200, 200, 200, 220];
 const DECO_DEFAULT_STROKE:  [u8; 4] = [255, 255, 255, 220];
-const DECO_DEFAULT_OUTLINE: [u8; 4] = [0,   0,   0,   200];
 
 fn make_default_decoration(kind: &str) -> LayoutDecoration {
     match kind {

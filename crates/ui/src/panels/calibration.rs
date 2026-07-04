@@ -351,7 +351,7 @@ pub fn show_windows(
         let title = format!("{} Calibration", display_name);
         // Default size capped to ~85% of the host window so the cal window
         // always fits inside the main app frame even on smaller monitors.
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         // Default to a compact size matching the min, so the window opens
         // as small as it can go and the user can grow it if needed.
         let min_w = (screen.width()  * 0.40).clamp(480.0, 700.0);
@@ -1674,11 +1674,11 @@ fn solve_orient_matrix(
                 for v in s { m[0] += v[0]; m[1] += v[1]; m[2] += v[2]; }
                 [m[0]/n, m[1]/n, m[2]/n]
             };
+            // Only Roll needs sign-aligning: Pitch is rebuilt below as
+            // Yaw × Roll, so its sign is fully determined by the other two.
             let m_roll  = mean_of(&samples[0]);
-            let m_pitch = mean_of(&samples[1]);
             let dot3 = |a: [f32;3], b: [f32;3]| a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
             if dot3(a_roll,  m_roll)  < 0.0 { a_roll  = [-a_roll[0],  -a_roll[1],  -a_roll[2]];  }
-            if dot3(a_pitch, m_pitch) < 0.0 { a_pitch = [-a_pitch[0], -a_pitch[1], -a_pitch[2]]; }
 
             // Gram-Schmidt: make Roll perpendicular to Yaw.
             let d = dot3(a_roll, a_yaw);

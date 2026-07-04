@@ -1622,19 +1622,15 @@ const AM_RATE_MAX_HZ: f32 = 150.0;
 /// felt LF carrier: the LF rumble's amplitude pulses at a rate set by the HF
 /// content, which the body perceives as roughness/sizzle.
 ///   * `lf_amp` / `lf_freq` — the base carrier (its frequency is what's felt).
-///   * `hf_amp`  — AM modulation DEPTH (0 = steady rumble, 1 = full pulse to ~0).
-///   * `hf_freq` — AM modulation RATE, mapped onto [AM_RATE_MIN_HZ, AM_RATE_MAX_HZ].
+///   * `mod_depth` — AM modulation DEPTH (0 = steady rumble, 1 = full pulse to ~0).
+///   * `mod_rate` — AM modulation RATE, mapped onto [AM_RATE_MIN_HZ, AM_RATE_MAX_HZ].
 ///   * `mod_phase` — current modulator phase in RADIANS (advanced by the caller
 ///     from a monotonic clock so the flutter is smooth regardless of packet timing).
 ///
 /// The emitted packet is a SINGLE carrier (LF) whose amplitude = lf_amp * AM
 /// envelope. Bytes 0/1 hold the LF freq high/low + amp high; bytes 2/3 the LF
 /// freq low field + amp low — exactly the proven [`switch_carrier_fields`] layout
-/// (the encoding that's actually felt). `_` params kept for signature stability.
-fn switch_rumble_encode_dual(lf_amp: f32, lf_freq: f32, hf_amp: f32, hf_freq: f32) -> [u8; 4] {
-    switch_rumble_encode_am(lf_amp, lf_freq, hf_amp, hf_freq, 0.0)
-}
-
+/// (the encoding that's actually felt).
 fn switch_rumble_encode_am(
     lf_amp: f32, lf_freq: f32, mod_depth: f32, mod_rate: f32, mod_phase: f32,
 ) -> [u8; 4] {

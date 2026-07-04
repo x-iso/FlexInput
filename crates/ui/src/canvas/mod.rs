@@ -4,7 +4,6 @@ pub mod node;
 pub mod remapper_icons;
 pub mod viewer;
 
-pub use curve::sample_curve;
 pub use node::NodeData;
 pub use viewer::FlexViewer;
 
@@ -604,6 +603,10 @@ impl Canvas {
     /// near `base_pos`. Non-AutoMap boundary wires should be dropped by the caller.
     ///
     /// Returns the NodeIds of inserted bridge nodes so the caller can connect them.
+    ///
+    /// RESERVED: built for the cross-boundary paste flow (D-04 item 3) which
+    /// was never wired up — paste currently drops boundary wires instead.
+    #[allow(dead_code)]
     pub(crate) fn insert_automap_bridge(
         &mut self,
         boundary_pins: &[String],
@@ -2124,6 +2127,8 @@ fn resolve_pin(old_id: &str, candidates: &[&str]) -> Option<usize> {
 pub enum GroupResult {
     /// Grouping succeeded; the new subpatch `NodeId` is returned.
     /// Non-AutoMap boundary wires were dropped; AutoMap boundary wires got inlet/outlet ports.
+    /// (The payload is only read by unit tests; production callers use `matches!`.)
+    #[allow(dead_code)]
     Ok(NodeId),
     /// Nothing to group — the selection was empty.
     EmptySelection,
