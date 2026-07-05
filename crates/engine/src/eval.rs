@@ -1476,13 +1476,14 @@ fn net_send_publish(
 }
 
 /// Network Receive: publish a peer's AutoMap bus (received over the network)
-/// into collector:{uid} for downstream sinks, and gather the feedback those
-/// sinks request to ship back to the peer. output[0] = AutoMap pass-through,
-/// output[1] = Bool "Connected".
+/// into collector:{uid} for downstream sinks. output[0] = AutoMap pass-through,
+/// output[1] = Bool "Connected". The outgoing feedback frame is assembled later
+/// by [`publish_recv_feedback_frames`] (a post-pass), not here — see the note
+/// at the end of this function.
 fn net_recv_publish(
     snap: &NodeSnap,
     uid: usize,
-    dev_sigs: &HashMap<(String, String), Signal>,
+    _dev_sigs: &HashMap<(String, String), Signal>,
     collector_sigs: &mut HashMap<(String, String), Signal>,
 ) -> Vec<Option<Signal>> {
     let uid_key = format!("collector:{}", uid);
@@ -1509,34 +1510,94 @@ fn net_recv_publish(
         }
     };
 
-    // ── 2. Gather feedback the downstream virtual sinks are requesting and ship
-    //    it back to the peer. `_net_fb_devs` (stamped by the UI) lists the
-    //    virtual device ids that AutoMap from this recv node; their game-driven
-    //    outputs land in dev_sigs keyed (virtual_dev, pin). ───────────────────
-    let fb_devs: Vec<String> = snap.params.get("_net_fb_devs")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    if !fb_devs.is_empty() {
-        let mut fb = flexinput_net::FeedbackFrame::empty();
-        for pin in flexinput_core::automap::FEEDBACK_INLET_PINS {
-            let mut best: Option<f32> = None;
-            for dev in &fb_devs {
-                if let Some(&sig) = dev_sigs.get(&(dev.clone(), pin.id.to_string())) {
-                    let v = sig.as_float();
-                    best = Some(best.map_or(v, |b| b.max(v)));
-                }
-            }
-            if let Some(v) = best {
-                fb.set(pin.id, v);
-            }
-        }
-        flexinput_net::publish_feedback_frame(uid, fb);
-    }
+    // NOTE: the outgoing feedback frame is NOT built here. It's assembled by
+    // `publish_recv_feedback_frames` in a post-pass, AFTER the whole graph has
+    // run — otherwise this node (an AutoMap *source*, so it evaluates upstream of
+    // the virtual sinks and any ASTH / Feedback Control node that targets it)
+    // would only ever see last-tick's feedback.
 
     let mut out = vec![None; snap.n_outputs.max(2)];
     out[1] = Some(Signal::Bool(connected));
     out
+}
+
+/// Scan every sink in the graph (all sub-patch levels) and index the virtual
+/// sink device ids by the AutoMap SOURCE they map from. Because `automap_source`
+/// is resolved at build time by `find_automap_device_rec` — which traces across
+/// sub-patch inlet/outlet boundaries and yields a network recv node's effective
+/// `collector:{uid}` id — this correctly links a recv node to its downstream
+/// virtual sinks regardless of which level either one lives on. That's the piece
+/// the build-time `_net_fb_devs` stamp couldn't do (it only saw its own level).
+fn collect_sink_sources(nodes: &[NodeSnap], out: &mut HashMap<String, Vec<String>>) {
+    for node in nodes {
+        if let Some(ref st) = node.sink_target {
+            if st.device_id.starts_with("virtual.") {
+                if let Some((src_id, _)) = &st.automap_source {
+                    out.entry(src_id.clone()).or_default().push(st.device_id.clone());
+                }
+            }
+        }
+        if let Some(ref sg) = node.inline_subgraph {
+            collect_sink_sources(&sg.graph.nodes, out);
+        }
+    }
+}
+
+/// Build and publish the outgoing feedback frame for every network_recv node,
+/// descending into inline sub-patches. Keyed by EFFECTIVE uid (raw at top level,
+/// namespaced inside a sub-patch) so it matches the socket worker, the recv
+/// node's forward publish, and any `feedback_inject:collector:{uid}` an ASTH /
+/// Feedback Control node on the receiver wrote while targeting this node.
+///
+/// Two feedback sources are max-combined per haptic pin:
+///   (a) game-driven output the downstream virtual sinks report (classic rumble,
+///       lightbar) — from `dev_sigs`, via `sink_sources` (the global source→sinks
+///       index, so cross-level wiring is covered).
+///   (b) HD/LED/trigger effects injected on the receiver — from `collector_sigs`
+///       under `feedback_inject:collector:{uid}`.
+///
+/// Runs after the feedback_inject post-pass, so (b) is fully populated.
+fn publish_recv_feedback_frames(
+    nodes: &[NodeSnap],
+    outer_uid: usize,
+    nested: bool,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &HashMap<(String, String), Signal>,
+    sink_sources: &HashMap<String, Vec<String>>,
+) {
+    for node in nodes {
+        let uid = if nested { namespaced_uid(outer_uid, node.node_uid) } else { node.node_uid };
+        if node.module_id == NET_RECV_ID {
+            let empty = Vec::new();
+            let fb_devs = sink_sources.get(&format!("collector:{}", uid)).unwrap_or(&empty);
+            let inject_key = format!("feedback_inject:collector:{}", uid);
+            let mut fb = flexinput_net::FeedbackFrame::empty();
+            let mut any = false;
+            for pin in flexinput_core::automap::FEEDBACK_INLET_PINS {
+                let mut best: Option<f32> = None;
+                for dev in fb_devs {
+                    if let Some(&sig) = dev_sigs.get(&(dev.clone(), pin.id.to_string())) {
+                        let v = sig.as_float();
+                        best = Some(best.map_or(v, |b| b.max(v)));
+                    }
+                }
+                if let Some(&sig) = collector_sigs.get(&(inject_key.clone(), pin.id.to_string())) {
+                    let v = sig.as_float();
+                    best = Some(best.map_or(v, |b| b.max(v)));
+                }
+                if let Some(v) = best {
+                    fb.set(pin.id, v);
+                    any = true;
+                }
+            }
+            if any {
+                flexinput_net::publish_feedback_frame(uid, fb);
+            }
+        }
+        if let Some(ref sg) = node.inline_subgraph {
+            publish_recv_feedback_frames(&sg.graph.nodes, uid, true, dev_sigs, collector_sigs, sink_sources);
+        }
+    }
 }
 
 /// Inverse of [`crossover_hz_to_pos`]: map a 0..1 spectral band position back to Hz
@@ -2895,6 +2956,21 @@ pub fn eval_graph_tick(
                 };
                 let Some(dst_pin) = dst_pin else { continue; };
                 if directly_wired.contains(dst_pin) { continue; }
+                // Perceptual HD shaping for a CLASSIC rumble that remapped onto an
+                // HD voice-coil amp pin (e.g. a networked Switch Pro: rumble_strong
+                // → hd_l_amp, since the pad exposes no rumble_strong inlet). Mirror
+                // the main-loop auto-feedback pass (`shape_hd_feedback`) so a weak
+                // game rumble (0.1–0.3) run through the encoder's power-law curve is
+                // still perceptible. Only when the pin actually REMAPPED (pin.id !=
+                // dst_pin): a direct hd_l_amp injection (ASTH / Feedback Control)
+                // already carries an intended amplitude and must NOT be reshaped.
+                // Uses the standard default floor/max/exp — the networked source's
+                // per-device shaping isn't available on this end.
+                let sig = if pin.id != dst_pin && matches!(dst_pin, "hd_l_amp" | "hd_r_amp") {
+                    shape_hd_feedback(sig, 0.35, 1.0, 0.6)
+                } else {
+                    sig
+                };
                 // Precedence: direct wire > injection > auto-feedback. The
                 // main-loop auto-feedback pass may have already `or_insert`-ed a
                 // value for this pin — typically `0.0` (the virtual sink's idle
@@ -2914,6 +2990,30 @@ pub fn eval_graph_tick(
             }
         }
     }
+
+    // Post-pass: network Receive feedback aggregation. Runs AFTER the
+    // feedback_inject post-pass so ASTH / Feedback Control nodes on the RECEIVER
+    // (which target a recv node's synthetic `collector:{uid}` id) have already
+    // written `feedback_inject:collector:{uid}`. Recurses into sub-patches, and
+    // uses a whole-graph source→sinks index so a recv node reaches its downstream
+    // virtual sinks even when they sit on a different sub-patch level.
+    //
+    // Cheap early-out: only build the index + walk if a network_recv node exists.
+    if graph_has_net_recv(&graph.nodes) {
+        let mut sink_sources: HashMap<String, Vec<String>> = HashMap::new();
+        collect_sink_sources(&graph.nodes, &mut sink_sources);
+        publish_recv_feedback_frames(&graph.nodes, 0, false, dev_sigs, &collector_sigs, &sink_sources);
+    }
+}
+
+/// True if any network_recv node exists anywhere in the graph (recurses into
+/// sub-patches). Gates the recv feedback post-pass so patches without networking
+/// pay nothing.
+fn graph_has_net_recv(nodes: &[NodeSnap]) -> bool {
+    nodes.iter().any(|n| {
+        n.module_id == NET_RECV_ID
+            || n.inline_subgraph.as_ref().is_some_and(|sg| graph_has_net_recv(&sg.graph.nodes))
+    })
 }
 
 /// Clamp a combined feedback value to the valid range for its haptic pin so

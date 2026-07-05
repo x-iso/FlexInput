@@ -175,12 +175,21 @@ pub fn retain_all(live: &HashSet<usize>) {
     }
 }
 
+/// Serializes tests that touch the process-global slots. In production there is
+/// exactly ONE `NetManager`, so `retain_all` (which drops every uid not in the
+/// reconciling manager's live set) is correct; but two concurrent test managers
+/// — or the retain-all check below — would clobber each other's slots. Every
+/// test that publishes/reads a slot or reconciles a manager must hold this.
+#[cfg(test)]
+pub(crate) static SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn slots_roundtrip_and_retain() {
+        let _guard = SLOT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Uids far outside any realistic node range to avoid collisions with
         // other tests sharing the process-global slots.
         let uid = 0xFFFF_0001;

@@ -10535,7 +10535,12 @@ fn build_processing_graph_rec(
                     .map(|(dev_id, _, fallback)| {
                         if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
                     })
-                    .filter(|d| is_real_device_id(d))
+                    // Keep real devices AND a network-receive node's synthetic
+                    // `collector:` id, so Feedback Control on the RECEIVER can
+                    // inject into the network back-channel (drained by the recv
+                    // feedback post-pass). A non-network collector id is harmless —
+                    // nothing drains it.
+                    .filter(|d| is_real_device_id(d) || d.starts_with("collector:"))
             };
             if let Some(d) = src_dev {
                 params.insert("_fb_source_dev".to_string(), serde_json::Value::String(d));
@@ -10572,33 +10577,22 @@ fn build_processing_graph_rec(
                     .map(|(dev_id, _, fallback)| {
                         if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
                     })
-                    .filter(|d| is_real_device_id(d))
+                    // Keep real devices AND a network-receive node's synthetic
+                    // `collector:` id, so Audio Stream Haptics on the RECEIVER can
+                    // drive the network back-channel (drained by the recv feedback
+                    // post-pass). See the matching Feedback Control note above.
+                    .filter(|d| is_real_device_id(d) || d.starts_with("collector:"))
             };
             if let Some(d) = dest_dev {
                 params.insert("_asth_dest_dev".to_string(), serde_json::Value::String(d));
             }
         }
 
-        // Network Receive: stamp the list of downstream virtual sink device ids
-        // whose game-driven feedback should be gathered and shipped back to the
-        // peer. The recv node is an AutoMap source resolving to `collector:{uid}`
-        // (no physical fallback), so the feedback_map pre-pass — keyed by that
-        // synthetic id via its `fallback.unwrap_or(d)` path — already lists the
-        // sinks that map from this node. The eval block reads `_net_fb_devs` and
-        // pulls each device's feedback outputs from dev_sigs.
-        if node.module_id == "module.network_recv" {
-            let collector_uid = match parents {
-                None => node_id.0,
-                Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), node_id.0),
-            };
-            let key = format!("collector:{}", collector_uid);
-            if let Some(sources) = feedback_map.get(&key) {
-                let devs: Vec<serde_json::Value> = sources.iter()
-                    .map(|s| serde_json::Value::String(s.device_id.clone()))
-                    .collect();
-                params.insert("_net_fb_devs".to_string(), serde_json::Value::Array(devs));
-            }
-        }
+        // Network Receive feedback: the downstream virtual sinks whose game rumble
+        // ships back to the peer are discovered at EVAL time (from resolved
+        // `sink_target.automap_source` ids), not stamped here — that traces across
+        // sub-patch boundaries, which a per-level stamp can't. See
+        // `collect_sink_sources` / `publish_recv_feedback_frames` in engine eval.
 
         // For subpatch nodes: recursively build the inner graph and locate outlet nodes.
         // The inner build receives a parent frame so any AutoMap traces from inner

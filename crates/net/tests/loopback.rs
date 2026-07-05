@@ -5,10 +5,16 @@
 //!
 //! Uses high, distinct uids per test so the process-global slots don't collide.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use flexinput_core::signal::Signal;
 use flexinput_net::{BusFrame, FeedbackFrame, NetManager, NetNodeConfig, Transport};
+
+/// Each test spins up a NetManager whose `reconcile` calls `retain_all`, which
+/// drops every process-global slot uid not in that manager's live set — so two
+/// tests running concurrently would wipe each other's frames. Serialize them.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Poll a closure until it returns Some or the deadline passes.
 fn wait_for<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
@@ -23,6 +29,7 @@ fn wait_for<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T>
 }
 
 fn run_link(transport: Transport, psk: &str, send_uid: usize, recv_uid: usize, port: u16) {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut mgr = NetManager::new();
     mgr.reconcile(&[
         (
@@ -98,6 +105,7 @@ fn psk_encrypted_loopback_bidirectional() {
 /// because every packet fails authentication.
 #[test]
 fn psk_mismatch_publishes_nothing() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (send_uid, recv_uid, port) = (0xE2E_00021, 0xE2E_00022, 47813);
     let mut mgr = NetManager::new();
     mgr.reconcile(&[

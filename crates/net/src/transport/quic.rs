@@ -413,6 +413,7 @@ mod tests {
     // return leg — all over a real quinn endpoint pair on 127.0.0.1.
     #[test]
     fn quic_loopback_bidirectional() {
+        let _guard = crate::SLOT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (send_uid, recv_uid, port) = (0xE2E_00101, 0xE2E_00102, 47821u16);
         let mut mgr = NetManager::new();
         mgr.reconcile(&[

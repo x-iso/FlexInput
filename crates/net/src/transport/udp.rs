@@ -13,12 +13,6 @@ use crate::protocol::{self, decode, DecodeError, Packet, SeqTracker};
 use crate::transport::should_stop;
 use crate::{LinkState, NetStatus};
 
-/// How long an inbound frame stays "fresh" for the SEND side's connected
-/// indicator + feedback forwarding. The recv side uses the node's own
-/// `stale_ms`; the send side has no such param, so a fixed 1 s window is used
-/// purely for status display.
-const SEND_FB_FRESH: Duration = Duration::from_secs(1);
-
 /// Retry cadence for bind/resolve failures.
 const RETRY: Duration = Duration::from_secs(2);
 
@@ -54,6 +48,7 @@ struct LinkStats {
     drops: u64,
     layout_warn: bool,
     last_valid_rx: Option<Instant>,
+    last_tx: Option<Instant>,
     remote: Option<SocketAddr>,
     last_status: Instant,
 }
@@ -65,25 +60,27 @@ impl LinkStats {
             drops: 0,
             layout_warn: false,
             last_valid_rx: None,
+            last_tx: None,
             remote: None,
             last_status: Instant::now() - STATUS_EVERY,
         }
     }
 
-    fn publish(&mut self, uid: usize, connected_window: Duration, force: bool) {
+    /// Publish status. `connected` is computed by the caller per role: the SEND
+    /// worker is connected whenever it is actively transmitting to its peer
+    /// (UDP is fire-and-forget, so a returning feedback stream isn't required to
+    /// call the forward link healthy); the RECV worker is connected while it has
+    /// fresh inbound input.
+    fn publish(&mut self, uid: usize, connected: bool, force: bool) {
         if !force && self.last_status.elapsed() < STATUS_EVERY {
             return;
         }
         self.last_status = Instant::now();
         self.pps.tick();
-        let fresh = self
-            .last_valid_rx
-            .map(|t| t.elapsed() < connected_window)
-            .unwrap_or(false);
         crate::set_status(
             uid,
             NetStatus {
-                state: if fresh { LinkState::Connected } else { LinkState::Listening },
+                state: if connected { LinkState::Connected } else { LinkState::Listening },
                 last_rx_ms: self.last_valid_rx.map(|t| t.elapsed().as_millis() as u64),
                 tx_pps: self.pps.tx_out,
                 rx_pps: self.pps.rx_out,
@@ -203,9 +200,13 @@ pub fn run_send(
                     }
                     if socket.send(&pkt).is_ok() {
                         stats.pps.tx += 1;
+                        stats.last_tx = Some(Instant::now());
                     }
                 }
-                stats.publish(uid, SEND_FB_FRESH, false);
+                // The forward link is healthy whenever we're actively sending —
+                // the returning feedback stream (rx_pps) is shown separately.
+                let connected = stats.last_tx.map(|t| t.elapsed() < Duration::from_secs(1)).unwrap_or(false);
+                stats.publish(uid, connected, false);
             }
         }
 
@@ -299,7 +300,8 @@ pub fn run_recv(
                 }
             }
 
-            stats.publish(uid, stale, false);
+            let connected = stats.last_valid_rx.map(|t| t.elapsed() < stale).unwrap_or(false);
+            stats.publish(uid, connected, false);
         }
         return;
     }
