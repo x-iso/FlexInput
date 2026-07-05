@@ -4,6 +4,7 @@ pub mod display;
 pub mod generator;
 pub mod logic;
 pub mod math;
+pub mod network;
 pub mod processing;
 pub mod subpatch;
 
@@ -18,6 +19,7 @@ pub fn all_modules() -> Vec<ModuleRegistration> {
     modules.extend(display::registrations());
     modules.extend(processing::registrations());
     modules.extend(generator::registrations());
+    modules.extend(network::registrations());
     modules.extend(subpatch::registrations());
     modules
 }

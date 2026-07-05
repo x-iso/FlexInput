@@ -11,6 +11,7 @@ flexinput-devices = { workspace = true }
 glam              = { workspace = true }
 flexinput-virtual = { workspace = true }
 flexinput-modules = { workspace = true }
+flexinput-net     = { workspace = true }
 egui              = { workspace = true }
 egui_extras       = { workspace = true }
 eframe            = { workspace = true }

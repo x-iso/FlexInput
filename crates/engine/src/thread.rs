@@ -52,6 +52,33 @@ fn collect_loopback_reqs(
     }
 }
 
+/// Recursively collect network-node configs across the whole graph, descending
+/// into inline sub-patches. Each config is keyed by the node's EFFECTIVE uid
+/// (raw at top level, namespaced inside a sub-patch), matching what the eval
+/// arms use to publish/read frames — so a network node nested in a sub-patch
+/// still binds its socket. Unlike loopback, this is NOT windows-gated:
+/// networking works on every platform.
+fn collect_net_reqs(
+    nodes: &[crate::graph::NodeSnap],
+    outer_uid: usize,
+    nested: bool,
+    out: &mut Vec<(usize, flexinput_net::NetNodeConfig)>,
+) {
+    for node in nodes {
+        let uid = if nested {
+            crate::eval::namespaced_uid(outer_uid, node.node_uid)
+        } else {
+            node.node_uid
+        };
+        if let Some(cfg) = crate::eval::net_config_from_params(&node.module_id, &node.params) {
+            out.push((uid, cfg));
+        }
+        if let Some(ref sg) = node.inline_subgraph {
+            collect_net_reqs(&sg.graph.nodes, uid, true, out);
+        }
+    }
+}
+
 /// Type alias for the atomically-swappable device-signal map. Same
 /// pattern as `ArcGraph` — the I/O thread publishes a fresh map per poll
 /// cycle; consumers (proc thread, UI) read by refcount bump.
@@ -206,6 +233,11 @@ pub fn spawn_processing_thread(
         let mut loopback_mgr = flexinput_devices::loopback_manager::LoopbackManager::new();
         #[cfg(windows)]
         let mut loopback_reqs: Vec<(usize, flexinput_devices::loopback_manager::CaptureRequest, f32, f32, f32)> = Vec::new();
+        // Owns the per-node network sockets for Network Send/Receive nodes.
+        // Reconciled once per wakeup against the live graph; eval moves frames
+        // through flexinput_net's global slots. All platforms.
+        let mut net_mgr = flexinput_net::NetManager::new();
+        let mut net_reqs: Vec<(usize, flexinput_net::NetNodeConfig)> = Vec::new();
         // Persistent scratch reused across ticks (cleared in-place at the
         // top of every `eval_graph_tick` call). Avoids 5 HashMap reallocs
         // per tick — significant at 2 kHz+ tick rates with an empty graph.
@@ -264,6 +296,16 @@ pub fn spawn_processing_thread(
                     // sub-patch never got a capture → it was silent there.
                     collect_loopback_reqs(&graph_snap.nodes, 0, false, &mut loopback_reqs);
                     loopback_mgr.reconcile(&loopback_reqs);
+                }
+
+                // Reconcile network sockets for Network Send/Receive nodes once
+                // per wakeup (before eval reads/writes their frames). Config-diff
+                // driven, so the UI's every-frame republish never flaps sockets.
+                {
+                    puffin::profile_scope!("net_reconcile");
+                    net_reqs.clear();
+                    collect_net_reqs(&graph_snap.nodes, 0, false, &mut net_reqs);
+                    net_mgr.reconcile(&net_reqs);
                 }
 
                 scope_acc.clear();

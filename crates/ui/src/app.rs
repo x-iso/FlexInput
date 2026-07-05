@@ -9923,6 +9923,8 @@ pub fn find_automap_device_id_for_viewer(
         // that collector key — not recurse past it like feedback_control does.
         if node.module_id == "module.automap_collect"
             || node.module_id == "module.audio_stream_haptics"
+            || node.module_id == "module.network_send"
+            || node.module_id == "module.network_recv"
         {
             let upstream_dev_id = node.inputs.iter()
                 .position(|p| p.signal_type == SignalType::AutoMap)
@@ -10067,6 +10069,8 @@ fn find_automap_device_rec(
     // → the port produced no signal.
     if node.module_id == "module.automap_collect"
         || node.module_id == "module.audio_stream_haptics"
+        || node.module_id == "module.network_send"
+        || node.module_id == "module.network_recv"
     {
         let upstream_dev_id = node.inputs.iter()
             .position(|p| p.signal_type == SignalType::AutoMap)
@@ -10420,7 +10424,8 @@ fn build_processing_graph_rec(
             "processing.gyro_3dof" | "module.automap_split"
             | "module.automap_fork" | "module.automap_selector"
             | "module.remapper" | "module.map_action"
-            | "module.automap_collect" | "module.audio_stream_haptics")
+            | "module.automap_collect" | "module.audio_stream_haptics"
+            | "module.network_send")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
             if let Some(idx) = automap_idx {
@@ -10571,6 +10576,27 @@ fn build_processing_graph_rec(
             };
             if let Some(d) = dest_dev {
                 params.insert("_asth_dest_dev".to_string(), serde_json::Value::String(d));
+            }
+        }
+
+        // Network Receive: stamp the list of downstream virtual sink device ids
+        // whose game-driven feedback should be gathered and shipped back to the
+        // peer. The recv node is an AutoMap source resolving to `collector:{uid}`
+        // (no physical fallback), so the feedback_map pre-pass — keyed by that
+        // synthetic id via its `fallback.unwrap_or(d)` path — already lists the
+        // sinks that map from this node. The eval block reads `_net_fb_devs` and
+        // pulls each device's feedback outputs from dev_sigs.
+        if node.module_id == "module.network_recv" {
+            let collector_uid = match parents {
+                None => node_id.0,
+                Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), node_id.0),
+            };
+            let key = format!("collector:{}", collector_uid);
+            if let Some(sources) = feedback_map.get(&key) {
+                let devs: Vec<serde_json::Value> = sources.iter()
+                    .map(|s| serde_json::Value::String(s.device_id.clone()))
+                    .collect();
+                params.insert("_net_fb_devs".to_string(), serde_json::Value::Array(devs));
             }
         }
 

@@ -5,6 +5,24 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Network Send / Network Receive modules** (Network category). Carry the
+  AutoMap gamepad bus between two FlexInput instances over the network: wire a
+  physical pad into **Network Send** on one PC and a **Network Receive** into a
+  virtual pad on another. Three transport tiers, chosen per node:
+  - **LAN (UDP)** — plaintext, IP + port only (also works over WAN with a static
+    IP or port forward).
+  - **Secure (PSK)** — the same UDP path with ChaCha20-Poly1305 authenticated
+    encryption keyed by a shared passphrase (HKDF-SHA256), replay-protected.
+  - **Secure (QUIC)** — QUIC unreliable datagrams (quinn), PSK-authenticated.
+- **Bidirectional haptics**: rumble, light bar, and adaptive-trigger feedback the
+  game requests on the receiving PC's virtual pad travels back over the same link
+  to the physical pad, riding the existing AutoMap feedback path.
+- **Fail-safe**: if no valid packet arrives within a configurable staleness
+  window (default 200 ms), the receive node publishes a neutral frame (sticks
+  centered, buttons released) so a dropped link can never leave inputs stuck.
+
 ## [0.10.7] - 2026-07-03
 
 A new Vec Reshaper module for fighting analog-stick "diagonal stickiness" —

@@ -10,6 +10,11 @@ flexinput-core = { workspace = true }
 # manager API takes primitives (node uid + LoopbackTarget), so devices stays a
 # leaf — no cycle. devices is a sibling leaf crate (core/glam/hid/wasapi only).
 flexinput-devices = { workspace = true }
+# Network Send/Receive: the proc thread reconciles per-node sockets (a leaf
+# crate that only knows core + primitives, same shape as loopback_manager).
+# `quic` pulls quinn/rustls/tokio so the shipped app offers all three transport
+# tiers (LAN UDP / PSK UDP / QUIC) out of the box.
+flexinput-net  = { workspace = true, features = ["quic"] }
 uuid           = { workspace = true }
 serde_json     = { workspace = true }
 glam           = { workspace = true }

@@ -887,6 +887,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "module.automap_split" | "module.automap_collect"
                 | "module.automap_fork" | "module.automap_selector"
                 | "module.automap_combiner" | "module.audio_stream_haptics"
+                | "module.network_send" | "module.network_recv"
                 | "module.remapper" | "module.map_action"
                 | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
         )
@@ -974,6 +975,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
             "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals),
             "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, self.automap_parent.as_ref()),
+            "module.network_send" => show_net_send_body(node_id, ui, snarl, self.automap_parent.as_ref()),
+            "module.network_recv" => show_net_recv_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
             "module.map_action" => show_map_action_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
             "subpatch" => {
@@ -3098,7 +3101,7 @@ fn render_asth_pinned_scope(
     container: egui::Vec2,
     bridged_parent: Option<&AutomapGlowParent<'_>>,
 ) {
-    let uid = asth_effective_uid(inner_id, bridged_parent);
+    let uid = effective_publish_uid(inner_id, bridged_parent);
     let a = asth_params_from_node(snarl, inner_id);
     let mut eq = snarl.get_node(inner_id)
         .and_then(|n| n.params.get("asth_eq_points").and_then(|v| v.as_array()).map(|arr| {
@@ -3142,7 +3145,7 @@ fn show_audio_stream_haptics_body(
 ) {
     // Effective uid for live capture data (raw at top level, namespaced in a
     // sub-patch) — must match what the capture manager + engine use.
-    let uid = asth_effective_uid(node_id, automap_parent);
+    let uid = effective_publish_uid(node_id, automap_parent);
     // Snapshot params.
     let mut a = asth_params_from_node(snarl, node_id);
 
@@ -3267,15 +3270,218 @@ fn write_widget_size(snarl: &mut Snarl<NodeData>, node_id: NodeId, key: &str, si
 /// the same Volume → Curve → amp-range shaping the engine does, so dragging those
 /// sliders visibly reshapes it in real time (live preview). Fills the resizable
 /// rect it's given.
-/// Effective uid for an ASTH node's live capture data: raw node id at the top
-/// level, or the namespaced uid folded through the sub-patch parent chain — must
-/// match the uid the capture manager registers + the engine reads, otherwise the
-/// scopes find no data (the "no signal" the pinned/nested widget showed).
-fn asth_effective_uid(node_id: NodeId, parent: Option<&AutomapGlowParent<'_>>) -> usize {
+/// Effective uid for a node's live engine-side data (ASTH captures, network
+/// link status): raw node id at the top level, or the namespaced uid folded
+/// through the sub-patch parent chain — must match the uid the manager
+/// registers + the engine reads, otherwise the body finds no data (the "no
+/// signal" the pinned/nested widget showed).
+fn effective_publish_uid(node_id: NodeId, parent: Option<&AutomapGlowParent<'_>>) -> usize {
     match parent {
         None => node_id.0,
         Some(p) => flexinput_engine::namespaced_uid(crate::app::fold_outer_uid_app(p), node_id.0),
     }
+}
+
+// ── Network Send / Receive ────────────────────────────────────────────────────
+//
+// Persisted params (defaults applied at read time, see flexinput-net docs):
+//   shared: net_transport ("udp" | "psk" | "quic"), net_psk (String)
+//   send:   net_host (String), net_port (u16), net_rate_hz (u32)
+//   recv:   net_bind_port (u16), net_stale_ms (u32), net_fb_rate_hz (u32)
+//
+// The bodies only edit params + display link status; sockets live in
+// flexinput-net's manager (reconciled by the proc thread from the snapshot).
+
+fn net_transport_label(t: &str) -> &'static str {
+    match t {
+        "psk" => "Secure (PSK)",
+        "quic" => "Secure (QUIC)",
+        _ => "LAN (UDP)",
+    }
+}
+
+/// Transport selector + PSK field (shared by both bodies). Returns nothing;
+/// writes params in place.
+fn net_transport_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let transport = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("net_transport").and_then(|v| v.as_str()))
+        .unwrap_or("udp")
+        .to_string();
+
+    ui.horizontal(|ui| {
+        ui.label("Mode:");
+        egui::ComboBox::from_id_salt(("net_transport", node_id))
+            .selected_text(net_transport_label(&transport))
+            .show_ui(ui, |ui| {
+                for t in ["udp", "psk", "quic"] {
+                    if ui
+                        .selectable_label(transport == t, net_transport_label(t))
+                        .clicked()
+                    {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            node.params
+                                .insert("net_transport".to_string(), Value::String(t.to_string()));
+                        }
+                    }
+                }
+            });
+    });
+
+    if transport != "udp" {
+        let mut psk = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("net_psk").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        ui.horizontal(|ui| {
+            ui.label("Passphrase:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut psk)
+                    .password(true)
+                    .desired_width(110.0),
+            );
+            if resp.changed() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("net_psk".to_string(), Value::String(psk.clone()));
+                }
+            }
+        });
+        if psk.is_empty() {
+            ui.label(
+                egui::RichText::new("Both ends need the same passphrase.")
+                    .small()
+                    .weak(),
+            );
+        } else {
+            // Stored verbatim in the patch file — make that visible, not buried.
+            ui.label(
+                egui::RichText::new("Saved as plain text in the patch file.")
+                    .small()
+                    .weak(),
+            );
+        }
+    }
+}
+
+/// Numeric param row with label. Writes the param on change.
+fn net_num_param(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    label: &str,
+    key: &str,
+    default: f64,
+    range: std::ops::RangeInclusive<f64>,
+    suffix: &str,
+) {
+    let val = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get(key).and_then(|v| v.as_f64()))
+        .unwrap_or(default);
+    let mut v = val;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let resp = ui.add(
+            egui::DragValue::new(&mut v)
+                .range(range)
+                .max_decimals(0)
+                .suffix(suffix),
+        );
+        if resp.changed() {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                if let Some(n) = Number::from_f64(v.round()) {
+                    node.params.insert(key.to_string(), Value::Number(n));
+                }
+            }
+        }
+    });
+}
+
+/// Live link-status row: colored dot + short state text + traffic counters.
+fn net_status_row(uid: usize, ui: &mut egui::Ui) {
+    let st = flexinput_net::status(uid);
+    let (color, text) = match &st.state {
+        flexinput_net::LinkState::Idle => (Color32::GRAY, "idle".to_string()),
+        flexinput_net::LinkState::Listening => (Color32::YELLOW, "waiting for peer".to_string()),
+        flexinput_net::LinkState::Connected => {
+            let peer = st.remote.as_deref().unwrap_or("peer");
+            (Color32::from_rgb(80, 220, 100), format!("connected · {peer}"))
+        }
+        flexinput_net::LinkState::Error(e) => (Color32::from_rgb(240, 80, 80), e.clone()),
+    };
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+        ui.label(egui::RichText::new(text).small());
+    });
+    if st.state == flexinput_net::LinkState::Connected || st.rx_pps > 0 || st.tx_pps > 0 {
+        ui.label(
+            egui::RichText::new(format!("tx {}/s · rx {}/s", st.tx_pps, st.rx_pps))
+                .small()
+                .weak(),
+        );
+    }
+    if st.layout_warn {
+        ui.label(
+            egui::RichText::new("⚠ peer runs a different FlexInput version")
+                .small()
+                .color(Color32::YELLOW),
+        );
+    }
+    // Live traffic counters only repaint if something requests frames.
+    request_repaint_throttled(ui.ctx());
+}
+
+fn show_net_send_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) {
+    let uid = effective_publish_uid(node_id, automap_parent);
+    ui.vertical(|ui| {
+        ui.set_min_width(170.0);
+        net_transport_controls(node_id, ui, snarl);
+
+        let mut host = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("net_host").and_then(|v| v.as_str()))
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        ui.horizontal(|ui| {
+            ui.label("Host:");
+            let resp = ui.add(egui::TextEdit::singleline(&mut host).desired_width(110.0));
+            if resp.changed() {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params
+                        .insert("net_host".to_string(), Value::String(host.trim().to_string()));
+                }
+            }
+        });
+        net_num_param(node_id, ui, snarl, "Port:", "net_port", 46700.0, 1.0..=65535.0, "");
+        net_num_param(node_id, ui, snarl, "Rate:", "net_rate_hz", 500.0, 30.0..=2000.0, " Hz");
+        ui.separator();
+        net_status_row(uid, ui);
+    });
+}
+
+fn show_net_recv_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+) {
+    let uid = effective_publish_uid(node_id, automap_parent);
+    ui.vertical(|ui| {
+        ui.set_min_width(170.0);
+        net_transport_controls(node_id, ui, snarl);
+        net_num_param(node_id, ui, snarl, "Listen port:", "net_bind_port", 46700.0, 1.0..=65535.0, "");
+        net_num_param(node_id, ui, snarl, "Fail-safe after:", "net_stale_ms", 200.0, 50.0..=5000.0, " ms");
+        net_num_param(node_id, ui, snarl, "Feedback rate:", "net_fb_rate_hz", 200.0, 30.0..=1000.0, " Hz");
+        ui.separator();
+        net_status_row(uid, ui);
+    });
 }
 
 fn draw_asth_ef_scope(uid: usize, ui: &mut egui::Ui, params: &AsthParams) {

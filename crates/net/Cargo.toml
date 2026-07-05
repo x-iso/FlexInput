@@ -1,0 +1,27 @@
+[package]
+name    = "flexinput-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flexinput-core = { workspace = true }
+glam           = { workspace = true }
+rand             = "0.9"
+chacha20poly1305 = "0.10"
+hkdf             = "0.12"
+sha2             = "0.10"
+
+# QUIC tier (feature-gated). quinn drives the endpoints; rustls provides the
+# TLS layer (deliberately unauthenticated — see transport/quic.rs); rcgen makes
+# the throwaway self-signed cert; tokio is quinn's async runtime.
+quinn   = { version = "0.11", optional = true }
+rustls  = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rcgen   = { version = "0.13", optional = true }
+tokio   = { version = "1", features = ["rt", "net", "time", "sync"], optional = true }
+bytes   = { version = "1", optional = true }
+
+[features]
+# QUIC tier pulls quinn/rustls/tokio (~60 transitive crates); off by default
+# so the LAN + PSK tiers stay dependency-light.
+default = []
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio", "dep:bytes"]

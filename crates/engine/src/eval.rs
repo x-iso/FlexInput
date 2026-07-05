@@ -11,6 +11,47 @@ use crate::state::NodeState;
 /// Stable module id for the Audio Stream Haptics node (audio-loopback → rumble).
 pub const AUDIO_STREAM_HAPTICS_ID: &str = "module.audio_stream_haptics";
 
+/// Stable module ids for the network transport nodes.
+pub const NET_SEND_ID: &str = "module.network_send";
+pub const NET_RECV_ID: &str = "module.network_recv";
+
+/// Build a [`NetNodeConfig`](flexinput_net::NetNodeConfig) from a network node's
+/// params, or `None` if the module id isn't a network node. Shared param keys:
+/// `net_transport` ("udp"|"psk"|"quic"), `net_psk`. Send adds `net_host`,
+/// `net_port`, `net_rate_hz`; recv adds `net_bind_port`, `net_stale_ms`,
+/// `net_fb_rate_hz`. See the node body UI in `crates/ui` for defaults.
+pub fn net_config_from_params(
+    module_id: &str,
+    params: &HashMap<String, Value>,
+) -> Option<flexinput_net::NetNodeConfig> {
+    use flexinput_net::{NetNodeConfig, Transport};
+    let transport = Transport::from_str(
+        params.get("net_transport").and_then(|v| v.as_str()).unwrap_or("udp"),
+    );
+    let psk = params.get("net_psk").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let u16p = |k: &str, d: u16| {
+        params.get(k).and_then(|v| v.as_u64()).unwrap_or(d as u64).clamp(1, 65535) as u16
+    };
+    let u32p = |k: &str, d: u32| params.get(k).and_then(|v| v.as_u64()).unwrap_or(d as u64) as u32;
+    match module_id {
+        NET_SEND_ID => Some(NetNodeConfig::Send {
+            transport,
+            host: params.get("net_host").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string(),
+            port: u16p("net_port", 46700),
+            rate_hz: u32p("net_rate_hz", 500),
+            psk,
+        }),
+        NET_RECV_ID => Some(NetNodeConfig::Recv {
+            transport,
+            bind_port: u16p("net_bind_port", 46700),
+            stale_ms: u32p("net_stale_ms", 200),
+            fb_rate_hz: u32p("net_fb_rate_hz", 200),
+            psk,
+        }),
+        _ => None,
+    }
+}
+
 /// Build a loopback [`CaptureRequest`](flexinput_devices::loopback_manager::CaptureRequest)
 /// from an Audio Stream Haptics node's params. Schema:
 ///   `asth_mode`         = "process" | "focused" | "system" (default "system")
@@ -1097,17 +1138,19 @@ fn feedback_control_publish(
 ///   0.5  → lighter audio, BOOSTED by standard-rumble events:
 ///          out = audio_amp * (base + (1-base) * std_rumble).
 /// Linearly interpolated between those anchors.
-fn audio_stream_haptics_publish(
+/// Mirror the upstream AutoMap bus into this node's own `collector:{uid}` key,
+/// so a downstream sink (which resolves the node as a `collector:` source) sees
+/// the forward signals passing through. Reads the node's stamped upstream
+/// references: `_automap_collector_id` (an upstream collector-style producer)
+/// takes priority, with `_automap_device_id` (a raw physical device) filling
+/// any pins the collector didn't carry. Shared by Audio Stream Haptics and
+/// Network Send — both are pass-through AutoMap nodes.
+fn republish_bus_as_collector(
     snap: &NodeSnap,
     uid: usize,
     dev_sigs: &HashMap<(String, String), Signal>,
     collector_sigs: &mut HashMap<(String, String), Signal>,
-) -> Vec<Option<Signal>> {
-    // `uid` is this node's effective publishing id: `snap.node_uid` at the top level,
-    // the namespaced uid inside a sub-patch. It keys the collector pass-through AND
-    // the loopback capture lookup (both must match what the capture manager + the
-    // downstream sink resolver use), so ASTH works identically nested or not.
-    // ── 1. AutoMap pass-through (mirror the Collector's phase-1 copy). ─────────
+) {
     let uid_key = format!("collector:{}", uid);
     let upstream_dev = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let upstream_collector = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1135,6 +1178,21 @@ fn audio_stream_haptics_publish(
             }
         }
     }
+}
+
+fn audio_stream_haptics_publish(
+    snap: &NodeSnap,
+    uid: usize,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) -> Vec<Option<Signal>> {
+    // `uid` is this node's effective publishing id: `snap.node_uid` at the top level,
+    // the namespaced uid inside a sub-patch. It keys the collector pass-through AND
+    // the loopback capture lookup (both must match what the capture manager + the
+    // downstream sink resolver use), so ASTH works identically nested or not.
+    // ── 1. AutoMap pass-through (mirror the Collector's phase-1 copy). ─────────
+    let uid_key = format!("collector:{}", uid);
+    republish_bus_as_collector(snap, uid, dev_sigs, collector_sigs);
 
     // ── 2. Latest audio-derived haptics for this node. ────────────────────────
     // (l_amp, l_freq, r_amp, r_freq) — zeros on non-Windows (no WASAPI loopback).
@@ -1363,6 +1421,121 @@ fn audio_stream_haptics_publish(
     if l_hf_amp > 0.0 { put("hd2_l_freq", l_mod_freq, false); }
     if r_hf_amp > 0.0 { put("hd2_r_freq", r_mod_freq, false); }
 
+    out
+}
+
+/// Network Send: transmit the upstream AutoMap bus to a peer and inject any
+/// feedback received from that peer back into the upstream physical pad.
+///
+/// `uid` is the node's effective publishing id (raw at top level, namespaced in
+/// a sub-patch) — it keys BOTH the collector pass-through AND the network
+/// worker's frame slots, so it must match what the UI's collector resolver and
+/// the NetManager use. output[0] is the AutoMap pass-through (no scalar).
+fn net_send_publish(
+    snap: &NodeSnap,
+    uid: usize,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) -> Vec<Option<Signal>> {
+    // ── 1. Forward pass-through: mirror the upstream bus into collector:{uid}
+    //    so a locally-wired sink downstream still receives the pad's signals. ──
+    let uid_key = format!("collector:{}", uid);
+    republish_bus_as_collector(snap, uid, dev_sigs, collector_sigs);
+
+    // ── 2. Pack the mirrored bus into a frame and hand it to the send worker. ──
+    let mut frame = flexinput_net::BusFrame::empty();
+    let prefix = format!("collector:{}", uid);
+    for ((dev, pin), sig) in collector_sigs.iter() {
+        if dev == &prefix {
+            frame.set(pin, *sig);
+        }
+    }
+    let _ = &uid_key; // (kept for symmetry with ASTH; prefix is the same string)
+    flexinput_net::publish_send_frame(uid, frame);
+
+    // ── 3. Feedback intake: values the peer's game requested, injected into the
+    //    upstream physical pad's feedback channel (drained by the post-pass). ──
+    let physical_dev = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+    if !physical_dev.is_empty() {
+        if let Some((fb, age)) = flexinput_net::latest_feedback(uid) {
+            // Match the send worker's status window: ignore feedback older than
+            // ~1 s so a dead peer can't leave the pad buzzing forever.
+            if age.as_millis() < 1000 {
+                let key = format!("feedback_inject:{physical_dev}");
+                for (pin, v) in fb.iter_present() {
+                    collector_sigs
+                        .entry((key.clone(), pin.to_string()))
+                        .and_modify(|e| *e = combine_signals(*e, Signal::Float(v)))
+                        .or_insert(Signal::Float(v));
+                }
+            }
+        }
+    }
+
+    vec![None; snap.n_outputs.max(1)]
+}
+
+/// Network Receive: publish a peer's AutoMap bus (received over the network)
+/// into collector:{uid} for downstream sinks, and gather the feedback those
+/// sinks request to ship back to the peer. output[0] = AutoMap pass-through,
+/// output[1] = Bool "Connected".
+fn net_recv_publish(
+    snap: &NodeSnap,
+    uid: usize,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+) -> Vec<Option<Signal>> {
+    let uid_key = format!("collector:{}", uid);
+    let stale_ms = snap.params.get("net_stale_ms").and_then(|v| v.as_u64()).unwrap_or(200) as u128;
+
+    // ── 1. Publish the received bus, or a neutral fail-safe frame. ────────────
+    let connected = match flexinput_net::latest_input(uid) {
+        Some((frame, age)) if age.as_millis() < stale_ms => {
+            for (pin, sig) in frame.iter_present() {
+                collector_sigs.insert((uid_key.clone(), pin.to_string()), sig);
+            }
+            for extra in &frame.extras {
+                collector_sigs.insert((uid_key.clone(), extra.name.clone()), extra.value);
+            }
+            true
+        }
+        // Stale or never received: actively center everything. Downstream holds
+        // last value, so we MUST write neutral, not just stop publishing.
+        _ => {
+            for (pin, sig) in flexinput_net::BusFrame::neutral().iter_present() {
+                collector_sigs.insert((uid_key.clone(), pin.to_string()), sig);
+            }
+            false
+        }
+    };
+
+    // ── 2. Gather feedback the downstream virtual sinks are requesting and ship
+    //    it back to the peer. `_net_fb_devs` (stamped by the UI) lists the
+    //    virtual device ids that AutoMap from this recv node; their game-driven
+    //    outputs land in dev_sigs keyed (virtual_dev, pin). ───────────────────
+    let fb_devs: Vec<String> = snap.params.get("_net_fb_devs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if !fb_devs.is_empty() {
+        let mut fb = flexinput_net::FeedbackFrame::empty();
+        for pin in flexinput_core::automap::FEEDBACK_INLET_PINS {
+            let mut best: Option<f32> = None;
+            for dev in &fb_devs {
+                if let Some(&sig) = dev_sigs.get(&(dev.clone(), pin.id.to_string())) {
+                    let v = sig.as_float();
+                    best = Some(best.map_or(v, |b| b.max(v)));
+                }
+            }
+            if let Some(v) = best {
+                fb.set(pin.id, v);
+            }
+        }
+        flexinput_net::publish_feedback_frame(uid, fb);
+    }
+
+    let mut out = vec![None; snap.n_outputs.max(2)];
+    out[1] = Some(Signal::Bool(connected));
     out
 }
 
@@ -2015,6 +2188,21 @@ fn eval_subgraph(
             last_outputs.insert(ns_uid, out);
             continue;
         }
+        // Network Send / Receive nested in a sub-patch. Publish under the
+        // NAMESPACED uid so the socket, collector pass-through, and downstream
+        // sink lookup all agree (mirrors ASTH's nested arm above).
+        if snap.module_id == NET_SEND_ID {
+            let out = net_send_publish(snap, ns_uid, dev_sigs, collector_sigs);
+            computed[idx] = out.clone();
+            last_outputs.insert(ns_uid, out);
+            continue;
+        }
+        if snap.module_id == NET_RECV_ID {
+            let out = net_recv_publish(snap, ns_uid, dev_sigs, collector_sigs);
+            computed[idx] = out.clone();
+            last_outputs.insert(ns_uid, out);
+            continue;
+        }
 
         let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
             .map(|src| src.and_then(|(si, op)| {
@@ -2272,6 +2460,22 @@ pub fn eval_graph_tick(
             // output[0] = AutoMap passthrough (no scalar); output[1..] = raw band
             // EFs + band carrier freqs (Hz), see audio_stream_haptics_publish.
             let out = audio_stream_haptics_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
+            last_outputs.insert(snap.node_uid, out.clone());
+            computed[idx] = out;
+            continue;
+        }
+        // ── module.network_send: pass the bus through locally + transmit it;
+        //    inject peer feedback into the upstream pad. ────────────────────────
+        if snap.module_id == NET_SEND_ID {
+            let out = net_send_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
+            last_outputs.insert(snap.node_uid, out.clone());
+            computed[idx] = out;
+            continue;
+        }
+        // ── module.network_recv: publish the peer's bus into collector:{uid};
+        //    gather downstream feedback to ship back. ──────────────────────────
+        if snap.module_id == NET_RECV_ID {
+            let out = net_recv_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
             last_outputs.insert(snap.node_uid, out.clone());
             computed[idx] = out;
             continue;
