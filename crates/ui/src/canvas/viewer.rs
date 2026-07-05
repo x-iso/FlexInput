@@ -3458,7 +3458,7 @@ fn show_net_send_body(
     automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
     let uid = effective_publish_uid(node_id, automap_parent);
-    ui.vertical(|ui| {
+    let body = ui.vertical(|ui| {
         ui.set_min_width(170.0);
         net_transport_controls(node_id, ui, snarl);
 
@@ -3503,6 +3503,8 @@ fn show_net_send_body(
         ui.separator();
         net_status_row(uid, ui);
     });
+    // Whole node is pinnable to a sub-patch's Easy-mode layout.
+    register_exposable_element(ui, node_id, "whole_module", body.response.rect);
 }
 
 fn show_net_recv_body(
@@ -3512,7 +3514,7 @@ fn show_net_recv_body(
     automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
     let uid = effective_publish_uid(node_id, automap_parent);
-    ui.vertical(|ui| {
+    let body = ui.vertical(|ui| {
         ui.set_min_width(170.0);
         net_transport_controls(node_id, ui, snarl);
 
@@ -3556,6 +3558,8 @@ fn show_net_recv_body(
         ui.separator();
         net_status_row(uid, ui);
     });
+    // Whole node is pinnable to a sub-patch's Easy-mode layout.
+    register_exposable_element(ui, node_id, "whole_module", body.response.rect);
 }
 
 fn draw_asth_ef_scope(uid: usize, ui: &mut egui::Ui, params: &AsthParams) {
@@ -8390,6 +8394,20 @@ fn render_pinned_element_impl(
             );
             return;
         }
+        ("module.network_send", "whole_module") => {
+            render_net_whole_module(
+                true, inner_id, ui, inner_snarl, container_size,
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
+            return;
+        }
+        ("module.network_recv", "whole_module") => {
+            render_net_whole_module(
+                false, inner_id, ui, inner_snarl, container_size,
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
+            return;
+        }
         // Knob slider: scaled-up slider taking the full container width.
         ("module.knob", "value") => {
             render_knob_value(inner_id, ui, inner_snarl, container_size);
@@ -8791,7 +8809,7 @@ fn render_remapper_whole_module(
     is_layout_mode: bool,
 ) {
     render_remap_whole_module_impl(
-        "remapper", inner_id, ui, inner_snarl, container_size,
+        "remapper", REMAP_DESIGN_W, inner_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, automap_parent, is_layout_mode,
         "Remapper",
         |id, ins, ui, sn, sigs, panic, am| {
@@ -8813,7 +8831,7 @@ fn render_map_action_whole_module(
     is_layout_mode: bool,
 ) {
     render_remap_whole_module_impl(
-        "map_action", inner_id, ui, inner_snarl, container_size,
+        "map_action", REMAP_DESIGN_W, inner_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, automap_parent, is_layout_mode,
         "Map Action",
         |id, ins, ui, sn, sigs, panic, am| {
@@ -8851,7 +8869,7 @@ fn render_combiner_whole_module(
     is_layout_mode: bool,
 ) {
     render_remap_whole_module_impl(
-        "combiner", inner_id, ui, inner_snarl, container_size,
+        "combiner", REMAP_DESIGN_W, inner_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, automap_parent, is_layout_mode,
         "Combiner",
         |id, ins, ui, sn, sigs, _panic, _am| {
@@ -8862,9 +8880,55 @@ fn render_combiner_whole_module(
     );
 }
 
+/// Design width for the Network Send/Receive whole-module pin — matches the
+/// node body's `set_min_width(170)` with a little breathing room.
+const NET_DESIGN_W: f32 = 184.0;
+
+/// Hash of a Network node's config so the whole-module pin re-bases its scroll
+/// when the transport / mode changes (mirrors the Combiner's config hash).
+fn net_hash_config(n: &NodeData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for key in ["net_transport", "net_host", "net_port", "net_peer", "net_keep"] {
+        if let Some(v) = n.params.get(key) {
+            v.to_string().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+fn render_net_whole_module(
+    is_send: bool,
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    is_layout_mode: bool,
+) {
+    let tag = if is_send { "net_send" } else { "net_recv" };
+    render_remap_whole_module_impl(
+        tag, NET_DESIGN_W, inner_id, ui, inner_snarl, container_size,
+        live_signals, panic_shortcut, automap_parent, is_layout_mode,
+        if is_send { "Network Send" } else { "Network Receive" },
+        move |id, _ins, ui, sn, _sigs, _panic, am| {
+            if is_send {
+                show_net_send_body(id, ui, sn, am);
+            } else {
+                show_net_recv_body(id, ui, sn, am);
+            }
+        },
+        net_hash_config,
+        net_hash_config,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_remap_whole_module_impl<BodyFn, MapLenFn, DraftLenFn>(
     tag: &'static str,
+    design_w: f32,
     inner_id: NodeId,
     ui: &mut egui::Ui,
     inner_snarl: &mut Snarl<NodeData>,
@@ -8904,7 +8968,7 @@ where
     // Cap min sizes so the scale math stays sane.
     let container_w = container_size.x.max(40.0);
     let container_h = container_size.y.max(20.0);
-    let scale = (container_w / REMAP_DESIGN_W).clamp(0.25, 4.0);
+    let scale = (container_w / design_w).clamp(0.25, 4.0);
 
     // ── 2. Detect "new capture" — compare current state vs last frame ───────
     // (Skip update in layout mode so the user's chosen scroll position is
@@ -9036,7 +9100,7 @@ where
         let inner = ui.with_visual_transform(xform, |ui| {
             let body_max_rect = egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(REMAP_DESIGN_W, 100_000.0),
+                egui::vec2(design_w, 100_000.0),
             );
             let mut body_ui = ui.new_child(
                 egui::UiBuilder::new().max_rect(body_max_rect),
@@ -9045,7 +9109,7 @@ where
             // will re-base these shapes into the container_rect on paint.
             let visible_band = egui::Rect::from_min_size(
                 egui::pos2(0.0, scroll_offset_body),
-                egui::vec2(REMAP_DESIGN_W, container_h / scale),
+                egui::vec2(design_w, container_h / scale),
             );
             body_ui.set_clip_rect(visible_band);
             body_ui.add_enabled_ui(false, |body_ui| {
@@ -9129,7 +9193,7 @@ where
             // constant regardless of the user's zoom on the widget.
             let sb_w_body = 6.0 / scale;
             let sb_inset_body = 1.0 / scale;
-            let track_x_min = REMAP_DESIGN_W - sb_w_body - sb_inset_body;
+            let track_x_min = design_w - sb_w_body - sb_inset_body;
             let track_y_min = band_top + sb_inset_body;
             let track_y_max = band_top + band_h_body - sb_inset_body;
             let track_h = (track_y_max - track_y_min).max(1.0);
@@ -9713,7 +9777,7 @@ fn render_gyro_lean_section_pin(
     };
 
     render_remap_whole_module_impl(
-        tag, inner_id, ui, inner_snarl, container_size,
+        tag, REMAP_DESIGN_W, inner_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, bridged_parent, is_layout_mode,
         "Lean section",
         move |id, ins, ui, sn, sigs, panic, am| {
