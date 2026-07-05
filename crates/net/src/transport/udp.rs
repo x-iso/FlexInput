@@ -87,6 +87,7 @@ impl LinkStats {
                 drops: self.drops,
                 layout_warn: self.layout_warn,
                 remote: self.remote.map(|a| a.to_string()),
+                code: None, // UDP/PSK tiers have no pairing code
             },
         );
     }

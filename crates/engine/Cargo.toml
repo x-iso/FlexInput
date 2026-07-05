@@ -12,9 +12,9 @@ flexinput-core = { workspace = true }
 flexinput-devices = { workspace = true }
 # Network Send/Receive: the proc thread reconciles per-node sockets (a leaf
 # crate that only knows core + primitives, same shape as loopback_manager).
-# `quic` pulls quinn/rustls/tokio so the shipped app offers all three transport
-# tiers (LAN UDP / PSK UDP / QUIC) out of the box.
-flexinput-net  = { workspace = true, features = ["quic"] }
+# `p2p` pulls iroh/quinn/tokio so the shipped app offers all transport tiers
+# (LAN UDP / PSK UDP / P2P dial-by-code) out of the box.
+flexinput-net  = { workspace = true, features = ["p2p"] }
 uuid           = { workspace = true }
 serde_json     = { workspace = true }
 glam           = { workspace = true }

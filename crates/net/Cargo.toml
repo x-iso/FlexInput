@@ -11,17 +11,17 @@ chacha20poly1305 = "0.10"
 hkdf             = "0.12"
 sha2             = "0.10"
 
-# QUIC tier (feature-gated). quinn drives the endpoints; rustls provides the
-# TLS layer (deliberately unauthenticated — see transport/quic.rs); rcgen makes
-# the throwaway self-signed cert; tokio is quinn's async runtime.
-quinn   = { version = "0.11", optional = true }
-rustls  = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-rcgen   = { version = "0.13", optional = true }
-tokio   = { version = "1", features = ["rt", "net", "time", "sync"], optional = true }
+# P2P tier (feature-gated). iroh gives dial-by-EndpointId QUIC with NAT traversal
+# (hole-punch) + relay fallback + DNS discovery, all over its own encrypted TLS
+# (authenticated by the peer's public key). We carry the SAME protocol packets in
+# its unreliable datagrams. tokio drives the async endpoints; bytes for datagram
+# buffers. Pulls a large tree (~iroh + quinn + tokio), so it's opt-in.
+iroh    = { version = "1", optional = true }
+tokio   = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync"], optional = true }
 bytes   = { version = "1", optional = true }
 
 [features]
-# QUIC tier pulls quinn/rustls/tokio (~60 transitive crates); off by default
-# so the LAN + PSK tiers stay dependency-light.
+# P2P tier pulls iroh/quinn/tokio (a large transitive tree); off by default so
+# the LAN + PSK tiers stay dependency-light. The app enables it via the engine.
 default = []
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio", "dep:bytes"]
+p2p = ["dep:iroh", "dep:tokio", "dep:bytes"]

@@ -1575,6 +1575,37 @@ impl Canvas {
     }
 }
 
+/// Produce a persistence-safe clone of a snarl for saving to disk. For Network
+/// Send/Receive nodes whose `net_keep` flag is not set, strip the identity
+/// params — the Send node's pasted peer code (`net_peer`) and the Receive node's
+/// secret key (`net_secret`) — so a shared patch or a workspace/recovery backup
+/// never leaks a pairing code or node key. With `net_keep` ticked the user has
+/// opted in and they're preserved (stable code across restarts, travels with the
+/// patch). Recurses into sub-patch inner snarls so nested network nodes are
+/// covered too.
+pub fn sanitize_snarl_for_save(snarl: &Snarl<NodeData>) -> Snarl<NodeData> {
+    let mut out = snarl.clone();
+    for node in out.nodes_mut() {
+        sanitize_node_for_save(node);
+    }
+    out
+}
+
+fn sanitize_node_for_save(node: &mut NodeData) {
+    if matches!(node.module_id.as_str(), "module.network_send" | "module.network_recv") {
+        let keep = node.params.get("net_keep").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !keep {
+            node.params.remove("net_peer");
+            node.params.remove("net_secret");
+        }
+    }
+    if let Some(sp) = node.subpatch.as_mut() {
+        for inner in sp.snarl.nodes_mut() {
+            sanitize_node_for_save(inner);
+        }
+    }
+}
+
 impl Canvas {
     /// Serialize the canvas + virtual device list to a `.fxp` file chosen by the user.
     /// Returns the chosen path on success so the caller can update the tab title.
@@ -1592,7 +1623,7 @@ impl Canvas {
 
         let patch = UiPatch {
             version: 1,
-            snarl: self.snarl.clone(),
+            snarl: sanitize_snarl_for_save(&self.snarl),
             virtual_device_ids,
             bound_exes,
             auto_bypass,

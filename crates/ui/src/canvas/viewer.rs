@@ -3295,26 +3295,31 @@ fn effective_publish_uid(node_id: NodeId, parent: Option<&AutomapGlowParent<'_>>
 fn net_transport_label(t: &str) -> &'static str {
     match t {
         "psk" => "Secure (PSK)",
-        "quic" => "Secure (QUIC)",
+        // "quic" is a legacy alias kept so old patches still display sensibly.
+        "p2p" | "quic" => "P2P (code)",
         _ => "LAN (UDP)",
     }
 }
 
-/// Transport selector + PSK field (shared by both bodies). Returns nothing;
-/// writes params in place.
-fn net_transport_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let transport = snarl
+/// Read a node's transport param, normalizing the legacy "quic" alias to "p2p".
+fn net_transport_of(node_id: NodeId, snarl: &Snarl<NodeData>) -> String {
+    let t = snarl
         .get_node(node_id)
         .and_then(|n| n.params.get("net_transport").and_then(|v| v.as_str()))
-        .unwrap_or("udp")
-        .to_string();
+        .unwrap_or("udp");
+    if t == "quic" { "p2p".to_string() } else { t.to_string() }
+}
+
+/// Transport selector + (PSK tier only) passphrase field. Writes params in place.
+fn net_transport_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let transport = net_transport_of(node_id, snarl);
 
     ui.horizontal(|ui| {
         ui.label("Mode:");
         egui::ComboBox::from_id_salt(("net_transport", node_id))
             .selected_text(net_transport_label(&transport))
             .show_ui(ui, |ui| {
-                for t in ["udp", "psk", "quic"] {
+                for t in ["udp", "psk", "p2p"] {
                     if ui
                         .selectable_label(transport == t, net_transport_label(t))
                         .clicked()
@@ -3328,7 +3333,10 @@ fn net_transport_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
             });
     });
 
-    if transport != "udp" {
+    // Passphrase applies only to the PSK-over-UDP tier. P2P authenticates by the
+    // pairing code itself (iroh's TLS keyed by the endpoint keypair), so it needs
+    // no passphrase.
+    if transport == "psk" {
         let mut psk = snarl
             .get_node(node_id)
             .and_then(|n| n.params.get("net_psk").and_then(|v| v.as_str()))
@@ -3347,20 +3355,12 @@ fn net_transport_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
                 }
             }
         });
-        if psk.is_empty() {
-            ui.label(
-                egui::RichText::new("Both ends need the same passphrase.")
-                    .small()
-                    .weak(),
-            );
+        let hint = if psk.is_empty() {
+            "Both ends need the same passphrase."
         } else {
-            // Stored verbatim in the patch file — make that visible, not buried.
-            ui.label(
-                egui::RichText::new("Saved as plain text in the patch file.")
-                    .small()
-                    .weak(),
-            );
-        }
+            "Saved as plain text in the patch file."
+        };
+        ui.label(egui::RichText::new(hint).small().weak());
     }
 }
 
@@ -3433,6 +3433,24 @@ fn net_status_row(uid: usize, ui: &mut egui::Ui) {
     request_repaint_throttled(ui.ctx());
 }
 
+/// "Keep saved" checkbox: gates whether the identity params (peer code / secret)
+/// are written to the patch + workspace/recovery backups. Off by default so a
+/// shared patch never leaks them; the strip happens in `sanitize_snarl_for_save`.
+fn net_keep_checkbox(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let mut keep = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("net_keep").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    if ui.checkbox(&mut keep, "Keep saved").changed() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("net_keep".to_string(), Value::Bool(keep));
+        }
+    }
+    if !keep {
+        ui.label(egui::RichText::new("Not saved — cleared on restart, kept out of shared patches.").small().weak());
+    }
+}
+
 fn show_net_send_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -3444,22 +3462,43 @@ fn show_net_send_body(
         ui.set_min_width(170.0);
         net_transport_controls(node_id, ui, snarl);
 
-        let mut host = snarl
-            .get_node(node_id)
-            .and_then(|n| n.params.get("net_host").and_then(|v| v.as_str()))
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        ui.horizontal(|ui| {
-            ui.label("Host:");
-            let resp = ui.add(egui::TextEdit::singleline(&mut host).desired_width(110.0));
+        if net_transport_of(node_id, snarl) == "p2p" {
+            // Dial-by-code: paste the peer Receive node's pairing code.
+            let mut peer = snarl
+                .get_node(node_id)
+                .and_then(|n| n.params.get("net_peer").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            ui.label("Peer code:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut peer)
+                    .hint_text("paste code")
+                    .desired_width(150.0),
+            );
             if resp.changed() {
                 if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params
-                        .insert("net_host".to_string(), Value::String(host.trim().to_string()));
+                    node.params.insert("net_peer".to_string(), Value::String(peer.trim().to_string()));
                 }
             }
-        });
-        net_num_param(node_id, ui, snarl, "Port:", "net_port", 46700.0, 1.0..=65535.0, "");
+            net_keep_checkbox(node_id, ui, snarl);
+        } else {
+            let mut host = snarl
+                .get_node(node_id)
+                .and_then(|n| n.params.get("net_host").and_then(|v| v.as_str()))
+                .unwrap_or("127.0.0.1")
+                .to_string();
+            ui.horizontal(|ui| {
+                ui.label("Host:");
+                let resp = ui.add(egui::TextEdit::singleline(&mut host).desired_width(110.0));
+                if resp.changed() {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params
+                            .insert("net_host".to_string(), Value::String(host.trim().to_string()));
+                    }
+                }
+            });
+            net_num_param(node_id, ui, snarl, "Port:", "net_port", 46700.0, 1.0..=65535.0, "");
+        }
         net_num_param(node_id, ui, snarl, "Rate:", "net_rate_hz", 500.0, 30.0..=2000.0, " Hz");
         ui.separator();
         net_status_row(uid, ui);
@@ -3476,7 +3515,42 @@ fn show_net_recv_body(
     ui.vertical(|ui| {
         ui.set_min_width(170.0);
         net_transport_controls(node_id, ui, snarl);
-        net_num_param(node_id, ui, snarl, "Listen port:", "net_bind_port", 46700.0, 1.0..=65535.0, "");
+
+        if net_transport_of(node_id, snarl) == "p2p" {
+            // Ensure a stable node secret exists (its public key is our code).
+            let mut secret = snarl
+                .get_node(node_id)
+                .and_then(|n| n.params.get("net_secret").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            if secret.is_empty() {
+                secret = flexinput_net::generate_secret_key();
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("net_secret".to_string(), Value::String(secret.clone()));
+                }
+            }
+            // Prefer the code derived directly from the secret (instant); fall
+            // back to whatever the worker published once bound.
+            let code = flexinput_net::endpoint_id_for_secret(&secret)
+                .or_else(|| flexinput_net::status(uid).code);
+            ui.label("Your code (share with sender):");
+            if let Some(code) = code {
+                ui.horizontal(|ui| {
+                    if ui.button("📋 Copy").clicked() {
+                        ui.ctx().copy_text(code.clone());
+                    }
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&code).monospace().small())
+                            .truncate(),
+                    );
+                });
+            } else {
+                ui.label(egui::RichText::new("(starting…)").small().weak());
+            }
+            net_keep_checkbox(node_id, ui, snarl);
+        } else {
+            net_num_param(node_id, ui, snarl, "Listen port:", "net_bind_port", 46700.0, 1.0..=65535.0, "");
+        }
         net_num_param(node_id, ui, snarl, "Fail-safe after:", "net_stale_ms", 200.0, 50.0..=5000.0, " ms");
         net_num_param(node_id, ui, snarl, "Feedback rate:", "net_fb_rate_hz", 200.0, 30.0..=1000.0, " Hz");
         ui.separator();

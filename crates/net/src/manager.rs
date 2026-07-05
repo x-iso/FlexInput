@@ -22,21 +22,26 @@ pub enum Transport {
     Udp,
     /// ChaCha20-Poly1305 over UDP, keyed by a shared passphrase.
     Psk,
-    /// QUIC unreliable datagrams, PSK-authenticated payloads.
-    Quic,
+    /// iroh: dial-by-EndpointId QUIC with NAT traversal + relay fallback. No IP
+    /// needed; the peer's public key is the address and the auth.
+    P2p,
 }
 
 impl Transport {
     pub fn from_str(s: &str) -> Self {
         match s {
             "psk" => Transport::Psk,
-            "quic" => Transport::Quic,
+            // "quic" kept as a back-compat alias for patches saved before the
+            // raw-QUIC tier was replaced by the iroh P2P tier.
+            "p2p" | "quic" => Transport::P2p,
             _ => Transport::Udp,
         }
     }
 
     fn encrypted(self) -> bool {
-        matches!(self, Transport::Psk | Transport::Quic)
+        // P2p rides iroh's own TLS encryption, so the inner protocol packets are
+        // plaintext (cipher = None); only the PSK-UDP tier seals per-packet.
+        matches!(self, Transport::Psk)
     }
 }
 
@@ -51,6 +56,8 @@ pub enum NetNodeConfig {
         port: u16,
         rate_hz: u32,
         psk: String,
+        /// P2p only: the peer Receive node's pairing code (EndpointId).
+        peer_code: String,
     },
     Recv {
         transport: Transport,
@@ -58,6 +65,8 @@ pub enum NetNodeConfig {
         stale_ms: u32,
         fb_rate_hz: u32,
         psk: String,
+        /// P2p only: this node's persisted hex secret key (stable identity/code).
+        secret_key: String,
     },
 }
 
@@ -101,22 +110,22 @@ impl NetManager {
 
 fn spawn_worker(uid: usize, config: NetNodeConfig) -> Worker {
     match config {
-        NetNodeConfig::Send { transport, host, port, rate_hz, psk } => {
+        NetNodeConfig::Send { transport, host, port, rate_hz, psk, peer_code } => {
             let name = format!("net-send-{uid}");
             match transport {
-                Transport::Quic => Worker::spawn(name, move |stop| {
-                    crate::transport::quic::run_send(&stop, uid, host, port, rate_hz, &psk);
+                Transport::P2p => Worker::spawn(name, move |stop| {
+                    crate::transport::p2p::run_send(&stop, uid, peer_code, rate_hz);
                 }),
                 _ => Worker::spawn(name, move |stop| {
                     udp::run_send(&stop, uid, host, port, rate_hz, transport.encrypted(), psk);
                 }),
             }
         }
-        NetNodeConfig::Recv { transport, bind_port, stale_ms, fb_rate_hz, psk } => {
+        NetNodeConfig::Recv { transport, bind_port, stale_ms, fb_rate_hz, psk, secret_key } => {
             let name = format!("net-recv-{uid}");
             match transport {
-                Transport::Quic => Worker::spawn(name, move |stop| {
-                    crate::transport::quic::run_recv(&stop, uid, bind_port, stale_ms, fb_rate_hz, &psk);
+                Transport::P2p => Worker::spawn(name, move |stop| {
+                    crate::transport::p2p::run_recv(&stop, uid, secret_key, stale_ms, fb_rate_hz);
                 }),
                 _ => Worker::spawn(name, move |stop| {
                     udp::run_recv(&stop, uid, bind_port, stale_ms, fb_rate_hz, transport.encrypted(), psk);

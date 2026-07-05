@@ -1,4 +1,4 @@
-pub mod quic;
+pub mod p2p;
 pub mod udp;
 
 use std::sync::atomic::{AtomicBool, Ordering};

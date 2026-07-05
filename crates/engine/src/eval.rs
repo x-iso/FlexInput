@@ -33,6 +33,7 @@ pub fn net_config_from_params(
         params.get(k).and_then(|v| v.as_u64()).unwrap_or(d as u64).clamp(1, 65535) as u16
     };
     let u32p = |k: &str, d: u32| params.get(k).and_then(|v| v.as_u64()).unwrap_or(d as u64) as u32;
+    let str_param = |k: &str| params.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     match module_id {
         NET_SEND_ID => Some(NetNodeConfig::Send {
             transport,
@@ -40,6 +41,7 @@ pub fn net_config_from_params(
             port: u16p("net_port", 46700),
             rate_hz: u32p("net_rate_hz", 500),
             psk,
+            peer_code: str_param("net_peer"),
         }),
         NET_RECV_ID => Some(NetNodeConfig::Recv {
             transport,
@@ -47,6 +49,7 @@ pub fn net_config_from_params(
             stale_ms: u32p("net_stale_ms", 200),
             fb_rate_hz: u32p("net_fb_rate_hz", 200),
             psk,
+            secret_key: str_param("net_secret"),
         }),
         _ => None,
     }

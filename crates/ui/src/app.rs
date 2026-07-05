@@ -2431,20 +2431,7 @@ impl eframe::App for FlexInputApp {
                 .set_file_name("workspace.fxw")
                 .save_file()
             {
-                let tabs: Vec<PersistedTab> = self.tabs.iter().map(|t| PersistedTab {
-                    title: t.title.clone(),
-                    file_path: t.file_path.clone(),
-                    bound_exes: t.bound_exes.clone(),
-                    auto_bypass: t.auto_bypass,
-                    snarl: t.canvas.snarl.clone(),
-                    easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
-                    view_salt: t.view_salt,
-                }).collect();
-                let ws = PersistedWorkspace {
-                    version: 1,
-                    active_tab: self.active_tab,
-                    tabs,
-                };
+                let ws = self.build_persisted_workspace();
                 if let Err(e) = settings::save_workspace_to(&ws, &path) {
                     eprintln!("[workspace] save failed: {e}");
                 }
@@ -9006,7 +8993,7 @@ impl FlexInputApp {
             file_path: t.file_path.clone(),
             bound_exes: t.bound_exes.clone(),
             auto_bypass: t.auto_bypass,
-            snarl: t.canvas.snarl.clone(),
+            snarl: crate::canvas::sanitize_snarl_for_save(&t.canvas.snarl),
             easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
             view_salt: t.view_salt,
         }).collect();

@@ -40,6 +40,7 @@ fn run_link(transport: Transport, psk: &str, send_uid: usize, recv_uid: usize, p
                 stale_ms: 500,
                 fb_rate_hz: 500,
                 psk: psk.to_string(),
+                secret_key: String::new(),
             },
         ),
         (
@@ -50,6 +51,7 @@ fn run_link(transport: Transport, psk: &str, send_uid: usize, recv_uid: usize, p
                 port,
                 rate_hz: 500,
                 psk: psk.to_string(),
+                peer_code: String::new(),
             },
         ),
     ]);
@@ -117,6 +119,7 @@ fn psk_mismatch_publishes_nothing() {
                 stale_ms: 500,
                 fb_rate_hz: 200,
                 psk: "alpha".to_string(),
+                secret_key: String::new(),
             },
         ),
         (
@@ -127,6 +130,7 @@ fn psk_mismatch_publishes_nothing() {
                 port,
                 rate_hz: 500,
                 psk: "bravo".to_string(),
+                peer_code: String::new(),
             },
         ),
     ]);

@@ -63,6 +63,36 @@ pub struct NetStatus {
     pub layout_warn: bool,
     /// Peer address as observed on the socket.
     pub remote: Option<String>,
+    /// P2P tier only: this Receive node's own pairing code (its EndpointId), to
+    /// be shared with the sender. Stable across restarts (derived from the
+    /// node's persisted secret key). `None` on the UDP/PSK tiers.
+    pub code: Option<String>,
+}
+
+/// Generate a fresh 32-byte node secret, hex-encoded (64 chars). Stored in the
+/// Receive node's params so its P2P pairing code stays stable across restarts
+/// and patch save/load. No iroh dependency — iroh's `SecretKey::from_str`
+/// accepts this hex form.
+pub fn generate_secret_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Derive the public pairing code (EndpointId) from a hex secret key, or `None`
+/// if the P2P feature is disabled or the hex is invalid. Lets the UI show the
+/// code immediately from params without waiting for the worker to bind.
+#[cfg(feature = "p2p")]
+pub fn endpoint_id_for_secret(secret_hex: &str) -> Option<String> {
+    use std::str::FromStr;
+    iroh::SecretKey::from_str(secret_hex).ok().map(|sk| sk.public().to_string())
+}
+
+/// Fallback when the P2P feature is off.
+#[cfg(not(feature = "p2p"))]
+pub fn endpoint_id_for_secret(_secret_hex: &str) -> Option<String> {
+    None
 }
 
 // ── process-global latest-value slots ───────────────────────────────────────
