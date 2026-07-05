@@ -1980,6 +1980,7 @@ fn automap_selector_publish(
     computed: &[Vec<Option<Signal>>],
     dev_sigs: &HashMap<(String, String), Signal>,
     collector_sigs: &mut HashMap<(String, String), Signal>,
+    fb_routes: &mut HashMap<String, String>,
 ) {
     let n_inputs = snap.input_sources.len().saturating_sub(1).max(1);
     let select = match snap.input_sources.get(0)
@@ -2003,6 +2004,13 @@ fn automap_selector_publish(
     let selected_dev = input_devs.get(select).map(|s| s.as_str()).unwrap_or("").to_string();
     let selected_collector = input_collectors.get(select).map(|s| s.as_str()).unwrap_or("").to_string();
     let key = format!("forksel:{}:0", key_uid);
+    // Record the reverse-feedback route: feedback injected at our OUTPUT id flows
+    // back to whichever input we're currently gating from (its collector id if it
+    // is one, else its raw device id). Empty when nothing is selected/wired.
+    let route_to = if !selected_collector.is_empty() { &selected_collector } else { &selected_dev };
+    if !route_to.is_empty() {
+        fb_routes.insert(key.clone(), route_to.clone());
+    }
     for pin in flexinput_core::automap::ALL_PINS {
         let sig = if !selected_collector.is_empty() {
             collector_sigs.get(&(selected_collector.clone(), pin.id.to_string())).copied()
@@ -2084,6 +2092,7 @@ fn eval_subgraph(
     scope_samples: &mut Vec<(usize, Vec<Option<f32>>)>,
     last_inputs: &mut HashMap<usize, Vec<Option<Signal>>>,
     last_outputs: &mut HashMap<usize, Vec<Option<Signal>>>,
+    fb_routes: &mut HashMap<String, String>,
     outer_uid: usize,
     dt: f32,
 ) -> Vec<Vec<Option<Signal>>> {
@@ -2113,7 +2122,7 @@ fn eval_subgraph(
             let nested_uid = namespaced_uid(outer_uid, snap.node_uid);
             let inner_computed = eval_subgraph(
                 &sg.graph, &inner_inputs, state, dev_sigs, collector_sigs,
-                scope_samples, last_inputs, last_outputs, nested_uid, dt,
+                scope_samples, last_inputs, last_outputs, fb_routes, nested_uid, dt,
             );
             computed[idx] = sg.outlet_locs.iter()
                 .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
@@ -2222,7 +2231,7 @@ fn eval_subgraph(
             continue;
         }
         if snap.module_id == "module.automap_selector" {
-            automap_selector_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs);
+            automap_selector_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs, fb_routes);
             computed[idx] = vec![None];
             last_outputs.insert(ns_uid, computed[idx].clone());
             continue;
@@ -2383,6 +2392,13 @@ pub fn eval_graph_tick(
     } = *out;
     // Signals injected by AutoMap Collector nodes, keyed by ("collector:{uid}", pin_id).
     let mut collector_sigs: HashMap<(String, String), Signal> = HashMap::new();
+    // Reverse feedback routes: a synthetic AutoMap node's OUTPUT id (e.g.
+    // "forksel:5:0" from a Selector) → the SOURCE id it currently gates from
+    // (e.g. "collector:3" for a network recv, or "gilrs:…" for a pad). Populated
+    // by the Selector/Fork eval below; consumed by the reverse-feedback post-pass
+    // so an ASTH / Feedback Control node placed AFTER a Selector still reaches the
+    // pad or network back-channel (feedback flows backward along the gate).
+    let mut fb_routes: HashMap<String, String> = HashMap::new();
 
     {
     puffin::profile_scope!("main_node_loop");
@@ -2503,7 +2519,7 @@ pub fn eval_graph_tick(
         }
         // ── module.automap_selector: gate selected AutoMap input to output ────
         if snap.module_id == "module.automap_selector" {
-            automap_selector_publish(snap, snap.node_uid, &computed, dev_sigs, &mut collector_sigs);
+            automap_selector_publish(snap, snap.node_uid, &computed, dev_sigs, &mut collector_sigs, &mut fb_routes);
             computed[idx] = vec![None];
             continue;
         }
@@ -2778,7 +2794,7 @@ pub fn eval_graph_tick(
                 .collect();
             let inner_computed = eval_subgraph(
                 &sg.graph, &outer_inputs, state, dev_sigs, &mut collector_sigs,
-                scope_samples, last_inputs, last_outputs, snap.node_uid, dt,
+                scope_samples, last_inputs, last_outputs, &mut fb_routes, snap.node_uid, dt,
             );
             let out: Vec<Option<Signal>> = sg.outlet_locs.iter()
                 .map(|loc| loc.and_then(|(ni, np)| inner_computed.get(ni).and_then(|v| v.get(np)).copied().flatten()))
@@ -2915,6 +2931,41 @@ pub fn eval_graph_tick(
             }
             if let Some(sig) = combined {
                 sink_outputs.insert((st.device_id.clone(), pin_id.clone()), sig);
+            }
+        }
+    }
+
+    // Post-pass: reverse-feedback routing through AutoMap Selectors. An ASTH /
+    // Feedback Control node placed AFTER a Selector injects into the selector's
+    // OUTPUT id (`feedback_inject:forksel:{uid}:{out}`). Copy those injections to
+    // the source the selector is currently gating from — following the route
+    // chain — so they land under the physical pad id (drained by the injection
+    // post-pass below) or the network recv's `collector:{uid}` (drained by the
+    // recv feedback post-pass). Runs BEFORE the injection drain so a pad terminal
+    // is delivered this tick. Only fires when a Selector recorded a route.
+    if !fb_routes.is_empty() {
+        for from_id in fb_routes.keys().cloned().collect::<Vec<_>>() {
+            // Resolve the terminal source through the (short) route chain.
+            let mut terminal = from_id.clone();
+            for _ in 0..8 {
+                match fb_routes.get(&terminal) {
+                    Some(next) => terminal = next.clone(),
+                    None => break,
+                }
+            }
+            if terminal == from_id { continue; }
+            let from_key = format!("feedback_inject:{from_id}");
+            let to_key = format!("feedback_inject:{terminal}");
+            let entries: Vec<(String, Signal)> = collector_sigs.iter()
+                .filter(|((d, _), _)| d == &from_key)
+                .map(|((_, p), s)| (p.clone(), *s))
+                .collect();
+            for (pin, sig) in entries {
+                use std::collections::hash_map::Entry;
+                match collector_sigs.entry((to_key.clone(), pin)) {
+                    Entry::Occupied(mut o) => { *o.get_mut() = combine_signals(*o.get(), sig); }
+                    Entry::Vacant(v) => { v.insert(sig); }
+                }
             }
         }
     }

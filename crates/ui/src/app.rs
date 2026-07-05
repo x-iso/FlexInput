@@ -9104,6 +9104,13 @@ fn spawn_io_thread(
             }
             let mut last_enum = Instant::now() - Duration::from_secs(10);
             let mut last_midi_out: HashMap<(String, String), Signal> = HashMap::new();
+            // Physical-pad haptic outputs we drove last tick (rumble, HD amp,
+            // lightbar…). Used to actively send a single 0 when a pin's feedback
+            // producer vanishes (network link dropped, wire disconnected, a game
+            // closed) — otherwise the motor/coil sticks on its last value because
+            // nothing writes it into sink_outputs anymore. See the zero-on-drop
+            // pass after the physical feedback send below.
+            let mut last_phys_haptics: HashMap<(String, String), Signal> = HashMap::new();
             // Latest virtual-device feedback (rumble/FFB from poll_outputs),
             // carried ACROSS ticks. Merged into the published signal map at the
             // START of each tick so the engine — which reads proc_device_signals
@@ -9469,6 +9476,28 @@ fn spawn_io_thread(
                                 backend.send(device_id, freq_pin, Signal::Float(0.6));
                             }
                         }
+                    }
+                }
+                // Zero-on-drop: if a physical-pad haptic pin we drove last tick is
+                // absent from sink_outputs this tick, its feedback producer went
+                // away (network link dropped, wire disconnected, game closed).
+                // Actively send 0 once so the motor/coil turns off instead of
+                // sticking on its last value. Producers that are still live write
+                // their pin every tick (0.0 when idle), so this only fires on a
+                // genuine disappearance — no flicker in normal operation.
+                for (key, &last) in &last_phys_haptics {
+                    if sink_outputs.contains_key(key) { continue; }
+                    if last.as_float() == 0.0 { continue; } // already silent
+                    for backend in &mut backends {
+                        backend.send(&key.0, &key.1, Signal::Float(0.0));
+                    }
+                }
+                // Snapshot this tick's physical-pad outputs for next-tick drop
+                // detection (gilrs feedback pins only).
+                last_phys_haptics.clear();
+                for ((device_id, pin_id), &signal) in &sink_outputs {
+                    if device_id.starts_with("gilrs:") {
+                        last_phys_haptics.insert((device_id.clone(), pin_id.clone()), signal);
                     }
                 }
                 if !bypass {
@@ -10535,12 +10564,14 @@ fn build_processing_graph_rec(
                     .map(|(dev_id, _, fallback)| {
                         if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
                     })
-                    // Keep real devices AND a network-receive node's synthetic
-                    // `collector:` id, so Feedback Control on the RECEIVER can
-                    // inject into the network back-channel (drained by the recv
-                    // feedback post-pass). A non-network collector id is harmless —
-                    // nothing drains it.
-                    .filter(|d| is_real_device_id(d) || d.starts_with("collector:"))
+                    // Keep any resolved AutoMap target: a real device, or a
+                    // synthetic id (collector:/forksel:/combiner:/remap:/lean:).
+                    // Synthetic targets are drained either by the network recv
+                    // feedback post-pass (collector:{recv_uid}) or reverse-forwarded
+                    // to their upstream source (Selector/Fork) so Feedback Control
+                    // placed after an AutoMap routing node still reaches the pad or
+                    // network. An id nothing drains is harmless.
+                    .filter(|d| !d.is_empty())
             };
             if let Some(d) = src_dev {
                 params.insert("_fb_source_dev".to_string(), serde_json::Value::String(d));
@@ -10577,11 +10608,11 @@ fn build_processing_graph_rec(
                     .map(|(dev_id, _, fallback)| {
                         if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
                     })
-                    // Keep real devices AND a network-receive node's synthetic
-                    // `collector:` id, so Audio Stream Haptics on the RECEIVER can
-                    // drive the network back-channel (drained by the recv feedback
-                    // post-pass). See the matching Feedback Control note above.
-                    .filter(|d| is_real_device_id(d) || d.starts_with("collector:"))
+                    // Keep any resolved AutoMap target (real device or synthetic
+                    // collector:/forksel:/combiner:/… id), so Audio Stream Haptics
+                    // after a Selector/Fork or before a network recv still reaches
+                    // its destination. See the matching Feedback Control note above.
+                    .filter(|d| !d.is_empty())
             };
             if let Some(d) = dest_dev {
                 params.insert("_asth_dest_dev".to_string(), serde_json::Value::String(d));
