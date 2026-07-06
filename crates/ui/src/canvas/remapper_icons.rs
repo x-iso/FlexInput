@@ -127,6 +127,11 @@ const PS_TP_RIGHT:    &[u8] = a!("Playstation/playstation5_touchpad_press_right.
 // Analog swipe gestures (touchpad), used by the Remapper/Lean swipe outputs.
 const PS_TP_SWIPE_H:  &[u8] = a!("Playstation/playstation5_touchpad_swipe_horizontal.svg");
 const PS_TP_SWIPE_V:  &[u8] = a!("Playstation/playstation5_touchpad_swipe_vertical.svg");
+// Directional touchpad swipes — Touch Zones swipe triggers.
+const PS_TP_SWIPE_UP:    &[u8] = a!("Playstation/playstation5_touchpad_swipe_up.svg");
+const PS_TP_SWIPE_DOWN:  &[u8] = a!("Playstation/playstation5_touchpad_swipe_down.svg");
+const PS_TP_SWIPE_LEFT:  &[u8] = a!("Playstation/playstation5_touchpad_swipe_left.svg");
+const PS_TP_SWIPE_RIGHT: &[u8] = a!("Playstation/playstation5_touchpad_swipe_right.svg");
 const PS_DPAD_U:   &[u8] = a!("Playstation/playstation_dpad_up.svg");
 const PS_DPAD_D:   &[u8] = a!("Playstation/playstation_dpad_down.svg");
 const PS_DPAD_L:   &[u8] = a!("Playstation/playstation_dpad_left.svg");
@@ -290,6 +295,10 @@ const M_SIDE_BACK:    &[u8] = a!("KBM/mouse_side_back.svg");
 const M_SIDE_FORWARD: &[u8] = a!("KBM/mouse_side_forward.svg");
 const M_SCROLL_U: &[u8] = a!("KBM/mouse_scroll_up.svg");
 const M_SCROLL_D: &[u8] = a!("KBM/mouse_scroll_down.svg");
+// Mouse-movement delta outputs (Touch Zones relative-mouse mapping).
+const M_MOVE:     &[u8] = a!("KBM/mouse_move.svg");
+const M_MOVE_H:   &[u8] = a!("KBM/mouse_horizontal.svg");
+const M_MOVE_V:   &[u8] = a!("KBM/mouse_vertical.svg");
 
 /// Long-arrow glyph used in place of the textual "→" between a mapping's
 /// input and output chips. Rasterized once and cached as an egui texture.
@@ -482,12 +491,23 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "mouse_forward" => return Some(M_SIDE_FORWARD),
         "scroll_up"     => return Some(M_SCROLL_U),
         "scroll_down"   => return Some(M_SCROLL_D),
+        // Mouse-movement delta (Touch Zones relative-mouse outputs).
+        "mouse"         => return Some(M_MOVE),
+        "mouse_x"       => return Some(M_MOVE_H),
+        "mouse_y"       => return Some(M_MOVE_V),
 
         // Touchpad + DualSense-specific pins are family-agnostic (no Xbox
         // equivalent): always resolve to the PS asset so they render in the
         // KB/M picker (Skin::Kbm) and on non-PS skins too.
         "touch_swipe_x" => return Some(PS_TP_SWIPE_H),
         "touch_swipe_y" => return Some(PS_TP_SWIPE_V),
+        // Touch Zones trigger tokens (family-agnostic touchpad glyphs).
+        "tz_touch"       => return Some(PS_TP_CENTER),
+        "tz_click"       => return Some(PS_TP_CLICK),
+        "tz_swipe_up"    => return Some(PS_TP_SWIPE_UP),
+        "tz_swipe_down"  => return Some(PS_TP_SWIPE_DOWN),
+        "tz_swipe_left"  => return Some(PS_TP_SWIPE_LEFT),
+        "tz_swipe_right" => return Some(PS_TP_SWIPE_RIGHT),
         "touch_left"   | "touchpad_left"   => return Some(PS_TP_LEFT),
         "touch_center" | "touchpad_center" => return Some(PS_TP_CENTER),
         "touch_right"  | "touchpad_right"  => return Some(PS_TP_RIGHT),

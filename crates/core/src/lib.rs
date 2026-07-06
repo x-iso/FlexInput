@@ -2,6 +2,7 @@ pub mod automap;
 pub mod module;
 pub mod patch;
 pub mod signal;
+pub mod touchzones;
 
 pub use module::{Module, ModuleDescriptor, ModuleFactory, ModuleRegistration, PinDescriptor};
 pub use patch::{NodeInstance, Patch, SubPatch, SubPatchPin, Wire, PATCH_VERSION};

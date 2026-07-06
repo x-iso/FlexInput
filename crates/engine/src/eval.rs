@@ -2204,6 +2204,16 @@ fn eval_subgraph(
             continue;
         }
 
+        // Touch Zones mapping mode nested in a sub-patch — publish under the
+        // NAMESPACED uid so the touchmap key matches downstream lookups.
+        if snap.module_id == "module.touch_zones"
+            && snap.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping")
+        {
+            eval_touch_zones_map_node(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
+            computed[idx] = vec![None];
+            continue;
+        }
+
         // module.map_action inside subpatch: mirror top-level behaviour but
         // write last_outputs keyed by the namespaced UID so UI/outer bodies
         // can observe inner output state.
@@ -2419,6 +2429,17 @@ pub fn eval_graph_tick(
             // Shared Remapper evaluation (identical at top level and in sub-patches).
             eval_remapper_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
 
+            computed[idx] = vec![None];
+            continue;
+        }
+
+        // ── module.touch_zones (mapping mode): inject per-zone behaviours ─────
+        // Ports mode falls through to compute_node (typed zone outputs); mapping
+        // mode publishes bus overrides under `touchmap:{uid}` like the Remapper.
+        if snap.module_id == "module.touch_zones"
+            && snap.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping")
+        {
+            eval_touch_zones_map_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
             computed[idx] = vec![None];
             continue;
         }
@@ -3121,6 +3142,78 @@ fn compute_node(
                     }
                 }
                 dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+            }).collect()
+        }
+        "module.touch_zones" => {
+            use flexinput_core::touchzones as tz;
+            // Same upstream resolution as the Splitter: prefer the closest
+            // collector's injected signals, else the raw device samples.
+            let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
+            let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+            let read = |pin: &str| -> Option<Signal> {
+                if !collector_id.is_empty() {
+                    if let Some(&s) = collector_sigs.get(&(collector_id.to_string(), pin.to_string())) {
+                        return Some(s);
+                    }
+                }
+                dev_sigs.get(&(dev_id.to_string(), pin.to_string())).copied()
+            };
+            let read_edges = |field: usize, which: &str| -> Vec<f32> {
+                let key = if field == 0 { which.to_string() } else { format!("{which}{field}") };
+                snap.params.get(&key).and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+                    .unwrap_or_default()
+            };
+
+            // Split mode: field 0 tracks touch1, field 1 tracks touch2 — each on
+            // its own grid (a Steam-Controller-style pair, or two fingers tracked
+            // separately). Single mode: one field, both fingers.
+            let split = snap.params.get("field_mode").and_then(|v| v.as_str()) == Some("split");
+            let n_fields = if split { 2 } else { 1 };
+
+            // Resolve which zone each active finger occupies, per field, keeping
+            // per-zone local coords. In single mode touch1 is processed last so it
+            // wins when both fingers land in the same zone.
+            let mut zone_hit: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
+            for field in 0..n_fields {
+                let col_edges = read_edges(field, "col_edges");
+                let row_edges = read_edges(field, "row_edges");
+                let fingers: &[(&str, &str, &str)] = if split {
+                    if field == 0 { &[("touch1_x", "touch1_y", "touch1_active")] }
+                    else          { &[("touch2_x", "touch2_y", "touch2_active")] }
+                } else {
+                    &[("touch2_x", "touch2_y", "touch2_active"),
+                      ("touch1_x", "touch1_y", "touch1_active")]
+                };
+                for &(px, py, pa) in fingers {
+                    if !read(pa).map(|s| s.as_bool()).unwrap_or(false) { continue; }
+                    let (x, y) = tz::pad_point_to_unit(
+                        read(px).map(|s| s.as_float()).unwrap_or(0.0),
+                        read(py).map(|s| s.as_float()).unwrap_or(0.0),
+                    );
+                    let (idx, lx, ly) = tz::locate_unit(x, y, &col_edges, &row_edges);
+                    zone_hit.insert((field, idx), (lx, ly));
+                }
+            }
+
+            (0..snap.n_outputs).map(|i| {
+                let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
+                match tz::parse_pin(pin_id)? {
+                    tz::Pin::Zone { field, idx, comp } => Some(match (zone_hit.get(&(field, idx)), comp) {
+                        (Some(&(lx, _)), tz::ZoneComp::X) => Signal::Float(lx),
+                        (Some(&(_, ly)), tz::ZoneComp::Y) => Signal::Float(ly),
+                        (Some(_), tz::ZoneComp::Active)   => Signal::Bool(true),
+                        (None, tz::ZoneComp::Active)      => Signal::Bool(false),
+                        (None, _)                         => Signal::Float(0.0),
+                    }),
+                    // Field 0 click = the touchpad button. Field 1 reads the
+                    // reserved `btn_touchpad2` pin (populated only once a device
+                    // with two clickable pads — e.g. Steam Controller — exposes it).
+                    tz::Pin::Click { field } => {
+                        let pin = if field == 0 { "btn_touchpad" } else { "btn_touchpad2" };
+                        Some(Signal::Bool(read(pin).map(|s| s.as_bool()).unwrap_or(false)))
+                    }
+                }
             }).collect()
         }
         "module.constant" | "module.knob" => {
@@ -4883,6 +4976,299 @@ fn eval_remapper_node(
                 }
                 publish_touch_points(&key, &fingers, collector_sigs);
             }
+}
+
+/// Evaluate a Touch Zones node in MAPPING mode — shared by the top-level and
+/// sub-patch loops. Resolves each active finger to its zone (per field), then
+/// applies every mapping card, publishing bus overrides into
+/// `collector_sigs[("touchmap:{uid}", pin)]` (mirrors [`eval_remapper_node`]).
+///
+/// Card schema (node.params["zone_maps"], array of objects):
+///   { "f": field, "z": zone, "behavior": "button"|"analog"|..., ... }
+///   button → { "src": "touch"|"click", "out": [bus_pin, …] }
+///   analog → { "out_stick": "left_stick"|"right_stick" }  (absolute: zone-local
+///            X/Y → axis pair, +Y = up)
+/// Stateful gestures (tap / double-tap / hold / swipe) are handled by a later
+/// pass; only `button` and `analog` are wired here.
+fn eval_touch_zones_map_node(
+    snap: &NodeSnap,
+    uid: usize,
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+    state: &mut HashMap<usize, NodeState>,
+    dt: f32,
+) {
+    use flexinput_core::touchzones as tz;
+    let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let key = format!("touchmap:{}", uid);
+
+    // Snapshot every canonical upstream pin once (collector override first, else
+    // raw device) into an owned map, so the publish pass can mutate collector_sigs
+    // without aliasing the read side. Mirrors eval_remapper_node's `upstream`.
+    let mut upstream: HashMap<String, Signal> = HashMap::new();
+    for ap in automap::ALL_PINS {
+        let sig = if !collector_id.is_empty() {
+            collector_sigs.get(&(collector_id.clone(), ap.id.to_string())).copied()
+        } else { None }
+        .or_else(|| {
+            if !dev_id.is_empty() {
+                dev_sigs.get(&(dev_id.clone(), ap.id.to_string())).copied()
+            } else { None }
+        });
+        if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+    }
+    let read = |pin: &str| -> Option<Signal> { upstream.get(pin).copied() };
+    let read_edges = |field: usize, which: &str| -> Vec<f32> {
+        let k = if field == 0 { which.to_string() } else { format!("{which}{field}") };
+        snap.params.get(&k).and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default()
+    };
+
+    // Resolve which zone each active finger occupies, per field, keeping local
+    // coords — identical to the ports-mode arm in compute_node.
+    let split = snap.params.get("field_mode").and_then(|v| v.as_str()) == Some("split");
+    let n_fields = if split { 2 } else { 1 };
+    let mut zone_hit: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
+    for field in 0..n_fields {
+        let col_edges = read_edges(field, "col_edges");
+        let row_edges = read_edges(field, "row_edges");
+        let fingers: &[(&str, &str, &str)] = if split {
+            if field == 0 { &[("touch1_x", "touch1_y", "touch1_active")] }
+            else          { &[("touch2_x", "touch2_y", "touch2_active")] }
+        } else {
+            &[("touch2_x", "touch2_y", "touch2_active"),
+              ("touch1_x", "touch1_y", "touch1_active")]
+        };
+        for &(px, py, pa) in fingers {
+            if !read(pa).map(|s| s.as_bool()).unwrap_or(false) { continue; }
+            let (x, y) = tz::pad_point_to_unit(
+                read(px).map(|s| s.as_float()).unwrap_or(0.0),
+                read(py).map(|s| s.as_float()).unwrap_or(0.0),
+            );
+            let (idx, lx, ly) = tz::locate_unit(x, y, &col_edges, &row_edges);
+            zone_hit.insert((field, idx), (lx, ly));
+        }
+    }
+    let click = |field: usize| -> bool {
+        let pin = if field == 0 { "btn_touchpad" } else { "btn_touchpad2" };
+        read(pin).map(|s| s.as_bool()).unwrap_or(false)
+    };
+
+    // ── Apply mapping cards ───────────────────────────────────────────────
+    let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    // Button out pins: OR every card targeting the same pin so two zones can
+    // share a button. `button_pins` tracks the full set for the release pass.
+    let mut button_on: HashMap<String, bool> = HashMap::new();
+    // Relative analog (adaptive-center): stick target → (x, y). Last card wins.
+    let mut sticks: HashMap<&'static str, (f32, f32)> = HashMap::new();
+    // Relative mouse delta accumulator (screen space, y-down).
+    let mut mouse_dx = 0.0f32;
+    let mut mouse_dy = 0.0f32;
+    let mut mouse_active = false;
+    // Mouse gain: the keymouse sink reads the `mouse` pin as pixels-per-60Hz
+    // reference frame, so a raw ±1 deflection is only ~60 px/s — unusable. Scale
+    // the deflection into a velocity here (default full-deflection ≈ 720 px/s at
+    // sink sensitivity 1.0). Per-node `mouse_speed` param tunes it; the sink's own
+    // mouse_sensitivity still multiplies on top downstream.
+    let mouse_speed = snap.params.get("mouse_speed").and_then(|v| v.as_f64()).unwrap_or(12.0) as f32;
+
+    // Cards use the shared Remapper schema: "in" = trigger token(s), "out" =
+    // target bus pins, "mode"/"window_ms"/"sustain"/"turbo" = the Remapper press
+    // pipeline. Per card: derive a raw gate from the zone trigger (touch/click),
+    // run it through the SAME `apply_press_mode` (+`apply_turbo`) the Remapper
+    // uses, then assert the target — button gets the shaped gate, a stick target
+    // is driven with the absolute zone-local position while active.
+    let ns = state.entry(uid).or_insert_with(NodeState::default);
+
+    // ── Per-finger tracking: swipe detection + relative analog ─────────────
+    // Track each finger (touch1/touch2) across frames. On touch-down record its
+    // start field/zone/position AND an ADAPTIVE CENTER: if the finger lands in the
+    // inner 30% of the zone, that landing point is the center (relative from where
+    // you touched); otherwise the zone's geometric center is used. While held we
+    // (a) latch a swipe direction once displacement passes a threshold (attributed
+    // to the START zone), and (b) emit a relative analog deflection = (current −
+    // center) / zone-half-extent, clamped to ±1. 9 aux_f32 slots per finger:
+    // [active, sx, sy, field, zone, dir, pulse_ms, cx, cy].
+    const SWIPE_THRESH: f32 = 0.18;   // fraction of the field
+    const SWIPE_PULSE_MS: f32 = 120.0;
+    const INNER_FRAC: f32 = 0.30;     // central region that captures an adaptive centre
+    let slots_per = 9usize;
+    while ns.aux_f32.len() < 2 * slots_per { ns.aux_f32.push(0.0); }
+    let mut swipes: Vec<(usize, usize, u8)> = Vec::new(); // (field, zone, dir 1=U 2=D 3=L 4=R)
+    let mut analog_by_zone: HashMap<(usize, usize), (f32, f32)> = HashMap::new(); // deflection, +Y up
+    for finger in 0..2 {
+        let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
+                            ("touch2_x", "touch2_y", "touch2_active")][finger];
+        let field = if split { finger } else { 0 };
+        let base = finger * slots_per;
+        let active = read(pa).map(|s| s.as_bool()).unwrap_or(false);
+        let prev_active = ns.aux_f32[base] > 0.5;
+        let col = read_edges(field, "col_edges");
+        let row = read_edges(field, "row_edges");
+        if active {
+            let (ux, uy) = tz::pad_point_to_unit(
+                read(px).map(|s| s.as_float()).unwrap_or(0.0),
+                read(py).map(|s| s.as_float()).unwrap_or(0.0));
+            if !prev_active {
+                let (zidx, _, _) = tz::locate_unit(ux, uy, &col, &row);
+                let (x0, y0, x1, y1) = tz::zone_rect(zidx, &col, &row);
+                let (zcx, zcy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+                let (hw, hh) = ((x1 - x0) * 0.5, (y1 - y0) * 0.5);
+                // Adaptive centre: landing inside the inner 30% → centre = landing.
+                let (cx, cy) = if (ux - zcx).abs() <= INNER_FRAC * hw && (uy - zcy).abs() <= INNER_FRAC * hh {
+                    (ux, uy)
+                } else { (zcx, zcy) };
+                ns.aux_f32[base + 1] = ux;
+                ns.aux_f32[base + 2] = uy;
+                ns.aux_f32[base + 3] = field as f32;
+                ns.aux_f32[base + 4] = zidx as f32;
+                ns.aux_f32[base + 5] = 0.0;
+                ns.aux_f32[base + 6] = 0.0;
+                ns.aux_f32[base + 7] = cx;
+                ns.aux_f32[base + 8] = cy;
+            } else if ns.aux_f32[base + 5] < 0.5 {
+                let dx = ux - ns.aux_f32[base + 1];
+                let dy = uy - ns.aux_f32[base + 2];
+                if dx.abs().max(dy.abs()) > SWIPE_THRESH {
+                    // Field space is y-down, so an upward swipe has dy < 0.
+                    let dir: u8 = if dx.abs() >= dy.abs() {
+                        if dx > 0.0 { 4 } else { 3 }
+                    } else if dy < 0.0 { 1 } else { 2 };
+                    ns.aux_f32[base + 5] = dir as f32;
+                    ns.aux_f32[base + 6] = SWIPE_PULSE_MS;
+                }
+            }
+            ns.aux_f32[base] = 1.0;
+
+            // Relative analog deflection from the adaptive centre, scaled by the
+            // START zone's half-extent (so a half-zone move = full deflection).
+            let sz = ns.aux_f32[base + 4] as usize;
+            let (cx, cy) = (ns.aux_f32[base + 7], ns.aux_f32[base + 8]);
+            let (x0, y0, x1, y1) = tz::zone_rect(sz, &col, &row);
+            let hw = ((x1 - x0) * 0.5).max(1e-3);
+            let hh = ((y1 - y0) * 0.5).max(1e-3);
+            let ax = ((ux - cx) / hw).clamp(-1.0, 1.0);
+            let ay = (-(uy - cy) / hh).clamp(-1.0, 1.0); // +Y up
+            analog_by_zone.insert((field, sz), (ax, ay));
+        } else {
+            ns.aux_f32[base] = 0.0;
+        }
+        if ns.aux_f32[base + 6] > 0.0 {
+            swipes.push((ns.aux_f32[base + 3] as usize,
+                         ns.aux_f32[base + 4] as usize,
+                         ns.aux_f32[base + 5] as u8));
+            ns.aux_f32[base + 6] = (ns.aux_f32[base + 6] - dt * 1000.0).max(0.0);
+        }
+    }
+
+    for (i, card) in cards.iter().enumerate() {
+        let field = card.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let zone = card.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let hit = zone_hit.get(&(field, zone)).copied();
+        let trigger = card.get("in").and_then(|v| v.as_array())
+            .and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("tz_touch");
+        let swipe_code: Option<u8> = match trigger {
+            "tz_swipe_up" => Some(1), "tz_swipe_down" => Some(2),
+            "tz_swipe_left" => Some(3), "tz_swipe_right" => Some(4),
+            _ => None,
+        };
+        let raw_held = match swipe_code {
+            Some(code) => swipes.iter().any(|&(f, z, d)| f == field && z == zone && d == code),
+            None => match trigger {
+                "tz_click" => hit.is_some() && click(field),
+                _          => hit.is_some(), // tz_touch (default)
+            },
+        };
+
+        let mode_s = card.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
+        let mode = PressMode::from_str(mode_s);
+        let window_ms = card.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+        let sustain = card.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+        let turbo = card.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+        let slots = press_state_get(ns, i);
+        let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
+        let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+
+        // Relative analog deflection for this card's zone (present only while a
+        // finger is down in it). Analog outputs ignore the press-mode gate — the
+        // contact itself drives them.
+        let deflect = analog_by_zone.get(&(field, zone)).copied();
+        for p in card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
+            .filter_map(|v| v.as_str())
+        {
+            match p {
+                "left_stick" | "right_stick" => {
+                    if let Some((ax, ay)) = deflect {
+                        sticks.insert(if p == "left_stick" { "left_stick" } else { "right_stick" }, (ax, ay));
+                    }
+                }
+                // Relative mouse: deflection → per-frame cursor delta (screen
+                // y-down, so invert the +Y-up analog). "mouse" drives both axes.
+                "mouse" | "mouse_x" | "mouse_y" => {
+                    if let Some((ax, ay)) = deflect {
+                        if p == "mouse" || p == "mouse_x" { mouse_dx += ax * mouse_speed; }
+                        if p == "mouse" || p == "mouse_y" { mouse_dy += -ay * mouse_speed; }
+                        mouse_active = true;
+                    }
+                }
+                _ => {
+                    let e = button_on.entry(p.to_string()).or_insert(false);
+                    *e = *e || held;
+                }
+            }
+        }
+    }
+
+    // Publish button pins. We OWN each targeted pin: assert true when any card
+    // is active, else write the released value only if upstream doesn't already
+    // emit it (matches the Remapper release rule so passthrough stays intact).
+    for (pin, on) in &button_on {
+        let sig_type = automap::ALL_PINS.iter()
+            .find(|ap| ap.id == pin.as_str())
+            .map(|ap| ap.signal_type).unwrap_or(SignalType::Bool);
+        if *on {
+            let sig = match sig_type {
+                SignalType::Float => Signal::Float(1.0),
+                SignalType::Int   => Signal::Int(1),
+                SignalType::Vec2  => continue,
+                _                 => Signal::Bool(true),
+            };
+            collector_sigs.insert((key.clone(), pin.clone()), sig);
+        } else {
+            // Upstream already carries this pin (e.g. a real gamepad button) →
+            // leave it to passthrough instead of forcing a released value.
+            if read(pin).is_some() { continue; }
+            let sig = match sig_type {
+                SignalType::Float => Signal::Float(0.0),
+                SignalType::Int   => Signal::Int(0),
+                SignalType::Vec2  => continue,
+                _                 => Signal::Bool(false),
+            };
+            collector_sigs.insert((key.clone(), pin.clone()), sig);
+        }
+    }
+
+    // Publish analog sticks (Vec2 authoritative + component floats). Only when a
+    // finger is in the zone this frame; absent, the pin falls back to upstream so
+    // the physical stick still passes through.
+    for (target, (x, y)) in &sticks {
+        let (xp, yp) = match *target {
+            "left_stick" => ("left_stick_x", "left_stick_y"),
+            _            => ("right_stick_x", "right_stick_y"),
+        };
+        collector_sigs.insert((key.clone(), target.to_string()), Signal::Vec2(Vec2::new(*x, *y)));
+        collector_sigs.insert((key.clone(), xp.to_string()), Signal::Float(*x));
+        collector_sigs.insert((key.clone(), yp.to_string()), Signal::Float(*y));
+    }
+    // Publish relative mouse delta (Vec2 authoritative + component floats) while
+    // a finger drives it. Absent, the pins fall back to upstream.
+    if mouse_active {
+        collector_sigs.insert((key.clone(), "mouse".to_string()), Signal::Vec2(Vec2::new(mouse_dx, mouse_dy)));
+        collector_sigs.insert((key.clone(), "mouse_x".to_string()), Signal::Float(mouse_dx));
+        collector_sigs.insert((key.clone(), "mouse_y".to_string()), Signal::Float(mouse_dy));
+    }
 }
 
 /// Evaluate a Map Action node — shared by the top-level and sub-patch loops.

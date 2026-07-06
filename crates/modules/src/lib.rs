@@ -7,6 +7,7 @@ pub mod math;
 pub mod network;
 pub mod processing;
 pub mod subpatch;
+pub mod touch;
 
 use flexinput_core::ModuleRegistration;
 
@@ -20,6 +21,7 @@ pub fn all_modules() -> Vec<ModuleRegistration> {
     modules.extend(processing::registrations());
     modules.extend(generator::registrations());
     modules.extend(network::registrations());
+    modules.extend(touch::registrations());
     modules.extend(subpatch::registrations());
     modules
 }

@@ -62,6 +62,15 @@ pub enum EditLevel {
     /// fields (press-mode / time-gap / hold / turbo, skipping grayed-out),
     /// up/down (or South) edit the focused field, East exits to `RemapScroll`.
     RemapCard,
+    /// Inside a Touch Zones pad (the pinned "field" element): left/right cycles
+    /// the selected COLUMN divider, up/down the ROW divider; South grabs the
+    /// focused line (→ `TzGrab`), North recenters it, West removes it (mapping
+    /// mode only), LT/RT add an adjacent line (mapping only), LB/RB switch the
+    /// focused pad (split mode), East exits to `Widget`.
+    TzLines,
+    /// A Touch Zones divider is grabbed: dpad/LS along its perpendicular axis
+    /// moves it, North recenters, South/East release back to `TzLines`.
+    TzGrab,
 }
 
 /// What activating a left-panel (I/O panel) nav target does. Published by
@@ -182,6 +191,13 @@ pub struct GamepadNav {
     /// 0=press-mode, 1=time-gap, 2=hold, 3=turbo. Left/right moves between the
     /// fields that apply for the current mode (grayed-out ones are skipped).
     pub card_field: usize,
+    /// Touch Zones line editing (`TzLines`/`TzGrab`). `tz_field` = focused pad
+    /// (0 or 1, split mode); `tz_axis` = 0 for a COLUMN divider (vertical line,
+    /// moves in X), 1 for a ROW divider (horizontal line, moves in Y); `tz_line`
+    /// = index into that axis's interior-edges array. Clamped each frame.
+    pub tz_field: usize,
+    pub tz_axis: u8,
+    pub tz_line: usize,
     /// Virtual KB/M picker (opened from a Remapper's Special slot). When open,
     /// the modal grid captures nav input: LS/dpad move the cursor, South appends
     /// the focused pin to the output chord, North resets it, East closes.
@@ -200,6 +216,13 @@ pub struct GamepadNav {
     /// → "learning"; Lean: `_lean_<side>_phase` → "learning").
     pub kbm_picker_draft_key: String,
     pub kbm_picker_phase_key: Option<String>,
+    /// Touch Zones variant: hide the touchpad cluster + offer mouse-movement delta.
+    pub kbm_picker_touch_zones: bool,
+    /// Viewport that requested (and therefore draws) the picker: `None` = the
+    /// main window; `Some(id)` = a sub-patch editor viewport. The modal must be
+    /// rendered inside the requesting viewport or it pops up on the wrong
+    /// window (immediate viewports can't share egui Windows).
+    pub kbm_picker_viewport: Option<egui::ViewportId>,
     /// Press-mode picker (opened from a mapping card's press-mode field via
     /// South). Modal: up/down move `press_mode_idx`, South applies the
     /// highlighted mode to card `press_mode_card`, East cancels.
@@ -263,12 +286,17 @@ impl Default for GamepadNav {
             card_index: 0,
             remap_card: 0,
             card_field: 0,
+            tz_field: 0,
+            tz_axis: 0,
+            tz_line: 0,
             kbm_picker_open: false,
             kbm_picker_idx: 0,
             kbm_picker_node: None,
             kbm_picker_outer: None,
             kbm_picker_draft_key: String::from("draft_output"),
             kbm_picker_phase_key: None,
+            kbm_picker_touch_zones: false,
+            kbm_picker_viewport: None,
             press_mode_open: false,
             press_mode_idx: 0,
             press_mode_card: 0,

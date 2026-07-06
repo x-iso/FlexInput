@@ -1,0 +1,6 @@
+<svg width="64" height="64" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs/>
+  <g>
+    <path stroke="none" fill="#FFFFFF" d="M44 40 L44 38 46 38 46 34 44 34 44 24 38 24 32 32 32 38 40 38 40 40 44 40 M16 8 L48 8 Q56 8 56 16 L56 48 Q56 56 48 56 L16 56 Q8 56 8 48 L8 16 Q8 8 16 8 M18 24 L18 40 29 40 29 36 22 36 22 24 18 24 M40 34 L36 34 40 28 40 34"/>
+  </g>
+</svg>

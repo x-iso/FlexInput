@@ -2241,7 +2241,34 @@ impl eframe::App for FlexInputApp {
         // ── Settings window ───────────────────────────────────────────────────
         self.draw_settings_window(ctx);
         self.draw_gp_settings_panel(ctx);
-        self.draw_kbm_picker(ctx);
+        // Auto-close the picker when a Touch Zones assignment finishes: the card
+        // renderer commits the mapping (or Cancel fires) by resetting the node's
+        // `_tz_phase` out of "captured". Watching that here means the picker
+        // closes on Add without a viewer→app close bridge. Only applies to the
+        // TZ picker variant; the Remapper's picker is closed by its own Done.
+        if self.gamepad_nav.kbm_picker_open && self.gamepad_nav.kbm_picker_touch_zones {
+            let outer = self.gamepad_nav.kbm_picker_outer;
+            if let Some(inner) = self.gamepad_nav.kbm_picker_node {
+                let phase = self.picker_target_param_str(outer, inner, "_tz_phase");
+                if phase.as_deref() != Some("captured") {
+                    self.gamepad_nav.kbm_picker_open = false;
+                    self.gamepad_nav.kbm_picker_viewport = None;
+                }
+            }
+        }
+
+        // KB/M picker: drawn here only when the main window owns the session.
+        // Editor-owned sessions render inside their own viewport (see
+        // show_subpatch_editors); if the owning editor has closed, fall back to
+        // the main window so the modal can't become unreachable.
+        if let Some(vp) = self.gamepad_nav.kbm_picker_viewport {
+            let owner_open = self.sub_patch_editors.iter().any(|e| egui::ViewportId::from_hash_of(
+                ("subpatch_editor", e.tab_idx, e.node_id.0)) == vp);
+            if !owner_open { self.gamepad_nav.kbm_picker_viewport = None; }
+        }
+        if self.gamepad_nav.kbm_picker_viewport.is_none() {
+            self.draw_kbm_picker(ctx);
+        }
         self.draw_press_mode_picker(ctx);
         self.draw_reinstall_confirm(ctx);
         self.draw_uninstall_confirm(ctx);
@@ -2982,7 +3009,7 @@ impl eframe::App for FlexInputApp {
         // show_subpatch_editors. Deferred to here so the `canvas` borrow above
         // has ended before this `&mut self` call.
         if let Some(req) = crate::canvas::viewer::take_special_picker_request(ctx) {
-            self.open_special_picker(req);
+            self.open_special_picker(req, None);
         }
 
         // ── Sub-patch editor windows ──────────────────────────────────────────
@@ -3165,6 +3192,9 @@ enum NavWidgetKind {
     /// edit it. Covers gyro rows, curve option rows, counter min/max, etc. Also
     /// used for single-field generic widgets (one field).
     MultiField,
+    /// Touch Zones pad (the pinned "field" element) — South enters line editing
+    /// (`TzLines`): cycle/grab/move/recenter dividers, add/remove in mapping mode.
+    TouchZones,
 }
 
 /// Identifies a setting in the gamepad-native settings panel for get/set.
@@ -3558,10 +3588,14 @@ impl FlexInputApp {
         }
 
         // ── LB/RB: switch tabs ───────────────────────────────────────────────
-        if nav.is_rising("btn_lb") && self.active_tab > 0 {
+        // Reserved while editing Touch Zones lines: there the bumpers switch the
+        // focused PAD (split mode), so they must not also flip tabs.
+        let tz_editing = matches!(self.gamepad_nav.edit_level,
+            crate::gamepad_nav::EditLevel::TzLines | crate::gamepad_nav::EditLevel::TzGrab);
+        if !tz_editing && nav.is_rising("btn_lb") && self.active_tab > 0 {
             self.set_active_tab(self.active_tab - 1);
         }
-        if nav.is_rising("btn_rb") && self.active_tab + 1 < self.tabs.len() {
+        if !tz_editing && nav.is_rising("btn_rb") && self.active_tab + 1 < self.tabs.len() {
             self.set_active_tab(self.active_tab + 1);
         }
 
@@ -3755,6 +3789,13 @@ impl FlexInputApp {
                             crate::canvas::viewer::nav_cycle_remapper_filter(ctx, inner.0, dir);
                         }
                     }
+                } else if matches!(kind, NavWidgetKind::TouchZones) {
+                    // Touch Zones pad: South ENTERS line editing (TzLines). Seed
+                    // the focused line at the first interior divider of the pad
+                    // and snapshot for one coalesced undo entry across the edit.
+                    if nav.is_rising("btn_south") {
+                        self.nav_tz_enter(outer_id);
+                    }
                 } else {
                     // South / RT → act on the selected widget by kind.
                     if nav.is_rising("btn_south") || rt_rising {
@@ -3781,8 +3822,10 @@ impl FlexInputApp {
                                     self.nav_set_dropdown_popup(ctx, outer_id, true);
                                 }
                             }
+                            // Curve / Remapper / TouchZones are handled by the
+                            // dedicated branches above; unreachable here.
                             NavWidgetKind::Curve | NavWidgetKind::Remapper
-                            | NavWidgetKind::None => {}
+                            | NavWidgetKind::TouchZones | NavWidgetKind::None => {}
                         }
                     }
                     let _ = lt_rising; // no back action at widget level
@@ -3862,6 +3905,9 @@ impl FlexInputApp {
             }
             EditLevel::RemapCard => {
                 self.nav_drive_remap_card(ctx, outer_id, nav, dt, step_dir, rt_rising, mag);
+            }
+            EditLevel::TzLines | EditLevel::TzGrab => {
+                self.nav_drive_touch_zones(ctx, outer_id, nav, dt, step_dir, rt_rising, lt_rising, mag);
             }
         }
     }
@@ -4096,6 +4142,295 @@ impl FlexInputApp {
         });
     }
 
+    // ── Touch Zones line editing (gamepad nav) ───────────────────────────────
+    // Easy-mode-only: operates on the pinned "field" element of a Touch Zones
+    // node in the tab-canvas sub-patch. Ports mode is MOVE-ONLY (dividers carry
+    // typed wiring); mapping mode also allows add/remove.
+
+    /// Param key for a field's interior-edge array (`col_edges`/`row_edges` for
+    /// field 0, suffixed for field N) — matches the viewer/eval convention.
+    fn tz_edge_key(field: usize, which: &str) -> String {
+        if field == 0 { which.to_string() } else { format!("{which}{field}") }
+    }
+
+    /// Read a Touch Zones inner node's interior-edge array from the tab-canvas
+    /// sub-patch (where gamepad nav operates on the body).
+    fn tz_edges(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, which: &str) -> Vec<f32>
+    {
+        let key = Self::tz_edge_key(field, which);
+        self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|n| n.params.get(&key).and_then(|v| v.as_array()))
+            .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Overwrite a field's interior-edge array (kept sorted by the caller). The
+    /// engine reads the tab-canvas snarl each frame, so the change is live; the
+    /// undo baseline snapshotted on enter is committed on exit.
+    fn tz_set_edges(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, which: &str, vals: &[f32])
+    {
+        let key = Self::tz_edge_key(field, which);
+        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl
+            .get_node_mut(outer).and_then(|n| n.subpatch.as_mut())
+        {
+            if let Some(node) = sp.snarl.get_node_mut(inner) {
+                node.params.insert(key, serde_json::Value::Array(
+                    vals.iter().map(|v| serde_json::json!(*v as f64)).collect()));
+            }
+        }
+    }
+
+    /// Mapping mode allows add/remove of dividers (no typed wiring to break);
+    /// ports mode is move-only.
+    fn tz_is_mapping(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+        self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str()))
+            == Some("mapping")
+    }
+
+    /// Number of pads (2 in split mode, else 1).
+    fn tz_n_fields(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> usize {
+        let split = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
+        if split { 2 } else { 1 }
+    }
+
+    /// Enter line editing from Widget level: focus the first interior divider of
+    /// pad 0 and snapshot for one coalesced undo entry across the whole edit.
+    fn nav_tz_enter(&mut self, outer_id: egui_snarl::NodeId) {
+        use crate::gamepad_nav::EditLevel;
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        self.gamepad_nav.tz_field = 0;
+        let cols = self.tz_edges(outer_id, inner, 0, "col_edges").len();
+        let rows = self.tz_edges(outer_id, inner, 0, "row_edges").len();
+        if cols > 0 { self.gamepad_nav.tz_axis = 0; }
+        else if rows > 0 { self.gamepad_nav.tz_axis = 1; }
+        else { self.gamepad_nav.tz_axis = 0; }
+        self.gamepad_nav.tz_line = 0;
+        self.gamepad_nav.edit_level = EditLevel::TzLines;
+        self.gamepad_nav.edit_baseline = Some(Box::new(
+            self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+    }
+
+    /// Exit line editing to Widget level, committing the coalesced undo entry.
+    fn nav_tz_exit(&mut self) {
+        self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::Widget;
+        if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {
+            self.tabs[self.active_tab].canvas.commit_undo_if_changed(*baseline);
+        }
+    }
+
+    /// Publish the focused/grabbed divider so the pinned field renderer can
+    /// highlight it (keyed by inner node id; consumed by `tz_draw_field`).
+    fn nav_tz_publish(&self, ctx: &egui::Context, inner: egui_snarl::NodeId) {
+        let grabbed = matches!(self.gamepad_nav.edit_level, crate::gamepad_nav::EditLevel::TzGrab);
+        let pass = ctx.cumulative_pass_nr();
+        ctx.data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_tz", inner.0)),
+            (pass, self.gamepad_nav.tz_field as u64, self.gamepad_nav.tz_axis as u64,
+             self.gamepad_nav.tz_line as u64, grabbed)));
+        ctx.request_repaint();
+    }
+
+    /// Drive Touch Zones line editing (`TzLines`/`TzGrab`). See the EditLevel
+    /// docs for the full control map.
+    #[allow(clippy::too_many_arguments)]
+    fn nav_drive_touch_zones(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        _dt: f32,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        rt_rising: bool,
+        lt_rising: bool,
+        _mag: f32,
+    ) {
+        use crate::gamepad_nav::{EditLevel, NavDir};
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else {
+            self.nav_tz_exit();
+            return;
+        };
+        let mapping = self.tz_is_mapping(outer_id, inner);
+        let n_fields = self.tz_n_fields(outer_id, inner);
+        let mut field = self.gamepad_nav.tz_field.min(n_fields - 1);
+
+        // LB/RB switch the focused pad (split mode only).
+        if n_fields > 1 && (nav.is_rising("btn_lb") || nav.is_rising("btn_rb")) {
+            field = (field + 1) % n_fields;
+        }
+        self.gamepad_nav.tz_field = field; // keep state reclamped to valid pads
+
+        let cols = self.tz_edges(outer_id, inner, field, "col_edges");
+        let rows = self.tz_edges(outer_id, inner, field, "row_edges");
+        // Clamp the focused line to the current axis's count (edits may shrink it).
+        let axis_len = |a: u8| if a == 0 { cols.len() } else { rows.len() };
+        if axis_len(self.gamepad_nav.tz_axis) == 0 {
+            // Current axis emptied: jump to the other if it has lines.
+            let other = 1 - self.gamepad_nav.tz_axis;
+            if axis_len(other) > 0 { self.gamepad_nav.tz_axis = other; }
+        }
+        let cur_len = axis_len(self.gamepad_nav.tz_axis).max(1);
+        self.gamepad_nav.tz_line = self.gamepad_nav.tz_line.min(cur_len - 1);
+
+        match self.gamepad_nav.edit_level {
+            EditLevel::TzLines => {
+                if nav.is_rising("btn_east") { self.nav_tz_exit(); return; }
+
+                // Left/Right → column dividers; Up/Down → row dividers.
+                match step_dir {
+                    Some(NavDir::Left)  => self.nav_tz_cycle(0, -1, cols.len(), rows.len()),
+                    Some(NavDir::Right) => self.nav_tz_cycle(0,  1, cols.len(), rows.len()),
+                    Some(NavDir::Up)    => self.nav_tz_cycle(1, -1, cols.len(), rows.len()),
+                    Some(NavDir::Down)  => self.nav_tz_cycle(1,  1, cols.len(), rows.len()),
+                    None => {}
+                }
+
+                let has_line = axis_len(self.gamepad_nav.tz_axis) > 0;
+                if nav.is_rising("btn_south") && has_line {
+                    self.gamepad_nav.edit_level = EditLevel::TzGrab;
+                }
+                if nav.is_rising("btn_north") && has_line {
+                    self.nav_tz_recenter(outer_id, inner, field, &cols, &rows);
+                }
+                if mapping && nav.is_rising("btn_west") && has_line {
+                    self.nav_tz_remove(outer_id, inner, field, &cols, &rows);
+                }
+                if mapping && (rt_rising || lt_rising) {
+                    self.nav_tz_add(outer_id, inner, field, rt_rising, &cols, &rows);
+                }
+            }
+            EditLevel::TzGrab => {
+                if nav.is_rising("btn_south") || nav.is_rising("btn_east") {
+                    self.gamepad_nav.edit_level = EditLevel::TzLines;
+                } else if nav.is_rising("btn_north") {
+                    self.nav_tz_recenter(outer_id, inner, field, &cols, &rows);
+                } else {
+                    // dpad/LS along the line's perpendicular axis nudges it.
+                    let axis = self.gamepad_nav.tz_axis;
+                    const STEP: f32 = 0.02;
+                    let delta = match (axis, step_dir) {
+                        (0, Some(NavDir::Left))  => -STEP,
+                        (0, Some(NavDir::Right)) =>  STEP,
+                        (1, Some(NavDir::Up))    => -STEP,
+                        (1, Some(NavDir::Down))  =>  STEP,
+                        _ => 0.0,
+                    };
+                    if delta != 0.0 {
+                        self.nav_tz_move(outer_id, inner, field, delta, &cols, &rows);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.nav_tz_publish(ctx, inner);
+    }
+
+    /// Move the line selection: set the focused axis and step within it. A no-op
+    /// when the requested axis has no dividers.
+    fn nav_tz_cycle(&mut self, axis: u8, dir: i32, n_cols: usize, n_rows: usize) {
+        let n = if axis == 0 { n_cols } else { n_rows };
+        if n == 0 { return; }
+        if self.gamepad_nav.tz_axis != axis {
+            self.gamepad_nav.tz_axis = axis;
+            self.gamepad_nav.tz_line = if dir >= 0 { 0 } else { n - 1 };
+        } else {
+            let next = (self.gamepad_nav.tz_line as i32 + dir).clamp(0, n as i32 - 1);
+            self.gamepad_nav.tz_line = next as usize;
+        }
+    }
+
+    /// Nudge the focused divider by `delta` (clamped between its neighbours,
+    /// matching the mouse-drag bounds).
+    fn nav_tz_move(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, delta: f32, cols: &[f32], rows: &[f32])
+    {
+        let axis = self.gamepad_nav.tz_axis;
+        let line = self.gamepad_nav.tz_line;
+        let (which, edges) = if axis == 0 { ("col_edges", cols) } else { ("row_edges", rows) };
+        if line >= edges.len() { return; }
+        let mut e = edges.to_vec();
+        let lo = if line == 0 { 0.05 } else { e[line - 1] + 0.04 };
+        let hi = if line + 1 == e.len() { 0.95 } else { e[line + 1] - 0.04 };
+        e[line] = (e[line] + delta).clamp(lo, hi);
+        self.tz_set_edges(outer, inner, field, which, &e);
+    }
+
+    /// Recenter the focused divider between its two adjacent borders (mirrors the
+    /// mouse double-click / "North" recenter action).
+    fn nav_tz_recenter(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, cols: &[f32], rows: &[f32])
+    {
+        let axis = self.gamepad_nav.tz_axis;
+        let line = self.gamepad_nav.tz_line;
+        let (which, edges) = if axis == 0 { ("col_edges", cols) } else { ("row_edges", rows) };
+        if line >= edges.len() { return; }
+        let mut e = edges.to_vec();
+        let lo = if line == 0 { 0.0 } else { e[line - 1] };
+        let hi = if line + 1 == e.len() { 1.0 } else { e[line + 1] };
+        e[line] = (lo + hi) * 0.5;
+        self.tz_set_edges(outer, inner, field, which, &e);
+    }
+
+    /// Remove the focused divider (mapping mode only) and reclamp the selection.
+    fn nav_tz_remove(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, cols: &[f32], rows: &[f32])
+    {
+        let axis = self.gamepad_nav.tz_axis;
+        let line = self.gamepad_nav.tz_line;
+        let (which, edges) = if axis == 0 { ("col_edges", cols) } else { ("row_edges", rows) };
+        if line >= edges.len() { return; }
+        let mut e = edges.to_vec();
+        e.remove(line);
+        self.tz_set_edges(outer, inner, field, which, &e);
+        // Reclamp: stay on this axis if it still has lines, else hop to the other.
+        if e.is_empty() {
+            let other = if axis == 0 { rows.len() } else { cols.len() };
+            if other > 0 { self.gamepad_nav.tz_axis = 1 - axis; }
+            self.gamepad_nav.tz_line = 0;
+        } else {
+            self.gamepad_nav.tz_line = line.min(e.len() - 1);
+        }
+    }
+
+    /// Add a divider in the cell adjacent to the focused line (mapping mode). RT
+    /// splits the high side (right/below), LT the low side (left/above). With no
+    /// lines yet on the axis, adds one at centre.
+    fn nav_tz_add(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, high_side: bool, cols: &[f32], rows: &[f32])
+    {
+        let axis = self.gamepad_nav.tz_axis;
+        let line = self.gamepad_nav.tz_line;
+        let (which, edges) = if axis == 0 { ("col_edges", cols) } else { ("row_edges", rows) };
+        let mut e = edges.to_vec();
+        if e.is_empty() {
+            e.push(0.5);
+            self.tz_set_edges(outer, inner, field, which, &e);
+            self.gamepad_nav.tz_line = 0;
+            return;
+        }
+        if line >= e.len() { return; }
+        let cur = e[line];
+        let (lo, hi) = if high_side {
+            (cur, if line + 1 == e.len() { 1.0 } else { e[line + 1] })
+        } else {
+            (if line == 0 { 0.0 } else { e[line - 1] }, cur)
+        };
+        let newv = (lo + hi) * 0.5;
+        let idx = e.iter().position(|&x| x > newv).unwrap_or(e.len());
+        e.insert(idx, newv);
+        self.tz_set_edges(outer, inner, field, which, &e);
+        self.gamepad_nav.tz_line = idx; // focus the new divider
+    }
+
     /// Drive a remapper-family widget the user has ENTERED (RemapScroll level):
     /// up/down moves the SELECTED CARD, North resets it (or arms Learn when the
     /// list is empty), West deletes it, South ENTERS it (`RemapCard`), LT/RT
@@ -4208,6 +4543,8 @@ impl FlexInputApp {
                     self.gamepad_nav.kbm_picker_idx = 0;
                     self.gamepad_nav.kbm_picker_node = Some(inner);
                     self.gamepad_nav.kbm_picker_outer = Some(outer_id);
+                    self.gamepad_nav.kbm_picker_touch_zones = false;
+                    self.gamepad_nav.kbm_picker_viewport = None;
                     self.gamepad_nav.kbm_picker_draft_key =
                         lean_draft.unwrap_or("draft_output").to_string();
                     self.gamepad_nav.kbm_picker_phase_key =
@@ -4255,6 +4592,7 @@ impl FlexInputApp {
         // East closes the picker.
         if nav.is_rising("btn_east") {
             self.gamepad_nav.kbm_picker_open = false;
+            self.gamepad_nav.kbm_picker_viewport = None;
             return;
         }
         // Spatial navigation: move to the nearest cell in the pressed direction.
@@ -4273,7 +4611,8 @@ impl FlexInputApp {
         // `outer = None` is valid (top-level node); only `inner` is required.
         let outer = self.gamepad_nav.kbm_picker_outer;
         let Some(inner) = self.gamepad_nav.kbm_picker_node else {
-            self.gamepad_nav.kbm_picker_open = false; return; };
+            self.gamepad_nav.kbm_picker_open = false;
+            self.gamepad_nav.kbm_picker_viewport = None; return; };
         let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
 
         // North resets the output chord.
@@ -4382,6 +4721,19 @@ impl FlexInputApp {
         }
     }
 
+    /// Read a string param from the picker's target node (top-level or sub-patch).
+    fn picker_target_param_str(&self, outer: Option<egui_snarl::NodeId>,
+        inner: egui_snarl::NodeId, key: &str) -> Option<String>
+    {
+        let node = match outer {
+            Some(o) => self.tabs[self.active_tab].canvas.snarl.get_node(o)
+                .and_then(|n| n.subpatch.as_ref())
+                .and_then(|sp| sp.snarl.get_node(inner)),
+            None => self.tabs[self.active_tab].canvas.snarl.get_node(inner),
+        };
+        node.and_then(|n| n.params.get(key).and_then(|v| v.as_str().map(String::from)))
+    }
+
     /// Write a string param on a top-level or sub-patch node.
     fn picker_set_param_str(&mut self, outer: Option<egui_snarl::NodeId>,
         inner: egui_snarl::NodeId, key: &str, val: &str)
@@ -4397,13 +4749,20 @@ impl FlexInputApp {
     }
 
     /// Open the shared KB/M + touchpad picker for a mouse-driven Special click.
-    fn open_special_picker(&mut self, req: crate::canvas::viewer::SpecialPickerRequest) {
+    /// `viewport` is the egui viewport the click came from (`None` = the main
+    /// window) — the modal is drawn inside THAT viewport so it appears on the
+    /// window the user is actually working in.
+    fn open_special_picker(&mut self, req: crate::canvas::viewer::SpecialPickerRequest,
+        viewport: Option<egui::ViewportId>)
+    {
         self.gamepad_nav.kbm_picker_open = true;
         self.gamepad_nav.kbm_picker_idx = 0;
         self.gamepad_nav.kbm_picker_node = Some(req.inner);
         self.gamepad_nav.kbm_picker_outer = req.outer;
         self.gamepad_nav.kbm_picker_draft_key = req.draft_key;
         self.gamepad_nav.kbm_picker_phase_key = req.phase_key;
+        self.gamepad_nav.kbm_picker_touch_zones = req.touch_zones;
+        self.gamepad_nav.kbm_picker_viewport = viewport;
     }
 
     /// Whether the picker's current target accepts analog-only outputs (swipe).
@@ -5676,6 +6035,10 @@ impl FlexInputApp {
                 if elem.as_deref() == Some("asth_scope") => NavWidgetKind::Curve,
             Some("module.remapper") | Some("module.map_action")
             | Some("module.automap_combiner") => NavWidgetKind::Remapper,
+            // Touch Zones pad "field" element = the grid → line editing. The
+            // "cards" element (zone_maps list) isn't gamepad-navigable yet; it
+            // falls through to None (mouse/touch only).
+            Some("module.touch_zones") if elem.as_deref() == Some("field") => NavWidgetKind::TouchZones,
             // Gyro lean sections are remapper-family mapping rows (Learn/capture +
             // filter), unlike gyro's other elements which are plain field rows.
             Some("processing.gyro_3dof")
@@ -7488,7 +7851,27 @@ impl FlexInputApp {
     /// display-only. Rendered top-level (not in a sublayer), so painting here is
     /// safe.
     fn draw_kbm_picker(&mut self, ctx: &egui::Context) {
-        if !self.gamepad_nav.kbm_picker_open { return; }
+        let (clicked_pin, done) = self.kbm_picker_window(ctx);
+        self.apply_kbm_picker_result(clicked_pin, done);
+    }
+
+    /// Apply a picker interaction collected by `kbm_picker_window` — split out
+    /// so a sub-patch editor viewport (which holds `&self` during its closure)
+    /// can render the window inline and apply the result once `&mut` is back.
+    fn apply_kbm_picker_result(&mut self, clicked_pin: Option<&'static str>, done: bool) {
+        if let Some(pin) = clicked_pin {
+            self.picker_append_pin(pin);
+        }
+        if done {
+            self.gamepad_nav.kbm_picker_open = false;
+            self.gamepad_nav.kbm_picker_viewport = None;
+        }
+    }
+
+    /// Render the picker window into `ctx` (read-only on `self`) and report
+    /// what the user did: `(clicked pin, Done pressed)`.
+    fn kbm_picker_window(&self, ctx: &egui::Context) -> (Option<&'static str>, bool) {
+        if !self.gamepad_nav.kbm_picker_open { return (None, false); }
         use crate::kbm_picker::{clamp_index, layout_extent, KBM_LAYOUT};
         let sel = clamp_index(self.gamepad_nav.kbm_picker_idx);
         let accent = ctx.style().visuals.selection.stroke.color;
@@ -7515,7 +7898,19 @@ impl FlexInputApp {
         let mut clicked_pin: Option<&'static str> = None;
         let mut done = false;
 
-        egui::Window::new("⌨ KB/M + touchpad picker")
+        // Touch Zones variant: a touchpad can't remap to itself, so hide the
+        // touchpad cluster; instead offer mouse-movement delta as an output.
+        let tz = self.gamepad_nav.kbm_picker_touch_zones;
+        let tz_hidden = |pin: &str| tz && matches!(pin,
+            "touch_left" | "touch_center" | "touch_right"
+            | "btn_touchpad" | "touch_swipe_x" | "touch_swipe_y"
+            | "btn_mute"); // DS-specific mic button goes with the DS touchpad cluster
+        // Extra mouse-delta cells placed in the vacated touchpad columns.
+        let tz_extra: &[(&'static str, f32, f32)] = if tz {
+            &[("mouse_x", 23.5, 1.0), ("mouse_y", 24.5, 1.0), ("mouse", 23.5, 2.0)]
+        } else { &[] };
+
+        egui::Window::new(if tz { "⌨ KB/M + mouse picker" } else { "⌨ KB/M + touchpad picker" })
             .id(egui::Id::new("gp_kbm_picker"))
             .collapsible(false)
             .resizable(false)
@@ -7552,6 +7947,7 @@ impl FlexInputApp {
                 let (board, _) = ui.allocate_exact_size(
                     egui::vec2(board_w, board_h), egui::Sense::hover());
                 for (i, cell) in KBM_LAYOUT.iter().enumerate() {
+                    if tz_hidden(cell.pin) { continue; }
                     let min = board.min + egui::vec2(
                         cell.x * (UNIT + GAP), cell.y * (UNIT + GAP));
                     let size = egui::vec2(
@@ -7600,15 +7996,31 @@ impl FlexInputApp {
                             if disabled { egui::Color32::from_gray(110) } else { ui.visuals().text_color() });
                     }
                 }
+                // Touch Zones extra: mouse-movement delta outputs.
+                for (pin, gx, gy) in tz_extra.iter().copied() {
+                    let rect = egui::Rect::from_min_size(
+                        board.min + egui::vec2(gx * (UNIT + GAP), gy * (UNIT + GAP)),
+                        egui::vec2(UNIT, UNIT));
+                    let r = ui.interact(rect, egui::Id::new(("kbm_extra", pin)), egui::Sense::click());
+                    if r.clicked() { clicked_pin = Some(pin); }
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 4.0,
+                        if r.hovered() { egui::Color32::from_gray(60) } else { egui::Color32::from_gray(40) });
+                    if let Some(tex) = kbm_cell_texture(ctx, skin, pin) {
+                        let s = UNIT - 6.0;
+                        painter.image(tex.id(),
+                            egui::Rect::from_center_size(rect.center(), egui::vec2(s, s)),
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE);
+                    } else {
+                        painter.text(rect.center(), egui::Align2::CENTER_CENTER,
+                            kbm_pin_label(pin), egui::FontId::proportional(10.0), ui.visuals().text_color());
+                    }
+                }
             });
 
-        if let Some(pin) = clicked_pin {
-            self.picker_append_pin(pin);
-        }
-        if done {
-            self.gamepad_nav.kbm_picker_open = false;
-        }
         ctx.request_repaint();
+        (clicked_pin, done)
     }
 
     /// Modal press-mode picker: a vertical list of the press modes (glyph +
@@ -7802,6 +8214,34 @@ impl FlexInputApp {
                 (vec!["btn_south"], "Toggle / Open"),
                 (vec!["btn_north"], "Reset card"),
                 (vec!["btn_east"], "Back"),
+            ],
+            EditLevel::TzLines => {
+                // Add/remove only shown in mapping mode (ports mode is move-only).
+                let mapping = self.nav_active_outer_id()
+                    .and_then(|o| self.nav_selected_inner_node(o).map(|i| self.tz_is_mapping(o, i)))
+                    .unwrap_or(false);
+                let split = self.nav_active_outer_id()
+                    .and_then(|o| self.nav_selected_inner_node(o).map(|i| self.tz_n_fields(o, i) > 1))
+                    .unwrap_or(false);
+                let mut v = vec![
+                    (hint_horiz(), "Col line"),
+                    (hint_vert(), "Row line"),
+                    (vec!["btn_south"], "Grab"),
+                    (vec!["btn_north"], "Recenter"),
+                ];
+                if mapping {
+                    v.push((vec!["btn_west"], "Remove"));
+                    v.push((vec!["left_trigger", "right_trigger"], "Add line"));
+                }
+                if split { v.push((vec!["btn_lb", "btn_rb"], "Pad")); }
+                v.push((vec!["btn_east"], "Back"));
+                v
+            }
+            EditLevel::TzGrab => vec![
+                (hint_move(), "Move line"),
+                (vec!["btn_north"], "Recenter"),
+                (vec!["btn_south"], "Drop"),
+                (vec!["btn_east"], "Drop"),
             ],
         }
     }
@@ -9917,7 +10357,31 @@ pub fn find_automap_device_id_for_viewer(
                 .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
             return Some((dev_id, pin_ids, None));
         }
-        if node.module_id == "module.automap_split" || node.module_id == "module.feedback_control" {
+        // Touch Zones mapping mode = injector under `touchmap:{uid}` (mirror of
+        // find_automap_device_rec); ports mode = passthrough (next arm).
+        if node.module_id == "module.touch_zones"
+            && node.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping")
+        {
+            let upstream_dev_id = node.inputs.iter()
+                .position(|p| p.signal_type == SignalType::AutoMap)
+                .and_then(|am_idx| {
+                    let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
+                    in_pin.remotes.first().copied()
+                })
+                .and_then(|s| rec(snarl, s, parents).map(|(id, _, _)| id));
+            let map_uid = match parents {
+                None => src.node.0,
+                Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
+            };
+            let map_id = format!("touchmap:{}", map_uid);
+            let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+                .iter().map(|p| p.id.to_string()).collect();
+            return Some((map_id, canonical_pins, upstream_dev_id));
+        }
+        if node.module_id == "module.automap_split"
+            || node.module_id == "module.feedback_control"
+            || node.module_id == "module.touch_zones"
+        {
             let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
             let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
             let upstream = *in_pin.remotes.first()?;
@@ -10055,8 +10519,36 @@ fn find_automap_device_rec(
             .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
         return Some((dev_id, pin_ids, None));
     }
-    if node.module_id == "module.automap_split" || node.module_id == "module.feedback_control" {
-        // Both pass the AutoMap bus through on output 0 from their AutoMap input.
+    // Touch Zones in MAPPING mode is an injector: it publishes per-zone behaviour
+    // overrides into collector_sigs under a `touchmap:{uid}` key, exactly like the
+    // Remapper. In PORTS mode it's a plain passthrough (zone data lives on the
+    // typed outputs, nothing is injected onto the bus) — handled below.
+    if node.module_id == "module.touch_zones"
+        && node.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping")
+    {
+        let upstream_dev_id = node.inputs.iter()
+            .position(|p| p.signal_type == SignalType::AutoMap)
+            .and_then(|am_idx| {
+                let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
+                in_pin.remotes.first().copied()
+            })
+            .and_then(|s| find_automap_device_rec(snarl, s, parents).map(|(id, _, _)| id));
+        let map_uid = match parents {
+            None => src.node.0,
+            Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
+        };
+        let map_id = format!("touchmap:{}", map_uid);
+        let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
+            .iter().map(|p| p.id.to_string()).collect();
+        return Some((map_id, canonical_pins, upstream_dev_id));
+    }
+    if node.module_id == "module.automap_split"
+        || node.module_id == "module.feedback_control"
+        || node.module_id == "module.touch_zones"
+    {
+        // All pass the AutoMap bus through on output 0 from their AutoMap input.
+        // (Touch Zones in ports mode injects nothing; its zone data is on the
+        // dynamic typed outputs, not the AutoMap passthrough.)
         let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
         let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
         let upstream = *in_pin.remotes.first()?;
@@ -10441,6 +10933,7 @@ fn build_processing_graph_rec(
             | "module.automap_fork" | "module.automap_selector"
             | "module.remapper" | "module.map_action"
             | "module.automap_collect" | "module.audio_stream_haptics"
+            | "module.touch_zones"
             | "module.network_send")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
@@ -10458,6 +10951,7 @@ fn build_processing_graph_rec(
                             || dev_id.starts_with("forksel:")
                             || dev_id.starts_with("combiner:")
                             || dev_id.starts_with("remap:")
+                            || dev_id.starts_with("touchmap:")
                             || dev_id.starts_with("lean:")
                         {
                             params.insert("_automap_collector_id".to_string(),
@@ -10481,6 +10975,7 @@ fn build_processing_graph_rec(
                             let is_collector = dev_id.starts_with("collector:")
                                 || dev_id.starts_with("forksel:")
                                 || dev_id.starts_with("remap:")
+                                || dev_id.starts_with("touchmap:")
                                 || dev_id.starts_with("combiner:")
                                 || dev_id.starts_with("lean:");
                             let dev = fallback.unwrap_or_else(|| if is_collector { String::new() } else { dev_id.clone() });
@@ -10517,6 +11012,7 @@ fn build_processing_graph_rec(
                         let is_collector = dev_id.starts_with("collector:")
                             || dev_id.starts_with("forksel:")
                             || dev_id.starts_with("remap:")
+                            || dev_id.starts_with("touchmap:")
                             || dev_id.starts_with("combiner:")
                             || dev_id.starts_with("lean:");
                         let dev = fallback.unwrap_or_else(|| if is_collector { String::new() } else { dev_id.clone() });
@@ -10709,6 +11205,7 @@ fn build_processing_graph_rec(
         let stripped = s.strip_prefix("collector:")
             .or_else(|| s.strip_prefix("combiner:"))
             .or_else(|| s.strip_prefix("remap:"))
+            .or_else(|| s.strip_prefix("touchmap:"))
             .or_else(|| s.strip_prefix("lean:"))
             .or_else(|| s.strip_prefix("forksel:").and_then(|t| t.split(':').next()))?;
         stripped.parse::<usize>().ok()
@@ -10815,6 +11312,7 @@ fn build_processing_graph_rec(
                 let uid_str = am_dev_id.strip_prefix("collector:")
                     .or_else(|| am_dev_id.strip_prefix("combiner:"))
                     .or_else(|| am_dev_id.strip_prefix("remap:"))
+                    .or_else(|| am_dev_id.strip_prefix("touchmap:"))
                     .or_else(|| am_dev_id.strip_prefix("forksel:").and_then(|s| s.split(':').next()));
                 if let Some(uid_str) = uid_str {
                     if let Ok(uid) = uid_str.parse::<usize>() {
@@ -12038,6 +12536,9 @@ fn kbm_pin_label(pin: &str) -> String {
         "btn_mute" => "Mic".into(),
         "touch_swipe_x" => "Swipe↔".into(),
         "touch_swipe_y" => "Swipe↕".into(),
+        "mouse" => "Mouse⤢".into(),
+        "mouse_x" => "Mouse↔".into(),
+        "mouse_y" => "Mouse↕".into(),
         _ => {
             let s = pin.strip_prefix("key_").or_else(|| pin.strip_prefix("mouse_"))
                 .unwrap_or(pin);
@@ -12357,6 +12858,9 @@ fn show_subpatch_editors(
         // inside this editor requested the shared picker (opened after the
         // viewport closure returns, where `app` is mutably available again).
         let mut special_req: Option<crate::canvas::viewer::SpecialPickerRequest> = None;
+        // Picker interaction collected inside the viewport closure (which only
+        // holds `&app`); applied after it returns.
+        let mut picker_result: (Option<&'static str>, bool) = (None, false);
 
         let viewport_id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
         // Build breadcrumb: "Parent Name > This Name" for nested editors.
@@ -12443,6 +12947,15 @@ fn show_subpatch_editors(
                     inner_canvas.pending_expose_module = Some((NodeId(inner_uid), eid, size));
                 }
                 special_req = crate::canvas::viewer::take_special_picker_request(vctx);
+                // When this editor's viewport owns the KB/M picker session,
+                // the modal is drawn HERE (immediate viewports can't share the
+                // main window's egui Windows). Interactions are applied after
+                // the closure, where `app` is mutable again.
+                if app.gamepad_nav.kbm_picker_open
+                    && app.gamepad_nav.kbm_picker_viewport == Some(viewport_id)
+                {
+                    picker_result = app.kbm_picker_window(vctx);
+                }
                 crate::canvas::viewer::set_layout_mode_active(vctx, false);
             },
         );
@@ -12452,11 +12965,15 @@ fn show_subpatch_editors(
         // A Special… button inside this editor requested the picker. Only
         // first-level sub-patches (parented to the tab canvas) can be addressed
         // by the picker's tab-canvas helpers; deeper nesting degrades to no-op.
+        // The session is owned by THIS viewport so the modal opens on the
+        // editor window the click came from, not the main window.
         if let Some(req) = special_req {
             if parent_editor_idx.is_none() {
-                app.open_special_picker(req);
+                app.open_special_picker(req, Some(viewport_id));
             }
         }
+        // Apply picker interactions collected inside the viewport closure.
+        app.apply_kbm_picker_result(picker_result.0, picker_result.1);
 
         // Collect nested edit request before putting inner_canvas back.
         if let Some(child_id) = inner_canvas.pending_edit_subpatch.take() {
