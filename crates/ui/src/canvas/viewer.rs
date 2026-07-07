@@ -1719,10 +1719,11 @@ fn tz_live_hits(
     }
     if advance {
         ctx.data_mut(|d| d.insert_temp(track_id, (pass, track)));
-        // Publish the last touched-down origin so the tab-follow locks to it.
-        if let Some(origin) = just_down {
+        // Publish the last touched-down origin (pass-stamped) so the tab-follow
+        // locks to it, and a pick-mode tap can act on a FRESH touchdown only.
+        if let Some((f, z)) = just_down {
             ctx.data_mut(|d| d.insert_temp(
-                egui::Id::new(("tz_last_origin", node_id.0)), origin));
+                egui::Id::new(("tz_last_origin", node_id.0)), (pass, f, z)));
         }
     }
     m
@@ -1799,6 +1800,7 @@ fn tz_render_merge_popup(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node_id
         if let Some(n) = snarl.get_node_mut(node_id) { n.params.remove("_tz_merge"); }
         return;
     };
+    let _ = kept;
     let n_cards = tz_cards_in_zones(snarl, node_id, field, &removed);
     let mut choice: Option<&'static str> = None;
     egui::Window::new("Remove divider")
@@ -1808,44 +1810,138 @@ fn tz_render_merge_popup(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node_id
         .show(ui.ctx(), |ui| {
             ui.label(format!("Merging removes {} zone(s) that carry {} mapping(s).",
                 removed.len(), n_cards));
-            ui.label(egui::RichText::new(format!("They can move onto the surviving zone {kept}, or be deleted."))
-                .weak());
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button(format!("Keep · move to zone {kept}")).clicked() { choice = Some("inherit"); }
+                if ui.button("Choose inheritor (tap a zone)")
+                    .on_hover_text("Pick which zone the mappings should move to — then the divider is removed.")
+                    .clicked() { choice = Some("pick"); }
                 if ui.button("Delete mappings").clicked() { choice = Some("delete"); }
                 if ui.button("Cancel").clicked() { choice = Some("cancel"); }
             });
         });
     let Some(choice) = choice else { return; };
-    if choice != "cancel" {
-        // Apply the merge; then re-home or drop the removed zones' cards.
-        tree.remove_split(&path, None);
-        tz_set_field_tree(snarl, node_id, field, &tree);
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            if let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) {
-                if choice == "inherit" {
-                    for c in cards.iter_mut() {
-                        let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        if f == field && removed.contains(&z) {
-                            if let Some(o) = c.as_object_mut() { o.insert("z".into(), Value::from(kept as u64)); }
-                        }
-                    }
-                } else { // delete
+    match choice {
+        // Enter merge-pick mode; the zone tap handler runs remove + re-home.
+        "pick" => {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("_tz_pick".into(), serde_json::json!({
+                    "kind": "merge", "field": field,
+                    "path": path.iter().map(|&b| b as u64).collect::<Vec<_>>(),
+                }));
+            }
+        }
+        "delete" => {
+            tree.remove_split(&path, None);
+            tz_set_field_tree(snarl, node_id, field, &tree);
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                if let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) {
                     cards.retain(|c| !(c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
                         removed.contains(&(c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as u32))));
                 }
             }
         }
+        _ => {} // cancel
     }
     if let Some(node) = snarl.get_node_mut(node_id) { node.params.remove("_tz_merge"); }
 }
 
-/// Subdivide the zone under unit point `(ux, uy)` at its own centre along `axis`
-/// (a partial divider — only that zone is cut). Used by the on-pad "+" handles.
+// ── "Pick a destination zone" mode — shared by Migrate (move a zone's mappings)
+// and the delete-inheritor flow (merge, then re-home the removed zones' cards).
+// While active, clicking / tapping a zone applies the action instead of selecting.
+
+fn tz_pick_kind(snarl: &Snarl<NodeData>, node_id: NodeId) -> Option<String> {
+    snarl.get_node(node_id).and_then(|n| n.params.get("_tz_pick"))
+        .and_then(|v| v.get("kind")).and_then(|v| v.as_str()).map(String::from)
+}
+
+fn tz_cancel_pick(snarl: &mut Snarl<NodeData>, node_id: NodeId) {
+    if let Some(n) = snarl.get_node_mut(node_id) { n.params.remove("_tz_pick"); }
+}
+
+/// Begin a Migrate: the SELECTED zone's mappings will move onto the next zone the
+/// user clicks / taps.
+fn tz_start_migrate(snarl: &mut Snarl<NodeData>, node_id: NodeId) {
+    let (field, zone) = tz_read_selection(snarl, node_id);
+    if let Some(n) = snarl.get_node_mut(node_id) {
+        n.params.insert("_tz_pick".into(), serde_json::json!({
+            "kind": "migrate", "field": field, "src": zone,
+        }));
+    }
+}
+
+/// Re-home every card in `from_zones` (this field) onto `dest`.
+fn tz_move_cards(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize,
+    from_zones: &[u32], dest: u32)
+{
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        if let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) {
+            for c in cards.iter_mut() {
+                let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                if f == field && from_zones.contains(&z) {
+                    if let Some(o) = c.as_object_mut() { o.insert("z".into(), Value::from(dest as u64)); }
+                }
+            }
+        }
+    }
+}
+
+/// Apply the pending pick to destination zone id `dest`, then clear the mode.
+fn tz_apply_pick(snarl: &mut Snarl<NodeData>, node_id: NodeId, dest: usize) {
+    let Some(pick) = snarl.get_node(node_id).and_then(|n| n.params.get("_tz_pick").cloned()) else { return; };
+    let kind = pick.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let field = pick.get("field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    match kind {
+        "migrate" => {
+            let src = pick.get("src").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            if dest as u32 != src { tz_move_cards(snarl, node_id, field, &[src], dest as u32); }
+        }
+        "merge" => {
+            let path: Vec<u8> = pick.get("path").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|b| b as u8)).collect()).unwrap_or_default();
+            let mut tree = tz_field_tree(snarl, node_id, field);
+            if let Some((kept, removed)) = tree.remove_split(&path, None) {
+                tz_set_field_tree(snarl, node_id, field, &tree);
+                // Tapping one of the merged-away zones means "the survivor".
+                let dest = if removed.contains(&(dest as u32)) { kept } else { dest as u32 };
+                tz_move_cards(snarl, node_id, field, &removed, dest);
+            }
+        }
+        _ => {}
+    }
+    tz_cancel_pick(snarl, node_id);
+}
+
+/// While picking, draw a banner over the pad prompting the user to choose a zone,
+/// with a Cancel. Returns nothing; the zone click/tap handlers do the applying.
+fn tz_pick_banner(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>,
+    painter: &egui::Painter, rect: egui::Rect, accent: egui::Color32)
+{
+    let Some(kind) = tz_pick_kind(snarl, node_id) else { return; };
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(2.0, accent), egui::epaint::StrokeKind::Inside);
+    let msg = if kind == "migrate" { "Tap a zone to MOVE the mappings there" }
+              else { "Tap a zone to INHERIT the mappings, then merge" };
+    let br = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 14.0),
+        egui::vec2(rect.width().min(300.0), 22.0));
+    painter.rect_filled(br, 4.0, egui::Color32::from_black_alpha(180));
+    painter.text(br.center(), egui::Align2::CENTER_CENTER, msg,
+        egui::FontId::proportional(12.0), accent);
+    let cancel = egui::Rect::from_min_size(egui::pos2(rect.right() - 60.0, rect.bottom() - 24.0), egui::vec2(52.0, 18.0));
+    if ui.interact(cancel, ui.id().with((node_id, "tzpickcancel")), egui::Sense::click()).clicked() {
+        tz_cancel_pick(snarl, node_id);
+    }
+    painter.rect_filled(cancel, 3.0, egui::Color32::from_black_alpha(180));
+    painter.text(cancel.center(), egui::Align2::CENTER_CENTER, "Cancel",
+        egui::FontId::proportional(11.0), egui::Color32::WHITE);
+    ui.ctx().request_repaint();
+}
+
+/// Subdivide the zone under unit point `(ux, uy)` at its own centre along `axis`.
+/// `new_low` puts the new EMPTY cell on the low side (left/top) so a "+" on a
+/// zone's left/top edge adds the empty cell there and pushes the mapping the
+/// other way.
 fn tz_subdivide_at(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize,
-    ux: f32, uy: f32, axis: flexinput_core::touchzones::Axis)
+    ux: f32, uy: f32, axis: flexinput_core::touchzones::Axis, new_low: bool)
 {
     use flexinput_core::touchzones::Axis;
     let mut tree = tz_field_tree(snarl, node_id, field);
@@ -1854,15 +1950,17 @@ fn tz_subdivide_at(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize,
         Axis::V => (x0 + x1) * 0.5,
         Axis::H => (y0 + y1) * 0.5,
     }).unwrap_or(0.5);
-    if tree.subdivide(id, axis, center).is_some() {
+    if tree.subdivide_side(id, axis, center, new_low).is_some() {
         tz_set_field_tree(snarl, node_id, field, &tree);
     }
 }
 
-/// Tree version of the hover-revealed +/- overlay (mapping mode). Same placement
-/// as the grid overlay — a "−" on each divider (removes/merges it, with the
-/// mapped-zone confirm popup), a "+" flanking each divider on hover (subdivides
-/// the zone on that side, parallel), and border "+" to split the edge zone.
+/// Tree version of the hover-revealed +/- overlay (mapping mode): a "−" on each
+/// divider removes/merges it (raising the mapped-zone confirm popup when needed),
+/// and — for the zone under the cursor — a "+" on the NEAREST edge splits that
+/// zone, adding the new empty cell on THAT side (so the "+" you reach for is the
+/// side the cell appears). The "+" tracks each zone's edges, not just the pad
+/// border.
 #[allow(clippy::too_many_arguments)]
 fn tz_tree_line_overlay(
     node_id: NodeId,
@@ -1878,74 +1976,56 @@ fn tz_tree_line_overlay(
     let tree = tz_field_tree(snarl, node_id, field);
     let to_x = |u: f32| rect.left() + u * rect.width();
     let to_y = |u: f32| rect.top() + u * rect.height();
-    let off = 18.0;      // "+" flanking distance from the "−"
-    let edge = 30.0;     // border-proximity threshold (px)
-    let inset = 12.0;    // border "+" inset so it sits fully inside the field
-    let eps = 0.01;
+    let edge = 28.0;     // edge-proximity threshold (px) that reveals the "+"
+    let inset = 12.0;    // "+" inset from the zone edge so it sits inside the cell
     let from_global = ui.ctx().layer_transform_to_global(ui.layer_id())
         .unwrap_or(egui::emath::TSTransform::IDENTITY)
         .inverse();
     let ptr = ui.input(|i| i.pointer.hover_pos()).map(|p| from_global * p);
-    let mut sub: Option<(f32, f32, Axis)> = None;
+    // (ux, uy, axis, new_low)
+    let mut sub: Option<(f32, f32, Axis, bool)> = None;
     let mut rem: Option<Vec<u8>> = None;
 
+    // "−" on each divider → remove/merge.
     for (di, div) in tree.dividers().iter().enumerate() {
         let mid = (div.span_lo + div.span_hi) * 0.5;
-        let (c, pill, plus_a, plus_b, a_pt, b_pt) = match div.axis {
-            Axis::V => {
-                let c = egui::pos2(to_x(div.pos), to_y(mid));
-                (c, egui::Rect::from_center_size(c, egui::vec2(2.0 * off + 20.0, 22.0)),
-                 egui::pos2(c.x - off, c.y), egui::pos2(c.x + off, c.y),
-                 (div.pos - eps, mid), (div.pos + eps, mid))
-            }
-            Axis::H => {
-                let c = egui::pos2(to_x(mid), to_y(div.pos));
-                (c, egui::Rect::from_center_size(c, egui::vec2(22.0, 2.0 * off + 20.0)),
-                 egui::pos2(c.x, c.y - off), egui::pos2(c.x, c.y + off),
-                 (mid, div.pos - eps), (mid, div.pos + eps))
-            }
+        let c = match div.axis {
+            Axis::V => egui::pos2(to_x(div.pos), to_y(mid)),
+            Axis::H => egui::pos2(to_x(mid), to_y(div.pos)),
         };
-        if ptr.is_some_and(|p| pill.contains(p)) {
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztpa", field, di)),
-                plus_a, "+", accent, visuals) { sub = Some((a_pt.0, a_pt.1, div.axis)); }
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztpb", field, di)),
-                plus_b, "+", accent, visuals) { sub = Some((b_pt.0, b_pt.1, div.axis)); }
-        }
         if tz_mini_button(ui, painter, ui.id().with((node_id, "tztm", field, di)),
             c, "−", accent, visuals) { rem = Some(div.path.clone()); }
     }
 
-    // Border "+": split the edge zone under the cursor.
+    // "+" on the hovered zone's nearest edge.
     if let Some(p) = ptr.filter(|p| rect.contains(*p)) {
-        let ux = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        let uy = ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-        if p.x - rect.left() < edge {
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztbL", field)),
-                egui::pos2(rect.left() + inset, to_y(uy)), "+", accent, visuals) {
-                sub = Some((eps, uy, Axis::V));
+        for (id, [x0, y0, x1, y1]) in tree.zones() {
+            let zr = egui::Rect::from_min_max(egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
+            if !zr.contains(p) { continue; }
+            let (dl, dr, dt, db) = (p.x - zr.left(), zr.right() - p.x, p.y - zr.top(), zr.bottom() - p.y);
+            let m = dl.min(dr).min(dt).min(db);
+            if m <= edge {
+                let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+                let (pos, axis, new_low) = if m == dl {
+                    (egui::pos2(zr.left() + inset, zr.center().y), Axis::V, true)
+                } else if m == dr {
+                    (egui::pos2(zr.right() - inset, zr.center().y), Axis::V, false)
+                } else if m == dt {
+                    (egui::pos2(zr.center().x, zr.top() + inset), Axis::H, true)
+                } else {
+                    (egui::pos2(zr.center().x, zr.bottom() - inset), Axis::H, false)
+                };
+                if tz_mini_button(ui, painter, ui.id().with((node_id, "tztp", field, id)),
+                    pos, "+", accent, visuals) { sub = Some((cx, cy, axis, new_low)); }
             }
-        }
-        if rect.right() - p.x < edge {
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztbR", field)),
-                egui::pos2(rect.right() - inset, to_y(uy)), "+", accent, visuals) {
-                sub = Some((1.0 - eps, uy, Axis::V));
-            }
-        }
-        if p.y - rect.top() < edge {
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztbT", field)),
-                egui::pos2(to_x(ux), rect.top() + inset), "+", accent, visuals) {
-                sub = Some((ux, eps, Axis::H));
-            }
-        }
-        if rect.bottom() - p.y < edge {
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztbB", field)),
-                egui::pos2(to_x(ux), rect.bottom() - inset), "+", accent, visuals) {
-                sub = Some((ux, 1.0 - eps, Axis::H));
-            }
+            let _ = id;
+            break; // only the hovered zone
         }
     }
 
-    if let Some((ux, uy, axis)) = sub { tz_subdivide_at(snarl, node_id, field, ux, uy, axis); }
+    if let Some((ux, uy, axis, new_low)) = sub {
+        tz_subdivide_at(snarl, node_id, field, ux, uy, axis, new_low);
+    }
     if let Some(path) = rem { tz_request_or_apply_merge(snarl, node_id, field, &tree, &path); }
 }
 
@@ -2606,17 +2686,25 @@ fn render_touch_zones_pinned(
             .and_then(|n| n.params.get("_tz_phase").and_then(|v| v.as_str()))
             .unwrap_or("idle") == "idle";
         if learn_idle {
-            // Follow the LAST touched-down origin (published by tz_live_hits), so
-            // two simultaneous touches don't flicker the cards between zones. Fall
-            // back to any active zone if no touchdown was recorded this session.
-            let follow = ui.ctx()
-                .data(|d| d.get_temp::<(usize, usize)>(egui::Id::new(("tz_last_origin", inner_id.0))))
-                .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
-                .or_else(|| zone_live.iter().find(|(_, v)| v.2).map(|(k, _)| *k));
-            if let Some((f, z)) = follow {
-                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
-                    node.params.insert("sel_field".to_string(), Value::from(f as u64));
-                    node.params.insert("sel_zone".to_string(), Value::from(z as u64));
+            let last: Option<(u64, usize, usize)> = ui.ctx()
+                .data(|d| d.get_temp(egui::Id::new(("tz_last_origin", inner_id.0))));
+            let cur_pass = ui.ctx().cumulative_pass_nr();
+            if tz_pick_kind(inner_snarl, inner_id).is_some() {
+                // Pick mode: a FRESH finger tap applies the pick to the touched zone.
+                if let Some((p, _, z)) = last {
+                    if cur_pass.saturating_sub(p) <= 1 { tz_apply_pick(inner_snarl, inner_id, z); }
+                }
+            } else {
+                // Follow the LAST touched-down origin so two touches don't flicker
+                // the cards. Fall back to any active zone.
+                let follow = last.map(|(_, f, z)| (f, z))
+                    .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
+                    .or_else(|| zone_live.iter().find(|(_, v)| v.2).map(|(k, _)| *k));
+                if let Some((f, z)) = follow {
+                    if let Some(node) = inner_snarl.get_node_mut(inner_id) {
+                        node.params.insert("sel_field".to_string(), Value::from(f as u64));
+                        node.params.insert("sel_zone".to_string(), Value::from(z as u64));
+                    }
                 }
             }
         }
@@ -2643,13 +2731,16 @@ fn render_touch_zones_pinned(
                 if zresp.clicked() { clicked = Some(id as usize); }
             }
             if let Some(idx) = clicked {
-                if let Some(node) = snarl.get_node_mut(inner_id) {
+                if tz_pick_kind(snarl, inner_id).is_some() {
+                    tz_apply_pick(snarl, inner_id, idx);
+                } else if let Some(node) = snarl.get_node_mut(inner_id) {
                     node.params.insert("sel_field".to_string(), Value::from(field as u64));
                     node.params.insert("sel_zone".to_string(), Value::from(idx as u64));
                 }
             }
         }
         tz_draw_field(inner_id, field, ui, snarl, &painter, r, &col, &row, &zone_live, &visuals, accent, "pin");
+        if mapping { tz_pick_banner(inner_id, ui, snarl, &painter, r, accent); }
         // Selected-zone outline on top of the pad fill.
         if let Some(tree) = &mtree {
             if sel_field == field {
@@ -2868,16 +2959,24 @@ fn show_touch_zones_body(
     let learn_idle = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_tz_phase").and_then(|v| v.as_str())).unwrap_or("idle") == "idle";
     if mapping && learn_idle {
-        // Follow the LAST touched-down origin so two touches don't flicker the tab.
-        let follow = ui.ctx()
-            .data(|d| d.get_temp::<(usize, usize)>(egui::Id::new(("tz_last_origin", node_id.0))))
-            .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
-            .or_else(|| zone_live.iter().find(|(_, v)| v.2).map(|(k, _)| *k));
-        if let Some((f, z)) = follow {
-            if tz_read_selection(snarl, node_id) != (f, z) {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("sel_field".to_string(), Value::from(f as u64));
-                    node.params.insert("sel_zone".to_string(), Value::from(z as u64));
+        let last: Option<(u64, usize, usize)> = ui.ctx()
+            .data(|d| d.get_temp(egui::Id::new(("tz_last_origin", node_id.0))));
+        let cur_pass = ui.ctx().cumulative_pass_nr();
+        if tz_pick_kind(snarl, node_id).is_some() {
+            if let Some((p, _, z)) = last {
+                if cur_pass.saturating_sub(p) <= 1 { tz_apply_pick(snarl, node_id, z); }
+            }
+        } else {
+            // Follow the LAST touched-down origin so two touches don't flicker the tab.
+            let follow = last.map(|(_, f, z)| (f, z))
+                .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
+                .or_else(|| zone_live.iter().find(|(_, v)| v.2).map(|(k, _)| *k));
+            if let Some((f, z)) = follow {
+                if tz_read_selection(snarl, node_id) != (f, z) {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("sel_field".to_string(), Value::from(f as u64));
+                        node.params.insert("sel_zone".to_string(), Value::from(z as u64));
+                    }
                 }
             }
         }
@@ -3137,6 +3236,15 @@ fn render_touch_zone_cards(
         hold_rect = Some(cb.rect);
         if cb.changed() {
             tz_set_zone_held(snarl, node_id, sel_f, sel_z, hold);
+        }
+        // Migrate: move THIS zone's mappings onto another zone you tap/click next.
+        if tz_pick_kind(snarl, node_id).as_deref() == Some("migrate") {
+            if ui.button("✖ Cancel move").clicked() { tz_cancel_pick(snarl, node_id); }
+        } else if ui.button("⇄ Move…")
+            .on_hover_text("Move this zone's mappings to another zone — click/tap the destination next.")
+            .clicked()
+        {
+            tz_start_migrate(snarl, node_id);
         }
         match phase.as_str() {
             "learning" => {
@@ -3566,7 +3674,9 @@ fn render_touch_field(
             if zresp.clicked() { clicked = Some(id as usize); }
         }
         if let Some(idx) = clicked {
-            if let Some(node) = snarl.get_node_mut(node_id) {
+            if tz_pick_kind(snarl, node_id).is_some() {
+                tz_apply_pick(snarl, node_id, idx);
+            } else if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("sel_field".to_string(), Value::from(field as u64));
                 node.params.insert("sel_zone".to_string(), Value::from(idx as u64));
             }
@@ -3575,6 +3685,7 @@ fn render_touch_field(
 
     // Pad visuals + dividers (tree-aware in mapping mode; grid in ports mode).
     tz_draw_field(node_id, field, ui, snarl, &painter, rect, &col_edges, &row_edges, zone_live, visuals, accent, "canvas");
+    if mapping { tz_pick_banner(node_id, ui, snarl, &painter, rect, accent); }
 
     // Selected-zone outline (mapping mode) — drawn on top of the pad fill.
     if let Some(tree) = &mtree {

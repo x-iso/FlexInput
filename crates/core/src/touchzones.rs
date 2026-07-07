@@ -266,27 +266,35 @@ impl ZoneNode {
         }
     }
 
-    /// Subdivide the leaf `id` with a new divider, keeping `id` on the a-side and
-    /// giving the b-side a fresh id (`next_id`). No-op if `id` isn't a leaf.
-    /// Returns the new zone's id on success.
+    /// Subdivide the leaf `id`, keeping `id` on the a-side (left/top) and giving the
+    /// b-side (right/bottom) a fresh id. Returns the new id, or None if not a leaf.
     pub fn subdivide(&mut self, id: u32, axis: Axis, t: f32) -> Option<u32> {
-        let new_id = self.next_id();
-        if self.subdivide_rec(id, axis, t, new_id) { Some(new_id) } else { None }
+        self.subdivide_side(id, axis, t, false)
     }
 
-    fn subdivide_rec(&mut self, id: u32, axis: Axis, t: f32, new_id: u32) -> bool {
+    /// Subdivide the leaf `id`. When `new_low` the NEW (empty) zone takes the
+    /// low side (left/top) and `id` keeps the high side (right/bottom) — used so a
+    /// "+" on a zone's left/top edge adds the empty cell on THAT side, pushing the
+    /// mapped content the other way. Returns the new id, or None if not a leaf.
+    pub fn subdivide_side(&mut self, id: u32, axis: Axis, t: f32, new_low: bool) -> Option<u32> {
+        let new_id = self.next_id();
+        if self.subdivide_rec(id, axis, t, new_id, new_low) { Some(new_id) } else { None }
+    }
+
+    fn subdivide_rec(&mut self, id: u32, axis: Axis, t: f32, new_id: u32, new_low: bool) -> bool {
         match self {
             ZoneNode::Leaf(lid) if *lid == id => {
+                let (lo, hi) = if new_low { (new_id, id) } else { (id, new_id) };
                 *self = ZoneNode::Split {
                     axis, t,
-                    a: Box::new(ZoneNode::Leaf(id)),
-                    b: Box::new(ZoneNode::Leaf(new_id)),
+                    a: Box::new(ZoneNode::Leaf(lo)),
+                    b: Box::new(ZoneNode::Leaf(hi)),
                 };
                 true
             }
             ZoneNode::Leaf(_) => false,
             ZoneNode::Split { a, b, .. } =>
-                a.subdivide_rec(id, axis, t, new_id) || b.subdivide_rec(id, axis, t, new_id),
+                a.subdivide_rec(id, axis, t, new_id, new_low) || b.subdivide_rec(id, axis, t, new_id, new_low),
         }
     }
 
@@ -596,6 +604,16 @@ mod tests {
         let hdiv = tree.dividers().into_iter().find(|d| d.axis == Axis::H).unwrap();
         assert!((hdiv.span_lo - 0.5).abs() < 1e-6 && (hdiv.span_hi - 1.0).abs() < 1e-6,
             "partial divider spans x∈[0.5,1], got [{},{}]", hdiv.span_lo, hdiv.span_hi);
+    }
+
+    #[test]
+    fn tree_subdivide_side_puts_new_cell_low() {
+        // new_low=true: the NEW empty cell takes the left/low side; the original
+        // id (its mappings) keeps the right side.
+        let mut tree = ZoneNode::Leaf(0);
+        let new = tree.subdivide_side(0, Axis::V, 0.5, true).unwrap();
+        assert_eq!(tree.locate(0.25, 0.5).0, new, "left half is the new empty cell");
+        assert_eq!(tree.locate(0.75, 0.5).0, 0, "right half keeps the original id/mappings");
     }
 
     #[test]
