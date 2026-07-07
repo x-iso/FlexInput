@@ -94,6 +94,263 @@ fn bucket(v: f32, edges: &[f32]) -> usize {
     slot
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hierarchical zone tree (BSP)
+//
+// The legacy grid (`col_edges`/`row_edges`) only supports full-width/height cuts.
+// The tree supports PARTIAL dividers: a split node divides only its OWN sub-rect,
+// so a divider line spans just that subtree — you can subdivide one zone without
+// cutting across the whole pad, and removing a divider merges only the zones under
+// it. Each leaf carries a STABLE id so mapping-card `(field, zone)` bindings
+// survive edits. A pure grid migrates losslessly (`ZoneNode::from_grid`) with leaf
+// ids == the old row-major indices, so existing patches keep working.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Split orientation. `V` = a vertical divider line (splits the X extent into
+/// left/right); `H` = a horizontal divider (splits the Y extent into top/bottom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis { V, H }
+
+/// A binary space-partition of the pad into zones. `t` is the ABSOLUTE unit-space
+/// position of the divider along its axis (kept within the node's sub-rect).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ZoneNode {
+    /// A zone with a stable id.
+    Leaf(u32),
+    /// A divider at `t`; child `a` is the left/top side, `b` the right/bottom.
+    Split { axis: Axis, t: f32, a: Box<ZoneNode>, b: Box<ZoneNode> },
+}
+
+/// A divider line materialized for drawing / hit-testing. For a `V` split the line
+/// is vertical at `x = pos`, spanning `y ∈ [span_lo, span_hi]`; for `H` it's
+/// horizontal at `y = pos`. `path` navigates to the split node (0 = a, 1 = b).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Divider {
+    pub axis: Axis,
+    pub pos: f32,
+    pub span_lo: f32,
+    pub span_hi: f32,
+    pub path: Vec<u8>,
+}
+
+impl ZoneNode {
+    /// Build a tree from the legacy grid, assigning each leaf the row-major grid
+    /// index (`row * cols + col`) so migrated cards stay bound to the same zones.
+    pub fn from_grid(col_edges: &[f32], row_edges: &[f32]) -> ZoneNode {
+        let ncol = cols(col_edges);
+        // One row band split into its columns (peel one column per V split).
+        fn band(row: usize, ncol: usize, c0: usize, col_edges: &[f32]) -> ZoneNode {
+            if c0 + 1 == ncol {
+                return ZoneNode::Leaf((row * ncol + c0) as u32);
+            }
+            ZoneNode::Split {
+                axis: Axis::V,
+                t: col_edges[c0],
+                a: Box::new(ZoneNode::Leaf((row * ncol + c0) as u32)),
+                b: Box::new(band(row, ncol, c0 + 1, col_edges)),
+            }
+        }
+        fn rows_rec(r0: usize, nrow: usize, ncol: usize, col_edges: &[f32], row_edges: &[f32]) -> ZoneNode {
+            if r0 + 1 == nrow {
+                return band(r0, ncol, 0, col_edges);
+            }
+            ZoneNode::Split {
+                axis: Axis::H,
+                t: row_edges[r0],
+                a: Box::new(band(r0, ncol, 0, col_edges)),
+                b: Box::new(rows_rec(r0 + 1, nrow, ncol, col_edges, row_edges)),
+            }
+        }
+        rows_rec(0, rows(row_edges), ncol, col_edges, row_edges)
+    }
+
+    /// Every zone as `(id, [x0, y0, x1, y1])` in unit space, in traversal order.
+    pub fn zones(&self) -> Vec<(u32, [f32; 4])> {
+        let mut out = Vec::new();
+        self.collect(0.0, 0.0, 1.0, 1.0, &mut out);
+        out
+    }
+
+    fn collect(&self, x0: f32, y0: f32, x1: f32, y1: f32, out: &mut Vec<(u32, [f32; 4])>) {
+        match self {
+            ZoneNode::Leaf(id) => out.push((*id, [x0, y0, x1, y1])),
+            ZoneNode::Split { axis: Axis::V, t, a, b } => {
+                let xt = t.clamp(x0, x1);
+                a.collect(x0, y0, xt, y1, out);
+                b.collect(xt, y0, x1, y1, out);
+            }
+            ZoneNode::Split { axis: Axis::H, t, a, b } => {
+                let yt = t.clamp(y0, y1);
+                a.collect(x0, y0, x1, yt, out);
+                b.collect(x0, yt, x1, y1, out);
+            }
+        }
+    }
+
+    /// Locate a unit-space point → `(zone_id, local_x, local_y)` within its rect.
+    pub fn locate(&self, x: f32, y: f32) -> (u32, f32, f32) {
+        self.locate_rec(x, y, 0.0, 0.0, 1.0, 1.0)
+    }
+
+    fn locate_rec(&self, x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> (u32, f32, f32) {
+        match self {
+            ZoneNode::Leaf(id) => {
+                let lx = if x1 > x0 { ((x - x0) / (x1 - x0)).clamp(0.0, 1.0) } else { 0.0 };
+                let ly = if y1 > y0 { ((y - y0) / (y1 - y0)).clamp(0.0, 1.0) } else { 0.0 };
+                (*id, lx, ly)
+            }
+            ZoneNode::Split { axis: Axis::V, t, a, b } => {
+                let xt = t.clamp(x0, x1);
+                if x < xt { a.locate_rec(x, y, x0, y0, xt, y1) }
+                else { b.locate_rec(x, y, xt, y0, x1, y1) }
+            }
+            ZoneNode::Split { axis: Axis::H, t, a, b } => {
+                let yt = t.clamp(y0, y1);
+                if y < yt { a.locate_rec(x, y, x0, y0, x1, yt) }
+                else { b.locate_rec(x, y, x0, yt, x1, y1) }
+            }
+        }
+    }
+
+    /// Unit rect of a zone by id, if present.
+    pub fn zone_rect(&self, id: u32) -> Option<[f32; 4]> {
+        self.zones().into_iter().find(|(zid, _)| *zid == id).map(|(_, r)| r)
+    }
+
+    /// All zone ids in traversal order.
+    pub fn ids(&self) -> Vec<u32> {
+        self.zones().into_iter().map(|(id, _)| id).collect()
+    }
+
+    pub fn zone_count(&self) -> usize {
+        match self {
+            ZoneNode::Leaf(_) => 1,
+            ZoneNode::Split { a, b, .. } => a.zone_count() + b.zone_count(),
+        }
+    }
+
+    /// Next free id (max existing + 1).
+    pub fn next_id(&self) -> u32 {
+        self.ids().into_iter().max().map(|m| m + 1).unwrap_or(0)
+    }
+
+    /// All divider lines with their spans + path, for drawing / hit-testing.
+    pub fn dividers(&self) -> Vec<Divider> {
+        let mut out = Vec::new();
+        self.dividers_rec(0.0, 0.0, 1.0, 1.0, &mut Vec::new(), &mut out);
+        out
+    }
+
+    fn dividers_rec(&self, x0: f32, y0: f32, x1: f32, y1: f32, path: &mut Vec<u8>, out: &mut Vec<Divider>) {
+        if let ZoneNode::Split { axis, t, a, b } = self {
+            match axis {
+                Axis::V => {
+                    let xt = t.clamp(x0, x1);
+                    out.push(Divider { axis: Axis::V, pos: xt, span_lo: y0, span_hi: y1, path: path.clone() });
+                    path.push(0); a.dividers_rec(x0, y0, xt, y1, path, out); path.pop();
+                    path.push(1); b.dividers_rec(xt, y0, x1, y1, path, out); path.pop();
+                }
+                Axis::H => {
+                    let yt = t.clamp(y0, y1);
+                    out.push(Divider { axis: Axis::H, pos: yt, span_lo: x0, span_hi: x1, path: path.clone() });
+                    path.push(0); a.dividers_rec(x0, y0, x1, yt, path, out); path.pop();
+                    path.push(1); b.dividers_rec(x0, yt, x1, y1, path, out); path.pop();
+                }
+            }
+        }
+    }
+
+    /// Subdivide the leaf `id` with a new divider, keeping `id` on the a-side and
+    /// giving the b-side a fresh id (`next_id`). No-op if `id` isn't a leaf.
+    /// Returns the new zone's id on success.
+    pub fn subdivide(&mut self, id: u32, axis: Axis, t: f32) -> Option<u32> {
+        let new_id = self.next_id();
+        if self.subdivide_rec(id, axis, t, new_id) { Some(new_id) } else { None }
+    }
+
+    fn subdivide_rec(&mut self, id: u32, axis: Axis, t: f32, new_id: u32) -> bool {
+        match self {
+            ZoneNode::Leaf(lid) if *lid == id => {
+                *self = ZoneNode::Split {
+                    axis, t,
+                    a: Box::new(ZoneNode::Leaf(id)),
+                    b: Box::new(ZoneNode::Leaf(new_id)),
+                };
+                true
+            }
+            ZoneNode::Leaf(_) => false,
+            ZoneNode::Split { a, b, .. } =>
+                a.subdivide_rec(id, axis, t, new_id) || b.subdivide_rec(id, axis, t, new_id),
+        }
+    }
+
+    /// Navigate to the split at `path` and set its `t`. Returns whether it applied.
+    pub fn set_divider_t(&mut self, path: &[u8], t: f32) -> bool {
+        match self {
+            ZoneNode::Split { t: cur, a, b, .. } => match path.split_first() {
+                None => { *cur = t; true }
+                Some((0, rest)) => a.set_divider_t(rest, t),
+                Some((_, rest)) => b.set_divider_t(rest, t),
+            },
+            ZoneNode::Leaf(_) => false,
+        }
+    }
+
+    /// Collapse the split at `path` into a single leaf. `inheritor` (if it is one
+    /// of the merged ids) is kept; otherwise the smallest merged id wins. Returns
+    /// `(kept_id, removed_ids)` — the caller reassigns/drops the removed zones'
+    /// mapping cards. No-op (None) if `path` doesn't point at a split.
+    pub fn remove_split(&mut self, path: &[u8], inheritor: Option<u32>) -> Option<(u32, Vec<u32>)> {
+        let target = self.node_at_mut(path)?;
+        if let ZoneNode::Leaf(_) = target { return None; }
+        let mut merged: Vec<u32> = target.ids();
+        merged.sort_unstable();
+        let kept = inheritor.filter(|i| merged.contains(i))
+            .unwrap_or_else(|| *merged.first().unwrap());
+        let removed: Vec<u32> = merged.into_iter().filter(|i| *i != kept).collect();
+        *target = ZoneNode::Leaf(kept);
+        Some((kept, removed))
+    }
+
+    fn node_at_mut(&mut self, path: &[u8]) -> Option<&mut ZoneNode> {
+        match path.split_first() {
+            None => Some(self),
+            Some((step, rest)) => match self {
+                ZoneNode::Split { a, b, .. } =>
+                    if *step == 0 { a.node_at_mut(rest) } else { b.node_at_mut(rest) },
+                ZoneNode::Leaf(_) => None,
+            },
+        }
+    }
+
+    /// Serialize to JSON: `{"id":N}` for a leaf, `{"axis":"v"|"h","t":..,"a":..,"b":..}`.
+    pub fn to_value(&self) -> serde_json::Value {
+        match self {
+            ZoneNode::Leaf(id) => serde_json::json!({ "id": id }),
+            ZoneNode::Split { axis, t, a, b } => serde_json::json!({
+                "axis": if *axis == Axis::V { "v" } else { "h" },
+                "t": t,
+                "a": a.to_value(),
+                "b": b.to_value(),
+            }),
+        }
+    }
+
+    /// Parse from the JSON produced by [`to_value`]. Returns None on malformed data.
+    pub fn from_value(v: &serde_json::Value) -> Option<ZoneNode> {
+        if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
+            return Some(ZoneNode::Leaf(id as u32));
+        }
+        let axis = match v.get("axis")?.as_str()? {
+            "v" => Axis::V, "h" => Axis::H, _ => return None,
+        };
+        let t = v.get("t")?.as_f64()? as f32;
+        let a = ZoneNode::from_value(v.get("a")?)?;
+        let b = ZoneNode::from_value(v.get("b")?)?;
+        Some(ZoneNode::Split { axis, t, a: Box::new(a), b: Box::new(b) })
+    }
+}
+
 /// A parsed dynamic output port. Ports are namespaced by FIELD so split mode
 /// (two independent pads — one per touch point) can coexist on one node. In
 /// single-field mode only field 0 exists.
@@ -290,6 +547,80 @@ mod tests {
         assert_eq!(idx, 1);
         assert!((lx - 0.5).abs() < 1e-6);
         assert!((ly - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tree_from_grid_matches_grid_indexing() {
+        // 2×2 grid → tree must locate the same row-major ids as `locate_unit`.
+        let cols_e = vec![0.5];
+        let rows_e = vec![0.5];
+        let tree = ZoneNode::from_grid(&cols_e, &rows_e);
+        assert_eq!(tree.zone_count(), 4);
+        let mut ids = tree.ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        for (x, y) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+            let grid = locate_unit(x, y, &cols_e, &rows_e).0 as u32;
+            let (tid, _, _) = tree.locate(x, y);
+            assert_eq!(tid, grid, "tree id must match grid at ({x},{y})");
+        }
+        // A 3×1 row also matches (peels columns left→right).
+        let t3 = ZoneNode::from_grid(&[0.33, 0.66], &[]);
+        assert_eq!(t3.locate(0.1, 0.5).0, 0);
+        assert_eq!(t3.locate(0.5, 0.5).0, 1);
+        assert_eq!(t3.locate(0.9, 0.5).0, 2);
+    }
+
+    #[test]
+    fn tree_subdivide_is_local_and_keeps_ids() {
+        // Start with one zone, split it vertically at 0.5 → ids 0 (left) + 1 (right).
+        let mut tree = ZoneNode::Leaf(0);
+        let new = tree.subdivide(0, Axis::V, 0.5).unwrap();
+        assert_eq!(new, 1);
+        assert_eq!(tree.locate(0.25, 0.5).0, 0);
+        assert_eq!(tree.locate(0.75, 0.5).0, 1);
+        // Subdivide ONLY the right zone horizontally → the divider is partial
+        // (spans only x∈[0.5,1]); the left zone is untouched.
+        let new2 = tree.subdivide(1, Axis::H, 0.5).unwrap();
+        assert_eq!(new2, 2);
+        assert_eq!(tree.locate(0.25, 0.9).0, 0, "left zone unaffected by right-side split");
+        assert_eq!(tree.locate(0.75, 0.25).0, 1);
+        assert_eq!(tree.locate(0.75, 0.75).0, 2);
+        // The horizontal divider spans only the right half.
+        let hdiv = tree.dividers().into_iter().find(|d| d.axis == Axis::H).unwrap();
+        assert!((hdiv.span_lo - 0.5).abs() < 1e-6 && (hdiv.span_hi - 1.0).abs() < 1e-6,
+            "partial divider spans x∈[0.5,1], got [{},{}]", hdiv.span_lo, hdiv.span_hi);
+    }
+
+    #[test]
+    fn tree_remove_split_merges_and_reports_removed() {
+        let mut tree = ZoneNode::from_grid(&[0.5], &[]); // ids 0 (left), 1 (right)
+        // Remove the only divider → the two zones merge; id 0 kept, 1 removed.
+        let div = tree.dividers()[0].clone();
+        let (kept, removed) = tree.remove_split(&div.path, None).unwrap();
+        assert_eq!(kept, 0);
+        assert_eq!(removed, vec![1]);
+        assert_eq!(tree.zone_count(), 1);
+        assert_eq!(tree.locate(0.9, 0.5).0, 0, "merged zone covers the whole pad");
+    }
+
+    #[test]
+    fn tree_remove_split_honors_inheritor() {
+        let mut tree = ZoneNode::from_grid(&[0.5], &[]);
+        let div = tree.dividers()[0].clone();
+        // Keep zone 1 instead of the default-smallest 0.
+        let (kept, removed) = tree.remove_split(&div.path, Some(1)).unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(removed, vec![0]);
+    }
+
+    #[test]
+    fn tree_json_roundtrip() {
+        let mut tree = ZoneNode::from_grid(&[0.4], &[0.6]);
+        tree.subdivide(0, Axis::V, 0.2);
+        let v = tree.to_value();
+        let back = ZoneNode::from_value(&v).unwrap();
+        assert_eq!(tree, back);
     }
 
     #[test]

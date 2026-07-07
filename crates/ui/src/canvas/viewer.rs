@@ -1685,6 +1685,7 @@ fn tz_live_hits(
         ctx.data(|d| d.get_temp(track_id)).unwrap_or((0, vec![0.0; 4]));
     if track.len() < 4 { track.resize(4, 0.0); }
     let advance = stored_pass != pass;
+    let mut just_down: Option<(usize, usize)> = None;
     for finger in 0..2usize {
         let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
                             ("touch2_x", "touch2_y", "touch2_active")][finger];
@@ -1696,23 +1697,65 @@ fn tz_live_hits(
             if advance { track[base] = 0.0; }
             continue;
         }
-        let col = tz_read_field_edges(snarl, node_id, field, "col_edges");
-        let row = tz_read_field_edges(snarl, node_id, field, "row_edges");
+        let tree = tz_field_tree(snarl, node_id, field);
         let (x, y) = tz::pad_point_to_unit(readf(px), readf(py));
-        let (cur_idx, _, _) = tz::locate_unit(x, y, &col, &row);
+        let (cur_id, _, _) = tree.locate(x, y);
+        let cur_idx = cur_id as usize;
         let start_zone = if !prev_active { cur_idx } else { track[base + 1] as usize };
         if advance {
-            if !prev_active { track[base + 1] = cur_idx as f32; }
+            if !prev_active {
+                track[base + 1] = cur_idx as f32;
+                // Newest touchdown wins the tab-follow (see render_touch_zones_*),
+                // so two fingers don't flicker the cards panel between zones.
+                just_down = Some((field, cur_idx));
+            }
             track[base] = 1.0;
         }
         let eff = if hold_zones.contains(&(field, start_zone)) { start_zone } else { cur_idx };
-        let (x0, y0, x1, y1) = tz::zone_rect(eff, &col, &row);
+        let [x0, y0, x1, y1] = tree.zone_rect(eff as u32).unwrap_or([0.0, 0.0, 1.0, 1.0]);
         let lx = if x1 > x0 { ((x - x0) / (x1 - x0)).clamp(0.0, 1.0) } else { 0.5 };
         let ly = if y1 > y0 { ((y - y0) / (y1 - y0)).clamp(0.0, 1.0) } else { 0.5 };
         m.insert((field, eff), (lx, ly, true));
     }
-    if advance { ctx.data_mut(|d| d.insert_temp(track_id, (pass, track))); }
+    if advance {
+        ctx.data_mut(|d| d.insert_temp(track_id, (pass, track)));
+        // Publish the last touched-down origin so the tab-follow locks to it.
+        if let Some(origin) = just_down {
+            ctx.data_mut(|d| d.insert_temp(
+                egui::Id::new(("tz_last_origin", node_id.0)), origin));
+        }
+    }
     m
+}
+
+/// The BSP zone tree for a field: an explicit `zone_tree`/`zone_tree{field}` param
+/// (once the user has added partial dividers), else derived from the legacy grid
+/// (`col_edges`/`row_edges`). Single source of truth shared with the eval so zone
+/// hit-testing, drawing and mapping stay in lock-step.
+pub(crate) fn tz_field_tree(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize)
+    -> flexinput_core::touchzones::ZoneNode
+{
+    use flexinput_core::touchzones as tz;
+    let key = if field == 0 { "zone_tree".to_string() } else { format!("zone_tree{field}") };
+    if let Some(t) = snarl.get_node(node_id)
+        .and_then(|n| n.params.get(&key)).and_then(tz::ZoneNode::from_value)
+    {
+        return t;
+    }
+    let col = tz_read_field_edges(snarl, node_id, field, "col_edges");
+    let row = tz_read_field_edges(snarl, node_id, field, "row_edges");
+    tz::ZoneNode::from_grid(&col, &row)
+}
+
+/// Write a field's zone tree back to its param, dropping the legacy grid edges for
+/// that field so the tree becomes authoritative.
+pub(crate) fn tz_set_field_tree(snarl: &mut Snarl<NodeData>, node_id: NodeId,
+    field: usize, tree: &flexinput_core::touchzones::ZoneNode)
+{
+    let key = if field == 0 { "zone_tree".to_string() } else { format!("zone_tree{field}") };
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        node.params.insert(key, tree.to_value());
+    }
 }
 
 /// The centred square used for a zone's analog viz (response-curve graph when
@@ -1773,6 +1816,40 @@ pub(crate) fn tz_set_zone_curve(snarl: &mut Snarl<NodeData>, node_id: NodeId,
             obj.insert("curve".to_string(), Value::Array(pts.iter()
                 .map(|p| Value::Array(vec![Value::from(p[0] as f64), Value::from(p[1] as f64)]))
                 .collect()));
+        }
+        return;
+    }
+}
+
+/// The zone's adaptive-centre inner fraction (0..1): how much of the zone acts as
+/// a RELATIVE centre for analog deflection (0 = absolute from zone centre, 1 =
+/// wherever you touch is the centre). Stored on the analog card. Default 0.30.
+fn tz_zone_adaptive(zone_maps: &[Value], field: usize, idx: usize) -> f32 {
+    zone_maps.iter().filter(|c|
+        c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
+        c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == idx as u64)
+        .find_map(|c| c.get("adaptive").and_then(|v| v.as_f64()))
+        .map(|v| (v as f32).clamp(0.0, 1.0)).unwrap_or(0.30)
+}
+
+/// Store the adaptive-centre inner fraction on the first analog card of the zone.
+fn tz_set_zone_adaptive(snarl: &mut Snarl<NodeData>, node_id: NodeId,
+    field: usize, idx: usize, val: f32)
+{
+    let is_analog = |p: &str| matches!(p,
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+    let Some(node) = snarl.get_node_mut(node_id) else { return };
+    let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) else { return };
+    for c in cards.iter_mut() {
+        let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if f != field || z != idx { continue; }
+        let analog = c.get("out").and_then(|v| v.as_array())
+            .map(|a| a.iter().any(|p| p.as_str().map(is_analog).unwrap_or(false)))
+            .unwrap_or(false);
+        if !analog { continue; }
+        if let Some(obj) = c.as_object_mut() {
+            obj.insert("adaptive".to_string(), Value::from(val.clamp(0.0, 1.0) as f64));
         }
         return;
     }
@@ -2268,7 +2345,14 @@ fn render_touch_zones_pinned(
             .and_then(|n| n.params.get("_tz_phase").and_then(|v| v.as_str()))
             .unwrap_or("idle") == "idle";
         if learn_idle {
-            if let Some((&(f, z), _)) = zone_live.iter().find(|(_, v)| v.2) {
+            // Follow the LAST touched-down origin (published by tz_live_hits), so
+            // two simultaneous touches don't flicker the cards between zones. Fall
+            // back to any active zone if no touchdown was recorded this session.
+            let follow = ui.ctx()
+                .data(|d| d.get_temp::<(usize, usize)>(egui::Id::new(("tz_last_origin", inner_id.0))))
+                .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
+                .or_else(|| zone_live.iter().find(|(_, v)| v.2).map(|(k, _)| *k));
+            if let Some((f, z)) = follow {
                 if let Some(node) = inner_snarl.get_node_mut(inner_id) {
                     node.params.insert("sel_field".to_string(), Value::from(f as u64));
                     node.params.insert("sel_zone".to_string(), Value::from(z as u64));
@@ -2518,7 +2602,12 @@ fn show_touch_zones_body(
     let learn_idle = snarl.get_node(node_id)
         .and_then(|n| n.params.get("_tz_phase").and_then(|v| v.as_str())).unwrap_or("idle") == "idle";
     if mapping && learn_idle {
-        if let Some((&(f, z), _)) = zone_live.iter().find(|(_, v)| v.2) {
+        // Follow the LAST touched-down origin so two touches don't flicker the tab.
+        let follow = ui.ctx()
+            .data(|d| d.get_temp::<(usize, usize)>(egui::Id::new(("tz_last_origin", node_id.0))))
+            .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
+            .or_else(|| zone_live.iter().find(|(_, v)| v.2).map(|(k, _)| *k));
+        if let Some((f, z)) = follow {
             if tz_read_selection(snarl, node_id) != (f, z) {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     node.params.insert("sel_field".to_string(), Value::from(f as u64));
@@ -2967,6 +3056,16 @@ fn render_touch_zone_cards(
         });
         let vis = ui.visuals().clone();
         tz_curve_editor(node_id, sel_f, sel_z, ui, snarl, accent, &vis, live_mag);
+        // Adaptive-centre inner %: 0 = absolute deflection from the zone centre,
+        // 100 = wherever your finger lands becomes the centre (fully relative).
+        let mut pct = tz_zone_adaptive(&zmaps_now, sel_f, sel_z) * 100.0;
+        if ui.add(egui::Slider::new(&mut pct, 0.0..=100.0)
+            .text("Relative center").suffix("%").fixed_decimals(0))
+            .on_hover_text("How much of the zone acts as a relative centre for analog deflection. 0% = the fixed zone centre (absolute across the whole zone); 100% = wherever your finger first lands becomes the centre (fully relative). In between, only a touch landing within that inner fraction re-centres.")
+            .changed()
+        {
+            tz_set_zone_adaptive(snarl, node_id, sel_f, sel_z, pct / 100.0);
+        }
     }
 }
 

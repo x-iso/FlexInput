@@ -5046,19 +5046,27 @@ fn eval_touch_zones_map_node(
     // Read-only peek at last frame's per-finger tracking (start zone lives in
     // aux_f32[base+4]); absent on the first frame → no holds yet.
     let prev_aux: Vec<f32> = state.get(&uid).map(|s| s.aux_f32.clone()).unwrap_or_default();
+    // Zone geometry: an explicit BSP tree (`zone_tree`/`zone_tree{field}`) once the
+    // user has added partial dividers, else derived from the legacy grid (lossless
+    // migration — leaf ids == the old row-major indices, so cards keep binding).
+    let field_tree = |field: usize| -> tz::ZoneNode {
+        let key = if field == 0 { "zone_tree".to_string() } else { format!("zone_tree{field}") };
+        snap.params.get(&key).and_then(tz::ZoneNode::from_value)
+            .unwrap_or_else(|| tz::ZoneNode::from_grid(
+                &read_edges(field, "col_edges"), &read_edges(field, "row_edges")))
+    };
+    let trees = [field_tree(0), field_tree(1)];
     let mut zone_hit: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
     for finger in 0..2usize {
         let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
                             ("touch2_x", "touch2_y", "touch2_active")][finger];
         let field = if split { finger } else { 0 };
         if !read(pa).map(|s| s.as_bool()).unwrap_or(false) { continue; }
-        let col_edges = read_edges(field, "col_edges");
-        let row_edges = read_edges(field, "row_edges");
         let (x, y) = tz::pad_point_to_unit(
             read(px).map(|s| s.as_float()).unwrap_or(0.0),
             read(py).map(|s| s.as_float()).unwrap_or(0.0),
         );
-        let (idx, lx, ly) = tz::locate_unit(x, y, &col_edges, &row_edges);
+        let (idx, lx, ly) = { let (i, lx, ly) = trees[field].locate(x, y); (i as usize, lx, ly) };
         // If this finger was already down and its START zone is a hold zone, lock
         // the hit to that start zone; the wandered-into zone gets no hit from it.
         let base = finger * SLOTS_PER;
@@ -5116,7 +5124,18 @@ fn eval_touch_zones_map_node(
     // [active, sx, sy, field, zone, dir, pulse_ms, cx, cy].
     const SWIPE_THRESH: f32 = 0.18;   // fraction of the field
     const SWIPE_PULSE_MS: f32 = 120.0;
-    const INNER_FRAC: f32 = 0.30;     // central region that captures an adaptive centre
+    // Per-zone "adaptive centre" inner fraction (0..1): the central region within
+    // which a touchdown becomes the RELATIVE centre. 0 = always the zone centre
+    // (absolute deflection across the whole zone); 1 = wherever you land is the
+    // centre (fully relative). Stored on the zone's analog card ("adaptive"),
+    // edited below the response-curve graph. Default 0.30.
+    let adaptive_for = |field: usize, zone: usize| -> f32 {
+        cards.iter().filter(|c|
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
+            c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zone as u64)
+            .find_map(|c| c.get("adaptive").and_then(|v| v.as_f64()))
+            .map(|v| (v as f32).clamp(0.0, 1.0)).unwrap_or(0.30)
+    };
     let slots_per = SLOTS_PER;
     while ns.aux_f32.len() < 2 * slots_per { ns.aux_f32.push(0.0); }
     let mut swipes: Vec<(usize, usize, u8)> = Vec::new(); // (field, zone, dir 1=U 2=D 3=L 4=R)
@@ -5128,19 +5147,20 @@ fn eval_touch_zones_map_node(
         let base = finger * slots_per;
         let active = read(pa).map(|s| s.as_bool()).unwrap_or(false);
         let prev_active = ns.aux_f32[base] > 0.5;
-        let col = read_edges(field, "col_edges");
-        let row = read_edges(field, "row_edges");
         if active {
             let (ux, uy) = tz::pad_point_to_unit(
                 read(px).map(|s| s.as_float()).unwrap_or(0.0),
                 read(py).map(|s| s.as_float()).unwrap_or(0.0));
             if !prev_active {
-                let (zidx, _, _) = tz::locate_unit(ux, uy, &col, &row);
-                let (x0, y0, x1, y1) = tz::zone_rect(zidx, &col, &row);
+                let (zid, _, _) = trees[field].locate(ux, uy);
+                let zidx = zid as usize;
+                let [x0, y0, x1, y1] = trees[field].zone_rect(zid).unwrap_or([0.0, 0.0, 1.0, 1.0]);
                 let (zcx, zcy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
                 let (hw, hh) = ((x1 - x0) * 0.5, (y1 - y0) * 0.5);
-                // Adaptive centre: landing inside the inner 30% → centre = landing.
-                let (cx, cy) = if (ux - zcx).abs() <= INNER_FRAC * hw && (uy - zcy).abs() <= INNER_FRAC * hh {
+                // Adaptive centre: landing inside the (configurable) inner region
+                // → centre = landing (relative); otherwise the zone's centre.
+                let inner = adaptive_for(field, zidx);
+                let (cx, cy) = if (ux - zcx).abs() <= inner * hw && (uy - zcy).abs() <= inner * hh {
                     (ux, uy)
                 } else { (zcx, zcy) };
                 ns.aux_f32[base + 1] = ux;
@@ -5169,7 +5189,7 @@ fn eval_touch_zones_map_node(
             // START zone's half-extent (so a half-zone move = full deflection).
             let sz = ns.aux_f32[base + 4] as usize;
             let (cx, cy) = (ns.aux_f32[base + 7], ns.aux_f32[base + 8]);
-            let (x0, y0, x1, y1) = tz::zone_rect(sz, &col, &row);
+            let [x0, y0, x1, y1] = trees[field].zone_rect(sz as u32).unwrap_or([0.0, 0.0, 1.0, 1.0]);
             let hw = ((x1 - x0) * 0.5).max(1e-3);
             let hh = ((y1 - y0) * 0.5).max(1e-3);
             let ax = ((ux - cx) / hw).clamp(-1.0, 1.0);
