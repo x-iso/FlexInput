@@ -411,7 +411,11 @@ impl DeviceBackend for SdlBackend {
             out.push((dev.clone(), "btn_misc4".into(), Signal::Bool(b(Button::Misc4))));
             out.push((dev.clone(), "btn_misc5".into(), Signal::Bool(b(Button::Misc5))));
             out.push((dev.clone(), "btn_misc6".into(), Signal::Bool(b(Button::Misc6))));
-            // Touchpad click is a Button in SDL.
+            // Touchpad click is a Button in SDL. NOTE: SDL2's GameController API
+            // has only ONE touchpad button, so a two-pad device (Steam Controller)
+            // reports a single click here — there is no distinct second-pad click
+            // to drive `btn_touchpad2` (field-1 tz_click). Finger CONTACT on the
+            // second pad still works (touch2_* above); only its click is absent.
             out.push((dev.clone(), "btn_touchpad".into(), Signal::Bool(b(Button::Touchpad))));
 
             // ── Gyro / accel via SDL sensor API. Normalized to the shared
@@ -440,26 +444,35 @@ impl DeviceBackend for SdlBackend {
             }
 
             // ── Touchpad fingers via raw FFI (the safe wrapper only exposes
-            // capability, not finger data). Read up to 2 fingers on touchpad 0
-            // and emit on touch1_*/touch2_* (normalized to [-1,1] to match the
-            // raw DualSense touch pins: SDL gives 0..1, so 2*v-1). ──────────────
-            if pad.num_touchpads > 0 {
-                let fingers = read_touchpad_fingers(*id, 0);
-                for (fi, (pin_x, pin_y, pin_a)) in
-                    [("touch1_x", "touch1_y", "touch1_active"),
-                     ("touch2_x", "touch2_y", "touch2_active")]
-                    .iter()
-                    .enumerate()
-                {
-                    if let Some(f) = fingers.get(fi).copied().flatten() {
-                        out.push((dev.clone(), pin_x.to_string(), Signal::Float(f.0 * 2.0 - 1.0)));
-                        out.push((dev.clone(), pin_y.to_string(), Signal::Float(f.1 * 2.0 - 1.0)));
-                        out.push((dev.clone(), pin_a.to_string(), Signal::Bool(true)));
-                    } else {
-                        out.push((dev.clone(), pin_a.to_string(), Signal::Bool(false)));
-                    }
-                    let _ = (pin_x, pin_y);
+            // capability, not finger data). Emit on touch1_*/touch2_* normalized
+            // to [-1,1] (SDL gives 0..1, so 2*v-1) to match the raw DualSense pins.
+            //
+            // A device with TWO touchpads (Steam Controller: left + right pads)
+            // maps each PAD to a field — pad 0 → touch1 (field 0), pad 1 → touch2
+            // (field 1) — so split-mode Touch Zones addresses the two sides
+            // independently. A single-touchpad device (DualSense/DS4) keeps the
+            // two-fingers-on-one-pad convention (finger 0/1 → the two fields).
+            let emit_finger = |out: &mut Vec<_>, f: Option<(f32, f32)>,
+                               pin_x: &str, pin_y: &str, pin_a: &str| {
+                if let Some(f) = f {
+                    out.push((dev.clone(), pin_x.to_string(), Signal::Float(f.0 * 2.0 - 1.0)));
+                    out.push((dev.clone(), pin_y.to_string(), Signal::Float(f.1 * 2.0 - 1.0)));
+                    out.push((dev.clone(), pin_a.to_string(), Signal::Bool(true)));
+                } else {
+                    out.push((dev.clone(), pin_a.to_string(), Signal::Bool(false)));
                 }
+            };
+            if pad.num_touchpads >= 2 {
+                let p0 = read_touchpad_fingers(*id, 0).into_iter().flatten().next();
+                let p1 = read_touchpad_fingers(*id, 1).into_iter().flatten().next();
+                emit_finger(&mut out, p0, "touch1_x", "touch1_y", "touch1_active");
+                emit_finger(&mut out, p1, "touch2_x", "touch2_y", "touch2_active");
+            } else if pad.num_touchpads == 1 {
+                let fingers = read_touchpad_fingers(*id, 0);
+                emit_finger(&mut out, fingers.first().copied().flatten(),
+                    "touch1_x", "touch1_y", "touch1_active");
+                emit_finger(&mut out, fingers.get(1).copied().flatten(),
+                    "touch2_x", "touch2_y", "touch2_active");
             }
 
             // Change-detection for the live Hz approximation: hash this pad's

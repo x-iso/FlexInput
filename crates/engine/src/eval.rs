@@ -6853,6 +6853,44 @@ mod trigger_tests {
         }
     }
 
+    // Hold with an ANALOG origin zone: the analog output holds AND a button
+    // mapped in the crossed-into zone must NOT fire (the held finger belongs
+    // wholly to its origin; other zones ignore it).
+    #[test]
+    fn touch_zones_hold_analog_origin_suppresses_crossed_button() {
+        let mut n = empty_node(1, "module.touch_zones");
+        n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        n.params.insert("col_edges".into(), serde_json::json!([0.5]));
+        n.params.insert("row_edges".into(), serde_json::json!([]));
+        n.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["left_stick"]},
+            {"f":0,"z":1,"in":["tz_touch"],"out":["btn_east"]},
+        ]));
+        n.params.insert("hold_zones".into(), serde_json::json!([[0,0]]));
+        let finger = |px: f32| {
+            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+            m
+        };
+        let mut state = HashMap::new();
+        let mut c = HashMap::new();
+        // Land in zone 0 (analog origin), establish the start zone.
+        eval_touch_zones_map_node(&n, 1, &finger(-0.5), &mut c, &mut state, 0.016);
+        c.clear();
+        eval_touch_zones_map_node(&n, 1, &finger(-0.5), &mut c, &mut state, 0.016);
+        // Cross into zone 1 (button). left_stick keeps outputting; btn_east silent.
+        c.clear();
+        eval_touch_zones_map_node(&n, 1, &finger(0.5), &mut c, &mut state, 0.016);
+        assert!(c.contains_key(&("touchmap:1".to_string(), "left_stick".to_string())),
+            "HOLD: analog origin keeps driving left_stick after crossing");
+        let btn_east = c.get(&("touchmap:1".to_string(), "btn_east".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        assert!(!btn_east, "HOLD: crossed-into button zone must NOT fire");
+    }
+
     // Analog swipe drives a finger coordinate continuously (absolute position).
     #[test]
     fn remapper_swipe_tracks_analog_input() {

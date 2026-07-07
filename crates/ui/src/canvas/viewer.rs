@@ -1649,37 +1649,69 @@ fn tz_zone_live(node: &NodeData) -> std::collections::HashMap<(usize, usize), (f
 /// for [`tz_zone_live`] to read. Mirrors the engine's zone resolution: single
 /// mode folds both fingers onto field 0 (touch1 last so it wins); split mode maps
 /// touch1→field0, touch2→field1. Returns local (x,y,active) per occupied zone.
+/// Live per-(field,zone) finger state for the mapping-mode field: which zone each
+/// finger is ACTIVATING (hold-aware) + its local position. Under "Hold" a finger
+/// stays attributed to its ORIGIN zone even after sliding into a neighbour (the
+/// neighbour reports no hit), mirroring the eval — so the glow / analog preview
+/// track ACTUAL output, not mere presence. Local coords are relative to the
+/// effective (origin-if-held) zone, clamped to 0..1 (a held finger dragged out
+/// saturates at the zone edge). Per-finger start zones persist in ctx temp,
+/// advanced once per pass so multiple widgets sharing a node don't double-step.
 fn tz_live_hits(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     automap_parent: Option<&AutomapGlowParent<'_>>,
+    ctx: &egui::Context,
 ) -> std::collections::HashMap<(usize, usize), (f32, f32, bool)> {
     use flexinput_core::touchzones as tz;
     let mut m = std::collections::HashMap::new();
     let Some(dev) = remapper_upstream_device_id(snarl, node_id, 0, automap_parent) else { return m; };
-    let split = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
-    let n_fields = if split { 2 } else { 1 };
+    let node = snarl.get_node(node_id);
+    let split = node.and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
+    let hold_zones: std::collections::HashSet<(usize, usize)> = node
+        .and_then(|n| n.params.get("hold_zones").and_then(|v| v.as_array()))
+        .map(|a| a.iter().filter_map(|p| {
+            let q = p.as_array()?;
+            Some((q.first()?.as_u64()? as usize, q.get(1)?.as_u64()? as usize))
+        }).collect())
+        .unwrap_or_default();
     let readf = |pin: &str| live_signals.get(&(dev.clone(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
     let readb = |pin: &str| live_signals.get(&(dev.clone(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
-    for field in 0..n_fields {
+    // Per-finger [active, start_zone] × 2, advanced once per pass.
+    let pass = ctx.cumulative_pass_nr();
+    let track_id = egui::Id::new(("tz_live_track", node_id.0));
+    let (stored_pass, mut track): (u64, Vec<f32>) =
+        ctx.data(|d| d.get_temp(track_id)).unwrap_or((0, vec![0.0; 4]));
+    if track.len() < 4 { track.resize(4, 0.0); }
+    let advance = stored_pass != pass;
+    for finger in 0..2usize {
+        let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
+                            ("touch2_x", "touch2_y", "touch2_active")][finger];
+        let field = if split { finger } else { 0 };
+        let base = finger * 2;
+        let active = readb(pa);
+        let prev_active = track[base] > 0.5;
+        if !active {
+            if advance { track[base] = 0.0; }
+            continue;
+        }
         let col = tz_read_field_edges(snarl, node_id, field, "col_edges");
         let row = tz_read_field_edges(snarl, node_id, field, "row_edges");
-        let fingers: &[(&str, &str, &str)] = if split {
-            if field == 0 { &[("touch1_x", "touch1_y", "touch1_active")] }
-            else          { &[("touch2_x", "touch2_y", "touch2_active")] }
-        } else {
-            &[("touch2_x", "touch2_y", "touch2_active"),
-              ("touch1_x", "touch1_y", "touch1_active")]
-        };
-        for &(px, py, pa) in fingers {
-            if !readb(pa) { continue; }
-            let (x, y) = tz::pad_point_to_unit(readf(px), readf(py));
-            let (idx, lx, ly) = tz::locate_unit(x, y, &col, &row);
-            m.insert((field, idx), (lx, ly, true));
+        let (x, y) = tz::pad_point_to_unit(readf(px), readf(py));
+        let (cur_idx, _, _) = tz::locate_unit(x, y, &col, &row);
+        let start_zone = if !prev_active { cur_idx } else { track[base + 1] as usize };
+        if advance {
+            if !prev_active { track[base + 1] = cur_idx as f32; }
+            track[base] = 1.0;
         }
+        let eff = if hold_zones.contains(&(field, start_zone)) { start_zone } else { cur_idx };
+        let (x0, y0, x1, y1) = tz::zone_rect(eff, &col, &row);
+        let lx = if x1 > x0 { ((x - x0) / (x1 - x0)).clamp(0.0, 1.0) } else { 0.5 };
+        let ly = if y1 > y0 { ((y - y0) / (y1 - y0)).clamp(0.0, 1.0) } else { 0.5 };
+        m.insert((field, eff), (lx, ly, true));
     }
+    if advance { ctx.data_mut(|d| d.insert_temp(track_id, (pass, track))); }
     m
 }
 
@@ -1999,17 +2031,30 @@ fn tz_paint_zone_mapping(
         }
         if let Some(ap) = out_pins.iter().find(|p| is_analog(p)) {
             let ic = (bx.width() * 0.42).clamp(12.0, 22.0);
-            paint_chord_chip_to_rect(painter, ctx,
-                egui::pos2(bx.right() - ic - 1.0, bx.bottom() - ic - 1.0), ic, ap, skin);
+            let pos = egui::pos2(bx.right() - ic - 1.0, bx.bottom() - ic - 1.0);
+            // Activation glow: light the output icon when the zone is ACTUALLY
+            // driving output (deflect present ⇒ a live, hold-aware hit).
+            if deflect.is_some() {
+                painter.rect_filled(egui::Rect::from_min_size(pos, egui::vec2(ic, ic)).expand(2.5),
+                    3.0, accent.gamma_multiply(0.55));
+            }
+            paint_chord_chip_to_rect(painter, ctx, pos, ic, ap, skin);
         }
     } else {
-        // Digital outputs: icon(s) centred in a row.
+        // Digital outputs: icon(s) centred in a row. Each icon lights when the
+        // zone is actually activating (hold-aware live hit).
+        let active = deflect.is_some();
         let n = out_pins.len();
         let ic = (zr.height() * 0.46).clamp(14.0, 30.0).min(zr.width() / n.max(1) as f32 - 2.0).max(10.0);
         let total_w = n as f32 * ic + (n as f32 - 1.0) * 3.0;
         let mut x = zr.center().x - total_w * 0.5;
         for p in &out_pins {
-            paint_chord_chip_to_rect(painter, ctx, egui::pos2(x, zr.center().y - ic * 0.5), ic, p, skin);
+            let pos = egui::pos2(x, zr.center().y - ic * 0.5);
+            if active {
+                painter.rect_filled(egui::Rect::from_min_size(pos, egui::vec2(ic, ic)).expand(3.0),
+                    4.0, accent.gamma_multiply(0.55));
+            }
+            paint_chord_chip_to_rect(painter, ctx, pos, ic, p, skin);
             x += ic + 3.0;
         }
     }
@@ -2210,7 +2255,7 @@ fn render_touch_zones_pinned(
     // Mapping mode has no zone output ports, so dots come from the resolved
     // device's live touch (same as the module body).
     let zone_live = if mapping {
-        tz_live_hits(inner_snarl, inner_id, live_signals, automap_parent)
+        tz_live_hits(inner_snarl, inner_id, live_signals, automap_parent, ui.ctx())
     } else {
         inner_snarl.get_node(inner_id).map(tz_zone_live).unwrap_or_default()
     };
@@ -2461,7 +2506,7 @@ fn show_touch_zones_body(
     // device's touch pins directly (local device; network-forwarded touch in
     // mapping mode shows no dot — a known gap).
     let zone_live = if mapping {
-        tz_live_hits(snarl, node_id, live_signals, automap_parent)
+        tz_live_hits(snarl, node_id, live_signals, automap_parent, ui.ctx())
     } else {
         snarl.get_node(node_id).map(tz_zone_live).unwrap_or_default()
     };
@@ -2915,7 +2960,7 @@ fn render_touch_zone_cards(
         ui.add_space(4.0);
         ui.label(egui::RichText::new("Response curve  ·  drag / dbl-click add / right-click remove")
             .small().weak());
-        let live = tz_live_hits(snarl, node_id, live_signals, automap_parent);
+        let live = tz_live_hits(snarl, node_id, live_signals, automap_parent, ui.ctx());
         let live_mag = live.get(&(sel_f, sel_z)).filter(|z| z.2).map(|&(lx, ly, _)| {
             let (dx, dy) = (2.0 * lx - 1.0, 2.0 * ly - 1.0);
             (dx * dx + dy * dy).sqrt().min(1.0)
