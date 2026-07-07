@@ -1842,23 +1842,111 @@ fn tz_render_merge_popup(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node_id
     if let Some(node) = snarl.get_node_mut(node_id) { node.params.remove("_tz_merge"); }
 }
 
-/// Subdivide the selected zone with a partial divider (mapping mode). Splits the
-/// currently selected leaf at its centre along `axis`, giving the new half a fresh
-/// stable id. A small control row calls this so the user can carve up one zone
-/// without cutting across the whole pad.
-fn tz_subdivide_selected(snarl: &mut Snarl<NodeData>, node_id: NodeId,
-    axis: flexinput_core::touchzones::Axis)
+/// Subdivide the zone under unit point `(ux, uy)` at its own centre along `axis`
+/// (a partial divider — only that zone is cut). Used by the on-pad "+" handles.
+fn tz_subdivide_at(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize,
+    ux: f32, uy: f32, axis: flexinput_core::touchzones::Axis)
 {
-    let (field, zone) = tz_read_selection(snarl, node_id);
+    use flexinput_core::touchzones::Axis;
     let mut tree = tz_field_tree(snarl, node_id, field);
-    // Split at the zone's own centre along the axis.
-    let center = tree.zone_rect(zone as u32).map(|[x0, y0, x1, y1]| match axis {
-        flexinput_core::touchzones::Axis::V => (x0 + x1) * 0.5,
-        flexinput_core::touchzones::Axis::H => (y0 + y1) * 0.5,
+    let (id, _, _) = tree.locate(ux, uy);
+    let center = tree.zone_rect(id).map(|[x0, y0, x1, y1]| match axis {
+        Axis::V => (x0 + x1) * 0.5,
+        Axis::H => (y0 + y1) * 0.5,
     }).unwrap_or(0.5);
-    if tree.subdivide(zone as u32, axis, center).is_some() {
+    if tree.subdivide(id, axis, center).is_some() {
         tz_set_field_tree(snarl, node_id, field, &tree);
     }
+}
+
+/// Tree version of the hover-revealed +/- overlay (mapping mode). Same placement
+/// as the grid overlay — a "−" on each divider (removes/merges it, with the
+/// mapped-zone confirm popup), a "+" flanking each divider on hover (subdivides
+/// the zone on that side, parallel), and border "+" to split the edge zone.
+#[allow(clippy::too_many_arguments)]
+fn tz_tree_line_overlay(
+    node_id: NodeId,
+    field: usize,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    accent: egui::Color32,
+    visuals: &egui::Visuals,
+) {
+    use flexinput_core::touchzones::Axis;
+    let tree = tz_field_tree(snarl, node_id, field);
+    let to_x = |u: f32| rect.left() + u * rect.width();
+    let to_y = |u: f32| rect.top() + u * rect.height();
+    let off = 18.0;      // "+" flanking distance from the "−"
+    let edge = 30.0;     // border-proximity threshold (px)
+    let inset = 12.0;    // border "+" inset so it sits fully inside the field
+    let eps = 0.01;
+    let from_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY)
+        .inverse();
+    let ptr = ui.input(|i| i.pointer.hover_pos()).map(|p| from_global * p);
+    let mut sub: Option<(f32, f32, Axis)> = None;
+    let mut rem: Option<Vec<u8>> = None;
+
+    for (di, div) in tree.dividers().iter().enumerate() {
+        let mid = (div.span_lo + div.span_hi) * 0.5;
+        let (c, pill, plus_a, plus_b, a_pt, b_pt) = match div.axis {
+            Axis::V => {
+                let c = egui::pos2(to_x(div.pos), to_y(mid));
+                (c, egui::Rect::from_center_size(c, egui::vec2(2.0 * off + 20.0, 22.0)),
+                 egui::pos2(c.x - off, c.y), egui::pos2(c.x + off, c.y),
+                 (div.pos - eps, mid), (div.pos + eps, mid))
+            }
+            Axis::H => {
+                let c = egui::pos2(to_x(mid), to_y(div.pos));
+                (c, egui::Rect::from_center_size(c, egui::vec2(22.0, 2.0 * off + 20.0)),
+                 egui::pos2(c.x, c.y - off), egui::pos2(c.x, c.y + off),
+                 (mid, div.pos - eps), (mid, div.pos + eps))
+            }
+        };
+        if ptr.is_some_and(|p| pill.contains(p)) {
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztpa", field, di)),
+                plus_a, "+", accent, visuals) { sub = Some((a_pt.0, a_pt.1, div.axis)); }
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztpb", field, di)),
+                plus_b, "+", accent, visuals) { sub = Some((b_pt.0, b_pt.1, div.axis)); }
+        }
+        if tz_mini_button(ui, painter, ui.id().with((node_id, "tztm", field, di)),
+            c, "−", accent, visuals) { rem = Some(div.path.clone()); }
+    }
+
+    // Border "+": split the edge zone under the cursor.
+    if let Some(p) = ptr.filter(|p| rect.contains(*p)) {
+        let ux = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let uy = ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+        if p.x - rect.left() < edge {
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztbL", field)),
+                egui::pos2(rect.left() + inset, to_y(uy)), "+", accent, visuals) {
+                sub = Some((eps, uy, Axis::V));
+            }
+        }
+        if rect.right() - p.x < edge {
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztbR", field)),
+                egui::pos2(rect.right() - inset, to_y(uy)), "+", accent, visuals) {
+                sub = Some((1.0 - eps, uy, Axis::V));
+            }
+        }
+        if p.y - rect.top() < edge {
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztbT", field)),
+                egui::pos2(to_x(ux), rect.top() + inset), "+", accent, visuals) {
+                sub = Some((ux, eps, Axis::H));
+            }
+        }
+        if rect.bottom() - p.y < edge {
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tztbB", field)),
+                egui::pos2(to_x(ux), rect.bottom() - inset), "+", accent, visuals) {
+                sub = Some((ux, 1.0 - eps, Axis::H));
+            }
+        }
+    }
+
+    if let Some((ux, uy, axis)) = sub { tz_subdivide_at(snarl, node_id, field, ux, uy, axis); }
+    if let Some(path) = rem { tz_request_or_apply_merge(snarl, node_id, field, &tree, &path); }
 }
 
 /// The centred square used for a zone's analog viz (response-curve graph when
@@ -2571,9 +2659,11 @@ fn render_touch_zones_pinned(
                 }
             }
         }
-        // Ports mode keeps the hover-revealed +/- full-cut overlay. Mapping mode
-        // edits the tree — drag + right-click-remove live in tz_draw_field.
-        if !mapping {
+        // Hover-revealed +/- handles: tree ops in mapping mode, full-cut grid in
+        // ports mode.
+        if mapping {
+            tz_tree_line_overlay(inner_id, field, ui, snarl, &painter, r, accent, &visuals);
+        } else {
             tz_line_edit_overlay(inner_id, field, ui, snarl, &painter, r, &col, &row, accent, &visuals);
         }
     };
@@ -2589,11 +2679,9 @@ fn render_touch_zones_pinned(
         draw(0, rect, ui, inner_snarl);
     }
 
-    // Mapping mode: compact subdivide row for the selected zone + the merge-confirm
-    // popup (right-click a divider on the pad above to remove/merge).
+    // Mapping mode: the merge-confirm popup (raised by a "−" removal that would
+    // drop mapped zones).
     if mapping {
-        let (sf, _) = tz_read_selection(inner_snarl, inner_id);
-        tz_subdivide_row(inner_id, sf, sf, ui, inner_snarl, accent);
         tz_render_merge_popup(ui, inner_snarl, inner_id);
     }
 }
@@ -3498,10 +3586,12 @@ fn render_touch_field(
         }
     }
 
-    // Line editing: PORTS mode keeps the full-cut grid +/- overlay. Mapping mode
-    // edits the tree — drag + right-click-remove live in tz_draw_field, and the
-    // subdivide row (below) adds a partial divider to the selected zone.
-    if !mapping {
+    // Line editing: same hover-revealed +/- handles in both modes. Mapping mode
+    // drives the tree (+ subdivides that zone, − removes/merges); ports mode drives
+    // the full-cut grid.
+    if mapping {
+        tz_tree_line_overlay(node_id, field, ui, snarl, &painter, rect, accent, visuals);
+    } else {
         tz_line_edit_overlay(node_id, field, ui, snarl, &painter, rect, &col_edges, &row_edges, accent, visuals);
     }
 
@@ -3536,41 +3626,7 @@ fn render_touch_field(
         }
     }
 
-    // Mapping mode: subdivide the selected zone (partial divider). Ports mode uses
-    // the on-field +/- overlay instead. The merge-confirm popup is rendered once by
-    // the caller (show_touch_zones_body / render_touch_zones_pinned).
-    if mapping {
-        tz_subdivide_row(node_id, field, sel_field, ui, snarl, accent);
-    }
-
     rect
-}
-
-/// A small control row for the tree editor: split the selected zone vertically or
-/// horizontally (partial dividers). Shown per field in mapping mode.
-fn tz_subdivide_row(node_id: NodeId, field: usize, sel_field: usize,
-    ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, accent: egui::Color32)
-{
-    use flexinput_core::touchzones::Axis;
-    if sel_field != field { return; }
-    let (_, sel_zone) = tz_read_selection(snarl, node_id);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(format!("Zone {sel_zone}:")).small().weak());
-        if ui.small_button("Split ▏")
-            .on_hover_text("Split the selected zone into left / right halves (a partial vertical divider — only this zone is cut).")
-            .clicked()
-        {
-            tz_subdivide_selected(snarl, node_id, Axis::V);
-        }
-        if ui.small_button("Split ▬")
-            .on_hover_text("Split the selected zone into top / bottom halves (a partial horizontal divider).")
-            .clicked()
-        {
-            tz_subdivide_selected(snarl, node_id, Axis::H);
-        }
-        ui.label(egui::RichText::new("· drag a divider to move · right-click to remove")
-            .small().weak().color(accent.gamma_multiply(0.7)));
-    });
 }
 
 // ── AutoMap Collector body ────────────────────────────────────────────────────
