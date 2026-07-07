@@ -123,13 +123,17 @@ pub enum ZoneNode {
 
 /// A divider line materialized for drawing / hit-testing. For a `V` split the line
 /// is vertical at `x = pos`, spanning `y ∈ [span_lo, span_hi]`; for `H` it's
-/// horizontal at `y = pos`. `path` navigates to the split node (0 = a, 1 = b).
+/// horizontal at `y = pos`. `[lo, hi]` is the draggable range of `pos` along the
+/// split axis (the subtree's extent). `path` navigates to the split node
+/// (0 = a, 1 = b).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Divider {
     pub axis: Axis,
     pub pos: f32,
     pub span_lo: f32,
     pub span_hi: f32,
+    pub lo: f32,
+    pub hi: f32,
     pub path: Vec<u8>,
 }
 
@@ -246,13 +250,15 @@ impl ZoneNode {
             match axis {
                 Axis::V => {
                     let xt = t.clamp(x0, x1);
-                    out.push(Divider { axis: Axis::V, pos: xt, span_lo: y0, span_hi: y1, path: path.clone() });
+                    out.push(Divider { axis: Axis::V, pos: xt, span_lo: y0, span_hi: y1,
+                        lo: x0, hi: x1, path: path.clone() });
                     path.push(0); a.dividers_rec(x0, y0, xt, y1, path, out); path.pop();
                     path.push(1); b.dividers_rec(xt, y0, x1, y1, path, out); path.pop();
                 }
                 Axis::H => {
                     let yt = t.clamp(y0, y1);
-                    out.push(Divider { axis: Axis::H, pos: yt, span_lo: x0, span_hi: x1, path: path.clone() });
+                    out.push(Divider { axis: Axis::H, pos: yt, span_lo: x0, span_hi: x1,
+                        lo: y0, hi: y1, path: path.clone() });
                     path.push(0); a.dividers_rec(x0, y0, x1, yt, path, out); path.pop();
                     path.push(1); b.dividers_rec(x0, yt, x1, y1, path, out); path.pop();
                 }
