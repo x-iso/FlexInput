@@ -2648,7 +2648,8 @@ pub fn eval_graph_tick(
                     || src_dev.starts_with("forksel:")
                     || src_dev.starts_with("remap:")
                     || src_dev.starts_with("combiner:")
-                    || src_dev.starts_with("lean:");
+                    || src_dev.starts_with("lean:")
+                    || src_dev.starts_with("touchmap:");
                 // Digital→analog trigger bridges (`btn_lt_dig`→`left_trigger`,
                 // `btn_rt_dig`→`right_trigger`) are a LOWEST-PRIORITY fallback:
                 // they only fill the analog trigger when no primary source — the
@@ -5029,27 +5030,44 @@ fn eval_touch_zones_map_node(
     // Resolve which zone each active finger occupies, per field, keeping local
     // coords — identical to the ports-mode arm in compute_node.
     let split = snap.params.get("field_mode").and_then(|v| v.as_str()) == Some("split");
-    let n_fields = if split { 2 } else { 1 };
+    const SLOTS_PER: usize = 9; // per-finger aux slots (see per-finger loop below)
+    // Zones the user marked "hold": once a gesture STARTS in one, that finger
+    // stays attributed to it for the whole touch even if it slides into a
+    // neighbour — so the neighbour doesn't also fire ("hold zone" option). Only
+    // the `zone_hit` gate (tz_touch / tz_click) needs this; analog + swipe are
+    // already attributed to the start zone.
+    let hold_zones: std::collections::HashSet<(usize, usize)> =
+        snap.params.get("hold_zones").and_then(|v| v.as_array()).map(|a| {
+            a.iter().filter_map(|p| {
+                let q = p.as_array()?;
+                Some((q.first()?.as_u64()? as usize, q.get(1)?.as_u64()? as usize))
+            }).collect()
+        }).unwrap_or_default();
+    // Read-only peek at last frame's per-finger tracking (start zone lives in
+    // aux_f32[base+4]); absent on the first frame → no holds yet.
+    let prev_aux: Vec<f32> = state.get(&uid).map(|s| s.aux_f32.clone()).unwrap_or_default();
     let mut zone_hit: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
-    for field in 0..n_fields {
+    for finger in 0..2usize {
+        let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
+                            ("touch2_x", "touch2_y", "touch2_active")][finger];
+        let field = if split { finger } else { 0 };
+        if !read(pa).map(|s| s.as_bool()).unwrap_or(false) { continue; }
         let col_edges = read_edges(field, "col_edges");
         let row_edges = read_edges(field, "row_edges");
-        let fingers: &[(&str, &str, &str)] = if split {
-            if field == 0 { &[("touch1_x", "touch1_y", "touch1_active")] }
-            else          { &[("touch2_x", "touch2_y", "touch2_active")] }
-        } else {
-            &[("touch2_x", "touch2_y", "touch2_active"),
-              ("touch1_x", "touch1_y", "touch1_active")]
-        };
-        for &(px, py, pa) in fingers {
-            if !read(pa).map(|s| s.as_bool()).unwrap_or(false) { continue; }
-            let (x, y) = tz::pad_point_to_unit(
-                read(px).map(|s| s.as_float()).unwrap_or(0.0),
-                read(py).map(|s| s.as_float()).unwrap_or(0.0),
-            );
-            let (idx, lx, ly) = tz::locate_unit(x, y, &col_edges, &row_edges);
-            zone_hit.insert((field, idx), (lx, ly));
-        }
+        let (x, y) = tz::pad_point_to_unit(
+            read(px).map(|s| s.as_float()).unwrap_or(0.0),
+            read(py).map(|s| s.as_float()).unwrap_or(0.0),
+        );
+        let (idx, lx, ly) = tz::locate_unit(x, y, &col_edges, &row_edges);
+        // If this finger was already down and its START zone is a hold zone, lock
+        // the hit to that start zone; the wandered-into zone gets no hit from it.
+        let base = finger * SLOTS_PER;
+        let prev_active = prev_aux.get(base).copied().unwrap_or(0.0) > 0.5;
+        let start_zone = prev_aux.get(base + 4).copied().unwrap_or(0.0) as usize;
+        let eff = if prev_active && hold_zones.contains(&(field, start_zone)) {
+            start_zone
+        } else { idx };
+        zone_hit.insert((field, eff), (lx, ly));
     }
     let click = |field: usize| -> bool {
         let pin = if field == 0 { "btn_touchpad" } else { "btn_touchpad2" };
@@ -5063,16 +5081,21 @@ fn eval_touch_zones_map_node(
     let mut button_on: HashMap<String, bool> = HashMap::new();
     // Relative analog (adaptive-center): stick target → (x, y). Last card wins.
     let mut sticks: HashMap<&'static str, (f32, f32)> = HashMap::new();
-    // Relative mouse delta accumulator (screen space, y-down).
+    // Relative mouse delta accumulator. The `mouse`/`mouse_x`/`mouse_y` pins use
+    // the +Y-UP convention (the keymouse sink negates y to screen space itself),
+    // so we accumulate the deflection directly WITHOUT flipping y.
     let mut mouse_dx = 0.0f32;
     let mut mouse_dy = 0.0f32;
     let mut mouse_active = false;
-    // Mouse gain: the keymouse sink reads the `mouse` pin as pixels-per-60Hz
-    // reference frame, so a raw ±1 deflection is only ~60 px/s — unusable. Scale
-    // the deflection into a velocity here (default full-deflection ≈ 720 px/s at
-    // sink sensitivity 1.0). Per-node `mouse_speed` param tunes it; the sink's own
-    // mouse_sensitivity still multiplies on top downstream.
-    let mouse_speed = snap.params.get("mouse_speed").and_then(|v| v.as_f64()).unwrap_or(12.0) as f32;
+    // Mouse gain. The emitted value stacks with the SINK's own mouse_sensitivity
+    // (like gyro / right-stick sources do), so a raw ±1 deflection would be wildly
+    // hot at typical sink sensitivities. `TZ_MOUSE_BASE` attenuates a full-zone
+    // deflection to a firm-but-controlled velocity comparable to gyro/RS at the
+    // same sink sensitivity; the per-node `mouse_speed` multiplier (default 1.0)
+    // tunes it from there.
+    const TZ_MOUSE_BASE: f32 = 0.03;
+    let mouse_gain = snap.params.get("mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32
+        * TZ_MOUSE_BASE;
 
     // Cards use the shared Remapper schema: "in" = trigger token(s), "out" =
     // target bus pins, "mode"/"window_ms"/"sustain"/"turbo" = the Remapper press
@@ -5094,7 +5117,7 @@ fn eval_touch_zones_map_node(
     const SWIPE_THRESH: f32 = 0.18;   // fraction of the field
     const SWIPE_PULSE_MS: f32 = 120.0;
     const INNER_FRAC: f32 = 0.30;     // central region that captures an adaptive centre
-    let slots_per = 9usize;
+    let slots_per = SLOTS_PER;
     while ns.aux_f32.len() < 2 * slots_per { ns.aux_f32.push(0.0); }
     let mut swipes: Vec<(usize, usize, u8)> = Vec::new(); // (field, zone, dir 1=U 2=D 3=L 4=R)
     let mut analog_by_zone: HashMap<(usize, usize), (f32, f32)> = HashMap::new(); // deflection, +Y up
@@ -5193,8 +5216,25 @@ fn eval_touch_zones_map_node(
 
         // Relative analog deflection for this card's zone (present only while a
         // finger is down in it). Analog outputs ignore the press-mode gate — the
-        // contact itself drives them.
-        let deflect = analog_by_zone.get(&(field, zone)).copied();
+        // contact itself drives them. A per-card response `curve` (points over the
+        // 0..1 deflection MAGNITUDE) reshapes the response while keeping direction
+        // — the touch-zone analog can't have a Response Curve module wired onto it.
+        let curve_pts: Vec<[f32; 2]> = card.get("curve").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|p| {
+                let q = p.as_array()?;
+                Some([q.first()?.as_f64()? as f32, q.get(1)?.as_f64()? as f32])
+            }).collect())
+            .unwrap_or_default();
+        let deflect = analog_by_zone.get(&(field, zone)).copied().map(|(ax, ay)| {
+            if curve_pts.len() >= 2 {
+                let mag = (ax * ax + ay * ay).sqrt().min(1.0);
+                if mag > 1e-4 {
+                    let m2 = sample_curve(&curve_pts, mag, &[]).clamp(0.0, 1.0);
+                    let s = m2 / mag;
+                    (ax * s, ay * s)
+                } else { (ax, ay) }
+            } else { (ax, ay) }
+        });
         for p in card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
             .filter_map(|v| v.as_str())
         {
@@ -5204,12 +5244,12 @@ fn eval_touch_zones_map_node(
                         sticks.insert(if p == "left_stick" { "left_stick" } else { "right_stick" }, (ax, ay));
                     }
                 }
-                // Relative mouse: deflection → per-frame cursor delta (screen
-                // y-down, so invert the +Y-up analog). "mouse" drives both axes.
+                // Relative mouse: deflection → velocity, +Y up (the sink flips to
+                // screen). "mouse" drives both axes.
                 "mouse" | "mouse_x" | "mouse_y" => {
                     if let Some((ax, ay)) = deflect {
-                        if p == "mouse" || p == "mouse_x" { mouse_dx += ax * mouse_speed; }
-                        if p == "mouse" || p == "mouse_y" { mouse_dy += -ay * mouse_speed; }
+                        if p == "mouse" || p == "mouse_x" { mouse_dx += ax * mouse_gain; }
+                        if p == "mouse" || p == "mouse_y" { mouse_dy += ay * mouse_gain; }
                         mouse_active = true;
                     }
                 }
@@ -6753,6 +6793,64 @@ mod trigger_tests {
         eval_graph_tick(&graph, &mut state, &HashMap::new(), 0.016, &mut out);
         assert!(!getb(&out, "touch1_active") && !getb(&out, "touch2_active"),
             "released zone mappings must release the touch points");
+    }
+
+    // "Hold zone": a tz_touch gesture that STARTS in a hold zone keeps firing that
+    // zone's mapping even after the finger slides into a neighbour, and the
+    // neighbour must NOT fire. Without the flag, crossing switches zones.
+    #[test]
+    fn touch_zones_hold_keeps_origin_zone_on_crossing() {
+        let mk = |hold: bool| {
+            let mut n = empty_node(1, "module.touch_zones");
+            n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+            n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+            n.params.insert("col_edges".into(), serde_json::json!([0.5])); // 2 columns
+            n.params.insert("row_edges".into(), serde_json::json!([]));
+            n.params.insert("zone_maps".into(), serde_json::json!([
+                {"f":0,"z":0,"in":["tz_touch"],"out":["btn_south"]},
+                {"f":0,"z":1,"in":["tz_touch"],"out":["btn_east"]},
+            ]));
+            if hold { n.params.insert("hold_zones".into(), serde_json::json!([[0,0]])); }
+            n
+        };
+        // px in [-1,1] → unit x in [0,1]: -0.5→0.25 (zone 0), +0.5→0.75 (zone 1).
+        let finger = |px: f32| {
+            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+            m
+        };
+        let getb = |c: &HashMap<(String, String), Signal>, pin: &str|
+            c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+
+        // WITH hold on zone 0.
+        {
+            let snap = mk(true);
+            let mut state = HashMap::new();
+            let mut c = HashMap::new();
+            eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
+            c.clear();
+            eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
+            assert!(getb(&c, "btn_south") && !getb(&c, "btn_east"), "zone0 fires btn_south");
+            c.clear();
+            eval_touch_zones_map_node(&snap, 1, &finger(0.5), &mut c, &mut state, 0.016);
+            assert!(getb(&c, "btn_south"), "HOLD: origin zone still fires after crossing");
+            assert!(!getb(&c, "btn_east"), "HOLD: crossed-into zone must NOT fire");
+        }
+        // WITHOUT hold — crossing switches zones.
+        {
+            let snap = mk(false);
+            let mut state = HashMap::new();
+            let mut c = HashMap::new();
+            eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
+            c.clear();
+            eval_touch_zones_map_node(&snap, 1, &finger(-0.5), &mut c, &mut state, 0.016);
+            c.clear();
+            eval_touch_zones_map_node(&snap, 1, &finger(0.5), &mut c, &mut state, 0.016);
+            assert!(!getb(&c, "btn_south") && getb(&c, "btn_east"),
+                "no hold: crossing switches to the new zone");
+        }
     }
 
     // Analog swipe drives a finger coordinate continuously (absolute position).

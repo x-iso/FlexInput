@@ -71,6 +71,11 @@ pub enum EditLevel {
     /// A Touch Zones divider is grabbed: dpad/LS along its perpendicular axis
     /// moves it, North recenters, South/East release back to `TzLines`.
     TzGrab,
+    /// Inside the Touch Zones mapping CARDS widget: left/right (or LB/RB) cycles
+    /// the selected zone; South advances the Learn→Assign→Add flow (idle: Learn;
+    /// captured w/o output: open the Assign picker; captured w/ output: Add the
+    /// mapping); North toggles gamepad-learn; West cancels a capture; East exits.
+    TzCards,
 }
 
 /// What activating a left-panel (I/O panel) nav target does. Published by
@@ -191,6 +196,15 @@ pub struct GamepadNav {
     /// 0=press-mode, 1=time-gap, 2=hold, 3=turbo. Left/right moves between the
     /// fields that apply for the current mode (grayed-out ones are skipped).
     pub card_field: usize,
+    /// Which level `RemapCard` returns to on exit. The Remapper enters cards from
+    /// `RemapScroll`; Touch Zones enters them from `TzCards`. Set at entry so the
+    /// SHARED card-field driver (`nav_drive_remap_card`) pops back to the right
+    /// list instead of hard-coding `RemapScroll`.
+    pub card_return_level: EditLevel,
+    /// Which level `CurveDots` returns to on exit. The Response Curve family exits
+    /// to `Widget`; a Touch Zones per-zone curve exits to `TzCards`. Set at every
+    /// curve entry so the shared curve driver serves both.
+    pub curve_return_level: EditLevel,
     /// Touch Zones line editing (`TzLines`/`TzGrab`). `tz_field` = focused pad
     /// (0 or 1, split mode); `tz_axis` = 0 for a COLUMN divider (vertical line,
     /// moves in X), 1 for a ROW divider (horizontal line, moves in Y); `tz_line`
@@ -286,6 +300,8 @@ impl Default for GamepadNav {
             card_index: 0,
             remap_card: 0,
             card_field: 0,
+            card_return_level: EditLevel::RemapScroll,
+            curve_return_level: EditLevel::Widget,
             tz_field: 0,
             tz_axis: 0,
             tz_line: 0,

@@ -1683,6 +1683,338 @@ fn tz_live_hits(
     m
 }
 
+/// The centred square used for a zone's analog viz (response-curve graph when
+/// idle, vectorscope when active) — shared by the painter and the interactive
+/// curve editor so their geometry matches exactly.
+fn tz_zone_scope_rect(zr: egui::Rect) -> egui::Rect {
+    let sz = (zr.width().min(zr.height()) * 0.62).clamp(20.0, 64.0);
+    egui::Rect::from_center_size(zr.center(), egui::vec2(sz, sz))
+}
+
+/// The response-curve control points for a zone's analog card (over the 0..1
+/// deflection magnitude). Defaults to linear when none stored.
+pub(crate) fn tz_zone_curve(zone_maps: &[Value], field: usize, idx: usize) -> Vec<[f32; 2]> {
+    for c in zone_maps.iter().filter(|c|
+        c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64
+            && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == idx as u64)
+    {
+        if let Some(arr) = c.get("curve").and_then(|v| v.as_array()) {
+            let pts: Vec<[f32; 2]> = arr.iter().filter_map(|p| {
+                let q = p.as_array()?;
+                Some([q.first()?.as_f64()? as f32, q.get(1)?.as_f64()? as f32])
+            }).collect();
+            if pts.len() >= 2 { return pts; }
+        }
+    }
+    vec![[0.0, 0.0], [1.0, 1.0]]
+}
+
+/// True when a zone has at least one analog (mouse / stick) output card.
+pub(crate) fn tz_zone_is_analog(zone_maps: &[Value], field: usize, idx: usize) -> bool {
+    let is_analog = |p: &str| matches!(p,
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+    zone_maps.iter().any(|c|
+        c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64
+            && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == idx as u64
+            && c.get("out").and_then(|v| v.as_array())
+                .map(|a| a.iter().any(|p| p.as_str().map(is_analog).unwrap_or(false)))
+                .unwrap_or(false))
+}
+
+/// Store `pts` as the response `curve` on the first analog card of (field, zone).
+pub(crate) fn tz_set_zone_curve(snarl: &mut Snarl<NodeData>, node_id: NodeId,
+    field: usize, idx: usize, pts: &[[f32; 2]])
+{
+    let is_analog = |p: &str| matches!(p,
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+    let Some(node) = snarl.get_node_mut(node_id) else { return };
+    let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) else { return };
+    for c in cards.iter_mut() {
+        let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if f != field || z != idx { continue; }
+        let analog = c.get("out").and_then(|v| v.as_array())
+            .map(|a| a.iter().any(|p| p.as_str().map(is_analog).unwrap_or(false)))
+            .unwrap_or(false);
+        if !analog { continue; }
+        if let Some(obj) = c.as_object_mut() {
+            obj.insert("curve".to_string(), Value::Array(pts.iter()
+                .map(|p| Value::Array(vec![Value::from(p[0] as f64), Value::from(p[1] as f64)]))
+                .collect()));
+        }
+        return;
+    }
+}
+
+/// True when zone `(field, zone)` is marked "hold" (a gesture starting there
+/// stays bound to it even if the finger slides into a neighbouring zone).
+pub(crate) fn tz_zone_held(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize) -> bool {
+    snarl.get_node(node_id)
+        .and_then(|n| n.params.get("hold_zones").and_then(|v| v.as_array()))
+        .map(|a| a.iter().any(|p| p.as_array().map(|q|
+            q.first().and_then(|v| v.as_u64()) == Some(field as u64)
+                && q.get(1).and_then(|v| v.as_u64()) == Some(zone as u64)).unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+/// Set/clear the "hold" flag for zone `(field, zone)` in the `hold_zones` param
+/// (a list of `[field, zone]` pairs).
+pub(crate) fn tz_set_zone_held(snarl: &mut Snarl<NodeData>, node_id: NodeId,
+    field: usize, zone: usize, held: bool)
+{
+    let Some(node) = snarl.get_node_mut(node_id) else { return };
+    let mut list: Vec<Value> = node.params.get("hold_zones")
+        .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    list.retain(|p| p.as_array().map(|q| !(
+        q.first().and_then(|v| v.as_u64()) == Some(field as u64)
+            && q.get(1).and_then(|v| v.as_u64()) == Some(zone as u64))).unwrap_or(true));
+    if held {
+        list.push(Value::Array(vec![Value::from(field as u64), Value::from(zone as u64)]));
+    }
+    node.params.insert("hold_zones".into(), Value::Array(list));
+}
+
+/// A full-size interactive response-curve editor for a zone's analog output,
+/// shown in the CARD ROW (below the pad) where there's room — the tiny on-zone
+/// graph is a read-only preview. Behaves like the Response Curve module's graph:
+/// drag points (endpoints move in Y, interior in X+Y), double-click empty space
+/// to add a point, right-click a point to remove it. X = deflection magnitude
+/// 0..1, Y = output 0..1. Writes the first analog card's `curve`; `live_mag`
+/// draws the current input→output dot when the zone is active.
+fn tz_curve_editor(node_id: NodeId, field: usize, idx: usize,
+    ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>,
+    accent: egui::Color32, visuals: &egui::Visuals, live_mag: Option<f32>)
+{
+    let zone_maps = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    let mut pts = tz_zone_curve(&zone_maps, field, idx);
+
+    let w = ui.available_width().clamp(140.0, 360.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 104.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
+    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, visuals.weak_text_color()), egui::StrokeKind::Inside);
+    let g = rect.shrink(8.0);
+    let to = |x: f32, y: f32| egui::pos2(
+        g.left() + x.clamp(0.0, 1.0) * g.width(),
+        g.bottom() - y.clamp(0.0, 1.0) * g.height());
+    let unto = |p: egui::Pos2| (
+        ((p.x - g.left()) / g.width()).clamp(0.0, 1.0),
+        ((g.bottom() - p.y) / g.height()).clamp(0.0, 1.0));
+
+    // ── Gamepad-nav integration ────────────────────────────────────────────
+    // Publish the graph geometry (GLOBAL space, 0..1 both axes) so the shared
+    // curve driver (`nav_drive_curve_dots`/`_dot`) can add/move/delete dots here
+    // exactly like the Response Curve module's graph. Read back the selected dot
+    // (while entered) + a focus flag (while the curve row is highlighted but not
+    // yet entered) to draw the matching rings.
+    let pass = ui.ctx().cumulative_pass_nr();
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    ui.ctx().data_mut(|d| d.insert_temp(
+        egui::Id::new(("gp_nav_curve_geom", node_id.0)),
+        (pass, to_global * g, 0.0f32, 1.0f32, 0.0f32, 1.0f32)));
+    let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
+        .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+    let nav_sel_dot: Option<usize> = nav_sel.filter(|(p, _, _)| pass.saturating_sub(*p) <= 1).map(|(_, i, _)| i);
+    let nav_focused: bool = ui.ctx()
+        .data(|d| d.get_temp::<u64>(egui::Id::new(("gp_nav_tz_curve_focus", node_id.0))))
+        .map(|p| pass.saturating_sub(p) <= 1).unwrap_or(false);
+    if nav_focused || nav_sel_dot.is_some() {
+        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+        // Gamepad users can't scroll manually, and the whole-module wrapper uses a
+        // MANUAL scroll offset (not an egui ScrollArea, so `scroll_to_rect` is a
+        // no-op). Publish a body-space scroll delta on the same channel the cards
+        // use (`gp_nav_remap_scroll`) so the wrapper brings the graph into view.
+        if nav_focused || nav_sel_dot.is_some() {
+            let clip = ui.clip_rect();
+            let mut need = 0.0f32;
+            if rect.top() < clip.top() + 4.0 {
+                need = rect.top() - (clip.top() + 4.0);
+            } else if rect.bottom() > clip.bottom() - 4.0 {
+                need = rect.bottom() - (clip.bottom() - 4.0);
+            }
+            if need.abs() > 1.0 {
+                ui.ctx().data_mut(|d| d.insert_temp(
+                    egui::Id::new(("gp_nav_remap_scroll", node_id.0)), (pass, need)));
+                request_repaint_throttled(ui.ctx());
+            }
+        }
+    }
+
+    // Grid + identity reference.
+    let grid = visuals.weak_text_color().gamma_multiply(0.35);
+    for k in 1..4 {
+        let t = k as f32 / 4.0;
+        painter.line_segment([to(t, 0.0), to(t, 1.0)], egui::Stroke::new(0.5, grid));
+        painter.line_segment([to(0.0, t), to(1.0, t)], egui::Stroke::new(0.5, grid));
+    }
+    painter.line_segment([to(0.0, 0.0), to(1.0, 1.0)], egui::Stroke::new(0.5, grid));
+
+    // Add-area first (bottom of z-order); handles after so they win their rects.
+    // NOTE: `interact_pointer_pos()` is ALREADY in this UI's local space (even
+    // inside the whole-module scale layer), so it maps directly through `unto` —
+    // do NOT apply the layer transform here (that double-transforms and scatters
+    // the points).
+    let bg = ui.interact(g, ui.id().with((node_id, "tzcvbg", field, idx)), egui::Sense::click());
+    let mut changed = false;
+    let mut remove: Option<usize> = None;
+    let n = pts.len();
+    for i in 0..n {
+        let hp = to(pts[i][0], pts[i][1]);
+        let r = ui.interact(egui::Rect::from_center_size(hp, egui::vec2(16.0, 16.0)),
+            ui.id().with((node_id, "tzcv", field, idx, i)), egui::Sense::click_and_drag());
+        let hot = r.hovered() || r.dragged();
+        if hot { r.clone().on_hover_cursor(egui::CursorIcon::Grab); }
+        if r.dragged() {
+            if let Some(p) = r.interact_pointer_pos() {
+                let (nx, ny) = unto(p);
+                // Interior points stay ordered; guard the clamp so a crowded pair
+                // (lo > hi) can't panic — pin to the midpoint of the neighbours.
+                let x = if i == 0 { 0.0 } else if i + 1 == n { 1.0 } else {
+                    let lo = pts[i - 1][0] + 0.03;
+                    let hi = pts[i + 1][0] - 0.03;
+                    if lo <= hi { nx.clamp(lo, hi) } else { (pts[i - 1][0] + pts[i + 1][0]) * 0.5 }
+                };
+                pts[i] = [x, ny];
+                changed = true;
+            }
+        }
+        if r.secondary_clicked() && i != 0 && i + 1 != n { remove = Some(i); }
+    }
+    if let Some(i) = remove {
+        pts.remove(i);
+        changed = true;
+    } else if bg.double_clicked() {
+        if let Some(p) = bg.interact_pointer_pos() {
+            let (nx, ny) = unto(p);
+            let at = pts.iter().position(|q| q[0] > nx).unwrap_or(pts.len());
+            if at > 0 && at < pts.len() {
+                pts.insert(at, [nx.clamp(0.02, 0.98), ny]);
+                changed = true;
+            }
+        }
+    }
+
+    // Curve polyline (over the possibly-just-edited points) + handles.
+    for wnd in pts.windows(2) {
+        painter.line_segment([to(wnd[0][0], wnd[0][1]), to(wnd[1][0], wnd[1][1])],
+            egui::Stroke::new(1.8, accent));
+    }
+    for (i, p) in pts.iter().enumerate() {
+        painter.circle_filled(to(p[0], p[1]), 4.0, accent);
+        painter.circle_stroke(to(p[0], p[1]), 4.0, egui::Stroke::new(1.0, visuals.extreme_bg_color));
+        // Gamepad-selected dot: accent ring (thicker while being moved/entered).
+        if nav_sel_dot == Some(i) {
+            let editing = nav_sel.map(|(_, _, e)| e).unwrap_or(false);
+            painter.circle_stroke(to(p[0], p[1]), if editing { 8.0 } else { 6.5 },
+                egui::Stroke::new(2.0, accent));
+        }
+    }
+    // Live input→output dot while the zone drives the analog output.
+    if let Some(m) = live_mag {
+        let m = m.clamp(0.0, 1.0);
+        let y = flexinput_engine::sample_curve(&pts, m, &[]).clamp(0.0, 1.0);
+        let dp = to(m, y);
+        painter.circle_filled(dp, 3.0, egui::Color32::from_rgb(90, 200, 255));
+    }
+
+    if changed {
+        tz_set_zone_curve(snarl, node_id, field, idx, &pts);
+    }
+}
+
+/// Paint one zone's MAPPING content (mapping mode): the output icon(s) of the
+/// zone's cards, or — for an analog output (mouse / stick) — the response-curve
+/// graph (idle) that swaps to a live vectorscope while the zone is active, with
+/// the output icon in the corner. Empty zones show a faint index. The zone's
+/// active highlight (drawn by the caller) is the "lit when activated" cue.
+#[allow(clippy::too_many_arguments)]
+fn tz_paint_zone_mapping(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    zr: egui::Rect,
+    field: usize,
+    idx: usize,
+    zone_maps: &[Value],
+    skin: super::remapper_icons::Skin,
+    deflect: Option<(f32, f32)>,
+    accent: egui::Color32,
+    visuals: &egui::Visuals,
+) {
+    let is_analog = |p: &str| matches!(p,
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+    // Output pins across every card bound to this (field, zone).
+    let mut out_pins: Vec<String> = Vec::new();
+    let mut analog = false;
+    for c in zone_maps.iter().filter(|c|
+        c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64
+            && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == idx as u64)
+    {
+        for p in c.get("out").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()) {
+            if is_analog(p) { analog = true; }
+            if !out_pins.iter().any(|x| x == p) { out_pins.push(p.to_string()); }
+        }
+    }
+
+    if out_pins.is_empty() {
+        // Unmapped zone: faint index so it's still identifiable as a target.
+        painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
+            egui::FontId::proportional(11.0), visuals.weak_text_color().gamma_multiply(0.5));
+        return;
+    }
+
+    if analog {
+        let bx = tz_zone_scope_rect(zr);
+        painter.rect_filled(bx, 2.0, visuals.extreme_bg_color.gamma_multiply(0.7));
+        let grid = visuals.weak_text_color().gamma_multiply(0.5);
+        painter.rect_stroke(bx, 2.0, egui::Stroke::new(1.0, visuals.weak_text_color()), egui::StrokeKind::Inside);
+        if let Some((dx, dy)) = deflect {
+            // ACTIVE → vectorscope: crosshair + live dot.
+            painter.line_segment([egui::pos2(bx.center().x, bx.top()), egui::pos2(bx.center().x, bx.bottom())],
+                egui::Stroke::new(0.5, grid));
+            painter.line_segment([egui::pos2(bx.left(), bx.center().y), egui::pos2(bx.right(), bx.center().y)],
+                egui::Stroke::new(0.5, grid));
+            let p = egui::pos2(
+                bx.center().x + dx.clamp(-1.0, 1.0) * 0.5 * bx.width(),
+                bx.center().y - dy.clamp(-1.0, 1.0) * 0.5 * bx.height()); // +Y up
+            painter.line_segment([bx.center(), p], egui::Stroke::new(1.5, accent.gamma_multiply(0.6)));
+            painter.circle_filled(p, 3.0, accent);
+        } else {
+            // IDLE → response curve over the 0..1 deflection magnitude.
+            let pts = tz_zone_curve(zone_maps, field, idx);
+            let to = |x: f32, y: f32| egui::pos2(
+                bx.left() + x.clamp(0.0, 1.0) * bx.width(),
+                bx.bottom() - y.clamp(0.0, 1.5) * bx.height());
+            // Faint linear reference (identity).
+            painter.line_segment([to(0.0, 0.0), to(1.0, 1.0)], egui::Stroke::new(0.5, grid));
+            for w in pts.windows(2) {
+                painter.line_segment([to(w[0][0], w[0][1]), to(w[1][0], w[1][1])],
+                    egui::Stroke::new(1.5, accent));
+            }
+            for p in &pts {
+                painter.circle_filled(to(p[0], p[1]), 2.0, accent);
+            }
+        }
+        if let Some(ap) = out_pins.iter().find(|p| is_analog(p)) {
+            let ic = (bx.width() * 0.42).clamp(12.0, 22.0);
+            paint_chord_chip_to_rect(painter, ctx,
+                egui::pos2(bx.right() - ic - 1.0, bx.bottom() - ic - 1.0), ic, ap, skin);
+        }
+    } else {
+        // Digital outputs: icon(s) centred in a row.
+        let n = out_pins.len();
+        let ic = (zr.height() * 0.46).clamp(14.0, 30.0).min(zr.width() / n.max(1) as f32 - 2.0).max(10.0);
+        let total_w = n as f32 * ic + (n as f32 - 1.0) * 3.0;
+        let mut x = zr.center().x - total_w * 0.5;
+        for p in &out_pins {
+            paint_chord_chip_to_rect(painter, ctx, egui::pos2(x, zr.center().y - ic * 0.5), ic, p, skin);
+            x += ic + 3.0;
+        }
+    }
+}
+
 /// Draw one field's pad into `rect`: background, zone cells + index labels, the
 /// active-zone highlight, live finger dots, the frame, and draggable dividers
 /// (line MOVING — never changes the zone count, so it's wiring-safe). Persists
@@ -1709,15 +2041,38 @@ fn tz_draw_field(
 
     painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
 
+    // In mapping mode each zone shows its mapping OUTPUT (icon, or a live mini
+    // vectorscope for analog) instead of the bare index. Ports mode keeps the
+    // numbers (the ports ARE the zones' identity there).
+    let mapping = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
+    let zone_maps: Vec<Value> = if mapping {
+        snarl.get_node(node_id)
+            .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
+            .unwrap_or_default()
+    } else { Vec::new() };
+    let skin = remapper_resolve_skin(snarl, node_id, "auto", None);
+    let ctx = ui.ctx().clone();
+
     let zn = tz::zone_count(col_edges, row_edges);
     for idx in 0..zn {
         let (x0, y0, x1, y1) = tz::zone_rect(idx, col_edges, row_edges);
         let zr = egui::Rect::from_min_max(egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
-        if zone_live.get(&(field, idx)).map(|z| z.2).unwrap_or(false) {
+        let live = zone_live.get(&(field, idx)).copied();
+        let active = live.map(|z| z.2).unwrap_or(false);
+        if active {
             painter.rect_filled(zr.shrink(1.0), 0.0, accent.gamma_multiply(0.35));
         }
-        painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
-            egui::FontId::proportional(12.0), visuals.weak_text_color());
+        if mapping {
+            // Local finger position → deflection estimate for the analog viz
+            // (+Y up; the eval's adaptive centre isn't reproduced here — this is
+            // a live direction indicator, not the exact stick value).
+            let deflect = live.filter(|z| z.2).map(|(lx, ly, _)| (2.0 * lx - 1.0, 1.0 - 2.0 * ly));
+            tz_paint_zone_mapping(&painter, &ctx, zr, field, idx, &zone_maps, skin, deflect, accent, visuals);
+        } else {
+            painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
+                egui::FontId::proportional(12.0), visuals.weak_text_color());
+        }
     }
     for (&(f, idx), &(lx, ly, act)) in zone_live {
         if f != field || !act || idx >= zn { continue; }
@@ -1747,12 +2102,18 @@ fn tz_draw_field(
     let nav_stroke = |grabbed: bool| -> (f32, egui::Color32) {
         if grabbed { (3.0, egui::Color32::from_rgb(90, 220, 120)) } else { (3.0, accent) }
     };
+    // Per-divider global-space hit-rects, published for the gamepad RS-cursor
+    // hover-select in `nav_drive_touch_zones`. (axis: 0=col/1=row, index, rect).
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let mut nav_line_rects: Vec<(u8, u32, egui::Rect)> = Vec::new();
 
     let mut new_cols = col_edges.to_vec();
     let mut cols_changed = false;
     for i in 0..col_edges.len() {
         let x = to_x(col_edges[i]);
         let hit = egui::Rect::from_min_max(egui::pos2(x - 4.0, rect.top()), egui::pos2(x + 4.0, rect.bottom()));
+        nav_line_rects.push((0, i as u32, to_global * hit));
         let r = ui.interact(hit, ui.id().with((node_id, id_salt, "col", field, i)), egui::Sense::click_and_drag());
         let hot = r.hovered() || r.dragged();
         if hot { r.clone().on_hover_cursor(egui::CursorIcon::ResizeHorizontal); }
@@ -1760,7 +2121,10 @@ fn tz_draw_field(
             if let Some(p) = r.interact_pointer_pos() {
                 let lo = if i == 0 { 0.05 } else { new_cols[i - 1] + 0.04 };
                 let hi = if i + 1 == col_edges.len() { 0.95 } else { col_edges[i + 1] - 0.04 };
-                new_cols[i] = ((p.x - rect.left()) / rect.width()).clamp(lo, hi);
+                let want = (p.x - rect.left()) / rect.width();
+                // Crowded neighbours can invert lo/hi — clamp would panic; pin to
+                // the midpoint instead.
+                new_cols[i] = if lo <= hi { want.clamp(lo, hi) } else { (lo + hi) * 0.5 };
                 cols_changed = true;
             }
         }
@@ -1784,6 +2148,7 @@ fn tz_draw_field(
     for i in 0..row_edges.len() {
         let y = to_y(row_edges[i]);
         let hit = egui::Rect::from_min_max(egui::pos2(rect.left(), y - 4.0), egui::pos2(rect.right(), y + 4.0));
+        nav_line_rects.push((1, i as u32, to_global * hit));
         let r = ui.interact(hit, ui.id().with((node_id, id_salt, "row", field, i)), egui::Sense::click_and_drag());
         let hot = r.hovered() || r.dragged();
         if hot { r.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical); }
@@ -1791,7 +2156,8 @@ fn tz_draw_field(
             if let Some(p) = r.interact_pointer_pos() {
                 let lo = if i == 0 { 0.05 } else { new_rows[i - 1] + 0.04 };
                 let hi = if i + 1 == row_edges.len() { 0.95 } else { row_edges[i + 1] - 0.04 };
-                new_rows[i] = ((p.y - rect.top()) / rect.height()).clamp(lo, hi);
+                let want = (p.y - rect.top()) / rect.height();
+                new_rows[i] = if lo <= hi { want.clamp(lo, hi) } else { (lo + hi) * 0.5 };
                 rows_changed = true;
             }
         }
@@ -1813,6 +2179,14 @@ fn tz_draw_field(
             if rows_changed { tz_write_field_edges(node, field, "row_edges", &new_rows); }
         }
     }
+    // Publish this pad's divider hit-rects (global space) for gamepad RS-cursor
+    // hover-select. Keyed per (node, field) so split pads don't clobber each other.
+    // NOTE: read the pass number BEFORE `data_mut` — calling a ctx accessor
+    // inside the data lock re-enters it and deadlocks epaint's RwLock.
+    let pass_nr = ui.ctx().cumulative_pass_nr();
+    ui.ctx().data_mut(|d| d.insert_temp(
+        egui::Id::new(("gp_nav_tz_lines", node_id.0, field)),
+        (pass_nr, nav_line_rects)));
 }
 
 /// Pinned-widget renderer (Easy-mode sub-patch layout). Ports mode shows the
@@ -1896,6 +2270,12 @@ fn render_touch_zones_pinned(
                 let zr = egui::Rect::from_min_max(egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
                 painter.rect_stroke(zr.shrink(1.5), 2.0, egui::Stroke::new(2.0, accent), egui::StrokeKind::Inside);
             }
+        }
+        // Mapping mode gets the hover-revealed +/- line-editing overlay (add/
+        // remove zones is safe here — no typed wiring). Ports mode stays
+        // move-only in the pinned widget (dividers carry per-zone port wiring).
+        if mapping {
+            tz_line_edit_overlay(inner_id, field, ui, snarl, &painter, r, &col, &row, accent, &visuals);
         }
     };
 
@@ -2210,6 +2590,30 @@ fn tz_read_selection(snarl: &Snarl<NodeData>, node_id: NodeId) -> (usize, usize)
 /// the Remapper / Map Action / Lean cards. Trigger + target editing is supplied
 /// here (the card's chords are paint-only), since the trigger is the zone gesture
 /// rather than a captured device input.
+/// Commit a captured Touch Zones mapping into `zone_maps` and reset the Learn
+/// state. Shared by the mouse "＋ Add" button and the gamepad `_tz_commit_add`
+/// path. Analog outputs (mouse / stick) default to "analog" press mode.
+fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
+    f: usize, z: usize, trigger: &str, draft_out: &[String])
+{
+    let is_analog = |p: &str| matches!(p,
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+    let mode = if draft_out.iter().any(|p| is_analog(p)) { "analog" } else { "down" };
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        let mut m = serde_json::Map::new();
+        m.insert("f".into(), Value::from(f as u64));
+        m.insert("z".into(), Value::from(z as u64));
+        m.insert("in".into(), Value::Array(vec![Value::from(trigger)]));
+        m.insert("out".into(), Value::Array(draft_out.iter().map(|s| Value::from(s.as_str())).collect()));
+        m.insert("mode".into(), Value::from(mode));
+        let mut cards = node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        cards.push(Value::Object(m));
+        node.params.insert("zone_maps".into(), Value::Array(cards));
+        node.params.insert("_tz_phase".into(), Value::from("idle"));
+        for k in ["_tz_trig", "_tz_draft_out", "_tz_gp_arm"] { node.params.remove(k); }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_touch_zone_cards(
     node_id: NodeId,
@@ -2221,6 +2625,9 @@ fn render_touch_zone_cards(
     automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
     use flexinput_core::touchzones as tz;
+    // Fixed mapping-card width — the header rows pin their right-aligned controls
+    // to this, so the layout stays put when the touchpad widget is scaled up.
+    const TZ_CARD_W: f32 = 358.0;
     let (sel_f, sel_z) = tz_read_selection(snarl, node_id);
     let single = snarl.get_node(node_id)
         .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) != Some("split");
@@ -2247,12 +2654,36 @@ fn render_touch_zone_cards(
     if phase == "captured"
         && getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false)
     {
-        if let Some(pin) = dev.as_deref()
-            .and_then(|d| remapper_pressed_now(live_signals, d).into_iter().next())
-        {
+        // Suppress gamepad UI navigation this + next frame so the button the user
+        // presses reaches THIS capture instead of driving the cursor/menus. Read
+        // by `run_gamepad_nav` (goes inert while the flag is fresh).
+        let pass = ui.ctx().cumulative_pass_nr();
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("fxi_tz_gp_learn"), pass));
+        ui.ctx().request_repaint();
+        let pressed_now: Vec<String> = dev.as_deref()
+            .map(|d| remapper_pressed_now(live_signals, d)).unwrap_or_default();
+        // Baseline: the pins already held at the instant we armed (typically the
+        // button the user pressed to arm — South/🎮). We latch it once, then only
+        // accept a pin that is NOT in the baseline, i.e. a FRESH press. Without
+        // this the still-held arming button gets captured as the output the same
+        // frame ("it just binds North immediately").
+        let base: Option<Vec<String>> = getp(snarl, "_tz_gp_base")
+            .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()));
+        let base = match base {
+            Some(b) => b,
+            None => {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("_tz_gp_base".into(),
+                        Value::Array(pressed_now.iter().map(|p| Value::from(p.as_str())).collect()));
+                }
+                pressed_now.clone()
+            }
+        };
+        if let Some(pin) = pressed_now.into_iter().find(|p| !base.contains(p)) {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("_tz_draft_out".into(), Value::Array(vec![Value::from(pin.as_str())]));
                 node.params.insert("_tz_gp_arm".into(), Value::from(false));
+                node.params.remove("_tz_gp_base");
             }
         }
     }
@@ -2265,6 +2696,15 @@ fn render_touch_zone_cards(
         .unwrap_or_default();
     let trigger = getp(snarl, "_tz_trig").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
 
+    // Gamepad "Add": the nav driver sets `_tz_commit_add` to commit the captured
+    // mapping (same path as the ＋ Add button).
+    if getp(snarl, "_tz_commit_add").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if let Some(node) = snarl.get_node_mut(node_id) { node.params.remove("_tz_commit_add"); }
+        if phase == "captured" && !draft_out.is_empty() && !trigger.is_empty() {
+            tz_commit_card(snarl, node_id, sel_f, sel_z, &trigger, &draft_out);
+        }
+    }
+
     // Whether ANY card (any zone) drives a relative-mouse output — gates the
     // node-global mouse-speed control so pure keyboard/stick maps stay uncluttered.
     let has_mouse_card = snarl.get_node(node_id)
@@ -2274,17 +2714,66 @@ fn render_touch_zone_cards(
             .unwrap_or(false)))
         .unwrap_or(false);
 
-    // ── Header + Learn / Assign controls ──────────────────────────────────
+    // ── Header ────────────────────────────────────────────────────────────
+    // Row 1: which zone + capture STATUS (listening / registered trigger →
+    // picked output). Row 2 (below): the action BUTTONS + mouse multiplier.
+    // Split so they stop competing for the pinned widget's limited width.
     let label = if single { format!("Zone {sel_z}") }
                 else { format!("{}{}", tz::field_letter(sel_f), sel_z) };
+    // Rect of the Hold checkbox — published LAST in the action-rect list so
+    // gamepad nav can focus + toggle it (see `nav_tz_action_items`).
+    let mut hold_rect: Option<egui::Rect> = None;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{label} mappings")).strong().color(accent));
+        // Hold-zone toggle: keep a gesture that STARTS in this zone bound to it
+        // even if the finger slides into a neighbour (so the neighbour's mapping
+        // doesn't also fire). Affects touch/click triggers.
+        let mut hold = tz_zone_held(snarl, node_id, sel_f, sel_z);
+        let cb = ui.checkbox(&mut hold, "Hold")
+            .on_hover_text("Hold zone: a touch that starts in this zone stays bound to it for the whole gesture, even if the finger slides into another zone — so the other zone won't trigger. Gamepad: focus it and press South to toggle.");
+        hold_rect = Some(cb.rect);
+        if cb.changed() {
+            tz_set_zone_held(snarl, node_id, sel_f, sel_z, hold);
+        }
+        match phase.as_str() {
+            "learning" => {
+                ui.label(egui::RichText::new("· listening — touch / click / swipe a zone…")
+                    .italics().color(accent));
+            }
+            "captured" => {
+                ui.label(egui::RichText::new("·").weak());
+                remapper_render_chip(ui, &trigger, skin);
+                ui.label(egui::RichText::new("→").weak());
+                if draft_out.is_empty() {
+                    ui.label(egui::RichText::new("(pick output)").italics().weak());
+                } else {
+                    remapper_render_chord(ui, &draft_out, skin);
+                }
+            }
+            _ => {}
+        }
+    });
+    // Row 2: actions + mouse multiplier. Constrained to the mapping-card width
+    // (TZ_CARD_W) so the right-aligned mouse multiplier pins to the CARD's right
+    // edge — not the widget's available width, which grows when the touchpad is
+    // scaled up (that made the control drift ever further right and jam against
+    // the scrollbar).
+    // Action-button rects, captured in the SAME order as `nav_tz_action_items`
+    // (app.rs) so the gamepad-nav glow rings the focused button and scroll-into-
+    // view lands on it. Order per phase: idle=[learn]; learning=[cancel];
+    // captured=[assign, gamepad, add, cancel].
+    let mut act_rects: Vec<egui::Rect> = Vec::new();
+    let mut mouse_rect: Option<egui::Rect> = None;
+    ui.allocate_ui_with_layout(
+        egui::vec2(TZ_CARD_W, ui.spacing().interact_size.y.max(20.0)),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
         match phase.as_str() {
             "idle" => {
-                if ui.button("Learn")
-                    .on_hover_text("Demonstrate a touch, click, or swipe on a zone, then assign an output.")
-                    .clicked()
-                {
+                let b = ui.button("Learn")
+                    .on_hover_text("Demonstrate a touch, click, or swipe on a zone, then assign an output.");
+                act_rects.push(b.rect);
+                if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("learning"));
                         for k in ["_tz_trig", "_tz_cap_active", "_tz_cap_sx", "_tz_cap_sy",
@@ -2293,20 +2782,19 @@ fn render_touch_zone_cards(
                 }
             }
             "learning" => {
-                ui.label(egui::RichText::new("Touch / click / swipe a zone…").italics().color(accent));
-                if ui.button("Cancel").clicked() {
+                let b = ui.button("Cancel");
+                act_rects.push(b.rect);
+                if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("idle"));
                     }
                 }
             }
             _ => { // captured
-                ui.label("Registered:");
-                remapper_render_chip(ui, &trigger, skin);
-                if ui.button("Assign…")
-                    .on_hover_text("Pick keyboard / mouse / mouse-delta outputs. Pick several for a chord, then Add.")
-                    .clicked()
-                {
+                let b = ui.button("Assign…")
+                    .on_hover_text("Pick keyboard / mouse / mouse-delta / stick outputs. Pick several for a chord, then Add.");
+                act_rects.push(b.rect);
+                if b.clicked() {
                     request_special_picker(ui.ctx(), SpecialPickerRequest {
                         inner: node_id,
                         outer: root_subpatch_id(automap_parent),
@@ -2316,32 +2804,42 @@ fn render_touch_zone_cards(
                     });
                 }
                 let armed = getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false);
-                if ui.add(egui::Button::new(if armed { "🎮…" } else { "🎮" }))
-                    .on_hover_text("Learn a gamepad button as the output — press one now.")
-                    .clicked()
-                {
+                let b = ui.add(egui::Button::new(if armed { "🎮…" } else { "🎮" }))
+                    .on_hover_text("Learn a gamepad button as the output — press one now.");
+                act_rects.push(b.rect);
+                if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_gp_arm".into(), Value::from(!armed));
+                        node.params.remove("_tz_gp_base");
                     }
                 }
-                if ui.button("Cancel").clicked() {
+                let add = ui.add_enabled(!draft_out.is_empty(),
+                    egui::Button::new(egui::RichText::new("＋ Add").strong()));
+                act_rects.push(add.rect);
+                if add.on_hover_text("Add this zone mapping").clicked() && !draft_out.is_empty() {
+                    tz_commit_card(snarl, node_id, sel_f, sel_z, &trigger, &draft_out);
+                }
+                let b = ui.button("Cancel");
+                act_rects.push(b.rect);
+                if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("idle"));
-                        for k in ["_tz_draft_out", "_tz_gp_arm"] { node.params.remove(k); }
+                        for k in ["_tz_draft_out", "_tz_gp_arm", "_tz_gp_base"] { node.params.remove(k); }
                     }
                 }
             }
         }
-        // Node-global relative-mouse speed, right-aligned (after the phase
-        // buttons so it claims the far right without displacing them). Only when
-        // a card actually drives a mouse output.
+        // Node-global relative-mouse speed, right-aligned. Only when a card
+        // actually drives a mouse output.
         if has_mouse_card {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut spd = getp(snarl, "mouse_speed").and_then(|v| v.as_f64()).unwrap_or(12.0) as f32;
-                if ui.add(egui::DragValue::new(&mut spd).speed(0.25).range(1.0..=120.0).prefix("🖱 "))
-                    .on_hover_text("Relative-mouse speed: cursor velocity at full zone deflection (the sink's own mouse sensitivity multiplies on top).")
-                    .changed()
-                {
+                let mut spd = getp(snarl, "mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let dv = ui.add(egui::DragValue::new(&mut spd).speed(0.02).range(0.1..=10.0).prefix("🖱 "))
+                    .on_hover_text("Relative-mouse speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and nudge with LT/RT.");
+                // Gamepad-nav target — appended LAST in action order (matches
+                // `nav_tz_action_items` when has_mouse_card).
+                mouse_rect = Some(dv.rect);
+                if dv.changed() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("mouse_speed".into(), Value::from(spd as f64));
                     }
@@ -2349,45 +2847,12 @@ fn render_touch_zone_cards(
             });
         }
     });
-    // Draft-output preview + Add: shown in the captured phase so the user can
-    // build a multi-pin chord (Assign picks / 🎮) and commit it all at once.
-    if phase == "captured" {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("→").weak());
-            if draft_out.is_empty() {
-                ui.label(egui::RichText::new("(pick an output)").italics().weak());
-            } else {
-                remapper_render_chord(ui, &draft_out, skin);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let add = ui.add_enabled(!draft_out.is_empty(),
-                    egui::Button::new(egui::RichText::new("＋ Add").strong()));
-                if add.on_hover_text("Add this zone mapping").clicked() && !draft_out.is_empty() {
-                    // Default press mode: analog outputs (mouse-delta / sticks) are
-                    // driven by the contact directly, so mark them "analog"; every
-                    // other output starts on plain "down" (editable on the card).
-                    let is_analog = |p: &str| matches!(p,
-                        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
-                    let mode = if draft_out.iter().any(|p| is_analog(p)) { "analog" } else { "down" };
-                    if let Some(node) = snarl.get_node_mut(node_id) {
-                        let mut m = serde_json::Map::new();
-                        m.insert("f".into(), Value::from(sel_f as u64));
-                        m.insert("z".into(), Value::from(sel_z as u64));
-                        m.insert("in".into(), Value::Array(vec![Value::from(trigger.as_str())]));
-                        m.insert("out".into(), Value::Array(
-                            draft_out.iter().map(|s| Value::from(s.as_str())).collect()));
-                        m.insert("mode".into(), Value::from(mode));
-                        let mut cards = node.params.get("zone_maps")
-                            .and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                        cards.push(Value::Object(m));
-                        node.params.insert("zone_maps".into(), Value::Array(cards));
-                        node.params.insert("_tz_phase".into(), Value::from("idle"));
-                        for k in ["_tz_trig", "_tz_draft_out", "_tz_gp_arm"] { node.params.remove(k); }
-                    }
-                }
-            });
-        });
-    }
+    if let Some(r) = mouse_rect { act_rects.push(r); }
+    if let Some(r) = hold_rect { act_rects.push(r); }
+    // Publish the action-button rects (scope "zone_maps") so the gamepad-nav
+    // overlay rings the focused button + can scroll it into view — same channel
+    // the Remapper's action row uses.
+    publish_nav_action_rects_scoped(ui, node_id, "zone_maps", &act_rects);
     // Keep polling live input while a capture is in flight.
     if phase != "idle" { ui.ctx().request_repaint(); }
 
@@ -2412,13 +2877,13 @@ fn render_touch_zone_cards(
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
 
         ui.allocate_ui_with_layout(
-            egui::vec2(358.0, 1.0),
+            egui::vec2(TZ_CARD_W, 1.0),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 let result = remapper_mapping_card_pixel(
                     ui, node_id, i, &mut working,
                     &in_pins, Some(&out_pins), skin,
-                    true, false, 0.0, "tz_cards",
+                    true, false, 0.0, "zone_maps",
                 );
                 if result.delete_clicked { remove = Some(i); }
             },
@@ -2437,6 +2902,26 @@ fn render_touch_zone_cards(
         if let Some(node) = snarl.get_node_mut(node_id) {
             node.params.insert("zone_maps".to_string(), Value::Array(cards));
         }
+    }
+
+    // Response-curve editor for the selected zone's analog output — full size in
+    // the card row (the on-zone graph is just a live preview). X = deflection
+    // magnitude, Y = output. Drag points, double-click to add, right-click to
+    // remove.
+    let zmaps_now = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    if tz_zone_is_analog(&zmaps_now, sel_f, sel_z) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Response curve  ·  drag / dbl-click add / right-click remove")
+            .small().weak());
+        let live = tz_live_hits(snarl, node_id, live_signals, automap_parent);
+        let live_mag = live.get(&(sel_f, sel_z)).filter(|z| z.2).map(|&(lx, ly, _)| {
+            let (dx, dy) = (2.0 * lx - 1.0, 2.0 * ly - 1.0);
+            (dx * dx + dy * dy).sqrt().min(1.0)
+        });
+        let vis = ui.visuals().clone();
+        tz_curve_editor(node_id, sel_f, sel_z, ui, snarl, accent, &vis, live_mag);
     }
 }
 
@@ -2496,6 +2981,132 @@ fn tz_learn_capture(
         node.params.insert("_tz_cap_active".into(), Value::from(false));
     }
     result
+}
+
+/// Hover-revealed +/- line-editing overlay over one pad `rect` (local layer
+/// space). Only "−" marks show at rest (one per interior divider per crossing
+/// band); hovering reveals flanking "+"; border "+" appears near a field edge.
+/// Applies the resulting grid op wire-preservingly via `tz_restructure`. Shared
+/// by the in-canvas body and the pinned widget (mapping mode). See
+/// `render_touch_field` for the original prose.
+#[allow(clippy::too_many_arguments)]
+fn tz_line_edit_overlay(
+    node_id: NodeId,
+    field: usize,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    col_edges: &[f32],
+    row_edges: &[f32],
+    accent: egui::Color32,
+    visuals: &egui::Visuals,
+) {
+    use flexinput_core::touchzones as tz;
+    let to_x = |u: f32| rect.left() + u * rect.width();
+    let to_y = |u: f32| rect.top() + u * rect.height();
+    let cols = tz::cols(col_edges);
+    let rows = tz::rows(row_edges);
+    let mut op: Option<tz::GridOp> = None;
+
+    let off = 18.0;      // "+" flanking distance from the "−"
+    let edge = 30.0;     // border-proximity threshold (px)
+    let inset = 12.0;    // border "+" inset so it sits fully inside the field
+    let from_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY)
+        .inverse();
+    let ptr = ui.input(|i| i.pointer.hover_pos()).map(|p| from_global * p);
+    let band_mid = |b: usize, n: usize, edges: &[f32]| -> f32 {
+        let lo = if b == 0 { 0.0 } else { edges[b - 1] };
+        let hi = if b == n - 1 { 1.0 } else { edges[b] };
+        (lo + hi) * 0.5
+    };
+    let band_of = |u: f32, edges: &[f32]| edges.iter().filter(|e| u >= **e).count();
+
+    for line in 1..cols {
+        let x = to_x(col_edges[line - 1]);
+        for band in 0..rows {
+            let y = to_y(band_mid(band, rows, row_edges));
+            let c = egui::pos2(x, y);
+            let pill = egui::Rect::from_center_size(c, egui::vec2(2.0 * off + 20.0, 22.0));
+            let expanded = ptr.is_some_and(|p| pill.contains(p));
+            if expanded {
+                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzcL", field, line, band)),
+                    egui::pos2(x - off, y), "+", accent, visuals) {
+                    op = Some(tz::GridOp::InsertCol(line - 1));
+                }
+                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzcR", field, line, band)),
+                    egui::pos2(x + off, y), "+", accent, visuals) {
+                    op = Some(tz::GridOp::InsertCol(line));
+                }
+            }
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzc-", field, line, band)),
+                c, "−", accent, visuals) {
+                op = Some(tz::GridOp::RemoveCol(line - 1));
+            }
+        }
+    }
+
+    for line in 1..rows {
+        let y = to_y(row_edges[line - 1]);
+        for band in 0..cols {
+            let x = to_x(band_mid(band, cols, col_edges));
+            let c = egui::pos2(x, y);
+            let pill = egui::Rect::from_center_size(c, egui::vec2(22.0, 2.0 * off + 20.0));
+            let expanded = ptr.is_some_and(|p| pill.contains(p));
+            if expanded {
+                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzrU", field, line, band)),
+                    egui::pos2(x, y - off), "+", accent, visuals) {
+                    op = Some(tz::GridOp::InsertRow(line - 1));
+                }
+                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzrD", field, line, band)),
+                    egui::pos2(x, y + off), "+", accent, visuals) {
+                    op = Some(tz::GridOp::InsertRow(line));
+                }
+            }
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzr-", field, line, band)),
+                c, "−", accent, visuals) {
+                op = Some(tz::GridOp::RemoveRow(line - 1));
+            }
+        }
+    }
+
+    if let Some(p) = ptr.filter(|p| rect.contains(*p)) {
+        let ux = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let uy = ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+        if p.x - rect.left() < edge {
+            let y = to_y(band_mid(band_of(uy, row_edges), rows, row_edges));
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzbL", field)),
+                egui::pos2(rect.left() + inset, y), "+", accent, visuals) {
+                op = Some(tz::GridOp::InsertCol(0));
+            }
+        }
+        if rect.right() - p.x < edge {
+            let y = to_y(band_mid(band_of(uy, row_edges), rows, row_edges));
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzbR", field)),
+                egui::pos2(rect.right() - inset, y), "+", accent, visuals) {
+                op = Some(tz::GridOp::InsertCol(cols - 1));
+            }
+        }
+        if p.y - rect.top() < edge {
+            let x = to_x(band_mid(band_of(ux, col_edges), cols, col_edges));
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzbT", field)),
+                egui::pos2(x, rect.top() + inset), "+", accent, visuals) {
+                op = Some(tz::GridOp::InsertRow(0));
+            }
+        }
+        if rect.bottom() - p.y < edge {
+            let x = to_x(band_mid(band_of(ux, col_edges), cols, col_edges));
+            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzbB", field)),
+                egui::pos2(x, rect.bottom() - inset), "+", accent, visuals) {
+                op = Some(tz::GridOp::InsertRow(rows - 1));
+            }
+        }
+    }
+
+    if let Some(op) = op {
+        tz_restructure(node_id, field, op, snarl);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2563,127 +3174,9 @@ fn render_touch_field(
         }
     }
 
-    // ── Relative line editing (wire-preserving) ──────────────────
-    // Controls sit ON each grid LINE. Every line (including the 4 outer borders)
-    // gets a "+" that splits the column/row on that side; INTERIOR dividers also
-    // get a "−" that removes the divider. Wire preservation: surviving zones'
-    // wires follow to their new indices; a removed divider drops one side's wires.
-    let cols = tz::cols(&col_edges);
-    let rows = tz::rows(&row_edges);
-    let mut op: Option<tz::GridOp> = None;
-
-    // Uncrowded, hover-revealed controls. Only "−" marks are shown at rest, one
-    // per interior divider per crossing wall-segment (centered in each cell band).
-    // Hovering a "−" expands a pill that reveals a "+" on each side (split the cell
-    // to that side). "+" for the OUTER borders (which have no divider to remove)
-    // appears only when the cursor nears that edge of the field, at the band the
-    // cursor is over. This keeps the field readable at high zone counts.
-    let off = 18.0;      // "+" flanking distance from the "−"
-    let edge = 30.0;     // border-proximity threshold (px)
-    let inset = 12.0;    // border "+" inset so it sits fully inside the field
-    // The pointer arrives in GLOBAL screen coords but `rect`/pill live in this
-    // UI layer's LOCAL space. The canvas — and a sub-patch's nested canvas — each
-    // install a TSTransform (zoom/pan); convert through the current layer's
-    // inverse xform so hover tests match whichever layer we're drawn on.
-    let from_global = ui.ctx().layer_transform_to_global(ui.layer_id())
-        .unwrap_or(egui::emath::TSTransform::IDENTITY)
-        .inverse();
-    let ptr = ui.input(|i| i.pointer.hover_pos()).map(|p| from_global * p);
-    // Center of band `b` of `n` bands, given that axis's interior edges.
-    let band_mid = |b: usize, n: usize, edges: &[f32]| -> f32 {
-        let lo = if b == 0 { 0.0 } else { edges[b - 1] };
-        let hi = if b == n - 1 { 1.0 } else { edges[b] };
-        (lo + hi) * 0.5
-    };
-    // Which band a normalized coord falls in (count of edges at or below it).
-    let band_of = |u: f32, edges: &[f32]| edges.iter().filter(|e| u >= **e).count();
-
-    // Interior column dividers: "−" per row band; hover reveals flanking "+".
-    for line in 1..cols {
-        let x = to_x(col_edges[line - 1]);
-        for band in 0..rows {
-            let y = to_y(band_mid(band, rows, &row_edges));
-            let c = egui::pos2(x, y);
-            let pill = egui::Rect::from_center_size(c, egui::vec2(2.0 * off + 20.0, 22.0));
-            let expanded = ptr.is_some_and(|p| pill.contains(p));
-            if expanded {
-                if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzcL", field, line, band)),
-                    egui::pos2(x - off, y), "+", accent, visuals) {
-                    op = Some(tz::GridOp::InsertCol(line - 1));
-                }
-                if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzcR", field, line, band)),
-                    egui::pos2(x + off, y), "+", accent, visuals) {
-                    op = Some(tz::GridOp::InsertCol(line));
-                }
-            }
-            if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzc-", field, line, band)),
-                c, "−", accent, visuals) {
-                op = Some(tz::GridOp::RemoveCol(line - 1));
-            }
-        }
-    }
-
-    // Interior row dividers: "−" per column band; hover reveals flanking "+".
-    for line in 1..rows {
-        let y = to_y(row_edges[line - 1]);
-        for band in 0..cols {
-            let x = to_x(band_mid(band, cols, &col_edges));
-            let c = egui::pos2(x, y);
-            let pill = egui::Rect::from_center_size(c, egui::vec2(22.0, 2.0 * off + 20.0));
-            let expanded = ptr.is_some_and(|p| pill.contains(p));
-            if expanded {
-                if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzrU", field, line, band)),
-                    egui::pos2(x, y - off), "+", accent, visuals) {
-                    op = Some(tz::GridOp::InsertRow(line - 1));
-                }
-                if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzrD", field, line, band)),
-                    egui::pos2(x, y + off), "+", accent, visuals) {
-                    op = Some(tz::GridOp::InsertRow(line));
-                }
-            }
-            if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzr-", field, line, band)),
-                c, "−", accent, visuals) {
-                op = Some(tz::GridOp::RemoveRow(line - 1));
-            }
-        }
-    }
-
-    // Border "+": split the edge column/row, shown only when the cursor nears that
-    // edge, placed at the band the cursor is over (so it targets that cell).
-    if let Some(p) = ptr.filter(|p| rect.contains(*p)) {
-        let ux = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        let uy = ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-        // Left / right borders → split first / last column.
-        if p.x - rect.left() < edge {
-            let y = to_y(band_mid(band_of(uy, &row_edges), rows, &row_edges));
-            if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzbL", field)),
-                egui::pos2(rect.left() + inset, y), "+", accent, visuals) {
-                op = Some(tz::GridOp::InsertCol(0));
-            }
-        }
-        if rect.right() - p.x < edge {
-            let y = to_y(band_mid(band_of(uy, &row_edges), rows, &row_edges));
-            if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzbR", field)),
-                egui::pos2(rect.right() - inset, y), "+", accent, visuals) {
-                op = Some(tz::GridOp::InsertCol(cols - 1));
-            }
-        }
-        // Top / bottom borders → split first / last row.
-        if p.y - rect.top() < edge {
-            let x = to_x(band_mid(band_of(ux, &col_edges), cols, &col_edges));
-            if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzbT", field)),
-                egui::pos2(x, rect.top() + inset), "+", accent, visuals) {
-                op = Some(tz::GridOp::InsertRow(0));
-            }
-        }
-        if rect.bottom() - p.y < edge {
-            let x = to_x(band_mid(band_of(ux, &col_edges), cols, &col_edges));
-            if tz_mini_button(ui, &painter, ui.id().with((node_id, "tzbB", field)),
-                egui::pos2(x, rect.bottom() - inset), "+", accent, visuals) {
-                op = Some(tz::GridOp::InsertRow(rows - 1));
-            }
-        }
-    }
+    // ── Relative line editing (wire-preserving) — hover-revealed +/- controls,
+    // shared with the pinned widget. ─────────────────────────────────────────
+    tz_line_edit_overlay(node_id, field, ui, snarl, &painter, rect, &col_edges, &row_edges, accent, visuals);
 
     // ── Resize grip (bottom-right corner). In split mode only the right pad
     // shows it; it writes the SHARED field size so both pads resize together. ─
@@ -2714,10 +3207,6 @@ fn render_touch_field(
                 node.params.insert("field_h".to_string(), Value::from(nh as f64));
             }
         }
-    }
-
-    if let Some(op) = op {
-        tz_restructure(node_id, field, op, snarl);
     }
 
     rect

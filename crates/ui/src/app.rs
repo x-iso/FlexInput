@@ -3195,6 +3195,9 @@ enum NavWidgetKind {
     /// Touch Zones pad (the pinned "field" element) — South enters line editing
     /// (`TzLines`): cycle/grab/move/recenter dividers, add/remove in mapping mode.
     TouchZones,
+    /// Touch Zones mapping CARDS widget — South enters the zone-tab + Learn/
+    /// Assign/Add flow (`TzCards`).
+    TouchZoneCards,
 }
 
 /// Identifies a setting in the gamepad-native settings panel for get/set.
@@ -3429,6 +3432,22 @@ impl FlexInputApp {
         // the right button-glyph skin this frame.
         self.gamepad_nav.active_dev = Some(dev_id.clone());
 
+        // ── Touch Zones gamepad-learn: hold nav inert ───────────────────────
+        // While a 🎮 gamepad-learn is armed on a Touch Zones card (the user is
+        // demonstrating a gamepad button as the mapping OUTPUT), the raw button
+        // must reach that capture, not drive navigation. The cards renderer
+        // publishes a fresh pass number while armed; go inert but keep edge state
+        // current so nav resumes cleanly the moment the capture latches.
+        if let Some(pass) = ctx.data(|d| d.get_temp::<u64>(egui::Id::new("fxi_tz_gp_learn"))) {
+            if ctx.cumulative_pass_nr().saturating_sub(pass) <= 2 {
+                self.gamepad_nav.prev_pressed = nav.pressed.clone();
+                self.gamepad_nav.prev_lt = nav.lt > 0.5;
+                self.gamepad_nav.prev_rt = nav.rt > 0.5;
+                ctx.request_repaint();
+                return;
+            }
+        }
+
         let dt = ctx
             .input(|i| i.stable_dt)
             .clamp(0.001, 0.1);
@@ -3588,10 +3607,12 @@ impl FlexInputApp {
         }
 
         // ── LB/RB: switch tabs ───────────────────────────────────────────────
-        // Reserved while editing Touch Zones lines: there the bumpers switch the
-        // focused PAD (split mode), so they must not also flip tabs.
+        // Reserved while editing Touch Zones: line editing uses the bumpers to
+        // switch the focused PAD, and the cards widget uses them to cycle zones,
+        // so they must not also flip tabs.
         let tz_editing = matches!(self.gamepad_nav.edit_level,
-            crate::gamepad_nav::EditLevel::TzLines | crate::gamepad_nav::EditLevel::TzGrab);
+            crate::gamepad_nav::EditLevel::TzLines | crate::gamepad_nav::EditLevel::TzGrab
+            | crate::gamepad_nav::EditLevel::TzCards);
         if !tz_editing && nav.is_rising("btn_lb") && self.active_tab > 0 {
             self.set_active_tab(self.active_tab - 1);
         }
@@ -3655,6 +3676,7 @@ impl FlexInputApp {
                     | crate::gamepad_nav::EditLevel::CurveDots
                     | crate::gamepad_nav::EditLevel::CurveDot
                     | crate::gamepad_nav::EditLevel::RemapScroll
+                    | crate::gamepad_nav::EditLevel::TzCards
             );
             let pass = ctx.cumulative_pass_nr();
             ctx.data_mut(|d| {
@@ -3665,7 +3687,8 @@ impl FlexInputApp {
             // body published last frame.
             if matches!(self.gamepad_nav.edit_level,
                 crate::gamepad_nav::EditLevel::RemapScroll
-                | crate::gamepad_nav::EditLevel::RemapCard)
+                | crate::gamepad_nav::EditLevel::RemapCard
+                | crate::gamepad_nav::EditLevel::TzCards)
             {
                 self.nav_draw_remap_card_glow(ctx, outer_id);
             }
@@ -3770,6 +3793,7 @@ impl FlexInputApp {
                 if matches!(kind, NavWidgetKind::Curve) {
                     if nav.is_rising("btn_south") || rt_rising {
                         self.gamepad_nav.edit_level = EditLevel::CurveDots;
+                        self.gamepad_nav.curve_return_level = EditLevel::Widget;
                         self.gamepad_nav.curve_dot = 0;
                         self.gamepad_nav.edit_baseline = Some(Box::new(
                             self.tabs[self.active_tab].canvas.snapshot_for_undo()));
@@ -3795,6 +3819,11 @@ impl FlexInputApp {
                     // and snapshot for one coalesced undo entry across the edit.
                     if nav.is_rising("btn_south") {
                         self.nav_tz_enter(outer_id);
+                    }
+                } else if matches!(kind, NavWidgetKind::TouchZoneCards) {
+                    // Touch Zones cards: South ENTERS the zone-tab + Learn flow.
+                    if nav.is_rising("btn_south") {
+                        self.gamepad_nav.edit_level = EditLevel::TzCards;
                     }
                 } else {
                     // South / RT → act on the selected widget by kind.
@@ -3822,10 +3851,11 @@ impl FlexInputApp {
                                     self.nav_set_dropdown_popup(ctx, outer_id, true);
                                 }
                             }
-                            // Curve / Remapper / TouchZones are handled by the
-                            // dedicated branches above; unreachable here.
+                            // Curve / Remapper / TouchZones(+Cards) are handled by
+                            // the dedicated branches above; unreachable here.
                             NavWidgetKind::Curve | NavWidgetKind::Remapper
-                            | NavWidgetKind::TouchZones | NavWidgetKind::None => {}
+                            | NavWidgetKind::TouchZones | NavWidgetKind::TouchZoneCards
+                            | NavWidgetKind::None => {}
                         }
                     }
                     let _ = lt_rising; // no back action at widget level
@@ -3909,6 +3939,9 @@ impl FlexInputApp {
             EditLevel::TzLines | EditLevel::TzGrab => {
                 self.nav_drive_touch_zones(ctx, outer_id, nav, dt, step_dir, rt_rising, lt_rising, mag);
             }
+            EditLevel::TzCards => {
+                self.nav_drive_tz_cards(ctx, outer_id, nav, step_dir, rt_rising, lt_rising);
+            }
         }
     }
 
@@ -3974,9 +4007,13 @@ impl FlexInputApp {
     /// Map Action / Combiner use `"mappings"`; gyro lean sections use
     /// `"lean_left"` / `"lean_right"` keyed by the pinned element id.
     fn nav_remap_mappings_key(&self, outer_id: egui_snarl::NodeId) -> &'static str {
-        match self.nav_selected_element(outer_id).as_ref().map(|(_, e)| e.as_str()) {
-            Some("lean_left") => "lean_left",
-            Some("lean_right") => "lean_right",
+        match self.nav_selected_element(outer_id).as_ref().map(|(m, e)| (m.as_str(), e.as_str())) {
+            Some((_, "lean_left")) => "lean_left",
+            Some((_, "lean_right")) => "lean_right",
+            // Touch Zones cards live in `zone_maps`. Routing them through the same
+            // key lets the shared Remapper card machinery (glow, scroll, field
+            // editing) operate on them unchanged.
+            Some(("module.touch_zones", "cards")) => "zone_maps",
             _ => "mappings",
         }
     }
@@ -4240,6 +4277,31 @@ impl FlexInputApp {
         ctx.request_repaint();
     }
 
+    /// Hit-test the RS/gyro cursor against the divider hit-rects the pinned pad
+    /// published (both pads). Returns (field, axis, line) of the divider under
+    /// the cursor. Rects are slightly expanded so thin lines are easy to target.
+    fn nav_tz_cursor_hit(&self, ctx: &egui::Context, inner: egui_snarl::NodeId, n_fields: usize)
+        -> Option<(usize, u8, usize)>
+    {
+        let cursor = self.gamepad_nav.cursor_pos;
+        let cur_pass = ctx.cumulative_pass_nr();
+        let mut best: Option<(f32, usize, u8, usize)> = None; // (dist, field, axis, line)
+        for field in 0..n_fields {
+            let entry: Option<(u64, Vec<(u8, u32, egui::Rect)>)> = ctx.data(|d|
+                d.get_temp(egui::Id::new(("gp_nav_tz_lines", inner.0, field))));
+            let Some((pass, rects)) = entry else { continue; };
+            if cur_pass.saturating_sub(pass) > 3 { continue; }
+            for (axis, line, rect) in rects {
+                if !rect.expand(6.0).contains(cursor) { continue; }
+                let d = (rect.center() - cursor).length();
+                if best.map_or(true, |(bd, ..)| d < bd) {
+                    best = Some((d, field, axis, line as usize));
+                }
+            }
+        }
+        best.map(|(_, f, a, l)| (f, a, l))
+    }
+
     /// Drive Touch Zones line editing (`TzLines`/`TzGrab`). See the EditLevel
     /// docs for the full control map.
     #[allow(clippy::too_many_arguments)]
@@ -4284,6 +4346,17 @@ impl FlexInputApp {
         match self.gamepad_nav.edit_level {
             EditLevel::TzLines => {
                 if nav.is_rising("btn_east") { self.nav_tz_exit(); return; }
+
+                // RS/gyro cursor hover-select: when the cursor is visible and
+                // over a divider (across either pad), focus it — the visual
+                // pointer picks a line without dpad cycling.
+                if self.gamepad_nav.cursor_visible {
+                    if let Some((f, a, l)) = self.nav_tz_cursor_hit(ctx, inner, n_fields) {
+                        self.gamepad_nav.tz_field = f;
+                        self.gamepad_nav.tz_axis = a;
+                        self.gamepad_nav.tz_line = l;
+                    }
+                }
 
                 // Left/Right → column dividers; Up/Down → row dividers.
                 match step_dir {
@@ -4360,7 +4433,8 @@ impl FlexInputApp {
         let mut e = edges.to_vec();
         let lo = if line == 0 { 0.05 } else { e[line - 1] + 0.04 };
         let hi = if line + 1 == e.len() { 0.95 } else { e[line + 1] - 0.04 };
-        e[line] = (e[line] + delta).clamp(lo, hi);
+        // Crowded neighbours can invert lo/hi (would panic in clamp).
+        e[line] = if lo <= hi { (e[line] + delta).clamp(lo, hi) } else { (lo + hi) * 0.5 };
         self.tz_set_edges(outer, inner, field, which, &e);
     }
 
@@ -4429,6 +4503,324 @@ impl FlexInputApp {
         e.insert(idx, newv);
         self.tz_set_edges(outer, inner, field, which, &e);
         self.gamepad_nav.tz_line = idx; // focus the new divider
+    }
+
+    /// Cycle the SELECTED zone of the Touch Zones cards widget by `dir`, wrapping
+    /// within the current pad's zone count.
+    fn nav_tz_cycle_zone(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, dir: i32) {
+        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let field = node.and_then(|n| n.params.get("sel_field").and_then(|v| v.as_u64())).unwrap_or(0) as usize;
+        let zone = node.and_then(|n| n.params.get("sel_zone").and_then(|v| v.as_u64())).unwrap_or(0) as usize;
+        let col = self.tz_edges(outer, inner, field, "col_edges");
+        let row = self.tz_edges(outer, inner, field, "row_edges");
+        let zn = flexinput_core::touchzones::zone_count(&col, &row).max(1) as i32;
+        let new = (zone as i32 + dir).rem_euclid(zn) as u64;
+        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer).and_then(|n| n.subpatch.as_mut()) {
+            if let Some(n) = sp.snarl.get_node_mut(inner) {
+                n.params.insert("sel_zone".into(), serde_json::Value::from(new));
+            }
+        }
+    }
+
+    /// The action-row items for the Touch Zones cards widget, in the SAME visual
+    /// order the body publishes their rects (`render_touch_zone_cards`, Row 2):
+    /// idle → [Learn]; learning → [Cancel]; captured → [Assign, 🎮, ＋Add, Cancel].
+    /// When any card drives a relative-mouse output the node-global mouse-speed
+    /// control is appended LAST (matching the right-aligned DragValue), navigable
+    /// like a button and nudged with LT/RT. Keeping this identical to the body
+    /// keeps the nav glow on the right item.
+    fn nav_tz_action_items(phase: &str, has_mouse: bool) -> Vec<&'static str> {
+        let mut v = match phase {
+            "idle"     => vec!["learn"],
+            "learning" => vec!["cancel"],
+            _          => vec!["assign", "gamepad", "add", "cancel"], // captured
+        };
+        if has_mouse { v.push("mouse_speed"); }
+        // "hold" is always available (any zone can hold); it sits LAST, matching
+        // the Hold checkbox's rect appended last in the body.
+        v.push("hold");
+        v
+    }
+
+    /// Toggle the SELECTED zone's "hold" flag in the `hold_zones` param (mirrors
+    /// the header checkbox), for the gamepad-nav path.
+    fn nav_tz_toggle_hold(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) {
+        let (field, zone) = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+            .map(|n| (
+                n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize))
+            .unwrap_or((0, 0));
+        let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
+            .and_then(|n| n.subpatch.as_mut()) else { return; };
+        let held = crate::canvas::viewer::tz_zone_held(&sp.snarl, inner, field, zone);
+        crate::canvas::viewer::tz_set_zone_held(&mut sp.snarl, inner, field, zone, !held);
+    }
+
+    /// Whether any card in the node's `zone_maps` drives a relative-mouse output
+    /// (gates the mouse-speed nav item, mirroring the body's `has_mouse_card`).
+    fn nav_tz_has_mouse_card(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+        self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
+            .map(|cards| cards.iter().any(|c| c.get("out").and_then(|o| o.as_array())
+                .map(|a| a.iter().any(|p| matches!(p.as_str(),
+                    Some("mouse") | Some("mouse_x") | Some("mouse_y"))))
+                .unwrap_or(false)))
+            .unwrap_or(false)
+    }
+
+    /// Nudge the node-global `mouse_speed` param, clamped to the UI range.
+    fn nav_tz_nudge_mouse_speed(&mut self, outer: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, delta: f32)
+    {
+        let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
+            .and_then(|n| n.subpatch.as_mut()) else { return; };
+        let Some(n) = sp.snarl.get_node_mut(inner) else { return; };
+        let cur = n.params.get("mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let next = (cur + delta).clamp(0.1, 10.0);
+        n.params.insert("mouse_speed".into(), serde_json::Value::from(next as f64));
+    }
+
+    /// Whether the SELECTED zone has an editable response curve (i.e. it drives an
+    /// analog output) — gates the curve pseudo-row in the TzCards nav.
+    fn nav_tz_zone_has_curve(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let Some(node) = node else { return false; };
+        let field = node.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let zone = node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let zm = node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        crate::canvas::viewer::tz_zone_is_analog(&zm, field, zone)
+    }
+
+    /// Full-array indices into the node's `zone_maps` that belong to the SELECTED
+    /// zone (`sel_field`/`sel_zone`) — i.e. the cards the body actually shows for
+    /// this zone, in display order. These absolute indices are what the shared
+    /// card renderer glows (`mapping_idx`) and what delete/enter operate on.
+    fn nav_tz_zone_card_indices(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId)
+        -> Vec<usize>
+    {
+        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let Some(node) = node else { return Vec::new(); };
+        let field = node.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0);
+        let zone = node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0);
+        node.params.get("zone_maps").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter().enumerate().filter_map(|(i, c)| {
+                let cf = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cz = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0);
+                (cf == field && cz == zone).then_some(i)
+            }).collect()
+        }).unwrap_or_default()
+    }
+
+    /// Publish the TzCards selection so the shared Remapper glow overlay rings the
+    /// focused action button OR card. Card selection is published as the ABSOLUTE
+    /// `zone_maps` index (what the card renderer tags each card with); action
+    /// selection as the action-row index. Scope is `zone_maps`, matching the body.
+    fn nav_tz_publish_selection(&self, ctx: &egui::Context,
+        outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, phase: &str)
+    {
+        let has_mouse = self.nav_tz_has_mouse_card(outer, inner);
+        let n_actions = Self::nav_tz_action_items(phase, has_mouse).len();
+        let card_idxs = self.nav_tz_zone_card_indices(outer, inner);
+        let sel = self.gamepad_nav.card_index;
+        let entered = matches!(self.gamepad_nav.edit_level,
+            crate::gamepad_nav::EditLevel::RemapCard);
+        let pass = ctx.cumulative_pass_nr();
+        let scope = self.nav_remap_mappings_key(outer); // "zone_maps"
+        let (act_sel, card_sel) = if entered {
+            (usize::MAX, self.gamepad_nav.remap_card)
+        } else if sel < n_actions {
+            (sel, usize::MAX)
+        } else {
+            (usize::MAX, card_idxs.get(sel - n_actions).copied().unwrap_or(usize::MAX))
+        };
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0, scope)),
+                (pass, card_sel, entered));
+            d.insert_temp(egui::Id::new(("gp_nav_remap_action", inner.0, scope)),
+                (pass, act_sel));
+        });
+        ctx.request_repaint();
+    }
+
+    /// Drive the Touch Zones mapping CARDS widget (`TzCards`). Adapts the
+    /// Remapper's proven two-row model (`nav_drive_remapper`): the ACTION row
+    /// (Learn / Assign / 🎮 / ＋Add / Cancel) is navigated LEFT/RIGHT; the card
+    /// list below it UP/DOWN. Down from the actions lands on the first card, Up
+    /// from the first card returns to the actions. South activates a focused
+    /// action or ENTERS a focused card for field editing (shared `RemapCard`
+    /// driver); West deletes a focused card; LB/RB cycle the selected zone; East
+    /// exits. While gamepad-learn is armed the driver goes INERT so the pressed
+    /// button reaches the body's capture machine (which ignores the still-held
+    /// arming button via a baseline).
+    fn nav_drive_tz_cards(
+        &mut self,
+        ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        rt_rising: bool,
+        lt_rising: bool,
+    ) {
+        use crate::gamepad_nav::{EditLevel, NavDir};
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else {
+            self.gamepad_nav.edit_level = EditLevel::Widget;
+            return;
+        };
+        let phase = self.picker_target_param_str(Some(outer_id), inner, "_tz_phase")
+            .unwrap_or_else(|| "idle".into());
+        let has_mouse = self.nav_tz_has_mouse_card(outer_id, inner);
+
+        // INERT while gamepad-learn is armed: the raw button must reach the body's
+        // capture (baseline-ignore there stops the arming button self-capturing).
+        // Keep publishing the selection so the glow persists.
+        if self.get_subpatch_param_bool(outer_id, inner, "_tz_gp_arm").unwrap_or(false) {
+            self.nav_tz_publish_selection(ctx, outer_id, inner, &phase);
+            ctx.request_repaint();
+            return;
+        }
+
+        // East exits the widget.
+        if nav.is_rising("btn_east") {
+            self.gamepad_nav.edit_level = EditLevel::Widget;
+            ctx.request_repaint();
+            return;
+        }
+
+        // LB/RB cycle the selected zone (only while idle — a capture freezes it).
+        // Reset the cursor to the action row so the new zone's card list is
+        // approached from the top.
+        if phase == "idle" {
+            let zdir = if nav.is_rising("btn_rb") { 1 }
+                       else if nav.is_rising("btn_lb") { -1 } else { 0 };
+            if zdir != 0 {
+                self.nav_tz_cycle_zone(outer_id, inner, zdir);
+                self.gamepad_nav.card_index = 0;
+            }
+        }
+
+        // Two-row cursor: [0..n_actions) = action buttons, [n_actions..total) =
+        // the selected zone's cards.
+        let actions = Self::nav_tz_action_items(&phase, has_mouse);
+        let n_actions = actions.len();
+        let card_idxs = self.nav_tz_zone_card_indices(outer_id, inner);
+        let count = card_idxs.len();
+        // A trailing "curve" pseudo-row when the selected zone drives an analog
+        // output (the response-curve editor shown below the cards). South enters
+        // the shared curve dot-editor (CurveDots).
+        let has_curve = self.nav_tz_zone_has_curve(outer_id, inner);
+        let total = n_actions + count + if has_curve { 1 } else { 0 };
+        if total == 0 {
+            self.nav_tz_publish_selection(ctx, outer_id, inner, &phase);
+            ctx.request_repaint();
+            return;
+        }
+        if self.gamepad_nav.card_index >= total { self.gamepad_nav.card_index = total - 1; }
+
+        let cur = self.gamepad_nav.card_index;
+        let on_actions = cur < n_actions;
+        let new_cur = match step_dir {
+            Some(NavDir::Left) if on_actions => cur.saturating_sub(1),
+            Some(NavDir::Right) if on_actions => (cur + 1).min(n_actions.saturating_sub(1)),
+            Some(NavDir::Down) => {
+                if on_actions { n_actions.min(total - 1) } else { (cur + 1).min(total - 1) }
+            }
+            Some(NavDir::Up) => {
+                if on_actions { cur }
+                else if cur == n_actions { 0 }
+                else { cur - 1 }
+            }
+            _ => cur,
+        };
+        self.gamepad_nav.card_index = new_cur;
+        let sel = new_cur;
+
+        if sel < n_actions {
+            // The mouse-speed item is a VALUE, not a button: LT/RT nudge it in
+            // place (no enter). Everything else activates on South.
+            if actions[sel] == "mouse_speed" {
+                let d = if rt_rising { 0.1 } else if lt_rising { -0.1 } else { 0.0 };
+                if d != 0.0 { self.nav_tz_nudge_mouse_speed(outer_id, inner, d); }
+            }
+            // An action button is focused → South activates it.
+            if nav.is_rising("btn_south") {
+                match actions[sel] {
+                    "learn" => {
+                        self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "learning");
+                        self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "");
+                        self.gamepad_nav.card_index = 0; // action list changed
+                    }
+                    "cancel" => {
+                        self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "idle");
+                        self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+                        self.set_subpatch_param_bool(outer_id, inner, "_tz_gp_arm", false);
+                        self.gamepad_nav.card_index = 0;
+                    }
+                    "assign" => {
+                        // Gamepad-navigable KB/M picker on the main window.
+                        self.open_special_picker(crate::canvas::viewer::SpecialPickerRequest {
+                            inner,
+                            outer: Some(outer_id),
+                            draft_key: "_tz_draft_out".to_string(),
+                            phase_key: None,
+                            touch_zones: true,
+                        }, None);
+                    }
+                    "gamepad" => {
+                        let armed = self.get_subpatch_param_bool(outer_id, inner, "_tz_gp_arm").unwrap_or(false);
+                        self.set_subpatch_param_bool(outer_id, inner, "_tz_gp_arm", !armed);
+                    }
+                    "add" => {
+                        // Commit only when there's a draft (mirrors the ＋Add button's
+                        // enable rule); the body consumes `_tz_commit_add`.
+                        if !self.nav_remap_draft_vec(outer_id, inner, "_tz_draft_out").is_empty() {
+                            self.set_subpatch_param_bool(outer_id, inner, "_tz_commit_add", true);
+                        }
+                    }
+                    "hold" => self.nav_tz_toggle_hold(outer_id, inner),
+                    // "mouse_speed" is nudged with LT/RT above — South does nothing.
+                    _ => {}
+                }
+            }
+        } else if sel < n_actions + count {
+            // A card is focused → West deletes, South ENTERS it for field editing
+            // (shared RemapCard driver, returning to TzCards on exit).
+            let card_idx = card_idxs[sel - n_actions];
+            if nav.is_rising("btn_west") {
+                let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+                if self.nav_remap_delete_card(outer_id, card_idx) {
+                    self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+                }
+            } else if nav.is_rising("btn_south") {
+                self.gamepad_nav.edit_level = EditLevel::RemapCard;
+                self.gamepad_nav.card_return_level = EditLevel::TzCards;
+                self.gamepad_nav.remap_card = card_idx;
+                self.gamepad_nav.card_field = 0;
+                self.gamepad_nav.edit_baseline = Some(Box::new(
+                    self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+            }
+        } else {
+            // The curve pseudo-row is focused → publish a focus flag so the graph
+            // rings itself; South ENTERS the shared curve dot-editor (returns to
+            // TzCards on exit).
+            let pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|d| d.insert_temp(
+                egui::Id::new(("gp_nav_tz_curve_focus", inner.0)), pass));
+            if nav.is_rising("btn_south") {
+                self.gamepad_nav.edit_level = EditLevel::CurveDots;
+                self.gamepad_nav.curve_return_level = EditLevel::TzCards;
+                self.gamepad_nav.curve_dot = 0;
+                self.gamepad_nav.edit_baseline = Some(Box::new(
+                    self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+            }
+        }
+
+        self.nav_tz_publish_selection(ctx, outer_id, inner, &phase);
+        ctx.request_repaint();
     }
 
     /// Drive a remapper-family widget the user has ENTERED (RemapScroll level):
@@ -4568,6 +4960,7 @@ impl FlexInputApp {
                 }
             } else if nav.is_rising("btn_south") {
                 self.gamepad_nav.edit_level = EditLevel::RemapCard;
+                self.gamepad_nav.card_return_level = EditLevel::RemapScroll;
                 self.gamepad_nav.remap_card = card_idx;
                 self.gamepad_nav.card_field = 0;
                 self.gamepad_nav.edit_baseline = Some(Box::new(
@@ -4939,16 +5332,19 @@ impl FlexInputApp {
         rt_rising: bool,
         mag: f32,
     ) {
-        use crate::gamepad_nav::{EditLevel, NavDir};
+        use crate::gamepad_nav::NavDir;
+        // Where to pop back to on exit — RemapScroll for the Remapper, TzCards for
+        // Touch Zones (set at entry). Lets this driver be shared by both.
+        let ret = self.gamepad_nav.card_return_level;
         if nav.is_rising("btn_east") {
-            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            self.gamepad_nav.edit_level = ret;
             if let Some(baseline) = self.gamepad_nav.edit_baseline.take() {
                 self.tabs[self.active_tab].canvas.commit_undo_if_changed(*baseline);
             }
             return;
         }
         let Some(inner) = self.nav_selected_inner_node(outer_id) else {
-            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            self.gamepad_nav.edit_level = ret;
             return;
         };
         let _ = inner;
@@ -4957,7 +5353,7 @@ impl FlexInputApp {
         // silently bailing to RemapScroll (the "modes/toggles don't work" bug).
         let count = self.nav_remap_card_count(outer_id);
         if count == 0 {
-            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            self.gamepad_nav.edit_level = ret;
             return;
         }
         if self.gamepad_nav.remap_card >= count {
@@ -4972,7 +5368,7 @@ impl FlexInputApp {
         // 3=turbo. Compute which apply for the current mode (mirror the card
         // renderer's gray-out rules) so we can skip the inert ones.
         let Some(mode) = self.nav_remap_card_mode(outer_id, idx) else {
-            self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+            self.gamepad_nav.edit_level = ret;
             return;
         };
         let turbo_on = self.nav_remap_card_bool(outer_id, idx, "turbo");
@@ -6035,10 +6431,10 @@ impl FlexInputApp {
                 if elem.as_deref() == Some("asth_scope") => NavWidgetKind::Curve,
             Some("module.remapper") | Some("module.map_action")
             | Some("module.automap_combiner") => NavWidgetKind::Remapper,
-            // Touch Zones pad "field" element = the grid → line editing. The
-            // "cards" element (zone_maps list) isn't gamepad-navigable yet; it
-            // falls through to None (mouse/touch only).
+            // Touch Zones pad "field" element = the grid → line editing; the
+            // "cards" element = the mapping list → zone-tab + Learn/Assign flow.
             Some("module.touch_zones") if elem.as_deref() == Some("field") => NavWidgetKind::TouchZones,
+            Some("module.touch_zones") if elem.as_deref() == Some("cards") => NavWidgetKind::TouchZoneCards,
             // Gyro lean sections are remapper-family mapping rows (Learn/capture +
             // filter), unlike gyro's other elements which are plain field rows.
             Some("processing.gyro_3dof")
@@ -6268,6 +6664,17 @@ impl FlexInputApp {
         let canvas = &self.tabs[self.active_tab].canvas;
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         let node = sp.snarl.get_node(inner)?;
+        // Touch Zones per-zone response curve: not a top-level curve param — it
+        // lives on the selected analog zone's card. Read it via the shared helper.
+        if node.module_id == "module.touch_zones" {
+            let field = node.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let zone = node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let zm = node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if !crate::canvas::viewer::tz_zone_is_analog(&zm, field, zone) { return None; }
+            let pts = crate::canvas::viewer::tz_zone_curve(&zm, field, zone);
+            if pts.len() < 2 { return None; }
+            return Some((inner, pts));
+        }
         if !matches!(node.module_id.as_str(),
             "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
             | "module.audio_stream_haptics" | "module.vec_reshape")
@@ -6287,6 +6694,27 @@ impl FlexInputApp {
     fn nav_curve_write_points(&mut self, inner: egui_snarl::NodeId,
         outer_id: egui_snarl::NodeId, pts: &[[f32; 2]])
     {
+        // Touch Zones: write back to the selected analog zone's card curve.
+        {
+            let canvas = &self.tabs[self.active_tab].canvas;
+            let is_tz = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
+                .and_then(|sp| sp.snarl.get_node(inner))
+                .map(|n| n.module_id == "module.touch_zones").unwrap_or(false);
+            if is_tz {
+                let (field, zone) = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
+                    .and_then(|sp| sp.snarl.get_node(inner))
+                    .map(|n| (
+                        n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                        n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize))
+                    .unwrap_or((0, 0));
+                if let Some(sp) = self.tabs[self.active_tab].canvas.snarl
+                    .get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
+                {
+                    crate::canvas::viewer::tz_set_zone_curve(&mut sp.snarl, inner, field, zone, pts);
+                }
+                return;
+            }
+        }
         let (pts_key, bias_key) = self.nav_curve_keys(outer_id, inner);
         let canvas = &mut self.tabs[self.active_tab].canvas;
         let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut())
@@ -6452,9 +6880,12 @@ impl FlexInputApp {
         lt_rising: bool,
     ) {
         use crate::gamepad_nav::{EditLevel, NavDir};
+        // Where to pop back to on exit — Widget for the Response Curve family,
+        // TzCards for a Touch Zones per-zone curve (set at entry).
+        let ret = self.gamepad_nav.curve_return_level;
         let Some((inner, pts)) = self.nav_curve_points(outer_id) else {
-            // Not a curve any more — bail to widget level.
-            self.gamepad_nav.edit_level = EditLevel::Widget;
+            // Not a curve any more — bail out.
+            self.gamepad_nav.edit_level = ret;
             return;
         };
         // Clamp highlight to valid range.
@@ -6462,7 +6893,7 @@ impl FlexInputApp {
 
         // East → exit the curve (commit one undo entry for the whole session).
         if nav.is_rising("btn_east") {
-            self.gamepad_nav.edit_level = EditLevel::Widget;
+            self.gamepad_nav.edit_level = ret;
             if let Some(b) = self.gamepad_nav.edit_baseline.take() {
                 self.tabs[self.active_tab].canvas.commit_undo_if_changed(*b);
             }
@@ -7905,9 +8336,12 @@ impl FlexInputApp {
             "touch_left" | "touch_center" | "touch_right"
             | "btn_touchpad" | "touch_swipe_x" | "touch_swipe_y"
             | "btn_mute"); // DS-specific mic button goes with the DS touchpad cluster
-        // Extra mouse-delta cells placed in the vacated touchpad columns.
+        // Extra analog-output cells placed in the vacated touchpad columns:
+        // mouse-delta and the full analog sticks (touch position → deflection).
+        // The KB/M grid has no stick keys, so they live here.
         let tz_extra: &[(&'static str, f32, f32)] = if tz {
-            &[("mouse_x", 23.5, 1.0), ("mouse_y", 24.5, 1.0), ("mouse", 23.5, 2.0)]
+            &[("mouse_x", 23.5, 1.0), ("mouse_y", 24.5, 1.0), ("mouse", 23.5, 2.0),
+              ("left_stick", 23.5, 3.0), ("right_stick", 24.5, 3.0)]
         } else { &[] };
 
         egui::Window::new(if tz { "⌨ KB/M + mouse picker" } else { "⌨ KB/M + touchpad picker" })
@@ -8013,8 +8447,14 @@ impl FlexInputApp {
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE);
                     } else {
+                        // Compact labels — "L-Stick" won't fit a 30px cell.
+                        let lbl = match pin {
+                            "left_stick" => "LS".to_string(),
+                            "right_stick" => "RS".to_string(),
+                            _ => kbm_pin_label(pin),
+                        };
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                            kbm_pin_label(pin), egui::FontId::proportional(10.0), ui.visuals().text_color());
+                            lbl, egui::FontId::proportional(10.0), ui.visuals().text_color());
                     }
                 }
             });
@@ -8243,6 +8683,22 @@ impl FlexInputApp {
                 (vec!["btn_south"], "Drop"),
                 (vec!["btn_east"], "Drop"),
             ],
+            EditLevel::TzCards => {
+                // Two-row nav (actions + cards + optional curve), mirroring the
+                // Remapper. West/LT-RT only shown when relevant.
+                let has_mouse = self.nav_active_outer_id()
+                    .and_then(|o| self.nav_selected_inner_node(o).map(|i| (o, i)))
+                    .map(|(o, i)| self.nav_tz_has_mouse_card(o, i)).unwrap_or(false);
+                let mut v = vec![
+                    (hint_move(), "Navigate"),
+                    (vec!["btn_south"], "Select / Enter"),
+                    (vec!["btn_west"], "Delete card"),
+                    (vec!["btn_lb", "btn_rb"], "Zone"),
+                ];
+                if has_mouse { v.push((vec!["left_trigger", "right_trigger"], "Mouse speed")); }
+                v.push((vec!["btn_east"], "Back"));
+                v
+            }
         }
     }
 
@@ -12539,6 +12995,8 @@ fn kbm_pin_label(pin: &str) -> String {
         "mouse" => "Mouse⤢".into(),
         "mouse_x" => "Mouse↔".into(),
         "mouse_y" => "Mouse↕".into(),
+        "left_stick" => "L-Stick".into(),
+        "right_stick" => "R-Stick".into(),
         _ => {
             let s = pin.strip_prefix("key_").or_else(|| pin.strip_prefix("mouse_"))
                 .unwrap_or(pin);
