@@ -941,7 +941,11 @@ struct MouseShared {
     vel_x: f32,
     vel_y: f32,
     /// Accumulated scroll clicks — consumed (zeroed) by the mouse thread.
-    scroll_pending: i32,
+    scroll_pending: i32,   // vertical (+up)
+    hscroll_pending: i32,  // horizontal (+right)
+    /// Analog scroll rate (notches/sec-ish); persists across ticks like vel_x/y.
+    scroll_vel_v: f32,     // vertical (+up)
+    scroll_vel_h: f32,     // horizontal (+right)
     buttons: MouseButtons,
     muted: bool,
     /// Set to true when VirtualKeyMouse is dropped — signals the thread to exit.
@@ -972,6 +976,11 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
     let mut enigo = Enigo::new(&Settings::default()).ok();
     let mut carry_x = 0.0f32;
     let mut carry_y = 0.0f32;
+    // Sub-notch remainder for analog (variable-speed) scroll on each axis.
+    let mut scroll_carry_v = 0.0f32;
+    let mut scroll_carry_h = 0.0f32;
+    // Analog scroll rate unit: notches/sec at |rate| = 1.0 (matches keymouse_hm).
+    const SCROLL_REF: f32 = 18.0;
     let mut os_buttons = MouseButtons::default();
     let mut last_cursor  = cursor_pos();
     let mut blocked_until: Option<Instant> = None;
@@ -1010,6 +1019,7 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             if s.stop { break; }
             let snap = s.clone();
             s.scroll_pending = 0;
+            s.hscroll_pending = 0;
             snap
         };
 
@@ -1089,9 +1099,19 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
                         suppress_cooldown = SELF_MOVE_COOLDOWN; // re-arm window after our own move
                     }
                 }
-                if state.scroll_pending != 0 {
-                    let _ = e.scroll(state.scroll_pending, Axis::Vertical);
-                }
+                // Scroll: digital clicks plus dt-scaled analog rate (sub-notch
+                // carry). Vertical +up, horizontal +right. enigo's vertical sign
+                // convention is preserved from before; horizontal follows suit.
+                scroll_carry_v += state.scroll_vel_v * SCROLL_REF * dt;
+                scroll_carry_h += state.scroll_vel_h * SCROLL_REF * dt;
+                let vclicks = scroll_carry_v.trunc() as i32;
+                let hclicks = scroll_carry_h.trunc() as i32;
+                scroll_carry_v -= vclicks as f32;
+                scroll_carry_h -= hclicks as f32;
+                let v_total = state.scroll_pending + vclicks;
+                let h_total = state.hscroll_pending + hclicks;
+                if v_total != 0 { let _ = e.scroll(v_total, Axis::Vertical); }
+                if h_total != 0 { let _ = e.scroll(h_total, Axis::Horizontal); }
                 btn_sync!(os_buttons.lmb, state.buttons.lmb, Button::Left);
                 btn_sync!(os_buttons.rmb, state.buttons.rmb, Button::Right);
                 btn_sync!(os_buttons.mmb, state.buttons.mmb, Button::Middle);
@@ -1100,6 +1120,8 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             } else {
                 carry_x = 0.0;
                 carry_y = 0.0;
+                scroll_carry_v = 0.0;
+                scroll_carry_h = 0.0;
                 btn_release!(os_buttons.lmb, Button::Left);
                 btn_release!(os_buttons.rmb, Button::Right);
                 btn_release!(os_buttons.mmb, Button::Middle);
@@ -1123,7 +1145,10 @@ pub struct VirtualKeyMouse {
     // Desired per-frame velocity / state set by send()
     mouse_vel_x: f32,
     mouse_vel_y: f32,
-    scroll_delta: i32,
+    scroll_delta: i32,   // vertical digital scroll clicks (scroll_up/down)
+    hscroll_delta: i32,  // horizontal digital scroll clicks (scroll_left/right)
+    scroll_vel_v: f32,   // analog vertical scroll rate (scroll_y), +up
+    scroll_vel_h: f32,   // analog horizontal scroll rate (scroll_x), +right
     buttons: MouseButtons,
     keys: KeysHeld,
     learned_keys: HashMap<String, bool>,
@@ -1162,6 +1187,9 @@ impl VirtualKeyMouse {
             mouse_vel_x: 0.0,
             mouse_vel_y: 0.0,
             scroll_delta: 0,
+            hscroll_delta: 0,
+            scroll_vel_v: 0.0,
+            scroll_vel_h: 0.0,
             buttons: MouseButtons::default(),
             keys: KeysHeld::default(),
             learned_keys: HashMap::new(),
@@ -1200,6 +1228,10 @@ impl VirtualDevice for VirtualKeyMouse {
             "mouse_y"       => { if let Signal::Float(f) = value { self.mouse_vel_y += -f; } }
             "scroll_up"     => { if matches!(value, Signal::Bool(true)) { self.scroll_delta += 1; } }
             "scroll_down"   => { if matches!(value, Signal::Bool(true)) { self.scroll_delta -= 1; } }
+            "scroll_right"  => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta += 1; } }
+            "scroll_left"   => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta -= 1; } }
+            "scroll_y"      => { if let Signal::Float(f) = value { self.scroll_vel_v += f; } }
+            "scroll_x"      => { if let Signal::Float(f) = value { self.scroll_vel_h += f; } }
             "mouse_left"    => { if let Signal::Bool(b) = value { self.buttons.lmb = b; } }
             "mouse_right"   => { if let Signal::Bool(b) = value { self.buttons.rmb = b; } }
             "mouse_middle"  => { if let Signal::Bool(b) = value { self.buttons.mmb = b; } }
@@ -1220,6 +1252,9 @@ impl VirtualDevice for VirtualKeyMouse {
             s.vel_x               = std::mem::take(&mut self.mouse_vel_x);
             s.vel_y               = std::mem::take(&mut self.mouse_vel_y);
             s.scroll_pending     += std::mem::take(&mut self.scroll_delta);
+            s.hscroll_pending    += std::mem::take(&mut self.hscroll_delta);
+            s.scroll_vel_v        = std::mem::take(&mut self.scroll_vel_v);
+            s.scroll_vel_h        = std::mem::take(&mut self.scroll_vel_h);
             s.buttons             = self.buttons;
             s.muted               = self.muted;
         }
@@ -1300,6 +1335,9 @@ impl VirtualDevice for VirtualKeyMouse {
         self.mouse_vel_x = 0.0;
         self.mouse_vel_y = 0.0;
         self.scroll_delta = 0;
+        self.hscroll_delta = 0;
+        self.scroll_vel_v = 0.0;
+        self.scroll_vel_h = 0.0;
         self.buttons = MouseButtons::default();
         self.keys = KeysHeld::default();
         for v in self.learned_keys.values_mut() { *v = false; }

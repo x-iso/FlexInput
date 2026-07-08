@@ -5095,6 +5095,11 @@ fn eval_touch_zones_map_node(
     let mut mouse_dx = 0.0f32;
     let mut mouse_dy = 0.0f32;
     let mut mouse_active = false;
+    // Analog scroll rate from a zone deflection (+Y up, +X right). Published as
+    // the Float scroll_y/scroll_x pins; the KB/M sink integrates them over time.
+    let mut scroll_vx = 0.0f32;
+    let mut scroll_vy = 0.0f32;
+    let mut scroll_active = false;
     // Mouse gain. The emitted value stacks with the SINK's own mouse_sensitivity
     // (like gyro / right-stick sources do), so a raw ±1 deflection would be wildly
     // hot at typical sink sensitivities. `TZ_MOUSE_BASE` attenuates a full-zone
@@ -5102,8 +5107,11 @@ fn eval_touch_zones_map_node(
     // same sink sensitivity; the per-node `mouse_speed` multiplier (default 1.0)
     // tunes it from there.
     const TZ_MOUSE_BASE: f32 = 0.03;
-    let mouse_gain = snap.params.get("mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32
-        * TZ_MOUSE_BASE;
+    let mouse_speed = snap.params.get("mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    let mouse_gain = mouse_speed * TZ_MOUSE_BASE;
+    // Analog scroll shares the same node multiplier so the "Relative sensitivity"
+    // slider also scales max scroll speed. The sink applies the per-notch base
+    // rate (SCROLL_REF), so here we pass the shaped deflection × the multiplier.
 
     // Cards use the shared Remapper schema: "in" = trigger token(s), "out" =
     // target bus pins, "mode"/"window_ms"/"sustain"/"turbo" = the Remapper press
@@ -5273,6 +5281,15 @@ fn eval_touch_zones_map_node(
                         mouse_active = true;
                     }
                 }
+                // Analog scroll: the (curve-shaped) deflection IS the scroll rate.
+                // +Y up, +X right; the sink applies its own per-notch scaling.
+                "scroll_x" | "scroll_y" => {
+                    if let Some((ax, ay)) = deflect {
+                        if p == "scroll_x" { scroll_vx += ax * mouse_speed; }
+                        if p == "scroll_y" { scroll_vy += ay * mouse_speed; }
+                        scroll_active = true;
+                    }
+                }
                 _ => {
                     let e = button_on.entry(p.to_string()).or_insert(false);
                     *e = *e || held;
@@ -5328,6 +5345,11 @@ fn eval_touch_zones_map_node(
         collector_sigs.insert((key.clone(), "mouse".to_string()), Signal::Vec2(Vec2::new(mouse_dx, mouse_dy)));
         collector_sigs.insert((key.clone(), "mouse_x".to_string()), Signal::Float(mouse_dx));
         collector_sigs.insert((key.clone(), "mouse_y".to_string()), Signal::Float(mouse_dy));
+    }
+    // Publish analog scroll rate while a finger drives it; else fall back upstream.
+    if scroll_active {
+        collector_sigs.insert((key.clone(), "scroll_x".to_string()), Signal::Float(scroll_vx));
+        collector_sigs.insert((key.clone(), "scroll_y".to_string()), Signal::Float(scroll_vy));
     }
 }
 
@@ -6911,6 +6933,71 @@ mod trigger_tests {
         assert!(!btn_east, "HOLD: crossed-into button zone must NOT fire");
     }
 
+    // A zone mapped to the analog scroll pins publishes a Float rate that tracks
+    // the finger's deflection (+Y up, +X right) — the variable-speed scroll dest.
+    #[test]
+    fn touch_zones_analog_scroll_rate_tracks_deflection() {
+        let mut n = empty_node(1, "module.touch_zones");
+        n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        n.params.insert("col_edges".into(), serde_json::json!([])); // single zone
+        n.params.insert("row_edges".into(), serde_json::json!([]));
+        n.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["scroll_y","scroll_x"],"mode":"analog"},
+        ]));
+        let finger = |px: f32, py: f32| {
+            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(py));
+            m
+        };
+        let getf = |c: &HashMap<(String, String), Signal>, pin: &str|
+            c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
+        let mut state = HashMap::new();
+        let mut c = HashMap::new();
+        // Land at centre to establish the adaptive centre, then deflect up-right
+        // (raw pad +Y is up; pad_point_to_unit flips it into y-down unit space).
+        eval_touch_zones_map_node(&n, 1, &finger(0.0, 0.0), &mut c, &mut state, 0.016);
+        c.clear();
+        eval_touch_zones_map_node(&n, 1, &finger(0.8, 0.8), &mut c, &mut state, 0.016);
+        assert!(getf(&c, "scroll_y") > 0.0, "upward deflection → scroll up (scroll_y > 0)");
+        assert!(getf(&c, "scroll_x") > 0.0, "rightward deflection → scroll right (scroll_x > 0)");
+    }
+
+    // A zone can carry BOTH an analog (tz_touch) card and a click (tz_click) card;
+    // clicking must still fire the click mapping while the analog output runs.
+    #[test]
+    fn touch_zones_analog_zone_click_still_fires() {
+        let mut n = empty_node(1, "module.touch_zones");
+        n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        n.params.insert("col_edges".into(), serde_json::json!([])); // single zone
+        n.params.insert("row_edges".into(), serde_json::json!([]));
+        n.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["mouse"],"mode":"analog"},
+            {"f":0,"z":0,"in":["tz_click"],"out":["btn_east"],"mode":"down"},
+        ]));
+        let input = |click: bool| {
+            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(0.3));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.3));
+            m.insert(("pad".into(), "btn_touchpad".into()), Signal::Bool(click));
+            m
+        };
+        let getb = |c: &HashMap<(String, String), Signal>, pin: &str|
+            c.get(&("touchmap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+        let mut state = HashMap::new();
+        let mut c = HashMap::new();
+        eval_touch_zones_map_node(&n, 1, &input(false), &mut c, &mut state, 0.016);
+        c.clear();
+        eval_touch_zones_map_node(&n, 1, &input(true), &mut c, &mut state, 0.016);
+        assert!(getb(&c, "btn_east"), "click on an analog zone must still fire the click mapping");
+        assert!(c.contains_key(&("touchmap:1".to_string(), "mouse".to_string())),
+            "analog output still runs alongside the click");
+    }
+
     // Analog swipe drives a finger coordinate continuously (absolute position).
     #[test]
     fn remapper_swipe_tracks_analog_input() {
@@ -7184,6 +7271,45 @@ mod trigger_tests {
             digital_trigger_bridge: false,
         });
         n
+    }
+
+    // End-to-end: a zone mapped touch→mouse_left must drive the keymouse sink's
+    // mouse_left pin (regression guard for "touch/click → mouse button does
+    // nothing"). Exercises the full graph tick: tz node → touchmap bus → sink.
+    #[test]
+    fn touch_zone_button_reaches_keymouse_sink() {
+        let dev = "pad";
+        let tz_uid = 2usize;
+        let mut tz = empty_node(tz_uid, "module.touch_zones");
+        tz.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        tz.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        tz.params.insert("col_edges".into(), serde_json::json!([]));
+        tz.params.insert("row_edges".into(), serde_json::json!([]));
+        tz.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["mouse_left"],"mode":"down"},
+        ]));
+        let mut sink = empty_node(3, "device.sink");
+        sink.sink_target = Some(SinkTarget {
+            device_id: "virtual.keymouse:0".to_string(),
+            pin_ids: canonical_pins(),
+            multi_sources: vec![Vec::new(); canonical_pins().len()],
+            automap_source: Some((format!("touchmap:{tz_uid}"), canonical_pins())),
+            automap_fallback_dev: None,
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+        });
+        let graph = ProcessingGraph { nodes: vec![tz, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "touch1_active".to_string()), Signal::Bool(true));
+        sigs.insert((dev.to_string(), "touch1_x".to_string()), Signal::Float(0.0));
+        sigs.insert((dev.to_string(), "touch1_y".to_string()), Signal::Float(0.0));
+        eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+        let lmb = out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "mouse_left".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        assert!(lmb, "touch→mouse_left must reach the keymouse sink");
     }
 
     #[test]

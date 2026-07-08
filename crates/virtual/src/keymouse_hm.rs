@@ -159,6 +159,9 @@ const SELF_MOVE_WINDOW: Duration = Duration::from_millis(16);
 const MAX_DT: f32 = 0.008;
 /// Velocity unit: pixels per 60 Hz reference frame (unchanged pin semantics).
 const REF: f32 = 60.0;
+/// Analog scroll rate unit: notches per second at |rate| = 1.0. A full-deflection
+/// stick / touch-zone maps to a firm-but-controllable continuous scroll.
+const SCROLL_REF: f32 = 18.0;
 
 pub struct VirtualKeyMouseHm {
     pub muted: bool,
@@ -166,7 +169,10 @@ pub struct VirtualKeyMouseHm {
     // Desired state accumulated by send(), consumed by flush().
     mouse_vel_x: f32,
     mouse_vel_y: f32,
-    scroll_delta: i32,
+    scroll_delta: i32,   // vertical digital scroll clicks (scroll_up/down)
+    hscroll_delta: i32,  // horizontal digital scroll clicks (scroll_left/right)
+    scroll_vel_v: f32,   // analog vertical scroll rate (scroll_y), +up
+    scroll_vel_h: f32,   // analog horizontal scroll rate (scroll_x), +right
     buttons: MouseButtons,
     keys: KeysHeld,
     learned_keys: HashMap<String, bool>,
@@ -181,8 +187,10 @@ pub struct VirtualKeyMouseHm {
     // Mouse emission state (port of the enigo thread's logic, at flush rate).
     carry_x: f32,
     carry_y: f32,
+    scroll_carry_v: f32, // sub-click remainder for analog vertical scroll
+    scroll_carry_h: f32, // sub-click remainder for analog horizontal scroll
     last_emit: Instant,
-    last_mouse_report: [u8; 6],
+    last_mouse_report: [u8; 7],
     mouse_report_dirty: bool,
 
     // Physical-mouse suppression (same semantics as the enigo backend).
@@ -221,6 +229,9 @@ impl VirtualKeyMouseHm {
             mouse_vel_x: 0.0,
             mouse_vel_y: 0.0,
             scroll_delta: 0,
+            hscroll_delta: 0,
+            scroll_vel_v: 0.0,
+            scroll_vel_h: 0.0,
             buttons: MouseButtons::default(),
             keys: KeysHeld::default(),
             learned_keys: HashMap::new(),
@@ -228,8 +239,10 @@ impl VirtualKeyMouseHm {
             mouse,
             carry_x: 0.0,
             carry_y: 0.0,
+            scroll_carry_v: 0.0,
+            scroll_carry_h: 0.0,
             last_emit: Instant::now(),
-            last_mouse_report: [0; 6],
+            last_mouse_report: [0; 7],
             mouse_report_dirty: false,
             last_cursor: None,
             blocked_until: None,
@@ -286,6 +299,10 @@ impl VirtualDevice for VirtualKeyMouseHm {
             "mouse_y"       => { if let Signal::Float(f) = value { self.mouse_vel_y += -f; } }
             "scroll_up"     => { if matches!(value, Signal::Bool(true)) { self.scroll_delta += 1; } }
             "scroll_down"   => { if matches!(value, Signal::Bool(true)) { self.scroll_delta -= 1; } }
+            "scroll_right"  => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta += 1; } }
+            "scroll_left"   => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta -= 1; } }
+            "scroll_y"      => { if let Signal::Float(f) = value { self.scroll_vel_v += f; } }
+            "scroll_x"      => { if let Signal::Float(f) = value { self.scroll_vel_h += f; } }
             "mouse_left"    => { if let Signal::Bool(b) = value { self.buttons.lmb = b; } }
             "mouse_right"   => { if let Signal::Bool(b) = value { self.buttons.rmb = b; } }
             "mouse_middle"  => { if let Signal::Bool(b) = value { self.buttons.mmb = b; } }
@@ -339,6 +356,9 @@ impl VirtualDevice for VirtualKeyMouseHm {
         let vel_x = std::mem::take(&mut self.mouse_vel_x);
         let vel_y = std::mem::take(&mut self.mouse_vel_y);
         let scroll = std::mem::take(&mut self.scroll_delta);
+        let hscroll = std::mem::take(&mut self.hscroll_delta);
+        let scroll_vel_v = std::mem::take(&mut self.scroll_vel_v);
+        let scroll_vel_h = std::mem::take(&mut self.scroll_vel_h);
 
         // Mixed-output braiding: keep the shared turn token alternating (see
         // module docs — the gamepad flush is gated on the other side of this
@@ -350,7 +370,7 @@ impl VirtualDevice for VirtualKeyMouseHm {
             true
         };
 
-        let mut rep = [0u8; 6];
+        let mut rep = [0u8; 7];
         if !self.muted && !suppressed {
             self.carry_x += vel_x * REF * dt;
             self.carry_y += vel_y * REF * dt;
@@ -361,10 +381,20 @@ impl VirtualDevice for VirtualKeyMouseHm {
                 self.carry_x -= dx as f32;
                 self.carry_y -= dy as f32;
             }
+            // Analog scroll: dt-scaled rate → sub-click carry → int8 clicks, then
+            // fold in the digital clicks. Scroll isn't braid-gated (like the
+            // wheel already wasn't), so it emits every flush.
+            self.scroll_carry_v += scroll_vel_v * SCROLL_REF * dt;
+            self.scroll_carry_h += scroll_vel_h * SCROLL_REF * dt;
+            let vclicks = self.scroll_carry_v.trunc() as i32;
+            let hclicks = self.scroll_carry_h.trunc() as i32;
+            self.scroll_carry_v -= vclicks as f32;
+            self.scroll_carry_h -= hclicks as f32;
             rep[0] = self.buttons.bits();
             rep[1..3].copy_from_slice(&(dx as i16).to_le_bytes());
             rep[3..5].copy_from_slice(&(dy as i16).to_le_bytes());
-            rep[5] = scroll.clamp(-127, 127) as i8 as u8;
+            rep[5] = (scroll + vclicks).clamp(-127, 127) as i8 as u8;   // vertical wheel
+            rep[6] = (hscroll + hclicks).clamp(-127, 127) as i8 as u8;  // horizontal (AC Pan)
             if dx != 0 || dy != 0 {
                 self.self_move_until = Some(now + SELF_MOVE_WINDOW);
                 if let Some(ref mut last) = self.last_cursor {
@@ -374,16 +404,19 @@ impl VirtualDevice for VirtualKeyMouseHm {
             }
         } else {
             // Muted/suppressed: zero deltas, all buttons released, and the
-            // banked carry is discarded so it can't discharge as a jump later.
+            // banked carry (motion + scroll) is discarded so it can't discharge
+            // as a jump later.
             self.carry_x = 0.0;
             self.carry_y = 0.0;
+            self.scroll_carry_v = 0.0;
+            self.scroll_carry_h = 0.0;
         }
 
         // Relative device: identical all-zero frames carry no information, so
         // only write when something moved/changed vs the last frame (buttons
         // level, motion, or wheel). A button release IS a change and gets its
         // report.
-        let has_motion = rep[1..6] != [0; 5];
+        let has_motion = rep[1..7] != [0; 6];
         if has_motion || rep != self.last_mouse_report || self.mouse_report_dirty {
             self.mouse.write_raw_input(&rep);
             self.mouse_report_dirty = false;
@@ -395,11 +428,16 @@ impl VirtualDevice for VirtualKeyMouseHm {
         self.mouse_vel_x = 0.0;
         self.mouse_vel_y = 0.0;
         self.scroll_delta = 0;
+        self.hscroll_delta = 0;
+        self.scroll_vel_v = 0.0;
+        self.scroll_vel_h = 0.0;
         self.buttons = MouseButtons::default();
         self.keys = KeysHeld::default();
         for v in self.learned_keys.values_mut() { *v = false; }
         self.carry_x = 0.0;
         self.carry_y = 0.0;
+        self.scroll_carry_v = 0.0;
+        self.scroll_carry_h = 0.0;
         // Force a neutral frame out even if the last report was already
         // neutral-equal (e.g. first reset after reconnect).
         self.mouse_report_dirty = true;

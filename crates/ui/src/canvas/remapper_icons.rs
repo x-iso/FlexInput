@@ -295,6 +295,12 @@ const M_SIDE_BACK:    &[u8] = a!("KBM/mouse_side_back.svg");
 const M_SIDE_FORWARD: &[u8] = a!("KBM/mouse_side_forward.svg");
 const M_SCROLL_U: &[u8] = a!("KBM/mouse_scroll_up.svg");
 const M_SCROLL_D: &[u8] = a!("KBM/mouse_scroll_down.svg");
+// Horizontal scroll: bool left/right + the analog (variable-speed) axis glyph.
+const M_SCROLL_L:  &[u8] = a!("KBM/mouse_horizontal_scroll_down.svg");
+const M_SCROLL_R:  &[u8] = a!("KBM/mouse_horizontal_scroll_up.svg");
+const M_HSCROLL:   &[u8] = a!("KBM/mouse_horizontal_scroll.svg");
+// Vertical analog (variable-speed) scroll axis glyph.
+const M_VSCROLL:   &[u8] = a!("KBM/mouse_scroll_vertical.svg");
 // Mouse-movement delta outputs (Touch Zones relative-mouse mapping).
 const M_MOVE:     &[u8] = a!("KBM/mouse_move.svg");
 const M_MOVE_H:   &[u8] = a!("KBM/mouse_horizontal.svg");
@@ -491,6 +497,10 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "mouse_forward" => return Some(M_SIDE_FORWARD),
         "scroll_up"     => return Some(M_SCROLL_U),
         "scroll_down"   => return Some(M_SCROLL_D),
+        "scroll_left"   => return Some(M_SCROLL_L),
+        "scroll_right"  => return Some(M_SCROLL_R),
+        "scroll_x"      => return Some(M_HSCROLL),
+        "scroll_y"      => return Some(M_VSCROLL),
         // Mouse-movement delta (Touch Zones relative-mouse outputs).
         "mouse"         => return Some(M_MOVE),
         "mouse_x"       => return Some(M_MOVE_H),

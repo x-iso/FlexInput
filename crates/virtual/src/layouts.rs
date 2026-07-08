@@ -66,8 +66,13 @@ pub static KEYMOUSE_DEFAULT_PINS: &[SinkPin] = &[
     sp!("mouse_back",    "Mouse 4 (Back)",   SignalType::Bool),
     sp!("mouse_forward", "Mouse 5 (Forward)", SignalType::Bool),
     // Scroll (discrete Bool pulses — one true frame per tick)
-    sp!("scroll_up",   "Scroll Up",   SignalType::Bool),
-    sp!("scroll_down", "Scroll Down", SignalType::Bool),
+    sp!("scroll_up",    "Scroll Up",    SignalType::Bool),
+    sp!("scroll_down",  "Scroll Down",  SignalType::Bool),
+    sp!("scroll_left",  "Scroll Left",  SignalType::Bool),
+    sp!("scroll_right", "Scroll Right", SignalType::Bool),
+    // Analog scroll rate (Float; continuous variable-speed scroll). +Y up, +X right.
+    sp!("scroll_y", "Scroll Y (rate)", SignalType::Float),
+    sp!("scroll_x", "Scroll X (rate)", SignalType::Float),
     // Mouse axes (Float delta per frame; e.g. stick deflection → cursor speed)
     sp!("mouse",   "Mouse XY (delta)", SignalType::Vec2),
     sp!("mouse_x", "Mouse X (delta)",  SignalType::Float),

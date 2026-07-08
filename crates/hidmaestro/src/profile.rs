@@ -395,9 +395,9 @@ mod tests {
         assert_eq!(p.id, "hm-mouse");
         assert!(!p.requires_xusb_companion);
         assert_eq!(p.function_mode, 0);
-        // [buttons, X lo/hi, Y lo/hi, wheel] = 6 bytes, no Report ID.
-        assert_eq!(p.input_report_size, 6);
-        assert_eq!(p.report.byte_size(), 6);
+        // [buttons, X lo/hi, Y lo/hi, wheel, hwheel] = 7 bytes, no Report ID.
+        assert_eq!(p.input_report_size, 7);
+        assert_eq!(p.report.byte_size(), 7);
         assert_eq!(p.report.report_id, 0);
         // X/Y must parse as 16-bit signed relative axes at the layout the
         // report builder in keymouse_hm hardcodes (bytes 1..5 after buttons).
@@ -406,9 +406,19 @@ mod tests {
         assert_eq!((x.bit_offset, x.bit_size), (8, 16));
         assert_eq!((y.bit_offset, y.bit_size), (24, 16));
         assert!(x.logical_min < 0, "X is signed/relative");
-        // Wheel: int8 at byte 5.
+        // Buttons: 5 button bits at byte 0 (LMB = bit 0) must survive the AC Pan
+        // addition — otherwise the OS mouse loses its buttons.
+        let b1 = p.report.field(0x09, 0x01).expect("button 1 (LMB)");
+        assert_eq!((b1.bit_offset, b1.bit_size), (0, 1), "LMB must be bit 0");
+        let b2 = p.report.field(0x09, 0x02).expect("button 2 (RMB)");
+        assert_eq!((b2.bit_offset, b2.bit_size), (1, 1), "RMB must be bit 1");
+        // Wheel (vertical): int8 at byte 5.
         let w = p.report.field(0x01, 0x38).expect("wheel");
         assert_eq!((w.bit_offset, w.bit_size), (40, 8));
+        // Horizontal wheel (Consumer AC Pan 0x0238): int8 at byte 6.
+        let hw = p.report.field(0x0c, 0x0238).expect("hwheel (AC Pan)");
+        assert_eq!((hw.bit_offset, hw.bit_size), (48, 8));
+        assert!(hw.logical_min < 0, "hwheel is signed/relative");
     }
 
     /// Golden: our parser must reproduce the exact field layout HIDMaestro's C#

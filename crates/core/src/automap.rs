@@ -235,6 +235,12 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "mouse_forward", display_name: "Mouse: Forward",       signal_type: SignalType::Bool },
     AutoMapPin { id: "scroll_up",     display_name: "Mouse: Scroll Up",     signal_type: SignalType::Bool },
     AutoMapPin { id: "scroll_down",   display_name: "Mouse: Scroll Down",   signal_type: SignalType::Bool },
+    AutoMapPin { id: "scroll_left",   display_name: "Mouse: Scroll Left",   signal_type: SignalType::Bool },
+    AutoMapPin { id: "scroll_right",  display_name: "Mouse: Scroll Right",  signal_type: SignalType::Bool },
+    // Analog scroll rate for variable-speed scrolling (stick/trigger/touch-zone
+    // deflection → continuous scroll). +Y scrolls up, +X scrolls right.
+    AutoMapPin { id: "scroll_y",      display_name: "Mouse: Scroll Y (rate)", signal_type: SignalType::Float },
+    AutoMapPin { id: "scroll_x",      display_name: "Mouse: Scroll X (rate)", signal_type: SignalType::Float },
     AutoMapPin { id: "mouse",         display_name: "Mouse: XY (delta)",    signal_type: SignalType::Vec2 },
     AutoMapPin { id: "mouse_x",       display_name: "Mouse: X (delta)",     signal_type: SignalType::Float },
     AutoMapPin { id: "mouse_y",       display_name: "Mouse: Y (delta)",     signal_type: SignalType::Float },
