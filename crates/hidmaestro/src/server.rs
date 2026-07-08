@@ -650,11 +650,38 @@ fn handle_create(
     // device_id. Re-attach by mapping its sections at the recorded index — don't
     // create a second node.
     let existing = list_hidmaestro_devices();
+    // Stale-descriptor guard: reclaim re-attaches a persisted node WITHOUT
+    // re-applying its report descriptor, so a node created by an older build keeps
+    // its old descriptor forever. We bump the profile's PID whenever the report
+    // LAYOUT changes (e.g. the mouse wheel report grew 6→7 bytes for horizontal
+    // scroll). If a same-device_id node exists but its USB identity no longer
+    // matches the profile, it holds a STALE descriptor — reclaiming it would leave
+    // the DRIVER on the old layout while the app writes the NEW report, which
+    // silently broke mouse buttons after that change. Tear such nodes down here so
+    // we fall through to a fresh create that enumerates the new descriptor.
+    for d in existing.iter().filter(|d|
+        d.device_id == device_id && !device_id.is_empty() && !d.is_companion
+            && (d.vid != profile.vid || d.pid != profile.pid))
+    {
+        diag_log(&format!(
+            "[helper] stale node device_id={device_id} pid {:#06x}->{:#06x}: destroying to recreate",
+            d.pid, profile.pid));
+        if let Some(cid) = existing.iter()
+            .find(|c| c.is_companion && c.index == d.index)
+            .map(|c| c.instance_id.clone())
+        {
+            let _ = remove_device_node(&cid);
+        }
+        let _ = remove_device_node(&d.instance_id);
+    }
     // Match the HID gamepad node (it drives the SHM section); the XUSB companion
-    // shares the same device_id/index but is a separate System-class node.
+    // shares the same device_id/index but is a separate System-class node. Only an
+    // EXACT identity match is reclaimable — a stale (destroyed above) node must not
+    // be re-attached, so it isn't matched here either.
     if let Some(found) = existing
         .iter()
-        .find(|d| d.device_id == device_id && !device_id.is_empty() && !d.is_companion)
+        .find(|d| d.device_id == device_id && !device_id.is_empty() && !d.is_companion
+            && d.vid == profile.vid && d.pid == profile.pid)
     {
         let mut input = match InputSection::create(found.index).or_else(|_| InputSection::open(found.index)) {
             Ok(s) => s,
