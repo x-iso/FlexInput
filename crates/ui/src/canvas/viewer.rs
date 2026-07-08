@@ -2520,23 +2520,43 @@ fn tz_draw_field(
         let mut edited: Option<tz::ZoneNode> = None;
         let mut want_remove: Option<Vec<u8>> = None;
         for (di, div) in tree.dividers().iter().enumerate() {
-            let (p0, p1, hitr, axis_v) = match div.axis {
+            // The "−" removal button (from tz_tree_line_overlay) sits at the
+            // divider midpoint; carve that band out of the drag handle so the
+            // button always wins the pointer there and the drag is grabbable
+            // anywhere else along the line.
+            let mid = (div.span_lo + div.span_hi) * 0.5;
+            let btn = 11.0; // half-band excluded around the midpoint button (px)
+            let (p0, p1, hitr, segs, axis_v) = match div.axis {
                 tz::Axis::V => {
                     let x = to_x(div.pos);
-                    (egui::pos2(x, to_y(div.span_lo)), egui::pos2(x, to_y(div.span_hi)),
-                     egui::Rect::from_min_max(egui::pos2(x - 4.0, to_y(div.span_lo)),
-                                              egui::pos2(x + 4.0, to_y(div.span_hi))), true)
+                    let (lo, hi, cy) = (to_y(div.span_lo), to_y(div.span_hi), to_y(mid));
+                    let full = egui::Rect::from_min_max(egui::pos2(x - 4.0, lo), egui::pos2(x + 4.0, hi));
+                    let mut segs = Vec::new();
+                    if cy - btn > lo + 2.0 { segs.push(egui::Rect::from_min_max(egui::pos2(x - 4.0, lo), egui::pos2(x + 4.0, cy - btn))); }
+                    if hi > cy + btn + 2.0 { segs.push(egui::Rect::from_min_max(egui::pos2(x - 4.0, cy + btn), egui::pos2(x + 4.0, hi))); }
+                    (egui::pos2(x, lo), egui::pos2(x, hi), full, segs, true)
                 }
                 tz::Axis::H => {
                     let y = to_y(div.pos);
-                    (egui::pos2(to_x(div.span_lo), y), egui::pos2(to_x(div.span_hi), y),
-                     egui::Rect::from_min_max(egui::pos2(to_x(div.span_lo), y - 4.0),
-                                              egui::pos2(to_x(div.span_hi), y + 4.0)), false)
+                    let (lo, hi, cx) = (to_x(div.span_lo), to_x(div.span_hi), to_x(mid));
+                    let full = egui::Rect::from_min_max(egui::pos2(lo, y - 4.0), egui::pos2(hi, y + 4.0));
+                    let mut segs = Vec::new();
+                    if cx - btn > lo + 2.0 { segs.push(egui::Rect::from_min_max(egui::pos2(lo, y - 4.0), egui::pos2(cx - btn, y + 4.0))); }
+                    if hi > cx + btn + 2.0 { segs.push(egui::Rect::from_min_max(egui::pos2(cx + btn, y - 4.0), egui::pos2(hi, y + 4.0))); }
+                    (egui::pos2(lo, y), egui::pos2(hi, y), full, segs, false)
                 }
             };
             nav_line_rects.push((if axis_v { 0 } else { 1 }, di as u32, to_global * hitr));
-            let r = ui.interact(hitr, ui.id().with((node_id, id_salt, "tzdiv", field, di)),
-                egui::Sense::click_and_drag());
+            // Union the (up to two) segments flanking the button into one response.
+            let r = segs.iter().enumerate().fold(None::<egui::Response>, |acc, (si, seg)| {
+                let resp = ui.interact(*seg, ui.id().with((node_id, id_salt, "tzdiv", field, di, si)),
+                    egui::Sense::click_and_drag());
+                Some(match acc { Some(a) => a | resp, None => resp })
+            });
+            let Some(r) = r else {
+                painter.line_segment([p0, p1], egui::Stroke::new(1.0, visuals.weak_text_color()));
+                continue;
+            };
             let hot = r.hovered() || r.dragged();
             if hot {
                 r.clone().on_hover_cursor(if axis_v { egui::CursorIcon::ResizeHorizontal }
