@@ -114,7 +114,9 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     // ── Mouse cluster (further right) ─────────────────────────────────────
     c("mouse_left", MOUSE_X, 1.0), c("mouse_middle", MOUSE_X + 1.0, 1.0), c("mouse_right", MOUSE_X + 2.0, 1.0),
     c("mouse_back", MOUSE_X, 2.0), c("mouse_forward", MOUSE_X + 1.0, 2.0),
-    c("scroll_up", MOUSE_X, 3.0), c("scroll_down", MOUSE_X + 1.0, 3.0),
+    // Scroll directions arranged like a d-pad: up on top, left/down/right below.
+    c("scroll_up", MOUSE_X + 1.0, 3.0),
+    c("scroll_left", MOUSE_X, 4.0), c("scroll_down", MOUSE_X + 1.0, 4.0), c("scroll_right", MOUSE_X + 2.0, 4.0),
 
     // ── Touchpad cluster (DualSense/DualShock) ────────────────────────────
     // Row 1: the three touch zones (finger touch, no click).
@@ -125,20 +127,52 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     ca("touch_swipe_x", TOUCH_X, 3.0), ca("touch_swipe_y", TOUCH_X + 1.0, 3.0),
 ];
 
-/// Width of the layout in grid units (for sizing the window).
-pub fn layout_extent() -> (f32, f32) {
+/// The cell set actually shown (and navigated) for the current picker mode.
+///
+/// In Touch-Zones mode a touchpad can't remap to itself, so the touchpad cluster
+/// is hidden and analog OUTPUT cells (mouse delta + sticks) fill the vacated
+/// columns. Those extras must be REAL cells in this list — otherwise gamepad nav
+/// (which walks this list) can't reach them, and the focus ring lands on a
+/// hidden cell, making the cursor vanish. Single source of truth shared by the
+/// renderer, the spatial nav, and activation.
+pub fn picker_cells(tz: bool) -> Vec<KbmCell> {
+    if !tz {
+        return KBM_LAYOUT.to_vec();
+    }
+    // Touchpad cluster pins hidden in Touch-Zones mode (see kbm_picker_window).
+    let hidden = |pin: &str| matches!(pin,
+        "touch_left" | "touch_center" | "touch_right"
+        | "btn_touchpad" | "touch_swipe_x" | "touch_swipe_y" | "btn_mute");
+    let mut cells: Vec<KbmCell> =
+        KBM_LAYOUT.iter().copied().filter(|c| !hidden(c.pin)).collect();
+    // Analog outputs placed in the vacated touchpad columns: mouse-delta and the
+    // full analog sticks (touch position → deflection). The KB/M grid has no
+    // stick keys, so they live here — and stay navigable.
+    cells.push(c("mouse_x", TOUCH_X, 1.0));
+    cells.push(c("mouse_y", TOUCH_X + 1.0, 1.0));
+    cells.push(c("mouse", TOUCH_X, 2.0));
+    cells.push(c("left_stick", TOUCH_X, 3.0));
+    cells.push(c("right_stick", TOUCH_X + 1.0, 3.0));
+    // Analog (variable-speed) scroll — the touch-zone deflection sets the rate.
+    cells.push(c("scroll_y", TOUCH_X, 4.0));
+    cells.push(c("scroll_x", TOUCH_X + 1.0, 4.0));
+    cells
+}
+
+/// Width/height of a cell list in grid units (for sizing the window).
+pub fn layout_extent(cells: &[KbmCell]) -> (f32, f32) {
     let mut max_x = 0.0f32;
     let mut max_y = 0.0f32;
-    for cell in KBM_LAYOUT {
+    for cell in cells {
         max_x = max_x.max(cell.x + cell.width);
         max_y = max_y.max(cell.y + 1.0);
     }
     (max_x, max_y)
 }
 
-/// The cell at `idx`, clamped to a valid index.
-pub fn clamp_index(idx: usize) -> usize {
-    idx.min(KBM_LAYOUT.len().saturating_sub(1))
+/// A valid index into `cells`, clamped.
+pub fn clamp_index(cells: &[KbmCell], idx: usize) -> usize {
+    idx.min(cells.len().saturating_sub(1))
 }
 
 /// Center point of a cell in grid units (for spatial navigation + hit-testing).
@@ -150,12 +184,12 @@ fn cell_center(cell: &KbmCell) -> (f32, f32) {
 /// unit direction: e.g. right = (1, 0), up = (0, -1)). Returns the current index
 /// if no cell lies in that direction. Scores by primary-axis distance plus a
 /// cross-axis penalty so navigation favors the same row/column.
-pub fn nearest_in_dir(from: usize, dx: f32, dy: f32) -> usize {
-    let from = clamp_index(from);
-    let (cx, cy) = cell_center(&KBM_LAYOUT[from]);
+pub fn nearest_in_dir(cells: &[KbmCell], from: usize, dx: f32, dy: f32) -> usize {
+    let from = clamp_index(cells, from);
+    let (cx, cy) = cell_center(&cells[from]);
     let mut best = from;
     let mut best_score = f32::INFINITY;
-    for (i, cell) in KBM_LAYOUT.iter().enumerate() {
+    for (i, cell) in cells.iter().enumerate() {
         if i == from { continue; }
         let (ox, oy) = cell_center(cell);
         let vx = ox - cx;

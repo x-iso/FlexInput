@@ -4980,7 +4980,7 @@ impl FlexInputApp {
         nav: &crate::gamepad_nav::NavInput,
     ) {
         use crate::gamepad_nav::NavDir;
-        use crate::kbm_picker::{clamp_index, nearest_in_dir, KBM_LAYOUT};
+        use crate::kbm_picker::{clamp_index, nearest_in_dir, picker_cells};
 
         // East closes the picker.
         if nav.is_rising("btn_east") {
@@ -4988,15 +4988,16 @@ impl FlexInputApp {
             self.gamepad_nav.kbm_picker_viewport = None;
             return;
         }
-        // Spatial navigation: move to the nearest cell in the pressed direction.
-        // The layout has separated clusters (nav cluster + arrows + mouse to the
-        // right), so we navigate by cell geometry rather than row/col stepping.
-        let mut idx = clamp_index(self.gamepad_nav.kbm_picker_idx);
+        // Spatial navigation over the cells actually shown for this mode (the
+        // Touch-Zones variant hides the touchpad cluster and adds analog outputs),
+        // so focus never lands on a hidden cell and the analog cells are reachable.
+        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones);
+        let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         idx = match step_dir {
-            Some(NavDir::Left)  => nearest_in_dir(idx, -1.0, 0.0),
-            Some(NavDir::Right) => nearest_in_dir(idx, 1.0, 0.0),
-            Some(NavDir::Up)    => nearest_in_dir(idx, 0.0, -1.0),
-            Some(NavDir::Down)  => nearest_in_dir(idx, 0.0, 1.0),
+            Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0),
+            Some(NavDir::Right) => nearest_in_dir(&cells, idx, 1.0, 0.0),
+            Some(NavDir::Up)    => nearest_in_dir(&cells, idx, 0.0, -1.0),
+            Some(NavDir::Down)  => nearest_in_dir(&cells, idx, 0.0, 1.0),
             None => idx,
         };
         self.gamepad_nav.kbm_picker_idx = idx;
@@ -5018,7 +5019,7 @@ impl FlexInputApp {
         // capture machine (so the South used to pick isn't swept into the chord).
         // Analog-only cells (swipe) are ignored when the input isn't analog.
         if nav.is_rising("btn_south") {
-            self.picker_append_pin(KBM_LAYOUT[idx].pin);
+            self.picker_append_pin(cells[idx].pin);
         }
     }
 
@@ -5164,6 +5165,9 @@ impl FlexInputApp {
     fn picker_analog_input_ok(&self) -> bool {
         let outer = self.gamepad_nav.kbm_picker_outer;
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return false; };
+        if self.gamepad_nav.kbm_picker_touch_zones {
+            return true; // Touch-zone position is inherently analog.
+        }
         if self.gamepad_nav.kbm_picker_phase_key.is_some() {
             return true; // Lean: the gesture itself is analog.
         }
@@ -5176,7 +5180,8 @@ impl FlexInputApp {
     /// click. Analog-only pins (swipe) are ignored unless the input is analog.
     fn picker_append_pin(&mut self, pin: &str) {
         // Gate analog-only outputs.
-        let analog_only = matches!(pin, "touch_swipe_x" | "touch_swipe_y");
+        let analog_only = matches!(pin,
+            "touch_swipe_x" | "touch_swipe_y" | "scroll_x" | "scroll_y");
         if analog_only && !self.picker_analog_input_ok() { return; }
         let outer = self.gamepad_nav.kbm_picker_outer;
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
@@ -8303,8 +8308,9 @@ impl FlexInputApp {
     /// what the user did: `(clicked pin, Done pressed)`.
     fn kbm_picker_window(&self, ctx: &egui::Context) -> (Option<&'static str>, bool) {
         if !self.gamepad_nav.kbm_picker_open { return (None, false); }
-        use crate::kbm_picker::{clamp_index, layout_extent, KBM_LAYOUT};
-        let sel = clamp_index(self.gamepad_nav.kbm_picker_idx);
+        use crate::kbm_picker::{clamp_index, layout_extent, picker_cells};
+        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones);
+        let sel = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         let accent = ctx.style().visuals.selection.stroke.color;
 
         // Current output chord for the header preview (read from whichever draft
@@ -8320,7 +8326,7 @@ impl FlexInputApp {
 
         const UNIT: f32 = 30.0; // px per grid unit
         const GAP: f32 = 3.0;   // gap between adjacent keys
-        let (ext_x, ext_y) = layout_extent();
+        let (ext_x, ext_y) = layout_extent(&cells);
         let board_w = ext_x * (UNIT + GAP);
         let board_h = ext_y * (UNIT + GAP);
         let skin = crate::canvas::remapper_icons::Skin::Kbm;
@@ -8329,20 +8335,10 @@ impl FlexInputApp {
         let mut clicked_pin: Option<&'static str> = None;
         let mut done = false;
 
-        // Touch Zones variant: a touchpad can't remap to itself, so hide the
-        // touchpad cluster; instead offer mouse-movement delta as an output.
+        // Touch Zones variant: a touchpad can't remap to itself, so the touchpad
+        // cluster is hidden and analog-output cells replace it (both handled by
+        // `picker_cells`, which also keeps them navigable).
         let tz = self.gamepad_nav.kbm_picker_touch_zones;
-        let tz_hidden = |pin: &str| tz && matches!(pin,
-            "touch_left" | "touch_center" | "touch_right"
-            | "btn_touchpad" | "touch_swipe_x" | "touch_swipe_y"
-            | "btn_mute"); // DS-specific mic button goes with the DS touchpad cluster
-        // Extra analog-output cells placed in the vacated touchpad columns:
-        // mouse-delta and the full analog sticks (touch position → deflection).
-        // The KB/M grid has no stick keys, so they live here.
-        let tz_extra: &[(&'static str, f32, f32)] = if tz {
-            &[("mouse_x", 23.5, 1.0), ("mouse_y", 24.5, 1.0), ("mouse", 23.5, 2.0),
-              ("left_stick", 23.5, 3.0), ("right_stick", 24.5, 3.0)]
-        } else { &[] };
 
         egui::Window::new(if tz { "⌨ KB/M + mouse picker" } else { "⌨ KB/M + touchpad picker" })
             .id(egui::Id::new("gp_kbm_picker"))
@@ -8380,8 +8376,7 @@ impl FlexInputApp {
                 // individually clickable (mouse) AND highlight the gamepad focus.
                 let (board, _) = ui.allocate_exact_size(
                     egui::vec2(board_w, board_h), egui::Sense::hover());
-                for (i, cell) in KBM_LAYOUT.iter().enumerate() {
-                    if tz_hidden(cell.pin) { continue; }
+                for (i, cell) in cells.iter().enumerate() {
                     let min = board.min + egui::vec2(
                         cell.x * (UNIT + GAP), cell.y * (UNIT + GAP));
                     let size = egui::vec2(
@@ -8424,37 +8419,16 @@ impl FlexInputApp {
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             tint);
                     } else {
-                        painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                            kbm_pin_label(cell.pin),
-                            egui::FontId::proportional(11.0),
-                            if disabled { egui::Color32::from_gray(110) } else { ui.visuals().text_color() });
-                    }
-                }
-                // Touch Zones extra: mouse-movement delta outputs.
-                for (pin, gx, gy) in tz_extra.iter().copied() {
-                    let rect = egui::Rect::from_min_size(
-                        board.min + egui::vec2(gx * (UNIT + GAP), gy * (UNIT + GAP)),
-                        egui::vec2(UNIT, UNIT));
-                    let r = ui.interact(rect, egui::Id::new(("kbm_extra", pin)), egui::Sense::click());
-                    if r.clicked() { clicked_pin = Some(pin); }
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 4.0,
-                        if r.hovered() { egui::Color32::from_gray(60) } else { egui::Color32::from_gray(40) });
-                    if let Some(tex) = kbm_cell_texture(ctx, skin, pin) {
-                        let s = UNIT - 6.0;
-                        painter.image(tex.id(),
-                            egui::Rect::from_center_size(rect.center(), egui::vec2(s, s)),
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE);
-                    } else {
                         // Compact labels — "L-Stick" won't fit a 30px cell.
-                        let lbl = match pin {
+                        let lbl = match cell.pin {
                             "left_stick" => "LS".to_string(),
                             "right_stick" => "RS".to_string(),
-                            _ => kbm_pin_label(pin),
+                            _ => kbm_pin_label(cell.pin),
                         };
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                            lbl, egui::FontId::proportional(10.0), ui.visuals().text_color());
+                            lbl,
+                            egui::FontId::proportional(11.0),
+                            if disabled { egui::Color32::from_gray(110) } else { ui.visuals().text_color() });
                     }
                 }
             });
@@ -12969,6 +12943,10 @@ fn kbm_pin_label(pin: &str) -> String {
         "mouse_forward" => "MB5".into(),
         "scroll_up" => "Scroll↑".into(),
         "scroll_down" => "Scroll↓".into(),
+        "scroll_left" => "Scroll←".into(),
+        "scroll_right" => "Scroll→".into(),
+        "scroll_y" => "Scroll⇅".into(),
+        "scroll_x" => "Scroll⇄".into(),
         "key_pageup" => "PgUp".into(),
         "key_pagedown" => "PgDn".into(),
         "key_insert" => "Ins".into(),
