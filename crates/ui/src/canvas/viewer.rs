@@ -1726,6 +1726,39 @@ fn tz_live_hits(
                 egui::Id::new(("tz_last_origin", node_id.0)), (pass, f, z)));
         }
     }
+
+    // Per-zone ACTIVE output pins for the on-pad activation glow: a finger is in
+    // the zone (hold-aware, from `m`) AND the card's trigger is satisfied this
+    // frame (touch = finger present; click = pad also pressed). Swipes are
+    // transient and skipped. Stashed in ctx so `tz_paint_zone_mapping` can light
+    // the exact icons that are firing — including a click's button alongside the
+    // analog vectorscope. Keyed by node so both fields/widgets read their own.
+    let cards = node.and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    let mut active_out: std::collections::HashMap<(usize, usize), Vec<String>> = std::collections::HashMap::new();
+    for (&(f, z), &(_, _, act)) in &m {
+        if !act { continue; }
+        let clicked = readb(if f == 0 { "btn_touchpad" } else { "btn_touchpad2" });
+        for c in cards.iter().filter(|c|
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == f as u64 &&
+            c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == z as u64)
+        {
+            let trig = c.get("in").and_then(|v| v.as_array()).and_then(|a| a.first())
+                .and_then(|v| v.as_str()).unwrap_or("tz_touch");
+            let fire = match trig {
+                "tz_click" => clicked,
+                t if t.starts_with("tz_swipe") => false, // transient — not shown
+                _ => true, // tz_touch
+            };
+            if !fire { continue; }
+            let e = active_out.entry((f, z)).or_default();
+            for p in c.get("out").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()) {
+                if !e.iter().any(|x| x == p) { e.push(p.to_string()); }
+            }
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("tz_active_out", node_id.0)), active_out));
+
     m
 }
 
@@ -2058,7 +2091,7 @@ pub(crate) fn tz_zone_curve(zone_maps: &[Value], field: usize, idx: usize) -> Ve
 /// True when a zone has at least one analog (mouse / stick) output card.
 pub(crate) fn tz_zone_is_analog(zone_maps: &[Value], field: usize, idx: usize) -> bool {
     let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
     zone_maps.iter().any(|c|
         c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64
             && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == idx as u64
@@ -2072,7 +2105,7 @@ pub(crate) fn tz_set_zone_curve(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     field: usize, idx: usize, pts: &[[f32; 2]])
 {
     let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
     let Some(node) = snarl.get_node_mut(node_id) else { return };
     let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) else { return };
     for c in cards.iter_mut() {
@@ -2108,7 +2141,7 @@ fn tz_set_zone_adaptive(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     field: usize, idx: usize, val: f32)
 {
     let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
     let Some(node) = snarl.get_node_mut(node_id) else { return };
     let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) else { return };
     for c in cards.iter_mut() {
@@ -2314,6 +2347,7 @@ fn tz_curve_editor(node_id: NodeId, field: usize, idx: usize,
 fn tz_paint_zone_mapping(
     painter: &egui::Painter,
     ctx: &egui::Context,
+    node_id: NodeId,
     zr: egui::Rect,
     field: usize,
     idx: usize,
@@ -2324,28 +2358,48 @@ fn tz_paint_zone_mapping(
     visuals: &egui::Visuals,
 ) {
     let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
-    // Output pins across every card bound to this (field, zone).
-    let mut out_pins: Vec<String> = Vec::new();
-    let mut analog = false;
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
+    // Output pins across every card bound to this (field, zone), split by kind so
+    // a click's button icon shows ALONGSIDE the analog vectorscope (not hidden by
+    // it). Order preserved (first-seen) so it matches the card list.
+    let mut analog_pins: Vec<String> = Vec::new();
+    let mut digital_pins: Vec<String> = Vec::new();
     for c in zone_maps.iter().filter(|c|
         c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64
             && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == idx as u64)
     {
         for p in c.get("out").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()) {
-            if is_analog(p) { analog = true; }
-            if !out_pins.iter().any(|x| x == p) { out_pins.push(p.to_string()); }
+            let bucket = if is_analog(p) { &mut analog_pins } else { &mut digital_pins };
+            if !bucket.iter().any(|x| x == p) { bucket.push(p.to_string()); }
         }
     }
 
-    if out_pins.is_empty() {
+    if analog_pins.is_empty() && digital_pins.is_empty() {
         // Unmapped zone: faint index so it's still identifiable as a target.
         painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
             egui::FontId::proportional(11.0), visuals.weak_text_color().gamma_multiply(0.5));
         return;
     }
 
-    if analog {
+    // Which output pins are actually FIRING this frame (per-trigger; computed in
+    // tz_live_hits). Drives the per-icon activation glow — a click lights its
+    // button independently of the analog deflection.
+    let active_set: Vec<String> = ctx.data(|d| d
+        .get_temp::<std::collections::HashMap<(usize, usize), Vec<String>>>(
+            egui::Id::new(("tz_active_out", node_id.0))))
+        .and_then(|mm| mm.get(&(field, idx)).cloned())
+        .unwrap_or_default();
+    let is_on = |p: &str| active_set.iter().any(|x| x == p);
+    // Small icon in a rect with an optional activation glow behind it.
+    let icon = |pos: egui::Pos2, ic: f32, pin: &str, on: bool| {
+        if on {
+            painter.rect_filled(egui::Rect::from_min_size(pos, egui::vec2(ic, ic)).expand(2.5),
+                3.0, accent.gamma_multiply(0.55));
+        }
+        paint_chord_chip_to_rect(painter, ctx, pos, ic, pin, skin);
+    };
+
+    if !analog_pins.is_empty() {
         let bx = tz_zone_scope_rect(zr);
         painter.rect_filled(bx, 2.0, visuals.extreme_bg_color.gamma_multiply(0.7));
         let grid = visuals.weak_text_color().gamma_multiply(0.5);
@@ -2377,32 +2431,36 @@ fn tz_paint_zone_mapping(
                 painter.circle_filled(to(p[0], p[1]), 2.0, accent);
             }
         }
-        if let Some(ap) = out_pins.iter().find(|p| is_analog(p)) {
+        // Analog output icon in the scope's bottom-right corner (glows while it
+        // drives — deflect present ⇒ a live hold-aware hit).
+        if let Some(ap) = analog_pins.first() {
             let ic = (bx.width() * 0.42).clamp(12.0, 22.0);
             let pos = egui::pos2(bx.right() - ic - 1.0, bx.bottom() - ic - 1.0);
-            // Activation glow: light the output icon when the zone is ACTUALLY
-            // driving output (deflect present ⇒ a live, hold-aware hit).
-            if deflect.is_some() {
-                painter.rect_filled(egui::Rect::from_min_size(pos, egui::vec2(ic, ic)).expand(2.5),
-                    3.0, accent.gamma_multiply(0.55));
+            icon(pos, ic, ap, deflect.is_some() || is_on(ap));
+        }
+        // Digital outputs (e.g. a touchpad-click button) share the zone: a small
+        // row across the TOP, each lighting when its own trigger fires.
+        if !digital_pins.is_empty() {
+            let n = digital_pins.len();
+            let ic = (zr.width() / (n as f32 + 0.5)).clamp(10.0, 18.0);
+            let total_w = n as f32 * ic + (n as f32 - 1.0) * 2.0;
+            let mut x = zr.center().x - total_w * 0.5;
+            let y = zr.top() + 2.0;
+            for p in &digital_pins {
+                icon(egui::pos2(x, y), ic, p, is_on(p));
+                x += ic + 2.0;
             }
-            paint_chord_chip_to_rect(painter, ctx, pos, ic, ap, skin);
         }
     } else {
-        // Digital outputs: icon(s) centred in a row. Each icon lights when the
-        // zone is actually activating (hold-aware live hit).
-        let active = deflect.is_some();
-        let n = out_pins.len();
+        // Digital-only zone: icon(s) centred in a row, each lit by its own trigger.
+        let n = digital_pins.len();
         let ic = (zr.height() * 0.46).clamp(14.0, 30.0).min(zr.width() / n.max(1) as f32 - 2.0).max(10.0);
         let total_w = n as f32 * ic + (n as f32 - 1.0) * 3.0;
         let mut x = zr.center().x - total_w * 0.5;
-        for p in &out_pins {
+        for p in &digital_pins {
             let pos = egui::pos2(x, zr.center().y - ic * 0.5);
-            if active {
-                painter.rect_filled(egui::Rect::from_min_size(pos, egui::vec2(ic, ic)).expand(3.0),
-                    4.0, accent.gamma_multiply(0.55));
-            }
-            paint_chord_chip_to_rect(painter, ctx, pos, ic, p, skin);
+            // Fall back to the finger-active cue if the fine-grained set is absent.
+            icon(pos, ic, p, is_on(p) || (active_set.is_empty() && deflect.is_some()));
             x += ic + 3.0;
         }
     }
@@ -2473,7 +2531,7 @@ fn tz_draw_field(
             // (+Y up; the eval's adaptive centre isn't reproduced here — this is
             // a live direction indicator, not the exact stick value).
             let deflect = live.filter(|z| z.2).map(|(lx, ly, _)| (2.0 * lx - 1.0, 1.0 - 2.0 * ly));
-            tz_paint_zone_mapping(&painter, &ctx, zr, field, idx, &zone_maps, skin, deflect, accent, visuals);
+            tz_paint_zone_mapping(&painter, &ctx, node_id, zr, field, idx, &zone_maps, skin, deflect, accent, visuals);
         } else {
             painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
                 egui::FontId::proportional(12.0), visuals.weak_text_color());
@@ -3131,7 +3189,7 @@ fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     f: usize, z: usize, trigger: &str, draft_out: &[String])
 {
     let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick");
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
     let mode = if draft_out.iter().any(|p| is_analog(p)) { "analog" } else { "down" };
     if let Some(node) = snarl.get_node_mut(node_id) {
         let mut m = serde_json::Map::new();
@@ -3144,7 +3202,7 @@ fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
         cards.push(Value::Object(m));
         node.params.insert("zone_maps".into(), Value::Array(cards));
         node.params.insert("_tz_phase".into(), Value::from("idle"));
-        for k in ["_tz_trig", "_tz_draft_out", "_tz_gp_arm"] { node.params.remove(k); }
+        for k in ["_tz_trig", "_tz_draft_out", "_tz_gp_arm", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
     }
 }
 
@@ -3183,8 +3241,9 @@ fn render_touch_zone_cards(
             }
         }
     }
-    // Gamepad-learn output: while armed, the first pressed gamepad pin becomes the
-    // draft output.
+    // Gamepad-learn output: while armed, the pressed gamepad CHORD becomes the
+    // draft output — accumulated while held and finalised on release, reusing the
+    // Remapper's combo-capture shape so multi-button outputs work here too.
     if phase == "captured"
         && getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false)
     {
@@ -3213,11 +3272,33 @@ fn render_touch_zone_cards(
                 pressed_now.clone()
             }
         };
-        if let Some(pin) = pressed_now.into_iter().find(|p| !base.contains(p)) {
+        // Fresh presses = held now but not part of the arming baseline. Accumulate
+        // the peak chord (sticky) into the draft, then finalise when the whole
+        // combo releases. `_tz_gp_seen` records that at least one fresh press has
+        // landed this session, so a draft lingering from a prior pick can't latch
+        // on the very first frame.
+        let seen = getp(snarl, "_tz_gp_seen").and_then(|v| v.as_bool()).unwrap_or(false);
+        let fresh: Vec<String> = pressed_now.iter().filter(|p| !base.contains(*p)).cloned().collect();
+        if !fresh.is_empty() {
+            // The first fresh press of the session replaces any prior draft;
+            // further simultaneous presses extend the chord.
+            let mut draft: Vec<String> = if seen {
+                getp(snarl, "_tz_draft_out").and_then(|v| v.as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
+                    .unwrap_or_default()
+            } else { Vec::new() };
+            for p in &fresh { if !draft.contains(p) { draft.push(p.clone()); } }
             if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("_tz_draft_out".into(), Value::Array(vec![Value::from(pin.as_str())]));
+                node.params.insert("_tz_draft_out".into(),
+                    Value::Array(draft.iter().map(|p| Value::from(p.as_str())).collect()));
+                node.params.insert("_tz_gp_seen".into(), Value::from(true));
+            }
+        } else if seen {
+            // Whole combo released → finalise the chord and disarm.
+            if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("_tz_gp_arm".into(), Value::from(false));
                 node.params.remove("_tz_gp_base");
+                node.params.remove("_tz_gp_seen");
             }
         }
     }
@@ -3354,6 +3435,7 @@ fn render_touch_zone_cards(
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_gp_arm".into(), Value::from(!armed));
                         node.params.remove("_tz_gp_base");
+                        node.params.remove("_tz_gp_seen");
                     }
                 }
                 let add = ui.add_enabled(!draft_out.is_empty(),
@@ -3367,7 +3449,7 @@ fn render_touch_zone_cards(
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("_tz_phase".into(), Value::from("idle"));
-                        for k in ["_tz_draft_out", "_tz_gp_arm", "_tz_gp_base"] { node.params.remove(k); }
+                        for k in ["_tz_draft_out", "_tz_gp_arm", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
                     }
                 }
             }
@@ -3399,26 +3481,34 @@ fn render_touch_zone_cards(
     // Keep polling live input while a capture is in flight.
     if phase != "idle" { ui.ctx().request_repaint(); }
 
-    // ── Existing cards for the selected zone (display + press-mode + delete) ──
+    // ── Existing cards for the selected zone (display + press-mode + delete +
+    // drag-to-reorder). The list is a FILTERED subset of `zone_maps` (this zone
+    // only), so reorder runs in DISPLAY-index space and the reordered subset is
+    // written back into the same array slots — other zones' cards stay put. ──
     let mut cards: Vec<Value> = snarl.get_node(node_id)
         .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
         .unwrap_or_default();
+    let display: Vec<usize> = cards.iter().enumerate().filter(|(_, c)|
+        c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == sel_f as u64 &&
+        c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == sel_z as u64)
+        .map(|(i, _)| i).collect();
     let mut dirty = false;
-    let mut remove: Option<usize> = None;
-    let mut any = false;
-    for (i, card) in cards.iter_mut().enumerate() {
-        let cf = card.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let cz = card.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        if cf != sel_f || cz != sel_z { continue; }
-        any = true;
-
-        let mut working = card.as_object().cloned().unwrap_or_default();
+    let mut remove: Option<usize> = None; // full-array index
+    if display.is_empty() && phase == "idle" {
+        ui.label(egui::RichText::new("No mappings — press Learn, then demonstrate on a zone.").weak());
+    }
+    let reorder_enabled = display.len() > 1;
+    let mut rv = ReorderView::begin(
+        ui, egui::Id::new(("fxi_tz_reorder", node_id.0, sel_f, sel_z)), reorder_enabled);
+    for (slot, &i) in display.iter().enumerate() {
+        if let Some(h) = rv.gap_before(slot) { draw_insertion_gap(ui, h); }
+        let mut working = cards[i].as_object().cloned().unwrap_or_default();
         let before = working.clone();
         let in_pins: Vec<String> = working.get("in").and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
         let out_pins: Vec<String> = working.get("out").and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
-
+        let drag_off = rv.offset_for(slot);
         ui.allocate_ui_with_layout(
             egui::vec2(TZ_CARD_W, 1.0),
             egui::Layout::top_down(egui::Align::Min),
@@ -3426,19 +3516,24 @@ fn render_touch_zone_cards(
                 let result = remapper_mapping_card_pixel(
                     ui, node_id, i, &mut working,
                     &in_pins, Some(&out_pins), skin,
-                    true, false, 0.0, "zone_maps",
+                    true, reorder_enabled, drag_off, "zone_maps",
                 );
                 if result.delete_clicked { remove = Some(i); }
+                rv.observe(slot, &result);
             },
         );
-
         if working != before {
-            *card = Value::Object(working);
+            cards[i] = Value::Object(working);
             dirty = true;
         }
     }
-    if !any && phase == "idle" {
-        ui.label(egui::RichText::new("No mappings — press Learn, then demonstrate on a zone.").weak());
+    if let Some(h) = rv.gap_after_last(display.len()) { draw_insertion_gap(ui, h); }
+    if let Some((from, to)) = rv.finish(ui) {
+        // from/to are DISPLAY slots — reorder the subset, write back into slots.
+        let mut sub: Vec<Value> = display.iter().map(|&fi| cards[fi].clone()).collect();
+        reorder_array(&mut sub, from, to);
+        for (k, &fi) in display.iter().enumerate() { cards[fi] = sub[k].clone(); }
+        dirty = true;
     }
     if let Some(i) = remove { cards.remove(i); dirty = true; }
     if dirty {
