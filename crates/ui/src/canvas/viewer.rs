@@ -2716,14 +2716,20 @@ fn render_touch_zones_pinned(
                 }
             } else {
                 // Follow the LAST touched-down origin so two touches don't flicker
-                // the cards. Fall back to any active zone.
+                // the cards. If it slid away, keep the current selection while still
+                // active, else pick the LOWEST active zone — never `HashMap::iter`,
+                // whose nondeterministic order flickers between the fingers' zones.
+                let sel = tz_read_selection(inner_snarl, inner_id);
                 let follow = last.map(|(_, f, z)| (f, z))
                     .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
-                    .or_else(|| zone_live.iter().find(|(_, v)| v.2).map(|(k, _)| *k));
+                    .or_else(|| zone_live.get(&sel).filter(|v| v.2).map(|_| sel))
+                    .or_else(|| zone_live.iter().filter(|(_, v)| v.2).map(|(k, _)| *k).min());
                 if let Some((f, z)) = follow {
-                    if let Some(node) = inner_snarl.get_node_mut(inner_id) {
-                        node.params.insert("sel_field".to_string(), Value::from(f as u64));
-                        node.params.insert("sel_zone".to_string(), Value::from(z as u64));
+                    if sel != (f, z) {
+                        if let Some(node) = inner_snarl.get_node_mut(inner_id) {
+                            node.params.insert("sel_field".to_string(), Value::from(f as u64));
+                            node.params.insert("sel_zone".to_string(), Value::from(z as u64));
+                        }
                     }
                 }
             }
@@ -2987,12 +2993,18 @@ fn show_touch_zones_body(
                 if cur_pass.saturating_sub(p) <= 1 { tz_apply_pick(snarl, node_id, z); }
             }
         } else {
-            // Follow the LAST touched-down origin so two touches don't flicker the tab.
+            // Follow the LAST touched-down origin so two touches don't flicker the
+            // tab. If that origin is no longer active (its finger slid into another
+            // zone), keep the current selection while it's still active, and only as
+            // a last resort pick the LOWEST active zone — never `HashMap::iter`,
+            // whose order is nondeterministic and flickers between fingers' zones.
+            let sel = tz_read_selection(snarl, node_id);
             let follow = last.map(|(_, f, z)| (f, z))
                 .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
-                .or_else(|| zone_live.iter().find(|(_, v)| v.2).map(|(k, _)| *k));
+                .or_else(|| zone_live.get(&sel).filter(|v| v.2).map(|_| sel))
+                .or_else(|| zone_live.iter().filter(|(_, v)| v.2).map(|(k, _)| *k).min());
             if let Some((f, z)) = follow {
-                if tz_read_selection(snarl, node_id) != (f, z) {
+                if sel != (f, z) {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert("sel_field".to_string(), Value::from(f as u64));
                         node.params.insert("sel_zone".to_string(), Value::from(z as u64));
