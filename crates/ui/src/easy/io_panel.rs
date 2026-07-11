@@ -792,9 +792,10 @@ fn digital_trigger_toggle(
             params.insert("digital_triggers".into(), Value::Bool(checked));
         }
         resp.on_hover_text(
-            "Drive the virtual pad's analog triggers from this controller's digital \
-             ZL/ZR buttons. A press maps to a full pull; otherwise the real analog \
-             value is used.",
+            "Make the analog triggers act digital: each snaps to a full pull once it \
+             crosses the digital threshold set in Calibration (default: half pull), \
+             and 0 below it. The LT/RT digital buttons follow the same threshold. \
+             Output stays analog-typed, so it still drives analog wires at full/zero.",
         );
     });
 }

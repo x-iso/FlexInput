@@ -219,7 +219,22 @@ struct DeviceCal {
     // is renormalised to 0..1 across it. Defaults (0.0, 1.0) = no-op.
     ltrig_range:   (f32, f32),
     rtrig_range:   (f32, f32),
+    /// "Digital triggers" opt-in (device.source `digital_triggers` param).
+    /// When set, each analog trigger becomes a thresholded snap: it outputs
+    /// full deflection once the calibrated value crosses the per-side
+    /// digital threshold, else 0.0 (staying Float). The `btn_lt_dig` /
+    /// `btn_rt_dig` buttons are re-derived from the same threshold so the
+    /// pad's own early-firing L2/R2 flag no longer leaks through.
+    digital_triggers: bool,
+    /// Per-side digital threshold on the calibrated (0..1) trigger value.
+    /// Written by the Calibration window's yellow pin. Defaults to 0.5.
+    ltrig_threshold: f32,
+    rtrig_threshold: f32,
 }
+
+/// Default digital-trigger threshold. Mirrors the Calibration UI's
+/// `TRIG_THRESHOLD_DEFAULT` so an uncalibrated pad snaps at the half pull.
+const TRIG_DIGITAL_THRESHOLD_DEFAULT: f32 = 0.5;
 
 const IDENTITY_M3: [f32; 9] = [
     1.0, 0.0, 0.0,
@@ -242,6 +257,9 @@ impl Default for DeviceCal {
             rstick_radial: [1.0; STICK_RADIAL_BUCKETS],
             ltrig_range:   (0.0, 1.0),
             rtrig_range:   (0.0, 1.0),
+            digital_triggers: false,
+            ltrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
+            rtrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
         }
     }
 }
@@ -333,6 +351,11 @@ fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
         rstick_radial: read_radial(params, "rstick_radial"),
         ltrig_range:   read_range(params, "ltrig_min", "ltrig_max"),
         rtrig_range:   read_range(params, "rtrig_min", "rtrig_max"),
+        digital_triggers: params.get("digital_triggers").and_then(|v| v.as_bool()).unwrap_or(false),
+        ltrig_threshold: params.get("ltrig_digital_threshold").and_then(|v| v.as_f64())
+            .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
+        rtrig_threshold: params.get("rtrig_digital_threshold").and_then(|v| v.as_f64())
+            .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
     }
 }
 
@@ -506,12 +529,36 @@ fn preprocess_dev_sigs(
         );
     }
 
-    // NOTE: the digital-trigger override (driving the virtual analog trigger from
-    // a digital ZL/ZR) is intentionally NOT applied here at the source level — it
-    // would clobber the `left_trigger` signal for everyone downstream, breaking
-    // manual AutoMap injection and Remapper analog output. Instead it's applied as
-    // a lowest-priority fallback at the AutoMap sink write (see the trigger handling
-    // around the `resolve_mapping` consumer in `eval_graph_tick`).
+    // ── Pass 3: digital-trigger snap ────────────────────────────────────────
+    //
+    // When a device.source opted into "Digital triggers", its analog triggers
+    // become a thresholded snap: the calibrated (0..1) value outputs full
+    // deflection once it crosses the per-side digital threshold, else 0.0 —
+    // staying Float so Float-consuming wires (direct or AutoMap) still work.
+    // The matching digital buttons (`btn_lt_dig` / `btn_rt_dig`) are re-derived
+    // from the SAME threshold, so the pad's own early-firing L2/R2 flag no
+    // longer leaks through and the Calibration threshold actually takes effect.
+    //
+    // Applied at the source (not as the lowest-priority AutoMap-sink fallback
+    // used for digital-ONLY pads) because the user explicitly asked for this
+    // pad's real analog travel to read as digital everywhere downstream. Pads
+    // without an analog `left_trigger`/`right_trigger` (e.g. Switch Pro) have
+    // nothing to snap here and fall through to that sink-side bridge unchanged.
+    for (dev_id, (_, _, cal)) in &params {
+        if !cal.digital_triggers { continue; }
+        for (analog_pin, dig_pin, thr) in [
+            ("left_trigger",  "btn_lt_dig", cal.ltrig_threshold),
+            ("right_trigger", "btn_rt_dig", cal.rtrig_threshold),
+        ] {
+            let key = (dev_id.clone(), analog_pin.to_string());
+            let Some(Signal::Float(v)) = out.get(&key).copied() else { continue };
+            // Guard against a threshold pinned at 0.0 firing on rest jitter.
+            let over = v >= thr.max(f32::EPSILON);
+            out.insert(key, Signal::Float(if over { 1.0 } else { 0.0 }));
+            out.insert((dev_id.clone(), dig_pin.to_string()), Signal::Bool(over));
+        }
+    }
+
     out
 }
 
@@ -7552,6 +7599,57 @@ mod trigger_tests {
         eval_graph_tick(&graph, &mut state, &dev, 0.016, &mut out);
         let leaked = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "right_trigger".to_string()));
         assert!(leaked.is_none(), "bridge off: digital button must not drive analog trigger, got {leaked:?}");
+    }
+
+    // "Digital triggers" opt-in on an analog-capable pad: the calibrated analog
+    // trigger must SNAP to full/zero at the Calibration threshold (not pass
+    // through continuously), and the digital LT/RT buttons must be re-derived
+    // from that SAME threshold rather than the pad's early-firing L2/R2 flag.
+    #[test]
+    fn digital_triggers_snap_analog_and_rederive_button() {
+        let dev_id = "gilrs:dualsense:0";
+        let mut src = empty_node(1, "device.source");
+        src.device_id = Some(dev_id.to_string());
+        src.params.insert("digital_triggers".into(), Value::Bool(true));
+        src.params.insert("ltrig_digital_threshold".into(), Value::from(0.5));
+        let graph = ProcessingGraph { nodes: vec![src] };
+
+        // Below threshold: analog snaps to 0, digital button ignores the pad's
+        // early-fired flag and stays off.
+        let mut dev = HashMap::new();
+        dev.insert((dev_id.to_string(), "left_trigger".to_string()), Signal::Float(0.3));
+        dev.insert((dev_id.to_string(), "btn_lt_dig".to_string()),  Signal::Bool(true));
+        let out = preprocess_dev_sigs(&graph, &dev);
+        assert_eq!(out.get(&(dev_id.to_string(), "left_trigger".to_string())).map(|s| s.as_float()),
+            Some(0.0), "below threshold must snap analog trigger to 0");
+        assert_eq!(out.get(&(dev_id.to_string(), "btn_lt_dig".to_string())).map(|s| s.as_bool()),
+            Some(false), "digital button must follow the calibration threshold, not the pad flag");
+
+        // Above threshold: analog snaps to full (staying Float), button on.
+        dev.insert((dev_id.to_string(), "left_trigger".to_string()), Signal::Float(0.7));
+        dev.insert((dev_id.to_string(), "btn_lt_dig".to_string()),  Signal::Bool(false));
+        let out = preprocess_dev_sigs(&graph, &dev);
+        assert_eq!(out.get(&(dev_id.to_string(), "left_trigger".to_string())).copied(),
+            Some(Signal::Float(1.0)), "above threshold must snap analog trigger to full Float(1.0)");
+        assert_eq!(out.get(&(dev_id.to_string(), "btn_lt_dig".to_string())).map(|s| s.as_bool()),
+            Some(true), "above threshold must fire the digital button");
+    }
+
+    // With "Digital triggers" OFF the analog trigger passes through unchanged —
+    // no thresholding, full continuous travel.
+    #[test]
+    fn digital_triggers_off_passes_analog_through() {
+        let dev_id = "gilrs:dualsense:0";
+        let mut src = empty_node(1, "device.source");
+        src.device_id = Some(dev_id.to_string());
+        // digital_triggers absent → defaults to off.
+        let graph = ProcessingGraph { nodes: vec![src] };
+
+        let mut dev = HashMap::new();
+        dev.insert((dev_id.to_string(), "left_trigger".to_string()), Signal::Float(0.3));
+        let out = preprocess_dev_sigs(&graph, &dev);
+        let v = out.get(&(dev_id.to_string(), "left_trigger".to_string())).map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 0.3).abs() < 1e-4, "digital triggers off must pass analog through, got {v}");
     }
 
     /// Build a `device.source` node carrying a `deadzone` param so
