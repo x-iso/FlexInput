@@ -2,6 +2,10 @@
 /out/
 *.fxp
 *.fxm
+.lla-embeddings.json
+.lla-index.json
+.lla-profile.json
+.vscode/
 .vs/
 .claude/
 .qwen/
