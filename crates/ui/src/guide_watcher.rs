@@ -10,7 +10,11 @@
 //! other controller surfaced in the canvas.
 //!
 //! Detection:
-//!  * Watches the `btn_guide` signal across every device.
+//!  * Watches the `btn_guide` signal across every device — EXCEPT
+//!    FlexInput's own virtual pads (`gilrs:<kind>:v<N>`): a mapped Guide
+//!    press loops back through those as a second edge and would re-toggle
+//!    the pin (the unpin→repin flicker). A short refractory window after
+//!    each fired toggle additionally absorbs duplicate-device echoes.
 //!  * Rising-edge taps trigger `toggle_requested` (single OR double-tap
 //!    per `require_double_tap`).
 //!  * If `chord_signal` is `Some`, BOTH the guide AND that signal
@@ -43,6 +47,13 @@ pub struct GuideWatchConfig {
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33); // ~30 Hz
 const DOUBLE_TAP_MS: u64 = 300;
+/// Refractory window after a fired toggle. A physical Guide press mapped
+/// through to a virtual pad comes back as a second `btn_guide` edge on
+/// another device a poll or two later (and this machine has been seen
+/// surfacing outright duplicate pads); without the window that echo
+/// immediately un-does the toggle — the pin "flickers". Longer than any
+/// loopback latency, shorter than a human re-toggle.
+const TOGGLE_REFRACTORY_MS: u64 = 400;
 /// Per-device settle window after first sight of its guide signal.
 /// Edges before this elapses are tracked but not honored — long enough
 /// to cover a controller's BT handshake / initial raw-HID garbage,
@@ -79,6 +90,7 @@ pub fn spawn_guide_watcher(
             // so we can spot a fresh rising edge of a non-guide button.
             let mut learn_prev: HashMap<(String, String), bool> = HashMap::new();
             let mut last_tap_at: Option<Instant> = None;
+            let mut last_toggle_at: Option<Instant> = None;
 
             loop {
                 let cfg = config.read().map(|c| c.clone()).unwrap_or_default();
@@ -98,7 +110,9 @@ pub fn spawn_guide_watcher(
                     let mut found: Option<String> = None;
                     for ((dev, sig), val) in &snapshot {
                         if let Signal::Bool(now) = val {
-                            if is_chord_candidate(sig) {
+                            if is_chord_candidate(sig)
+                                && !crate::app::is_own_virtual_gilrs_id(dev)
+                            {
                                 let key = (dev.clone(), sig.clone());
                                 let was = *learn_prev.get(&key).unwrap_or(&false);
                                 if *now && !was && found.is_none() {
@@ -121,6 +135,14 @@ pub fn spawn_guide_watcher(
                 if cfg.enabled {
                     for ((dev, sig), val) in &snapshot {
                         if sig != "btn_guide" { continue; }
+                        // Never watch FlexInput's own virtual pads: a mapped
+                        // Guide press loops back through the virtual device
+                        // (`gilrs:<kind>:v<N>`) as a second rising edge a poll
+                        // or two later and re-toggles the pin right back
+                        // (visible while FlexInput has focus, i.e. exactly
+                        // when un-pinning — WGI feeds the virtual pad's state
+                        // only to the focused app).
+                        if crate::app::is_own_virtual_gilrs_id(dev) { continue; }
                         let Signal::Bool(now_pressed) = val else { continue; };
                         // First time we see this device's guide signal,
                         // record when and seed its prev state with the
@@ -156,6 +178,18 @@ pub fn spawn_guide_watcher(
                                 }
                             }
                             let now = Instant::now();
+                            // Post-toggle refractory: any further guide edge —
+                            // even from another device — inside the window is
+                            // an echo of the press that just fired, not a new
+                            // intent. Track state (below), honor nothing.
+                            let in_refractory = last_toggle_at
+                                .map(|t| now.duration_since(t)
+                                    < Duration::from_millis(TOGGLE_REFRACTORY_MS))
+                                .unwrap_or(false);
+                            if in_refractory {
+                                guide_prev.insert(dev.clone(), *now_pressed);
+                                continue;
+                            }
                             if cfg.require_double_tap {
                                 let is_double = last_tap_at
                                     .map(|t| now.duration_since(t)
@@ -164,11 +198,13 @@ pub fn spawn_guide_watcher(
                                 if is_double {
                                     toggle_requested.store(true, Ordering::Relaxed);
                                     last_tap_at = None;
+                                    last_toggle_at = Some(now);
                                 } else {
                                     last_tap_at = Some(now);
                                 }
                             } else {
                                 toggle_requested.store(true, Ordering::Relaxed);
+                                last_toggle_at = Some(now);
                             }
                         }
                         guide_prev.insert(dev.clone(), *now_pressed);
@@ -177,6 +213,7 @@ pub fn spawn_guide_watcher(
                     guide_prev.clear();
                     guide_seen_at.clear();
                     last_tap_at = None;
+                    last_toggle_at = None;
                 }
 
                 std::thread::sleep(POLL_INTERVAL);

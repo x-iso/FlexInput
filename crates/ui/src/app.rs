@@ -295,7 +295,7 @@ fn snarl_virtual_device_ids(snarl: &Snarl<NodeData>) -> Vec<String> {
 /// emulated HIDMaestro pads — the input enumerator tags those with a `v`-prefixed
 /// instance (`gilrs:dualsense:v0`). Used to filter the loopback devices out of
 /// the physical list deterministically (vs the old plug-order heuristic).
-fn is_own_virtual_gilrs_id(gilrs_id: &str) -> bool {
+pub(crate) fn is_own_virtual_gilrs_id(gilrs_id: &str) -> bool {
     gilrs_id
         .rsplit(':')
         .next()
