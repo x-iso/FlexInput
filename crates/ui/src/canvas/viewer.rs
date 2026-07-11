@@ -602,7 +602,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // Auto-Map; the user's own direct rumble wiring is sent full-scale.
             if is_device_sink && !is_keymouse_sink && dev_id_str.starts_with("virtual.") {
                 if let Some(n) = snarl.get_node_mut(node) {
-                    crate::canvas::header_controls::render_rumble_feedback_controls(ui, &mut n.params);
+                    crate::canvas::header_controls::render_rumble_feedback_controls(ui, &mut n.params, self.param_defaults);
                 }
             }
 

@@ -228,11 +228,24 @@ fn main() -> eframe::Result<()> {
         match flexinput_ui::startup_renderer_choice() {
             flexinput_ui::RendererChoice::Vulkan => wgpu::Backends::VULKAN,
             flexinput_ui::RendererChoice::OpenGl => wgpu::Backends::GL,
+            flexinput_ui::RendererChoice::Dx12 => wgpu::Backends::DX12,
             flexinput_ui::RendererChoice::Auto => auto_backends(),
         }
     });
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
         setup.instance_descriptor.backends = backends;
+        // DX12 must present through a DirectComposition visual, not a plain
+        // HWND swapchain: the HWND path is opaque-only, while the DComp path
+        // supports pre-multiplied per-pixel alpha — the only Windows backend
+        // where see-through works on AMD (their Vulkan surface is
+        // COMPOSITE_ALPHA_OPAQUE-only). No-op for Vulkan/GL surfaces. Costs
+        // RenderDoc capture support on DX12; set
+        // WGPU_DX12_PRESENTATION_SYSTEM=Hwnd if a capture is ever needed.
+        // (`Dx12SwapchainKind` is missing from wgpu 27's root re-exports;
+        // reach through the public `wgt` alias.)
+        setup.instance_descriptor.backend_options.dx12.presentation_system =
+            wgpu::wgt::Dx12SwapchainKind::from_env()
+                .unwrap_or(wgpu::wgt::Dx12SwapchainKind::DxgiFromVisual);
     }
     // Defense-in-depth for device loss. The default handler treats every
     // SurfaceError except `Outdated` as a skipped frame and logs a warning —

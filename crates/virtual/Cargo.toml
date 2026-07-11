@@ -8,7 +8,11 @@ flexinput-core = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 vigem-client = { version = "0.1", features = ["unstable_ds4", "unstable_xtarget_notification"] }
-enigo = "0.2"
+# 0.6 targets `windows` 0.61 — the same major accesskit/wasapi use. Keeping
+# enigo (and midir) off `windows` 0.56 also lets gpu-allocator's range
+# requirement resolve to 0.58, which the wgpu dx12 backend needs (see the
+# wgpu comment in the workspace Cargo.toml).
+enigo = "0.6"
 flexinput-hidmaestro = { workspace = true }
 
 [dev-dependencies]

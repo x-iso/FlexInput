@@ -54,7 +54,14 @@ fn default_sample_rate_hz() -> u32 { SAMPLE_RATE_HZ_DEFAULT }
 fn default_true() -> bool { true }
 fn default_deadzone() -> f32 { 0.1 }
 fn default_gyro_mult() -> f32 { 1.0 }
-fn default_mouse_sens() -> f32 { 1.0 }
+// 100, not 1: the sink multiplies raw per-tick deltas, and at ×1 the cursor
+// barely moves — first-run users read that as "mouse output doesn't work".
+fn default_mouse_sens() -> f32 { 100.0 }
+// Neutral rumble forwarding: full 0..1 band, linear curve — game rumble
+// passes through unshaped until the user dials in a preference.
+fn default_rumble_floor() -> f32 { crate::canvas::header_controls::RUMBLE_DEF_FLOOR }
+fn default_rumble_max() -> f32 { crate::canvas::header_controls::RUMBLE_DEF_MAX }
+fn default_rumble_exp() -> f32 { crate::canvas::header_controls::RUMBLE_DEF_EXP }
 fn default_theme() -> Theme { Theme::Dark }
 fn default_contrast() -> f32 { 0.0 }
 fn default_see_through_alpha() -> f32 { 0.55 }
@@ -123,7 +130,7 @@ pub struct AppSettings {
     pub polling_hz: u32,
     #[serde(default = "default_sample_rate_hz")]
     pub sample_rate_hz: u32,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub keep_workspace: bool,
     #[serde(default = "default_true")]
     pub device_nodes_default_collapsed: bool,
@@ -136,6 +143,16 @@ pub struct AppSettings {
     /// Default `mouse_sensitivity` param applied to newly-added keymouse sinks.
     #[serde(default = "default_mouse_sens")]
     pub default_mouse_sensitivity: f32,
+    /// Default rumble-forwarding shape for virtual pad sinks whose node params
+    /// don't override it: output band `floor..max` plus response exponent.
+    /// Neutral out of the box (full band, linear curve); the node widget's
+    /// double-click reset also returns to these values.
+    #[serde(default = "default_rumble_floor")]
+    pub default_rumble_floor: f32,
+    #[serde(default = "default_rumble_max")]
+    pub default_rumble_max: f32,
+    #[serde(default = "default_rumble_exp")]
+    pub default_rumble_exp: f32,
     /// Selected app theme. Defaults to Dark to match existing visuals.
     #[serde(default = "default_theme")]
     pub theme: Theme,
@@ -339,6 +356,12 @@ pub enum RendererChoice {
     Vulkan,
     /// Force OpenGL.
     OpenGl,
+    /// Force DirectX 12 (Windows only). Presents through a DirectComposition
+    /// swapchain, the only Windows path whose per-pixel window alpha works on
+    /// AMD — their Vulkan win32 surface reports COMPOSITE_ALPHA_OPAQUE only,
+    /// so see-through mode can never work there (NVIDIA Vulkan only works by
+    /// driver quirk).
+    Dx12,
 }
 
 impl RendererChoice {
@@ -347,6 +370,7 @@ impl RendererChoice {
             Self::Auto => "Auto",
             Self::Vulkan => "Vulkan",
             Self::OpenGl => "OpenGL",
+            Self::Dx12 => "DirectX 12",
         }
     }
 }
@@ -388,11 +412,14 @@ impl Default for AppSettings {
         Self {
             polling_hz: POLLING_HZ_DEFAULT,
             sample_rate_hz: SAMPLE_RATE_HZ_DEFAULT,
-            keep_workspace: false,
+            keep_workspace: true,
             device_nodes_default_collapsed: true,
             default_stick_deadzone: 0.1,
             default_gyro_mult: 1.0,
-            default_mouse_sensitivity: 1.0,
+            default_mouse_sensitivity: 100.0,
+            default_rumble_floor: default_rumble_floor(),
+            default_rumble_max: default_rumble_max(),
+            default_rumble_exp: default_rumble_exp(),
             theme: Theme::Dark,
             contrast: 0.0,
             see_through_alpha: 0.55,

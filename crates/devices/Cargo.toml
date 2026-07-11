@@ -18,7 +18,12 @@ hidapi         = "2"
 # Requires cmake + a C compiler at build time (VS-bundled cmake/ninja/cl —
 # build from a VS Developer shell so they're on PATH).
 sdl3           = { version = "0.18", features = ["build-from-source-static", "hidapi"] }
-midir          = "0.10"
+# 0.11 targets `windows` 0.62 — already present in the graph via iroh's
+# netwatch, so no new parallel `windows` runtime (midir's WinRT MIDI stack ran
+# on its own parallel major, 0.56, before too). Getting midir and enigo off
+# 0.56 evicts that copy entirely, which keeps gpu-allocator bound to `windows`
+# 0.58 as the dx12 backend requires (see workspace Cargo.toml).
+midir          = "0.11"
 # See engine/Cargo.toml — instrumentation is unconditional; emission is
 # gated by the runtime puffin::set_scopes_on() flag.
 puffin         = { workspace = true }

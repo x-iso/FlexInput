@@ -1172,7 +1172,7 @@ fn gamepad_selector_card(
             if let Some(node) = sink_node_of_kind(canvas, kind) {
                 ui.add_space(6.0);
                 if let Some(params) = canvas.snarl.get_node_mut(node).map(|n| &mut n.params) {
-                    header_controls::render_rumble_feedback_controls(ui, params);
+                    header_controls::render_rumble_feedback_controls(ui, params, defaults);
                 }
             }
         }

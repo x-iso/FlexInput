@@ -44,11 +44,23 @@ pub struct DeviceParamDefaults {
     pub stick_deadzone: f32,
     pub gyro_mult: f32,
     pub mouse_sensitivity: f32,
+    /// Rumble-forwarding shape for virtual pad sinks (floor..max band +
+    /// response exponent); see `header_controls::render_rumble_feedback_controls`.
+    pub rumble_floor: f32,
+    pub rumble_max: f32,
+    pub rumble_exp: f32,
 }
 
 impl Default for DeviceParamDefaults {
     fn default() -> Self {
-        Self { stick_deadzone: 0.1, gyro_mult: 1.0, mouse_sensitivity: 1.0 }
+        Self {
+            stick_deadzone: 0.1,
+            gyro_mult: 1.0,
+            mouse_sensitivity: 100.0,
+            rumble_floor: header_controls::RUMBLE_DEF_FLOOR,
+            rumble_max: header_controls::RUMBLE_DEF_MAX,
+            rumble_exp: header_controls::RUMBLE_DEF_EXP,
+        }
     }
 }
 
@@ -127,6 +139,23 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
                 .and_then(migrate_vigem_device_id)
             {
                 node.value.params.insert("device_id".to_string(), Value::from(new_id));
+            }
+        }
+        // Pre-rumble-defaults patches: a virtual gamepad sink (non-keymouse)
+        // with no rumble params relied on the old implicit 0.35/1.0/0.6 boost.
+        // Newly created pads always carry these keys now, so their absence
+        // uniquely identifies an old patch — backfill the legacy values so it
+        // keeps the feel it was saved with. Idempotent: touched pads already
+        // have the keys and are skipped.
+        if node.value.module_id == "device.sink" {
+            let dev = node.value.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+            if dev.starts_with("virtual.") && !dev.starts_with("virtual.keymouse")
+                && !node.value.params.contains_key("rumble_floor")
+            {
+                use header_controls::{RUMBLE_LEGACY_EXP, RUMBLE_LEGACY_FLOOR, RUMBLE_LEGACY_MAX};
+                node.value.params.insert("rumble_floor".into(), Value::from(RUMBLE_LEGACY_FLOOR as f64));
+                node.value.params.insert("rumble_max".into(), Value::from(RUMBLE_LEGACY_MAX as f64));
+                node.value.params.insert("rumble_exp".into(), Value::from(RUMBLE_LEGACY_EXP as f64));
             }
         }
         if let Some(sp) = node.value.subpatch.as_mut() {
@@ -215,6 +244,52 @@ mod migration_tests {
             .find_map(|(_, n)| n.value.params.get("device_id").and_then(|v| v.as_str()).map(String::from))
             .expect("inner device node present");
         assert_eq!(inner_id, "virtual.hm.ds4", "nested ds4 sink migrated");
+    }
+
+    /// A virtual gamepad sink saved before rumble became configurable (no
+    /// rumble params) is backfilled with the legacy shaping on load, so the
+    /// patch keeps its old feel. keymouse sinks and pads that already carry
+    /// rumble params are left untouched.
+    #[test]
+    fn migrate_backfills_legacy_rumble_on_old_virtual_pads() {
+        use header_controls::{RUMBLE_LEGACY_EXP, RUMBLE_LEGACY_FLOOR};
+
+        fn sink(device_id: &str) -> NodeData {
+            let mut params = HashMap::new();
+            params.insert("device_id".to_string(), Value::from(device_id));
+            NodeData {
+                module_id: "device.sink".to_string(),
+                display_name: "Dev".to_string(),
+                category: "Device".to_string(),
+                inputs: vec![],
+                outputs: vec![],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            }
+        }
+
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        // Old pad: HIDMaestro id, no rumble params → should be backfilled.
+        let old_pad = snarl.insert_node(egui::Pos2::ZERO, sink("virtual.hm.xinput"));
+        // keymouse: never gets rumble params.
+        let km = snarl.insert_node(egui::pos2(10.0, 0.0), sink("virtual.keymouse"));
+        // Already-tuned pad: explicit rumble_floor must be preserved, not clobbered.
+        let mut tuned = sink("virtual.hm.ds4");
+        tuned.params.insert("rumble_floor".into(), Value::from(0.8_f64));
+        let tuned_id = snarl.insert_node(egui::pos2(20.0, 0.0), tuned);
+
+        migrate_loaded_snarl(&mut snarl);
+
+        let floor_of = |id| snarl.get_node(id).unwrap().params.get("rumble_floor")
+            .and_then(|v| v.as_f64()).map(|f| f as f32);
+        let exp_of = |id| snarl.get_node(id).unwrap().params.get("rumble_exp")
+            .and_then(|v| v.as_f64()).map(|f| f as f32);
+
+        assert_eq!(floor_of(old_pad), Some(RUMBLE_LEGACY_FLOOR), "old pad floor backfilled");
+        assert_eq!(exp_of(old_pad), Some(RUMBLE_LEGACY_EXP), "old pad exp backfilled");
+        assert_eq!(floor_of(km), None, "keymouse gets no rumble params");
+        assert_eq!(floor_of(tuned_id), Some(0.8), "tuned pad's explicit value preserved");
     }
 }
 
@@ -1552,6 +1627,18 @@ impl Canvas {
         if device_id.starts_with("virtual.keymouse") {
             params.insert("mouse_sensitivity".to_string(),
                 Value::from(defaults.mouse_sensitivity as f64));
+        } else if device_id.starts_with("virtual.") {
+            // Bake the user's default rumble shaping into the node so the pad is
+            // self-describing per-patch (changing the Settings default later
+            // won't retroactively reshape this saved pad), and so the absence of
+            // these keys reliably marks a pre-rumble-defaults patch for
+            // `migrate_loaded_snarl` to backfill with the legacy feel.
+            params.insert("rumble_floor".to_string(),
+                Value::from(defaults.rumble_floor as f64));
+            params.insert("rumble_max".to_string(),
+                Value::from(defaults.rumble_max as f64));
+            params.insert("rumble_exp".to_string(),
+                Value::from(defaults.rumble_exp as f64));
         }
 
         let node = NodeData {

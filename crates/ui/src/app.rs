@@ -1616,8 +1616,9 @@ impl eframe::App for FlexInputApp {
             puffin::profile_scope!("build_and_publish_graph");
             let (graph_snap, dirty_uids) = {
                 puffin::profile_scope!("build_processing_graph");
+                let defaults = self.nav_device_defaults();
                 let snarl = &self.tabs[self.active_tab].canvas.snarl;
-                build_processing_graph(snarl)
+                build_processing_graph(snarl, defaults)
             };
             {
                 puffin::profile_scope!("write_proc_graph");
@@ -2615,11 +2616,7 @@ impl eframe::App for FlexInputApp {
         // call. Visible only while a nav-enabled gamepad drives the UI.
         self.draw_gp_legend_bar(ctx);
 
-        let device_defaults_for_easy = crate::canvas::DeviceParamDefaults {
-            stick_deadzone: self.settings.default_stick_deadzone,
-            gyro_mult: self.settings.default_gyro_mult,
-            mouse_sensitivity: self.settings.default_mouse_sensitivity,
-        };
+        let device_defaults_for_easy = self.nav_device_defaults();
         let user_presets_folder = self.settings.user_presets_folder.clone();
         // Snapshots needed for the inner sub-patch render in Easy
         // center panel (mirrors what show_subpatch_editors passes to
@@ -2690,10 +2687,16 @@ impl eframe::App for FlexInputApp {
                         else { scaled_frame(phys_open) };
 
         let default_collapsed = self.settings.device_nodes_default_collapsed;
+        // Built inline (not via `nav_device_defaults`) because a whole-`self`
+        // method call can't coexist with the `&mut self.gamepad_nav` above;
+        // field reads on `self.settings` can.
         let device_defaults = crate::canvas::DeviceParamDefaults {
             stick_deadzone: self.settings.default_stick_deadzone,
             gyro_mult: self.settings.default_gyro_mult,
             mouse_sensitivity: self.settings.default_mouse_sensitivity,
+            rumble_floor: self.settings.default_rumble_floor,
+            rumble_max: self.settings.default_rumble_max,
+            rumble_exp: self.settings.default_rumble_exp,
         };
 
         // Both side panels are declared unconditionally so egui's
@@ -6082,13 +6085,17 @@ impl FlexInputApp {
         crate::easy::wiring::rewire(canvas);
     }
 
-    /// Device param defaults from settings (mirrors the Easy panel's inline
-    /// construction).
+    /// Device param defaults from settings — the single construction point
+    /// (Easy panel, Advanced panels, gamepad nav, and sub-patch editors all
+    /// share it).
     fn nav_device_defaults(&self) -> crate::canvas::DeviceParamDefaults {
         crate::canvas::DeviceParamDefaults {
             stick_deadzone: self.settings.default_stick_deadzone,
             gyro_mult: self.settings.default_gyro_mult,
             mouse_sensitivity: self.settings.default_mouse_sensitivity,
+            rumble_floor: self.settings.default_rumble_floor,
+            rumble_max: self.settings.default_rumble_max,
+            rumble_exp: self.settings.default_rumble_exp,
         }
     }
 
@@ -9788,7 +9795,7 @@ impl FlexInputApp {
                             .clamping(egui::SliderClamping::Always));
                         if r.changed() { dirty = true; }
                         if track_dbl(ui, &r) {
-                            self.settings.default_mouse_sensitivity = 1.0;
+                            self.settings.default_mouse_sensitivity = 100.0;
                             dirty = true;
                         }
                         if ui.add(egui::DragValue::new(&mut self.settings.default_mouse_sensitivity)
@@ -9796,6 +9803,46 @@ impl FlexInputApp {
                             .range(0.0_f32..=3000.0)
                             .fixed_decimals(2))
                             .changed() { dirty = true; }
+                        ui.end_row();
+
+                        // Default rumble-forwarding shape for virtual pads whose
+                        // Rumble control hasn't been touched. Same widgets as the
+                        // node control; double-click resets to neutral.
+                        ui.label("Default Rumble");
+                        {
+                            use crate::canvas::header_controls::{
+                                curve_box, range_slider,
+                                RUMBLE_DEF_EXP, RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX,
+                            };
+                            let (f0, m0, e0) = (
+                                self.settings.default_rumble_floor,
+                                self.settings.default_rumble_max,
+                                self.settings.default_rumble_exp,
+                            );
+                            let mut floor = f0.clamp(0.0, 1.0);
+                            let mut max = m0.clamp(0.0, 1.0);
+                            let mut exp = e0.clamp(0.2, 3.0);
+                            range_slider(ui, &mut floor, &mut max,
+                                RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX,
+                                ui.spacing().slider_width)
+                                .on_hover_text(
+                                    "Default band for game rumble forwarded by virtual \
+                                     pads: left handle = floor (lifts faint rumble), \
+                                     right = ceiling. Applies to pads whose own Rumble \
+                                     control hasn't been changed. Double-click resets \
+                                     to neutral (full range).");
+                            curve_box(ui, &mut exp, RUMBLE_DEF_EXP);
+                            if max < floor { max = floor; }
+                            if (floor - f0).abs() > f32::EPSILON
+                                || (max - m0).abs() > f32::EPSILON
+                                || (exp - e0).abs() > f32::EPSILON
+                            {
+                                self.settings.default_rumble_floor = floor;
+                                self.settings.default_rumble_max = max;
+                                self.settings.default_rumble_exp = exp;
+                                dirty = true;
+                            }
+                        }
                         ui.end_row();
                     });
 
@@ -9816,11 +9863,15 @@ impl FlexInputApp {
                     egui::ComboBox::from_id_salt("renderer_choice")
                         .selected_text(choice.label())
                         .show_ui(ui, |ui| {
-                            for c in [
+                            let mut choices = vec![
                                 settings::RendererChoice::Auto,
                                 settings::RendererChoice::Vulkan,
                                 settings::RendererChoice::OpenGl,
-                            ] {
+                            ];
+                            if cfg!(windows) {
+                                choices.push(settings::RendererChoice::Dx12);
+                            }
+                            for c in choices {
                                 ui.selectable_value(&mut choice, c, c.label());
                             }
                         });
@@ -9831,7 +9882,9 @@ impl FlexInputApp {
                     ui.label(egui::RichText::new(
                         "Takes effect after restarting FlexInput. Auto picks Vulkan, \
                          except AMD GPUs on Windows get OpenGL (their Vulkan driver \
-                         stalls on window resize/restore)."
+                         stalls on window resize/restore). On AMD, DirectX 12 is the \
+                         only backend where see-through mode can work — the AMD \
+                         Vulkan driver doesn't support transparent windows."
                     ).small().weak());
                 }
 
@@ -11252,13 +11305,17 @@ fn find_automap_dest_sink_rec(
 /// Builds a topologically-sorted [`ProcessingGraph`] from the current Snarl state.
 /// Also returns the UIDs of any counter nodes whose reset was just requested
 /// (caller must clear the `aux_f32_dirty` flag on those nodes after writing the snapshot).
-fn build_processing_graph(snarl: &Snarl<NodeData>) -> (ProcessingGraph, Vec<usize>) {
-    build_processing_graph_rec(snarl, None)
+fn build_processing_graph(
+    snarl: &Snarl<NodeData>,
+    defaults: crate::canvas::DeviceParamDefaults,
+) -> (ProcessingGraph, Vec<usize>) {
+    build_processing_graph_rec(snarl, None, defaults)
 }
 
 fn build_processing_graph_rec(
     snarl: &Snarl<NodeData>,
     parents: Option<&AutomapParent<'_>>,
+    defaults: crate::canvas::DeviceParamDefaults,
 ) -> (ProcessingGraph, Vec<usize>) {
     use std::collections::{HashSet, VecDeque};
     use flexinput_engine::graph::{InlineSubgraph, SinkTarget};
@@ -11323,16 +11380,17 @@ fn build_processing_graph_rec(
         // Only track virtual sinks (their feedback flows back to physical sources).
         if sink_dev.starts_with("virtual.") {
             // Per-device rumble shaping from the virtual sink node's params.
-            // Defaults match the previous env-var boost (floor 0.35, max 1.0,
-            // exp 0.6) so existing patches feel identical until tuned.
+            // Nodes that never touched their Rumble control have no params and
+            // follow the user's Settings defaults (neutral pass-through on a
+            // fresh install), same as the node widget displays.
             let p = |k: &str, d: f32| {
                 node.params.get(k).and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(d)
             };
             feedback_map.entry(src_dev).or_default().push(flexinput_engine::FeedbackSource {
                 device_id: sink_dev.to_string(),
-                rumble_floor: p("rumble_floor", 0.35).clamp(0.0, 1.0),
-                rumble_max:   p("rumble_max", 1.0).clamp(0.0, 1.0),
-                rumble_exp:   p("rumble_exp", 0.6).max(0.01),
+                rumble_floor: p("rumble_floor", defaults.rumble_floor).clamp(0.0, 1.0),
+                rumble_max:   p("rumble_max", defaults.rumble_max).clamp(0.0, 1.0),
+                rumble_exp:   p("rumble_exp", defaults.rumble_exp).max(0.01),
             });
         }
     }
@@ -11614,7 +11672,7 @@ fn build_processing_graph_rec(
         let inline_subgraph = if node.module_id == "subpatch" {
             node.subpatch.as_ref().map(|sp| {
                 let inner_frame = AutomapParent { snarl, subpatch_id: *node_id, prev: parents };
-                let (inner_graph, _) = build_processing_graph_rec(&sp.snarl, Some(&inner_frame));
+                let (inner_graph, _) = build_processing_graph_rec(&sp.snarl, Some(&inner_frame), defaults);
                 let n_out = sp.pins_out.len();
                 let mut outlet_locs: Vec<Option<(usize, usize)>> = vec![None; n_out];
                 for (flat_idx, inner_snap) in inner_graph.nodes.iter().enumerate() {
@@ -13222,11 +13280,7 @@ fn show_subpatch_editors(
     // we borrow it inside the closure. Saves one HashMap clone per editor
     // frame at large patches.
     let panic_shortcut = app.panic_shortcut.clone();
-    let device_defaults_inner = crate::canvas::DeviceParamDefaults {
-        stick_deadzone: app.settings.default_stick_deadzone,
-        gyro_mult: app.settings.default_gyro_mult,
-        mouse_sensitivity: app.settings.default_mouse_sensitivity,
-    };
+    let device_defaults_inner = app.nav_device_defaults();
 
     // Open new editors requested this frame by the canvas viewer.
     let pending = app.tabs[active].canvas.pending_edit_subpatch.take();
@@ -13859,7 +13913,7 @@ mod macro_ordering_tests {
         snarl.insert_node(egui::pos2(0.0, 0.0), mac);
         snarl.insert_node(egui::pos2(100.0, 0.0), bare_node("module.remapper"));
 
-        let (graph, _) = build_processing_graph(&snarl);
+        let (graph, _) = build_processing_graph(&snarl, Default::default());
         let pos = |mid: &str| graph.nodes.iter().position(|s| s.module_id == mid).unwrap();
         assert!(
             pos("module.remapper") < pos("module.macro"),
@@ -13875,7 +13929,7 @@ mod macro_ordering_tests {
         snarl.insert_node(egui::pos2(0.0, 0.0), sp_node);
         snarl.insert_node(egui::pos2(100.0, 0.0), bare_node("processing.gyro_3dof"));
 
-        let (graph, _) = build_processing_graph(&snarl);
+        let (graph, _) = build_processing_graph(&snarl, Default::default());
         let pos = |mid: &str| graph.nodes.iter().position(|s| s.module_id == mid).unwrap();
         assert!(
             pos("processing.gyro_3dof") < pos("subpatch"),

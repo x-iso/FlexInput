@@ -64,12 +64,11 @@ egui_extras = { version = "0.33", features = ["svg"] }
 # "No wgpu backend feature that is implemented for the target
 # platform was enabled". We add wgpu as a direct dep and explicitly
 # enable Vulkan (works on Windows + Linux; NVIDIA/AMD/Intel all ship
-# good drivers) and Metal (macOS). DX12 is intentionally omitted —
-# wgpu-hal 27.0.4's dx12 backend has a windows-crate version conflict
-# (gpu-allocator 0.27 pulls windows 0.56 but wgpu-hal targets 0.58).
-# Vulkan is sufficient and gives us Linux parity without a second
-# backend to maintain.
+# good drivers) and Metal (macOS). DX12 is needed on Windows because
+# AMD's Vulkan driver only supports opaque surfaces (see-through mode
+# needs the DX12 DirectComposition swapchain; see app/src/main.rs).
 wgpu       = { version = "27", default-features = false, features = [
+    "dx12",
     "gles",
     "metal",
     "vulkan",

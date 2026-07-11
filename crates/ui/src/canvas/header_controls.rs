@@ -47,11 +47,24 @@ pub fn render_calibrate_row(
     });
 }
 
-/// Default shaping params for game→physical rumble forwarding. Match the
-/// values the user dialed in by feel; also used as the double-click reset.
-pub const RUMBLE_DEF_FLOOR: f32 = 0.35;
+/// App-level defaults for game→physical rumble forwarding: neutral
+/// pass-through (full 0..1 band, linear curve). The *user's* preferred
+/// defaults live in Settings (`AppSettings::default_rumble_*`) — node widgets
+/// fall back and double-click-reset to those; these constants back the
+/// Settings fields' own serde defaults and the Settings row's reset.
+pub const RUMBLE_DEF_FLOOR: f32 = 0.0;
 pub const RUMBLE_DEF_MAX: f32 = 1.0;
-pub const RUMBLE_DEF_EXP: f32 = 0.6;
+pub const RUMBLE_DEF_EXP: f32 = 1.0;
+
+/// The shaping that was hard-coded as the *implicit* fallback before rumble
+/// became per-node/per-patch (floor 0.35, max 1.0, exp 0.6 — the old env-var
+/// boost). A virtual pad sink saved before that change carries no rumble
+/// params; `migrate_loaded_snarl` backfills these so the loaded patch keeps
+/// the feel it had when it was saved, instead of silently jumping to the new
+/// neutral default. (Legacy max == neutral max, so only floor/exp differ.)
+pub const RUMBLE_LEGACY_FLOOR: f32 = 0.35;
+pub const RUMBLE_LEGACY_MAX: f32 = 1.0;
+pub const RUMBLE_LEGACY_EXP: f32 = 0.6;
 
 /// A two-handle range slider for the rumble floor..max band, plus a compact
 /// Curve value box on the side. Used by virtual gamepad sink nodes (everything
@@ -63,17 +76,21 @@ pub const RUMBLE_DEF_EXP: f32 = 0.6;
 /// affect ONLY the game/app rumble this virtual pad forwards to a physical pad
 /// via Auto-Map; the user's own direct rumble wiring is sent at full scale.
 ///
+/// Nodes whose params don't set the rumble keys follow (and double-click
+/// reset to) the user's Settings defaults, passed in via `defaults`.
+///
 /// Returns true if any value changed this frame.
 pub fn render_rumble_feedback_controls(
     ui: &mut egui::Ui,
     params: &mut HashMap<String, Value>,
+    defaults: crate::canvas::DeviceParamDefaults,
 ) -> bool {
     let getp = |k: &str, d: f32| -> f32 {
         params.get(k).and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(d)
     };
-    let mut floor = getp("rumble_floor", RUMBLE_DEF_FLOOR).clamp(0.0, 1.0);
-    let mut max = getp("rumble_max", RUMBLE_DEF_MAX).clamp(0.0, 1.0);
-    let mut exp = getp("rumble_exp", RUMBLE_DEF_EXP).clamp(0.2, 3.0);
+    let mut floor = getp("rumble_floor", defaults.rumble_floor).clamp(0.0, 1.0);
+    let mut max = getp("rumble_max", defaults.rumble_max).clamp(0.0, 1.0);
+    let mut exp = getp("rumble_exp", defaults.rumble_exp).clamp(0.2, 3.0);
     if max < floor { max = floor; }
     let (f0, m0, e0) = (floor, max, exp);
 
@@ -102,12 +119,12 @@ pub fn render_rumble_feedback_controls(
             ui.add_space(5.0);
             // Compact Curve box: a mini graph whose line bends with the response
             // exponent. Drag to adjust; Ctrl+click to type; double-click resets.
-            curve_box(ui, &mut exp, RUMBLE_DEF_EXP);
+            curve_box(ui, &mut exp, defaults.rumble_exp);
             ui.add_space(4.0);
             // `available_width()` here is the space left between the label and the
             // curve box; fill it (capped so the canvas-node slider stays compact).
             let slider_w = ui.available_width().clamp(40.0, 150.0);
-            range_slider(ui, &mut floor, &mut max, RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX, slider_w)
+            range_slider(ui, &mut floor, &mut max, defaults.rumble_floor, defaults.rumble_max, slider_w)
                 .on_hover_text(
                     "Rumble a game/app sends to this virtual pad, when forwarded to a \
                      physical pad via Auto-Map. Left handle = floor (lifts faint rumble \
