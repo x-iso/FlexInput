@@ -5,6 +5,7 @@
 .lla-embeddings.json
 .lla-index.json
 .lla-profile.json
+.github/copilot-instructions.md
 .vscode/
 .vs/
 .claude/
