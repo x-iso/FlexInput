@@ -3217,6 +3217,46 @@ fn compute_node(
                 }
             }).collect()
         }
+        "module.macro" => {
+            // Macro Output: no wired inputs — each output pin reads back the
+            // per-tick macro namespace that mapping evaluators (Remapper /
+            // Touch Zones cards / 3DOF-Lean) published into via
+            // `merge_macro_scalar` / `merge_macro_vec2`, then coerces to the
+            // port's declared type. Absent entry = mapping released → the
+            // type's off value, so downstream logic always sees a defined
+            // signal (Any ports emit None when unset, like an unwired pin).
+            use flexinput_core::macros as mac;
+            let port_types: HashMap<String, SignalType> = mac::ports_from_params(&snap.params)
+                .into_iter()
+                .map(|p| (mac::macro_pin_id(&p.id), p.signal_type))
+                .collect();
+            (0..snap.n_outputs).map(|i| {
+                let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
+                if pin_id.is_empty() { return None; }
+                let ty = port_types.get(pin_id).copied().unwrap_or(SignalType::Bool);
+                let scalar = collector_sigs.get(&(mac::SIGS_NS.to_string(), pin_id.to_string())).copied();
+                let vec2 = collector_sigs.get(&(mac::SIGS_NS_VEC2.to_string(), pin_id.to_string())).copied();
+                match ty {
+                    SignalType::Vec2 => Some(vec2.unwrap_or(Signal::Vec2(Vec2::ZERO))),
+                    // Float / Any prefer the deflection aspect when present:
+                    // a Touch Zones card writes BOTH the (binary) gate and the
+                    // deflection, and an analog-typed port wants the position,
+                    // not a gate pinned at 1.0. Remapper/Lean write only the
+                    // scalar, so they're unaffected.
+                    SignalType::Float => Some(match (scalar, vec2) {
+                        (_, Some(Signal::Vec2(v))) => Signal::Float(v.length().min(1.0)),
+                        (Some(s), _) => Signal::Float(s.as_float().clamp(0.0, 1.0)),
+                        _ => Signal::Float(0.0),
+                    }),
+                    SignalType::Any => vec2.or(scalar),
+                    _ => Some(match (scalar, vec2) {
+                        (Some(s), _) => Signal::Bool(s.as_bool()),
+                        (None, Some(Signal::Vec2(v))) => Signal::Bool(v.length() >= 0.5),
+                        _ => Signal::Bool(false),
+                    }),
+                }
+            }).collect()
+        }
         "module.constant" | "module.knob" => {
             let v = snap.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             vec![Some(Signal::Float(v))]
@@ -4385,6 +4425,60 @@ const CARDINAL_PIN_IDS: &[&str] = &[
     "dpad_up", "dpad_down", "dpad_left", "dpad_right",
 ];
 
+// ── Macro-port publish helpers ────────────────────────────────────────────────
+//
+// Mapping evaluators (Remapper / Touch Zones cards / 3DOF-Lean) can target a
+// macro port by putting its pin id ("macro:{id}") into a mapping's `out`
+// array, exactly like a bus pin. Macro pins are NOT bus pins though: they are
+// intercepted at each publish site and routed into reserved per-tick
+// namespaces in `collector_sigs` — `("macro", pin)` for the scalar/bool
+// aspect, `("macro#v2", pin)` for the Vec2 aspect (zone deflection) — instead
+// of the evaluator's own `remap:{uid}`-style key, so they never leak onto the
+// AutoMap bus or reach sinks. `module.macro`'s compute (see compute_node)
+// reads them back and coerces to each port's declared type.
+//
+// Only ASSERTED values are written (absent = released = the port's off
+// value), and multiple writers to one port merge by larger magnitude, so an
+// active mapping always wins over an idle one regardless of evaluation order.
+
+fn sig_magnitude(s: Signal) -> f32 {
+    match s {
+        Signal::Vec2(v) => v.length(),
+        other => other.as_float().abs(),
+    }
+}
+
+fn merge_macro_ns(
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+    ns: &str,
+    pin: &str,
+    sig: Signal,
+) {
+    let key = (ns.to_string(), pin.to_string());
+    match collector_sigs.get(&key) {
+        Some(&prev) if sig_magnitude(prev) >= sig_magnitude(sig) => {}
+        _ => { collector_sigs.insert(key, sig); }
+    }
+}
+
+/// Publish the scalar/bool aspect of a macro-port write.
+fn merge_macro_scalar(
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+    pin: &str,
+    sig: Signal,
+) {
+    merge_macro_ns(collector_sigs, flexinput_core::macros::SIGS_NS, pin, sig);
+}
+
+/// Publish the Vec2 aspect of a macro-port write (zone-local deflection).
+fn merge_macro_vec2(
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+    pin: &str,
+    v: Vec2,
+) {
+    merge_macro_ns(collector_sigs, flexinput_core::macros::SIGS_NS_VEC2, pin, Signal::Vec2(v));
+}
+
 /// Shared Remapper pass-through + suppression pass, called identically by the
 /// top-level and sub-patch Remapper arms (so the two never diverge). For every
 /// canonical pin it writes `collector_sigs[(key, pin)]`:
@@ -4752,6 +4846,20 @@ fn eval_remapper_node(
                     // Touchpad zone/swipe outputs are handled by the touchpad
                     // synthesis pass below, not as axis/trigger/button writes.
                     if touchpad_out_kind(out_p).is_some() { continue; }
+                    // Macro-port target: publish the live input magnitude into
+                    // the macro namespace and skip the bus handling below
+                    // (macro pins never reach sinks or the release pass).
+                    if flexinput_core::macros::parse_macro_pin(out_p).is_some() {
+                        let mag = if analog_axis_for_cardinal(in_p).is_some() {
+                            analog_cardinal_input_value(&upstream, in_p)
+                        } else {
+                            1.0 // gate buttons all held (checked by effective[])
+                        };
+                        if mag > 0.0 {
+                            merge_macro_scalar(collector_sigs, out_p, Signal::Float(mag.min(1.0)));
+                        }
+                        continue;
+                    }
                     analog_out_pins.insert(out_p.clone());
                     let in_is_cardinal  = analog_axis_for_cardinal(in_p).is_some();
                     let out_axis_opt    = analog_axis_for_cardinal(out_p);
@@ -4831,6 +4939,9 @@ fn eval_remapper_node(
                     for v in arr {
                         if let Some(s) = v.as_str() {
                             if touchpad_out_kind(s).is_some() { continue; } // synthesized below
+                            // Macro pins skip the bus release pass entirely —
+                            // absent from the macro namespace = released.
+                            if flexinput_core::macros::parse_macro_pin(s).is_some() { continue; }
                             digital_all_out_pins.insert(s.to_string());
                         }
                     }
@@ -4842,6 +4953,14 @@ fn eval_remapper_node(
                 for p in out_pins {
                     if touchpad_out_kind(p).is_some() { continue; } // synthesized below
                     digital_asserted.insert(p.clone());
+                }
+            }
+            // Macro-port targets of triggered digital mappings: publish into
+            // the macro namespace (press-mode shaping already applied via
+            // `effective[]` → `triggered`). Bus pins continue below.
+            for p in &digital_asserted {
+                if flexinput_core::macros::parse_macro_pin(p).is_some() {
+                    merge_macro_scalar(collector_sigs, p, Signal::Bool(true));
                 }
             }
             for out_pin in &digital_all_out_pins {
@@ -4894,9 +5013,12 @@ fn eval_remapper_node(
                             // Triggers are analog axes (handled by analog_axis_acc),
                             // not buttons — exclude them from the binary on/off
                             // release pass or it would clobber the analog value.
+                            // Macro pins are published via the macro namespace
+                            // in the emit loop above, never as bus buttons.
                             if analog_axis_for_cardinal(s).is_none()
                                 && analog_trigger_out(s).is_none()
                                 && touchpad_out_kind(s).is_none()
+                                && flexinput_core::macros::parse_macro_pin(s).is_none()
                             {
                                 analog_button_pins.insert(s.to_string());
                             }
@@ -5291,6 +5413,19 @@ fn eval_touch_zones_map_node(
                     }
                 }
                 _ => {
+                    // Macro-port target: the shaped gate drives the Bool
+                    // aspect; the zone's (curve-shaped) relative deflection
+                    // publishes the Vec2 aspect for Vec2/Float ports. Macro
+                    // pins never enter `button_on` — they aren't bus pins.
+                    if flexinput_core::macros::parse_macro_pin(p).is_some() {
+                        if held {
+                            merge_macro_scalar(collector_sigs, p, Signal::Bool(true));
+                        }
+                        if let Some((ax, ay)) = deflect {
+                            merge_macro_vec2(collector_sigs, p, Vec2::new(ax, ay));
+                        }
+                        continue;
+                    }
                     let e = button_on.entry(p.to_string()).or_insert(false);
                     *e = *e || held;
                 }
@@ -5835,6 +5970,9 @@ fn lean_dispatch_into_collector_sigs(
             for v in arr {
                 if let Some(s) = v.as_str() {
                     if touchpad_out_kind(s).is_some() { continue; } // synthesized below
+                    // Macro pins skip the bus release pass — absent from the
+                    // macro namespace = released.
+                    if flexinput_core::macros::parse_macro_pin(s).is_some() { continue; }
                     all_out_pins.insert(s.to_string());
                     if let Some((axis_pin, _)) = analog_axis_for_cardinal(s) {
                         all_out_pins.insert(axis_pin.to_string());
@@ -5889,6 +6027,22 @@ fn lean_dispatch_into_collector_sigs(
                 // Touchpad zone/swipe outputs are synthesized into touch points
                 // after this loop, not emitted as axis/button pins.
                 if touchpad_out_kind(p).is_some() { continue; }
+                // Macro-port target: Analog mode passes the live lean
+                // magnitude (unsigned — the port is bound per-side, so
+                // direction is implied by which side's mapping fires); other
+                // press modes assert while the shaped gate is open. Macro
+                // pins never enter `asserted` — they aren't bus pins.
+                if flexinput_core::macros::parse_macro_pin(p).is_some() {
+                    if is_analog_mode {
+                        let mag = if *active { analog_val_opt.unwrap_or(0.0) } else { 0.0 };
+                        if mag > 0.0 {
+                            merge_macro_scalar(collector_sigs, p, Signal::Float(mag.min(1.0)));
+                        }
+                    } else if held_now {
+                        merge_macro_scalar(collector_sigs, p, Signal::Bool(true));
+                    }
+                    continue;
+                }
                 // Cardinal → analog-axis remap (all press modes):
                 // A stick-cardinal like `left_stick_right` represents the
                 // user's INTENT to drive that axis in that direction. The
@@ -6605,6 +6759,192 @@ mod trigger_tests {
             digital_trigger_bridge: bridge,
         });
         n
+    }
+
+    // ── Macro Output routing ──────────────────────────────────────────────────
+
+    /// Macro node snap with `ports` as (id, type_str) pairs.
+    fn macro_node(uid: usize, ports: &[(&str, &str)]) -> NodeSnap {
+        let mut n = empty_node(uid, "module.macro");
+        n.n_outputs = ports.len();
+        n.output_pin_ids = ports.iter().map(|(id, _)| format!("macro:{id}")).collect();
+        n.params.insert("macro_ports".into(), Value::Array(ports.iter().map(|(id, ty)|
+            serde_json::json!({ "id": id, "name": id, "icon": "", "type": ty })
+        ).collect()));
+        n
+    }
+
+    // A digital Remapper mapping targeting a macro pin drives the macro node's
+    // Bool port (same tick — the macro node evaluates after the remapper), the
+    // unmapped port emits its typed off value, and the macro pin never leaks
+    // onto the AutoMap bus toward the sink.
+    #[test]
+    fn remapper_digital_mapping_drives_macro_port() {
+        let dev = "gilrs:switch_pro:0";
+        let src = source_node(1, dev, 0.0);
+        let mut remap = empty_node(2, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["macro:aa11bb22"] }
+        ]));
+        remap.input_sources = vec![Some((0, 0))];
+        remap.n_outputs = 1;
+        let mac = macro_node(3, &[("aa11bb22", "bool"), ("cc33dd44", "float")]);
+        let sink = sink_node(4, "virtual.xinput:0", "remap:2", true);
+        let graph = ProcessingGraph { nodes: vec![src, remap, mac, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let press = |on: bool| {
+            let mut m = HashMap::new();
+            m.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(on));
+            m
+        };
+
+        eval_graph_tick(&graph, &mut state, &press(true), 0.016, &mut out);
+        assert_eq!(out.outputs.get(&(3, 0)).copied().flatten(), Some(Signal::Bool(true)),
+            "mapped macro Bool port must assert while the chord is held");
+        assert_eq!(out.outputs.get(&(3, 1)).copied().flatten(), Some(Signal::Float(0.0)),
+            "unmapped Float port emits its typed off value");
+        assert!(out.sink_outputs.keys().all(|(_, p)| !p.starts_with("macro:")),
+            "macro pins must never reach a sink");
+
+        eval_graph_tick(&graph, &mut state, &press(false), 0.016, &mut out);
+        assert_eq!(out.outputs.get(&(3, 0)).copied().flatten(), Some(Signal::Bool(false)),
+            "released mapping must drop the port back to false");
+    }
+
+    // An analog-mode mapping targeting a Float macro port passes the live
+    // stick magnitude through — continuous, not a binary gate — and a Bool
+    // port fed by the same analog write thresholds at 0.5.
+    #[test]
+    fn remapper_analog_mapping_drives_float_macro() {
+        let dev = "gilrs:switch_pro:0";
+        let src = source_node(1, dev, 0.0);
+        let mut remap = empty_node(2, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["macro:f1f1f1f1"], "mode": "analog" }
+        ]));
+        remap.input_sources = vec![Some((0, 0))];
+        remap.n_outputs = 1;
+        let mac = macro_node(3, &[("f1f1f1f1", "float")]);
+        let graph = ProcessingGraph { nodes: vec![src, remap, mac] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let push = |y: f32| {
+            let mut m = HashMap::new();
+            m.insert((dev.to_string(), "left_stick_y".to_string()), Signal::Float(y));
+            m
+        };
+
+        eval_graph_tick(&graph, &mut state, &push(0.5), 0.016, &mut out);
+        let v = out.outputs.get(&(3, 0)).copied().flatten().map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 0.5).abs() < 0.05, "half push should give ~0.5 on the Float port, got {v}");
+
+        eval_graph_tick(&graph, &mut state, &push(0.0), 0.016, &mut out);
+        let v = out.outputs.get(&(3, 0)).copied().flatten().map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!(v.abs() < 0.01, "neutral stick should release the port to 0, got {v}");
+    }
+
+    // A Touch Zones card targeting a macro pin publishes BOTH aspects: the
+    // shaped gate (Bool) and the zone-local deflection (Vec2). The macro node
+    // then coerces per port type: Vec2 passes through, Float takes the
+    // magnitude, Bool follows the gate.
+    #[test]
+    fn touch_zones_card_drives_macro_aspects() {
+        let mut tz = empty_node(1, "module.touch_zones");
+        tz.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        tz.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        tz.params.insert("col_edges".into(), serde_json::json!([]));
+        tz.params.insert("row_edges".into(), serde_json::json!([]));
+        tz.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["macro:abcd0123"]},
+        ]));
+        // Finger at pad center then pushed right: unit x 0.5→0.75 within the
+        // single full-pad zone → deflection x ≈ +0.5 from the zone center.
+        let finger = |px: f32| {
+            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+            m
+        };
+        let mut state = HashMap::new();
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        // Land at center (adaptive center latches there), then move right.
+        eval_touch_zones_map_node(&tz, 1, &finger(0.0), &mut c, &mut state, 0.016);
+        c.clear();
+        eval_touch_zones_map_node(&tz, 1, &finger(0.5), &mut c, &mut state, 0.016);
+
+        assert_eq!(c.get(&("macro".to_string(), "macro:abcd0123".to_string())).copied(),
+            Some(Signal::Bool(true)), "gate aspect must assert while touched");
+        let v2 = c.get(&("macro#v2".to_string(), "macro:abcd0123".to_string())).copied();
+        let Some(Signal::Vec2(v)) = v2 else { panic!("deflection aspect missing: {v2:?}") };
+        assert!(v.x > 0.4 && v.y.abs() < 0.05, "rightward deflection expected, got {v:?}");
+        assert!(c.iter().all(|((k, p), _)| k != "touchmap:1" || !p.starts_with("macro:")),
+            "macro pins must not be published on the touchmap bus key");
+
+        // Coercion: read the same namespace back through each port type.
+        let mut ns = NodeState::default();
+        let dev_sigs = HashMap::new();
+        let mac = macro_node(2, &[("abcd0123", "vec2")]);
+        let out = compute_node(&mac, &[], &mut ns, &dev_sigs, &c, 0.016);
+        assert!(matches!(out[0], Some(Signal::Vec2(v)) if v.x > 0.4),
+            "Vec2 port passes the deflection through, got {:?}", out[0]);
+        let mac = macro_node(2, &[("abcd0123", "float")]);
+        let out = compute_node(&mac, &[], &mut ns, &dev_sigs, &c, 0.016);
+        assert!(matches!(out[0], Some(Signal::Float(f)) if (f - 0.5).abs() < 0.05),
+            "Float port prefers the deflection magnitude over the binary gate, got {:?}", out[0]);
+        let mac = macro_node(2, &[("abcd0123", "bool")]);
+        let out = compute_node(&mac, &[], &mut ns, &dev_sigs, &c, 0.016);
+        assert_eq!(out[0], Some(Signal::Bool(true)), "Bool port follows the gate");
+    }
+
+    // 3DOF-Lean mappings targeting macro pins: analog mode passes the live
+    // lean magnitude; digital (down) mode asserts while the side is active.
+    #[test]
+    fn lean_mapping_drives_macro_port() {
+        let mk = |mode: &str| {
+            let mut n = empty_node(1, "processing.gyro_3dof");
+            n.params.insert("lean_left".into(), serde_json::json!([
+                { "out": ["macro:11aa22bb"], "mode": mode }
+            ]));
+            n
+        };
+        let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
+        let get = |c: &HashMap<(String, String), Signal>|
+            c.get(&("macro".to_string(), "macro:11aa22bb".to_string())).copied();
+
+        // Analog: leaning left at 0.8 → Float(0.8) on the macro namespace.
+        let snap = mk("analog");
+        let mut ns = NodeState::default();
+        let mut c = HashMap::new();
+        lean_dispatch_into_collector_sigs(&snap, 1, &outs(-0.8), &mut ns, &mut c, 0.016);
+        let v = get(&c).map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 0.8).abs() < 1e-4, "analog lean should pass magnitude, got {v}");
+        // Below threshold → no write (port reads as released).
+        c.clear();
+        lean_dispatch_into_collector_sigs(&snap, 1, &outs(-0.1), &mut ns, &mut c, 0.016);
+        assert_eq!(get(&c), None, "below-threshold lean must not assert the port");
+
+        // Down mode: asserts Bool while the side is active.
+        let snap = mk("down");
+        let mut ns = NodeState::default();
+        let mut c = HashMap::new();
+        lean_dispatch_into_collector_sigs(&snap, 1, &outs(-0.8), &mut ns, &mut c, 0.016);
+        assert_eq!(get(&c), Some(Signal::Bool(true)));
+    }
+
+    // Multiple writers to one macro port merge by larger magnitude, in either
+    // arrival order — an asserted mapping beats an idle/weaker one.
+    #[test]
+    fn macro_merge_larger_magnitude_wins() {
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        merge_macro_scalar(&mut c, "macro:x", Signal::Float(0.3));
+        merge_macro_scalar(&mut c, "macro:x", Signal::Bool(true)); // mag 1.0
+        merge_macro_scalar(&mut c, "macro:x", Signal::Float(0.6));
+        assert_eq!(c.get(&("macro".to_string(), "macro:x".to_string())).copied(),
+            Some(Signal::Bool(true)), "largest-magnitude write must win");
     }
 
     // Remapper in analog mode mapping a stick cardinal → right_trigger should

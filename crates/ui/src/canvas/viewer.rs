@@ -881,7 +881,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
                 | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
                 | "math.add" | "math.subtract" | "math.multiply" | "math.divide"
-                | "module.selector" | "module.split" | "module.dropdown"
+                | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
                 | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
                 | "generator.oscillator" | "generator.envelope" | "processing.gyro_3dof"
                 | "module.automap_split" | "module.automap_collect"
@@ -959,6 +959,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.selector" => show_selector_body(node_id, inputs, ui, snarl),
             "module.split"    => show_split_body(node_id, outputs, ui, snarl),
             "module.dropdown" => show_dropdown_body(node_id, ui, snarl),
+            "module.macro"    => show_macro_body(node_id, outputs, ui, snarl),
             "module.label"    => show_label_body(node_id, ui, snarl),
             "module.svg"      => show_svg_body(node_id, ui, snarl),
             "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl),
@@ -2089,14 +2090,33 @@ pub(crate) fn tz_zone_curve(zone_maps: &[Value], field: usize, idx: usize) -> Ve
 }
 
 /// True when a zone has at least one analog (mouse / stick) output card.
+/// Whether a Touch Zones OUT pin receives the zone's analog deflection —
+/// the gate for the response curve, the Relative-center slider, and the
+/// on-zone vectorscope. Static analog bus pins always do; a macro pin does
+/// when its port's declared type carries the deflection (Vec2 / Float / Any —
+/// Bool ports only take the gate). Resolved through the per-frame macro
+/// registry, so a dangling id counts as digital.
+pub(crate) fn tz_out_pin_is_analog(pin: &str) -> bool {
+    if matches!(pin,
+        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y")
+    {
+        return true;
+    }
+    if flexinput_core::macros::parse_macro_pin(pin).is_some() {
+        return crate::macro_icons::registry_entry(pin).is_some_and(|e| matches!(
+            e.signal_type,
+            SignalType::Vec2 | SignalType::Float | SignalType::Any
+        ));
+    }
+    false
+}
+
 pub(crate) fn tz_zone_is_analog(zone_maps: &[Value], field: usize, idx: usize) -> bool {
-    let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
     zone_maps.iter().any(|c|
         c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64
             && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == idx as u64
             && c.get("out").and_then(|v| v.as_array())
-                .map(|a| a.iter().any(|p| p.as_str().map(is_analog).unwrap_or(false)))
+                .map(|a| a.iter().any(|p| p.as_str().map(tz_out_pin_is_analog).unwrap_or(false)))
                 .unwrap_or(false))
 }
 
@@ -2104,8 +2124,7 @@ pub(crate) fn tz_zone_is_analog(zone_maps: &[Value], field: usize, idx: usize) -
 pub(crate) fn tz_set_zone_curve(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     field: usize, idx: usize, pts: &[[f32; 2]])
 {
-    let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
+    let is_analog = tz_out_pin_is_analog;
     let Some(node) = snarl.get_node_mut(node_id) else { return };
     let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) else { return };
     for c in cards.iter_mut() {
@@ -2140,8 +2159,7 @@ fn tz_zone_adaptive(zone_maps: &[Value], field: usize, idx: usize) -> f32 {
 fn tz_set_zone_adaptive(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     field: usize, idx: usize, val: f32)
 {
-    let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
+    let is_analog = tz_out_pin_is_analog;
     let Some(node) = snarl.get_node_mut(node_id) else { return };
     let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) else { return };
     for c in cards.iter_mut() {
@@ -2357,8 +2375,7 @@ fn tz_paint_zone_mapping(
     accent: egui::Color32,
     visuals: &egui::Visuals,
 ) {
-    let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
+    let is_analog = tz_out_pin_is_analog;
     // Output pins across every card bound to this (field, zone), split by kind so
     // a click's button icon shows ALONGSIDE the analog vectorscope (not hidden by
     // it). Order preserved (first-seen) so it matches the card list.
@@ -3188,8 +3205,7 @@ fn tz_read_selection(snarl: &Snarl<NodeData>, node_id: NodeId) -> (usize, usize)
 fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     f: usize, z: usize, trigger: &str, draft_out: &[String])
 {
-    let is_analog = |p: &str| matches!(p,
-        "mouse" | "mouse_x" | "mouse_y" | "left_stick" | "right_stick" | "scroll_x" | "scroll_y");
+    let is_analog = tz_out_pin_is_analog;
     let mode = if draft_out.iter().any(|p| is_analog(p)) { "analog" } else { "down" };
     if let Some(node) = snarl.get_node_mut(node_id) {
         let mut m = serde_json::Map::new();
@@ -7138,6 +7154,197 @@ fn show_svg_body_sized(
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
+}
+
+// ── Macro Output body ─────────────────────────────────────────────────────────
+
+/// Body for the Macro Output node: the list of user-defined ports, edited
+/// inline — icon (menu of the embedded macro icon set), name, type (Bool /
+/// Float / Vec2 / Any), remove. Every change rewrites the `macro_ports`
+/// param, the node's dynamic output pins, and `output_pin_ids` together so
+/// the three can never drift. Removal drops the port's wires and shifts the
+/// ones above down a slot (same surgery as the AutoMap Splitter).
+fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    use flexinput_core::macros as mac;
+
+    let Some(node) = snarl.get_node(node_id) else { return };
+    let mut ports = mac::ports_from_params(&node.params);
+    let mut changed = false;
+
+    // First open of a fresh node: seed one port so the node has a pin and the
+    // picker immediately shows something assignable.
+    if ports.is_empty() && node.params.get(mac::MACRO_PORTS_PARAM).is_none() {
+        ports.push(mac::MacroPortDef {
+            id: mac::new_port_id(),
+            name: "Macro 1".to_string(),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: SignalType::Bool,
+        });
+        changed = true;
+    }
+
+    let mut remove_idx: Option<usize> = None;
+
+    // The snarl body ui lays out HORIZONTALLY by default — without this
+    // wrapper every port row lands side by side on one line.
+    ui.vertical(|ui| {
+    ui.set_min_width(230.0);
+
+    for (i, port) in ports.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            // Icon button (custom patch-embedded SVG wins over the set) opens
+            // the icon picker popup: custom-SVG loader up top, then the
+            // embedded set as a 10-wide grid, scrollable past 10 rows.
+            let icon_btn = if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
+                ui.ctx(), &port.icon, &port.icon_svg, 18.0)
+            {
+                egui::Button::image(egui::Image::new(&tex)
+                    .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                    .tint(Color32::WHITE))
+            } else {
+                egui::Button::new(egui::RichText::new("◌").size(14.0))
+            };
+            egui::containers::menu::MenuButton::from_button(icon_btn).ui(ui, |ui: &mut egui::Ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Load custom SVG…")
+                        .on_hover_text("Pick an .svg file — it's embedded into the patch")
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SVG", &["svg"])
+                            .pick_file()
+                        {
+                            if let Ok(text) = std::fs::read_to_string(&path) {
+                                port.icon_svg = text;
+                                port.icon.clear();
+                                changed = true;
+                            }
+                        }
+                        ui.close();
+                    }
+                    if (!port.icon.is_empty() || !port.icon_svg.is_empty())
+                        && ui.button("No icon").clicked()
+                    {
+                        port.icon.clear();
+                        port.icon_svg.clear();
+                        changed = true;
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                const COLS: usize = 10;
+                const CELL: f32 = 26.0;
+                const GAP: f32 = 4.0;
+                ui.set_min_width(COLS as f32 * (CELL + GAP));
+                egui::ScrollArea::vertical()
+                    .max_height(10.0 * (CELL + GAP))
+                    .show(ui, |ui| {
+                        egui::Grid::new((node_id, "macro_icon_grid", i))
+                            .spacing([GAP, GAP])
+                            .show(ui, |ui| {
+                                for (idx, (key, label, _)) in
+                                    crate::macro_icons::ALL_ICONS.iter().enumerate()
+                                {
+                                    let selected =
+                                        port.icon_svg.is_empty() && port.icon == *key;
+                                    let btn = if let Some(tex) =
+                                        crate::macro_icons::macro_icon_texture(
+                                            ui.ctx(), key, CELL - 6.0)
+                                    {
+                                        egui::Button::image(egui::Image::new(&tex)
+                                            .fit_to_exact_size(egui::vec2(CELL - 6.0, CELL - 6.0))
+                                            .tint(Color32::WHITE))
+                                            .min_size(egui::vec2(CELL, CELL))
+                                            .selected(selected)
+                                    } else {
+                                        egui::Button::new(*label).selected(selected)
+                                    };
+                                    if ui.add(btn).on_hover_text(*label).clicked() {
+                                        port.icon = key.to_string();
+                                        port.icon_svg.clear();
+                                        changed = true;
+                                        ui.close();
+                                    }
+                                    if (idx + 1) % COLS == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    });
+            });
+
+            let name_resp = ui.add(
+                egui::TextEdit::singleline(&mut port.name).desired_width(96.0));
+            if name_resp.changed() { changed = true; }
+
+            egui::ComboBox::from_id_salt((node_id, "macro_ty", i))
+                .selected_text(port.signal_type.display_name())
+                .width(58.0)
+                .show_ui(ui, |ui| {
+                    for ty in [SignalType::Bool, SignalType::Float, SignalType::Vec2, SignalType::Any] {
+                        if ui.selectable_label(port.signal_type == ty, ty.display_name()).clicked()
+                            && port.signal_type != ty
+                        {
+                            port.signal_type = ty;
+                            changed = true;
+                        }
+                    }
+                });
+
+            if ui.small_button("✕").on_hover_text("Remove port (drops its wires)").clicked() {
+                remove_idx = Some(i);
+            }
+        });
+    }
+
+    ui.add_space(2.0);
+    if ui.small_button("+ Add output").clicked() {
+        ports.push(mac::MacroPortDef {
+            id: mac::new_port_id(),
+            name: format!("Macro {}", ports.len() + 1),
+            icon: String::new(),
+            icon_svg: String::new(),
+            signal_type: SignalType::Bool,
+        });
+        changed = true;
+    }
+    }); // end ui.vertical
+
+    if let Some(rm) = remove_idx {
+        // Drop the removed port's wires and reconnect the ones above one slot
+        // down, so wiring follows its port.
+        let tail: Vec<Vec<egui_snarl::InPinId>> = outputs
+            .iter()
+            .skip(rm)
+            .map(|o| o.remotes.clone())
+            .collect();
+        for i in 0..tail.len() {
+            snarl.drop_outputs(OutPinId { node: node_id, output: rm + i });
+        }
+        for (shift, remotes) in tail.into_iter().enumerate().skip(1) {
+            let new_out = OutPinId { node: node_id, output: rm + shift - 1 };
+            for remote in remotes {
+                snarl.connect(new_out, remote);
+            }
+        }
+        ports.remove(rm);
+        changed = true;
+    }
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert(mac::MACRO_PORTS_PARAM.to_string(), mac::ports_to_value(&ports));
+            node.params.insert(
+                "output_pin_ids".to_string(),
+                Value::Array(ports.iter().map(|p| Value::String(mac::macro_pin_id(&p.id))).collect()),
+            );
+            node.outputs = ports
+                .iter()
+                .map(|p| PinDescriptor::new(p.name.clone(), p.signal_type))
+                .collect();
+        }
+    }
 }
 
 /// Rasterize an SVG to a rect of `(w, h)` and recolor the resulting pixmap
@@ -18951,6 +19158,33 @@ fn remapper_kbm_pressed_now(
 fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_icons::Skin) {
     use super::remapper_icons;
     const CHIP_H: f32 = 28.0;
+    // Macro-port pins: resolve name + icon through the per-frame registry
+    // (published by app.rs). Icon chip with the name as tooltip, or a plain
+    // name label when the port has no icon. A dangling id (port deleted while
+    // the mapping still references it) renders a struck placeholder.
+    if flexinput_core::macros::parse_macro_pin(pin_id).is_some() {
+        match crate::macro_icons::registry_entry(pin_id) {
+            Some(entry) => {
+                let hover = format!("{} ({})", entry.name, entry.signal_type.display_name());
+                if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
+                    ui.ctx(), &entry.icon, &entry.icon_svg, CHIP_H)
+                {
+                    ui.add(egui::Image::new(&tex)
+                        .fit_to_exact_size(egui::vec2(CHIP_H, CHIP_H))
+                        .tint(Color32::WHITE))
+                        .on_hover_text(hover);
+                } else {
+                    ui.label(egui::RichText::new(&entry.name).size(13.0).strong())
+                        .on_hover_text(hover);
+                }
+            }
+            None => {
+                ui.label(egui::RichText::new("macro?").size(13.0).weak().strikethrough())
+                    .on_hover_text("This macro port no longer exists");
+            }
+        }
+        return;
+    }
     if let Some(bytes) = remapper_icons::pin_svg(skin, pin_id) {
         let size_px = (CHIP_H * ui.ctx().pixels_per_point()).round() as u32;
         let tint = egui::Color32::TRANSPARENT;
@@ -20143,6 +20377,27 @@ fn paint_chord_chip_to_rect(
 ) -> f32 {
     use super::remapper_icons::{self, Skin};
 
+    // Macro-port pins: registry icon, else a pill with the port's NAME (the
+    // raw "macro:{id}" token means nothing to the user). Dangling ids (port
+    // deleted, mapping kept) paint a dimmed placeholder pill.
+    if flexinput_core::macros::parse_macro_pin(pin_id).is_some() {
+        match crate::macro_icons::registry_entry(pin_id) {
+            Some(entry) => {
+                if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
+                    ctx, &entry.icon, &entry.icon_svg, chip_h)
+                {
+                    let rect = egui::Rect::from_min_size(top_left, egui::vec2(chip_h, chip_h));
+                    painter.image(tex.id(), rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE);
+                    return chip_h;
+                }
+                return paint_text_pill(painter, top_left, chip_h, entry.name, false);
+            }
+            None => return paint_text_pill(painter, top_left, chip_h, "macro?".to_string(), true),
+        }
+    }
+
     // Probe current skin first; fall back to any other skin that has the
     // icon. `tinted` is true when we matched a non-current skin — the chip
     // is then dimmed to communicate that it isn't available on the device.
@@ -20199,10 +20454,26 @@ fn paint_chord_chip_to_rect(
 
     // Last-resort text pill — still useful for non-canonical pins (e.g.
     // unmapped keys). Dimmed so it reads as "label, no icon available".
-    let label = remapper_pin_display(pin_id);
+    paint_text_pill(painter, top_left, chip_h, remapper_pin_display(pin_id), true)
+}
+
+/// Paint a rounded text pill at `top_left` and return its width. `dim` uses
+/// the muted "label, no icon available" text; bright text is for labels that
+/// ARE the intended rendering (e.g. a macro port's name).
+fn paint_text_pill(
+    painter: &egui::Painter,
+    top_left: egui::Pos2,
+    chip_h: f32,
+    label: String,
+    dim: bool,
+) -> f32 {
     let font = egui::FontId::proportional(chip_h * 0.48);
-    let dim_text = Color32::from_rgba_unmultiplied(255, 255, 255, 160);
-    let galley = painter.layout_no_wrap(label, font, dim_text);
+    let text_col = if dim {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 160)
+    } else {
+        Color32::WHITE
+    };
+    let galley = painter.layout_no_wrap(label, font, text_col);
     let text_w = galley.size().x;
     let pad_x = chip_h * 0.30;
     let pill_w = text_w + pad_x * 2.0;
@@ -20211,7 +20482,7 @@ fn paint_chord_chip_to_rect(
     painter.galley(
         egui::pos2(rect.left() + pad_x, rect.center().y - galley.size().y * 0.5),
         galley,
-        dim_text,
+        text_col,
     );
     pill_w
 }

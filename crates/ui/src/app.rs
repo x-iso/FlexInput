@@ -1159,6 +1159,13 @@ impl eframe::App for FlexInputApp {
         puffin::GlobalProfiler::lock().new_frame();
         puffin::profile_function!();
 
+        // Publish this frame's macro-port table so mapping-card chips, the
+        // KB/M picker, and Touch Zones' analog-output checks can resolve
+        // "macro:{id}" pins to names/icons/types anywhere without threading
+        // the table through signatures.
+        crate::macro_icons::publish_registry(
+            std::sync::Arc::new(self.macro_display_entries()));
+
         // ── GPU-recovery persist safety net ──────────────────────────────
         // On a GPU-loss relaunch the helper's persistence was forced ON so the
         // devices kept alive across the relaunch aren't wiped before reclaim.
@@ -4974,6 +4981,36 @@ impl FlexInputApp {
     /// Drive the virtual KB/M picker (modal). `step_dir` is the resolved
     /// dpad/stick direction this frame. South appends the focused pin to the
     /// remapper's `draft_output`; North resets `draft_output`; East closes.
+    /// All macro ports defined on the active tab's canvas (including nested
+    /// sub-patches), as the display entries the picker / chip renderers use.
+    /// Order: canvas traversal order, so the picker cluster stays stable
+    /// frame-to-frame.
+    fn macro_display_entries(&self) -> Vec<crate::macro_icons::MacroDisplayEntry> {
+        use flexinput_core::macros as mac;
+        fn scan(snarl: &Snarl<NodeData>, out: &mut Vec<crate::macro_icons::MacroDisplayEntry>) {
+            for (_, node_ref) in snarl.nodes_ids_data() {
+                let n = &node_ref.value;
+                if n.module_id == "module.macro" {
+                    for p in mac::ports_from_params(&n.params) {
+                        out.push(crate::macro_icons::MacroDisplayEntry {
+                            pin: mac::macro_pin_id(&p.id),
+                            name: p.name,
+                            icon: p.icon,
+                            icon_svg: p.icon_svg,
+                            signal_type: p.signal_type,
+                        });
+                    }
+                }
+                if let Some(sp) = n.subpatch.as_ref() {
+                    scan(&sp.snarl, out);
+                }
+            }
+        }
+        let mut v = Vec::new();
+        scan(&self.tabs[self.active_tab].canvas.snarl, &mut v);
+        v
+    }
+
     fn drive_kbm_picker(
         &mut self,
         step_dir: Option<crate::gamepad_nav::NavDir>,
@@ -4991,7 +5028,7 @@ impl FlexInputApp {
         // Spatial navigation over the cells actually shown for this mode (the
         // Touch-Zones variant hides the touchpad cluster and adds analog outputs),
         // so focus never lands on a hidden cell and the analog cells are reachable.
-        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones);
+        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones, &self.macro_display_entries());
         let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         idx = match step_dir {
             Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0),
@@ -5019,7 +5056,8 @@ impl FlexInputApp {
         // capture machine (so the South used to pick isn't swept into the chord).
         // Analog-only cells (swipe) are ignored when the input isn't analog.
         if nav.is_rising("btn_south") {
-            self.picker_append_pin(cells[idx].pin);
+            let pin = cells[idx].pin.clone();
+            self.picker_append_pin(&pin);
         }
     }
 
@@ -8294,9 +8332,9 @@ impl FlexInputApp {
     /// Apply a picker interaction collected by `kbm_picker_window` — split out
     /// so a sub-patch editor viewport (which holds `&self` during its closure)
     /// can render the window inline and apply the result once `&mut` is back.
-    fn apply_kbm_picker_result(&mut self, clicked_pin: Option<&'static str>, done: bool) {
+    fn apply_kbm_picker_result(&mut self, clicked_pin: Option<String>, done: bool) {
         if let Some(pin) = clicked_pin {
-            self.picker_append_pin(pin);
+            self.picker_append_pin(&pin);
         }
         if done {
             self.gamepad_nav.kbm_picker_open = false;
@@ -8306,10 +8344,11 @@ impl FlexInputApp {
 
     /// Render the picker window into `ctx` (read-only on `self`) and report
     /// what the user did: `(clicked pin, Done pressed)`.
-    fn kbm_picker_window(&self, ctx: &egui::Context) -> (Option<&'static str>, bool) {
+    fn kbm_picker_window(&self, ctx: &egui::Context) -> (Option<String>, bool) {
         if !self.gamepad_nav.kbm_picker_open { return (None, false); }
-        use crate::kbm_picker::{clamp_index, layout_extent, picker_cells};
-        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones);
+        use crate::kbm_picker::{clamp_index, layout_extent, picker_cells, MACRO_Y};
+        let macros = self.macro_display_entries();
+        let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones, &macros);
         let sel = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         let accent = ctx.style().visuals.selection.stroke.color;
 
@@ -8332,7 +8371,7 @@ impl FlexInputApp {
         let skin = crate::canvas::remapper_icons::Skin::Kbm;
 
         // Collected from the closure (no &mut self inside the egui window body).
-        let mut clicked_pin: Option<&'static str> = None;
+        let mut clicked_pin: Option<String> = None;
         let mut done = false;
 
         // Touch Zones variant: a touchpad can't remap to itself, so the touchpad
@@ -8363,7 +8402,11 @@ impl FlexInputApp {
                     } else {
                         for (i, pin) in chord.iter().enumerate() {
                             if i > 0 { ui.label(egui::RichText::new("+").strong()); }
-                            ui.label(egui::RichText::new(kbm_pin_label(pin)).strong());
+                            // Macro pins show the port's display name.
+                            let label = macros.iter().find(|e| e.pin == *pin)
+                                .map(|e| e.name.clone())
+                                .unwrap_or_else(|| kbm_pin_label(pin));
+                            ui.label(egui::RichText::new(label).strong());
                         }
                     }
                 });
@@ -8376,6 +8419,13 @@ impl FlexInputApp {
                 // individually clickable (mouse) AND highlight the gamepad focus.
                 let (board, _) = ui.allocate_exact_size(
                     egui::vec2(board_w, board_h), egui::Sense::hover());
+                // "MACROS" caption above the dynamic cluster (only when present).
+                if cells.iter().any(|c| c.macro_meta.is_some()) {
+                    ui.painter_at(board).text(
+                        board.min + egui::vec2(2.0, (MACRO_Y - 0.42) * (UNIT + GAP)),
+                        egui::Align2::LEFT_TOP, "MACROS",
+                        egui::FontId::proportional(9.0), egui::Color32::from_gray(130));
+                }
                 for (i, cell) in cells.iter().enumerate() {
                     let min = board.min + egui::vec2(
                         cell.x * (UNIT + GAP), cell.y * (UNIT + GAP));
@@ -8388,7 +8438,7 @@ impl FlexInputApp {
                         ui.interact(rect, egui::Id::new(("kbm_cell", i)), egui::Sense::hover())
                     } else {
                         let r = ui.interact(rect, egui::Id::new(("kbm_cell", i)), egui::Sense::click());
-                        if r.clicked() { clicked_pin = Some(cell.pin); }
+                        if r.clicked() { clicked_pin = Some(cell.pin.clone()); }
                         r
                     };
                     let focused = i == sel;
@@ -8410,8 +8460,28 @@ impl FlexInputApp {
                             egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
                     }
                     let tint = if disabled { egui::Color32::from_gray(110) } else { egui::Color32::WHITE };
-                    // Icon (or text fallback), centered.
-                    if let Some(tex) = kbm_cell_texture(ctx, skin, cell.pin) {
+                    // Macro cells: the port's icon (custom patch-embedded SVG
+                    // or embedded set) or the port name + full-name tooltip.
+                    // KBM cells: skin icon or text fallback.
+                    if let Some(entry) = cell.macro_meta.as_ref() {
+                        if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
+                            ctx, &entry.icon, &entry.icon_svg, UNIT - 6.0)
+                        {
+                            let s = (UNIT - 6.0).min(size.x - 6.0).max(8.0);
+                            let img_rect = egui::Rect::from_center_size(
+                                rect.center(), egui::vec2(s, s));
+                            painter.image(tex.id(), img_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                tint);
+                        } else {
+                            let short: String = entry.name.chars().take(4).collect();
+                            painter.text(rect.center(), egui::Align2::CENTER_CENTER,
+                                short, egui::FontId::proportional(10.0), ui.visuals().text_color());
+                        }
+                        resp.on_hover_text(&entry.name);
+                        continue;
+                    }
+                    if let Some(tex) = kbm_cell_texture(ctx, skin, &cell.pin) {
                         let s = (UNIT - 6.0).min(size.x - 6.0).max(8.0);
                         let img_rect = egui::Rect::from_center_size(
                             rect.center(), egui::vec2(s, s));
@@ -8420,10 +8490,10 @@ impl FlexInputApp {
                             tint);
                     } else {
                         // Compact labels — "L-Stick" won't fit a 30px cell.
-                        let lbl = match cell.pin {
+                        let lbl = match cell.pin.as_str() {
                             "left_stick" => "LS".to_string(),
                             "right_stick" => "RS".to_string(),
-                            _ => kbm_pin_label(cell.pin),
+                            _ => kbm_pin_label(&cell.pin),
                         };
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
                             lbl,
@@ -11778,6 +11848,45 @@ fn build_processing_graph_rec(
         }
         } // end !is_source_self_sink guard
     }
+
+    // ── Macro-port ordering edges ─────────────────────────────────────────
+    // module.macro nodes have no wired inputs, so the plain topo sort would
+    // run them FIRST — before the mapping evaluators (Remapper / Touch Zones
+    // cards / 3DOF-Lean) publish this tick's macro values into the shared
+    // macro namespace. Add explicit publisher → macro edges so every macro
+    // reader evaluates after every potential publisher. Sub-patch nodes count
+    // on both sides (their inner graphs may contain either kind); a subpatch
+    // containing both is publisher AND reader, and the self-edge is skipped.
+    // A mutual pair of such subpatches would cycle — the topo fallback below
+    // appends them in insertion order, costing one tick of macro latency but
+    // still evaluating everything.
+    fn subpatch_has_module(sp: &UiSubPatch, pred: &dyn Fn(&str) -> bool) -> bool {
+        sp.snarl.nodes_ids_data().any(|(_, n)| {
+            pred(&n.value.module_id)
+                || n.value.subpatch.as_deref().is_some_and(|inner| subpatch_has_module(inner, pred))
+        })
+    }
+    let is_macro_publisher = |mid: &str| matches!(mid,
+        "module.remapper" | "module.touch_zones" | "processing.gyro_3dof");
+    let is_macro_reader = |mid: &str| mid == "module.macro";
+    let macro_publishers: Vec<usize> = node_list.iter().enumerate().filter(|(_, (_, node))| {
+        is_macro_publisher(&node.module_id)
+            || node.subpatch.as_deref().is_some_and(|sp| subpatch_has_module(sp, &is_macro_publisher))
+    }).map(|(i, _)| i).collect();
+    let macro_readers: Vec<usize> = node_list.iter().enumerate().filter(|(_, (_, node))| {
+        is_macro_reader(&node.module_id)
+            || node.subpatch.as_deref().is_some_and(|sp| subpatch_has_module(sp, &is_macro_reader))
+    }).map(|(i, _)| i).collect();
+    if !macro_readers.is_empty() {
+        for &p in &macro_publishers {
+            for &m in &macro_readers {
+                if p == m { continue; }
+                dependents[p].push(m);
+                in_degree[m] += 1;
+            }
+        }
+    }
+
     let mut queue: VecDeque<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
     let mut sorted: Vec<usize> = Vec::with_capacity(n);
     while let Some(idx) = queue.pop_front() {
@@ -13296,7 +13405,7 @@ fn show_subpatch_editors(
         let mut special_req: Option<crate::canvas::viewer::SpecialPickerRequest> = None;
         // Picker interaction collected inside the viewport closure (which only
         // holds `&app`); applied after it returns.
-        let mut picker_result: (Option<&'static str>, bool) = (None, false);
+        let mut picker_result: (Option<String>, bool) = (None, false);
 
         let viewport_id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
         // Build breadcrumb: "Parent Name > This Name" for nested editors.
@@ -13411,11 +13520,10 @@ fn show_subpatch_editors(
         // Apply picker interactions collected inside the viewport closure.
         app.apply_kbm_picker_result(picker_result.0, picker_result.1);
 
-        // Collect nested edit request before putting inner_canvas back.
+        // Collect nested edit requests before putting inner_canvas back.
         if let Some(child_id) = inner_canvas.pending_edit_subpatch.take() {
             pending_nested.push((i, child_id));
         }
-
         // Sync clipboard upward only when the user actually copied inside this editor.
         // clipboard_gen is incremented by copy_selected(); comparing before/after show()
         // is exact regardless of node count, content, or number of copies in a row.
@@ -13717,3 +13825,61 @@ fn sync_inner_canvas_ports(
 
 
 
+
+#[cfg(test)]
+mod macro_ordering_tests {
+    use super::*;
+
+    fn bare_node(module_id: &str) -> NodeData {
+        NodeData {
+            module_id: module_id.to_string(),
+            display_name: module_id.to_string(),
+            category: String::new(),
+            inputs: vec![],
+            outputs: vec![],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    // A Macro node has no wired inputs (in-degree 0), so without the explicit
+    // publisher → macro edges the topo sort would evaluate it BEFORE the
+    // Remapper that publishes its values — one tick of stale macro state.
+    // Insertion order deliberately puts the macro node first to prove the
+    // edge, not luck, produces the ordering. The sub-patch variant guards the
+    // recursive containment scan on both sides.
+    #[test]
+    fn macro_nodes_evaluate_after_mapping_publishers() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let mut mac = bare_node("module.macro");
+        mac.outputs = vec![PinDescriptor::new("Ping", SignalType::Bool)];
+        mac.params.insert("output_pin_ids".into(),
+            serde_json::json!(["macro:aabbccdd"]));
+        snarl.insert_node(egui::pos2(0.0, 0.0), mac);
+        snarl.insert_node(egui::pos2(100.0, 0.0), bare_node("module.remapper"));
+
+        let (graph, _) = build_processing_graph(&snarl);
+        let pos = |mid: &str| graph.nodes.iter().position(|s| s.module_id == mid).unwrap();
+        assert!(
+            pos("module.remapper") < pos("module.macro"),
+            "remapper must evaluate before the macro node it feeds"
+        );
+
+        // Same guarantee when the macro node lives inside a sub-patch.
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let mut sp_node = bare_node("subpatch");
+        let mut sp = UiSubPatch::default();
+        sp.snarl.insert_node(egui::pos2(0.0, 0.0), bare_node("module.macro"));
+        sp_node.subpatch = Some(Box::new(sp));
+        snarl.insert_node(egui::pos2(0.0, 0.0), sp_node);
+        snarl.insert_node(egui::pos2(100.0, 0.0), bare_node("processing.gyro_3dof"));
+
+        let (graph, _) = build_processing_graph(&snarl);
+        let pos = |mid: &str| graph.nodes.iter().position(|s| s.module_id == mid).unwrap();
+        assert!(
+            pos("processing.gyro_3dof") < pos("subpatch"),
+            "lean publisher must evaluate before the sub-patch holding a macro node"
+        );
+    }
+}

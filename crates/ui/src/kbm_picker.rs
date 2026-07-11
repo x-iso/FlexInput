@@ -127,6 +127,38 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
     ca("touch_swipe_x", TOUCH_X, 3.0), ca("touch_swipe_y", TOUCH_X + 1.0, 3.0),
 ];
 
+/// An owned picker cell — the static [`KBM_LAYOUT`] plus the current patch's
+/// dynamic macro ports resolve into these. `macro_meta` carries the port's
+/// display entry only for macro cells (their pin ids aren't in the KBM icon
+/// set, so the renderer needs the name/icon/custom-SVG alongside).
+#[derive(Clone)]
+pub struct PickerCell {
+    pub pin: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub analog_only: bool,
+    pub macro_meta: Option<crate::macro_icons::MacroDisplayEntry>,
+}
+
+impl From<&KbmCell> for PickerCell {
+    fn from(c: &KbmCell) -> Self {
+        PickerCell {
+            pin: c.pin.to_string(),
+            x: c.x,
+            y: c.y,
+            width: c.width,
+            analog_only: c.analog_only,
+            macro_meta: None,
+        }
+    }
+}
+
+/// Grid Y where the macro cluster starts (one gap row below the keyboard).
+pub const MACRO_Y: f32 = 6.6;
+/// Macro cells per row before wrapping.
+const MACRO_PER_ROW: usize = 14;
+
 /// The cell set actually shown (and navigated) for the current picker mode.
 ///
 /// In Touch-Zones mode a touchpad can't remap to itself, so the touchpad cluster
@@ -135,32 +167,47 @@ pub const KBM_LAYOUT: &[KbmCell] = &[
 /// (which walks this list) can't reach them, and the focus ring lands on a
 /// hidden cell, making the cursor vanish. Single source of truth shared by the
 /// renderer, the spatial nav, and activation.
-pub fn picker_cells(tz: bool) -> Vec<KbmCell> {
-    if !tz {
-        return KBM_LAYOUT.to_vec();
+///
+/// `macros` is the patch's defined macro ports, laid out as an extra cluster
+/// BELOW the keyboard at [`MACRO_Y`].
+pub fn picker_cells(tz: bool, macros: &[crate::macro_icons::MacroDisplayEntry]) -> Vec<PickerCell> {
+    let mut cells: Vec<PickerCell> = if !tz {
+        KBM_LAYOUT.iter().map(PickerCell::from).collect()
+    } else {
+        // Touchpad cluster pins hidden in Touch-Zones mode (see kbm_picker_window).
+        let hidden = |pin: &str| matches!(pin,
+            "touch_left" | "touch_center" | "touch_right"
+            | "btn_touchpad" | "touch_swipe_x" | "touch_swipe_y" | "btn_mute");
+        let mut cells: Vec<PickerCell> = KBM_LAYOUT.iter()
+            .filter(|c| !hidden(c.pin)).map(PickerCell::from).collect();
+        // Analog outputs placed in the vacated touchpad columns: mouse-delta and the
+        // full analog sticks (touch position → deflection). The KB/M grid has no
+        // stick keys, so they live here — and stay navigable.
+        cells.push((&c("mouse_x", TOUCH_X, 1.0)).into());
+        cells.push((&c("mouse_y", TOUCH_X + 1.0, 1.0)).into());
+        cells.push((&c("mouse", TOUCH_X, 2.0)).into());
+        cells.push((&c("left_stick", TOUCH_X, 3.0)).into());
+        cells.push((&c("right_stick", TOUCH_X + 1.0, 3.0)).into());
+        // Analog (variable-speed) scroll — the touch-zone deflection sets the rate.
+        cells.push((&c("scroll_y", TOUCH_X, 4.0)).into());
+        cells.push((&c("scroll_x", TOUCH_X + 1.0, 4.0)).into());
+        cells
+    };
+    for (i, entry) in macros.iter().enumerate() {
+        cells.push(PickerCell {
+            pin: entry.pin.clone(),
+            x: (i % MACRO_PER_ROW) as f32,
+            y: MACRO_Y + (i / MACRO_PER_ROW) as f32 * 1.1,
+            width: 1.0,
+            analog_only: false,
+            macro_meta: Some(entry.clone()),
+        });
     }
-    // Touchpad cluster pins hidden in Touch-Zones mode (see kbm_picker_window).
-    let hidden = |pin: &str| matches!(pin,
-        "touch_left" | "touch_center" | "touch_right"
-        | "btn_touchpad" | "touch_swipe_x" | "touch_swipe_y" | "btn_mute");
-    let mut cells: Vec<KbmCell> =
-        KBM_LAYOUT.iter().copied().filter(|c| !hidden(c.pin)).collect();
-    // Analog outputs placed in the vacated touchpad columns: mouse-delta and the
-    // full analog sticks (touch position → deflection). The KB/M grid has no
-    // stick keys, so they live here — and stay navigable.
-    cells.push(c("mouse_x", TOUCH_X, 1.0));
-    cells.push(c("mouse_y", TOUCH_X + 1.0, 1.0));
-    cells.push(c("mouse", TOUCH_X, 2.0));
-    cells.push(c("left_stick", TOUCH_X, 3.0));
-    cells.push(c("right_stick", TOUCH_X + 1.0, 3.0));
-    // Analog (variable-speed) scroll — the touch-zone deflection sets the rate.
-    cells.push(c("scroll_y", TOUCH_X, 4.0));
-    cells.push(c("scroll_x", TOUCH_X + 1.0, 4.0));
     cells
 }
 
 /// Width/height of a cell list in grid units (for sizing the window).
-pub fn layout_extent(cells: &[KbmCell]) -> (f32, f32) {
+pub fn layout_extent(cells: &[PickerCell]) -> (f32, f32) {
     let mut max_x = 0.0f32;
     let mut max_y = 0.0f32;
     for cell in cells {
@@ -171,12 +218,12 @@ pub fn layout_extent(cells: &[KbmCell]) -> (f32, f32) {
 }
 
 /// A valid index into `cells`, clamped.
-pub fn clamp_index(cells: &[KbmCell], idx: usize) -> usize {
+pub fn clamp_index(cells: &[PickerCell], idx: usize) -> usize {
     idx.min(cells.len().saturating_sub(1))
 }
 
 /// Center point of a cell in grid units (for spatial navigation + hit-testing).
-fn cell_center(cell: &KbmCell) -> (f32, f32) {
+fn cell_center(cell: &PickerCell) -> (f32, f32) {
     (cell.x + cell.width * 0.5, cell.y + 0.5)
 }
 
@@ -184,7 +231,7 @@ fn cell_center(cell: &KbmCell) -> (f32, f32) {
 /// unit direction: e.g. right = (1, 0), up = (0, -1)). Returns the current index
 /// if no cell lies in that direction. Scores by primary-axis distance plus a
 /// cross-axis penalty so navigation favors the same row/column.
-pub fn nearest_in_dir(cells: &[KbmCell], from: usize, dx: f32, dy: f32) -> usize {
+pub fn nearest_in_dir(cells: &[PickerCell], from: usize, dx: f32, dy: f32) -> usize {
     let from = clamp_index(cells, from);
     let (cx, cy) = cell_center(&cells[from]);
     let mut best = from;

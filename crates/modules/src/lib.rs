@@ -9,6 +9,9 @@ pub mod processing;
 pub mod subpatch;
 pub mod touch;
 
+// `macro` is a reserved keyword, hence the `_module` suffix on the file.
+pub mod macro_module;
+
 use flexinput_core::ModuleRegistration;
 
 /// Returns every built-in module registration.
@@ -22,6 +25,7 @@ pub fn all_modules() -> Vec<ModuleRegistration> {
     modules.extend(generator::registrations());
     modules.extend(network::registrations());
     modules.extend(touch::registrations());
+    modules.extend(macro_module::registrations());
     modules.extend(subpatch::registrations());
     modules
 }

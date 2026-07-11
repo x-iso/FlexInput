@@ -1,4 +1,5 @@
 pub mod automap;
+pub mod macros;
 pub mod module;
 pub mod patch;
 pub mod signal;

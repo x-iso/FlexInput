@@ -5,6 +5,7 @@ mod easy;
 mod gamepad_nav;
 mod kbm_picker;
 mod guide_watcher;
+mod macro_icons;
 mod panels;
 mod panic_hotkey;
 mod pin_hotkey;
