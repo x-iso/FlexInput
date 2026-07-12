@@ -3,6 +3,35 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Info overlay** — a transparent, click-through, always-on-top layer over the
+  whole screen (works over borderless/windowed games; exclusive fullscreen
+  bypasses the compositor). Pin module UI elements onto it — from the tab
+  canvas or from inside first-level sub-patches (Easy presets included) — and
+  they render live with signal glow while every click passes through to the
+  game underneath. Toggle it from the title bar (▣), a global keyboard
+  shortcut (default `Ctrl+Shift+O`, re-bindable in Settings), or a learnable
+  gamepad chord.
+  - **Edit mode** (✏ button): drag, resize, recolor, and z-order pinned
+    elements, and add the same Text/SVG/shape decorations as sub-patch
+    layouts — the full layout toolbar, snap grid, and inspector are shared.
+  - **Add element**: the overlay collapses to a glowing border while pinnable
+    elements light up amber in the FlexInput window; click one and you're
+    back on the overlay with the new pin selected, ready to place.
+  - **Overlay frame rate** setting — the overlay paces its own repaint
+    (default 60 FPS) independent of the background repaint rate, so pinned
+    readouts stay smooth on top of a game while the main window idles.
+  - Overlay layouts persist per patch tab (workspace, save files, recovery).
+
+### Fixed
+
+- Transparent child windows no longer composite as an opaque white sheet on
+  Win11 + AMD (missing `WS_EX_NOREDIRECTIONBITMAP` at window creation), and
+  window resizes no longer churn the swapchain through stale buffered sizes.
+
 ## [0.11.7] - 2026-07-12
 
 ### Added

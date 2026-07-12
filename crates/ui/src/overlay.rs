@@ -3,18 +3,23 @@
 //! borderless/windowed — exclusive fullscreen bypasses the compositor).
 //!
 //! Renders the active tab's [`OverlayLayout`] (pinned module elements +
-//! decorations; see `canvas::overlay_body`). Three states:
+//! decorations; see `canvas::overlay_body`). Four states:
 //!
 //! * **Hidden** — viewport not declared; eframe destroys the OS window.
 //! * **Live** — mouse-passthrough on, never focused; pins render read-only
-//!   with live signal glow. Repaint is paced by `OVERLAY_FRAME_INTERVAL`
-//!   (becomes the `overlay_fps` setting) on the PARENT context — immediate
-//!   viewports render with the parent, and egui keeps the earliest deadline,
-//!   so the background throttle can't slow the overlay down.
+//!   with live signal glow. Repaint is paced by the `overlay_fps` setting
+//!   on the PARENT context — immediate viewports render with the parent,
+//!   and egui keeps the earliest deadline, so the background throttle can't
+//!   slow the overlay down.
 //! * **Edit** — passthrough off, window focused; items get drag/resize/
 //!   selection chrome plus a floating toolbar (Done, Add element, snap +
 //!   decorations + inspector via the shared `layout_editing_controls_core`).
 //!   Esc or Done returns to Live.
+//! * **Pick** — entered from the toolbar's Add element: the overlay collapses
+//!   to a pulsing amber border (click-through again) while exposable elements
+//!   in the main window / first-level sub-patch editors arm amber; app.rs
+//!   path-resolves the click and the overlay consumes it back into Edit with
+//!   the new pin selected. Esc (in any FlexInput window) cancels.
 //!
 //! Transparency notes (hard-won, see the machine-quirks memory):
 //! * The window title + transparent + skip-taskbar combo triggers the
@@ -45,10 +50,6 @@ pub const OVERLAY_EDIT_KEY: &str = "fxi_overlay_edit";
 /// cosmetic, but stays unique for debuggability).
 const OVERLAY_WINDOW_TITLE: &str = "FlexInput Overlay";
 
-/// Repaint cadence while the overlay is visible. Hardcoded ~60 FPS for now;
-/// becomes the `overlay_fps` setting (the low `bg_repaint_hz` cadence would
-/// look awful animating on top of a game).
-const OVERLAY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 fn visible_id() -> egui::Id { egui::Id::new(OVERLAY_VISIBLE_KEY) }
 fn edit_id() -> egui::Id { egui::Id::new(OVERLAY_EDIT_KEY) }
@@ -107,6 +108,22 @@ pub fn render_overlay_toggle(ui: &mut egui::Ui, bar_h: f32) {
         {
             set_overlay_edit(ui.ctx(), !editing);
         }
+
+        // The active GPU backend couldn't give any window a transparent
+        // surface (latched by the vendored egui-wgpu when surface creation
+        // falls back to an opaque alpha mode) — the overlay composites as an
+        // opaque sheet. Warn right next to the toggle.
+        if eframe::egui_wgpu::winit::TRANSPARENCY_UNSUPPORTED
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            ui.label(egui::RichText::new("⚠").size(14.0).color(egui::Color32::from_rgb(240, 180, 60)))
+                .on_hover_text(
+                    "The active GPU backend doesn't support transparent windows,\n\
+                     so the overlay renders as an opaque sheet instead of floating\n\
+                     over your game. Try switching the Renderer in Settings\n\
+                     (DirectX 12 on AMD) and restarting FlexInput.",
+                );
+        }
     }
 }
 
@@ -126,6 +143,9 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         .unwrap_or(egui::vec2(1920.0, 1080.0));
 
     let edit = overlay_edit(ctx);
+    // Live repaint cadence — the user's `overlay_fps` setting, NOT the low
+    // `bg_repaint_hz` cadence (which would look awful over a game).
+    let frame_interval = Duration::from_secs_f64(1.0 / app.overlay_fps() as f64);
     // Pick mode is only meaningful while editing (it's entered from the edit
     // toolbar); anything else left it stale — clear it.
     let mut pick = crate::canvas::viewer::overlay_pick_active(ctx);
@@ -268,7 +288,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // Live signal glow / animations need a real cadence; pace the PARENT
     // context (immediate viewports render with the parent; egui keeps the
     // earliest requested deadline, so the bg throttle can't override this).
-    ctx.request_repaint_after(OVERLAY_FRAME_INTERVAL);
+    ctx.request_repaint_after(frame_interval);
 }
 
 /// Pick-state visuals: a pulsing amber border frame hugging the screen edge

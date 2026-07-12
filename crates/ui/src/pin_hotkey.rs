@@ -1,25 +1,34 @@
-//! Global pin-toggle hotkey listener (Windows). Companion to
-//! [`crate::panic_hotkey`]: same RegisterHotKey pattern, different HOTKEY_ID
-//! so both chords can be registered simultaneously without colliding.
+//! Global toggle-hotkey listener (Windows). Companion to
+//! [`crate::panic_hotkey`]: same RegisterHotKey pattern, caller-supplied
+//! HOTKEY_ID so multiple chords can be registered simultaneously without
+//! colliding (always-on-top pin, info overlay, …).
 //!
-//! The chord toggles "always-on-top" pinning of the FlexInput window. The
-//! UI thread polls `toggle_requested` each frame and flips its `pin_active`
-//! state from there (so the viewport command, focus flip-flop, and any
-//! visual feedback happen on the main thread).
+//! Each chord raises its `toggle_requested` flag; the UI thread polls it
+//! once per frame and applies the state flip there (so viewport commands,
+//! focus flip-flops, and any visual feedback happen on the main thread).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::settings::PinShortcut;
 
+/// HOTKEY_ID for the always-on-top pin chord. Distinct from
+/// `panic_hotkey`'s id and `HOTKEY_ID_OVERLAY` so all registrations coexist.
+pub const HOTKEY_ID_PIN: i32 = 0xF1E2;
+/// HOTKEY_ID for the info-overlay visibility chord.
+pub const HOTKEY_ID_OVERLAY: i32 = 0xF1E3;
+
 pub fn spawn_pin_hotkey_listener(
+    hotkey_id: i32,
+    thread_label: &'static str,
     shortcut: Arc<RwLock<PinShortcut>>,
     toggle_requested: Arc<AtomicBool>,
 ) {
     #[cfg(windows)]
-    windows_impl::spawn(shortcut, toggle_requested);
+    windows_impl::spawn(hotkey_id, thread_label, shortcut, toggle_requested);
     #[cfg(not(windows))]
     {
+        let _ = (hotkey_id, thread_label);
         let _ = shortcut;
         let _ = toggle_requested;
     }
@@ -36,15 +45,14 @@ mod windows_impl {
         PeekMessageW, MSG, PM_REMOVE, WM_HOTKEY,
     };
 
-    // Distinct from panic_hotkey::HOTKEY_ID so both registrations coexist.
-    const HOTKEY_ID: i32 = 0xF1E2;
-
     pub fn spawn(
+        hotkey_id: i32,
+        thread_label: &'static str,
         shortcut: Arc<RwLock<PinShortcut>>,
         toggle_requested: Arc<AtomicBool>,
     ) {
         std::thread::Builder::new()
-            .name("pin-hotkey".into())
+            .name(thread_label.into())
             .spawn(move || unsafe {
                 let mut current: Option<PinShortcut> = None;
                 let mut registered = false;
@@ -52,12 +60,12 @@ mod windows_impl {
                 if let Ok(sc) = shortcut.read() {
                     let snapshot = sc.clone();
                     drop(sc);
-                    registered = register(&snapshot);
+                    registered = register(hotkey_id, &snapshot);
                     current = Some(snapshot);
                 }
                 if let Some(c) = current.as_ref() {
                     eprintln!(
-                        "[pin-hotkey] initial registration {} for {}",
+                        "[{thread_label}] initial registration {} for {}",
                         if registered { "OK" } else { "FAILED" },
                         c.label()
                     );
@@ -67,7 +75,7 @@ mod windows_impl {
                 let mut last_check = std::time::Instant::now();
                 loop {
                     while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                        if msg.message == WM_HOTKEY && msg.wParam as i32 == HOTKEY_ID {
+                        if msg.message == WM_HOTKEY && msg.wParam as i32 == hotkey_id {
                             toggle_requested.store(true, Ordering::Relaxed);
                         }
                     }
@@ -83,11 +91,11 @@ mod windows_impl {
                             };
                             if need_reregister {
                                 if registered {
-                                    UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID);
+                                    UnregisterHotKey(std::ptr::null_mut(), hotkey_id);
                                 }
-                                registered = register(&want);
+                                registered = register(hotkey_id, &want);
                                 eprintln!(
-                                    "[pin-hotkey] re-registered {} for {}",
+                                    "[{thread_label}] re-registered {} for {}",
                                     if registered { "OK" } else { "FAILED" },
                                     want.label()
                                 );
@@ -99,10 +107,10 @@ mod windows_impl {
                     std::thread::sleep(std::time::Duration::from_millis(15));
                 }
             })
-            .expect("failed to spawn pin-hotkey thread");
+            .expect("failed to spawn hotkey thread");
     }
 
-    unsafe fn register(sc: &PinShortcut) -> bool {
+    unsafe fn register(hotkey_id: i32, sc: &PinShortcut) -> bool {
         let Some(ref name) = sc.key else { return false; };
         let Some(vk) = egui_name_to_vk(name) else { return false; };
         let mut mods: u32 = MOD_NOREPEAT;
@@ -116,7 +124,7 @@ mod windows_impl {
         let is_letter_or_digit = matches!(name.len(), 1) || (name.starts_with("Num") && name.len() == 4);
         let no_mods = !sc.ctrl && !sc.shift && !sc.alt && !sc.win;
         if no_mods && is_letter_or_digit { return false; }
-        RegisterHotKey(std::ptr::null_mut(), HOTKEY_ID, mods, vk) != 0
+        RegisterHotKey(std::ptr::null_mut(), hotkey_id, mods, vk) != 0
     }
 
     fn egui_name_to_vk(name: &str) -> Option<u32> {

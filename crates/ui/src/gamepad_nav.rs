@@ -38,6 +38,7 @@ pub enum NavDir {
 pub enum ChordTarget {
     SeeThrough,
     Panic,
+    Overlay,
 }
 
 /// Selection model levels.
@@ -266,6 +267,7 @@ pub struct GamepadNav {
     /// to fire the toggle once per press, not every frame the combo is held.
     pub seethrough_chord_down: bool,
     pub panic_chord_down: bool,
+    pub overlay_chord_down: bool,
     /// UI-thread keyboard tapper for the Alt+Tab switcher. Independent of the
     /// device pool (which the I/O thread resets while nav-suppression is on).
     #[cfg(windows)]
@@ -329,6 +331,7 @@ impl Default for GamepadNav {
             chord_arm_idle: false,
             seethrough_chord_down: false,
             panic_chord_down: false,
+            overlay_chord_down: false,
             #[cfg(windows)]
             key_tapper: None,
         }

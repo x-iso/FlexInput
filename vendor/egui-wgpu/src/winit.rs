@@ -9,6 +9,14 @@ use crate::{
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::{num::NonZeroU32, sync::Arc};
 
+// FLEXINPUT PATCH: latched true when a transparent backbuffer was requested
+// but the created surface offered no transparency-capable
+// `CompositeAlphaMode` (the window will composite opaque). Read by the app
+// UI to warn near its transparency-dependent features (info overlay,
+// see-through mode). Never reset — backend can't change within a process.
+pub static TRANSPARENCY_UNSUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
     alpha_mode: wgpu::CompositeAlphaMode,
@@ -252,6 +260,8 @@ impl Painter {
                 log::warn!(
                     "Transparent window was requested, but the active wgpu surface does not support a `CompositeAlphaMode` with transparency."
                 );
+                // FLEXINPUT PATCH: surface the failure to the app UI.
+                TRANSPARENCY_UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
                 wgpu::CompositeAlphaMode::Auto
             }
         } else {

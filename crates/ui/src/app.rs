@@ -659,6 +659,14 @@ pub struct FlexInputApp {
     pin_learned_chord: Arc<Mutex<Option<String>>>,
     /// True while the pin shortcut button is in Learn mode in Settings.
     pin_learning: bool,
+    /// Raised by the overlay hotkey listener thread; the UI loop consumes
+    /// it once per frame and flips the overlay's visible flag.
+    overlay_toggle_requested: Arc<AtomicBool>,
+    /// Live snapshot of the overlay keyboard chord shared with its hotkey
+    /// listener thread. Updated whenever the user re-binds in Settings.
+    overlay_shortcut_shared: Arc<RwLock<PinShortcut>>,
+    /// True while the overlay shortcut button is in Learn mode in Settings.
+    overlay_learning: bool,
     /// HWND of whatever foreground window we left when the pin was last
     /// engaged. Used by the focus flip-flop feature to restore focus to
     /// that window so the user can immediately test their changes.
@@ -1028,8 +1036,19 @@ impl FlexInputApp {
         let pin_learn_chord      = Arc::new(AtomicBool::new(false));
         let pin_learned_chord    = Arc::new(Mutex::new(None));
         spawn_pin_hotkey_listener(
+            crate::pin_hotkey::HOTKEY_ID_PIN,
+            "pin-hotkey",
             Arc::clone(&pin_shortcut_shared),
             Arc::clone(&pin_toggle_requested),
+        );
+        // Info-overlay visibility hotkey — same listener pattern, own id.
+        let overlay_toggle_requested = Arc::new(AtomicBool::new(false));
+        let overlay_shortcut_shared  = Arc::new(RwLock::new(app_settings.overlay_shortcut.clone()));
+        spawn_pin_hotkey_listener(
+            crate::pin_hotkey::HOTKEY_ID_OVERLAY,
+            "overlay-hotkey",
+            Arc::clone(&overlay_shortcut_shared),
+            Arc::clone(&overlay_toggle_requested),
         );
         spawn_guide_watcher(
             Arc::clone(&pin_guide_cfg),
@@ -1141,6 +1160,9 @@ impl FlexInputApp {
             pin_learn_chord,
             pin_learned_chord,
             pin_learning: false,
+            overlay_toggle_requested,
+            overlay_shortcut_shared,
+            overlay_learning: false,
             pin_prev_foreground_hwnd: None,
             pin_last_external_hwnd: None,
             pin_pending_yield: None,
@@ -1580,6 +1602,13 @@ impl eframe::App for FlexInputApp {
         // thread, where the Win32 calls are safe to make.
         if self.pin_toggle_requested.swap(false, Ordering::Relaxed) {
             self.toggle_pin(ctx);
+        }
+
+        // ── Overlay visibility toggle (global hotkey) ─────────────────────
+        // The keyboard listener thread raises the flag; flip the ctx slot
+        // here on the UI thread (show_overlay reads it later this frame).
+        if self.overlay_toggle_requested.swap(false, Ordering::Relaxed) {
+            crate::overlay::set_overlay_visible(ctx, !crate::overlay::overlay_visible(ctx));
         }
 
         // Deferred pin-off foreground handoff. Scheduled by `toggle_pin` on
@@ -7739,6 +7768,7 @@ impl FlexInputApp {
         match self.gamepad_nav.chord_learn.take() {
             Some(ChordTarget::SeeThrough) => self.settings.seethrough_chord = Some(chord),
             Some(ChordTarget::Panic)      => self.settings.panic_chord = Some(chord),
+            Some(ChordTarget::Overlay)    => self.settings.overlay_chord = Some(chord),
             None => {}
         }
         self.settings_dirty = true;
@@ -7779,6 +7809,13 @@ impl FlexInputApp {
             fired = true;
         }
         self.gamepad_nav.panic_chord_down = pn_now;
+        // Overlay.
+        let ov_now = chord_held(&self.settings.overlay_chord);
+        if ov_now && !self.gamepad_nav.overlay_chord_down {
+            crate::overlay::set_overlay_visible(ctx, !crate::overlay::overlay_visible(ctx));
+            fired = true;
+        }
+        self.gamepad_nav.overlay_chord_down = ov_now;
         fired
     }
 
@@ -7789,9 +7826,13 @@ impl FlexInputApp {
     fn check_shortcut_chords_global(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.focused) { return; }
         // Nothing to do if no combos are assigned.
-        if self.settings.seethrough_chord.is_none() && self.settings.panic_chord.is_none() {
+        if self.settings.seethrough_chord.is_none()
+            && self.settings.panic_chord.is_none()
+            && self.settings.overlay_chord.is_none()
+        {
             self.gamepad_nav.seethrough_chord_down = false;
             self.gamepad_nav.panic_chord_down = false;
+            self.gamepad_nav.overlay_chord_down = false;
             return;
         }
         let excluded = self.own_virtual_device_ids();
@@ -7822,6 +7863,11 @@ impl FlexInputApp {
             self.panic_active = !self.panic_active;
         }
         self.gamepad_nav.panic_chord_down = pn_now;
+        let ov_now = any_holds(&self.settings.overlay_chord);
+        if ov_now && !self.gamepad_nav.overlay_chord_down {
+            crate::overlay::set_overlay_visible(ctx, !crate::overlay::overlay_visible(ctx));
+        }
+        self.gamepad_nav.overlay_chord_down = ov_now;
     }
 
     /// Update the right-stick + gyro cursor overlay position/visibility.
@@ -8376,6 +8422,8 @@ impl FlexInputApp {
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::SeeThrough }, suffix: "" },
             GpSettingRow { label: "Shortcut: Panic".into(),
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Panic }, suffix: "" },
+            GpSettingRow { label: "Shortcut: Overlay".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Overlay }, suffix: "" },
         ]
     }
 
@@ -8532,6 +8580,7 @@ impl FlexInputApp {
                     match target {
                         ChordTarget::SeeThrough => self.settings.seethrough_chord = None,
                         ChordTarget::Panic      => self.settings.panic_chord = None,
+                        ChordTarget::Overlay    => self.settings.overlay_chord = None,
                     }
                     self.settings_dirty = true;
                 }
@@ -8671,6 +8720,7 @@ impl FlexInputApp {
                                 let assigned = match target {
                                     ChordTarget::SeeThrough => self.settings.seethrough_chord.as_ref(),
                                     ChordTarget::Panic => self.settings.panic_chord.as_ref(),
+                                    ChordTarget::Overlay => self.settings.overlay_chord.as_ref(),
                                 };
                                 match assigned {
                                     Some(c) if !c.is_empty() => { combo_icons = Some(c.clone()); String::new() }
@@ -9288,6 +9338,7 @@ impl FlexInputApp {
             let assigned: Option<&Vec<String>> = match target {
                 ChordTarget::SeeThrough => self.settings.seethrough_chord.as_ref(),
                 ChordTarget::Panic      => self.settings.panic_chord.as_ref(),
+                ChordTarget::Overlay    => self.settings.overlay_chord.as_ref(),
             };
             (assigned.map(|c| pretty_chord_combo(c)), assigned.is_some())
         };
@@ -9320,6 +9371,7 @@ impl FlexInputApp {
                 match target {
                     ChordTarget::SeeThrough => self.settings.seethrough_chord = None,
                     ChordTarget::Panic      => self.settings.panic_chord = None,
+                    ChordTarget::Overlay    => self.settings.overlay_chord = None,
                 }
                 if learning { self.gamepad_nav.chord_learn = None; }
                 changed = true;
@@ -10044,6 +10096,79 @@ impl FlexInputApp {
                 ui.separator();
                 ui.add_space(6.0);
 
+                // ── Info overlay ────────────────────────────────────────
+                ui.label(egui::RichText::new("Info overlay").strong());
+                ui.add_space(4.0);
+
+                // Global toggle shortcut (mirrors the pin binder above).
+                ui.horizontal(|ui| {
+                    ui.label("Overlay shortcut:");
+                    let btn_text = if self.overlay_learning {
+                        "Press chord…".to_string()
+                    } else {
+                        self.settings.overlay_shortcut.label()
+                    };
+                    let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+                    if self.overlay_learning {
+                        btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
+                                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                    }
+                    let resp = ui.add(btn).on_hover_text(
+                        if self.overlay_learning {
+                            "Press the new shortcut (modifier + key).\nClick again to cancel."
+                        } else {
+                            "Click to re-bind. Press the shortcut anywhere on the system to show/hide the overlay."
+                        }
+                    );
+                    if resp.clicked() {
+                        self.overlay_learning = !self.overlay_learning;
+                    }
+                });
+                if self.overlay_learning {
+                    let pressed: Option<egui::Key> = ctx.input(|i| {
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                            _ => None,
+                        })
+                    });
+                    if let Some(key) = pressed {
+                        let m = ctx.input(|i| i.modifiers);
+                        let key_name = format!("{:?}", key);
+                        self.settings.overlay_shortcut = settings::PinShortcut {
+                            ctrl:  m.ctrl,
+                            shift: m.shift,
+                            alt:   m.alt,
+                            win:   m.command && !m.ctrl,
+                            key:   Some(key_name),
+                        };
+                        if let Ok(mut s) = self.overlay_shortcut_shared.write() {
+                            *s = self.settings.overlay_shortcut.clone();
+                        }
+                        self.overlay_learning = false;
+                        dirty = true;
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Overlay frame rate")
+                        .on_hover_text("Repaint rate of the overlay while it's visible. Separate from the background repaint rate — the overlay animates on top of your game.");
+                    let resp = ui.add(egui::Slider::new(
+                        &mut self.settings.overlay_fps,
+                        settings::OVERLAY_FPS_MIN..=settings::OVERLAY_FPS_MAX,
+                    ).suffix(" FPS"));
+                    if resp.changed() {
+                        dirty = true;
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "How smoothly pinned elements animate on the overlay. Higher = smoother glow, a bit more CPU/GPU while the overlay is shown."
+                ).small().color(egui::Color32::from_gray(140)));
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
                 // ── Gamepad shortcuts ───────────────────────────────────
                 // Assign a gamepad button combo to toggle see-through / panic.
                 // Learned by clicking Learn then pressing+releasing a combo.
@@ -10053,6 +10178,9 @@ impl FlexInputApp {
                     dirty = true;
                 }
                 if self.gamepad_shortcut_row(ui, "Panic mode", crate::gamepad_nav::ChordTarget::Panic) {
+                    dirty = true;
+                }
+                if self.gamepad_shortcut_row(ui, "Overlay", crate::gamepad_nav::ChordTarget::Overlay) {
                     dirty = true;
                 }
                 ui.add_space(2.0);
@@ -10534,6 +10662,12 @@ impl FlexInputApp {
         let shortcut = self.panic_shortcut.clone();
         let idx = self.active_tab.min(self.tabs.len().saturating_sub(1));
         (&mut self.tabs[idx], &self.last_signals, shortcut)
+    }
+
+    /// The overlay's live repaint rate (clamped to the settings bounds).
+    pub(crate) fn overlay_fps(&self) -> u32 {
+        self.settings.overlay_fps
+            .clamp(settings::OVERLAY_FPS_MIN, settings::OVERLAY_FPS_MAX)
     }
 
     fn save_workspace_now(&self) {

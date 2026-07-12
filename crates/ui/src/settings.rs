@@ -278,6 +278,20 @@ pub struct AppSettings {
     /// Optional gamepad button combo that toggles PANIC mode. None = unassigned.
     #[serde(default)]
     pub panic_chord: Option<Vec<String>>,
+    /// Optional gamepad button combo that toggles the info OVERLAY.
+    /// None = unassigned.
+    #[serde(default)]
+    pub overlay_chord: Option<Vec<String>>,
+    /// Global keyboard chord toggling the info overlay's visibility. Mirrors
+    /// `pin_shortcut` — RegisterHotKey under the hood (see `pin_hotkey.rs`).
+    #[serde(default = "default_overlay_shortcut")]
+    pub overlay_shortcut: PinShortcut,
+    /// Repaint rate of the info overlay while it's visible. Deliberately
+    /// separate from `bg_repaint_hz`: the overlay animates on top of a game,
+    /// where the low background cadence would look terrible. Range
+    /// OVERLAY_FPS_MIN..=MAX.
+    #[serde(default = "default_overlay_fps")]
+    pub overlay_fps: u32,
     /// When true, the see-through / panic gamepad combos above only fire while
     /// the driving gamepad is in UI-navigation mode (so the same buttons stay
     /// free for in-game mappings otherwise). When false, they fire whenever
@@ -407,6 +421,19 @@ pub const BG_REPAINT_HZ_MAX: u32 = 30;
 pub const BG_REPAINT_HZ_DEFAULT: u32 = 10;
 fn default_bg_repaint_hz() -> u32 { BG_REPAINT_HZ_DEFAULT }
 
+/// Info-overlay repaint rate bounds. The floor keeps signal glow readable;
+/// the ceiling matches common high-refresh monitors without letting the
+/// setting turn into a busy-loop.
+pub const OVERLAY_FPS_MIN: u32 = 10;
+pub const OVERLAY_FPS_MAX: u32 = 144;
+pub const OVERLAY_FPS_DEFAULT: u32 = 60;
+fn default_overlay_fps() -> u32 { OVERLAY_FPS_DEFAULT }
+fn default_overlay_shortcut() -> PinShortcut {
+    // Ctrl+Shift+O — "overlay"; clear of the pin (Ctrl+Shift+P) and panic
+    // (Ctrl+Backtick) defaults.
+    PinShortcut { ctrl: true, shift: true, alt: false, win: false, key: Some("O".to_string()) }
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -444,6 +471,9 @@ impl Default for AppSettings {
             favorite_presets: Vec::new(),
             seethrough_chord: None,
             panic_chord: None,
+            overlay_chord: None,
+            overlay_shortcut: default_overlay_shortcut(),
+            overlay_fps: OVERLAY_FPS_DEFAULT,
             gamepad_chords_nav_only: true,
             bg_repaint_hz: BG_REPAINT_HZ_DEFAULT,
             mouse_suppression_enabled: true,
