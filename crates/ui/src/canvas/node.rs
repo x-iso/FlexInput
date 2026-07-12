@@ -255,6 +255,95 @@ impl LayoutItem {
     }
 }
 
+/// A screen-overlay layout: module elements + decorations pinned onto the
+/// transparent info overlay (see `crate::overlay`). One per patch tab,
+/// persisted with the tab (workspace + .fxp). Mirrors `UiSubPatch`'s layout
+/// fields — items in paint order, snap grid, runtime-only selection — but
+/// items reference modules anywhere in the tab via a node *path* instead of
+/// implicitly inside one sub-patch's snarl.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayLayout {
+    /// Paint order (first = bottom, last = top), same convention as
+    /// `UiSubPatch::items`. Positions/sizes are overlay-local logical px.
+    #[serde(default)]
+    pub items: Vec<OverlayItem>,
+    /// Grid snap on overlay-edit drag/resize.
+    #[serde(default)]
+    pub snap_enabled: bool,
+    /// Grid step in logical pixels.
+    #[serde(default = "default_snap_grid_px")]
+    pub snap_grid_px: u32,
+    /// Runtime-only: PRIMARY selected item index (into `items`). Cleared on
+    /// overlay-edit exit. Mirrors `UiSubPatch::selected_item`.
+    #[serde(skip)]
+    pub selected_item: Option<usize>,
+    /// Runtime-only: full multi-selection (contains the primary).
+    #[serde(skip)]
+    pub selected_items: Vec<usize>,
+    /// Runtime-only: click-cycle anchor (see `UiSubPatch::cycle_pos`).
+    #[serde(skip)]
+    pub cycle_pos: Option<[f32; 2]>,
+}
+
+impl Default for OverlayLayout {
+    fn default() -> Self {
+        Self {
+            items: vec![],
+            snap_enabled: false,
+            snap_grid_px: default_snap_grid_px(),
+            selected_item: None,
+            selected_items: Vec::new(),
+            cycle_pos: None,
+        }
+    }
+}
+
+impl OverlayLayout {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// One overlay item: a pinned module element (addressed by node path) or a
+/// static decoration. Same split as `LayoutItem`, plus the path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OverlayItem {
+    Module {
+        /// Path from the tab canvas to the snarl containing the pinned node:
+        /// `[]` = the node lives directly on the tab canvas; `[sp]` = inside
+        /// the first-level sub-patch node with `NodeId.0 == sp`. Deeper
+        /// nesting is reserved (the schema already carries it; milestone 1
+        /// resolves at most one level).
+        #[serde(default)]
+        path: Vec<usize>,
+        /// The pinned element itself — `inner_node_id` is the node's id
+        /// within the snarl addressed by `path`; pos/size/element_id and the
+        /// per-pin color overrides are reused unchanged.
+        pin: ExposedModule,
+    },
+    Deco(LayoutDecoration),
+}
+
+impl OverlayItem {
+    pub fn bbox(&self) -> ([f32; 2], [f32; 2]) {
+        match self {
+            OverlayItem::Module { pin, .. } => (pin.pos, pin.size),
+            OverlayItem::Deco(d) => d.bbox(),
+        }
+    }
+    /// Same hit-test semantics as `LayoutItem::hit_test`.
+    pub fn hit_test(&self, p: [f32; 2]) -> bool {
+        if let OverlayItem::Deco(LayoutDecoration::Line { a, b, stroke_px, .. }) = self {
+            let tol = (stroke_px + 4.0).max(6.0);
+            point_line_dist(p, *a, *b) <= tol
+        } else {
+            let (lp, ls) = self.bbox();
+            p[0] >= lp[0] && p[1] >= lp[1] &&
+            p[0] <= lp[0] + ls[0].max(1.0) && p[1] <= lp[1] + ls[1].max(1.0)
+        }
+    }
+}
+
 fn point_line_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     let abx = b[0] - a[0];
     let aby = b[1] - a[1];
@@ -439,3 +528,90 @@ impl From<&ModuleDescriptor> for NodeData {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_layout_serde_roundtrip() {
+        let layout = OverlayLayout {
+            items: vec![
+                OverlayItem::Module {
+                    path: vec![3],
+                    pin: ExposedModule {
+                        inner_node_id: 7,
+                        element_id: "curve".into(),
+                        pos: [40.0, 60.0],
+                        size: [220.0, 120.0],
+                        text_override: None,
+                        switch_override: None,
+                        graph_override: Some(PinGraphOverride {
+                            background: Some([1, 2, 3, 4]),
+                            ..Default::default()
+                        }),
+                    },
+                },
+                OverlayItem::Deco(LayoutDecoration::Rect {
+                    pos: [5.0, 6.0],
+                    size: [100.0, 50.0],
+                    fill: [10, 20, 30, 200],
+                    stroke: [1, 1, 1, 255],
+                    stroke_px: 2.0,
+                    corner_radius: 4.0,
+                }),
+            ],
+            snap_enabled: true,
+            snap_grid_px: 16,
+            selected_item: Some(1), // runtime-only: must NOT survive
+            selected_items: vec![1],
+            cycle_pos: Some([9.0, 9.0]),
+        };
+        let json = serde_json::to_string(&layout).unwrap();
+        let back: OverlayLayout = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.items.len(), 2);
+        assert!(back.snap_enabled);
+        assert_eq!(back.snap_grid_px, 16);
+        // Runtime-only selection state is serde(skip).
+        assert_eq!(back.selected_item, None);
+        assert!(back.selected_items.is_empty());
+        assert_eq!(back.cycle_pos, None);
+        match &back.items[0] {
+            OverlayItem::Module { path, pin } => {
+                assert_eq!(path, &vec![3]);
+                assert_eq!(pin.inner_node_id, 7);
+                assert_eq!(pin.element_id, "curve");
+                assert_eq!(
+                    pin.graph_override.as_ref().unwrap().background,
+                    Some([1, 2, 3, 4]),
+                );
+            }
+            other => panic!("expected Module, got {other:?}"),
+        }
+        match &back.items[1] {
+            OverlayItem::Deco(LayoutDecoration::Rect { corner_radius, .. }) => {
+                assert_eq!(*corner_radius, 4.0);
+            }
+            other => panic!("expected Rect deco, got {other:?}"),
+        }
+    }
+
+    /// Fields absent from older documents (the whole `path`, `element_id`,
+    /// `size`, snap settings) must default in instead of failing the load.
+    #[test]
+    fn overlay_layout_defaults_when_absent() {
+        let json = r#"{"items":[{"Module":{"pin":{"inner_node_id":2,"pos":[1.0,2.0]}}}]}"#;
+        let layout: OverlayLayout = serde_json::from_str(json).unwrap();
+        assert_eq!(layout.snap_grid_px, default_snap_grid_px());
+        assert!(!layout.snap_enabled);
+        match &layout.items[0] {
+            OverlayItem::Module { path, pin } => {
+                assert!(path.is_empty());
+                assert_eq!(pin.inner_node_id, 2);
+                assert_eq!(pin.element_id, "default");
+                assert_eq!(pin.size, default_exposed_size());
+            }
+            other => panic!("expected Module, got {other:?}"),
+        }
+    }
+}

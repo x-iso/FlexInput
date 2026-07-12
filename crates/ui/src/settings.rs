@@ -584,6 +584,11 @@ pub struct PersistedTab {
     /// loader allocates a fresh unique salt instead.
     #[serde(default)]
     pub view_salt: u64,
+    /// Screen-overlay layout (pinned module elements + decorations on the
+    /// transparent info overlay). Default-empty so pre-overlay workspaces
+    /// keep loading.
+    #[serde(default)]
+    pub overlay: crate::canvas::OverlayLayout,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

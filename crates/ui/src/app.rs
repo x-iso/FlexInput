@@ -116,6 +116,9 @@ pub struct PatchTab {
     /// `canvas.view_salt`. Persisted via `PersistedTab.view_salt` so each tab
     /// keeps its own independent view across tab switches and restarts.
     pub view_salt: u64,
+    /// Screen-overlay layout (pinned module elements + decorations on the
+    /// transparent info overlay). Persisted with the tab (workspace + .fxp).
+    pub overlay: crate::canvas::OverlayLayout,
 }
 
 /// Per-tab transient state used only when Easy mode is active. Holds the
@@ -150,6 +153,7 @@ impl PatchTab {
             auto_bypass: false,
             easy_state: EasyState::default(),
             view_salt,
+            overlay: Default::default(),
         }
     }
 }
@@ -893,6 +897,7 @@ impl FlexInputApp {
                 auto_bypass: pt.auto_bypass,
                 easy_state,
                 view_salt,
+                overlay: pt.overlay,
             }
         };
         // A crash-recovery snapshot takes precedence over the opt-in workspace:
@@ -2375,8 +2380,9 @@ impl eframe::App for FlexInputApp {
             let auto_bypass = self.tabs[self.active_tab].auto_bypass;
             let preset_path = self.tabs[self.active_tab]
                 .easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone());
+            let overlay = self.tabs[self.active_tab].overlay.clone();
             if let Some(saved_path) = self.tabs[self.active_tab].canvas
-                .save_patch(vids, bound, auto_bypass, preset_path)
+                .save_patch(vids, bound, auto_bypass, preset_path, overlay)
             {
                 let tab = &mut self.tabs[self.active_tab];
                 tab.title = saved_path.file_stem()
@@ -2386,7 +2392,7 @@ impl eframe::App for FlexInputApp {
             }
         }
         if do_load {
-            if let Some((new_canvas, vids, bound, auto_bypass, path, preset_path)) =
+            if let Some((new_canvas, vids, bound, auto_bypass, path, preset_path, overlay)) =
                 crate::canvas::Canvas::load_patch()
             {
                 // If the loaded file was a .fxsp wrapped into an
@@ -2413,6 +2419,7 @@ impl eframe::App for FlexInputApp {
                 tab.file_path = Some(path);
                 tab.bound_exes = bound;
                 tab.auto_bypass = auto_bypass;
+                tab.overlay = overlay;
                 // Restore Easy-mode preset link: rederive content hash
                 // from the live sub-patch. If the saved path is gone,
                 // EasyState will fall back to hash-matching against the
@@ -2514,6 +2521,7 @@ impl eframe::App for FlexInputApp {
                             auto_bypass: pt.auto_bypass,
                             easy_state,
                             view_salt,
+                            overlay: pt.overlay,
                         }
                     }).collect();
                     if !new_tabs.is_empty() {
@@ -3078,6 +3086,15 @@ impl eframe::App for FlexInputApp {
         {
             puffin::profile_scope!("show_subpatch_editors");
             show_subpatch_editors(self, ctx, &live_device_ids);
+        }
+
+        // ── Info overlay (spike) ──────────────────────────────────────────────
+        // Transparent click-through viewport; paces its own repaint, so it
+        // stays smooth even when the bg-throttle branch below asks for a
+        // slower cadence (egui keeps the earliest requested deadline).
+        {
+            puffin::profile_scope!("show_overlay");
+            crate::overlay::show_overlay(ctx);
         }
 
         // Repaint scheduling:
@@ -10480,6 +10497,7 @@ impl FlexInputApp {
             snarl: crate::canvas::sanitize_snarl_for_save(&t.canvas.snarl),
             easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
             view_salt: t.view_salt,
+            overlay: t.overlay.clone(),
         }).collect();
         PersistedWorkspace {
             version: 1,
@@ -13055,6 +13073,10 @@ fn show_title_bar(
             // pops out a vertical opacity slider.
             ui.add_space(4.0);
             render_eye_toggle(ui, h);
+
+            // ── Info overlay toggle (spike) ─────────────────────────────
+            ui.add_space(4.0);
+            crate::overlay::render_overlay_toggle(ui, h);
         });
     });
 

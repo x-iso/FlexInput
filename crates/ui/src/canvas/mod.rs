@@ -5,6 +5,7 @@ pub mod remapper_icons;
 pub mod viewer;
 
 pub use node::NodeData;
+pub use node::{OverlayItem, OverlayLayout};
 pub use viewer::FlexViewer;
 
 use std::collections::{HashMap, HashSet};
@@ -311,6 +312,11 @@ pub struct UiPatch {
     /// matching against the preset index when the path is stale.
     #[serde(default)]
     pub easy_preset_path: Option<std::path::PathBuf>,
+    /// Screen-overlay layout for this patch (pinned module elements +
+    /// decorations on the transparent info overlay). Default-empty so
+    /// pre-overlay .fxp files keep loading.
+    #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
+    pub overlay: OverlayLayout,
 }
 
 #[derive(Clone)]
@@ -1702,6 +1708,7 @@ impl Canvas {
         bound_exes: Vec<String>,
         auto_bypass: bool,
         easy_preset_path: Option<std::path::PathBuf>,
+        overlay: OverlayLayout,
     ) -> Option<std::path::PathBuf> {
         let path = rfd::FileDialog::new()
             .add_filter("FlexInput Patch", &["fxp"])
@@ -1715,6 +1722,7 @@ impl Canvas {
             bound_exes,
             auto_bypass,
             easy_preset_path,
+            overlay,
         };
         if let Ok(json) = serde_json::to_string_pretty(&patch) {
             let _ = std::fs::write(&path, json);
@@ -1733,6 +1741,7 @@ impl Canvas {
         bool,
         std::path::PathBuf,
         Option<std::path::PathBuf>,
+        OverlayLayout,
     )> {
         // Accept both `.fxp` (full patches) and `.fxsp` (sub-patch
         // presets). For .fxsp, build an empty canvas and drop in a
@@ -1799,6 +1808,7 @@ impl Canvas {
                 path.clone(),
                 Some(path),    // record fxsp path so Easy mode's
                                // restore_preset_link can re-link
+                OverlayLayout::default(), // presets carry no overlay
             ));
         }
 
@@ -1826,6 +1836,7 @@ impl Canvas {
             patch.auto_bypass,
             path,
             patch.easy_preset_path,
+            patch.overlay,
         ))
     }
 }
