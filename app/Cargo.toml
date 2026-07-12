@@ -12,6 +12,10 @@ default-run = "flexinput"
 [dependencies]
 flexinput-ui = { workspace = true }
 eframe       = { workspace = true }
+# Surface `log::warn!`/`log::error!` from wgpu/winit/egui on stderr. Without a
+# logger those are silently dropped — which hid the swapchain errors behind
+# the overlay-viewport "white ghost" bug. Filter default lives in main().
+env_logger   = { version = "0.11", default-features = false, features = ["humantime"] }
 
 # The bundled elevated helper: when launched with `--hidmaestro-helper` the app
 # re-execs itself elevated and runs the HIDMaestro named-pipe server, so a

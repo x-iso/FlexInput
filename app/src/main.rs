@@ -249,6 +249,16 @@ fn main() -> eframe::Result<()> {
 
     install_gpu_panic_hook();
 
+    // Route `log` records from wgpu/winit/egui to stderr. warn+ by default —
+    // wgpu reports swapchain/DComp failures ONLY through `log::error!`, and
+    // without a logger they vanish (that silence hid the overlay-viewport
+    // "white ghost" swapchain bug). `RUST_LOG` overrides for deeper digging.
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn"),
+    )
+    .format_timestamp_millis()
+    .try_init();
+
     // Window / taskbar icon — decoded from the pre-baked 256px logo PNG
     // (rendered from icon_v2.svg). Decoding is instant; rasterizing the
     // source SVG at 256px takes ~45s and was stalling startup.

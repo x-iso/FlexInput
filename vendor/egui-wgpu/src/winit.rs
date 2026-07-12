@@ -15,6 +15,19 @@ struct SurfaceState {
     width: u32,
     height: u32,
     resizing: bool,
+    // FLEXINPUT PATCH (DComp white-ghost fix, see apply_pending_resize):
+    /// Window backing this surface, kept so the surface can be dropped and
+    /// rebuilt on resize. `None` when created via `set_window_unsafe`.
+    window: Option<Arc<winit::window::Window>>,
+    /// Deferred resize target, applied at the next paint. Winit replays
+    /// buffered creation-time `Resized` events late (through
+    /// `dispatch_buffered_events`), producing a burst of stale sizes that
+    /// ends back at the current size — deferring lets the burst coalesce to
+    /// a no-op instead of churning the swapchain through bogus sizes.
+    pending_resize: Option<(NonZeroU32, NonZeroU32)>,
+    /// An in-place (ResizeBuffers) resize ran during an interactive drag;
+    /// schedule one clean surface rebuild when the drag ends.
+    dirty_after_drag: bool,
 }
 
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
@@ -150,8 +163,13 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
-                let surface = self.instance.create_surface(window)?;
+                let surface = self.instance.create_surface(window.clone())?;
                 self.add_surface(surface, viewport_id, size).await?;
+            }
+            // FLEXINPUT PATCH: remember the window so resizes can rebuild the
+            // surface (see `apply_pending_resize`).
+            if let Some(state) = self.surfaces.get_mut(&viewport_id) {
+                state.window = Some(window);
             }
         } else {
             log::warn!("No window - clearing all surfaces");
@@ -195,9 +213,7 @@ impl Painter {
         viewport_id: ViewportId,
         size: winit::dpi::PhysicalSize<u32>,
     ) -> Result<(), crate::WgpuError> {
-        let render_state = if let Some(render_state) = &self.render_state {
-            render_state
-        } else {
+        if self.render_state.is_none() {
             let render_state = RenderState::create(
                 &self.configuration,
                 &self.instance,
@@ -205,8 +221,25 @@ impl Painter {
                 self.options,
             )
             .await?;
-            self.render_state.get_or_insert(render_state)
-        };
+            self.render_state = Some(render_state);
+        }
+        self.add_surface_sync(surface, viewport_id, size);
+        Ok(())
+    }
+
+    /// FLEXINPUT PATCH: synchronous tail of [`Self::add_surface`], split out so
+    /// `rebuild_surface` (resize-time surface recreation on Windows) can reuse
+    /// it without an async context. Requires `self.render_state` to be set.
+    fn add_surface_sync(
+        &mut self,
+        surface: wgpu::Surface<'static>,
+        viewport_id: ViewportId,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) {
+        let render_state = self
+            .render_state
+            .as_ref()
+            .expect("add_surface_sync called before render state creation");
         let alpha_mode = if self.support_transparent_backbuffer {
             let supported_alpha_modes = surface.get_capabilities(&render_state.adapter).alpha_modes;
 
@@ -224,6 +257,13 @@ impl Painter {
         } else {
             wgpu::CompositeAlphaMode::Auto
         };
+        // FLEXINPUT PATCH: breadcrumb for per-viewport transparency triage
+        // (a viewport is only transparent when its own surface got
+        // PreMultiplied here; RUST_LOG=egui_wgpu=debug to see).
+        log::debug!(
+            "surface CREATED for {viewport_id:?}: {}x{} px, transparent_backbuffer={} alpha_mode={alpha_mode:?}",
+            size.width, size.height, self.support_transparent_backbuffer,
+        );
         self.surfaces.insert(
             viewport_id,
             SurfaceState {
@@ -232,18 +272,20 @@ impl Painter {
                 height: size.height,
                 alpha_mode,
                 resizing: false,
+                window: None,
+                pending_resize: None,
+                dirty_after_drag: false,
             },
         );
         let Some(width) = NonZeroU32::new(size.width) else {
             log::debug!("The window width was zero; skipping generate textures");
-            return Ok(());
+            return;
         };
         let Some(height) = NonZeroU32::new(size.height) else {
             log::debug!("The window height was zero; skipping generate textures");
-            return Ok(());
+            return;
         };
         self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
-        Ok(())
     }
 
     /// Returns the maximum texture dimension supported if known
@@ -270,6 +312,12 @@ impl Painter {
 
         let render_state = self.render_state.as_ref().unwrap();
         let surface_state = self.surfaces.get_mut(&viewport_id).unwrap();
+
+        // FLEXINPUT PATCH: reconfigure breadcrumb.
+        log::debug!(
+            "surface RECONFIGURE for {viewport_id:?}: {}x{} → {}x{} px",
+            surface_state.width, surface_state.height, width, height,
+        );
 
         surface_state.width = width;
         surface_state.height = height;
@@ -379,6 +427,99 @@ impl Painter {
         }
 
         state.resizing = resizing;
+
+        // FLEXINPUT PATCH: interactive-drag resizes take the fast in-place
+        // ResizeBuffers path and may strand a DComp ghost frame; run one
+        // clean surface rebuild when the drag ends.
+        #[cfg(target_os = "windows")]
+        if !resizing && state.dirty_after_drag {
+            state.dirty_after_drag = false;
+            let window = state.window.clone();
+            let w = NonZeroU32::new(state.width);
+            let h = NonZeroU32::new(state.height);
+            if let (Some(window), Some(w), Some(h)) = (window, w, h) {
+                self.rebuild_surface(viewport_id, window, w, h);
+            }
+        }
+    }
+
+    /// FLEXINPUT PATCH: apply a resize recorded by [`Self::on_window_resized`].
+    /// Called at the start of every paint. See `on_window_resized` for why
+    /// resizes are deferred; see `rebuild_surface` for why a real size change
+    /// recreates the surface on Windows instead of reconfiguring in place.
+    fn apply_pending_resize(&mut self, viewport_id: ViewportId) {
+        let (w, h, in_drag, window) = {
+            let Some(state) = self.surfaces.get_mut(&viewport_id) else {
+                return;
+            };
+            let Some((w, h)) = state.pending_resize.take() else {
+                return;
+            };
+            if (w.get(), h.get()) == (state.width, state.height) {
+                // The resize burst netted out to the current size (winit
+                // replaying stale buffered creation-time events) — nothing
+                // to do. Skipping here is what prevents the startup ghost.
+                return;
+            }
+            let in_drag = state.resizing;
+            if in_drag {
+                state.dirty_after_drag = true;
+            }
+            (w, h, in_drag, state.window.clone())
+        };
+
+        #[cfg(target_os = "windows")]
+        if !in_drag {
+            if let Some(window) = window {
+                self.rebuild_surface(viewport_id, window, w, h);
+                return;
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = (in_drag, window);
+
+        // Interactive drag (or no window handle): fast in-place reconfigure.
+        // Any ghost it strands is cleaned by the rebuild at drag end.
+        self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, w, h);
+    }
+
+    /// FLEXINPUT PATCH: drop and recreate the surface at the new size instead
+    /// of `ResizeBuffers`-ing it in place. On Windows the swapchain presents
+    /// through a DirectComposition visual (`Dx12SwapchainKind::DxgiFromVisual`,
+    /// required for per-pixel window transparency — see app/src/main.rs); an
+    /// in-place resize leaves the previous frame stranded in the DWM tree,
+    /// which composites as an opaque white rectangle at the old size under
+    /// all subsequent frames. Dropping the wgpu surface releases its DComp
+    /// target/visual (erasing the ghost) — and must happen BEFORE creating
+    /// the replacement, since DComp allows only one target per HWND.
+    #[cfg(target_os = "windows")]
+    fn rebuild_surface(
+        &mut self,
+        viewport_id: ViewportId,
+        window: Arc<winit::window::Window>,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) {
+        log::debug!("surface REBUILD for {viewport_id:?}: {width}x{height} px");
+        self.surfaces.remove(&viewport_id);
+        match self.instance.create_surface(window.clone()) {
+            Ok(surface) => {
+                self.add_surface_sync(
+                    surface,
+                    viewport_id,
+                    winit::dpi::PhysicalSize::new(width.get(), height.get()),
+                );
+                if let Some(state) = self.surfaces.get_mut(&viewport_id) {
+                    state.window = Some(window);
+                }
+            }
+            Err(err) => {
+                // The old surface is gone; for immediate/deferred viewports
+                // eframe's per-frame `set_window` recreates it next frame.
+                // Loud because it should never happen.
+                log::error!("rebuild_surface: create_surface failed: {err}");
+            }
+        }
     }
 
     pub fn on_window_resized(
@@ -389,12 +530,16 @@ impl Painter {
     ) {
         profiling::function_scope!();
 
-        if self.surfaces.contains_key(&viewport_id) {
-            self.resize_and_generate_depth_texture_view_and_msaa_view(
-                viewport_id,
-                width_in_pixels,
-                height_in_pixels,
-            );
+        // FLEXINPUT PATCH: don't reconfigure immediately — record the target
+        // and apply at the next paint (`apply_pending_resize`). Winit replays
+        // buffered stale `Resized` events from window creation in a burst
+        // that ends at the already-current size; deferring coalesces the
+        // burst into nothing. Immediate ResizeBuffers on a DirectComposition
+        // swapchain strands the previous frame in the DWM tree as an opaque
+        // "ghost" rectangle — visible on mostly-transparent windows (the
+        // info overlay), hidden by content on opaque ones.
+        if let Some(state) = self.surfaces.get_mut(&viewport_id) {
+            state.pending_resize = Some((width_in_pixels, height_in_pixels));
         } else {
             log::warn!(
                 "Ignoring window resize notification with no surface created via Painter::set_window()"
@@ -418,6 +563,10 @@ impl Painter {
         capture_data: Vec<UserData>,
     ) -> f32 {
         profiling::function_scope!();
+
+        // FLEXINPUT PATCH: apply any resize deferred by `on_window_resized`
+        // now, before the surface is used for this frame.
+        self.apply_pending_resize(viewport_id);
 
         let capture = !capture_data.is_empty();
         let mut vsync_sec = 0.0;

@@ -100,6 +100,14 @@ egui-snarl = { path = "vendor/egui-snarl" }
 # state and relaunch cleanly instead of crashing. See `vendor/egui-wgpu/
 # src/renderer.rs` (search "GPU_LOST") and `app/src/main.rs`.
 egui-wgpu = { path = "vendor/egui-wgpu" }
+# Vendored for one creation-time-only Windows extended style egui can't
+# express: transparent + skip-taskbar viewports (FlexInput's screen overlay)
+# need WS_EX_NOREDIRECTIONBITMAP, otherwise their never-painted GDI
+# redirection surface composites as an opaque white sheet (frozen at an early
+# creation-time size) UNDER the DirectComposition swapchain on Win11 26H1 +
+# AMD. See the FLEXINPUT PATCH in vendor/egui-winit/src/lib.rs
+# (create_winit_window_attributes).
+egui-winit = { path = "vendor/egui-winit" }
 
 # ── Debug-build performance ─────────────────────────────────────────────────
 # The processing thread runs at 2 kHz (500 µs/tick budget) and the device-io
