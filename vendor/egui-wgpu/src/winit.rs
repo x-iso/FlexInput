@@ -23,19 +23,13 @@ struct SurfaceState {
     width: u32,
     height: u32,
     resizing: bool,
-    // FLEXINPUT PATCH (DComp white-ghost fix, see apply_pending_resize):
-    /// Window backing this surface, kept so the surface can be dropped and
-    /// rebuilt on resize. `None` when created via `set_window_unsafe`.
-    window: Option<Arc<winit::window::Window>>,
+    // FLEXINPUT PATCH:
     /// Deferred resize target, applied at the next paint. Winit replays
     /// buffered creation-time `Resized` events late (through
     /// `dispatch_buffered_events`), producing a burst of stale sizes that
     /// ends back at the current size — deferring lets the burst coalesce to
     /// a no-op instead of churning the swapchain through bogus sizes.
     pending_resize: Option<(NonZeroU32, NonZeroU32)>,
-    /// An in-place (ResizeBuffers) resize ran during an interactive drag;
-    /// schedule one clean surface rebuild when the drag ends.
-    dirty_after_drag: bool,
 }
 
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
@@ -174,11 +168,6 @@ impl Painter {
                 let surface = self.instance.create_surface(window.clone())?;
                 self.add_surface(surface, viewport_id, size).await?;
             }
-            // FLEXINPUT PATCH: remember the window so resizes can rebuild the
-            // surface (see `apply_pending_resize`).
-            if let Some(state) = self.surfaces.get_mut(&viewport_id) {
-                state.window = Some(window);
-            }
         } else {
             log::warn!("No window - clearing all surfaces");
             self.surfaces.clear();
@@ -282,9 +271,7 @@ impl Painter {
                 height: size.height,
                 alpha_mode,
                 resizing: false,
-                window: None,
                 pending_resize: None,
-                dirty_after_drag: false,
             },
         );
         let Some(width) = NonZeroU32::new(size.width) else {
@@ -437,28 +424,19 @@ impl Painter {
         }
 
         state.resizing = resizing;
-
-        // FLEXINPUT PATCH: interactive-drag resizes take the fast in-place
-        // ResizeBuffers path and may strand a DComp ghost frame; run one
-        // clean surface rebuild when the drag ends.
-        #[cfg(target_os = "windows")]
-        if !resizing && state.dirty_after_drag {
-            state.dirty_after_drag = false;
-            let window = state.window.clone();
-            let w = NonZeroU32::new(state.width);
-            let h = NonZeroU32::new(state.height);
-            if let (Some(window), Some(w), Some(h)) = (window, w, h) {
-                self.rebuild_surface(viewport_id, window, w, h);
-            }
-        }
     }
 
     /// FLEXINPUT PATCH: apply a resize recorded by [`Self::on_window_resized`].
     /// Called at the start of every paint. See `on_window_resized` for why
-    /// resizes are deferred; see `rebuild_surface` for why a real size change
-    /// recreates the surface on Windows instead of reconfiguring in place.
+    /// resizes are deferred. Always an in-place reconfigure (upstream
+    /// behavior) — an earlier revision dropped and rebuilt the surface here
+    /// to chase a DComp "ghost frame" theory, but the real culprit was the
+    /// missing `WS_EX_NOREDIRECTIONBITMAP` (fixed in vendored egui-winit),
+    /// and rebuilding blanked the DComp target for a frame. eframe flips its
+    /// resize-drag heuristic on every interleaved non-resize event, so those
+    /// rebuilds fired continuously during a drag = whole-window strobing.
     fn apply_pending_resize(&mut self, viewport_id: ViewportId) {
-        let (w, h, in_drag, window) = {
+        let (w, h) = {
             let Some(state) = self.surfaces.get_mut(&viewport_id) else {
                 return;
             };
@@ -468,68 +446,12 @@ impl Painter {
             if (w.get(), h.get()) == (state.width, state.height) {
                 // The resize burst netted out to the current size (winit
                 // replaying stale buffered creation-time events) — nothing
-                // to do. Skipping here is what prevents the startup ghost.
+                // to do. Skipping here is what prevents the startup churn.
                 return;
             }
-            let in_drag = state.resizing;
-            if in_drag {
-                state.dirty_after_drag = true;
-            }
-            (w, h, in_drag, state.window.clone())
+            (w, h)
         };
-
-        #[cfg(target_os = "windows")]
-        if !in_drag {
-            if let Some(window) = window {
-                self.rebuild_surface(viewport_id, window, w, h);
-                return;
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        let _ = (in_drag, window);
-
-        // Interactive drag (or no window handle): fast in-place reconfigure.
-        // Any ghost it strands is cleaned by the rebuild at drag end.
         self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, w, h);
-    }
-
-    /// FLEXINPUT PATCH: drop and recreate the surface at the new size instead
-    /// of `ResizeBuffers`-ing it in place. On Windows the swapchain presents
-    /// through a DirectComposition visual (`Dx12SwapchainKind::DxgiFromVisual`,
-    /// required for per-pixel window transparency — see app/src/main.rs); an
-    /// in-place resize leaves the previous frame stranded in the DWM tree,
-    /// which composites as an opaque white rectangle at the old size under
-    /// all subsequent frames. Dropping the wgpu surface releases its DComp
-    /// target/visual (erasing the ghost) — and must happen BEFORE creating
-    /// the replacement, since DComp allows only one target per HWND.
-    #[cfg(target_os = "windows")]
-    fn rebuild_surface(
-        &mut self,
-        viewport_id: ViewportId,
-        window: Arc<winit::window::Window>,
-        width: NonZeroU32,
-        height: NonZeroU32,
-    ) {
-        log::debug!("surface REBUILD for {viewport_id:?}: {width}x{height} px");
-        self.surfaces.remove(&viewport_id);
-        match self.instance.create_surface(window.clone()) {
-            Ok(surface) => {
-                self.add_surface_sync(
-                    surface,
-                    viewport_id,
-                    winit::dpi::PhysicalSize::new(width.get(), height.get()),
-                );
-                if let Some(state) = self.surfaces.get_mut(&viewport_id) {
-                    state.window = Some(window);
-                }
-            }
-            Err(err) => {
-                // The old surface is gone; for immediate/deferred viewports
-                // eframe's per-frame `set_window` recreates it next frame.
-                // Loud because it should never happen.
-                log::error!("rebuild_surface: create_surface failed: {err}");
-            }
-        }
     }
 
     pub fn on_window_resized(

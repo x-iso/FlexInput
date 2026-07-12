@@ -10185,6 +10185,24 @@ pub(crate) fn show_subpatch_body(
     // ── Render pass (paint widgets / decorations in z-order) ────────────────
     // All items render disabled in Layout mode (clicks fall through to the
     // unified select layer below). In Lock mode modules are interactive.
+    //
+    // Overlay pick: each PIN is itself a pick target (path = this sub-patch
+    // node on the tab canvas) — that's what "pin the same element to the
+    // overlay" means for a layout the user already curated. The pinned
+    // bodies' own `register_exposable_element` calls are suppressed during
+    // the render: their node ids live in the INNER snarl, which the overlay's
+    // one-level path schema can't address from here (and the top-level drain
+    // would mislabel them as tab-canvas nodes).
+    let pick_raw = ui.ctx().data(|d| {
+        d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_ACTIVE_KEY)).unwrap_or(false)
+    });
+    // Armed for THIS body: pick active, not suppressed by an outer context
+    // (nested editors), body sits on the tab canvas (one-level path), and
+    // not in layout-edit mode (whose manual pointer machinery would fight
+    // the pick targets).
+    let pick_here = overlay_pick_active(ui.ctx())
+        && automap_parent.is_none()
+        && !is_unlocked;
     for (idx, it) in items.iter().enumerate() {
         match it {
             LayoutItem::Module(m) => {
@@ -10198,6 +10216,12 @@ pub(crate) fn show_subpatch_body(
                 let element_id = m.element_id.clone();
                 let graph_ov = m.graph_override.clone();
                 let outer_snap_ref = outer_snapshot.as_ref();
+                let prev_suppressed = ui.ctx().data(|d| {
+                    d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY)).unwrap_or(false)
+                });
+                if pick_raw {
+                    set_overlay_pick_suppressed(ui.ctx(), true);
+                }
                 ui.scope_builder(egui::UiBuilder::new().max_rect(element_rect), |ui| {
                     let new_clip = ui.clip_rect().intersect(element_rect);
                     ui.set_clip_rect(new_clip);
@@ -10216,6 +10240,30 @@ pub(crate) fn show_subpatch_body(
                         });
                     });
                 });
+                if pick_raw {
+                    set_overlay_pick_suppressed(ui.ctx(), prev_suppressed);
+                }
+                if pick_here {
+                    let id = egui::Id::new(("fxi_overlay_pick_pin", outer_id.0, idx));
+                    let resp = ui.interact(element_rect, id, egui::Sense::click());
+                    let painter = ui.painter().with_clip_rect(body_rect);
+                    let (fill, outline) = if resp.hovered() {
+                        (egui::Color32::from_rgba_unmultiplied(255, 200, 90, 90),
+                         egui::Color32::from_rgb(255, 220, 140))
+                    } else {
+                        (egui::Color32::from_rgba_unmultiplied(230, 160, 40, 35),
+                         egui::Color32::from_rgb(230, 160, 40))
+                    };
+                    painter.rect_filled(element_rect, 4.0, fill);
+                    painter.rect_stroke(element_rect, 4.0,
+                        egui::Stroke::new(1.5, outline), egui::StrokeKind::Inside);
+                    if resp.clicked() {
+                        put_overlay_pick_result(
+                            ui.ctx(), vec![outer_id.0], m.inner_node_id,
+                            m.element_id.clone(), m.size,
+                        );
+                    }
+                }
             }
             LayoutItem::Deco(d) => {
                 let painter = ui.painter().with_clip_rect(body_rect);
