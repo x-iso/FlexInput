@@ -14,7 +14,10 @@ mod settings;
 
 pub use app::{render_app_icon, FlexInputApp};
 pub use canvas::UiPatch;
-pub use settings::{startup_renderer_choice, RendererChoice};
+pub use settings::{
+    clear_render_attempt, read_render_attempt, startup_renderer_choice, write_render_attempt,
+    RendererChoice,
+};
 
 /// Append a timestamped crash/diagnostic entry to `%APPDATA%\FlexInput\crash.log`
 /// — the same directory that holds `settings.json` and the recovery snapshot.

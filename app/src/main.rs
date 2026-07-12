@@ -41,7 +41,29 @@ fn install_gpu_panic_hook() {
         // We intentionally do NOT treat every "Validation Error" as device
         // loss — only ones carrying a managed-egui-texture-invalid or
         // device-lost signature — so a genuine logic bug can't loop-relaunch.
-        let gpu_lost = msg.contains("Failed to create staging buffer")
+        // OpenGL/WGL context loss — the signature seen on wake from sleep or
+        // hibernation (and on a display-topology change) when the OpenGL backend
+        // is active, which on this machine is the Auto pick for AMD. wgpu-hal's
+        // GL backend hard-`unwrap()`s the `wglMakeCurrent` result inside
+        // `AdapterContext::lock()` (src/gles/{device,wgl}.rs); once the context
+        // is invalidated on wake that unwrap panics with a raw Windows error
+        // whose *text* is localized ("The operation completed successfully.",
+        // HRESULT 0) and can't be matched — but the panic's *source location* is
+        // stable (`#[track_caller]` points it at the wgpu-hal `gles` module).
+        // A fresh process rebuilds the GL context cleanly, so treat it as
+        // recoverable device loss.
+        //
+        // Relaunching from the hook is also what prevents the abort the user
+        // hit: the hook runs BEFORE unwinding and the relaunch helpers
+        // `process::exit` without running drops. If we instead let unwinding
+        // proceed, the Painter/Queue drop calls `queue.wait()` →
+        // `AdapterContext::lock().unwrap()` a SECOND time, and the double-panic
+        // aborts the process with STATUS_STACK_BUFFER_OVERRUN (0xc0000409).
+        let gl_context_lost =
+            location.contains("wgpu-hal") && location.contains("gles");
+
+        let gpu_lost = gl_context_lost
+            || msg.contains("Failed to create staging buffer")
             || msg.contains("GPU device lost")
             || msg.contains("Device is lost")
             || msg.contains("device was lost")
@@ -77,14 +99,27 @@ fn install_gpu_panic_hook() {
             // logger surfaced to a console, so drop a breadcrumb in AppData
             // (next to settings.json) for the user/support to see why FlexInput
             // blinked mid-game.
-            let note = "GPU device was lost (another app, likely a fullscreen game, \
-                 reset the graphics device). FlexInput is relaunching to recover; \
+            let note = "GPU device/context was lost (a fullscreen game reset the \
+                 graphics device, or the system woke from sleep/hibernation and the \
+                 OpenGL context was invalidated). FlexInput is relaunching to recover; \
                  your patch is restored from the crash-recovery snapshot.";
             eprintln!("{note}");
             flexinput_ui::log_crash(
                 "gpu-lost (relaunching)",
                 &format!("{note}\n\npanic: {msg}{location}"),
             );
+            // Renderer cascade (Auto only): a panic here means the device was
+            // lost at RUNTIME (init failures surface as a `run_native` Err, not a
+            // panic — handled in `main`). So re-assert the CURRENT backend for
+            // the recovery boot: a fresh process usually re-inits the same
+            // backend fine after a transient loss (game TDR, wake). If it can't,
+            // that child's own init-Err path advances the cascade. We never
+            // advance from here, so a recoverable blip can't silently demote a
+            // healthy backend (e.g. DX12 → GL).
+            use std::sync::atomic::Ordering;
+            if RENDER_AUTO.load(Ordering::Relaxed) {
+                flexinput_ui::write_render_attempt(RENDER_IDX.load(Ordering::Relaxed));
+            }
             // Spawn a fresh instance and exit this dead-GPU process. The
             // recovery snapshot the child restores from was written by the
             // app's autosave-on-settle (and forced on the GPU_LOST path); we
@@ -147,16 +182,25 @@ fn run_as_helper_if_requested() -> bool {
     false
 }
 
-/// Backend set for `RendererChoice::Auto`: Vulkan (eframe's default pick on
-/// Windows/Linux), EXCEPT when the GPU wgpu would land on is AMD on Windows —
-/// AMD's Windows Vulkan swapchain stalls for seconds on every reconfigure
-/// (window resize, restore-from-minimize presents a stale stretched frame),
-/// while its GL path is smooth, transparency included (groundtruthed on Win11
-/// 26H1 + Radeon, 2026-07; NVIDIA Vulkan is fine). The probe instance below is
-/// startup-only and cheap (~tens of ms). Wrong guess? Settings → Renderer
-/// forces either backend; `WGPU_BACKEND` overrides everything.
+/// Ordered backend cascade for `RendererChoice::Auto`. Startup tries element
+/// `[0]`; if that backend fails to *initialize* (surface/device creation errors
+/// out of `run_native`), the process advances to the next element and relaunches
+/// (see `main` and `flexinput_ui::{read,write,clear}_render_attempt`).
+///
+/// AMD-on-Windows leads with **DX12**: it's the only AMD backend that both
+/// composites the transparent window AND survives sleep/wake. Their Vulkan
+/// win32 surface is opaque-only (no see-through), and their GL/WGL context is
+/// invalidated on wake — wgpu-hal then hard-`unwrap()`s `wglMakeCurrent` and the
+/// process aborts (the crash this cascade exists to escape). Order for AMD:
+/// DX12 (transparency + wake-safe) → Vulkan (stable, opaque) → GL (transparency
+/// but wake-crash) as the last resort. NVIDIA/Intel keep Vulkan first (healthy
+/// there, transparency included) with DX12/GL as fallbacks.
+///
+/// The Vulkan probe below only enumerates adapters (vendor id) — it never
+/// creates a surface, so it's cheap and safe even when Vulkan is the flaky path.
+/// `WGPU_BACKEND` and a non-Auto Settings choice both bypass this entirely.
 #[cfg(windows)]
-fn auto_backends() -> wgpu::Backends {
+fn auto_cascade() -> Vec<wgpu::Backends> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN,
         ..Default::default()
@@ -168,17 +212,29 @@ fn auto_backends() -> wgpu::Backends {
         .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
         .or_else(|| adapters.first());
     const VENDOR_AMD: u32 = 0x1002;
-    match pick {
-        Some(a) if a.get_info().vendor == VENDOR_AMD => {
-            eprintln!(
-                "[gpu] auto: AMD adapter \"{}\" — preferring OpenGL over Vulkan",
-                a.get_info().name
-            );
-            wgpu::Backends::GL
+    let is_amd = pick.map(|a| a.get_info().vendor == VENDOR_AMD).unwrap_or(false);
+    if is_amd {
+        if let Some(a) = pick {
+            eprintln!("[gpu] auto: AMD adapter \"{}\" — cascade DX12 → Vulkan → GL", a.get_info().name);
         }
-        _ => wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+        vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL]
+    } else {
+        vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12, wgpu::Backends::GL]
     }
 }
+
+#[cfg(not(windows))]
+fn auto_cascade() -> Vec<wgpu::Backends> {
+    vec![wgpu::Backends::PRIMARY | wgpu::Backends::GL]
+}
+
+// Renderer-cascade state, set once in `main` after backend selection and read by
+// the panic hook. `RENDER_AUTO` gates all of it — an explicit Settings/env
+// backend never cascades (it relaunches to itself). `RENDER_IDX`/`RENDER_LEN`
+// are the current cascade position and length.
+static RENDER_AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RENDER_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RENDER_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 #[cfg(not(windows))]
 fn auto_backends() -> wgpu::Backends {
@@ -222,16 +278,42 @@ fn main() -> eframe::Result<()> {
     // `present_mode: AutoVsync` and the surface-error handler.
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
     // Backend pick, priority: `WGPU_BACKEND` env (dev escape hatch, matches
-    // plain wgpu behavior) > Settings → Renderer > Auto heuristic (Vulkan,
-    // except AMD-on-Windows → GL; see `auto_backends`).
-    let backends = wgpu::Backends::from_env().unwrap_or_else(|| {
-        match flexinput_ui::startup_renderer_choice() {
+    // plain wgpu behavior) > Settings → Renderer > Auto cascade (see
+    // `auto_cascade`). Only Auto cascades on init failure; an explicit env or
+    // Settings backend is used verbatim and, on a GPU-recovery relaunch, retries
+    // itself. When Auto is active we record the cascade position in RENDER_* for
+    // the panic hook and the `run_native` init-failure handler below.
+    use std::sync::atomic::Ordering;
+    let backends = match wgpu::Backends::from_env() {
+        Some(env_backends) => env_backends,
+        None => match flexinput_ui::startup_renderer_choice() {
             flexinput_ui::RendererChoice::Vulkan => wgpu::Backends::VULKAN,
             flexinput_ui::RendererChoice::OpenGl => wgpu::Backends::GL,
             flexinput_ui::RendererChoice::Dx12 => wgpu::Backends::DX12,
-            flexinput_ui::RendererChoice::Auto => auto_backends(),
-        }
-    });
+            flexinput_ui::RendererChoice::Auto => {
+                let cascade = auto_cascade();
+                // Only a GPU-recovery relaunch inherits the cascade position; a
+                // fresh (manual) launch always restarts from the preferred
+                // backend and clears any stale marker.
+                let recovery = std::env::var(flexinput_ui::GPU_RECOVERY_ENV).is_ok();
+                let attempt = if recovery {
+                    flexinput_ui::read_render_attempt().unwrap_or(0)
+                } else {
+                    flexinput_ui::clear_render_attempt();
+                    0
+                };
+                let idx = attempt.min(cascade.len() - 1);
+                // Persist the current position so a subsequent relaunch (panic
+                // hook = retry same; init-Err below = advance) starts from here.
+                flexinput_ui::write_render_attempt(idx);
+                RENDER_AUTO.store(true, Ordering::Relaxed);
+                RENDER_IDX.store(idx, Ordering::Relaxed);
+                RENDER_LEN.store(cascade.len(), Ordering::Relaxed);
+                eprintln!("[gpu] auto: cascade attempt {}/{} → {:?}", idx + 1, cascade.len(), cascade[idx]);
+                cascade[idx]
+            }
+        },
+    };
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
         setup.instance_descriptor.backends = backends;
         // DX12 must present through a DirectComposition visual, not a plain
@@ -286,9 +368,61 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "FlexInput",
         native_options,
         Box::new(|cc| Ok(Box::new(flexinput_ui::FlexInputApp::new(cc)))),
-    )
+    );
+
+    // Renderer cascade — the init-failure half (the panic hook handles runtime
+    // loss). `run_native` returns Err when the chosen backend can't stand up its
+    // surface/device (e.g. `FailedToCreateSurfaceForAnyBackend`, seen when the GL
+    // context can't be created right after wake). In Auto mode, advance to the
+    // next backend in the cascade and relaunch; if the cascade is exhausted,
+    // clear the marker (so the next manual launch starts fresh) and surface the
+    // error. A clean exit clears the marker so the cascade resets to the
+    // preferred backend next time.
+    match result {
+        Ok(()) => {
+            if RENDER_AUTO.load(Ordering::Relaxed) {
+                flexinput_ui::clear_render_attempt();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if RENDER_AUTO.load(Ordering::Relaxed) {
+                // Match wgpu/surface/adapter/device init failures. The concrete
+                // error is `eframe::Error::Wgpu(..)` here; a Debug substring match
+                // is robust across the exact variant wording.
+                let s = format!("{e:?}");
+                let gpu_init_err = s.contains("Wgpu")
+                    || s.contains("Surface")
+                    || s.contains("Adapter")
+                    || s.contains("Device")
+                    || s.contains("Backend");
+                let idx = RENDER_IDX.load(Ordering::Relaxed);
+                let len = RENDER_LEN.load(Ordering::Relaxed);
+                if gpu_init_err && idx + 1 < len {
+                    flexinput_ui::write_render_attempt(idx + 1);
+                    flexinput_ui::log_crash(
+                        "renderer-init-failed (cascading)",
+                        &format!("backend attempt {} of {len} failed: {e:?}\nretrying next backend", idx + 1),
+                    );
+                    eprintln!("[gpu] backend attempt {} failed; cascading to attempt {}", idx + 1, idx + 2);
+                    flexinput_ui::relaunch_self_and_exit();
+                }
+                // Exhausted (or a non-GPU error): reset so a manual relaunch
+                // starts from the preferred backend rather than pinning to the
+                // last-failed one.
+                flexinput_ui::clear_render_attempt();
+                if gpu_init_err {
+                    flexinput_ui::log_crash(
+                        "renderer-init-failed (exhausted)",
+                        &format!("all {len} Auto backends failed to initialize; last error: {e:?}"),
+                    );
+                }
+            }
+            Err(e)
+        }
+    }
 }

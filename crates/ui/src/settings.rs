@@ -510,6 +510,37 @@ fn settings_path() -> Option<std::path::PathBuf> {
     Some(p)
 }
 
+fn render_attempt_path() -> Option<std::path::PathBuf> {
+    let mut p = appdata_dir()?;
+    p.push("render_attempt");
+    Some(p)
+}
+
+/// Read the persisted renderer-cascade attempt index (see `app/src/main.rs`
+/// `auto_cascade`). `None` if the file is absent/unreadable. Only consulted on a
+/// GPU-recovery relaunch; a normal launch ignores and clears it, so the cascade
+/// always restarts from the preferred backend on a fresh start.
+pub fn read_render_attempt() -> Option<usize> {
+    let p = render_attempt_path()?;
+    std::fs::read_to_string(&p).ok()?.trim().parse().ok()
+}
+
+/// Persist the renderer-cascade attempt index so the next GPU-recovery relaunch
+/// knows which backend to try. Best-effort.
+pub fn write_render_attempt(n: usize) {
+    if let Some(p) = render_attempt_path() {
+        let _ = std::fs::write(p, n.to_string());
+    }
+}
+
+/// Remove the renderer-cascade marker (cascade solved / reset to the preferred
+/// backend). Best-effort.
+pub fn clear_render_attempt() {
+    if let Some(p) = render_attempt_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 fn workspace_path() -> Option<std::path::PathBuf> {
     let mut p = appdata_dir()?;
     p.push("workspace.json");
