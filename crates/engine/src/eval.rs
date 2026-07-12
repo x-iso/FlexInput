@@ -4393,7 +4393,9 @@ fn compute_counter(
 /// for the positive direction (right/up) or -1 for the negative direction
 /// (left/down). Returns None when the pin isn't a stick cardinal — those
 /// fall through to normal pulse-train Bool emission.
-fn analog_axis_for_cardinal(pin_id: &str) -> Option<(&'static str, f32)> {
+/// Pub for the UI too: mapping-card curve editors read the live cardinal
+/// deflection from `live_signals` to draw the input→output preview dot.
+pub fn analog_axis_for_cardinal(pin_id: &str) -> Option<(&'static str, f32)> {
     match pin_id {
         "left_stick_right"  => Some(("left_stick_x",   1.0)),
         "left_stick_left"   => Some(("left_stick_x",  -1.0)),
@@ -4694,7 +4696,15 @@ fn eval_remapper_node(
                 // track which cardinals have been visited during the active
                 // gesture and fire when all required cardinals across both
                 // sticks have been visited at least once.
-                let raw_held = if let Some(required) = gesture_required_bits(&in_pins) {
+                // Manual activation threshold: an explicit "fire at this
+                // magnitude" instruction. It BYPASSES the stick-gesture
+                // accumulator (visit-all-cardinals semantics conflict with a
+                // hold-above-the-line gate) and replaces the built-in
+                // cardinal derivation / 0.5 trigger coercion: each analog in
+                // pin gates on the card's curve-shaped magnitude crossing the
+                // line, releasing the moment it dips back below.
+                let thr = mapping_threshold(m);
+                let raw_held = if let (Some(required), None) = (gesture_required_bits(&in_pins), thr) {
                     let buttons_held = in_pins.iter().all(|p| {
                         if gesture_pin_to_bit(p).is_some() { return true; }
                         read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
@@ -4702,7 +4712,11 @@ fn eval_remapper_node(
                     let visited = gesture_state_get(ns, i);
                     buttons_held && gesture_tick(required, visited, &upstream)
                 } else {
+                    let curve = mapping_curve_pts(m);
                     in_pins.iter().all(|p| {
+                        if let (Some(t), Some(v)) = (thr, analog_in_value(&upstream, p)) {
+                            return shape_mag(&curve, v) >= t;
+                        }
                         read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
                     })
                 };
@@ -4735,7 +4749,15 @@ fn eval_remapper_node(
                 if mapping_targets_touch(m) {
                     return eval_touch_combo(&in_pins, &upstream).active;
                 }
+                // With a manual threshold, suppression tracks the same
+                // shaped-magnitude gate as activation so a below-threshold
+                // deflection doesn't consume the input it isn't firing on.
+                let thr = mapping_threshold(m);
+                let curve = mapping_curve_pts(m);
                 in_pins.iter().all(|p| {
+                    if let (Some(t), Some(v)) = (thr, analog_in_value(&upstream, p)) {
+                        return shape_mag(&curve, v) >= t;
+                    }
                     if analog_axis_for_cardinal(p).is_some() {
                         analog_cardinal_input_value(&upstream, p) > 0.0
                     } else {
@@ -4886,6 +4908,12 @@ fn eval_remapper_node(
                 let sustain = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
                 let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
                 let slots = press_state_get(ns, orig_i);
+                // Per-card response curve + manual threshold: the curve
+                // reshapes every magnitude this mapping emits (axis, trigger,
+                // macro, pulse rate); the threshold turns digital outs into a
+                // plain hold gate on the shaped value (see the button arm).
+                let curve = mapping_curve_pts(m);
+                let thr = mapping_threshold(m);
                 // Zip in↔out by index; drop the excess from whichever side
                 // is longer.
                 let n = in_pins.len().min(out_pins.len());
@@ -4902,6 +4930,7 @@ fn eval_remapper_node(
                         } else {
                             1.0 // gate buttons all held (checked by effective[])
                         };
+                        let mag = shape_mag(&curve, mag);
                         if mag > 0.0 {
                             merge_macro_scalar(collector_sigs, out_p, Signal::Float(mag.min(1.0)));
                         }
@@ -4920,6 +4949,7 @@ fn eval_remapper_node(
                         // non-cardinal buttons are held).
                         1.0
                     };
+                    let mag_from_input = shape_mag(&curve, mag_from_input);
                     if let Some((axis_pin, sign)) = out_axis_opt {
                         let contrib = sign * mag_from_input;
                         // Sum across all (mapping × in/out pair) contributions.
@@ -4933,14 +4963,22 @@ fn eval_remapper_node(
                         let entry = analog_axis_acc.entry(trigger_pin).or_insert(0.0);
                         *entry += mag_from_input.max(0.0);
                     } else {
-                        // Non-cardinal out: button / key. Analog magnitude
-                        // drives a freq-modulated tap train (or PWM under
-                        // Hold) so a digital destination still reflects HOW
-                        // FAR the stick is pushed — matching the 3DOF-Lean
-                        // analog→digital behaviour.
-                        let active = analog_digital_pulse(
-                            mag_from_input, window_ms, sustain, turbo, slots, dt,
-                        );
+                        // Non-cardinal out: button / key.
+                        // With a manual threshold, the output is a PLAIN HOLD:
+                        // pressed while the shaped magnitude sits on/above the
+                        // line, released the moment it dips below (Turbo still
+                        // taps while held). Without one, the legacy behaviour:
+                        // a freq-modulated tap train (or PWM under Hold) so the
+                        // digital destination reflects HOW FAR the stick is
+                        // pushed — matching the 3DOF-Lean analog→digital path.
+                        let active = if let Some(t) = thr {
+                            let held = mag_from_input >= t;
+                            if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
+                        } else {
+                            analog_digital_pulse(
+                                mag_from_input, window_ms, sustain, turbo, slots, dt,
+                            )
+                        };
                         if active {
                             analog_button_out.insert(out_p.clone());
                         }
@@ -5835,6 +5873,54 @@ fn analog_cardinal_input_value(upstream: &HashMap<String, Signal>, pin_id: &str)
     signed.max(0.0).min(1.0)
 }
 
+// ── Per-mapping response curve + activation threshold ────────────────────────
+//
+// Every mapping card (Remapper `mappings`, Lean `lean_left`/`lean_right`,
+// Touch Zones `zone_maps`) may carry:
+//   curve:     [[x, y], …] — response curve over the analog input magnitude
+//              (0..1 → 0..1). Absent = identity.
+//   threshold: f32 0..1 — a HORIZONTAL line on the curve's OUTPUT: a digital
+//              binding is held while the shaped magnitude sits on/above it
+//              and releases the moment it dips below (manual activation
+//              point). Absent = legacy behaviour (derived cardinal bools /
+//              0.5 trigger coercion / freq-modulated pulse train).
+
+/// The card's `curve` points, or empty when absent/malformed.
+fn mapping_curve_pts(m: &Value) -> Vec<[f32; 2]> {
+    m.get("curve").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|p| {
+            let q = p.as_array()?;
+            Some([q.first()?.as_f64()? as f32, q.get(1)?.as_f64()? as f32])
+        }).collect())
+        .unwrap_or_default()
+}
+
+/// The card's manual activation threshold, when set.
+fn mapping_threshold(m: &Value) -> Option<f32> {
+    m.get("threshold").and_then(|v| v.as_f64()).map(|v| (v as f32).clamp(0.0, 1.0))
+}
+
+/// Shape an input magnitude through a card's curve (identity when no curve).
+fn shape_mag(pts: &[[f32; 2]], mag: f32) -> f32 {
+    if pts.len() >= 2 {
+        sample_curve(pts, mag.clamp(0.0, 1.0), &[]).clamp(0.0, 1.0)
+    } else {
+        mag
+    }
+}
+
+/// Live analog INPUT value of a mapping in-pin: a stick cardinal's one-sided
+/// deflection or an analog trigger's travel. `None` for digital pins.
+fn analog_in_value(upstream: &HashMap<String, Signal>, pin_id: &str) -> Option<f32> {
+    if analog_axis_for_cardinal(pin_id).is_some() {
+        return Some(analog_cardinal_input_value(upstream, pin_id));
+    }
+    if matches!(pin_id, "left_trigger" | "right_trigger") {
+        return Some(upstream.get(pin_id).map(|s| sig_scalar(*s)).unwrap_or(0.0).clamp(0.0, 1.0));
+    }
+    None
+}
+
 /// True when a pin id is an analog INPUT source — a stick cardinal or an analog
 /// trigger. The Remapper/Lean UI uses this to gate analog-only outputs (e.g. the
 /// touchpad swipe bindings) so they're only offered once an analog input chord
@@ -6048,23 +6134,49 @@ fn lean_dispatch_into_collector_sigs(
 
             let slots = press_state_get(node_state, base_idx + i);
 
+            // Per-card response curve + manual threshold. The curve reshapes
+            // the lean magnitude this card emits; a threshold replaces the
+            // NODE-level lean_threshold for THIS card's activation, gating on
+            // the curve-shaped OUTPUT (dips below → release). `side_sign_ok`
+            // is the raw side test (any magnitude), so a card threshold can
+            // sit below the node threshold too.
+            let curve = mapping_curve_pts(m);
+            let thr = mapping_threshold(m);
+            let shaped = shape_mag(&curve, lean_mag);
+            let side_sign_ok = if side_idx == 0 { lean_val < 0.0 } else { lean_val > 0.0 };
+
             let (held_now, analog_val_opt): (bool, Option<f32>) = if mode_s == "analog" {
-                if !*active || lean_mag < 0.01 {
+                let gate = match thr {
+                    Some(t) => side_sign_ok && shaped >= t,
+                    None => *active && lean_mag >= 0.01,
+                };
+                if !gate {
                     slots[0] = 0.0;
                     (false, Some(0.0))
                 } else {
-                    // Shared analog→digital modulation: Hold → PWM (duty =
-                    // lean_mag), Turbo → ×2 max frequency, plain → tap train
-                    // whose frequency tracks lean_mag. Float destinations
-                    // ignore `pulse_on` and use `lean_mag` directly below.
-                    let pulse_on = analog_digital_pulse(
-                        lean_mag, window_ms, sustain, turbo, slots, dt,
-                    );
-                    (pulse_on, Some(lean_mag))
+                    // Manual threshold → plain hold while above the line
+                    // (Turbo still taps). Otherwise the shared analog→digital
+                    // modulation: Hold → PWM (duty = shaped), Turbo → ×2 max
+                    // frequency, plain → tap train whose frequency tracks the
+                    // shaped magnitude. Float destinations ignore `pulse_on`
+                    // and use the shaped magnitude directly below.
+                    let pulse_on = match thr {
+                        Some(_) => {
+                            if turbo { apply_turbo(true, window_ms, slots, dt) } else { true }
+                        }
+                        None => analog_digital_pulse(
+                            shaped, window_ms, sustain, turbo, slots, dt,
+                        ),
+                    };
+                    (pulse_on, Some(shaped))
                 }
             } else {
+                let card_active = match thr {
+                    Some(t) => side_sign_ok && shaped >= t,
+                    None => *active,
+                };
                 let mode = PressMode::from_str(mode_s);
-                let held = apply_press_mode(*active, mode, window_ms, sustain, slots, dt);
+                let held = apply_press_mode(card_active, mode, window_ms, sustain, slots, dt);
                 let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
                 (held, None)
             };
@@ -6081,7 +6193,10 @@ fn lean_dispatch_into_collector_sigs(
                 // pins never enter `asserted` — they aren't bus pins.
                 if flexinput_core::macros::parse_macro_pin(p).is_some() {
                     if is_analog_mode {
-                        let mag = if *active { analog_val_opt.unwrap_or(0.0) } else { 0.0 };
+                        // The activation gate is already encoded upstream:
+                        // analog_val_opt is Some(0.0) when the card's gate
+                        // (node or per-card threshold) didn't pass.
+                        let mag = analog_val_opt.unwrap_or(0.0);
                         if mag > 0.0 {
                             merge_macro_scalar(collector_sigs, p, Signal::Float(mag.min(1.0)));
                         }
@@ -6100,8 +6215,11 @@ fn lean_dispatch_into_collector_sigs(
                 // magnitude tracks lean_mag; in other press modes it's a
                 // gated full-deflection write (±1.0 when held, 0 when not).
                 if let Some((axis_pin, cardinal_sign)) = analog_axis_for_cardinal(p.as_str()) {
+                    // Analog mode: analog_val_opt already carries the gated,
+                    // curve-shaped magnitude (0.0 when the card's gate —
+                    // node or per-card threshold — didn't pass).
                     let mag = if is_analog_mode {
-                        if !*active { 0.0 } else { analog_val_opt.unwrap_or(1.0) }
+                        analog_val_opt.unwrap_or(1.0)
                     } else if held_now {
                         1.0
                     } else {
@@ -6129,7 +6247,9 @@ fn lean_dispatch_into_collector_sigs(
                     .find(|x| x.id == p.as_str())
                     .map(|x| x.signal_type).unwrap_or(SignalType::Bool);
                 let emit = match (is_analog_mode, sig_type) {
-                    (true, SignalType::Float) => *active,
+                    // Gate already applied upstream: Some(>0) only while the
+                    // card's (node- or threshold-based) activation holds.
+                    (true, SignalType::Float) => analog_val_opt.map(|v| v > 0.0).unwrap_or(false),
                     (true, SignalType::Vec2)  => false,
                     (true, _)                 => held_now,
                     (false, _)                => held_now,
@@ -6980,6 +7100,126 @@ mod trigger_tests {
         let mut c = HashMap::new();
         lean_dispatch_into_collector_sigs(&snap, 1, &outs(-0.8), &mut ns, &mut c, 0.016);
         assert_eq!(get(&c), Some(Signal::Bool(true)));
+    }
+
+    // ── Per-card response curve + manual activation threshold ────────────────
+
+    fn curve_remap_graph(mapping: serde_json::Value) -> ProcessingGraph {
+        let dev = "gilrs:switch_pro:0";
+        let src = source_node(1, dev, 0.0);
+        let mut remap = empty_node(2, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([mapping]));
+        remap.input_sources = vec![Some((0, 0))];
+        remap.n_outputs = 1;
+        let sink = sink_node(3, "virtual.xinput:0", "remap:2", true);
+        ProcessingGraph { nodes: vec![src, remap, sink] }
+    }
+
+    fn stick_y(y: f32) -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        m.insert(("gilrs:switch_pro:0".to_string(), "left_stick_y".to_string()), Signal::Float(y));
+        m
+    }
+
+    fn sinkv(out: &TickOutput, pin: &str) -> Option<Signal> {
+        out.sink_outputs.get(&("virtual.xinput:0".to_string(), pin.to_string())).copied()
+    }
+
+    // An analog mapping's per-card curve reshapes the emitted magnitude —
+    // a halving curve turns a full stick push into ~0.5 trigger travel.
+    #[test]
+    fn remapper_analog_curve_shapes_output() {
+        let graph = curve_remap_graph(serde_json::json!({
+            "in": ["left_stick_up"], "out": ["right_trigger"], "mode": "analog",
+            "curve": [[0.0, 0.0], [1.0, 0.5]],
+        }));
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut state, &stick_y(1.0), 0.016, &mut out);
+        let v = sinkv(&out, "right_trigger").map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 0.5).abs() < 0.05, "halving curve should give ~0.5 at full push, got {v}");
+    }
+
+    // Manual threshold on an analog→digital mapping: PLAIN HOLD above the
+    // line (steady across ticks — no tap train), release the moment the
+    // shaped value dips below.
+    #[test]
+    fn remapper_analog_threshold_holds_digital() {
+        let graph = curve_remap_graph(serde_json::json!({
+            "in": ["left_stick_up"], "out": ["btn_east"], "mode": "analog",
+            "threshold": 0.6,
+        }));
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let east = |out: &TickOutput| sinkv(out, "btn_east").map(|s| s.as_bool()).unwrap_or(false);
+
+        eval_graph_tick(&graph, &mut state, &stick_y(0.4), 0.016, &mut out);
+        assert!(!east(&out), "below threshold must stay released");
+        // Above threshold: held EVERY tick — the legacy pulse train would
+        // toggle off within this window.
+        for tick in 0..20 {
+            eval_graph_tick(&graph, &mut state, &stick_y(0.8), 0.016, &mut out);
+            assert!(east(&out), "threshold hold must be steady (tick {tick})");
+        }
+        eval_graph_tick(&graph, &mut state, &stick_y(0.4), 0.016, &mut out);
+        assert!(!east(&out), "dipping below the line must release");
+    }
+
+    // Manual threshold on a DIGITAL-mode mapping with a cardinal input
+    // overrides the built-in cardinal derivation (~0.5): the mapping only
+    // fires past the card's own line.
+    #[test]
+    fn remapper_digital_threshold_overrides_cardinal() {
+        let graph = curve_remap_graph(serde_json::json!({
+            "in": ["left_stick_up"], "out": ["btn_east"],
+            "threshold": 0.8,
+        }));
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let east = |out: &TickOutput| sinkv(out, "btn_east").map(|s| s.as_bool()).unwrap_or(false);
+
+        eval_graph_tick(&graph, &mut state, &stick_y(0.6), 0.016, &mut out);
+        assert!(!east(&out), "0.6 push is past the built-in derivation but below the card threshold");
+        eval_graph_tick(&graph, &mut state, &stick_y(0.9), 0.016, &mut out);
+        assert!(east(&out), "0.9 push crosses the card threshold");
+        eval_graph_tick(&graph, &mut state, &stick_y(0.6), 0.016, &mut out);
+        assert!(!east(&out), "falling back below the threshold releases");
+    }
+
+    // Lean cards: a per-card threshold replaces the node lean_threshold for
+    // that card, and a curve reshapes the analog magnitude the card emits.
+    #[test]
+    fn lean_card_threshold_and_curve() {
+        // Threshold 0.7 on a down-mode card: node threshold (0.3) alone
+        // would fire at 0.5 lean — the card must not.
+        let mut n = empty_node(1, "processing.gyro_3dof");
+        n.params.insert("lean_left".into(), serde_json::json!([
+            { "out": ["btn_south"], "mode": "down", "threshold": 0.7 }
+        ]));
+        let outs = |lean: f32| vec![None, None, None, Some(Signal::Float(lean))];
+        let get = |c: &HashMap<(String, String), Signal>, pin: &str|
+            c.get(&("lean:1".to_string(), pin.to_string())).copied();
+        let mut ns = NodeState::default();
+        let mut c = HashMap::new();
+        lean_dispatch_into_collector_sigs(&n, 1, &outs(-0.5), &mut ns, &mut c, 0.016);
+        assert_eq!(get(&c, "btn_south"), Some(Signal::Bool(false)),
+            "below the card threshold the mapping must not fire");
+        c.clear();
+        lean_dispatch_into_collector_sigs(&n, 1, &outs(-0.8), &mut ns, &mut c, 0.016);
+        assert_eq!(get(&c, "btn_south"), Some(Signal::Bool(true)));
+
+        // Halving curve on an analog card: full lean → ~0.5 on the Float out.
+        let mut n = empty_node(1, "processing.gyro_3dof");
+        n.params.insert("lean_right".into(), serde_json::json!([
+            { "out": ["right_trigger"], "mode": "analog",
+              "curve": [[0.0, 0.0], [1.0, 0.5]] }
+        ]));
+        let mut ns = NodeState::default();
+        let mut c = HashMap::new();
+        lean_dispatch_into_collector_sigs(&n, 1, &outs(1.0), &mut ns, &mut c, 0.016);
+        let v = get(&c, "right_trigger").map(|s| s.as_float()).unwrap_or(-1.0);
+        assert!((v - 0.5).abs() < 0.01, "curve must shape the analog lean magnitude, got {v}");
     }
 
     // Multiple writers to one macro port merge by larger magnitude, in either

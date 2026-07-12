@@ -10,6 +10,7 @@ pub mod state;
 pub mod thread;
 
 pub use eval::{
+    analog_axis_for_cardinal,
     apply_curve, biases_from_params, curve_points_from_params, curve_points_from_params_keyed,
     curve_scale, curve_scale_inv, envelope_flags, eval_graph_tick, eval_pure, get_b, get_f,
     crossover_hz_to_pos, multiband_collapse_band, multiband_collapse_carrier, namespaced_uid,

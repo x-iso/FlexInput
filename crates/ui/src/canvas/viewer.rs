@@ -1679,19 +1679,31 @@ fn tz_live_hits(
         .unwrap_or_default();
     let readf = |pin: &str| live_signals.get(&(dev.clone(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
     let readb = |pin: &str| live_signals.get(&(dev.clone(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false);
-    // Per-finger [active, start_zone] × 2, advanced once per pass.
+    // Per-finger [active, start_zone, centre_x, centre_y] × 2, advanced once per
+    // pass. The centre is the adaptive relative origin captured at touchdown
+    // (mirrors eval's analog_by_zone): a landing inside the zone's inner region
+    // becomes the centre (relative), otherwise the zone centre (absolute). It lets
+    // the live vectorscope + curve preview reflect the zone's relative/absolute
+    // setting instead of a raw absolute position.
     let pass = ctx.cumulative_pass_nr();
     let track_id = egui::Id::new(("tz_live_track", node_id.0));
     let (stored_pass, mut track): (u64, Vec<f32>) =
-        ctx.data(|d| d.get_temp(track_id)).unwrap_or((0, vec![0.0; 4]));
-    if track.len() < 4 { track.resize(4, 0.0); }
+        ctx.data(|d| d.get_temp(track_id)).unwrap_or((0, vec![0.0; 8]));
+    if track.len() < 8 { track.resize(8, 0.0); }
     let advance = stored_pass != pass;
     let mut just_down: Option<(usize, usize)> = None;
+    // Adaptive-centre deflection per START zone (unit space, +Y DOWN — callers
+    // flip to +Y up). Keyed like eval's analog_by_zone and published in ctx so the
+    // vectorscope + curve preview read the SAME value the engine emits.
+    let mut defl: std::collections::HashMap<(usize, usize), (f32, f32)> = std::collections::HashMap::new();
+    let adaptive_cards: Vec<Value> = node
+        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
     for finger in 0..2usize {
         let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
                             ("touch2_x", "touch2_y", "touch2_active")][finger];
         let field = if split { finger } else { 0 };
-        let base = finger * 2;
+        let base = finger * 4;
         let active = readb(pa);
         let prev_active = track[base] > 0.5;
         if !active {
@@ -1703,9 +1715,20 @@ fn tz_live_hits(
         let (cur_id, _, _) = tree.locate(x, y);
         let cur_idx = cur_id as usize;
         let start_zone = if !prev_active { cur_idx } else { track[base + 1] as usize };
+        // START zone geometry drives both the absolute centre and the deflection
+        // scale (matches eval: a half-zone move = full deflection).
+        let [sx0, sy0, sx1, sy1] = tree.zone_rect(start_zone as u32).unwrap_or([0.0, 0.0, 1.0, 1.0]);
+        let (scx, scy) = ((sx0 + sx1) * 0.5, (sy0 + sy1) * 0.5);
+        let (shw, shh) = (((sx1 - sx0) * 0.5).max(1e-3), ((sy1 - sy0) * 0.5).max(1e-3));
         if advance {
             if !prev_active {
                 track[base + 1] = cur_idx as f32;
+                let inner = tz_zone_adaptive(&adaptive_cards, field, cur_idx);
+                let (cx, cy) = if (x - scx).abs() <= inner * shw && (y - scy).abs() <= inner * shh {
+                    (x, y)
+                } else { (scx, scy) };
+                track[base + 2] = cx;
+                track[base + 3] = cy;
                 // Newest touchdown wins the tab-follow (see render_touch_zones_*),
                 // so two fingers don't flicker the cards panel between zones.
                 just_down = Some((field, cur_idx));
@@ -1717,6 +1740,11 @@ fn tz_live_hits(
         let lx = if x1 > x0 { ((x - x0) / (x1 - x0)).clamp(0.0, 1.0) } else { 0.5 };
         let ly = if y1 > y0 { ((y - y0) / (y1 - y0)).clamp(0.0, 1.0) } else { 0.5 };
         m.insert((field, eff), (lx, ly, true));
+        // Adaptive deflection about the captured centre, scaled by the START zone.
+        let (cx, cy) = (track[base + 2], track[base + 3]);
+        let dfx = ((x - cx) / shw).clamp(-1.0, 1.0);
+        let dfy = ((y - cy) / shh).clamp(-1.0, 1.0);
+        defl.insert((field, start_zone), (dfx, dfy));
     }
     if advance {
         ctx.data_mut(|d| d.insert_temp(track_id, (pass, track)));
@@ -1727,6 +1755,10 @@ fn tz_live_hits(
                 egui::Id::new(("tz_last_origin", node_id.0)), (pass, f, z)));
         }
     }
+    // Publish the adaptive deflection map for the live vectorscope + curve preview
+    // (pass-stamped so a stale frame doesn't leak a phantom deflection).
+    ctx.data_mut(|d| d.insert_temp(
+        egui::Id::new(("tz_live_defl", node_id.0)), (pass, defl.clone())));
 
     // Per-zone ACTIVE output pins for the on-pad activation glow: a finger is in
     // the zone (hold-aware, from `m`) AND the card's trigger is satisfied this
@@ -2212,15 +2244,104 @@ pub(crate) fn tz_set_zone_held(snarl: &mut Snarl<NodeData>, node_id: NodeId,
 /// to add a point, right-click a point to remove it. X = deflection magnitude
 /// 0..1, Y = output 0..1. Writes the first analog card's `curve`; `live_mag`
 /// draws the current input→output dot when the zone is active.
-fn tz_curve_editor(node_id: NodeId, field: usize, idx: usize,
-    ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>,
-    accent: egui::Color32, visuals: &egui::Visuals, live_mag: Option<f32>)
-{
-    let zone_maps = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
-        .unwrap_or_default();
-    let mut pts = tz_zone_curve(&zone_maps, field, idx);
+/// Default (identity) card curve — a card carrying exactly this stores no
+/// `curve` param at all, keeping saved patches lean.
+fn identity_curve() -> Vec<[f32; 2]> {
+    vec![[0.0, 0.0], [1.0, 1.0]]
+}
 
+/// Normalize points pasted/loaded from elsewhere so the card sampler's
+/// invariants hold: clamp to the 0..1 unit box, sort by x, pin the endpoints
+/// to x=0 / x=1, and guarantee at least two points.
+fn sanitize_card_curve(pts: &mut Vec<[f32; 2]>) {
+    for p in pts.iter_mut() {
+        p[0] = p[0].clamp(0.0, 1.0);
+        p[1] = p[1].clamp(0.0, 1.0);
+    }
+    pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+    if pts.len() < 2 {
+        *pts = identity_curve();
+        return;
+    }
+    pts.first_mut().unwrap()[0] = 0.0;
+    pts.last_mut().unwrap()[0] = 1.0;
+}
+
+/// Save a card curve as a `.fxc` file — same format the Response Curve
+/// module writes, so files are interchangeable (card curves live in the
+/// 0..1 magnitude space, hence the 0-based ranges).
+fn card_curve_save(pts: &[[f32; 2]]) {
+    let cf = CurveFile {
+        points: pts.iter().map(|p| [p[0] as f64, p[1] as f64]).collect(),
+        biases: vec![],
+        absolute: true,
+        in_min: 0.0,
+        in_max: 1.0,
+        out_min: 0.0,
+        out_max: 1.0,
+        grid_x: 4,
+        grid_y: 4,
+        snap: false,
+        scale_t: 0.0,
+        trail_ms: 300,
+        show_scaled_grid: false,
+        show_grid_labels: false,
+    };
+    if let Some(path) = rfd::FileDialog::new()
+        .add_filter("FlexInput Curve", &["fxc"])
+        .set_file_name("curve.fxc")
+        .save_file()
+    {
+        if let Ok(json) = serde_json::to_string_pretty(&cf) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// Load ONLY the points from a `.fxc` file (module settings in the file are
+/// ignored, mirroring the module-side "Load only the curve" semantics).
+fn card_curve_load() -> Option<Vec<[f32; 2]>> {
+    let path = rfd::FileDialog::new()
+        .add_filter("FlexInput Curve", &["fxc"])
+        .pick_file()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let cf: CurveFile = serde_json::from_str(&text).ok()?;
+    let mut pts: Vec<[f32; 2]> = cf.points.iter().map(|p| [p[0] as f32, p[1] as f32]).collect();
+    sanitize_card_curve(&mut pts);
+    Some(pts)
+}
+
+/// Per-mapping-card response-curve editor. Drag points, double-click to add,
+/// right-click a point to remove; right-click the background for the shared
+/// curve menu (Reset / Copy / Paste / Save… / Load… — same clipboard and
+/// `.fxc` files as the Response Curve module).
+///
+/// `threshold`: `Some(slot)` shows the manual-activation controls — a
+/// HORIZONTAL line over the curve's OUTPUT plus a checkbox row. While set,
+/// a digital binding is held whenever the shaped magnitude sits on/above the
+/// line and releases the moment it dips below (see the matching engine
+/// logic in `eval.rs`). Drag the line vertically to tune it.
+///
+/// `nav_uid`: publishes the gamepad-nav graph geometry / selection rings on
+/// the channels the TZ zone editor used (`gp_nav_curve_geom` etc.) — passed
+/// only by the Touch Zones first-analog card so controller curve editing
+/// keeps working; Remapper/Lean card curves are mouse-edited for now.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn mapping_curve_editor(
+    ui: &mut egui::Ui,
+    id_salt: egui::Id,
+    pts: &mut Vec<[f32; 2]>,
+    threshold: Option<&mut Option<f32>>,
+    live_mag: Option<f32>,
+    accent: egui::Color32,
+    visuals: &egui::Visuals,
+    nav_uid: Option<usize>,
+    // Gamepad-focused curve field on this card: Some(6) = threshold (highlight the
+    // line + enable row so the user sees what up/down / South act on).
+    nav_curve_field: Option<u64>,
+) -> bool {
+    let mut changed = false;
     let w = ui.available_width().clamp(140.0, 360.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 104.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -2234,41 +2355,51 @@ fn tz_curve_editor(node_id: NodeId, field: usize, idx: usize,
         ((p.x - g.left()) / g.width()).clamp(0.0, 1.0),
         ((g.bottom() - p.y) / g.height()).clamp(0.0, 1.0));
 
-    // ── Gamepad-nav integration ────────────────────────────────────────────
+    // ── Gamepad-nav integration (nav_uid channels only) ───────────────────
     // Publish the graph geometry (GLOBAL space, 0..1 both axes) so the shared
     // curve driver (`nav_drive_curve_dots`/`_dot`) can add/move/delete dots here
     // exactly like the Response Curve module's graph. Read back the selected dot
     // (while entered) + a focus flag (while the curve row is highlighted but not
     // yet entered) to draw the matching rings.
     let pass = ui.ctx().cumulative_pass_nr();
-    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
-        .unwrap_or(egui::emath::TSTransform::IDENTITY);
-    ui.ctx().data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_curve_geom", node_id.0)),
-        (pass, to_global * g, 0.0f32, 1.0f32, 0.0f32, 1.0f32)));
-    let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
-        .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
-    let nav_sel_dot: Option<usize> = nav_sel.filter(|(p, _, _)| pass.saturating_sub(*p) <= 1).map(|(_, i, _)| i);
-    let nav_focused: bool = ui.ctx()
-        .data(|d| d.get_temp::<u64>(egui::Id::new(("gp_nav_tz_curve_focus", node_id.0))))
-        .map(|p| pass.saturating_sub(p) <= 1).unwrap_or(false);
-    if nav_focused || nav_sel_dot.is_some() {
-        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+    let mut nav_sel_dot: Option<usize> = None;
+    let mut nav_editing = false;
+    if let Some(uid) = nav_uid {
+        let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+            .unwrap_or(egui::emath::TSTransform::IDENTITY);
+        ui.ctx().data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_curve_geom", uid)),
+            (pass, to_global * g, 0.0f32, 1.0f32, 0.0f32, 1.0f32)));
+        let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
+            .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", uid))));
+        let nav_sel = nav_sel.filter(|(p, _, _)| pass.saturating_sub(*p) <= 1);
+        nav_sel_dot = nav_sel.map(|(_, i, _)| i);
+        nav_editing = nav_sel.map(|(_, _, e)| e).unwrap_or(false);
+        let nav_focused: bool = ui.ctx()
+            .data(|d| d.get_temp::<u64>(egui::Id::new(("gp_nav_tz_curve_focus", uid))))
+            .map(|p| pass.saturating_sub(p) <= 1).unwrap_or(false);
+        if nav_focused || nav_sel_dot.is_some() {
+            painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
+        }
         // Gamepad users can't scroll manually, and the whole-module wrapper uses a
         // MANUAL scroll offset (not an egui ScrollArea, so `scroll_to_rect` is a
         // no-op). Publish a body-space scroll delta on the same channel the cards
-        // use (`gp_nav_remap_scroll`) so the wrapper brings the graph into view.
-        if nav_focused || nav_sel_dot.is_some() {
+        // use (`gp_nav_remap_scroll`) so the wrapper keeps the focused element in
+        // view — the graph while editing, and the threshold enable-row (which sits
+        // ~30px BELOW the graph) while the threshold field is focused.
+        if nav_focused || nav_sel_dot.is_some() || nav_curve_field.is_some() {
+            let extra = if nav_curve_field == Some(6) { 32.0 } else { 0.0 };
+            let target = egui::Rect::from_min_max(rect.min, rect.max + egui::vec2(0.0, extra));
             let clip = ui.clip_rect();
             let mut need = 0.0f32;
-            if rect.top() < clip.top() + 4.0 {
-                need = rect.top() - (clip.top() + 4.0);
-            } else if rect.bottom() > clip.bottom() - 4.0 {
-                need = rect.bottom() - (clip.bottom() - 4.0);
+            if target.top() < clip.top() + 4.0 {
+                need = target.top() - (clip.top() + 4.0);
+            } else if target.bottom() > clip.bottom() - 4.0 {
+                need = target.bottom() - (clip.bottom() - 4.0);
             }
             if need.abs() > 1.0 {
                 ui.ctx().data_mut(|d| d.insert_temp(
-                    egui::Id::new(("gp_nav_remap_scroll", node_id.0)), (pass, need)));
+                    egui::Id::new(("gp_nav_remap_scroll", uid)), (pass, need)));
                 request_repaint_throttled(ui.ctx());
             }
         }
@@ -2288,14 +2419,32 @@ fn tz_curve_editor(node_id: NodeId, field: usize, idx: usize,
     // inside the whole-module scale layer), so it maps directly through `unto` —
     // do NOT apply the layer transform here (that double-transforms and scatters
     // the points).
-    let bg = ui.interact(g, ui.id().with((node_id, "tzcvbg", field, idx)), egui::Sense::click());
-    let mut changed = false;
+    let bg = ui.interact(g, id_salt.with("bg"), egui::Sense::click());
+    // Threshold-line drag band — registered BEFORE the point handles so a
+    // handle sitting on the line still wins its own 16px rect.
+    let mut thr_val: Option<f32> = threshold.as_ref().and_then(|s| **s);
+    if let Some(t) = thr_val {
+        let ly = to(0.0, t).y;
+        let band = egui::Rect::from_min_max(
+            egui::pos2(g.left(), ly - 6.0), egui::pos2(g.right(), ly + 6.0));
+        let tr = ui.interact(band, id_salt.with("thr"), egui::Sense::drag());
+        if tr.hovered() || tr.dragged() {
+            tr.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        }
+        if tr.dragged() {
+            if let Some(p) = tr.interact_pointer_pos() {
+                let (_, ny) = unto(p);
+                thr_val = Some(ny.clamp(0.01, 1.0));
+                changed = true;
+            }
+        }
+    }
     let mut remove: Option<usize> = None;
     let n = pts.len();
     for i in 0..n {
         let hp = to(pts[i][0], pts[i][1]);
         let r = ui.interact(egui::Rect::from_center_size(hp, egui::vec2(16.0, 16.0)),
-            ui.id().with((node_id, "tzcv", field, idx, i)), egui::Sense::click_and_drag());
+            id_salt.with(("pt", i)), egui::Sense::click_and_drag());
         let hot = r.hovered() || r.dragged();
         if hot { r.clone().on_hover_cursor(egui::CursorIcon::Grab); }
         if r.dragged() {
@@ -2328,6 +2477,30 @@ fn tz_curve_editor(node_id: NodeId, field: usize, idx: usize,
         }
     }
 
+    // Threshold line (under the curve): dashed, warm color, right-edge knob.
+    // Thickens + gains an accent halo while the gamepad has the threshold field
+    // focused (field 6) so the user sees it's the drag target.
+    let thr_focused = nav_curve_field == Some(6);
+    if let Some(t) = thr_val {
+        let ly = to(0.0, t).y;
+        let thr_col = egui::Color32::from_rgb(255, 170, 60);
+        painter.add(egui::Shape::dashed_line(
+            &[egui::pos2(g.left(), ly), egui::pos2(g.right(), ly)],
+            egui::Stroke::new(if thr_focused { 2.2 } else { 1.2 }, thr_col), 5.0, 4.0));
+        let knob = egui::pos2(g.right() - 4.0, ly);
+        painter.circle_filled(knob, if thr_focused { 4.5 } else { 3.5 }, thr_col);
+        if thr_focused {
+            painter.circle_stroke(knob, 6.5, egui::Stroke::new(1.5, accent));
+        }
+    } else if thr_focused {
+        // Threshold OFF but focused → hint the line at the default so South-to-
+        // enable has an anchor.
+        let ly = to(0.0, 0.5).y;
+        painter.add(egui::Shape::dashed_line(
+            &[egui::pos2(g.left(), ly), egui::pos2(g.right(), ly)],
+            egui::Stroke::new(1.0, accent.gamma_multiply(0.6)), 4.0, 4.0));
+    }
+
     // Curve polyline (over the possibly-just-edited points) + handles.
     for wnd in pts.windows(2) {
         painter.line_segment([to(wnd[0][0], wnd[0][1]), to(wnd[1][0], wnd[1][1])],
@@ -2338,22 +2511,273 @@ fn tz_curve_editor(node_id: NodeId, field: usize, idx: usize,
         painter.circle_stroke(to(p[0], p[1]), 4.0, egui::Stroke::new(1.0, visuals.extreme_bg_color));
         // Gamepad-selected dot: accent ring (thicker while being moved/entered).
         if nav_sel_dot == Some(i) {
-            let editing = nav_sel.map(|(_, _, e)| e).unwrap_or(false);
-            painter.circle_stroke(to(p[0], p[1]), if editing { 8.0 } else { 6.5 },
+            painter.circle_stroke(to(p[0], p[1]), if nav_editing { 8.0 } else { 6.5 },
                 egui::Stroke::new(2.0, accent));
         }
     }
-    // Live input→output dot while the zone drives the analog output.
+    // Live input→output dot; green while it would hold a thresholded binding.
     if let Some(m) = live_mag {
         let m = m.clamp(0.0, 1.0);
-        let y = flexinput_engine::sample_curve(&pts, m, &[]).clamp(0.0, 1.0);
-        let dp = to(m, y);
-        painter.circle_filled(dp, 3.0, egui::Color32::from_rgb(90, 200, 255));
+        let y = flexinput_engine::sample_curve(pts, m, &[]).clamp(0.0, 1.0);
+        let on = thr_val.map(|t| y >= t).unwrap_or(false);
+        let col = if on { egui::Color32::from_rgb(110, 230, 130) }
+                  else  { egui::Color32::from_rgb(90, 200, 255) };
+        painter.circle_filled(to(m, y), 3.0, col);
+        request_repaint_throttled(ui.ctx());
     }
 
-    if changed {
-        tz_set_zone_curve(snarl, node_id, field, idx, &pts);
+    // Shared curve menu — same clipboard and .fxc files as the Response
+    // Curve module, so shapes travel freely between modules and cards.
+    bg.context_menu(|ui| {
+        if ui.button("Reset").clicked() {
+            *pts = identity_curve();
+            changed = true;
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Copy").clicked() {
+            curve_clipboard_set(ui.ctx(), CurveClip { points: pts.clone(), biases: vec![] });
+            ui.close();
+        }
+        let has_clip = curve_clipboard_get(ui.ctx()).is_some();
+        if ui.add_enabled(has_clip, egui::Button::new("Paste")).clicked() {
+            if let Some(clip) = curve_clipboard_get(ui.ctx()) {
+                *pts = clip.points;
+                sanitize_card_curve(pts);
+                changed = true;
+            }
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Save…").clicked() {
+            card_curve_save(pts);
+            ui.close();
+        }
+        if ui.button("Load…").clicked() {
+            if let Some(p) = card_curve_load() {
+                *pts = p;
+                changed = true;
+            }
+            ui.close();
+        }
+    });
+
+    // Threshold enable + readout row (shown only where a manual activation
+    // point is meaningful — the caller decides via `threshold`).
+    if let Some(slot) = threshold {
+        let mut on = thr_val.is_some();
+        let row = ui.horizontal(|ui| {
+            if ui.checkbox(&mut on, egui::RichText::new("Activation threshold").small())
+                .on_hover_text("Manual activation point for digital outputs: the binding is held while the curve's output sits on/above the orange line and releases the moment it dips below. Off = default behaviour (freq-modulated taps for analog mode, built-in stick threshold otherwise). Drag the line on the graph to tune it.")
+                .changed()
+            {
+                thr_val = if on { Some(0.5) } else { None };
+                changed = true;
+            }
+            if let Some(t) = thr_val.as_mut() {
+                let mut pct = *t * 100.0;
+                if ui.add(egui::DragValue::new(&mut pct).speed(1.0).range(1.0..=100.0)
+                    .suffix("%").fixed_decimals(0)).changed()
+                {
+                    *t = pct / 100.0;
+                    changed = true;
+                }
+            }
+        });
+        // Accent ring around the enable row while the gamepad has it focused, so
+        // the "toggle / adjust threshold" target is unmistakable.
+        if thr_focused {
+            ui.painter().rect_stroke(row.response.rect.expand(2.0), 3.0,
+                egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+        }
+        *slot = thr_val;
     }
+
+    changed
+}
+
+/// `Some(node.0)` when card `idx` (scope) is the gamepad-nav ENTERED card, so its
+/// curve section should publish geometry to the shared curve nav channel and ring
+/// while being dot-edited. Only the entered card publishes (one per node), so the
+/// per-node geometry channel never collides across cards.
+fn curve_nav_uid(ctx: &egui::Context, node_id: NodeId, scope: &str, idx: usize) -> Option<usize> {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<(u64, usize, bool)>(
+            egui::Id::new(("gp_nav_remap_card", node_id.0, scope))))
+        .filter(|(p, sel, ent)| *ent && *sel == idx && pass.saturating_sub(*p) <= 1)
+        .map(|_| node_id.0)
+}
+
+/// Slim expander strip + (when open) the curve editor for one mapping card.
+/// Reads/writes `curve` + `threshold` on the card's `working` map; returns
+/// true when the card changed. Identity curve + no threshold stores nothing,
+/// so untouched cards stay lean and take the engine's default paths.
+///
+/// `nav_uid`: forwarded to the editor AND force-opens the section while the
+/// gamepad-nav curve row is focused/entered (the Touch Zones controller flow
+/// needs the graph visible to ring it).
+#[allow(clippy::too_many_arguments)]
+fn mapping_card_curve_section(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    scope: &str,
+    idx: usize,
+    working: &mut serde_json::Map<String, Value>,
+    show_threshold: bool,
+    live_mag: Option<f32>,
+    nav_uid: Option<usize>,
+) -> bool {
+    // Render as a flush continuation of the header card above: zero the inter-item
+    // gap (on THIS child ui only) and wrap the content in a frame with the card's
+    // body fill + black border, bottom corners rounded and top square — so the
+    // card (which squares its bottom when a section follows) and this section
+    // share ONE continuous border and read as a single mapping card.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    const C_BODY_BG: egui::Color32 = egui::Color32::from_rgb(0x3C, 0x3C, 0x3C);
+    const C_BORDER:  egui::Color32 = egui::Color32::BLACK;
+    let accent = ui.visuals().selection.stroke.color;
+    // Gamepad selection/focus. `selected_here` = this card is the nav selection
+    // (used to extend the card GLOW around this section so header + section share
+    // ONE ring, drawn by the nav driver — not a second border here). `nav_field` =
+    // the focused curve field on the ENTERED card (4 toggle / 5 graph / 6
+    // threshold), driving the per-element highlights inside.
+    let pass = ui.ctx().cumulative_pass_nr();
+    let card_sel: Option<(usize, bool)> = ui.ctx()
+        .data(|d| d.get_temp::<(u64, usize, bool)>(
+            egui::Id::new(("gp_nav_remap_card", node_id.0, scope))))
+        .filter(|(p, _, _)| pass.saturating_sub(*p) <= 1)
+        .map(|(_, sel, ent)| (sel, ent));
+    let selected_here = card_sel.map(|(sel, _)| sel == idx).unwrap_or(false);
+    let entered_here = card_sel.map(|(sel, ent)| ent && sel == idx).unwrap_or(false);
+    let nav_field: Option<u64> = if !entered_here { None } else {
+        ui.ctx().data(|d| d.get_temp::<(u64, u64)>(
+                egui::Id::new(("gp_nav_remap_card_field", node_id.0, scope))))
+            .filter(|(p, f)| *f >= 4 && pass.saturating_sub(*p) <= 1)
+            .map(|(_, f)| f)
+    };
+    let out = egui::Frame::default()
+        .fill(C_BODY_BG)
+        .stroke(egui::Stroke::new(1.0, C_BORDER))
+        .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 5, se: 5 })
+        .inner_margin(egui::Margin { left: 0, right: 0, top: 1, bottom: 2 })
+        .show(ui, |ui| {
+    let open_id = egui::Id::new(("card_curve_open", node_id.0, scope.to_string(), idx));
+    let mut open = ui.ctx().data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+    if let Some(uid) = nav_uid {
+        let pass = ui.ctx().cumulative_pass_nr();
+        let focus = ui.ctx()
+            .data(|d| d.get_temp::<u64>(egui::Id::new(("gp_nav_tz_curve_focus", uid))))
+            .map(|p| pass.saturating_sub(p) <= 1).unwrap_or(false);
+        let entered = ui.ctx()
+            .data(|d| d.get_temp::<(u64, usize, bool)>(egui::Id::new(("gp_nav_curve_sel", uid))))
+            .map(|(p, _, _)| pass.saturating_sub(p) <= 1).unwrap_or(false);
+        if focus || entered { open = true; }
+    }
+
+    let has_custom = working.contains_key("curve") || working.contains_key("threshold");
+    let (row, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 15.0), egui::Sense::click());
+    {
+        let painter = ui.painter_at(row);
+        let col = if nav_field == Some(4) {
+            accent
+        } else if resp.hovered() {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let tri = if open { "⏷" } else { "⏵" };
+        painter.text(row.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER,
+            format!("{tri} Response curve"), egui::FontId::proportional(10.5), col);
+        // Accent dot: this card carries a custom curve and/or threshold.
+        if has_custom {
+            painter.circle_filled(row.left_center() + egui::vec2(96.0, 0.0), 2.5, accent);
+        }
+    }
+    if resp.clicked() { open = !open; }
+    ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+    if !open {
+        return false;
+    }
+
+    let mut pts: Vec<[f32; 2]> = working.get("curve").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|p| {
+            let q = p.as_array()?;
+            Some([q.first()?.as_f64()? as f32, q.get(1)?.as_f64()? as f32])
+        }).collect())
+        .unwrap_or_default();
+    if pts.len() < 2 {
+        pts = identity_curve();
+    }
+    let mut thr: Option<f32> = working.get("threshold").and_then(|v| v.as_f64()).map(|v| v as f32);
+
+    let vis = ui.visuals().clone();
+    let changed = mapping_curve_editor(
+        ui, open_id.with("ed"), &mut pts,
+        if show_threshold { Some(&mut thr) } else { None },
+        live_mag, accent, &vis, nav_uid, nav_field,
+    );
+    if changed {
+        if pts == identity_curve() {
+            working.remove("curve");
+        } else {
+            working.insert("curve".into(),
+                Value::Array(pts.iter().map(|p| serde_json::json!([p[0], p[1]])).collect()));
+        }
+        match thr.and_then(|t| Number::from_f64(t as f64)) {
+            Some(t) => { working.insert("threshold".into(), Value::Number(t)); }
+            None => { working.remove("threshold"); }
+        }
+    }
+    changed
+    });
+    // Publish this section's GLOBAL rect for the selected card so the nav driver's
+    // card glow expands to wrap header + section as ONE ring (instead of a separate
+    // border here). Keyed per node+scope; only the selected card publishes.
+    if selected_here {
+        let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+            .unwrap_or(egui::emath::TSTransform::IDENTITY);
+        ui.ctx().data_mut(|d| d.insert_temp(
+            egui::Id::new(("gp_nav_card_section_rect", node_id.0, scope.to_string())),
+            (pass, to_global * out.response.rect)));
+    }
+    out.inner
+}
+
+/// Largest live analog-input magnitude across a mapping's in pins, read from
+/// the upstream device's live signals — drives the editor's preview dot.
+fn live_analog_in_mag(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev: Option<&str>,
+    in_pins: &[String],
+) -> Option<f32> {
+    let dev = dev?;
+    let mut best: Option<f32> = None;
+    for p in in_pins {
+        let v = if let Some((axis, sign)) = flexinput_engine::analog_axis_for_cardinal(p) {
+            live_signals.get(&(dev.to_string(), axis.to_string()))
+                .map(|s| s.as_float())
+                .or_else(|| {
+                    // Vec2 fallback: some sources publish the stick as a Vec2
+                    // ("left_stick") rather than separate axis floats.
+                    let (vpin, comp) = axis.rsplit_once('_')?;
+                    match live_signals.get(&(dev.to_string(), vpin.to_string()))? {
+                        Signal::Vec2(v) => Some(if comp == "x" { v.x } else { v.y }),
+                        _ => None,
+                    }
+                })
+                .map(|r| (r * sign).clamp(0.0, 1.0))
+        } else if matches!(p.as_str(), "left_trigger" | "right_trigger") {
+            live_signals.get(&(dev.to_string(), p.to_string()))
+                .map(|s| s.as_float().clamp(0.0, 1.0))
+        } else {
+            None
+        };
+        if let Some(v) = v {
+            best = Some(best.map_or(v, |b: f32| b.max(v)));
+        }
+    }
+    best
 }
 
 /// Paint one zone's MAPPING content (mapping mode): the output icon(s) of the
@@ -2544,10 +2968,15 @@ fn tz_draw_field(
             painter.rect_filled(zr.shrink(1.0), 0.0, accent.gamma_multiply(0.35));
         }
         if mapping {
-            // Local finger position → deflection estimate for the analog viz
-            // (+Y up; the eval's adaptive centre isn't reproduced here — this is
-            // a live direction indicator, not the exact stick value).
-            let deflect = live.filter(|z| z.2).map(|(lx, ly, _)| (2.0 * lx - 1.0, 1.0 - 2.0 * ly));
+            // Adaptive-centre deflection published by tz_live_hits (relative or
+            // absolute per the zone's setting) → the analog vectorscope, so it
+            // matches the engine's stick value. +Y up (flip the unit-space +Y-down
+            // value). Keyed by the START zone, so the scope stays on the zone the
+            // finger began in even if it drifts to a neighbour.
+            let deflect = ctx.data(|d| d.get_temp::<(u64, std::collections::HashMap<(usize, usize), (f32, f32)>)>(
+                    egui::Id::new(("tz_live_defl", node_id.0))))
+                .and_then(|(_, mp)| mp.get(&(field, idx)).copied())
+                .map(|(dx, dy)| (dx, -dy));
             tz_paint_zone_mapping(&painter, &ctx, node_id, zr, field, idx, &zone_maps, skin, deflect, accent, visuals);
         } else {
             painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
@@ -3455,7 +3884,7 @@ fn render_touch_zone_cards(
                     }
                 }
                 let add = ui.add_enabled(!draft_out.is_empty(),
-                    egui::Button::new(egui::RichText::new("＋ Add").strong()));
+                    egui::Button::new(egui::RichText::new("Add").strong()));
                 act_rects.push(add.rect);
                 if add.on_hover_text("Add this zone mapping").clicked() && !draft_out.is_empty() {
                     tz_commit_card(snarl, node_id, sel_f, sel_z, &trigger, &draft_out);
@@ -3514,6 +3943,22 @@ fn render_touch_zone_cards(
         ui.label(egui::RichText::new("No mappings — press Learn, then demonstrate on a zone.").weak());
     }
     let reorder_enabled = display.len() > 1;
+    // Live deflection magnitude of the selected zone — the preview dot on any
+    // open card curve editor. Computed once for the whole card list.
+    let tz_live_mag: Option<f32> = {
+        // Adaptive-centre deflection magnitude of the selected zone (published by
+        // tz_live_hits), so the preview dot's input matches the engine — relative
+        // or absolute per the zone's setting, not a raw absolute position.
+        let _ = tz_live_hits(snarl, node_id, live_signals, automap_parent, ui.ctx());
+        ui.ctx().data(|d| d.get_temp::<(u64, std::collections::HashMap<(usize, usize), (f32, f32)>)>(
+                egui::Id::new(("tz_live_defl", node_id.0))))
+            .and_then(|(_, mp)| mp.get(&(sel_f, sel_z)).copied())
+            .map(|(dx, dy)| (dx * dx + dy * dy).sqrt().min(1.0))
+    };
+    // Gamepad nav still edits ONE curve per zone (the shared driver has a
+    // single geometry channel per node) — attach it to the FIRST analog card,
+    // matching what `tz_zone_curve`/`tz_set_zone_curve` in the nav path edit.
+    let mut nav_curve_given = false;
     let mut rv = ReorderView::begin(
         ui, egui::Id::new(("fxi_tz_reorder", node_id.0, sel_f, sel_z)), reorder_enabled);
     for (slot, &i) in display.iter().enumerate() {
@@ -3525,6 +3970,13 @@ fn render_touch_zone_cards(
         let out_pins: Vec<String> = working.get("out").and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
         let drag_off = rv.offset_for(slot);
+        let card_analog = out_pins.iter().any(|p| tz_out_pin_is_analog(p));
+        let nav_uid = if card_analog && !nav_curve_given {
+            nav_curve_given = true;
+            Some(node_id.0)
+        } else {
+            None
+        };
         ui.allocate_ui_with_layout(
             egui::vec2(TZ_CARD_W, 1.0),
             egui::Layout::top_down(egui::Align::Min),
@@ -3532,10 +3984,19 @@ fn render_touch_zone_cards(
                 let result = remapper_mapping_card_pixel(
                     ui, node_id, i, &mut working,
                     &in_pins, Some(&out_pins), skin,
-                    true, reorder_enabled, drag_off, "zone_maps",
+                    true, reorder_enabled, drag_off, "zone_maps", card_analog,
                 );
                 if result.delete_clicked { remove = Some(i); }
                 rv.observe(slot, &result);
+                // Per-card response curve (analog outputs shape the zone's
+                // deflection). Thresholds don't apply to TZ triggers — the
+                // gate is touch presence, not a magnitude.
+                if card_analog {
+                    mapping_card_curve_section(
+                        ui, node_id, "zone_maps", i, &mut working,
+                        false, tz_live_mag, nav_uid,
+                    );
+                }
             },
         );
         if working != before {
@@ -3558,24 +4019,14 @@ fn render_touch_zone_cards(
         }
     }
 
-    // Response-curve editor for the selected zone's analog output — full size in
-    // the card row (the on-zone graph is just a live preview). X = deflection
-    // magnitude, Y = output. Drag points, double-click to add, right-click to
-    // remove.
+    // The response curve now lives ON each analog card (expander strip in the
+    // loop above). Only the zone-level Relative-center slider stays here — the
+    // adaptive centre is a per-zone property, not per-card.
     let zmaps_now = snarl.get_node(node_id)
         .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
         .unwrap_or_default();
     if tz_zone_is_analog(&zmaps_now, sel_f, sel_z) {
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("Response curve  ·  drag / dbl-click add / right-click remove")
-            .small().weak());
-        let live = tz_live_hits(snarl, node_id, live_signals, automap_parent, ui.ctx());
-        let live_mag = live.get(&(sel_f, sel_z)).filter(|z| z.2).map(|&(lx, ly, _)| {
-            let (dx, dy) = (2.0 * lx - 1.0, 2.0 * ly - 1.0);
-            (dx * dx + dy * dy).sqrt().min(1.0)
-        });
-        let vis = ui.visuals().clone();
-        tz_curve_editor(node_id, sel_f, sel_z, ui, snarl, accent, &vis, live_mag);
         // Adaptive-centre inner %: 0 = absolute deflection from the zone centre,
         // 100 = wherever your finger lands becomes the centre (fully relative).
         let mut pct = tz_zone_adaptive(&zmaps_now, sel_f, sel_z) * 100.0;
@@ -9010,6 +9461,12 @@ fn show_gyro_lean_mapping_section(
     let mut to_update: Option<(usize, serde_json::Map<String, Value>)> = None;
     ui.spacing_mut().item_spacing.y = 2.0;
     let reorder_enabled = filter.kind == MapFilterKind::All;
+    // Live lean magnitude for THIS side (gyro output slot 3, exported to the
+    // UI via last_signals) — the preview dot on any open card curve editor.
+    let lean_live: Option<f32> = snarl.get_node(node_id)
+        .and_then(|n| n.extra.last_signals.get(3).copied().flatten())
+        .map(|s| s.as_float())
+        .map(|v| if side == "left" { (-v).max(0.0) } else { v.max(0.0) });
     let mut rv = ReorderView::begin(
         ui, egui::Id::new(("fxi_lean_reorder", node_id.0, side)), reorder_enabled,
     );
@@ -9039,11 +9496,22 @@ fn show_gyro_lean_mapping_section(
                     let result = remapper_mapping_card_pixel(
                         ui, node_id, i, &mut working,
                         &out_pins, None, skin, true,
-                        reorder_enabled, drag_off, key,
+                        reorder_enabled, drag_off, key, true,
                     );
                     if result.delete_clicked { to_remove = Some(i); }
                     if result.changed { working_changed = true; }
                     rv.observe(i, &result);
+                    // Per-card response curve + manual activation threshold —
+                    // the lean gesture is inherently analog, so every card
+                    // qualifies. A card threshold replaces the node-level
+                    // lean threshold for that card.
+                    let nav_uid = curve_nav_uid(ui.ctx(), node_id, key, i);
+                    if mapping_card_curve_section(
+                        ui, node_id, key, i, &mut working,
+                        true, lean_live, nav_uid,
+                    ) {
+                        working_changed = true;
+                    }
                 },
             );
         });
@@ -19034,12 +19502,23 @@ fn remapper_pressed_now(
     dev_id: &str,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    // Prefer the ANALOG trigger over the digital L2/R2 button when the pad exposes
+    // it: a PS/Xbox pad fires `btn_lt_dig`/`btn_rt_dig` WHENEVER the trigger is
+    // pulled (alongside the analog axis), which would otherwise always win the
+    // capture and rob the mapping of its analog value + response curve. Keyed on
+    // whether the analog pin is actually present (digital-only pads like the Switch
+    // Pro have none, so they keep capturing the digital button — their only signal).
+    let has = |pin: &str| live_signals.contains_key(&(dev_id.to_string(), pin.to_string()));
+    let lt_analog = has("left_trigger");
+    let rt_analog = has("right_trigger");
     for ap in am_canon::ALL_PINS {
         if ap.signal_type != SignalType::Bool { continue; }
         // Touch-active pins are canonical (Splitter/Collector use them) but
         // suppressed in Remapper Learn — the zone synthesis below already
         // expresses the same information as touch_left/center/right.
         if ap.id == "touch1_active" || ap.id == "touch2_active" { continue; }
+        if ap.id == "btn_lt_dig" && lt_analog { continue; }
+        if ap.id == "btn_rt_dig" && rt_analog { continue; }
         // btn_touchpad is conditionally suppressed below: when a finger is
         // on the pad during a click, the specific-zone pin is the right
         // capture target; when there is no finger, the bare click stands as
@@ -19088,6 +19567,20 @@ fn remapper_pressed_now(
             || y >  T_CARDINAL && (ax < T_CARDINAL ||  y >  DOM * ax) { out.push(up.to_string()); }
         if diagonal && y < -T_DIAGONAL
             || y < -T_CARDINAL && (ax < T_CARDINAL || -y >  DOM * ax) { out.push(down.to_string()); }
+    }
+    // Analog triggers. `left_trigger`/`right_trigger` are Float pins (skipped by
+    // the Bool loop above), so Learn would otherwise never capture an analog
+    // trigger — leaving it un-mappable as an analog input (no response curve /
+    // activation threshold). When the analog pin exists, capture it once pulled past
+    // a threshold (matching the stick-cardinal treatment); the digital L2/R2 button
+    // was suppressed above so this analog capture is the sole one. Digital-only pads
+    // (Switch Pro) have no analog pin here and kept their digital button instead.
+    const T_TRIGGER: f32 = 0.5;
+    for (analog, present) in [("left_trigger", lt_analog), ("right_trigger", rt_analog)] {
+        if !present { continue; }
+        let v = live_signals.get(&(dev_id.to_string(), analog.to_string()))
+            .map(|s| s.as_float()).unwrap_or(0.0);
+        if v > T_TRIGGER { out.push(analog.to_string()); }
     }
     out
 }
@@ -19828,6 +20321,8 @@ fn remapper_mapping_card_pixel(
     drag_offset_y: f32,             // visual lift (paint offset) while dragging this card
     nav_scope: &str,                // nav-temp key scope: "mappings" / "lean_left" / "lean_right"
                                     // — disambiguates the two Lean lists sharing one node
+    has_curve_below: bool,          // a response-curve section is rendered flush below this card
+                                    // → square the bottom corners so the two read as ONE card
 ) -> MappingCardResult {
     // ── Figma palette ─────────────────────────────────────────────────────
     const C_CARD_BG:   Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);  // outer
@@ -19916,9 +20411,18 @@ fn remapper_mapping_card_pixel(
     let painter = ui.painter().with_clip_rect(painter_clip);
 
     // ── Paint outer card + body fill ──────────────────────────────────────
+    // When a response-curve section is drawn flush below, square the bottom
+    // corners (both outer frame + body fill) so the section's frame closes the
+    // card off — the two share one continuous border.
+    let radius_i = RADIUS as u8;
+    let outer_cr = if has_curve_below {
+        egui::CornerRadius { nw: radius_i, ne: radius_i, sw: 0, se: 0 }
+    } else {
+        egui::CornerRadius::same(radius_i)
+    };
     painter.rect(
         card_rect,
-        RADIUS,
+        outer_cr,
         C_CARD_BG,
         egui::Stroke::new(1.0, C_BORDER),
         egui::epaint::StrokeKind::Inside,
@@ -19929,7 +20433,8 @@ fn remapper_mapping_card_pixel(
         card_origin + egui::vec2(0.0, body_top_y),
         card_origin + egui::vec2(card_w, card_h),
     );
-    painter.rect_filled(body_rect, RADIUS, C_BODY_BG);
+    let body_cr = if has_curve_below { egui::CornerRadius::ZERO } else { egui::CornerRadius::same(radius_i) };
+    painter.rect_filled(body_rect, body_cr, C_BODY_BG);
     // Square off the body's top corners by overpainting the top edge with a
     // small rect — the rounded radius lives only on the bottom of the card.
     painter.rect_filled(
@@ -20289,10 +20794,19 @@ fn remapper_mapping_card_pixel(
             .and_then(|f| nav_field_rects.get(f as usize).copied())
             .filter(|fr| fr.is_finite() && fr.width() > 0.5)
             .map(|fr| to_global * fr);
+        // Publish the card-list viewport (global) too, so the nav driver can CLIP
+        // the card glow to it — a tall expanded card scrolled partly out of view
+        // gets its ring cropped at the visible edge instead of spilling past it.
+        let clip_g = to_global * ui.clip_rect();
         let pass = ui.ctx().cumulative_pass_nr();
-        ui.ctx().data_mut(|d| d.insert_temp(
-            egui::Id::new(("gp_nav_remap_card_rects", node_id.0, nav_scope)),
-            (pass, card_g, field_g, nav_card_entered)));
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(("gp_nav_remap_card_rects", node_id.0, nav_scope)),
+                (pass, card_g, field_g, nav_card_entered));
+            d.insert_temp(
+                egui::Id::new(("gp_nav_remap_viewport", node_id.0, nav_scope)),
+                (pass, clip_g));
+        });
 
         // Auto-scroll: if the selected card is outside the visible band, request
         // a body-space scroll so it comes into view. This only touches data,
@@ -21274,14 +21788,32 @@ fn show_remapper_body(
                             egui::vec2((BODY_W - 18.0).min(358.0), 1.0),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
+                                // Per-card response curve + manual activation
+                                // threshold — offered whenever an in pin is
+                                // analog (stick cardinal / trigger), since
+                                // both analog-mode shaping and digital-mode
+                                // thresholds key off the input magnitude.
+                                let card_analog = in_pins.iter()
+                                    .any(|p| flexinput_engine::pin_is_analog_input(p));
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin,
-                                    true, reorder_enabled, drag_off, "mappings",
+                                    true, reorder_enabled, drag_off, "mappings", card_analog,
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
                                 rv.observe(i, &result);
+                                if card_analog {
+                                    let live = live_analog_in_mag(
+                                        live_signals, upstream_dev_id.as_deref(), &in_pins);
+                                    let nav_uid = curve_nav_uid(ui.ctx(), node_id, "mappings", i);
+                                    if mapping_card_curve_section(
+                                        ui, node_id, "mappings", i, &mut working,
+                                        true, live, nav_uid,
+                                    ) {
+                                        working_changed = true;
+                                    }
+                                }
                             },
                         );
                     });
@@ -21740,7 +22272,7 @@ fn show_map_action_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin,
-                                    true, reorder_enabled, drag_off, "mappings",
+                                    true, reorder_enabled, drag_off, "mappings", false,
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }

@@ -3983,15 +3983,52 @@ impl FlexInputApp {
                 egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
         };
 
-        // Card glow (selected/entered card + focused header field).
+        // Card glow (selected/entered card + focused header field). Extend the
+        // ring to also enclose the response-curve section (published separately)
+        // so the header + its expanded curve read as ONE bordered card, not two.
+        // Clip it to the card-list viewport so a tall expanded card scrolled partly
+        // out of view has its ring cropped at the visible edge, not spilling past.
         if let Some((pass, card, field, entered)) = ctx.data(|d|
             d.get_temp::<(u64, egui::Rect, Option<egui::Rect>, bool)>(
                 egui::Id::new(("gp_nav_remap_card_rects", inner.0, scope))))
         {
             if cur_pass.saturating_sub(pass) <= 2 {
-                ring(card, 5.0, if entered { 130.0 } else { 90.0 }, 7.0);
+                let mut whole = card;
+                if let Some((sp, sect)) = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
+                    egui::Id::new(("gp_nav_card_section_rect", inner.0, scope))))
+                {
+                    // Only union when the section actually butts the bottom of THIS
+                    // card (flush, 0-gap) — rejects a rect left over from a
+                    // previously-selected card before its owner stops publishing.
+                    if cur_pass.saturating_sub(sp) <= 2 && sect.is_finite()
+                        && (sect.top() - card.bottom()).abs() < 6.0
+                    {
+                        whole = whole.union(sect);
+                    }
+                }
+                let clipped = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
+                        egui::Id::new(("gp_nav_remap_viewport", inner.0, scope))))
+                    .filter(|(p, r)| cur_pass.saturating_sub(*p) <= 2 && r.is_finite())
+                    .map(|(_, vp)| painter.with_clip_rect(vp));
+                let cp = clipped.as_ref().unwrap_or(&painter);
+                let ring_c = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
+                    if !rect.is_finite() || rect.width() < 1.0 { return; }
+                    let n = 6;
+                    for i in 0..n {
+                        let t = (i as f32 + 1.0) / n as f32;
+                        let grow = t * max_grow;
+                        let a = (peak * (1.0 - t)).round() as u8;
+                        if a == 0 { continue; }
+                        cp.rect_stroke(rect.expand(grow), round + grow,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                            egui::StrokeKind::Outside);
+                    }
+                    cp.rect_stroke(rect.expand(1.0), round,
+                        egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+                };
+                ring_c(whole, 5.0, if entered { 130.0 } else { 90.0 }, 7.0);
                 if entered {
-                    if let Some(fr) = field { ring(fr, 4.0, 160.0, 6.0); }
+                    if let Some(fr) = field { ring_c(fr, 4.0, 160.0, 6.0); }
                 }
             }
         }
@@ -5364,10 +5401,115 @@ impl FlexInputApp {
             .map(|a| a.len()).unwrap_or(0)
     }
 
+    /// Whether the entered card carries a per-card response curve section, and if
+    /// so whether it also offers an activation THRESHOLD (`Some(show_threshold)`).
+    /// Mirrors the body's gating: Remapper cards with any analog in pin, and Lean
+    /// cards (always). Map Action ("mappings" on a non-Remapper node) and Touch
+    /// Zones (own curve nav flow) return `None`.
+    fn nav_card_curve_shape(&self, outer_id: egui_snarl::NodeId, idx: usize) -> Option<bool> {
+        let scope = self.nav_remap_mappings_key(outer_id);
+        let inner = self.nav_selected_inner_node(outer_id)?;
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let node = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.snarl.get_node(inner)?;
+        match scope {
+            "lean_left" | "lean_right" => Some(true),
+            "mappings" => {
+                if node.module_id != "module.remapper" { return None; }
+                let analog = node.params.get("mappings").and_then(|v| v.as_array())
+                    .and_then(|a| a.get(idx))
+                    .and_then(|m| m.get("in").and_then(|v| v.as_array()))
+                    .map(|a| a.iter().filter_map(|v| v.as_str())
+                        .any(flexinput_engine::pin_is_analog_input))
+                    .unwrap_or(false);
+                if analog { Some(true) } else { None }
+            }
+            _ => None, // zone_maps → handled by the Touch Zones curve flow
+        }
+    }
+
+    /// Ctx-temp id for a card's response-curve open flag (matches the body's
+    /// `mapping_card_curve_section` key exactly).
+    fn nav_card_curve_open_id(inner: egui_snarl::NodeId, scope: &str, idx: usize) -> egui::Id {
+        egui::Id::new(("card_curve_open", inner.0, scope.to_string(), idx))
+    }
+    fn nav_card_curve_open(&self, ctx: &egui::Context, inner: egui_snarl::NodeId, scope: &str, idx: usize) -> bool {
+        ctx.data(|d| d.get_temp::<bool>(Self::nav_card_curve_open_id(inner, scope, idx))).unwrap_or(false)
+    }
+    fn nav_set_card_curve_open(&self, ctx: &egui::Context, inner: egui_snarl::NodeId, scope: &str, idx: usize, open: bool) {
+        ctx.data_mut(|d| d.insert_temp(Self::nav_card_curve_open_id(inner, scope, idx), open));
+    }
+
+    /// Toggle the presence of a card's `threshold` param (default 0.5 when added).
+    /// Returns whether it changed anything.
+    fn nav_toggle_card_threshold(&mut self, outer_id: egui_snarl::NodeId, idx: usize) -> bool {
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+            if m.contains_key("threshold") {
+                m.remove("threshold");
+            } else {
+                m.insert("threshold".to_string(), serde_json::json!(0.5));
+            }
+            true
+        })
+    }
+
+    /// Nudge a card's `threshold` value (only when present) by `delta`, clamped to
+    /// 0.01..1.0. Returns whether it changed.
+    fn nav_nudge_card_threshold(&mut self, outer_id: egui_snarl::NodeId, idx: usize, delta: f32) -> bool {
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+            let Some(cur) = m.get("threshold").and_then(|v| v.as_f64()) else { return false; };
+            let next = ((cur as f32) + delta).clamp(0.01, 1.0);
+            m.insert("threshold".to_string(), serde_json::json!(next as f64));
+            true
+        })
+    }
+
+    /// Read the entered card's response `curve` (≥2 pts) for the gamepad dot
+    /// editor — the Remapper/Lean analogue of the Touch Zones per-zone curve.
+    fn nav_card_curve_points(&self, outer_id: egui_snarl::NodeId)
+        -> Option<(egui_snarl::NodeId, Vec<[f32; 2]>)>
+    {
+        let scope = self.nav_remap_mappings_key(outer_id);
+        if !matches!(scope, "mappings" | "lean_left" | "lean_right") { return None; }
+        let inner = self.nav_selected_inner_node(outer_id)?;
+        let idx = self.gamepad_nav.remap_card;
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let node = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.snarl.get_node(inner)?;
+        let pts: Vec<[f32; 2]> = node.params.get(scope).and_then(|v| v.as_array())
+            .and_then(|a| a.get(idx))
+            .and_then(|m| m.get("curve").and_then(|v| v.as_array()))
+            .map(|a| a.iter().filter_map(|p| {
+                let q = p.as_array()?;
+                Some([q.first()?.as_f64()? as f32, q.get(1)?.as_f64()? as f32])
+            }).collect())
+            .unwrap_or_default();
+        // No stored curve yet → seed identity so the editor has dots to grab.
+        let pts = if pts.len() >= 2 { pts } else { vec![[0.0, 0.0], [1.0, 1.0]] };
+        Some((inner, pts))
+    }
+
+    /// Write dot edits back onto the entered card's `curve` (identity collapses
+    /// to no stored curve, matching the mouse editor).
+    fn nav_card_curve_write(&mut self, outer_id: egui_snarl::NodeId, pts: &[[f32; 2]]) {
+        let idx = self.gamepad_nav.remap_card;
+        let identity = pts.len() == 2 && pts[0] == [0.0, 0.0] && pts[1] == [1.0, 1.0];
+        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+            if identity {
+                m.remove("curve");
+            } else {
+                m.insert("curve".to_string(), serde_json::Value::Array(
+                    pts.iter().map(|p| serde_json::json!([p[0] as f64, p[1] as f64])).collect()));
+            }
+            true
+        });
+    }
+
     /// Drive header-field editing of the entered mapping card (`RemapCard`):
     /// left/right move between the fields that APPLY for the current mode
     /// (press-mode / time-gap / hold / turbo — grayed-out ones skipped), up/down
     /// or South edit the focused field, North resets the card, East exits.
+    /// Analog cards extend past the header onto the response-curve section:
+    /// field 4 = show/hide graph, 5 = enter dot editing (when open), 6 = threshold
+    /// toggle (when open + applicable).
     fn nav_drive_remap_card(
         &mut self,
         ctx: &egui::Context,
@@ -5378,7 +5520,7 @@ impl FlexInputApp {
         rt_rising: bool,
         mag: f32,
     ) {
-        use crate::gamepad_nav::NavDir;
+        use crate::gamepad_nav::{EditLevel, NavDir};
         // Where to pop back to on exit — RemapScroll for the Remapper, TzCards for
         // Touch Zones (set at entry). Lets this driver be shared by both.
         let ret = self.gamepad_nav.card_return_level;
@@ -5425,24 +5567,47 @@ impl FlexInputApp {
         // Field 0 (press-mode) always applies.
         let applies = [true, gap_applies, hold_applies, turbo_applies];
 
-        // Left/right move to the previous/next applicable field.
-        let mut field = self.gamepad_nav.card_field.min(3);
+        // Response-curve section fields extend past the header for analog cards
+        // (Touch Zones keep their own per-zone curve nav flow, so skip them here):
+        // 4 = show/hide graph, 5 = enter dot editing (only when shown), 6 =
+        // threshold toggle (only when shown + applicable).
+        let scope = self.nav_remap_mappings_key(outer_id);
+        let curve_shape = if matches!(ret, EditLevel::TzCards) {
+            None
+        } else {
+            self.nav_card_curve_shape(outer_id, idx)
+        };
+        let curve_open = curve_shape.is_some()
+            && self.nav_card_curve_open(ctx, inner, scope, idx);
+        // Ordered list of reachable field ids for this card.
+        let mut nav_fields: Vec<usize> = (0..4).filter(|&f| applies[f]).collect();
+        if let Some(show_threshold) = curve_shape {
+            nav_fields.push(4);
+            if curve_open {
+                nav_fields.push(5);
+                if show_threshold { nav_fields.push(6); }
+            }
+        }
+
+        // Left/right move within the reachable field list (wrapping).
         let move_dir = match step_dir {
             Some(NavDir::Left) => -1i32,
             Some(NavDir::Right) => 1,
             _ => 0,
         };
-        if move_dir != 0 {
-            let mut f = field as i32;
-            for _ in 0..4 {
-                f = (f + move_dir).rem_euclid(4);
-                if applies[f as usize] { break; }
-            }
-            field = f as usize;
-            self.gamepad_nav.card_field = field;
-        }
-        // If the focused field became inert (mode changed), snap to press-mode.
-        if !applies[field] { field = 0; self.gamepad_nav.card_field = 0; }
+        let want = self.gamepad_nav.card_field;
+        // Current position in the list; if the focused field is no longer
+        // reachable (mode changed / section collapsed), snap to the nearest one.
+        let cur_pos = nav_fields.iter().position(|&f| f == want)
+            .unwrap_or_else(|| nav_fields.iter().filter(|&&f| f < want).count()
+                .min(nav_fields.len().saturating_sub(1)));
+        let pos = if move_dir != 0 && !nav_fields.is_empty() {
+            ((cur_pos as i32 + move_dir).rem_euclid(nav_fields.len() as i32)) as usize
+        } else {
+            cur_pos
+        };
+        let field = nav_fields.get(pos).copied().unwrap_or(0);
+        self.gamepad_nav.card_field = field;
 
         // Edit the focused field with up/down (and South for toggles / mode).
         let edit_press = match step_dir {
@@ -5507,12 +5672,58 @@ impl FlexInputApp {
                     self.nav_remap_set_card_bool(outer_id, idx, "turbo", next);
                 }
             }
+            4 => {
+                // Show/hide the response-curve graph.
+                if south || edit_press != 0 {
+                    let now = self.nav_card_curve_open(ctx, inner, scope, idx);
+                    let next = if south { !now } else { edit_press > 0 };
+                    self.nav_set_card_curve_open(ctx, inner, scope, idx, next);
+                }
+            }
+            5 => {
+                // Focused on the graph: publish the curve-focus flag so the body
+                // rings the graph (and keeps the section open); South enters the
+                // shared dot editor (returns here on exit).
+                let fpass = ctx.cumulative_pass_nr();
+                ctx.data_mut(|d| d.insert_temp(
+                    egui::Id::new(("gp_nav_tz_curve_focus", inner.0)), fpass));
+                if south {
+                    self.gamepad_nav.edit_level = EditLevel::CurveDots;
+                    self.gamepad_nav.curve_return_level = EditLevel::RemapCard;
+                    self.gamepad_nav.curve_dot = 0;
+                    if self.gamepad_nav.edit_baseline.is_none() {
+                        self.gamepad_nav.edit_baseline = Some(Box::new(
+                            self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+                    }
+                }
+            }
+            6 => {
+                // South toggles the activation threshold on/off; up/down + stick-Y
+                // nudge its value (only while present), so it's fully gamepad-editable.
+                if south {
+                    let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+                    if self.nav_toggle_card_threshold(outer_id, idx) {
+                        self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+                    }
+                } else {
+                    let mut delta = 0.0f32;
+                    if mag > 0.5 {
+                        let accel = self.settings.cursor_accel.max(1.0);
+                        let c = nav.lstick.y;
+                        delta += c.signum() * c.abs().powf(accel) * 0.6 * dt;
+                    } else if edit_press != 0 {
+                        delta += edit_press as f32 * 0.02;
+                    }
+                    if delta != 0.0 {
+                        self.nav_nudge_card_threshold(outer_id, idx, delta);
+                    }
+                }
+            }
             _ => {}
         }
 
         // Publish selected card + focused field so the body glows them.
         let pass = ctx.cumulative_pass_nr();
-        let scope = self.nav_remap_mappings_key(outer_id);
         ctx.data_mut(|d| {
             d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0, scope)), (pass, idx, true));
             d.insert_temp(egui::Id::new(("gp_nav_remap_card_field", inner.0, scope)), (pass, field as u64));
@@ -6710,6 +6921,12 @@ impl FlexInputApp {
     fn nav_curve_points(&self, outer_id: egui_snarl::NodeId)
         -> Option<(egui_snarl::NodeId, Vec<[f32; 2]>)>
     {
+        // Remapper/Lean per-card response curve: entered from a mapping card
+        // (curve_return_level == RemapCard), so it lives on the entered card's
+        // `curve`, not a node-level param.
+        if matches!(self.gamepad_nav.curve_return_level, crate::gamepad_nav::EditLevel::RemapCard) {
+            return self.nav_card_curve_points(outer_id);
+        }
         let inner = self.nav_selected_inner_node(outer_id)?;
         let canvas = &self.tabs[self.active_tab].canvas;
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
@@ -6744,6 +6961,11 @@ impl FlexInputApp {
     fn nav_curve_write_points(&mut self, inner: egui_snarl::NodeId,
         outer_id: egui_snarl::NodeId, pts: &[[f32; 2]])
     {
+        // Remapper/Lean per-card response curve (entered from a mapping card).
+        if matches!(self.gamepad_nav.curve_return_level, crate::gamepad_nav::EditLevel::RemapCard) {
+            self.nav_card_curve_write(outer_id, pts);
+            return;
+        }
         // Touch Zones: write back to the selected analog zone's card curve.
         {
             let canvas = &self.tabs[self.active_tab].canvas;
@@ -6917,6 +7139,26 @@ impl FlexInputApp {
             egui::Id::new(("gp_nav_curve_sel", inner.0)), (pass, idx, editing)));
     }
 
+    /// While dot-editing a Remapper/Lean PER-CARD curve, keep the entered-card
+    /// channel fresh (field 5) so the body keeps publishing the graph geometry —
+    /// otherwise `nav_drive_remap_card` (which normally publishes it) isn't running
+    /// and the geometry goes stale, breaking dot placement. No-op for module /
+    /// Touch Zones curves, which publish geometry unconditionally.
+    fn nav_keep_card_curve_focus(&self, ctx: &egui::Context,
+        outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
+    {
+        if !matches!(self.gamepad_nav.curve_return_level, crate::gamepad_nav::EditLevel::RemapCard) {
+            return;
+        }
+        let scope = self.nav_remap_mappings_key(outer_id);
+        let pass = ctx.cumulative_pass_nr();
+        let idx = self.gamepad_nav.remap_card;
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card", inner.0, scope)), (pass, idx, true));
+            d.insert_temp(egui::Id::new(("gp_nav_remap_card_field", inner.0, scope)), (pass, 5u64));
+        });
+    }
+
     /// `CurveDots` level: dpad/LS highlights a dot, RT adds (at cursor if
     /// visible else largest gap), LT deletes (nearest cursor / highlighted),
     /// South enters dot move, East exits the curve.
@@ -6938,6 +7180,7 @@ impl FlexInputApp {
             self.gamepad_nav.edit_level = ret;
             return;
         };
+        self.nav_keep_card_curve_focus(ctx, outer_id, inner);
         // Clamp highlight to valid range.
         self.gamepad_nav.curve_dot = self.gamepad_nav.curve_dot.min(pts.len() - 1);
 
@@ -7019,6 +7262,7 @@ impl FlexInputApp {
             self.gamepad_nav.edit_level = EditLevel::Widget;
             return;
         };
+        self.nav_keep_card_curve_focus(ctx, outer_id, inner);
         let i = self.gamepad_nav.curve_dot.min(pts.len() - 1);
 
         // East / South → back to dot navigation.
