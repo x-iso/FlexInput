@@ -3082,19 +3082,35 @@ impl eframe::App for FlexInputApp {
             self.open_special_picker(req, None);
         }
 
+        // Overlay pick: a click on an exposable element of the MAIN canvas
+        // (armed amber by the overlay's "Add element"). Drained here — before
+        // the sub-patch editors run — so an editor drain can't misattribute
+        // a top-level click. Path `[]` = tab canvas.
+        if crate::canvas::viewer::overlay_pick_active(ctx) {
+            if let Some((inner_uid, eid, size)) =
+                crate::canvas::viewer::take_overlay_pick_pending(ctx)
+            {
+                crate::canvas::viewer::put_overlay_pick_result(ctx, vec![], inner_uid, eid, size);
+            }
+            // Esc in the main window cancels the pick back to overlay edit.
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                crate::canvas::viewer::set_overlay_pick_active(ctx, false);
+            }
+        }
+
         // ── Sub-patch editor windows ──────────────────────────────────────────
         {
             puffin::profile_scope!("show_subpatch_editors");
             show_subpatch_editors(self, ctx, &live_device_ids);
         }
 
-        // ── Info overlay (spike) ──────────────────────────────────────────────
+        // ── Info overlay ──────────────────────────────────────────────────────
         // Transparent click-through viewport; paces its own repaint, so it
         // stays smooth even when the bg-throttle branch below asks for a
         // slower cadence (egui keeps the earliest requested deadline).
         {
             puffin::profile_scope!("show_overlay");
-            crate::overlay::show_overlay(ctx);
+            crate::overlay::show_overlay(self, ctx);
         }
 
         // Repaint scheduling:
@@ -10506,6 +10522,20 @@ impl FlexInputApp {
         }
     }
 
+    /// Field-split accessor for the overlay viewport (`crate::overlay`):
+    /// the active tab (mutably — its snarl renders the pinned elements and
+    /// its `overlay` layout gets edited), the live signal map, and a clone
+    /// of the panic shortcut. One method so the borrows stay disjoint.
+    pub(crate) fn overlay_parts(&mut self) -> (
+        &mut PatchTab,
+        &HashMap<(String, String), Signal>,
+        PanicShortcut,
+    ) {
+        let shortcut = self.panic_shortcut.clone();
+        let idx = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        (&mut self.tabs[idx], &self.last_signals, shortcut)
+    }
+
     fn save_workspace_now(&self) {
         if !self.settings.keep_workspace { return; }
         settings::save_workspace(&self.build_persisted_workspace());
@@ -13999,6 +14029,13 @@ fn show_subpatch_editors(
                     open = false;
                 }
                 crate::canvas::viewer::set_layout_mode_active(vctx, outer_layout_mode);
+                // Overlay pick can only address first-level sub-patches (path
+                // schema is one level deep in MVP) — keep nested editors'
+                // elements cold instead of amber-but-inert.
+                let pick_armed = crate::canvas::viewer::overlay_pick_active(vctx);
+                if pick_armed && parent_editor_idx.is_some() {
+                    crate::canvas::viewer::set_overlay_pick_suppressed(vctx, true);
+                }
 
                 egui::TopBottomPanel::top("subpatch_editor_header").show(vctx, |ui| {
                     ui.horizontal(|ui| {
@@ -14018,6 +14055,10 @@ fn show_subpatch_editors(
                             ui.separator();
                             ui.label(egui::RichText::new("LAYOUT MODE — click highlighted elements to pin")
                                 .small().color(egui::Color32::from_rgb(150, 220, 255)));
+                        } else if pick_armed && parent_editor_idx.is_none() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("OVERLAY PICK — click a highlighted element to pin it to the overlay (Esc cancels)")
+                                .small().color(egui::Color32::from_rgb(230, 170, 60)));
                         }
                     });
                 });
@@ -14057,6 +14098,24 @@ fn show_subpatch_editors(
 
                 if let Some((inner_uid, eid, size)) = crate::canvas::viewer::take_layout_pending(vctx) {
                     inner_canvas.pending_expose_module = Some((NodeId(inner_uid), eid, size));
+                }
+                if pick_armed {
+                    if parent_editor_idx.is_some() {
+                        crate::canvas::viewer::set_overlay_pick_suppressed(vctx, false);
+                    } else if let Some((inner_uid, eid, size)) =
+                        crate::canvas::viewer::take_overlay_pick_pending(vctx)
+                    {
+                        // A click inside THIS first-level editor: the pin's
+                        // path is the editor's node on the tab canvas.
+                        crate::canvas::viewer::put_overlay_pick_result(
+                            vctx, vec![node_id.0], inner_uid, eid, size,
+                        );
+                    }
+                    // Esc in an editor window cancels the pick, same as in
+                    // the main window.
+                    if vctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        crate::canvas::viewer::set_overlay_pick_active(vctx, false);
+                    }
                 }
                 special_req = crate::canvas::viewer::take_special_picker_request(vctx);
                 // When this editor's viewport owns the KB/M picker session,
@@ -14172,6 +14231,7 @@ fn show_subpatch_editors(
                             text_override: None,
                             switch_override: None,
                             graph_override: None,
+                            source_path: vec![],
                         });
                     }
                 }

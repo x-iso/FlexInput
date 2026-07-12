@@ -1,11 +1,12 @@
 mod curve;
 pub mod header_controls;
 pub mod node;
+pub(crate) mod overlay_body;
 pub mod remapper_icons;
 pub mod viewer;
 
 pub use node::NodeData;
-pub use node::{OverlayItem, OverlayLayout};
+pub use node::OverlayLayout;
 pub use viewer::FlexViewer;
 
 use std::collections::{HashMap, HashSet};

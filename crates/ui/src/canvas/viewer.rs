@@ -10929,20 +10929,66 @@ pub(crate) fn layout_editing_controls(
     snarl: &mut Snarl<NodeData>,
     outer_id: NodeId,
 ) {
-    let (mut snap_enabled, mut snap_grid_px) = snarl.get_node(outer_id)
-        .and_then(|n| n.subpatch.as_ref())
-        .map(|sp| (sp.snap_enabled, sp.snap_grid_px))
-        .unwrap_or((false, 8));
-    let mut changed = false;
+    let sel_module = subpatch_selected_module_info(snarl, outer_id);
+    if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+        layout_editing_controls_core(ui, &mut LayoutStateMut::of_subpatch(sp), sel_module);
+    }
+}
+
+/// Mutable view over the layout-edit state shared by sub-patch layouts
+/// (`UiSubPatch`) and the screen overlay (`OverlayLayout`). Lets the toolbar,
+/// inspector, and (overlay) body machinery operate on either container.
+pub(crate) struct LayoutStateMut<'a> {
+    pub items: &'a mut Vec<LayoutItem>,
+    pub snap_enabled: &'a mut bool,
+    pub snap_grid_px: &'a mut u32,
+    pub selected_item: &'a mut Option<usize>,
+    pub selected_items: &'a mut Vec<usize>,
+}
+
+impl<'a> LayoutStateMut<'a> {
+    pub fn of_subpatch(sp: &'a mut crate::canvas::node::UiSubPatch) -> Self {
+        Self {
+            items: &mut sp.items,
+            snap_enabled: &mut sp.snap_enabled,
+            snap_grid_px: &mut sp.snap_grid_px,
+            selected_item: &mut sp.selected_item,
+            selected_items: &mut sp.selected_items,
+        }
+    }
+    pub fn of_overlay(ov: &'a mut crate::canvas::node::OverlayLayout) -> Self {
+        Self {
+            items: &mut ov.items,
+            snap_enabled: &mut ov.snap_enabled,
+            snap_grid_px: &mut ov.snap_grid_px,
+            selected_item: &mut ov.selected_item,
+            selected_items: &mut ov.selected_items,
+        }
+    }
+}
+
+/// Module info the inspector strip needs for the currently-selected item when
+/// it's a module pin: (module_id, graph channel count). Precomputed by the
+/// caller because resolving it requires the snarl that CONTAINS the pinned
+/// node — which differs between sub-patch layouts (the owning sub-patch's
+/// inner snarl) and the overlay (per-pin `source_path`).
+pub(crate) type SelectedModuleInfo = Option<(String, usize)>;
+
+/// Container-agnostic core of the layout-edit toolbar (snap controls +
+/// decoration adders) and inspector strip. See `layout_editing_controls` for
+/// the sub-patch wrapper; the overlay toolbar calls this directly.
+pub(crate) fn layout_editing_controls_core(
+    ui: &mut egui::Ui,
+    state: &mut LayoutStateMut<'_>,
+    sel_module: SelectedModuleInfo,
+) {
     let mut add_kind: Option<&'static str> = None;
     ui.horizontal(|ui| {
-        let was = snap_enabled;
-        ui.checkbox(&mut snap_enabled, egui::RichText::new("Snap").small())
+        ui.checkbox(state.snap_enabled, egui::RichText::new("Snap").small())
             .on_hover_text("Snap pinned-element positions and sizes to a grid in Layout mode");
-        if snap_enabled != was { changed = true; }
-        ui.add_enabled_ui(snap_enabled, |ui| {
+        ui.add_enabled_ui(*state.snap_enabled, |ui| {
             ui.label(egui::RichText::new("grid").small().weak());
-            let mut g = snap_grid_px as i32;
+            let mut g = *state.snap_grid_px as i32;
             if ui.add(egui::DragValue::new(&mut g)
                 .speed(0.5)
                 .range(2i32..=64)
@@ -10950,8 +10996,7 @@ pub(crate) fn layout_editing_controls(
                 .on_hover_text("Grid step in pixels (rounded to multiples of 2)")
                 .changed()
             {
-                let g2 = ((g.max(2)) / 2 * 2) as u32;
-                if g2 != snap_grid_px { snap_grid_px = g2; changed = true; }
+                *state.snap_grid_px = ((g.max(2)) / 2 * 2) as u32;
             }
         });
         ui.separator();
@@ -10972,56 +11017,62 @@ pub(crate) fn layout_editing_controls(
             add_kind = Some("svg");
         }
     });
-    if changed {
-        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
-            sp.snap_enabled = snap_enabled;
-            sp.snap_grid_px = snap_grid_px;
-        }
-    }
     if let Some(kind) = add_kind {
-        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
-            let deco = make_default_decoration(kind);
-            sp.items.push(LayoutItem::Deco(deco));
-            let idx = sp.items.len() - 1;
-            sp.selected_item = Some(idx);
-            sp.selected_items = vec![idx];
-        }
+        let deco = make_default_decoration(kind);
+        state.items.push(LayoutItem::Deco(deco));
+        let idx = state.items.len() - 1;
+        *state.selected_item = Some(idx);
+        *state.selected_items = vec![idx];
     }
 
     // Inspector strip for the currently selected item (+ bulk-style
     // propagation across a multi-selection).
-    layout_inspector_strip(ui, snarl, outer_id);
+    layout_inspector_strip_core(ui, state, sel_module);
 }
 
-/// Render the inspector strip for the currently-selected layout item and, when
-/// a multi-selection is active, propagate any style change the user makes on the
-/// PRIMARY to the rest of the selection (where the field exists). Shared between
-/// the Advanced sub-patch node body and the Easy-mode central panel so both
-/// surfaces edit styling identically. No-op when nothing is selected.
-pub(crate) fn layout_inspector_strip(
-    ui: &mut egui::Ui,
-    snarl: &mut Snarl<NodeData>,
+/// Resolve `SelectedModuleInfo` for a sub-patch layout's current selection:
+/// looks the pinned node up in the sub-patch's own inner snarl.
+fn subpatch_selected_module_info(
+    snarl: &Snarl<NodeData>,
     outer_id: NodeId,
-) {
-    let sel_idx = snarl.get_node(outer_id)
-        .and_then(|n| n.subpatch.as_ref())
-        .and_then(|sp| sp.selected_item);
-    let Some(idx) = sel_idx else { return };
+) -> SelectedModuleInfo {
+    let sp = snarl.get_node(outer_id).and_then(|n| n.subpatch.as_deref())?;
+    let idx = sp.selected_item?;
+    let LayoutItem::Module(m) = sp.items.get(idx)? else { return None };
+    let inner = sp.snarl.get_node(egui_snarl::NodeId(m.inner_node_id))?;
+    Some((inner.module_id.clone(), graph_channels_of_node(inner)))
+}
 
-    let inner_mid: Option<String> = snarl.get_node(outer_id)
-        .and_then(|n| n.subpatch.as_ref())
-        .and_then(|sp| sp.items.get(idx))
-        .and_then(|it| match it {
-            LayoutItem::Module(m) => sp_module_id(
-                snarl.get_node(outer_id).and_then(|n| n.subpatch.as_deref()),
-                m.inner_node_id,
-            ),
-            _ => None,
-        });
-    let is_text_pin   = inner_mid.as_deref() == Some("module.label");
-    let is_switch_pin = inner_mid.as_deref() == Some("module.switch");
+/// Channel count for a graph pin's per-channel color row. Response curves
+/// expose `min(inputs, outputs)` channels; scopes one per input; the
+/// trigscope's index 0 is the trigger; envelope has a single trail color.
+pub(crate) fn graph_channels_of_node(inner: &NodeData) -> usize {
+    match inner.module_id.as_str() {
+        "module.response_curve"
+        | "module.vec_response_curve"
+        | "module.twoway_response_curve" =>
+            inner.inputs.len().min(inner.outputs.len()).max(1),
+        "display.trigscope" => inner.inputs.len().saturating_sub(1).max(1),
+        "generator.envelope" => 1,
+        _ => inner.inputs.len().max(1),
+    }
+}
+
+/// Container-agnostic core of `layout_inspector_strip`. `sel_module` carries
+/// (module_id, graph_channels) for the selected item when it's a module pin —
+/// resolved by the caller against the snarl that contains the pinned node.
+pub(crate) fn layout_inspector_strip_core(
+    ui: &mut egui::Ui,
+    state: &mut LayoutStateMut<'_>,
+    sel_module: SelectedModuleInfo,
+) {
+    let Some(idx) = *state.selected_item else { return };
+
+    let inner_mid = sel_module.as_ref().map(|(mid, _)| mid.as_str());
+    let is_text_pin   = inner_mid == Some("module.label");
+    let is_switch_pin = inner_mid == Some("module.switch");
     let is_graph_pin = matches!(
-        inner_mid.as_deref(),
+        inner_mid,
         Some("module.response_curve")
             | Some("module.vec_response_curve")
             | Some("module.twoway_response_curve")
@@ -11030,78 +11081,45 @@ pub(crate) fn layout_inspector_strip(
             | Some("display.trigscope")
             | Some("generator.envelope")
     );
-
-    // Channel count for the graph pin's per-channel color row. Response curves
-    // expose `min(inputs, outputs)` channels; scopes one per input. Resolved
-    // here from the inner node since the inspector strip only sees the items.
-    let graph_channels: usize = if is_graph_pin {
-        snarl.get_node(outer_id)
-            .and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.items.get(idx).and_then(|it| match it {
-                LayoutItem::Module(m) => sp.snarl
-                    .get_node(egui_snarl::NodeId(m.inner_node_id))
-                    .map(|inner| match inner.module_id.as_str() {
-                        "module.response_curve"
-                        | "module.vec_response_curve"
-                        | "module.twoway_response_curve" =>
-                            inner.inputs.len().min(inner.outputs.len()).max(1),
-                        // trigscope: index 0 is trig, data channels are 1..
-                        "display.trigscope" =>
-                            inner.inputs.len().saturating_sub(1).max(1),
-                        // envelope: single trail/dot color channel
-                        "generator.envelope" => 1,
-                        _ => inner.inputs.len().max(1),
-                    }),
-                _ => None,
-            }))
-            .unwrap_or(1)
-    } else { 1 };
+    let graph_channels = sel_module.as_ref().map(|(_, ch)| *ch).unwrap_or(1);
 
     // Snapshot the primary's style BEFORE the inspector edits it (only when a
     // multi-selection is active — single-select needs no propagation).
-    let multi: Vec<usize> = snarl.get_node(outer_id)
-        .and_then(|n| n.subpatch.as_ref())
-        .map(|sp| sp.selected_items.clone())
-        .unwrap_or_default();
+    let multi: Vec<usize> = state.selected_items.clone();
     let before: Option<ItemStyle> = if multi.len() > 1 {
-        snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref())
-            .and_then(|sp| sp.items.get(idx)).map(item_style_of)
+        state.items.get(idx).map(item_style_of)
     } else { None };
 
-    if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
-        if idx < sp.items.len() {
-            match &mut sp.items[idx] {
-                LayoutItem::Deco(_) => {
-                    decoration_inspector_strip_item(ui, &mut sp.items, idx);
-                }
-                LayoutItem::Module(_) if is_text_pin => {
-                    text_pin_inspector_strip_item(ui, &mut sp.items, idx);
-                }
-                LayoutItem::Module(_) if is_switch_pin => {
-                    switch_pin_inspector_strip_item(ui, &mut sp.items, idx);
-                }
-                LayoutItem::Module(_) if is_graph_pin => {
-                    graph_pin_inspector_strip_item(ui, &mut sp.items, idx, graph_channels);
-                }
-                _ => {}
+    if idx < state.items.len() {
+        match &mut state.items[idx] {
+            LayoutItem::Deco(_) => {
+                decoration_inspector_strip_item(ui, state.items, idx);
             }
-        } else {
-            sp.selected_item = None;
+            LayoutItem::Module(_) if is_text_pin => {
+                text_pin_inspector_strip_item(ui, state.items, idx);
+            }
+            LayoutItem::Module(_) if is_switch_pin => {
+                switch_pin_inspector_strip_item(ui, state.items, idx);
+            }
+            LayoutItem::Module(_) if is_graph_pin => {
+                graph_pin_inspector_strip_item(ui, state.items, idx, graph_channels);
+            }
+            _ => {}
         }
+    } else {
+        *state.selected_item = None;
     }
 
     // Diff the primary against its pre-edit snapshot and apply the changed
     // style fields to the rest of the selection.
     if let Some(before) = before {
-        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
-            if let Some(after) = sp.items.get(idx).map(item_style_of) {
-                let changed = before.diff(&after);
-                if changed.any() {
-                    for &j in multi.iter() {
-                        if j == idx { continue; }
-                        if let Some(it) = sp.items.get_mut(j) {
-                            changed.apply_to(it);
-                        }
+        if let Some(after) = state.items.get(idx).map(item_style_of) {
+            let changed = before.diff(&after);
+            if changed.any() {
+                for &j in multi.iter() {
+                    if j == idx { continue; }
+                    if let Some(it) = state.items.get_mut(j) {
+                        changed.apply_to(it);
                     }
                 }
             }
@@ -11110,7 +11128,7 @@ pub(crate) fn layout_inspector_strip(
 }
 
 /// ctx-data slot holding a copied layout-item style for paste-across.
-fn layout_style_clipboard_key() -> egui::Id {
+pub(crate) fn layout_style_clipboard_key() -> egui::Id {
     egui::Id::new("flexinput::layout_style_clipboard")
 }
 
@@ -11118,7 +11136,7 @@ fn layout_style_clipboard_key() -> egui::Id {
 /// both the selected (primary) item and non-selected items. Sets the various
 /// pending-action flags the caller commits after the loop.
 #[allow(clippy::too_many_arguments)]
-fn layout_item_context_menu(
+pub(crate) fn layout_item_context_menu(
     ui: &mut egui::Ui,
     idx: usize,
     is_deco: bool,
@@ -11173,7 +11191,7 @@ fn layout_item_context_menu(
 /// frame" — to get a taller row (bigger text) you first have to give it
 /// enough width for the enlarged labels plus the flexible parts' minimum.
 /// Pins without a cached natural (graphs, whole-module) are unconstrained.
-fn clamp_pin_frame_to_content(
+pub(crate) fn clamp_pin_frame_to_content(
     ui: &egui::Ui,
     outer_id: NodeId,
     it: &LayoutItem,
@@ -11195,7 +11213,7 @@ fn clamp_pin_frame_to_content(
 }
 
 /// Apply a Z-order action against a `Vec<LayoutItem>` (paint order).
-fn apply_zorder_action_items(items: &mut Vec<LayoutItem>, idx: usize, act: &str, n: usize) {
+pub(crate) fn apply_zorder_action_items(items: &mut Vec<LayoutItem>, idx: usize, act: &str, n: usize) {
     match act {
         "up"     if idx + 1 < n => { items.swap(idx, idx + 1); }
         "down"   if idx > 0     => { items.swap(idx, idx - 1); }
@@ -11205,19 +11223,13 @@ fn apply_zorder_action_items(items: &mut Vec<LayoutItem>, idx: usize, act: &str,
     }
 }
 
-/// Lookup helper for the header inspector — get an inner module's id.
-fn sp_module_id(sp: Option<&crate::canvas::node::UiSubPatch>, inner_node_id: usize) -> Option<String> {
-    sp?.snarl.get_node(egui_snarl::NodeId(inner_node_id))
-        .map(|n| n.module_id.clone())
-}
-
 /// Dispatches to the appropriate per-element renderer for a pinned element,
 /// wrapping the dispatch with content-size measurement: after the element
 /// renders, its content size (normalized back to scale 1.0) is cached per pin
 /// so the next frame's `apply_widget_scale` fits the ACTUAL content to the
 /// container instead of a hard-coded estimate. This is what keeps row widgets
 /// scaling coherently with their frame and never cropping out of it.
-fn render_pinned_element(
+pub(crate) fn render_pinned_element(
     inner_id: egui_snarl::NodeId,
     module_id: &str,
     element_id: &str,
@@ -14352,6 +14364,79 @@ fn paint_response_curve_graph(
 const LAYOUT_ACTIVE_KEY:  &str = "fxi_layout_active";
 const LAYOUT_PENDING_KEY: &str = "fxi_layout_pending";
 
+// ── Overlay pick mode ─────────────────────────────────────────────────────────
+//
+// A second "armed" state alongside layout mode, entered from the overlay edit
+// toolbar's "Add element" button. Exposable elements light up amber (vs. the
+// layout mode's blue) in the MAIN window and first-level sub-patch editors;
+// a click stashes a PENDING request (no path context — the clicked viewport
+// doesn't know where its snarl lives). `app.rs` drains PENDING at the call
+// sites that DO know the context and re-stashes it as a RESULT carrying the
+// full node path, which the overlay consumes to create the pin.
+
+const OVERLAY_PICK_ACTIVE_KEY:  &str = "fxi_overlay_pick_active";
+const OVERLAY_PICK_PENDING_KEY: &str = "fxi_overlay_pick_pending";
+const OVERLAY_PICK_RESULT_KEY:  &str = "fxi_overlay_pick_result";
+// All viewports share one egui Context (and thus these temp slots), so pick
+// mode would also arm elements inside NESTED sub-patch editors — which MVP
+// can't address (paths are one level deep). Those editors set this around
+// their canvas render so their elements stay cold instead of amber-but-dead.
+const OVERLAY_PICK_SUPPRESSED_KEY: &str = "fxi_overlay_pick_suppressed";
+
+pub fn set_overlay_pick_suppressed(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY), on));
+}
+
+pub fn set_overlay_pick_active(ctx: &egui::Context, active: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(OVERLAY_PICK_ACTIVE_KEY), active));
+    if !active {
+        // Drop any half-finished request so a cancelled pick can't pin later.
+        ctx.data_mut(|d| {
+            d.remove_temp::<(usize, String, [f32; 2])>(egui::Id::new(OVERLAY_PICK_PENDING_KEY));
+            d.remove_temp::<(Vec<usize>, usize, String, [f32; 2])>(egui::Id::new(OVERLAY_PICK_RESULT_KEY));
+        });
+    }
+}
+
+pub fn overlay_pick_active(ctx: &egui::Context) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_ACTIVE_KEY)).unwrap_or(false)
+            && !d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY)).unwrap_or(false)
+    })
+}
+
+/// Raw click from `register_exposable_element` while overlay pick is armed:
+/// `(inner_node_id, element_id, source_size)`. Drained by app.rs at the
+/// canvas / sub-patch-editor call sites (which know the path context).
+pub fn take_overlay_pick_pending(ctx: &egui::Context) -> Option<(usize, String, [f32; 2])> {
+    ctx.data_mut(|d| d.remove_temp::<(usize, String, [f32; 2])>(egui::Id::new(OVERLAY_PICK_PENDING_KEY)))
+}
+
+/// Path-resolved pick, ready for the overlay to turn into an ExposedModule:
+/// `(source_path, inner_node_id, element_id, source_size)`.
+pub fn put_overlay_pick_result(
+    ctx: &egui::Context,
+    path: Vec<usize>,
+    inner_node_id: usize,
+    element_id: String,
+    size: [f32; 2],
+) {
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new(OVERLAY_PICK_RESULT_KEY),
+            (path, inner_node_id, element_id, size),
+        );
+    });
+}
+
+pub fn take_overlay_pick_result(
+    ctx: &egui::Context,
+) -> Option<(Vec<usize>, usize, String, [f32; 2])> {
+    ctx.data_mut(|d| {
+        d.remove_temp::<(Vec<usize>, usize, String, [f32; 2])>(egui::Id::new(OVERLAY_PICK_RESULT_KEY))
+    })
+}
+
 pub fn set_layout_mode_active(ctx: &egui::Context, active: bool) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(LAYOUT_ACTIVE_KEY), active));
 }
@@ -14424,17 +14509,24 @@ fn register_exposable_element(
     element_id: &str,
     rect: egui::Rect,
 ) {
-    if !layout_mode_active(ui.ctx()) { return; }
+    let layout = layout_mode_active(ui.ctx());
+    let picking = !layout && overlay_pick_active(ui.ctx());
+    if !layout && !picking { return; }
     if rect.area() < 4.0 { return; }
     let id = egui::Id::new(("fxi_layout_elem", node_id.0, element_id));
     let resp = ui.interact(rect, id, egui::Sense::click());
     let painter = ui.painter();
-    let (fill, outline) = if resp.hovered() {
-        (egui::Color32::from_rgba_unmultiplied(120, 200, 255, 90),
-         egui::Color32::from_rgb(180, 230, 255))
-    } else {
-        (egui::Color32::from_rgba_unmultiplied(80, 160, 220, 35),
-         egui::Color32::from_rgb(80, 160, 220))
+    // Layout mode is blue; overlay pick is amber so the two armed states
+    // can't be confused.
+    let (fill, outline) = match (picking, resp.hovered()) {
+        (false, true)  => (egui::Color32::from_rgba_unmultiplied(120, 200, 255, 90),
+                           egui::Color32::from_rgb(180, 230, 255)),
+        (false, false) => (egui::Color32::from_rgba_unmultiplied(80, 160, 220, 35),
+                           egui::Color32::from_rgb(80, 160, 220)),
+        (true,  true)  => (egui::Color32::from_rgba_unmultiplied(255, 200, 90, 90),
+                           egui::Color32::from_rgb(255, 220, 140)),
+        (true,  false) => (egui::Color32::from_rgba_unmultiplied(230, 160, 40, 35),
+                           egui::Color32::from_rgb(230, 160, 40)),
     };
     painter.rect_filled(rect, 4.0, fill);
     let s = egui::Stroke::new(1.5, outline);
@@ -14444,9 +14536,10 @@ fn register_exposable_element(
     painter.line_segment([rect.left_bottom(),  rect.left_top()],     s);
     if resp.clicked() {
         let size = [rect.width().max(40.0), rect.height().max(20.0)];
+        let key = if picking { OVERLAY_PICK_PENDING_KEY } else { LAYOUT_PENDING_KEY };
         ui.ctx().data_mut(|d| {
             d.insert_temp(
-                egui::Id::new(LAYOUT_PENDING_KEY),
+                egui::Id::new(key),
                 (node_id.0, element_id.to_string(), size),
             );
         });
@@ -22327,7 +22420,7 @@ fn show_map_action_body(
 const DECO_DEFAULT_FILL:    [u8; 4] = [200, 200, 200, 220];
 const DECO_DEFAULT_STROKE:  [u8; 4] = [255, 255, 255, 220];
 
-fn make_default_decoration(kind: &str) -> LayoutDecoration {
+pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
     match kind {
         "text" => LayoutDecoration::Text {
             pos: [16.0, 16.0],
@@ -22407,7 +22500,7 @@ fn color_button(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4]) -> bool {
 /// item kind exposes the same field — e.g. changing a Rect's fill while a Line
 /// is also selected leaves the Line's (absent) fill untouched.
 #[derive(Clone, Default, PartialEq)]
-struct ItemStyle {
+pub(crate) struct ItemStyle {
     fill: Option<[u8; 4]>,
     stroke: Option<[u8; 4]>,
     stroke_px: Option<f32>,
@@ -22424,13 +22517,13 @@ struct ItemStyle {
 }
 
 impl ItemStyle {
-    fn any(&self) -> bool {
+    pub(crate) fn any(&self) -> bool {
         self.fill.is_some() || self.stroke.is_some() || self.stroke_px.is_some()
             || self.corner_radius.is_some() || self.font_size.is_some()
             || self.graph.is_some()
     }
     /// Build the set of fields that differ between `self` (before) and `after`.
-    fn diff(&self, after: &ItemStyle) -> ItemStyle {
+    pub(crate) fn diff(&self, after: &ItemStyle) -> ItemStyle {
         fn pick<T: PartialEq + Copy>(b: Option<T>, a: Option<T>) -> Option<T> {
             match (b, a) { (Some(bv), Some(av)) if bv != av => Some(av), _ => None }
         }
@@ -22448,7 +22541,7 @@ impl ItemStyle {
         }
     }
     /// Apply each changed field to `it` where that field exists on the item.
-    fn apply_to(&self, it: &mut LayoutItem) {
+    pub(crate) fn apply_to(&self, it: &mut LayoutItem) {
         let d = match it {
             LayoutItem::Deco(d) => d,
             // Graph-pin styling rides on the `graph` payload only; copy/paste
@@ -22496,7 +22589,7 @@ impl ItemStyle {
 /// Snapshot the bulk-propagatable style of a layout item. For Text the
 /// `outline`/`outline_px` map onto the generic `stroke`/`stroke_px` slots so a
 /// stroke change made on, say, a Rect can carry to a Text outline.
-fn item_style_of(it: &LayoutItem) -> ItemStyle {
+pub(crate) fn item_style_of(it: &LayoutItem) -> ItemStyle {
     match it {
         LayoutItem::Deco(LayoutDecoration::Text { fill, outline, outline_px, font_size, .. }) => ItemStyle {
             fill: Some(*fill), stroke: Some(*outline), stroke_px: Some(*outline_px),
@@ -22805,7 +22898,7 @@ fn graph_pin_inspector_strip_item(
 /// Paint a single decoration into the given body painter. Coordinates are in
 /// body-local space; caller already translated `origin` and provides absolute
 /// `painter` and `offset` to add to local coords.
-fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco: &LayoutDecoration) {
+pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco: &LayoutDecoration) {
     match deco {
         LayoutDecoration::Rect { pos, size, fill, stroke, stroke_px, corner_radius } => {
             let r = egui::Rect::from_min_size(
