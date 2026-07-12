@@ -3,10 +3,25 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.11.7] - 2026-07-12
 
 ### Added
 
+- **Touch Zones module** — divide a touchpad into a BSP tree of zones (including
+  partial / in-zone dividers) and map each to buttons, chords, mouse, sticks, or
+  scroll. Per-trigger activation glow, drag-reorder, combo capture, hold-zones,
+  a per-zone adaptive relative/absolute centre, and full gamepad navigation.
+- **Macro Output module** — user-created named, typed, iconed output ports
+  (Bool / Float / Vec2 / Any) addressable BY NAME from Remapper, Touch Zones, and
+  Lean pickers with no wires; custom SVG icons can be embedded into the patch.
+- **Per-card response curves + activation thresholds** — every analog mapping
+  card (Remapper, Lean, Touch Zones) gets its own response curve editor and an
+  optional manual activation threshold (a horizontal line on the curve's output:
+  the binding holds while the shaped value sits on/above it, releasing when it
+  dips below). Shared Copy/Paste/Save/Load with the Response Curve module, and
+  full gamepad navigation into the graph + threshold. Analog triggers are now
+  captured as analog inputs during Learn so they can carry a curve.
+- Horizontal + analog scroll for the virtual mouse.
 - **Network Send / Network Receive modules** (Network category). Carry the
   AutoMap gamepad bus between two FlexInput instances over the network: wire a
   physical pad into **Network Send** on one PC and a **Network Receive** into a
