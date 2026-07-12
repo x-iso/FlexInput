@@ -251,8 +251,17 @@ fn show_preset_picker(
         // buttons, clamped so it doesn't collapse on narrow windows.
         let bar_w = (ui.available_width() - label_w - trailing_w - 16.0)
             .clamp(220.0, 560.0);
-        let pad = ((ui.available_width() - label_w - bar_w - trailing_w - 16.0) * 0.5)
+        let mut pad = ((ui.available_width() - label_w - bar_w - trailing_w - 16.0) * 0.5)
             .max(0.0);
+        // Clamp so the "Preset:" cluster never slides under the Easy-mode
+        // "Devices" tab (its right edge is published by app.rs each frame). When
+        // the left panel is expanded the tab sits at the panel seam, left of this
+        // row, so the clamp is a no-op; when collapsed the tab pins to the window
+        // top-left over this row and the clamp pushes "Preset:" right to clear it.
+        let devices_label_right: f32 = ui.ctx()
+            .data(|d| d.get_temp(egui::Id::new("easy_devices_label_right_x")).unwrap_or(0.0));
+        let min_pad = (devices_label_right - row_rect.min.x + 8.0).max(0.0);
+        pad = pad.max(min_pad);
         ui.add_space(pad);
 
         ui.label(egui::RichText::new("Preset:").strong());

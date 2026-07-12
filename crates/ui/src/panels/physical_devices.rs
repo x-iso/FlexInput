@@ -179,6 +179,95 @@ pub fn draw_floating_heading(
     resp
 }
 
+/// Easy-mode "Devices" tab — a small horizontal label that hangs off the RIGHT
+/// edge of the left panel (its LEFT edge anchored at `left_edge_x`, top at
+/// `top_y`), extending rightward onto the preset bar. The attached (left) side
+/// has sharp corners; the free (right) side is rounded. The caller anchors it to
+/// the (animating) left-panel edge, so it rides the panel as it collapses and
+/// stays pinned at the window's top-left as the re-open button. Returns the
+/// clickable tab response and its rect (the latter feeds the preset-label clamp).
+pub fn draw_devices_tab(
+    ctx: &egui::Context,
+    id_source: &str,
+    text: &str,
+    left_edge_x: f32,
+    top_y: f32,
+) -> (egui::Response, egui::Rect) {
+    // Fixed height matches the preset-dropdown pill (30px) for a clean visual
+    // pairing; text is centred vertically inside it.
+    const TAB_H: f32 = 30.0;
+    const TAB_PAD_X: f32 = 12.0;
+    const R: f32 = 6.0;
+
+    let interact_id = egui::Id::new((id_source, "tab_interact"));
+    let was_hovered = ctx.memory(|m| m.data.get_temp::<bool>(interact_id).unwrap_or(false));
+
+    let area = egui::Area::new(egui::Id::new(id_source))
+        .order(egui::Order::Middle)
+        .fixed_pos(egui::pos2(left_edge_x, top_y))
+        .interactable(true)
+        .show(ctx, |ui| {
+            let font = egui::FontId::proportional(14.0);
+            let text_w = ui.painter()
+                .layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE)
+                .size().x;
+            let tab_w = text_w + 2.0 * TAB_PAD_X;
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(tab_w, TAB_H), egui::Sense::click());
+
+            let panel_bg = ui.visuals().panel_fill;
+            let base = darken_color(panel_bg, 0.35);
+            let fill = if was_hovered || resp.hovered() {
+                lighten_color(base, 0.20)
+            } else {
+                base
+            };
+            // Rounded on the free (right) side, sharp where it meets the panel.
+            let cr = egui::CornerRadius { nw: 0, ne: R as u8, sw: 0, se: R as u8 };
+            let painter = ui.painter();
+            painter.rect_filled(rect, cr, fill);
+
+            // Outline the three free sides (top, right, bottom); the left edge
+            // stays open where it attaches to the panel border.
+            let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+            let stroke = egui::Stroke::new(1.0, stroke_color);
+            const ARC_SEGS: usize = 6;
+            use std::f32::consts::FRAC_PI_2;
+            let arc = |center: egui::Pos2, a0: f32, a1: f32| -> Vec<egui::Pos2> {
+                (0..=ARC_SEGS).map(|i| {
+                    let t = i as f32 / ARC_SEGS as f32;
+                    let a = a0 + (a1 - a0) * t;
+                    egui::pos2(center.x + R * a.cos(), center.y + R * a.sin())
+                }).collect()
+            };
+            let mut path: Vec<egui::Pos2> = Vec::new();
+            // top-left (open) → along top → top-right arc → down right → bottom-
+            // right arc → along bottom → bottom-left (open).
+            path.push(egui::pos2(rect.left(), rect.top()));
+            path.push(egui::pos2(rect.right() - R, rect.top()));
+            path.extend(arc(egui::pos2(rect.right() - R, rect.top() + R), -FRAC_PI_2, 0.0));
+            path.push(egui::pos2(rect.right(), rect.bottom() - R));
+            path.extend(arc(egui::pos2(rect.right() - R, rect.bottom() - R), 0.0, FRAC_PI_2));
+            path.push(egui::pos2(rect.left(), rect.bottom()));
+            painter.add(egui::Shape::line(path, stroke));
+
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                font,
+                ui.visuals().strong_text_color(),
+            );
+
+            (resp, rect)
+        });
+
+    let (resp, rect) = area.inner;
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    ctx.memory_mut(|m| m.data.insert_temp(interact_id, resp.hovered()));
+    (resp, rect)
+}
+
 pub fn lighten_color(c: Color32, amount: f32) -> Color32 {
     let f = amount.clamp(0.0, 1.0);
     let lift = |v: u8| -> u8 {

@@ -173,6 +173,12 @@ pub struct GamepadNav {
     /// West toggles fine, North resets, East/LT exits. None = not editing the
     /// left panel.
     pub left_edit: Option<LeftNavAction>,
+    /// LS/D-pad selection within the left I/O panel: index into the frame's
+    /// published `LeftNavTarget` list (deterministic order; clamped each frame,
+    /// same stability model as `preset_nav_index`). `Some` means focus lives in
+    /// the left panel and LS/D-pad move between its targets; `None` means focus
+    /// is on the sub-patch (or nothing). Independent of the RS/gyro cursor.
+    pub left_selected: Option<usize>,
     /// Gamepad-native settings panel (Hold-Start). Modal: captures dpad/South/
     /// East. `settings_index` is the highlighted row; `settings_editing` is true
     /// while a numeric row is being nudged.
@@ -292,6 +298,7 @@ impl Default for GamepadNav {
             prev_lt: false,
             prev_rt: false,
             left_edit: None,
+            left_selected: None,
             settings_open: false,
             settings_index: 0,
             settings_editing: false,
@@ -525,6 +532,63 @@ pub fn nearest_in_dir(items: &[LayoutItem], cur: Option<usize>, dir: NavDir) -> 
         }
     }
 
+    best.map(|(i, _)| i)
+}
+
+/// Spatial neighbour-finding for the left I/O panel: from `cur` (an index into
+/// `targets`), pick the nearest target in screen direction `dir` using each
+/// target's rect centre. Mirrors `nearest_in_dir`'s primary-axis + penalised-
+/// cross scoring, but over screen rects. With `cur = None`, seeds at the
+/// top-left-most target. `None` when nothing lies in the pressed direction.
+pub fn nearest_target_rect_in_dir(
+    targets: &[LeftNavTarget],
+    cur: Option<usize>,
+    dir: NavDir,
+) -> Option<usize> {
+    if targets.is_empty() {
+        return None;
+    }
+    let cur = match cur.filter(|&i| i < targets.len()) {
+        Some(i) => i,
+        None => {
+            // No selection → top-left-most target.
+            return targets
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let ca = a.rect.center();
+                    let cb = b.rect.center();
+                    (ca.y, ca.x)
+                        .partial_cmp(&(cb.y, cb.x))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i);
+        }
+    };
+
+    let c = targets[cur].rect.center();
+    let mut best: Option<(usize, f32)> = None;
+    for (i, t) in targets.iter().enumerate() {
+        if i == cur {
+            continue;
+        }
+        let o = t.rect.center();
+        let dx = o.x - c.x;
+        let dy = o.y - c.y;
+        let (primary, cross) = match dir {
+            NavDir::Right => (dx, dy),
+            NavDir::Left => (-dx, dy),
+            NavDir::Down => (dy, dx),
+            NavDir::Up => (-dy, dx),
+        };
+        if primary <= 0.0 {
+            continue;
+        }
+        let score = primary + 2.0 * cross.abs();
+        if best.map(|(_, s)| score < s).unwrap_or(true) {
+            best = Some((i, score));
+        }
+    }
     best.map(|(i, _)| i)
 }
 

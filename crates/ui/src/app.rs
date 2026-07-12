@@ -493,6 +493,10 @@ pub struct FlexInputApp {
     virtual_panel_collapsed: bool,
     /// Whether the Physical Devices (bottom) panel is collapsed.
     physical_panel_collapsed: bool,
+    /// Whether the Easy-mode left "Devices" panel is collapsed (folded to the
+    /// left, leaving only its floating tab as the re-open button). Session-only,
+    /// mirroring the Advanced device panels above.
+    easy_left_panel_collapsed: bool,
     /// Whether to automatically switch to the tab whose bound_exe matches the foreground process.
     auto_switch: bool,
     /// Last foreground exe seen, used to avoid redundant switches.
@@ -1073,6 +1077,7 @@ impl FlexInputApp {
             last_recovery_mutation_gen: 0,
             virtual_panel_collapsed: false,
             physical_panel_collapsed: false,
+            easy_left_panel_collapsed: false,
             auto_switch: false,
             last_fg_exe: String::new(),
             bind_window_open: false,
@@ -2847,11 +2852,30 @@ impl eframe::App for FlexInputApp {
                 // Fixed left-panel width so cards / chips don't restyle
                 // as the user resizes the window. Only shrinks if the
                 // window itself is narrower than this baseline.
-                let side_w = 280.0_f32.min(total.width() * 0.5);
-                let gap = 6.0_f32;
+                let side_w_full = 280.0_f32.min(total.width() * 0.5);
+                // Collapse animation: 1.0 = fully open, 0.0 = folded away left.
+                // `side_w` is the on-screen SLICE width; the panel itself keeps its
+                // full width and SLIDES left (translated + clipped) so its contents
+                // move out of frame rather than being squeezed into nothing.
+                let left_open = ctx.animate_bool_with_time(
+                    egui::Id::new("easy_left_open_anim"),
+                    !self.easy_left_panel_collapsed,
+                    0.18,
+                );
+                let side_w = side_w_full * left_open;
+                let left_visible = left_open > 0.01;
+                let gap = 6.0_f32 * left_open;
+                // Visible slice (also the clip + dark-fill + tab-anchor rect).
                 let left_rect = egui::Rect::from_min_size(
                     total.min,
                     egui::vec2(side_w, total.height()),
+                );
+                // Full-width panel, translated left so its RIGHT edge lands on the
+                // slice's right edge; the part left of `total.min.x` is clipped off
+                // frame. At open=1 it coincides with `left_rect`.
+                let panel_full_rect = egui::Rect::from_min_size(
+                    egui::pos2(total.min.x + side_w - side_w_full, total.min.y),
+                    egui::vec2(side_w_full, total.height()),
                 );
                 let center_rect = egui::Rect::from_min_size(
                     egui::pos2(total.min.x + side_w + gap, total.min.y),
@@ -2898,24 +2922,52 @@ impl eframe::App for FlexInputApp {
                 }
                 // Darker panel background fill so the left panel
                 // visually groups itself apart from the central canvas.
-                ui.painter().rect_filled(left_rect, 0.0, left_fill);
-                ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                    puffin::profile_scope!("easy_io_panel_show");
-                    crate::easy::io_panel::show(
-                        ui,
-                        devices,
-                        canvas,
-                        &shared_pool_for_panel,
-                        default_collapsed,
-                        device_defaults_for_easy,
-                        &mut calibrate_request,
-                        &device_rates_snap,
-                        &ping_requests_for_panel,
-                        &mut gamepad_nav.mode,
-                        nav_mode_default,
-                        &nav_excluded_ids,
-                    );
-                });
+                // Skipped once folded away (zero width) so nothing renders.
+                if left_visible {
+                    ui.painter().rect_filled(left_rect, 0.0, left_fill);
+                    // Lay the panel out at FULL width in `panel_full_rect` (so cards
+                    // never reflow), but clip to the visible slice — the content
+                    // then slides left out of frame as the panel folds.
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(panel_full_rect), |ui| {
+                        ui.set_clip_rect(left_rect);
+                        puffin::profile_scope!("easy_io_panel_show");
+                        crate::easy::io_panel::show(
+                            ui,
+                            devices,
+                            canvas,
+                            &shared_pool_for_panel,
+                            default_collapsed,
+                            device_defaults_for_easy,
+                            &mut calibrate_request,
+                            &device_rates_snap,
+                            &ping_requests_for_panel,
+                            &mut gamepad_nav.mode,
+                            nav_mode_default,
+                            &nav_excluded_ids,
+                        );
+                    });
+                }
+
+                // Floating "Devices" tab: hangs off the left panel's right edge
+                // onto the preset bar, aligned with the preset-dropdown row. Rides
+                // the panel as it collapses and pins at the window's top-left as
+                // the re-open button. Publish its right edge so the center panel
+                // clamps the "Preset:" label off it.
+                let (tab_resp, tab_rect) = crate::panels::physical_devices::draw_devices_tab(
+                    ctx,
+                    "easy_devices_tab",
+                    "Devices",
+                    left_rect.right(),
+                    // Match the preset pill's top: center content top + add_space(6)
+                    // + the (34-row − 30-pill)/2 centering inset.
+                    total.min.y + 8.0,
+                );
+                if tab_resp.clicked() {
+                    self.easy_left_panel_collapsed = !self.easy_left_panel_collapsed;
+                }
+                ctx.data_mut(|d| d.insert_temp(
+                    egui::Id::new("easy_devices_label_right_x"), tab_rect.right()));
+
                 ui.scope_builder(egui::UiBuilder::new().max_rect(center_rect), |ui| {
                     puffin::profile_scope!("easy_center_panel_show");
                     crate::easy::center_panel::show(
@@ -3656,11 +3708,29 @@ impl FlexInputApp {
         self.gamepad_nav.prev_rt = nav.rt > 0.5;
         self.gamepad_nav.prev_lt = nav.lt > 0.5;
 
-        // ── Left I/O panel navigation (cursor-driven) ────────────────────────
-        // When the RS/gyro cursor is over a left-panel target, South/RT acts on
-        // it (select input device, toggle output, enter slider edit). While a
-        // slider edit is in progress, the controller drives that value and the
-        // sub-patch handling is skipped. Returns true when it consumed input.
+        // ── North: toggle the Easy left "Devices" panel (top nav level only) ──
+        // North is otherwise unused at the base Widget level, so it doubles as the
+        // panel Show/Hide. Suppressed inside slider edits / deeper edit levels
+        // (where North is Reset/Recenter). Consumes the frame.
+        if matches!(self.gamepad_nav.edit_level, gn::EditLevel::Widget)
+            && self.gamepad_nav.left_edit.is_none()
+            && nav.is_rising("btn_north")
+        {
+            self.easy_left_panel_collapsed = !self.easy_left_panel_collapsed;
+            if self.easy_left_panel_collapsed {
+                self.gamepad_nav.left_selected = None;
+            }
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Left I/O panel navigation (cursor + LS/D-pad) ────────────────────
+        // The RS/gyro cursor and an LS/D-pad selection both point at left-panel
+        // targets; South/RT acts on whichever is active (select input device,
+        // toggle output, enter slider edit). While focus lives in the panel or a
+        // slider edit is in progress, sub-patch handling is skipped. Returns true
+        // when it consumed input.
         if self.nav_drive_left_panel(ctx, &nav, dt, rt_rising, lt_rising) {
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
@@ -3759,6 +3829,36 @@ impl FlexInputApp {
             EditLevel::Widget => {
                 // Move selection spatially.
                 if let Some(dir) = step_dir {
+                    // Seamless cross LEFT into the Devices panel: when already at
+                    // the left-most sub-patch widget (a real selection with no
+                    // left neighbour) and the panel is visible, hand focus to the
+                    // panel instead of staying put. Consumes this frame; the panel
+                    // takes over next frame.
+                    if matches!(dir, NavDir::Left) && !self.easy_left_panel_collapsed {
+                        let at_left_edge = {
+                            let canvas = &self.tabs[self.active_tab].canvas;
+                            canvas.snarl.get_node(outer_id)
+                                .and_then(|n| n.subpatch.as_ref())
+                                .map(|sp| sp.selected_item.is_some()
+                                    && gn::nearest_in_dir(&sp.items, sp.selected_item, NavDir::Left).is_none())
+                                .unwrap_or(false)
+                        };
+                        if at_left_edge {
+                            let targets: Vec<gn::LeftNavTarget> = ctx
+                                .data(|d| d.get_temp::<(u64, Vec<gn::LeftNavTarget>)>(
+                                    gn::left_targets_id()))
+                                .map(|(_, t)| t)
+                                .unwrap_or_default();
+                            if let Some(idx) =
+                                gn::nearest_target_rect_in_dir(&targets, None, NavDir::Left)
+                            {
+                                self.gamepad_nav.left_selected = Some(idx);
+                                self.gamepad_nav.repeat_dir = None;
+                                self.gamepad_nav.repeat_accum = 0.0;
+                                return;
+                            }
+                        }
+                    }
                     let canvas = &mut self.tabs[self.active_tab].canvas;
                     if let Some(sp) = canvas
                         .snarl
@@ -6227,23 +6327,98 @@ impl FlexInputApp {
             return true;
         }
 
-        // ── Not editing: hover-glow + act on the target under the cursor ──
-        if !self.gamepad_nav.cursor_visible {
+        // ── Not editing: RS-cursor hover + LS/D-pad selection share the panel ──
+        // Panel folded away (or no targets published) → drop any stale selection
+        // and let sub-patch navigation run.
+        if self.easy_left_panel_collapsed || targets.is_empty() {
+            self.gamepad_nav.left_selected = None;
             return false;
         }
-        let cursor = self.gamepad_nav.cursor_pos;
-        // Hover highlight whatever target the cursor is over (even without a
-        // press) so the user sees what South/RT will act on.
-        if let Some(hov) = targets.iter().rev().find(|t| t.rect.contains(cursor)) {
-            glow(hov.rect, false);
-        }
-        if !(nav.is_rising("btn_south") || rt_rising) {
-            return false;
-        }
-        let Some(hit) = targets.iter().rev().find(|t| t.rect.contains(cursor)) else {
-            return false;
+
+        // RS/gyro cursor: top-most target under the cursor (glow it so the user
+        // sees what South/RT will act on). `enumerate().rev()` so a later
+        // (top-most) target wins overlaps; we keep the index.
+        let cursor_hit: Option<usize> = if self.gamepad_nav.cursor_visible {
+            let cursor = self.gamepad_nav.cursor_pos;
+            targets.iter().enumerate().rev()
+                .find(|(_, t)| t.rect.contains(cursor)).map(|(i, _)| i)
+        } else {
+            None
         };
-        match hit.action.clone() {
+        if let Some(ci) = cursor_hit {
+            glow(targets[ci].rect, false);
+        }
+
+        // LS/D-pad selection movement — only while focus lives in the panel.
+        if let Some(sel0) = self.gamepad_nav.left_selected {
+            let sel = sel0.min(targets.len() - 1);
+            self.gamepad_nav.left_selected = Some(sel);
+
+            // Directional intent: D-pad discrete + left-stick auto-repeat (mirrors
+            // the sub-patch Widget nav so both regions feel identical).
+            let mut step_dir: Option<NavDir> = None;
+            if nav.is_rising("dpad_up") { step_dir = Some(NavDir::Up); }
+            else if nav.is_rising("dpad_down") { step_dir = Some(NavDir::Down); }
+            else if nav.is_rising("dpad_left") { step_dir = Some(NavDir::Left); }
+            else if nav.is_rising("dpad_right") { step_dir = Some(NavDir::Right); }
+            let mag = nav.lstick.length();
+            if let Some(sd) = gn::stick_dir(nav.lstick) {
+                if self.gamepad_nav.repeat_dir != Some(sd) {
+                    self.gamepad_nav.repeat_dir = Some(sd);
+                    self.gamepad_nav.repeat_accum = 1.0;
+                }
+                let rate = 6.0 + ((mag - 0.5) / 0.5).clamp(0.0, 1.0) * 12.0;
+                self.gamepad_nav.repeat_accum += dt * rate;
+                if self.gamepad_nav.repeat_accum >= 1.0 {
+                    self.gamepad_nav.repeat_accum -= 1.0;
+                    if step_dir.is_none() { step_dir = Some(sd); }
+                }
+            } else {
+                self.gamepad_nav.repeat_dir = None;
+                self.gamepad_nav.repeat_accum = 0.0;
+            }
+
+            if let Some(dir) = step_dir {
+                match gn::nearest_target_rect_in_dir(&targets, Some(sel), dir) {
+                    Some(next) => self.gamepad_nav.left_selected = Some(next),
+                    // Off the right edge → hand focus back to the sub-patch (which
+                    // seeds its left-most widget next frame). Consume this frame.
+                    None if matches!(dir, NavDir::Right) => {
+                        self.gamepad_nav.left_selected = None;
+                        self.gamepad_nav.repeat_dir = None;
+                        self.gamepad_nav.repeat_accum = 0.0;
+                        return true;
+                    }
+                    None => {}
+                }
+            }
+            if let Some(s) = self.gamepad_nav.left_selected {
+                if let Some(t) = targets.get(s) { glow(t.rect, false); }
+            }
+        }
+
+        // Activation (South / RT): the cursor target wins when the cursor is over
+        // one; otherwise the LS/D-pad selection.
+        if nav.is_rising("btn_south") || rt_rising {
+            if let Some(idx) = cursor_hit.or(self.gamepad_nav.left_selected) {
+                if let Some(t) = targets.get(idx) {
+                    let action = t.action.clone();
+                    self.nav_dispatch_left_action(action);
+                }
+                return true;
+            }
+        }
+
+        // Consume the frame when focus lives in the panel (LS owns directional
+        // input); otherwise let sub-patch navigation proceed.
+        self.gamepad_nav.left_selected.is_some()
+    }
+
+    /// Dispatch an activated left-panel target action (shared by the RS-cursor
+    /// and LS/D-pad selection paths).
+    fn nav_dispatch_left_action(&mut self, action: crate::gamepad_nav::LeftNavAction) {
+        use crate::gamepad_nav::LeftNavAction;
+        match action {
             LeftNavAction::SelectInput { device_id } => {
                 self.nav_select_input_device(&device_id);
             }
@@ -6267,7 +6442,6 @@ impl FlexInputApp {
                 self.gamepad_nav.left_edit = Some(action);
             }
         }
-        true
     }
 
     /// Make `device_id` the active input source (mirrors the io_panel card
@@ -8889,6 +9063,7 @@ impl FlexInputApp {
                 (hint_move(), "Navigate"),
                 (vec!["right_stick"], "Cursor"),
                 (vec!["btn_south", "right_trigger"], "Select / Edit"),
+                (vec!["btn_north"], "Show/Hide devices"),
                 (vec!["btn_lb", "btn_rb"], "Tab"),
                 (vec!["btn_start"], "Presets"),
                 (vec!["btn_start"], "Hold: Settings"),
@@ -9134,34 +9309,104 @@ impl FlexInputApp {
             .show_separator_line(true)
             .frame(egui::Frame::default()
                 .fill(ctx.style().visuals.panel_fill)
-                .inner_margin(egui::Margin::symmetric(10, 5)))
+                .inner_margin(egui::Margin::symmetric(12, 6)))
             .show(ctx, |ui| {
-                // Wrap so a long hint set folds onto a second line instead of
-                // overflowing the window width on narrow displays.
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    const GLYPH: f32 = 18.0;
-                    for (i, (pins, label)) in hints.iter().enumerate() {
-                        if i > 0 {
-                            ui.add_space(3.0);
-                            ui.separator();
-                            ui.add_space(3.0);
+                // Manual measured flow so each hint (glyphs + shared label) wraps
+                // onto the next row AS A UNIT. egui's `horizontal_wrapped` reflows
+                // at the individual-widget level and would orphan a glyph from its
+                // label; a nested `horizontal` doesn't wrap at all (it overflows +
+                // crops). So we measure each hint group's width, greedily pack the
+                // groups into rows, and render each row as its own horizontal line.
+                // Inter-hint dividers are FIXED-height lines. Sizes are 1.2x base.
+                const GLYPH: f32 = 21.6;
+                const ITEM_PAD: f32 = 4.8; // around the "/" between multi-glyphs
+                const LABEL_GAP: f32 = 2.4; // glyph → label
+                const DIV_GAP: f32 = 5.0;   // around the inter-hint divider
+                let div_stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color());
+                let label_font = egui::FontId::proportional(14.4);
+                let slash_font = egui::FontId::proportional(13.2);
+                let token_font = egui::FontId::proportional(14.4);
+                let measure = |text: &str, font: &egui::FontId| -> f32 {
+                    ui.painter()
+                        .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE)
+                        .size().x
+                };
+                let slash_w = measure("/", &slash_font);
+
+                // ── Build per-hint render specs + measured widths ──
+                enum Elem { Tex(egui::TextureHandle), Token(String) }
+                struct Spec { elems: Vec<Elem>, label: String, width: f32 }
+                let mut specs: Vec<Spec> = Vec::with_capacity(hints.len());
+                for (pins, label) in &hints {
+                    let mut elems = Vec::new();
+                    let mut w = 0.0f32;
+                    for (j, pin) in pins.iter().enumerate() {
+                        if j > 0 { w += 2.0 * ITEM_PAD + slash_w; }
+                        if let Some(tex) = self.gp_legend_glyph(ctx, skin, pin) {
+                            w += GLYPH;
+                            elems.push(Elem::Tex(tex));
+                        } else {
+                            let tok = gp_pin_token(pin).to_string();
+                            w += measure(&tok, &token_font);
+                            elems.push(Elem::Token(tok));
                         }
-                        // One or more glyphs (e.g. LS + D-pad, LB + RB) shown
-                        // side-by-side before the shared label.
-                        for (j, pin) in pins.iter().enumerate() {
-                            if j > 0 {
-                                ui.label(egui::RichText::new("/").size(11.0).weak());
+                    }
+                    w += LABEL_GAP + measure(label, &label_font);
+                    specs.push(Spec { elems, label: label.to_string(), width: w });
+                }
+
+                // ── Greedily pack groups into rows ──
+                let div_w = 2.0 * DIV_GAP + 1.0;
+                let budget = (ui.available_width() - 4.0).max(1.0);
+                let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+                let mut row_w = 0.0f32;
+                for (i, s) in specs.iter().enumerate() {
+                    let row_empty = rows.last().unwrap().is_empty();
+                    let extra = if row_empty { s.width } else { div_w + s.width };
+                    if !row_empty && row_w + extra > budget {
+                        rows.push(vec![i]);
+                        row_w = s.width;
+                    } else {
+                        rows.last_mut().unwrap().push(i);
+                        row_w += extra;
+                    }
+                }
+
+                // ── Render row by row ──
+                ui.vertical(|ui| {
+                    for row in &rows {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (k, &hi) in row.iter().enumerate() {
+                                if k > 0 {
+                                    ui.add_space(DIV_GAP);
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(1.0, GLYPH), egui::Sense::hover());
+                                    ui.painter().vline(
+                                        r.center().x, r.top()..=r.bottom(), div_stroke);
+                                    ui.add_space(DIV_GAP);
+                                }
+                                let s = &specs[hi];
+                                for (j, elem) in s.elems.iter().enumerate() {
+                                    if j > 0 {
+                                        ui.add_space(ITEM_PAD);
+                                        ui.label(egui::RichText::new("/").size(13.2).weak());
+                                        ui.add_space(ITEM_PAD);
+                                    }
+                                    match elem {
+                                        Elem::Tex(tex) => {
+                                            ui.add(egui::Image::new(
+                                                (tex.id(), egui::vec2(GLYPH, GLYPH))));
+                                        }
+                                        Elem::Token(tok) => {
+                                            ui.label(egui::RichText::new(tok).strong().size(14.4));
+                                        }
+                                    }
+                                }
+                                ui.add_space(LABEL_GAP);
+                                ui.label(egui::RichText::new(&s.label).size(14.4));
                             }
-                            if let Some(tex) = self.gp_legend_glyph(ctx, skin, pin) {
-                                ui.add(egui::Image::new((tex.id(), egui::vec2(GLYPH, GLYPH))));
-                            } else {
-                                // No glyph under this skin — short textual token.
-                                ui.label(egui::RichText::new(gp_pin_token(pin)).strong().size(12.0));
-                            }
-                        }
-                        ui.add_space(2.0);
-                        ui.label(egui::RichText::new(*label).size(12.0));
+                        });
                     }
                 });
             });
