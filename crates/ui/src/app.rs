@@ -11684,6 +11684,7 @@ pub fn find_automap_device_id_for_viewer(
         if node.module_id == "module.automap_split"
             || node.module_id == "module.feedback_control"
             || node.module_id == "module.touch_zones"
+            || node.module_id == "module.input_viewer"
         {
             let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
             let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });

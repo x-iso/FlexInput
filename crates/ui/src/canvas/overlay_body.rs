@@ -104,11 +104,12 @@ pub(crate) fn show_overlay_body(
         .collect();
 
     // Snapshot of the tab snarl for pins inside sub-patches whose renderers
-    // walk the AutoMap parent chain (same element set as show_subpatch_body).
+    // walk the AutoMap parent chain. Not gated per element id — a hardcoded
+    // list here silently broke device resolution for every newly instrumented
+    // element (the Input Viewer's "viewer" showed "No device" on the overlay
+    // while working everywhere else).
     let needs_outer_snapshot = items.iter().any(|it| matches!(it,
         LayoutItem::Module(m) if !m.source_path.is_empty()
-            && (m.element_id == "whole_module" || m.element_id == "text"
-                || m.element_id == "field" || m.element_id == "cards")
     ));
     let outer_snapshot: Option<Snarl<NodeData>> =
         if needs_outer_snapshot { Some(tab_snarl.clone()) } else { None };

@@ -209,6 +209,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let is_svg            = snarl.get_node(node).map(|n| n.module_id == "module.svg").unwrap_or(false);
         let is_remapper       = snarl.get_node(node).map(|n| n.module_id == "module.remapper").unwrap_or(false);
         let is_map_action     = snarl.get_node(node).map(|n| n.module_id == "module.map_action").unwrap_or(false);
+        let is_input_viewer   = snarl.get_node(node).map(|n| n.module_id == "module.input_viewer").unwrap_or(false);
         let is_response_curve = snarl.get_node(node).map(|n| {
             n.module_id == "module.response_curve"
                 || n.module_id == "module.vec_response_curve"
@@ -449,9 +450,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     }
                 }
 
-                // Remapper / Map Action module: skin selector + Labels live in the
+                // Remapper / Map Action / Input Viewer: skin selector lives in the
                 // header so the body stays compact and the label/dropdown can sit next to the title.
-                if is_remapper || is_map_action {
+                if is_remapper || is_map_action || is_input_viewer {
                     use super::remapper_icons::Skin;
                     let current_str = snarl.get_node(node)
                         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()).map(|s| s.to_string()))
@@ -482,7 +483,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                                     }
                                 }
                             });
-                        ui.label(egui::RichText::new("Labels").small().weak());
+                        ui.label(egui::RichText::new(if is_input_viewer { "Skin" } else { "Labels" })
+                            .small().weak());
                     });
                     if new_skin != current {
                         if let Some(n) = snarl.get_node_mut(node) {

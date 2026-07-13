@@ -41,33 +41,12 @@ pub(crate) fn show_input_viewer_body(
     live_signals: &LiveSignals,
     automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
+    // Skin is picked in the node HEADER (shared selector with the Remapper).
     let skin_param = snarl
         .get_node(node_id)
         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()))
         .unwrap_or("auto")
         .to_string();
-
-    // Skin row.
-    let mut new_skin: Option<&'static str> = None;
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Skin").small().weak());
-        let current = Skin::from_str(&skin_param);
-        egui::ComboBox::from_id_salt(("iv_skin", node_id.0))
-            .selected_text(current.label())
-            .show_ui(ui, |ui| {
-                for s in [Skin::Auto, Skin::Xbox, Skin::Playstation, Skin::SwitchPro] {
-                    if ui.selectable_label(current == s, s.label()).clicked() {
-                        new_skin = Some(s.as_str());
-                    }
-                }
-            });
-    });
-    if let Some(s) = new_skin {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("skin".into(), serde_json::Value::String(s.into()));
-        }
-    }
-
     let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
     let dev_id = remapper_upstream_device_id(snarl, node_id, 0, automap_parent);
 
@@ -152,11 +131,21 @@ pub(crate) fn paint_viewer_board(
         glyph_chip(ui, &painter, skin, "btn_mute", at(0.59, 0.46), 18.0 * s, glow("btn_mute"), accent);
     }
 
-    // ── D-pad cluster (left) ──
-    glyph_chip(ui, &painter, skin, "dpad_up",    at(0.165, 0.345), 22.0 * s, glow("dpad_up"), accent);
-    glyph_chip(ui, &painter, skin, "dpad_down",  at(0.165, 0.575), 22.0 * s, glow("dpad_down"), accent);
-    glyph_chip(ui, &painter, skin, "dpad_left",  at(0.085, 0.46),  22.0 * s, glow("dpad_left"), accent);
-    glyph_chip(ui, &painter, skin, "dpad_right", at(0.245, 0.46),  22.0 * s, glow("dpad_right"), accent);
+    // ── D-pad: ONE glyph whose art switches to the pressed direction ──
+    // (the icon set ships a neutral cross + one variant per direction; on a
+    // diagonal the direction that rose most recently wins via glow ordering).
+    {
+        let dirs = [
+            ("dpad_up", glow("dpad_up")), ("dpad_down", glow("dpad_down")),
+            ("dpad_left", glow("dpad_left")), ("dpad_right", glow("dpad_right")),
+        ];
+        let (pin, g) = dirs.iter()
+            .filter(|(p, _)| readb(p))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, g)| (*p, *g))
+            .unwrap_or(("dpad", dirs.iter().map(|(_, g)| *g).fold(0.0f32, f32::max)));
+        glyph_chip(ui, &painter, skin, pin, at(0.165, 0.46), 46.0 * s, g, accent);
+    }
 
     // ── Face diamond (right) ──
     glyph_chip(ui, &painter, skin, "btn_north", at(0.835, 0.345), 24.0 * s, glow("btn_north"), accent);

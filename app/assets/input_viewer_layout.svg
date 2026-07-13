@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Input Viewer board layout — design source.
+
+  Canvas = 420 x 260 (the board's fixed design space; it letterboxes when
+  pinned, so only RELATIVE positions matter). Every element's id matches the
+  canonical pin / element it renders:
+
+    rect  #board                       background plate
+    rect  #left_trigger / #right_trigger   analog fill bars (drawn as rects)
+    rect  #touchpad                    touch strip (only on pads that have one)
+    circle#dpad                        the single directional d-pad glyph
+    circle#btn_*                       button glyph chips (r = half the glyph size)
+    circle#left_stick / #right_stick   stick scopes
+    circle#btn_paddle_*                rear paddles (only on pads that have them)
+
+  Edit freely in Figma/Inkscape (move / resize; keep the ids!) and hand the
+  file back — positions and sizes are read from the shapes' geometry.
+  Note: without a touchpad, btn_back/btn_start slide inward to x=176/244
+  (this variant is handled in code; design the WITH-touchpad layout here).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="260" viewBox="0 0 420 260">
+  <rect id="board" x="0" y="0" width="420" height="260" rx="10" fill="#1c1c1e"/>
+
+  <!-- Triggers (vertical fill bars) -->
+  <rect id="left_trigger"  x="18.9"  y="15.6" width="25.2" height="62.4" rx="3" fill="#2d2d30" stroke="#5a5a5e"/>
+  <rect id="right_trigger" x="375.9" y="15.6" width="25.2" height="62.4" rx="3" fill="#2d2d30" stroke="#5a5a5e"/>
+
+  <!-- Bumpers -->
+  <circle id="btn_lb" cx="77.7"  cy="31.2" r="13" fill="#3a3a3e"/>
+  <circle id="btn_rb" cx="342.3" cy="31.2" r="13" fill="#3a3a3e"/>
+
+  <!-- Touchpad strip (finger dots drawn inside at runtime) -->
+  <rect id="touchpad" x="151.2" y="14.3" width="117.6" height="67.6" rx="5" fill="#282828" stroke="#5a5a5e"/>
+
+  <!-- Menu cluster -->
+  <circle id="btn_back"  cx="128.1" cy="31.2" r="10" fill="#3a3a3e"/>
+  <circle id="btn_start" cx="291.9" cy="31.2" r="10" fill="#3a3a3e"/>
+  <circle id="btn_guide" cx="210"   cy="114.4" r="13" fill="#3a3a3e"/>
+  <circle id="btn_capture" cx="172.2" cy="119.6" r="9" fill="#333"/>
+  <circle id="btn_mute"    cx="247.8" cy="119.6" r="9" fill="#333"/>
+
+  <!-- D-pad: one glyph, art swaps per pressed direction -->
+  <circle id="dpad" cx="69.3" cy="119.6" r="23" fill="#3a3a3e"/>
+
+  <!-- Face diamond -->
+  <circle id="btn_north" cx="350.7" cy="89.7"  r="12" fill="#3a3a3e"/>
+  <circle id="btn_south" cx="350.7" cy="149.5" r="12" fill="#3a3a3e"/>
+  <circle id="btn_west"  cx="317.1" cy="119.6" r="12" fill="#3a3a3e"/>
+  <circle id="btn_east"  cx="384.3" cy="119.6" r="12" fill="#3a3a3e"/>
+
+  <!-- Stick scopes -->
+  <circle id="left_stick"  cx="144.9" cy="191.1" r="36" fill="#262626" stroke="#5a5a5e"/>
+  <circle id="right_stick" cx="275.1" cy="191.1" r="36" fill="#262626" stroke="#5a5a5e"/>
+
+  <!-- Rear paddles -->
+  <circle id="btn_paddle_l1" cx="23.1"  cy="239.2" r="9" fill="#333"/>
+  <circle id="btn_paddle_l2" cx="56.7"  cy="239.2" r="9" fill="#333"/>
+  <circle id="btn_paddle_r2" cx="363.3" cy="239.2" r="9" fill="#333"/>
+  <circle id="btn_paddle_r1" cx="396.9" cy="239.2" r="9" fill="#333"/>
+</svg>
