@@ -1,5 +1,6 @@
 mod curve;
 pub mod header_controls;
+pub(crate) mod input_viewer;
 pub mod node;
 pub(crate) mod overlay_body;
 pub mod remapper_icons;

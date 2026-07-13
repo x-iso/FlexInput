@@ -889,7 +889,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "module.automap_combiner" | "module.audio_stream_haptics"
                 | "module.network_send" | "module.network_recv"
                 | "module.remapper" | "module.map_action"
-                | "module.touch_zones"
+                | "module.touch_zones" | "module.input_viewer"
                 | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
         )
     }
@@ -982,6 +982,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
             "module.map_action" => show_map_action_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
             "module.touch_zones" => show_touch_zones_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
+            "module.input_viewer" => super::input_viewer::show_input_viewer_body(
+                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "subpatch" => {
                 if show_subpatch_body(
                     node_id, ui, snarl,
@@ -11457,6 +11459,21 @@ fn render_pinned_element_impl(
             );
             return;
         }
+        // Input Viewer board: whole-container render, letterboxed to the
+        // board's fixed aspect. Pure display — no interaction when pinned.
+        ("module.input_viewer", "viewer") => {
+            let (rect, _) = ui.allocate_exact_size(container_size, egui::Sense::hover());
+            let board = super::input_viewer::letterbox(rect);
+            let skin_param = inner_snarl.get_node(inner_id)
+                .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()))
+                .unwrap_or("auto").to_string();
+            let skin = remapper_resolve_skin(inner_snarl, inner_id, &skin_param, bridged_parent);
+            let dev = remapper_upstream_device_id(inner_snarl, inner_id, 0, bridged_parent);
+            super::input_viewer::paint_viewer_board(
+                ui, board, inner_id.0, dev.as_deref(), skin, live_signals,
+            );
+            return;
+        }
         // Touch Zones pad(s): whole-container render, move-only dividers + live
         // dots. Ports mode exposes no add/remove (that needs advanced wiring).
         ("module.touch_zones", "field") => {
@@ -14587,7 +14604,7 @@ pub fn take_layout_pending(ctx: &egui::Context) -> Option<(usize, String, [f32; 
 /// is off, so callers can sprinkle it around without conditionals. The rect's
 /// size is captured into the pin request so the new pinned widget inherits
 /// the source element's dimensions.
-fn register_exposable_element(
+pub(crate) fn register_exposable_element(
     ui: &mut egui::Ui,
     node_id: NodeId,
     element_id: &str,
@@ -19661,7 +19678,7 @@ fn sig_f32(s: &Signal) -> f32 {
 /// followed here — for the Remapper's capture UX the common case is
 /// `Device → Remapper`. More complex topologies can be added later by reusing
 /// the engine-side `find_automap_device_rec` from app.rs.
-fn remapper_upstream_device_id(
+pub(crate) fn remapper_upstream_device_id(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
     input_idx: usize,
@@ -21210,7 +21227,7 @@ fn remapper_render_arrow(ui: &mut egui::Ui) {
 /// Detect the upstream device family for a Remapper's AutoMap input, falling
 /// back to Xbox when no device is wired or auto detection fails. The user's
 /// manual override in `node.params["skin"]` takes precedence.
-fn remapper_resolve_skin(
+pub(crate) fn remapper_resolve_skin(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
     override_param: &str,

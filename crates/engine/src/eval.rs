@@ -3192,6 +3192,12 @@ fn compute_node(
                 dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
             }).collect()
         }
+        "module.input_viewer" => {
+            // Pure display: the board renders from live signals on the UI
+            // thread; output 0 is the AutoMap passthrough (resolved by the
+            // device walk, carries no Signal).
+            (0..snap.n_outputs).map(|_| None).collect()
+        }
         "module.touch_zones" => {
             use flexinput_core::touchzones as tz;
             // Same upstream resolution as the Splitter: prefer the closest

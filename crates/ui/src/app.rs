@@ -11848,6 +11848,7 @@ fn find_automap_device_rec(
     if node.module_id == "module.automap_split"
         || node.module_id == "module.feedback_control"
         || node.module_id == "module.touch_zones"
+        || node.module_id == "module.input_viewer"
     {
         // All pass the AutoMap bus through on output 0 from their AutoMap input.
         // (Touch Zones in ports mode injects nothing; its zone data is on the
