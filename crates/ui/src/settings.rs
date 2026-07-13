@@ -282,6 +282,11 @@ pub struct AppSettings {
     /// None = unassigned.
     #[serde(default)]
     pub overlay_chord: Option<Vec<String>>,
+    /// Whether the info overlay was visible on exit — restored on launch
+    /// (mirrors `see_through_active`; the live state lives in a ctx temp
+    /// slot that `update()` syncs back here).
+    #[serde(default)]
+    pub overlay_visible: bool,
     /// Global keyboard chord toggling the info overlay's visibility. Mirrors
     /// `pin_shortcut` — RegisterHotKey under the hood (see `pin_hotkey.rs`).
     #[serde(default = "default_overlay_shortcut")]
@@ -472,6 +477,7 @@ impl Default for AppSettings {
             seethrough_chord: None,
             panic_chord: None,
             overlay_chord: None,
+            overlay_visible: false,
             overlay_shortcut: default_overlay_shortcut(),
             overlay_fps: OVERLAY_FPS_DEFAULT,
             gamepad_chords_nav_only: true,

@@ -1065,6 +1065,10 @@ impl FlexInputApp {
                 app_settings.see_through_active,
             );
         });
+        // Same for the info overlay's visible flag (▣ toggle).
+        if app_settings.overlay_visible {
+            crate::overlay::set_overlay_visible(&cc.egui_ctx, true);
+        }
 
         // Pick `next_untitled` high enough that any restored "Untitled N" tab
         // doesn't collide with a freshly-created one.
@@ -1589,6 +1593,16 @@ impl eframe::App for FlexInputApp {
                 .unwrap_or(self.settings.see_through_active);
             if from_slot != self.settings.see_through_active {
                 self.settings.see_through_active = from_slot;
+                self.settings_dirty = true;
+            }
+        }
+
+        // Overlay visibility persists the same way (titlebar ▣ / hotkey /
+        // chord all write the ctx slot; we mirror it into settings here).
+        {
+            let from_slot = crate::overlay::overlay_visible(ctx);
+            if from_slot != self.settings.overlay_visible {
+                self.settings.overlay_visible = from_slot;
                 self.settings_dirty = true;
             }
         }
