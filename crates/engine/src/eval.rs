@@ -3200,15 +3200,22 @@ fn compute_node(
         }
         "module.menu" => {
             // Stub until the menu state machine lands: closed, nothing
-            // hovered, all zone pins low. Slot 0 stays the AutoMap
-            // passthrough sentinel (no Signal).
+            // hovered, all zone pins idle. Slot 0 stays the AutoMap
+            // passthrough sentinel (no Signal). Zone pins share the Touch
+            // Zones id vocabulary (f0z{id}_x/y/act + f0c = Select).
             use flexinput_core::menu as fm;
+            use flexinput_core::touchzones as tz;
             (0..snap.n_outputs).map(|i| {
                 let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
-                match fm::parse_pin(pin_id)? {
-                    fm::Pin::Open => Some(Signal::Bool(false)),
-                    fm::Pin::Hover => Some(Signal::Float(-1.0)),
-                    fm::Pin::Zone { .. } => Some(Signal::Bool(false)),
+                match fm::parse_pin(pin_id) {
+                    Some(fm::Pin::Open) => return Some(Signal::Bool(false)),
+                    Some(fm::Pin::Hover) => return Some(Signal::Float(-1.0)),
+                    Some(fm::Pin::Zone { .. }) | None => {}
+                }
+                match tz::parse_pin(pin_id)? {
+                    tz::Pin::Zone { comp: tz::ZoneComp::Active, .. } => Some(Signal::Bool(false)),
+                    tz::Pin::Zone { .. } => Some(Signal::Float(0.0)),
+                    tz::Pin::Click { .. } => Some(Signal::Bool(false)),
                 }
             }).collect()
         }

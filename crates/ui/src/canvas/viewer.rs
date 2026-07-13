@@ -987,7 +987,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.input_viewer" => super::input_viewer::show_input_viewer_body(
                 node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "module.menu" => super::menu_body::show_menu_body(
-                node_id, ui, snarl, self.live_signals),
+                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "subpatch" => {
                 if show_subpatch_body(
                     node_id, ui, snarl,
@@ -1633,7 +1633,7 @@ fn tz_n_fields(snarl: &Snarl<NodeData>, node_id: NodeId) -> usize {
 /// Reconstruct per-(field,zone) live state from a node's OWN computed outputs
 /// (`extra.last_out`). Source-agnostic — works for physical, network, and
 /// collector touch. Returns `(field, zone) → (local_x, local_y, active)`.
-fn tz_zone_live(node: &NodeData) -> std::collections::HashMap<(usize, usize), (f32, f32, bool)> {
+pub(crate) fn tz_zone_live(node: &NodeData) -> std::collections::HashMap<(usize, usize), (f32, f32, bool)> {
     use flexinput_core::touchzones as tz;
     let mut m = std::collections::HashMap::new();
     if let Some(ids) = node.params.get("output_pin_ids").and_then(|v| v.as_array()) {
@@ -1861,7 +1861,7 @@ pub(crate) fn tz_request_or_apply_merge(snarl: &mut Snarl<NodeData>, node_id: No
 /// If a merge is pending (`_tz_merge`), draw the confirm popup: the removed
 /// zone(s) carry mappings, so the user picks whether to DELETE those mappings,
 /// keep them by re-homing onto the surviving zone, or CANCEL.
-fn tz_render_merge_popup(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node_id: NodeId) {
+pub(crate) fn tz_render_merge_popup(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node_id: NodeId) {
     let Some(m) = snarl.get_node(node_id).and_then(|n| n.params.get("_tz_merge").cloned()) else { return; };
     let field = m.get("field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let path: Vec<u8> = m.get("path").and_then(|v| v.as_array())
@@ -3337,7 +3337,7 @@ fn render_touch_zones_pinned(
 /// when already in sync, so it's safe to call every frame. Slot 0 (the AutoMap
 /// passthrough) is always kept; changing a grid drops existing zone-port wiring
 /// for now (zone indices reshuffle row-major).
-fn regenerate_touch_zone_ports(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
+pub(crate) fn regenerate_touch_zone_ports(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
     use flexinput_core::touchzones as tz;
 
     // Build desired (id, label, type) triples from field_mode + per-field grids.
@@ -3648,7 +3648,7 @@ fn show_touch_zones_body(
 /// the pinnable "field" element over the union of pads).
 #[allow(clippy::too_many_arguments)]
 /// Read the currently-selected (field, zone) for mapping mode (defaults 0,0).
-fn tz_read_selection(snarl: &Snarl<NodeData>, node_id: NodeId) -> (usize, usize) {
+pub(crate) fn tz_read_selection(snarl: &Snarl<NodeData>, node_id: NodeId) -> (usize, usize) {
     snarl.get_node(node_id).map(|n| (
         n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
         n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
@@ -3686,7 +3686,7 @@ fn tz_commit_card(snarl: &mut Snarl<NodeData>, node_id: NodeId,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_touch_zone_cards(
+pub(crate) fn render_touch_zone_cards(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
@@ -4267,7 +4267,7 @@ fn tz_line_edit_overlay(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_touch_field(
+pub(crate) fn render_touch_field(
     node_id: NodeId,
     field: usize,
     single: bool,
@@ -11480,8 +11480,17 @@ fn render_pinned_element_impl(
         }
         // Touch Zones pad(s): whole-container render, move-only dividers + live
         // dots. Ports mode exposes no add/remove (that needs advanced wiring).
-        ("module.touch_zones", "field") => {
+        // The Virtual Menu's field/cards share the same param schema and route
+        // through the same pinned renderers.
+        ("module.touch_zones", "field") | ("module.menu", "field") => {
             render_touch_zones_pinned(inner_id, ui, inner_snarl, container_size, live_signals, bridged_parent);
+            return;
+        }
+        ("module.menu", "cards") => {
+            render_touch_zone_cards_whole_module(
+                inner_id, ui, inner_snarl, container_size,
+                live_signals, panic_shortcut, bridged_parent, is_layout_mode,
+            );
             return;
         }
         ("module.touch_zones", "cards") => {
