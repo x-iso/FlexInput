@@ -1837,7 +1837,7 @@ fn tz_cards_in_zones(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, zon
 /// Remove the divider at `path`. If the zones it would merge away carry no
 /// mappings, apply immediately; otherwise stash a pending-merge so the module
 /// shows a confirm popup (`tz_render_merge_popup`).
-fn tz_request_or_apply_merge(snarl: &mut Snarl<NodeData>, node_id: NodeId,
+pub(crate) fn tz_request_or_apply_merge(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     field: usize, tree: &flexinput_core::touchzones::ZoneNode, path: &[u8])
 {
     let mut probe = tree.clone();
@@ -2006,7 +2006,7 @@ fn tz_pick_banner(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData
 /// `new_low` puts the new EMPTY cell on the low side (left/top) so a "+" on a
 /// zone's left/top edge adds the empty cell there and pushes the mapping the
 /// other way.
-fn tz_subdivide_at(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize,
+pub(crate) fn tz_subdivide_at(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize,
     ux: f32, uy: f32, axis: flexinput_core::touchzones::Axis, new_low: bool)
 {
     use flexinput_core::touchzones::Axis;
@@ -3023,6 +3023,10 @@ fn tz_draw_field(
     if let Some(tree) = &tree {
         let mut edited: Option<tz::ZoneNode> = None;
         let mut want_remove: Option<Vec<u8>> = None;
+        // Per-axis divider index (V's and H's counted separately) so the gamepad
+        // focus highlight + hit-rects line up with the nav driver's (axis, line)
+        // model, which walks `dividers()` per axis.
+        let (mut vcount, mut hcount) = (0u32, 0u32);
         for (di, div) in tree.dividers().iter().enumerate() {
             // The "−" removal button (from tz_tree_line_overlay) sits at the
             // divider midpoint; carve that band out of the drag handle so the
@@ -3050,7 +3054,9 @@ fn tz_draw_field(
                     (egui::pos2(lo, y), egui::pos2(hi, y), full, segs, false)
                 }
             };
-            nav_line_rects.push((if axis_v { 0 } else { 1 }, di as u32, to_global * hitr));
+            let axis_idx = if axis_v { let i = vcount; vcount += 1; i }
+                           else       { let i = hcount; hcount += 1; i };
+            nav_line_rects.push((if axis_v { 0 } else { 1 }, axis_idx, to_global * hitr));
             // Union the (up to two) segments flanking the button into one response.
             let r = segs.iter().enumerate().fold(None::<egui::Response>, |acc, (si, seg)| {
                 let resp = ui.interact(*seg, ui.id().with((node_id, id_salt, "tzdiv", field, di, si)),
@@ -3082,7 +3088,9 @@ fn tz_draw_field(
                 if nt.set_divider_t(&div.path, (div.lo + div.hi) * 0.5) { edited = Some(nt); }
             }
             if r.secondary_clicked() { want_remove = Some(div.path.clone()); }
-            let (w, c) = if hot { (2.0, accent) } else { (1.0, visuals.weak_text_color()) };
+            let (w, c) = if let Some(grabbed) = nav_focus(if axis_v { 0 } else { 1 }, axis_idx as usize) {
+                nav_stroke(grabbed)
+            } else if hot { (2.0, accent) } else { (1.0, visuals.weak_text_color()) };
             painter.line_segment([p0, p1], egui::Stroke::new(w, c));
         }
         if let Some(t) = edited { tz_set_field_tree(snarl, node_id, field, &t); }
@@ -3206,10 +3214,15 @@ fn render_touch_zones_pinned(
     // zone selects it, mirroring the module body, so the pinned cards widget
     // filters to the zone under the finger.
     if mapping {
-        let learn_idle = inner_snarl.get_node(inner_id)
+        // Suppress the follow ONLY while a gesture is being demonstrated
+        // ("learning") — that swipe can cross zones and must not hijack the tab.
+        // Once "captured", output is picked via buttons, so browsing/re-selecting
+        // is safe (the trigger is zone-independent, so it just re-targets the
+        // pending mapping to the touched zone).
+        let follow_ok = inner_snarl.get_node(inner_id)
             .and_then(|n| n.params.get("_tz_phase").and_then(|v| v.as_str()))
-            .unwrap_or("idle") == "idle";
-        if learn_idle {
+            .unwrap_or("idle") != "learning";
+        if follow_ok {
             let last: Option<(u64, usize, usize)> = ui.ctx()
                 .data(|d| d.get_temp(egui::Id::new(("tz_last_origin", inner_id.0))));
             let cur_pass = ui.ctx().cumulative_pass_nr();
@@ -3219,13 +3232,18 @@ fn render_touch_zones_pinned(
                     if cur_pass.saturating_sub(p) <= 1 { tz_apply_pick(inner_snarl, inner_id, z); }
                 }
             } else {
-                // Follow the LAST touched-down origin so two touches don't flicker
-                // the cards. If it slid away, keep the current selection while still
-                // active, else pick the LOWEST active zone — never `HashMap::iter`,
-                // whose nondeterministic order flickers between the fingers' zones.
+                // Select the LAST touched-down zone. A FRESH touchdown wins outright
+                // (a quick tap whose finger already lifted still selects — the
+                // pass-stamp says it just happened), else fall back to its zone while
+                // active → keep the current selection while active → the LOWEST active
+                // zone (never `HashMap::iter` unordered, which flickers between two
+                // fingers' zones).
                 let sel = tz_read_selection(inner_snarl, inner_id);
-                let follow = last.map(|(_, f, z)| (f, z))
-                    .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
+                let fresh = last.filter(|(p, _, _)| cur_pass.saturating_sub(*p) <= 2)
+                    .map(|(_, f, z)| (f, z));
+                let follow = fresh
+                    .or_else(|| last.map(|(_, f, z)| (f, z))
+                        .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false)))
                     .or_else(|| zone_live.get(&sel).filter(|v| v.2).map(|_| sel))
                     .or_else(|| zone_live.iter().filter(|(_, v)| v.2).map(|(k, _)| *k).min());
                 if let Some((f, z)) = follow {
@@ -3234,6 +3252,7 @@ fn render_touch_zones_pinned(
                             node.params.insert("sel_field".to_string(), Value::from(f as u64));
                             node.params.insert("sel_zone".to_string(), Value::from(z as u64));
                         }
+                        ui.ctx().request_repaint();
                     }
                 }
             }
@@ -3486,9 +3505,12 @@ fn show_touch_zones_body(
     // Suppressed while a Learn capture is in flight — the tab must stay on the
     // zone the Learn started on, and the gesture may be demonstrated ANYWHERE on
     // the pad without hijacking the selection.
-    let learn_idle = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("_tz_phase").and_then(|v| v.as_str())).unwrap_or("idle") == "idle";
-    if mapping && learn_idle {
+    // Suppress the follow ONLY during a gesture demo ("learning") — see the pinned
+    // widget's copy for the rationale. "captured" browses freely (trigger is
+    // zone-independent, so re-selecting just re-targets the pending mapping).
+    let follow_ok = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("_tz_phase").and_then(|v| v.as_str())).unwrap_or("idle") != "learning";
+    if mapping && follow_ok {
         let last: Option<(u64, usize, usize)> = ui.ctx()
             .data(|d| d.get_temp(egui::Id::new(("tz_last_origin", node_id.0))));
         let cur_pass = ui.ctx().cumulative_pass_nr();
@@ -3497,14 +3519,19 @@ fn show_touch_zones_body(
                 if cur_pass.saturating_sub(p) <= 1 { tz_apply_pick(snarl, node_id, z); }
             }
         } else {
-            // Follow the LAST touched-down origin so two touches don't flicker the
-            // tab. If that origin is no longer active (its finger slid into another
-            // zone), keep the current selection while it's still active, and only as
-            // a last resort pick the LOWEST active zone — never `HashMap::iter`,
-            // whose order is nondeterministic and flickers between fingers' zones.
+            // Select the LAST touched-down zone. A FRESH touchdown wins outright —
+            // even a quick tap whose finger has already lifted by the time we read
+            // (the pass-stamp says it just happened), which the "still-active" check
+            // below would otherwise miss. For a held/sliding finger the origin goes
+            // stale, so we fall back to: its zone while still active → keep the
+            // current selection while active → the LOWEST active zone (never
+            // `HashMap::iter` unordered, which flickers between two fingers' zones).
             let sel = tz_read_selection(snarl, node_id);
-            let follow = last.map(|(_, f, z)| (f, z))
-                .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false))
+            let fresh = last.filter(|(p, _, _)| cur_pass.saturating_sub(*p) <= 2)
+                .map(|(_, f, z)| (f, z));
+            let follow = fresh
+                .or_else(|| last.map(|(_, f, z)| (f, z))
+                    .filter(|fz| zone_live.get(fz).map(|v| v.2).unwrap_or(false)))
                 .or_else(|| zone_live.get(&sel).filter(|v| v.2).map(|_| sel))
                 .or_else(|| zone_live.iter().filter(|(_, v)| v.2).map(|(k, _)| *k).min());
             if let Some((f, z)) = follow {
@@ -3513,6 +3540,7 @@ fn show_touch_zones_body(
                         node.params.insert("sel_field".to_string(), Value::from(f as u64));
                         node.params.insert("sel_zone".to_string(), Value::from(z as u64));
                     }
+                    ui.ctx().request_repaint();
                 }
             }
         }
@@ -3680,9 +3708,17 @@ fn render_touch_zone_cards(
     // idle → Learn → (demonstrate on pad) → captured → Assign / gamepad → commit.
     if phase == "learning" {
         if let Some(trig) = tz_learn_capture(snarl, node_id, live_signals, dev.as_deref()) {
+            // The zone the gesture STARTED on becomes the mapping's target — matching
+            // the Learn hint "demonstrate … on a zone". Located from the captured
+            // touchdown point in the current field's tree. (The tab-follow was
+            // suppressed during "learning", so sel_field still holds the active field.)
+            let sx = getp(snarl, "_tz_cap_sx").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+            let sy = getp(snarl, "_tz_cap_sy").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+            let start_zone = tz_field_tree(snarl, node_id, sel_f).locate(sx, sy).0 as usize;
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("_tz_trig".into(), Value::from(trig.as_str()));
                 node.params.insert("_tz_phase".into(), Value::from("captured"));
+                node.params.insert("sel_zone".into(), Value::from(start_zone as u64));
             }
         }
     }

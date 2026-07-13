@@ -4449,14 +4449,101 @@ impl FlexInputApp {
         if split { 2 } else { 1 }
     }
 
+    // ── Mapping-mode (BSP-tree) divider nav ──────────────────────────────────
+    // Mapping mode draws dividers from the zone TREE, not the grid edge arrays, so
+    // the gamepad line editor drives the tree by divider PATH. (axis, tz_line) index
+    // per-axis into `dividers()` order, matching the renderer's per-axis numbering.
+
+    /// Tree dividers for a field as (axis 0=V/1=H, pos, lo, hi, path), `dividers()`
+    /// order preserved so the Nth of an axis matches the renderer's Nth.
+    fn tz_tree_divs(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, field: usize)
+        -> Vec<(u8, f32, f32, f32, Vec<u8>)>
+    {
+        let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()) else { return Vec::new(); };
+        crate::canvas::viewer::tz_field_tree(&sp.snarl, inner, field).dividers().into_iter()
+            .map(|d| (
+                if d.axis == flexinput_core::touchzones::Axis::V { 0u8 } else { 1u8 },
+                d.pos, d.lo, d.hi, d.path,
+            )).collect()
+    }
+
+    /// Count of tree dividers of `axis` (0=V, 1=H) in the field.
+    fn tz_tree_axis_len(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, axis: u8) -> usize
+    {
+        self.tz_tree_divs(outer, inner, field).iter().filter(|d| d.0 == axis).count()
+    }
+
+    /// The currently-focused tree divider (tz_axis + tz_line): (pos, lo, hi, path).
+    fn tz_tree_sel(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, field: usize)
+        -> Option<(f32, f32, f32, Vec<u8>)>
+    {
+        let axis = self.gamepad_nav.tz_axis;
+        self.tz_tree_divs(outer, inner, field).into_iter()
+            .filter(|d| d.0 == axis).nth(self.gamepad_nav.tz_line)
+            .map(|d| (d.1, d.2, d.3, d.4))
+    }
+
+    /// Set the tree divider at `path` to absolute `t`, writing the tree back.
+    fn tz_tree_set_t(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, path: &[u8], t: f32)
+    {
+        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
+            .and_then(|n| n.subpatch.as_mut())
+        {
+            let mut tree = crate::canvas::viewer::tz_field_tree(&sp.snarl, inner, field);
+            if tree.set_divider_t(path, t) {
+                crate::canvas::viewer::tz_set_field_tree(&mut sp.snarl, inner, field, &tree);
+            }
+        }
+    }
+
+    /// Remove/merge the tree divider at `path` (raises the mapped-zone confirm popup
+    /// when the merged zones carry cards — same as the mouse "−").
+    fn tz_tree_remove(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, path: &[u8])
+    {
+        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
+            .and_then(|n| n.subpatch.as_mut())
+        {
+            let tree = crate::canvas::viewer::tz_field_tree(&sp.snarl, inner, field);
+            crate::canvas::viewer::tz_request_or_apply_merge(&mut sp.snarl, inner, field, &tree, path);
+        }
+    }
+
+    /// Subdivide the currently-selected zone along `axis` (gamepad "add"), the new
+    /// cell on the high side — same primitive as the mouse "+".
+    fn tz_tree_add(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, axis: flexinput_core::touchzones::Axis)
+    {
+        let zone = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|n| n.params.get("sel_zone").and_then(|v| v.as_u64())).unwrap_or(0) as u32;
+        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
+            .and_then(|n| n.subpatch.as_mut())
+        {
+            let tree = crate::canvas::viewer::tz_field_tree(&sp.snarl, inner, field);
+            if let Some([x0, y0, x1, y1]) = tree.zone_rect(zone) {
+                let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+                crate::canvas::viewer::tz_subdivide_at(&mut sp.snarl, inner, field, cx, cy, axis, false);
+            }
+        }
+    }
+
     /// Enter line editing from Widget level: focus the first interior divider of
     /// pad 0 and snapshot for one coalesced undo entry across the whole edit.
     fn nav_tz_enter(&mut self, outer_id: egui_snarl::NodeId) {
         use crate::gamepad_nav::EditLevel;
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         self.gamepad_nav.tz_field = 0;
-        let cols = self.tz_edges(outer_id, inner, 0, "col_edges").len();
-        let rows = self.tz_edges(outer_id, inner, 0, "row_edges").len();
+        let (cols, rows) = if self.tz_is_mapping(outer_id, inner) {
+            (self.tz_tree_axis_len(outer_id, inner, 0, 0),
+             self.tz_tree_axis_len(outer_id, inner, 0, 1))
+        } else {
+            (self.tz_edges(outer_id, inner, 0, "col_edges").len(),
+             self.tz_edges(outer_id, inner, 0, "row_edges").len())
+        };
         if cols > 0 { self.gamepad_nav.tz_axis = 0; }
         else if rows > 0 { self.gamepad_nav.tz_axis = 1; }
         else { self.gamepad_nav.tz_axis = 0; }
@@ -4540,10 +4627,14 @@ impl FlexInputApp {
         }
         self.gamepad_nav.tz_field = field; // keep state reclamped to valid pads
 
-        let cols = self.tz_edges(outer_id, inner, field, "col_edges");
-        let rows = self.tz_edges(outer_id, inner, field, "row_edges");
+        // Line counts + edits differ by mode: mapping mode drives the BSP tree by
+        // divider PATH; ports mode drives the grid edge arrays (move-only).
+        let cols = if mapping { Vec::new() } else { self.tz_edges(outer_id, inner, field, "col_edges") };
+        let rows = if mapping { Vec::new() } else { self.tz_edges(outer_id, inner, field, "row_edges") };
+        let n_col = if mapping { self.tz_tree_axis_len(outer_id, inner, field, 0) } else { cols.len() };
+        let n_row = if mapping { self.tz_tree_axis_len(outer_id, inner, field, 1) } else { rows.len() };
         // Clamp the focused line to the current axis's count (edits may shrink it).
-        let axis_len = |a: u8| if a == 0 { cols.len() } else { rows.len() };
+        let axis_len = |a: u8| if a == 0 { n_col } else { n_row };
         if axis_len(self.gamepad_nav.tz_axis) == 0 {
             // Current axis emptied: jump to the other if it has lines.
             let other = 1 - self.gamepad_nav.tz_axis;
@@ -4551,6 +4642,17 @@ impl FlexInputApp {
         }
         let cur_len = axis_len(self.gamepad_nav.tz_axis).max(1);
         self.gamepad_nav.tz_line = self.gamepad_nav.tz_line.min(cur_len - 1);
+
+        // Recenter the focused divider (tree path in mapping mode, grid edge in ports).
+        let recenter = |s: &mut Self, field: usize| {
+            if mapping {
+                if let Some((_, lo, hi, path)) = s.tz_tree_sel(outer_id, inner, field) {
+                    s.tz_tree_set_t(outer_id, inner, field, &path, (lo + hi) * 0.5);
+                }
+            } else {
+                s.nav_tz_recenter(outer_id, inner, field, &cols, &rows);
+            }
+        };
 
         match self.gamepad_nav.edit_level {
             EditLevel::TzLines => {
@@ -4569,10 +4671,10 @@ impl FlexInputApp {
 
                 // Left/Right → column dividers; Up/Down → row dividers.
                 match step_dir {
-                    Some(NavDir::Left)  => self.nav_tz_cycle(0, -1, cols.len(), rows.len()),
-                    Some(NavDir::Right) => self.nav_tz_cycle(0,  1, cols.len(), rows.len()),
-                    Some(NavDir::Up)    => self.nav_tz_cycle(1, -1, cols.len(), rows.len()),
-                    Some(NavDir::Down)  => self.nav_tz_cycle(1,  1, cols.len(), rows.len()),
+                    Some(NavDir::Left)  => self.nav_tz_cycle(0, -1, n_col, n_row),
+                    Some(NavDir::Right) => self.nav_tz_cycle(0,  1, n_col, n_row),
+                    Some(NavDir::Up)    => self.nav_tz_cycle(1, -1, n_col, n_row),
+                    Some(NavDir::Down)  => self.nav_tz_cycle(1,  1, n_col, n_row),
                     None => {}
                 }
 
@@ -4581,20 +4683,25 @@ impl FlexInputApp {
                     self.gamepad_nav.edit_level = EditLevel::TzGrab;
                 }
                 if nav.is_rising("btn_north") && has_line {
-                    self.nav_tz_recenter(outer_id, inner, field, &cols, &rows);
+                    recenter(self, field);
                 }
                 if mapping && nav.is_rising("btn_west") && has_line {
-                    self.nav_tz_remove(outer_id, inner, field, &cols, &rows);
+                    if let Some((_, _, _, path)) = self.tz_tree_sel(outer_id, inner, field) {
+                        self.tz_tree_remove(outer_id, inner, field, &path);
+                    }
                 }
+                // RT/LT subdivide the selected zone (vertical / horizontal).
                 if mapping && (rt_rising || lt_rising) {
-                    self.nav_tz_add(outer_id, inner, field, rt_rising, &cols, &rows);
+                    use flexinput_core::touchzones::Axis;
+                    let axis = if rt_rising { Axis::V } else { Axis::H };
+                    self.tz_tree_add(outer_id, inner, field, axis);
                 }
             }
             EditLevel::TzGrab => {
                 if nav.is_rising("btn_south") || nav.is_rising("btn_east") {
                     self.gamepad_nav.edit_level = EditLevel::TzLines;
                 } else if nav.is_rising("btn_north") {
-                    self.nav_tz_recenter(outer_id, inner, field, &cols, &rows);
+                    recenter(self, field);
                 } else {
                     // dpad/LS along the line's perpendicular axis nudges it.
                     let axis = self.gamepad_nav.tz_axis;
@@ -4607,7 +4714,13 @@ impl FlexInputApp {
                         _ => 0.0,
                     };
                     if delta != 0.0 {
-                        self.nav_tz_move(outer_id, inner, field, delta, &cols, &rows);
+                        if mapping {
+                            if let Some((pos, lo, hi, path)) = self.tz_tree_sel(outer_id, inner, field) {
+                                self.tz_tree_set_t(outer_id, inner, field, &path, (pos + delta).clamp(lo, hi));
+                            }
+                        } else {
+                            self.nav_tz_move(outer_id, inner, field, delta, &cols, &rows);
+                        }
                     }
                 }
             }
@@ -4663,56 +4776,6 @@ impl FlexInputApp {
         self.tz_set_edges(outer, inner, field, which, &e);
     }
 
-    /// Remove the focused divider (mapping mode only) and reclamp the selection.
-    fn nav_tz_remove(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
-        field: usize, cols: &[f32], rows: &[f32])
-    {
-        let axis = self.gamepad_nav.tz_axis;
-        let line = self.gamepad_nav.tz_line;
-        let (which, edges) = if axis == 0 { ("col_edges", cols) } else { ("row_edges", rows) };
-        if line >= edges.len() { return; }
-        let mut e = edges.to_vec();
-        e.remove(line);
-        self.tz_set_edges(outer, inner, field, which, &e);
-        // Reclamp: stay on this axis if it still has lines, else hop to the other.
-        if e.is_empty() {
-            let other = if axis == 0 { rows.len() } else { cols.len() };
-            if other > 0 { self.gamepad_nav.tz_axis = 1 - axis; }
-            self.gamepad_nav.tz_line = 0;
-        } else {
-            self.gamepad_nav.tz_line = line.min(e.len() - 1);
-        }
-    }
-
-    /// Add a divider in the cell adjacent to the focused line (mapping mode). RT
-    /// splits the high side (right/below), LT the low side (left/above). With no
-    /// lines yet on the axis, adds one at centre.
-    fn nav_tz_add(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
-        field: usize, high_side: bool, cols: &[f32], rows: &[f32])
-    {
-        let axis = self.gamepad_nav.tz_axis;
-        let line = self.gamepad_nav.tz_line;
-        let (which, edges) = if axis == 0 { ("col_edges", cols) } else { ("row_edges", rows) };
-        let mut e = edges.to_vec();
-        if e.is_empty() {
-            e.push(0.5);
-            self.tz_set_edges(outer, inner, field, which, &e);
-            self.gamepad_nav.tz_line = 0;
-            return;
-        }
-        if line >= e.len() { return; }
-        let cur = e[line];
-        let (lo, hi) = if high_side {
-            (cur, if line + 1 == e.len() { 1.0 } else { e[line + 1] })
-        } else {
-            (if line == 0 { 0.0 } else { e[line - 1] }, cur)
-        };
-        let newv = (lo + hi) * 0.5;
-        let idx = e.iter().position(|&x| x > newv).unwrap_or(e.len());
-        e.insert(idx, newv);
-        self.tz_set_edges(outer, inner, field, which, &e);
-        self.gamepad_nav.tz_line = idx; // focus the new divider
-    }
 
     /// Cycle the SELECTED zone of the Touch Zones cards widget by `dir`, wrapping
     /// within the current pad's zone count.
