@@ -889,7 +889,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "module.automap_combiner" | "module.audio_stream_haptics"
                 | "module.network_send" | "module.network_recv"
                 | "module.remapper" | "module.map_action"
-                | "module.touch_zones" | "module.input_viewer"
+                | "module.touch_zones" | "module.input_viewer" | "module.menu"
                 | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
         )
     }
@@ -984,6 +984,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.touch_zones" => show_touch_zones_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "module.input_viewer" => super::input_viewer::show_input_viewer_body(
                 node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
+            "module.menu" => super::menu_body::show_menu_body(
+                node_id, ui, snarl, self.live_signals),
             "subpatch" => {
                 if show_subpatch_body(
                     node_id, ui, snarl,

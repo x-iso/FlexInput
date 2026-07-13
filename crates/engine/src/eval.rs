@@ -3198,6 +3198,20 @@ fn compute_node(
             // device walk, carries no Signal).
             (0..snap.n_outputs).map(|_| None).collect()
         }
+        "module.menu" => {
+            // Stub until the menu state machine lands: closed, nothing
+            // hovered, all zone pins low. Slot 0 stays the AutoMap
+            // passthrough sentinel (no Signal).
+            use flexinput_core::menu as fm;
+            (0..snap.n_outputs).map(|i| {
+                let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
+                match fm::parse_pin(pin_id)? {
+                    fm::Pin::Open => Some(Signal::Bool(false)),
+                    fm::Pin::Hover => Some(Signal::Float(-1.0)),
+                    fm::Pin::Zone { .. } => Some(Signal::Bool(false)),
+                }
+            }).collect()
+        }
         "module.touch_zones" => {
             use flexinput_core::touchzones as tz;
             // Same upstream resolution as the Splitter: prefer the closest
