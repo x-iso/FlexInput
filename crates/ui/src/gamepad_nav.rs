@@ -230,7 +230,12 @@ pub struct GamepadNav {
     /// navigated spatially (nearest-in-direction), not a row/col pair.
     pub kbm_picker_idx: usize,
     pub kbm_picker_node: Option<egui_snarl::NodeId>,
-    pub kbm_picker_outer: Option<egui_snarl::NodeId>,
+    /// Sub-patch path from the tab canvas to the snarl holding
+    /// `kbm_picker_node`: node ids of the subpatch chain, outermost first.
+    /// Empty = the node sits directly on the tab canvas. Replaces the old
+    /// single-level `outer` (which silently mis-addressed nodes nested more
+    /// than one sub-patch deep — drafts written to the wrong snarl).
+    pub kbm_picker_path: Vec<usize>,
     /// Draft param the picker appends to — `draft_output` for the Remapper,
     /// `_lean_<side>_draft` for a Lean section. And the phase param to flip into
     /// the learning/learning-equivalent state after a pick (Remapper: `ui_phase`
@@ -321,7 +326,7 @@ impl Default for GamepadNav {
             kbm_picker_open: false,
             kbm_picker_idx: 0,
             kbm_picker_node: None,
-            kbm_picker_outer: None,
+            kbm_picker_path: Vec::new(),
             kbm_picker_draft_key: String::from("draft_output"),
             kbm_picker_phase_key: None,
             kbm_picker_touch_zones: false,

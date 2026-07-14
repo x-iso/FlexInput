@@ -2308,9 +2308,9 @@ impl eframe::App for FlexInputApp {
         // closes on Add without a viewer→app close bridge. Only applies to the
         // TZ picker variant; the Remapper's picker is closed by its own Done.
         if self.gamepad_nav.kbm_picker_open && self.gamepad_nav.kbm_picker_touch_zones {
-            let outer = self.gamepad_nav.kbm_picker_outer;
+            let path = self.gamepad_nav.kbm_picker_path.clone();
             if let Some(inner) = self.gamepad_nav.kbm_picker_node {
-                let phase = self.picker_target_param_str(outer, inner, "_tz_phase");
+                let phase = self.picker_target_param_str(&path, inner, "_tz_phase");
                 if phase.as_deref() != Some("captured") {
                     self.gamepad_nav.kbm_picker_open = false;
                     self.gamepad_nav.kbm_picker_viewport = None;
@@ -4966,7 +4966,7 @@ impl FlexInputApp {
             self.gamepad_nav.edit_level = EditLevel::Widget;
             return;
         };
-        let phase = self.picker_target_param_str(Some(outer_id), inner, "_tz_phase")
+        let phase = self.picker_target_param_str(&[outer_id.0], inner, "_tz_phase")
             .unwrap_or_else(|| "idle".into());
         let has_mouse = self.nav_tz_has_mouse_card(outer_id, inner);
 
@@ -5059,7 +5059,7 @@ impl FlexInputApp {
                         // Gamepad-navigable KB/M picker on the main window.
                         self.open_special_picker(crate::canvas::viewer::SpecialPickerRequest {
                             inner,
-                            outer: Some(outer_id),
+                            path: vec![outer_id.0],
                             draft_key: "_tz_draft_out".to_string(),
                             phase_key: None,
                             touch_zones: true,
@@ -5230,7 +5230,7 @@ impl FlexInputApp {
                     self.gamepad_nav.kbm_picker_open = true;
                     self.gamepad_nav.kbm_picker_idx = 0;
                     self.gamepad_nav.kbm_picker_node = Some(inner);
-                    self.gamepad_nav.kbm_picker_outer = Some(outer_id);
+                    self.gamepad_nav.kbm_picker_path = vec![outer_id.0];
                     self.gamepad_nav.kbm_picker_touch_zones = false;
                     self.gamepad_nav.kbm_picker_exclude = None;
                     self.gamepad_nav.kbm_picker_viewport = None;
@@ -5349,8 +5349,8 @@ impl FlexInputApp {
         };
         self.gamepad_nav.kbm_picker_idx = idx;
 
-        // `outer = None` is valid (top-level node); only `inner` is required.
-        let outer = self.gamepad_nav.kbm_picker_outer;
+        // An empty path is valid (top-level node); only `inner` is required.
+        let path = self.gamepad_nav.kbm_picker_path.clone();
         let Some(inner) = self.gamepad_nav.kbm_picker_node else {
             self.gamepad_nav.kbm_picker_open = false;
             self.gamepad_nav.kbm_picker_viewport = None; return; };
@@ -5358,7 +5358,7 @@ impl FlexInputApp {
 
         // North resets the output chord.
         if nav.is_rising("btn_north") {
-            self.picker_set_draft(outer, inner, &draft_key, &[]);
+            self.picker_set_draft(&path, inner, &draft_key, &[]);
             return;
         }
         // South appends the focused pin (de-duped) + flips the widget into the
@@ -5433,65 +5433,68 @@ impl FlexInputApp {
         }
     }
 
-    // ── KB/M picker addressing (top-level OR sub-patch) ───────────────────
-    // The Special picker can target a Remapper/Lean node sitting directly on the
-    // tab canvas (`outer = None`) or one level deep inside a sub-patch
-    // (`outer = Some(subpatch_node_id)`). These wrappers branch on that so the
-    // same picker code serves both mouse and gamepad opens.
+    // ── KB/M picker addressing (arbitrary sub-patch depth) ────────────────
+    // The Special picker can target a node sitting directly on the tab canvas
+    // (`path = []`) or nested through any chain of sub-patches (`path` = the
+    // subpatch node ids, outermost first). The old single-level `outer`
+    // addressing silently wrote drafts into the wrong snarl for nodes more
+    // than one level deep — the picker "picked" but the body never saw it.
 
-    /// Read a string-array param as a Vec, from a top-level or sub-patch node.
-    fn picker_draft_vec(&self, outer: Option<egui_snarl::NodeId>,
-        inner: egui_snarl::NodeId, key: &str) -> Vec<String>
+    /// Resolve the picker's target node through its sub-patch path.
+    fn picker_node(&self, path: &[usize], inner: egui_snarl::NodeId)
+        -> Option<&crate::canvas::NodeData>
     {
-        match outer {
-            Some(o) => self.nav_remap_draft_vec(o, inner, key),
-            None => self.tabs[self.active_tab].canvas.snarl.get_node(inner)
-                .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default(),
+        let mut snarl = &self.tabs[self.active_tab].canvas.snarl;
+        for &p in path {
+            snarl = &snarl.get_node(egui_snarl::NodeId(p))?.subpatch.as_ref()?.snarl;
+        }
+        snarl.get_node(inner)
+    }
+
+    /// Mutable variant of [`Self::picker_node`].
+    fn picker_node_mut(&mut self, path: &[usize], inner: egui_snarl::NodeId)
+        -> Option<&mut crate::canvas::NodeData>
+    {
+        let mut snarl = &mut self.tabs[self.active_tab].canvas.snarl;
+        for &p in path {
+            snarl = &mut snarl.get_node_mut(egui_snarl::NodeId(p))?.subpatch.as_mut()?.snarl;
+        }
+        snarl.get_node_mut(inner)
+    }
+
+    /// Read a string-array param as a Vec from the picker's target node.
+    fn picker_draft_vec(&self, path: &[usize], inner: egui_snarl::NodeId, key: &str) -> Vec<String> {
+        self.picker_node(path, inner)
+            .and_then(|node| node.params.get(key).and_then(|v| v.as_array()))
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Write a string-array param on the picker's target node.
+    fn picker_set_draft(&mut self, path: &[usize], inner: egui_snarl::NodeId,
+        key: &str, vals: &[String])
+    {
+        if let Some(node) = self.picker_node_mut(path, inner) {
+            let arr: Vec<serde_json::Value> = vals.iter()
+                .map(|s| serde_json::Value::String(s.clone())).collect();
+            node.params.insert(key.to_string(), serde_json::Value::Array(arr));
         }
     }
 
-    /// Write a string-array param on a top-level or sub-patch node.
-    fn picker_set_draft(&mut self, outer: Option<egui_snarl::NodeId>,
-        inner: egui_snarl::NodeId, key: &str, vals: &[String])
+    /// Read a string param from the picker's target node.
+    fn picker_target_param_str(&self, path: &[usize], inner: egui_snarl::NodeId,
+        key: &str) -> Option<String>
     {
-        match outer {
-            Some(o) => self.set_subpatch_param_str_array(o, inner, key, vals),
-            None => {
-                if let Some(node) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(inner) {
-                    let arr: Vec<serde_json::Value> = vals.iter()
-                        .map(|s| serde_json::Value::String(s.clone())).collect();
-                    node.params.insert(key.to_string(), serde_json::Value::Array(arr));
-                }
-            }
-        }
+        self.picker_node(path, inner)
+            .and_then(|n| n.params.get(key).and_then(|v| v.as_str().map(String::from)))
     }
 
-    /// Read a string param from the picker's target node (top-level or sub-patch).
-    fn picker_target_param_str(&self, outer: Option<egui_snarl::NodeId>,
-        inner: egui_snarl::NodeId, key: &str) -> Option<String>
+    /// Write a string param on the picker's target node.
+    fn picker_set_param_str(&mut self, path: &[usize], inner: egui_snarl::NodeId,
+        key: &str, val: &str)
     {
-        let node = match outer {
-            Some(o) => self.tabs[self.active_tab].canvas.snarl.get_node(o)
-                .and_then(|n| n.subpatch.as_ref())
-                .and_then(|sp| sp.snarl.get_node(inner)),
-            None => self.tabs[self.active_tab].canvas.snarl.get_node(inner),
-        };
-        node.and_then(|n| n.params.get(key).and_then(|v| v.as_str().map(String::from)))
-    }
-
-    /// Write a string param on a top-level or sub-patch node.
-    fn picker_set_param_str(&mut self, outer: Option<egui_snarl::NodeId>,
-        inner: egui_snarl::NodeId, key: &str, val: &str)
-    {
-        match outer {
-            Some(o) => self.set_subpatch_param_str(o, inner, key, val),
-            None => {
-                if let Some(node) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(inner) {
-                    node.params.insert(key.to_string(), serde_json::Value::String(val.to_string()));
-                }
-            }
+        if let Some(node) = self.picker_node_mut(path, inner) {
+            node.params.insert(key.to_string(), serde_json::Value::String(val.to_string()));
         }
     }
 
@@ -5505,7 +5508,7 @@ impl FlexInputApp {
         self.gamepad_nav.kbm_picker_open = true;
         self.gamepad_nav.kbm_picker_idx = 0;
         self.gamepad_nav.kbm_picker_node = Some(req.inner);
-        self.gamepad_nav.kbm_picker_outer = req.outer;
+        self.gamepad_nav.kbm_picker_path = req.path;
         self.gamepad_nav.kbm_picker_draft_key = req.draft_key;
         self.gamepad_nav.kbm_picker_phase_key = req.phase_key;
         self.gamepad_nav.kbm_picker_touch_zones = req.touch_zones;
@@ -5517,7 +5520,6 @@ impl FlexInputApp {
     /// Lean sections are always analog (the lean gesture is the input); Remapper
     /// is analog only when its captured `draft_input` holds an analog source.
     fn picker_analog_input_ok(&self) -> bool {
-        let outer = self.gamepad_nav.kbm_picker_outer;
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return false; };
         if self.gamepad_nav.kbm_picker_touch_zones {
             return true; // Touch-zone position is inherently analog.
@@ -5525,7 +5527,7 @@ impl FlexInputApp {
         if self.gamepad_nav.kbm_picker_phase_key.is_some() {
             return true; // Lean: the gesture itself is analog.
         }
-        self.picker_draft_vec(outer, inner, "draft_input").iter()
+        self.picker_draft_vec(&self.gamepad_nav.kbm_picker_path.clone(), inner, "draft_input").iter()
             .any(|p| flexinput_engine::pin_is_analog_input(p))
     }
 
@@ -5537,18 +5539,23 @@ impl FlexInputApp {
         let analog_only = matches!(pin,
             "touch_swipe_x" | "touch_swipe_y" | "scroll_x" | "scroll_y");
         if analog_only && !self.picker_analog_input_ok() { return; }
-        let outer = self.gamepad_nav.kbm_picker_outer;
+        let path = self.gamepad_nav.kbm_picker_path.clone();
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return; };
         let draft_key = self.gamepad_nav.kbm_picker_draft_key.clone();
         let phase_key = self.gamepad_nav.kbm_picker_phase_key.clone();
-        let mut out = self.picker_draft_vec(outer, inner, &draft_key);
+        let mut out = self.picker_draft_vec(&path, inner, &draft_key);
         if !out.iter().any(|p| p == pin) { out.push(pin.to_string()); }
-        self.picker_set_draft(outer, inner, &draft_key, &out);
+        self.picker_set_draft(&path, inner, &draft_key, &out);
         // Swipe outputs require analog mode; the viewer's Add detects a swipe pin
         // in the draft and stamps `mode = "analog"` on the committed mapping.
+        // The `ui_phase` flip only means something to the Remapper's own state
+        // machine — a TZ/menu session (draft `_tz_draft_out`) must NOT get it.
         match phase_key.as_deref() {
-            Some(pk) => self.picker_set_param_str(outer, inner, pk, "ready"),
-            None => self.picker_set_param_str(outer, inner, "ui_phase", "learning"),
+            Some(pk) => self.picker_set_param_str(&path, inner, pk, "ready"),
+            None if draft_key == "draft_output" => {
+                self.picker_set_param_str(&path, inner, "ui_phase", "learning");
+            }
+            None => {}
         }
     }
 
@@ -8975,11 +8982,10 @@ impl FlexInputApp {
         let accent = ctx.style().visuals.selection.stroke.color;
 
         // Current output chord for the header preview (read from whichever draft
-        // param this picker session targets — top-level or sub-patch).
+        // param this picker session targets — any sub-patch depth).
         let dk = self.gamepad_nav.kbm_picker_draft_key.clone();
-        let outer = self.gamepad_nav.kbm_picker_outer;
         let chord: Vec<String> = match self.gamepad_nav.kbm_picker_node {
-            Some(i) => self.picker_draft_vec(outer, i, &dk),
+            Some(i) => self.picker_draft_vec(&self.gamepad_nav.kbm_picker_path, i, &dk),
             None => Vec::new(),
         };
         // Whether analog-only (swipe) cells are usable for this target.
@@ -12296,7 +12302,7 @@ fn build_processing_graph_rec(
             | "module.automap_fork" | "module.automap_selector"
             | "module.remapper" | "module.map_action"
             | "module.automap_collect" | "module.audio_stream_haptics"
-            | "module.touch_zones"
+            | "module.touch_zones" | "module.menu"
             | "module.network_send")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);

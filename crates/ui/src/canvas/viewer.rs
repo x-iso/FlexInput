@@ -3934,7 +3934,7 @@ pub(crate) fn render_touch_zone_cards(
                     }
                     request_special_picker(ui.ctx(), SpecialPickerRequest {
                         inner: node_id,
-                        outer: root_subpatch_id(automap_parent),
+                        path: subpatch_path(automap_parent),
                         draft_key: "_tz_draft_out".to_string(),
                         phase_key: None,
                         touch_zones: true,
@@ -3970,7 +3970,7 @@ pub(crate) fn render_touch_zone_cards(
                 if b.clicked() {
                     request_special_picker(ui.ctx(), SpecialPickerRequest {
                         inner: node_id,
-                        outer: root_subpatch_id(automap_parent),
+                        path: subpatch_path(automap_parent),
                         draft_key: "_tz_draft_out".to_string(),
                         phase_key: None,
                         touch_zones: true,
@@ -9470,7 +9470,7 @@ fn show_gyro_lean_mapping_section(
                 crate::canvas::viewer::request_special_picker(ui.ctx(),
                     crate::canvas::viewer::SpecialPickerRequest {
                         inner: node_id,
-                        outer: crate::canvas::viewer::root_subpatch_id(automap_parent),
+                        path: crate::canvas::viewer::subpatch_path(automap_parent),
                         draft_key: draft_key.to_string(),
                         phase_key: Some(phase_key.to_string()),
                         touch_zones: false,
@@ -11545,8 +11545,9 @@ fn render_pinned_element_impl(
                 .unwrap_or("auto").to_string();
             let skin = remapper_resolve_skin(inner_snarl, inner_id, &skin_param, bridged_parent);
             let dev = remapper_upstream_device_id(inner_snarl, inner_id, 0, bridged_parent);
+            let style = super::input_viewer::iv_style_of(inner_snarl.get_node(inner_id));
             super::input_viewer::paint_viewer_board(
-                ui, board, inner_id.0, dev.as_deref(), skin, live_signals,
+                ui, board, inner_id.0, dev.as_deref(), skin, &style, live_signals,
             );
             return;
         }
@@ -14636,9 +14637,10 @@ pub struct SpecialPickerRequest {
     /// The Remapper/Lean node id (within its own snarl).
     pub inner: NodeId,
     // (Default impl below — egui's `remove_temp` requires `Default`.)
-    /// The containing sub-patch node in the TAB canvas, or `None` when the node
-    /// sits directly on the tab canvas. Derived from the AutoMap parent chain.
-    pub outer: Option<NodeId>,
+    /// Sub-patch path from the tab canvas to the snarl holding `inner`
+    /// (node ids, outermost first; empty = the node sits directly on the tab
+    /// canvas). Derived from the AutoMap parent chain via [`subpatch_path`].
+    pub path: Vec<usize>,
     pub draft_key: String,
     /// Phase param key for Lean sections (`_lean_<side>_phase`); `None` for the
     /// Remapper (which uses `ui_phase`).
@@ -14659,9 +14661,24 @@ pub fn root_subpatch_id(parent: Option<&AutomapGlowParent<'_>>) -> Option<NodeId
     Some(cur.subpatch_node_id)
 }
 
+/// Full sub-patch path for an AutoMap parent chain: the subpatch node ids from
+/// the OUTERMOST level down to the node's immediate container (empty at the
+/// top level). Unlike [`root_subpatch_id`] this keeps every level, so the
+/// Special picker can address nodes nested arbitrarily deep.
+pub fn subpatch_path(parent: Option<&AutomapGlowParent<'_>>) -> Vec<usize> {
+    let mut rev = Vec::new();
+    let mut cur = parent;
+    while let Some(p) = cur {
+        rev.push(p.subpatch_node_id.0);
+        cur = p.prev;
+    }
+    rev.reverse();
+    rev
+}
+
 impl Default for SpecialPickerRequest {
     fn default() -> Self {
-        Self { inner: NodeId(0), outer: None, draft_key: String::new(), phase_key: None, touch_zones: false, exclude_pin_prefix: None }
+        Self { inner: NodeId(0), path: Vec::new(), draft_key: String::new(), phase_key: None, touch_zones: false, exclude_pin_prefix: None }
     }
 }
 
@@ -21940,7 +21957,7 @@ fn show_remapper_body(
                     crate::canvas::viewer::request_special_picker(ui.ctx(),
                         crate::canvas::viewer::SpecialPickerRequest {
                             inner: node_id,
-                            outer: crate::canvas::viewer::root_subpatch_id(automap_parent),
+                            path: crate::canvas::viewer::subpatch_path(automap_parent),
                             draft_key: "draft_output".to_string(),
                             phase_key: None,
                             touch_zones: false,
