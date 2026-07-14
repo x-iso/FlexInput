@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="100%" height="100%" viewBox="0 0 420 201" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;">
+    <g id="board" transform="matrix(1,0,0,0.771762,0,0)">
+        <path d="M420,12.957L420,247.043C420,254.194 415.519,260 410,260L10,260C4.481,260 0,254.194 0,247.043L0,12.957C0,5.806 4.481,0 10,0L410,0C415.519,0 420,5.806 420,12.957Z" style="fill:rgb(28,28,30);"/>
+    </g>
+    <g id="left_trigger" transform="matrix(1,0,0,1,-7.087175,32.457836)">
+        <path d="M44.1,18.6L44.1,75C44.1,76.656 42.756,78 41.1,78L21.9,78C20.244,78 18.9,76.656 18.9,75L18.9,18.6C18.9,16.944 20.244,15.6 21.9,15.6L41.1,15.6C42.756,15.6 44.1,16.944 44.1,18.6Z" style="fill:rgb(45,45,48);stroke:rgb(90,90,94);stroke-width:1px;"/>
+    </g>
+    <g id="right_trigger" transform="matrix(1,0,0,1,7.087175,32.457836)">
+        <path d="M401.1,18.6L401.1,75C401.1,76.656 399.756,78 398.1,78L378.9,78C377.244,78 375.9,76.656 375.9,75L375.9,18.6C375.9,16.944 377.244,15.6 378.9,15.6L398.1,15.6C399.756,15.6 401.1,16.944 401.1,18.6Z" style="fill:rgb(45,45,48);stroke:rgb(90,90,94);stroke-width:1px;"/>
+    </g>
+    <g id="btn_lb" transform="matrix(1.402775,0,0,1.402775,-84.582818,-18.997899)">
+        <circle cx="77.7" cy="31.2" r="13" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="btn_rb" transform="matrix(1.402775,0,0,1.402775,-84.582818,-18.997899)">
+        <circle cx="342.3" cy="31.2" r="13" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="touchpad" transform="matrix(1,0,0,1,0,-3.50269)">
+        <path d="M268.8,19.3L268.8,76.9C268.8,79.66 266.56,81.9 263.8,81.9L156.2,81.9C153.44,81.9 151.2,79.66 151.2,76.9L151.2,19.3C151.2,16.54 153.44,14.3 156.2,14.3L263.8,14.3C266.56,14.3 268.8,16.54 268.8,19.3Z" style="fill:rgb(40,40,40);stroke:rgb(90,90,94);stroke-width:1px;"/>
+    </g>
+    <g id="btn_back" transform="matrix(1,0,0,1,0,-10.40269)">
+        <circle cx="128.1" cy="31.2" r="10" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="btn_start" transform="matrix(1,0,0,1,0,-10.40269)">
+        <circle cx="291.9" cy="31.2" r="10" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="btn_guide" transform="matrix(1,0,0,1,0,30.59731)">
+        <circle cx="210" cy="114.4" r="13" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="btn_capture" transform="matrix(1,0,0,1,37.8,-14.60269)">
+        <circle cx="172.2" cy="119.6" r="9" style="fill:rgb(51,51,51);"/>
+    </g>
+    <g id="btn_mute" transform="matrix(1,0,0,1,-37.8,57.39731)">
+        <circle cx="247.8" cy="119.6" r="9" style="fill:rgb(51,51,51);"/>
+    </g>
+    <g id="dpad" transform="matrix(1.565217,0,0,1.565217,-15.733067,-116.30269)">
+        <circle cx="69.3" cy="119.6" r="23" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="btn_north" transform="matrix(1,0,0,1,-23.2,-48.70269)">
+        <circle cx="350.7" cy="89.7" r="12" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="btn_south" transform="matrix(1,0,0,1,-23.2,-48.70269)">
+        <circle cx="350.7" cy="149.5" r="12" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="btn_west" transform="matrix(1,0,0,1,-23.2,-48.70269)">
+        <circle cx="317.1" cy="119.6" r="12" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="btn_east" transform="matrix(1,0,0,1,-23.2,-48.70269)">
+        <circle cx="384.3" cy="119.6" r="12" style="fill:rgb(58,58,62);"/>
+    </g>
+    <g id="left_stick" transform="matrix(1,0,0,1,0,-41.10269)">
+        <circle cx="144.9" cy="191.1" r="36" style="fill:rgb(38,38,38);stroke:rgb(90,90,94);stroke-width:1px;"/>
+    </g>
+    <g id="right_stick" transform="matrix(1,0,0,1,0,-41.10269)">
+        <circle cx="275.1" cy="191.1" r="36" style="fill:rgb(38,38,38);stroke:rgb(90,90,94);stroke-width:1px;"/>
+    </g>
+    <g id="btn_paddle_l1" transform="matrix(1.143482,0,0,1.143482,8.289725,-129.640573)">
+        <circle cx="23.1" cy="239.2" r="9" style="fill:rgb(51,51,51);"/>
+    </g>
+    <g id="btn_paddle_l2" transform="matrix(1.143482,0,0,1.143482,-30.13128,-90.999333)">
+        <circle cx="56.7" cy="239.2" r="9" style="fill:rgb(51,51,51);"/>
+    </g>
+    <g id="btn_paddle_r2" transform="matrix(1.143482,0,0,1.143482,-30.13128,-90.999333)">
+        <circle cx="363.3" cy="239.2" r="9" style="fill:rgb(51,51,51);"/>
+    </g>
+    <g id="btn_paddle_r1" transform="matrix(1.143482,0,0,1.143482,-68.552285,-129.640573)">
+        <circle cx="396.9" cy="239.2" r="9" style="fill:rgb(51,51,51);"/>
+    </g>
+</svg>

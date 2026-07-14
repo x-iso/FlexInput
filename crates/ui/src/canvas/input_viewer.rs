@@ -7,10 +7,16 @@
 //! into its container (whole-container widget per the pinned-widget scaling
 //! contract — no `apply_widget_scale`).
 //!
-//! Cluster visibility is presence-based: a cluster renders when the resolved
-//! device currently exposes its pins in `live_signals` (touchpad strip, mute,
-//! capture, paddles), so a DS4 shows its pad and an Xbox pad doesn't. With no
-//! device wired, the base board renders dimmed with a hint.
+//! Board geometry is per skin family, baked from the user-editable layout
+//! SVGs `app/assets/input_viewer_{ps,x,sw}_layout.svg` (420×201 canvas,
+//! element ids = pin ids). Edit those files, then re-derive the [`Layout`]
+//! tables (each shape's group transform applied to its geometry).
+//!
+//! Cluster visibility is presence-based on top of the layout: a cluster
+//! renders when the layout has a slot for it AND the resolved device
+//! currently exposes its pins in `live_signals` (touchpad strip, mute,
+//! capture, paddles). With no device wired, the base board renders dimmed
+//! with a hint.
 
 use std::collections::HashMap;
 
@@ -27,10 +33,66 @@ use super::viewer::{
 type LiveSignals = HashMap<(String, String), Signal>;
 
 /// Design-space board size (logical px at scale 1). Everything inside is laid
-/// out in fractions of this rect, so any target rect with the same aspect
+/// out in design px of this rect, so any target rect with the same aspect
 /// renders identically.
 pub(crate) const BOARD_W: f32 = 420.0;
-pub(crate) const BOARD_H: f32 = 260.0;
+pub(crate) const BOARD_H: f32 = 201.0;
+
+// ── Per-skin layouts (design px, from the layout SVGs) ────────────────────────
+
+/// Skin-specific slot geometry. Chips are `(cx, cy, glyph_size)`; the touchpad
+/// slot is `(x, y, w, h)`. Shared geometry (triggers, bumpers, face diamond,
+/// right stick, paddles) is identical across the three source SVGs and lives
+/// inline in [`paint_viewer_board`].
+struct Layout {
+    touchpad: Option<(f32, f32, f32, f32)>,
+    back: (f32, f32, f32),
+    start: (f32, f32, f32),
+    guide: (f32, f32, f32),
+    capture: (f32, f32, f32),
+    mute: Option<(f32, f32, f32)>,
+    dpad: (f32, f32, f32),
+    left_stick: (f32, f32),
+}
+
+/// PlayStation: touchpad strip top-center, symmetric sticks, d-pad top-left,
+/// create/PS/mute stacked in the middle.
+const PS_LAYOUT: Layout = Layout {
+    touchpad: Some((151.2, 10.8, 117.6, 67.6)),
+    back: (128.1, 20.8, 20.0),
+    start: (291.9, 20.8, 20.0),
+    guide: (210.0, 145.0, 26.0),
+    capture: (210.0, 105.0, 18.0),
+    mute: Some((210.0, 177.0, 18.0)),
+    dpad: (92.7, 70.9, 72.0),
+    left_stick: (144.9, 150.0),
+};
+
+/// Xbox: no touchpad, asymmetric sticks (left stick top-left, d-pad low),
+/// big guide up top with share/mute below it.
+const X_LAYOUT: Layout = Layout {
+    touchpad: None,
+    back: (154.9, 44.9, 20.0),
+    start: (264.9, 44.9, 20.0),
+    guide: (210.0, 47.9, 35.6),
+    capture: (210.0, 105.0, 18.0),
+    mute: Some((210.0, 177.0, 18.0)),
+    dpad: (144.9, 150.0, 72.0),
+    left_stick: (92.7, 70.9),
+};
+
+/// Switch Pro: Xbox stick arrangement, capture/home as a symmetric pair, no
+/// mute.
+const SW_LAYOUT: Layout = Layout {
+    touchpad: None,
+    back: (154.9, 44.9, 20.0),
+    start: (264.9, 44.9, 20.0),
+    guide: (242.6, 78.3, 24.5),
+    capture: (177.4, 78.3, 24.5),
+    mute: None,
+    dpad: (144.9, 150.0, 72.0),
+    left_stick: (92.7, 70.9),
+};
 
 // ── Node body ─────────────────────────────────────────────────────────────────
 
@@ -71,7 +133,10 @@ pub(crate) fn paint_viewer_board(
     let ctx = ui.ctx().clone();
     let painter = ui.painter_at(rect);
     let s = rect.width() / BOARD_W; // uniform scale (aspect preserved)
-    let at = |fx: f32, fy: f32| egui::pos2(rect.left() + fx * rect.width(), rect.top() + fy * rect.height());
+    // Design px → screen.
+    let at = |x: f32, y: f32| {
+        egui::pos2(rect.left() + x / BOARD_W * rect.width(), rect.top() + y / BOARD_H * rect.height())
+    };
 
     let dev = dev_id.unwrap_or("");
     let has = |pin: &str| !dev.is_empty() && live_signals.contains_key(&(dev.to_string(), pin.to_string()));
@@ -88,6 +153,15 @@ pub(crate) fn paint_viewer_board(
         glow_smoothed(&ctx, node_uid, pin, target)
     };
 
+    let has_touch = has("touch1_x");
+    let layout = match skin {
+        Skin::Playstation => &PS_LAYOUT,
+        Skin::SwitchPro => &SW_LAYOUT,
+        // Touch-bearing pads outside the PS family still get the touchpad slot.
+        _ if has_touch => &PS_LAYOUT,
+        _ => &X_LAYOUT,
+    };
+
     // Board plate.
     let plate = ui.visuals().extreme_bg_color;
     painter.rect_filled(rect, 10.0 * s, plate.gamma_multiply(0.85));
@@ -100,74 +174,73 @@ pub(crate) fn paint_viewer_board(
 
     let accent = egui::Color32::from_rgb(255, 196, 90);
 
-    // ── Triggers: vertical fill bars in the top corners ──
+    // ── Triggers: vertical fill bars below the bumpers ──
     let lt = if has("left_trigger") { readf("left_trigger") } else if readb("btn_lt_dig") { 1.0 } else { 0.0 };
     let rt = if has("right_trigger") { readf("right_trigger") } else if readb("btn_rt_dig") { 1.0 } else { 0.0 };
-    paint_trigger_bar(&painter, egui::Rect::from_min_max(at(0.045, 0.06), at(0.105, 0.30)), lt, accent, s);
-    paint_trigger_bar(&painter, egui::Rect::from_min_max(at(0.895, 0.06), at(0.955, 0.30)), rt, accent, s);
+    paint_trigger_bar(&painter, egui::Rect::from_min_max(at(11.8, 48.1), at(37.0, 110.5)), lt, accent, s);
+    paint_trigger_bar(&painter, egui::Rect::from_min_max(at(383.0, 48.1), at(408.2, 110.5)), rt, accent, s);
 
-    // ── Bumpers ──
-    glyph_chip(ui, &painter, skin, "btn_lb", at(0.185, 0.12), 26.0 * s, glow("btn_lb"), accent);
-    glyph_chip(ui, &painter, skin, "btn_rb", at(0.815, 0.12), 26.0 * s, glow("btn_rb"), accent);
+    // ── Bumpers (top corners) ──
+    glyph_chip(ui, &painter, skin, "btn_lb", at(24.4, 24.8), 36.5 * s, glow("btn_lb"), accent);
+    glyph_chip(ui, &painter, skin, "btn_rb", at(395.6, 24.8), 36.5 * s, glow("btn_rb"), accent);
 
-    // ── Center column: touchpad strip (when present) or just menu chips ──
-    let has_touch = has("touch1_x");
+    // ── Touchpad strip (layout slot + device presence) ──
     if has_touch {
-        let pad = egui::Rect::from_min_max(at(0.36, 0.055), at(0.64, 0.315));
-        paint_touchpad_strip(&painter, pad, dev, live_signals, glow("btn_touchpad"), accent, s);
-        glyph_chip(ui, &painter, skin, "btn_back",  at(0.305, 0.12), 20.0 * s, glow("btn_back"), accent);
-        glyph_chip(ui, &painter, skin, "btn_start", at(0.695, 0.12), 20.0 * s, glow("btn_start"), accent);
-    } else {
-        glyph_chip(ui, &painter, skin, "btn_back",  at(0.42, 0.12), 20.0 * s, glow("btn_back"), accent);
-        glyph_chip(ui, &painter, skin, "btn_start", at(0.58, 0.12), 20.0 * s, glow("btn_start"), accent);
+        if let Some((tx, ty, tw, th)) = layout.touchpad {
+            let pad = egui::Rect::from_min_max(at(tx, ty), at(tx + tw, ty + th));
+            paint_touchpad_strip(&painter, pad, dev, live_signals, glow("btn_touchpad"), accent, s);
+        }
     }
+
+    // ── Menu chips ──
+    let (bx, by, bs) = layout.back;
+    glyph_chip(ui, &painter, skin, "btn_back", at(bx, by), bs * s, glow("btn_back"), accent);
+    let (sx, sy, ss) = layout.start;
+    glyph_chip(ui, &painter, skin, "btn_start", at(sx, sy), ss * s, glow("btn_start"), accent);
 
     // ── Guide cluster ──
-    glyph_chip(ui, &painter, skin, "btn_guide", at(0.50, 0.44), 26.0 * s, glow("btn_guide"), accent);
+    let (gx, gy, gs) = layout.guide;
+    glyph_chip(ui, &painter, skin, "btn_guide", at(gx, gy), gs * s, glow("btn_guide"), accent);
     if has("btn_capture") {
-        glyph_chip(ui, &painter, skin, "btn_capture", at(0.41, 0.46), 18.0 * s, glow("btn_capture"), accent);
+        let (cx, cy, cs) = layout.capture;
+        glyph_chip(ui, &painter, skin, "btn_capture", at(cx, cy), cs * s, glow("btn_capture"), accent);
     }
-    if has("btn_mute") {
-        glyph_chip(ui, &painter, skin, "btn_mute", at(0.59, 0.46), 18.0 * s, glow("btn_mute"), accent);
+    if let Some((mx, my, ms)) = layout.mute {
+        if has("btn_mute") {
+            glyph_chip(ui, &painter, skin, "btn_mute", at(mx, my), ms * s, glow("btn_mute"), accent);
+        }
     }
 
-    // ── D-pad: ONE glyph whose art switches to the pressed direction ──
-    // (the icon set ships a neutral cross + one variant per direction; on a
-    // diagonal the direction that rose most recently wins via glow ordering).
+    // ── D-pad: neutral base + per-direction highlight layers (the direction
+    // art ships as base-white paths + one colored path per pressed arm, so
+    // compositing the colored layers covers diagonals with no extra SVGs) ──
     {
-        let dirs = [
-            ("dpad_up", glow("dpad_up")), ("dpad_down", glow("dpad_down")),
-            ("dpad_left", glow("dpad_left")), ("dpad_right", glow("dpad_right")),
-        ];
-        let (pin, g) = dirs.iter()
-            .filter(|(p, _)| readb(p))
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(p, g)| (*p, *g))
-            .unwrap_or(("dpad", dirs.iter().map(|(_, g)| *g).fold(0.0f32, f32::max)));
-        glyph_chip(ui, &painter, skin, pin, at(0.165, 0.46), 46.0 * s, g, accent);
+        let (dx, dy, ds) = layout.dpad;
+        paint_dpad(ui, &painter, skin, at(dx, dy), ds * s, accent, &glow);
     }
 
     // ── Face diamond (right) ──
-    glyph_chip(ui, &painter, skin, "btn_north", at(0.835, 0.345), 24.0 * s, glow("btn_north"), accent);
-    glyph_chip(ui, &painter, skin, "btn_south", at(0.835, 0.575), 24.0 * s, glow("btn_south"), accent);
-    glyph_chip(ui, &painter, skin, "btn_west",  at(0.755, 0.46),  24.0 * s, glow("btn_west"), accent);
-    glyph_chip(ui, &painter, skin, "btn_east",  at(0.915, 0.46),  24.0 * s, glow("btn_east"), accent);
+    glyph_chip(ui, &painter, skin, "btn_north", at(327.5, 41.0), 24.0 * s, glow("btn_north"), accent);
+    glyph_chip(ui, &painter, skin, "btn_south", at(327.5, 100.8), 24.0 * s, glow("btn_south"), accent);
+    glyph_chip(ui, &painter, skin, "btn_west",  at(293.9, 70.9),  24.0 * s, glow("btn_west"), accent);
+    glyph_chip(ui, &painter, skin, "btn_east",  at(361.1, 70.9),  24.0 * s, glow("btn_east"), accent);
 
     // ── Stick scopes ──
     let ls = stick_vec(live_signals, dev, "left_stick", "left_stick_x", "left_stick_y");
     let rs = stick_vec(live_signals, dev, "right_stick", "right_stick_x", "right_stick_y");
-    paint_stick_scope(&painter, at(0.345, 0.735), 36.0 * s, ls, glow("btn_ls"), ui, accent);
-    paint_stick_scope(&painter, at(0.655, 0.735), 36.0 * s, rs, glow("btn_rs"), ui, accent);
+    let (lx, ly) = layout.left_stick;
+    paint_stick_scope(&painter, at(lx, ly), 36.0 * s, ls, glow("btn_ls"), ui, accent);
+    paint_stick_scope(&painter, at(275.1, 150.0), 36.0 * s, rs, glow("btn_rs"), ui, accent);
 
-    // ── Rear paddles (when present) ──
-    for (pin, fx, label) in [
-        ("btn_paddle_l1", 0.055, "P1"), ("btn_paddle_l2", 0.135, "P2"),
-        ("btn_paddle_r1", 0.945, "P1"), ("btn_paddle_r2", 0.865, "P2"),
+    // ── Rear paddles (when present): vertical pairs on the side edges ──
+    for (pin, px, py, label) in [
+        ("btn_paddle_l1", 34.7, 143.9, "P1"), ("btn_paddle_l2", 34.7, 182.5, "P2"),
+        ("btn_paddle_r1", 385.3, 143.9, "P1"), ("btn_paddle_r2", 385.3, 182.5, "P2"),
     ] {
         if has(pin) {
-            glyph_chip(ui, &painter, skin, pin, at(fx, 0.92), 18.0 * s, glow(pin), accent);
+            glyph_chip(ui, &painter, skin, pin, at(px, py), 20.6 * s, glow(pin), accent);
             painter.text(
-                at(fx, 0.92), egui::Align2::CENTER_CENTER, label,
+                at(px, py), egui::Align2::CENTER_CENTER, label,
                 egui::FontId::proportional(7.0 * s), egui::Color32::from_gray(210),
             );
         }
@@ -279,6 +352,40 @@ fn stick_vec(live_signals: &LiveSignals, dev: &str, vec_pin: &str, x_pin: &str, 
     egui::vec2(rf(x_pin), rf(y_pin))
 }
 
+/// Composite d-pad: the neutral cross as base, plus the colored layer of each
+/// pressed direction's SVG faded in by its glow (diagonals light two arms).
+fn paint_dpad(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    skin: Skin,
+    center: egui::Pos2,
+    size: f32,
+    accent: egui::Color32,
+    glow: &dyn Fn(&str) -> f32,
+) {
+    let dirs = [
+        ("dpad_up", glow("dpad_up")), ("dpad_down", glow("dpad_down")),
+        ("dpad_left", glow("dpad_left")), ("dpad_right", glow("dpad_right")),
+    ];
+    let gmax = dirs.iter().map(|(_, g)| *g).fold(0.0f32, f32::max);
+    if gmax > 0.02 {
+        painter.circle_filled(center, size * 0.62, accent.gamma_multiply(0.30 * gmax));
+        painter.circle_stroke(center, size * 0.62, egui::Stroke::new(1.0, accent.gamma_multiply(0.7 * gmax)));
+    }
+    let r = egui::Rect::from_center_size(center, egui::vec2(size, size));
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    if let Some(tex) = glyph_texture(ui, skin, "dpad", size) {
+        let b = (140.0 + 115.0 * gmax) as u8;
+        painter.image(tex.id(), r, uv, egui::Color32::from_gray(b));
+    }
+    for (pin, g) in dirs {
+        if g <= 0.02 { continue; }
+        if let Some(tex) = dpad_highlight_texture(ui, skin, pin, size) {
+            painter.image(tex.id(), r, uv, egui::Color32::WHITE.gamma_multiply(g));
+        }
+    }
+}
+
 /// Glyph chip: cached rasterized SVG for the pin, dimmed at rest, with an
 /// accent halo scaling with glow.
 fn glyph_chip(
@@ -327,6 +434,48 @@ fn glyph_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: f32) -> Opt
     let tex = ui.ctx().load_texture(format!("iv_glyph_{pin}"), img, egui::TextureOptions::LINEAR);
     ui.ctx().data_mut(|d| d.insert_temp(key, tex.clone()));
     Some(tex)
+}
+
+/// The colored ("pressed") layer of a directional d-pad SVG: same canvas, the
+/// base-white paths stripped so only the highlighted arm remains. Cached like
+/// [`glyph_texture`].
+fn dpad_highlight_texture(ui: &egui::Ui, skin: Skin, pin: &str, logical_size: f32) -> Option<egui::TextureHandle> {
+    let px = (logical_size * ui.ctx().pixels_per_point()).round().max(4.0) as u32;
+    let key = egui::Id::new(("iv_dpad_hl", skin.as_str(), pin, px));
+    if let Some(tex) = ui.ctx().data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+        return Some(tex);
+    }
+    let bytes = remapper_icons::pin_svg(skin, pin)?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    let highlight_only = strip_white_paths(text);
+    let img = rasterize_svg_recolored(&highlight_only, px, px, "override", egui::Color32::TRANSPARENT)?;
+    let tex = ui.ctx().load_texture(format!("iv_dpad_hl_{pin}"), img, egui::TextureOptions::LINEAR);
+    ui.ctx().data_mut(|d| d.insert_temp(key, tex.clone()));
+    Some(tex)
+}
+
+/// Remove `<path … fill="#FFFFFF" …/>` elements from an SVG, leaving only the
+/// colored paths (the icon set draws the pressed arm as its own colored path
+/// on top of white base paths).
+fn strip_white_paths(svg: &str) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(i) = rest.find("<path") {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        let end = tail.find("/>").map(|e| e + 2).unwrap_or(tail.len());
+        let (elem, after) = tail.split_at(end);
+        let lower = elem.to_ascii_lowercase();
+        let white = lower.contains("fill=\"#ffffff\"")
+            || lower.contains("fill=\"#fff\"")
+            || lower.contains("fill=\"white\"");
+        if !white {
+            out.push_str(elem);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Up-fast / down-slow smoothing, mirroring the canvas `pin_glow_smoothed`
