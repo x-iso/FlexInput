@@ -5451,8 +5451,13 @@ impl FlexInputApp {
         snarl.get_node(inner)
     }
 
-    /// Mutable variant of [`Self::picker_node`].
-    fn picker_node_mut(&mut self, path: &[usize], inner: egui_snarl::NodeId)
+    /// Mutable resolve through the TAB canvas only. While a sub-patch editor
+    /// window is open, the tab node's `sp.snarl` is a MIRROR — the editor's
+    /// own `canvas` is the live copy, cloned over the mirror on every editor
+    /// mutation (see `show_subpatch_editors`' write-back). Writing only here
+    /// gets silently wiped by that clone, so picker writes must go through
+    /// [`Self::picker_write`]; this is its building block.
+    fn picker_tab_node_mut(&mut self, path: &[usize], inner: egui_snarl::NodeId)
         -> Option<&mut crate::canvas::NodeData>
     {
         let mut snarl = &mut self.tabs[self.active_tab].canvas.snarl;
@@ -5460,6 +5465,55 @@ impl FlexInputApp {
             snarl = &mut snarl.get_node_mut(egui_snarl::NodeId(p))?.subpatch.as_mut()?.snarl;
         }
         snarl.get_node_mut(inner)
+    }
+
+    /// Open editor windows holding a live copy of the picker target: for each
+    /// prefix of `path` whose sub-patch chain is open as an editor chain
+    /// (top-level editor parented to the tab canvas, then children matched via
+    /// `parent_editor_idx`), the deepest matching editor's canvas contains the
+    /// target — reached by descending the REMAINING path elements as plain
+    /// subpatch fields. Returns `(editor index, consumed prefix len)` pairs.
+    fn picker_editor_hits(&self, path: &[usize]) -> Vec<(usize, usize)> {
+        let mut hits = Vec::new();
+        let mut parent: Option<usize> = None;
+        for (k, &p) in path.iter().enumerate() {
+            let Some(idx) = self.sub_patch_editors.iter().position(|e| {
+                e.tab_idx == self.active_tab
+                    && e.parent_editor_idx == parent
+                    && e.node_id.0 == p
+            }) else { break; };
+            hits.push((idx, k + 1));
+            parent = Some(idx);
+        }
+        hits
+    }
+
+    /// Apply `f` to EVERY live copy of the picker's target node: the tab
+    /// canvas (mirror) plus each open sub-patch editor canvas along `path`.
+    /// Keeping all copies identical means neither the editors' write-back
+    /// (editor → parent, on editor mutation) nor their pre-sync (parent →
+    /// editor, on parent mutation) can clobber a picked draft — the whole-
+    /// snarl clone in either direction carries the same data.
+    fn picker_write(&mut self, path: &[usize], inner: egui_snarl::NodeId,
+        f: &dyn Fn(&mut crate::canvas::NodeData))
+    {
+        fn descend<'a>(
+            mut snarl: &'a mut egui_snarl::Snarl<crate::canvas::NodeData>,
+            path: &[usize],
+        ) -> Option<&'a mut egui_snarl::Snarl<crate::canvas::NodeData>> {
+            for &p in path {
+                snarl = &mut snarl.get_node_mut(egui_snarl::NodeId(p))?
+                    .subpatch.as_mut()?.snarl;
+            }
+            Some(snarl)
+        }
+        if let Some(node) = self.picker_tab_node_mut(path, inner) { f(node); }
+        for (idx, consumed) in self.picker_editor_hits(path) {
+            let root = &mut self.sub_patch_editors[idx].canvas.snarl;
+            if let Some(node) = descend(root, &path[consumed..])
+                .and_then(|s| s.get_node_mut(inner))
+            { f(node); }
+        }
     }
 
     /// Read a string-array param as a Vec from the picker's target node.
@@ -5470,15 +5524,17 @@ impl FlexInputApp {
             .unwrap_or_default()
     }
 
-    /// Write a string-array param on the picker's target node.
+    /// Write a string-array param on the picker's target node (all live copies).
     fn picker_set_draft(&mut self, path: &[usize], inner: egui_snarl::NodeId,
         key: &str, vals: &[String])
     {
-        if let Some(node) = self.picker_node_mut(path, inner) {
-            let arr: Vec<serde_json::Value> = vals.iter()
-                .map(|s| serde_json::Value::String(s.clone())).collect();
-            node.params.insert(key.to_string(), serde_json::Value::Array(arr));
-        }
+        let arr: Vec<serde_json::Value> = vals.iter()
+            .map(|s| serde_json::Value::String(s.clone())).collect();
+        let val = serde_json::Value::Array(arr);
+        let key = key.to_string();
+        self.picker_write(path, inner, &move |node| {
+            node.params.insert(key.clone(), val.clone());
+        });
     }
 
     /// Read a string param from the picker's target node.
@@ -5489,13 +5545,15 @@ impl FlexInputApp {
             .and_then(|n| n.params.get(key).and_then(|v| v.as_str().map(String::from)))
     }
 
-    /// Write a string param on the picker's target node.
+    /// Write a string param on the picker's target node (all live copies).
     fn picker_set_param_str(&mut self, path: &[usize], inner: egui_snarl::NodeId,
         key: &str, val: &str)
     {
-        if let Some(node) = self.picker_node_mut(path, inner) {
-            node.params.insert(key.to_string(), serde_json::Value::String(val.to_string()));
-        }
+        let key = key.to_string();
+        let val = val.to_string();
+        self.picker_write(path, inner, &move |node| {
+            node.params.insert(key.clone(), serde_json::Value::String(val.clone()));
+        });
     }
 
     /// Open the shared KB/M + touchpad picker for a mouse-driven Special click.
@@ -14412,18 +14470,25 @@ fn show_subpatch_editors(
 
         if close_self { open = false; }
 
-        // A Special… button inside this editor requested the picker. Only
-        // first-level sub-patches (parented to the tab canvas) can be addressed
-        // by the picker's tab-canvas helpers; deeper nesting degrades to no-op.
-        // The session is owned by THIS viewport so the modal opens on the
-        // editor window the click came from, not the main window.
-        if let Some(req) = special_req {
-            if parent_editor_idx.is_none() {
-                app.open_special_picker(req, Some(viewport_id));
+        // A Special… button inside this editor requested the picker. The
+        // request's path was built from the editor's ONE-LEVEL AutoMap frame,
+        // so it starts at this editor's own node in its parent — prefix the
+        // ancestor editor chain so the picker helpers can resolve the target
+        // from the tab canvas at any nesting depth. The session is owned by
+        // THIS viewport so the modal opens on the editor window the click
+        // came from, not the main window.
+        if let Some(mut req) = special_req {
+            let mut full_path: Vec<usize> = Vec::new();
+            let mut cur = parent_editor_idx;
+            while let Some(p) = cur {
+                full_path.push(app.sub_patch_editors[p].node_id.0);
+                cur = app.sub_patch_editors[p].parent_editor_idx;
             }
+            full_path.reverse();
+            full_path.extend(req.path.iter().copied());
+            req.path = full_path;
+            app.open_special_picker(req, Some(viewport_id));
         }
-        // Apply picker interactions collected inside the viewport closure.
-        app.apply_kbm_picker_result(picker_result.0, picker_result.1);
 
         // Collect nested edit requests before putting inner_canvas back.
         if let Some(child_id) = inner_canvas.pending_edit_subpatch.take() {
@@ -14519,6 +14584,14 @@ fn show_subpatch_editors(
 
         app.sub_patch_editors[i].open = open;
         app.sub_patch_editors[i].canvas = inner_canvas;
+
+        // Apply picker interactions collected inside the viewport closure.
+        // Deliberately AFTER the canvas put-back above: `picker_write` fans a
+        // picked pin out to every live copy of the target node, including
+        // THIS editor's canvas — which until this point was mem::replace'd
+        // out, so an earlier apply would write into the empty placeholder
+        // and the draft would vanish when the real canvas returned.
+        app.apply_kbm_picker_result(picker_result.0, picker_result.1);
 
         // Port sync: always against parent snarl.
         match parent_editor_idx {
