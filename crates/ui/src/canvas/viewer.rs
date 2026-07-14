@@ -21183,7 +21183,7 @@ fn remapper_render_chord(ui: &mut egui::Ui, pins: &[String], skin: super::remapp
 ///   3. No SVG anywhere → fall back to a left-aligned text pill, gray.
 ///
 /// Returns the painted chip width (= `chip_h` for icons, larger for text).
-fn paint_chord_chip_to_rect(
+pub(crate) fn paint_chord_chip_to_rect(
     painter: &egui::Painter,
     ctx: &egui::Context,
     top_left: egui::Pos2,
@@ -21193,10 +21193,13 @@ fn paint_chord_chip_to_rect(
 ) -> f32 {
     use super::remapper_icons::{self, Skin};
 
-    // Macro-port pins: registry icon, else a pill with the port's NAME (the
-    // raw "macro:{id}" token means nothing to the user). Dangling ids (port
-    // deleted, mapping kept) paint a dimmed placeholder pill.
-    if flexinput_core::macros::parse_macro_pin(pin_id).is_some() {
+    // Macro-port pins (and macro-style Virtual-Menu targets): registry icon,
+    // else a pill with the port's NAME (the raw "macro:{id}" / "menu:{id}_show"
+    // token means nothing to the user). Dangling ids (port/menu deleted,
+    // mapping kept) paint a dimmed placeholder pill.
+    if flexinput_core::macros::parse_macro_pin(pin_id).is_some()
+        || flexinput_core::menu::parse_target_pin(pin_id).is_some()
+    {
         match crate::macro_icons::registry_entry(pin_id) {
             Some(entry) => {
                 if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
@@ -21210,7 +21213,7 @@ fn paint_chord_chip_to_rect(
                 }
                 return paint_text_pill(painter, top_left, chip_h, entry.name, false);
             }
-            None => return paint_text_pill(painter, top_left, chip_h, "macro?".to_string(), true),
+            None => return paint_text_pill(painter, top_left, chip_h, "target?".to_string(), true),
         }
     }
 
@@ -21407,6 +21410,17 @@ fn remapper_pin_display(pin_id: &str) -> String {
         "menu_sel"          => return "Select".into(),
         "menu_hover"        => return "Hover".into(),
         _ => {}
+    }
+    // Macro ports and Virtual-Menu targets: the raw "macro:{id}" /
+    // "menu:{id}_show" token means nothing to the user — show the registry
+    // name (the port's name / "Menu — Show"). Dangling ids fall through to
+    // the raw token, which at least marks the mapping as broken.
+    if flexinput_core::macros::parse_macro_pin(pin_id).is_some()
+        || flexinput_core::menu::parse_target_pin(pin_id).is_some()
+    {
+        if let Some(e) = crate::macro_icons::registry_entry(pin_id) {
+            return e.name;
+        }
     }
     // Fall back to a humanised form of the raw id. `key_space` → "Space",
     // `key_a` → "A", `key_f5` → "F5". Unknown prefix → return id as-is.

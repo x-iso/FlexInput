@@ -56,6 +56,8 @@ struct MenuInst {
     icon_svg: String,
     rect: [f32; 4],
     tree: tz::ZoneNode,
+    /// The node's mapping cards (`zone_maps`), for per-zone destination icons.
+    zone_maps: Vec<serde_json::Value>,
 }
 
 fn read_menu(node: &NodeData, outer: Option<NodeId>, inner: NodeId) -> MenuInst {
@@ -85,6 +87,7 @@ fn read_menu(node: &NodeData, outer: Option<NodeId>, inner: NodeId) -> MenuInst 
         icon_svg: pstr("menu_icon_svg"),
         rect,
         tree,
+        zone_maps: node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
     }
 }
 
@@ -298,11 +301,50 @@ fn paint_menu(ui: &mut egui::Ui, px: egui::Rect, m: &MenuInst, editing: bool) {
         } else {
             p.rect_stroke(zr, 5.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)), egui::StrokeKind::Inside);
         }
-        p.text(
-            zr.center(), egui::Align2::CENTER_CENTER, format!("{zid}"),
-            egui::FontId::proportional((zr.height() * 0.28).clamp(11.0, 26.0)),
-            if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(150) },
-        );
+
+        // Destination icons: every out pin across the zone's mapping cards,
+        // deduped in card order. KBM as the base skin — destinations are
+        // typically keys/mouse/macro targets; a virtual-pad pin still renders
+        // via the chip painter's any-skin fallback (dimmed).
+        let mut pins: Vec<String> = Vec::new();
+        for c in m.zone_maps.iter().filter(|c|
+            c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zid as u64)
+        {
+            for pin in c.get("out").and_then(|v| v.as_array()).into_iter().flatten()
+                .filter_map(|v| v.as_str())
+            {
+                if !pins.iter().any(|x| x == pin) { pins.push(pin.to_string()); }
+            }
+        }
+        if pins.is_empty() {
+            // Unmapped zone: faint index so it's still identifiable as a target.
+            p.text(
+                zr.center(), egui::Align2::CENTER_CENTER, format!("{zid}"),
+                egui::FontId::proportional((zr.height() * 0.28).clamp(11.0, 26.0)),
+                if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(150) },
+            );
+        } else {
+            let ic = (zr.height() * 0.42).clamp(14.0, 30.0);
+            let gap = 4.0;
+            // Show as many icons as fit; a trailing "…" marks the overflow.
+            let fit = (((zr.width() - 8.0 + gap) / (ic + gap)).floor() as usize)
+                .clamp(1, pins.len());
+            let truncated = fit < pins.len();
+            let total_w = fit as f32 * ic + (fit.saturating_sub(1)) as f32 * gap;
+            let mut x = zr.center().x - total_w * 0.5;
+            let y = zr.center().y - ic * 0.5;
+            for pin in pins.iter().take(fit) {
+                let w = crate::canvas::viewer::paint_chord_chip_to_rect(
+                    p, ui.ctx(), egui::pos2(x, y), ic, pin,
+                    crate::canvas::remapper_icons::Skin::Kbm,
+                );
+                x += w + gap;
+            }
+            if truncated {
+                p.text(egui::pos2(x, zr.center().y), egui::Align2::LEFT_CENTER, "…",
+                    egui::FontId::proportional(ic * 0.6), egui::Color32::from_gray(170));
+            }
+        }
     }
 
     // Name + icon chip above the plate.
