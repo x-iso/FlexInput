@@ -239,6 +239,10 @@ pub struct GamepadNav {
     pub kbm_picker_phase_key: Option<String>,
     /// Touch Zones variant: hide the touchpad cluster + offer mouse-movement delta.
     pub kbm_picker_touch_zones: bool,
+    /// Pin-id prefix whose cells render disabled for this picker session
+    /// (e.g. `menu:{id}` so a Virtual Menu can't target itself). `None` = all
+    /// cells usable.
+    pub kbm_picker_exclude: Option<String>,
     /// Viewport that requested (and therefore draws) the picker: `None` = the
     /// main window; `Some(id)` = a sub-patch editor viewport. The modal must be
     /// rendered inside the requesting viewport or it pops up on the wrong
@@ -321,6 +325,7 @@ impl Default for GamepadNav {
             kbm_picker_draft_key: String::from("draft_output"),
             kbm_picker_phase_key: None,
             kbm_picker_touch_zones: false,
+            kbm_picker_exclude: None,
             kbm_picker_viewport: None,
             press_mode_open: false,
             press_mode_idx: 0,

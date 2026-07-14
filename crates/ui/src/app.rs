@@ -5054,6 +5054,7 @@ impl FlexInputApp {
                             draft_key: "_tz_draft_out".to_string(),
                             phase_key: None,
                             touch_zones: true,
+                            exclude_pin_prefix: None,
                         }, None);
                     }
                     "gamepad" => {
@@ -5222,6 +5223,7 @@ impl FlexInputApp {
                     self.gamepad_nav.kbm_picker_node = Some(inner);
                     self.gamepad_nav.kbm_picker_outer = Some(outer_id);
                     self.gamepad_nav.kbm_picker_touch_zones = false;
+                    self.gamepad_nav.kbm_picker_exclude = None;
                     self.gamepad_nav.kbm_picker_viewport = None;
                     self.gamepad_nav.kbm_picker_draft_key =
                         lean_draft.unwrap_or("draft_output").to_string();
@@ -5267,6 +5269,7 @@ impl FlexInputApp {
     fn macro_display_entries(&self) -> Vec<crate::macro_icons::MacroDisplayEntry> {
         use flexinput_core::macros as mac;
         fn scan(snarl: &Snarl<NodeData>, out: &mut Vec<crate::macro_icons::MacroDisplayEntry>) {
+            use flexinput_core::menu as fm;
             for (_, node_ref) in snarl.nodes_ids_data() {
                 let n = &node_ref.value;
                 if n.module_id == "module.macro" {
@@ -5278,6 +5281,25 @@ impl FlexInputApp {
                             icon_svg: p.icon_svg,
                             signal_type: p.signal_type,
                         });
+                    }
+                }
+                // Virtual Menus are macro-style targets too: one Show + one
+                // Select entry per menu, wearing the menu's name + icon.
+                if n.module_id == "module.menu" {
+                    if let Some(mid) = n.params.get("menu_id").and_then(|v| v.as_str()) {
+                        let name = n.params.get("menu_name").and_then(|v| v.as_str()).unwrap_or("");
+                        let name = if name.is_empty() { "Menu" } else { name };
+                        let icon = n.params.get("menu_icon").and_then(|v| v.as_str()).unwrap_or("");
+                        let icon_svg = n.params.get("menu_icon_svg").and_then(|v| v.as_str()).unwrap_or("");
+                        for (t, verb) in [(fm::TargetPin::Show, "Show"), (fm::TargetPin::Select, "Select")] {
+                            out.push(crate::macro_icons::MacroDisplayEntry {
+                                pin: fm::target_pin(mid, t),
+                                name: format!("{name} — {verb}"),
+                                icon: icon.to_string(),
+                                icon_svg: icon_svg.to_string(),
+                                signal_type: flexinput_core::SignalType::Bool,
+                            });
+                        }
                     }
                 }
                 if let Some(sp) = n.subpatch.as_ref() {
@@ -5333,10 +5355,15 @@ impl FlexInputApp {
         // South appends the focused pin (de-duped) + flips the widget into the
         // phase that shows the draft + enables Add, WITHOUT running the gamepad
         // capture machine (so the South used to pick isn't swept into the chord).
-        // Analog-only cells (swipe) are ignored when the input isn't analog.
+        // Analog-only cells (swipe) are ignored when the input isn't analog;
+        // excluded cells (a menu's own targets) are never appendable.
         if nav.is_rising("btn_south") {
             let pin = cells[idx].pin.clone();
-            self.picker_append_pin(&pin);
+            let excluded = self.gamepad_nav.kbm_picker_exclude.as_deref()
+                .is_some_and(|p| pin.starts_with(p));
+            if !excluded {
+                self.picker_append_pin(&pin);
+            }
         }
     }
 
@@ -5473,6 +5500,7 @@ impl FlexInputApp {
         self.gamepad_nav.kbm_picker_draft_key = req.draft_key;
         self.gamepad_nav.kbm_picker_phase_key = req.phase_key;
         self.gamepad_nav.kbm_picker_touch_zones = req.touch_zones;
+        self.gamepad_nav.kbm_picker_exclude = req.exclude_pin_prefix;
         self.gamepad_nav.kbm_picker_viewport = viewport;
     }
 
@@ -9017,8 +9045,12 @@ impl FlexInputApp {
                     let size = egui::vec2(
                         cell.width * UNIT + (cell.width - 1.0) * GAP, UNIT);
                     let rect = egui::Rect::from_min_size(min, size);
-                    // Analog-only cells (swipe) are disabled unless the input is analog.
-                    let disabled = cell.analog_only && !analog_ok;
+                    // Analog-only cells (swipe) are disabled unless the input is
+                    // analog; excluded cells (a menu's own targets from its own
+                    // cards) are always disabled.
+                    let self_target = self.gamepad_nav.kbm_picker_exclude.as_deref()
+                        .is_some_and(|p| cell.pin.starts_with(p));
+                    let disabled = (cell.analog_only && !analog_ok) || self_target;
                     let resp = if disabled {
                         ui.interact(rect, egui::Id::new(("kbm_cell", i)), egui::Sense::hover())
                     } else {
@@ -9063,7 +9095,11 @@ impl FlexInputApp {
                             painter.text(rect.center(), egui::Align2::CENTER_CENTER,
                                 short, egui::FontId::proportional(10.0), ui.visuals().text_color());
                         }
-                        resp.on_hover_text(&entry.name);
+                        if self_target {
+                            resp.on_hover_text(format!("{} — a menu can't target itself", entry.name));
+                        } else {
+                            resp.on_hover_text(&entry.name);
+                        }
                         continue;
                     }
                     if let Some(tex) = kbm_cell_texture(ctx, skin, &cell.pin) {
@@ -12678,7 +12714,9 @@ fn build_processing_graph_rec(
     }
     let is_macro_publisher = |mid: &str| matches!(mid,
         "module.remapper" | "module.touch_zones" | "processing.gyro_3dof");
-    let is_macro_reader = |mid: &str| mid == "module.macro";
+    // Virtual Menus read their macro-style Show/Select targets from the same
+    // namespaces, so they order after the publishers exactly like Macro nodes.
+    let is_macro_reader = |mid: &str| mid == "module.macro" || mid == "module.menu";
     let macro_publishers: Vec<usize> = node_list.iter().enumerate().filter(|(_, (_, node))| {
         is_macro_publisher(&node.module_id)
             || node.subpatch.as_deref().is_some_and(|sp| subpatch_has_module(sp, &is_macro_publisher))

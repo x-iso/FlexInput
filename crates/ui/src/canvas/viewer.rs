@@ -3699,6 +3699,18 @@ pub(crate) fn render_touch_zone_cards(
     // Fixed mapping-card width — the header rows pin their right-aligned controls
     // to this, so the layout stays put when the touchpad widget is scaled up.
     const TZ_CARD_W: f32 = 358.0;
+    // Virtual Menu variant: the zone IS the trigger (token "menu_sel" — fires
+    // on menu selection), so there is no touch-gesture Learn phase. "Learn"
+    // arms the gamepad DESTINATION capture directly and "Assign…" opens the
+    // picker with this menu's own target pins disabled (no self-targeting).
+    let menu_mode = snarl.get_node(node_id).map(|n| n.module_id == "module.menu").unwrap_or(false);
+    let menu_excl: Option<String> = if menu_mode {
+        snarl.get_node(node_id)
+            .and_then(|n| n.params.get("menu_id").and_then(|v| v.as_str()))
+            .map(|id| format!("menu:{id}"))
+    } else {
+        None
+    };
     let (sel_f, sel_z) = tz_read_selection(snarl, node_id);
     let single = snarl.get_node(node_id)
         .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) != Some("split");
@@ -3712,7 +3724,8 @@ pub(crate) fn render_touch_zone_cards(
 
     // ── Learn state machine ───────────────────────────────────────────────
     // idle → Learn → (demonstrate on pad) → captured → Assign / gamepad → commit.
-    if phase == "learning" {
+    // (Menu nodes never enter "learning" — their trigger is fixed.)
+    if !menu_mode && phase == "learning" {
         if let Some(trig) = tz_learn_capture(snarl, node_id, live_signals, dev.as_deref()) {
             // The zone the gesture STARTED on becomes the mapping's target — matching
             // the Learn hint "demonstrate … on a zone". Located from the captured
@@ -3829,13 +3842,16 @@ pub(crate) fn render_touch_zone_cards(
         ui.label(egui::RichText::new(format!("{label} mappings")).strong().color(accent));
         // Hold-zone toggle: keep a gesture that STARTS in this zone bound to it
         // even if the finger slides into a neighbour (so the neighbour's mapping
-        // doesn't also fire). Affects touch/click triggers.
-        let mut hold = tz_zone_held(snarl, node_id, sel_f, sel_z);
-        let cb = ui.checkbox(&mut hold, "Hold")
-            .on_hover_text("Hold zone: a touch that starts in this zone stays bound to it for the whole gesture, even if the finger slides into another zone — so the other zone won't trigger. Gamepad: focus it and press South to toggle.");
-        hold_rect = Some(cb.rect);
-        if cb.changed() {
-            tz_set_zone_held(snarl, node_id, sel_f, sel_z, hold);
+        // doesn't also fire). Affects touch/click triggers — a touch-gesture
+        // concept, so hidden on menu nodes (a menu pointer just highlights).
+        if !menu_mode {
+            let mut hold = tz_zone_held(snarl, node_id, sel_f, sel_z);
+            let cb = ui.checkbox(&mut hold, "Hold")
+                .on_hover_text("Hold zone: a touch that starts in this zone stays bound to it for the whole gesture, even if the finger slides into another zone — so the other zone won't trigger. Gamepad: focus it and press South to toggle.");
+            hold_rect = Some(cb.rect);
+            if cb.changed() {
+                tz_set_zone_held(snarl, node_id, sel_f, sel_z, hold);
+            }
         }
         // Migrate: move THIS zone's mappings onto another zone you tap/click next.
         if tz_pick_kind(snarl, node_id).as_deref() == Some("migrate") {
@@ -3853,10 +3869,23 @@ pub(crate) fn render_touch_zone_cards(
             }
             "captured" => {
                 ui.label(egui::RichText::new("·").weak());
-                remapper_render_chip(ui, &trigger, skin);
-                ui.label(egui::RichText::new("→").weak());
+                if menu_mode {
+                    // The trigger is implicit (this zone's selection) — show
+                    // where the output goes instead of a trigger chip.
+                    ui.label(egui::RichText::new("on select →").weak());
+                } else {
+                    remapper_render_chip(ui, &trigger, skin);
+                    ui.label(egui::RichText::new("→").weak());
+                }
                 if draft_out.is_empty() {
-                    ui.label(egui::RichText::new("(pick output)").italics().weak());
+                    let hint = if menu_mode
+                        && getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false)
+                    {
+                        "press a gamepad button…"
+                    } else {
+                        "(pick output)"
+                    };
+                    ui.label(egui::RichText::new(hint).italics().weak());
                 } else {
                     remapper_render_chord(ui, &draft_out, skin);
                 }
@@ -3880,6 +3909,39 @@ pub(crate) fn render_touch_zone_cards(
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
         match phase.as_str() {
+            "idle" if menu_mode => {
+                // Menu: the trigger is this zone's selection — go straight to
+                // picking the DESTINATION (gamepad learn or the picker).
+                let b = ui.button("Learn")
+                    .on_hover_text("Learn a gamepad button as this zone's output — press one on the pad.");
+                act_rects.push(b.rect);
+                if b.clicked() {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("_tz_phase".into(), Value::from("captured"));
+                        node.params.insert("_tz_trig".into(), Value::from("menu_sel"));
+                        node.params.insert("_tz_gp_arm".into(), Value::from(true));
+                        for k in ["_tz_draft_out", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
+                    }
+                }
+                let b = ui.button("Assign…")
+                    .on_hover_text("Pick keyboard / mouse / stick / macro outputs for this zone. Pick several for a chord, then Add.");
+                act_rects.push(b.rect);
+                if b.clicked() {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("_tz_phase".into(), Value::from("captured"));
+                        node.params.insert("_tz_trig".into(), Value::from("menu_sel"));
+                        node.params.remove("_tz_draft_out");
+                    }
+                    request_special_picker(ui.ctx(), SpecialPickerRequest {
+                        inner: node_id,
+                        outer: root_subpatch_id(automap_parent),
+                        draft_key: "_tz_draft_out".to_string(),
+                        phase_key: None,
+                        touch_zones: true,
+                        exclude_pin_prefix: menu_excl.clone(),
+                    });
+                }
+            }
             "idle" => {
                 let b = ui.button("Learn")
                     .on_hover_text("Demonstrate a touch, click, or swipe on a zone, then assign an output.");
@@ -3912,6 +3974,7 @@ pub(crate) fn render_touch_zone_cards(
                         draft_key: "_tz_draft_out".to_string(),
                         phase_key: None,
                         touch_zones: true,
+                        exclude_pin_prefix: menu_excl.clone(),
                     });
                 }
                 let armed = getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -3982,12 +4045,20 @@ pub(crate) fn render_touch_zone_cards(
     let mut dirty = false;
     let mut remove: Option<usize> = None; // full-array index
     if display.is_empty() && phase == "idle" {
-        ui.label(egui::RichText::new("No mappings — press Learn, then demonstrate on a zone.").weak());
+        let hint = if menu_mode {
+            "No mappings — Learn a gamepad output or Assign… one for this zone."
+        } else {
+            "No mappings — press Learn, then demonstrate on a zone."
+        };
+        ui.label(egui::RichText::new(hint).weak());
     }
     let reorder_enabled = display.len() > 1;
     // Live deflection magnitude of the selected zone — the preview dot on any
     // open card curve editor. Computed once for the whole card list.
-    let tz_live_mag: Option<f32> = {
+    let tz_live_mag: Option<f32> = if menu_mode {
+        // Menu zones have no touch deflection; the curve preview dot stays put.
+        None
+    } else {
         // Adaptive-centre deflection magnitude of the selected zone (published by
         // tz_live_hits), so the preview dot's input matches the engine — relative
         // or absolute per the zone's setting, not a raw absolute position.
@@ -9403,6 +9474,7 @@ fn show_gyro_lean_mapping_section(
                         draft_key: draft_key.to_string(),
                         phase_key: Some(phase_key.to_string()),
                         touch_zones: false,
+                        exclude_pin_prefix: None,
                     });
             }
         }
@@ -14574,6 +14646,9 @@ pub struct SpecialPickerRequest {
     /// Touch Zones variant: hide the touchpad cluster (a touchpad can't remap to
     /// itself) and offer mouse-movement delta as an output. Default false.
     pub touch_zones: bool,
+    /// Pin-id prefix whose cells render disabled for this session (e.g.
+    /// `menu:{id}` so a Virtual Menu's own cards can't target that menu).
+    pub exclude_pin_prefix: Option<String>,
 }
 
 /// Outermost (tab-canvas-level) sub-patch node id for an AutoMap parent chain,
@@ -14586,7 +14661,7 @@ pub fn root_subpatch_id(parent: Option<&AutomapGlowParent<'_>>) -> Option<NodeId
 
 impl Default for SpecialPickerRequest {
     fn default() -> Self {
-        Self { inner: NodeId(0), outer: None, draft_key: String::new(), phase_key: None, touch_zones: false }
+        Self { inner: NodeId(0), outer: None, draft_key: String::new(), phase_key: None, touch_zones: false, exclude_pin_prefix: None }
     }
 }
 
@@ -19858,11 +19933,14 @@ fn remapper_kbm_pressed_now(
 fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_icons::Skin) {
     use super::remapper_icons;
     const CHIP_H: f32 = 28.0;
-    // Macro-port pins: resolve name + icon through the per-frame registry
-    // (published by app.rs). Icon chip with the name as tooltip, or a plain
-    // name label when the port has no icon. A dangling id (port deleted while
-    // the mapping still references it) renders a struck placeholder.
-    if flexinput_core::macros::parse_macro_pin(pin_id).is_some() {
+    // Macro-port pins (and macro-style Virtual-Menu targets): resolve name +
+    // icon through the per-frame registry (published by app.rs). Icon chip with
+    // the name as tooltip, or a plain name label when the port has no icon. A
+    // dangling id (port deleted while the mapping still references it) renders
+    // a struck placeholder.
+    if flexinput_core::macros::parse_macro_pin(pin_id).is_some()
+        || flexinput_core::menu::parse_target_pin(pin_id).is_some()
+    {
         match crate::macro_icons::registry_entry(pin_id) {
             Some(entry) => {
                 let hover = format!("{} ({})", entry.name, entry.signal_type.display_name());
@@ -19879,8 +19957,8 @@ fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: super::remapper_i
                 }
             }
             None => {
-                ui.label(egui::RichText::new("macro?").size(13.0).weak().strikethrough())
-                    .on_hover_text("This macro port no longer exists");
+                ui.label(egui::RichText::new("target?").size(13.0).weak().strikethrough())
+                    .on_hover_text("This macro port / menu no longer exists");
             }
         }
         return;
@@ -21308,6 +21386,9 @@ fn remapper_pin_display(pin_id: &str) -> String {
         "touch_right"       => return "Touchpad Right (Touch)".into(),
         "touch_swipe_x"     => return "Touchpad Swipe ↔".into(),
         "touch_swipe_y"     => return "Touchpad Swipe ↕".into(),
+        // Virtual Menu card trigger tokens (the zone's selection / highlight).
+        "menu_sel"          => return "Select".into(),
+        "menu_hover"        => return "Hover".into(),
         _ => {}
     }
     // Fall back to a humanised form of the raw id. `key_space` → "Space",
@@ -21863,6 +21944,7 @@ fn show_remapper_body(
                             draft_key: "draft_output".to_string(),
                             phase_key: None,
                             touch_zones: false,
+                            exclude_pin_prefix: None,
                         });
                 }
             }

@@ -57,6 +57,46 @@ pub fn zone_pin_label(id: u32, comp: MenuComp) -> String {
     }
 }
 
+// ── Macro-style target pins ──────────────────────────────────────────────────
+//
+// A menu is CONTROLLED from other mapping modules (Remapper / Touch Zones /
+// Lean) the way Macro ports are targeted: its identity (menu_id param) backs
+// stable pin ids that appear in mapping `out` arrays and route into the shared
+// macro collector namespaces instead of the AutoMap bus. The menu evaluator
+// reads them back by its own id. Ids are save-format — never rename.
+
+/// Which aspect of the menu a target pin drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPin {
+    /// Bool — the menu's Show control (open per `activation_mode`).
+    Show,
+    /// Bool — the menu's Select control (commit per `select_on`).
+    Select,
+}
+
+/// Target pin id, e.g. `target_pin("1f3a9c2b", TargetPin::Show) ==
+/// "menu:1f3a9c2b_show"`.
+pub fn target_pin(menu_id: &str, t: TargetPin) -> String {
+    match t {
+        TargetPin::Show => format!("menu:{menu_id}_show"),
+        TargetPin::Select => format!("menu:{menu_id}_sel"),
+    }
+}
+
+/// Parse a macro-style menu target pin into `(menu_id, aspect)`.
+pub fn parse_target_pin(pin: &str) -> Option<(&str, TargetPin)> {
+    let rest = pin.strip_prefix("menu:")?;
+    let (id, comp) = rest.rsplit_once('_')?;
+    if id.is_empty() {
+        return None;
+    }
+    match comp {
+        "show" => Some((id, TargetPin::Show)),
+        "sel" => Some((id, TargetPin::Select)),
+        _ => None,
+    }
+}
+
 /// Parse a dynamic port id into a [`Pin`]. Returns `None` for the passthrough
 /// sentinel or any unrecognized id.
 pub fn parse_pin(id: &str) -> Option<Pin> {
@@ -95,5 +135,21 @@ mod tests {
         );
         assert_eq!(parse_pin("m3_bogus"), None);
         assert_eq!(parse_pin("z0_x"), None);
+    }
+
+    #[test]
+    fn target_pins_roundtrip() {
+        assert_eq!(
+            parse_target_pin(&target_pin("1f3a9c2b", TargetPin::Show)),
+            Some(("1f3a9c2b", TargetPin::Show))
+        );
+        assert_eq!(
+            parse_target_pin(&target_pin("1f3a9c2b", TargetPin::Select)),
+            Some(("1f3a9c2b", TargetPin::Select))
+        );
+        assert_eq!(parse_target_pin("menu:_show"), None);
+        assert_eq!(parse_target_pin("menu:abc_bogus"), None);
+        assert_eq!(parse_target_pin("macro:abc"), None);
+        assert_eq!(parse_target_pin("menu_open"), None);
     }
 }

@@ -4524,6 +4524,15 @@ fn sig_magnitude(s: Signal) -> f32 {
     }
 }
 
+/// True for any out-pin that routes into the macro collector namespaces
+/// instead of the AutoMap bus: Macro ports (`macro:{id}`) and Virtual-Menu
+/// targets (`menu:{id}_show` / `_sel`). Every publish/skip gate in the mapping
+/// evaluators goes through this so the two pin families behave identically.
+fn is_macro_style_target(pin: &str) -> bool {
+    flexinput_core::macros::parse_macro_pin(pin).is_some()
+        || flexinput_core::menu::parse_target_pin(pin).is_some()
+}
+
 fn merge_macro_ns(
     collector_sigs: &mut HashMap<(String, String), Signal>,
     ns: &str,
@@ -4951,7 +4960,7 @@ fn eval_remapper_node(
                     // Macro-port target: publish the live input magnitude into
                     // the macro namespace and skip the bus handling below
                     // (macro pins never reach sinks or the release pass).
-                    if flexinput_core::macros::parse_macro_pin(out_p).is_some() {
+                    if is_macro_style_target(out_p) {
                         let mag = if analog_axis_for_cardinal(in_p).is_some() {
                             analog_cardinal_input_value(&upstream, in_p)
                         } else {
@@ -5053,7 +5062,7 @@ fn eval_remapper_node(
                             if touchpad_out_kind(s).is_some() { continue; } // synthesized below
                             // Macro pins skip the bus release pass entirely —
                             // absent from the macro namespace = released.
-                            if flexinput_core::macros::parse_macro_pin(s).is_some() { continue; }
+                            if is_macro_style_target(s) { continue; }
                             digital_all_out_pins.insert(s.to_string());
                         }
                     }
@@ -5071,7 +5080,7 @@ fn eval_remapper_node(
             // the macro namespace (press-mode shaping already applied via
             // `effective[]` → `triggered`). Bus pins continue below.
             for p in &digital_asserted {
-                if flexinput_core::macros::parse_macro_pin(p).is_some() {
+                if is_macro_style_target(p) {
                     merge_macro_scalar(collector_sigs, p, Signal::Bool(true));
                 }
             }
@@ -5130,7 +5139,7 @@ fn eval_remapper_node(
                             if analog_axis_for_cardinal(s).is_none()
                                 && analog_trigger_out(s).is_none()
                                 && touchpad_out_kind(s).is_none()
-                                && flexinput_core::macros::parse_macro_pin(s).is_none()
+                                && !is_macro_style_target(s)
                             {
                                 analog_button_pins.insert(s.to_string());
                             }
@@ -5529,7 +5538,7 @@ fn eval_touch_zones_map_node(
                     // aspect; the zone's (curve-shaped) relative deflection
                     // publishes the Vec2 aspect for Vec2/Float ports. Macro
                     // pins never enter `button_on` — they aren't bus pins.
-                    if flexinput_core::macros::parse_macro_pin(p).is_some() {
+                    if is_macro_style_target(p) {
                         if held {
                             merge_macro_scalar(collector_sigs, p, Signal::Bool(true));
                         }
@@ -6132,7 +6141,7 @@ fn lean_dispatch_into_collector_sigs(
                     if touchpad_out_kind(s).is_some() { continue; } // synthesized below
                     // Macro pins skip the bus release pass — absent from the
                     // macro namespace = released.
-                    if flexinput_core::macros::parse_macro_pin(s).is_some() { continue; }
+                    if is_macro_style_target(s) { continue; }
                     all_out_pins.insert(s.to_string());
                     if let Some((axis_pin, _)) = analog_axis_for_cardinal(s) {
                         all_out_pins.insert(axis_pin.to_string());
@@ -6218,7 +6227,7 @@ fn lean_dispatch_into_collector_sigs(
                 // direction is implied by which side's mapping fires); other
                 // press modes assert while the shaped gate is open. Macro
                 // pins never enter `asserted` — they aren't bus pins.
-                if flexinput_core::macros::parse_macro_pin(p).is_some() {
+                if is_macro_style_target(p) {
                     if is_analog_mode {
                         // The activation gate is already encoded upstream:
                         // analog_val_opt is Some(0.0) when the card's gate

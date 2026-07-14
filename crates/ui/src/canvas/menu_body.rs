@@ -10,15 +10,20 @@
 //! pads; that slot holds the menu options and, later, the RADIAL toggle).
 //!
 //! The difference is the DRIVER: instead of the upstream device's touchpad,
-//! the menu is pointed at by whatever analog input the user maps to it as a
-//! macro-style named target (plus wired Show/Select pins as alternates), and
-//! it renders on its own screen overlay while open. The zone-live highlight
-//! here comes from the node's own eval mirror (Open/Hover outputs), not from
-//! touch pins.
+//! the menu's pointer comes from a chosen analog input of the upstream device
+//! (`pointer_source`: LS / RS / touch 1 / touch 2) or the wired Pointer Vec2
+//! inlet, and its Show/Select controls are macro-style named targets
+//! (menu:{menu_id}_show / _sel — assignable from Remapper / Touch Zones /
+//! Lean via the Special picker, where the menu wears its name + icon) plus
+//! the wired Show/Select pins as alternates. It renders on its own screen
+//! overlay while open. The zone-live highlight here comes from the node's own
+//! eval mirror (Open/Hover outputs), not from touch pins.
 //!
 //! Menu-specific params (on top of the TZ set):
+//!   menu_id — stable identity behind the target pin ids (save-format)
 //!   menu_name, menu_icon, menu_icon_svg — identity (Macro pattern)
 //!   activation_mode: "hold" | "toggle" | "touch"
+//!   pointer_source: "left_stick" | "right_stick" | "touch1" | "touch2"
 //!   select_on: "release" | "press" | "click"
 //!   pointer_deadzone: f32
 //!   suppress_while_open: bool
@@ -131,6 +136,14 @@ pub(crate) fn show_menu_body(
     // Lazy default init: single-field 2×2 grid, MAPPING mode (the menu's
     // headline use — zones firing outputs without wiring).
     if let Some(node) = snarl.get_node_mut(node_id) {
+        // Stable identity behind the macro-style target pins
+        // (menu:{id}_show/_sel) — generated once, survives rename.
+        if !node.params.contains_key("menu_id") {
+            node.params.insert(
+                "menu_id".to_string(),
+                serde_json::json!(flexinput_core::macros::new_port_id()),
+            );
+        }
         if !node.params.contains_key("col_edges") {
             node.params.insert("zone_mode".to_string(), serde_json::json!("mapping"));
             node.params.insert("field_mode".to_string(), serde_json::json!("single"));
@@ -283,6 +296,36 @@ fn show_menu_identity_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
             .hint_text("Menu name")
             .desired_width(140.0));
         if resp.changed() { name_changed = true; }
+
+        // Pointer source: which analog input of the upstream device drives the
+        // highlight while the menu is open (the wired Pointer inlet, when
+        // connected, wins over this).
+        let src = {
+            let Some(node) = snarl.get_node(node_id) else { return };
+            pstr(node, "pointer_source", "left_stick").to_string()
+        };
+        ui.label(egui::RichText::new("Driven by").small().weak())
+            .on_hover_text("Which analog input points at zones while the menu is open.\nThe wired Pointer inlet overrides this when connected.");
+        egui::ComboBox::from_id_salt((node_id, "menu_ptr_src"))
+            .selected_text(match src.as_str() {
+                "right_stick" => "RS",
+                "touch1" => "Touch 1",
+                "touch2" => "Touch 2",
+                _ => "LS",
+            })
+            .width(76.0)
+            .show_ui(ui, |ui| {
+                for (val, label) in [
+                    ("left_stick", "LS"), ("right_stick", "RS"),
+                    ("touch1", "Touch 1"), ("touch2", "Touch 2"),
+                ] {
+                    if ui.selectable_label(src == val, label).clicked() {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            node.params.insert("pointer_source".into(), serde_json::json!(val));
+                        }
+                    }
+                }
+            });
     });
     if name_changed || new_icon.is_some() {
         if let Some(node) = snarl.get_node_mut(node_id) {

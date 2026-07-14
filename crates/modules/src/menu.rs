@@ -25,13 +25,15 @@ fn reg<M: Module + Default + 'static>() -> ModuleRegistration {
 //               `menu_hover` (held while highlighted).
 //
 // Persisted params (all optional with defaults; ids are save-format):
+//   menu_id                               — stable id behind the macro-style
+//                                           target pins menu:{id}_show/_sel
 //   menu_name, menu_icon                  — label + icon (Macro pattern)
 //   col_edges, row_edges, zone_tree       — zone geometry (TZ keys, field 0 only)
 //   zone_mode: "ports" | "mapping"
 //   menu_maps: [..]                       — mapping cards (Remapper card schema)
 //   zone_meta: [{id, label, icon}]        — per-zone display metadata
 //   activation_mode: "hold" | "toggle" | "touch"
-//   pointer_source: "left_stick" | "right_stick" | "touch1"
+//   pointer_source: "left_stick" | "right_stick" | "touch1" | "touch2"
 //   select_on: "release" | "press" | "click"
 //   pointer_deadzone: f32
 //   suppress_while_open: bool             — zero pointer pins on the passthrough
@@ -53,6 +55,7 @@ impl Module for VirtualMenuModule {
                 PinDescriptor::new("Device", SignalType::AutoMap),
                 PinDescriptor::new("Show", SignalType::Bool).optional(),
                 PinDescriptor::new("Select", SignalType::Bool).optional(),
+                PinDescriptor::new("Pointer", SignalType::Vec2).optional(),
             ],
             outputs: vec![
                 PinDescriptor::new("AutoMap", SignalType::AutoMap),
