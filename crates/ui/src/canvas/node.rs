@@ -97,6 +97,32 @@ pub struct ExposedModule {
     /// milestone 1 resolves at most one level).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_path: Vec<usize>,
+    /// Per-pin Input Viewer board style. Populated only for
+    /// `module.input_viewer` pins via the layout inspector strip. `None` =
+    /// the default board style (dark plate, amber highlight, white tint,
+    /// thin outline). Each pinned instance styles independently — the same
+    /// board can be an opaque widget in a sub-patch layout and a
+    /// see-through overlay board at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iv_style_override: Option<IvStyleOverride>,
+}
+
+/// Per-pin style for a pinned Input Viewer board. Unlike the color-per-field
+/// overrides above (which fall back field-by-field), this is a COMPLETE style
+/// — `Some` replaces the default board style wholesale, `None` uses defaults.
+/// Colors carry alpha so the plate can go fully transparent over a game.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct IvStyleOverride {
+    /// Board plate fill (incl. transparency).
+    pub bg: [u8; 4],
+    /// Highlight for pressed elements (halos, trigger fill, dots, rings).
+    pub accent: [u8; 4],
+    /// Element tint: multiplies the glyph art; brightness ramps with glow.
+    pub tint: [u8; 4],
+    /// Board outline stroke color.
+    pub outline: [u8; 4],
+    /// Board outline stroke width (0 = no outline).
+    pub outline_px: f32,
 }
 
 fn default_exposed_size() -> [f32; 2] { [220.0, 100.0] }
@@ -519,6 +545,7 @@ mod tests {
                         ..Default::default()
                     }),
                     source_path: vec![3],
+                    iv_style_override: None,
                 }),
                 LayoutItem::Deco(LayoutDecoration::Rect {
                     pos: [5.0, 6.0],

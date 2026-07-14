@@ -14576,6 +14576,7 @@ fn show_subpatch_editors(
                             switch_override: None,
                             graph_override: None,
                             source_path: vec![],
+                            iv_style_override: None,
                         });
                     }
                 }

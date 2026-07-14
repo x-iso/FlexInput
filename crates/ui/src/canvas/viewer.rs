@@ -10329,6 +10329,7 @@ pub(crate) fn show_subpatch_body(
                 let module_id = mid.clone();
                 let element_id = m.element_id.clone();
                 let graph_ov = m.graph_override.clone();
+                let iv_style_ov = m.iv_style_override;
                 let outer_snap_ref = outer_snapshot.as_ref();
                 let prev_suppressed = ui.ctx().data(|d| {
                     d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY)).unwrap_or(false)
@@ -10348,7 +10349,7 @@ pub(crate) fn show_subpatch_body(
                                 render_pinned_element(
                                     inner_id, &module_id, &element_id, ui, &mut sp.snarl,
                                     mod_size, live_signals, panic_shortcut, automap_parent,
-                                    outer_snap_ref, outer_id, is_unlocked, graph_ov,
+                                    outer_snap_ref, outer_id, is_unlocked, graph_ov, iv_style_ov,
                                 );
                             }
                         });
@@ -11233,6 +11234,7 @@ pub(crate) fn layout_inspector_strip_core(
     let inner_mid = sel_module.as_ref().map(|(mid, _)| mid.as_str());
     let is_text_pin   = inner_mid == Some("module.label");
     let is_switch_pin = inner_mid == Some("module.switch");
+    let is_input_viewer_pin = inner_mid == Some("module.input_viewer");
     let is_graph_pin = matches!(
         inner_mid,
         Some("module.response_curve")
@@ -11262,6 +11264,9 @@ pub(crate) fn layout_inspector_strip_core(
             }
             LayoutItem::Module(_) if is_switch_pin => {
                 switch_pin_inspector_strip_item(ui, state.items, idx);
+            }
+            LayoutItem::Module(_) if is_input_viewer_pin => {
+                input_viewer_pin_inspector_strip_item(ui, state.items, idx);
             }
             LayoutItem::Module(_) if is_graph_pin => {
                 graph_pin_inspector_strip_item(ui, state.items, idx, graph_channels);
@@ -11405,6 +11410,7 @@ pub(crate) fn render_pinned_element(
     outer_id: NodeId,
     is_layout_mode: bool,
     graph_override: Option<crate::canvas::node::PinGraphOverride>,
+    iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
 ) {
     // Stable identity for this pin's natural-size cache: (outer node, inner
     // node, element). Two pins of the same element share one entry, which is
@@ -11415,7 +11421,7 @@ pub(crate) fn render_pinned_element(
     render_pinned_element_impl(
         inner_id, module_id, element_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, automap_parent, outer_snapshot,
-        outer_id, is_layout_mode, graph_override,
+        outer_id, is_layout_mode, graph_override, iv_style_override,
     );
 
     // `applied` is only present when the renderer routed through
@@ -11460,6 +11466,7 @@ fn render_pinned_element_impl(
     outer_id: NodeId,
     is_layout_mode: bool,
     graph_override: Option<crate::canvas::node::PinGraphOverride>,
+    iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
 ) {
     let cap_w = container_size.x.max(20.0);
     // Whole-module pinned renderers manage their own width/clip; don't cap
@@ -11545,7 +11552,7 @@ fn render_pinned_element_impl(
                 .unwrap_or("auto").to_string();
             let skin = remapper_resolve_skin(inner_snarl, inner_id, &skin_param, bridged_parent);
             let dev = remapper_upstream_device_id(inner_snarl, inner_id, 0, bridged_parent);
-            let style = super::input_viewer::iv_style_of(inner_snarl.get_node(inner_id));
+            let style = super::input_viewer::IvStyle::from_override(iv_style_override.as_ref());
             super::input_viewer::paint_viewer_board(
                 ui, board, inner_id.0, dev.as_deref(), skin, &style, live_signals,
             );
@@ -22982,6 +22989,23 @@ fn text_pin_inspector_strip_item(
     } else if ov.fill.is_some() || ov.outline.is_some() || ov.outline_px.is_some() {
         exp.text_override = Some(ov);
     }
+}
+
+/// Inspector strip for a pinned Input Viewer board's style (when the selected
+/// item is a `module.input_viewer` pin). Delegates to the board module's own
+/// control cluster; stores the result on the pin's `iv_style_override`.
+fn input_viewer_pin_inspector_strip_item(
+    ui: &mut egui::Ui,
+    items: &mut Vec<LayoutItem>,
+    idx: usize,
+) {
+    if idx >= items.len() { return; }
+    let exp = match &mut items[idx] {
+        LayoutItem::Module(m) => m,
+        _ => return,
+    };
+    exp.iv_style_override = super::input_viewer::iv_style_inspector(
+        ui, exp.inner_node_id, exp.iv_style_override.as_ref());
 }
 
 /// Inspector strip for the per-pin Switch color override (when the selected

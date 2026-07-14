@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use egui_snarl::{NodeId, Snarl};
 use flexinput_core::Signal;
 
+use super::node::IvStyleOverride;
 use super::remapper_icons::{self, Skin};
 use super::NodeData;
 use super::viewer::{
@@ -96,9 +97,12 @@ const SW_LAYOUT: Layout = Layout {
 
 // ── Style ─────────────────────────────────────────────────────────────────────
 
-/// User-tunable board style, persisted under the `iv_style` param (only when
-/// changed — absent = defaults). All colors carry alpha, so the plate can go
-/// fully transparent for overlay use.
+/// Resolved board style handed to the painter. Not persisted directly — each
+/// pinned instance stores an [`IvStyleOverride`] on its `ExposedModule` and
+/// converts via [`IvStyle::from_override`]; the on-canvas node body always
+/// paints with defaults (style lives in the layout / overlay editor, not on
+/// the module). All colors carry alpha, so the plate can go fully transparent
+/// for overlay use.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct IvStyle {
     /// Board plate fill (incl. transparency).
@@ -125,83 +129,81 @@ impl Default for IvStyle {
     }
 }
 
-fn color_to_json(c: egui::Color32) -> serde_json::Value {
-    serde_json::json!([c.r(), c.g(), c.b(), c.a()])
+fn color32(c: [u8; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
 }
 
-fn color_from_json(v: Option<&serde_json::Value>) -> Option<egui::Color32> {
-    let a = v?.as_array()?;
-    let ch = |i: usize| a.get(i).and_then(|x| x.as_u64()).map(|x| x.min(255) as u8);
-    Some(egui::Color32::from_rgba_unmultiplied(ch(0)?, ch(1)?, ch(2)?, ch(3)?))
+fn rgba(c: egui::Color32) -> [u8; 4] {
+    [c.r(), c.g(), c.b(), c.a()]
 }
 
-/// Resolve the style from a node's `iv_style` param (defaults when absent).
-pub(crate) fn iv_style_of(node: Option<&NodeData>) -> IvStyle {
-    let mut s = IvStyle::default();
-    let Some(obj) = node.and_then(|n| n.params.get("iv_style")) else { return s };
-    if let Some(c) = color_from_json(obj.get("bg")) { s.bg = c; }
-    if let Some(c) = color_from_json(obj.get("accent")) { s.accent = c; }
-    if let Some(c) = color_from_json(obj.get("tint")) { s.tint = c; }
-    if let Some(c) = color_from_json(obj.get("outline")) { s.outline = c; }
-    if let Some(w) = obj.get("outline_w").and_then(|v| v.as_f64()) { s.outline_w = w as f32; }
-    s
+impl IvStyle {
+    /// Resolve a pinned board's style from its per-pin override (defaults when
+    /// `None`). The on-canvas node body always uses `IvStyle::default()`.
+    pub(crate) fn from_override(ov: Option<&IvStyleOverride>) -> Self {
+        match ov {
+            None => Self::default(),
+            Some(o) => Self {
+                bg: color32(o.bg),
+                accent: color32(o.accent),
+                tint: color32(o.tint),
+                outline: color32(o.outline),
+                outline_w: o.outline_px,
+            },
+        }
+    }
+
+    fn to_override(self) -> IvStyleOverride {
+        IvStyleOverride {
+            bg: rgba(self.bg),
+            accent: rgba(self.accent),
+            tint: rgba(self.tint),
+            outline: rgba(self.outline),
+            outline_px: self.outline_w,
+        }
+    }
 }
 
-fn iv_style_to_json(s: &IvStyle) -> serde_json::Value {
-    serde_json::json!({
-        "bg": color_to_json(s.bg),
-        "accent": color_to_json(s.accent),
-        "tint": color_to_json(s.tint),
-        "outline": color_to_json(s.outline),
-        "outline_w": s.outline_w,
-    })
-}
-
-/// 🎨 style popup: background (with transparency), highlight, element tint,
-/// and outline color/width, plus Reset. Edited on the node body; the pinned
-/// board reads the same param.
-fn show_style_menu(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let mut style = iv_style_of(snarl.get_node(node_id));
+/// Inspector-strip controls for a pinned Input Viewer board's style, edited in
+/// the sub-patch layout editor and the screen overlay editor (never on the
+/// module body). Background (with transparency), highlight, element tint, and
+/// outline color/width, plus Reset-to-defaults. `ov` is the pin's stored
+/// override (`None` = defaults); returns the new override state to persist.
+pub(crate) fn iv_style_inspector(
+    ui: &mut egui::Ui,
+    id_salt: usize,
+    ov: Option<&IvStyleOverride>,
+) -> Option<IvStyleOverride> {
+    let mut style = IvStyle::from_override(ov);
     let before = style;
     let mut reset = false;
-    let btn = egui::Button::new(egui::RichText::new("🎨").size(13.0));
-    egui::containers::menu::MenuButton::from_button(btn).ui(ui, |ui: &mut egui::Ui| {
-        ui.set_min_width(190.0);
-        egui::Grid::new((node_id, "iv_style_grid")).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-            ui.label("Background");
-            ui.color_edit_button_srgba(&mut style.bg)
-                .on_hover_text("Board plate color — lower the alpha for a see-through board on the overlay.");
-            ui.end_row();
-            ui.label("Highlight");
-            ui.color_edit_button_srgba(&mut style.accent)
-                .on_hover_text("Pressed-element color: halos, trigger fill, stick/touch dots.");
-            ui.end_row();
-            ui.label("Element tint");
-            ui.color_edit_button_srgba(&mut style.tint)
-                .on_hover_text("Multiplies the button art; brightness still rises on press.");
-            ui.end_row();
-            ui.label("Outline");
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgba(&mut style.outline);
-                ui.add(egui::DragValue::new(&mut style.outline_w).range(0.0..=6.0).speed(0.05))
-                    .on_hover_text("Board outline width (0 = none).");
-            });
-            ui.end_row();
-        });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Input Viewer style").small().strong());
         ui.separator();
-        if ui.button("Reset to defaults").clicked() {
+        ui.label(egui::RichText::new("bg").small().weak());
+        ui.color_edit_button_srgba(&mut style.bg)
+            .on_hover_text("Board plate color — lower the alpha for a see-through board over a game.");
+        ui.label(egui::RichText::new("highlight").small().weak());
+        ui.color_edit_button_srgba(&mut style.accent)
+            .on_hover_text("Pressed-element color: halos, trigger fill, stick/touch dots.");
+        ui.label(egui::RichText::new("tint").small().weak());
+        ui.color_edit_button_srgba(&mut style.tint)
+            .on_hover_text("Multiplies the button art; brightness still rises on press.");
+        ui.label(egui::RichText::new("outline").small().weak());
+        ui.color_edit_button_srgba(&mut style.outline);
+        ui.add(egui::DragValue::new(&mut style.outline_w).range(0.0..=6.0).speed(0.05))
+            .on_hover_text("Board outline width (0 = none).");
+        if ui.small_button("Reset").on_hover_text("Use the default board style").clicked() {
             reset = true;
-            ui.close();
         }
     });
+    let _ = id_salt;
     if reset {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.remove("iv_style");
-        }
+        None
     } else if style != before {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            node.params.insert("iv_style".to_string(), iv_style_to_json(&style));
-        }
+        Some(style.to_override())
+    } else {
+        ov.copied()
     }
 }
 
@@ -214,8 +216,10 @@ pub(crate) fn show_input_viewer_body(
     live_signals: &LiveSignals,
     automap_parent: Option<&AutomapGlowParent<'_>>,
 ) {
-    // Skin is picked in the node HEADER (shared selector with the Remapper);
-    // the 🎨 popup holds the style controls.
+    // Skin is picked in the node HEADER (shared selector with the Remapper).
+    // Board STYLE is a per-pin property, edited in the layout / overlay editor
+    // inspector (not on the module body) — the on-canvas board always paints
+    // with the default style.
     let skin_param = snarl
         .get_node(node_id)
         .and_then(|n| n.params.get("skin").and_then(|v| v.as_str()))
@@ -224,13 +228,7 @@ pub(crate) fn show_input_viewer_body(
     let skin = remapper_resolve_skin(snarl, node_id, &skin_param, automap_parent);
     let dev_id = remapper_upstream_device_id(snarl, node_id, 0, automap_parent);
 
-    ui.allocate_ui_with_layout(
-        egui::vec2(BOARD_W, 20.0),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| show_style_menu(node_id, ui, snarl),
-    );
-
-    let style = iv_style_of(snarl.get_node(node_id));
+    let style = IvStyle::default();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(BOARD_W, BOARD_H), egui::Sense::hover());
     paint_viewer_board(ui, rect, node_id.0, dev_id.as_deref(), skin, &style, live_signals);
 

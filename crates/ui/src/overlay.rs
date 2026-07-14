@@ -183,6 +183,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     switch_override: None,
                     graph_override: None,
                     source_path,
+                    iv_style_override: None,
                 },
             ));
             let idx = overlay_layout.items.len() - 1;

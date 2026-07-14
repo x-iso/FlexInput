@@ -259,6 +259,7 @@ pub(crate) fn show_overlay_body(
                     let module_id = mid.clone();
                     let element_id = m.element_id.clone();
                     let graph_ov = m.graph_override.clone();
+                    let iv_style_ov = m.iv_style_override;
                     let outer_snap_ref = outer_snapshot.as_ref();
                     let path = m.source_path.clone();
                     ui.scope_builder(egui::UiBuilder::new().max_rect(item_rect), |ui| {
@@ -272,7 +273,7 @@ pub(crate) fn show_overlay_body(
                                     render_pinned_element(
                                         inner_id, &module_id, &element_id, ui, tab_snarl,
                                         mod_size, live_signals, panic_shortcut, None,
-                                        None, OVERLAY_TOP_OUTER, edit, graph_ov,
+                                        None, OVERLAY_TOP_OUTER, edit, graph_ov, iv_style_ov,
                                     );
                                 }
                                 [sp] => {
@@ -285,7 +286,7 @@ pub(crate) fn show_overlay_body(
                                         render_pinned_element(
                                             inner_id, &module_id, &element_id, ui, inner_snarl,
                                             mod_size, live_signals, panic_shortcut, None,
-                                            outer_snap_ref, sp_node, edit, graph_ov,
+                                            outer_snap_ref, sp_node, edit, graph_ov, iv_style_ov,
                                         );
                                     }
                                 }
