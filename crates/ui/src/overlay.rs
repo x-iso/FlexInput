@@ -355,39 +355,43 @@ fn overlay_edit_toolbar(
             .corner_radius(8.0)
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button(egui::RichText::new("✔ Done").strong())
-                        .on_hover_text("Exit overlay editing (Esc)")
-                        .clicked()
-                    {
-                        *exit_edit = true;
-                    }
-                    ui.separator();
-                    if ui.button("➕ Add element")
-                        .on_hover_text("Pick a module UI element to pin: the overlay collapses to a\nglowing border and pinnable elements light up amber in the\nFlexInput window (and first-level sub-patch editors). Esc cancels.")
-                        .clicked()
-                    {
-                        crate::canvas::viewer::set_overlay_pick_active(ui.ctx(), true);
-                        // Bring the main window forward so the highlighted
-                        // elements are actually visible/clickable.
-                        ui.ctx().send_viewport_cmd_to(
-                            egui::ViewportId::ROOT,
-                            egui::ViewportCommand::Minimized(false),
-                        );
-                        ui.ctx().send_viewport_cmd_to(
-                            egui::ViewportId::ROOT,
-                            egui::ViewportCommand::Focus,
-                        );
-                    }
-                    ui.separator();
-                    let sel_module = crate::canvas::overlay_body::overlay_selected_module_info(
-                        tab_snarl, overlay_layout,
-                    );
-                    crate::canvas::viewer::layout_editing_controls_core(
-                        ui,
-                        &mut crate::canvas::viewer::LayoutStateMut::of_overlay(overlay_layout),
-                        sel_module,
-                    );
+                // Main controls on row 1; the selected item's properties drop
+                // to a full-width row 2 below (so they spread in line instead
+                // of stacking vertically in the narrow right margin).
+                let sel_module = crate::canvas::overlay_body::overlay_selected_module_info(
+                    tab_snarl, overlay_layout,
+                );
+                let mut state = crate::canvas::viewer::LayoutStateMut::of_overlay(overlay_layout);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button(egui::RichText::new("✔ Done").strong())
+                            .on_hover_text("Exit overlay editing (Esc)")
+                            .clicked()
+                        {
+                            *exit_edit = true;
+                        }
+                        ui.separator();
+                        if ui.button("➕ Add element")
+                            .on_hover_text("Pick a module UI element to pin: the overlay collapses to a\nglowing border and pinnable elements light up amber in the\nFlexInput window (and first-level sub-patch editors). Esc cancels.")
+                            .clicked()
+                        {
+                            crate::canvas::viewer::set_overlay_pick_active(ui.ctx(), true);
+                            // Bring the main window forward so the highlighted
+                            // elements are actually visible/clickable.
+                            ui.ctx().send_viewport_cmd_to(
+                                egui::ViewportId::ROOT,
+                                egui::ViewportCommand::Minimized(false),
+                            );
+                            ui.ctx().send_viewport_cmd_to(
+                                egui::ViewportId::ROOT,
+                                egui::ViewportCommand::Focus,
+                            );
+                        }
+                        ui.separator();
+                        crate::canvas::viewer::layout_toolbar_controls_core(ui, &mut state);
+                    });
+                    // Second row: properties of the selected item, if any.
+                    crate::canvas::viewer::layout_inspector_strip_core(ui, &mut state, sel_module);
                 });
             });
     });

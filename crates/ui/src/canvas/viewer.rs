@@ -11145,41 +11145,55 @@ pub(crate) fn layout_editing_controls_core(
     state: &mut LayoutStateMut<'_>,
     sel_module: SelectedModuleInfo,
 ) {
+    ui.horizontal(|ui| layout_toolbar_controls_core(ui, state));
+
+    // Inspector strip for the currently selected item (+ bulk-style
+    // propagation across a multi-selection).
+    layout_inspector_strip_core(ui, state, sel_module);
+}
+
+/// The snap + decoration-adder controls, WITHOUT a row wrapper — the caller
+/// supplies the layout (a `ui.horizontal` in the sub-patch wrapper; the
+/// overlay toolbar keeps these on its main row while the inspector strip drops
+/// to a second row below). Split out of `layout_editing_controls_core` so the
+/// selected-item properties can always live on their own row.
+pub(crate) fn layout_toolbar_controls_core(
+    ui: &mut egui::Ui,
+    state: &mut LayoutStateMut<'_>,
+) {
     let mut add_kind: Option<&'static str> = None;
-    ui.horizontal(|ui| {
-        ui.checkbox(state.snap_enabled, egui::RichText::new("Snap").small())
-            .on_hover_text("Snap pinned-element positions and sizes to a grid in Layout mode");
-        ui.add_enabled_ui(*state.snap_enabled, |ui| {
-            ui.label(egui::RichText::new("grid").small().weak());
-            let mut g = *state.snap_grid_px as i32;
-            if ui.add(egui::DragValue::new(&mut g)
-                .speed(0.5)
-                .range(2i32..=64)
-                .suffix("px"))
-                .on_hover_text("Grid step in pixels (rounded to multiples of 2)")
-                .changed()
-            {
-                *state.snap_grid_px = ((g.max(2)) / 2 * 2) as u32;
-            }
-        });
-        ui.separator();
-        ui.label(egui::RichText::new("Add:").small().weak());
-        if ui.small_button("T").on_hover_text("Add Text label").clicked() {
-            add_kind = Some("text");
-        }
-        if ui.small_button("▢").on_hover_text("Add Rectangle").clicked() {
-            add_kind = Some("rect");
-        }
-        if ui.small_button("◯").on_hover_text("Add Ellipse").clicked() {
-            add_kind = Some("ellipse");
-        }
-        if ui.small_button("╱").on_hover_text("Add Line").clicked() {
-            add_kind = Some("line");
-        }
-        if ui.small_button("SVG").on_hover_text("Add SVG").clicked() {
-            add_kind = Some("svg");
+    ui.checkbox(state.snap_enabled, egui::RichText::new("Snap").small())
+        .on_hover_text("Snap pinned-element positions and sizes to a grid in Layout mode");
+    ui.add_enabled_ui(*state.snap_enabled, |ui| {
+        ui.label(egui::RichText::new("grid").small().weak());
+        let mut g = *state.snap_grid_px as i32;
+        if ui.add(egui::DragValue::new(&mut g)
+            .speed(0.5)
+            .range(2i32..=64)
+            .suffix("px"))
+            .on_hover_text("Grid step in pixels (rounded to multiples of 2)")
+            .changed()
+        {
+            *state.snap_grid_px = ((g.max(2)) / 2 * 2) as u32;
         }
     });
+    ui.separator();
+    ui.label(egui::RichText::new("Add:").small().weak());
+    if ui.small_button("T").on_hover_text("Add Text label").clicked() {
+        add_kind = Some("text");
+    }
+    if ui.small_button("▢").on_hover_text("Add Rectangle").clicked() {
+        add_kind = Some("rect");
+    }
+    if ui.small_button("◯").on_hover_text("Add Ellipse").clicked() {
+        add_kind = Some("ellipse");
+    }
+    if ui.small_button("╱").on_hover_text("Add Line").clicked() {
+        add_kind = Some("line");
+    }
+    if ui.small_button("SVG").on_hover_text("Add SVG").clicked() {
+        add_kind = Some("svg");
+    }
     if let Some(kind) = add_kind {
         let deco = make_default_decoration(kind);
         state.items.push(LayoutItem::Deco(deco));
@@ -11187,10 +11201,6 @@ pub(crate) fn layout_editing_controls_core(
         *state.selected_item = Some(idx);
         *state.selected_items = vec![idx];
     }
-
-    // Inspector strip for the currently selected item (+ bulk-style
-    // propagation across a multi-selection).
-    layout_inspector_strip_core(ui, state, sel_module);
 }
 
 /// Resolve `SelectedModuleInfo` for a sub-patch layout's current selection:
