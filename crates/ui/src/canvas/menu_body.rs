@@ -214,9 +214,16 @@ pub(crate) fn show_menu_body(
             register_exposable_element(ui, node_id, "cards", cards_area);
         }
 
-        // Placeholder until the menu overlay + edit mode lands.
-        ui.add_enabled(false, egui::Button::new("🖵 Position on screen…"))
-            .on_hover_text("Place/size the menu on the screen overlay (coming up)");
+        // Summon the menu overlay in position-edit mode for THIS menu.
+        let outer_uid = super::viewer::root_subpatch_id(automap_parent).map(|n| n.0);
+        let editing = crate::menu_overlay::menu_edit_target(ui.ctx())
+            == Some((outer_uid, node_id.0));
+        if ui.add(egui::Button::selectable(editing, "🖵 Position on screen…"))
+            .on_hover_text("Place/size this menu on the screen: it appears as an editable\noverlay widget — drag to move, corner to resize, Esc/Done saves.")
+            .clicked()
+        {
+            crate::menu_overlay::request_menu_edit(ui.ctx(), outer_uid, node_id.0);
+        }
     });
 }
 

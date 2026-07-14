@@ -3156,6 +3156,15 @@ impl eframe::App for FlexInputApp {
             crate::overlay::show_overlay(self, ctx);
         }
 
+        // ── Virtual Menu overlay ──────────────────────────────────────────────
+        // A SECOND transparent viewport, summoned by open menus (eval-side
+        // truth) or a menu's position-edit mode; fully independent of the info
+        // overlay's visibility.
+        {
+            puffin::profile_scope!("show_menu_overlay");
+            crate::menu_overlay::show_menu_overlay(self, ctx);
+        }
+
         // Repaint scheduling:
         //   Focused → vsync (or 100 ms fallback for empty patch). The user
         //       is actively using the app; smoothness wins. Animated
