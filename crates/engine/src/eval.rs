@@ -2261,6 +2261,21 @@ fn eval_subgraph(
             continue;
         }
 
+        // Virtual Menu nested in a sub-patch — publish under the NAMESPACED
+        // uid so the menumap key matches downstream lookups; mirror outputs
+        // into last_outputs so the outer body's zone-live highlight works.
+        if snap.module_id == "module.menu" {
+            let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+                .map(|src| src.and_then(|(si, op)| {
+                    computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+                }))
+                .collect();
+            computed[idx] = eval_menu_node(
+                snap, ns_uid, &inputs, dev_sigs, collector_sigs, state, dt);
+            last_outputs.insert(ns_uid, computed[idx].clone());
+            continue;
+        }
+
         // module.map_action inside subpatch: mirror top-level behaviour but
         // write last_outputs keyed by the namespaced UID so UI/outer bodies
         // can observe inner output state.
@@ -2488,6 +2503,21 @@ pub fn eval_graph_tick(
         {
             eval_touch_zones_map_node(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
             computed[idx] = vec![None];
+            continue;
+        }
+
+        // ── module.menu: open/hover/select state machine + `menumap:{uid}`
+        // injector (cards, suppression). Runs in BOTH zone modes — ports mode
+        // still needs the state machine for its typed outputs and suppression.
+        if snap.module_id == "module.menu" {
+            let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+                .map(|src| src.and_then(|(si, op)| {
+                    computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+                }))
+                .collect();
+            computed[idx] = eval_menu_node(
+                snap, snap.node_uid, &inputs, dev_sigs, &mut collector_sigs, state, dt);
+            last_outputs.insert(snap.node_uid, computed[idx].clone());
             continue;
         }
 
@@ -3199,10 +3229,11 @@ fn compute_node(
             (0..snap.n_outputs).map(|_| None).collect()
         }
         "module.menu" => {
-            // Stub until the menu state machine lands: closed, nothing
-            // hovered, all zone pins idle. Slot 0 stays the AutoMap
-            // passthrough sentinel (no Signal). Zone pins share the Touch
-            // Zones id vocabulary (f0z{id}_x/y/act + f0c = Select).
+            // Fallback only — both eval loops intercept module.menu with
+            // eval_menu_node before compute_node runs. Idle-typed outputs:
+            // closed, nothing hovered, all zone pins off. Slot 0 stays the
+            // AutoMap passthrough sentinel (no Signal). Zone pins share the
+            // Touch Zones id vocabulary (f0z{id}_x/y/act + f0c = Select).
             use flexinput_core::menu as fm;
             use flexinput_core::touchzones as tz;
             (0..snap.n_outputs).map(|i| {
@@ -5607,6 +5638,279 @@ fn eval_touch_zones_map_node(
         collector_sigs.insert((key.clone(), "scroll_x".to_string()), Signal::Float(scroll_vx));
         collector_sigs.insert((key.clone(), "scroll_y".to_string()), Signal::Float(scroll_vy));
     }
+}
+
+/// Evaluate a Virtual Menu node — shared by the top-level and sub-patch loops.
+/// Runs the open → hover → select state machine, fires mapping-mode cards,
+/// publishes overrides + pointer suppression under `menumap:{uid}`, and
+/// returns the typed outputs (Open / Hover + ports-mode zone pins) for wired
+/// consumers and the UI mirror (the body's zone-live highlight).
+///
+/// Control resolution — macro-style targets first, wired pins as alternates:
+///   Show    = ("macro", menu:{menu_id}_show) OR wired Show (slot 1)
+///   Select  = ("macro", menu:{menu_id}_sel)  OR wired Select (slot 2)
+///   Pointer = wired Pointer Vec2 (slot 3) when connected, else the
+///             `pointer_source` analog of the upstream device: stick
+///             deflection past the deadzone maps onto the menu rect (full
+///             deflection = rect edge), a touch point maps by its absolute
+///             pad position. The hover is STICKY — a pointer inside the
+///             deadzone (or a lifted finger) keeps the last highlighted zone,
+///             so flick-and-release selection works.
+fn eval_menu_node(
+    snap: &NodeSnap,
+    uid: usize,
+    inputs: &[Option<Signal>],
+    dev_sigs: &HashMap<(String, String), Signal>,
+    collector_sigs: &mut HashMap<(String, String), Signal>,
+    state: &mut HashMap<usize, NodeState>,
+    dt: f32,
+) -> Vec<Option<Signal>> {
+    use flexinput_core::menu as fm;
+    use flexinput_core::touchzones as tz;
+    let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let key = format!("menumap:{}", uid);
+
+    // Upstream snapshot (collector override first, else raw device), owned so
+    // the publish pass below can mutate collector_sigs freely.
+    let mut upstream: HashMap<String, Signal> = HashMap::new();
+    for ap in automap::ALL_PINS {
+        let sig = if !collector_id.is_empty() {
+            collector_sigs.get(&(collector_id.clone(), ap.id.to_string())).copied()
+        } else { None }
+        .or_else(|| {
+            if !dev_id.is_empty() {
+                dev_sigs.get(&(dev_id.clone(), ap.id.to_string())).copied()
+            } else { None }
+        });
+        if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+    }
+    let read = |pin: &str| -> Option<Signal> { upstream.get(pin).copied() };
+
+    let pstr = |k: &str, d: &'static str| -> String {
+        snap.params.get(k).and_then(|v| v.as_str()).unwrap_or(d).to_string()
+    };
+    let menu_id = pstr("menu_id", "");
+    let act = pstr("activation_mode", "hold");
+    let sel_on = pstr("select_on", "release");
+    let src = pstr("pointer_source", "left_stick");
+    let deadzone = snap.params.get("pointer_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
+    let suppress = snap.params.get("suppress_while_open").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    // ── Controls (macro-style targets OR wired pins) ──
+    let macro_on = |cs: &HashMap<(String, String), Signal>, pin: String| -> bool {
+        cs.get(&(flexinput_core::macros::SIGS_NS.to_string(), pin))
+            .map(|s| s.as_bool()).unwrap_or(false)
+    };
+    let show_raw = inputs.get(1).and_then(|s| *s).map(|s| s.as_bool()).unwrap_or(false)
+        || (!menu_id.is_empty()
+            && macro_on(collector_sigs, fm::target_pin(&menu_id, fm::TargetPin::Show)));
+    let sel_raw = inputs.get(2).and_then(|s| *s).map(|s| s.as_bool()).unwrap_or(false)
+        || (!menu_id.is_empty()
+            && macro_on(collector_sigs, fm::target_pin(&menu_id, fm::TargetPin::Select)));
+    let wired_ptr: Option<Vec2> = inputs.get(3).and_then(|s| *s)
+        .and_then(|s| if let Signal::Vec2(v) = s { Some(v) } else { None });
+
+    // ── Pointer → unit point in the menu rect (0..1, y down) + a "touching"
+    // gate for activation_mode = touch ──
+    let stick_read = |name: &str| -> Vec2 {
+        if let Some(Signal::Vec2(v)) = read(name) { return v; }
+        Vec2::new(
+            read(&format!("{name}_x")).map(|s| s.as_float()).unwrap_or(0.0),
+            read(&format!("{name}_y")).map(|s| s.as_float()).unwrap_or(0.0),
+        )
+    };
+    // Deflection vector (+Y up) → unit point: full deflection = rect edge.
+    let deflect_to_unit = |v: Vec2| -> (f32, f32) {
+        ((0.5 + v.x * 0.5).clamp(0.0, 1.0), (0.5 - v.y * 0.5).clamp(0.0, 1.0))
+    };
+    let (ptr_unit, touching): (Option<(f32, f32)>, bool) = if let Some(v) = wired_ptr {
+        let on = v.length() > deadzone;
+        (if on { Some(deflect_to_unit(v)) } else { None }, on)
+    } else if src == "touch1" || src == "touch2" {
+        let (px, py, pa) = if src == "touch2" { ("touch2_x", "touch2_y", "touch2_active") }
+                           else { ("touch1_x", "touch1_y", "touch1_active") };
+        let active = read(pa).map(|s| s.as_bool()).unwrap_or(false);
+        let (x, y) = tz::pad_point_to_unit(
+            read(px).map(|s| s.as_float()).unwrap_or(0.0),
+            read(py).map(|s| s.as_float()).unwrap_or(0.0),
+        );
+        (if active { Some((x, y)) } else { None }, active)
+    } else {
+        let name = if src == "right_stick" { "right_stick" } else { "left_stick" };
+        let v = stick_read(name);
+        let on = v.length() > deadzone;
+        (if on { Some(deflect_to_unit(v)) } else { None }, on)
+    };
+
+    // Zone geometry: explicit BSP tree once partial dividers exist, else the
+    // legacy grid (identical to Touch Zones, single field).
+    let read_edges = |which: &str| -> Vec<f32> {
+        snap.params.get(which).and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default()
+    };
+    let tree = snap.params.get("zone_tree").and_then(tz::ZoneNode::from_value)
+        .unwrap_or_else(|| tz::ZoneNode::from_grid(
+            &read_edges("col_edges"), &read_edges("row_edges")));
+
+    // ── State machine. aux_f32: [0] open, [1] prev_show, [2] prev_sel,
+    // [3] hover+1 (0 = none), [4] select-pulse ms left, [5] selected zone+1,
+    // [6] prev_click, [7] hover local x, [8] hover local y ──
+    const SLOTS: usize = 9;
+    const SELECT_PULSE_MS: f32 = 120.0;
+    let ns = state.entry(uid).or_insert_with(NodeState::default);
+    while ns.aux_f32.len() < SLOTS { ns.aux_f32.push(0.0); }
+    let prev_open = ns.aux_f32[0] > 0.5;
+    let prev_show = ns.aux_f32[1] > 0.5;
+    let prev_sel = ns.aux_f32[2] > 0.5;
+    let prev_hover: i32 = ns.aux_f32[3] as i32 - 1;
+    let prev_click = ns.aux_f32[6] > 0.5;
+    let click_now = read("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
+
+    let open = match act.as_str() {
+        "toggle" => prev_open ^ (show_raw && !prev_show),
+        "touch" => touching,
+        _ => show_raw, // hold
+    };
+
+    // Hover: sticky while open; the frame the menu closes still sees the last
+    // hover (release-select reads it), then it resets to none.
+    let mut hover: i32 = if prev_open { prev_hover } else { -1 };
+    let mut hover_local = (ns.aux_f32[7], ns.aux_f32[8]);
+    if open {
+        if let Some((ux, uy)) = ptr_unit {
+            let (zid, lx, ly) = tree.locate(ux, uy);
+            hover = zid as i32;
+            hover_local = (lx, ly);
+        }
+    }
+
+    let select_now = hover >= 0 && match sel_on.as_str() {
+        "press" => open && sel_raw && !prev_sel,
+        "click" => open && click_now && !prev_click,
+        _ => prev_open && !open, // release: the closing edge selects
+    };
+    if select_now {
+        ns.aux_f32[4] = SELECT_PULSE_MS;
+        ns.aux_f32[5] = (hover + 1) as f32;
+    }
+    let pulse_on = ns.aux_f32[4] > 0.0;
+    let selected: i32 = ns.aux_f32[5] as i32 - 1;
+    ns.aux_f32[4] = (ns.aux_f32[4] - dt * 1000.0).max(0.0);
+    if !open { hover = -1; }
+
+    ns.aux_f32[0] = if open { 1.0 } else { 0.0 };
+    ns.aux_f32[1] = if show_raw { 1.0 } else { 0.0 };
+    ns.aux_f32[2] = if sel_raw { 1.0 } else { 0.0 };
+    ns.aux_f32[3] = (hover + 1) as f32;
+    ns.aux_f32[6] = if click_now { 1.0 } else { 0.0 };
+    ns.aux_f32[7] = hover_local.0;
+    ns.aux_f32[8] = hover_local.1;
+
+    // ── Mapping-mode cards (shared Remapper card schema; trigger tokens
+    // "menu_sel" = the select pulse of this card's zone, "menu_hover" = held
+    // while the zone is highlighted) ──
+    let mapping = pstr("zone_mode", "mapping") == "mapping";
+    let cards = snap.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut button_on: HashMap<String, bool> = HashMap::new();
+    if mapping {
+        for (i, card) in cards.iter().enumerate() {
+            let zone = card.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+            let trigger = card.get("in").and_then(|v| v.as_array())
+                .and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("menu_sel");
+            let raw_held = match trigger {
+                "menu_hover" => open && hover == zone,
+                _ => pulse_on && selected == zone, // menu_sel (default)
+            };
+            let mode = PressMode::from_str(card.get("mode").and_then(|v| v.as_str()).unwrap_or("down"));
+            let window_ms = card.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+            let sustain = card.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
+            let turbo = card.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+            let slots = press_state_get(ns, i);
+            let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
+            let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+            for p in card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
+                .filter_map(|v| v.as_str())
+            {
+                // Macro-style targets (macro ports, OTHER menus) route into
+                // the macro namespace; self-targeting is blocked in the UI.
+                if is_macro_style_target(p) {
+                    if held {
+                        merge_macro_scalar(collector_sigs, p, Signal::Bool(true));
+                    }
+                    continue;
+                }
+                let e = button_on.entry(p.to_string()).or_insert(false);
+                *e = *e || held;
+            }
+        }
+    }
+
+    // Publish button pins with the shared release rule: assert while active,
+    // else write the released value only when upstream doesn't already emit
+    // the pin (keeps passthrough intact).
+    for (pin, on) in &button_on {
+        let sig_type = automap::ALL_PINS.iter()
+            .find(|ap| ap.id == pin.as_str())
+            .map(|ap| ap.signal_type).unwrap_or(SignalType::Bool);
+        if *on {
+            let sig = match sig_type {
+                SignalType::Float => Signal::Float(1.0),
+                SignalType::Int   => Signal::Int(1),
+                SignalType::Vec2  => continue,
+                _                 => Signal::Bool(true),
+            };
+            collector_sigs.insert((key.clone(), pin.clone()), sig);
+        } else {
+            if read(pin).is_some() { continue; }
+            let sig = match sig_type {
+                SignalType::Float => Signal::Float(0.0),
+                SignalType::Int   => Signal::Int(0),
+                SignalType::Vec2  => continue,
+                _                 => Signal::Bool(false),
+            };
+            collector_sigs.insert((key.clone(), pin.clone()), sig);
+        }
+    }
+
+    // ── Suppress the pointing input on the passthrough while open, so the
+    // game doesn't see the stick/finger that's steering the menu ──
+    if suppress && open && wired_ptr.is_none() {
+        if src == "touch1" || src == "touch2" {
+            collector_sigs.insert((key.clone(), format!("{src}_active")), Signal::Bool(false));
+            collector_sigs.insert((key.clone(), format!("{src}_x")), Signal::Float(0.0));
+            collector_sigs.insert((key.clone(), format!("{src}_y")), Signal::Float(0.0));
+            // The pad click doubles as the Select gesture — keep it from the
+            // game too while the menu is up.
+            collector_sigs.insert((key.clone(), "btn_touchpad".to_string()), Signal::Bool(false));
+        } else {
+            let name = if src == "right_stick" { "right_stick" } else { "left_stick" };
+            collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(Vec2::ZERO));
+            collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(0.0));
+            collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(0.0));
+        }
+    }
+
+    // ── Typed outputs: fixed Open/Hover + ports-mode zone pins (TZ vocabulary,
+    // field 0). X/Y carry the hovered zone's local pointer coords. ──
+    (0..snap.n_outputs).map(|i| {
+        let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
+        match fm::parse_pin(pin_id) {
+            Some(fm::Pin::Open) => return Some(Signal::Bool(open)),
+            Some(fm::Pin::Hover) => return Some(Signal::Float(hover as f32)),
+            _ => {}
+        }
+        match tz::parse_pin(pin_id)? {
+            tz::Pin::Zone { idx, comp: tz::ZoneComp::Active, .. } =>
+                Some(Signal::Bool(open && hover == idx as i32)),
+            tz::Pin::Zone { idx, comp: tz::ZoneComp::X, .. } =>
+                Some(Signal::Float(if hover == idx as i32 { hover_local.0 } else { 0.0 })),
+            tz::Pin::Zone { idx, comp: tz::ZoneComp::Y, .. } =>
+                Some(Signal::Float(if hover == idx as i32 { hover_local.1 } else { 0.0 })),
+            tz::Pin::Click { .. } => Some(Signal::Bool(pulse_on)),
+        }
+    }).collect()
 }
 
 /// Evaluate a Map Action node — shared by the top-level and sub-patch loops.
@@ -8587,5 +8891,163 @@ mod trigger_tests {
         let dl = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "dpad_left".to_string()))
             .map(|s| s.as_bool()).unwrap_or(false);
         assert!(dl, "self-mapped dpad_left must pass through (not be suppressed)");
+    }
+}
+
+#[cfg(test)]
+mod menu_eval_tests {
+    use super::*;
+
+    fn menu_snap(uid: usize) -> NodeSnap {
+        let mut n = NodeSnap {
+            node_uid: uid,
+            module_id: "module.menu".to_string(),
+            params: HashMap::new(),
+            n_outputs: 3,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: vec![
+                "automap_pass".to_string(), "menu_open".to_string(), "menu_hover".to_string(),
+            ],
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        };
+        n.params.insert("_automap_device_id".into(), Value::String("dev".into()));
+        n.params.insert("menu_id".into(), Value::String("abcd1234".into()));
+        // 2x2 grid: zone ids row-major (0 TL, 1 TR, 2 BL, 3 BR).
+        n.params.insert("col_edges".into(), serde_json::json!([0.5]));
+        n.params.insert("row_edges".into(), serde_json::json!([0.5]));
+        n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        n
+    }
+
+    fn dev_stick(x: f32, y: f32) -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        m.insert(("dev".to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(x, y)));
+        m
+    }
+
+    fn show(b: bool) -> Vec<Option<Signal>> {
+        vec![None, Some(Signal::Bool(b)), None, None]
+    }
+
+    // Hold activation + release-select: wired Show opens, stick bottom-right
+    // highlights zone 3 (hover is sticky once the stick returns to center),
+    // releasing Show closes AND selects — the zone's card fires for the pulse.
+    #[test]
+    fn hold_open_stick_hover_release_selects() {
+        let mut snap = menu_snap(1);
+        snap.params.insert("zone_maps".into(), serde_json::json!([
+            { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_south"] }
+        ]));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+
+        let out = eval_menu_node(&snap, 1, &show(false), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(false)));
+        assert_eq!(out[2], Some(Signal::Float(-1.0)));
+
+        // Open + point bottom-right (stick +x, -y => unit (0.9, 0.9) => zone 3).
+        let out = eval_menu_node(&snap, 1, &show(true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)));
+        assert_eq!(out[2], Some(Signal::Float(3.0)));
+        // Not selected yet — the card hasn't fired.
+        assert!(c.get(&("menumap:1".to_string(), "btn_south".to_string()))
+            .map(|s| !s.as_bool()).unwrap_or(true));
+        // Suppression: the pointing stick is zeroed on the passthrough while open.
+        assert_eq!(c.get(&("menumap:1".to_string(), "left_stick".to_string())).copied(),
+            Some(Signal::Vec2(Vec2::ZERO)));
+
+        // Stick back to center — hover STAYS on 3 (sticky).
+        let out = eval_menu_node(&snap, 1, &show(true), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(3.0)));
+
+        // Release Show: closes, selects zone 3, card fires during the pulse.
+        let out = eval_menu_node(&snap, 1, &show(false), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(false)));
+        assert_eq!(out[2], Some(Signal::Float(-1.0)));
+        assert_eq!(c.get(&("menumap:1".to_string(), "btn_south".to_string())).copied(),
+            Some(Signal::Bool(true)));
+    }
+
+    // The macro-style Show target (published by a Remapper mapping via
+    // merge_macro_scalar) opens the menu with nothing wired.
+    #[test]
+    fn macro_style_show_target_opens() {
+        let snap = menu_snap(2);
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        merge_macro_scalar(&mut c, "menu:abcd1234_show", Signal::Bool(true));
+        let mut state = HashMap::new();
+        let out = eval_menu_node(&snap, 2, &[], &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)));
+    }
+
+    // Toggle activation: rising Show opens, holding/releasing changes nothing,
+    // the next rising edge closes.
+    #[test]
+    fn toggle_mode_edges() {
+        let mut snap = menu_snap(3);
+        snap.params.insert("activation_mode".into(), Value::String("toggle".into()));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+        let dev = dev_stick(0.0, 0.0);
+
+        let out = eval_menu_node(&snap, 3, &show(true), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)), "rising edge opens");
+        let out = eval_menu_node(&snap, 3, &show(true), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)), "held: stays open");
+        let out = eval_menu_node(&snap, 3, &show(false), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)), "released: stays open");
+        let out = eval_menu_node(&snap, 3, &show(true), &dev, &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(false)), "second rising edge closes");
+    }
+
+    // select_on = "press": the wired Select input commits the hovered zone
+    // while the menu stays open.
+    #[test]
+    fn press_select_fires_card_while_open() {
+        let mut snap = menu_snap(4);
+        snap.params.insert("select_on".into(), Value::String("press".into()));
+        snap.params.insert("zone_maps".into(), serde_json::json!([
+            { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["btn_west"] }
+        ]));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+        let sel = |show_b: bool, sel_b: bool| {
+            vec![None, Some(Signal::Bool(show_b)), Some(Signal::Bool(sel_b)), None]
+        };
+        // Open + hover top-left (stick -x, +y => unit (0.1, 0.1) => zone 0).
+        let out = eval_menu_node(&snap, 4, &sel(true, false), &dev_stick(-0.8, 0.8), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(0.0)));
+        // Select press: card fires; menu stays open.
+        let out = eval_menu_node(&snap, 4, &sel(true, true), &dev_stick(-0.8, 0.8), &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)));
+        assert_eq!(c.get(&("menumap:4".to_string(), "btn_west".to_string())).copied(),
+            Some(Signal::Bool(true)));
+    }
+
+    // A mapping card targeting ANOTHER macro-style pin routes into the macro
+    // namespace instead of the bus (a menu selection can raise a Macro port /
+    // another menu's Show).
+    #[test]
+    fn menu_card_can_target_macro_pin() {
+        let mut snap = menu_snap(5);
+        snap.params.insert("select_on".into(), Value::String("press".into()));
+        snap.params.insert("zone_maps".into(), serde_json::json!([
+            { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["macro:ff00ff00"] }
+        ]));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+        // Two frames: hover establishes on frame 1, the Select edge rises on
+        // frame 2 (prev_sel must be low for the edge to register).
+        let f1 = vec![None, Some(Signal::Bool(true)), Some(Signal::Bool(false)), None];
+        let f2 = vec![None, Some(Signal::Bool(true)), Some(Signal::Bool(true)), None];
+        eval_menu_node(&snap, 5, &f1, &dev_stick(-0.8, 0.8), &mut c, &mut state, 0.016);
+        eval_menu_node(&snap, 5, &f2, &dev_stick(-0.8, 0.8), &mut c, &mut state, 0.016);
+        assert_eq!(c.get(&("macro".to_string(), "macro:ff00ff00".to_string())).copied(),
+            Some(Signal::Bool(true)));
+        assert!(!c.contains_key(&("menumap:5".to_string(), "macro:ff00ff00".to_string())),
+            "macro-style targets must not leak onto the menu's bus key");
     }
 }

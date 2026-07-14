@@ -11698,8 +11698,11 @@ pub fn find_automap_device_id_for_viewer(
         }
         // Touch Zones mapping mode = injector under `touchmap:{uid}` (mirror of
         // find_automap_device_rec); ports mode = passthrough (next arm).
-        if node.module_id == "module.touch_zones"
-            && node.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping")
+        // The Virtual Menu is ALWAYS an injector (`menumap:{uid}`) — its
+        // suppression applies in ports mode too.
+        if node.module_id == "module.menu"
+            || (node.module_id == "module.touch_zones"
+                && node.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping"))
         {
             let upstream_dev_id = node.inputs.iter()
                 .position(|p| p.signal_type == SignalType::AutoMap)
@@ -11712,7 +11715,8 @@ pub fn find_automap_device_id_for_viewer(
                 None => src.node.0,
                 Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid_app(p), src.node.0),
             };
-            let map_id = format!("touchmap:{}", map_uid);
+            let prefix = if node.module_id == "module.menu" { "menumap" } else { "touchmap" };
+            let map_id = format!("{prefix}:{map_uid}");
             let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
                 .iter().map(|p| p.id.to_string()).collect();
             return Some((map_id, canonical_pins, upstream_dev_id));
@@ -11863,9 +11867,12 @@ fn find_automap_device_rec(
     // overrides into collector_sigs under a `touchmap:{uid}` key, exactly like the
     // Remapper. In PORTS mode it's a plain passthrough (zone data lives on the
     // typed outputs, nothing is injected onto the bus) — handled below.
-    if node.module_id == "module.touch_zones"
-        && node.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping")
+    if node.module_id == "module.menu"
+        || (node.module_id == "module.touch_zones"
+            && node.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping"))
     {
+        // The Virtual Menu is ALWAYS an injector (`menumap:{uid}`) — its
+        // suppression applies in ports mode too.
         let upstream_dev_id = node.inputs.iter()
             .position(|p| p.signal_type == SignalType::AutoMap)
             .and_then(|am_idx| {
@@ -11877,7 +11884,8 @@ fn find_automap_device_rec(
             None => src.node.0,
             Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
         };
-        let map_id = format!("touchmap:{}", map_uid);
+        let prefix = if node.module_id == "module.menu" { "menumap" } else { "touchmap" };
+        let map_id = format!("{prefix}:{map_uid}");
         let canonical_pins: Vec<String> = flexinput_core::automap::ALL_PINS
             .iter().map(|p| p.id.to_string()).collect();
         return Some((map_id, canonical_pins, upstream_dev_id));
@@ -12298,6 +12306,7 @@ fn build_processing_graph_rec(
                             || dev_id.starts_with("combiner:")
                             || dev_id.starts_with("remap:")
                             || dev_id.starts_with("touchmap:")
+                            || dev_id.starts_with("menumap:")
                             || dev_id.starts_with("lean:")
                         {
                             params.insert("_automap_collector_id".to_string(),
@@ -12322,6 +12331,7 @@ fn build_processing_graph_rec(
                                 || dev_id.starts_with("forksel:")
                                 || dev_id.starts_with("remap:")
                                 || dev_id.starts_with("touchmap:")
+                                || dev_id.starts_with("menumap:")
                                 || dev_id.starts_with("combiner:")
                                 || dev_id.starts_with("lean:");
                             let dev = fallback.unwrap_or_else(|| if is_collector { String::new() } else { dev_id.clone() });
@@ -12359,6 +12369,7 @@ fn build_processing_graph_rec(
                             || dev_id.starts_with("forksel:")
                             || dev_id.starts_with("remap:")
                             || dev_id.starts_with("touchmap:")
+                            || dev_id.starts_with("menumap:")
                             || dev_id.starts_with("combiner:")
                             || dev_id.starts_with("lean:");
                         let dev = fallback.unwrap_or_else(|| if is_collector { String::new() } else { dev_id.clone() });
@@ -12552,6 +12563,7 @@ fn build_processing_graph_rec(
             .or_else(|| s.strip_prefix("combiner:"))
             .or_else(|| s.strip_prefix("remap:"))
             .or_else(|| s.strip_prefix("touchmap:"))
+            .or_else(|| s.strip_prefix("menumap:"))
             .or_else(|| s.strip_prefix("lean:"))
             .or_else(|| s.strip_prefix("forksel:").and_then(|t| t.split(':').next()))?;
         stripped.parse::<usize>().ok()
@@ -12659,6 +12671,7 @@ fn build_processing_graph_rec(
                     .or_else(|| am_dev_id.strip_prefix("combiner:"))
                     .or_else(|| am_dev_id.strip_prefix("remap:"))
                     .or_else(|| am_dev_id.strip_prefix("touchmap:"))
+                    .or_else(|| am_dev_id.strip_prefix("menumap:"))
                     .or_else(|| am_dev_id.strip_prefix("forksel:").and_then(|s| s.split(':').next()));
                 if let Some(uid_str) = uid_str {
                     if let Ok(uid) = uid_str.parse::<usize>() {
