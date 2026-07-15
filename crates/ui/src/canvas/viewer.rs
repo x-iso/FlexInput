@@ -13562,6 +13562,7 @@ fn render_readout_value(
         Some(Signal::Float(f)) => format!("{f:.4}"),
         Some(Signal::Bool(b))  => if b { "true".into() } else { "false".into() },
         Some(Signal::Vec2(v))  => format!("({:.3}, {:.3})", v.x, v.y),
+        Some(Signal::Vec4(v))  => format!("({:.3}, {:.3}, {:.3}, {:.3})", v.x, v.y, v.z, v.w),
         Some(Signal::Int(i))   => format!("{i}"),
         None                   => "—".into(),
     };
@@ -15169,6 +15170,7 @@ fn signal_intensity(sig: &Signal) -> f32 {
         Signal::Float(f) => f.abs().min(1.0),
         Signal::Bool(b)  => if *b { 1.0 } else { 0.0 },
         Signal::Vec2(v)  => v.length().min(1.0),
+        Signal::Vec4(v)  => v.length().min(1.0),
         Signal::Int(i)   => if *i != 0 { 1.0 } else { 0.0 },
     }
 }
@@ -15628,6 +15630,7 @@ fn show_readout_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
         Some(Signal::Float(f)) => format!("{f:.4}"),
         Some(Signal::Bool(b))  => if b { "true".into() } else { "false".into() },
         Some(Signal::Vec2(v))  => format!("({:.3}, {:.3})", v.x, v.y),
+        Some(Signal::Vec4(v))  => format!("({:.3}, {:.3}, {:.3}, {:.3})", v.x, v.y, v.z, v.w),
         Some(Signal::Int(i))   => format!("{i}"),
         None                   => "—".into(),
     };
@@ -19769,6 +19772,7 @@ fn sig_f32(s: &Signal) -> f32 {
         Signal::Bool(b)  => if *b { 1.0 } else { 0.0 },
         Signal::Int(i)   => *i as f32,
         Signal::Vec2(v)  => v.length(),
+        Signal::Vec4(v)  => v.length(),
     }
 }
 
@@ -22936,10 +22940,15 @@ fn decoration_inspector_strip_item(
             }
             LayoutDecoration::Svg { tint, tint_mode, stroke, stroke_px, svg_data, rev, .. } => {
                 if ui.small_button("Load…").on_hover_text("Load SVG file").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("SVG", &["svg"])
-                        .pick_file()
-                    {
+                    // This inspector strip is reachable from the overlay's edit
+                    // toolbar, where the always-on-top overlay would otherwise
+                    // sit ON TOP of the (owner-less) native file dialog and hide
+                    // it. Drop the overlay's topmost bit around the blocking
+                    // pick_file so the dialog is reachable (no-op elsewhere).
+                    let picked = crate::overlay::with_overlay_not_topmost(|| {
+                        rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file()
+                    });
+                    if let Some(path) = picked {
                         if let Ok(text) = std::fs::read_to_string(&path) {
                             *svg_data = text;
                             *rev = rev.wrapping_add(1);

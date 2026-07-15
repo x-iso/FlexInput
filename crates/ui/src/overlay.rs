@@ -54,6 +54,75 @@ const OVERLAY_WINDOW_TITLE: &str = "FlexInput Overlay";
 fn visible_id() -> egui::Id { egui::Id::new(OVERLAY_VISIBLE_KEY) }
 fn edit_id() -> egui::Id { egui::Id::new(OVERLAY_EDIT_KEY) }
 
+/// Run `f` (typically a blocking native file dialog) with the overlay window
+/// temporarily dropped out of always-on-top, then restore topmost.
+///
+/// The overlay is `always_on_top`; a native file dialog opens without an owner
+/// window, so it lands BEHIND the topmost overlay and is unreachable. And
+/// because `pick_file` blocks the event loop, the overlay can't repaint to
+/// toggle its own passthrough while the dialog is up — the window style is
+/// frozen at whatever it was when the toolbar button was clicked (interactive,
+/// covering the dialog). Dropping the OS topmost bit directly, synchronously,
+/// before the blocking call is the reliable fix; we restore it after. No-op
+/// off Windows or when the overlay window isn't present.
+#[cfg(windows)]
+pub fn with_overlay_not_topmost<R>(f: impl FnOnce() -> R) -> R {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    let title: Vec<u16> = OVERLAY_WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: FindWindowW with a null class + valid NUL-terminated title;
+    // returns null when no such window exists (overlay hidden).
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    if !hwnd.is_null() {
+        unsafe { SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags) };
+    }
+    let r = f();
+    if !hwnd.is_null() {
+        unsafe { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags) };
+    }
+    r
+}
+
+#[cfg(not(windows))]
+pub fn with_overlay_not_topmost<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// OS cursor position in the overlay's logical points. The overlay covers the
+/// primary monitor anchored at screen origin, so physical screen pixels divided
+/// by the overlay's scale give overlay-local points directly. Read from the OS
+/// (not egui) because a click-through window receives no pointer events — this
+/// is what lets edit mode decide, each frame, whether the cursor sits over an
+/// interactive region (toolbar / pinned item) and flip passthrough accordingly.
+#[cfg(windows)]
+fn os_cursor_in_points(pixels_per_point: f32) -> Option<egui::Pos2> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT { x: 0, y: 0 };
+    // SAFETY: GetCursorPos writes into our POINT; returns 0 on failure.
+    if unsafe { GetCursorPos(&mut p) } == 0 {
+        return None;
+    }
+    let ppp = pixels_per_point.max(0.1);
+    Some(egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp))
+}
+
+#[cfg(not(windows))]
+fn os_cursor_in_points(_pixels_per_point: f32) -> Option<egui::Pos2> {
+    None
+}
+
+/// Ctx temp slot holding last frame's overlay edit-toolbar rect (points), used
+/// by the passthrough hit-test (the toolbar's size isn't known until it's laid
+/// out, so we hit-test against the previous frame's rect — imperceptible lag).
+fn toolbar_rect_id() -> egui::Id { egui::Id::new("fxi_overlay_toolbar_rect") }
+
 pub fn overlay_visible(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<bool>(visible_id())).unwrap_or(false)
 }
@@ -229,8 +298,47 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // desired state changes (each send is a SetWindowLong round-trip).
         // During a pick the overlay goes back to click-through so the click
         // lands on the FlexInput window underneath/behind it.
+        //
+        // In EDIT mode the window is click-through on EMPTY space but
+        // interactive over the toolbar or any pinned item — so the user can
+        // reach the game / windows behind the overlay while still dragging
+        // pins and using the toolbar. The cursor is read from the OS (a
+        // click-through window gets no pointer events of its own), hit-tested
+        // against the toolbar rect (previous frame) and the item boxes.
+        const HIT_MARGIN: f32 = 18.0; // room for selection / resize handles
+        let interactive = if edit && !pick {
+            match os_cursor_in_points(vctx.pixels_per_point()) {
+                // Can't read the cursor → stay interactive (old whole-window
+                // behavior); never worse than before.
+                None => true,
+                Some(c) => {
+                    let over_toolbar = vctx
+                        .data(|d| d.get_temp::<egui::Rect>(toolbar_rect_id()))
+                        .map(|r| r.expand(4.0).contains(c))
+                        .unwrap_or(false);
+                    let over_item = overlay_layout.items.iter().any(|it| {
+                        let (p, s) = it.bbox();
+                        egui::Rect::from_min_size(
+                            egui::pos2(p[0], p[1]),
+                            egui::vec2(s[0].max(8.0), s[1].max(8.0)),
+                        )
+                        .expand(HIT_MARGIN)
+                        .contains(c)
+                    });
+                    // Keep interactive through an active drag even if the
+                    // cursor briefly leaves the item, so a move/resize can't be
+                    // cut off by a passthrough flip mid-gesture.
+                    let dragging = vctx.input(|i| i.pointer.any_down())
+                        || vctx.is_using_pointer();
+                    over_toolbar || over_item || dragging
+                }
+            }
+        } else {
+            false
+        };
+
         let pt_id = egui::Id::new("fxi_overlay_passthrough_applied");
-        let want_passthrough = !edit || pick;
+        let want_passthrough = if edit && !pick { !interactive } else { true };
         let applied: Option<bool> = vctx.data(|d| d.get_temp(pt_id));
         if applied != Some(want_passthrough) {
             vctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
@@ -347,7 +455,7 @@ fn overlay_edit_toolbar(
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
         .interactable(true);
-    area.show(ui.ctx(), |ui| {
+    let area_resp = area.show(ui.ctx(), |ui| {
         let bg = ui.visuals().window_fill();
         egui::Frame::default()
             .fill(egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 240))
@@ -395,5 +503,9 @@ fn overlay_edit_toolbar(
                 });
             });
     });
+    // Record the toolbar's rect so next frame's passthrough hit-test keeps the
+    // window interactive while the cursor is over it (its size isn't known
+    // until laid out here).
+    ui.ctx().data_mut(|d| d.insert_temp(toolbar_rect_id(), area_resp.response.rect));
     let _ = rect;
 }
