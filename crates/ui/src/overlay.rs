@@ -307,30 +307,43 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // against the toolbar rect (previous frame) and the item boxes.
         const HIT_MARGIN: f32 = 18.0; // room for selection / resize handles
         let interactive = if edit && !pick {
-            match os_cursor_in_points(vctx.pixels_per_point()) {
-                // Can't read the cursor → stay interactive (old whole-window
-                // behavior); never worse than before.
-                None => true,
-                Some(c) => {
-                    let over_toolbar = vctx
-                        .data(|d| d.get_temp::<egui::Rect>(toolbar_rect_id()))
-                        .map(|r| r.expand(4.0).contains(c))
-                        .unwrap_or(false);
-                    let over_item = overlay_layout.items.iter().any(|it| {
-                        let (p, s) = it.bbox();
-                        egui::Rect::from_min_size(
-                            egui::pos2(p[0], p[1]),
-                            egui::vec2(s[0].max(8.0), s[1].max(8.0)),
-                        )
-                        .expand(HIT_MARGIN)
-                        .contains(c)
-                    });
-                    // Keep interactive through an active drag even if the
-                    // cursor briefly leaves the item, so a move/resize can't be
-                    // cut off by a passthrough flip mid-gesture.
-                    let dragging = vctx.input(|i| i.pointer.any_down())
-                        || vctx.is_using_pointer();
-                    over_toolbar || over_item || dragging
+            // A right-click context menu (or a combo popup) extends BEYOND the
+            // item box it was opened from, so hit-testing only the item rect
+            // makes the menu click-through the instant the cursor leaves the
+            // item — you could only reach "Unpin" on a pin big enough to
+            // contain the whole menu. While any popup/menu is open, keep the
+            // whole overlay interactive so its entries are reachable. (The
+            // popup can only have opened while the cursor was over an
+            // interactive region, so this never latches on empty space.
+            // Tooltips use a separate order and don't count.)
+            if egui::Popup::is_any_open(vctx) {
+                true
+            } else {
+                match os_cursor_in_points(vctx.pixels_per_point()) {
+                    // Can't read the cursor → stay interactive (old whole-window
+                    // behavior); never worse than before.
+                    None => true,
+                    Some(c) => {
+                        let over_toolbar = vctx
+                            .data(|d| d.get_temp::<egui::Rect>(toolbar_rect_id()))
+                            .map(|r| r.expand(4.0).contains(c))
+                            .unwrap_or(false);
+                        let over_item = overlay_layout.items.iter().any(|it| {
+                            let (p, s) = it.bbox();
+                            egui::Rect::from_min_size(
+                                egui::pos2(p[0], p[1]),
+                                egui::vec2(s[0].max(8.0), s[1].max(8.0)),
+                            )
+                            .expand(HIT_MARGIN)
+                            .contains(c)
+                        });
+                        // Keep interactive through an active drag even if the
+                        // cursor briefly leaves the item, so a move/resize can't
+                        // be cut off by a passthrough flip mid-gesture.
+                        let dragging = vctx.input(|i| i.pointer.any_down())
+                            || vctx.is_using_pointer();
+                        over_toolbar || over_item || dragging
+                    }
                 }
             }
         } else {
