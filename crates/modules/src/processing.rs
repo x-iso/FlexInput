@@ -460,16 +460,18 @@ impl Module for Gyro3DOFModule {
                 PinDescriptor::new("Accel Z", SignalType::Float).optional(),
             ],
             outputs: vec![
-                PinDescriptor::new("Out",   SignalType::Vec2),
-                PinDescriptor::new("X",     SignalType::Float),
-                PinDescriptor::new("Y",     SignalType::Float),
-                PinDescriptor::new("Lean",  SignalType::Float),
-                PinDescriptor::new("Lean!", SignalType::Bool),
+                PinDescriptor::new("Out",    SignalType::Vec2),
+                PinDescriptor::new("X",      SignalType::Float),
+                PinDescriptor::new("Y",      SignalType::Float),
+                PinDescriptor::new("Lean",   SignalType::Float),
+                PinDescriptor::new("Lean!",  SignalType::Bool),
+                // Quaternion orientation (x,y,z,w) — continuous 3DOF pose from gyro + gravity alignment.
+                PinDescriptor::new("Orientation", SignalType::Vec4),
                 // AutoMap-out carries downstream per-pin signals produced
                 // by the module's lean_left / lean_right mapping arrays.
                 // Same contract as Remapper: pin injection happens in
                 // eval.rs.
-                PinDescriptor::new("Map",   SignalType::AutoMap),
+                PinDescriptor::new("Map",    SignalType::AutoMap),
             ],
         }
     }

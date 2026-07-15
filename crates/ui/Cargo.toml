@@ -15,6 +15,10 @@ flexinput-net     = { workspace = true }
 egui              = { workspace = true }
 egui_extras       = { workspace = true }
 eframe            = { workspace = true }
+wgpu              = { workspace = true }
+egui-wgpu         = { path = "../../vendor/egui-wgpu" }
+bytemuck          = "1.24"
+thiserror         = "2"
 # Direct SVG rasterization so we can recolor the pixmap before uploading as a
 # texture — egui_extras' built-in SVG loader only supports multiplicative tint.
 resvg             = "0.45"

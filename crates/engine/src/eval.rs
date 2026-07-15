@@ -559,6 +559,15 @@ fn preprocess_dev_sigs(
         }
     }
 
+    // Stash each device's `gyro_multiplier` under a synthetic pin key so the
+    // Gyro 3DOF module can divide it back out of its orientation quaternion
+    // (keeping the 3D pose 1:1 while the multiplier still scales the 2D pointer
+    // output). "__gyro_mult" is not a real pin, so per-name pin lookups and the
+    // canonical pin lists never surface it.
+    for (dev_id, (_, gm, _)) in &params {
+        out.insert((dev_id.clone(), "__gyro_mult".to_string()), Signal::Float(*gm));
+    }
+
     out
 }
 
@@ -1869,6 +1878,7 @@ fn automap_combiner_publish(
                     Signal::Int(i)  => *i != 0,
                     Signal::Float(f) => *f != 0.0,
                     Signal::Vec2(v) => *v != glam::Vec2::ZERO,
+                    Signal::Vec4(v) => *v != glam::Vec4::ZERO,
                 });
                 asserted.or_else(|| raw.into_iter().next())
             }
@@ -2398,6 +2408,11 @@ fn eval_subgraph(
                     _ => [None, None],
                 }).collect();
                 scope_samples.push((ns_uid, sample));
+                last_inputs.insert(ns_uid, inputs.clone());
+            }
+            // The 3D controller viewer reads its Orientation quaternion (input
+            // pin 1, a Vec4) from the mirrored inputs.
+            "display.controller3d" => {
                 last_inputs.insert(ns_uid, inputs.clone());
             }
             "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
@@ -2965,6 +2980,11 @@ pub fn eval_graph_tick(
                 scope_samples.push((snap.node_uid, sample));
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
+            // The 3D controller viewer reads its Orientation quaternion (input
+            // pin 1, a Vec4) from the mirrored inputs.
+            "display.controller3d" => {
+                last_inputs.insert(snap.node_uid, inputs.clone());
+            }
             "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
                 last_inputs.insert(snap.node_uid, inputs.clone());
             }
@@ -3499,7 +3519,8 @@ fn compute_node(
                 eval_pure(&snap.module_id, out_idx, inputs, &snap.params, snap.n_outputs)
             }).collect()
         }
-        "display.oscilloscope" | "display.vectorscope" | "display.readout" => vec![],
+        "display.oscilloscope" | "display.vectorscope" | "display.readout"
+        | "display.controller3d" => vec![],
         "device.sink" => {
             if snap.n_outputs == 0 { return vec![]; }
             let dev_id = snap.device_id.as_deref().unwrap_or("");
@@ -6773,7 +6794,13 @@ fn compute_gyro_3dof(
     //   [4] smoothed gravity Z
     //   [5] prev_reset edge guard
     //   [6] ease-in residual (0..1 progresses while resetting)
-    while state.aux_f32.len() < 7 { state.aux_f32.push(0.0); }
+    //   [7] quaternion x (orientation integration)
+    //   [8] quaternion y
+    //   [9] quaternion z
+    //   [10] quaternion w (always 1.0 at initialization, updated on each tick)
+    //   [11] prev_reset edge guard for reset tracking
+    //   [12] ease-in residual for orientation blend during reset
+    while state.aux_f32.len() < 13 { state.aux_f32.push(0.0); }
 
     // ── Axis selection: decide which gyro components feed X / Y ───────────
     //
@@ -6904,12 +6931,124 @@ fn compute_gyro_3dof(
     let lean_threshold = pf("lean_threshold", 0.3).clamp(0.01, 4.0);
     let lean_active = lean_val.abs() >= lean_threshold;
 
+    // ── Quaternion orientation integration (3DOF pose estimate) ───────────
+    //
+    // Maintains a continuous orientation estimate by integrating angular
+    // velocity over time. Uses aux_f32[7..10] for quaternion x,y,z,w.
+    // Gravity-based drift correction can be added later if needed.
+    let q_reset_now = get_b(inputs, 1, false);
+    let q_reset_edge = q_reset_now && state.aux_f32[11] < 0.5;
+    state.aux_f32[11] = if q_reset_now { 1.0 } else { 0.0 };
+
+    // Initialize quaternion to identity on first run or reset
+    if state.aux_f32[7] == 0.0 && state.aux_f32[8] == 0.0 && state.aux_f32[9] == 0.0 {
+        state.aux_f32[7] = 0.0; // qx
+        state.aux_f32[8] = 0.0; // qy
+        state.aux_f32[9] = 0.0; // qz
+        state.aux_f32[10] = 1.0; // qw (identity)
+    }
+
+    // Integrate the TRUE physical angular velocity so this orientation tracks
+    // the controller 1:1 in the real world — independent of BOTH the pointer/
+    // steering sensitivity AND the device's `gyro_multiplier`. Device gyro
+    // signals are NORMALIZED: ±1.0 == ±GYRO_REF_DPS deg/s (see
+    // crates/devices/src/gyro.rs), so convert to rad/s before integrating, else
+    // the model under-rotates by ~34.9×.
+    const GYRO_REF_DPS: f32 = 2000.0;
+    let norm_to_rad_s = GYRO_REF_DPS * std::f32::consts::PI / 180.0;
+    // `gyro_multiplier` (a device.source calibration knob) is already baked into
+    // the gyro signals by `preprocess_dev_sigs`; divide it back out so the
+    // orientation stays 1:1 no matter what the user sets it to. The multiplier
+    // is stashed per-device under the synthetic pin key "__gyro_mult".
+    let dev_gyro_mult = params
+        .get("_automap_device_id")
+        .and_then(|v| v.as_str())
+        .and_then(|dev| dev_sigs.get(&(dev.to_string(), "__gyro_mult".to_string())))
+        .and_then(|s| if let Signal::Float(f) = s { Some(*f) } else { None })
+        .filter(|m| m.abs() > 1e-6)
+        .unwrap_or(1.0);
+    // Orientation display scale, applied to the RATE (before integration) — the
+    // only place scaling a full 3D pose stays continuous. Scaling the finished
+    // quaternion (viewer-side) flips discontinuously as the rotation passes
+    // ~180°. Affects ONLY this Orientation output, not the 2D pointer/steering.
+    // 1.0 = physical; e.g. Switch Pro ≈ 0.5 (its device layer reports ~2× dps).
+    let orient_disp_scale = pf("orient_scale", 1.0);
+    let orient_scale = norm_to_rad_s / dev_gyro_mult * orient_disp_scale;
+    // Polarity comes from the module's EXISTING inv_* toggles — the same ones
+    // that orient the 2D output — not hardcoded per-device sign guesses. So a
+    // device calibrated once (its inv_yaw/inv_pitch/inv_roll) is correct for
+    // BOTH the 2D output and this 3D orientation. `gx` already carries inv_roll
+    // (applied at read); apply inv_pitch/inv_yaw here to match the 2D output,
+    // which negates by `inv("inv_pitch")` / `inv("inv_yaw")` on its Y / X.
+    let pitch_rate = gy * inv("inv_pitch");
+    let yaw_rate   = gz * inv("inv_yaw");
+    let roll_rate  = gx;
+    // Device gyro axes (roll, pitch, yaw) → model rotation axes (X=pitch,
+    // Y=yaw, Z=roll). Fixed base signs establish the model's handedness; the
+    // inv_* toggles above flip per-device as needed. Body-frame angular
+    // velocity, composed intrinsically (q_old * dq).
+    let gyro_vec = glam::Vec3::new(pitch_rate, -yaw_rate, -roll_rate) * orient_scale;
+    let mag = gyro_vec.length();
+    if mag > 1e-6 && dt > 0.0 {
+        let axis = gyro_vec / mag;
+        let angle = mag * dt;
+        let rot_q = glam::Quat::from_axis_angle(axis, angle);
+        let cur_q = glam::Quat::from_xyzw(
+            state.aux_f32[7],
+            state.aux_f32[8],
+            state.aux_f32[9],
+            state.aux_f32[10],
+        );
+        // Renormalize to shed accumulated floating-point drift over long runs.
+        let new_q = (cur_q * rot_q).normalize();
+        state.aux_f32[7] = new_q.x;
+        state.aux_f32[8] = new_q.y;
+        state.aux_f32[9] = new_q.z;
+        state.aux_f32[10] = new_q.w;
+    }
+
+    // Reset edge: fade quaternion toward identity over ease_in period
+    let q_ease_in = pf("reset_ease_in", 0.25).clamp(0.0, 2.0);
+    if q_reset_edge { state.aux_f32[12] = 1.0; }
+    if state.aux_f32[12] > 0.001 && q_ease_in > 0.001 {
+        let step = (dt / q_ease_in).clamp(0.0, 1.0);
+        let cur_q = glam::Quat::from_xyzw(
+            state.aux_f32[7],
+            state.aux_f32[8],
+            state.aux_f32[9],
+            state.aux_f32[10],
+        );
+        // Blend toward identity (0,0,0,1)
+        let blend_q = cur_q.slerp(glam::Quat::IDENTITY, step);
+        state.aux_f32[7] = blend_q.x;
+        state.aux_f32[8] = blend_q.y;
+        state.aux_f32[9] = blend_q.z;
+        state.aux_f32[10] = blend_q.w;
+        state.aux_f32[12] = (state.aux_f32[12] - step).max(0.0);
+    } else if q_reset_edge && q_ease_in <= 0.001 {
+        // Hard reset
+        state.aux_f32[7] = 0.0;
+        state.aux_f32[8] = 0.0;
+        state.aux_f32[9] = 0.0;
+        state.aux_f32[10] = 1.0;
+        state.aux_f32[12] = 0.0;
+    }
+
+    // Emit orientation as Vec4 (x, y, z, w)
+    let orientation_signal = Some(Signal::Vec4(glam::Vec4::new(
+        state.aux_f32[7],
+        state.aux_f32[8],
+        state.aux_f32[9],
+        state.aux_f32[10],
+    )));
+
     vec![
         Some(Signal::Vec2(glam::Vec2::new(final_x, final_y))),
         Some(Signal::Float(final_x)),
         Some(Signal::Float(final_y)),
         Some(Signal::Float(lean_val)),
         Some(Signal::Bool(lean_active)),
+        orientation_signal,
         // Map (AutoMap) — routing-only, no per-frame value. Slot must
         // exist so its index lines up with the module descriptor; the
         // actual per-pin signals are written into collector_sigs under
@@ -7166,6 +7305,7 @@ pub fn sig_to_f32(s: Option<Signal>) -> Option<f32> {
         Some(Signal::Float(f)) => Some(f),
         Some(Signal::Bool(b))  => Some(if b { 1.0 } else { 0.0 }),
         Some(Signal::Vec2(v))  => Some(v.length()),
+        Some(Signal::Vec4(v))  => Some(v.length()),
         Some(Signal::Int(i))   => Some(i as f32),
         None => None,
     }
@@ -7194,6 +7334,7 @@ fn sig_scalar(s: Signal) -> f32 {
         Signal::Int(i)   => i as f32,
         Signal::Bool(b)  => if b { 1.0 } else { 0.0 },
         Signal::Vec2(v)  => v.length(),
+        Signal::Vec4(v)  => v.length(),
     }
 }
 

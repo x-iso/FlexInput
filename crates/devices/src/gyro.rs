@@ -1431,7 +1431,7 @@ fn build(buf: &[u8], gyro_off: usize, accel_off: usize, gyro_dps_per_lsb: f32, a
     // Accel raw order is (side, vertical, fwd-tilt) — move vertical to z so that accel_z is
     // the gravity axis (≈ +1 when flat face-up), matching Switch Pro's accel_z orientation.
     HidReading {
-        gyro_x:  ri16(buf, gyro_off + 4)  as f32 * gs,   // raw[2] roll
+        gyro_x: -ri16(buf, gyro_off + 4)  as f32 * gs,   // raw[2] roll, negated to match Switch Pro's roll polarity
         gyro_y:  ri16(buf, gyro_off)      as f32 * gs,   // raw[0] pitch
         gyro_z: -ri16(buf, gyro_off + 2)  as f32 * gs,   // raw[1] yaw, negated: right=positive
         accel_x: ri16(buf, accel_off)     as f32 * as_,  // raw[0] side

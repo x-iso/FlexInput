@@ -881,6 +881,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             node.module_id.as_str(),
             "device.sink" | "module.constant" | "module.switch" | "module.knob" | "module.label" | "module.svg"
                 | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
+                | "display.controller3d"
                 | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
                 | "math.add" | "math.subtract" | "math.multiply" | "math.divide"
                 | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
@@ -932,6 +933,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl),
             "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl),
             "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl),
+            "display.controller3d"  => show_controller3d_body(node_id, ui, snarl),
             "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl),
             "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl),
             "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl),
@@ -9024,6 +9026,9 @@ fn show_gyro_3dof_body(
     let recenter_strength = snap.and_then(|n| n.params.get("recenter_strength").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let reset_ease_in     = snap.and_then(|n| n.params.get("reset_ease_in").and_then(|v| v.as_f64())).unwrap_or(0.25) as f32;
     let lean_threshold    = snap.and_then(|n| n.params.get("lean_threshold").and_then(|v| v.as_f64())).unwrap_or(0.3) as f32;
+    // Display scale for the 3D Orientation output only (applied to the
+    // integration rate so it stays continuous). Does NOT affect the 2D outputs.
+    let orient_scale      = snap.and_then(|n| n.params.get("orient_scale").and_then(|v| v.as_f64())).unwrap_or(1.0) as f32;
     let out_x = snap.and_then(|n| match n.extra.last_signals.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
     let out_y = snap.and_then(|n| match n.extra.last_signals.get(2) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
     let lean_v = snap.and_then(|n| match n.extra.last_signals.get(3) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
@@ -9036,6 +9041,7 @@ fn show_gyro_3dof_body(
     let mut recenter_strength = recenter_strength;
     let mut reset_ease_in = reset_ease_in;
     let mut lean_threshold = lean_threshold;
+    let mut orient_scale = orient_scale;
     let mut changed   = false;
 
     const GYR_LABELS: [(&str, &str); 3] = [
@@ -9113,6 +9119,28 @@ fn show_gyro_3dof_body(
             });
         });
         stopts_rect = Some(r.response.rect);
+
+        // 3D Orientation display scale (applied to the integration rate, so it's
+        // continuous — no flipping at 180°). Affects the Orientation output that
+        // feeds the Controller 3D viewer, NOT the 2D pointer/steering outputs.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(egui::RichText::new("3D rot ×").small().weak())
+                .on_hover_text(
+                    "Rotation scale for the 3D Orientation output only.\n\
+                     1.0 = physically 1:1. If the on-screen model over- or\n\
+                     under-rotates vs. your real controller, adjust here\n\
+                     (e.g. Switch Pro ≈ 0.5). Applied to the integration rate\n\
+                     so it never flips; does NOT affect pointer/steering.",
+                );
+            if ui.add(egui::DragValue::new(&mut orient_scale)
+                .speed(0.01).range(0.05..=5.0))
+                .changed() { changed = true; }
+            if ui.small_button("⟲").on_hover_text("Reset to 1.0").clicked() {
+                orient_scale = 1.0;
+                changed = true;
+            }
+        });
 
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
@@ -9205,6 +9233,8 @@ fn show_gyro_3dof_body(
             node.params.remove("spike_k");
             node.params.insert("lean_threshold".into(),
                 serde_json::Number::from_f64(lean_threshold as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("orient_scale".into(),
+                serde_json::Number::from_f64(orient_scale as f64).map(Value::Number).unwrap_or(Value::Null));
         }
     }
 }
@@ -15874,6 +15904,196 @@ fn show_oscilloscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, 
         });
     });
     if let Some(r) = display_rect { register_exposable_element(ui, node_id, "display", r); }
+}
+
+/// Body for the Controller 3D display node: renders the connected (or manually
+/// chosen) controller model, rotated live by the gyro `Orientation` quaternion
+/// (input 1, a Vec4). The model is auto-detected from the connected device
+/// (input 0, AutoMap) unless the `model` param overrides it.
+/// Trace the AutoMap bus from `src` back to the ORIGINATING physical device id,
+/// for the 3D viewer's skin auto-detection. Unlike
+/// `find_automap_device_id_for_viewer` (which returns injector keys like
+/// `remap:` / `lean:` / `forksel:` for signal lookup), this always follows the
+/// bus through every module to the real `device.source`, so auto-detect works
+/// when the Device input is wired through a Remapper, Gyro 3DOF, Fork, etc., or
+/// across sub-patch boundaries. Returns `None` if no device is reachable.
+fn controller3d_physical_device(
+    snarl: &Snarl<NodeData>,
+    src: OutPinId,
+    parents: Option<&AutomapGlowParent<'_>>,
+) -> Option<String> {
+    let node = snarl.get_node(src.node)?;
+    match node.module_id.as_str() {
+        "device.source" => node
+            .params
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        "subpatch" => {
+            // Descend through the outlet feeding this output pin.
+            let sp = node.subpatch.as_ref()?;
+            let outlet_id: NodeId = sp
+                .snarl
+                .nodes_ids_data()
+                .find(|(_, n)| {
+                    n.value.module_id == "subpatch.outlet"
+                        && n.value.params.get("pin_index").and_then(|v| v.as_u64())
+                            == Some(src.output as u64)
+                })
+                .map(|(id, _)| id)?;
+            let outlet_in = sp.snarl.in_pin(InPinId { node: outlet_id, input: 0 });
+            let inner_upstream = *outlet_in.remotes.first()?;
+            let frame = AutomapGlowParent { snarl, subpatch_node_id: src.node, prev: parents };
+            controller3d_physical_device(&sp.snarl, inner_upstream, Some(&frame))
+        }
+        "subpatch.inlet" => {
+            // Pop back out to the enclosing snarl through the matching inlet.
+            let pin_idx = node.params.get("pin_index").and_then(|v| v.as_u64())? as usize;
+            let p = parents?;
+            let outer_in = p.snarl.in_pin(InPinId { node: p.subpatch_node_id, input: pin_idx });
+            let upstream = *outer_in.remotes.first()?;
+            controller3d_physical_device(p.snarl, upstream, p.prev)
+        }
+        _ => {
+            // Any other module carrying the bus: follow its first AutoMap input.
+            let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
+            let in_pin = snarl.in_pin(InPinId { node: src.node, input: am_idx });
+            let upstream = *in_pin.remotes.first()?;
+            controller3d_physical_device(snarl, upstream, parents)
+        }
+    }
+}
+
+fn show_controller3d_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    use crate::model;
+
+    // Model override ("" / "auto" = auto-detect from the connected device).
+    let override_name = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("model").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    // Auto-detect the skin by tracing the Device bus (input 0) back to the
+    // physical source — through Remapper/Gyro/Fork/sub-patches, not just a
+    // direct device.source wire.
+    let dev_id = snarl
+        .in_pin(InPinId { node: node_id, input: 0 })
+        .remotes
+        .first()
+        .copied()
+        .and_then(|src| controller3d_physical_device(snarl, src, None));
+    let resolved = if !override_name.is_empty() && override_name != "auto" {
+        override_name.clone()
+    } else if let Some(dev) = dev_id.as_deref() {
+        model::model_for_device(dev)
+    } else {
+        model::available_models().into_iter().next().unwrap_or_default()
+    };
+
+    // Orientation quaternion from the Vec4 input (index 1), else identity. The
+    // Gyro module already applies any orientation scale to the integration rate
+    // (the only place scaling a full 3D pose is continuous), so the viewer just
+    // displays the quaternion as received.
+    let orientation = snarl
+        .get_node(node_id)
+        .and_then(|n| n.extra.last_signals.get(1).copied().flatten())
+        .and_then(|s| match s {
+            Signal::Vec4(v) => Some(glam::Quat::from_xyzw(v.x, v.y, v.z, v.w)),
+            _ => None,
+        })
+        .filter(|q| q.length_squared() > 1e-6)
+        .map(|q| q.normalize())
+        .unwrap_or(glam::Quat::IDENTITY);
+
+    ui.vertical(|ui| {
+        // Model picker: Auto (device) + every available model folder.
+        let models = model::available_models();
+        let mut sel = if override_name.is_empty() { "auto".to_string() } else { override_name.clone() };
+        let mut new_sel: Option<String> = None;
+        egui::ComboBox::from_id_salt(("c3d_model", node_id))
+            .selected_text(if sel == "auto" { "Auto (device)".to_string() } else { sel.clone() })
+            .show_ui(ui, |ui| {
+                if ui.selectable_value(&mut sel, "auto".to_string(), "Auto (device)").changed() {
+                    new_sel = Some(String::new());
+                }
+                for m in &models {
+                    if ui.selectable_value(&mut sel, m.clone(), m).changed() {
+                        new_sel = Some(m.clone());
+                    }
+                }
+            });
+        if let Some(val) = new_sel {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("model".to_string(), serde_json::Value::String(val));
+            }
+        }
+
+        // Resizable rectangular viewport (persisted like the scopes).
+        let size_id = egui::Id::new(("c3d_size", node_id));
+        let mut size = ui
+            .ctx()
+            .data_mut(|d| d.get_persisted::<[f32; 2]>(size_id))
+            .unwrap_or([200.0, 160.0]);
+        size[0] = size[0].max(80.0);
+        size[1] = size[1].max(60.0);
+        let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(size[0], size[1]));
+
+        match model::load_model_cached(&resolved) {
+            Some(m) => {
+                // Clamp the 3D paint rect to the visible clip area. egui otherwise
+                // clamps the GPU viewport to the screen bounds when the node is
+                // scrolled partly off an edge, which squashes the model into the
+                // visible band. Rendering into the already-visible sub-rect keeps
+                // the aspect correct (the camera frames whatever is visible) with
+                // no squash. `rect` itself still drives layout + the resize handle.
+                let vis_rect = rect.intersect(ui.clip_rect());
+                ui.painter_at(rect).rect_filled(rect, 4.0, egui::Color32::from_rgb(18, 18, 22));
+                if vis_rect.width() > 1.0 && vis_rect.height() > 1.0 {
+                    // vis_rect = what's painted; rect = full framing (crops, no shrink).
+                    ui.add(model::build_controller_widget(vis_rect, rect, m, orientation));
+                }
+                // Live pose needs a real cadence.
+                ui.ctx().request_repaint();
+            }
+            None => {
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(26, 20, 20));
+                let msg = if model::models_base_dir().is_none() {
+                    "No models folder found\n(app/assets/models)".to_string()
+                } else if resolved.is_empty() {
+                    "No controller models available".to_string()
+                } else {
+                    format!("Couldn't load model:\n{resolved}")
+                };
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    msg,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgb(210, 160, 160),
+                );
+                ui.allocate_rect(rect, egui::Sense::hover());
+            }
+        }
+
+        // Bottom-right resize handle.
+        let hs = 12.0;
+        let handle = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - hs, rect.bottom() - hs),
+            egui::vec2(hs, hs),
+        );
+        let hr = ui.interact(handle, size_id.with("h"), egui::Sense::click_and_drag());
+        if hr.hovered() || hr.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+        }
+        if hr.dragged() {
+            let d = hr.drag_delta();
+            size[0] = (size[0] + d.x).max(80.0);
+            size[1] = (size[1] + d.y).max(60.0);
+            ui.ctx().data_mut(|d2| d2.insert_persisted(size_id, size));
+        }
+    });
 }
 
 fn show_vectorscope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {

@@ -774,6 +774,10 @@ impl FlexInputApp {
                 "[gpu] adapter=\"{}\" backend={:?} type={:?} driver=\"{}\"",
                 info.name, info.backend, info.device_type, info.driver_info
             );
+            // Capture the negotiated surface format so the 3D controller
+            // pipeline is built to match the render pass (else wgpu rejects
+            // the draw with an incompatible-target validation error).
+            crate::model::callback::set_target_format(rs.target_format);
         }
         setup_fonts(&cc.egui_ctx);
         // Install egui_extras image loaders so SVG images render inside nodes

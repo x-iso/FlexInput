@@ -375,6 +375,13 @@ fn main() -> eframe::Result<()> {
             .with_transparent(true)
             .with_icon(icon),
         wgpu_options,
+        // 32-bit depth buffer for egui's render pass (Depth32Float). egui's own
+        // pipeline ignores it (depth_compare: Always, no write), so 2D UI is
+        // unaffected — but it lets the 3D Controller viewer's paint callback do
+        // real depth testing so parts occlude correctly instead of drawing
+        // see-through. Depth is separate from color, so this does not touch the
+        // transparent-window / DirectComposition alpha path.
+        depth_buffer: 32,
         ..Default::default()
     };
 
