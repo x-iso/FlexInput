@@ -123,6 +123,23 @@ pub struct IvStyleOverride {
     pub outline: [u8; 4],
     /// Board outline stroke width (0 = no outline).
     pub outline_px: f32,
+    /// 3D controller viewer only — per-pin camera elevation in degrees.
+    /// `None` = use the module's own `cam_pitch` param. Ignored by 2D boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c3d_pitch: Option<f32>,
+    /// 3D controller viewer only — per-pin model opacity (0..1). `None` = use
+    /// the module's `overlay_alpha` param.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c3d_alpha: Option<f32>,
+    /// 3D controller viewer only — per-pin highlight fade time in seconds.
+    /// `None` = use the module's `highlight_tailoff` param.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c3d_fade: Option<f32>,
+    /// 3D controller viewer only — per-pin widget composite alpha (0..1):
+    /// fades the whole rendered controller as a 2D image, independent of the
+    /// model-opacity see-through. `None` = fully opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c3d_composite: Option<f32>,
 }
 
 fn default_exposed_size() -> [f32; 2] { [220.0, 100.0] }

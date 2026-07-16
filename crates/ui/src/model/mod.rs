@@ -7,15 +7,18 @@
 
 mod obj;
 pub mod controller_wgsl;
+pub mod material;
 pub mod pipeline;
 pub mod callback;
 
 // Re-export OBJ loader types/functions for use by other crates.
-pub use obj::{parse_obj, parse_info_txt, load_controller_model, part_transform};
+pub use obj::{parse_obj, parse_info_txt, load_controller_model, load_controller_model_with, part_transform};
 pub use obj::{Mesh, Part, ControllerModel, PartTransform, ObjError};
 
 // Runtime model cache + render-widget builder + device→model mapping.
 pub use callback::{
-    available_models, build_controller_widget, load_model_cached, model_for_device,
-    models_base_dir, set_target_format, LoadedModel,
+    available_models, load_model_cached, model_for_device, models_base_dir,
+    paint_controller_model, set_target_format, set_user_models_dir,
+    ControllerLive, LoadedModel,
 };
+pub use material::{default_scheme, MaterialGroup, Scheme, MIC_COLOR, N_GROUPS};

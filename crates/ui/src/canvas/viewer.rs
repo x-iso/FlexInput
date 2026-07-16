@@ -933,7 +933,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl),
             "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl),
             "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl),
-            "display.controller3d"  => show_controller3d_body(node_id, ui, snarl),
+            "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals),
             "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl),
             "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl),
             "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl),
@@ -11275,6 +11275,9 @@ pub(crate) fn layout_inspector_strip_core(
     let is_text_pin   = inner_mid == Some("module.label");
     let is_switch_pin = inner_mid == Some("module.switch");
     let is_input_viewer_pin = inner_mid == Some("module.input_viewer");
+    // The 3D controller viewer shares the Input Viewer's style-override STORAGE
+    // but has its own inspector (adds view angle / opacity / highlight fade).
+    let is_c3d_pin = inner_mid == Some("display.controller3d");
     let is_graph_pin = matches!(
         inner_mid,
         Some("module.response_curve")
@@ -11307,6 +11310,9 @@ pub(crate) fn layout_inspector_strip_core(
             }
             LayoutItem::Module(_) if is_input_viewer_pin => {
                 input_viewer_pin_inspector_strip_item(ui, state.items, idx);
+            }
+            LayoutItem::Module(_) if is_c3d_pin => {
+                controller3d_pin_inspector_strip_item(ui, state.items, idx);
             }
             LayoutItem::Module(_) if is_graph_pin => {
                 graph_pin_inspector_strip_item(ui, state.items, idx, graph_channels);
@@ -11595,6 +11601,135 @@ fn render_pinned_element_impl(
             let style = super::input_viewer::IvStyle::from_override(iv_style_override.as_ref());
             super::input_viewer::paint_viewer_board(
                 ui, board, inner_id.0, dev.as_deref(), skin, &style, live_signals,
+            );
+            return;
+        }
+        // 3D controller viewer: whole-container render, cropped/tinted per its
+        // style override. Pure display — orientation from its Vec4 input mirror.
+        ("display.controller3d", "viewer") => {
+            let (rect, _) = ui.allocate_exact_size(container_size, egui::Sense::hover());
+            let override_name = inner_snarl.get_node(inner_id)
+                .and_then(|n| n.params.get("model").and_then(|v| v.as_str()))
+                .unwrap_or("").to_string();
+            let traced = inner_snarl.in_pin(InPinId { node: inner_id, input: 0 })
+                .remotes.first().copied()
+                .and_then(|src| controller3d_physical_device(inner_snarl, src, bridged_parent));
+            let (dev_id, deadzone) = match traced {
+                Some((d, z)) => (Some(d), z),
+                None => (None, 0.1),
+            };
+            let resolved = if !override_name.is_empty() && override_name != "auto" {
+                override_name
+            } else if let Some(dev) = dev_id.as_deref() {
+                crate::model::model_for_device(dev)
+            } else {
+                crate::model::available_models().into_iter().next().unwrap_or_default()
+            };
+            let orientation = inner_snarl.get_node(inner_id)
+                .and_then(|n| n.extra.last_signals.get(1).copied().flatten())
+                .and_then(|s| match s {
+                    Signal::Vec4(v) => Some(glam::Quat::from_xyzw(v.x, v.y, v.z, v.w)),
+                    _ => None,
+                })
+                .filter(|q| q.length_squared() > 1e-6)
+                .map(|q| q.normalize())
+                .unwrap_or(glam::Quat::IDENTITY);
+            // Deferred materials edits from the layout/overlay inspector strip
+            // (the strip has no snarl access, so requests ride egui temp
+            // memory; we hold the &mut snarl and apply them here).
+            let edit_id = egui::Id::new(("c3d_matedit", inner_id.0));
+            let reset_id = egui::Id::new(("c3d_matreset", inner_id.0));
+            let pending_edit =
+                ui.ctx().data_mut(|d| d.remove_temp::<(String, [u8; 3])>(edit_id));
+            let pending_reset = ui
+                .ctx()
+                .data_mut(|d| d.remove_temp::<bool>(reset_id))
+                .unwrap_or(false);
+            if pending_reset {
+                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
+                    node.params.remove("materials");
+                }
+            } else if let Some((key, rgb)) = pending_edit {
+                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
+                    let mut mats = node
+                        .params
+                        .get("materials")
+                        .and_then(|v| v.as_object().cloned())
+                        .unwrap_or_default();
+                    mats.insert(key, serde_json::json!([rgb[0], rgb[1], rgb[2]]));
+                    node.params
+                        .insert("materials".into(), serde_json::Value::Object(mats));
+                }
+            }
+            // Whole-scheme load (inspector Load… button).
+            if let Some(map) = ui.ctx().data_mut(|d| {
+                d.remove_temp::<serde_json::Map<String, serde_json::Value>>(
+                    egui::Id::new(("c3d_matload", inner_id.0)),
+                )
+            }) {
+                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
+                    node.params
+                        .insert("materials".into(), serde_json::Value::Object(map));
+                }
+            }
+            // Model swap (inspector chooser) — same keep-colours semantics as
+            // the module body ("" = auto-detect from the device).
+            if let Some(model_sel) = ui.ctx().data_mut(|d| {
+                d.remove_temp::<String>(egui::Id::new(("c3d_modeledit", inner_id.0)))
+            }) {
+                let keep = inner_snarl
+                    .get_node(inner_id)
+                    .and_then(|n| n.params.get("keep_colors").and_then(|v| v.as_bool()))
+                    .unwrap_or(false);
+                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
+                    node.params
+                        .insert("model".to_string(), serde_json::Value::String(model_sel));
+                    if !keep {
+                        node.params.remove("materials");
+                    }
+                }
+            }
+            // Publish the effective colours for the inspector strip to display.
+            let cur_rgb = controller3d_scheme_rgb(inner_snarl, inner_id, &resolved);
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    egui::Id::new(("c3d_pub", inner_id.0)),
+                    (resolved.clone(), cur_rgb),
+                )
+            });
+
+            let (bg, outline, outline_w, accent) = controller3d_style(iv_style_override.as_ref());
+            let (scheme, mut alpha, mut cam_pitch) =
+                controller3d_scheme(inner_snarl, inner_id, &resolved);
+            let mut tailoff = inner_snarl
+                .get_node(inner_id)
+                .and_then(|n| n.params.get("highlight_tailoff").and_then(|v| v.as_f64()))
+                .unwrap_or(0.25) as f32;
+            // Per-pin display overrides (view angle / opacity / fade /
+            // composite) — each falls back to the module's own params (or
+            // fully-opaque for composite) when unset.
+            let mut composite = 1.0f32;
+            if let Some(o) = iv_style_override.as_ref() {
+                if let Some(p) = o.c3d_pitch {
+                    cam_pitch = p.to_radians();
+                }
+                if let Some(a) = o.c3d_alpha {
+                    alpha = a.clamp(0.0, 1.0);
+                }
+                if let Some(f) = o.c3d_fade {
+                    tailoff = f;
+                }
+                if let Some(c) = o.c3d_composite {
+                    composite = c.clamp(0.0, 1.0);
+                }
+            }
+            let ctx = ui.ctx().clone();
+            let live = controller3d_live(
+                live_signals, dev_id.as_deref(), &ctx, inner_id.0, tailoff, accent, deadzone,
+            );
+            render_controller3d_core(
+                ui, rect, &resolved, orientation, bg, outline, outline_w, scheme, alpha, cam_pitch,
+                live, composite,
             );
             return;
         }
@@ -15921,14 +16056,23 @@ fn controller3d_physical_device(
     snarl: &Snarl<NodeData>,
     src: OutPinId,
     parents: Option<&AutomapGlowParent<'_>>,
-) -> Option<String> {
+) -> Option<(String, f32)> {
     let node = snarl.get_node(src.node)?;
     match node.module_id.as_str() {
-        "device.source" => node
-            .params
-            .get("device_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        // Returns the device id + the source's stick deadzone, so the viewer
+        // shows the same post-deadzone stick deflection the engine feeds the
+        // graph. 0.1 mirrors the engine default for an omitted param.
+        "device.source" => {
+            let dz = node
+                .params
+                .get("deadzone")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.1) as f32;
+            node.params
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .map(|s| (s.to_string(), dz))
+        }
         "subpatch" => {
             // Descend through the outlet feeding this output pin.
             let sp = node.subpatch.as_ref()?;
@@ -15964,8 +16108,415 @@ fn controller3d_physical_device(
     }
 }
 
-fn show_controller3d_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+/// Shared 3D-viewer painter used by both the node body and pinned/overlay
+/// instances. Draws the styled background, the model (cropped to the visible
+/// area, tinted) or an error hint, and an optional outline into `full_rect`.
+/// Does NOT allocate — the caller reserves `full_rect` first.
+fn render_controller3d_core(
+    ui: &mut egui::Ui,
+    full_rect: egui::Rect,
+    resolved: &str,
+    orientation: glam::Quat,
+    bg: egui::Color32,
+    outline: egui::Color32,
+    outline_w: f32,
+    scheme: [[f32; 3]; crate::model::N_GROUPS],
+    global_alpha: f32,
+    cam_pitch: f32,
+    live: crate::model::ControllerLive,
+    composite: f32,
+) {
     use crate::model;
+    match model::load_model_cached(resolved) {
+        Some(m) => {
+            ui.painter_at(full_rect).rect_filled(full_rect, 4.0, bg);
+            // Crop to the visible area (egui clamps the GPU viewport to the
+            // screen; painting the full-rect projection into the visible sub-rect
+            // crops at the edge instead of squashing). `full_rect` still frames
+            // the camera so the model keeps a stable size.
+            let vis_rect = full_rect.intersect(ui.clip_rect());
+            if vis_rect.width() > 1.0 && vis_rect.height() > 1.0 {
+                model::paint_controller_model(
+                    ui, vis_rect, full_rect, m, orientation, scheme, global_alpha, cam_pitch,
+                    live, composite,
+                );
+            }
+            ui.ctx().request_repaint(); // live pose cadence
+        }
+        None => {
+            let painter = ui.painter_at(full_rect);
+            painter.rect_filled(full_rect, 4.0, egui::Color32::from_rgb(26, 20, 20));
+            let msg = if model::models_base_dir().is_none() {
+                "No models folder found\n(app/assets/models)".to_string()
+            } else if resolved.is_empty() {
+                "No controller models available".to_string()
+            } else {
+                format!("Couldn't load model:\n{resolved}")
+            };
+            painter.text(
+                full_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                msg,
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(210, 160, 160),
+            );
+        }
+    }
+    if outline_w > 0.0 {
+        ui.painter_at(full_rect).rect_stroke(
+            full_rect,
+            4.0,
+            egui::Stroke::new(outline_w, outline),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// Default highlight accent for the 3D viewer (matches the Input Viewer's
+/// default amber so the style swatches agree with what renders).
+const C3D_DEFAULT_ACCENT: [u8; 4] = [255, 196, 90, 255];
+
+/// Resolve `(bg, outline, outline_w, highlight_rgb)` for a 3D viewer from its
+/// per-pin style override, falling back to the node body's defaults when unset.
+/// (Model colours live in the per-node material scheme, not here; the highlight
+/// is the style `accent`, returned as shader-space 0..1 RGB.)
+fn controller3d_style(
+    ov: Option<&crate::canvas::node::IvStyleOverride>,
+) -> (egui::Color32, egui::Color32, f32, [f32; 3]) {
+    let c = |a: [u8; 4]| egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], a[3]);
+    let hl = |a: [u8; 4]| [a[0] as f32 / 255.0, a[1] as f32 / 255.0, a[2] as f32 / 255.0];
+    match ov {
+        Some(o) => (c(o.bg), c(o.outline), o.outline_px, hl(o.accent)),
+        None => (
+            egui::Color32::from_rgb(18, 18, 22), // bg
+            egui::Color32::from_rgb(70, 70, 75), // outline colour (only if width > 0)
+            0.0,                                 // outline width (none by default)
+            hl(C3D_DEFAULT_ACCENT),
+        ),
+    }
+}
+
+/// Build the per-node material scheme (per-model default + per-group param
+/// overrides) and overlay opacity for a 3D viewer node. Colours are converted to
+/// the shader's 0..1 RGB; the fixed Mic colour is left at its default.
+/// Default camera elevation (degrees above horizontal) — a 3/4 overhead view.
+const C3D_DEFAULT_PITCH_DEG: f32 = 38.0;
+
+/// The node's effective u8 colour scheme: per-model default with the node's
+/// `materials` param overrides applied. Shared by the shader-space converter
+/// below and the inspector-strip publisher.
+fn controller3d_scheme_rgb(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    model_name: &str,
+) -> crate::model::Scheme {
+    let mut rgb = crate::model::default_scheme(model_name);
+    if let Some(mats) = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("materials"))
+        .and_then(|v| v.as_object())
+    {
+        for (_, groups) in crate::model::material::ROWS {
+            for &g in *groups {
+                if let Some(arr) = mats.get(g.key()).and_then(|v| v.as_array()) {
+                    if arr.len() >= 3 {
+                        rgb[g as usize] = [
+                            arr[0].as_u64().unwrap_or(0) as u8,
+                            arr[1].as_u64().unwrap_or(0) as u8,
+                            arr[2].as_u64().unwrap_or(0) as u8,
+                        ];
+                    }
+                }
+            }
+        }
+    }
+    rgb
+}
+
+fn controller3d_scheme(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    model_name: &str,
+) -> ([[f32; 3]; crate::model::N_GROUPS], f32, f32) {
+    let rgb = controller3d_scheme_rgb(snarl, node_id, model_name);
+    let node = snarl.get_node(node_id);
+    let alpha = node
+        .and_then(|n| n.params.get("overlay_alpha").and_then(|v| v.as_f64()))
+        .unwrap_or(1.0) as f32;
+    let cam_pitch = node
+        .and_then(|n| n.params.get("cam_pitch").and_then(|v| v.as_f64()))
+        .unwrap_or(C3D_DEFAULT_PITCH_DEG as f64) as f32;
+    let mut out = [[0.0f32; 3]; crate::model::N_GROUPS];
+    for i in 0..crate::model::N_GROUPS {
+        out[i] = [
+            rgb[i][0] as f32 / 255.0,
+            rgb[i][1] as f32 / 255.0,
+            rgb[i][2] as f32 / 255.0,
+        ];
+    }
+    (out, alpha.clamp(0.0, 1.0), cam_pitch.to_radians())
+}
+
+/// Smoothed highlight for one part: snaps up instantly, fades to zero over
+/// roughly `tailoff` seconds. State is cached in egui temp memory per node+key.
+fn c3d_glow(ctx: &egui::Context, node_uid: usize, key: &str, target: f32, tailoff: f32) -> f32 {
+    let id = egui::Id::new(("c3d_glow", node_uid, key));
+    let prev = ctx.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+    let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+    let v = if target >= prev {
+        target
+    } else {
+        // ~4 time-constants to fade out over `tailoff` seconds.
+        let rate = 4.0 / tailoff.max(0.05);
+        prev + (target - prev) * (1.0 - (-rate * dt).exp())
+    };
+    ctx.data_mut(|d| d.insert_temp(id, v));
+    v
+}
+
+/// Live input state driving the 3D model (touch dots, stick tilt, trigger pull,
+/// button presses, and the fading active-input highlight) for the resolved
+/// device. Reads the same live-signal pin keys the 2D input viewer uses; touch
+/// is normalized via `pad_point_to_unit` (the codebase-standard mapping).
+fn controller3d_live(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    dev_id: Option<&str>,
+    ctx: &egui::Context,
+    node_uid: usize,
+    tailoff: f32,
+    highlight: [f32; 3],
+    deadzone: f32,
+) -> crate::model::ControllerLive {
+    let mut live = crate::model::ControllerLive::default();
+    live.highlight = highlight;
+    let Some(dev) = dev_id else { return live };
+    let f = |pin: &str| {
+        live_signals
+            .get(&(dev.to_string(), pin.to_string()))
+            .map(|s| s.as_float())
+            .unwrap_or(0.0)
+    };
+    let b = |pin: &str| {
+        live_signals
+            .get(&(dev.to_string(), pin.to_string()))
+            .map(|s| s.as_bool())
+            .unwrap_or(false)
+    };
+    let has = |pin: &str| live_signals.contains_key(&(dev.to_string(), pin.to_string()));
+
+    // Touch dots (normalized, y already flipped by pad_point_to_unit).
+    for (k, (px, py, pa)) in [
+        ("touch1_x", "touch1_y", "touch1_active"),
+        ("touch2_x", "touch2_y", "touch2_active"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if b(pa) {
+            let (ux, uy) = flexinput_core::touchzones::pad_point_to_unit(f(px), f(py));
+            live.touch[k] = Some(glam::Vec2::new(ux, uy));
+        }
+    }
+
+    // Sticks (Vec2 pin or split x/y), triggers (analog + digital fallback).
+    // The same radial deadzone the engine applies (`apply_deadzone`) is
+    // reproduced here so the model's tilt matches what the graph receives.
+    let stick = |vec_pin: &str, xp: &str, yp: &str| -> glam::Vec2 {
+        let raw = if let Some(Signal::Vec2(v)) =
+            live_signals.get(&(dev.to_string(), vec_pin.to_string()))
+        {
+            glam::Vec2::new(v.x, v.y)
+        } else {
+            glam::Vec2::new(f(xp), f(yp))
+        };
+        let len = raw.length();
+        if deadzone <= 0.0 || len <= 0.0 {
+            raw
+        } else if len < deadzone {
+            glam::Vec2::ZERO
+        } else {
+            raw / len * ((len - deadzone) / (1.0 - deadzone).max(f32::EPSILON))
+        }
+    };
+    live.left_stick = stick("left_stick", "left_stick_x", "left_stick_y");
+    live.right_stick = stick("right_stick", "right_stick_x", "right_stick_y");
+    live.left_stick_press = if b("btn_ls") { 1.0 } else { 0.0 };
+    live.right_stick_press = if b("btn_rs") { 1.0 } else { 0.0 };
+    live.left_trigger = if has("left_trigger") { f("left_trigger") } else if b("btn_lt_dig") { 1.0 } else { 0.0 };
+    live.right_trigger = if has("right_trigger") { f("right_trigger") } else if b("btn_rt_dig") { 1.0 } else { 0.0 };
+
+    // Buttons keyed by MESH PART name → live pin (bool → 0/1).
+    const BUTTON_PART_PINS: &[(&str, &str)] = &[
+        ("a_button", "btn_south"),
+        ("b_button", "btn_east"),
+        ("x_button", "btn_west"),
+        ("y_button", "btn_north"),
+        ("dpad_up", "dpad_up"),
+        ("dpad_down", "dpad_down"),
+        ("dpad_left", "dpad_left"),
+        ("dpad_right", "dpad_right"),
+        ("start_button", "btn_start"),
+        ("back_button", "btn_back"),
+        ("guide_button", "btn_guide"),
+        ("left_bumper", "btn_lb"),
+        ("right_bumper", "btn_rb"),
+    ];
+    for (part, pin) in BUTTON_PART_PINS {
+        if b(pin) {
+            live.buttons.insert((*part).to_string(), 1.0);
+        }
+    }
+
+    // LED / lightbar relay: the feedback pins the graph sends toward the device
+    // (carried on the AutoMap bus). Accept either 0..1 or 0..255 encodings.
+    if has("lightbar_r") || has("lightbar_g") || has("lightbar_b") {
+        let norm = |v: f32| if v > 1.5 { v / 255.0 } else { v };
+        live.led = Some([norm(f("lightbar_r")), norm(f("lightbar_g")), norm(f("lightbar_b"))]);
+    }
+
+    // Active-input highlight (per mesh part, time-smoothed with tail-off). We
+    // update every tracked part each frame so released inputs keep fading.
+    let mut glow = |part: &str, target: f32| {
+        let v = c3d_glow(ctx, node_uid, part, target.clamp(0.0, 1.0), tailoff);
+        if v > 0.01 {
+            live.glow.insert(part.to_string(), v);
+        }
+    };
+    for (part, _) in BUTTON_PART_PINS {
+        glow(part, if live.buttons.contains_key(*part) { 1.0 } else { 0.0 });
+    }
+    glow("left_trigger", live.left_trigger);
+    glow("right_trigger", live.right_trigger);
+    // Sticks: movement lights the dome + rim; the CAP lights on an L3/R3
+    // click only (so a click reads distinctly from deflection).
+    let lmag = live.left_stick.length().min(1.0);
+    let rmag = live.right_stick.length().min(1.0);
+    for p in ["left_stick", "left_ring"] {
+        glow(p, lmag);
+    }
+    for p in ["right_stick", "right_ring"] {
+        glow(p, rmag);
+    }
+    glow("left_cap", live.left_stick_press);
+    glow("right_cap", live.right_stick_press);
+    // Touchpad click lights the whole pad surface.
+    glow("touchpad", if b("btn_touchpad") { 1.0 } else { 0.0 });
+    live
+}
+
+/// Material colour swatch with a right-click Copy/Paste menu (app-wide colour
+/// clipboard in egui temp memory; Copy also puts a hex string on the system
+/// clipboard). Returns true when the colour changed (picked OR pasted).
+fn c3d_color_swatch(ui: &mut egui::Ui, col: &mut [u8; 3], tooltip: &str) -> bool {
+    let clip_id = egui::Id::new("fxi_color_clipboard");
+    let resp = ui.color_edit_button_srgb(col).on_hover_text(tooltip);
+    let mut changed = resp.changed();
+    // Right-click Copy/Paste menu under its OWN popup id — attaching a
+    // `context_menu` to the response conflicted with the colour-picker popup
+    // (same widget id) and closed it a frame after opening.
+    let menu_id = resp.id.with("fxi_color_menu");
+    if resp.secondary_clicked() {
+        egui::Popup::toggle_id(ui.ctx(), menu_id);
+    }
+    popup_below_widget(
+        &resp,
+        menu_id,
+        egui::PopupCloseBehavior::CloseOnClick,
+        |ui| {
+            ui.set_min_width(150.0);
+            if ui.button("Copy colour").clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(clip_id, *col));
+                ui.ctx()
+                    .copy_text(format!("#{:02X}{:02X}{:02X}", col[0], col[1], col[2]));
+            }
+            let clip: Option<[u8; 3]> = ui.ctx().data(|d| d.get_temp(clip_id));
+            let label = match clip {
+                Some(c) => format!("Paste colour  #{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
+                None => "Paste colour".to_string(),
+            };
+            if ui
+                .add_enabled(clip.is_some(), egui::Button::new(label))
+                .clicked()
+            {
+                if let Some(c) = clip {
+                    *col = c;
+                    changed = true;
+                }
+            }
+        },
+    );
+    changed
+}
+
+/// Save a controller colour scheme to a `.fxcol` JSON file. The native dialog
+/// runs on its OWN thread — a blocking dialog on the UI thread starves the
+/// overlay viewport's rendering (white bars, dead hotkeys) until dismissed.
+fn controller3d_scheme_save(scheme: &crate::model::Scheme) {
+    let mut map = serde_json::Map::new();
+    for (_, groups) in crate::model::material::ROWS {
+        for &g in *groups {
+            let c = scheme[g as usize];
+            map.insert(g.key().to_string(), serde_json::json!([c[0], c[1], c[2]]));
+        }
+    }
+    std::thread::spawn(move || {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("FlexInput Colours", &["fxcol"])
+            .set_file_name("controller.fxcol")
+            .save_file()
+        {
+            if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+                let _ = std::fs::write(path, json);
+            }
+        }
+    });
+}
+
+/// Pick + parse a `.fxcol` on a worker thread (same UI-starvation reason as
+/// above); the map is delivered via the `("c3d_matload", uid)` temp channel,
+/// consumed by the node body or pinned arm — whichever renders first applies
+/// it to the node's params.
+fn controller3d_scheme_load_async(ctx: &egui::Context, uid: usize) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("FlexInput Colours", &["fxcol"])
+            .pick_file()
+        else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let Some(map) = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+        else {
+            return;
+        };
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("c3d_matload", uid)), map));
+        ctx.request_repaint();
+    });
+}
+
+fn show_controller3d_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+) {
+    use crate::model;
+
+    // Async .fxcol load result (worker-thread file dialog) → node params.
+    if let Some(map) = ui.ctx().data_mut(|d| {
+        d.remove_temp::<serde_json::Map<String, serde_json::Value>>(egui::Id::new((
+            "c3d_matload",
+            node_id.0,
+        )))
+    }) {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params
+                .insert("materials".into(), serde_json::Value::Object(map));
+        }
+    }
 
     // Model override ("" / "auto" = auto-detect from the connected device).
     let override_name = snarl
@@ -15976,13 +16527,17 @@ fn show_controller3d_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
 
     // Auto-detect the skin by tracing the Device bus (input 0) back to the
     // physical source — through Remapper/Gyro/Fork/sub-patches, not just a
-    // direct device.source wire.
-    let dev_id = snarl
+    // direct device.source wire. Also yields the source's stick deadzone.
+    let traced = snarl
         .in_pin(InPinId { node: node_id, input: 0 })
         .remotes
         .first()
         .copied()
         .and_then(|src| controller3d_physical_device(snarl, src, None));
+    let (dev_id, deadzone) = match traced {
+        Some((d, z)) => (Some(d), z),
+        None => (None, 0.1),
+    };
     let resolved = if !override_name.is_empty() && override_name != "auto" {
         override_name.clone()
     } else if let Some(dev) = dev_id.as_deref() {
@@ -16024,10 +16579,184 @@ fn show_controller3d_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
                 }
             });
         if let Some(val) = new_sel {
+            // Unless the user opted to keep custom colours, swapping the model
+            // resets the scheme to the new model's defaults.
+            let keep = snarl
+                .get_node(node_id)
+                .and_then(|n| n.params.get("keep_colors").and_then(|v| v.as_bool()))
+                .unwrap_or(false);
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("model".to_string(), serde_json::Value::String(val));
+                if !keep {
+                    node.params.remove("materials");
+                }
             }
         }
+
+        // Per-node colour scheme + overlay opacity. Colours default to the
+        // model's tuned palette; overrides persist under `materials`.
+        egui::CollapsingHeader::new("🎨 Colours")
+            .id_salt(("c3d_colors", node_id))
+            .default_open(false)
+            .show(ui, |ui| {
+                let defaults = crate::model::default_scheme(&resolved);
+                let mut mats: serde_json::Map<String, serde_json::Value> = snarl
+                    .get_node(node_id)
+                    .and_then(|n| n.params.get("materials"))
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                let mut mats_changed = false;
+                let read_col = |mats: &serde_json::Map<String, serde_json::Value>,
+                                g: crate::model::MaterialGroup,
+                                def: [u8; 3]| -> [u8; 3] {
+                    mats.get(g.key())
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| {
+                            if a.len() >= 3 {
+                                Some([a[0].as_u64()? as u8, a[1].as_u64()? as u8, a[2].as_u64()? as u8])
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(def)
+                };
+                // One row per general group; multi-material groups (Shell,
+                // Sticks) show their swatches side by side on that row.
+                egui::Grid::new(("c3d_col_grid", node_id))
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        for (row_label, groups) in crate::model::material::ROWS {
+                            ui.label(egui::RichText::new(*row_label).small());
+                            ui.horizontal(|ui| {
+                                for &g in *groups {
+                                    let mut col = read_col(&mats, g, defaults[g as usize]);
+                                    if c3d_color_swatch(ui, &mut col, g.label()) {
+                                        mats.insert(
+                                            g.key().to_string(),
+                                            serde_json::json!([col[0], col[1], col[2]]),
+                                        );
+                                        mats_changed = true;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("Reset")
+                        .on_hover_text("Reset to this model's default colours")
+                        .clicked()
+                    {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            node.params.remove("materials");
+                        }
+                    }
+                    if ui
+                        .small_button("Save…")
+                        .on_hover_text("Save these colours to a .fxcol file")
+                        .clicked()
+                    {
+                        // Effective scheme = model default with the user's overrides applied.
+                        let mut eff = defaults;
+                        for (_, groups) in crate::model::material::ROWS {
+                            for &g in *groups {
+                                eff[g as usize] = read_col(&mats, g, defaults[g as usize]);
+                            }
+                        }
+                        controller3d_scheme_save(&eff);
+                    }
+                    if ui
+                        .small_button("Load…")
+                        .on_hover_text("Load colours from a .fxcol file")
+                        .clicked()
+                    {
+                        controller3d_scheme_load_async(ui.ctx(), node_id.0);
+                    }
+                });
+
+                // Keep-custom-colours toggle: when off, swapping the model resets
+                // the scheme to the new model's defaults.
+                let mut keep = snarl
+                    .get_node(node_id)
+                    .and_then(|n| n.params.get("keep_colors").and_then(|v| v.as_bool()))
+                    .unwrap_or(false);
+                if ui
+                    .checkbox(&mut keep, "Keep custom colours on model change")
+                    .changed()
+                {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("keep_colors".into(), serde_json::json!(keep));
+                    }
+                }
+
+                if mats_changed {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("materials".into(), serde_json::Value::Object(mats));
+                    }
+                }
+            });
+
+        // Camera view angle: elevation above the controller (0° = level/front,
+        // higher = more overhead). Defaults to a 3/4 overhead view.
+        let mut pitch_deg = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("cam_pitch").and_then(|v| v.as_f64()))
+            .unwrap_or(C3D_DEFAULT_PITCH_DEG as f64) as f32;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("View angle").small())
+                .on_hover_text("Camera elevation above the controller.\n0° = front/level, higher = more overhead.");
+            if ui
+                .add(egui::Slider::new(&mut pitch_deg, 0.0..=85.0).suffix("°"))
+                .changed()
+            {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params.insert("cam_pitch".into(), serde_json::json!(pitch_deg));
+                }
+            }
+        });
+
+        // Model opacity: whole-model see-through (per-fragment alpha). Distinct
+        // from the overlay's 2D composite alpha (an Overlay-style option). Kept
+        // here as a module option — useful for seeing activated inputs behind
+        // the shell.
+        let mut opacity = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("overlay_alpha").and_then(|v| v.as_f64()))
+            .unwrap_or(1.0) as f32;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Model opacity").small())
+                .on_hover_text("Whole-model transparency (see-through).");
+            if ui
+                .add(egui::Slider::new(&mut opacity, 0.1..=1.0))
+                .changed()
+            {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params
+                        .insert("overlay_alpha".into(), serde_json::json!(opacity));
+                }
+            }
+        });
+
+        // Active-input highlight fade time (how long a press glow lingers).
+        let mut tail = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("highlight_tailoff").and_then(|v| v.as_f64()))
+            .unwrap_or(0.25) as f32;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Highlight fade").small())
+                .on_hover_text("How long the active-input highlight takes to fade out.");
+            if ui
+                .add(egui::Slider::new(&mut tail, 0.05..=2.0).suffix(" s"))
+                .changed()
+            {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.params
+                        .insert("highlight_tailoff".into(), serde_json::json!(tail));
+                }
+            }
+        });
 
         // Resizable rectangular viewport (persisted like the scopes).
         let size_id = egui::Id::new(("c3d_size", node_id));
@@ -16038,44 +16767,26 @@ fn show_controller3d_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<
         size[0] = size[0].max(80.0);
         size[1] = size[1].max(60.0);
         let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(size[0], size[1]));
-
-        match model::load_model_cached(&resolved) {
-            Some(m) => {
-                // Clamp the 3D paint rect to the visible clip area. egui otherwise
-                // clamps the GPU viewport to the screen bounds when the node is
-                // scrolled partly off an edge, which squashes the model into the
-                // visible band. Rendering into the already-visible sub-rect keeps
-                // the aspect correct (the camera frames whatever is visible) with
-                // no squash. `rect` itself still drives layout + the resize handle.
-                let vis_rect = rect.intersect(ui.clip_rect());
-                ui.painter_at(rect).rect_filled(rect, 4.0, egui::Color32::from_rgb(18, 18, 22));
-                if vis_rect.width() > 1.0 && vis_rect.height() > 1.0 {
-                    // vis_rect = what's painted; rect = full framing (crops, no shrink).
-                    ui.add(model::build_controller_widget(vis_rect, rect, m, orientation));
-                }
-                // Live pose needs a real cadence.
-                ui.ctx().request_repaint();
-            }
-            None => {
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(26, 20, 20));
-                let msg = if model::models_base_dir().is_none() {
-                    "No models folder found\n(app/assets/models)".to_string()
-                } else if resolved.is_empty() {
-                    "No controller models available".to_string()
-                } else {
-                    format!("Couldn't load model:\n{resolved}")
-                };
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    msg,
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_rgb(210, 160, 160),
-                );
-                ui.allocate_rect(rect, egui::Sense::hover());
-            }
-        }
+        // Reserve the full rect for layout so the node keeps a stable size (the
+        // painter/callback don't allocate). The body always renders with default
+        // style; per-pin styling applies to pinned/overlay instances.
+        ui.allocate_rect(rect, egui::Sense::hover());
+        let (bg, outline, outline_w, accent) = controller3d_style(None);
+        let (scheme, alpha, cam_pitch) = controller3d_scheme(snarl, node_id, &resolved);
+        let tailoff = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("highlight_tailoff").and_then(|v| v.as_f64()))
+            .unwrap_or(0.25) as f32;
+        let ctx = ui.ctx().clone();
+        let live = controller3d_live(
+            live_signals, dev_id.as_deref(), &ctx, node_id.0, tailoff, accent, deadzone,
+        );
+        render_controller3d_core(
+            ui, rect, &resolved, orientation, bg, outline, outline_w, scheme, alpha, cam_pitch,
+            live, 1.0,
+        );
+        // Expose the viewport so it can be pinned to a sub-patch layout / overlay.
+        register_exposable_element(ui, node_id, "viewer", rect);
 
         // Bottom-right resize handle.
         let hs = 12.0;
@@ -23245,6 +23956,166 @@ fn input_viewer_pin_inspector_strip_item(
     };
     exp.iv_style_override = super::input_viewer::iv_style_inspector(
         ui, exp.inner_node_id, exp.iv_style_override.as_ref());
+}
+
+/// Inspector strip for a pinned 3D controller viewer: frame style (bg /
+/// highlight accent / outline) plus per-pin display settings — view angle,
+/// model opacity, and highlight fade — each overriding the module's own params
+/// for THIS pinned instance only. Reset clears the whole override.
+fn controller3d_pin_inspector_strip_item(
+    ui: &mut egui::Ui,
+    items: &mut Vec<LayoutItem>,
+    idx: usize,
+) {
+    use crate::canvas::node::IvStyleOverride;
+    if idx >= items.len() { return; }
+    let exp = match &mut items[idx] {
+        LayoutItem::Module(m) => m,
+        _ => return,
+    };
+    let mut ov = exp.iv_style_override.unwrap_or(IvStyleOverride {
+        bg: [18, 18, 22, 255],
+        accent: C3D_DEFAULT_ACCENT,
+        tint: [255, 255, 255, 255],
+        outline: [70, 70, 75, 255],
+        outline_px: 0.0,
+        c3d_pitch: None,
+        c3d_alpha: None,
+        c3d_fade: None,
+        c3d_composite: None,
+    });
+    let before = ov;
+    let mut reset = false;
+    let c32 = |a: [u8; 4]| egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], a[3]);
+    let rgba = |c: egui::Color32| [c.r(), c.g(), c.b(), c.a()];
+
+    ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("3D viewer style").small().strong());
+            ui.separator();
+            let mut bg = c32(ov.bg);
+            ui.label(egui::RichText::new("bg").small().weak());
+            if ui.color_edit_button_srgba(&mut bg)
+                .on_hover_text("Frame fill — lower the alpha for a see-through frame over a game.")
+                .changed() { ov.bg = rgba(bg); }
+            let mut acc = c32(ov.accent);
+            ui.label(egui::RichText::new("highlight").small().weak());
+            if ui.color_edit_button_srgba(&mut acc)
+                .on_hover_text("Active-input highlight: pressed buttons, trigger pull, stick tilt, touch dots, x-ray ghosts.")
+                .changed() { ov.accent = rgba(acc); }
+            let mut outl = c32(ov.outline);
+            ui.label(egui::RichText::new("outline").small().weak());
+            if ui.color_edit_button_srgba(&mut outl).changed() { ov.outline = rgba(outl); }
+            ui.add(egui::DragValue::new(&mut ov.outline_px).range(0.0..=6.0).speed(0.05))
+                .on_hover_text("Frame outline width (0 = none).");
+            if ui.small_button("Reset").on_hover_text("Use default style + the module's own display settings").clicked() {
+                reset = true;
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            // Display overrides: initialized from the override, else the module
+            // defaults; touching a slider pins it for this instance.
+            let mut pitch = ov.c3d_pitch.unwrap_or(C3D_DEFAULT_PITCH_DEG);
+            ui.label(egui::RichText::new("view").small().weak());
+            if ui.add(egui::Slider::new(&mut pitch, 0.0..=85.0).suffix("°"))
+                .on_hover_text("Camera elevation for this pinned instance.")
+                .changed() { ov.c3d_pitch = Some(pitch); }
+            let mut alpha = ov.c3d_alpha.unwrap_or(1.0);
+            ui.label(egui::RichText::new("opacity").small().weak());
+            if ui.add(egui::Slider::new(&mut alpha, 0.1..=1.0))
+                .on_hover_text("Model see-through for this pinned instance.")
+                .changed() { ov.c3d_alpha = Some(alpha); }
+            let mut fade = ov.c3d_fade.unwrap_or(0.25);
+            ui.label(egui::RichText::new("fade").small().weak());
+            if ui.add(egui::Slider::new(&mut fade, 0.05..=2.0).suffix(" s"))
+                .on_hover_text("Highlight fade-out time for this pinned instance.")
+                .changed() { ov.c3d_fade = Some(fade); }
+            let mut comp = ov.c3d_composite.unwrap_or(1.0);
+            ui.label(egui::RichText::new("alpha").small().weak());
+            if ui.add(egui::Slider::new(&mut comp, 0.05..=1.0))
+                .on_hover_text("Widget composite alpha: fades the whole rendered controller as a 2D image (overlay), without the see-through look.")
+                .changed() { ov.c3d_composite = Some(comp); }
+        });
+
+        // Material colours + model — edit the NODE (shared with the module
+        // body and every pinned instance). Current values are published by the
+        // pinned renderer each frame; edits ride temp memory back to it.
+        let uid = exp.inner_node_id;
+        let pub_data = ui.ctx().data(|d| {
+            d.get_temp::<(String, crate::model::Scheme)>(egui::Id::new(("c3d_pub", uid)))
+        });
+        if let Some((model, cur)) = pub_data {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                // Model chooser (Auto + every available model folder).
+                ui.label(egui::RichText::new("Model").small().strong());
+                let mut sel = model.clone();
+                egui::ComboBox::from_id_salt(("c3d_pin_model", uid))
+                    .selected_text(sel.clone())
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_value(&mut sel, "auto".to_string(), "Auto (device)").clicked() {
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new(("c3d_modeledit", uid)), String::new())
+                            });
+                        }
+                        for m in crate::model::available_models() {
+                            if ui.selectable_value(&mut sel, m.clone(), &m).clicked() {
+                                ui.ctx().data_mut(|d| {
+                                    d.insert_temp(egui::Id::new(("c3d_modeledit", uid)), m.clone())
+                                });
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.label(egui::RichText::new("Colours").small().strong())
+                    .on_hover_text("Model colours — shared with the module (not per-pin).");
+                for (row_label, groups) in crate::model::material::ROWS {
+                    ui.label(egui::RichText::new(*row_label).small().weak());
+                    for &g in *groups {
+                        let mut col = cur[g as usize];
+                        if c3d_color_swatch(ui, &mut col, g.label()) {
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(
+                                    egui::Id::new(("c3d_matedit", uid)),
+                                    (g.key().to_string(), col),
+                                )
+                            });
+                        }
+                    }
+                }
+                if ui
+                    .small_button("Reset colours")
+                    .on_hover_text("Reset the model colours to this model's defaults")
+                    .clicked()
+                {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new(("c3d_matreset", uid)), true)
+                    });
+                }
+                if ui
+                    .small_button("Save…")
+                    .on_hover_text("Save these colours to a .fxcol file")
+                    .clicked()
+                {
+                    controller3d_scheme_save(&cur);
+                }
+                if ui
+                    .small_button("Load…")
+                    .on_hover_text("Load colours from a .fxcol file")
+                    .clicked()
+                {
+                    controller3d_scheme_load_async(ui.ctx(), uid);
+                }
+            });
+        }
+    });
+
+    if reset {
+        exp.iv_style_override = None;
+    } else if ov != before || exp.iv_style_override.is_some() {
+        exp.iv_style_override = Some(ov);
+    }
 }
 
 /// Inspector strip for the per-pin Switch color override (when the selected

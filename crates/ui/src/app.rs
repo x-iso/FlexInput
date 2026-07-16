@@ -537,6 +537,10 @@ pub struct FlexInputApp {
     proc_graph: flexinput_engine::ArcGraph,
     proc_device_signals: flexinput_engine::ArcSignals,
     proc_outputs: Arc<Mutex<ProcessingOutput>>,
+    /// Resolved sink-bound feedback (rumble/lightbar) per `(device_id, pin)`,
+    /// written by the processing thread. The UI reads it to RELAY live LED
+    /// colours into displays (3D viewer LED strip) — never to route hardware.
+    sink_bus: SinkBus,
     // ── I/O thread shared state ───────────────────────────────────────────────
     /// App-level shared pool of virtual output devices. Same instance of
     /// `virtual.xinput.0` is reused across every tab that references it.
@@ -860,6 +864,15 @@ impl FlexInputApp {
         // keymouse thread via the shared phase clock in flexinput-virtual).
         flexinput_virtual::set_braid_enabled(app_settings.mixed_braid_enabled);
         flexinput_virtual::set_braid_rate_hz(app_settings.mixed_braid_rate_hz);
+        // Register the user 3D-models directory (global setting) before any
+        // viewer loads a model.
+        crate::model::set_user_models_dir(
+            app_settings
+                .user_models_dir
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from),
+        );
 
         let proc_graph          = flexinput_engine::new_arc_graph();
         let proc_device_signals = flexinput_engine::new_arc_signals();
@@ -1127,6 +1140,7 @@ impl FlexInputApp {
             proc_graph,
             proc_device_signals,
             proc_outputs,
+            sink_bus: Arc::clone(&sink_bus),
             shared_virtual_devices,
             device_ops,
             pending_device_ids,
@@ -1392,6 +1406,17 @@ impl eframe::App for FlexInputApp {
             puffin::profile_scope!("read_signals_load");
             let snap = self.proc_device_signals.load_full();
             self.last_signals = (*snap).clone();
+        }
+        // Merge live LED/lightbar feedback into the signal map so displays can
+        // relay it (the 3D viewer's LED strip). These are sink-bound OUTPUT
+        // pins ("lightbar_*"), so they never collide with input pin names.
+        {
+            let bus = self.sink_bus.read().unwrap();
+            for ((dev, pin), sig) in bus.iter() {
+                if pin.starts_with("lightbar_") {
+                    self.last_signals.insert((dev.clone(), pin.clone()), *sig);
+                }
+            }
         }
         // Refresh device list from I/O thread. Both gilrs and MIDI device
         // listings are populated there, so the UI never contends with the
@@ -10048,6 +10073,42 @@ impl FlexInputApp {
                 ui.separator();
                 ui.add_space(6.0);
 
+                // ── 3D controller models ───────────────────────────────
+                ui.label(egui::RichText::new("3D controller models").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("User models folder")
+                        .on_hover_text(
+                            "Optional folder with your own controller models. Same \
+                             structure as the bundled ones: <Name>/info.txt + .obj files \
+                             (+ optional colors.fxcol). A same-named folder overrides the \
+                             bundled model.",
+                        );
+                    let cur = self.settings.user_models_dir.clone().unwrap_or_default();
+                    ui.label(
+                        egui::RichText::new(if cur.is_empty() { "(none)" } else { &cur })
+                            .small()
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                    if ui.small_button("Browse…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                            let s = p.to_string_lossy().to_string();
+                            self.settings.user_models_dir = Some(s);
+                            crate::model::set_user_models_dir(Some(p));
+                            dirty = true;
+                        }
+                    }
+                    if !cur.is_empty() && ui.small_button("Clear").clicked() {
+                        self.settings.user_models_dir = None;
+                        crate::model::set_user_models_dir(None);
+                        dirty = true;
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
                 // ── Gamepad UI navigation ──────────────────────────────
                 ui.label(egui::RichText::new("Gamepad UI navigation").strong());
                 ui.add_space(4.0);
@@ -10808,6 +10869,14 @@ impl FlexInputApp {
                         "https://kenney.nl/assets/input-prompts",
                     );
                     ui.label(egui::RichText::new("(CC0).").small());
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("3D controller models adapted from").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("3d-controller-overlay").small(),
+                        "https://github.com/larfingshnew/3d-controller-overlay",
+                    );
+                    ui.label(egui::RichText::new("by larfingshnew (MIT).").small());
                 });
                 }); // ScrollArea
             });

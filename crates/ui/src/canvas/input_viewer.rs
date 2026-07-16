@@ -160,6 +160,11 @@ impl IvStyle {
             tint: rgba(self.tint),
             outline: rgba(self.outline),
             outline_px: self.outline_w,
+            // 3D-only extras never set by the 2D board inspector.
+            c3d_pitch: None,
+            c3d_alpha: None,
+            c3d_fade: None,
+            c3d_composite: None,
         }
     }
 }

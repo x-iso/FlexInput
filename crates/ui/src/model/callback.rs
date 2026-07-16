@@ -20,7 +20,7 @@ use wgpu::{CommandEncoder, Queue};
 
 use crate::canvas::remapper_icons::{skin_from_device_id, Skin};
 use crate::model::pipeline::*;
-use crate::model::{load_controller_model, part_transform};
+use crate::model::part_transform;
 
 // ── Loaded model (CPU side, cached) ───────────────────────────────────────────
 
@@ -34,15 +34,128 @@ pub struct LoadedModel {
     pub center: Vec3,
     /// Bounding radius from `center` (camera distance is derived from this).
     pub radius: f32,
+    /// Touchpad surface for mapping normalized touch input onto the model, if
+    /// the model has `touch_point*` parts with extents in `info.txt`.
+    pub touch_surface: Option<TouchSurface>,
+    /// Part indices of `touch_point1` / `touch_point2` (the movable finger dots),
+    /// or `None` when the model has no such part.
+    pub touch_point_parts: [Option<usize>; 2],
+}
+
+/// The touchpad's flat surface in model space: finger dots rest at `center` and
+/// move within `± half` on the X (width) and Z (depth) axes.
+#[derive(Clone, Copy)]
+pub struct TouchSurface {
+    pub center: Vec3,
+    /// Half-extents `(half_x, half_z)`.
+    pub half: glam::Vec2,
+}
+
+/// Live input state that animates the model: touch dots, stick tilt, trigger
+/// pull and button presses. Built each frame from the resolved device's live
+/// signals (see `controller3d_live` in the viewer).
+#[derive(Clone, Default)]
+pub struct ControllerLive {
+    /// Normalized `[0,1]` touch positions (x = left→right, y = top→bottom);
+    /// `None` = that finger is up.
+    pub touch: [Option<glam::Vec2>; 2],
+    /// Stick deflections, each component `-1..1`.
+    pub left_stick: glam::Vec2,
+    pub right_stick: glam::Vec2,
+    /// Analog trigger pulls, `0..1`.
+    pub left_trigger: f32,
+    pub right_trigger: f32,
+    /// Stick click (L3/R3) press amounts, `0..1` — the whole stick sinks and
+    /// the cap highlights on press.
+    pub left_stick_press: f32,
+    pub right_stick_press: f32,
+    /// Button press amounts keyed by the mesh part name (e.g. `"a_button"`,
+    /// `"dpad_up"`, `"left_bumper"`), `0..1`.
+    pub buttons: std::collections::HashMap<String, f32>,
+    /// Live LED / lightbar colour (0..1 RGB) relayed onto the `Led` material
+    /// group, when the device exposes it on the AutoMap bus. `None` = keep the
+    /// group's scheme colour.
+    pub led: Option<[f32; 3]>,
+    /// Per-part highlight intensity (`0..1`, already time-smoothed with the
+    /// node's tail-off) keyed by mesh part name — lights active inputs and fades
+    /// them out. Empty = nothing highlighted.
+    pub glow: std::collections::HashMap<String, f32>,
+    /// Highlight colour (0..1 RGB) for active inputs — from the pinned item's
+    /// style `accent` (or the default accent on the node body).
+    pub highlight: [f32; 3],
+}
+
+impl ControllerLive {
+    /// Extra model-space transform for a part given its rest transform, or
+    /// identity when the part isn't animated. Rotations pivot about the part's
+    /// own placement so sticks/triggers hinge in place. Touch points are handled
+    /// separately in `prepare` (they also change colour / visibility).
+    fn part_xform(&self, name: &str, part_tf: &Mat4) -> Mat4 {
+        let n = name.to_ascii_lowercase();
+        // Pivot = the part's placed origin (translation column of its transform).
+        let pivot = part_tf.w_axis.truncate();
+        let about = |r: Quat| {
+            Mat4::from_translation(pivot) * Mat4::from_quat(r) * Mat4::from_translation(-pivot)
+        };
+        // Buttons: depress while held. Bumpers hinge back into the shell (+Z);
+        // the rest indent into their top face (−Y). Small travel — the highlight
+        // glow carries most of the visual feedback.
+        if let Some(&press) = self.buttons.get(n.as_str()) {
+            if press <= 0.001 {
+                return Mat4::IDENTITY;
+            }
+            if n.contains("bumper") {
+                return Mat4::from_translation(Vec3::new(0.0, 0.0, 0.04 * press));
+            }
+            return Mat4::from_translation(Vec3::new(0.0, -0.012 * press, 0.0));
+        }
+        // Sticks: the dome + cap + rim tilt together about the stick base, and
+        // the whole assembly sinks on an L3/R3 click.
+        let stick = if n == "left_stick" || n == "left_cap" || n == "left_ring" {
+            Some((self.left_stick, self.left_stick_press))
+        } else if n == "right_stick" || n == "right_cap" || n == "right_ring" {
+            Some((self.right_stick, self.right_stick_press))
+        } else {
+            None
+        };
+        if let Some((v, press)) = stick {
+            const MAX_TILT: f32 = 0.35; // radians at full deflection
+            let r = Quat::from_rotation_x(-v.y * MAX_TILT) * Quat::from_rotation_z(-v.x * MAX_TILT);
+            let sink = Mat4::from_translation(Vec3::new(0.0, -0.035 * press, 0.0));
+            return sink * about(r);
+        }
+        // Triggers: rotate inward about the hinge (approximated at the part origin).
+        let trig = if n == "left_trigger" {
+            Some(self.left_trigger)
+        } else if n == "right_trigger" {
+            Some(self.right_trigger)
+        } else {
+            None
+        };
+        if let Some(t) = trig {
+            return about(Quat::from_rotation_x(-0.4 * t));
+        }
+        Mat4::IDENTITY
+    }
 }
 
 /// Per-part mesh data carried from model loading into the callback.
 pub struct PartData {
+    /// Part name (`.obj` stem, e.g. `"a_button"`) — used to dispatch animations.
+    pub name: String,
     /// Interleaved `[pos.x, pos.y, pos.z, norm.x, norm.y, norm.z]`.
     pub vertices: Vec<f32>,
     pub tri_count: usize,
     /// Static model-space transform (position + rotation from `info.txt`).
     pub transform: Mat4,
+    /// Material group index (`MaterialGroup as usize`) — selects the part's
+    /// colour from the viewer's per-group scheme.
+    pub group: usize,
+    /// Assembled-space centroid of the part's vertices — with `avg_normal`,
+    /// estimates whether the part faces the camera (x-ray gating).
+    pub centroid: Vec3,
+    /// Assembled-space average outward normal (normalized; ZERO if degenerate).
+    pub avg_normal: Vec3,
 }
 
 // ── Render target format ──────────────────────────────────────────────────────
@@ -86,9 +199,15 @@ pub fn models_base_dir() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             cands.push(dir.join("assets").join("models"));
-            cands.push(dir.join("app").join("assets").join("models"));
-            if let Some(up) = dir.parent() {
-                cands.push(up.join("app").join("assets").join("models"));
+            // Walk up from the exe so `target/debug/flexinput.exe` (run
+            // directly, not via `cargo run`) still finds the workspace's
+            // `app/assets/models` two levels up.
+            let mut anc = Some(dir);
+            for _ in 0..5 {
+                let Some(d) = anc else { break };
+                cands.push(d.join("app").join("assets").join("models"));
+                cands.push(d.join("assets").join("models"));
+                anc = d.parent();
             }
         }
     }
@@ -99,23 +218,114 @@ pub fn models_base_dir() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_dir())
 }
 
-/// Names of every controller model folder available (those containing an
-/// `info.txt`), sorted. Drives the node's model-override dropdown.
-pub fn available_models() -> Vec<String> {
-    let Some(base) = models_base_dir() else { return Vec::new(); };
+/// Optional user-provided models directory (global setting). Folders inside it
+/// follow the same structure as the bundled ones (`<Name>/info.txt` + `.obj`s
+/// + optional `colors.fxcol`); a same-named folder OVERRIDES the bundled model.
+static USER_MODELS_DIR: OnceLock<std::sync::RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn user_models_lock() -> &'static std::sync::RwLock<Option<PathBuf>> {
+    USER_MODELS_DIR.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Set (or clear) the user models directory. Clears the model + scheme caches
+/// so newly added models appear without an app restart.
+pub fn set_user_models_dir(dir: Option<PathBuf>) {
+    if let Ok(mut w) = user_models_lock().write() {
+        *w = dir.filter(|d| d.is_dir());
+    }
+    if let Ok(mut c) = model_cache().lock() {
+        c.clear();
+    }
+    crate::model::material::clear_scheme_cache();
+}
+
+fn user_models_dir() -> Option<PathBuf> {
+    user_models_lock().read().ok()?.clone()
+}
+
+/// All model roots, user directory first (so user models override bundled).
+fn model_dirs() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&base) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() && p.join("info.txt").is_file() {
-                if let Some(n) = e.file_name().to_str() {
-                    out.push(n.to_string());
+    if let Some(u) = user_models_dir() {
+        out.push(u);
+    }
+    if let Some(b) = models_base_dir() {
+        out.push(b);
+    }
+    out
+}
+
+/// The whole `app/assets/models` tree embedded at COMPILE time — the binary
+/// always carries the models it was built with (like the SVG assets). No
+/// model names are hardcoded: whatever folders exist get bundled. On-disk
+/// sources (user dir, then the dev assets folder) override the embedded copy,
+/// so models stay editable during development without a rebuild... of assets.
+static EMBEDDED_MODELS: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../app/assets/models");
+
+/// Where a model's files come from, in priority order: user dir → dev assets
+/// on disk → embedded copy.
+pub(crate) enum ModelSrc {
+    Dir(PathBuf),
+    Embedded,
+}
+
+/// Resolve the source tier for model `name`.
+pub(crate) fn model_src_for(name: &str) -> Option<ModelSrc> {
+    for d in model_dirs() {
+        let p = d.join(name);
+        if p.join("info.txt").is_file() {
+            return Some(ModelSrc::Dir(p));
+        }
+    }
+    if EMBEDDED_MODELS
+        .get_file(format!("{name}/info.txt"))
+        .is_some()
+    {
+        return Some(ModelSrc::Embedded);
+    }
+    None
+}
+
+/// Read a text file belonging to model `name` through the source tiers.
+pub(crate) fn model_file(name: &str, file: &str) -> Option<String> {
+    match model_src_for(name)? {
+        ModelSrc::Dir(p) => std::fs::read_to_string(p.join(file)).ok(),
+        ModelSrc::Embedded => EMBEDDED_MODELS
+            .get_file(format!("{name}/{file}"))?
+            .contents_utf8()
+            .map(str::to_string),
+    }
+}
+
+/// Names of every controller model folder available (those containing an
+/// `info.txt`), across the user + disk + embedded roots, sorted and
+/// de-duplicated. Drives the node's model-override dropdown.
+pub fn available_models() -> Vec<String> {
+    let mut set = std::collections::BTreeSet::new();
+    for base in model_dirs() {
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() && p.join("info.txt").is_file() {
+                    if let Some(n) = e.file_name().to_str() {
+                        set.insert(n.to_string());
+                    }
                 }
             }
         }
     }
-    out.sort();
-    out
+    for d in EMBEDDED_MODELS.dirs() {
+        let has_info = d
+            .files()
+            .any(|f| f.path().file_name().is_some_and(|n| n == "info.txt"));
+        if has_info {
+            if let Some(n) = d.path().file_name().and_then(|n| n.to_str()) {
+                set.insert(n.to_string());
+            }
+        }
+    }
+    set.into_iter().collect()
 }
 
 /// Load a model by folder name, caching the result (including failures).
@@ -134,28 +344,79 @@ pub fn load_model_cached(name: &str) -> Option<Arc<LoadedModel>> {
 }
 
 fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
-    let base = models_base_dir()?;
-    let model = load_controller_model(&base.join(name)).ok()?;
+    model_src_for(name)?; // no source at all → cache the failure
+    let read = |f: &str| model_file(name, f);
+    let model = crate::model::obj::load_controller_model_with(&read, name.to_string()).ok()?;
 
     let mut parts = Vec::with_capacity(model.parts.len());
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
-    for p in &model.parts {
+    // Bounding box of the touchpad mesh itself — the true surface the finger
+    // dots must stay within (far more reliable than baked-in numbers).
+    let mut pad_min = Vec3::splat(f32::INFINITY);
+    let mut pad_max = Vec3::splat(f32::NEG_INFINITY);
+    let mut pad_extent_fallback: Option<TouchSurface> = None;
+    let mut touch_point_parts: [Option<usize>; 2] = [None, None];
+    for (idx, p) in model.parts.iter().enumerate() {
         let tf = part_transform(p.pos, p.rot);
+        let lname = p.name.to_ascii_lowercase();
+        let is_touchpad = lname == "touchpad" || lname.starts_with("touchpad");
         let v = &p.mesh.vertices;
         let mut i = 0;
+        let mut pos_sum = Vec3::ZERO;
+        let mut nrm_sum = Vec3::ZERO;
+        let mut n_verts = 0u32;
         while i + 5 < v.len() {
             let world = tf.transform_point3(Vec3::new(v[i], v[i + 1], v[i + 2]));
             min = min.min(world);
             max = max.max(world);
+            if is_touchpad {
+                pad_min = pad_min.min(world);
+                pad_max = pad_max.max(world);
+            }
+            pos_sum += world;
+            nrm_sum += tf.transform_vector3(Vec3::new(v[i + 3], v[i + 4], v[i + 5]));
+            n_verts += 1;
             i += 6;
         }
+        let centroid = if n_verts > 0 { pos_sum / n_verts as f32 } else { Vec3::ZERO };
+        let avg_normal = if nrm_sum.length_squared() > 1e-8 {
+            nrm_sum.normalize()
+        } else {
+            Vec3::ZERO
+        };
+        // Record the movable touch-point dots (+ a fallback surface from the
+        // extents baked into their info.txt block, used only if the model has
+        // no touchpad mesh to measure).
+        if lname.starts_with("touch_point") {
+            let slot = if lname.ends_with('2') { 1 } else { 0 };
+            touch_point_parts[slot] = Some(idx);
+            if pad_extent_fallback.is_none() {
+                if let Some(half) = p.extent {
+                    pad_extent_fallback = Some(TouchSurface { center: p.pos, half });
+                }
+            }
+        }
         parts.push(PartData {
+            name: p.name.clone(),
             vertices: p.mesh.vertices.clone(),
             tri_count: p.mesh.tri_count,
             transform: tf,
+            group: crate::model::material::group_for_part(&p.name) as usize,
+            centroid,
+            avg_normal,
         });
     }
+
+    // Prefer the measured touchpad box; fall back to the info.txt extents.
+    let touch_surface = if pad_min.x.is_finite() && pad_max.x.is_finite() {
+        Some(TouchSurface {
+            center: (pad_min + pad_max) * 0.5,
+            half: glam::Vec2::new((pad_max.x - pad_min.x) * 0.5, (pad_max.z - pad_min.z) * 0.5),
+        })
+    } else {
+        pad_extent_fallback
+    };
 
     let (center, radius) = if min.x.is_finite() && max.x.is_finite() {
         let c = (min + max) * 0.5;
@@ -169,6 +430,8 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
         parts,
         center,
         radius,
+        touch_surface,
+        touch_point_parts,
     }))
 }
 
@@ -208,8 +471,86 @@ pub struct MeshRenderState {
     /// frame edge (like any other UI element) instead of shrinking to fit. Equal
     /// to `full_rect` when the node is entirely on-screen.
     pub vis_rect: egui::Rect,
+    /// Per-group base colours (linear-ish 0..1 RGB), indexed by `PartData.group`.
+    pub scheme: [[f32; 3]; crate::model::material::N_GROUPS],
+    /// Whole-model opacity (0..1) for the 2D composite (overlay transparency).
+    pub global_alpha: f32,
+    /// Camera elevation above the horizontal, in radians (0 = level/front view,
+    /// larger = more overhead). Set from the viewer's `cam_pitch` param.
+    pub cam_pitch: f32,
+    /// Live input state: touch dots, stick tilt, trigger pull, button presses.
+    pub live: ControllerLive,
+    /// Widget composite alpha (0..1): fades the whole rendered controller as a
+    /// 2D image (overlay style), independent of `global_alpha` see-through.
+    pub composite: f32,
     /// Shared render pipeline — created lazily on first prepare().
     pub pipeline: Option<Arc<ControllerPipeline>>,
+}
+
+/// X-ray draw lists, computed in `prepare` and consumed in `paint` via the
+/// shared `CallbackResources` (the same single-model slot the GPU buffers
+/// use). `ghosts` are the off-view active parts in painter's order (farthest
+/// first — the ghost pass has no depth writes). `restore` are ALL highlighted
+/// parts, re-drawn after the ghosts with depth LessEqual so their visible
+/// surfaces reclaim their pixels — a ghost pierces the inert shell but never
+/// covers a nearer highlighted input (z-order among highlighted objects).
+struct XrayOrder {
+    ghosts: Vec<usize>,
+    restore: Vec<usize>,
+}
+
+/// Offscreen target for the widget matte: when composite alpha < 1 the
+/// controller renders into this texture in `prepare`, and `paint` composites
+/// the finished 2D image at the matte alpha (a true image fade — no
+/// see-through layering artifacts).
+struct MatteTarget {
+    color_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    size: (u32, u32),
+    alpha_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+/// Whether this frame's `paint` should composite from the matte target.
+struct MatteActive(bool);
+
+/// Ghost-gate threshold on the measured `visible / total` sample ratio. The
+/// "total" query rasterizes front AND back faces (cull is off), so a fully
+/// visible closed mesh measures ≈ 0.5 — 0.05 therefore corresponds to the
+/// spec's "less than ~10% of the part's geometry visible on camera".
+const GHOST_VIS_THRESHOLD: f32 = 0.05;
+
+/// Async-readback state for the visibility measurement.
+#[derive(Clone, Copy, PartialEq)]
+enum VisMapState {
+    /// No measurement in flight — record one this frame.
+    Idle,
+    /// Queries resolved + copied to the staging buffer (submits with egui's
+    /// frame); map it next frame.
+    Copied,
+    /// `map_async` registered; waiting for the device poll to complete it.
+    Mapping,
+    /// Staging buffer mapped — read the counts, then back to `Idle`.
+    Ready,
+}
+
+/// GPU-measured per-part visibility (occlusion queries). A depth prepass of
+/// the whole model into a small offscreen target, then per part two queries:
+/// samples passing `LessEqual` against that depth (its visible surface) and
+/// samples passing `Always` (its whole rasterized footprint). The ratio is the
+/// REAL visibility fraction — part-vs-part occlusion included — and drives the
+/// "<10% visible → x-ray ghost" rule. Readback is async (~3 frames behind,
+/// invisible at highlight timescales).
+struct VisMeasure {
+    depth_view: wgpu::TextureView,
+    qs: wgpu::QuerySet,
+    n_parts: usize,
+    resolve_buf: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    state: Arc<Mutex<VisMapState>>,
+    /// Latest computed `visible / total` per part index (empty until the first
+    /// readback completes; treated as fully visible).
+    fractions: Arc<Mutex<Vec<f32>>>,
 }
 
 impl CallbackTrait for MeshRenderState {
@@ -217,7 +558,7 @@ impl CallbackTrait for MeshRenderState {
         &self,
         device: &wgpu::Device,
         queue: &Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
         _egui_encoder: &mut CommandEncoder,
         callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
@@ -282,8 +623,11 @@ impl CallbackTrait for MeshRenderState {
         let near = (dist - radius).max(0.01);
         let proj = Mat4::perspective_infinite_rh(fov_y, aspect, near);
 
-        // View from +Z, slightly raised, looking at the model centre.
-        let cam = center + Vec3::new(0.0, radius * 0.15, dist);
+        // Camera orbits the model centre at `cam_pitch` above the horizontal
+        // (0 = level/front, larger = more overhead). Clamped below 90° so the
+        // up-vector never becomes parallel to the view direction.
+        let pitch = self.cam_pitch.clamp(-1.4, 1.4);
+        let cam = center + dist * Vec3::new(0.0, pitch.sin(), pitch.cos());
         let view = Mat4::look_at_rh(cam, center, Vec3::Y);
 
         // Crop matrix: we paint into `vis_rect` (the visible sub-rect), but the
@@ -322,19 +666,456 @@ impl CallbackTrait for MeshRenderState {
             * Mat4::from_quat(self.orientation)
             * Mat4::from_translation(-center);
 
+        let tp = self.model.touch_point_parts;
+        let surf = self.model.touch_surface;
+        let hl = self.live.highlight;
+        let hl4 = [hl[0], hl[1], hl[2], 1.0];
+        let cam_pos4 = [cam.x, cam.y, cam.z, 1.0]; // w unused (matte is a blit pass)
+        // Latest measured per-part visibility (occlusion queries, ~3 frames
+        // behind). Missing data (first frames / new model) = fully visible,
+        // so nothing ghosts until real measurements arrive.
+        let vis_fractions: Vec<f32> = callback_resources
+            .get::<VisMeasure>()
+            .and_then(|v| v.fractions.lock().ok().map(|f| f.clone()))
+            .unwrap_or_default();
+        let center_radius4 = [center.x, center.y, center.z, radius];
+        let mut ghosts: Vec<(usize, f32)> = Vec::new(); // (part idx, camera distance)
+        let mut restore: Vec<usize> = Vec::new(); // highlighted parts (re-drawn after ghosts)
         for (i, gpu_part) in gpu_parts.iter().enumerate() {
-            let part_tf = self.model.parts.get(i).map(|p| p.transform).unwrap_or(Mat4::IDENTITY);
-            let model_m = orient * part_tf;
+            let part = self.model.parts.get(i);
+            let part_tf = part.map(|p| p.transform).unwrap_or(Mat4::IDENTITY);
+            let g = part.map(|p| p.group).unwrap_or(0);
+            let base = self.scheme.get(g).copied().unwrap_or([0.5, 0.5, 0.5]);
+            let name = part.map(|p| p.name.as_str()).unwrap_or("");
+
+            // Touch-point dots: hidden when the finger is up; otherwise slid to
+            // the mapped position on the touchpad surface and highlighted.
+            let touch_slot = if Some(i) == tp[0] {
+                Some(0)
+            } else if Some(i) == tp[1] {
+                Some(1)
+            } else {
+                None
+            };
+            let (model_m, base_color, glow_color, glow) = match touch_slot {
+                Some(k) => match (self.live.touch[k], surf) {
+                    (Some(uv), Some(s)) => {
+                        // `uv` is already normalized [0,1] (x: left→right,
+                        // y: top→bottom). Map onto the measured pad box, pulled in
+                        // ~10% so a full-scale touch stays on the pad. If Y still
+                        // reads inverted, negate the `dz` term.
+                        const PAD_INSET: f32 = 0.9;
+                        let dx = (uv.x * 2.0 - 1.0) * s.half.x * PAD_INSET;
+                        let dz = (uv.y * 2.0 - 1.0) * s.half.y * PAD_INSET;
+                        let m = orient * Mat4::from_translation(Vec3::new(dx, 0.0, dz)) * part_tf;
+                        (m, hl4, hl4, 0.6)
+                    }
+                    // Hidden: collapse to a zero-area point (draws nothing).
+                    _ => (Mat4::from_scale(Vec3::splat(0.0)), [0.0; 4], [0.0; 4], 0.0),
+                },
+                None => {
+                    // Animate presses/tilts/pulls via the part's extra transform.
+                    let model_m = orient * self.live.part_xform(name, &part_tf) * part_tf;
+                    // Relay the live LED colour onto the LED-strip group (emissive).
+                    let is_led = g == crate::model::material::MaterialGroup::Led as usize;
+                    match (is_led, self.live.led) {
+                        // The live LED blends ADDITIVELY into the base strip
+                        // colour (cloudy grey plastic lit from within), so an
+                        // unlit relay (0,0,0) shows the base colour — not black.
+                        (true, Some(c)) => {
+                            let b = [
+                                (base[0] + c[0]).min(1.0),
+                                (base[1] + c[1]).min(1.0),
+                                (base[2] + c[2]).min(1.0),
+                            ];
+                            let inten = c[0].max(c[1]).max(c[2]).clamp(0.0, 1.0);
+                            (
+                                model_m,
+                                [b[0], b[1], b[2], 1.0],
+                                [c[0], c[1], c[2], 1.0],
+                                0.85 * inten,
+                            )
+                        }
+                        _ => {
+                            // Highlight active inputs (albedo shifts toward the
+                            // style accent; shading is preserved in the shader).
+                            let g = self.live.glow.get(name).copied().unwrap_or(0.0);
+                            (model_m, [base[0], base[1], base[2], 1.0], hl4, g)
+                        }
+                    }
+                }
+            };
             let uniforms = Uniforms {
                 mvp: view_proj.to_cols_array_2d(),
                 model: model_m.to_cols_array_2d(),
-                base_color: mesh_part_color(i),
-                glow_color: [1.0, 0.3, 0.2, 1.0],
-                glow: 0.0,
-                _pad0: [0.0; 3],
+                base_color,
+                glow_color,
+                glow,
+                global_alpha: self.global_alpha,
+                _pad0: [0.0; 2],
+                cam_pos: cam_pos4,
+                center_radius: center_radius4,
             };
             gpu_part.update_uniforms(queue, &uniforms);
+
+            // X-ray ghost: an ACTIVE part that is measurably out of view —
+            // under ~10% of its geometry visible per the occlusion-query
+            // measurement (real per-fragment occlusion, so a camera-facing
+            // d-pad hidden behind the trigger counts as hidden) — is re-drawn
+            // where OCCLUDED (depth Greater) as a strong accent ghost. Parts
+            // that are meaningfully visible keep only the normal highlight.
+            let xg = match touch_slot {
+                // Touch dots aren't in the glow map (it's keyed by button/stick
+                // pins) — an active finger counts as fully highlighted, so a
+                // dot on an away-facing touchpad ghosts like any other input.
+                Some(k) => {
+                    if self.live.touch[k].is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                None => part
+                    .map(|p| self.live.glow.get(&p.name).copied().unwrap_or(0.0))
+                    .unwrap_or(0.0),
+            };
+            let vis = vis_fractions.get(i).copied().unwrap_or(1.0);
+            let ghosted = xg > 0.02 && vis < GHOST_VIS_THRESHOLD;
+            if xg > 0.02 {
+                restore.push(i);
+            }
+            if ghosted {
+                let ghost = Uniforms {
+                    mvp: view_proj.to_cols_array_2d(),
+                    model: model_m.to_cols_array_2d(),
+                    // Strong ghost: high alpha + full emissive so it cuts
+                    // through the shell colour instead of blending dirty.
+                    base_color: [hl[0], hl[1], hl[2], 0.9 * xg],
+                    glow_color: hl4,
+                    glow: 0.85,
+                    global_alpha: 1.0,
+                    _pad0: [0.0; 2],
+                    cam_pos: cam_pos4,
+                    center_radius: center_radius4,
+                };
+                gpu_part.update_xray_uniforms(queue, &ghost);
+                let dist = part
+                    .map(|p| {
+                        let c = self.orientation * (p.centroid - center) + center;
+                        (cam - c).length()
+                    })
+                    .unwrap_or(0.0);
+                ghosts.push((i, dist));
+            }
         }
+        // Painter's order for the ghost pass: far → near.
+        ghosts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let ghost_order: Vec<usize> = ghosts.into_iter().map(|(i, _)| i).collect();
+
+        // ── Widget matte (composite alpha) ─────────────────────────────────
+        // Render the whole controller into an offscreen texture now; `paint`
+        // composites the finished image at the matte alpha. Skipped entirely
+        // (direct draw) when fully opaque. Mutable resource setup happens
+        // FIRST (ends the `gpu_parts` borrow), then the pass re-borrows.
+        let use_matte = self.composite < 0.999;
+        if use_matte {
+            if callback_resources.get::<Arc<BlitPipeline>>().is_none() {
+                let b = Arc::new(BlitPipeline::new(device, target_format(), 1));
+                callback_resources.insert(b);
+            }
+            let blit = callback_resources
+                .get::<Arc<BlitPipeline>>()
+                .expect("just inserted")
+                .clone();
+            let ppp = screen_descriptor.pixels_per_point;
+            let w = ((self.vis_rect.width() * ppp).round() as u32).max(1);
+            let h = ((self.vis_rect.height() * ppp).round() as u32).max(1);
+            let rebuild = callback_resources
+                .get::<MatteTarget>()
+                .map(|m| m.size != (w, h))
+                .unwrap_or(true);
+            if rebuild {
+                let mk_tex = |label: &str, format, usage| {
+                    device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage,
+                        view_formats: &[],
+                    })
+                };
+                let color = mk_tex(
+                    "c3d_matte_color",
+                    target_format(),
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                );
+                let depth = mk_tex(
+                    "c3d_matte_depth",
+                    crate::model::pipeline::CONTROLLER_DEPTH_FORMAT,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT,
+                );
+                let color_view = color.create_view(&Default::default());
+                let depth_view = depth.create_view(&Default::default());
+                let alpha_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("c3d_matte_alpha"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("c3d_matte_bg"),
+                    layout: &blit.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&color_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&blit.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: alpha_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                callback_resources.insert(MatteTarget {
+                    color_view,
+                    depth_view,
+                    size: (w, h),
+                    alpha_buf,
+                    bind_group,
+                });
+            }
+            // Immutable phase: re-borrow the parts + target and record the pass.
+            let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
+                Some(parts) => parts.as_slice(),
+                None => return Vec::new(),
+            };
+            if let Some(mt) = callback_resources.get::<MatteTarget>() {
+                queue.write_buffer(
+                    &mt.alpha_buf,
+                    0,
+                    bytemuck::bytes_of(&[self.composite.clamp(0.0, 1.0), 0.0, 0.0, 0.0]),
+                );
+                let mut pass = _egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("c3d_matte_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &mt.color_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &mt.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&pipeline.pipeline);
+                for gpu_part in gpu_parts {
+                    gpu_part.draw(&mut pass);
+                }
+                if !ghost_order.is_empty() {
+                    pass.set_pipeline(&pipeline.xray);
+                    for &i in &ghost_order {
+                        if let Some(gp) = gpu_parts.get(i) {
+                            gp.draw_xray(&mut pass);
+                        }
+                    }
+                    // Highlighted visible surfaces reclaim their pixels.
+                    pass.set_pipeline(&pipeline.restore);
+                    for &i in &restore {
+                        if let Some(gp) = gpu_parts.get(i) {
+                            gp.draw(&mut pass);
+                        }
+                    }
+                }
+            }
+        }
+        // ── Visibility measurement (occlusion queries) ─────────────────────
+        // One measurement in flight at a time: record → (egui submits) → map →
+        // read → record again. Runs at a fraction of the frame rate, which is
+        // plenty — visibility changes with orientation, not per frame.
+        let n_parts = self.model.parts.len();
+        let vis_rebuild = callback_resources
+            .get::<VisMeasure>()
+            .map(|v| v.n_parts != n_parts)
+            .unwrap_or(true);
+        if vis_rebuild && n_parts > 0 {
+            const VIS_RES: u32 = 256; // small target: ratios are resolution-independent
+            let depth = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("c3d_vis_depth"),
+                size: wgpu::Extent3d {
+                    width: VIS_RES,
+                    height: VIS_RES,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::model::pipeline::CONTROLLER_DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let bytes = (2 * n_parts * 8) as u64;
+            let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("c3d_vis_resolve"),
+                size: bytes,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("c3d_vis_staging"),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("c3d_vis_queries"),
+                ty: wgpu::QueryType::Occlusion,
+                count: (2 * n_parts) as u32,
+            });
+            callback_resources.insert(VisMeasure {
+                depth_view: depth.create_view(&Default::default()),
+                qs,
+                n_parts,
+                resolve_buf,
+                staging,
+                state: Arc::new(Mutex::new(VisMapState::Idle)),
+                fractions: Arc::new(Mutex::new(Vec::new())),
+            });
+        }
+        if n_parts > 0 {
+            // Immutable phase: advance the readback state machine / record.
+            let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
+                Some(parts) => parts.as_slice(),
+                None => return Vec::new(),
+            };
+            if let Some(vm) = callback_resources.get::<VisMeasure>() {
+                let st = *vm.state.lock().unwrap();
+                match st {
+                    VisMapState::Ready => {
+                        {
+                            let data = vm.staging.slice(..).get_mapped_range();
+                            let counts: &[u64] = bytemuck::cast_slice(&data);
+                            let mut fr = vm.fractions.lock().unwrap();
+                            fr.resize(vm.n_parts, 1.0);
+                            for i in 0..vm.n_parts {
+                                let vis = counts.get(2 * i).copied().unwrap_or(0) as f32;
+                                let tot = counts.get(2 * i + 1).copied().unwrap_or(0).max(1) as f32;
+                                fr[i] = vis / tot;
+                            }
+                        }
+                        vm.staging.unmap();
+                        *vm.state.lock().unwrap() = VisMapState::Idle;
+                    }
+                    VisMapState::Copied => {
+                        // Mark Mapping BEFORE registering, so a synchronous
+                        // completion can't be overwritten.
+                        *vm.state.lock().unwrap() = VisMapState::Mapping;
+                        let state = vm.state.clone();
+                        vm.staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+                            let mut s = state.lock().unwrap();
+                            *s = if res.is_ok() { VisMapState::Ready } else { VisMapState::Idle };
+                        });
+                    }
+                    VisMapState::Mapping => {}
+                    VisMapState::Idle => {
+                        // Depth prepass: the whole model into the small target.
+                        {
+                            let mut pass =
+                                _egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("c3d_vis_prepass"),
+                                    color_attachments: &[],
+                                    depth_stencil_attachment: Some(
+                                        wgpu::RenderPassDepthStencilAttachment {
+                                            view: &vm.depth_view,
+                                            depth_ops: Some(wgpu::Operations {
+                                                load: wgpu::LoadOp::Clear(1.0),
+                                                store: wgpu::StoreOp::Store,
+                                            }),
+                                            stencil_ops: None,
+                                        },
+                                    ),
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                });
+                            pass.set_pipeline(&pipeline.vis_prepass);
+                            for gpu_part in gpu_parts {
+                                gpu_part.draw(&mut pass);
+                            }
+                        }
+                        // Measurement pass: two occlusion queries per part.
+                        {
+                            let mut pass =
+                                _egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("c3d_vis_measure"),
+                                    color_attachments: &[],
+                                    depth_stencil_attachment: Some(
+                                        wgpu::RenderPassDepthStencilAttachment {
+                                            view: &vm.depth_view,
+                                            depth_ops: Some(wgpu::Operations {
+                                                load: wgpu::LoadOp::Load,
+                                                store: wgpu::StoreOp::Discard,
+                                            }),
+                                            stencil_ops: None,
+                                        },
+                                    ),
+                                    timestamp_writes: None,
+                                    occlusion_query_set: Some(&vm.qs),
+                                });
+                            for (i, gpu_part) in gpu_parts.iter().enumerate() {
+                                pass.set_pipeline(&pipeline.vis_measure_visible);
+                                pass.begin_occlusion_query((2 * i) as u32);
+                                gpu_part.draw(&mut pass);
+                                pass.end_occlusion_query();
+                                pass.set_pipeline(&pipeline.vis_measure_total);
+                                pass.begin_occlusion_query((2 * i + 1) as u32);
+                                gpu_part.draw(&mut pass);
+                                pass.end_occlusion_query();
+                            }
+                        }
+                        _egui_encoder.resolve_query_set(
+                            &vm.qs,
+                            0..(2 * vm.n_parts) as u32,
+                            &vm.resolve_buf,
+                            0,
+                        );
+                        _egui_encoder.copy_buffer_to_buffer(
+                            &vm.resolve_buf,
+                            0,
+                            &vm.staging,
+                            0,
+                            (2 * vm.n_parts * 8) as u64,
+                        );
+                        *vm.state.lock().unwrap() = VisMapState::Copied;
+                    }
+                }
+            }
+        }
+
+        callback_resources.insert(MatteActive(use_matte));
+        callback_resources.insert(XrayOrder {
+            ghosts: ghost_order,
+            restore,
+        });
 
         Vec::new() // write_buffer is immediate; no command buffers to submit
     }
@@ -359,76 +1140,89 @@ impl CallbackTrait for MeshRenderState {
             return;
         }
 
+        // Widget matte path: the controller was already rendered offscreen in
+        // `prepare`; composite that image at the matte alpha and stop.
+        if callback_resources
+            .get::<MatteActive>()
+            .map(|m| m.0)
+            .unwrap_or(false)
+        {
+            if let (Some(blit), Some(mt)) = (
+                callback_resources.get::<Arc<BlitPipeline>>(),
+                callback_resources.get::<MatteTarget>(),
+            ) {
+                render_pass.set_pipeline(&blit.pipeline);
+                render_pass.set_bind_group(0, &mt.bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+                return;
+            }
+        }
+
         render_pass.set_pipeline(&pipeline.pipeline);
         for gpu_part in gpu_parts {
             gpu_part.draw(render_pass);
         }
+
+        // X-ray pass: re-draw active off-view parts where they are OCCLUDED
+        // (depth Greater) as accent ghosts, far → near. Then the highlighted
+        // VISIBLE parts re-draw their front surfaces (LessEqual + bias), so a
+        // ghost pierces the inert shell but never covers a nearer highlighted
+        // input.
+        if let Some(xo) = callback_resources.get::<XrayOrder>() {
+            if !xo.ghosts.is_empty() {
+                render_pass.set_pipeline(&pipeline.xray);
+                for &i in &xo.ghosts {
+                    if let Some(gp) = gpu_parts.get(i) {
+                        gp.draw_xray(render_pass);
+                    }
+                }
+                render_pass.set_pipeline(&pipeline.restore);
+                for &i in &xo.restore {
+                    if let Some(gp) = gpu_parts.get(i) {
+                        gp.draw(render_pass);
+                    }
+                }
+            }
+        }
     }
 }
 
-// ── Color palette helper ──────────────────────────────────────────────────────
+// ── Public paint API ──────────────────────────────────────────────────────────
 
-/// A subtle per-part color so the assembly reads as distinct pieces.
-fn mesh_part_color(index: usize) -> [f32; 4] {
-    const PALETTE: [[f32; 4]; 6] = [
-        [0.18, 0.18, 0.20, 1.0], // dark shell gray
-        [0.15, 0.15, 0.17, 1.0], // darker inner parts
-        [0.22, 0.22, 0.24, 1.0], // light gray plastic
-        [0.30, 0.30, 0.32, 1.0], // mid-gray buttons
-        [0.12, 0.12, 0.15, 1.0], // very dark rubber
-        [0.25, 0.24, 0.26, 1.0], // soft gray
-    ];
-    PALETTE[index % PALETTE.len()]
-}
-
-// ── Public widget API ─────────────────────────────────────────────────────────
-
-/// egui widget that renders a controller model (via a wgpu paint callback). It
-/// paints into `vis_rect` (the visible sub-rect) but frames the camera for
-/// `full_rect`, so the model crops at the frame edge rather than shrinking.
-pub struct Controller3DWidget {
-    /// Sub-rect actually painted into (the paint-callback / viewport rect).
-    vis_rect: egui::Rect,
-    state: MeshRenderState,
-}
-
-impl egui::Widget for Controller3DWidget {
-    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        // Reserve the FULL rect for layout so the node body keeps a stable size
-        // regardless of how much is scrolled into view (allocating only the
-        // visible sub-rect made the whole module appear to resize as you
-        // scrolled, and lag when restoring). Only the paint callback is confined
-        // to the visible sub-rect.
-        let full_rect = self.state.full_rect;
-        let vis_rect = self.vis_rect;
-        let paint_callback = Callback::new_paint_callback(vis_rect, self.state);
-        let response = ui.allocate_rect(full_rect, egui::Sense::hover());
-        ui.painter_at(vis_rect)
-            .add(egui::epaint::Shape::Callback(paint_callback));
-        response
-    }
-}
-
-/// Build the controller-viewer widget for `model`, oriented by `orientation`.
-/// `vis_rect` is the visible sub-rect painted into; `full_rect` is the node's
-/// full intended rect (drives camera framing so the model keeps a stable size
-/// and simply crops when partly scrolled off). Pass `vis_rect == full_rect` when
-/// fully on-screen. Model data is shared (`Arc`), so per-frame construction is
-/// cheap; GPU buffers are cached across frames in the callback resources.
-pub fn build_controller_widget(
+/// Paint a controller `model` at `orientation`, tinted by `tint`, into
+/// `vis_rect` while framing the camera for `full_rect` (so the model crops at
+/// the frame edge rather than shrinking when partly scrolled off). Pass
+/// `vis_rect == full_rect` when fully visible.
+///
+/// This does NOT allocate layout space — the caller reserves its own rect first
+/// (matching the pinned-render pattern), so the same function serves the node
+/// body and pinned/overlay instances. Model data is shared (`Arc`); GPU buffers
+/// are cached across frames in the callback resources.
+pub fn paint_controller_model(
+    ui: &egui::Ui,
     vis_rect: egui::Rect,
     full_rect: egui::Rect,
     model: Arc<LoadedModel>,
     orientation: Quat,
-) -> impl egui::Widget {
-    Controller3DWidget {
+    scheme: [[f32; 3]; crate::model::material::N_GROUPS],
+    global_alpha: f32,
+    cam_pitch: f32,
+    live: ControllerLive,
+    composite: f32,
+) {
+    let state = MeshRenderState {
+        model,
+        orientation,
+        full_rect,
         vis_rect,
-        state: MeshRenderState {
-            model,
-            orientation,
-            full_rect,
-            vis_rect,
-            pipeline: None,
-        },
-    }
+        scheme,
+        global_alpha,
+        cam_pitch,
+        live,
+        composite,
+        pipeline: None,
+    };
+    let paint_callback = Callback::new_paint_callback(vis_rect, state);
+    ui.painter_at(vis_rect)
+        .add(egui::epaint::Shape::Callback(paint_callback));
 }

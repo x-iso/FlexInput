@@ -123,6 +123,13 @@ State is shared via `Arc<RwLock<T>>` and `Arc<Mutex<T>>` with careful lock hiera
 - **Polling rate** — Configurable maximum polling rate for device I/O (typically 500 Hz - 4 kHz)
 - **Processing rate** — Configurable signal evaluation rate (tuned for real-time response)
 
+## Credits
+
+- 3D controller models in `app/assets/models` are adapted from
+  [larfingshnew/3d-controller-overlay](https://github.com/larfingshnew/3d-controller-overlay)
+  (MIT). That repo is also the reference for the model format when adding
+  custom controllers — see `app/assets/models/README.md`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

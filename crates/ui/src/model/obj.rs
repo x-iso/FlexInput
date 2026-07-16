@@ -25,6 +25,11 @@ pub struct Part {
     pub pos: Vec3,
     /// Rotation as quaternion (from axis-angle or single-axis angle stored in info.txt).
     pub rot: Quat,
+    /// Optional surface half-extents (from the trailing two info.txt values):
+    /// used by `touch_point*` parts as the touchpad's `(half_x, half_z)` so
+    /// normalized touch input can be mapped onto the model. `None` for parts
+    /// whose trailing values are zero.
+    pub extent: Option<glam::Vec2>,
 }
 
 /// A complete controller model assembled from parts with their transforms.
@@ -156,7 +161,9 @@ pub fn parse_obj(text: &str) -> Result<Mesh, ObjError> {
 ///   Line 11: rotation angle in radians
 ///     • If axis (lines 5-7) is non-zero: rotate around that axis by this angle
 ///     • If axis is all zeros but angle ≠ 0: single-axis X rotation
-///   Lines 12-16: padding zeros
+///   Lines 12-14: padding zeros
+///   Lines 15-16: surface half-extents `(half_x, half_z)` — non-zero only on
+///     `touch_point*` parts, giving the touchpad size for input mapping.
 pub fn parse_info_txt(text: &str) -> Vec<PartTransform> {
     let mut parts = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
@@ -222,7 +229,15 @@ pub fn parse_info_txt(text: &str) -> Vec<PartTransform> {
             _ => (Vec3::ZERO, Quat::IDENTITY),
         };
 
-        parts.push(PartTransform { name, pos, rot });
+        // Trailing surface half-extents (lines 15-16); non-zero only for
+        // touch_point parts.
+        let extent = if vals.len() >= 16 && (vals[14].abs() > 1e-6 || vals[15].abs() > 1e-6) {
+            Some(glam::Vec2::new(vals[14], vals[15]))
+        } else {
+            None
+        };
+
+        parts.push(PartTransform { name, pos, rot, extent });
     }
 
     parts
@@ -233,43 +248,35 @@ pub struct PartTransform {
     pub name: String,
     pub pos: Vec3,
     pub rot: Quat,
+    pub extent: Option<glam::Vec2>,
 }
 
 // ── Model assembly ────────────────────────────────────────────────────────────
 
-/// Load a complete controller model from an assets directory.
-/// `base_path` points to the folder containing `.obj` files and `info.txt`.
-pub fn load_controller_model(base_path: &Path) -> Result<ControllerModel, ObjError> {
-    let info_path = base_path.join("info.txt");
-    if !info_path.exists() {
-        return Err(ObjError::InfoFileMissing);
-    }
-
-    let info_text = std::fs::read_to_string(&info_path).map_err(|e| ObjError::IO(e))?;
+/// Load a complete controller model through a file-reading closure — the same
+/// assembly path serves on-disk folders AND the compiled-in (embedded) copies.
+/// `read_file("info.txt")` / `read_file("left_stick.obj")` return the file's
+/// text or `None` when absent.
+pub fn load_controller_model_with(
+    read_file: &dyn Fn(&str) -> Option<String>,
+    display_name: String,
+) -> Result<ControllerModel, ObjError> {
+    let info_text = read_file("info.txt").ok_or(ObjError::InfoFileMissing)?;
     let parts_transforms = parse_info_txt(&info_text);
 
-    // Determine display name from the folder name.
-    let display_name = base_path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
     let mut assembled_parts: Vec<Part> = Vec::new();
-
     for pt in &parts_transforms {
-        let obj_path = base_path.join(format!("{}.obj", pt.name));
-        if !obj_path.exists() {
-            // Some parts listed in info.txt may not have corresponding .obj files.
+        // Some parts listed in info.txt may not have corresponding .obj files.
+        let Some(obj_text) = read_file(&format!("{}.obj", pt.name)) else {
             continue;
-        }
-
-        let obj_text = std::fs::read_to_string(&obj_path).map_err(|e| ObjError::IO(e))?;
+        };
         let mesh = parse_obj(&obj_text)?;
-
         assembled_parts.push(Part {
             name: pt.name.clone(),
             mesh,
             pos: pt.pos,
             rot: pt.rot,
+            extent: pt.extent,
         });
     }
 
@@ -277,6 +284,16 @@ pub fn load_controller_model(base_path: &Path) -> Result<ControllerModel, ObjErr
         parts: assembled_parts,
         display_name,
     })
+}
+
+/// Load a complete controller model from an assets directory.
+/// `base_path` points to the folder containing `.obj` files and `info.txt`.
+pub fn load_controller_model(base_path: &Path) -> Result<ControllerModel, ObjError> {
+    let display_name = base_path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let read = |f: &str| std::fs::read_to_string(base_path.join(f)).ok();
+    load_controller_model_with(&read, display_name)
 }
 
 // ── Transform helpers ─────────────────────────────────────────────────────────

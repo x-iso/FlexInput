@@ -126,6 +126,12 @@ pub enum UiMode {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
+    /// Optional user 3D-controller-models directory. Same folder structure as
+    /// the bundled `app/assets/models` (`<Name>/info.txt` + `.obj` files +
+    /// optional `colors.fxcol`); a same-named folder overrides the bundled
+    /// model. `None`/empty = bundled models only.
+    #[serde(default)]
+    pub user_models_dir: Option<String>,
     #[serde(default = "default_polling_hz")]
     pub polling_hz: u32,
     #[serde(default = "default_sample_rate_hz")]
@@ -442,6 +448,7 @@ fn default_overlay_shortcut() -> PinShortcut {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            user_models_dir: None,
             polling_hz: POLLING_HZ_DEFAULT,
             sample_rate_hz: SAMPLE_RATE_HZ_DEFAULT,
             keep_workspace: true,
