@@ -5,8 +5,25 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-18
+
 ### Added
 
+- **Virtual Menu module** — a pop-up grid/radial menu summoned by a mapped
+  analog input (Macro-style named targeting), drawn on its own transparent,
+  click-through overlay independent of the info overlay. Reuses the Touch Zones
+  editor (BSP zones, partial dividers, per-zone mapping cards) plus a radial
+  ring mode, per-zone name/icon, and hold/toggle/touch activation with optional
+  input suppression while the menu is open.
+- **Icon picker categories & search** — icons are embedded from
+  `app/assets/general/` sub-folders at build time; the picker gains a category
+  dropdown (default "All") and a name filter, shared by the Macro, Menu, and
+  Touch Zones pickers. Ships a large [game-icons.net](https://game-icons.net/)
+  set (CC BY 3.0, attributed in Settings, the README, and `ATTRIBUTION.md`).
+- **Pinned Touch Zones / Menu style** — per-pin main/highlight colour overrides
+  and a visibility mode (always show / show on touch / touched-zones-only, the
+  last fading non-active zones to 20%) for pads pinned to a sub-patch layout or
+  the screen overlay.
 - **Info overlay** — a transparent, click-through, always-on-top layer over the
   whole screen (works over borderless/windowed games; exclusive fullscreen
   bypasses the compositor). Pin module UI elements onto it — from the tab
@@ -28,6 +45,16 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- Colour picker no longer darkens toward black or clamps RGB to the alpha value
+  at reduced opacity — colour params are read as straight (un-premultiplied)
+  bytes end to end, so menus and materials render the colour you picked.
+- Double-clicking a zone divider recentres it between its immediate neighbours
+  instead of overshooting and squashing the next zone (radial and grid editors).
+- 3D viewer: each stick's dome / cap / rim are treated as one object for x-ray
+  occlusion, so a cap covering its own dome no longer strobes the whole stick
+  transparent.
+- Switch Pro gyro now uses ±2000 dps like the other controllers, so a physical
+  rotation reads the same normalized value on every pad.
 - Transparent child windows no longer composite as an opaque white sheet on
   Win11 + AMD (missing `WS_EX_NOREDIRECTIONBITMAP` at window creation), and
   window resizes no longer churn the swapchain through stale buffered sizes.
