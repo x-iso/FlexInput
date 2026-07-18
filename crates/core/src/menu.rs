@@ -97,6 +97,25 @@ pub fn parse_target_pin(pin: &str) -> Option<(&str, TargetPin)> {
     }
 }
 
+// ── Radial geometry ──────────────────────────────────────────────────────────
+//
+// Radial mode is a POLAR PROJECTION of the zone tree: the tree's unit space
+// maps x → angle (0 at 12 o'clock, increasing CLOCKWISE, seam fixed at the
+// top) and y → radius (0 = dead-center hub edge, 1 = outer rim). Columns are
+// sectors, rows are concentric rings, and every tree operation (dividers,
+// partial splits, merges) works unchanged — grid and radial share the same
+// zone data and ids; only locate and painting go through the mapping.
+
+/// Polar coordinates of a pointer given as a CENTERED vector in screen coords
+/// (+y down), any magnitude. Returns `(angle fraction 0..1 clockwise from 12
+/// o'clock, magnitude)`. The caller gates the magnitude (dead center) and
+/// rescales it into the ring's radius fraction itself.
+pub fn radial_unit(x: f32, y: f32) -> (f32, f32) {
+    let tau = std::f32::consts::TAU;
+    let ang = x.atan2(-y).rem_euclid(tau) / tau;
+    (ang, (x * x + y * y).sqrt())
+}
+
 /// Parse a dynamic port id into a [`Pin`]. Returns `None` for the passthrough
 /// sentinel or any unrecognized id.
 pub fn parse_pin(id: &str) -> Option<Pin> {
@@ -135,6 +154,21 @@ mod tests {
         );
         assert_eq!(parse_pin("m3_bogus"), None);
         assert_eq!(parse_pin("z0_x"), None);
+    }
+
+    #[test]
+    fn radial_unit_angles() {
+        // Clockwise from 12 o'clock: up = 0, right = 0.25, down = 0.5, left = 0.75.
+        assert!((radial_unit(0.0, -1.0).0 - 0.0).abs() < 1e-6);
+        assert!((radial_unit(1.0, 0.0).0 - 0.25).abs() < 1e-6);
+        assert!((radial_unit(0.0, 1.0).0 - 0.5).abs() < 1e-6);
+        assert!((radial_unit(-1.0, 0.0).0 - 0.75).abs() < 1e-6);
+        // Just left of straight up wraps to just under 1.0 (the seam is fixed
+        // at the top — the tree's x-space has no wraparound).
+        assert!(radial_unit(-0.01, -1.0).0 > 0.99);
+        // Magnitude passes through untouched.
+        let (_, mag) = radial_unit(0.0, -0.5);
+        assert!((mag - 0.5).abs() < 1e-6);
     }
 
     #[test]

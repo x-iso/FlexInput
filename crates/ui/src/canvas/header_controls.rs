@@ -33,10 +33,10 @@ pub fn render_calibrate_row(
         return;
     }
     ui.horizontal(|ui| {
-        if ui.small_button("Calibrate")
-            .on_hover_text("Open the Device Calibration window")
-            .clicked()
-        {
+        let cal_resp = ui.small_button("Calibrate")
+            .on_hover_text("Open the Device Calibration window");
+        crate::panels::calibration::calibrate_button_activity(ui, node_id, cal_resp.rect);
+        if cal_resp.clicked() {
             *calibrate_request = Some(node_id);
         }
         let hz = device_rates_hz.get(device_id).copied().unwrap_or(0);

@@ -3132,6 +3132,9 @@ impl eframe::App for FlexInputApp {
         }
         {
             puffin::profile_scope!("calibration_show_windows");
+            // Hands-free gyro auto-calibration watcher — runs whether or not
+            // a calibration window is open.
+            crate::panels::calibration::auto_cal_tick(ctx, canvas, &self.last_signals);
             crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps, &self.spike_filter_settings);
         }
 
@@ -10871,6 +10874,19 @@ impl FlexInputApp {
                     ui.label(egui::RichText::new("(CC0).").small());
                 });
                 ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Macro & menu icons from").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("game-icons.net").small(),
+                        "https://game-icons.net/",
+                    );
+                    ui.label(egui::RichText::new("by their respective authors, licensed").small());
+                    ui.hyperlink_to(
+                        egui::RichText::new("CC BY 3.0").small(),
+                        "https://creativecommons.org/licenses/by/3.0/",
+                    );
+                    ui.label(egui::RichText::new("(per-icon authors listed on the site).").small());
+                });
+                ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("3D controller models adapted from").small());
                     ui.hyperlink_to(
                         egui::RichText::new("3d-controller-overlay").small(),
@@ -14650,6 +14666,7 @@ fn show_subpatch_editors(
                             graph_override: None,
                             source_path: vec![],
                             iv_style_override: None,
+                            menu_style_override: None,
                         });
                     }
                 }

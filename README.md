@@ -129,6 +129,15 @@ State is shared via `Arc<RwLock<T>>` and `Arc<Mutex<T>>` with careful lock hiera
   [larfingshnew/3d-controller-overlay](https://github.com/larfingshnew/3d-controller-overlay)
   (MIT). That repo is also the reference for the model format when adding
   custom controllers — see `app/assets/models/README.md`.
+- Macro & menu icons in `app/assets/general` are from
+  [game-icons.net](https://game-icons.net/) by their respective authors,
+  licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
+  Each icon's individual author is credited on game-icons.net (and in the
+  metadata of the downloaded pack); see
+  [`app/assets/general/ATTRIBUTION.md`](app/assets/general/ATTRIBUTION.md)
+  for the per-author list.
+- Input-prompt SVG icons are by [Kenney](https://kenney.nl/assets/input-prompts)
+  (CC0).
 
 ## License
 

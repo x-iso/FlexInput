@@ -208,6 +208,9 @@ struct GyroSession {
     mean:  [f64; 5],
     m2:    [f64; 5],
     scope: ScopeBuffer,
+    /// When the last calibration (manual or auto) finished — drives the
+    /// green completion glow on the start button.
+    done_at: Option<Instant>,
 }
 
 /// Per-axis orientation-calibration sample buffer. Each Vec collects raw
@@ -383,6 +386,193 @@ pub fn show_windows(
     for nid in to_close { open.remove(&nid); }
 }
 
+// ── Auto-calibration: flat + still watcher ───────────────────────────────────
+//
+// Runs every app frame (independent of the calibration window) for each
+// device.source node that opted in via `gyro_auto_cal`. Keeps a rolling
+// 5 s buffer of raw IMU samples; only once every gyro/accel axis holds
+// still for the WHOLE window AND gravity unambiguously says the pad lies
+// flat on a level surface do the buffer means become the new offsets and
+// its variance the new noise floors (one atomic write) — then the watcher
+// stays in cooldown until the controller is picked up again.
+
+/// How long the pad must be flat + still before auto-calibration fires. The
+/// stats come from this whole window and apply ATOMICALLY at its end — any
+/// violation inside the window keeps poisoning the peak-to-peak checks until
+/// it slides out, so a "half-done" calibration can never land.
+const AUTOCAL_WINDOW_S: f32 = 5.0;
+/// Max peak-to-peak span per gyro axis over the window to count as "still"
+/// (normalized units: 0.006 ≈ 12 dps span at the ±2000 dps reference —
+/// hand-held tremor is well above this, a table is well below).
+const AUTOCAL_GYRO_P2P: f32 = 0.006;
+/// Max peak-to-peak span per accel axis (0.008 ≈ 0.064 G span at ±8 G).
+const AUTOCAL_ACCEL_P2P: f32 = 0.008;
+/// "Flat" must be UNAMBIGUOUS: mean |ax| / |ay| under this (≈ 3.7° of surface
+/// tilt at ±8 G) — a pad held in hands or propped on a stand never passes…
+const AUTOCAL_FLAT_XY: f64 = 0.008;
+/// …and mean |az| inside this tight band (±1 G ≈ 0.125 at ±8 G, ±8 %).
+const AUTOCAL_FLAT_Z: (f32, f32) = (0.115, 0.135);
+
+#[derive(Clone, Default)]
+struct AutoCalState {
+    /// Rolling raw-sample window [gx, gy, gz, ax, ay, az] at UI frame rate.
+    buf: VecDeque<(Instant, [f32; 6])>,
+    /// Set after firing; clears once stillness breaks (pad picked up).
+    cooldown: bool,
+}
+
+fn auto_cal_id(node: NodeId) -> egui::Id { egui::Id::new(("auto_cal", node)) }
+
+/// Completion-glow timestamp, separate from `WindowState` so the device-card
+/// Calibrate buttons can glow green even when the window is closed (auto-cal).
+fn cal_glow_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_done_glow", node)) }
+
+/// Border animation for a device card's Calibrate button: orange trail while
+/// any calibration session is sampling on that node, green fading glow right
+/// after one finishes (manual or auto). Call with the button's rect from any
+/// place that renders a Calibrate button for a `device.source` node.
+pub fn calibrate_button_activity(ui: &egui::Ui, node: NodeId, rect: egui::Rect) {
+    let (sampling, done) = ui.ctx().data(|d| {
+        let win = d.get_temp::<WindowState>(state_id(node));
+        let sampling = win.as_ref()
+            .map(|s| s.gyro.sampling || s.stick.sampling || s.trig.sampling
+                || s.orient.sampling_axis.is_some())
+            .unwrap_or(false);
+        // Manual completions live in WindowState; auto-cal also stamps the
+        // standalone key so the glow works with the window closed. Take the
+        // most recent so neither can shadow a fresh one with a stale one.
+        let done = match (d.get_temp::<Instant>(cal_glow_id(node)),
+                          win.and_then(|s| s.gyro.done_at)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        (sampling, done)
+    });
+    if sampling {
+        button_border_trail(ui, rect);
+    } else if let Some(done) = done {
+        button_done_glow(ui, rect, done);
+    }
+}
+
+pub fn auto_cal_tick(ctx: &egui::Context, canvas: &mut Canvas, live: &LiveSignals) {
+    let candidates: Vec<(NodeId, String, bool)> = canvas.snarl.node_ids()
+        .filter(|(_, n)| n.module_id == "device.source"
+            && n.params.get("gyro_auto_cal").and_then(|v| v.as_bool()).unwrap_or(false))
+        .filter_map(|(id, n)| {
+            let dev = n.params.get("device_id").and_then(|v| v.as_str())?.to_string();
+            let skip_accel = n.params.get("skip_accel_cal")
+                .and_then(|v| v.as_bool()).unwrap_or(false);
+            Some((id, dev, skip_accel))
+        })
+        .collect();
+
+    for (node_id, dev_id, skip_accel) in candidates {
+        if !caps_for(&dev_id).gyro { continue; }
+        // Device disconnected → its pins vanish; read_float would return
+        // steady zeros, which look perfectly "still". Require a live stream.
+        if !live.contains_key(&(dev_id.clone(), "gyro_x".to_string())) { continue; }
+        // A manual sampling session owns the offsets while it runs.
+        let manual = ctx.data(|d| {
+            d.get_temp::<WindowState>(state_id(node_id))
+                .map(|s| s.gyro.sampling)
+                .unwrap_or(false)
+        });
+        if manual { continue; }
+
+        let raw = [
+            read_float(live, &dev_id, "gyro_x"),
+            read_float(live, &dev_id, "gyro_y"),
+            read_float(live, &dev_id, "gyro_z"),
+            read_float(live, &dev_id, "accel_x"),
+            read_float(live, &dev_id, "accel_y"),
+            read_float(live, &dev_id, "accel_z"),
+        ];
+
+        let fired = ctx.data_mut(|d| {
+            let st = d.get_temp_mut_or_insert_with::<AutoCalState>(
+                auto_cal_id(node_id), AutoCalState::default);
+            let now = Instant::now();
+            st.buf.push_back((now, raw));
+            let keep = std::time::Duration::from_secs_f32(AUTOCAL_WINDOW_S * 1.25);
+            while st.buf.front().map(|(t, _)| now.duration_since(*t) > keep).unwrap_or(false) {
+                st.buf.pop_front();
+            }
+            let span = st.buf.front()
+                .map(|(t, _)| now.duration_since(*t).as_secs_f32())
+                .unwrap_or(0.0);
+            if span < AUTOCAL_WINDOW_S || st.buf.len() < 30 { return None; }
+
+            let mut mn = [f32::INFINITY; 6];
+            let mut mx = [f32::NEG_INFINITY; 6];
+            let mut mean = [0.0_f64; 6];
+            for (_, s) in &st.buf {
+                for i in 0..6 {
+                    mn[i] = mn[i].min(s[i]);
+                    mx[i] = mx[i].max(s[i]);
+                    mean[i] += s[i] as f64;
+                }
+            }
+            let n = st.buf.len() as f64;
+            for m in &mut mean { *m /= n; }
+
+            let still = (0..3).all(|i| mx[i] - mn[i] < AUTOCAL_GYRO_P2P)
+                && (3..6).all(|i| mx[i] - mn[i] < AUTOCAL_ACCEL_P2P);
+            if !still {
+                // Movement re-arms the watcher for the next put-down.
+                st.cooldown = false;
+                return None;
+            }
+            if st.cooldown { return None; }
+            let flat = mean[3].abs() < AUTOCAL_FLAT_XY
+                && mean[4].abs() < AUTOCAL_FLAT_XY
+                && (AUTOCAL_FLAT_Z.0..=AUTOCAL_FLAT_Z.1).contains(&(mean[5].abs() as f32));
+            if !flat { return None; }
+
+            let mut var = [0.0_f64; 6];
+            for (_, s) in &st.buf {
+                for i in 0..6 {
+                    let dv = s[i] as f64 - mean[i];
+                    var[i] += dv * dv;
+                }
+            }
+            for v in &mut var { *v /= n; }
+            st.cooldown = true;
+            Some((mean, var))
+        });
+        let Some((mean, var)) = fired else { continue };
+
+        // Same quantization snap as the manual path.
+        const SNAP_EPS: f32 = 1.0 / 16384.0;
+        let snap = |v: f64| -> f32 {
+            let f = v as f32;
+            if f.abs() < SNAP_EPS { 0.0 } else { f }
+        };
+        let g_floor = (var[0] + var[1] + var[2]).sqrt() as f32;
+        let a_floor = ((var[3] + var[4]) * 1.5).sqrt() as f32;
+        if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
+            nd.params.insert("gyro_offset".into(),
+                serde_json::json!([snap(mean[0]), snap(mean[1]), snap(mean[2])]));
+            if !skip_accel {
+                nd.params.insert("accel_offset".into(),
+                    serde_json::json!([snap(mean[3]), snap(mean[4]), 0.0_f32]));
+            }
+            nd.params.insert("gyro_calibrated".into(), Value::Bool(true));
+            nd.params.insert("gyro_noise_floor".into(), serde_json::json!(g_floor));
+            nd.params.insert("accel_noise_floor".into(), serde_json::json!(a_floor));
+        }
+        // Light the completion glow: on the device-card Calibrate buttons
+        // always, and inside the calibration window if it's open.
+        ctx.data_mut(|d| {
+            d.insert_temp(cal_glow_id(node_id), Instant::now());
+            if let Some(mut st) = d.get_temp::<WindowState>(state_id(node_id)) {
+                st.gyro.done_at = Some(Instant::now());
+                d.insert_temp(state_id(node_id), st);
+            }
+        });
+    }
+}
+
 fn draw_window_body(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
@@ -472,6 +662,60 @@ fn add_button_with_progress(ui: &mut egui::Ui, button: egui::Button<'_>, progres
     resp
 }
 
+/// Orange trail chasing around a button's border — the "currently
+/// calibrating" indicator. Head is brightest, tail fades out over ~30 % of
+/// the perimeter; one lap ≈ 1.5 s.
+fn button_border_trail(ui: &egui::Ui, rect: egui::Rect) {
+    let t = ui.input(|i| i.time) as f32;
+    let head = (t * 0.65).fract();
+    let w = rect.width();
+    let h = rect.height();
+    let per = 2.0 * (w + h);
+    // Walk the rect perimeter clockwise from the top-left corner, u ∈ 0..1.
+    let point_at = |u: f32| -> Pos2 {
+        let d = u.rem_euclid(1.0) * per;
+        if d < w {
+            egui::pos2(rect.left() + d, rect.top())
+        } else if d < w + h {
+            egui::pos2(rect.right(), rect.top() + (d - w))
+        } else if d < 2.0 * w + h {
+            egui::pos2(rect.right() - (d - w - h), rect.bottom())
+        } else {
+            egui::pos2(rect.left(), rect.bottom() - (d - 2.0 * w - h))
+        }
+    };
+    const SEGS: usize = 26;
+    const TRAIL: f32 = 0.30;
+    let painter = ui.painter();
+    for k in 0..SEGS {
+        let f0 = k as f32 / SEGS as f32;
+        let f1 = (k + 1) as f32 / SEGS as f32;
+        let p0 = point_at(head - f0 * TRAIL);
+        let p1 = point_at(head - f1 * TRAIL);
+        // Segments are short enough that one spanning a corner just cuts it.
+        painter.line_segment([p0, p1],
+            Stroke::new(2.0, ORANGE.gamma_multiply(1.0 - f1)));
+    }
+    ui.ctx().request_repaint();
+}
+
+/// Green border glow fading out over ~2 s after a calibration finishes.
+fn button_done_glow(ui: &egui::Ui, rect: egui::Rect, done_at: Instant) {
+    const DUR: f32 = 2.0;
+    let el = done_at.elapsed().as_secs_f32();
+    if el >= DUR { return; }
+    let a = (1.0 - el / DUR).clamp(0.0, 1.0);
+    let g = Color32::from_rgb(80, 200, 100);
+    let painter = ui.painter();
+    painter.rect_stroke(rect.expand(1.0), 4.0,
+        Stroke::new(2.0, g.gamma_multiply(a)),
+        egui::epaint::StrokeKind::Outside);
+    painter.rect_stroke(rect.expand(3.5), 6.0,
+        Stroke::new(3.0, g.gamma_multiply(a * 0.35)),
+        egui::epaint::StrokeKind::Outside);
+    ui.ctx().request_repaint();
+}
+
 /// One paragraph of instruction text at the larger calibration-window size.
 /// `segments` is an alternating sequence of (orange, normal) chunks rendered
 /// inline. Pass `(true, "...")` for words you want highlighted, `(false, "...")`
@@ -540,7 +784,7 @@ fn gyro_section(
     // While sampling, we push fresh offsets to the node every frame so the
     // displayed scope visibly converges on 0 — except gz (gravity-coupled
     // in some mounts) and az, which we never write.
-    let (sampling_now, n_now) = ui.ctx().data_mut(|d| {
+    let (sampling_now, n_now, gyro_done_at) = ui.ctx().data_mut(|d| {
         let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
         st.gyro.scope.push(disp);
         let raw = [raw_gx, raw_gy, raw_gz, raw_ax, raw_ay];
@@ -589,16 +833,30 @@ fn gyro_section(
                     if !skip_accel {
                         n.params.insert("accel_offset".into(), serde_json::json!(a_write));
                     }
+                    // Noise floors from the running Welford variance — written
+                    // every frame once the estimate is meaningful, so the
+                    // scope's deadzone brackets visibly converge into place
+                    // while sampling runs. Gyro floor = RMS magnitude of the
+                    // 3-axis noise (the engine gates on |g|); accel floor
+                    // scales the 2 sampled axes up to a 3-axis distance.
+                    if st.gyro.n > 16 {
+                        let var = |i: usize| st.gyro.m2[i] / st.gyro.n as f64;
+                        let g_floor = (var(0) + var(1) + var(2)).sqrt() as f32;
+                        let a_floor = ((var(3) + var(4)) * 1.5).sqrt() as f32;
+                        n.params.insert("gyro_noise_floor".into(), serde_json::json!(g_floor));
+                        n.params.insert("accel_noise_floor".into(), serde_json::json!(a_floor));
+                    }
                 }
             }
             if st.gyro.n >= GYRO_SAMPLE_FRAMES {
                 st.gyro.sampling = false;
+                st.gyro.done_at = Some(Instant::now());
                 if let Some(n) = canvas.snarl.get_node_mut(node_id) {
                     n.params.insert("gyro_calibrated".into(), Value::Bool(true));
                 }
             }
         }
-        (st.gyro.sampling, st.gyro.n)
+        (st.gyro.sampling, st.gyro.n, st.gyro.done_at)
     });
 
     // Push the maximum repaint rate during sampling so the scope captures as
@@ -639,11 +897,17 @@ fn gyro_section(
                 let gyro_progress = if sampling_now {
                     (n_now as f32 / GYRO_SAMPLE_FRAMES as f32).clamp(0.0, 1.0)
                 } else { 0.0 };
-                if cal_button_with_progress(
+                let start_resp = cal_button_with_progress(
                     ui,
                     if sampling_now { "stop" } else { "start" },
                     gyro_progress,
-                ).clicked() {
+                );
+                if sampling_now {
+                    button_border_trail(ui, start_resp.rect);
+                } else if let Some(done) = gyro_done_at {
+                    button_done_glow(ui, start_resp.rect, done);
+                }
+                if start_resp.clicked() {
                     ui.ctx().data_mut(|d| {
                         let st = d.get_temp_mut_or_insert_with::<WindowState>(state_id(node_id), WindowState::default);
                         if sampling_now {
@@ -678,6 +942,28 @@ fn gyro_section(
                     }
                 }
             });
+
+            // Hands-free auto-calibration: a watcher on the app frame (runs
+            // with this window closed too) recalibrates whenever the pad has
+            // been lying flat and motionless for a couple of seconds.
+            {
+                let mut auto_on = canvas.snarl.get_node(node_id)
+                    .and_then(|n| n.params.get("gyro_auto_cal").and_then(|v| v.as_bool()))
+                    .unwrap_or(false);
+                if ui.checkbox(&mut auto_on,
+                    egui::RichText::new("auto-calibrate when still").size(INSTRUCT_SIZE - 1.0))
+                    .on_hover_text("Recalibrates hands-free after the controller has been lying\n\
+                                    flat on a level surface, fully motionless, for 5 seconds —\n\
+                                    even while this window is closed. Any movement during the\n\
+                                    wait restarts it; the write is atomic (never half-done).\n\
+                                    Re-arms once the controller is picked up again.")
+                    .changed()
+                {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.insert("gyro_auto_cal".into(), Value::Bool(auto_on));
+                    }
+                }
+            }
 
             ui.add_space(8.0);
 
@@ -819,6 +1105,66 @@ fn gyro_section(
             }
             if let Ok(mut map) = spike_settings.write() {
                 map.insert(dev_id.to_string(), (enabled, sens));
+            }
+
+            // Noise-floor deadzone row: zero out readings inside the measured
+            // noise band. The floor itself comes from calibration (manual or
+            // auto); the width factor scales how far the brackets sit around
+            // it. Gyro gates on the 3-axis magnitude at center; accel gets a
+            // dynamic band that follows gravity as the device rotates.
+            {
+                let (mut dz_on, mut dz_w, g_floor, mut dz_view) = canvas.snarl.get_node(node_id)
+                    .map(|n| (
+                        n.params.get("gyro_dz_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                        n.params.get("gyro_dz_width").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32,
+                        n.params.get("gyro_noise_floor").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        n.params.get("dz_view_after").and_then(|v| v.as_bool()).unwrap_or(false),
+                    ))
+                    .unwrap_or((false, 2.0, 0.0, false));
+                let mut dz_changed = false;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(egui::RichText::new("Noise-floor deadzone")
+                        .size(INSTRUCT_SIZE).strong());
+                    if ui.checkbox(&mut dz_on, "")
+                        .on_hover_text("Zero gyro readings whose 3-axis magnitude stays inside the\n\
+                                        measured noise band (kills orientation drift and lean bias\n\
+                                        at rest), and hold the accel steady inside a band that\n\
+                                        follows gravity as the device rotates. The border eases in\n\
+                                        exponentially — no snap when crossing it.")
+                        .changed() { dz_changed = true; }
+                    ui.add_enabled_ui(dz_on, |ui| {
+                        ui.label(egui::RichText::new("width ×").weak());
+                        if ui.add(egui::DragValue::new(&mut dz_w)
+                            .speed(0.05).range(0.05..=10.0))
+                            .on_hover_text("Bracket width as a multiple of the measured noise floor.\n\
+                                            2.0 clears ~99 % of noise; raise it if drift persists,\n\
+                                            lower it if slow motions get eaten.")
+                            .changed() { dz_changed = true; }
+                        if g_floor > 0.0 {
+                            ui.label(egui::RichText::new(format!("±{:.4}", g_floor * dz_w))
+                                .size(INSTRUCT_SIZE - 1.0).weak());
+                        } else {
+                            ui.label(egui::RichText::new("calibrate first")
+                                .size(INSTRUCT_SIZE - 1.0)
+                                .color(Color32::from_gray(120)));
+                        }
+                        if ui.checkbox(&mut dz_view,
+                            egui::RichText::new("view filtered").size(INSTRUCT_SIZE - 2.0))
+                            .on_hover_text("Show the scope traces AFTER the deadzone (what the\n\
+                                            engine outputs) instead of the raw readings.")
+                            .changed() { dz_changed = true; }
+                    });
+                });
+                if dz_changed {
+                    if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+                        n.params.insert("gyro_dz_enabled".into(), Value::Bool(dz_on));
+                        n.params.insert("gyro_dz_width".into(),
+                            serde_json::Number::from_f64(dz_w as f64)
+                                .map(Value::Number).unwrap_or(Value::Null));
+                        n.params.insert("dz_view_after".into(), Value::Bool(dz_view));
+                    }
+                }
             }
 
             // Invert axis — single row: Gyro: X Y Z   Accel: X Y Z.
@@ -1021,6 +1367,50 @@ fn gyro_scope(
             }
         }
     }
+
+    // "View filtered": replay the engine's noise-floor deadzone over the
+    // rings so the scope shows what actually leaves the device stage.
+    // Gyro = the same magnitude gate + exponential border ease; accel = the
+    // same dynamic baseline, simulated chronologically over the visible
+    // window (2D — az isn't a scope channel — so it's a close approximation
+    // of the engine's 3D distance).
+    {
+        let node = canvas.snarl.get_node(_node_id);
+        let dz_on = node.and_then(|n| n.params.get("gyro_dz_enabled").and_then(|v| v.as_bool())).unwrap_or(false);
+        let view_after = node.and_then(|n| n.params.get("dz_view_after").and_then(|v| v.as_bool())).unwrap_or(false);
+        if dz_on && view_after {
+            let dz_w    = node.and_then(|n| n.params.get("gyro_dz_width").and_then(|v| v.as_f64())).unwrap_or(2.0) as f32;
+            let g_dz = node.and_then(|n| n.params.get("gyro_noise_floor").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32 * dz_w;
+            let a_dz = node.and_then(|n| n.params.get("accel_noise_floor").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32 * dz_w;
+            if g_dz > 0.0 {
+                let n = samples_ch[0].len().min(samples_ch[1].len()).min(samples_ch[2].len());
+                for i in 0..n {
+                    let (gx, gy, gz) = (samples_ch[0][i].1, samples_ch[1][i].1, samples_ch[2][i].1);
+                    let s = flexinput_engine::eval::gyro_dz_ease(
+                        (gx * gx + gy * gy + gz * gz).sqrt(), g_dz);
+                    samples_ch[0][i].1 = gx * s;
+                    samples_ch[1][i].1 = gy * s;
+                    samples_ch[2][i].1 = gz * s;
+                }
+            }
+            if a_dz > 0.0 {
+                let n = samples_ch[3].len().min(samples_ch[4].len());
+                let mut base: Option<[f32; 2]> = None;
+                for i in 0..n {
+                    let v = [samples_ch[3][i].1, samples_ch[4][i].1];
+                    let b = base.get_or_insert(v);
+                    let d = ((v[0] - b[0]).powi(2) + (v[1] - b[1]).powi(2)).sqrt();
+                    let s = flexinput_engine::eval::gyro_dz_ease(d, a_dz);
+                    if s > 0.0 {
+                        b[0] += (v[0] - b[0]) * s;
+                        b[1] += (v[1] - b[1]) * s;
+                    }
+                    samples_ch[3][i].1 = b[0];
+                    samples_ch[4][i].1 = b[1];
+                }
+            }
+        }
+    }
     // Repaint as fast as possible so new tap samples flow in promptly.
     ui.ctx().request_repaint();
 
@@ -1127,6 +1517,43 @@ fn gyro_scope(
                 colors[ch].r(), colors[ch].g(), colors[ch].b(), 110);
             painter.circle_filled(head, 5.0, halo);
             painter.circle_filled(head, 2.6, colors[ch]);
+        }
+    }
+
+    // ── Noise-floor deadzone brackets ────────────────────────────────────
+    //
+    // Vertical borders at ±(floor × width) around the zero line, in the same
+    // auto-zoom scale as the traces so they track the zoom. Orange while
+    // sampling — converging into place as the floor estimate settles — then
+    // green once the deadzone is armed. (Gyro only: the accel band follows
+    // gravity dynamically, so it has no fixed place on the scope.)
+    {
+        let node = canvas.snarl.get_node(_node_id);
+        let dz_on = node.and_then(|n| n.params.get("gyro_dz_enabled").and_then(|v| v.as_bool())).unwrap_or(false);
+        let dz_w  = node.and_then(|n| n.params.get("gyro_dz_width").and_then(|v| v.as_f64())).unwrap_or(2.0) as f32;
+        let g_floor = node.and_then(|n| n.params.get("gyro_noise_floor").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
+        let sampling = ui.ctx().data(|d| {
+            d.get_temp::<WindowState>(state_id(_node_id))
+                .map(|s| s.gyro.sampling)
+                .unwrap_or(false)
+        });
+        if g_floor > 0.0 && (dz_on || sampling) {
+            let dx = (g_floor * dz_w * scale).min(half_w);
+            let col = if sampling { ORANGE } else { Color32::from_rgb(90, 190, 120) }
+                .gamma_multiply(0.85);
+            let top = scope_rect.top() + 4.0;
+            let bot = scope_rect.bottom() - 4.0;
+            for side in [-1.0_f32, 1.0] {
+                let x = center_x + side * dx;
+                painter.line_segment([egui::pos2(x, top), egui::pos2(x, bot)],
+                    Stroke::new(1.3, col));
+                // Bracket feet point inward, toward the zero line.
+                let foot = -side * 5.0;
+                painter.line_segment([egui::pos2(x, top), egui::pos2(x + foot, top)],
+                    Stroke::new(1.3, col));
+                painter.line_segment([egui::pos2(x, bot), egui::pos2(x + foot, bot)],
+                    Stroke::new(1.3, col));
+            }
         }
     }
 

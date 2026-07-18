@@ -133,8 +133,11 @@ fn color32(c: [u8; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
 }
 
+/// Straight-alpha bytes from a paint colour. `Color32` is PREMULTIPLIED
+/// internally, so raw `.r()/.g()/.b()` return `rgb × alpha` — storing those as
+/// straight bytes darkens the colour a little more on every round-trip.
 fn rgba(c: egui::Color32) -> [u8; 4] {
-    [c.r(), c.g(), c.b(), c.a()]
+    c.to_srgba_unmultiplied()
 }
 
 impl IvStyle {
@@ -179,24 +182,32 @@ pub(crate) fn iv_style_inspector(
     id_salt: usize,
     ov: Option<&IvStyleOverride>,
 ) -> Option<IvStyleOverride> {
-    let mut style = IvStyle::from_override(ov);
-    let before = style;
+    // Edit the RAW override bytes (straight alpha), seeded from the stored
+    // override or the default style. Never edit via the painter's `Color32`s:
+    // they're premultiplied internally, so bytes pulled back out of one are
+    // `rgb × alpha` — the swatch would re-darken the colour every frame (see
+    // `fxi_color_swatch`'s caller contract).
+    let mut o = ov.copied().unwrap_or_else(|| IvStyle::default().to_override());
+    let before = o;
     let mut reset = false;
+    let swatch = |ui: &mut egui::Ui, c: &mut [u8; 4], tip: &str| {
+        crate::canvas::viewer::fxi_color_swatch(ui, c, tip, true);
+    };
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new("Input Viewer style").small().strong());
         ui.separator();
         ui.label(egui::RichText::new("bg").small().weak());
-        ui.color_edit_button_srgba(&mut style.bg)
-            .on_hover_text("Board plate color — lower the alpha for a see-through board over a game.");
+        swatch(ui, &mut o.bg,
+            "Board plate color — lower the alpha for a see-through board over a game.");
         ui.label(egui::RichText::new("highlight").small().weak());
-        ui.color_edit_button_srgba(&mut style.accent)
-            .on_hover_text("Pressed-element color: halos, trigger fill, stick/touch dots.");
+        swatch(ui, &mut o.accent,
+            "Pressed-element color: halos, trigger fill, stick/touch dots.");
         ui.label(egui::RichText::new("tint").small().weak());
-        ui.color_edit_button_srgba(&mut style.tint)
-            .on_hover_text("Multiplies the button art; brightness still rises on press.");
+        swatch(ui, &mut o.tint,
+            "Multiplies the button art; brightness still rises on press.");
         ui.label(egui::RichText::new("outline").small().weak());
-        ui.color_edit_button_srgba(&mut style.outline);
-        ui.add(egui::DragValue::new(&mut style.outline_w).range(0.0..=6.0).speed(0.05))
+        swatch(ui, &mut o.outline, "Board outline colour.");
+        ui.add(egui::DragValue::new(&mut o.outline_px).range(0.0..=6.0).speed(0.05))
             .on_hover_text("Board outline width (0 = none).");
         if ui.small_button("Reset").on_hover_text("Use the default board style").clicked() {
             reset = true;
@@ -205,8 +216,8 @@ pub(crate) fn iv_style_inspector(
     let _ = id_salt;
     if reset {
         None
-    } else if style != before {
-        Some(style.to_override())
+    } else if o != before {
+        Some(o)
     } else {
         ov.copied()
     }

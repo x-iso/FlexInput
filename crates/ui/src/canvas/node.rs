@@ -105,6 +105,43 @@ pub struct ExposedModule {
     /// see-through overlay board at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iv_style_override: Option<IvStyleOverride>,
+    /// Per-pin Touch Zones / Virtual Menu FIELD pad style + visibility.
+    /// Populated via the layout inspector strip. `None` = the module's own
+    /// colours, always shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_style_override: Option<MenuStyleOverride>,
+}
+
+/// Per-pin style for a pinned Touch Zones / Virtual Menu field pad. Colour
+/// fields fall back FIELD-BY-FIELD to the module's own `main_color` /
+/// `highlight_color` params (unlike [`IvStyleOverride`]'s wholesale replace),
+/// so a pin can recolour just the highlight, just the plate, or neither.
+/// `visibility` gates when the pad is painted in LIVE views — the layout
+/// editor always paints it so it stays selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MenuStyleOverride {
+    /// Main colour (plate/borders tint; alpha = pad opacity). `None` = module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<[u8; 4]>,
+    /// Highlight colour (active zone / affordances). `None` = module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hi: Option<[u8; 4]>,
+    /// When the pinned pad is painted (live views only).
+    #[serde(default)]
+    pub visibility: ZoneVisibility,
+}
+
+/// When a pinned Touch Zones / Menu pad is painted in live views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ZoneVisibility {
+    /// Always painted (default).
+    #[default]
+    Always,
+    /// Painted only while at least one touch point / zone is active.
+    OnTouch,
+    /// Only the zone(s) currently touched are painted (whole-pad chrome
+    /// hidden). Radial menus treat this like `OnTouch`.
+    TouchedZones,
 }
 
 /// Per-pin style for a pinned Input Viewer board. Unlike the color-per-field
@@ -563,6 +600,7 @@ mod tests {
                     }),
                     source_path: vec![3],
                     iv_style_override: None,
+                    menu_style_override: None,
                 }),
                 LayoutItem::Deco(LayoutDecoration::Rect {
                     pos: [5.0, 6.0],

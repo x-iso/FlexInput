@@ -56,8 +56,10 @@ pub enum MaterialGroup {
 /// Number of material groups (length of a [`Scheme`]).
 pub const N_GROUPS: usize = 20;
 
-/// Per-group RGB colour scheme, indexed by `MaterialGroup as usize`.
-pub type Scheme = [[u8; 3]; N_GROUPS];
+/// Per-group RGBA colour scheme, indexed by `MaterialGroup as usize`. Alpha
+/// 255 = opaque; anything lower renders the group as translucent plastic
+/// (drawn in a sorted blend pass after the opaque parts).
+pub type Scheme = [[u8; 4]; N_GROUPS];
 
 /// Fixed colour for the mic capsule — a soft cloudy white.
 pub const MIC_COLOR: [u8; 3] = [224, 223, 216];
@@ -160,8 +162,15 @@ pub fn group_for_part(name: &str) -> MaterialGroup {
     if n.contains("mic") {
         return Mic;
     }
-    if n.contains("guide") {
-        return Logo; // PS / Xbox / Home logo button
+    // Home/guide logo button, plus the Switch Pro capture (screenshot) button
+    // — the model names that part "misc" — which shares the home button's
+    // colour group per user preference.
+    if n.contains("guide")
+        || n.contains("capture")
+        || n.contains("screenshot")
+        || n.starts_with("misc")
+    {
+        return Logo;
     }
     // The `extra` mesh on DS/DS4 is the LED strip; also match explicit names.
     if n.contains("extra") || n.contains("led") || n.contains("light") {
@@ -196,7 +205,6 @@ pub fn group_for_part(name: &str) -> MaterialGroup {
         || n.contains("create")
         || n.contains("plus")
         || n.contains("minus")
-        || n.contains("capture")
     {
         return Menu;
     }
@@ -215,9 +223,38 @@ pub fn group_for_part(name: &str) -> MaterialGroup {
     ShellMain
 }
 
+/// Coarse **occlusion object** id for x-ray grouping. The x-ray ghost measures
+/// each mesh part's visible-vs-total footprint, but a stick is modelled as
+/// three separate meshes (dome + cap + rim): the cap covering its *own* dome
+/// makes the dome read as "hidden" and ghosts it, even though the stick as a
+/// whole is plainly on camera — and it strobes at the covering edge. Collapsing
+/// the three stick meshes into one object means self-occlusion inside the stick
+/// never trips x-ray; only the whole stick going behind the body drops its
+/// combined visibility below threshold. Every other part stays its own object
+/// (keyed by `part_index`), so unrelated parts still ghost independently.
+pub fn xray_object_for_part(name: &str, part_index: usize) -> u32 {
+    use MaterialGroup::*;
+    match group_for_part(name) {
+        LeftDome | LeftCap | LeftRim => u32::MAX,
+        RightDome | RightCap | RightRim => u32::MAX - 1,
+        _ => part_index as u32,
+    }
+}
+
 /// Neutral distinct-grey palette used when a model has no tuned default.
 /// Order MUST match the `MaterialGroup` discriminants.
-const NEUTRAL: Scheme = [
+/// Widen an RGB table to the RGBA [`Scheme`] (opaque).
+const fn with_alpha(rgb: [[u8; 3]; N_GROUPS]) -> Scheme {
+    let mut out = [[0u8; 4]; N_GROUPS];
+    let mut i = 0;
+    while i < N_GROUPS {
+        out[i] = [rgb[i][0], rgb[i][1], rgb[i][2], 255];
+        i += 1;
+    }
+    out
+}
+
+const NEUTRAL: Scheme = with_alpha([
     [46, 47, 52], // ShellMain
     [46, 47, 52], // ShellSecondary — matches main by default
     [64, 64, 64], // Led — cloudy plastic strip (grey, lit by the live relay)
@@ -238,12 +275,13 @@ const NEUTRAL: Scheme = [
     [40, 41, 46], // RightRim
     [82, 84, 92], // Logo
     MIC_COLOR,    // Mic
-];
+]);
 
-/// Set every group in `groups` to `c`.
+/// Set every group in `groups` to opaque `c` (palettes stay RGB; alpha is a
+/// user-edit / fxcol concept).
 fn put(s: &mut Scheme, groups: &[MaterialGroup], c: [u8; 3]) {
     for g in groups {
-        s[*g as usize] = c;
+        s[*g as usize] = [c[0], c[1], c[2], 255];
     }
 }
 
@@ -367,8 +405,9 @@ fn load_model_fxcol(model: &str) -> Option<serde_json::Map<String, serde_json::V
         .cloned()
 }
 
-/// Overlay a `key → [r,g,b]` map onto a scheme (only the editable [`ROWS`]
-/// groups; missing keys keep the built-in value).
+/// Overlay a `key → [r,g,b]` / `[r,g,b,a]` map onto a scheme (only the
+/// editable [`ROWS`] groups; missing keys keep the built-in value; a missing
+/// alpha means opaque).
 fn apply_fxcol_map(scheme: &mut Scheme, map: &serde_json::Map<String, serde_json::Value>) {
     for (_, groups) in ROWS {
         for &g in *groups {
@@ -378,6 +417,7 @@ fn apply_fxcol_map(scheme: &mut Scheme, map: &serde_json::Map<String, serde_json
                         arr[0].as_u64().unwrap_or(0) as u8,
                         arr[1].as_u64().unwrap_or(0) as u8,
                         arr[2].as_u64().unwrap_or(0) as u8,
+                        arr.get(3).and_then(|v| v.as_u64()).unwrap_or(255) as u8,
                     ];
                 }
             }
@@ -410,6 +450,31 @@ mod tests {
         assert_eq!(group_for_part("touchpad"), MaterialGroup::Touchpad);
         assert_eq!(group_for_part("left_trigger"), MaterialGroup::Trigger);
         assert_eq!(group_for_part("left_bumper"), MaterialGroup::Bumper);
+    }
+
+    #[test]
+    fn xray_object_groups_stick_meshes() {
+        // The three meshes of one stick collapse to a single occlusion object,
+        // so a cap covering its own dome can't ghost the stick.
+        let l = [
+            xray_object_for_part("left_stick", 0),
+            xray_object_for_part("left_cap", 1),
+            xray_object_for_part("left_ring", 2),
+        ];
+        assert!(l.iter().all(|&x| x == l[0]), "left stick meshes share one object");
+        let r = [
+            xray_object_for_part("right_stick", 3),
+            xray_object_for_part("right_cap", 4),
+            xray_object_for_part("right_ring", 5),
+        ];
+        assert!(r.iter().all(|&x| x == r[0]), "right stick meshes share one object");
+        assert_ne!(l[0], r[0], "left and right sticks are distinct objects");
+
+        // Every non-stick part is its own object (keyed by part index) and can
+        // never collide with the stick sentinels (u32::MAX / MAX-1).
+        assert_eq!(xray_object_for_part("top_shell", 6), 6);
+        assert_eq!(xray_object_for_part("dpad_up", 7), 7);
+        assert_ne!(xray_object_for_part("top_shell", 6), l[0]);
     }
 
     #[test]

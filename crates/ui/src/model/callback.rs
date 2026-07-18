@@ -90,7 +90,7 @@ impl ControllerLive {
     /// identity when the part isn't animated. Rotations pivot about the part's
     /// own placement so sticks/triggers hinge in place. Touch points are handled
     /// separately in `prepare` (they also change colour / visibility).
-    fn part_xform(&self, name: &str, part_tf: &Mat4) -> Mat4 {
+    fn part_xform(&self, name: &str, part_tf: &Mat4, footprint: f32) -> Mat4 {
         let n = name.to_ascii_lowercase();
         // Pivot = the part's placed origin (translation column of its transform).
         let pivot = part_tf.w_axis.truncate();
@@ -98,8 +98,10 @@ impl ControllerLive {
             Mat4::from_translation(pivot) * Mat4::from_quat(r) * Mat4::from_translation(-pivot)
         };
         // Buttons: depress while held. Bumpers hinge back into the shell (+Z);
-        // the rest indent into their top face (−Y). Small travel — the highlight
-        // glow carries most of the visual feedback.
+        // the rest indent into their top face (−Y). Travel scales with the
+        // button's horizontal footprint so the tiny Home/Capture/± caps sink
+        // barely at all instead of disappearing into the shell — the highlight
+        // glow carries most of the visual feedback anyway.
         if let Some(&press) = self.buttons.get(n.as_str()) {
             if press <= 0.001 {
                 return Mat4::IDENTITY;
@@ -107,7 +109,12 @@ impl ControllerLive {
             if n.contains("bumper") {
                 return Mat4::from_translation(Vec3::new(0.0, 0.0, 0.04 * press));
             }
-            return Mat4::from_translation(Vec3::new(0.0, -0.012 * press, 0.0));
+            let travel = if footprint > 1e-4 {
+                (footprint * 0.12).clamp(0.002, 0.012)
+            } else {
+                0.012
+            };
+            return Mat4::from_translation(Vec3::new(0.0, -travel * press, 0.0));
         }
         // Sticks: the dome + cap + rim tilt together about the stick base, and
         // the whole assembly sinks on an L3/R3 click.
@@ -156,6 +163,9 @@ pub struct PartData {
     pub centroid: Vec3,
     /// Assembled-space average outward normal (normalized; ZERO if degenerate).
     pub avg_normal: Vec3,
+    /// Horizontal footprint (max of assembled-space X/Z extents) — scales the
+    /// press-travel so small buttons don't vanish into the shell.
+    pub footprint: f32,
 }
 
 // ── Render target format ──────────────────────────────────────────────────────
@@ -366,10 +376,14 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
         let mut pos_sum = Vec3::ZERO;
         let mut nrm_sum = Vec3::ZERO;
         let mut n_verts = 0u32;
+        let mut p_min = Vec3::splat(f32::INFINITY);
+        let mut p_max = Vec3::splat(f32::NEG_INFINITY);
         while i + 5 < v.len() {
             let world = tf.transform_point3(Vec3::new(v[i], v[i + 1], v[i + 2]));
             min = min.min(world);
             max = max.max(world);
+            p_min = p_min.min(world);
+            p_max = p_max.max(world);
             if is_touchpad {
                 pad_min = pad_min.min(world);
                 pad_max = pad_max.max(world);
@@ -379,6 +393,14 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
             n_verts += 1;
             i += 6;
         }
+        // Horizontal footprint (assembled space, Y up) — scales the press
+        // travel so tiny buttons (Home/Capture/±) barely sink while the big
+        // face buttons keep their full travel.
+        let footprint = if n_verts > 0 {
+            (p_max.x - p_min.x).max(p_max.z - p_min.z)
+        } else {
+            0.0
+        };
         let centroid = if n_verts > 0 { pos_sum / n_verts as f32 } else { Vec3::ZERO };
         let avg_normal = if nrm_sum.length_squared() > 1e-8 {
             nrm_sum.normalize()
@@ -405,6 +427,7 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
             group: crate::model::material::group_for_part(&p.name) as usize,
             centroid,
             avg_normal,
+            footprint,
         });
     }
 
@@ -471,8 +494,9 @@ pub struct MeshRenderState {
     /// frame edge (like any other UI element) instead of shrinking to fit. Equal
     /// to `full_rect` when the node is entirely on-screen.
     pub vis_rect: egui::Rect,
-    /// Per-group base colours (linear-ish 0..1 RGB), indexed by `PartData.group`.
-    pub scheme: [[f32; 3]; crate::model::material::N_GROUPS],
+    /// Per-group base colours (linear-ish 0..1 RGBA — alpha < 1 renders the
+    /// group as translucent plastic), indexed by `PartData.group`.
+    pub scheme: [[f32; 4]; crate::model::material::N_GROUPS],
     /// Whole-model opacity (0..1) for the 2D composite (overlay transparency).
     pub global_alpha: f32,
     /// Camera elevation above the horizontal, in radians (0 = level/front view,
@@ -494,9 +518,12 @@ pub struct MeshRenderState {
 /// parts, re-drawn after the ghosts with depth LessEqual so their visible
 /// surfaces reclaim their pixels — a ghost pierces the inert shell but never
 /// covers a nearer highlighted input (z-order among highlighted objects).
+/// `translucent` are the parts whose material alpha < 1, excluded from the
+/// opaque pass and drawn far→near with blending (depth-tested, no writes).
 struct XrayOrder {
     ghosts: Vec<usize>,
     restore: Vec<usize>,
+    translucent: Vec<usize>,
 }
 
 /// Offscreen target for the widget matte: when composite alpha < 1 the
@@ -518,7 +545,15 @@ struct MatteActive(bool);
 /// "total" query rasterizes front AND back faces (cull is off), so a fully
 /// visible closed mesh measures ≈ 0.5 — 0.05 therefore corresponds to the
 /// spec's "less than ~10% of the part's geometry visible on camera".
-const GHOST_VIS_THRESHOLD: f32 = 0.05;
+/// X-ray ghost gating with hysteresis (kills the strobe when a part sits at the
+/// edge of occlusion): an active part ENTERS x-ray only once its smoothed
+/// visibility falls below LOW, and LEAVES it once back above HIGH. LOW is low so
+/// a still-visible part (e.g. a stick ring peeking past the dome) doesn't ghost.
+const GHOST_VIS_LOW: f32 = 0.025;
+const GHOST_VIS_HIGH: f32 = 0.06;
+/// EMA weight applied to each raw visibility readback — damps the measurement
+/// noise (already ~3 frames behind) that made the ghost flicker in and out.
+const VIS_SMOOTH: f32 = 0.35;
 
 /// Async-readback state for the visibility measurement.
 #[derive(Clone, Copy, PartialEq)]
@@ -548,9 +583,23 @@ struct VisMeasure {
     resolve_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
     state: Arc<Mutex<VisMapState>>,
-    /// Latest computed `visible / total` per part index (empty until the first
-    /// readback completes; treated as fully visible).
+    /// Smoothed `visible / total` per part index (EMA over readbacks; empty
+    /// until the first readback completes). Feeds the hysteresis latch below.
     fractions: Arc<Mutex<Vec<f32>>>,
+    /// Latched "hidden" per part (hysteresis on `fractions`): true = currently
+    /// x-ray-ghosted. Prevents strobing at the LOW/HIGH visibility boundary.
+    ghost: Arc<Mutex<Vec<bool>>>,
+    /// Occlusion object id per part (`material::xray_object_for_part`). Parts
+    /// sharing an id (the three-mesh sticks) are judged as ONE solid: their
+    /// visible/total counts are summed before the fraction + latch, so a cap
+    /// covering its own dome never ghosts the stick. Length == `n_parts`.
+    obj: Vec<u32>,
+    /// Consecutive frames spent in `Mapping` — the map_async callback only
+    /// fires on device maintenance, and if it's ever lost the machine would
+    /// wedge and the ghost gating would keep judging visibility from a STALE
+    /// pose (x-ray firing for a camera angle the model left long ago). The
+    /// watchdog cancels and restarts the readback instead.
+    stalled_frames: std::sync::atomic::AtomicU32,
 }
 
 impl CallbackTrait for MeshRenderState {
@@ -674,18 +723,23 @@ impl CallbackTrait for MeshRenderState {
         // Latest measured per-part visibility (occlusion queries, ~3 frames
         // behind). Missing data (first frames / new model) = fully visible,
         // so nothing ghosts until real measurements arrive.
-        let vis_fractions: Vec<f32> = callback_resources
+        // Latched per-part "hidden" flags (smoothing + hysteresis applied at
+        // readback) — an active part that's hidden shows the x-ray ghost.
+        let ghost_hidden: Vec<bool> = callback_resources
             .get::<VisMeasure>()
-            .and_then(|v| v.fractions.lock().ok().map(|f| f.clone()))
+            .and_then(|v| v.ghost.lock().ok().map(|g| g.clone()))
             .unwrap_or_default();
         let center_radius4 = [center.x, center.y, center.z, radius];
         let mut ghosts: Vec<(usize, f32)> = Vec::new(); // (part idx, camera distance)
         let mut restore: Vec<usize> = Vec::new(); // highlighted parts (re-drawn after ghosts)
+        // Parts with a translucent material (scheme alpha < 1): excluded from
+        // the opaque pass and re-drawn sorted far→near with blending.
+        let mut translucent: Vec<(usize, f32)> = Vec::new();
         for (i, gpu_part) in gpu_parts.iter().enumerate() {
             let part = self.model.parts.get(i);
             let part_tf = part.map(|p| p.transform).unwrap_or(Mat4::IDENTITY);
             let g = part.map(|p| p.group).unwrap_or(0);
-            let base = self.scheme.get(g).copied().unwrap_or([0.5, 0.5, 0.5]);
+            let base = self.scheme.get(g).copied().unwrap_or([0.5, 0.5, 0.5, 1.0]);
             let name = part.map(|p| p.name.as_str()).unwrap_or("");
 
             // Touch-point dots: hidden when the finger is up; otherwise slid to
@@ -715,7 +769,8 @@ impl CallbackTrait for MeshRenderState {
                 },
                 None => {
                     // Animate presses/tilts/pulls via the part's extra transform.
-                    let model_m = orient * self.live.part_xform(name, &part_tf) * part_tf;
+                    let fp = part.map(|p| p.footprint).unwrap_or(0.0);
+                    let model_m = orient * self.live.part_xform(name, &part_tf, fp) * part_tf;
                     // Relay the live LED colour onto the LED-strip group (emissive).
                     let is_led = g == crate::model::material::MaterialGroup::Led as usize;
                     match (is_led, self.live.led) {
@@ -731,7 +786,7 @@ impl CallbackTrait for MeshRenderState {
                             let inten = c[0].max(c[1]).max(c[2]).clamp(0.0, 1.0);
                             (
                                 model_m,
-                                [b[0], b[1], b[2], 1.0],
+                                [b[0], b[1], b[2], base[3]],
                                 [c[0], c[1], c[2], 1.0],
                                 0.85 * inten,
                             )
@@ -740,7 +795,7 @@ impl CallbackTrait for MeshRenderState {
                             // Highlight active inputs (albedo shifts toward the
                             // style accent; shading is preserved in the shader).
                             let g = self.live.glow.get(name).copied().unwrap_or(0.0);
-                            (model_m, [base[0], base[1], base[2], 1.0], hl4, g)
+                            (model_m, base, hl4, g)
                         }
                     }
                 }
@@ -779,10 +834,18 @@ impl CallbackTrait for MeshRenderState {
                     .map(|p| self.live.glow.get(&p.name).copied().unwrap_or(0.0))
                     .unwrap_or(0.0),
             };
-            let vis = vis_fractions.get(i).copied().unwrap_or(1.0);
-            let ghosted = xg > 0.02 && vis < GHOST_VIS_THRESHOLD;
+            let ghosted = xg > 0.02 && ghost_hidden.get(i).copied().unwrap_or(false);
             if xg > 0.02 {
                 restore.push(i);
+            }
+            let dist = part
+                .map(|p| {
+                    let c = self.orientation * (p.centroid - center) + center;
+                    (cam - c).length()
+                })
+                .unwrap_or(0.0);
+            if touch_slot.is_none() && base_color[3] < 0.999 {
+                translucent.push((i, dist));
             }
             if ghosted {
                 let ghost = Uniforms {
@@ -799,17 +862,22 @@ impl CallbackTrait for MeshRenderState {
                     center_radius: center_radius4,
                 };
                 gpu_part.update_xray_uniforms(queue, &ghost);
-                let dist = part
-                    .map(|p| {
-                        let c = self.orientation * (p.centroid - center) + center;
-                        (cam - c).length()
-                    })
-                    .unwrap_or(0.0);
                 ghosts.push((i, dist));
             }
         }
-        // Painter's order for the ghost pass: far → near.
+        // Painter's order for the ghost + translucent passes: far → near.
         ghosts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        translucent.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let trans_order: Vec<usize> = translucent.into_iter().map(|(i, _)| i).collect();
+        let is_trans: Vec<bool> = {
+            let mut v = vec![false; gpu_parts.len()];
+            for &i in &trans_order {
+                if let Some(s) = v.get_mut(i) {
+                    *s = true;
+                }
+            }
+            v
+        };
         let ghost_order: Vec<usize> = ghosts.into_iter().map(|(i, _)| i).collect();
 
         // ── Widget matte (composite alpha) ─────────────────────────────────
@@ -929,8 +997,20 @@ impl CallbackTrait for MeshRenderState {
                     occlusion_query_set: None,
                 });
                 pass.set_pipeline(&pipeline.pipeline);
-                for gpu_part in gpu_parts {
+                for (i, gpu_part) in gpu_parts.iter().enumerate() {
+                    if is_trans.get(i).copied().unwrap_or(false) {
+                        continue; // drawn blended below
+                    }
                     gpu_part.draw(&mut pass);
+                }
+                if !trans_order.is_empty() {
+                    // Translucent materials: far → near over the opaque depth.
+                    pass.set_pipeline(&pipeline.translucent);
+                    for &i in &trans_order {
+                        if let Some(gp) = gpu_parts.get(i) {
+                            gp.draw(&mut pass);
+                        }
+                    }
                 }
                 if !ghost_order.is_empty() {
                     pass.set_pipeline(&pipeline.xray);
@@ -1000,6 +1080,15 @@ impl CallbackTrait for MeshRenderState {
                 staging,
                 state: Arc::new(Mutex::new(VisMapState::Idle)),
                 fractions: Arc::new(Mutex::new(Vec::new())),
+                ghost: Arc::new(Mutex::new(Vec::new())),
+                obj: self
+                    .model
+                    .parts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| crate::model::material::xray_object_for_part(&p.name, i))
+                    .collect(),
+                stalled_frames: std::sync::atomic::AtomicU32::new(0),
             });
         }
         if n_parts > 0 {
@@ -1016,11 +1105,34 @@ impl CallbackTrait for MeshRenderState {
                             let data = vm.staging.slice(..).get_mapped_range();
                             let counts: &[u64] = bytemuck::cast_slice(&data);
                             let mut fr = vm.fractions.lock().unwrap();
+                            let mut gh = vm.ghost.lock().unwrap();
                             fr.resize(vm.n_parts, 1.0);
+                            gh.resize(vm.n_parts, false);
+                            // Sum visible + total per occlusion OBJECT first, so a
+                            // stick's three meshes are judged as one solid: the cap
+                            // covering its own dome leaves cap+rim visible, so the
+                            // object stays on-camera and never ghosts. Only the
+                            // whole object going behind the body drops below
+                            // threshold. Non-stick parts each get a unique id, so
+                            // they still measure independently.
+                            let mut obj_sum: std::collections::HashMap<u32, (f32, f32)> =
+                                std::collections::HashMap::new();
                             for i in 0..vm.n_parts {
                                 let vis = counts.get(2 * i).copied().unwrap_or(0) as f32;
-                                let tot = counts.get(2 * i + 1).copied().unwrap_or(0).max(1) as f32;
-                                fr[i] = vis / tot;
+                                let tot = counts.get(2 * i + 1).copied().unwrap_or(0) as f32;
+                                let key = vm.obj.get(i).copied().unwrap_or(i as u32);
+                                let e = obj_sum.entry(key).or_insert((0.0, 0.0));
+                                e.0 += vis;
+                                e.1 += tot;
+                            }
+                            for i in 0..vm.n_parts {
+                                let key = vm.obj.get(i).copied().unwrap_or(i as u32);
+                                let (vis, tot) = obj_sum.get(&key).copied().unwrap_or((0.0, 1.0));
+                                let frac = vis / tot.max(1.0);
+                                // Smooth the raw fraction, then latch hidden/visible
+                                // with hysteresis so an edge-of-occlusion part holds.
+                                fr[i] = fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH;
+                                gh[i] = if gh[i] { fr[i] < GHOST_VIS_HIGH } else { fr[i] < GHOST_VIS_LOW };
                             }
                         }
                         vm.staging.unmap();
@@ -1030,13 +1142,29 @@ impl CallbackTrait for MeshRenderState {
                         // Mark Mapping BEFORE registering, so a synchronous
                         // completion can't be overwritten.
                         *vm.state.lock().unwrap() = VisMapState::Mapping;
+                        vm.stalled_frames.store(0, std::sync::atomic::Ordering::Relaxed);
                         let state = vm.state.clone();
                         vm.staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
                             let mut s = state.lock().unwrap();
                             *s = if res.is_ok() { VisMapState::Ready } else { VisMapState::Idle };
                         });
                     }
-                    VisMapState::Mapping => {}
+                    VisMapState::Mapping => {
+                        // The callback only runs on device maintenance — pump
+                        // it explicitly so the readback can't depend on the
+                        // frame loop happening to poll for us.
+                        let _ = device.poll(wgpu::PollType::Poll);
+                        // Watchdog: a lost callback would freeze the fractions
+                        // at a stale pose forever (x-ray judged from a camera
+                        // angle the model left minutes ago). Cancel + restart.
+                        let stalled = vm.stalled_frames
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if stalled > 180 {
+                            vm.staging.unmap(); // cancels the pending map_async
+                            *vm.state.lock().unwrap() = VisMapState::Idle;
+                            vm.stalled_frames.store(0, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     VisMapState::Idle => {
                         // Depth prepass: the whole model into the small target.
                         {
@@ -1115,6 +1243,7 @@ impl CallbackTrait for MeshRenderState {
         callback_resources.insert(XrayOrder {
             ghosts: ghost_order,
             restore,
+            translucent: trans_order,
         });
 
         Vec::new() // write_buffer is immediate; no command buffers to submit
@@ -1158,17 +1287,41 @@ impl CallbackTrait for MeshRenderState {
             }
         }
 
+        let xo = callback_resources.get::<XrayOrder>();
+        let is_trans: Vec<bool> = {
+            let mut v = vec![false; gpu_parts.len()];
+            if let Some(xo) = xo {
+                for &i in &xo.translucent {
+                    if let Some(s) = v.get_mut(i) {
+                        *s = true;
+                    }
+                }
+            }
+            v
+        };
         render_pass.set_pipeline(&pipeline.pipeline);
-        for gpu_part in gpu_parts {
+        for (i, gpu_part) in gpu_parts.iter().enumerate() {
+            if is_trans.get(i).copied().unwrap_or(false) {
+                continue; // drawn blended below
+            }
             gpu_part.draw(render_pass);
         }
 
-        // X-ray pass: re-draw active off-view parts where they are OCCLUDED
-        // (depth Greater) as accent ghosts, far → near. Then the highlighted
-        // VISIBLE parts re-draw their front surfaces (LessEqual + bias), so a
-        // ghost pierces the inert shell but never covers a nearer highlighted
-        // input.
-        if let Some(xo) = callback_resources.get::<XrayOrder>() {
+        if let Some(xo) = xo {
+            // Translucent materials: far → near over the opaque depth.
+            if !xo.translucent.is_empty() {
+                render_pass.set_pipeline(&pipeline.translucent);
+                for &i in &xo.translucent {
+                    if let Some(gp) = gpu_parts.get(i) {
+                        gp.draw(render_pass);
+                    }
+                }
+            }
+            // X-ray pass: re-draw active off-view parts where they are OCCLUDED
+            // (depth Greater) as accent ghosts, far → near. Then the highlighted
+            // VISIBLE parts re-draw their front surfaces (LessEqual + bias), so a
+            // ghost pierces the inert shell but never covers a nearer highlighted
+            // input.
             if !xo.ghosts.is_empty() {
                 render_pass.set_pipeline(&pipeline.xray);
                 for &i in &xo.ghosts {
@@ -1204,7 +1357,7 @@ pub fn paint_controller_model(
     full_rect: egui::Rect,
     model: Arc<LoadedModel>,
     orientation: Quat,
-    scheme: [[f32; 3]; crate::model::material::N_GROUPS],
+    scheme: [[f32; 4]; crate::model::material::N_GROUPS],
     global_alpha: f32,
     cam_pitch: f32,
     live: ControllerLive,

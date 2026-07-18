@@ -57,18 +57,20 @@ pub fn registry_entry(pin: &str) -> Option<MacroDisplayEntry> {
 
 // ── Embedded SVG bytes (app/assets/general/) ─────────────────────────────────
 //
-// `ALL_ICONS` is generated at build time by `build.rs` from every `.svg` in
-// `app/assets/general/` — so the shippable icon set is defined by that folder,
-// not by a hardcoded list here. Add / rename / remove an SVG there and the
-// pickers update on the next build with no code change. Each entry is
-// `(key, human label, svg bytes)`; the `key` is the file stem and is persisted
-// in `macro_ports.icon`, so renaming a file changes its key and orphans any
-// saved reference (same caveat as when the keys were curated by hand).
+// `ALL_ICONS` + `ICON_CATEGORIES` are generated at build time by `build.rs`
+// from every `.svg` under `app/assets/general/` — so the shippable icon set is
+// defined by that folder, not by a hardcoded list here. Add / rename / remove
+// an SVG (or a whole category sub-folder) and the pickers update on the next
+// build with no code change. Each entry is `(key, human label, category, svg
+// bytes)`; the `key` is the file stem, persisted in `macro_ports.icon`, so
+// renaming a file changes its key and orphans any saved reference. The
+// `category` is the prettified immediate sub-folder under `general/` (loose
+// files are "Uncategorized") and drives the icon picker's category dropdown.
 include!(concat!(env!("OUT_DIR"), "/generated_macro_icons.rs"));
 
 /// Resolve an icon key to its embedded SVG bytes.
 pub fn macro_icon_svg(key: &str) -> Option<&'static [u8]> {
-    ALL_ICONS.iter().find(|(k, _, _)| *k == key).map(|(_, _, b)| *b)
+    ALL_ICONS.iter().find(|(k, _, _, _)| *k == key).map(|(_, _, _, b)| *b)
 }
 
 /// Rasterize a macro icon to a cached white-on-transparent texture, sized for

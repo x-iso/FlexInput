@@ -29,9 +29,12 @@ pub const ACCEL_REF_G: f32 = 8.0;
 // DS4 / DualSense: factory ±2000 dps gyro, ±8 G accel.
 const DS4_GYRO_DPS_PER_LSB: f32 = 2000.0 / 32767.0;
 const DS4_ACCEL_G_PER_LSB: f32  = 8.0   / 32767.0;
-// Switch Pro (ICM-20689): configured at ±4000 dps gyro (not ±2000), per empirical testing.
-// If gyro reads ~2× too large, change 4000.0 → 2000.0.
-const SWITCH_GYRO_DPS_PER_LSB: f32 = 4000.0 / 32767.0;
+// Switch Pro (ICM-20689): ±2000 dps, matching DS4/DualSense so a physical
+// rotation produces the SAME normalized value on every known controller (the
+// 3D orientation view confirmed the old 4000-based scale read exactly 2× too
+// large — it needed a 0.5 display scale to track reality). Uniformity beats
+// preserving old patches' feel per user decision 2026-07-17.
+const SWITCH_GYRO_DPS_PER_LSB: f32 = 2000.0 / 32767.0;
 const SWITCH_ACCEL_G_PER_LSB: f32  = 8.0   / 32767.0;
 
 // Retry open no more than once per N seconds to avoid hammering HidHide.

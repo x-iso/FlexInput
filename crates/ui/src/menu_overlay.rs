@@ -58,6 +58,26 @@ struct MenuInst {
     tree: tz::ZoneNode,
     /// The node's mapping cards (`zone_maps`), for per-zone destination icons.
     zone_maps: Vec<serde_json::Value>,
+    /// Radial mode: the same zone tree projected as a sector ring.
+    radial: bool,
+    /// Pointer deadzone — doubles as the ring's dead-center radius fraction.
+    deadzone: f32,
+    /// Radial angular origin offset (fraction) — rotates the ring.
+    origin: f32,
+    /// Configurable main / highlight colours.
+    colors: crate::canvas::menu_body::ZoneColors,
+    /// Live pointer (unit-rect 0..1, y down) from the eval mirror — drives the
+    /// cursor-deflection indicator while the menu is open.
+    ptr: Option<egui::Vec2>,
+    /// Per-zone icon + name overrides (`zone_meta` param).
+    zone_meta: std::collections::HashMap<u32, crate::canvas::menu_body::ZoneMeta>,
+    /// Last accepted selection `(zone, seq)` from the eval mirror — the seq
+    /// increments per selection, driving the select-linger animation and the
+    /// select glow.
+    sel: Option<(u32, u32)>,
+    /// How long the selected cell stays on screen after the menu hides
+    /// before fading out (`select_linger` param, seconds; 0 = off).
+    linger_s: f32,
 }
 
 fn read_menu(node: &NodeData, outer: Option<NodeId>, inner: NodeId) -> MenuInst {
@@ -88,6 +108,114 @@ fn read_menu(node: &NodeData, outer: Option<NodeId>, inner: NodeId) -> MenuInst 
         rect,
         tree,
         zone_maps: node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+        radial: node.params.get("menu_radial").and_then(|v| v.as_bool()).unwrap_or(false),
+        deadzone: node.params.get("pointer_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.25) as f32,
+        origin: node.params.get("menu_radial_origin").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        colors: crate::canvas::menu_body::ZoneColors::read(node),
+        ptr: crate::canvas::menu_body::menu_pointer(node),
+        zone_meta: crate::canvas::menu_body::menu_zone_meta(node),
+        sel: crate::canvas::menu_body::menu_sel_info(node),
+        linger_s: node.params.get("select_linger").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32,
+    }
+}
+
+/// Per-menu select-linger/glow tracking state (ctx temp):
+/// `(seen seq, zone of that seq, linger start time, open last frame,
+/// seq when the current/last open session began, glow start time)`.
+type LingerState = (u32, u32, f64, bool, u32, f64);
+
+/// Seconds the lingering cell takes to fade out once its hold time is up.
+const LINGER_FADE_S: f64 = 0.45;
+/// Duration of the select-glow border flash (plays on EVERY selection,
+/// open menu or lingering cell alike).
+const GLOW_S: f64 = 0.35;
+
+/// Advance one menu's linger/glow state machine. Returns
+/// `(linger cell, glow)` — each as `(zone, alpha)`:
+/// * linger — the cell of a now-hidden menu to keep painting while it fades.
+///   A selection only replays when it happened during the open session that
+///   just ended; reopening cancels the fade, and a stale seq from before the
+///   overlay started tracking never animates.
+/// * glow — the quick border flash marking the moment a zone was accepted.
+fn linger_tick(
+    ctx: &egui::Context,
+    m: &MenuInst,
+    now: f64,
+) -> (Option<(u32, f32)>, Option<(u32, f32)>) {
+    let key = egui::Id::new(("fxi_menu_linger", m.outer.map(|n| n.0), m.inner.0));
+    let cur_seq = m.sel.map(|(_, s)| s).unwrap_or(0);
+    let mut st: LingerState = ctx.data(|d| d.get_temp(key)).unwrap_or((
+        cur_seq, 0, f64::NEG_INFINITY, m.open, cur_seq, f64::NEG_INFINITY,
+    ));
+    // Selection observed (order matters: before the close check, so a
+    // release-select — close + seq bump on the same tick — lingers).
+    if let Some((zone, seq)) = m.sel {
+        if seq != st.0 {
+            st.0 = seq;
+            st.1 = zone;
+            st.5 = now; // glow flash on every accepted selection
+        }
+    }
+    if m.open && !st.3 {
+        // Opened: remember the session's starting seq, cancel any fade.
+        st.4 = st.0;
+        st.2 = f64::NEG_INFINITY;
+    }
+    if !m.open && st.3 && st.0 != st.4 {
+        // Closed after at least one accepted selection → start the linger.
+        st.2 = now;
+    }
+    st.3 = m.open;
+    ctx.data_mut(|d| d.insert_temp(key, st));
+
+    let glow = if st.5.is_finite() && now - st.5 < GLOW_S {
+        Some((st.1, (1.0 - ((now - st.5) / GLOW_S) as f32).clamp(0.0, 1.0)))
+    } else {
+        None
+    };
+
+    let linger = if m.open || m.linger_s <= 0.0 || !st.2.is_finite() {
+        None
+    } else {
+        let t = now - st.2;
+        let hold = m.linger_s as f64;
+        if t >= hold + LINGER_FADE_S {
+            None
+        } else {
+            let alpha = if t <= hold { 1.0 } else { 1.0 - ((t - hold) / LINGER_FADE_S) as f32 };
+            Some((st.1, alpha.clamp(0.0, 1.0)))
+        }
+    };
+    (linger, glow)
+}
+
+/// The select-glow border stroke for one zone — a bright flash that decays
+/// over [`GLOW_S`]. Drawn on top of the live cell (press/click selects) and
+/// the lingering cell (release selects) so accepting is unmistakable.
+fn paint_zone_glow(ui: &egui::Ui, px: egui::Rect, m: &MenuInst, zone: u32, alpha: f32) {
+    let col = egui::Color32::from_rgb(255, 235, 170).gamma_multiply(alpha);
+    let stroke = egui::Stroke::new(2.0 + 3.0 * alpha, col);
+    let Some((_, band)) = m.tree.zones().into_iter().find(|(z, _)| *z == zone) else {
+        return;
+    };
+    if m.radial {
+        let geom = crate::canvas::menu_body::RingGeom::of(px, m.deadzone, m.origin);
+        if let Some((r0, r1, a0, a1)) =
+            crate::canvas::menu_body::radial_band_geom(&geom, band)
+        {
+            for s in crate::canvas::menu_body::radial_sector_shapes(
+                geom.center, r0, r1, a0, a1, egui::Color32::TRANSPARENT, stroke,
+            ) {
+                ui.painter().add(s);
+            }
+        }
+    } else {
+        let [x0, y0, x1, y1] = band;
+        let zr = egui::Rect::from_min_max(
+            egui::pos2(px.left() + x0 * px.width(), px.top() + y0 * px.height()),
+            egui::pos2(px.left() + x1 * px.width(), px.top() + y1 * px.height()),
+        ).shrink(2.0);
+        ui.painter().rect_stroke(zr, 5.0, stroke, egui::StrokeKind::Middle);
     }
 }
 
@@ -150,8 +278,22 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         }
     }
 
+    // Select-linger + select-glow: after a menu hides, its chosen cell stays
+    // for `select_linger` seconds and fades; every accepted selection also
+    // flashes the cell border. Tracked BEFORE the early return — the close
+    // transition is only observable on frames where every menu is already
+    // closed. `(menu index, zone, alpha)` per entry.
+    let now = ctx.input(|i| i.time);
+    let mut lingers: Vec<(usize, u32, f32)> = Vec::new();
+    let mut glows: Vec<(usize, u32, f32)> = Vec::new();
+    for (i, m) in menus.iter().enumerate() {
+        let (linger, glow) = linger_tick(ctx, m, now);
+        if let Some((z, a)) = linger { lingers.push((i, z, a)); }
+        if let Some((z, a)) = glow { glows.push((i, z, a)); }
+    }
+
     let any_open = menus.iter().any(|m| m.open);
-    if !any_open && edit.is_none() {
+    if !any_open && edit.is_none() && lingers.is_empty() {
         return; // viewport not declared → eframe destroys the OS window
     }
 
@@ -263,8 +405,23 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         menu_edit_chrome(ui, screen, &mut exit_edit);
                     }
                 } else {
-                    for m in menus.iter().filter(|m| m.open) {
+                    for (i, m) in menus.iter().enumerate() {
+                        if !m.open { continue; }
                         paint_menu(ui, to_px(m.rect), m, false);
+                        // Select glow on the live cell (press/click selects
+                        // keep the menu open).
+                        if let Some(&(_, z, a)) = glows.iter().find(|(gi, _, _)| *gi == i) {
+                            paint_zone_glow(ui, to_px(m.rect), m, z, a);
+                        }
+                    }
+                    // Lingering select cells of menus that just hid: only the
+                    // chosen zone, fading out on its own (+ its glow flash).
+                    for &(idx, zone, alpha) in &lingers {
+                        let m = &menus[idx];
+                        paint_menu_linger(ui, to_px(m.rect), m, zone, alpha);
+                        if let Some(&(_, z, a)) = glows.iter().find(|(gi, _, _)| *gi == idx) {
+                            paint_zone_glow(ui, to_px(m.rect), m, z, a);
+                        }
                     }
                 }
             });
@@ -285,69 +442,85 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 /// name/icon chip above. In edit mode nothing is highlighted.
 fn paint_menu(ui: &mut egui::Ui, px: egui::Rect, m: &MenuInst, editing: bool) {
     let p = ui.painter();
-    let accent = egui::Color32::from_rgb(255, 196, 90);
-    p.rect_filled(px, 8.0, egui::Color32::from_rgba_unmultiplied(16, 16, 20, 210));
-    p.rect_stroke(px, 8.0, egui::Stroke::new(1.5, egui::Color32::from_gray(110)), egui::StrokeKind::Inside);
 
+    if m.radial {
+        // Sector ring — the zones carry their own plate fill, no backdrop.
+        crate::canvas::menu_body::paint_radial_ring(
+            ui, px, &m.tree.zones(), m.deadzone, m.origin,
+            if editing { -1 } else { m.hover },
+            None, &m.zone_maps, &m.zone_meta, m.colors, None,
+            if editing { None } else { m.ptr },
+        );
+        paint_menu_chip(ui, px, m);
+        return;
+    }
+
+    p.rect_filled(px, 8.0, crate::canvas::menu_body::plate_fill(m.colors.main));
+    p.rect_stroke(px, 8.0, egui::Stroke::new(1.5, m.colors.main), egui::StrokeKind::Inside);
+
+    // Zone cells (plate/hover/icons/labels) via the shared painter — the
+    // select-linger fade draws the same cell, so they must match exactly.
     for (zid, [x0, y0, x1, y1]) in m.tree.zones() {
         let zr = egui::Rect::from_min_max(
             egui::pos2(px.left() + x0 * px.width(), px.top() + y0 * px.height()),
             egui::pos2(px.left() + x1 * px.width(), px.top() + y1 * px.height()),
         ).shrink(2.0);
         let hovered = !editing && m.hover == zid as i32;
-        if hovered {
-            p.rect_filled(zr, 5.0, accent.gamma_multiply(0.30));
-            p.rect_stroke(zr, 5.0, egui::Stroke::new(2.0, accent), egui::StrokeKind::Inside);
-        } else {
-            p.rect_stroke(zr, 5.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)), egui::StrokeKind::Inside);
-        }
+        crate::canvas::menu_body::paint_grid_zone_cell(
+            ui, zr, zid, hovered, &m.zone_maps, &m.zone_meta, m.colors,
+        );
+    }
 
-        // Destination icons: every out pin across the zone's mapping cards,
-        // deduped in card order. KBM as the base skin — destinations are
-        // typically keys/mouse/macro targets; a virtual-pad pin still renders
-        // via the chip painter's any-skin fallback (dimmed).
-        let mut pins: Vec<String> = Vec::new();
-        for c in m.zone_maps.iter().filter(|c|
-            c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zid as u64)
-        {
-            for pin in c.get("out").and_then(|v| v.as_array()).into_iter().flatten()
-                .filter_map(|v| v.as_str())
-            {
-                if !pins.iter().any(|x| x == pin) { pins.push(pin.to_string()); }
-            }
-        }
-        if pins.is_empty() {
-            // Unmapped zone: faint index so it's still identifiable as a target.
-            p.text(
-                zr.center(), egui::Align2::CENTER_CENTER, format!("{zid}"),
-                egui::FontId::proportional((zr.height() * 0.28).clamp(11.0, 26.0)),
-                if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(150) },
+    // Cursor-deflection indicator: where the pointer currently is relative to
+    // the field center (translucent — blends over icons it crosses).
+    if !editing {
+        if let Some(c) = m.ptr {
+            let pos = egui::pos2(
+                px.left() + c.x.clamp(0.0, 1.0) * px.width(),
+                px.top() + c.y.clamp(0.0, 1.0) * px.height(),
             );
-        } else {
-            let ic = (zr.height() * 0.42).clamp(14.0, 30.0);
-            let gap = 4.0;
-            // Show as many icons as fit; a trailing "…" marks the overflow.
-            let fit = (((zr.width() - 8.0 + gap) / (ic + gap)).floor() as usize)
-                .clamp(1, pins.len());
-            let truncated = fit < pins.len();
-            let total_w = fit as f32 * ic + (fit.saturating_sub(1)) as f32 * gap;
-            let mut x = zr.center().x - total_w * 0.5;
-            let y = zr.center().y - ic * 0.5;
-            for pin in pins.iter().take(fit) {
-                let w = crate::canvas::viewer::paint_chord_chip_to_rect(
-                    p, ui.ctx(), egui::pos2(x, y), ic, pin,
-                    crate::canvas::remapper_icons::Skin::Kbm,
-                );
-                x += w + gap;
-            }
-            if truncated {
-                p.text(egui::pos2(x, zr.center().y), egui::Align2::LEFT_CENTER, "…",
-                    egui::FontId::proportional(ic * 0.6), egui::Color32::from_gray(170));
-            }
+            crate::canvas::menu_body::paint_menu_cursor(p, px.center(), pos, m.colors.hi);
         }
     }
 
-    // Name + icon chip above the plate.
+    paint_menu_chip(ui, px, m);
+}
+
+/// Paint just the selected zone cell of a hidden menu at `alpha` — the
+/// select-linger: the menu vanished on accept, its chosen cell stays and
+/// fades. Geometry matches the live painters exactly (same tree fractions,
+/// same shared cell painters).
+fn paint_menu_linger(ui: &mut egui::Ui, px: egui::Rect, m: &MenuInst, zone: u32, alpha: f32) {
+    let Some((_, band)) = m.tree.zones().into_iter().find(|(z, _)| *z == zone) else {
+        return; // zone got restructured away since the selection
+    };
+    ui.scope(|ui| {
+        ui.set_opacity(alpha);
+        if m.radial {
+            let geom = crate::canvas::menu_body::RingGeom::of(px, m.deadzone, m.origin);
+            crate::canvas::menu_body::paint_radial_zone(
+                ui, &geom, zone, band, true, false,
+                &m.zone_maps, &m.zone_meta, m.colors,
+            );
+        } else {
+            let [x0, y0, x1, y1] = band;
+            let zr = egui::Rect::from_min_max(
+                egui::pos2(px.left() + x0 * px.width(), px.top() + y0 * px.height()),
+                egui::pos2(px.left() + x1 * px.width(), px.top() + y1 * px.height()),
+            ).shrink(2.0);
+            // Its own little plate — the menu's backdrop is gone, and a bare
+            // outlined cell would float unreadably over the game.
+            ui.painter().rect_filled(zr, 5.0, crate::canvas::menu_body::plate_fill(m.colors.main));
+            crate::canvas::menu_body::paint_grid_zone_cell(
+                ui, zr, zone, true, &m.zone_maps, &m.zone_meta, m.colors,
+            );
+        }
+    });
+}
+
+/// Name + icon chip above the plate.
+fn paint_menu_chip(ui: &mut egui::Ui, px: egui::Rect, m: &MenuInst) {
+    let p = ui.painter();
     let label = if m.name.is_empty() { "Menu".to_string() } else { m.name.clone() };
     let font = egui::FontId::proportional(13.0);
     let galley = p.layout_no_wrap(label, font, egui::Color32::from_gray(230));

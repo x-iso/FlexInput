@@ -79,6 +79,9 @@ pub struct ControllerPipeline {
     /// depth write): reclaims their pixels from ghosts so x-ray never covers a
     /// nearer highlighted input.
     pub(crate) restore: RenderPipeline,
+    /// Translucent-material pass (LessEqual, no depth write, premult blend):
+    /// parts whose scheme alpha < 1, drawn far → near after the opaque set.
+    pub(crate) translucent: RenderPipeline,
     /// Depth-only pipelines for the per-part VISIBILITY measurement (occlusion
     /// queries): a prepass laying down the whole model's depth, then per part
     /// a "visible samples" draw (LessEqual vs that depth) and a "total
@@ -209,6 +212,14 @@ impl ControllerPipeline {
             CompareFunction::LessEqual,
             -2,
         );
+        // Translucent-material pass: depth-tested against the opaque parts but
+        // never writing (parts are pre-sorted far → near by the caller).
+        let translucent = build(
+            "controller_pipeline_translucent",
+            false,
+            CompareFunction::LessEqual,
+            0,
+        );
 
         // Depth-only builder (no fragment stage) for the visibility queries.
         let build_depth = |label: &str, depth_write: bool, depth_compare: CompareFunction| {
@@ -258,6 +269,7 @@ impl ControllerPipeline {
             pipeline,
             xray,
             restore,
+            translucent,
             vis_prepass,
             vis_measure_visible,
             vis_measure_total,

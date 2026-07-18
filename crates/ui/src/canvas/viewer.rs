@@ -210,6 +210,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let is_remapper       = snarl.get_node(node).map(|n| n.module_id == "module.remapper").unwrap_or(false);
         let is_map_action     = snarl.get_node(node).map(|n| n.module_id == "module.map_action").unwrap_or(false);
         let is_input_viewer   = snarl.get_node(node).map(|n| n.module_id == "module.input_viewer").unwrap_or(false);
+        let is_menu           = snarl.get_node(node).map(|n| n.module_id == "module.menu").unwrap_or(false);
         let is_response_curve = snarl.get_node(node).map(|n| {
             n.module_id == "module.response_curve"
                 || n.module_id == "module.vec_response_curve"
@@ -256,10 +257,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         ui.label(&title);
                         if has_cal_here {
                             ui.horizontal(|ui| {
-                                if ui.small_button("Calibrate")
-                                    .on_hover_text("Open the Device Calibration window")
-                                    .clicked()
-                                {
+                                let cal_resp = ui.small_button("Calibrate")
+                                    .on_hover_text("Open the Device Calibration window");
+                                crate::panels::calibration::calibrate_button_activity(
+                                    ui, node, cal_resp.rect);
+                                if cal_resp.clicked() {
                                     self.calibrate_request = Some(node);
                                 }
                                 let hz = self.device_rates.get(&dev_id_owned).copied().unwrap_or(0);
@@ -275,6 +277,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         ui.label(egui::RichText::new("●").color(color).small());
                     }
                     ui.label(&title);
+                } else if is_menu {
+                    // Virtual Menu: identity (icon + editable name) + the
+                    // Ports/Mapping switch live in the header.
+                    super::menu_body::show_menu_header(node, ui, snarl);
                 } else {
                     if let Some(live) = status_dot {
                         let color = if live { Color32::from_rgb(80, 200, 100) } else { Color32::from_rgb(220, 80, 60) };
@@ -499,36 +505,32 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let (mut size, mut col) = snarl.get_node(node).map(|n| {
                         let sz = n.params.get("font_size").and_then(|v| v.as_f64()).unwrap_or(14.0) as f32;
                         let arr = n.params.get("color").and_then(|v| v.as_array()).cloned();
-                        let c = match arr.as_deref() {
-                            Some([r, g, b, a]) => egui::Color32::from_rgba_unmultiplied(
+                        let c: [u8; 4] = match arr.as_deref() {
+                            Some([r, g, b, a]) => [
                                 r.as_u64().unwrap_or(220) as u8,
                                 g.as_u64().unwrap_or(220) as u8,
                                 b.as_u64().unwrap_or(220) as u8,
                                 a.as_u64().unwrap_or(255) as u8,
-                            ),
-                            _ => egui::Color32::from_rgb(220, 220, 220),
+                            ],
+                            _ => [220, 220, 220, 255],
                         };
                         (sz, c)
-                    }).unwrap_or((14.0, egui::Color32::from_rgb(220, 220, 220)));
+                    }).unwrap_or((14.0, [220, 220, 220, 255]));
                     let mut changed = false;
-                    let prev_size = size;
-                    let prev_col  = col;
                     if ui.add(egui::DragValue::new(&mut size).speed(0.25).range(8.0..=72.0).suffix("px"))
                         .on_hover_text("Font size").changed()
                     {
                         changed = true;
                     }
-                    if ui.color_edit_button_srgba(&mut col).on_hover_text("Text color").changed() {
+                    if fxi_color_swatch(ui, &mut col, "Text colour", true) {
                         changed = true;
                     }
-                    let _ = prev_size;
-                    let _ = prev_col;
                     if changed {
                         if let Some(n) = snarl.get_node_mut(node) {
                             if let Some(num) = Number::from_f64(size as f64) {
                                 n.params.insert("font_size".into(), Value::Number(num));
                             }
-                            let arr = serde_json::json!([col.r() as u64, col.g() as u64, col.b() as u64, col.a() as u64]);
+                            let arr = serde_json::json!([col[0] as u64, col[1] as u64, col[2] as u64, col[3] as u64]);
                             n.params.insert("color".into(), arr);
                         }
                     }
@@ -1616,7 +1618,7 @@ fn tz_node_edges(node: &NodeData, field: usize, which: &str) -> Vec<f32> {
         .unwrap_or_default()
 }
 
-fn tz_read_field_edges(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, which: &str) -> Vec<f32> {
+pub(crate) fn tz_read_field_edges(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, which: &str) -> Vec<f32> {
     snarl.get_node(node_id).map(|n| tz_node_edges(n, field, which)).unwrap_or_default()
 }
 
@@ -2059,9 +2061,25 @@ fn tz_tree_line_overlay(
     // (ux, uy, axis, new_low)
     let mut sub: Option<(f32, f32, Axis, bool)> = None;
     let mut rem: Option<Vec<u8>> = None;
+    let divs = tree.dividers();
 
-    // "−" on each divider → remove/merge.
-    for (di, div) in tree.dividers().iter().enumerate() {
+    // Nearest divider under the pointer (within a few px of its line) → the "−"
+    // shows there dynamically, like the "+", instead of one marker per divider.
+    let near_div: Option<usize> = ptr.filter(|p| rect.contains(*p)).and_then(|p| {
+        divs.iter().enumerate().filter_map(|(di, div)| {
+            let (d, on_span) = match div.axis {
+                Axis::V => ((p.x - to_x(div.pos)).abs(),
+                    p.y >= to_y(div.span_lo) - 6.0 && p.y <= to_y(div.span_hi) + 6.0),
+                Axis::H => ((p.y - to_y(div.pos)).abs(),
+                    p.x >= to_x(div.span_lo) - 6.0 && p.x <= to_x(div.span_hi) + 6.0),
+            };
+            (on_span && d <= 10.0).then_some((di, d))
+        }).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(di, _)| di)
+    });
+
+    if let Some(di) = near_div {
+        // "−" on the hovered divider → remove/merge.
+        let div = &divs[di];
         let mid = (div.span_lo + div.span_hi) * 0.5;
         let c = match div.axis {
             Axis::V => egui::pos2(to_x(div.pos), to_y(mid)),
@@ -2069,10 +2087,8 @@ fn tz_tree_line_overlay(
         };
         if tz_mini_button(ui, painter, ui.id().with((node_id, "tztm", field, di)),
             c, "−", accent, visuals) { rem = Some(div.path.clone()); }
-    }
-
-    // "+" on the hovered zone's nearest edge.
-    if let Some(p) = ptr.filter(|p| rect.contains(*p)) {
+    } else if let Some(p) = ptr.filter(|p| rect.contains(*p)) {
+        // "+" on the hovered zone's nearest edge.
         for (id, [x0, y0, x1, y1]) in tree.zones() {
             let zr = egui::Rect::from_min_max(egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
             if !zr.contains(p) { continue; }
@@ -2794,6 +2810,7 @@ fn live_analog_in_mag(
 /// the output icon in the corner. Empty zones show a faint index. The zone's
 /// active highlight (drawn by the caller) is the "lit when activated" cue.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn tz_paint_zone_mapping(
     painter: &egui::Painter,
     ctx: &egui::Context,
@@ -2806,7 +2823,30 @@ fn tz_paint_zone_mapping(
     deflect: Option<(f32, f32)>,
     accent: egui::Color32,
     visuals: &egui::Visuals,
+    // Virtual Menu per-zone overrides (empty for Touch Zones). A zone icon
+    // override REPLACES the destination icons; a zone name reserves a bottom
+    // band so the icon lifts clear of it (the label text is drawn by the
+    // menu's own post-pass, which knows the same band).
+    zone_meta: &std::collections::HashMap<u32, super::menu_body::ZoneMeta>,
 ) {
+    // Icon override (menu only): drawn instead of the mapping destination
+    // icons, lifted above the zone-name band when the zone is also named.
+    if let Some(m) = zone_meta.get(&(idx as u32)) {
+        if !m.icon.is_empty() || !m.svg.is_empty() {
+            let band = if m.label.is_empty() { 0.0 } else { (zr.height() * 0.22).clamp(10.0, 15.0) + 3.0 };
+            let region = egui::Rect::from_min_max(zr.min, egui::pos2(zr.max.x, zr.max.y - band));
+            let ic = (region.height() * 0.6).clamp(14.0, 34.0).min(region.width() - 6.0).max(10.0);
+            if let Some(tex) = crate::macro_icons::macro_port_icon_texture(ctx, &m.icon, &m.svg, ic) {
+                painter.image(
+                    tex.id(),
+                    egui::Rect::from_center_size(region.center(), egui::vec2(ic, ic)),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            return;
+        }
+    }
     let is_analog = tz_out_pin_is_analog;
     // Output pins across every card bound to this (field, zone), split by kind so
     // a click's button icon shows ALONGSIDE the analog vectorscope (not hidden by
@@ -2933,13 +2973,42 @@ fn tz_draw_field(
     zone_live: &std::collections::HashMap<(usize, usize), (f32, f32, bool)>,
     visuals: &egui::Visuals,
     accent: egui::Color32,
+    main_override: Option<egui::Color32>,
+    // `Some(a)` = "touched zones only": non-active zones (plate + content) paint
+    // at opacity `a`, active zones stay full. `None` = normal full render.
+    inactive_alpha: Option<f32>,
     id_salt: &'static str,
 ) {
     use flexinput_core::touchzones as tz;
     let to_x = |u: f32| rect.left() + u * rect.width();
     let to_y = |u: f32| rect.top() + u * rect.height();
 
-    painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
+    // Dimmed painter clone for non-active zone content in "touched zones only"
+    // mode (`multiply_opacity` fades fills/text/icons alike). `None` → the real
+    // painter, so the normal path is byte-for-byte unchanged.
+    let dim = inactive_alpha.map(|a| {
+        let mut p = painter.clone();
+        p.set_opacity(a);
+        p
+    });
+
+    // Optional `main_color` theming (menu + Touch Zones): tints the plate
+    // (additively) and the frame. Absent → the plain themed look, unchanged.
+    // `main_override` (per-pin style) wins over the module's own param.
+    let main_col = main_override.or_else(|| snarl.get_node(node_id)
+        .filter(|n| n.params.contains_key("main_color"))
+        .map(|n| super::menu_body::pcolor(n, "main_color", super::menu_body::MENU_MAIN_DEFAULT)));
+    let plate = main_col
+        .map(super::menu_body::plate_fill)
+        .unwrap_or(visuals.extreme_bg_color);
+    let frame_col = main_col.unwrap_or(visuals.widgets.noninteractive.bg_stroke.color);
+
+    // Whole-pad plate — but in "touched zones only" mode the plate is painted
+    // PER ZONE inside the loop (active full, inactive dimmed) so the game shows
+    // through the faded zones.
+    if dim.is_none() {
+        painter.rect_filled(rect, 4.0, plate);
+    }
 
     // In mapping mode each zone shows its mapping OUTPUT (icon, or a live mini
     // vectorscope for analog) instead of the bare index. Ports mode keeps the
@@ -2951,6 +3020,13 @@ fn tz_draw_field(
             .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
             .unwrap_or_default()
     } else { Vec::new() };
+    // Virtual Menu per-zone icon/name overrides (empty for Touch Zones — the
+    // icon override then shows on the module body + pinned grid too, matching
+    // the overlay).
+    let zone_meta = snarl.get_node(node_id)
+        .filter(|n| n.module_id == "module.menu")
+        .map(super::menu_body::menu_zone_meta)
+        .unwrap_or_default();
     let skin = remapper_resolve_skin(snarl, node_id, "auto", None);
     let ctx = ui.ctx().clone();
 
@@ -2972,6 +3048,13 @@ fn tz_draw_field(
         let zr = egui::Rect::from_min_max(egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
         let live = zone_live.get(&(field, idx)).copied();
         let active = live.map(|z| z.2).unwrap_or(false);
+        // "Touched zones only": non-active zones (plate + content) render through
+        // the dimmed painter; the touched zone stays full.
+        let zp: &egui::Painter = match (&dim, active) { (Some(d), false) => d, _ => painter };
+        // Per-zone plate (only in dim mode — the normal path painted it whole).
+        if dim.is_some() {
+            zp.rect_filled(zr.shrink(0.5), 3.0, plate);
+        }
         if active {
             painter.rect_filled(zr.shrink(1.0), 0.0, accent.gamma_multiply(0.35));
         }
@@ -2985,9 +3068,9 @@ fn tz_draw_field(
                     egui::Id::new(("tz_live_defl", node_id.0))))
                 .and_then(|(_, mp)| mp.get(&(field, idx)).copied())
                 .map(|(dx, dy)| (dx, -dy));
-            tz_paint_zone_mapping(&painter, &ctx, node_id, zr, field, idx, &zone_maps, skin, deflect, accent, visuals);
+            tz_paint_zone_mapping(zp, &ctx, node_id, zr, field, idx, &zone_maps, skin, deflect, accent, visuals, &zone_meta);
         } else {
-            painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
+            zp.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
                 egui::FontId::proportional(12.0), visuals.weak_text_color());
         }
     }
@@ -3000,7 +3083,7 @@ fn tz_draw_field(
         }
     }
     painter.rect_stroke(rect, 4.0,
-        egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
+        egui::Stroke::new(1.0, frame_col), egui::StrokeKind::Inside);
 
     // Gamepad-nav focus: the driver publishes (pass, field, axis, line, grabbed)
     // keyed by this node id when line-editing this pad in Easy mode. Highlight
@@ -3092,8 +3175,13 @@ fn tz_draw_field(
                 }
             }
             if r.double_clicked() {
+                // Recentre between the divider's IMMEDIATE neighbours (not the
+                // midpoint of its parent span, which overshoots and squashes the
+                // next zone in a 3+-zone tree).
+                let target = tree.centered_divider_pos(&div.path)
+                    .unwrap_or((div.lo + div.hi) * 0.5);
                 let mut nt = tree.clone();
-                if nt.set_divider_t(&div.path, (div.lo + div.hi) * 0.5) { edited = Some(nt); }
+                if nt.set_divider_t(&div.path, target) { edited = Some(nt); }
             }
             if r.secondary_clicked() { want_remove = Some(div.path.clone()); }
             let (w, c) = if let Some(grabbed) = nav_focus(if axis_v { 0 } else { 1 }, axis_idx as usize) {
@@ -3203,13 +3291,102 @@ fn render_touch_zones_pinned(
     container: egui::Vec2,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     automap_parent: Option<&AutomapGlowParent<'_>>,
+    style: Option<&crate::canvas::node::MenuStyleOverride>,
+    edit_mode: bool,
 ) {
+    use crate::canvas::node::ZoneVisibility;
     let visuals = ui.visuals().clone();
-    let accent = visuals.selection.bg_fill;
+    // Colour resolution: per-pin override falls back FIELD-BY-FIELD to the
+    // module's own colour params; both absent = the plain themed look.
+    let node_main = inner_snarl.get_node(inner_id)
+        .filter(|n| n.params.contains_key("main_color"))
+        .map(|n| super::menu_body::pcolor_bytes(
+            n, "main_color", super::menu_body::MENU_MAIN_DEFAULT));
+    let node_hi = inner_snarl.get_node(inner_id)
+        .filter(|n| n.params.contains_key("highlight_color"))
+        .map(|n| super::menu_body::pcolor_bytes(
+            n, "highlight_color", super::menu_body::MENU_HIGHLIGHT_DEFAULT));
+    let main_b = style.and_then(|s| s.main).or(node_main);
+    let hi_b = style.and_then(|s| s.hi).or(node_hi);
+    // Highlight colour (opaque, for editor affordances) when themed, else
+    // theme selection.
+    let accent = hi_b
+        .map(|h| super::menu_body::ZoneColors::build(
+            main_b.unwrap_or(super::menu_body::MENU_MAIN_DEFAULT), h).accent)
+        .unwrap_or(visuals.selection.bg_fill);
+    // Plate/frame colour override for the grid painter (`None` = the field
+    // painter's own param read — which matches when no pin override is set).
+    let main_c32 = main_b
+        .map(|c| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]));
+    // Visibility gating applies to LIVE views only — the layout editor always
+    // paints the pad so it can be seen, selected, and styled.
+    let vis = if edit_mode { ZoneVisibility::Always }
+              else { style.map(|s| s.visibility).unwrap_or_default() };
     let split = inner_snarl.get_node(inner_id)
         .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
     let mapping = inner_snarl.get_node(inner_id)
         .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
+
+    // Radial Virtual Menu: its zone tree is a synthetic 1×N strip, so the grid
+    // painter below would show a flat row of columns. Paint the sector ring
+    // instead — same shared geometry as the node body and the menu overlay,
+    // with hover from the node's own eval mirror.
+    let radial_menu = inner_snarl.get_node(inner_id)
+        .map(|n| n.module_id == "module.menu"
+            && n.params.get("menu_radial").and_then(|v| v.as_bool()).unwrap_or(false))
+        .unwrap_or(false);
+    if radial_menu {
+        let (rect, resp) = ui.allocate_exact_size(container, egui::Sense::click());
+        let zones = tz_field_tree(inner_snarl, inner_id, 0).zones();
+        let (deadzone, origin, sel_zone, zone_maps) = inner_snarl.get_node(inner_id)
+            .map(|n| (
+                n.params.get("pointer_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.25) as f32,
+                n.params.get("menu_radial_origin").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                n.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+            ))
+            .unwrap_or((0.25, 0.0, 0, Vec::new()));
+        let (menu_live, zone_meta, ptr) = inner_snarl.get_node(inner_id)
+            .map(|n| (
+                super::menu_body::menu_zone_live(n),
+                super::menu_body::menu_zone_meta(n),
+                super::menu_body::menu_pointer(n),
+            ))
+            .unwrap_or_else(|| (Default::default(), Default::default(), None));
+        // Per-pin override colours over the module's own (both default-filled —
+        // a menu is always themed).
+        let colors = super::menu_body::ZoneColors::build(
+            main_b.unwrap_or(super::menu_body::MENU_MAIN_DEFAULT),
+            hi_b.unwrap_or(super::menu_body::MENU_HIGHLIGHT_DEFAULT));
+        let hover = menu_live.iter()
+            .find(|(_, (_, _, act))| *act)
+            .map(|((_, z), _)| *z as i32)
+            .unwrap_or(-1);
+        // Visibility gating: for a radial menu "touch active" = open + hovering
+        // a zone (the eval mirror), so both non-Always modes hide the ring
+        // until the menu is actually in use. The rect stays allocated so the
+        // pin's geometry is stable.
+        if !matches!(vis, ZoneVisibility::Always) && hover < 0 {
+            return;
+        }
+        let picked = super::menu_body::paint_radial_ring(
+            ui, rect, &zones, deadzone, origin, hover,
+            if mapping { Some(sel_zone) } else { None },
+            &zone_maps, &zone_meta, colors, resp.interact_pointer_pos(), ptr,
+        );
+        if mapping && resp.clicked() {
+            if let Some(z) = picked {
+                if tz_pick_kind(inner_snarl, inner_id).is_some() {
+                    tz_apply_pick(inner_snarl, inner_id, z);
+                } else if let Some(node) = inner_snarl.get_node_mut(inner_id) {
+                    node.params.insert("sel_field".to_string(), Value::from(0u64));
+                    node.params.insert("sel_zone".to_string(), Value::from(z as u64));
+                }
+            }
+        }
+        return;
+    }
+
     // Mapping mode has no zone output ports, so dots come from the resolved
     // device's live touch (same as the module body).
     let zone_live = if mapping {
@@ -3217,6 +3394,13 @@ fn render_touch_zones_pinned(
     } else {
         inner_snarl.get_node(inner_id).map(tz_zone_live).unwrap_or_default()
     };
+
+    // OnTouch / TouchedZones with nothing active: keep the pin's footprint
+    // (stable layout, resizable frame) but paint nothing at all.
+    if !matches!(vis, ZoneVisibility::Always) && !zone_live.values().any(|v| v.2) {
+        ui.allocate_exact_size(container, egui::Sense::hover());
+        return;
+    }
 
     // Live-touch tab-follow (mapping mode, no capture in flight): touching a
     // zone selects it, mirroring the module body, so the pinned cards widget
@@ -3271,6 +3455,12 @@ fn render_touch_zones_pinned(
     let painter = ui.painter_at(rect);
     let (sel_field, sel_zone) = tz_read_selection(inner_snarl, inner_id);
 
+    // "Touched zones only" renders the full pad EXACTLY like "show on touch",
+    // but fades every non-active zone (plate + icon/label) to 20% so the
+    // touched zone stands out — all visuals stay in place, structure (frame,
+    // dividers) is untouched. (Radial menus were handled above.)
+    let inactive_alpha = matches!(vis, ZoneVisibility::TouchedZones).then_some(0.2_f32);
+
     let draw = |field: usize, r: egui::Rect, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>| {
         let col = tz_read_field_edges(snarl, inner_id, field, "col_edges");
         let row = tz_read_field_edges(snarl, inner_id, field, "row_edges");
@@ -3296,7 +3486,7 @@ fn render_touch_zones_pinned(
                 }
             }
         }
-        tz_draw_field(inner_id, field, ui, snarl, &painter, r, &col, &row, &zone_live, &visuals, accent, "pin");
+        tz_draw_field(inner_id, field, ui, snarl, &painter, r, &col, &row, &zone_live, &visuals, accent, main_c32, inactive_alpha, "pin");
         if mapping { tz_pick_banner(inner_id, ui, snarl, &painter, r, accent); }
         // Selected-zone outline on top of the pad fill.
         if let Some(tree) = &mtree {
@@ -3325,6 +3515,32 @@ fn render_touch_zones_pinned(
         draw(1, b, ui, inner_snarl);
     } else {
         draw(0, rect, ui, inner_snarl);
+    }
+
+    // Virtual Menu pinned in grid mode: zone-name labels over the field (the
+    // TZ field painter predates `zone_meta`; the radial shape returned above
+    // and paints labels inside the ring painter). Menus are always single
+    // field.
+    if inner_snarl.get_node(inner_id).map(|n| n.module_id == "module.menu").unwrap_or(false) {
+        let metas = inner_snarl.get_node(inner_id)
+            .map(super::menu_body::menu_zone_meta).unwrap_or_default();
+        if !metas.is_empty() {
+            // Dim non-active labels in "touched zones only" mode, matching the
+            // field painter's per-zone fade.
+            let dim = inactive_alpha.map(|a| { let mut p = painter.clone(); p.set_opacity(a); p });
+            for (zid, [x0, _y0, x1, y1]) in tz_field_tree(inner_snarl, inner_id, 0).zones() {
+                let Some(m) = metas.get(&zid) else { continue };
+                if m.label.is_empty() { continue; }
+                let active = zone_live.get(&(0usize, zid as usize)).map(|z| z.2).unwrap_or(false);
+                let lp: &egui::Painter = match (&dim, active) { (Some(d), false) => d, _ => &painter };
+                let cx = rect.left() + (x0 + x1) * 0.5 * rect.width();
+                let by = rect.top() + y1 * rect.height();
+                let (f, txt) = super::menu_body::fit_zone_label(
+                    lp, &m.label, 11.0, (x1 - x0) * rect.width() - 6.0);
+                lp.text(egui::pos2(cx, by - 3.0), egui::Align2::CENTER_BOTTOM, txt,
+                    f, egui::Color32::from_gray(210));
+            }
+        }
     }
 
     // Mapping mode: the merge-confirm popup (raised by a "−" removal that would
@@ -3398,7 +3614,7 @@ pub(crate) fn regenerate_touch_zone_ports(node_id: NodeId, snarl: &mut Snarl<Nod
 /// then reconnects — remapping only the mutated field's zones (other fields and
 /// the click ports keep their ids). Index remap math lives in
 /// `flexinput_core::touchzones::apply_grid_op` (unit-tested there).
-fn tz_restructure(node_id: NodeId, field: usize, op: flexinput_core::touchzones::GridOp, snarl: &mut Snarl<NodeData>) {
+pub(crate) fn tz_restructure(node_id: NodeId, field: usize, op: flexinput_core::touchzones::GridOp, snarl: &mut Snarl<NodeData>) {
     use flexinput_core::touchzones as tz;
     let col = tz_read_field_edges(snarl, node_id, field, "col_edges");
     let row = tz_read_field_edges(snarl, node_id, field, "row_edges");
@@ -3448,7 +3664,7 @@ fn tz_restructure(node_id: NodeId, field: usize, op: flexinput_core::touchzones:
 }
 
 /// Small painted +/- button overlaid on the field. Returns true when clicked.
-fn tz_mini_button(
+pub(crate) fn tz_mini_button(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     id: egui::Id,
@@ -3492,7 +3708,13 @@ fn show_touch_zones_body(
     regenerate_touch_zone_ports(node_id, snarl);
 
     let visuals = ui.visuals().clone();
-    let accent = visuals.selection.bg_fill;
+    // Highlight colour: the `highlight_color` swatch (opaque, for editor
+    // affordances) when set, else the theme selection colour (preserves
+    // existing patches — real Touch Zones nodes carry no colour params).
+    let accent = snarl.get_node(node_id)
+        .filter(|n| n.params.contains_key("highlight_color"))
+        .map(|n| super::menu_body::ZoneColors::read(n).accent)
+        .unwrap_or(visuals.selection.bg_fill);
     let split = snarl.get_node(node_id)
         .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
     let mapping = snarl.get_node(node_id)
@@ -3597,6 +3819,8 @@ fn show_touch_zones_body(
                 }
                 regenerate_touch_zone_ports(node_id, snarl);
             }
+            ui.separator();
+            super::menu_body::show_zone_color_row(node_id, ui, snarl);
         });
 
         // Re-read mode flags AFTER the toggles (regen already ran) so the rest of
@@ -4269,10 +4493,11 @@ fn tz_line_edit_overlay(
                     egui::pos2(x + off, y), "+", accent, visuals) {
                     op = Some(tz::GridOp::InsertCol(line));
                 }
-            }
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzc-", field, line, band)),
-                c, "−", accent, visuals) {
-                op = Some(tz::GridOp::RemoveCol(line - 1));
+                // "−" shows with the flanking "+", only on hover (dynamic).
+                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzc-", field, line, band)),
+                    c, "−", accent, visuals) {
+                    op = Some(tz::GridOp::RemoveCol(line - 1));
+                }
             }
         }
     }
@@ -4293,10 +4518,11 @@ fn tz_line_edit_overlay(
                     egui::pos2(x, y + off), "+", accent, visuals) {
                     op = Some(tz::GridOp::InsertRow(line));
                 }
-            }
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzr-", field, line, band)),
-                c, "−", accent, visuals) {
-                op = Some(tz::GridOp::RemoveRow(line - 1));
+                // "−" shows with the flanking "+", only on hover (dynamic).
+                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzr-", field, line, band)),
+                    c, "−", accent, visuals) {
+                    op = Some(tz::GridOp::RemoveRow(line - 1));
+                }
             }
         }
     }
@@ -4393,7 +4619,7 @@ pub(crate) fn render_touch_field(
     }
 
     // Pad visuals + dividers (tree-aware in mapping mode; grid in ports mode).
-    tz_draw_field(node_id, field, ui, snarl, &painter, rect, &col_edges, &row_edges, zone_live, visuals, accent, "canvas");
+    tz_draw_field(node_id, field, ui, snarl, &painter, rect, &col_edges, &row_edges, zone_live, visuals, accent, None, None, "canvas");
     if mapping { tz_pick_banner(node_id, ui, snarl, &painter, rect, accent); }
 
     // Selected-zone outline (mapping mode) — drawn on top of the pad fill.
@@ -7759,86 +7985,19 @@ fn show_macro_body(node_id: NodeId, outputs: &[OutPin], ui: &mut egui::Ui, snarl
 
     for (i, port) in ports.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            // Icon button (custom patch-embedded SVG wins over the set) opens
-            // the icon picker popup: custom-SVG loader up top, then the
-            // embedded set as a 10-wide grid, scrollable past 10 rows.
-            let icon_btn = if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
-                ui.ctx(), &port.icon, &port.icon_svg, 18.0)
-            {
-                egui::Button::image(egui::Image::new(&tex)
-                    .fit_to_exact_size(egui::vec2(18.0, 18.0))
-                    .tint(Color32::WHITE))
-            } else {
-                egui::Button::new(egui::RichText::new("◌").size(14.0))
-            };
-            egui::containers::menu::MenuButton::from_button(icon_btn).ui(ui, |ui: &mut egui::Ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Load custom SVG…")
-                        .on_hover_text("Pick an .svg file — it's embedded into the patch")
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("SVG", &["svg"])
-                            .pick_file()
-                        {
-                            if let Ok(text) = std::fs::read_to_string(&path) {
-                                port.icon_svg = text;
-                                port.icon.clear();
-                                changed = true;
-                            }
-                        }
-                        ui.close();
-                    }
-                    if (!port.icon.is_empty() || !port.icon_svg.is_empty())
-                        && ui.button("No icon").clicked()
-                    {
-                        port.icon.clear();
-                        port.icon_svg.clear();
-                        changed = true;
-                        ui.close();
-                    }
-                });
-                ui.separator();
-                const COLS: usize = 10;
-                const CELL: f32 = 26.0;
-                const GAP: f32 = 4.0;
-                ui.set_min_width(COLS as f32 * (CELL + GAP));
-                egui::ScrollArea::vertical()
-                    .max_height(10.0 * (CELL + GAP))
-                    .show(ui, |ui| {
-                        egui::Grid::new((node_id, "macro_icon_grid", i))
-                            .spacing([GAP, GAP])
-                            .show(ui, |ui| {
-                                for (idx, (key, label, _)) in
-                                    crate::macro_icons::ALL_ICONS.iter().enumerate()
-                                {
-                                    let selected =
-                                        port.icon_svg.is_empty() && port.icon == *key;
-                                    let btn = if let Some(tex) =
-                                        crate::macro_icons::macro_icon_texture(
-                                            ui.ctx(), key, CELL - 6.0)
-                                    {
-                                        egui::Button::image(egui::Image::new(&tex)
-                                            .fit_to_exact_size(egui::vec2(CELL - 6.0, CELL - 6.0))
-                                            .tint(Color32::WHITE))
-                                            .min_size(egui::vec2(CELL, CELL))
-                                            .selected(selected)
-                                    } else {
-                                        egui::Button::new(*label).selected(selected)
-                                    };
-                                    if ui.add(btn).on_hover_text(*label).clicked() {
-                                        port.icon = key.to_string();
-                                        port.icon_svg.clear();
-                                        changed = true;
-                                        ui.close();
-                                    }
-                                    if (idx + 1) % COLS == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    });
-            });
+            // Icon button + picker (shared with the Virtual Menu module): the
+            // custom-SVG loader, category dropdown, name search, and the
+            // embedded-set grid all live in `icon_picker_button`.
+            if let Some((k, svg)) = crate::canvas::menu_body::icon_picker_button(
+                ui,
+                egui::Id::new((node_id, "macro_icon_grid", i)),
+                &port.icon,
+                &port.icon_svg,
+            ) {
+                port.icon = k;
+                port.icon_svg = svg;
+                changed = true;
+            }
 
             let name_resp = ui.add(
                 egui::TextEdit::singleline(&mut port.name).desired_width(96.0));
@@ -9029,6 +9188,9 @@ fn show_gyro_3dof_body(
     // Display scale for the 3D Orientation output only (applied to the
     // integration rate so it stays continuous). Does NOT affect the 2D outputs.
     let orient_scale      = snap.and_then(|n| n.params.get("orient_scale").and_then(|v| v.as_f64())).unwrap_or(1.0) as f32;
+    let orient_drift      = snap.and_then(|n| n.params.get("orient_drift").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
+    let yaw_recenter      = snap.and_then(|n| n.params.get("orient_auto_recenter").and_then(|v| v.as_bool())).unwrap_or(false);
+    let yaw_thresh        = snap.and_then(|n| n.params.get("orient_recenter_thresh").and_then(|v| v.as_f64())).unwrap_or(0.005) as f32;
     let out_x = snap.and_then(|n| match n.extra.last_signals.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
     let out_y = snap.and_then(|n| match n.extra.last_signals.get(2) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
     let lean_v = snap.and_then(|n| match n.extra.last_signals.get(3) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
@@ -9042,6 +9204,9 @@ fn show_gyro_3dof_body(
     let mut reset_ease_in = reset_ease_in;
     let mut lean_threshold = lean_threshold;
     let mut orient_scale = orient_scale;
+    let mut orient_drift = orient_drift;
+    let mut yaw_recenter = yaw_recenter;
+    let mut yaw_thresh   = yaw_thresh;
     let mut changed   = false;
 
     const GYR_LABELS: [(&str, &str); 3] = [
@@ -9128,9 +9293,9 @@ fn show_gyro_3dof_body(
             ui.label(egui::RichText::new("3D rot ×").small().weak())
                 .on_hover_text(
                     "Rotation scale for the 3D Orientation output only.\n\
-                     1.0 = physically 1:1. If the on-screen model over- or\n\
-                     under-rotates vs. your real controller, adjust here\n\
-                     (e.g. Switch Pro ≈ 0.5). Applied to the integration rate\n\
+                     1.0 = physically 1:1 on known controllers. If the\n\
+                     on-screen model over- or under-rotates vs. your real\n\
+                     controller, adjust here. Applied to the integration rate\n\
                      so it never flips; does NOT affect pointer/steering.",
                 );
             if ui.add(egui::DragValue::new(&mut orient_scale)
@@ -9140,6 +9305,48 @@ fn show_gyro_3dof_body(
                 orient_scale = 1.0;
                 changed = true;
             }
+            ui.label(egui::RichText::new("drift fix").small().weak())
+                .on_hover_text(
+                    "Accelerometer drift correction for the 3D Orientation\n\
+                     output. While the controller is held steady, gravity\n\
+                     pulls accumulated pitch/roll drift back out (yaw can't\n\
+                     be corrected — reset for that). OFF by default: linear\n\
+                     motion (shakes/swings) is indistinguishable from tilt\n\
+                     and can rotate the model falsely — prefer Auto re-center.\n\
+                     Higher = faster pull; reference pose captured on Reset.",
+                );
+            if ui.add(egui::DragValue::new(&mut orient_drift)
+                .speed(0.01).range(0.0..=1.0))
+                .changed() { changed = true; }
+        });
+
+        // Auto re-center — without an absolute reference the pose can end up
+        // shifted on any axis. Below the threshold for 3 s, the whole
+        // orientation eases back to identity until centered or the threshold
+        // is exceeded again.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            changed |= ui.checkbox(&mut yaw_recenter,
+                egui::RichText::new("Auto re-center").small())
+                .on_hover_text(
+                    "3D Orientation output only: when gyro readings stay under\n\
+                     the threshold for 3 s, gradually re-center the whole\n\
+                     orientation (all axes) until it's centered or the\n\
+                     threshold is exceeded again.",
+                )
+                .changed();
+            ui.add_enabled_ui(yaw_recenter, |ui| {
+                ui.label(egui::RichText::new("threshold").small().weak())
+                    .on_hover_text(
+                        "Gyro magnitude (normalized, 1.0 = 2000 dps) that counts\n\
+                         as \"not moving\". With the noise-floor deadzone armed,\n\
+                         resting readings are exactly 0, so the default is fine.",
+                    );
+                if ui.add(egui::DragValue::new(&mut yaw_thresh)
+                    .speed(0.001).range(0.0005..=0.2)
+                    .min_decimals(3).max_decimals(4))
+                    .changed() { changed = true; }
+            });
         });
 
         let r = ui.horizontal(|ui| {
@@ -9235,6 +9442,11 @@ fn show_gyro_3dof_body(
                 serde_json::Number::from_f64(lean_threshold as f64).map(Value::Number).unwrap_or(Value::Null));
             node.params.insert("orient_scale".into(),
                 serde_json::Number::from_f64(orient_scale as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("orient_drift".into(),
+                serde_json::Number::from_f64(orient_drift as f64).map(Value::Number).unwrap_or(Value::Null));
+            node.params.insert("orient_auto_recenter".into(), Value::Bool(yaw_recenter));
+            node.params.insert("orient_recenter_thresh".into(),
+                serde_json::Number::from_f64(yaw_thresh as f64).map(Value::Number).unwrap_or(Value::Null));
         }
     }
 }
@@ -10360,6 +10572,7 @@ pub(crate) fn show_subpatch_body(
                 let element_id = m.element_id.clone();
                 let graph_ov = m.graph_override.clone();
                 let iv_style_ov = m.iv_style_override;
+                let menu_style_ov = m.menu_style_override;
                 let outer_snap_ref = outer_snapshot.as_ref();
                 let prev_suppressed = ui.ctx().data(|d| {
                     d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY)).unwrap_or(false)
@@ -10380,6 +10593,7 @@ pub(crate) fn show_subpatch_body(
                                     inner_id, &module_id, &element_id, ui, &mut sp.snarl,
                                     mod_size, live_signals, panic_shortcut, automap_parent,
                                     outer_snap_ref, outer_id, is_unlocked, graph_ov, iv_style_ov,
+                                    menu_style_ov,
                                 );
                             }
                         });
@@ -11278,6 +11492,13 @@ pub(crate) fn layout_inspector_strip_core(
     // The 3D controller viewer shares the Input Viewer's style-override STORAGE
     // but has its own inspector (adds view angle / opacity / highlight fade).
     let is_c3d_pin = inner_mid == Some("display.controller3d");
+    // Touch Zones / Virtual Menu pins: pad colour + visibility overrides. The
+    // override only affects the "field" element's render; on cards/options
+    // pins the controls are inert.
+    let is_zone_pad_pin = matches!(
+        inner_mid,
+        Some("module.touch_zones") | Some("module.menu")
+    );
     let is_graph_pin = matches!(
         inner_mid,
         Some("module.response_curve")
@@ -11310,6 +11531,9 @@ pub(crate) fn layout_inspector_strip_core(
             }
             LayoutItem::Module(_) if is_input_viewer_pin => {
                 input_viewer_pin_inspector_strip_item(ui, state.items, idx);
+            }
+            LayoutItem::Module(_) if is_zone_pad_pin => {
+                menu_pin_inspector_strip_item(ui, state.items, idx);
             }
             LayoutItem::Module(_) if is_c3d_pin => {
                 controller3d_pin_inspector_strip_item(ui, state.items, idx);
@@ -11457,6 +11681,7 @@ pub(crate) fn render_pinned_element(
     is_layout_mode: bool,
     graph_override: Option<crate::canvas::node::PinGraphOverride>,
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
+    menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
 ) {
     // Stable identity for this pin's natural-size cache: (outer node, inner
     // node, element). Two pins of the same element share one entry, which is
@@ -11468,6 +11693,7 @@ pub(crate) fn render_pinned_element(
         inner_id, module_id, element_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, automap_parent, outer_snapshot,
         outer_id, is_layout_mode, graph_override, iv_style_override,
+        menu_style_override,
     );
 
     // `applied` is only present when the renderer routed through
@@ -11513,6 +11739,7 @@ fn render_pinned_element_impl(
     is_layout_mode: bool,
     graph_override: Option<crate::canvas::node::PinGraphOverride>,
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
+    menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
 ) {
     let cap_w = container_size.x.max(20.0);
     // Whole-module pinned renderers manage their own width/clip; don't cap
@@ -11738,7 +11965,14 @@ fn render_pinned_element_impl(
         // The Virtual Menu's field/cards share the same param schema and route
         // through the same pinned renderers.
         ("module.touch_zones", "field") | ("module.menu", "field") => {
-            render_touch_zones_pinned(inner_id, ui, inner_snarl, container_size, live_signals, bridged_parent);
+            render_touch_zones_pinned(
+                inner_id, ui, inner_snarl, container_size, live_signals,
+                bridged_parent, menu_style_override.as_ref(), is_layout_mode,
+            );
+            return;
+        }
+        ("module.menu", "options") => {
+            super::menu_body::render_menu_options_pinned(inner_id, ui, inner_snarl, container_size);
             return;
         }
         ("module.menu", "cards") => {
@@ -13384,7 +13618,7 @@ fn pin_flex_width(ui: &egui::Ui, container: egui::Vec2, min_w: f32) -> f32 {
     min_w * scale + surplus
 }
 
-fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::Vec2) -> f32 {
+pub(crate) fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natural: egui::Vec2) -> f32 {
     // Text/controls scale with the container HEIGHT, capped by what the WIDTH
     // can hold, so a pinned row grows with its frame but never crops out of
     // it: when the frame is too narrow for the height-scaled text (plus the
@@ -15419,16 +15653,19 @@ fn resolve_automap_glow_output(
             let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
             walk_automap_input(live_signals, snarl, src.node, am_idx, parent)
         }
-        // 3DOF lean dispatch: the Map output is only the AutoMap port
-        // (index 5). Other outputs use their own glow rules. The Map's
-        // activity tracks the absolute Lean value (output index 3 of the
-        // module's last_signals) — non-zero lean = active dispatch.
+        // 3DOF AutoMap output: the bus passes straight through (the module
+        // only injects lean dispatch on top), so it glows from its input like
+        // the other passthroughs, max-pooled with the absolute Lean value
+        // (output index 3) so its own injection shows even on a quiet bus.
         "processing.gyro_3dof" if node.outputs.get(src.output).map(|p| p.signal_type) == Some(SignalType::AutoMap) => {
             let lean = match node.extra.last_signals.get(3) {
                 Some(Some(Signal::Float(f))) => f.abs(),
                 _ => 0.0,
             };
-            Some(lean.clamp(0.0, 1.0))
+            let bus = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)
+                .and_then(|am_idx| walk_automap_input(live_signals, snarl, src.node, am_idx, parent))
+                .unwrap_or(0.0);
+            Some(bus.max(lean).clamp(0.0, 1.0))
         }
         "module.automap_fork" => {
             // Either output mirrors the input bus's activity (gating is logical).
@@ -16120,7 +16357,7 @@ fn render_controller3d_core(
     bg: egui::Color32,
     outline: egui::Color32,
     outline_w: f32,
-    scheme: [[f32; 3]; crate::model::N_GROUPS],
+    scheme: [[f32; 4]; crate::model::N_GROUPS],
     global_alpha: f32,
     cam_pitch: f32,
     live: crate::model::ControllerLive,
@@ -16224,6 +16461,7 @@ fn controller3d_scheme_rgb(
                             arr[0].as_u64().unwrap_or(0) as u8,
                             arr[1].as_u64().unwrap_or(0) as u8,
                             arr[2].as_u64().unwrap_or(0) as u8,
+                            arr.get(3).and_then(|v| v.as_u64()).unwrap_or(255) as u8,
                         ];
                     }
                 }
@@ -16237,7 +16475,7 @@ fn controller3d_scheme(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
     model_name: &str,
-) -> ([[f32; 3]; crate::model::N_GROUPS], f32, f32) {
+) -> ([[f32; 4]; crate::model::N_GROUPS], f32, f32) {
     let rgb = controller3d_scheme_rgb(snarl, node_id, model_name);
     let node = snarl.get_node(node_id);
     let alpha = node
@@ -16246,12 +16484,13 @@ fn controller3d_scheme(
     let cam_pitch = node
         .and_then(|n| n.params.get("cam_pitch").and_then(|v| v.as_f64()))
         .unwrap_or(C3D_DEFAULT_PITCH_DEG as f64) as f32;
-    let mut out = [[0.0f32; 3]; crate::model::N_GROUPS];
+    let mut out = [[0.0f32; 4]; crate::model::N_GROUPS];
     for i in 0..crate::model::N_GROUPS {
         out[i] = [
             rgb[i][0] as f32 / 255.0,
             rgb[i][1] as f32 / 255.0,
             rgb[i][2] as f32 / 255.0,
+            rgb[i][3] as f32 / 255.0,
         ];
     }
     (out, alpha.clamp(0.0, 1.0), cam_pitch.to_radians())
@@ -16358,6 +16597,8 @@ fn controller3d_live(
         ("start_button", "btn_start"),
         ("back_button", "btn_back"),
         ("guide_button", "btn_guide"),
+        // Switch Pro capture / screenshot button (the model names it "misc").
+        ("misc", "btn_capture"),
         ("left_bumper", "btn_lb"),
         ("right_bumper", "btn_rb"),
     ];
@@ -16404,13 +16645,87 @@ fn controller3d_live(
     live
 }
 
-/// Material colour swatch with a right-click Copy/Paste menu (app-wide colour
-/// clipboard in egui temp memory; Copy also puts a hex string on the system
-/// clipboard). Returns true when the colour changed (picked OR pasted).
-fn c3d_color_swatch(ui: &mut egui::Ui, col: &mut [u8; 3], tooltip: &str) -> bool {
+/// Material colour swatch (RGBA — alpha renders the group as translucent
+/// plastic) with a right-click Copy/Paste menu (app-wide colour clipboard in
+/// egui temp memory; Copy also puts a hex string on the system clipboard).
+/// Returns true when the colour changed (picked OR pasted). Alpha is edited.
+fn c3d_color_swatch(ui: &mut egui::Ui, col: &mut [u8; 4], tooltip: &str) -> bool {
+    fxi_color_swatch(ui, col, tooltip, true)
+}
+
+/// The one colour swatch used everywhere in the app: an egui colour button
+/// wired for correct straight-alpha editing plus a right-click copy/paste
+/// menu (hex on the system clipboard too). `use_alpha` picks whether the
+/// alpha channel is editable — when false the picker shows no alpha slider
+/// and the stored alpha is forced opaque.
+///
+/// Correctness note: two egui gotchas, both handled here. (1) `Hsva::from_srgba_
+/// unmultiplied` routes through PREMULTIPLIED `Color32`, which collapses toward
+/// black at low alpha — so we build the picker's HSVA from an OPAQUE RGB
+/// conversion and attach alpha separately. (2) egui re-round-trips `value`
+/// through gamma space every frame the picker is open (`Hsva`⇄`HsvaGamma`);
+/// caching that HSVA in memory let the tiny float error ACCUMULATE and the
+/// colour crept dark, so we re-derive HSVA from the (u8-quantized) bytes each
+/// frame instead — the quantization resets the drift and the colour settles.
+///
+/// CALLER CONTRACT: `col` must be the raw STRAIGHT-alpha bytes as stored —
+/// never bytes recovered from a `Color32` (`from_rgba_unmultiplied(..).r()` …):
+/// `Color32` is premultiplied internally, so that hands back `rgb × alpha`,
+/// brightness clamps to the alpha value, and the colour re-darkens every frame
+/// (see `menu_body::pcolor_bytes`, which parses colour params correctly).
+pub(crate) fn fxi_color_swatch(
+    ui: &mut egui::Ui,
+    col: &mut [u8; 4],
+    tooltip: &str,
+    use_alpha: bool,
+) -> bool {
+    use egui::ecolor::Hsva;
+    use egui::widgets::color_picker::{color_edit_button_hsva, Alpha};
+
     let clip_id = egui::Id::new("fxi_color_clipboard");
-    let resp = ui.color_edit_button_srgb(col).on_hover_text(tooltip);
-    let mut changed = resp.changed();
+    let alpha = if use_alpha { Alpha::OnlyBlend } else { Alpha::Opaque };
+    // Opaque path: the picker edits RGB only and the caller's stored alpha is
+    // preserved (used by the theme swatches, whose alpha is a separate slider).
+    let keep_a = col[3];
+
+    // HSVA ⇄ sRGB bytes, straight-alpha. Crucial: `Hsva::from_srgba_unmultiplied`
+    // round-trips through *premultiplied* `Color32`, which collapses to black at
+    // low alpha — the "roll to dark" glitch. Build HSVA from an OPAQUE RGB
+    // conversion (lossless) and attach alpha separately instead.
+    let to_bytes = |h: &Hsva| -> [u8; 4] {
+        if use_alpha {
+            h.to_srgba_unmultiplied()
+        } else {
+            let [r, g, b] = h.to_srgb();
+            [r, g, b, keep_a]
+        }
+    };
+    let from_bytes = |c: &[u8; 4]| -> Hsva {
+        let mut h = Hsva::from(egui::Color32::from_rgb(c[0], c[1], c[2]));
+        if use_alpha {
+            h.a = c[3] as f32 / 255.0;
+        }
+        h
+    };
+
+    // Re-derive the working HSVA from the (u8-quantized) bytes every frame — NOT
+    // cached across frames. egui re-round-trips value through gamma space each
+    // frame the picker is open; carrying that f32 in memory let the error
+    // accumulate and the colour drifted dark. Re-quantizing here settles it.
+    let mut hsva = from_bytes(col);
+
+    let resp = color_edit_button_hsva(ui, &mut hsva, alpha)
+        .on_hover_text(format!("{tooltip}\nRight-click: copy / paste colour"));
+
+    let mut changed = false;
+    let picked = to_bytes(&hsva);
+    if picked != *col {
+        *col = picked;
+        changed = true;
+    }
+    // (No overpaint here: egui's colour button splits a non-opaque swatch into
+    // "over checkers | opaque" — the proper transparency preview. It only ever
+    // looked muddy because callers used to hand in premultiplied bytes.)
     // Right-click Copy/Paste menu under its OWN popup id — attaching a
     // `context_menu` to the response conflicted with the colour-picker popup
     // (same widget id) and closed it a frame after opening.
@@ -16426,12 +16741,25 @@ fn c3d_color_swatch(ui: &mut egui::Ui, col: &mut [u8; 3], tooltip: &str) -> bool
             ui.set_min_width(150.0);
             if ui.button("Copy colour").clicked() {
                 ui.ctx().data_mut(|d| d.insert_temp(clip_id, *col));
-                ui.ctx()
-                    .copy_text(format!("#{:02X}{:02X}{:02X}", col[0], col[1], col[2]));
+                ui.ctx().copy_text(if col[3] == 255 {
+                    format!("#{:02X}{:02X}{:02X}", col[0], col[1], col[2])
+                } else {
+                    format!("#{:02X}{:02X}{:02X}{:02X}", col[0], col[1], col[2], col[3])
+                });
             }
-            let clip: Option<[u8; 3]> = ui.ctx().data(|d| d.get_temp(clip_id));
+            // Old clipboard entries may still be RGB triples — accept both.
+            let clip: Option<[u8; 4]> = ui.ctx().data(|d| {
+                d.get_temp::<[u8; 4]>(clip_id)
+                    .or_else(|| d.get_temp::<[u8; 3]>(clip_id).map(|c| [c[0], c[1], c[2], 255]))
+            });
             let label = match clip {
-                Some(c) => format!("Paste colour  #{:02X}{:02X}{:02X}", c[0], c[1], c[2]),
+                Some(c) if c[3] == 255 => {
+                    format!("Paste colour  #{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+                }
+                Some(c) => format!(
+                    "Paste colour  #{:02X}{:02X}{:02X}{:02X}",
+                    c[0], c[1], c[2], c[3]
+                ),
                 None => "Paste colour".to_string(),
             };
             if ui
@@ -16439,7 +16767,8 @@ fn c3d_color_swatch(ui: &mut egui::Ui, col: &mut [u8; 3], tooltip: &str) -> bool
                 .clicked()
             {
                 if let Some(c) = clip {
-                    *col = c;
+                    // Opaque swatches keep their own alpha (a separate slider).
+                    *col = if use_alpha { c } else { [c[0], c[1], c[2], keep_a] };
                     changed = true;
                 }
             }
@@ -16456,7 +16785,14 @@ fn controller3d_scheme_save(scheme: &crate::model::Scheme) {
     for (_, groups) in crate::model::material::ROWS {
         for &g in *groups {
             let c = scheme[g as usize];
-            map.insert(g.key().to_string(), serde_json::json!([c[0], c[1], c[2]]));
+            // Opaque colours save as RGB (hand-edit friendly); translucent
+            // ones carry the alpha as a 4th component.
+            let v = if c[3] == 255 {
+                serde_json::json!([c[0], c[1], c[2]])
+            } else {
+                serde_json::json!([c[0], c[1], c[2], c[3]])
+            };
+            map.insert(g.key().to_string(), v);
         }
     }
     std::thread::spawn(move || {
@@ -16608,12 +16944,17 @@ fn show_controller3d_body(
                 let mut mats_changed = false;
                 let read_col = |mats: &serde_json::Map<String, serde_json::Value>,
                                 g: crate::model::MaterialGroup,
-                                def: [u8; 3]| -> [u8; 3] {
+                                def: [u8; 4]| -> [u8; 4] {
                     mats.get(g.key())
                         .and_then(|v| v.as_array())
                         .and_then(|a| {
                             if a.len() >= 3 {
-                                Some([a[0].as_u64()? as u8, a[1].as_u64()? as u8, a[2].as_u64()? as u8])
+                                Some([
+                                    a[0].as_u64()? as u8,
+                                    a[1].as_u64()? as u8,
+                                    a[2].as_u64()? as u8,
+                                    a.get(3).and_then(|v| v.as_u64()).unwrap_or(255) as u8,
+                                ])
                             } else {
                                 None
                             }
@@ -16634,7 +16975,7 @@ fn show_controller3d_body(
                                     if c3d_color_swatch(ui, &mut col, g.label()) {
                                         mats.insert(
                                             g.key().to_string(),
-                                            serde_json::json!([col[0], col[1], col[2]]),
+                                            serde_json::json!([col[0], col[1], col[2], col[3]]),
                                         );
                                         mats_changed = true;
                                     }
@@ -23657,17 +23998,13 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
 fn rgba_to_color32(c: [u8; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
 }
-fn color32_to_rgba(c: egui::Color32) -> [u8; 4] { [c.r(), c.g(), c.b(), c.a()] }
 
 fn color_button(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4]) -> bool {
-    let mut col = rgba_to_color32(*rgba);
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).small().weak());
-        if ui.color_edit_button_srgba(&mut col).changed() {
-            *rgba = color32_to_rgba(col);
-            changed = true;
-        }
+        // Overlay decorations blend over a game, so alpha is always meaningful.
+        changed = fxi_color_swatch(ui, rgba, label, true);
     });
     changed
 }
@@ -23944,6 +24281,71 @@ fn text_pin_inspector_strip_item(
 /// Inspector strip for a pinned Input Viewer board's style (when the selected
 /// item is a `module.input_viewer` pin). Delegates to the board module's own
 /// control cluster; stores the result on the pin's `iv_style_override`.
+/// Inspector-strip controls for a pinned Touch Zones / Virtual Menu field pad:
+/// main / highlight colour overrides (each falls back to the module's own
+/// colour when unset) plus a visibility mode for live views (always / show on
+/// touch / touched zones only). Stored per pin on `menu_style_override`.
+fn menu_pin_inspector_strip_item(
+    ui: &mut egui::Ui,
+    items: &mut Vec<LayoutItem>,
+    idx: usize,
+) {
+    use crate::canvas::node::{MenuStyleOverride, ZoneVisibility};
+    if idx >= items.len() { return; }
+    let exp = match &mut items[idx] {
+        LayoutItem::Module(m) => m,
+        _ => return,
+    };
+    let cleared = MenuStyleOverride { main: None, hi: None, visibility: ZoneVisibility::Always };
+    let mut ov = exp.menu_style_override.unwrap_or(cleared);
+    let before = ov;
+    let mut reset = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Zone pad style").small().strong());
+        ui.separator();
+        ui.label(egui::RichText::new("main").small().weak());
+        let mut mc = ov.main.unwrap_or(super::menu_body::MENU_MAIN_DEFAULT);
+        if fxi_color_swatch(ui, &mut mc,
+            "Main colour for THIS pinned pad (alpha = pad opacity).\nUnset = the module's own colour.", true)
+        {
+            ov.main = Some(mc);
+        }
+        ui.label(egui::RichText::new("highlight").small().weak());
+        let mut hc = ov.hi.unwrap_or(super::menu_body::MENU_HIGHLIGHT_DEFAULT);
+        if fxi_color_swatch(ui, &mut hc,
+            "Highlight colour for THIS pinned pad (active zone / affordances).\nUnset = the module's own colour.", true)
+        {
+            ov.hi = Some(hc);
+        }
+        ui.separator();
+        egui::ComboBox::from_id_salt(("menu_pin_vis", exp.inner_node_id, idx))
+            .selected_text(match ov.visibility {
+                ZoneVisibility::Always => "Always show",
+                ZoneVisibility::OnTouch => "Show on touch",
+                ZoneVisibility::TouchedZones => "Touched zones only",
+            })
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut ov.visibility, ZoneVisibility::Always, "Always show");
+                ui.selectable_value(&mut ov.visibility, ZoneVisibility::OnTouch, "Show on touch")
+                    .on_hover_text("Hide the pad unless a touch point / zone is active.");
+                ui.selectable_value(&mut ov.visibility, ZoneVisibility::TouchedZones, "Touched zones only")
+                    .on_hover_text("Paint only the zone(s) currently touched — no pad chrome.\nRadial menus behave like Show on touch.");
+            });
+        if ui.small_button("Reset")
+            .on_hover_text("Module colours, always shown")
+            .clicked()
+        {
+            reset = true;
+        }
+    });
+    if reset {
+        exp.menu_style_override = None;
+    } else if ov != before || exp.menu_style_override.is_some() {
+        exp.menu_style_override = if ov == cleared { None } else { Some(ov) };
+    }
+}
+
 fn input_viewer_pin_inspector_strip_item(
     ui: &mut egui::Ui,
     items: &mut Vec<LayoutItem>,
@@ -23986,26 +24388,19 @@ fn controller3d_pin_inspector_strip_item(
     });
     let before = ov;
     let mut reset = false;
-    let c32 = |a: [u8; 4]| egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], a[3]);
-    let rgba = |c: egui::Color32| [c.r(), c.g(), c.b(), c.a()];
 
     ui.vertical(|ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("3D viewer style").small().strong());
             ui.separator();
-            let mut bg = c32(ov.bg);
             ui.label(egui::RichText::new("bg").small().weak());
-            if ui.color_edit_button_srgba(&mut bg)
-                .on_hover_text("Frame fill — lower the alpha for a see-through frame over a game.")
-                .changed() { ov.bg = rgba(bg); }
-            let mut acc = c32(ov.accent);
+            fxi_color_swatch(ui, &mut ov.bg,
+                "Frame fill — lower the alpha for a see-through frame over a game.", true);
             ui.label(egui::RichText::new("highlight").small().weak());
-            if ui.color_edit_button_srgba(&mut acc)
-                .on_hover_text("Active-input highlight: pressed buttons, trigger pull, stick tilt, touch dots, x-ray ghosts.")
-                .changed() { ov.accent = rgba(acc); }
-            let mut outl = c32(ov.outline);
+            fxi_color_swatch(ui, &mut ov.accent,
+                "Active-input highlight: pressed buttons, trigger pull, stick tilt, touch dots, x-ray ghosts.", true);
             ui.label(egui::RichText::new("outline").small().weak());
-            if ui.color_edit_button_srgba(&mut outl).changed() { ov.outline = rgba(outl); }
+            fxi_color_swatch(ui, &mut ov.outline, "Frame outline colour.", true);
             ui.add(egui::DragValue::new(&mut ov.outline_px).range(0.0..=6.0).speed(0.05))
                 .on_hover_text("Frame outline width (0 = none).");
             if ui.small_button("Reset").on_hover_text("Use default style + the module's own display settings").clicked() {

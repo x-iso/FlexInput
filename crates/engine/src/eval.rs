@@ -207,6 +207,17 @@ struct DeviceCal {
     orient_matrix: [f32; 9],
     /// True if `orient_matrix` is non-identity and should be applied.
     orient_active: bool,
+    /// Noise-floor deadzone on the gyro TRIPLE's magnitude (post offset /
+    /// matrix / sign): |g| below this zeroes all three axes at once, so slow
+    /// diagonal rotations don't get per-axis steps. 0.0 = disabled. Effective
+    /// value = measured `gyro_noise_floor` × user `gyro_dz_width`, gated by
+    /// `gyro_dz_enabled` (all written by the Calibration window).
+    gyro_dz:  f32,
+    /// Dynamic accel deadzone: deviations from a per-device frozen baseline
+    /// below this emit the baseline (noise suppressed); larger deviations
+    /// re-anchor it, so the baseline follows real rotation with error
+    /// bounded by the floor. 0.0 = disabled.
+    accel_dz: f32,
     lstick_center: [f32; 2], // subtracted from left_stick_{x,y}
     rstick_center: [f32; 2],
     /// Per-bucket radial scale: lstick_radial[i] = 1.0 / (mean stick radius
@@ -242,6 +253,26 @@ const IDENTITY_M3: [f32; 9] = [
     0.0, 0.0, 1.0,
 ];
 
+/// Per-device frozen baseline for the dynamic accel noise-floor deadzone
+/// (see `DeviceCal::accel_dz`). Keyed by device id; entries are only touched
+/// while the feature is enabled, so a stale entry after a device swap just
+/// re-anchors on the first over-floor deviation.
+static ACCEL_DZ_BASELINE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, [f32; 3]>>> =
+    std::sync::OnceLock::new();
+
+/// Exponential ease out of a noise-floor deadzone border: 0 inside the
+/// border, then `1 − e^−((v−dz)/dz)` above it — ~63 % one border-width out,
+/// ~95 % three widths out. Keeps the exit from the deadzone snap-free while
+/// leaving fast motion effectively untouched. Shared by the gyro magnitude
+/// gate, the dynamic accel baseline, and the calibration scope's filtered
+/// view (which must match what the engine does).
+#[inline]
+pub fn gyro_dz_ease(v: f32, dz: f32) -> f32 {
+    if dz <= 0.0 { return 1.0; }
+    if v <= dz { return 0.0; }
+    1.0 - (-(v - dz) / dz).exp()
+}
+
 impl Default for DeviceCal {
     fn default() -> Self {
         Self {
@@ -251,6 +282,8 @@ impl Default for DeviceCal {
             accel_sign:    [1.0; 3],
             orient_matrix: IDENTITY_M3,
             orient_active: false,
+            gyro_dz:  0.0,
+            accel_dz: 0.0,
             lstick_center: [0.0; 2],
             rstick_center: [0.0; 2],
             lstick_radial: [1.0; STICK_RADIAL_BUCKETS],
@@ -338,6 +371,12 @@ fn mat3_apply(m: &[f32; 9], v: [f32; 3]) -> [f32; 3] {
 
 fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
     let (orient_matrix, orient_active) = read_orient_matrix(params, "gyro_orient_matrix");
+    let dz_on = params.get("gyro_dz_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dz_w  = params.get("gyro_dz_width").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32;
+    let floor = |key: &str| -> f32 {
+        if !dz_on { return 0.0; }
+        (params.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32 * dz_w).max(0.0)
+    };
     DeviceCal {
         gyro_offset:   read_arr3(params, "gyro_offset"),
         accel_offset:  read_arr3(params, "accel_offset"),
@@ -345,6 +384,8 @@ fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
         accel_sign:    read_sign3(params, "accel_invert"),
         orient_matrix,
         orient_active,
+        gyro_dz:  floor("gyro_noise_floor"),
+        accel_dz: floor("accel_noise_floor"),
         lstick_center: read_arr2(params, "lstick_center"),
         rstick_center: read_arr2(params, "rstick_center"),
         lstick_radial: read_radial(params, "lstick_radial"),
@@ -484,11 +525,22 @@ fn preprocess_dev_sigs(
                 gz - cal.gyro_offset[2],
             ];
             let v = if cal.orient_active { mat3_apply(&cal.orient_matrix, v) } else { v };
-            let out = [
+            let mut out = [
                 v[0] * cal.gyro_sign[0],
                 v[1] * cal.gyro_sign[1],
                 v[2] * cal.gyro_sign[2],
             ];
+            // Noise-floor deadzone: gate on the MAGNITUDE of the triple so a
+            // slow diagonal rotation never steps per axis. Below the floor
+            // the whole vector is noise → zero it (this is what stops the
+            // 3D-orientation drift and lean bias at rest). Crossing the
+            // border eases in exponentially over ~3 border-widths instead of
+            // snapping from 0 to the full value.
+            if cal.gyro_dz > 0.0 {
+                let mag = (out[0] * out[0] + out[1] * out[1] + out[2] * out[2]).sqrt();
+                let s = gyro_dz_ease(mag, cal.gyro_dz);
+                out = [out[0] * s, out[1] * s, out[2] * s];
+            }
             imu_override.insert((dev_id.clone(), "gyro_x".into()), Signal::Float(out[0]));
             imu_override.insert((dev_id.clone(), "gyro_y".into()), Signal::Float(out[1]));
             imu_override.insert((dev_id.clone(), "gyro_z".into()), Signal::Float(out[2]));
@@ -501,11 +553,32 @@ fn preprocess_dev_sigs(
                 az - cal.accel_offset[2],
             ];
             let v = if cal.orient_active { mat3_apply(&cal.orient_matrix, v) } else { v };
-            let out = [
+            let mut out = [
                 v[0] * cal.accel_sign[0],
                 v[1] * cal.accel_sign[1],
                 v[2] * cal.accel_sign[2],
             ];
+            // Dynamic noise-floor deadzone: accel's "center" is gravity and
+            // moves with device rotation, so a fixed gate can't work. Hold a
+            // per-device baseline instead — deviations under the floor emit
+            // the baseline (noise suppressed at rest); past the border the
+            // baseline chases the reading with the same exponential ease as
+            // the gyro gate, so real rotation follows with no snap and error
+            // bounded by ~the floor.
+            if cal.accel_dz > 0.0 {
+                let map = ACCEL_DZ_BASELINE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+                let mut map = map.lock().unwrap();
+                let base = map.entry(dev_id.clone()).or_insert(out);
+                let d = ((out[0] - base[0]).powi(2)
+                    + (out[1] - base[1]).powi(2)
+                    + (out[2] - base[2]).powi(2))
+                    .sqrt();
+                let s = gyro_dz_ease(d, cal.accel_dz);
+                if s > 0.0 {
+                    for i in 0..3 { base[i] += (out[i] - base[i]) * s; }
+                }
+                out = *base;
+            }
             imu_override.insert((dev_id.clone(), "accel_x".into()), Signal::Float(out[0]));
             imu_override.insert((dev_id.clone(), "accel_y".into()), Signal::Float(out[1]));
             imu_override.insert((dev_id.clone(), "accel_z".into()), Signal::Float(out[2]));
@@ -5670,13 +5743,17 @@ fn eval_touch_zones_map_node(
 /// Control resolution — macro-style targets first, wired pins as alternates:
 ///   Show    = ("macro", menu:{menu_id}_show) OR wired Show (slot 1)
 ///   Select  = ("macro", menu:{menu_id}_sel)  OR wired Select (slot 2)
-///   Pointer = wired Pointer Vec2 (slot 3) when connected, else the
-///             `pointer_source` analog of the upstream device: stick
-///             deflection past the deadzone maps onto the menu rect (full
-///             deflection = rect edge), a touch point maps by its absolute
-///             pad position. The hover is STICKY — a pointer inside the
-///             deadzone (or a lifted finger) keeps the last highlighted zone,
-///             so flick-and-release selection works.
+///   Pointer = wired Pointer Vec2 (slot 3) when connected, else the SUM of
+///             every enabled source checkbox (`ptr_ls`/`ptr_rs`/`ptr_touch`/
+///             `ptr_gyro`): stick deflection past the deadzone maps onto the
+///             menu rect (full deflection = rect edge), a touch point adds
+///             its absolute pad position as a centered deflection, and gyro
+///             integrates rotation rate while open (Pitch+Yaw or Pitch+Roll
+///             pairs, matching the 3DOF→2D module, scaled by
+///             `ptr_gyro_sens` where 1 ≈ 10×). By default the hover is
+///             STICKY — a pointer inside the deadzone (or a lifted finger)
+///             keeps the last highlighted zone so flick-and-release selection
+///             works; `hover_sticky: false` clears the highlight instead.
 fn eval_menu_node(
     snap: &NodeSnap,
     uid: usize,
@@ -5714,9 +5791,27 @@ fn eval_menu_node(
     let menu_id = pstr("menu_id", "");
     let act = pstr("activation_mode", "hold");
     let sel_on = pstr("select_on", "release");
-    let src = pstr("pointer_source", "left_stick");
     let deadzone = snap.params.get("pointer_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
     let suppress = snap.params.get("suppress_while_open").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Sticky hover: keep the last highlighted zone when the pointer returns
+    // to the deadzone (flick-and-release selection). Off = the highlight
+    // clears, and a release inside the deadzone selects nothing.
+    let sticky = snap.params.get("hover_sticky").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Pointer sources are ADDITIVE checkboxes (any combination sums into one
+    // deflection vector). The legacy single-choice `pointer_source` seeds the
+    // defaults so pre-existing patches keep their behaviour.
+    let legacy_src = pstr("pointer_source", "left_stick");
+    let pbp = |k: &str, d: bool| snap.params.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
+    let src_ls = pbp("ptr_ls", legacy_src == "left_stick");
+    let src_rs = pbp("ptr_rs", legacy_src == "right_stick");
+    let src_touch = pbp("ptr_touch", legacy_src == "touch1" || legacy_src == "touch2");
+    let touch_which = pstr("ptr_touch_which",
+        if legacy_src == "touch2" { "touch2" } else { "touch1" });
+    let src_gyro = pbp("ptr_gyro", false);
+    let gyro_axes = pstr("ptr_gyro_axes", "pitch_yaw");
+    // Gyro pointer sensitivity: 1 ≈ 10× the raw rotation rate (the raw IMU
+    // stream alone is too slow to sweep the menu). Range 0.5..8, default 4.
+    let gyro_sens = snap.params.get("ptr_gyro_sens").and_then(|v| v.as_f64()).unwrap_or(4.0) as f32;
 
     // ── Controls (macro-style targets OR wired pins) ──
     let macro_on = |cs: &HashMap<(String, String), Signal>, pin: String| -> bool {
@@ -5732,8 +5827,31 @@ fn eval_menu_node(
     let wired_ptr: Option<Vec2> = inputs.get(3).and_then(|s| *s)
         .and_then(|s| if let Signal::Vec2(v) = s { Some(v) } else { None });
 
+    // ── State machine slots — created BEFORE the pointer resolves because
+    // the gyro source integrates into per-node accumulators and needs
+    // prev_open. aux_f32: [0] open, [1] prev_show, [2] prev_sel,
+    // [3] hover+1 (0 = none), [4] select-pulse ms left, [5] selected zone+1,
+    // [6] prev_click, [7] hover local x, [8] hover local y,
+    // [9] selection sequence (increments on each accepted selection — the
+    //     overlay's linger animation keys off changes, so it can't miss a
+    //     short pulse at low overlay FPS),
+    // [10]/[11] gyro pointer accumulator X/Y (integrated rad, reset while
+    //     closed so the pointer always starts centered) ──
+    const SLOTS: usize = 12;
+    const SELECT_PULSE_MS: f32 = 120.0;
+    let ns = state.entry(uid).or_insert_with(NodeState::default);
+    while ns.aux_f32.len() < SLOTS { ns.aux_f32.push(0.0); }
+    let prev_open = ns.aux_f32[0] > 0.5;
+    let prev_show = ns.aux_f32[1] > 0.5;
+    let prev_sel = ns.aux_f32[2] > 0.5;
+    let prev_hover: i32 = ns.aux_f32[3] as i32 - 1;
+    let prev_click = ns.aux_f32[6] > 0.5;
+    let click_now = read("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
+
     // ── Pointer → unit point in the menu rect (0..1, y down) + a "touching"
-    // gate for activation_mode = touch ──
+    // gate for activation_mode = touch. Enabled sources SUM into one
+    // deflection vector (stick convention, +Y up); the wired Pointer inlet
+    // overrides them all. ──
     let stick_read = |name: &str| -> Vec2 {
         if let Some(Signal::Vec2(v)) = read(name) { return v; }
         Vec2::new(
@@ -5745,23 +5863,58 @@ fn eval_menu_node(
     let deflect_to_unit = |v: Vec2| -> (f32, f32) {
         ((0.5 + v.x * 0.5).clamp(0.0, 1.0), (0.5 - v.y * 0.5).clamp(0.0, 1.0))
     };
+    // Accumulated gyro tilt of this many radians = full deflection.
+    const GYRO_FULL_RAD: f32 = 0.35;
     let (ptr_unit, touching): (Option<(f32, f32)>, bool) = if let Some(v) = wired_ptr {
         let on = v.length() > deadzone;
         (if on { Some(deflect_to_unit(v)) } else { None }, on)
-    } else if src == "touch1" || src == "touch2" {
-        let (px, py, pa) = if src == "touch2" { ("touch2_x", "touch2_y", "touch2_active") }
-                           else { ("touch1_x", "touch1_y", "touch1_active") };
-        let active = read(pa).map(|s| s.as_bool()).unwrap_or(false);
-        let (x, y) = tz::pad_point_to_unit(
-            read(px).map(|s| s.as_float()).unwrap_or(0.0),
-            read(py).map(|s| s.as_float()).unwrap_or(0.0),
-        );
-        (if active { Some((x, y)) } else { None }, active)
     } else {
-        let name = if src == "right_stick" { "right_stick" } else { "left_stick" };
-        let v = stick_read(name);
-        let on = v.length() > deadzone;
-        (if on { Some(deflect_to_unit(v)) } else { None }, on)
+        let mut v = Vec2::ZERO;
+        let mut touch_on = false;
+        if src_ls { v += stick_read("left_stick"); }
+        if src_rs { v += stick_read("right_stick"); }
+        if src_touch {
+            let (px, py, pa) = if touch_which == "touch2" {
+                ("touch2_x", "touch2_y", "touch2_active")
+            } else {
+                ("touch1_x", "touch1_y", "touch1_active")
+            };
+            if read(pa).map(|s| s.as_bool()).unwrap_or(false) {
+                touch_on = true;
+                let (ux, uy) = tz::pad_point_to_unit(
+                    read(px).map(|s| s.as_float()).unwrap_or(0.0),
+                    read(py).map(|s| s.as_float()).unwrap_or(0.0),
+                );
+                // Absolute pad position → centered deflection: a lone touch
+                // source reproduces the old absolute mapping exactly.
+                v += Vec2::new((ux - 0.5) * 2.0, (0.5 - uy) * 2.0);
+            }
+        }
+        if src_gyro {
+            // Integrate rotation rate while open (tilt to point); closed
+            // resets so the pointer starts centered on every open. Axis
+            // pairs mirror the 3DOF→2D module: X ← yaw (gz) or roll (gx),
+            // Y ← pitch (gy).
+            if prev_open {
+                let gx = read("gyro_x").map(|s| s.as_float()).unwrap_or(0.0);
+                let gy = read("gyro_y").map(|s| s.as_float()).unwrap_or(0.0);
+                let gz = read("gyro_z").map(|s| s.as_float()).unwrap_or(0.0);
+                let (dx, dy) = if gyro_axes == "pitch_roll" { (gx, gy) } else { (gz, gy) };
+                let gain = gyro_sens * 10.0 / GYRO_FULL_RAD;
+                ns.aux_f32[10] = (ns.aux_f32[10] + dx * dt * gain).clamp(-1.5, 1.5);
+                ns.aux_f32[11] = (ns.aux_f32[11] + dy * dt * gain).clamp(-1.5, 1.5);
+            } else {
+                ns.aux_f32[10] = 0.0;
+                ns.aux_f32[11] = 0.0;
+            }
+            v += Vec2::new(ns.aux_f32[10], ns.aux_f32[11]);
+        }
+        if v.length() > 1.0 { v = v.normalize(); }
+        let past_dz = v.length() > deadzone;
+        (
+            if past_dz || touch_on { Some(deflect_to_unit(v)) } else { None },
+            past_dz || touch_on,
+        )
     };
 
     // Zone geometry: explicit BSP tree once partial dividers exist, else the
@@ -5774,20 +5927,17 @@ fn eval_menu_node(
     let tree = snap.params.get("zone_tree").and_then(tz::ZoneNode::from_value)
         .unwrap_or_else(|| tz::ZoneNode::from_grid(
             &read_edges("col_edges"), &read_edges("row_edges")));
-
-    // ── State machine. aux_f32: [0] open, [1] prev_show, [2] prev_sel,
-    // [3] hover+1 (0 = none), [4] select-pulse ms left, [5] selected zone+1,
-    // [6] prev_click, [7] hover local x, [8] hover local y ──
-    const SLOTS: usize = 9;
-    const SELECT_PULSE_MS: f32 = 120.0;
-    let ns = state.entry(uid).or_insert_with(NodeState::default);
-    while ns.aux_f32.len() < SLOTS { ns.aux_f32.push(0.0); }
-    let prev_open = ns.aux_f32[0] > 0.5;
-    let prev_show = ns.aux_f32[1] > 0.5;
-    let prev_sel = ns.aux_f32[2] > 0.5;
-    let prev_hover: i32 = ns.aux_f32[3] as i32 - 1;
-    let prev_click = ns.aux_f32[6] > 0.5;
-    let click_now = read("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
+    // Radial mode: the SAME zone tree projected into polar space — x is the
+    // angle (clockwise from 12 o'clock), y the radius past the dead center.
+    // Columns are sectors, rows are concentric rings; ids and dividers are
+    // shared with grid mode. The dead center — below `pointer_deadzone` of
+    // the unit radius — hovers nothing, so a stick can rest without
+    // committing.
+    let radial = snap.params.get("menu_radial").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Angular origin offset (fraction, clockwise): the display rotates the
+    // ring by this, so the input mapping must subtract it back out — pushing
+    // toward a zone's on-screen direction has to select THAT zone.
+    let radial_origin = snap.params.get("menu_radial_origin").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
     let open = match act.as_str() {
         "toggle" => prev_open ^ (show_raw && !prev_show),
@@ -5795,15 +5945,43 @@ fn eval_menu_node(
         _ => show_raw, // hold
     };
 
-    // Hover: sticky while open; the frame the menu closes still sees the last
-    // hover (release-select reads it), then it resets to none.
+    // Hover: sticky while open (default) — the frame the menu closes still
+    // sees the last hover (release-select reads it), then it resets to none.
+    // With `hover_sticky` off, a pointer back inside the deadzone clears the
+    // highlight instead, so releasing there selects nothing.
     let mut hover: i32 = if prev_open { prev_hover } else { -1 };
     let mut hover_local = (ns.aux_f32[7], ns.aux_f32[8]);
     if open {
-        if let Some((ux, uy)) = ptr_unit {
-            let (zid, lx, ly) = tree.locate(ux, uy);
-            hover = zid as i32;
-            hover_local = (lx, ly);
+        match ptr_unit {
+            Some((ux, uy)) => {
+                if radial {
+                    // Centered vector (unit-rect coords → ±1, +y down); ptr_unit
+                    // is already deadzone-gated for sticks, but touch pointers
+                    // aren't — gate the dead center here for both.
+                    let (cx, cy) = ((ux - 0.5) * 2.0, (uy - 0.5) * 2.0);
+                    let (au, mag) = fm::radial_unit(cx, cy);
+                    if mag > deadzone {
+                        // Radius past the hub → tree y; angle (minus the origin
+                        // offset) → tree x. Local coords come from the zone
+                        // itself, exactly like grid mode: X across the zone's
+                        // arc, Y across its ring band.
+                        let rv = ((mag - deadzone) / (1.0 - deadzone).max(1e-3)).clamp(0.0, 0.999);
+                        let ax = (au - radial_origin).rem_euclid(1.0).min(0.9999);
+                        let (zid, lx, ly) = tree.locate(ax, rv);
+                        hover = zid as i32;
+                        hover_local = (lx, ly);
+                    } else if !sticky {
+                        hover = -1;
+                    }
+                } else {
+                    let (zid, lx, ly) = tree.locate(ux, uy);
+                    hover = zid as i32;
+                    hover_local = (lx, ly);
+                }
+            }
+            None => {
+                if !sticky { hover = -1; }
+            }
         }
     }
 
@@ -5815,6 +5993,7 @@ fn eval_menu_node(
     if select_now {
         ns.aux_f32[4] = SELECT_PULSE_MS;
         ns.aux_f32[5] = (hover + 1) as f32;
+        ns.aux_f32[9] += 1.0;
     }
     let pulse_on = ns.aux_f32[4] > 0.0;
     let selected: i32 = ns.aux_f32[5] as i32 - 1;
@@ -5895,27 +6074,33 @@ fn eval_menu_node(
         }
     }
 
-    // ── Suppress the pointing input on the passthrough while open, so the
-    // game doesn't see the stick/finger that's steering the menu ──
+    // ── Suppress every enabled pointing input on the passthrough while open,
+    // so the game doesn't see the sticks/finger/gyro steering the menu ──
     if suppress && open && wired_ptr.is_none() {
-        if src == "touch1" || src == "touch2" {
-            collector_sigs.insert((key.clone(), format!("{src}_active")), Signal::Bool(false));
-            collector_sigs.insert((key.clone(), format!("{src}_x")), Signal::Float(0.0));
-            collector_sigs.insert((key.clone(), format!("{src}_y")), Signal::Float(0.0));
-            // The pad click doubles as the Select gesture — keep it from the
-            // game too while the menu is up.
-            collector_sigs.insert((key.clone(), "btn_touchpad".to_string()), Signal::Bool(false));
-        } else {
-            let name = if src == "right_stick" { "right_stick" } else { "left_stick" };
+        for (on, name) in [(src_ls, "left_stick"), (src_rs, "right_stick")] {
+            if !on { continue; }
             collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(Vec2::ZERO));
             collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(0.0));
             collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(0.0));
+        }
+        if src_touch {
+            collector_sigs.insert((key.clone(), format!("{touch_which}_active")), Signal::Bool(false));
+            collector_sigs.insert((key.clone(), format!("{touch_which}_x")), Signal::Float(0.0));
+            collector_sigs.insert((key.clone(), format!("{touch_which}_y")), Signal::Float(0.0));
+            // The pad click doubles as the Select gesture — keep it from the
+            // game too while the menu is up.
+            collector_sigs.insert((key.clone(), "btn_touchpad".to_string()), Signal::Bool(false));
+        }
+        if src_gyro {
+            for pin in ["gyro_x", "gyro_y", "gyro_z"] {
+                collector_sigs.insert((key.clone(), pin.to_string()), Signal::Float(0.0));
+            }
         }
     }
 
     // ── Typed outputs: fixed Open/Hover + ports-mode zone pins (TZ vocabulary,
     // field 0). X/Y carry the hovered zone's local pointer coords. ──
-    (0..snap.n_outputs).map(|i| {
+    let mut out: Vec<Option<Signal>> = (0..snap.n_outputs).map(|i| {
         let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
         match fm::parse_pin(pin_id) {
             Some(fm::Pin::Open) => return Some(Signal::Bool(open)),
@@ -5931,7 +6116,29 @@ fn eval_menu_node(
                 Some(Signal::Float(if hover == idx as i32 { hover_local.1 } else { 0.0 })),
             tz::Pin::Click { .. } => Some(Signal::Bool(pulse_on)),
         }
-    }).collect()
+    }).collect();
+    // TWO extra trailing slots beyond the real ports (invisible to the port
+    // UI, carried by the last_out mirror; the UI reads them from the END so
+    // the count of real ports never matters):
+    //   [len-2] last selection as Vec2(zone id, selection seq) — None until
+    //           the first selection ever; the overlay lingers the selected
+    //           cell when it sees the seq change (`menu_sel_info`).
+    //   [len-1] the live pointer as a unit-rect Vec2 (0..1, y down) while the
+    //           menu is open — the overlay / body fields draw the
+    //           cursor-deflection indicator from it (`menu_pointer`). None
+    //           when closed or centered.
+    let sel_seq = ns.aux_f32[9];
+    let sel_zone: i32 = ns.aux_f32[5] as i32 - 1;
+    out.push(if sel_seq > 0.0 && sel_zone >= 0 {
+        Some(Signal::Vec2(Vec2::new(sel_zone as f32, sel_seq)))
+    } else {
+        None
+    });
+    out.push(match (open, ptr_unit) {
+        (true, Some((ux, uy))) => Some(Signal::Vec2(Vec2::new(ux, uy))),
+        _ => None,
+    });
+    out
 }
 
 /// Evaluate a Map Action node — shared by the top-level and sub-patch loops.
@@ -6800,7 +7007,9 @@ fn compute_gyro_3dof(
     //   [10] quaternion w (always 1.0 at initialization, updated on each tick)
     //   [11] prev_reset edge guard for reset tracking
     //   [12] ease-in residual for orientation blend during reset
-    while state.aux_f32.len() < 13 { state.aux_f32.push(0.0); }
+    //   [13..16] captured world-frame gravity reference for drift correction
+    //   [16] gyro-still time accumulator for the yaw auto re-center
+    while state.aux_f32.len() < 17 { state.aux_f32.push(0.0); }
 
     // ── Axis selection: decide which gyro components feed X / Y ───────────
     //
@@ -6971,7 +7180,8 @@ fn compute_gyro_3dof(
     // only place scaling a full 3D pose stays continuous. Scaling the finished
     // quaternion (viewer-side) flips discontinuously as the rotation passes
     // ~180°. Affects ONLY this Orientation output, not the 2D pointer/steering.
-    // 1.0 = physical; e.g. Switch Pro ≈ 0.5 (its device layer reports ~2× dps).
+    // 1.0 = physical for all known controllers (the device layer normalizes
+    // every family to the same ±2000 dps reference).
     let orient_disp_scale = pf("orient_scale", 1.0);
     let orient_scale = norm_to_rad_s / dev_gyro_mult * orient_disp_scale;
     // Polarity comes from the module's EXISTING inv_* toggles — the same ones
@@ -7032,6 +7242,125 @@ fn compute_gyro_3dof(
         state.aux_f32[9] = 0.0;
         state.aux_f32[10] = 1.0;
         state.aux_f32[12] = 0.0;
+    }
+
+    // ── Accel drift correction (complementary filter) ──────────────────────
+    //
+    // Pure gyro integration accumulates tilt drift. Whenever the controller
+    // isn't being shaken, the accelerometer reads gravity — an absolute
+    // attitude reference — so nudge the quaternion to keep gravity mapping
+    // to a CAPTURED world-frame reference. Capturing (at first steady
+    // reading, and re-capturing through a reset) instead of assuming a
+    // fixed world "up" means no absolute axis-sign assumptions: whatever
+    // pose the user resets in becomes truth, and only tilt drift relative
+    // to it is corrected. Yaw (rotation about gravity) is unobservable from
+    // accel; the cross-product correction leaves it untouched.
+    //
+    // Post-inv_* pins are in the canonical device convention, so the accel
+    // vector maps into the model body frame with the same fixed axis map
+    // the gyro rates use above: dev (x=roll/fwd, y=pitch/side, z=yaw/vert)
+    // → model (y, −z, −x).
+    // OFF by default: gravity can't distinguish tilt from linear acceleration,
+    // so translation (side-to-side / up-down swings) reads as false rotation
+    // even behind the steadiness gates. Auto re-center covers rest drift
+    // without that failure mode; this stays as an explicit opt-in.
+    let drift_corr = pf("orient_drift", 0.0).clamp(0.0, 1.0);
+    if drift_corr > 0.0 && dt > 0.0 {
+        let a_model = glam::Vec3::new(ay, -az, -ax);
+        let acc_len = a_model.length();
+        // Accel pins are normalized ±1 == ±8 G; trust the reading only when
+        // its magnitude is near 1 g (anything else isn't just gravity).
+        const ONE_G: f32 = 1.0 / 8.0;
+        if acc_len > 1e-4 {
+            // Trust the reading only when BOTH hold:
+            //  - |a| ≈ 1 g, TIGHTLY — side-to-side translation adds lateral
+            //    acceleration in quadrature, so even a mild shake pushes the
+            //    magnitude off 1 g. The old ×4 falloff still corrected at
+            //    ~80 % strength during a 0.3 g shake and visibly rotated the
+            //    model while it was only being translated.
+            //  - the gyro reads near-still — if the pad isn't rotating, a
+            //    moving accel vector is translation by definition, and must
+            //    never tilt the pose. Drift correction at rest is the whole
+            //    point anyway; during motion the gyro integration rules.
+            let steady_mag = (1.0 - ((acc_len / ONE_G) - 1.0).abs() * 25.0).clamp(0.0, 1.0);
+            let steady_rot = (1.0 - mag / 0.6).clamp(0.0, 1.0); // fades out by ~35°/s
+            let steady = steady_mag * steady_rot;
+            let u_body = a_model / acc_len;
+            let cur_q = glam::Quat::from_xyzw(
+                state.aux_f32[7],
+                state.aux_f32[8],
+                state.aux_f32[9],
+                state.aux_f32[10],
+            );
+            let u_ref = glam::Vec3::new(state.aux_f32[13], state.aux_f32[14], state.aux_f32[15]);
+            if u_ref.length_squared() < 0.5 || q_reset_edge || state.aux_f32[12] > 0.001 {
+                // First valid reading, reset edge, or mid reset-ease: (re)capture
+                // the reference against the current quaternion instead of
+                // correcting, so the blend toward identity can't be fought.
+                if steady > 0.5 {
+                    let w = cur_q * u_body;
+                    state.aux_f32[13] = w.x;
+                    state.aux_f32[14] = w.y;
+                    state.aux_f32[15] = w.z;
+                }
+            } else if steady > 0.0 {
+                let pred = cur_q * u_body; // measured up, world frame
+                let err = pred.cross(u_ref); // axis = correction, |err| = sin(angle)
+                // Slider → pull rate: 0.25 (default) ≈ τ 2 s, 1.0 ≈ τ 0.125 s.
+                let gain = drift_corr * drift_corr * 8.0;
+                let step = (gain * steady * dt).min(1.0);
+                let new_q = (glam::Quat::from_scaled_axis(err * step) * cur_q).normalize();
+                state.aux_f32[7] = new_q.x;
+                state.aux_f32[8] = new_q.y;
+                state.aux_f32[9] = new_q.z;
+                state.aux_f32[10] = new_q.w;
+            }
+        }
+    }
+
+    // ── Auto re-center (Orientation output only) ───────────────────────────
+    //
+    // With no absolute reference the pose can end up shifted on ANY axis
+    // (yaw worst — nothing pins it — but pitch/roll can wander too). When
+    // the gyro magnitude stays under the user threshold for 3 s, ease the
+    // whole orientation back to identity (τ ≈ 1 s) until it's centered or
+    // the threshold is exceeded again.
+    if pb("orient_auto_recenter", false) {
+        let thresh = pf("orient_recenter_thresh", 0.005).max(1e-5);
+        let g_mag = (gx * gx + gy * gy + gz * gz).sqrt();
+        if g_mag < thresh {
+            state.aux_f32[16] += dt;
+        } else {
+            state.aux_f32[16] = 0.0;
+        }
+        if state.aux_f32[16] >= 3.0 && dt > 0.0 {
+            let q = glam::Quat::from_xyzw(
+                state.aux_f32[7],
+                state.aux_f32[8],
+                state.aux_f32[9],
+                state.aux_f32[10],
+            );
+            let step = 1.0 - (-dt / 1.0_f32).exp();
+            let new_q = q.slerp(glam::Quat::IDENTITY, step).normalize();
+            state.aux_f32[7] = new_q.x;
+            state.aux_f32[8] = new_q.y;
+            state.aux_f32[9] = new_q.z;
+            state.aux_f32[10] = new_q.w;
+            // Re-anchor the drift-correction gravity reference against the
+            // easing pose, exactly like a manual reset does — otherwise the
+            // tilt correction would fight the pull toward identity whenever
+            // the controller rests in a non-flat pose.
+            let a_model = glam::Vec3::new(ay, -az, -ax);
+            let len = a_model.length();
+            if len > 1e-4 {
+                let w = new_q * (a_model / len);
+                state.aux_f32[13] = w.x;
+                state.aux_f32[14] = w.y;
+                state.aux_f32[15] = w.z;
+            }
+        }
+    } else {
+        state.aux_f32[16] = 0.0;
     }
 
     // Emit orientation as Vec4 (x, y, z, w)
@@ -9093,6 +9422,9 @@ mod menu_eval_tests {
         let out = eval_menu_node(&snap, 1, &show(true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
         assert_eq!(out[1], Some(Signal::Bool(true)));
         assert_eq!(out[2], Some(Signal::Float(3.0)));
+        // Trailing mirror slots: no selection yet, live pointer present.
+        assert_eq!(out[out.len() - 2], None);
+        assert!(matches!(out[out.len() - 1], Some(Signal::Vec2(_))));
         // Not selected yet — the card hasn't fired.
         assert!(c.get(&("menumap:1".to_string(), "btn_south".to_string()))
             .map(|s| !s.as_bool()).unwrap_or(true));
@@ -9110,6 +9442,9 @@ mod menu_eval_tests {
         assert_eq!(out[2], Some(Signal::Float(-1.0)));
         assert_eq!(c.get(&("menumap:1".to_string(), "btn_south".to_string())).copied(),
             Some(Signal::Bool(true)));
+        // Selection mirror: zone 3, seq 1 — persists for the overlay's linger.
+        assert_eq!(out[out.len() - 2], Some(Signal::Vec2(Vec2::new(3.0, 1.0))));
+        assert_eq!(out[out.len() - 1], None, "pointer mirror clears when closed");
     }
 
     // The macro-style Show target (published by a Remapper mapping via
@@ -9166,6 +9501,60 @@ mod menu_eval_tests {
         assert_eq!(out[1], Some(Signal::Bool(true)));
         assert_eq!(c.get(&("menumap:4".to_string(), "btn_west".to_string())).copied(),
             Some(Signal::Bool(true)));
+    }
+
+    // Radial mode: the pointer picks a sector by ANGLE (sector 0 up,
+    // clockwise), the dead center hovers nothing, and hover stays sticky
+    // when the stick returns to rest.
+    #[test]
+    fn radial_mode_sector_by_angle() {
+        let mut snap = menu_snap(6);
+        snap.params.insert("menu_radial".into(), Value::Bool(true));
+        // Synthetic 1×4 strip = 4 sectors (up, right, down, left).
+        snap.params.insert("col_edges".into(), serde_json::json!([0.25, 0.5, 0.75]));
+        snap.params.insert("row_edges".into(), serde_json::json!([] as [f32; 0]));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+
+        // Stick up (+y = up in stick coords) → sector 0.
+        let out = eval_menu_node(&snap, 6, &show(true), &dev_stick(0.0, 0.9), &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)));
+        assert_eq!(out[2], Some(Signal::Float(0.0)));
+        // Stick right → sector 1; down → 2; left → 3.
+        let out = eval_menu_node(&snap, 6, &show(true), &dev_stick(0.9, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(1.0)));
+        let out = eval_menu_node(&snap, 6, &show(true), &dev_stick(0.0, -0.9), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(2.0)));
+        let out = eval_menu_node(&snap, 6, &show(true), &dev_stick(-0.9, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(3.0)));
+        // Back to rest: hover stays sticky on the last sector.
+        let out = eval_menu_node(&snap, 6, &show(true), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(3.0)));
+    }
+
+    // hover_sticky = false: returning to the deadzone clears the highlight,
+    // and a release there selects nothing (no card fires).
+    #[test]
+    fn non_sticky_hover_clears_in_deadzone() {
+        let mut snap = menu_snap(7);
+        snap.params.insert("hover_sticky".into(), Value::Bool(false));
+        snap.params.insert("zone_maps".into(), serde_json::json!([
+            { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_south"] }
+        ]));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+
+        let out = eval_menu_node(&snap, 7, &show(true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(3.0)));
+        // Back inside the deadzone: highlight clears instead of sticking.
+        let out = eval_menu_node(&snap, 7, &show(true), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[2], Some(Signal::Float(-1.0)));
+        // Release with nothing highlighted: closes without selecting.
+        let out = eval_menu_node(&snap, 7, &show(false), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(false)));
+        assert_eq!(out[out.len() - 2], None, "no selection mirrored");
+        assert!(c.get(&("menumap:7".to_string(), "btn_south".to_string()))
+            .map(|s| !s.as_bool()).unwrap_or(true));
     }
 
     // A mapping card targeting ANOTHER macro-style pin routes into the macro

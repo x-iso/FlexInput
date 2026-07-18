@@ -310,6 +310,41 @@ impl ZoneNode {
         }
     }
 
+    /// The position that recentres the divider at `path` between its immediate
+    /// same-axis neighbours — the borders that actually bound the two zones it
+    /// separates — so a double-click equalises those two zones (what the flat
+    /// `col_edges`/`row_edges` editor does with `(edge[i-1]+edge[i+1])/2`).
+    ///
+    /// A divider's own `[lo, hi]` draggable range is its *parent node's* span,
+    /// which in this right-leaning tree is often far wider than the gap between
+    /// its visible neighbours — so the naïve `(lo+hi)/2` overshoots and squashes
+    /// the next zone. This walks the flattened dividers, keeps only same-axis
+    /// ones whose perpendicular span overlaps, and centres between the nearest
+    /// on each side (falling back to the field edge / parent span). `None` if
+    /// `path` isn't a split.
+    pub fn centered_divider_pos(&self, path: &[u8]) -> Option<f32> {
+        let all = self.dividers();
+        let me = all.iter().find(|d| d.path == path)?;
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for d in &all {
+            if d.path == me.path || d.axis != me.axis {
+                continue;
+            }
+            // Only neighbours whose perpendicular span overlaps ours bound us
+            // (a divider in another row/column can't squash this one).
+            if d.span_lo >= me.span_hi - 1e-4 || d.span_hi <= me.span_lo + 1e-4 {
+                continue;
+            }
+            if d.pos < me.pos {
+                lo = lo.max(d.pos);
+            } else if d.pos > me.pos {
+                hi = hi.min(d.pos);
+            }
+        }
+        // Never leave the divider's own parent span.
+        Some(((lo + hi) * 0.5).clamp(me.lo, me.hi))
+    }
+
     /// Collapse the split at `path` into a single leaf. `inheritor` (if it is one
     /// of the merged ids) is kept; otherwise the smallest merged id wins. Returns
     /// `(kept_id, removed_ids)` — the caller reassigns/drops the removed zones'
@@ -583,6 +618,27 @@ mod tests {
         assert_eq!(t3.locate(0.1, 0.5).0, 0);
         assert_eq!(t3.locate(0.5, 0.5).0, 1);
         assert_eq!(t3.locate(0.9, 0.5).0, 2);
+    }
+
+    #[test]
+    fn centered_divider_uses_immediate_neighbours() {
+        // 3 columns at 0.2 / 0.8 (right-leaning tree). Centring the FIRST
+        // divider must land between the left edge and the SECOND divider (0.4),
+        // NOT the field midpoint 0.5 — that overshoot squashes the middle zone.
+        let tree = ZoneNode::from_grid(&[0.2, 0.8], &[]);
+        let d0 = tree.centered_divider_pos(&[]).unwrap();
+        assert!((d0 - 0.4).abs() < 1e-4, "first divider centres at 0.4, got {d0}");
+        // The second divider centres between the first divider and the right edge.
+        let d1 = tree.centered_divider_pos(&[1]).unwrap();
+        assert!((d1 - 0.6).abs() < 1e-4, "second divider centres at 0.6, got {d1}");
+        // A path that isn't a split has no centred position.
+        assert!(tree.centered_divider_pos(&[0]).is_none());
+
+        // 2×2 grid: a column divider ignores the OTHER row's column divider
+        // (non-overlapping perpendicular span) → centres at 0.5 in its band.
+        let g = ZoneNode::from_grid(&[0.3], &[0.5]);
+        let c = g.centered_divider_pos(&[0]).unwrap();
+        assert!((c - 0.5).abs() < 1e-4, "column divider centres at 0.5, got {c}");
     }
 
     #[test]
