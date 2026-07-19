@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use glam::Vec2;
@@ -56,4 +56,25 @@ pub struct NodeState {
     pub twoway_prev_input: Vec<f32>,
     /// Per-channel blended output frozen at the moment a lane switch begins.
     pub twoway_old_output: Vec<f32>,
+    // ── Macro-namespace carry-over (stored on a single reserved sentinel uid) ──
+    /// Previous tick's macro-namespace values (`macro:` / `menu:` control pins).
+    /// `collector_sigs` is rebuilt from empty every tick, so a macro READER that
+    /// is forced to evaluate BEFORE its producer — e.g. a Virtual Menu that sits
+    /// upstream of the Remapper mapping to its Select target, a genuine feedback
+    /// cycle — would never observe the value this tick. This snapshot lets such a
+    /// reader fall back to the last published value (one tick stale, imperceptible
+    /// at kHz rates). Only the reserved `MACRO_CARRY_UID` entry uses this field.
+    pub macro_prev: HashMap<(String, String), Signal>,
+    /// Virtual Menu SOURCE-BLOCK request, `(device_id, pin_id)` pairs an open
+    /// menu asked to zero at the source so those analog inputs reach ONLY the
+    /// menu's navigation (not a mouse mapping, another module, or the pad).
+    /// Rebuilt each tick from `collector_sigs` and applied to `dev_sigs` at the
+    /// START of the NEXT tick — one tick stale, imperceptible. Only the reserved
+    /// `MACRO_CARRY_UID` entry uses this field.
+    pub source_block: HashSet<(String, String)>,
+    /// Pre-block values of the pins in `source_block`, snapshotted when the block
+    /// is applied so the menu can still READ its navigation inputs (it's the
+    /// reason they're blocked for everyone else). Only the reserved
+    /// `MACRO_CARRY_UID` entry uses this field.
+    pub unblocked_src: HashMap<(String, String), Signal>,
 }

@@ -15648,9 +15648,33 @@ fn resolve_automap_glow_output(
         // Pass-through processors: AutoMap activity = activity on their single
         // AutoMap input wire. Audio Stream Haptics passes the bus straight through
         // (it only injects feedback), so it glows from its input like the others.
+        // Touch Zones and the Virtual Menu likewise pass the bus through on their
+        // AutoMap output (their zone behaviour goes onto the bus / typed ports);
+        // without this they fell to the `_` arm, whose `last_out[0]` is None for
+        // the passthrough slot — so the port never lit despite live signals.
         "module.automap_split" | "module.automap_collect" | "module.remapper"
-        | "module.audio_stream_haptics" => {
+        | "module.audio_stream_haptics" | "module.touch_zones" => {
             let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
+            walk_automap_input(live_signals, snarl, src.node, am_idx, parent)
+        }
+        // The Virtual Menu is a pass-through too, but while it is OPEN and
+        // SUPPRESSING it strips its enabled pointer sources (stick / touch / gyro)
+        // from the bus it forwards. Reflect that in the output glow so the port
+        // stops lighting from inputs the game never sees — the user's visual cue
+        // that suppression is working. Closed / not-suppressing → plain input walk.
+        "module.menu" => {
+            let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
+            let open = node.extra.last_out.get(1).and_then(|s| *s)
+                .map(|s| s.as_bool()).unwrap_or(false);
+            let suppress = node.params.get("suppress_while_open")
+                .and_then(|v| v.as_bool()).unwrap_or(true);
+            if open && suppress {
+                if let Some(g) = menu_output_glow_excluding_suppressed(
+                    live_signals, snarl, src.node, am_idx, node, parent)
+                {
+                    return Some(g);
+                }
+            }
             walk_automap_input(live_signals, snarl, src.node, am_idx, parent)
         }
         // 3DOF AutoMap output: the bus passes straight through (the module
@@ -15743,6 +15767,79 @@ fn walk_automap_input(
     let pin = snarl.in_pin(InPinId { node: node_id, input: in_idx });
     let src = *pin.remotes.first()?;
     resolve_automap_glow_output(live_signals, snarl, src, parent)
+}
+
+/// Output-bus glow for a Virtual Menu while it is open and suppressing: pool the
+/// upstream device's live activity but SKIP the pins the menu strips from the bus
+/// (its enabled pointer sources), so the AutoMap port reflects the suppressed
+/// OUTPUT rather than the raw input. Returns `None` — caller falls back to the
+/// plain input walk — when the upstream resolves to a synthetic injector key
+/// rather than a raw device (those values aren't in `live_signals`) or can't be
+/// resolved at all.
+fn menu_output_glow_excluding_suppressed(
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    am_idx: usize,
+    node: &NodeData,
+    parent: Option<&AutomapGlowParent<'_>>,
+) -> Option<f32> {
+    let src = *snarl.in_pin(InPinId { node: node_id, input: am_idx }).remotes.first()?;
+    let dev_id = crate::app::find_automap_device_id_for_viewer(snarl, src, parent)?;
+    // Synthetic injector keys (an upstream Remapper / Collector / …) aren't in
+    // live_signals — fall back to the plain walk for those chains.
+    if ["collector:", "remap:", "combiner:", "forksel:", "touchmap:", "menumap:", "lean:"]
+        .iter().any(|p| dev_id.starts_with(p))
+    {
+        return None;
+    }
+    let excluded = menu_suppressed_pin_set(node);
+    let mut max_i = 0.0_f32;
+    for ap in flexinput_core::automap::ALL_PINS {
+        if excluded.contains(ap.id) { continue; }
+        // Touch X/Y only count while the matching Active flag is asserted
+        // (mirrors the device.source pool).
+        if (ap.id == "touch1_x" || ap.id == "touch1_y")
+            && !matches!(live_signals.get(&(dev_id.clone(), "touch1_active".to_string())),
+                         Some(Signal::Bool(true)))
+        { continue; }
+        if (ap.id == "touch2_x" || ap.id == "touch2_y")
+            && !matches!(live_signals.get(&(dev_id.clone(), "touch2_active".to_string())),
+                         Some(Signal::Bool(true)))
+        { continue; }
+        if let Some(sig) = live_signals.get(&(dev_id.clone(), ap.id.to_string())) {
+            max_i = max_i.max(signal_intensity(sig));
+        }
+    }
+    Some(max_i)
+}
+
+/// The canonical pins a Virtual Menu strips from its forwarded bus while open +
+/// suppressing — its ENABLED pointer sources. Mirrors the suppression set in
+/// `flexinput_engine::eval::eval_menu_node`.
+fn menu_suppressed_pin_set(node: &NodeData) -> std::collections::HashSet<&'static str> {
+    let mut ex: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let pb = |k: &str, d: bool| node.params.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
+    let legacy = node.params.get("pointer_source").and_then(|v| v.as_str()).unwrap_or("left_stick");
+    if pb("ptr_ls", legacy == "left_stick") {
+        ex.extend(["left_stick", "left_stick_x", "left_stick_y"]);
+    }
+    if pb("ptr_rs", legacy == "right_stick") {
+        ex.extend(["right_stick", "right_stick_x", "right_stick_y"]);
+    }
+    if pb("ptr_touch", legacy == "touch1" || legacy == "touch2") {
+        let which = node.params.get("ptr_touch_which").and_then(|v| v.as_str())
+            .unwrap_or(if legacy == "touch2" { "touch2" } else { "touch1" });
+        if which == "touch2" {
+            ex.extend(["touch2_x", "touch2_y", "touch2_active", "btn_touchpad"]);
+        } else {
+            ex.extend(["touch1_x", "touch1_y", "touch1_active", "btn_touchpad"]);
+        }
+    }
+    if pb("ptr_gyro", false) {
+        ex.extend(["gyro_x", "gyro_y", "gyro_z"]);
+    }
+    ex
 }
 
 /// Look up live activity for any output pin: device sources read from

@@ -263,10 +263,12 @@ fn write_menu_rect(tab_snarl: &mut Snarl<NodeData>, outer: Option<NodeId>, inner
 /// is open or being positioned.
 pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let frame_interval = Duration::from_secs_f64(1.0 / app.overlay_fps() as f64);
-    let (tab, _live_signals, _panic) = app.overlay_parts();
-    let tab_snarl = &mut tab.canvas.snarl;
-
-    let menus = collect_menus(tab_snarl);
+    // Collect the active tab's menus, then drop the borrow so the write-back at
+    // the end can also reach any open sub-patch editor (see below).
+    let menus = {
+        let (tab, _live_signals, _panic) = app.overlay_parts();
+        collect_menus(&tab.canvas.snarl)
+    };
     // Validate the edit target against the current node set (node deleted /
     // tab switched while editing → drop the edit).
     let mut edit = menu_edit_target(ctx);
@@ -428,7 +430,16 @@ pub fn show_menu_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     });
 
     if let Some((outer, inner, r)) = rect_write {
-        write_menu_rect(tab_snarl, outer, inner, r);
+        {
+            let (tab, _live_signals, _panic) = app.overlay_parts();
+            write_menu_rect(&mut tab.canvas.snarl, outer, inner, r);
+        }
+        // A sub-patch editor renders (and writes back) its OWN clone of the inner
+        // snarl; without this, the next time the user edits the menu the editor's
+        // full-snarl write-back clobbers the menu_rect we just wrote to the
+        // embedded copy — the placement would silently reset. Mirror the write
+        // into the editor's clone so its write-back preserves it.
+        app.write_menu_rect_to_editors(outer, inner, r);
     }
     if exit_edit {
         clear_menu_edit(ctx);

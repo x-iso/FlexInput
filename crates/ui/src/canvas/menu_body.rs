@@ -1737,18 +1737,44 @@ pub(crate) fn show_menu_header(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut S
             regenerate_menu_ports(node_id, snarl);
         }
 
-        // Suppress + Radial live in the header with the mode switch — they
-        // shape what the module IS, not how a session behaves.
-        let (suppress, radial) = snarl.get_node(node_id)
-            .map(|n| (pbool(n, "suppress_while_open", true), pbool(n, "menu_radial", false)))
-            .unwrap_or((true, false));
-        let mut sup = suppress;
-        if ui.checkbox(&mut sup, "Suppress")
-            .on_hover_text("While the menu is open, the pointing inputs no longer reach\nwhatever is wired after the AutoMap passthrough.")
-            .changed()
-        {
+        // Suppression + Radial live in the header with the mode switch — they
+        // shape what the module IS, not how a session behaves. Suppression is
+        // one 3-way choice stored across `suppress_while_open` (off vs on) and
+        // `suppress_mode` (partial vs full), so older patches load unchanged.
+        let (suppress, sup_mode, radial) = snarl.get_node(node_id)
+            .map(|n| (pbool(n, "suppress_while_open", true),
+                      pstr(n, "suppress_mode", "partial").to_string(),
+                      pbool(n, "menu_radial", false)))
+            .unwrap_or((true, "partial".to_string(), false));
+        let cur = if !suppress { "off" }
+            else if sup_mode == "full" { "full" }
+            else if sup_mode == "latch" { "latch" }
+            else { "partial" };
+        let mut sel = cur.to_string();
+        egui::ComboBox::from_id_salt((node_id, "menu_suppress_mode"))
+            .selected_text(match sel.as_str() {
+                "off" => "Passthrough",
+                "full" => "Full suppress",
+                "latch" => "Latch suppress",
+                _ => "Active suppress",
+            })
+            .width(122.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut sel, "off".to_string(), "Passthrough")
+                    .on_hover_text("Menu drivers keep flowing to the rest of the patch\nwhile the menu is open.");
+                ui.selectable_value(&mut sel, "partial".to_string(), "Active suppress")
+                    .on_hover_text("Block a driver AT THE SOURCE only while it's actively\nsteering the menu (stick past deadzone / finger down /\ngyro cursor out of the deadzone), so it reaches only the\nmenu's navigation. Idle enabled drivers still pass; a\nblocked one returns the moment it's back at rest.");
+                ui.selectable_value(&mut sel, "latch".to_string(), "Latch suppress")
+                    .on_hover_text("The FIRST driver to engage owns the menu: it alone\nsteers and is blocked at the source. Every other driver\nis ignored by the menu and keeps flowing to the game,\nuntil the owner disengages (stick back to deadzone /\nfinger up / gyro cursor re-centred) — then the next\nengaged driver can take over.");
+                ui.selectable_value(&mut sel, "full".to_string(), "Full suppress")
+                    .on_hover_text("Block every enabled driver AT THE SOURCE for as long\nas the menu is open — none of them reach a mouse\nmapping, another module, or the virtual pad.");
+            });
+        if sel != cur {
             if let Some(node) = snarl.get_node_mut(node_id) {
-                node.params.insert("suppress_while_open".into(), serde_json::json!(sup));
+                node.params.insert("suppress_while_open".into(), serde_json::json!(sel != "off"));
+                if sel != "off" {
+                    node.params.insert("suppress_mode".into(), serde_json::json!(sel));
+                }
             }
         }
         let mut want_radial = radial;

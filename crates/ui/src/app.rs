@@ -10939,6 +10939,31 @@ impl FlexInputApp {
         (&mut self.tabs[idx], &self.last_signals, shortcut)
     }
 
+    /// Mirror a menu's `menu_rect` into any OPEN sub-patch editor that owns the
+    /// menu's node, so the editor's full-snarl write-back (`show_subpatch_editors`)
+    /// doesn't clobber a placement the menu overlay wrote to the embedded copy.
+    /// `outer` is the first-level sub-patch node the menu lives in (`None` = the
+    /// menu sits on the tab canvas, where no editor clone exists to reconcile);
+    /// `inner` is the menu's NodeId, identical in the editor's clone (its slots
+    /// were seeded aligned).
+    pub(crate) fn write_menu_rect_to_editors(
+        &mut self, outer: Option<NodeId>, inner: NodeId, r: [f32; 4],
+    ) {
+        let Some(outer) = outer else { return; };
+        let val = serde_json::json!([r[0], r[1], r[2], r[3]]);
+        let active = self.active_tab;
+        for ed in self.sub_patch_editors.iter_mut() {
+            if ed.tab_idx == active
+                && ed.parent_editor_idx.is_none()
+                && ed.node_id == outer
+            {
+                if let Some(node) = ed.canvas.snarl.get_node_mut(inner) {
+                    node.params.insert("menu_rect".to_string(), val.clone());
+                }
+            }
+        }
+    }
+
     /// The overlay's live repaint rate (clamped to the settings bounds).
     pub(crate) fn overlay_fps(&self) -> u32 {
         self.settings.overlay_fps

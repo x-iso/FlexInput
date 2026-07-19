@@ -1142,6 +1142,16 @@ fn derive_stick_cardinals(upstream: &mut HashMap<String, Signal>) {
 /// pin on lower-priority inputs (hierarchy), unless that port's policy is ADD.
 const CONSUMED_PREFIX: &str = "__consumed__:";
 
+/// Reserved `state` key holding the cross-tick menu carry state
+/// (`NodeState::macro_prev` / `source_block` / `unblocked_src`). No real node
+/// ever has this uid.
+const MACRO_CARRY_UID: usize = usize::MAX;
+
+/// `collector_sigs` key prefix a Virtual Menu writes its SOURCE-BLOCK request
+/// under: `("{SRC_BLOCK_PREFIX}{device_id}", pin_id) = Bool(true)`. Drained at
+/// tick end into `NodeState::source_block` and applied to `dev_sigs` next tick.
+const SRC_BLOCK_PREFIX: &str = "__src_block__:";
+
 /// Write `__consumed__:{pin}` markers into `collector_sigs` under `key` for
 /// every pin a Remapper claimed — both the claimed cardinals/buttons and the
 /// underlying stick axes of any claimed cardinal (so a Combiner suppresses the
@@ -2536,10 +2546,30 @@ pub fn eval_graph_tick(
     // AutoMap split/collector, sink AutoMap, remapper — sees the processed
     // values. Avoids the prior leak where AutoMap pulled raw dev_sigs and
     // bypassed the source node's params.
-    let dev_sigs_owned: HashMap<(String, String), Signal> = {
+    let mut dev_sigs_owned: HashMap<(String, String), Signal> = {
         puffin::profile_scope!("preprocess_dev_sigs");
         preprocess_dev_sigs(graph, dev_sigs)
     };
+    // Apply the Virtual Menu SOURCE-BLOCK (one tick stale): zero every pointer
+    // pin an open menu asked to block last tick, so those analog inputs reach
+    // ONLY the menu's navigation — not a mouse mapping, another module, or a
+    // sink. Snapshot their pre-block values first so the menu itself still reads
+    // them (it's the reason they're blocked for everyone else). See
+    // `NodeState::source_block` / `unblocked_src`.
+    {
+        let req: Vec<(String, String)> = state.get(&MACRO_CARRY_UID)
+            .map(|s| s.source_block.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut snap: HashMap<(String, String), Signal> = HashMap::new();
+        for key in &req {
+            if let Some(&v) = dev_sigs_owned.get(key) {
+                snap.insert(key.clone(), v);
+            }
+            dev_sigs_owned.insert(key.clone(), pointer_block_off(&key.1));
+        }
+        let e = state.entry(MACRO_CARRY_UID).or_default();
+        e.unblocked_src = snap;
+    }
     let dev_sigs = &dev_sigs_owned;
 
     // Destructure with `ref mut` so the rest of the function can keep
@@ -2814,7 +2844,8 @@ pub fn eval_graph_tick(
                     || src_dev.starts_with("remap:")
                     || src_dev.starts_with("combiner:")
                     || src_dev.starts_with("lean:")
-                    || src_dev.starts_with("touchmap:");
+                    || src_dev.starts_with("touchmap:")
+                    || src_dev.starts_with("menumap:");
                 // Digital→analog trigger bridges (`btn_lt_dig`→`left_trigger`,
                 // `btn_rt_dig`→`right_trigger`) are a LOWEST-PRIORITY fallback:
                 // they only fill the analog trigger when no primary source — the
@@ -3250,6 +3281,25 @@ pub fn eval_graph_tick(
         collect_sink_sources(&graph.nodes, &mut sink_sources);
         publish_recv_feedback_frames(&graph.nodes, 0, false, dev_sigs, &collector_sigs, &sink_sources);
     }
+
+    // Snapshot this tick's macro-namespace values onto the reserved carry-over
+    // entry so next tick a macro READER that runs before its producer (a menu
+    // upstream of the Remapper targeting its Select/Show — a feedback cycle)
+    // still observes the value, one tick stale. Rebuilt from empty each tick so a
+    // released macro clears after one tick. See `NodeState::macro_prev`.
+    {
+        use flexinput_core::macros::{SIGS_NS, SIGS_NS_VEC2};
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        carry.macro_prev.clear();
+        carry.source_block.clear();
+        for ((k, pin), sig) in collector_sigs.iter() {
+            if k == SIGS_NS || k == SIGS_NS_VEC2 {
+                carry.macro_prev.insert((k.clone(), pin.clone()), *sig);
+            } else if let Some(dev) = k.strip_prefix(SRC_BLOCK_PREFIX) {
+                carry.source_block.insert((dev.to_string(), pin.clone()));
+            }
+        }
+    }
 }
 
 /// True if any network_recv node exists anywhere in the graph (recurses into
@@ -3270,6 +3320,17 @@ fn clamp_feedback_signal(_pin: &str, sig: Signal) -> Signal {
     match sig {
         Signal::Float(f) => Signal::Float(f.clamp(0.0, 1.0)),
         other => other,
+    }
+}
+
+/// Typed OFF value for a canonical pin the sink forces to zero because an open
+/// Virtual Menu is blocking it at the game boundary.
+fn pointer_block_off(pin_id: &str) -> Signal {
+    match automap::ALL_PINS.iter().find(|ap| ap.id == pin_id).map(|ap| ap.signal_type) {
+        Some(SignalType::Vec2) => Signal::Vec2(Vec2::ZERO),
+        Some(SignalType::Bool) => Signal::Bool(false),
+        Some(SignalType::Int)  => Signal::Int(0),
+        _ => Signal::Float(0.0),
     }
 }
 
@@ -5783,7 +5844,16 @@ fn eval_menu_node(
         });
         if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
     }
-    let read = |pin: &str| -> Option<Signal> { upstream.get(pin).copied() };
+    // Navigation reads: the source-block zeroed the menu's pointer pins in
+    // `dev_sigs` (so nothing ELSE in the patch sees them), but the menu is the
+    // reason they're blocked and must still steer from them — so it reads the
+    // pre-block snapshot, falling back to the (unblocked) bus for everything else.
+    let unblocked_nav: HashMap<(String, String), Signal> = state.get(&MACRO_CARRY_UID)
+        .map(|s| s.unblocked_src.clone()).unwrap_or_default();
+    let read_nav = |pin: &str| -> Option<Signal> {
+        unblocked_nav.get(&(dev_id.clone(), pin.to_string())).copied()
+            .or_else(|| upstream.get(pin).copied())
+    };
 
     let pstr = |k: &str, d: &'static str| -> String {
         snap.params.get(k).and_then(|v| v.as_str()).unwrap_or(d).to_string()
@@ -5793,6 +5863,16 @@ fn eval_menu_node(
     let sel_on = pstr("select_on", "release");
     let deadzone = snap.params.get("pointer_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
     let suppress = snap.params.get("suppress_while_open").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Suppression scope: "full" blocks every enabled driver while the menu is
+    // open; "partial" blocks a driver only while it's actually being used (past
+    // its deadzone / tilting / touching), so an idle enabled driver still reaches
+    // the game; "latch" gives the FIRST driver to engage exclusive ownership —
+    // it alone steers and is blocked, every other driver passes through
+    // untouched until the owner disengages (back to deadzone / finger up /
+    // gyro cursor re-centred).
+    let sup_mode = pstr("suppress_mode", "partial");
+    let suppress_full = sup_mode == "full";
+    let suppress_latch = sup_mode == "latch";
     // Sticky hover: keep the last highlighted zone when the pointer returns
     // to the deadzone (flick-and-release selection). Off = the highlight
     // clears, and a release inside the deadzone selects nothing.
@@ -5814,9 +5894,18 @@ fn eval_menu_node(
     let gyro_sens = snap.params.get("ptr_gyro_sens").and_then(|v| v.as_f64()).unwrap_or(4.0) as f32;
 
     // ── Controls (macro-style targets OR wired pins) ──
+    // A macro target resolves to this tick's published value first, else the
+    // previous tick's carry-over snapshot. The snapshot is what makes a Select /
+    // Show mapping work when the menu sits UPSTREAM of the Remapper that targets
+    // it: that Remapper is forced to evaluate AFTER the menu this tick (a
+    // feedback cycle), so `collector_sigs` doesn't hold the value yet — one tick
+    // stale is imperceptible at kHz. Captured before the mutable `state.entry`
+    // below so the immutable borrow ends first (NLL).
+    let macro_prev = state.get(&MACRO_CARRY_UID).map(|s| &s.macro_prev);
     let macro_on = |cs: &HashMap<(String, String), Signal>, pin: String| -> bool {
-        cs.get(&(flexinput_core::macros::SIGS_NS.to_string(), pin))
-            .map(|s| s.as_bool()).unwrap_or(false)
+        let key = (flexinput_core::macros::SIGS_NS.to_string(), pin);
+        cs.get(&key).map(|s| s.as_bool()).unwrap_or(false)
+            || macro_prev.and_then(|m| m.get(&key)).map(|s| s.as_bool()).unwrap_or(false)
     };
     let show_raw = inputs.get(1).and_then(|s| *s).map(|s| s.as_bool()).unwrap_or(false)
         || (!menu_id.is_empty()
@@ -5836,8 +5925,9 @@ fn eval_menu_node(
     //     overlay's linger animation keys off changes, so it can't miss a
     //     short pulse at low overlay FPS),
     // [10]/[11] gyro pointer accumulator X/Y (integrated rad, reset while
-    //     closed so the pointer always starts centered) ──
-    const SLOTS: usize = 12;
+    //     closed so the pointer always starts centered),
+    // [12] latch-mode owner (0 = none, 1 = LS, 2 = RS, 3 = touch, 4 = gyro) ──
+    const SLOTS: usize = 13;
     const SELECT_PULSE_MS: f32 = 120.0;
     let ns = state.entry(uid).or_insert_with(NodeState::default);
     while ns.aux_f32.len() < SLOTS { ns.aux_f32.push(0.0); }
@@ -5846,17 +5936,19 @@ fn eval_menu_node(
     let prev_sel = ns.aux_f32[2] > 0.5;
     let prev_hover: i32 = ns.aux_f32[3] as i32 - 1;
     let prev_click = ns.aux_f32[6] > 0.5;
-    let click_now = read("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
+    // The touchpad click doubles as the Select gesture, and it may itself be a
+    // blocked pin — read it unblocked.
+    let click_now = read_nav("btn_touchpad").map(|s| s.as_bool()).unwrap_or(false);
 
     // ── Pointer → unit point in the menu rect (0..1, y down) + a "touching"
     // gate for activation_mode = touch. Enabled sources SUM into one
     // deflection vector (stick convention, +Y up); the wired Pointer inlet
     // overrides them all. ──
     let stick_read = |name: &str| -> Vec2 {
-        if let Some(Signal::Vec2(v)) = read(name) { return v; }
+        if let Some(Signal::Vec2(v)) = read_nav(name) { return v; }
         Vec2::new(
-            read(&format!("{name}_x")).map(|s| s.as_float()).unwrap_or(0.0),
-            read(&format!("{name}_y")).map(|s| s.as_float()).unwrap_or(0.0),
+            read_nav(&format!("{name}_x")).map(|s| s.as_float()).unwrap_or(0.0),
+            read_nav(&format!("{name}_y")).map(|s| s.as_float()).unwrap_or(0.0),
         )
     };
     // Deflection vector (+Y up) → unit point: full deflection = rect edge.
@@ -5865,50 +5957,114 @@ fn eval_menu_node(
     };
     // Accumulated gyro tilt of this many radians = full deflection.
     const GYRO_FULL_RAD: f32 = 0.35;
+    // Gyro rate (post-noise-floor) above this counts as "actively used" for
+    // partial suppression — the source-block noise floor already zeros rest.
+    const GYRO_ACTIVE_RATE: f32 = 0.05;
+    // Per-source "actively used" flags (past deadzone / touching / tilting) —
+    // partial suppression blocks only the sources that are actually steering.
+    let mut ls_active = false;
+    let mut rs_active = false;
+    let mut touch_active_now = false;
+    let mut gyro_active = false;
+    // Latch-mode owner this tick (0 = none, 1 = LS, 2 = RS, 3 = touch,
+    // 4 = gyro) — read by the suppression block below.
+    let mut latched: u8 = 0;
     let (ptr_unit, touching): (Option<(f32, f32)>, bool) = if let Some(v) = wired_ptr {
+        ns.aux_f32[12] = 0.0;
         let on = v.length() > deadzone;
         (if on { Some(deflect_to_unit(v)) } else { None }, on)
     } else {
-        let mut v = Vec2::ZERO;
+        // Per-source candidate vectors, summed (or latch-selected) below.
         let mut touch_on = false;
-        if src_ls { v += stick_read("left_stick"); }
-        if src_rs { v += stick_read("right_stick"); }
+        let ls_vec = if src_ls { stick_read("left_stick") } else { Vec2::ZERO };
+        ls_active = src_ls && ls_vec.length() > deadzone;
+        let rs_vec = if src_rs { stick_read("right_stick") } else { Vec2::ZERO };
+        rs_active = src_rs && rs_vec.length() > deadzone;
+        let mut touch_vec = Vec2::ZERO;
         if src_touch {
             let (px, py, pa) = if touch_which == "touch2" {
                 ("touch2_x", "touch2_y", "touch2_active")
             } else {
                 ("touch1_x", "touch1_y", "touch1_active")
             };
-            if read(pa).map(|s| s.as_bool()).unwrap_or(false) {
+            if read_nav(pa).map(|s| s.as_bool()).unwrap_or(false) {
                 touch_on = true;
+                touch_active_now = true;
                 let (ux, uy) = tz::pad_point_to_unit(
-                    read(px).map(|s| s.as_float()).unwrap_or(0.0),
-                    read(py).map(|s| s.as_float()).unwrap_or(0.0),
+                    read_nav(px).map(|s| s.as_float()).unwrap_or(0.0),
+                    read_nav(py).map(|s| s.as_float()).unwrap_or(0.0),
                 );
                 // Absolute pad position → centered deflection: a lone touch
                 // source reproduces the old absolute mapping exactly.
-                v += Vec2::new((ux - 0.5) * 2.0, (0.5 - uy) * 2.0);
+                touch_vec = Vec2::new((ux - 0.5) * 2.0, (0.5 - uy) * 2.0);
             }
         }
-        if src_gyro {
-            // Integrate rotation rate while open (tilt to point); closed
-            // resets so the pointer starts centered on every open. Axis
-            // pairs mirror the 3DOF→2D module: X ← yaw (gz) or roll (gx),
-            // Y ← pitch (gy).
-            if prev_open {
-                let gx = read("gyro_x").map(|s| s.as_float()).unwrap_or(0.0);
-                let gy = read("gyro_y").map(|s| s.as_float()).unwrap_or(0.0);
-                let gz = read("gyro_z").map(|s| s.as_float()).unwrap_or(0.0);
-                let (dx, dy) = if gyro_axes == "pitch_roll" { (gx, gy) } else { (gz, gy) };
-                let gain = gyro_sens * 10.0 / GYRO_FULL_RAD;
-                ns.aux_f32[10] = (ns.aux_f32[10] + dx * dt * gain).clamp(-1.5, 1.5);
-                ns.aux_f32[11] = (ns.aux_f32[11] + dy * dt * gain).clamp(-1.5, 1.5);
-            } else {
-                ns.aux_f32[10] = 0.0;
-                ns.aux_f32[11] = 0.0;
+        // Gyro rate is read BEFORE the latch decision — the decision needs the
+        // gyro "engaged" signal, and integration below is gated on ownership.
+        // Axis pairs mirror the 3DOF→2D module: X ← yaw (gz) or roll (gx),
+        // Y ← pitch (gy).
+        let (g_rate, g_delta) = if src_gyro && prev_open {
+            let gx = read_nav("gyro_x").map(|s| s.as_float()).unwrap_or(0.0);
+            let gy = read_nav("gyro_y").map(|s| s.as_float()).unwrap_or(0.0);
+            let gz = read_nav("gyro_z").map(|s| s.as_float()).unwrap_or(0.0);
+            let (dx, dy) = if gyro_axes == "pitch_roll" { (gx, gy) } else { (gz, gy) };
+            ((gx * gx + gy * gy + gz * gz).sqrt(), Vec2::new(dx, dy))
+        } else {
+            (0.0, Vec2::ZERO)
+        };
+        let gyro_engaged = src_gyro && prev_open
+            && (Vec2::new(ns.aux_f32[10], ns.aux_f32[11]).length() > deadzone
+                || g_rate > GYRO_ACTIVE_RATE);
+
+        // Latch mode: the FIRST driver to engage owns the menu — it alone
+        // steers and gets blocked; the others are ignored here and keep
+        // passing to the game until the owner disengages (stick back inside
+        // the deadzone / finger up / gyro cursor re-centred), at which point
+        // the next engaged driver can take over.
+        if suppress_latch {
+            latched = if prev_open { ns.aux_f32[12] as u8 } else { 0 };
+            let engaged = [false, ls_active, rs_active, touch_active_now, gyro_engaged];
+            if latched != 0 && !engaged[latched as usize] { latched = 0; }
+            if latched == 0 && prev_open {
+                latched = engaged.iter().position(|&e| e).map(|i| i as u8).unwrap_or(0);
             }
-            v += Vec2::new(ns.aux_f32[10], ns.aux_f32[11]);
         }
+        ns.aux_f32[12] = latched as f32;
+
+        // Integrate rotation rate while gyro steers (tilt to point) — in latch
+        // mode only while it owns the latch; closed / ignored resets so the
+        // pointer starts centered whenever gyro (re)takes control.
+        if src_gyro && prev_open && (!suppress_latch || latched == 4) {
+            let gain = gyro_sens * 10.0 / GYRO_FULL_RAD;
+            ns.aux_f32[10] = (ns.aux_f32[10] + g_delta.x * dt * gain).clamp(-1.5, 1.5);
+            ns.aux_f32[11] = (ns.aux_f32[11] + g_delta.y * dt * gain).clamp(-1.5, 1.5);
+            // "Actively used" latches off the gyro CURSOR being out of the
+            // deadzone, not the rotation rate alone: the accumulator is an
+            // integrator, so its deflection persists while the user holds
+            // on a target even though the rate drops to ~0 — a rate-only
+            // flag flickers there and leaks single ticks of gyro to e.g. a
+            // mouse mapping between block requests. The rate term only
+            // covers the first few ms of a tilt, before the cursor crosses
+            // the deadzone.
+            gyro_active = Vec2::new(ns.aux_f32[10], ns.aux_f32[11]).length() > deadzone
+                || g_rate > GYRO_ACTIVE_RATE;
+        } else {
+            ns.aux_f32[10] = 0.0;
+            ns.aux_f32[11] = 0.0;
+        }
+        let gyro_vec = Vec2::new(ns.aux_f32[10], ns.aux_f32[11]);
+
+        let mut v = if suppress_latch {
+            match latched {
+                1 => ls_vec,
+                2 => rs_vec,
+                3 => touch_vec,
+                4 => gyro_vec,
+                _ => Vec2::ZERO,
+            }
+        } else {
+            ls_vec + rs_vec + touch_vec + gyro_vec
+        };
         if v.length() > 1.0 { v = v.normalize(); }
         let past_dz = v.length() > deadzone;
         (
@@ -6047,9 +6203,24 @@ fn eval_menu_node(
         }
     }
 
-    // Publish button pins with the shared release rule: assert while active,
-    // else write the released value only when upstream doesn't already emit
-    // the pin (keeps passthrough intact).
+    // Republish the FULL upstream bus under `menumap:{uid}` — a passthrough,
+    // exactly like Touch Zones' `touchmap:{uid}`. Previously only card overrides
+    // and suppression zeros were written, leaving `menumap:` a SPARSE map: the
+    // AutoMap output port had no bus to glow from, and downstream consumers had
+    // to fall back to the raw device for every un-overridden pin (so suppression
+    // leaked). Card overrides + suppression below overwrite specific pins on top
+    // of this complete bus.
+    for (pin, sig) in &upstream {
+        collector_sigs.insert((key.clone(), pin.clone()), *sig);
+    }
+
+    // Card button pins. While the card is active, assert the pin. When the card
+    // is INACTIVE we must still drive the pin to OFF unless the passthrough bus
+    // already carries it: the select pulse is momentary, and a virtual sink
+    // LATCHES the last value for any pin it stops receiving — so a card output
+    // the source device never emits (not in `upstream`) would stick "pressed"
+    // forever after one selection. A pin that IS on the bus keeps its passthrough
+    // value (OR semantics — a real press of the same button still comes through).
     for (pin, on) in &button_on {
         let sig_type = automap::ALL_PINS.iter()
             .find(|ap| ap.id == pin.as_str())
@@ -6062,38 +6233,93 @@ fn eval_menu_node(
                 _                 => Signal::Bool(true),
             };
             collector_sigs.insert((key.clone(), pin.clone()), sig);
-        } else {
-            if read(pin).is_some() { continue; }
-            let sig = match sig_type {
+        } else if !upstream.contains_key(pin) {
+            let off = match sig_type {
                 SignalType::Float => Signal::Float(0.0),
                 SignalType::Int   => Signal::Int(0),
                 SignalType::Vec2  => continue,
                 _                 => Signal::Bool(false),
             };
-            collector_sigs.insert((key.clone(), pin.clone()), sig);
+            collector_sigs.insert((key.clone(), pin.clone()), off);
         }
     }
 
-    // ── Suppress every enabled pointing input on the passthrough while open,
-    // so the game doesn't see the sticks/finger/gyro steering the menu ──
+    // ── Suppress the pointing inputs steering the menu ──
+    //
+    // Two layers. (1) A SOURCE-BLOCK request keyed by the physical source device
+    // — applied to `dev_sigs` at the start of NEXT tick so the blocked pins reach
+    // ONLY the menu's navigation, not a mouse mapping, another module, or any
+    // sink (the menu reads the pre-block snapshot to keep steering). (2) Zeroing
+    // the same pins on the menu's OWN passthrough now, so a downstream module on
+    // the menu's route doesn't react this tick before the 1-tick source-block
+    // lands. `suppress_full` blocks every enabled driver; "latch" blocks ONLY
+    // the driver currently owning the menu (the others pass untouched);
+    // otherwise (partial) only the drivers actually being used (past deadzone /
+    // touching / tilting) are blocked, so an idle enabled driver still reaches
+    // the game.
     if suppress && open && wired_ptr.is_none() {
-        for (on, name) in [(src_ls, "left_stick"), (src_rs, "right_stick")] {
+        let (block_ls, block_rs, block_touch, block_gyro) = if suppress_latch {
+            (latched == 1, latched == 2, latched == 3, latched == 4)
+        } else {
+            (src_ls    && (suppress_full || ls_active),
+             src_rs    && (suppress_full || rs_active),
+             src_touch && (suppress_full || touch_active_now),
+             src_gyro  && (suppress_full || gyro_active))
+        };
+
+        // (2) Zero the blocked pins on our own passthrough bus.
+        for (on, name) in [(block_ls, "left_stick"), (block_rs, "right_stick")] {
             if !on { continue; }
             collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(Vec2::ZERO));
             collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(0.0));
             collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(0.0));
         }
-        if src_touch {
+        if block_touch {
             collector_sigs.insert((key.clone(), format!("{touch_which}_active")), Signal::Bool(false));
             collector_sigs.insert((key.clone(), format!("{touch_which}_x")), Signal::Float(0.0));
             collector_sigs.insert((key.clone(), format!("{touch_which}_y")), Signal::Float(0.0));
-            // The pad click doubles as the Select gesture — keep it from the
-            // game too while the menu is up.
             collector_sigs.insert((key.clone(), "btn_touchpad".to_string()), Signal::Bool(false));
         }
-        if src_gyro {
+        if block_gyro {
             for pin in ["gyro_x", "gyro_y", "gyro_z"] {
                 collector_sigs.insert((key.clone(), pin.to_string()), Signal::Float(0.0));
+            }
+        }
+
+        // (1) Publish the SOURCE-BLOCK request (drained into NodeState::source_block
+        // at tick end, applied to dev_sigs next tick).
+        if !dev_id.is_empty() {
+            let bk = format!("{SRC_BLOCK_PREFIX}{dev_id}");
+            let mut blocked: Vec<String> = Vec::new();
+            if block_ls { for p in ["left_stick", "left_stick_x", "left_stick_y"] { blocked.push(p.to_string()); } }
+            if block_rs { for p in ["right_stick", "right_stick_x", "right_stick_y"] { blocked.push(p.to_string()); } }
+            if block_touch {
+                blocked.push(format!("{touch_which}_active"));
+                blocked.push(format!("{touch_which}_x"));
+                blocked.push(format!("{touch_which}_y"));
+                blocked.push("btn_touchpad".to_string());
+            }
+            if block_gyro { for p in ["gyro_x", "gyro_y", "gyro_z"] { blocked.push(p.to_string()); } }
+            for p in blocked {
+                collector_sigs.insert((bk.clone(), p), Signal::Bool(true));
+            }
+        }
+
+        // Re-derive stick cardinals from the (now zeroed) axes so a suppressed
+        // stick can't leak through synthetic left_stick_up/down/... pins, which
+        // a pass-through Collector would otherwise copy verbatim from the bus.
+        let mut local: HashMap<String, Signal> = HashMap::new();
+        for axis in ["left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"] {
+            if let Some(&sig) = collector_sigs.get(&(key.clone(), axis.to_string())) {
+                local.insert(axis.to_string(), sig);
+            }
+        }
+        derive_stick_cardinals(&mut local);
+        for (k, v) in local {
+            if k.contains("_stick_") && (k.ends_with("_up") || k.ends_with("_down")
+                || k.ends_with("_left") || k.ends_with("_right"))
+            {
+                collector_sigs.insert((key.clone(), k), v);
             }
         }
     }
@@ -7790,6 +8016,151 @@ mod trigger_tests {
             "released mapping must drop the port back to false");
     }
 
+    // A Virtual Menu placed UPSTREAM of the Remapper that maps a button to its
+    // Select target is a feedback cycle: the Remapper is forced to evaluate
+    // AFTER the menu, so this tick's `collector_sigs` never carries the Select
+    // value when the menu reads it. The cross-tick macro carry-over
+    // (`NodeState::macro_prev`) delivers it one tick later, so `select_on =
+    // "press"` fires. Also exercises the Show target opening the menu the same
+    // way. Node order [src, menu, remap, sink] reproduces the cyclic fallback
+    // (menu before its producer).
+    #[test]
+    fn menu_select_from_downstream_remapper_via_carryover() {
+        let dev = "gilrs:switch_pro:0";
+        let src = source_node(1, dev, 0.0);
+
+        let mut menu = empty_node(2, "module.menu");
+        menu.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        menu.params.insert("menu_id".into(), Value::String("abcd1234".into()));
+        menu.params.insert("select_on".into(), Value::String("press".into()));
+        menu.params.insert("col_edges".into(), serde_json::json!([0.5]));
+        menu.params.insert("row_edges".into(), serde_json::json!([0.5]));
+        menu.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        menu.params.insert("zone_maps".into(), serde_json::json!([
+            { "f": 0, "z": 0, "in": ["menu_sel"], "out": ["btn_north"] }
+        ]));
+        menu.n_outputs = 3;
+        menu.output_pin_ids = vec![
+            "automap_pass".into(), "menu_open".into(), "menu_hover".into(),
+        ];
+
+        let mut remap = empty_node(3, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_start"], "out": ["menu:abcd1234_show"] },
+            { "in": ["btn_south"], "out": ["menu:abcd1234_sel"] },
+        ]));
+        remap.input_sources = vec![Some((0, 0))];
+        remap.n_outputs = 1;
+
+        // Sink pulls the menu's published bus (where the zone card writes btn_north).
+        let sink = sink_node(4, "virtual.xinput:0", "menumap:2", false);
+
+        let graph = ProcessingGraph { nodes: vec![src, menu, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // btn_start held (Show), stick points top-left (zone 0); btn_south varies.
+        let sigs = |south: bool| {
+            let mut m = HashMap::new();
+            m.insert((dev.to_string(), "btn_start".to_string()), Signal::Bool(true));
+            m.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(south));
+            m.insert((dev.to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(-0.8, 0.8)));
+            m
+        };
+        let north = |o: &TickOutput| o.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), "btn_north".to_string()))
+            .map(|s| s.as_bool()).unwrap_or(false);
+        let menu_open = |o: &TickOutput| o.last_outputs.get(&2)
+            .and_then(|v| v.get(1)).copied().flatten().map(|s| s.as_bool()).unwrap_or(false);
+
+        // Warm up: the Show macro opens the menu one tick after it's published.
+        for _ in 0..4 {
+            eval_graph_tick(&graph, &mut state, &sigs(false), 0.016, &mut out);
+        }
+        assert!(menu_open(&out), "macro Show target must open the menu via the carry-over");
+        assert!(!north(&out), "no selection before Select is pressed");
+        let hover = out.last_outputs.get(&2).and_then(|v| v.get(2)).copied().flatten();
+        assert_eq!(hover, Some(Signal::Float(0.0)), "stick must hover zone 0 after warm-up");
+
+        // Press Select: the menu sees a STALE (false) value this tick — the
+        // Remapper only publishes it now, one node later …
+        eval_graph_tick(&graph, &mut state, &sigs(true), 0.016, &mut out);
+        assert!(!north(&out), "Select is one node downstream — not visible the same tick");
+        // … and reads it via the carry-over on the next tick, firing the card
+        // whose btn_north reaches the sink through the menu's published bus.
+        eval_graph_tick(&graph, &mut state, &sigs(true), 0.016, &mut out);
+        assert!(north(&out),
+            "press-mode Select from a downstream Remapper must fire the zone card via the carry-over");
+    }
+
+    // The Virtual Menu's SOURCE-BLOCK must suppress a navigation input even when a
+    // PARALLEL Combiner port carries a RAW copy that bypasses the menu — the exact
+    // leak the user hit (SORT picks the raw port over the menu's zero). Blocking at
+    // the source (dev_sigs) zeroes the raw port too, so nothing reaches the sink.
+    #[test]
+    fn menu_blocks_navigation_input_at_sink_despite_parallel_raw_port() {
+        let dev = "gilrs:switch_pro:0";
+        let src = source_node(1, dev, 0.0);
+
+        // Menu opened by a Remapper's Show macro; suppresses the left stick.
+        let mut menu = empty_node(2, "module.menu");
+        menu.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        menu.params.insert("menu_id".into(), Value::String("abcd1234".into()));
+        menu.n_outputs = 3;
+        menu.output_pin_ids = vec![
+            "automap_pass".into(), "menu_open".into(), "menu_hover".into(),
+        ];
+
+        let mut remap = empty_node(3, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_start"], "out": ["menu:abcd1234_show"] },
+        ]));
+        remap.input_sources = vec![Some((0, 0))];
+        remap.n_outputs = 1;
+
+        // Combiner: port 0 = menu bus (suppressed), port 1 = RAW device (leak path).
+        let mut comb = empty_node(4, "module.automap_combiner");
+        comb.params.insert("_automap_input_devs".into(), Value::Array(vec![
+            Value::String(String::new()), Value::String(dev.into()),
+        ]));
+        comb.params.insert("_automap_input_collectors".into(), Value::Array(vec![
+            Value::String("menumap:2".into()), Value::String(String::new()),
+        ]));
+        comb.input_sources = vec![Some((0, 0)), Some((1, 0))];
+
+        // sink_node sets automap_fallback_dev = the switch_pro pad — the physical
+        // source the menu keys its block by.
+        let sink = sink_node(5, "virtual.xinput:0", "combiner:4", false);
+
+        let graph = ProcessingGraph { nodes: vec![src, menu, remap, comb, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        // btn_start opens the menu; the left stick is fully deflected.
+        let sigs = || {
+            let mut m = HashMap::new();
+            m.insert((dev.to_string(), "btn_start".to_string()), Signal::Bool(true));
+            m.insert((dev.to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(0.9, 0.0)));
+            m.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.9));
+            m
+        };
+        for _ in 0..4 { eval_graph_tick(&graph, &mut state, &sigs(), 0.016, &mut out); }
+
+        assert!(out.last_outputs.get(&2).and_then(|v| v.get(1)).copied().flatten()
+            .map(|s| s.as_bool()).unwrap_or(false), "menu should be open after warm-up");
+
+        // Combiner SORT lets the raw port's 0.9 win, but the sink block zeroes it.
+        let lx = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick_x".to_string()))
+            .map(|s| s.as_float());
+        let lv = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "left_stick".to_string()))
+            .and_then(|s| if let Signal::Vec2(v) = s { Some(v.x) } else { None });
+        let v = lx.or(lv).unwrap_or(0.0);
+        assert!(v.abs() < 1e-4,
+            "menu must suppress the navigation stick at the game boundary even via a parallel raw port, got {v}");
+    }
+
     // An analog-mode mapping targeting a Float macro port passes the live
     // stick magnitude through — continuous, not a binary gate — and a Bool
     // port fed by the same analog write thresholds at 0.5.
@@ -9445,6 +9816,221 @@ mod menu_eval_tests {
         // Selection mirror: zone 3, seq 1 — persists for the overlay's linger.
         assert_eq!(out[out.len() - 2], Some(Signal::Vec2(Vec2::new(3.0, 1.0))));
         assert_eq!(out[out.len() - 1], None, "pointer mirror clears when closed");
+    }
+
+    // The menu republishes the FULL upstream bus under `menumap:{uid}` (like
+    // Touch Zones' touchmap:), not a sparse override map — so the AutoMap output
+    // port glows and downstream reads a complete, coherently-suppressed bus.
+    #[test]
+    fn passthrough_republishes_full_bus() {
+        // Closed menu = pure passthrough: the stick passes straight through.
+        let snap = menu_snap(8);
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+        eval_menu_node(&snap, 8, &show(false), &dev_stick(0.6, -0.3), &mut c, &mut state, 0.016);
+        assert_eq!(
+            c.get(&("menumap:8".to_string(), "left_stick".to_string())).copied(),
+            Some(Signal::Vec2(Vec2::new(0.6, -0.3))),
+            "closed menu passes the stick through under menumap:"
+        );
+
+        // Open with suppression OFF: still passes through (suppression is opt-in).
+        let mut snap2 = menu_snap(9);
+        snap2.params.insert("suppress_while_open".into(), Value::Bool(false));
+        let mut c2: HashMap<(String, String), Signal> = HashMap::new();
+        let mut st2 = HashMap::new();
+        eval_menu_node(&snap2, 9, &show(true), &dev_stick(0.6, -0.3), &mut c2, &mut st2, 0.016);
+        assert_eq!(
+            c2.get(&("menumap:9".to_string(), "left_stick".to_string())).copied(),
+            Some(Signal::Vec2(Vec2::new(0.6, -0.3))),
+            "suppression off → stick passes through even while open"
+        );
+    }
+
+    // Suppression zeros the enabled pointer pins on the menu's OWN passthrough
+    // AND publishes a SOURCE-BLOCK request keyed by the physical source device
+    // (`__src_block__:{dev}`), drained into `dev_sigs` next tick so the input
+    // reaches ONLY the menu's navigation — not a mouse mapping, another module,
+    // or the pad.
+    #[test]
+    fn suppress_publishes_source_block() {
+        let snap = menu_snap(11); // default: suppress = true, left-stick pointer
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+        // Open (wired Show) while the left stick is deflected (active).
+        eval_menu_node(&snap, 11, &show(true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
+
+        let sk = format!("{SRC_BLOCK_PREFIX}dev");
+        // Zeroed on the menu's own passthrough bus …
+        assert_eq!(
+            c.get(&("menumap:11".to_string(), "left_stick".to_string())).copied(),
+            Some(Signal::Vec2(Vec2::ZERO)),
+        );
+        // … and the active driver's pins are flagged on the source-block channel.
+        for pin in ["left_stick", "left_stick_x", "left_stick_y"] {
+            assert_eq!(
+                c.get(&(sk.clone(), pin.to_string())).map(|s| s.as_bool()),
+                Some(true),
+                "{pin} must be requested for source-block while open",
+            );
+        }
+        // A source that ISN'T an enabled driver is not blocked.
+        assert!(c.get(&(sk.clone(), "right_stick".to_string())).is_none());
+
+        // Partial mode: an IDLE enabled driver (stick inside deadzone) is NOT
+        // blocked, so it still reaches the game.
+        let mut c_idle: HashMap<(String, String), Signal> = HashMap::new();
+        let mut st_idle = HashMap::new();
+        eval_menu_node(&snap, 11, &show(true), &dev_stick(0.05, 0.0), &mut c_idle, &mut st_idle, 0.016);
+        assert!(c_idle.get(&(sk.clone(), "left_stick".to_string())).is_none(),
+            "partial mode must not block an idle driver");
+
+        // Full mode: the enabled driver is blocked even when idle.
+        let mut snap_full = menu_snap(14);
+        snap_full.params.insert("suppress_mode".into(), Value::String("full".into()));
+        let mut c_full: HashMap<(String, String), Signal> = HashMap::new();
+        let mut st_full = HashMap::new();
+        eval_menu_node(&snap_full, 14, &show(true), &dev_stick(0.0, 0.0), &mut c_full, &mut st_full, 0.016);
+        assert_eq!(
+            c_full.get(&(format!("{SRC_BLOCK_PREFIX}dev"), "left_stick".to_string())).map(|s| s.as_bool()),
+            Some(true), "full mode blocks the enabled driver even when idle",
+        );
+
+        // Suppression OFF → no block published.
+        let mut snap2 = menu_snap(12);
+        snap2.params.insert("suppress_while_open".into(), Value::Bool(false));
+        let mut c2: HashMap<(String, String), Signal> = HashMap::new();
+        let mut st2 = HashMap::new();
+        eval_menu_node(&snap2, 12, &show(true), &dev_stick(0.8, -0.8), &mut c2, &mut st2, 0.016);
+        assert!(c2.get(&(sk, "left_stick".to_string())).is_none());
+    }
+
+    // Partial suppression must LATCH gyro as the active driver off the menu
+    // CURSOR being out of the deadzone: the rotation rate drops to ~0 whenever
+    // the user holds the cursor on a target, and a rate-only flag would unblock
+    // the source for those ticks — leaking gyro to e.g. a mouse mapping one
+    // tick at a time while the menu is being steered.
+    #[test]
+    fn gyro_partial_suppress_latches_while_cursor_deflected() {
+        let mut snap = menu_snap(15);
+        snap.params.insert("ptr_ls".into(), Value::Bool(false));
+        snap.params.insert("ptr_gyro".into(), Value::Bool(true));
+        let dev_gyro = |rate: f32| -> HashMap<(String, String), Signal> {
+            let mut m = HashMap::new();
+            for pin in ["gyro_x", "gyro_y", "gyro_z"] {
+                m.insert(("dev".to_string(), pin.to_string()), Signal::Float(rate));
+            }
+            m
+        };
+        let gk = (format!("{SRC_BLOCK_PREFIX}dev"), "gyro_x".to_string());
+        let mut state = HashMap::new();
+
+        // Tick 1 opens (prev_open false → no integration yet); tick 2 rotates,
+        // driving the cursor past the deadzone. Fresh collector map per tick,
+        // like the real pipeline — a stale block entry can't fake a pass.
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        eval_menu_node(&snap, 15, &show(true), &dev_gyro(1.0), &mut c, &mut state, 0.016);
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        eval_menu_node(&snap, 15, &show(true), &dev_gyro(1.0), &mut c, &mut state, 0.016);
+        assert_eq!(c.get(&gk).map(|s| s.as_bool()), Some(true),
+            "rotating gyro must be source-blocked in partial mode");
+
+        // Rotation stops (holding on a target): the cursor is still deflected,
+        // so the block must hold.
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        eval_menu_node(&snap, 15, &show(true), &dev_gyro(0.0), &mut c, &mut state, 0.016);
+        assert_eq!(c.get(&gk).map(|s| s.as_bool()), Some(true),
+            "block must latch while the gyro cursor is out of the deadzone");
+
+        // A menu opened without ever tilting keeps gyro passing in partial mode.
+        let mut st2 = HashMap::new();
+        let mut c2: HashMap<(String, String), Signal> = HashMap::new();
+        for _ in 0..3 {
+            c2 = HashMap::new();
+            eval_menu_node(&snap, 15, &show(true), &dev_gyro(0.0), &mut c2, &mut st2, 0.016);
+        }
+        assert!(c2.get(&gk).is_none(),
+            "an untouched gyro driver must not be blocked in partial mode");
+    }
+
+    // Latch mode: the first driver to engage owns the menu exclusively — it is
+    // blocked at the source while every OTHER enabled driver keeps passing to
+    // the game — until it disengages, at which point the next engaged driver
+    // takes over.
+    #[test]
+    fn latch_suppress_first_engaged_driver_owns_menu() {
+        let mut snap = menu_snap(16);
+        snap.params.insert("ptr_ls".into(), Value::Bool(true));
+        snap.params.insert("ptr_gyro".into(), Value::Bool(true));
+        snap.params.insert("suppress_mode".into(), Value::String("latch".into()));
+        let dev = |x: f32, y: f32, rate: f32| -> HashMap<(String, String), Signal> {
+            let mut m = HashMap::new();
+            m.insert(("dev".to_string(), "left_stick".to_string()), Signal::Vec2(Vec2::new(x, y)));
+            for pin in ["gyro_x", "gyro_y", "gyro_z"] {
+                m.insert(("dev".to_string(), pin.to_string()), Signal::Float(rate));
+            }
+            m
+        };
+        let sk = format!("{SRC_BLOCK_PREFIX}dev");
+        let lk = (sk.clone(), "left_stick".to_string());
+        let gk = (sk.clone(), "gyro_x".to_string());
+        let mut state = HashMap::new();
+
+        // Tick 1 opens (no engagement while prev_open is false); tick 2: LS
+        // deflects AND gyro rotates at once — LS engages first and takes the
+        // latch, so LS is blocked while gyro passes untouched.
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        eval_menu_node(&snap, 16, &show(true), &dev(0.8, -0.8, 1.0), &mut c, &mut state, 0.016);
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        eval_menu_node(&snap, 16, &show(true), &dev(0.8, -0.8, 1.0), &mut c, &mut state, 0.016);
+        assert_eq!(c.get(&lk).map(|s| s.as_bool()), Some(true),
+            "the latched driver must be source-blocked");
+        assert!(c.get(&gk).is_none(),
+            "a non-latched driver must keep passing while another owns the menu");
+
+        // LS returns to the deadzone while gyro keeps rotating: ownership hands
+        // over — gyro is now blocked, LS passes again.
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        eval_menu_node(&snap, 16, &show(true), &dev(0.0, 0.0, 1.0), &mut c, &mut state, 0.016);
+        assert!(c.get(&lk).is_none(),
+            "a disengaged driver must be released from the block");
+        assert_eq!(c.get(&gk).map(|s| s.as_bool()), Some(true),
+            "the next engaged driver must take over the latch");
+    }
+
+    // A selected zone card must fire a momentary PULSE and then RELEASE, even
+    // when its output pin isn't on the passthrough bus (the source device never
+    // emits it). Without an explicit off-write the pin would latch "pressed" on
+    // the virtual sink forever — the stuck-selection regression.
+    #[test]
+    fn selected_card_pulse_releases_not_latches() {
+        let mut snap = menu_snap(13);
+        snap.params.insert("select_on".into(), Value::String("press".into()));
+        snap.params.insert("zone_maps".into(), serde_json::json!([
+            { "f": 0, "z": 3, "in": ["menu_sel"], "out": ["btn_north"] }
+        ]));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+        // Wired Show + Select: [_, Show, Select, _].
+        let sel = |sh: bool, se: bool|
+            vec![None, Some(Signal::Bool(sh)), Some(Signal::Bool(se)), None];
+
+        // Open + hover zone 3, then press Select (rising edge selects).
+        eval_menu_node(&snap, 13, &sel(true, false), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
+        eval_menu_node(&snap, 13, &sel(true, true), &dev_stick(0.8, -0.8), &mut c, &mut state, 0.016);
+        assert_eq!(
+            c.get(&("menumap:13".to_string(), "btn_north".to_string())).map(|s| s.as_bool()),
+            Some(true), "the select pulse asserts the zone card's output",
+        );
+
+        // Hold past the pulse (120 ms / 16 ms ≈ 8 ticks) with Select released.
+        for _ in 0..12 {
+            eval_menu_node(&snap, 13, &sel(true, false), &dev_stick(0.0, 0.0), &mut c, &mut state, 0.016);
+        }
+        assert_eq!(
+            c.get(&("menumap:13".to_string(), "btn_north".to_string())).map(|s| s.as_bool()),
+            Some(false), "after the pulse the card output must RELEASE (explicit off, no latch)",
+        );
     }
 
     // The macro-style Show target (published by a Remapper mapping via
