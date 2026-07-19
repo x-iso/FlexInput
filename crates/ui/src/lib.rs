@@ -11,6 +11,7 @@ mod overlay;
 mod panels;
 mod panic_hotkey;
 mod pin_hotkey;
+mod widgets;
 pub mod process_list;
 mod settings;
 pub mod model;
