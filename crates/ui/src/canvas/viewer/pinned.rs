@@ -260,15 +260,9 @@ pub(crate) fn render_pinned_element_impl(
             let live = controller3d_live(
                 live_signals, dev_id.as_deref(), &ctx, inner_id.0, tailoff, accent, deadzone,
             );
-            // GPU-state key: the containing `Ui`'s id, which callers already
-            // salt per pinned copy (overlay pins by item index, sub-patch
-            // layouts by their own container), so two pins of the SAME node
-            // still get separate state. Distinct from the node body's key
-            // above, so a pin never shares state with its own module.
-            let instance_key = ui.id().with(("c3d_pin", inner_id)).value();
             render_controller3d_core(
                 ui, rect, &resolved, orientation, bg, outline, outline_w, scheme, alpha, cam_pitch,
-                live, composite, instance_key,
+                live, composite,
             );
             return;
         }

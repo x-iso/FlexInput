@@ -222,10 +222,7 @@ impl ControllerPipeline {
         );
 
         // Depth-only builder (no fragment stage) for the visibility queries.
-        let build_depth = |label: &str,
-                           depth_write: bool,
-                           depth_compare: CompareFunction,
-                           cull_mode: Option<Face>| {
+        let build_depth = |label: &str, depth_write: bool, depth_compare: CompareFunction| {
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -242,7 +239,7 @@ impl ControllerPipeline {
                 fragment: None,
                 primitive: PrimitiveState {
                     topology: PrimitiveTopology::TriangleList,
-                    cull_mode,
+                    cull_mode: None,
                     ..Default::default()
                 },
                 depth_stencil: Some(DepthStencilState {
@@ -261,27 +258,12 @@ impl ControllerPipeline {
                 cache: None,
             })
         };
-        // No culling anywhere here, for the same reason as the main pipeline:
-        // the OBJ winding order isn't guaranteed to match wgpu's front-face, so
-        // culling could discard a part's CAMERA-FACING triangles on some models
-        // and measure nothing at all. Occlusion is resolved per-fragment by the
-        // depth buffer, which is winding-independent.
-        //
-        // Consequence for the ratio: `total` (Always) counts every rasterized
-        // fragment — near and far surfaces — while `visible` (LessEqual) only
-        // counts the nearest one. A fully-visible closed part therefore scores
-        // well below 1.0, and how far below depends on how many of its own
-        // surfaces stack up along the view ray. The threshold is calibrated for
-        // that, and the readback below refuses to score a part it has no
-        // samples for rather than reading absence as occlusion.
-        //
         // LessEqual (not Less): the prepass wrote this part's own depth, so its
         // visible front surface must still pass its own values.
-        let vis_prepass = build_depth("c3d_vis_prepass", true, CompareFunction::Less, None);
+        let vis_prepass = build_depth("c3d_vis_prepass", true, CompareFunction::Less);
         let vis_measure_visible =
-            build_depth("c3d_vis_measure_visible", false, CompareFunction::LessEqual, None);
-        let vis_measure_total =
-            build_depth("c3d_vis_measure_total", false, CompareFunction::Always, None);
+            build_depth("c3d_vis_measure_visible", false, CompareFunction::LessEqual);
+        let vis_measure_total = build_depth("c3d_vis_measure_total", false, CompareFunction::Always);
 
         Self {
             pipeline,

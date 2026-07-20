@@ -477,6 +477,10 @@ pub fn model_for_device(dev_id: &str) -> String {
 
 // ── Render callback ───────────────────────────────────────────────────────────
 
+/// Marks which model the cached GPU buffers belong to, so buffers are rebuilt
+/// when the node switches models.
+struct BuffersKey(String);
+
 /// A complete 3D mesh render callback built from a loaded model + orientation.
 pub struct MeshRenderState {
     pub model: Arc<LoadedModel>,
@@ -505,12 +509,6 @@ pub struct MeshRenderState {
     pub composite: f32,
     /// Shared render pipeline — created lazily on first prepare().
     pub pipeline: Option<Arc<ControllerPipeline>>,
-    /// Identifies WHICH on-screen viewer this is. All mutable GPU state is
-    /// bucketed under this key — see `InstanceRes`. Supplied by the caller and
-    /// REQUIRED to be stable across frames: the occlusion measurement driving
-    /// x-ray spans several frames, so a key that changes per frame rebuilds
-    /// the bucket before any measurement can land and x-ray never fires.
-    pub instance_key: u64,
 }
 
 /// X-ray draw lists, computed in `prepare` and consumed in `paint` via the
@@ -540,42 +538,8 @@ struct MatteTarget {
     bind_group: wgpu::BindGroup,
 }
 
-/// Per-VIEWER GPU state, bucketed by `MeshRenderState::instance_key`.
-///
-/// Everything here is written in `prepare` and read back in `paint`, so it
-/// cannot be shared: egui runs every callback's `prepare` before any `paint`,
-/// so with one shared slot the last viewer to prepare would overwrite the
-/// uniforms, x-ray draw lists and occlusion measurements of every other one —
-/// and they would all paint that last viewer's state. That is what made a
-/// second visible copy of a model (sub-patch editor open alongside an overlay
-/// pin) x-ray parts that were in plain sight: the two viewers' cameras were
-/// measuring visibility into the same buffers.
-struct InstanceRes {
-    /// Which model these buffers hold (rebuild on model swap).
-    buffers_key: String,
-    parts: Vec<PartBuffers>,
-    vis: Option<VisMeasure>,
-    xray: XrayOrder,
-    matte: Option<MatteTarget>,
-    /// Whether this pass's `paint` should composite from the matte target.
-    matte_active: bool,
-    /// When this bucket was last drawn (drives retirement).
-    ///
-    /// Deliberately a wall clock rather than egui's pass counter: viewers live
-    /// in DIFFERENT viewports (the overlay is its own), and each viewport
-    /// counts passes independently, so comparing one viewer's pass number
-    /// against another's would retire live buckets — rebuilding their buffers
-    /// every frame and resetting the multi-frame occlusion readback before it
-    /// could ever complete, which silently disables x-ray.
-    last_seen: std::time::Instant,
-}
-
-type InstanceMap = std::collections::HashMap<u64, InstanceRes>;
-
-/// Retire a viewer's GPU buffers after this long off-screen. Generous:
-/// unpinning and re-pinning an element should not pay for a rebuild, but a
-/// closed sub-patch editor must not hold its buffers forever.
-const INSTANCE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Whether this frame's `paint` should composite from the matte target.
+struct MatteActive(bool);
 
 /// Ghost-gate threshold on the measured `visible / total` sample ratio. The
 /// "total" query rasterizes front AND back faces (cull is off), so a fully
@@ -590,16 +554,6 @@ const GHOST_VIS_HIGH: f32 = 0.06;
 /// EMA weight applied to each raw visibility readback — damps the measurement
 /// noise (already ~3 frames behind) that made the ghost flicker in and out.
 const VIS_SMOOTH: f32 = 0.35;
-/// Minimum `total` samples an occlusion object must rasterize before its
-/// visibility ratio means anything.
-///
-/// This is deliberately just "it rasterized at all". `total` ignores depth, so
-/// a genuinely occluded part still reports its full footprint here and scores
-/// correctly — only a part that never reached the query lands below this, and
-/// that says nothing about line of sight. Setting it any higher starts
-/// discarding real readings from small parts, which is the opposite failure:
-/// x-ray stops firing on exactly the thin parts that most need it.
-const VIS_MIN_SAMPLES: f32 = 1.0;
 
 /// Async-readback state for the visibility measurement.
 #[derive(Clone, Copy, PartialEq)]
@@ -623,10 +577,6 @@ enum VisMapState {
 /// "<10% visible → x-ray ghost" rule. Readback is async (~3 frames behind,
 /// invisible at highlight timescales).
 struct VisMeasure {
-    /// Measurement target size, matched to the widget's aspect. Rebuilt when
-    /// the widget reshapes, so the measurement always reflects the geometry as
-    /// actually rendered.
-    size: (u32, u32),
     depth_view: wgpu::TextureView,
     qs: wgpu::QuerySet,
     n_parts: usize,
@@ -678,52 +628,27 @@ impl CallbackTrait for MeshRenderState {
             }
         };
 
-        // ── Blit pipeline (once, shared) ───────────────────────────────────
-        // Created up-front while `callback_resources` is still free of the
-        // per-instance borrow taken below.
-        let use_matte = self.composite < 0.999;
-        if use_matte && callback_resources.get::<Arc<BlitPipeline>>().is_none() {
-            let b = Arc::new(BlitPipeline::new(device, target_format(), 1));
-            callback_resources.insert(b);
-        }
-        let blit = callback_resources.get::<Arc<BlitPipeline>>().cloned();
-
-        // ── This viewer's own bucket ───────────────────────────────────────
-        let now = std::time::Instant::now();
-        let instances = callback_resources
-            .entry::<InstanceMap>()
-            .or_insert_with(Default::default);
-        // Retire buckets whose viewer has been off-screen a while (an unpinned
-        // element or a closed sub-patch editor would otherwise leak its GPU
-        // buffers for the life of the process).
-        instances.retain(|_, r| now.duration_since(r.last_seen) < INSTANCE_TTL);
-        let res = instances.entry(self.instance_key).or_insert_with(|| InstanceRes {
-            buffers_key: String::new(),
-            parts: Vec::new(),
-            vis: None,
-            xray: XrayOrder { ghosts: Vec::new(), restore: Vec::new(), translucent: Vec::new() },
-            matte: None,
-            matte_active: false,
-            last_seen: now,
-        });
-        res.last_seen = now;
-
         // ── Per-part GPU buffers (rebuilt when the model changes) ──────────
-        if res.buffers_key != self.model.name {
+        let need_rebuild = callback_resources
+            .get::<BuffersKey>()
+            .map(|k| k.0 != self.model.name)
+            .unwrap_or(true);
+        if need_rebuild {
             let defaults = Uniforms::default_uniform();
-            res.parts = self
+            let parts: Vec<PartBuffers> = self
                 .model
                 .parts
                 .iter()
                 .map(|pd| PartBuffers::new(device, &pipeline, &pd.vertices, &defaults))
                 .collect();
-            res.buffers_key = self.model.name.clone();
-            // Measurement state is sized/keyed to the old model — drop it so
-            // it rebuilds against the new part list.
-            res.vis = None;
+            callback_resources.insert(parts);
+            callback_resources.insert(BuffersKey(self.model.name.clone()));
         }
 
-        let gpu_parts = res.parts.as_slice();
+        let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
+            Some(parts) => parts.as_slice(),
+            None => return Vec::new(),
+        };
         if gpu_parts.is_empty() {
             return Vec::new();
         }
@@ -800,9 +725,8 @@ impl CallbackTrait for MeshRenderState {
         // so nothing ghosts until real measurements arrive.
         // Latched per-part "hidden" flags (smoothing + hysteresis applied at
         // readback) — an active part that's hidden shows the x-ray ghost.
-        let ghost_hidden: Vec<bool> = res
-            .vis
-            .as_ref()
+        let ghost_hidden: Vec<bool> = callback_resources
+            .get::<VisMeasure>()
             .and_then(|v| v.ghost.lock().ok().map(|g| g.clone()))
             .unwrap_or_default();
         let center_radius4 = [center.x, center.y, center.z, radius];
@@ -961,16 +885,21 @@ impl CallbackTrait for MeshRenderState {
         // composites the finished image at the matte alpha. Skipped entirely
         // (direct draw) when fully opaque. Mutable resource setup happens
         // FIRST (ends the `gpu_parts` borrow), then the pass re-borrows.
+        let use_matte = self.composite < 0.999;
         if use_matte {
-            let Some(blit) = blit.as_ref() else {
-                return Vec::new();
-            };
+            if callback_resources.get::<Arc<BlitPipeline>>().is_none() {
+                let b = Arc::new(BlitPipeline::new(device, target_format(), 1));
+                callback_resources.insert(b);
+            }
+            let blit = callback_resources
+                .get::<Arc<BlitPipeline>>()
+                .expect("just inserted")
+                .clone();
             let ppp = screen_descriptor.pixels_per_point;
             let w = ((self.vis_rect.width() * ppp).round() as u32).max(1);
             let h = ((self.vis_rect.height() * ppp).round() as u32).max(1);
-            let rebuild = res
-                .matte
-                .as_ref()
+            let rebuild = callback_resources
+                .get::<MatteTarget>()
                 .map(|m| m.size != (w, h))
                 .unwrap_or(true);
             if rebuild {
@@ -1026,7 +955,7 @@ impl CallbackTrait for MeshRenderState {
                         },
                     ],
                 });
-                res.matte = Some(MatteTarget {
+                callback_resources.insert(MatteTarget {
                     color_view,
                     depth_view,
                     size: (w, h),
@@ -1034,9 +963,12 @@ impl CallbackTrait for MeshRenderState {
                     bind_group,
                 });
             }
-            // Re-borrow the parts + target (distinct fields) and record the pass.
-            let gpu_parts = res.parts.as_slice();
-            if let Some(mt) = res.matte.as_ref() {
+            // Immutable phase: re-borrow the parts + target and record the pass.
+            let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
+                Some(parts) => parts.as_slice(),
+                None => return Vec::new(),
+            };
+            if let Some(mt) = callback_resources.get::<MatteTarget>() {
                 queue.write_buffer(
                     &mt.alpha_buf,
                     0,
@@ -1102,34 +1034,17 @@ impl CallbackTrait for MeshRenderState {
         // read → record again. Runs at a fraction of the frame rate, which is
         // plenty — visibility changes with orientation, not per frame.
         let n_parts = self.model.parts.len();
-        // Measure at the WIDGET's aspect, not a fixed square. The projection
-        // above bakes `aspect` in, so squashing that into a square target
-        // distorts every part's footprint — and by a different amount in each
-        // viewer, since they have different widget shapes. Thin parts then land
-        // above the sample floor in one viewer and below it in another, which
-        // is precisely how two views of one model came to disagree about what
-        // was occluded. Long side fixed, short side derived.
-        const VIS_RES: u32 = 256;
-        // Quantised: a rebuild resets the readback state machine, so letting
-        // sub-pixel widget jitter change the target size would keep cancelling
-        // measurements mid-flight.
-        let quant = |v: f32| ((v / 16.0).round() as u32 * 16).clamp(64, VIS_RES);
-        let vis_size = if aspect >= 1.0 {
-            (VIS_RES, quant(VIS_RES as f32 / aspect))
-        } else {
-            (quant(VIS_RES as f32 * aspect), VIS_RES)
-        };
-        let vis_rebuild = res
-            .vis
-            .as_ref()
-            .map(|v| v.n_parts != n_parts || v.size != vis_size)
+        let vis_rebuild = callback_resources
+            .get::<VisMeasure>()
+            .map(|v| v.n_parts != n_parts)
             .unwrap_or(true);
         if vis_rebuild && n_parts > 0 {
+            const VIS_RES: u32 = 256; // small target: ratios are resolution-independent
             let depth = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("c3d_vis_depth"),
                 size: wgpu::Extent3d {
-                    width: vis_size.0,
-                    height: vis_size.1,
+                    width: VIS_RES,
+                    height: VIS_RES,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -1157,29 +1072,15 @@ impl CallbackTrait for MeshRenderState {
                 ty: wgpu::QueryType::Occlusion,
                 count: (2 * n_parts) as u32,
             });
-            // Carry the measured state across a rebuild caused only by the
-            // widget reshaping — the readings still describe this same model,
-            // and discarding them restarts the whole convergence (below), which
-            // on a widget being dragged/resized means x-ray never settles at
-            // all. A model swap DOES invalidate them: part indices change
-            // meaning, so start clean.
-            let keep = res.vis.as_ref().filter(|v| v.n_parts == n_parts);
-            let fractions = keep
-                .map(|v| v.fractions.clone())
-                .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
-            let ghost = keep
-                .map(|v| v.ghost.clone())
-                .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
-            res.vis = Some(VisMeasure {
-                size: vis_size,
+            callback_resources.insert(VisMeasure {
                 depth_view: depth.create_view(&Default::default()),
                 qs,
                 n_parts,
                 resolve_buf,
                 staging,
                 state: Arc::new(Mutex::new(VisMapState::Idle)),
-                fractions,
-                ghost,
+                fractions: Arc::new(Mutex::new(Vec::new())),
+                ghost: Arc::new(Mutex::new(Vec::new())),
                 obj: self
                     .model
                     .parts
@@ -1191,10 +1092,12 @@ impl CallbackTrait for MeshRenderState {
             });
         }
         if n_parts > 0 {
-            // Re-borrow the parts (distinct field) and advance this viewer's
-            // own readback state machine.
-            let gpu_parts = res.parts.as_slice();
-            if let Some(vm) = res.vis.as_ref() {
+            // Immutable phase: advance the readback state machine / record.
+            let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
+                Some(parts) => parts.as_slice(),
+                None => return Vec::new(),
+            };
+            if let Some(vm) = callback_resources.get::<VisMeasure>() {
                 let st = *vm.state.lock().unwrap();
                 match st {
                     VisMapState::Ready => {
@@ -1203,16 +1106,7 @@ impl CallbackTrait for MeshRenderState {
                             let counts: &[u64] = bytemuck::cast_slice(&data);
                             let mut fr = vm.fractions.lock().unwrap();
                             let mut gh = vm.ghost.lock().unwrap();
-                            // NaN = never measured. The first real reading is
-                            // taken as-is instead of being averaged in from an
-                            // assumed 1.0: starting at "fully visible" and
-                            // easing down at VIS_SMOOTH per readback needs ~9
-                            // readbacks (each several frames) before a fully
-                            // occluded part can cross the threshold, which read
-                            // as x-ray simply not working. Seeding makes the
-                            // first verdict immediate; smoothing still damps
-                            // every reading after it.
-                            fr.resize(vm.n_parts, f32::NAN);
+                            fr.resize(vm.n_parts, 1.0);
                             gh.resize(vm.n_parts, false);
                             // Sum visible + total per occlusion OBJECT first, so a
                             // stick's three meshes are judged as one solid: the cap
@@ -1233,39 +1127,11 @@ impl CallbackTrait for MeshRenderState {
                             }
                             for i in 0..vm.n_parts {
                                 let key = vm.obj.get(i).copied().unwrap_or(i as u32);
-                                let (vis, tot) = obj_sum.get(&key).copied().unwrap_or((0.0, 0.0));
-                                // NO SAMPLES IS NOT OCCLUSION. A part can miss the
-                                // query entirely for reasons that say nothing about
-                                // line of sight: it rasterizes below a pixel in the
-                                // small measurement target (thin parts like triggers,
-                                // especially seen near edge-on), it falls outside the
-                                // crop when the widget is partly scrolled off, or it
-                                // is a touch dot collapsed to zero scale while the
-                                // finger is up.
-                                //
-                                // Scoring those as vis/tot = 0 made them maximally
-                                // "hidden", so the latch engaged and — because a
-                                // part that never rasterizes never scores above the
-                                // release threshold either — it stayed engaged. That
-                                // is the permanent x-ray on parts in plain sight, and
-                                // why it differed per viewer: each has its own camera
-                                // pitch and widget size, so the same part lands above
-                                // or below the sample floor in one and not the other.
-                                //
-                                // Below the floor we keep the previous reading and
-                                // leave the latch alone: no information, no update.
-                                if tot < VIS_MIN_SAMPLES {
-                                    continue;
-                                }
-                                let frac = vis / tot;
+                                let (vis, tot) = obj_sum.get(&key).copied().unwrap_or((0.0, 1.0));
+                                let frac = vis / tot.max(1.0);
                                 // Smooth the raw fraction, then latch hidden/visible
                                 // with hysteresis so an edge-of-occlusion part holds.
-                                // First reading seeds directly (see the resize above).
-                                fr[i] = if fr[i].is_nan() {
-                                    frac
-                                } else {
-                                    fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH
-                                };
+                                fr[i] = fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH;
                                 gh[i] = if gh[i] { fr[i] < GHOST_VIS_HIGH } else { fr[i] < GHOST_VIS_LOW };
                             }
                         }
@@ -1373,12 +1239,12 @@ impl CallbackTrait for MeshRenderState {
             }
         }
 
-        res.matte_active = use_matte;
-        res.xray = XrayOrder {
+        callback_resources.insert(MatteActive(use_matte));
+        callback_resources.insert(XrayOrder {
             ghosts: ghost_order,
             restore,
             translucent: trans_order,
-        };
+        });
 
         Vec::new() // write_buffer is immediate; no command buffers to submit
     }
@@ -1393,15 +1259,10 @@ impl CallbackTrait for MeshRenderState {
             Some(p) => p.clone(),
             None => return,
         };
-        // This viewer's own bucket — never another viewer's (see `InstanceRes`).
-        let res = match callback_resources
-            .get::<InstanceMap>()
-            .and_then(|m| m.get(&self.instance_key))
-        {
-            Some(r) => r,
+        let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
+            Some(parts) => parts.as_slice(),
             None => return,
         };
-        let gpu_parts = res.parts.as_slice();
 
         let vp = info.viewport;
         if !vp.is_finite() || vp.width() <= 0.0 || vp.height() <= 0.0 {
@@ -1410,10 +1271,14 @@ impl CallbackTrait for MeshRenderState {
 
         // Widget matte path: the controller was already rendered offscreen in
         // `prepare`; composite that image at the matte alpha and stop.
-        if res.matte_active {
+        if callback_resources
+            .get::<MatteActive>()
+            .map(|m| m.0)
+            .unwrap_or(false)
+        {
             if let (Some(blit), Some(mt)) = (
                 callback_resources.get::<Arc<BlitPipeline>>(),
-                res.matte.as_ref(),
+                callback_resources.get::<MatteTarget>(),
             ) {
                 render_pass.set_pipeline(&blit.pipeline);
                 render_pass.set_bind_group(0, &mt.bind_group, &[]);
@@ -1422,12 +1287,14 @@ impl CallbackTrait for MeshRenderState {
             }
         }
 
-        let xo = &res.xray;
+        let xo = callback_resources.get::<XrayOrder>();
         let is_trans: Vec<bool> = {
             let mut v = vec![false; gpu_parts.len()];
-            for &i in &xo.translucent {
-                if let Some(s) = v.get_mut(i) {
-                    *s = true;
+            if let Some(xo) = xo {
+                for &i in &xo.translucent {
+                    if let Some(s) = v.get_mut(i) {
+                        *s = true;
+                    }
                 }
             }
             v
@@ -1440,7 +1307,7 @@ impl CallbackTrait for MeshRenderState {
             gpu_part.draw(render_pass);
         }
 
-        {
+        if let Some(xo) = xo {
             // Translucent materials: far → near over the opaque depth.
             if !xo.translucent.is_empty() {
                 render_pass.set_pipeline(&pipeline.translucent);
@@ -1484,10 +1351,6 @@ impl CallbackTrait for MeshRenderState {
 /// (matching the pinned-render pattern), so the same function serves the node
 /// body and pinned/overlay instances. Model data is shared (`Arc`); GPU buffers
 /// are cached across frames in the callback resources.
-///
-/// `instance_key` identifies this viewer's GPU state and MUST be stable across
-/// frames (see `MeshRenderState::instance_key`) and distinct from every other
-/// simultaneously visible viewer.
 pub fn paint_controller_model(
     ui: &egui::Ui,
     vis_rect: egui::Rect,
@@ -1499,7 +1362,6 @@ pub fn paint_controller_model(
     cam_pitch: f32,
     live: ControllerLive,
     composite: f32,
-    instance_key: u64,
 ) {
     let state = MeshRenderState {
         model,
@@ -1512,7 +1374,6 @@ pub fn paint_controller_model(
         live,
         composite,
         pipeline: None,
-        instance_key,
     };
     let paint_callback = Callback::new_paint_callback(vis_rect, state);
     ui.painter_at(vis_rect)
