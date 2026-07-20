@@ -8,6 +8,10 @@
 use super::*;
 
 mod curves;
+mod fields;
+mod gp_settings;
+mod left_panel;
+mod legend;
 mod pickers;
 mod remap;
 mod touch_zones;
