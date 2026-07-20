@@ -708,11 +708,12 @@ pub(crate) fn card_curve_save(pts: &[[f32; 2]]) {
         show_scaled_grid: false,
         show_grid_labels: false,
     };
-    if let Some(path) = rfd::FileDialog::new()
-        .add_filter("FlexInput Curve", &["fxc"])
-        .set_file_name("curve.fxc")
-        .save_file()
-    {
+    if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+        rfd::FileDialog::new()
+            .add_filter("FlexInput Curve", &["fxc"])
+            .set_file_name("curve.fxc")
+            .save_file()
+    }) {
         if let Ok(json) = serde_json::to_string_pretty(&cf) {
             let _ = std::fs::write(path, json);
         }
@@ -722,9 +723,11 @@ pub(crate) fn card_curve_save(pts: &[[f32; 2]]) {
 /// Load ONLY the points from a `.fxc` file (module settings in the file are
 /// ignored, mirroring the module-side "Load only the curve" semantics).
 pub(crate) fn card_curve_load() -> Option<Vec<[f32; 2]>> {
-    let path = rfd::FileDialog::new()
-        .add_filter("FlexInput Curve", &["fxc"])
-        .pick_file()?;
+    let path = crate::overlay::with_overlay_not_topmost(|| {
+        rfd::FileDialog::new()
+            .add_filter("FlexInput Curve", &["fxc"])
+            .pick_file()
+    })?;
     let text = std::fs::read_to_string(path).ok()?;
     let cf: CurveFile = serde_json::from_str(&text).ok()?;
     let mut pts: Vec<[f32; 2]> = cf.points.iter().map(|p| [p[0] as f32, p[1] as f32]).collect();

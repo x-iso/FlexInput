@@ -784,11 +784,12 @@ pub(crate) fn curve_header_save(node_id: NodeId, snarl: &Snarl<NodeData>) {
         show_scaled_grid: n.params.get("show_scaled_grid").and_then(|v| v.as_bool()).unwrap_or(false),
         show_grid_labels: n.params.get("show_grid_labels").and_then(|v| v.as_bool()).unwrap_or(false),
     };
-    if let Some(path) = rfd::FileDialog::new()
-        .add_filter("FlexInput Curve", &["fxc"])
-        .set_file_name("curve.fxc")
-        .save_file()
-    {
+    if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+        rfd::FileDialog::new()
+            .add_filter("FlexInput Curve", &["fxc"])
+            .set_file_name("curve.fxc")
+            .save_file()
+    }) {
         if let Ok(json) = serde_json::to_string_pretty(&cf) {
             let _ = std::fs::write(path, json);
         }
@@ -796,10 +797,11 @@ pub(crate) fn curve_header_save(node_id: NodeId, snarl: &Snarl<NodeData>) {
 }
 
 pub(crate) fn curve_header_load(node_id: NodeId, is_float: bool, snarl: &mut Snarl<NodeData>) {
-    let Some(path) = rfd::FileDialog::new()
-        .add_filter("FlexInput Curve", &["fxc"])
-        .pick_file()
-    else { return };
+    let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+        rfd::FileDialog::new()
+            .add_filter("FlexInput Curve", &["fxc"])
+            .pick_file()
+    }) else { return };
     let Ok(json) = std::fs::read_to_string(path) else { return };
     let Ok(cf)   = serde_json::from_str::<CurveFile>(&json) else { return };
     let Some(node) = snarl.get_node_mut(node_id) else { return };
@@ -839,10 +841,11 @@ pub(crate) fn curve_header_load(node_id: NodeId, is_float: bool, snarl: &mut Sna
 /// sub-patch layouts where module settings may not be visible) never
 /// surprises the user by changing hidden state.
 pub(crate) fn curve_graph_load(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
-    let Some(path) = rfd::FileDialog::new()
-        .add_filter("FlexInput Curve", &["fxc"])
-        .pick_file()
-    else { return };
+    let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+        rfd::FileDialog::new()
+            .add_filter("FlexInput Curve", &["fxc"])
+            .pick_file()
+    }) else { return };
     let Ok(json) = std::fs::read_to_string(path) else { return };
     let Ok(cf)   = serde_json::from_str::<CurveFile>(&json) else { return };
     let Some(node) = snarl.get_node_mut(node_id) else { return };

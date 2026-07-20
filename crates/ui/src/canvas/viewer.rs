@@ -402,10 +402,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         .on_hover_text("Load an .svg file (the source is embedded in the patch)")
                         .clicked()
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("SVG", &["svg"])
-                            .pick_file()
-                        {
+                        if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+                            rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file()
+                        }) {
                             if let Ok(text) = std::fs::read_to_string(&path) {
                                 if let Some(n) = snarl.get_node_mut(node) {
                                     n.params.insert("svg_data".into(), Value::String(text));

@@ -426,7 +426,7 @@ impl FlexInputApp {
                             .color(egui::Color32::from_gray(160)),
                     );
                     if ui.small_button("Browse…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        if let Some(p) = crate::overlay::with_overlay_not_topmost(|| rfd::FileDialog::new().pick_folder()) {
                             let s = p.to_string_lossy().to_string();
                             self.settings.user_models_dir = Some(s);
                             crate::model::set_user_models_dir(Some(p));
@@ -946,7 +946,7 @@ impl FlexInputApp {
                         .unwrap_or_else(|| "(none)".into());
                     ui.monospace(label);
                     if ui.button("Browse…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        if let Some(p) = crate::overlay::with_overlay_not_topmost(|| rfd::FileDialog::new().pick_folder()) {
                             self.settings.user_presets_folder = Some(p);
                             dirty = true;
                         }

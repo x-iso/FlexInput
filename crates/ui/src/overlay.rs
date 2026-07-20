@@ -57,6 +57,19 @@ fn edit_id() -> egui::Id { egui::Id::new(OVERLAY_EDIT_KEY) }
 /// Run `f` (typically a blocking native file dialog) with the overlay window
 /// temporarily dropped out of always-on-top, then restore topmost.
 ///
+/// **Every blocking `rfd` call on the UI thread must go through this.** Any that
+/// doesn't is an overlay hang waiting to be reported: with the overlay up, the
+/// dialog opens behind it and the frozen event loop leaves the overlay
+/// unable to repaint or toggle passthrough, so it also stops responding until
+/// the invisible dialog is dismissed. This was first fixed for the SVG picker
+/// alone, and every un-wrapped dialog added since reproduced it exactly.
+///
+/// Dialogs spawned on a worker thread (`*_async`) don't cause the FREEZE — the
+/// UI thread keeps running, so the overlay repaints and manages its own
+/// passthrough. They can still open *behind* the topmost overlay, though, so if
+/// one of those ever reads as "nothing happened", this is the reason; it wants
+/// the topmost drop applied from the worker rather than a wrapper here.
+///
 /// The overlay is `always_on_top`; a native file dialog opens without an owner
 /// window, so it lands BEHIND the topmost overlay and is unreachable. And
 /// because `pick_file` blocks the event loop, the overlay can't repaint to

@@ -1908,11 +1908,12 @@ impl eframe::App for FlexInputApp {
         // swapping between an empty workspace and a loaded one without
         // restarting the app.
         if do_save_workspace {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("FlexInput Workspace", &["fxw", "json"])
-                .set_file_name("workspace.fxw")
-                .save_file()
-            {
+            if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+                rfd::FileDialog::new()
+                    .add_filter("FlexInput Workspace", &["fxw", "json"])
+                    .set_file_name("workspace.fxw")
+                    .save_file()
+            }) {
                 let ws = self.build_persisted_workspace();
                 if let Err(e) = settings::save_workspace_to(&ws, &path) {
                     eprintln!("[workspace] save failed: {e}");
@@ -1922,10 +1923,11 @@ impl eframe::App for FlexInputApp {
 
         // ── Load workspace (full tab set, replacing current state) ───────────
         if do_load_workspace {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("FlexInput Workspace", &["fxw", "json"])
-                .pick_file()
-            {
+            if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+                rfd::FileDialog::new()
+                    .add_filter("FlexInput Workspace", &["fxw", "json"])
+                    .pick_file()
+            }) {
                 if let Some(ws) = settings::load_workspace_from(&path) {
                     let on_load_view = match self.settings.on_patch_load {
                         settings::OnPatchLoad::Off       => None,

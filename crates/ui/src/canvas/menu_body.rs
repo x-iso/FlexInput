@@ -1593,9 +1593,9 @@ pub(crate) fn icon_picker_button(
                 .on_hover_text("Pick an .svg file — it's embedded into the patch")
                 .clicked()
             {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("SVG", &["svg"]).pick_file()
-                {
+                if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+                    rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file()
+                }) {
                     if let Ok(text) = std::fs::read_to_string(&path) {
                         new_icon = Some((String::new(), text));
                     }

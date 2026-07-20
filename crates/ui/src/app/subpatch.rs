@@ -157,10 +157,12 @@ pub(crate) fn save_subpatch_file(sp: &UiSubPatch) -> Option<std::path::PathBuf> 
     } else {
         format!("{}.fxsp", sp.display_name)
     };
-    let path = rfd::FileDialog::new()
-        .add_filter("FlexInput Sub-Patch", &["fxsp"])
-        .set_file_name(default_name)
-        .save_file()?;
+    let path = crate::overlay::with_overlay_not_topmost(|| {
+        rfd::FileDialog::new()
+            .add_filter("FlexInput Sub-Patch", &["fxsp"])
+            .set_file_name(default_name)
+            .save_file()
+    })?;
     let file = SubPatchFile { version: 1, sub_patch: sp.clone() };
     if let Ok(json) = serde_json::to_string_pretty(&file) {
         let _ = std::fs::write(&path, json);
@@ -169,9 +171,11 @@ pub(crate) fn save_subpatch_file(sp: &UiSubPatch) -> Option<std::path::PathBuf> 
 }
 
 pub(crate) fn load_subpatch_file() -> Option<UiSubPatch> {
-    let path = rfd::FileDialog::new()
-        .add_filter("FlexInput Sub-Patch", &["fxsp"])
-        .pick_file()?;
+    let path = crate::overlay::with_overlay_not_topmost(|| {
+        rfd::FileDialog::new()
+            .add_filter("FlexInput Sub-Patch", &["fxsp"])
+            .pick_file()
+    })?;
     let json = std::fs::read_to_string(&path).ok()?;
     let file: SubPatchFile = serde_json::from_str(&json).ok()?;
     Some(file.sub_patch)

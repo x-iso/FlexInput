@@ -753,7 +753,9 @@ pub(crate) fn switch_state_submenu(
     let has_svg = !st.svg_data.is_empty();
     ui.horizontal(|ui| {
         if ui.button("Load SVG…").clicked() {
-            if let Some(path) = rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file() {
+            if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+                rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file()
+            }) {
                 if let Ok(text) = std::fs::read_to_string(&path) {
                     if let Some(node) = snarl.get_node_mut(node_id) {
                         node.params.insert(svg_key.to_string(), Value::String(text));

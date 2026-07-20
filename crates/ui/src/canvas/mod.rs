@@ -1713,10 +1713,12 @@ impl Canvas {
         easy_preset_path: Option<std::path::PathBuf>,
         overlay: OverlayLayout,
     ) -> Option<std::path::PathBuf> {
-        let path = rfd::FileDialog::new()
-            .add_filter("FlexInput Patch", &["fxp"])
-            .set_file_name("patch.fxp")
-            .save_file()?;
+        let path = crate::overlay::with_overlay_not_topmost(|| {
+            rfd::FileDialog::new()
+                .add_filter("FlexInput Patch", &["fxp"])
+                .set_file_name("patch.fxp")
+                .save_file()
+        })?;
 
         let patch = UiPatch {
             version: 1,
@@ -1752,11 +1754,13 @@ impl Canvas {
         // user gets a one-click way to open a preset directly from
         // File→Load Patch, and the app.rs caller switches to Easy
         // mode if the result is Easy-compatible.
-        let path = rfd::FileDialog::new()
-            .add_filter("FlexInput Patch", &["fxp", "fxsp"])
-            .add_filter("Full Patch (.fxp)", &["fxp"])
-            .add_filter("Sub-Patch (.fxsp)", &["fxsp"])
-            .pick_file()?;
+        let path = crate::overlay::with_overlay_not_topmost(|| {
+            rfd::FileDialog::new()
+                .add_filter("FlexInput Patch", &["fxp", "fxsp"])
+                .add_filter("Full Patch (.fxp)", &["fxp"])
+                .add_filter("Sub-Patch (.fxsp)", &["fxsp"])
+                .pick_file()
+        })?;
 
         let json = std::fs::read_to_string(&path).ok()?;
         let is_subpatch_file = path.extension()
