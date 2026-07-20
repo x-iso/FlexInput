@@ -591,11 +591,15 @@ const GHOST_VIS_HIGH: f32 = 0.06;
 /// noise (already ~3 frames behind) that made the ghost flicker in and out.
 const VIS_SMOOTH: f32 = 0.35;
 /// Minimum `total` samples an occlusion object must rasterize before its
-/// visibility ratio is trusted. Below this the readback carries no usable
-/// signal — a handful of samples is mostly aliasing noise, and zero samples
-/// means the part never reached the query at all — so the previous reading and
-/// the ghost latch are left untouched rather than scored as fully hidden.
-const VIS_MIN_SAMPLES: f32 = 8.0;
+/// visibility ratio means anything.
+///
+/// This is deliberately just "it rasterized at all". `total` ignores depth, so
+/// a genuinely occluded part still reports its full footprint here and scores
+/// correctly — only a part that never reached the query lands below this, and
+/// that says nothing about line of sight. Setting it any higher starts
+/// discarding real readings from small parts, which is the opposite failure:
+/// x-ray stops firing on exactly the thin parts that most need it.
+const VIS_MIN_SAMPLES: f32 = 1.0;
 
 /// Async-readback state for the visibility measurement.
 #[derive(Clone, Copy, PartialEq)]
@@ -1106,10 +1110,14 @@ impl CallbackTrait for MeshRenderState {
         // is precisely how two views of one model came to disagree about what
         // was occluded. Long side fixed, short side derived.
         const VIS_RES: u32 = 256;
+        // Quantised: a rebuild resets the readback state machine, so letting
+        // sub-pixel widget jitter change the target size would keep cancelling
+        // measurements mid-flight.
+        let quant = |v: f32| ((v / 16.0).round() as u32 * 16).clamp(64, VIS_RES);
         let vis_size = if aspect >= 1.0 {
-            (VIS_RES, ((VIS_RES as f32 / aspect).round() as u32).clamp(64, VIS_RES))
+            (VIS_RES, quant(VIS_RES as f32 / aspect))
         } else {
-            (((VIS_RES as f32 * aspect).round() as u32).clamp(64, VIS_RES), VIS_RES)
+            (quant(VIS_RES as f32 * aspect), VIS_RES)
         };
         let vis_rebuild = res
             .vis
@@ -1149,6 +1157,19 @@ impl CallbackTrait for MeshRenderState {
                 ty: wgpu::QueryType::Occlusion,
                 count: (2 * n_parts) as u32,
             });
+            // Carry the measured state across a rebuild caused only by the
+            // widget reshaping — the readings still describe this same model,
+            // and discarding them restarts the whole convergence (below), which
+            // on a widget being dragged/resized means x-ray never settles at
+            // all. A model swap DOES invalidate them: part indices change
+            // meaning, so start clean.
+            let keep = res.vis.as_ref().filter(|v| v.n_parts == n_parts);
+            let fractions = keep
+                .map(|v| v.fractions.clone())
+                .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
+            let ghost = keep
+                .map(|v| v.ghost.clone())
+                .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
             res.vis = Some(VisMeasure {
                 size: vis_size,
                 depth_view: depth.create_view(&Default::default()),
@@ -1157,8 +1178,8 @@ impl CallbackTrait for MeshRenderState {
                 resolve_buf,
                 staging,
                 state: Arc::new(Mutex::new(VisMapState::Idle)),
-                fractions: Arc::new(Mutex::new(Vec::new())),
-                ghost: Arc::new(Mutex::new(Vec::new())),
+                fractions,
+                ghost,
                 obj: self
                     .model
                     .parts
@@ -1182,7 +1203,16 @@ impl CallbackTrait for MeshRenderState {
                             let counts: &[u64] = bytemuck::cast_slice(&data);
                             let mut fr = vm.fractions.lock().unwrap();
                             let mut gh = vm.ghost.lock().unwrap();
-                            fr.resize(vm.n_parts, 1.0);
+                            // NaN = never measured. The first real reading is
+                            // taken as-is instead of being averaged in from an
+                            // assumed 1.0: starting at "fully visible" and
+                            // easing down at VIS_SMOOTH per readback needs ~9
+                            // readbacks (each several frames) before a fully
+                            // occluded part can cross the threshold, which read
+                            // as x-ray simply not working. Seeding makes the
+                            // first verdict immediate; smoothing still damps
+                            // every reading after it.
+                            fr.resize(vm.n_parts, f32::NAN);
                             gh.resize(vm.n_parts, false);
                             // Sum visible + total per occlusion OBJECT first, so a
                             // stick's three meshes are judged as one solid: the cap
@@ -1230,7 +1260,12 @@ impl CallbackTrait for MeshRenderState {
                                 let frac = vis / tot;
                                 // Smooth the raw fraction, then latch hidden/visible
                                 // with hysteresis so an edge-of-occlusion part holds.
-                                fr[i] = fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH;
+                                // First reading seeds directly (see the resize above).
+                                fr[i] = if fr[i].is_nan() {
+                                    frac
+                                } else {
+                                    fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH
+                                };
                                 gh[i] = if gh[i] { fr[i] < GHOST_VIS_HIGH } else { fr[i] < GHOST_VIS_LOW };
                             }
                         }
