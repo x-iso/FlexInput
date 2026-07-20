@@ -27,13 +27,21 @@ pub(crate) fn brighten_wire_color(base: Color32, intensity: f32) -> Color32 {
     )
 }
 
-/// Paint a soft circular halo via a triangle fan with per-vertex colors.
-/// Center color = `hot` premultiplied by intensity; edge color = transparent.
-/// Uses `Color32::TRANSPARENT` for the edge so the gradient is premultiplied-
-/// correct (no white-fringe artifacts when interpolating).
-pub(crate) fn paint_radial_glow(painter: &egui::Painter, center: egui::Pos2, radius: f32, hot: Color32, intensity: f32) {
+/// Triangle-fan glow over the angular sweep `a0..a1`, shared by the full-disc
+/// and half-disc painters. Center color = `hot` premultiplied by intensity,
+/// edge = `Color32::TRANSPARENT` so the gradient is premultiplied-correct (no
+/// white-fringe artifacts when interpolating).
+fn paint_glow_fan(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    hot: Color32,
+    intensity: f32,
+    a0: f32,
+    a1: f32,
+    segments: usize,
+) {
     use egui::epaint::{Mesh, Vertex};
-    const SEGMENTS: usize = 24;
     let mut mesh = Mesh::default();
     let i = intensity.clamp(0.0, 1.0);
     // Premultiplied: scale all channels by alpha = intensity.
@@ -46,23 +54,29 @@ pub(crate) fn paint_radial_glow(painter: &egui::Painter, center: egui::Pos2, rad
     let edge_color = Color32::TRANSPARENT;
     let uv = egui::Pos2::ZERO;
     mesh.vertices.push(Vertex { pos: center, uv, color: center_color });
-    for k in 0..SEGMENTS {
-        let theta = (k as f32) / (SEGMENTS as f32) * std::f32::consts::TAU;
+    // Rim vertices INCLUDE both endpoints, so the fan closes without wrapping
+    // the index list. On a full sweep the last vertex coincides with the first
+    // — one redundant vertex, identical raster.
+    for k in 0..=segments {
+        let t = (k as f32) / (segments as f32);
+        let theta = a0 + (a1 - a0) * t;
         let p = center + egui::vec2(theta.cos(), theta.sin()) * radius;
         mesh.vertices.push(Vertex { pos: p, uv, color: edge_color });
     }
-    for k in 0..SEGMENTS {
-        let a = (k + 1) as u32;
-        let b = ((k + 1) % SEGMENTS + 1) as u32;
-        mesh.indices.extend_from_slice(&[0, a, b]);
+    for k in 0..segments {
+        mesh.indices.extend_from_slice(&[0, (k + 1) as u32, (k + 2) as u32]);
     }
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// Half-disc radial glow. `a0..a1` defines the angular sweep (radians);
-/// the fan is built as a triangle fan around `center` with vertices on
-/// the arc, so the glow stays on the convex (outward) side of the pin
-/// and doesn't bleed into the node body.
+/// Paint a soft circular halo via a triangle fan with per-vertex colors.
+pub(crate) fn paint_radial_glow(painter: &egui::Painter, center: egui::Pos2, radius: f32, hot: Color32, intensity: f32) {
+    paint_glow_fan(painter, center, radius, hot, intensity, 0.0, std::f32::consts::TAU, 24);
+}
+
+/// Half-disc radial glow. `a0..a1` defines the angular sweep (radians), so the
+/// glow stays on the convex (outward) side of the pin and doesn't bleed into
+/// the node body.
 pub(crate) fn paint_radial_glow_half(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -72,31 +86,7 @@ pub(crate) fn paint_radial_glow_half(
     a0: f32,
     a1: f32,
 ) {
-    use egui::epaint::{Mesh, Vertex};
-    const SEGMENTS: usize = 16;
-    let mut mesh = Mesh::default();
-    let i = intensity.clamp(0.0, 1.0);
-    let center_color = Color32::from_rgba_premultiplied(
-        (hot.r() as f32 * i) as u8,
-        (hot.g() as f32 * i) as u8,
-        (hot.b() as f32 * i) as u8,
-        (255.0 * i) as u8,
-    );
-    let edge_color = Color32::TRANSPARENT;
-    let uv = egui::Pos2::ZERO;
-    mesh.vertices.push(Vertex { pos: center, uv, color: center_color });
-    for k in 0..=SEGMENTS {
-        let t = (k as f32) / (SEGMENTS as f32);
-        let theta = a0 + (a1 - a0) * t;
-        let p = center + egui::vec2(theta.cos(), theta.sin()) * radius;
-        mesh.vertices.push(Vertex { pos: p, uv, color: edge_color });
-    }
-    for k in 0..SEGMENTS {
-        let a = (k + 1) as u32;
-        let b = (k + 2) as u32;
-        mesh.indices.extend_from_slice(&[0, a, b]);
-    }
-    painter.add(egui::Shape::mesh(mesh));
+    paint_glow_fan(painter, center, radius, hot, intensity, a0, a1, 16);
 }
 
 /// Convert a `Signal` to a 0..1 glow intensity. Bool→on/off, Float→|v|,
