@@ -1930,6 +1930,7 @@ dependencies = [
  "glam",
  "include_dir",
  "open",
+ "pollster",
  "puffin",
  "puffin_http",
  "raw-window-handle",

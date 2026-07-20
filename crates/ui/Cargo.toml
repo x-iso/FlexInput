@@ -17,6 +17,9 @@ egui_extras       = { workspace = true }
 eframe            = { workspace = true }
 wgpu              = { workspace = true }
 egui-wgpu         = { path = "../../vendor/egui-wgpu" }
+# Blocks on wgpu's async adapter/buffer-map futures. Only the GPU capability
+# tests need it, but wgpu re-exports no blocking helper of its own.
+pollster          = "0.4"
 bytemuck          = "1.24"
 thiserror         = "2"
 # Embeds app/assets/models into the binary at compile time (no hardcoded model
