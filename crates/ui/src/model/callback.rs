@@ -166,7 +166,21 @@ pub struct PartData {
     /// Horizontal footprint (max of assembled-space X/Z extents) — scales the
     /// press-travel so small buttons don't vanish into the shell.
     pub footprint: f32,
+    /// Evenly-strided `(position, normal)` samples in LOCAL space (the same
+    /// space as `vertices`, i.e. before `transform`), capped at
+    /// `VIS_SAMPLES_PER_PART`. The x-ray visibility test projects these against
+    /// a depth prepass on the CPU; keeping them local means the exact same
+    /// `model_m` the renderer builds for the part applies unchanged, animation
+    /// included.
+    pub samples: Vec<(Vec3, Vec3)>,
 }
+
+/// How many surface points represent a part in the visibility test. The measure
+/// is a ratio, so precision comes from spread rather than count — a couple of
+/// hundred points put the sampling error well under the gap between the
+/// hysteresis thresholds, and the whole model then costs a few thousand point
+/// transforms per measurement.
+const VIS_SAMPLES_PER_PART: usize = 192;
 
 // ── Render target format ──────────────────────────────────────────────────────
 
@@ -419,6 +433,24 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
                 }
             }
         }
+        // Surface samples for the x-ray visibility test: stride the vertex list
+        // so the points spread over the whole part instead of clustering in
+        // whichever region the exporter happened to emit first.
+        let samples = {
+            let n_v = v.len() / 6;
+            let stride = (n_v / VIS_SAMPLES_PER_PART).max(1);
+            (0..n_v)
+                .step_by(stride)
+                .take(VIS_SAMPLES_PER_PART)
+                .map(|k| {
+                    let b = k * 6;
+                    (
+                        Vec3::new(v[b], v[b + 1], v[b + 2]),
+                        Vec3::new(v[b + 3], v[b + 4], v[b + 5]),
+                    )
+                })
+                .collect()
+        };
         parts.push(PartData {
             name: p.name.clone(),
             vertices: p.mesh.vertices.clone(),
@@ -428,6 +460,7 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
             centroid,
             avg_normal,
             footprint,
+            samples,
         });
     }
 
@@ -542,15 +575,18 @@ struct MatteTarget {
 struct MatteActive(bool);
 
 /// Ghost-gate threshold on the measured `visible / total` sample ratio. The
-/// "total" query rasterizes front AND back faces (cull is off), so a fully
-/// visible closed mesh measures ≈ 0.5 — 0.05 therefore corresponds to the
-/// spec's "less than ~10% of the part's geometry visible on camera".
 /// X-ray ghost gating with hysteresis (kills the strobe when a part sits at the
 /// edge of occlusion): an active part ENTERS x-ray only once its smoothed
-/// visibility falls below LOW, and LEAVES it once back above HIGH. LOW is low so
-/// a still-visible part (e.g. a stick ring peeking past the dome) doesn't ghost.
-const GHOST_VIS_LOW: f32 = 0.025;
-const GHOST_VIS_HIGH: f32 = 0.06;
+/// visibility falls below LOW, and LEAVES it once back above HIGH.
+///
+/// The measured fraction counts only CAMERA-FACING surface samples, so a fully
+/// unobstructed part reads ≈ 1.0 and the numbers mean what the spec says
+/// literally: ghost below ~5% of the part's facing surface visible, un-ghost
+/// once back over ~12%. (The older occlusion-query measure counted front and
+/// back faces alike and so topped out near 0.5, which is why its thresholds
+/// looked half this size.)
+const GHOST_VIS_LOW: f32 = 0.05;
+const GHOST_VIS_HIGH: f32 = 0.12;
 /// EMA weight applied to each raw visibility readback — damps the measurement
 /// noise (already ~3 frames behind) that made the ghost flicker in and out.
 const VIS_SMOOTH: f32 = 0.35;
@@ -560,8 +596,8 @@ const VIS_SMOOTH: f32 = 0.35;
 enum VisMapState {
     /// No measurement in flight — record one this frame.
     Idle,
-    /// Queries resolved + copied to the staging buffer (submits with egui's
-    /// frame); map it next frame.
+    /// Depth prepass copied to the staging buffer (submits with egui's frame);
+    /// map it next frame.
     Copied,
     /// `map_async` registered; waiting for the device poll to complete it.
     Mapping,
@@ -569,19 +605,115 @@ enum VisMapState {
     Ready,
 }
 
-/// GPU-measured per-part visibility (occlusion queries). A depth prepass of
-/// the whole model into a small offscreen target, then per part two queries:
-/// samples passing `LessEqual` against that depth (its visible surface) and
-/// samples passing `Always` (its whole rasterized footprint). The ratio is the
-/// REAL visibility fraction — part-vs-part occlusion included — and drives the
-/// "<10% visible → x-ray ghost" rule. Readback is async (~3 frames behind,
-/// invisible at highlight timescales).
+/// Side of the offscreen visibility target, in pixels. The measure is a ratio
+/// of sample counts, so it is resolution-independent; this only has to be fine
+/// enough that a small part still covers several pixels. 256 keeps the readback
+/// at 256 KB and its row pitch (1024 B) already a multiple of wgpu's 256-byte
+/// `bytes_per_row` alignment, so no padding arithmetic is needed.
+const VIS_RES: u32 = 256;
+
+/// Everything the CPU-side visibility test needs from the frame whose depth
+/// prepass is being read back.
+struct VisPose {
+    /// View-projection at record time (`crop * proj * view`).
+    view_proj: Mat4,
+    /// Per-part model matrix at record time — the animated `model_m` the
+    /// renderer used, so a depressed button is tested where it was drawn.
+    part_model: Vec<Mat4>,
+    /// Camera position, for the camera-facing test.
+    cam: Vec3,
+    /// Depth tolerance in NDC units, derived from the projection rather than
+    /// guessed: the depth delta a small world-space step toward the camera
+    /// produces near the model centre. A part's own samples sit exactly on the
+    /// surface the prepass recorded, so they need only survive float rounding,
+    /// while anything genuinely behind the shell is further away by far more
+    /// than this.
+    depth_eps: f32,
+}
+
+/// Fraction of each part's camera-facing surface left unobstructed, judged
+/// against `depth` — the prepass image, row-major and `VIS_RES` square.
+///
+/// Parts with no camera-facing samples in frame report 1.0: there is nothing on
+/// screen to reveal, so ghosting them would be noise. That default also makes
+/// the measurement fail SAFE — if it ever stops producing data the model
+/// renders normally, rather than every input turning permanently to glass the
+/// way a silently-dead occlusion query did.
+fn visibility_fractions(parts: &[PartData], pose: &VisPose, depth: &[f32]) -> Vec<f32> {
+    let res = VIS_RES as usize;
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let model = pose.part_model.get(i).copied().unwrap_or(Mat4::IDENTITY);
+            let mvp = pose.view_proj * model;
+            let (mut visible, mut total) = (0u32, 0u32);
+            for (p_local, n_local) in &part.samples {
+                let world = model.transform_point3(*p_local);
+                // Away-facing samples describe the part's far side, which its
+                // own body hides wherever the camera stands. Counting them
+                // would peg every fraction near one half and make the
+                // thresholds meaningless.
+                if model.transform_vector3(*n_local).dot(pose.cam - world) <= 0.0 {
+                    continue;
+                }
+                let clip = mvp * p_local.extend(1.0);
+                if clip.w <= 1e-6 {
+                    continue; // at or behind the eye
+                }
+                let ndc = clip.truncate() / clip.w;
+                if !(-1.0..=1.0).contains(&ndc.x) || !(-1.0..=1.0).contains(&ndc.y) {
+                    continue; // outside the frame
+                }
+                total += 1;
+                let px = (((ndc.x * 0.5 + 0.5) * res as f32) as usize).min(res - 1);
+                // NDC y points up; the depth image's rows run down.
+                let py = (((0.5 - ndc.y * 0.5) * res as f32) as usize).min(res - 1);
+                if ndc.z <= depth[py * res + px] + pose.depth_eps {
+                    visible += 1;
+                }
+            }
+            if total == 0 {
+                1.0
+            } else {
+                visible as f32 / total as f32
+            }
+        })
+        .collect()
+}
+
+/// Per-part visibility measurement: is this input in the camera's line of
+/// sight, or hidden behind the controller body?
+///
+/// The GPU renders a depth prepass of the whole model into a small offscreen
+/// target; that depth image is read back and every part's surface samples are
+/// tested against it on the CPU. A sample counts toward the total if it faces
+/// the camera and lands inside the frame, and counts as visible if its own
+/// depth is no further than the depth already recorded at that pixel — i.e.
+/// nothing else got there first. The ratio is the REAL visibility fraction,
+/// part-vs-part occlusion included, and drives the "<10% visible → x-ray
+/// ghost" rule.
+///
+/// This deliberately does NOT use occlusion queries, which is what the pass
+/// originally did. They ask the driver the same question far more cheaply, but
+/// when a driver stops answering it returns zero samples rather than an error —
+/// indistinguishable at the call site from "completely hidden", so every input
+/// silently ghosts forever. That happened on AMD across both DX12 and Vulkan
+/// (see `tests/occlusion_query.rs`). Projecting points against a depth image
+/// costs a readback and a few thousand transforms per measurement, and it
+/// behaves identically on every backend.
+///
+/// Readback is async (~3 frames behind, invisible at highlight timescales).
 struct VisMeasure {
+    depth_tex: wgpu::Texture,
     depth_view: wgpu::TextureView,
-    qs: wgpu::QuerySet,
     n_parts: usize,
-    resolve_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
+    /// Camera + per-part transforms captured when the prepass was RECORDED.
+    /// The readback lands frames later, by which time the live matrices have
+    /// moved on; testing against the current pose would compare sample
+    /// positions to a depth image of a different one.
+    pose: Arc<Mutex<Option<VisPose>>>,
     state: Arc<Mutex<VisMapState>>,
     /// Smoothed `visible / total` per part index (EMA over readbacks; empty
     /// until the first readback completes). Feeds the hysteresis latch below.
@@ -594,6 +726,10 @@ struct VisMeasure {
     /// visible/total counts are summed before the fraction + latch, so a cap
     /// covering its own dome never ghosts the stick. Length == `n_parts`.
     obj: Vec<u32>,
+    /// Model the samples and `obj` ids were built for — the buffers rebuild on
+    /// a model swap and this must follow, or parts get judged against another
+    /// controller's geometry.
+    model: String,
     /// Consecutive frames spent in `Mapping` — the map_async callback only
     /// fires on device maintenance, and if it's ever lost the machine would
     /// wedge and the ghost gating would keep judging visibility from a STALE
@@ -735,6 +871,9 @@ impl CallbackTrait for MeshRenderState {
         // Parts with a translucent material (scheme alpha < 1): excluded from
         // the opaque pass and re-drawn sorted far→near with blending.
         let mut translucent: Vec<(usize, f32)> = Vec::new();
+        // Per-part model matrices, in draw order — handed to the visibility
+        // measurement below so it tests the pose that was actually rendered.
+        let mut part_model: Vec<Mat4> = Vec::with_capacity(gpu_parts.len());
         for (i, gpu_part) in gpu_parts.iter().enumerate() {
             let part = self.model.parts.get(i);
             let part_tf = part.map(|p| p.transform).unwrap_or(Mat4::IDENTITY);
@@ -812,10 +951,13 @@ impl CallbackTrait for MeshRenderState {
                 center_radius: center_radius4,
             };
             gpu_part.update_uniforms(queue, &uniforms);
+            // Same matrix the draw uses, kept for the visibility test so its
+            // sample points land exactly where the part is actually rendered.
+            part_model.push(model_m);
 
             // X-ray ghost: an ACTIVE part that is measurably out of view —
-            // under ~10% of its geometry visible per the occlusion-query
-            // measurement (real per-fragment occlusion, so a camera-facing
+            // under ~10% of its facing surface visible per the depth-prepass
+            // measurement (real per-pixel occlusion, so a camera-facing
             // d-pad hidden behind the trigger counts as hidden) — is re-drawn
             // where OCCLUDED (depth Greater) as a strong accent ghost. Parts
             // that are meaningfully visible keep only the normal highlight.
@@ -1029,17 +1171,16 @@ impl CallbackTrait for MeshRenderState {
                 }
             }
         }
-        // ── Visibility measurement (occlusion queries) ─────────────────────
+        // ── Visibility measurement (depth prepass + CPU sample test) ───────
         // One measurement in flight at a time: record → (egui submits) → map →
         // read → record again. Runs at a fraction of the frame rate, which is
         // plenty — visibility changes with orientation, not per frame.
         let n_parts = self.model.parts.len();
         let vis_rebuild = callback_resources
             .get::<VisMeasure>()
-            .map(|v| v.n_parts != n_parts)
+            .map(|v| v.n_parts != n_parts || v.model != self.model.name)
             .unwrap_or(true);
         if vis_rebuild && n_parts > 0 {
-            const VIS_RES: u32 = 256; // small target: ratios are resolution-independent
             let depth = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("c3d_vis_depth"),
                 size: wgpu::Extent3d {
@@ -1051,33 +1192,24 @@ impl CallbackTrait for MeshRenderState {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: crate::model::pipeline::CONTROLLER_DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                // COPY_SRC: the depth image itself is the measurement, so it
+                // has to come back to the CPU.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
-            });
-            let bytes = (2 * n_parts * 8) as u64;
-            let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("c3d_vis_resolve"),
-                size: bytes,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
             });
             let staging = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("c3d_vis_staging"),
-                size: bytes,
+                size: (VIS_RES * VIS_RES * 4) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
-                label: Some("c3d_vis_queries"),
-                ty: wgpu::QueryType::Occlusion,
-                count: (2 * n_parts) as u32,
-            });
             callback_resources.insert(VisMeasure {
                 depth_view: depth.create_view(&Default::default()),
-                qs,
+                depth_tex: depth,
                 n_parts,
-                resolve_buf,
                 staging,
+                model: self.model.name.clone(),
+                pose: Arc::new(Mutex::new(None)),
                 state: Arc::new(Mutex::new(VisMapState::Idle)),
                 fractions: Arc::new(Mutex::new(Vec::new())),
                 ghost: Arc::new(Mutex::new(Vec::new())),
@@ -1101,34 +1233,37 @@ impl CallbackTrait for MeshRenderState {
                 let st = *vm.state.lock().unwrap();
                 match st {
                     VisMapState::Ready => {
-                        {
+                        // The pose is only missing if a model swap landed
+                        // between record and readback — the depth image then
+                        // belongs to different geometry, so drop it.
+                        if let Some(pose) = vm.pose.lock().unwrap().take() {
                             let data = vm.staging.slice(..).get_mapped_range();
-                            let counts: &[u64] = bytemuck::cast_slice(&data);
+                            let depth: &[f32] = bytemuck::cast_slice(&data);
+                            let per_part =
+                                visibility_fractions(&self.model.parts, &pose, depth);
                             let mut fr = vm.fractions.lock().unwrap();
                             let mut gh = vm.ghost.lock().unwrap();
                             fr.resize(vm.n_parts, 1.0);
                             gh.resize(vm.n_parts, false);
-                            // Sum visible + total per occlusion OBJECT first, so a
-                            // stick's three meshes are judged as one solid: the cap
-                            // covering its own dome leaves cap+rim visible, so the
-                            // object stays on-camera and never ghosts. Only the
-                            // whole object going behind the body drops below
-                            // threshold. Non-stick parts each get a unique id, so
-                            // they still measure independently.
+                            // Average per occlusion OBJECT first, so a stick's
+                            // three meshes are judged as one solid: the cap
+                            // covering its own dome leaves cap+rim visible, so
+                            // the object stays on-camera and never ghosts. Only
+                            // the whole object going behind the body drops below
+                            // threshold. Non-stick parts each get a unique id,
+                            // so they still measure independently.
                             let mut obj_sum: std::collections::HashMap<u32, (f32, f32)> =
                                 std::collections::HashMap::new();
                             for i in 0..vm.n_parts {
-                                let vis = counts.get(2 * i).copied().unwrap_or(0) as f32;
-                                let tot = counts.get(2 * i + 1).copied().unwrap_or(0) as f32;
                                 let key = vm.obj.get(i).copied().unwrap_or(i as u32);
                                 let e = obj_sum.entry(key).or_insert((0.0, 0.0));
-                                e.0 += vis;
-                                e.1 += tot;
+                                e.0 += per_part.get(i).copied().unwrap_or(1.0);
+                                e.1 += 1.0;
                             }
                             for i in 0..vm.n_parts {
                                 let key = vm.obj.get(i).copied().unwrap_or(i as u32);
-                                let (vis, tot) = obj_sum.get(&key).copied().unwrap_or((0.0, 1.0));
-                                let frac = vis / tot.max(1.0);
+                                let (sum, n) = obj_sum.get(&key).copied().unwrap_or((1.0, 1.0));
+                                let frac = sum / n.max(1.0);
                                 // Smooth the raw fraction, then latch hidden/visible
                                 // with hysteresis so an edge-of-occlusion part holds.
                                 fr[i] = fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH;
@@ -1190,49 +1325,40 @@ impl CallbackTrait for MeshRenderState {
                                 gpu_part.draw(&mut pass);
                             }
                         }
-                        // Measurement pass: two occlusion queries per part.
-                        {
-                            let mut pass =
-                                _egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("c3d_vis_measure"),
-                                    color_attachments: &[],
-                                    depth_stencil_attachment: Some(
-                                        wgpu::RenderPassDepthStencilAttachment {
-                                            view: &vm.depth_view,
-                                            depth_ops: Some(wgpu::Operations {
-                                                load: wgpu::LoadOp::Load,
-                                                store: wgpu::StoreOp::Discard,
-                                            }),
-                                            stencil_ops: None,
-                                        },
-                                    ),
-                                    timestamp_writes: None,
-                                    occlusion_query_set: Some(&vm.qs),
-                                });
-                            for (i, gpu_part) in gpu_parts.iter().enumerate() {
-                                pass.set_pipeline(&pipeline.vis_measure_visible);
-                                pass.begin_occlusion_query((2 * i) as u32);
-                                gpu_part.draw(&mut pass);
-                                pass.end_occlusion_query();
-                                pass.set_pipeline(&pipeline.vis_measure_total);
-                                pass.begin_occlusion_query((2 * i + 1) as u32);
-                                gpu_part.draw(&mut pass);
-                                pass.end_occlusion_query();
-                            }
-                        }
-                        _egui_encoder.resolve_query_set(
-                            &vm.qs,
-                            0..(2 * vm.n_parts) as u32,
-                            &vm.resolve_buf,
-                            0,
+                        // Pull the finished depth image back for the CPU test.
+                        _egui_encoder.copy_texture_to_buffer(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &vm.depth_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::DepthOnly,
+                            },
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: &vm.staging,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    // VIS_RES * 4 bytes: already 256-aligned.
+                                    bytes_per_row: Some(VIS_RES * 4),
+                                    rows_per_image: Some(VIS_RES),
+                                },
+                            },
+                            wgpu::Extent3d {
+                                width: VIS_RES,
+                                height: VIS_RES,
+                                depth_or_array_layers: 1,
+                            },
                         );
-                        _egui_encoder.copy_buffer_to_buffer(
-                            &vm.resolve_buf,
-                            0,
-                            &vm.staging,
-                            0,
-                            (2 * vm.n_parts * 8) as u64,
-                        );
+                        // Freeze the pose this image was rendered from — the
+                        // readback lands frames later against moved matrices.
+                        let toward_cam = (cam - center).normalize_or_zero();
+                        let d0 = view_proj.project_point3(center).z;
+                        let d1 = view_proj.project_point3(center + toward_cam * radius * 0.02).z;
+                        *vm.pose.lock().unwrap() = Some(VisPose {
+                            view_proj,
+                            part_model: part_model.clone(),
+                            cam,
+                            depth_eps: (d0 - d1).abs().max(1e-6),
+                        });
                         *vm.state.lock().unwrap() = VisMapState::Copied;
                     }
                 }
@@ -1378,4 +1504,146 @@ pub fn paint_controller_model(
     let paint_callback = Callback::new_paint_callback(vis_rect, state);
     ui.painter_at(vis_rect)
         .add(egui::epaint::Shape::Callback(paint_callback));
+}
+
+#[cfg(test)]
+mod vis_tests {
+    use super::*;
+
+    /// A flat 1×1 quad in the z=0 plane facing +Z, sampled on an 8×8 grid.
+    fn facing_quad(flip_normals: bool) -> PartData {
+        let n = if flip_normals { -Vec3::Z } else { Vec3::Z };
+        let mut samples = Vec::new();
+        for iy in 0..8 {
+            for ix in 0..8 {
+                let x = -0.5 + ix as f32 / 7.0;
+                let y = -0.5 + iy as f32 / 7.0;
+                samples.push((Vec3::new(x, y, 0.0), n));
+            }
+        }
+        PartData {
+            name: "quad".into(),
+            vertices: Vec::new(),
+            tri_count: 0,
+            transform: Mat4::IDENTITY,
+            group: 0,
+            centroid: Vec3::ZERO,
+            avg_normal: n,
+            footprint: 1.0,
+            samples,
+        }
+    }
+
+    /// Camera on +Z looking at the origin — the quad faces it head on.
+    fn pose(part_model: Mat4) -> VisPose {
+        let cam = Vec3::new(0.0, 0.0, 3.0);
+        let view = Mat4::look_at_rh(cam, Vec3::ZERO, Vec3::Y);
+        let view_proj = Mat4::perspective_infinite_rh(45.0_f32.to_radians(), 1.0, 0.1) * view;
+        // Same derivation as the renderer: the depth delta of a small step
+        // toward the camera near the model centre.
+        let d0 = view_proj.project_point3(Vec3::ZERO).z;
+        let d1 = view_proj.project_point3(Vec3::Z * 0.01).z;
+        VisPose {
+            view_proj,
+            part_model: vec![part_model],
+            cam,
+            depth_eps: (d0 - d1).abs().max(1e-6),
+        }
+    }
+
+    /// The depth image a prepass of this part alone would produce: each sample's
+    /// own depth at the pixel it lands on, far plane everywhere else.
+    fn self_depth(part: &PartData, pose: &VisPose) -> Vec<f32> {
+        let res = VIS_RES as usize;
+        let mut depth = vec![1.0f32; res * res];
+        let mvp = pose.view_proj * pose.part_model[0];
+        for (p, _) in &part.samples {
+            let clip = mvp * p.extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            let px = (((ndc.x * 0.5 + 0.5) * res as f32) as usize).min(res - 1);
+            let py = (((0.5 - ndc.y * 0.5) * res as f32) as usize).min(res - 1);
+            depth[py * res + px] = depth[py * res + px].min(ndc.z);
+        }
+        depth
+    }
+
+    #[test]
+    fn unobstructed_part_reads_fully_visible() {
+        let part = facing_quad(false);
+        let pose = pose(Mat4::IDENTITY);
+        let depth = self_depth(&part, &pose);
+        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        assert_eq!(f[0], 1.0, "a part alone in front of the camera is fully visible");
+    }
+
+    #[test]
+    fn part_behind_a_nearer_surface_reads_hidden() {
+        let part = facing_quad(false);
+        let pose = pose(Mat4::IDENTITY);
+        // Something solid much closer to the camera covers the whole frame.
+        let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
+        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        assert_eq!(f[0], 0.0, "fully covered part must read as hidden");
+        assert!(f[0] < GHOST_VIS_LOW, "and must cross the ghost threshold");
+    }
+
+    #[test]
+    fn half_covered_part_reads_about_half() {
+        let part = facing_quad(false);
+        let pose = pose(Mat4::IDENTITY);
+        let res = VIS_RES as usize;
+        let mut depth = self_depth(&part, &pose);
+        // Occlude the right half of the frame.
+        for y in 0..res {
+            for x in res / 2..res {
+                depth[y * res + x] = 0.0;
+            }
+        }
+        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        assert!(
+            (f[0] - 0.5).abs() < 0.1,
+            "half-occluded part should read near 0.5, got {}",
+            f[0]
+        );
+    }
+
+    #[test]
+    fn part_outside_the_frame_fails_safe_to_visible() {
+        let part = facing_quad(false);
+        // Push it far to the side: nothing projects inside the viewport.
+        let pose = pose(Mat4::from_translation(Vec3::new(50.0, 0.0, 0.0)));
+        let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
+        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        assert_eq!(
+            f[0], 1.0,
+            "off-screen parts have nothing to reveal — ghosting them is noise"
+        );
+    }
+
+    #[test]
+    fn part_turned_away_fails_safe_to_visible() {
+        // Every sample faces away from the camera, so none counts toward the
+        // total. That must not read as "hidden" — there is no facing surface to
+        // x-ray through in the first place.
+        let part = facing_quad(true);
+        let pose = pose(Mat4::IDENTITY);
+        let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
+        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        assert_eq!(f[0], 1.0);
+    }
+
+    #[test]
+    fn a_part_never_occludes_itself() {
+        // The prepass contains this part's own depth, and the renderer animates
+        // it with the very same matrix the test uses. Rotating it must not make
+        // its own recorded surface read as an occluder.
+        for deg in [0.0f32, 15.0, 30.0, 45.0, 60.0] {
+            let part = facing_quad(false);
+            let m = Mat4::from_rotation_y(deg.to_radians());
+            let pose = pose(m);
+            let depth = self_depth(&part, &pose);
+            let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+            assert_eq!(f[0], 1.0, "self-occlusion at {deg}° — depth epsilon too tight");
+        }
+    }
 }

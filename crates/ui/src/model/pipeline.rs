@@ -82,13 +82,11 @@ pub struct ControllerPipeline {
     /// Translucent-material pass (LessEqual, no depth write, premult blend):
     /// parts whose scheme alpha < 1, drawn far → near after the opaque set.
     pub(crate) translucent: RenderPipeline,
-    /// Depth-only pipelines for the per-part VISIBILITY measurement (occlusion
-    /// queries): a prepass laying down the whole model's depth, then per part
-    /// a "visible samples" draw (LessEqual vs that depth) and a "total
-    /// footprint" draw (Always). No fragment stage / colour output.
+    /// Depth-only prepass for the per-part VISIBILITY measurement: lays the
+    /// whole model's depth into a small offscreen target, which is then read
+    /// back and tested against each part's surface samples on the CPU. No
+    /// fragment stage / colour output.
     pub(crate) vis_prepass: RenderPipeline,
-    pub(crate) vis_measure_visible: RenderPipeline,
-    pub(crate) vis_measure_total: RenderPipeline,
     pub(crate) bind_group_layout: BindGroupLayout,
 }
 
@@ -261,9 +259,6 @@ impl ControllerPipeline {
         // LessEqual (not Less): the prepass wrote this part's own depth, so its
         // visible front surface must still pass its own values.
         let vis_prepass = build_depth("c3d_vis_prepass", true, CompareFunction::Less);
-        let vis_measure_visible =
-            build_depth("c3d_vis_measure_visible", false, CompareFunction::LessEqual);
-        let vis_measure_total = build_depth("c3d_vis_measure_total", false, CompareFunction::Always);
 
         Self {
             pipeline,
@@ -271,8 +266,6 @@ impl ControllerPipeline {
             restore,
             translucent,
             vis_prepass,
-            vis_measure_visible,
-            vis_measure_total,
             bind_group_layout,
         }
     }
