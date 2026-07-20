@@ -131,145 +131,23 @@ pub(crate) fn show_midi_out_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
 }
 
 // ── MIDI pin removal helpers ──────────────────────────────────────────────────
-
-/// One side (inputs or outputs) of a node's dynamic MIDI pin list.
-///
-/// The removal/compaction logic below is identical for both sides; only the
-/// primitives differ — which snarl id type addresses a pin, which end of
-/// `connect(from_out, to_in)` the remote goes on, which pin vector and which
-/// `*_pin_ids` param to rewrite. Naming those five things lets the two
-/// algorithms exist once instead of as mirrored pairs that can drift apart.
-trait MidiSide {
-    /// The pin type snarl hands the body (`OutPin` / `InPin`).
-    type Pin;
-    /// The id of the pin at the OTHER end of a wire, as stored in `remotes`.
-    type Remote: Copy;
-    /// Params key holding this side's stable pin ids.
-    const IDS_KEY: &'static str;
-
-    fn index(pin: &Self::Pin) -> usize;
-    fn remotes(pin: &Self::Pin) -> &[Self::Remote];
-    /// Drop every wire attached to this side's pin `idx`.
-    fn drop_at(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize);
-    /// Reconnect `remote` to this side's pin `idx`.
-    fn connect(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize, remote: Self::Remote);
-    fn pins_mut(node: &mut NodeData) -> &mut Vec<PinDescriptor>;
-}
-
-struct Outputs;
-struct Inputs;
-
-impl MidiSide for Outputs {
-    type Pin = OutPin;
-    type Remote = egui_snarl::InPinId;
-    const IDS_KEY: &'static str = "output_pin_ids";
-
-    fn index(pin: &OutPin) -> usize { pin.id.output }
-    fn remotes(pin: &OutPin) -> &[Self::Remote] { &pin.remotes }
-    fn drop_at(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize) {
-        snarl.drop_outputs(OutPinId { node, output: idx });
-    }
-    fn connect(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize, remote: Self::Remote) {
-        snarl.connect(OutPinId { node, output: idx }, remote);
-    }
-    fn pins_mut(node: &mut NodeData) -> &mut Vec<PinDescriptor> { &mut node.outputs }
-}
-
-impl MidiSide for Inputs {
-    type Pin = InPin;
-    type Remote = OutPinId;
-    const IDS_KEY: &'static str = "input_pin_ids";
-
-    fn index(pin: &InPin) -> usize { pin.id.input }
-    fn remotes(pin: &InPin) -> &[Self::Remote] { &pin.remotes }
-    fn drop_at(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize) {
-        snarl.drop_inputs(InPinId { node, input: idx });
-    }
-    fn connect(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize, remote: Self::Remote) {
-        snarl.connect(remote, InPinId { node, input: idx });
-    }
-    fn pins_mut(node: &mut NodeData) -> &mut Vec<PinDescriptor> { &mut node.inputs }
-}
-
-/// Remove pin `rm_idx`, then slide every later pin down one slot, carrying its
-/// wires with it (snarl addresses wires by index, so the tail must be dropped
-/// and re-made rather than left dangling on stale indices).
-fn remove_midi_pin<S: MidiSide>(
-    node_id: NodeId,
-    rm_idx: usize,
-    pins: &[S::Pin],
-    snarl: &mut Snarl<NodeData>,
-) {
-    let tail: Vec<Vec<S::Remote>> = pins[rm_idx..].iter().map(|p| S::remotes(p).to_vec()).collect();
-    for i in 0..tail.len() {
-        S::drop_at(snarl, node_id, rm_idx + i);
-    }
-    if let Some(node) = snarl.get_node_mut(node_id) {
-        S::pins_mut(node).remove(rm_idx);
-        if let Some(Value::Array(ids)) = node.params.get_mut(S::IDS_KEY) {
-            ids.remove(rm_idx);
-        }
-    }
-    // `skip(1)` drops the removed pin's own wires; the rest shift down one.
-    for (shift, remotes) in tail.into_iter().enumerate().skip(1) {
-        for remote in remotes {
-            S::connect(snarl, node_id, rm_idx + shift - 1, remote);
-        }
-    }
-}
-
-/// Keep only pins that have at least one wire, compacting the rest away.
-fn clear_unused_midi_pins<S: MidiSide>(
-    node_id: NodeId,
-    pins: &[S::Pin],
-    snarl: &mut Snarl<NodeData>,
-) {
-    let connected: Vec<(usize, Vec<S::Remote>)> = pins
-        .iter()
-        .filter(|p| !S::remotes(p).is_empty())
-        .map(|p| (S::index(p), S::remotes(p).to_vec()))
-        .collect();
-
-    for p in pins {
-        S::drop_at(snarl, node_id, S::index(p));
-    }
-
-    if let Some(node) = snarl.get_node_mut(node_id) {
-        let kept_pins: Vec<PinDescriptor> = connected
-            .iter()
-            .map(|(idx, _)| S::pins_mut(node)[*idx].clone())
-            .collect();
-        let kept_ids: Vec<Value> = node.params.get(S::IDS_KEY)
-            .and_then(|v| v.as_array())
-            .map(|ids| connected.iter()
-                .map(|(idx, _)| ids.get(*idx).cloned().unwrap_or(Value::String(String::new())))
-                .collect())
-            .unwrap_or_default();
-        *S::pins_mut(node) = kept_pins;
-        if let Some(Value::Array(ids)) = node.params.get_mut(S::IDS_KEY) {
-            *ids = kept_ids;
-        }
-    }
-
-    for (new_idx, (_, remotes)) in connected.iter().enumerate() {
-        for &remote in remotes {
-            S::connect(snarl, node_id, new_idx, remote);
-        }
-    }
-}
+//
+// Direction-bound wrappers over the shared dynamic-pin editing in `pins.rs`.
+// Every MIDI pin is removable (no protected passthrough) and the id arrays
+// cover every pin, hence `id_offset` 0.
 
 pub(crate) fn remove_midi_output(node_id: NodeId, rm_idx: usize, outputs: &[OutPin], snarl: &mut Snarl<NodeData>) {
-    remove_midi_pin::<Outputs>(node_id, rm_idx, outputs, snarl);
+    remove_dynamic_pin::<Outputs>(node_id, rm_idx, outputs, snarl, "output_pin_ids", 0);
 }
 
 pub(crate) fn remove_midi_input(node_id: NodeId, rm_idx: usize, inputs: &[InPin], snarl: &mut Snarl<NodeData>) {
-    remove_midi_pin::<Inputs>(node_id, rm_idx, inputs, snarl);
+    remove_dynamic_pin::<Inputs>(node_id, rm_idx, inputs, snarl, "input_pin_ids", 0);
 }
 
 pub(crate) fn clear_unused_midi_outputs(node_id: NodeId, outputs: &[OutPin], snarl: &mut Snarl<NodeData>) {
-    clear_unused_midi_pins::<Outputs>(node_id, outputs, snarl);
+    clear_unused_dynamic_pins::<Outputs>(node_id, outputs, snarl, "output_pin_ids");
 }
 
 pub(crate) fn clear_unused_midi_inputs(node_id: NodeId, inputs: &[InPin], snarl: &mut Snarl<NodeData>) {
-    clear_unused_midi_pins::<Inputs>(node_id, inputs, snarl);
+    clear_unused_dynamic_pins::<Inputs>(node_id, inputs, snarl, "input_pin_ids");
 }

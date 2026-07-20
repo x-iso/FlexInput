@@ -250,21 +250,8 @@ pub(crate) fn show_automap_split_body(
 pub(crate) fn remove_automap_split_output(node_id: NodeId, rm_idx: usize, outputs: &[OutPin], snarl: &mut Snarl<NodeData>) {
     // Never remove index 0 (the AutoMap passthrough output).
     if rm_idx == 0 { return; }
-    let tail: Vec<Vec<egui_snarl::InPinId>> = outputs[rm_idx..]
-        .iter().map(|o| o.remotes.clone()).collect();
-    for i in 0..tail.len() {
-        snarl.drop_outputs(OutPinId { node: node_id, output: rm_idx + i });
-    }
-    if let Some(node) = snarl.get_node_mut(node_id) {
-        node.outputs.remove(rm_idx);
-        if let Some(Value::Array(ids)) = node.params.get_mut("output_pin_ids") {
-            ids.remove(rm_idx);
-        }
-    }
-    for (shift, remotes) in tail.into_iter().enumerate().skip(1) {
-        let new_out = OutPinId { node: node_id, output: rm_idx + shift - 1 };
-        for remote in remotes { snarl.connect(new_out, remote); }
-    }
+    // Splitter ids cover every output, passthrough included — offset 0.
+    remove_dynamic_pin::<Outputs>(node_id, rm_idx, outputs, snarl, "output_pin_ids", 0);
 }
 
 // ── AutoMap Collector body ────────────────────────────────────────────────────
@@ -393,23 +380,9 @@ pub(crate) fn show_automap_collect_body(
 
 pub(crate) fn remove_automap_collect_input(node_id: NodeId, rm_idx: usize, inputs: &[InPin], snarl: &mut Snarl<NodeData>) {
     if rm_idx == 0 { return; } // Never remove the AutoMap passthrough input.
-    let tail: Vec<Vec<OutPinId>> = inputs[rm_idx..]
-        .iter().map(|p| p.remotes.clone()).collect();
-    for i in 0..tail.len() {
-        snarl.drop_inputs(InPinId { node: node_id, input: rm_idx + i });
-    }
-    if let Some(node) = snarl.get_node_mut(node_id) {
-        node.inputs.remove(rm_idx);
-        // Keep collect_input_pin_ids in sync (index rm_idx-1 because it doesn't include input[0]).
-        if let Some(Value::Array(ids)) = node.params.get_mut("collect_input_pin_ids") {
-            let id_idx = rm_idx - 1;
-            if id_idx < ids.len() { ids.remove(id_idx); }
-        }
-    }
-    for (shift, remotes) in tail.into_iter().enumerate().skip(1) {
-        let new_in = InPinId { node: node_id, input: rm_idx + shift - 1 };
-        for remote in remotes { snarl.connect(remote, new_in); }
-    }
+    // `collect_input_pin_ids` does NOT include the passthrough `input[0]`, so
+    // pin `n`'s id lives at `n - 1` — hence offset 1.
+    remove_dynamic_pin::<Inputs>(node_id, rm_idx, inputs, snarl, "collect_input_pin_ids", 1);
 }
 
 // ── AutoMap Fork body ─────────────────────────────────────────────────────────

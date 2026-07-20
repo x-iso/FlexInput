@@ -1,6 +1,144 @@
-//! Pin rendering: type-colored PinInfo and the header-row snarl pin.
+//! Pin rendering: type-colored PinInfo and the header-row snarl pin, plus the
+//! direction-generic editing of nodes' dynamic (user-added) pin lists.
 
 use super::*;
+
+// ── dynamic pin lists ─────────────────────────────────────────────────────────
+
+/// One side (inputs or outputs) of a node's dynamic pin list.
+///
+/// Editing those lists is identical for both sides; only five primitives
+/// differ — which snarl id type addresses a pin, which end of
+/// `connect(from_out, to_in)` the remote goes on, which pin vector to rewrite,
+/// and how to read a pin's index and wires. Naming them lets the editing
+/// algorithms exist once instead of as mirrored pairs that drift apart (MIDI
+/// in/out, AutoMap Splitter/Collector).
+pub(crate) trait PinSide {
+    /// The pin type snarl hands the body (`OutPin` / `InPin`).
+    type Pin;
+    /// The id of the pin at the OTHER end of a wire, as stored in `remotes`.
+    type Remote: Copy;
+
+    fn index(pin: &Self::Pin) -> usize;
+    fn remotes(pin: &Self::Pin) -> &[Self::Remote];
+    /// Drop every wire attached to this side's pin `idx`.
+    fn drop_at(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize);
+    /// Reconnect `remote` to this side's pin `idx`.
+    fn connect(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize, remote: Self::Remote);
+    fn pins_mut(node: &mut NodeData) -> &mut Vec<PinDescriptor>;
+}
+
+pub(crate) struct Outputs;
+pub(crate) struct Inputs;
+
+impl PinSide for Outputs {
+    type Pin = OutPin;
+    type Remote = egui_snarl::InPinId;
+
+    fn index(pin: &OutPin) -> usize { pin.id.output }
+    fn remotes(pin: &OutPin) -> &[Self::Remote] { &pin.remotes }
+    fn drop_at(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize) {
+        snarl.drop_outputs(OutPinId { node, output: idx });
+    }
+    fn connect(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize, remote: Self::Remote) {
+        snarl.connect(OutPinId { node, output: idx }, remote);
+    }
+    fn pins_mut(node: &mut NodeData) -> &mut Vec<PinDescriptor> { &mut node.outputs }
+}
+
+impl PinSide for Inputs {
+    type Pin = InPin;
+    type Remote = OutPinId;
+
+    fn index(pin: &InPin) -> usize { pin.id.input }
+    fn remotes(pin: &InPin) -> &[Self::Remote] { &pin.remotes }
+    fn drop_at(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize) {
+        snarl.drop_inputs(InPinId { node, input: idx });
+    }
+    fn connect(snarl: &mut Snarl<NodeData>, node: NodeId, idx: usize, remote: Self::Remote) {
+        snarl.connect(remote, InPinId { node, input: idx });
+    }
+    fn pins_mut(node: &mut NodeData) -> &mut Vec<PinDescriptor> { &mut node.inputs }
+}
+
+/// Remove pin `rm_idx`, then slide every later pin down one slot, carrying its
+/// wires with it (snarl addresses wires by index, so the tail must be dropped
+/// and re-made rather than left dangling on stale indices).
+///
+/// `ids_key` names the params array of stable pin ids to keep in step, and
+/// `id_offset` is how many leading pins that array does NOT cover — the
+/// AutoMap Collector's ids exclude its passthrough `input[0]`, so its entry
+/// for pin `n` lives at `n - 1`.
+pub(crate) fn remove_dynamic_pin<S: PinSide>(
+    node_id: NodeId,
+    rm_idx: usize,
+    pins: &[S::Pin],
+    snarl: &mut Snarl<NodeData>,
+    ids_key: &str,
+    id_offset: usize,
+) {
+    let tail: Vec<Vec<S::Remote>> = pins[rm_idx..].iter().map(|p| S::remotes(p).to_vec()).collect();
+    for i in 0..tail.len() {
+        S::drop_at(snarl, node_id, rm_idx + i);
+    }
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        S::pins_mut(node).remove(rm_idx);
+        if let Some(Value::Array(ids)) = node.params.get_mut(ids_key) {
+            if let Some(i) = rm_idx.checked_sub(id_offset) {
+                if i < ids.len() {
+                    ids.remove(i);
+                }
+            }
+        }
+    }
+    // `skip(1)` drops the removed pin's own wires; the rest shift down one.
+    for (shift, remotes) in tail.into_iter().enumerate().skip(1) {
+        for remote in remotes {
+            S::connect(snarl, node_id, rm_idx + shift - 1, remote);
+        }
+    }
+}
+
+/// Keep only pins that have at least one wire, compacting the rest away.
+pub(crate) fn clear_unused_dynamic_pins<S: PinSide>(
+    node_id: NodeId,
+    pins: &[S::Pin],
+    snarl: &mut Snarl<NodeData>,
+    ids_key: &str,
+) {
+    let connected: Vec<(usize, Vec<S::Remote>)> = pins
+        .iter()
+        .filter(|p| !S::remotes(p).is_empty())
+        .map(|p| (S::index(p), S::remotes(p).to_vec()))
+        .collect();
+
+    for p in pins {
+        S::drop_at(snarl, node_id, S::index(p));
+    }
+
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        let kept_pins: Vec<PinDescriptor> = connected
+            .iter()
+            .map(|(idx, _)| S::pins_mut(node)[*idx].clone())
+            .collect();
+        let kept_ids: Vec<Value> = node.params.get(ids_key)
+            .and_then(|v| v.as_array())
+            .map(|ids| connected.iter()
+                .map(|(idx, _)| ids.get(*idx).cloned().unwrap_or(Value::String(String::new())))
+                .collect())
+            .unwrap_or_default();
+        *S::pins_mut(node) = kept_pins;
+        if let Some(Value::Array(ids)) = node.params.get_mut(ids_key) {
+            *ids = kept_ids;
+        }
+    }
+
+    for (new_idx, (_, remotes)) in connected.iter().enumerate() {
+        for &remote in remotes {
+            S::connect(snarl, node_id, new_idx, remote);
+        }
+    }
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
