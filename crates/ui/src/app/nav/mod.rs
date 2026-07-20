@@ -8,3 +8,6 @@
 use super::*;
 
 mod curves;
+mod pickers;
+mod remap;
+mod touch_zones;
