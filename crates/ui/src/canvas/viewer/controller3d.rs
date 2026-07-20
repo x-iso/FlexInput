@@ -462,6 +462,7 @@ pub(crate) fn show_controller3d_body(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     live_signals: &std::collections::HashMap<(String, String), Signal>,
+    parents: Option<&AutomapGlowParent<'_>>,
 ) {
     use crate::model;
 
@@ -488,12 +489,16 @@ pub(crate) fn show_controller3d_body(
     // Auto-detect the skin by tracing the Device bus (input 0) back to the
     // physical source — through Remapper/Gyro/Fork/sub-patches, not just a
     // direct device.source wire. Also yields the source's stick deadzone.
+    // `parents` is what lets the walk pop OUT through a `subpatch.inlet` into
+    // the enclosing canvas — without it a viewer living inside a sub-patch can
+    // never reach its device, and the model renders inert (the pinned renderer
+    // has always passed its bridged parent; the body used to pass `None`).
     let traced = snarl
         .in_pin(InPinId { node: node_id, input: 0 })
         .remotes
         .first()
         .copied()
-        .and_then(|src| controller3d_physical_device(snarl, src, None));
+        .and_then(|src| controller3d_physical_device(snarl, src, parents));
     let (dev_id, deadzone) = match traced {
         Some((d, z)) => (Some(d), z),
         None => (None, 0.1),

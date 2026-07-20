@@ -971,7 +971,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl),
             "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl),
             "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl),
-            "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals),
+            "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
             "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl),
             "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl),
             "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl),
