@@ -784,7 +784,7 @@ pub(crate) fn controller3d_pin_inspector_strip_item(
         LayoutItem::Module(m) => m,
         _ => return,
     };
-    let mut ov = exp.iv_style_override.unwrap_or(IvStyleOverride {
+    let mut ov = exp.iv_style_override.clone().unwrap_or(IvStyleOverride {
         bg: [18, 18, 22, 255],
         accent: C3D_DEFAULT_ACCENT,
         tint: [255, 255, 255, 255],
@@ -794,8 +794,10 @@ pub(crate) fn controller3d_pin_inspector_strip_item(
         c3d_alpha: None,
         c3d_fade: None,
         c3d_composite: None,
+        c3d_materials: None,
+        c3d_model: None,
     });
-    let before = ov;
+    let before = ov.clone();
     let mut reset = false;
 
     ui.vertical(|ui| {
@@ -842,74 +844,90 @@ pub(crate) fn controller3d_pin_inspector_strip_item(
                 .changed() { ov.c3d_composite = Some(comp); }
         });
 
-        // Material colours + model — edit the NODE (shared with the module
-        // body and every pinned instance). Current values are published by the
-        // pinned renderer each frame; edits ride temp memory back to it.
+        // Material colours + model — this PIN's own override (the module and
+        // other pinned instances keep their own; unset groups show the
+        // module's shared colours through). Effective values are published by
+        // the pinned renderer each frame under `c3d_pub`; edits land straight
+        // in `ov`, which commits to `exp.iv_style_override` below.
         let uid = exp.inner_node_id;
+        // Async .fxcol load result for THIS pin (worker-thread file dialog).
+        if let Some(map) = ui.ctx().data_mut(|d| {
+            d.remove_temp::<serde_json::Map<String, serde_json::Value>>(
+                egui::Id::new(("c3d_pin_matload", uid)),
+            )
+        }) {
+            ov.c3d_materials = Some(map);
+        }
         let pub_data = ui.ctx().data(|d| {
             d.get_temp::<(String, crate::model::Scheme)>(egui::Id::new(("c3d_pub", uid)))
         });
-        if let Some((model, cur)) = pub_data {
+        if let Some((model, mut cur)) = pub_data {
+            // `cur` arrives as the NODE-base scheme — apply THIS pin's own
+            // overrides so the swatches show what this instance renders.
+            if let Some(m) = ov.c3d_materials.as_ref() {
+                c3d_apply_materials(&mut cur, m);
+            }
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                // Model chooser (Auto + every available model folder).
+                // Model chooser: follow the module, force auto-detect, or pin
+                // a specific model for this instance.
                 ui.label(egui::RichText::new("Model").small().strong());
-                let mut sel = model.clone();
+                let sel_label = match ov.c3d_model.as_deref() {
+                    None => format!("{model} (module)"),
+                    Some("") => "Auto (device)".to_string(),
+                    Some(m) => m.to_string(),
+                };
                 egui::ComboBox::from_id_salt(("c3d_pin_model", uid))
-                    .selected_text(sel.clone())
+                    .selected_text(sel_label)
                     .show_ui(ui, |ui| {
-                        if ui.selectable_value(&mut sel, "auto".to_string(), "Auto (device)").clicked() {
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(egui::Id::new(("c3d_modeledit", uid)), String::new())
-                            });
+                        if ui.selectable_label(ov.c3d_model.is_none(), "Follow module").clicked() {
+                            ov.c3d_model = None;
+                        }
+                        if ui.selectable_label(ov.c3d_model.as_deref() == Some(""), "Auto (device)").clicked() {
+                            ov.c3d_model = Some(String::new());
                         }
                         for m in crate::model::available_models() {
-                            if ui.selectable_value(&mut sel, m.clone(), &m).clicked() {
-                                ui.ctx().data_mut(|d| {
-                                    d.insert_temp(egui::Id::new(("c3d_modeledit", uid)), m.clone())
-                                });
+                            if ui.selectable_label(ov.c3d_model.as_deref() == Some(m.as_str()), &m).clicked() {
+                                ov.c3d_model = Some(m.clone());
                             }
                         }
                     });
                 ui.separator();
                 ui.label(egui::RichText::new("Colours").small().strong())
-                    .on_hover_text("Model colours — shared with the module (not per-pin).");
+                    .on_hover_text("This pin's own colour overrides — groups you don't touch keep showing the module's colours.");
                 for (row_label, groups) in crate::model::material::ROWS {
                     ui.label(egui::RichText::new(*row_label).small().weak());
                     for &g in *groups {
                         let mut col = cur[g as usize];
                         if c3d_color_swatch(ui, &mut col, g.label()) {
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(
-                                    egui::Id::new(("c3d_matedit", uid)),
-                                    (g.key().to_string(), col),
-                                )
-                            });
+                            let mats = ov.c3d_materials.get_or_insert_with(Default::default);
+                            mats.insert(
+                                g.key().to_string(),
+                                serde_json::json!([col[0], col[1], col[2]]),
+                            );
                         }
                     }
                 }
                 if ui
                     .small_button("Reset colours")
-                    .on_hover_text("Reset the model colours to this model's defaults")
+                    .on_hover_text("Drop this pin's colour overrides and follow the module's colours again")
                     .clicked()
                 {
-                    ui.ctx().data_mut(|d| {
-                        d.insert_temp(egui::Id::new(("c3d_matreset", uid)), true)
-                    });
+                    ov.c3d_materials = None;
                 }
                 if ui
                     .small_button("Save…")
-                    .on_hover_text("Save these colours to a .fxcol file")
+                    .on_hover_text("Save this pin's effective colours to a .fxcol file")
                     .clicked()
                 {
                     controller3d_scheme_save(&cur);
                 }
                 if ui
                     .small_button("Load…")
-                    .on_hover_text("Load colours from a .fxcol file")
+                    .on_hover_text("Load colours from a .fxcol file into this pin's override")
                     .clicked()
                 {
-                    controller3d_scheme_load_async(ui.ctx(), uid);
+                    controller3d_scheme_load_async(ui.ctx(), "c3d_pin_matload", uid);
                 }
             });
         }

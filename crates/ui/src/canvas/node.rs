@@ -148,7 +148,7 @@ pub enum ZoneVisibility {
 /// overrides above (which fall back field-by-field), this is a COMPLETE style
 /// — `Some` replaces the default board style wholesale, `None` uses defaults.
 /// Colors carry alpha so the plate can go fully transparent over a game.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IvStyleOverride {
     /// Board plate fill (incl. transparency).
     pub bg: [u8; 4],
@@ -177,6 +177,17 @@ pub struct IvStyleOverride {
     /// model-opacity see-through. `None` = fully opaque.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub c3d_composite: Option<f32>,
+    /// 3D controller viewer only — this pin's model colour overrides, keyed
+    /// like the node's `materials` param (`"body"` → `[r, g, b]`). Groups
+    /// missing from the map fall back to the module's shared scheme;
+    /// `None` = follow the module's colours entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c3d_materials: Option<serde_json::Map<String, serde_json::Value>>,
+    /// 3D controller viewer only — this pin's model choice. `None` = follow
+    /// the module's model; `Some("")` = auto-detect from the connected
+    /// device; `Some(name)` = that model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c3d_model: Option<String>,
 }
 
 fn default_exposed_size() -> [f32; 2] { [220.0, 100.0] }

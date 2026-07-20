@@ -188,12 +188,21 @@ pub(crate) fn render_pinned_element_impl(
                 Some((d, z)) => (Some(d), z),
                 None => (None, 0.1),
             };
-            let resolved = if !override_name.is_empty() && override_name != "auto" {
-                override_name
-            } else if let Some(dev) = dev_id.as_deref() {
-                crate::model::model_for_device(dev)
-            } else {
-                crate::model::available_models().into_iter().next().unwrap_or_default()
+            // Model: the pin's own choice wins (`Some("")` = force auto-detect),
+            // else follow the module's param, else auto-detect.
+            let pin_model = iv_style_override.as_ref().and_then(|o| o.c3d_model.clone());
+            let auto_resolve = |dev_id: Option<&str>| {
+                if let Some(dev) = dev_id {
+                    crate::model::model_for_device(dev)
+                } else {
+                    crate::model::available_models().into_iter().next().unwrap_or_default()
+                }
+            };
+            let resolved = match pin_model {
+                Some(m) if !m.is_empty() => m,
+                Some(_) => auto_resolve(dev_id.as_deref()),
+                None if !override_name.is_empty() && override_name != "auto" => override_name,
+                None => auto_resolve(dev_id.as_deref()),
             };
             let orientation = inner_snarl.get_node(inner_id)
                 .and_then(|n| n.extra.last_signals.get(1).copied().flatten())
@@ -204,62 +213,16 @@ pub(crate) fn render_pinned_element_impl(
                 .filter(|q| q.length_squared() > 1e-6)
                 .map(|q| q.normalize())
                 .unwrap_or(glam::Quat::IDENTITY);
-            // Deferred materials edits from the layout/overlay inspector strip
-            // (the strip has no snarl access, so requests ride egui temp
-            // memory; we hold the &mut snarl and apply them here).
-            let edit_id = egui::Id::new(("c3d_matedit", inner_id.0));
-            let reset_id = egui::Id::new(("c3d_matreset", inner_id.0));
-            let pending_edit =
-                ui.ctx().data_mut(|d| d.remove_temp::<(String, [u8; 3])>(edit_id));
-            let pending_reset = ui
-                .ctx()
-                .data_mut(|d| d.remove_temp::<bool>(reset_id))
-                .unwrap_or(false);
-            if pending_reset {
-                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
-                    node.params.remove("materials");
-                }
-            } else if let Some((key, rgb)) = pending_edit {
-                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
-                    let mut mats = node
-                        .params
-                        .get("materials")
-                        .and_then(|v| v.as_object().cloned())
-                        .unwrap_or_default();
-                    mats.insert(key, serde_json::json!([rgb[0], rgb[1], rgb[2]]));
-                    node.params
-                        .insert("materials".into(), serde_json::Value::Object(mats));
-                }
-            }
-            // Whole-scheme load (inspector Load… button).
-            if let Some(map) = ui.ctx().data_mut(|d| {
-                d.remove_temp::<serde_json::Map<String, serde_json::Value>>(
-                    egui::Id::new(("c3d_matload", inner_id.0)),
-                )
-            }) {
-                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
-                    node.params
-                        .insert("materials".into(), serde_json::Value::Object(map));
-                }
-            }
-            // Model swap (inspector chooser) — same keep-colours semantics as
-            // the module body ("" = auto-detect from the device).
-            if let Some(model_sel) = ui.ctx().data_mut(|d| {
-                d.remove_temp::<String>(egui::Id::new(("c3d_modeledit", inner_id.0)))
-            }) {
-                let keep = inner_snarl
-                    .get_node(inner_id)
-                    .and_then(|n| n.params.get("keep_colors").and_then(|v| v.as_bool()))
-                    .unwrap_or(false);
-                if let Some(node) = inner_snarl.get_node_mut(inner_id) {
-                    node.params
-                        .insert("model".to_string(), serde_json::Value::String(model_sel));
-                    if !keep {
-                        node.params.remove("materials");
-                    }
-                }
-            }
-            // Publish the effective colours for the inspector strip to display.
+            // Colours/model are the PIN's own style override (edited directly
+            // by the inspector strip — no snarl writes, no temp channels; a
+            // pinned instance can never hijack the module's own state, and the
+            // module's shared scheme shows through wherever the pin doesn't
+            // override).
+            let pin_mats = iv_style_override.as_ref().and_then(|o| o.c3d_materials.clone());
+            // Publish the NODE-base colours (shared scheme, no pin override)
+            // for the inspector strip — each strip applies its OWN pin's
+            // `c3d_materials` on top, so two pins of the same node never fight
+            // over this key.
             let cur_rgb = controller3d_scheme_rgb(inner_snarl, inner_id, &resolved);
             ui.ctx().data_mut(|d| {
                 d.insert_temp(
@@ -270,7 +233,7 @@ pub(crate) fn render_pinned_element_impl(
 
             let (bg, outline, outline_w, accent) = controller3d_style(iv_style_override.as_ref());
             let (scheme, mut alpha, mut cam_pitch) =
-                controller3d_scheme(inner_snarl, inner_id, &resolved);
+                controller3d_scheme_with(inner_snarl, inner_id, &resolved, pin_mats.as_ref());
             let mut tailoff = inner_snarl
                 .get_node(inner_id)
                 .and_then(|n| n.params.get("highlight_tailoff").and_then(|v| v.as_f64()))

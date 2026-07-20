@@ -168,6 +168,8 @@ impl IvStyle {
             c3d_alpha: None,
             c3d_fade: None,
             c3d_composite: None,
+            c3d_materials: None,
+            c3d_model: None,
         }
     }
 }
@@ -187,8 +189,8 @@ pub(crate) fn iv_style_inspector(
     // they're premultiplied internally, so bytes pulled back out of one are
     // `rgb × alpha` — the swatch would re-darken the colour every frame (see
     // `fxi_color_swatch`'s caller contract).
-    let mut o = ov.copied().unwrap_or_else(|| IvStyle::default().to_override());
-    let before = o;
+    let mut o = ov.cloned().unwrap_or_else(|| IvStyle::default().to_override());
+    let before = o.clone();
     let mut reset = false;
     let swatch = |ui: &mut egui::Ui, c: &mut [u8; 4], tip: &str| {
         crate::canvas::viewer::fxi_color_swatch(ui, c, tip, true);
@@ -219,7 +221,7 @@ pub(crate) fn iv_style_inspector(
     } else if o != before {
         Some(o)
     } else {
-        ov.copied()
+        ov.cloned()
     }
 }
 

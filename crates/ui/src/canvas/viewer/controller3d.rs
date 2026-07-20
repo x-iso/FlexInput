@@ -174,22 +174,32 @@ pub(crate) fn controller3d_scheme_rgb(
         .and_then(|n| n.params.get("materials"))
         .and_then(|v| v.as_object())
     {
-        for (_, groups) in crate::model::material::ROWS {
-            for &g in *groups {
-                if let Some(arr) = mats.get(g.key()).and_then(|v| v.as_array()) {
-                    if arr.len() >= 3 {
-                        rgb[g as usize] = [
-                            arr[0].as_u64().unwrap_or(0) as u8,
-                            arr[1].as_u64().unwrap_or(0) as u8,
-                            arr[2].as_u64().unwrap_or(0) as u8,
-                            arr.get(3).and_then(|v| v.as_u64()).unwrap_or(255) as u8,
-                        ];
-                    }
+        c3d_apply_materials(&mut rgb, mats);
+    }
+    rgb
+}
+
+/// Apply a `materials`-shaped map (`"group"` → `[r, g, b(, a)]`) onto a u8
+/// scheme in place. Shared by the node scheme builder above and the per-pin
+/// `IvStyleOverride::c3d_materials` override path.
+pub(crate) fn c3d_apply_materials(
+    rgb: &mut crate::model::Scheme,
+    mats: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (_, groups) in crate::model::material::ROWS {
+        for &g in *groups {
+            if let Some(arr) = mats.get(g.key()).and_then(|v| v.as_array()) {
+                if arr.len() >= 3 {
+                    rgb[g as usize] = [
+                        arr[0].as_u64().unwrap_or(0) as u8,
+                        arr[1].as_u64().unwrap_or(0) as u8,
+                        arr[2].as_u64().unwrap_or(0) as u8,
+                        arr.get(3).and_then(|v| v.as_u64()).unwrap_or(255) as u8,
+                    ];
                 }
             }
         }
     }
-    rgb
 }
 
 pub(crate) fn controller3d_scheme(
@@ -197,7 +207,21 @@ pub(crate) fn controller3d_scheme(
     node_id: NodeId,
     model_name: &str,
 ) -> ([[f32; 4]; crate::model::N_GROUPS], f32, f32) {
-    let rgb = controller3d_scheme_rgb(snarl, node_id, model_name);
+    controller3d_scheme_with(snarl, node_id, model_name, None)
+}
+
+/// Like `controller3d_scheme`, with a pin's `c3d_materials` override applied
+/// over the node's shared scheme (missing groups fall through per group).
+pub(crate) fn controller3d_scheme_with(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    model_name: &str,
+    pin_mats: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> ([[f32; 4]; crate::model::N_GROUPS], f32, f32) {
+    let mut rgb = controller3d_scheme_rgb(snarl, node_id, model_name);
+    if let Some(m) = pin_mats {
+        c3d_apply_materials(&mut rgb, m);
+    }
     let node = snarl.get_node(node_id);
     let alpha = node
         .and_then(|n| n.params.get("overlay_alpha").and_then(|v| v.as_f64()))
@@ -407,10 +431,12 @@ pub(crate) fn controller3d_scheme_save(scheme: &crate::model::Scheme) {
 }
 
 /// Pick + parse a `.fxcol` on a worker thread (same UI-starvation reason as
-/// above); the map is delivered via the `("c3d_matload", uid)` temp channel,
-/// consumed by the node body or pinned arm — whichever renders first applies
-/// it to the node's params.
-pub(crate) fn controller3d_scheme_load_async(ctx: &egui::Context, uid: usize) {
+/// above); the map is delivered via the `(chan, uid)` temp channel. Each
+/// caller drains its OWN channel — the module body uses `"c3d_matload"`
+/// (→ node params), a pin's inspector strip uses `"c3d_pin_matload"`
+/// (→ that pin's `c3d_materials` override) — so a module-side load can never
+/// be swallowed by a pinned instance or vice versa.
+pub(crate) fn controller3d_scheme_load_async(ctx: &egui::Context, chan: &'static str, uid: usize) {
     let ctx = ctx.clone();
     std::thread::spawn(move || {
         let Some(path) = rfd::FileDialog::new()
@@ -426,7 +452,7 @@ pub(crate) fn controller3d_scheme_load_async(ctx: &egui::Context, uid: usize) {
         else {
             return;
         };
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("c3d_matload", uid)), map));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new((chan, uid)), map));
         ctx.request_repaint();
     });
 }
@@ -611,7 +637,7 @@ pub(crate) fn show_controller3d_body(
                         .on_hover_text("Load colours from a .fxcol file")
                         .clicked()
                     {
-                        controller3d_scheme_load_async(ui.ctx(), node_id.0);
+                        controller3d_scheme_load_async(ui.ctx(), "c3d_matload", node_id.0);
                     }
                 });
 

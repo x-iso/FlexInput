@@ -259,7 +259,7 @@ pub(crate) fn show_overlay_body(
                     let module_id = mid.clone();
                     let element_id = m.element_id.clone();
                     let graph_ov = m.graph_override.clone();
-                    let iv_style_ov = m.iv_style_override;
+                    let iv_style_ov = m.iv_style_override.clone();
                     let menu_style_ov = m.menu_style_override;
                     let outer_snap_ref = outer_snapshot.as_ref();
                     let path = m.source_path.clone();
