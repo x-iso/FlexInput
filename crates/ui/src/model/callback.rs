@@ -587,9 +587,42 @@ struct MatteActive(bool);
 /// looked half this size.)
 const GHOST_VIS_LOW: f32 = 0.05;
 const GHOST_VIS_HIGH: f32 = 0.12;
-/// EMA weight applied to each raw visibility readback — damps the measurement
-/// noise (already ~3 frames behind) that made the ghost flicker in and out.
-const VIS_SMOOTH: f32 = 0.35;
+
+/// Consecutive readbacks that must agree before a part's ghost state flips.
+///
+/// This replaces the EMA the measurement used to smooth: an exponential average
+/// approaches its target geometrically, so with both thresholds down near zero,
+/// falling from "visible" (≈1.0) to below 0.05 took about seven readbacks while
+/// rising from "hidden" (≈0.0) past 0.12 took exactly one. Un-ghosting was
+/// instant and re-ghosting visibly dragged. A streak counter costs the same
+/// delay in both directions by construction.
+///
+/// Two readbacks (~130 ms) is enough to reject a single bad measurement while
+/// staying inside the "seamless" feel the un-ghost direction already had; the
+/// hysteresis band above does the work of holding a part that sits at the edge.
+const GHOST_DEBOUNCE: u8 = 2;
+
+/// Advance one part's ghost latch with a freshly measured visibility fraction.
+///
+/// `ghosted` is the latched state the renderer reads; `streak` counts how many
+/// consecutive readbacks have disagreed with it. Hysteresis picks the bar
+/// (harder to leave x-ray than to enter it) and the streak supplies the delay.
+fn update_ghost_latch(frac: f32, ghosted: &mut bool, streak: &mut u8) {
+    let want = if *ghosted {
+        frac < GHOST_VIS_HIGH
+    } else {
+        frac < GHOST_VIS_LOW
+    };
+    if want == *ghosted {
+        *streak = 0; // agreement resets the run
+        return;
+    }
+    *streak += 1;
+    if *streak >= GHOST_DEBOUNCE {
+        *ghosted = want;
+        *streak = 0;
+    }
+}
 
 /// Async-readback state for the visibility measurement.
 #[derive(Clone, Copy, PartialEq)]
@@ -748,12 +781,16 @@ struct VisMeasure {
     /// positions to a depth image of a different one.
     pose: Arc<Mutex<Option<VisPose>>>,
     state: Arc<Mutex<VisMapState>>,
-    /// Smoothed `visible / total` per part index (EMA over readbacks; empty
-    /// until the first readback completes). Feeds the hysteresis latch below.
+    /// Latest raw `visible / total` per part index (empty until the first
+    /// readback completes). Feeds the latch below.
     fractions: Arc<Mutex<Vec<f32>>>,
-    /// Latched "hidden" per part (hysteresis on `fractions`): true = currently
-    /// x-ray-ghosted. Prevents strobing at the LOW/HIGH visibility boundary.
+    /// Latched "hidden" per part: true = currently x-ray-ghosted. Hysteresis on
+    /// `fractions` plus the `streak` debounce keeps a part at the edge of
+    /// occlusion from strobing.
     ghost: Arc<Mutex<Vec<bool>>>,
+    /// Consecutive readbacks disagreeing with `ghost`, per part — see
+    /// [`update_ghost_latch`].
+    streak: Arc<Mutex<Vec<u8>>>,
     /// Occlusion object id per part (`material::xray_object_for_part`). Parts
     /// sharing an id (the three-mesh sticks) are judged as ONE solid: their
     /// visible/total counts are summed before the fraction + latch, so a cap
@@ -1246,6 +1283,7 @@ impl CallbackTrait for MeshRenderState {
                 state: Arc::new(Mutex::new(VisMapState::Idle)),
                 fractions: Arc::new(Mutex::new(Vec::new())),
                 ghost: Arc::new(Mutex::new(Vec::new())),
+                streak: Arc::new(Mutex::new(Vec::new())),
                 obj: self
                     .model
                     .parts
@@ -1280,14 +1318,13 @@ impl CallbackTrait for MeshRenderState {
                             );
                             let mut fr = vm.fractions.lock().unwrap();
                             let mut gh = vm.ghost.lock().unwrap();
+                            let mut st = vm.streak.lock().unwrap();
                             fr.resize(vm.n_parts, 1.0);
                             gh.resize(vm.n_parts, false);
+                            st.resize(vm.n_parts, 0);
                             for i in 0..vm.n_parts {
-                                let frac = measured.get(i).copied().unwrap_or(1.0);
-                                // Smooth the raw fraction, then latch hidden/visible
-                                // with hysteresis so an edge-of-occlusion part holds.
-                                fr[i] = fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH;
-                                gh[i] = if gh[i] { fr[i] < GHOST_VIS_HIGH } else { fr[i] < GHOST_VIS_LOW };
+                                fr[i] = measured.get(i).copied().unwrap_or(1.0);
+                                update_ghost_latch(fr[i], &mut gh[i], &mut st[i]);
                             }
                         }
                         vm.staging.unmap();
@@ -1715,6 +1752,55 @@ mod vis_tests {
             f[0]
         );
         assert!(f[0] < 1.0, "the covered mesh must still count against it");
+    }
+
+    /// Readbacks needed for the latch to flip, feeding it a steady `frac`.
+    fn readbacks_to_flip(from_ghosted: bool, frac: f32) -> u32 {
+        let (mut ghosted, mut streak) = (from_ghosted, 0u8);
+        for n in 1..100 {
+            update_ghost_latch(frac, &mut ghosted, &mut streak);
+            if ghosted != from_ghosted {
+                return n;
+            }
+        }
+        panic!("latch never flipped from {from_ghosted} at frac {frac}");
+    }
+
+    /// Entering and leaving x-ray must cost the same delay. The EMA this
+    /// replaced converged geometrically toward its target, so with both
+    /// thresholds near zero it fell from 1.0 to under 0.05 in about seven
+    /// readbacks but rose from 0.0 past 0.12 in one — un-ghosting looked
+    /// seamless while re-ghosting visibly dragged.
+    #[test]
+    fn ghost_latch_is_symmetric_in_both_directions() {
+        let to_ghost = readbacks_to_flip(false, 0.0); // fully hidden
+        let to_clear = readbacks_to_flip(true, 1.0); // fully visible
+        assert_eq!(to_ghost, to_clear, "x-ray must engage as fast as it clears");
+        assert_eq!(to_ghost, GHOST_DEBOUNCE as u32);
+    }
+
+    #[test]
+    fn ghost_latch_ignores_a_lone_bad_readback() {
+        let (mut ghosted, mut streak) = (false, 0u8);
+        // One hidden reading between visible ones must not flip the state.
+        for frac in [1.0, 1.0, 0.0, 1.0, 1.0] {
+            update_ghost_latch(frac, &mut ghosted, &mut streak);
+            assert!(!ghosted, "a single outlier must not engage x-ray");
+        }
+    }
+
+    /// The band between the thresholds exists so a part hovering at the edge of
+    /// occlusion holds whatever state it is in instead of strobing.
+    #[test]
+    fn ghost_latch_holds_inside_the_hysteresis_band() {
+        let mid = (GHOST_VIS_LOW + GHOST_VIS_HIGH) * 0.5;
+        for start in [false, true] {
+            let (mut ghosted, mut streak) = (start, 0u8);
+            for _ in 0..20 {
+                update_ghost_latch(mid, &mut ghosted, &mut streak);
+            }
+            assert_eq!(ghosted, start, "edge-of-occlusion part must hold its state");
+        }
     }
 
     #[test]
