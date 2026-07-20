@@ -5977,9 +5977,6 @@ impl FlexInputApp {
     // be fixed properly later by subclassing the window proc and
     // handling WM_GETMINMAXINFO to clamp to work area.)
 
-    /// Render the Settings modal. Reads/writes `self.settings`, mirrors live
-    /// values into the engine/I-O atomics, and flips `settings_dirty` so the
-    /// outer update loop persists settings.json at end of frame.
     /// Ordered list of gamepad-navigable settings rows. Keeps the panel and the
     /// driver in lock-step (same indices). Each row is a kind + label; the
     /// numeric kinds carry their range/step so the driver can nudge them.
@@ -7133,11 +7130,6 @@ impl FlexInputApp {
         Some(t)
     }
 
-    /// Recompute and apply HidHide masking for the active patch. Cheap to call
-    /// every frame: a last-applied snapshot debounces redundant applies, and the
-    /// slow SetupAPI instance-id lookup + blocking helper IPC run on a spawned
-    /// thread. Never spawns the elevated helper just to apply/clear *nothing*
-    /// (avoids a spurious UAC when the feature is on but nothing is mapped yet).
     /// Device id of a deployed virtual XInput (Virtual Xbox) sink in the active
     /// patch, if any — the target for a player-slot re-arrive.
     fn active_virtual_xinput_device_id(&self) -> Option<String> {
@@ -7158,6 +7150,11 @@ impl FlexInputApp {
         None
     }
 
+    /// Recompute and apply HidHide masking for the active patch. Cheap to call
+    /// every frame: a last-applied snapshot debounces redundant applies, and the
+    /// slow SetupAPI instance-id lookup + blocking helper IPC run on a spawned
+    /// thread. Never spawns the elevated helper just to apply/clear *nothing*
+    /// (avoids a spurious UAC when the feature is on but nothing is mapped yet).
     #[cfg(windows)]
     fn reconcile_hidhide(&mut self) {
         // Only do real work on a relevant change: an explicit dirty (toggle /
@@ -7283,6 +7280,9 @@ impl FlexInputApp {
         out
     }
 
+    /// Render the Settings modal. Reads/writes `self.settings`, mirrors live
+    /// values into the engine/I-O atomics, and flips `settings_dirty` so the
+    /// outer update loop persists settings.json at end of frame.
     fn draw_settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open { return; }
         let mut open = true;
