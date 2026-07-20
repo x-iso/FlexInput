@@ -631,53 +631,86 @@ struct VisPose {
     depth_eps: f32,
 }
 
-/// Fraction of each part's camera-facing surface left unobstructed, judged
-/// against `depth` — the prepass image, row-major and `VIS_RES` square.
+/// `(unobstructed, camera-facing-and-in-frame)` sample counts for one part,
+/// judged against `depth` — the prepass image, row-major and `VIS_RES` square.
 ///
-/// Parts with no camera-facing samples in frame report 1.0: there is nothing on
-/// screen to reveal, so ghosting them would be noise. That default also makes
-/// the measurement fail SAFE — if it ever stops producing data the model
-/// renders normally, rather than every input turning permanently to glass the
-/// way a silently-dead occlusion query did.
-fn visibility_fractions(parts: &[PartData], pose: &VisPose, depth: &[f32]) -> Vec<f32> {
+/// Raw counts rather than a ratio, because parts are judged in occlusion
+/// GROUPS and the group's verdict has to weigh each mesh by how much surface it
+/// actually presents. See `object_visibility_fractions`.
+fn part_visibility_counts(
+    part: &PartData,
+    model: Mat4,
+    pose: &VisPose,
+    depth: &[f32],
+) -> (u32, u32) {
     let res = VIS_RES as usize;
-    parts
-        .iter()
-        .enumerate()
-        .map(|(i, part)| {
-            let model = pose.part_model.get(i).copied().unwrap_or(Mat4::IDENTITY);
-            let mvp = pose.view_proj * model;
-            let (mut visible, mut total) = (0u32, 0u32);
-            for (p_local, n_local) in &part.samples {
-                let world = model.transform_point3(*p_local);
-                // Away-facing samples describe the part's far side, which its
-                // own body hides wherever the camera stands. Counting them
-                // would peg every fraction near one half and make the
-                // thresholds meaningless.
-                if model.transform_vector3(*n_local).dot(pose.cam - world) <= 0.0 {
-                    continue;
-                }
-                let clip = mvp * p_local.extend(1.0);
-                if clip.w <= 1e-6 {
-                    continue; // at or behind the eye
-                }
-                let ndc = clip.truncate() / clip.w;
-                if !(-1.0..=1.0).contains(&ndc.x) || !(-1.0..=1.0).contains(&ndc.y) {
-                    continue; // outside the frame
-                }
-                total += 1;
-                let px = (((ndc.x * 0.5 + 0.5) * res as f32) as usize).min(res - 1);
-                // NDC y points up; the depth image's rows run down.
-                let py = (((0.5 - ndc.y * 0.5) * res as f32) as usize).min(res - 1);
-                if ndc.z <= depth[py * res + px] + pose.depth_eps {
-                    visible += 1;
-                }
-            }
-            if total == 0 {
-                1.0
-            } else {
-                visible as f32 / total as f32
-            }
+    let mvp = pose.view_proj * model;
+    let (mut visible, mut total) = (0u32, 0u32);
+    for (p_local, n_local) in &part.samples {
+        let world = model.transform_point3(*p_local);
+        // Away-facing samples describe the part's far side, which its own body
+        // hides wherever the camera stands. Counting them would peg every
+        // fraction near one half and make the thresholds meaningless.
+        if model.transform_vector3(*n_local).dot(pose.cam - world) <= 0.0 {
+            continue;
+        }
+        let clip = mvp * p_local.extend(1.0);
+        if clip.w <= 1e-6 {
+            continue; // at or behind the eye
+        }
+        let ndc = clip.truncate() / clip.w;
+        if !(-1.0..=1.0).contains(&ndc.x) || !(-1.0..=1.0).contains(&ndc.y) {
+            continue; // outside the frame
+        }
+        total += 1;
+        let px = (((ndc.x * 0.5 + 0.5) * res as f32) as usize).min(res - 1);
+        // NDC y points up; the depth image's rows run down.
+        let py = (((0.5 - ndc.y * 0.5) * res as f32) as usize).min(res - 1);
+        if ndc.z <= depth[py * res + px] + pose.depth_eps {
+            visible += 1;
+        }
+    }
+    (visible, total)
+}
+
+/// Visibility fraction per part, aggregated over its occlusion OBJECT (`obj`,
+/// from `material::xray_object_for_part`).
+///
+/// Parts sharing an id — a stick's dome, cap and rim — are judged as ONE solid,
+/// so the cap covering its own dome leaves cap+rim visible and the stick never
+/// ghosts itself; only the whole assembly going behind the shell drops below
+/// threshold. Everything else gets a unique id and measures alone.
+///
+/// The group's counts are SUMMED, not its fractions averaged. Averaging lets a
+/// mesh that measured nothing at all (turned away, off-screen — reported as
+/// fully visible, since there is no facing surface to reveal) count as an equal
+/// vote against the meshes that did measure, and a stick rotated away from the
+/// camera always has such a mesh. Summing weighs each mesh by the surface it
+/// actually presents, so an unmeasurable one contributes nothing either way.
+///
+/// An object with no facing samples anywhere reports 1.0, which also makes the
+/// measurement fail SAFE: if it ever stops producing data the model renders
+/// normally, rather than every input turning permanently to glass the way a
+/// silently-dead occlusion query did.
+fn object_visibility_fractions(
+    parts: &[PartData],
+    obj: &[u32],
+    pose: &VisPose,
+    depth: &[f32],
+) -> Vec<f32> {
+    let key_of = |i: usize| obj.get(i).copied().unwrap_or(i as u32);
+    let mut sums: std::collections::HashMap<u32, (u32, u32)> = std::collections::HashMap::new();
+    for (i, part) in parts.iter().enumerate() {
+        let model = pose.part_model.get(i).copied().unwrap_or(Mat4::IDENTITY);
+        let (vis, tot) = part_visibility_counts(part, model, pose, depth);
+        let e = sums.entry(key_of(i)).or_insert((0, 0));
+        e.0 += vis;
+        e.1 += tot;
+    }
+    (0..parts.len())
+        .map(|i| match sums.get(&key_of(i)).copied().unwrap_or((0, 0)) {
+            (_, 0) => 1.0,
+            (vis, tot) => vis as f32 / tot as f32,
         })
         .collect()
 }
@@ -1239,31 +1272,18 @@ impl CallbackTrait for MeshRenderState {
                         if let Some(pose) = vm.pose.lock().unwrap().take() {
                             let data = vm.staging.slice(..).get_mapped_range();
                             let depth: &[f32] = bytemuck::cast_slice(&data);
-                            let per_part =
-                                visibility_fractions(&self.model.parts, &pose, depth);
+                            let measured = object_visibility_fractions(
+                                &self.model.parts,
+                                &vm.obj,
+                                &pose,
+                                depth,
+                            );
                             let mut fr = vm.fractions.lock().unwrap();
                             let mut gh = vm.ghost.lock().unwrap();
                             fr.resize(vm.n_parts, 1.0);
                             gh.resize(vm.n_parts, false);
-                            // Average per occlusion OBJECT first, so a stick's
-                            // three meshes are judged as one solid: the cap
-                            // covering its own dome leaves cap+rim visible, so
-                            // the object stays on-camera and never ghosts. Only
-                            // the whole object going behind the body drops below
-                            // threshold. Non-stick parts each get a unique id,
-                            // so they still measure independently.
-                            let mut obj_sum: std::collections::HashMap<u32, (f32, f32)> =
-                                std::collections::HashMap::new();
                             for i in 0..vm.n_parts {
-                                let key = vm.obj.get(i).copied().unwrap_or(i as u32);
-                                let e = obj_sum.entry(key).or_insert((0.0, 0.0));
-                                e.0 += per_part.get(i).copied().unwrap_or(1.0);
-                                e.1 += 1.0;
-                            }
-                            for i in 0..vm.n_parts {
-                                let key = vm.obj.get(i).copied().unwrap_or(i as u32);
-                                let (sum, n) = obj_sum.get(&key).copied().unwrap_or((1.0, 1.0));
-                                let frac = sum / n.max(1.0);
+                                let frac = measured.get(i).copied().unwrap_or(1.0);
                                 // Smooth the raw fraction, then latch hidden/visible
                                 // with hysteresis so an edge-of-occlusion part holds.
                                 fr[i] = fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH;
@@ -1572,7 +1592,7 @@ mod vis_tests {
         let part = facing_quad(false);
         let pose = pose(Mat4::IDENTITY);
         let depth = self_depth(&part, &pose);
-        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
         assert_eq!(f[0], 1.0, "a part alone in front of the camera is fully visible");
     }
 
@@ -1582,7 +1602,7 @@ mod vis_tests {
         let pose = pose(Mat4::IDENTITY);
         // Something solid much closer to the camera covers the whole frame.
         let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
-        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
         assert_eq!(f[0], 0.0, "fully covered part must read as hidden");
         assert!(f[0] < GHOST_VIS_LOW, "and must cross the ghost threshold");
     }
@@ -1599,7 +1619,7 @@ mod vis_tests {
                 depth[y * res + x] = 0.0;
             }
         }
-        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
         assert!(
             (f[0] - 0.5).abs() < 0.1,
             "half-occluded part should read near 0.5, got {}",
@@ -1613,7 +1633,7 @@ mod vis_tests {
         // Push it far to the side: nothing projects inside the viewport.
         let pose = pose(Mat4::from_translation(Vec3::new(50.0, 0.0, 0.0)));
         let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
-        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
         assert_eq!(
             f[0], 1.0,
             "off-screen parts have nothing to reveal — ghosting them is noise"
@@ -1628,8 +1648,73 @@ mod vis_tests {
         let part = facing_quad(true);
         let pose = pose(Mat4::IDENTITY);
         let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
-        let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+        let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
         assert_eq!(f[0], 1.0);
+    }
+
+    /// The stick regression: a multi-mesh occlusion object whose meshes are all
+    /// hidden, but where one presents no camera-facing surface at all and so
+    /// measures nothing. Its "nothing to reveal -> visible" default must not
+    /// vote against the meshes that did measure — averaging the two fractions
+    /// gives 0.5, and the stick then never ghosts however far it rotates away.
+    #[test]
+    fn an_unmeasurable_mesh_does_not_rescue_its_hidden_group() {
+        let hidden = facing_quad(false); // faces the camera, fully covered below
+        let turned_away = facing_quad(true); // no facing samples: measures nothing
+        let parts = [hidden, turned_away];
+        let pose = VisPose {
+            part_model: vec![Mat4::IDENTITY; 2],
+            ..pose(Mat4::IDENTITY)
+        };
+        let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
+
+        // Both meshes in ONE object, the way a stick's dome/cap/rim are.
+        let grouped = object_visibility_fractions(&parts, &[7, 7], &pose, &depth);
+        assert_eq!(
+            grouped[0], 0.0,
+            "group is entirely hidden; the mesh that measured nothing must not lift it"
+        );
+        assert!(grouped[0] < GHOST_VIS_LOW, "so the stick actually ghosts");
+
+        // The same meshes as independent objects: the turned-away one still
+        // reads visible alone, since there is genuinely nothing to x-ray.
+        let separate = object_visibility_fractions(&parts, &[0, 1], &pose, &depth);
+        assert_eq!(separate[0], 0.0);
+        assert_eq!(separate[1], 1.0);
+    }
+
+    /// Grouping must weigh meshes by the surface they present, not one vote
+    /// each: a large visible mesh should outweigh a small hidden one.
+    #[test]
+    fn group_fraction_weighs_meshes_by_presented_surface() {
+        let big = facing_quad(false);
+        // Far fewer samples, so it presents far less surface to the camera.
+        let small = PartData {
+            samples: big.samples.iter().take(6).copied().collect(),
+            ..facing_quad(false)
+        };
+        let parts = [big, small];
+        let pose = VisPose {
+            part_model: vec![Mat4::IDENTITY; 2],
+            ..pose(Mat4::IDENTITY)
+        };
+        // Depth showing the big mesh, with the small mesh's pixels covered.
+        let res = VIS_RES as usize;
+        let mut depth = self_depth(&parts[0], &pose);
+        for (p, _) in &parts[1].samples {
+            let clip = pose.view_proj * p.extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            let px = (((ndc.x * 0.5 + 0.5) * res as f32) as usize).min(res - 1);
+            let py = (((0.5 - ndc.y * 0.5) * res as f32) as usize).min(res - 1);
+            depth[py * res + px] = -1.0; // something much nearer
+        }
+        let f = object_visibility_fractions(&parts, &[3, 3], &pose, &depth);
+        assert!(
+            f[0] > 0.8,
+            "group dominated by its large visible mesh should read visible, got {}",
+            f[0]
+        );
+        assert!(f[0] < 1.0, "the covered mesh must still count against it");
     }
 
     #[test]
@@ -1642,7 +1727,7 @@ mod vis_tests {
             let m = Mat4::from_rotation_y(deg.to_radians());
             let pose = pose(m);
             let depth = self_depth(&part, &pose);
-            let f = visibility_fractions(std::slice::from_ref(&part), &pose, &depth);
+            let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
             assert_eq!(f[0], 1.0, "self-occlusion at {deg}° — depth epsilon too tight");
         }
     }
