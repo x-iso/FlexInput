@@ -89,6 +89,20 @@ pub(crate) fn paint_radial_glow_half(
     paint_glow_fan(painter, center, radius, hot, intensity, a0, a1, 16);
 }
 
+/// Pin glow for a live signal value: its type's wire colour paired with its
+/// activity level. The `(colour, intensity)` shape both pin-glow lookups return.
+fn glow_of(sig: &Signal) -> (Color32, f32) {
+    let [r, g, b] = sig.signal_type().color_rgb();
+    (Color32::from_rgb(r, g, b), signal_intensity(sig))
+}
+
+/// Pin glow for an AutoMap bus pin: the fixed bus colour with an intensity
+/// walked back through the chain (no scalar value flows on the bus itself).
+fn automap_glow(intensity: f32) -> (Color32, f32) {
+    let [r, g, b] = SignalType::AutoMap.color_rgb();
+    (Color32::from_rgb(r, g, b), intensity)
+}
+
 /// Convert a `Signal` to a 0..1 glow intensity. Bool→on/off, Float→|v|,
 /// Vec2→length, Int→nonzero.
 pub(crate) fn signal_intensity(sig: &Signal) -> f32 {
@@ -389,8 +403,7 @@ pub(crate) fn output_pin_glow(
         let src = OutPinId { node: node_id, output: out_idx };
         let intensity = resolve_automap_glow_output(live_signals, snarl, src, automap_parent)
             .unwrap_or(0.0);
-        let [r, g, b] = SignalType::AutoMap.color_rgb();
-        return Some((Color32::from_rgb(r, g, b), intensity));
+        return Some(automap_glow(intensity));
     }
     // Device source's other outputs: read from live_signals.
     if node.module_id == "device.source" {
@@ -400,18 +413,16 @@ pub(crate) fn output_pin_glow(
             .and_then(|a| a.get(out_idx))
             .and_then(|v| v.as_str())?;
         let sig = live_signals.get(&(dev_id.to_string(), pin_id.to_string()))?;
+        let (color, intensity) = glow_of(sig);
         // Battery is a steady-state status readout, not activity — keep its own
         // pin/wire glow dark (matches its exclusion from the AutoMap bus pool).
         // The value still renders; only the activity glow is suppressed.
-        let intensity = if pin_id == "battery" { 0.0 } else { signal_intensity(sig) };
-        let [r, g, b] = sig.signal_type().color_rgb();
-        return Some((Color32::from_rgb(r, g, b), intensity));
+        let intensity = if pin_id == "battery" { 0.0 } else { intensity };
+        return Some((color, intensity));
     }
     // Module nodes: latest evaluated output from NodeExtra.last_out.
     let sig = node.extra.last_out.get(out_idx).and_then(|s| s.as_ref())?;
-    let intensity = signal_intensity(sig);
-    let [r, g, b] = sig.signal_type().color_rgb();
-    Some((Color32::from_rgb(r, g, b), intensity))
+    Some(glow_of(sig))
 }
 
 /// Look up live activity for any input pin by walking back to the upstream
@@ -432,8 +443,7 @@ pub(crate) fn input_pin_glow(
         let src = snarl.in_pin(pin_id).remotes.first().copied()?;
         let i = resolve_automap_glow_output(live_signals, snarl, src, automap_parent)
             .unwrap_or(0.0);
-        let [r, g, b] = SignalType::AutoMap.color_rgb();
-        return Some((Color32::from_rgb(r, g, b), i));
+        return Some(automap_glow(i));
     }
     // Walk upstream: take the live value from whatever feeds this input.
     let pin_id = InPinId { node: node_id, input: in_idx };
@@ -445,9 +455,7 @@ pub(crate) fn input_pin_glow(
     }
     // Fallback: most-recently evaluated input value stashed on the node itself.
     let sig = node.extra.last_signals.get(in_idx).and_then(|s| s.as_ref())?;
-    let intensity = signal_intensity(sig);
-    let [r, g, b] = sig.signal_type().color_rgb();
-    Some((Color32::from_rgb(r, g, b), intensity))
+    Some(glow_of(sig))
 }
 
 /// Derive the screen-space Y at which a header-relocated AutoMap pin should
