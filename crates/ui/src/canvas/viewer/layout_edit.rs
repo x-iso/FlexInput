@@ -903,7 +903,7 @@ pub(crate) fn controller3d_pin_inspector_strip_item(
                             let mats = ov.c3d_materials.get_or_insert_with(Default::default);
                             mats.insert(
                                 g.key().to_string(),
-                                serde_json::json!([col[0], col[1], col[2]]),
+                                serde_json::json!([col[0], col[1], col[2], col[3]]),
                             );
                         }
                     }
