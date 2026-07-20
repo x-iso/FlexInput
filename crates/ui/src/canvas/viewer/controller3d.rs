@@ -83,6 +83,7 @@ pub(crate) fn render_controller3d_core(
     cam_pitch: f32,
     live: crate::model::ControllerLive,
     composite: f32,
+    instance_key: u64,
 ) {
     use crate::model;
     match model::load_model_cached(resolved) {
@@ -96,7 +97,7 @@ pub(crate) fn render_controller3d_core(
             if vis_rect.width() > 1.0 && vis_rect.height() > 1.0 {
                 model::paint_controller_model(
                     ui, vis_rect, full_rect, m, orientation, scheme, global_alpha, cam_pitch,
-                    live, composite,
+                    live, composite, instance_key,
                 );
             }
             ui.ctx().request_repaint(); // live pose cadence
@@ -751,9 +752,13 @@ pub(crate) fn show_controller3d_body(
         let live = controller3d_live(
             live_signals, dev_id.as_deref(), &ctx, node_id.0, tailoff, accent, deadzone,
         );
+        // GPU-state key: the node's own identity. There is exactly one body
+        // per node, and this is stable for the node's lifetime — unlike the
+        // painting `Ui`'s auto-generated id, which need not be.
+        let instance_key = egui::Id::new(("c3d_body", node_id)).value();
         render_controller3d_core(
             ui, rect, &resolved, orientation, bg, outline, outline_w, scheme, alpha, cam_pitch,
-            live, 1.0,
+            live, 1.0, instance_key,
         );
         // Expose the viewport so it can be pinned to a sub-patch layout / overlay.
         register_exposable_element(ui, node_id, "viewer", rect);

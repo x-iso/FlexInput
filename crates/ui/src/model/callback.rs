@@ -505,14 +505,12 @@ pub struct MeshRenderState {
     pub composite: f32,
     /// Shared render pipeline — created lazily on first prepare().
     pub pipeline: Option<Arc<ControllerPipeline>>,
-    /// Identifies WHICH on-screen viewer this is (derived from the painting
-    /// `Ui`'s id, so it is stable across frames and distinct per node body /
-    /// pinned copy / overlay copy). All mutable GPU state is bucketed under
-    /// this key — see `InstanceRes`.
+    /// Identifies WHICH on-screen viewer this is. All mutable GPU state is
+    /// bucketed under this key — see `InstanceRes`. Supplied by the caller and
+    /// REQUIRED to be stable across frames: the occlusion measurement driving
+    /// x-ray spans several frames, so a key that changes per frame rebuilds
+    /// the bucket before any measurement can land and x-ray never fires.
     pub instance_key: u64,
-    /// egui's cumulative pass number, used to retire buckets whose viewer is
-    /// no longer on screen.
-    pub pass_nr: u64,
 }
 
 /// X-ray draw lists, computed in `prepare` and consumed in `paint` via the
@@ -561,16 +559,23 @@ struct InstanceRes {
     matte: Option<MatteTarget>,
     /// Whether this pass's `paint` should composite from the matte target.
     matte_active: bool,
-    /// Pass number this bucket was last drawn in (drives retirement).
-    last_seen: u64,
+    /// When this bucket was last drawn (drives retirement).
+    ///
+    /// Deliberately a wall clock rather than egui's pass counter: viewers live
+    /// in DIFFERENT viewports (the overlay is its own), and each viewport
+    /// counts passes independently, so comparing one viewer's pass number
+    /// against another's would retire live buckets — rebuilding their buffers
+    /// every frame and resetting the multi-frame occlusion readback before it
+    /// could ever complete, which silently disables x-ray.
+    last_seen: std::time::Instant,
 }
 
 type InstanceMap = std::collections::HashMap<u64, InstanceRes>;
 
-/// Retire a viewer's GPU buffers after this many passes off-screen. Generous
-/// (a few seconds): unpinning and re-pinning an element should not pay for a
-/// rebuild, but a closed sub-patch editor must not hold its buffers forever.
-const INSTANCE_TTL_PASSES: u64 = 240;
+/// Retire a viewer's GPU buffers after this long off-screen. Generous:
+/// unpinning and re-pinning an element should not pay for a rebuild, but a
+/// closed sub-patch editor must not hold its buffers forever.
+const INSTANCE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Ghost-gate threshold on the measured `visible / total` sample ratio. The
 /// "total" query rasterizes front AND back faces (cull is off), so a fully
@@ -670,14 +675,14 @@ impl CallbackTrait for MeshRenderState {
         let blit = callback_resources.get::<Arc<BlitPipeline>>().cloned();
 
         // ── This viewer's own bucket ───────────────────────────────────────
-        let pass_nr = self.pass_nr;
+        let now = std::time::Instant::now();
         let instances = callback_resources
             .entry::<InstanceMap>()
             .or_insert_with(Default::default);
         // Retire buckets whose viewer has been off-screen a while (an unpinned
         // element or a closed sub-patch editor would otherwise leak its GPU
         // buffers for the life of the process).
-        instances.retain(|_, r| pass_nr.saturating_sub(r.last_seen) < INSTANCE_TTL_PASSES);
+        instances.retain(|_, r| now.duration_since(r.last_seen) < INSTANCE_TTL);
         let res = instances.entry(self.instance_key).or_insert_with(|| InstanceRes {
             buffers_key: String::new(),
             parts: Vec::new(),
@@ -685,9 +690,9 @@ impl CallbackTrait for MeshRenderState {
             xray: XrayOrder { ghosts: Vec::new(), restore: Vec::new(), translucent: Vec::new() },
             matte: None,
             matte_active: false,
-            last_seen: pass_nr,
+            last_seen: now,
         });
-        res.last_seen = pass_nr;
+        res.last_seen = now;
 
         // ── Per-part GPU buffers (rebuilt when the model changes) ──────────
         if res.buffers_key != self.model.name {
@@ -1394,6 +1399,10 @@ impl CallbackTrait for MeshRenderState {
 /// (matching the pinned-render pattern), so the same function serves the node
 /// body and pinned/overlay instances. Model data is shared (`Arc`); GPU buffers
 /// are cached across frames in the callback resources.
+///
+/// `instance_key` identifies this viewer's GPU state and MUST be stable across
+/// frames (see `MeshRenderState::instance_key`) and distinct from every other
+/// simultaneously visible viewer.
 pub fn paint_controller_model(
     ui: &egui::Ui,
     vis_rect: egui::Rect,
@@ -1405,6 +1414,7 @@ pub fn paint_controller_model(
     cam_pitch: f32,
     live: ControllerLive,
     composite: f32,
+    instance_key: u64,
 ) {
     let state = MeshRenderState {
         model,
@@ -1417,13 +1427,7 @@ pub fn paint_controller_model(
         live,
         composite,
         pipeline: None,
-        // The painting `Ui`'s id identifies this viewer: stable across frames,
-        // yet distinct for the node body, each pinned copy and each overlay
-        // copy (egui salts those by container/index). Keying the GPU state on
-        // it is what stops two visible copies of one model from overwriting
-        // each other's uniforms and occlusion measurements.
-        instance_key: ui.id().value(),
-        pass_nr: ui.ctx().cumulative_pass_nr(),
+        instance_key,
     };
     let paint_callback = Callback::new_paint_callback(vis_rect, state);
     ui.painter_at(vis_rect)
