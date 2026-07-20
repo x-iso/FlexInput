@@ -590,6 +590,12 @@ const GHOST_VIS_HIGH: f32 = 0.06;
 /// EMA weight applied to each raw visibility readback — damps the measurement
 /// noise (already ~3 frames behind) that made the ghost flicker in and out.
 const VIS_SMOOTH: f32 = 0.35;
+/// Minimum `total` samples an occlusion object must rasterize before its
+/// visibility ratio is trusted. Below this the readback carries no usable
+/// signal — a handful of samples is mostly aliasing noise, and zero samples
+/// means the part never reached the query at all — so the previous reading and
+/// the ghost latch are left untouched rather than scored as fully hidden.
+const VIS_MIN_SAMPLES: f32 = 8.0;
 
 /// Async-readback state for the visibility measurement.
 #[derive(Clone, Copy, PartialEq)]
@@ -613,6 +619,10 @@ enum VisMapState {
 /// "<10% visible → x-ray ghost" rule. Readback is async (~3 frames behind,
 /// invisible at highlight timescales).
 struct VisMeasure {
+    /// Measurement target size, matched to the widget's aspect. Rebuilt when
+    /// the widget reshapes, so the measurement always reflects the geometry as
+    /// actually rendered.
+    size: (u32, u32),
     depth_view: wgpu::TextureView,
     qs: wgpu::QuerySet,
     n_parts: usize,
@@ -1088,14 +1098,30 @@ impl CallbackTrait for MeshRenderState {
         // read → record again. Runs at a fraction of the frame rate, which is
         // plenty — visibility changes with orientation, not per frame.
         let n_parts = self.model.parts.len();
-        let vis_rebuild = res.vis.as_ref().map(|v| v.n_parts != n_parts).unwrap_or(true);
+        // Measure at the WIDGET's aspect, not a fixed square. The projection
+        // above bakes `aspect` in, so squashing that into a square target
+        // distorts every part's footprint — and by a different amount in each
+        // viewer, since they have different widget shapes. Thin parts then land
+        // above the sample floor in one viewer and below it in another, which
+        // is precisely how two views of one model came to disagree about what
+        // was occluded. Long side fixed, short side derived.
+        const VIS_RES: u32 = 256;
+        let vis_size = if aspect >= 1.0 {
+            (VIS_RES, ((VIS_RES as f32 / aspect).round() as u32).clamp(64, VIS_RES))
+        } else {
+            (((VIS_RES as f32 * aspect).round() as u32).clamp(64, VIS_RES), VIS_RES)
+        };
+        let vis_rebuild = res
+            .vis
+            .as_ref()
+            .map(|v| v.n_parts != n_parts || v.size != vis_size)
+            .unwrap_or(true);
         if vis_rebuild && n_parts > 0 {
-            const VIS_RES: u32 = 256; // small target: ratios are resolution-independent
             let depth = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("c3d_vis_depth"),
                 size: wgpu::Extent3d {
-                    width: VIS_RES,
-                    height: VIS_RES,
+                    width: vis_size.0,
+                    height: vis_size.1,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -1124,6 +1150,7 @@ impl CallbackTrait for MeshRenderState {
                 count: (2 * n_parts) as u32,
             });
             res.vis = Some(VisMeasure {
+                size: vis_size,
                 depth_view: depth.create_view(&Default::default()),
                 qs,
                 n_parts,
@@ -1176,8 +1203,31 @@ impl CallbackTrait for MeshRenderState {
                             }
                             for i in 0..vm.n_parts {
                                 let key = vm.obj.get(i).copied().unwrap_or(i as u32);
-                                let (vis, tot) = obj_sum.get(&key).copied().unwrap_or((0.0, 1.0));
-                                let frac = vis / tot.max(1.0);
+                                let (vis, tot) = obj_sum.get(&key).copied().unwrap_or((0.0, 0.0));
+                                // NO SAMPLES IS NOT OCCLUSION. A part can miss the
+                                // query entirely for reasons that say nothing about
+                                // line of sight: it rasterizes below a pixel in the
+                                // small measurement target (thin parts like triggers,
+                                // especially seen near edge-on), it falls outside the
+                                // crop when the widget is partly scrolled off, or it
+                                // is a touch dot collapsed to zero scale while the
+                                // finger is up.
+                                //
+                                // Scoring those as vis/tot = 0 made them maximally
+                                // "hidden", so the latch engaged and — because a
+                                // part that never rasterizes never scores above the
+                                // release threshold either — it stayed engaged. That
+                                // is the permanent x-ray on parts in plain sight, and
+                                // why it differed per viewer: each has its own camera
+                                // pitch and widget size, so the same part lands above
+                                // or below the sample floor in one and not the other.
+                                //
+                                // Below the floor we keep the previous reading and
+                                // leave the latch alone: no information, no update.
+                                if tot < VIS_MIN_SAMPLES {
+                                    continue;
+                                }
+                                let frac = vis / tot;
                                 // Smooth the raw fraction, then latch hidden/visible
                                 // with hysteresis so an edge-of-occlusion part holds.
                                 fr[i] = fr[i] * (1.0 - VIS_SMOOTH) + frac * VIS_SMOOTH;
