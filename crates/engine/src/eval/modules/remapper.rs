@@ -481,10 +481,7 @@ pub(crate) fn eval_remapper_node(
                 if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
                     for v in arr {
                         if let Some(s) = v.as_str() {
-                            if touchpad_out_kind(s).is_some() { continue; } // synthesized below
-                            // Macro pins skip the bus release pass entirely —
-                            // absent from the macro namespace = released.
-                            if is_macro_style_target(s) { continue; }
+                            if !is_bus_out_pin(s) { continue; }
                             digital_all_out_pins.insert(s.to_string());
                         }
                     }
@@ -560,8 +557,7 @@ pub(crate) fn eval_remapper_node(
                             // in the emit loop above, never as bus buttons.
                             if analog_axis_for_cardinal(s).is_none()
                                 && analog_trigger_out(s).is_none()
-                                && touchpad_out_kind(s).is_none()
-                                && !is_macro_style_target(s)
+                                && is_bus_out_pin(s)
                             {
                                 analog_button_pins.insert(s.to_string());
                             }

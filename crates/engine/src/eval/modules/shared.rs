@@ -158,6 +158,19 @@ pub(crate) fn touchpad_out_kind(pin_id: &str) -> Option<TouchOutKind> {
     }
 }
 
+/// Does this output pin go on the shared signal bus?
+///
+/// Two kinds of pin do not. Touchpad zone/swipe outputs are SYNTHESIZED into
+/// touch points after the mapping loop, and macro-style targets are published
+/// into the macro namespace instead — where absence means released, so they
+/// must also stay out of the bus release pass or it would fight them.
+///
+/// Both exclusions were checked as an adjacent pair at three sites; naming the
+/// pair says what the two have in common, which is that neither is a bus pin.
+pub(crate) fn is_bus_out_pin(pin: &str) -> bool {
+    touchpad_out_kind(pin).is_none() && !is_macro_style_target(pin)
+}
+
 /// True when any of a mapping's `out` pins drives the touchpad (zone or swipe).
 pub(crate) fn mapping_targets_touch(m: &serde_json::Value) -> bool {
     m.get("out").and_then(|v| v.as_array()).map(|a| a.iter().any(|v|

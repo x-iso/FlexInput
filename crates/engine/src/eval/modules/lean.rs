@@ -40,10 +40,7 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
         if let Some(arr) = m.get("out").and_then(|v| v.as_array()) {
             for v in arr {
                 if let Some(s) = v.as_str() {
-                    if touchpad_out_kind(s).is_some() { continue; } // synthesized below
-                    // Macro pins skip the bus release pass — absent from the
-                    // macro namespace = released.
-                    if is_macro_style_target(s) { continue; }
+                    if !is_bus_out_pin(s) { continue; }
                     all_out_pins.insert(s.to_string());
                     if let Some((axis_pin, _)) = analog_axis_for_cardinal(s) {
                         all_out_pins.insert(axis_pin.to_string());
