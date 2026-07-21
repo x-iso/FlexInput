@@ -228,8 +228,13 @@ pub(crate) fn compute_gyro_3dof(
     // ── Lean output: tilt fraction from accelerometer ─────────────────────
     //
     // Lean is the controller's signed side-tilt as a fraction of full
-    // sideways. Positive = right lean (right grip drops, +ay in FlexInput
-    // accel convention). Magnitude in [0, 1] where 1 ≈ on its side.
+    // sideways. Magnitude in [0, 1] where 1 ≈ on its side.
+    //
+    // SIDE tilt is accel X. The device layer normalizes every pad to
+    // (x = side, y = forward-tilt, z = vertical/gravity) — see the axis remap
+    // in `flexinput_devices::gyro::build`. This read `ay` until 2026-07, which
+    // is FORWARD tilt, so lean tracked pitch: it fired when the controller was
+    // tipped toward or away from the player rather than rolled left/right.
     //
     // This is derived from accel ONLY, not gyro rate, so:
     //   - Holding a tilted controller produces a STEADY non-zero lean.
@@ -241,7 +246,7 @@ pub(crate) fn compute_gyro_3dof(
     // tilt measure since "is the controller tilted sideways" is the
     // intuitive lean axis regardless of how X/Y are derived.
     let acc_mag_full = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
-    let lean_val = (ay / acc_mag_full).clamp(-1.0, 1.0);
+    let lean_val = (ax / acc_mag_full).clamp(-1.0, 1.0);
     let lean_threshold = pf("lean_threshold", 0.3).clamp(0.01, 4.0);
     let lean_active = lean_val.abs() >= lean_threshold;
 

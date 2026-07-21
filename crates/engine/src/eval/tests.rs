@@ -2315,3 +2315,71 @@ mod source_namespace_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lean_axis_tests {
+    use super::*;
+
+    /// Output slot 3 of `compute_gyro_3dof` is the lean scalar.
+    const LEAN_OUT: usize = 3;
+
+    /// Drive the module through its direct accel pin overrides (inputs 5/6/7 =
+    /// Accel X/Y/Z) and read the lean scalar back.
+    fn lean_for(accel: [f32; 3]) -> f32 {
+        let inputs: Vec<Option<Signal>> = vec![
+            None, None,                       // 0,1: unused here
+            Some(Signal::Float(0.0)),         // 2: gyro X
+            Some(Signal::Float(0.0)),         // 3: gyro Y
+            Some(Signal::Float(0.0)),         // 4: gyro Z
+            Some(Signal::Float(accel[0])),    // 5: accel X
+            Some(Signal::Float(accel[1])),    // 6: accel Y
+            Some(Signal::Float(accel[2])),    // 7: accel Z
+        ];
+        let mut state = NodeState::default();
+        let out = compute_gyro_3dof(
+            &inputs,
+            &mut state,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            1.0 / 60.0,
+        );
+        match out.get(LEAN_OUT) {
+            Some(Some(Signal::Float(f))) => *f,
+            other => panic!("lean output slot held {other:?}"),
+        }
+    }
+
+    /// The device layer normalizes every pad to (x = side, y = forward-tilt,
+    /// z = vertical) — see `flexinput_devices::gyro::build`. Lean means SIDE
+    /// tilt, so it must follow X and ignore Y. It read Y until 2026-07, which
+    /// made leaning fire on pitch.
+    #[test]
+    fn lean_follows_side_tilt_not_forward_tilt() {
+        // Flat: gravity straight down the vertical axis, no lean.
+        assert!(lean_for([0.0, 0.0, 1.0]).abs() < 1e-3, "flat must not lean");
+
+        // Tipped forward/back — pitch. Lean must stay silent.
+        assert!(
+            lean_for([0.0, 0.7, 0.7]).abs() < 1e-3,
+            "forward tilt is pitch, not lean",
+        );
+        assert!(
+            lean_for([0.0, -0.7, 0.7]).abs() < 1e-3,
+            "backward tilt is pitch, not lean",
+        );
+
+        // Rolled onto its side — this is what lean means.
+        let right = lean_for([0.7, 0.0, 0.7]);
+        let left = lean_for([-0.7, 0.0, 0.7]);
+        assert!(right.abs() > 0.5, "side tilt must lean, got {right}");
+        assert!(left.abs() > 0.5, "side tilt must lean, got {left}");
+        assert!(
+            right.signum() != left.signum(),
+            "opposite side tilts must lean opposite ways ({right} vs {left})",
+        );
+
+        // Fully on its side reads as full deflection.
+        assert!((lean_for([1.0, 0.0, 0.0]).abs() - 1.0).abs() < 1e-3);
+    }
+}
