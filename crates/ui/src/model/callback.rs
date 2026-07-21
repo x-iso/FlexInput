@@ -597,10 +597,13 @@ const GHOST_VIS_HIGH: f32 = 0.12;
 /// instant and re-ghosting visibly dragged. A streak counter costs the same
 /// delay in both directions by construction.
 ///
-/// Two readbacks (~130 ms) is enough to reject a single bad measurement while
-/// staying inside the "seamless" feel the un-ghost direction already had; the
-/// hysteresis band above does the work of holding a part that sits at the edge.
-const GHOST_DEBOUNCE: u8 = 2;
+/// One readback (~65 ms, the measurement cadence itself) is the floor, and
+/// testing put two at ~130 ms still reading as laggy. Rejecting outliers is
+/// left entirely to the hysteresis band above, which is the right place for it:
+/// the measurement is deterministic given a pose, so a lone contrary reading is
+/// a real measurement of a real transient pose rather than noise to filter, and
+/// it still has to clear the band to flip anything.
+const GHOST_DEBOUNCE: u8 = 1;
 
 /// Advance one part's ghost latch with a freshly measured visibility fraction.
 ///
@@ -1779,13 +1782,16 @@ mod vis_tests {
         assert_eq!(to_ghost, GHOST_DEBOUNCE as u32);
     }
 
+    /// A reading inside the hysteresis band cannot flip the latch however often
+    /// it repeats — with GHOST_DEBOUNCE at 1 the band is the ONLY thing
+    /// standing between a contrary measurement and a state change, so this is
+    /// the property that keeps a part at the edge of occlusion from strobing.
     #[test]
-    fn ghost_latch_ignores_a_lone_bad_readback() {
+    fn a_reading_in_the_band_never_flips_a_visible_part() {
         let (mut ghosted, mut streak) = (false, 0u8);
-        // One hidden reading between visible ones must not flip the state.
-        for frac in [1.0, 1.0, 0.0, 1.0, 1.0] {
+        for frac in [1.0, 0.08, 1.0, 0.06, 0.11, 1.0] {
             update_ghost_latch(frac, &mut ghosted, &mut streak);
-            assert!(!ghosted, "a single outlier must not engage x-ray");
+            assert!(!ghosted, "only a reading under LOW may engage x-ray");
         }
     }
 
