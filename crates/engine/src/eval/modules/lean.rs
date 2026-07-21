@@ -65,10 +65,7 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
             if out_pins.is_empty() { continue; }
-            let mode_s    = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-            let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-            let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-            let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
+            let press = PressParams::from_card(m);
 
             let slots = press_state_get(node_state, base_idx + i);
 
@@ -83,7 +80,7 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
             let shaped = shape_mag(&curve, lean_mag);
             let side_sign_ok = if side_idx == 0 { lean_val < 0.0 } else { lean_val > 0.0 };
 
-            let (held_now, analog_val_opt): (bool, Option<f32>) = if mode_s == "analog" {
+            let (held_now, analog_val_opt): (bool, Option<f32>) = if press.is_analog() {
                 let gate = match thr {
                     Some(t) => side_sign_ok && shaped >= t,
                     None => *active && lean_mag >= 0.01,
@@ -99,12 +96,8 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                     // shaped magnitude. Float destinations ignore `pulse_on`
                     // and use the shaped magnitude directly below.
                     let pulse_on = match thr {
-                        Some(_) => {
-                            if turbo { apply_turbo(true, window_ms, slots, dt) } else { true }
-                        }
-                        None => analog_digital_pulse(
-                            shaped, window_ms, sustain, turbo, slots, dt,
-                        ),
+                        Some(_) => press.turbo_only(true, slots, dt),
+                        None => press.analog_pulse(shaped, slots, dt),
                     };
                     (pulse_on, Some(shaped))
                 }
@@ -113,13 +106,10 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                     Some(t) => side_sign_ok && shaped >= t,
                     None => *active,
                 };
-                let mode = PressMode::from_str(mode_s);
-                let held = apply_press_mode(card_active, mode, window_ms, sustain, slots, dt);
-                let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
-                (held, None)
+                (press.gate(card_active, slots, dt), None)
             };
 
-            let is_analog_mode = mode_s == "analog";
+            let is_analog_mode = press.is_analog();
             for p in &out_pins {
                 // Touchpad zone/swipe outputs are synthesized into touch points
                 // after this loop, not emitted as axis/button pins.

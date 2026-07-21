@@ -174,6 +174,77 @@ pub(crate) fn gesture_tick(
         && (visited[1] & required[1]) == required[1]
 }
 
+/// The four press fields every mapping card carries, and the three ways they
+/// get applied.
+///
+/// Remapper, Lean, Menu, Touch Zones and Map Action each read the same keys
+/// with the same defaults and then combine `apply_press_mode`, `apply_turbo`
+/// and `analog_digital_pulse` in the same orders. Keeping that in one place is
+/// what stops the five evaluators drifting apart on press semantics — they are
+/// meant to behave identically, and previously only did so by repetition.
+#[derive(Copy, Clone)]
+pub(crate) struct PressParams<'a> {
+    /// Raw mode string, kept rather than parsed eagerly: "analog" selects a
+    /// different code path entirely and is not a [`PressMode`].
+    pub(crate) mode_s: &'a str,
+    pub(crate) window_ms: f32,
+    pub(crate) sustain: bool,
+    pub(crate) turbo: bool,
+}
+
+impl<'a> PressParams<'a> {
+    /// What a mapping with none of these fields set behaves as. Also the
+    /// legacy array-form mapping, which carries no options at all.
+    pub(crate) const DEFAULT: PressParams<'static> = PressParams {
+        mode_s: "down",
+        window_ms: 200.0,
+        sustain: false,
+        turbo: false,
+    };
+
+    /// Read from a mapping / zone card object.
+    pub(crate) fn from_card(v: &'a Value) -> Self {
+        Self {
+            mode_s: v.get("mode").and_then(|x| x.as_str()).unwrap_or(Self::DEFAULT.mode_s),
+            window_ms: v.get("window_ms").and_then(|x| x.as_f64())
+                .unwrap_or(Self::DEFAULT.window_ms as f64) as f32,
+            sustain: v.get("sustain").and_then(|x| x.as_bool()).unwrap_or(Self::DEFAULT.sustain),
+            turbo: v.get("turbo").and_then(|x| x.as_bool()).unwrap_or(Self::DEFAULT.turbo),
+        }
+    }
+
+    /// "analog" is a mode string but not a press mode — it routes to
+    /// [`Self::analog_pulse`] instead of [`Self::gate`].
+    pub(crate) fn is_analog(&self) -> bool {
+        self.mode_s == "analog"
+    }
+
+    pub(crate) fn mode(&self) -> PressMode {
+        PressMode::from_str(self.mode_s)
+    }
+
+    /// Press mode, then turbo. Order matters: turbo taps the ALREADY gated
+    /// hold, so a Long mapping only starts tapping once its hold has latched.
+    pub(crate) fn gate(&self, raw_held: bool, slots: &mut [f32], dt: f32) -> bool {
+        let held = apply_press_mode(raw_held, self.mode(), self.window_ms, self.sustain, slots, dt);
+        self.turbo_only(held, slots, dt)
+    }
+
+    /// Turbo alone, for the manual-threshold paths: those output a plain hold
+    /// while the shaped magnitude sits above the line, so press modes don't
+    /// apply — but turbo still taps.
+    pub(crate) fn turbo_only(&self, held: bool, slots: &mut [f32], dt: f32) -> bool {
+        if self.turbo { apply_turbo(held, self.window_ms, slots, dt) } else { held }
+    }
+
+    /// The analog→digital conversion for a mapping with no manual threshold:
+    /// Hold → PWM, Turbo → doubled max frequency, plain → a tap train whose
+    /// frequency tracks `mag`.
+    pub(crate) fn analog_pulse(&self, mag: f32, slots: &mut [f32], dt: f32) -> bool {
+        analog_digital_pulse(mag, self.window_ms, self.sustain, self.turbo, slots, dt)
+    }
+}
+
 /// Apply the configured press mode to the raw input gate. Returns the
 /// transformed gate the mapping should treat as "held this tick".
 ///

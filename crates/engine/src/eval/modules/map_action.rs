@@ -87,21 +87,19 @@ pub(crate) fn eval_map_action_node(
             let mut any_analog_present = false;
             let mut max_analog_mag: f32 = 0.0;
             for (i, m) in mappings.iter().enumerate() {
-                let (in_pins, mode_s, window_ms, sustain, turbo) = if let Some(arr) = m.as_array() {
+                // Legacy array form is a bare pin list, so it carries none of
+                // the press options and takes their defaults.
+                let (in_pins, press) = if let Some(arr) = m.as_array() {
                     let pins: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    (pins, "down", 200.0_f32, false, false)
+                    (pins, PressParams::DEFAULT)
                 } else {
                     let pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
                         .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                         .unwrap_or_default();
-                    let mode = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-                    let win  = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-                    let sus  = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let tur  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                    (pins, mode, win, sus, tur)
+                    (pins, PressParams::from_card(m))
                 };
                 if in_pins.is_empty() { continue; }
-                if mode_s == "analog" {
+                if press.is_analog() {
                     any_analog_present = true;
                     // Combo gate (same as Remapper): all non-cardinal pins
                     // held AND any cardinal contributing a non-zero mag.
@@ -132,7 +130,7 @@ pub(crate) fn eval_map_action_node(
                     // (Turbo) driven by the magnitude, so a digital destination
                     // reflects how far the input is pushed.
                     let slots = press_state_get(ns_map, i);
-                    if analog_digital_pulse(mag, window_ms, sustain, turbo, slots, dt) {
+                    if press.analog_pulse(mag, slots, dt) {
                         any_trigger = true;
                     }
                     continue;
@@ -153,10 +151,7 @@ pub(crate) fn eval_map_action_node(
                         read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
                     })
                 };
-                let mode = PressMode::from_str(mode_s);
-                let slots = press_state_get(ns_map, i);
-                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-                let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+                let held = press.gate(raw_held, press_state_get(ns_map, i), dt);
                 if held { any_trigger = true; }
             }
 

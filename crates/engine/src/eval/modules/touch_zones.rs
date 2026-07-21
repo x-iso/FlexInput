@@ -257,14 +257,8 @@ pub(crate) fn eval_touch_zones_map_node(
             },
         };
 
-        let mode_s = card.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-        let mode = PressMode::from_str(mode_s);
-        let window_ms = card.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-        let sustain = card.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-        let turbo = card.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-        let slots = press_state_get(ns, i);
-        let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-        let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+        let press = PressParams::from_card(card);
+        let held = press.gate(raw_held, press_state_get(ns, i), dt);
 
         // Relative analog deflection for this card's zone (present only while a
         // finger is down in it). Analog outputs ignore the press-mode gate — the

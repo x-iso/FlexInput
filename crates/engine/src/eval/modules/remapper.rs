@@ -138,8 +138,8 @@ pub(crate) fn eval_remapper_node(
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
                 if in_pins.is_empty() { return false; }
-                let mode_s = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
-                if mode_s == "analog" {
+                let press = PressParams::from_card(m);
+                if press.is_analog() {
                     // Buttons (non-cardinal) all held? Cardinals: any
                     // non-zero magnitude is enough — analog mode passes the
                     // live magnitude through, no activation threshold.
@@ -190,13 +190,7 @@ pub(crate) fn eval_remapper_node(
                         read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
                     })
                 };
-                let mode = PressMode::from_str(mode_s);
-                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-                let sustain   = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-                let turbo     = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                let slots = press_state_get(ns, i);
-                let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-                if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
+                press.gate(raw_held, press_state_get(ns, i), dt)
             }).collect();
 
             // Physical-hold state per mapping, INDEPENDENT of press mode — true
@@ -374,9 +368,7 @@ pub(crate) fn eval_remapper_node(
             for &t_idx in &analog_emit_idx {
                 let (ref in_pins, ref out_pins, _, orig_i) = triggered[t_idx];
                 let m = &mappings[orig_i];
-                let turbo  = m.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-                let sustain = m.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-                let window_ms = m.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
+                let press = PressParams::from_card(m);
                 let slots = press_state_get(ns, orig_i);
                 // Per-card response curve + manual threshold: the curve
                 // reshapes every magnitude this mapping emits (axis, trigger,
@@ -442,12 +434,9 @@ pub(crate) fn eval_remapper_node(
                         // digital destination reflects HOW FAR the stick is
                         // pushed — matching the 3DOF-Lean analog→digital path.
                         let active = if let Some(t) = thr {
-                            let held = mag_from_input >= t;
-                            if turbo { apply_turbo(held, window_ms, slots, dt) } else { held }
+                            press.turbo_only(mag_from_input >= t, slots, dt)
                         } else {
-                            analog_digital_pulse(
-                                mag_from_input, window_ms, sustain, turbo, slots, dt,
-                            )
+                            press.analog_pulse(mag_from_input, slots, dt)
                         };
                         if active {
                             analog_button_out.insert(out_p.clone());

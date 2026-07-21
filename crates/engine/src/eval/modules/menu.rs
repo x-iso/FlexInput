@@ -387,13 +387,8 @@ pub(crate) fn eval_menu_node(
                 "menu_hover" => open && hover == zone,
                 _ => pulse_on && selected == zone, // menu_sel (default)
             };
-            let mode = PressMode::from_str(card.get("mode").and_then(|v| v.as_str()).unwrap_or("down"));
-            let window_ms = card.get("window_ms").and_then(|v| v.as_f64()).unwrap_or(200.0) as f32;
-            let sustain = card.get("sustain").and_then(|v| v.as_bool()).unwrap_or(false);
-            let turbo = card.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
-            let slots = press_state_get(ns, i);
-            let held = apply_press_mode(raw_held, mode, window_ms, sustain, slots, dt);
-            let held = if turbo { apply_turbo(held, window_ms, slots, dt) } else { held };
+            let press = PressParams::from_card(card);
+            let held = press.gate(raw_held, press_state_get(ns, i), dt);
             for p in card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
                 .filter_map(|v| v.as_str())
             {
