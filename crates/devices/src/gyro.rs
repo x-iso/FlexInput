@@ -96,6 +96,26 @@ pub struct SwitchProButtons {
     pub rstick_y: f32,
 }
 
+/// # Canonical IMU frame (the AutoMap contract)
+///
+/// Every device's parser MUST fill `gyro_*` / `accel_*` in ONE shared body
+/// frame, so that nothing downstream — the 3DOF module, AutoMap, the canvas —
+/// ever has to know which pad produced a value. This is the entire point of
+/// AutoMap; a device that deviates here is a bug at the source, not something
+/// for a consumer to special-case.
+///
+/// Axes (right = the player's right, holding the pad normally):
+/// - **x = forward / longitudinal.** `accel_x > 0` when the nose (USB port)
+///   tilts up. `gyro_x` is ROLL (rotation about this axis), + clockwise.
+/// - **y = side / lateral.** `accel_y > 0` when the right grip drops.
+///   `gyro_y` is PITCH (about this axis), + nose-up.
+/// - **z = vertical.** `accel_z > 0` when the pad lies flat, face up
+///   (gravity ≈ +1 g). `gyro_z` is YAW (about this axis), + clockwise.
+///
+/// Accel and gyro therefore share the same axis assignment: roll is about the
+/// forward axis, pitch about the side axis, yaw about vertical. The reference
+/// device is the Switch Pro, whose raw report already lands in this frame; the
+/// Sony parser permutes and signs its raw accel to match (see `build`).
 #[derive(Clone, Copy, Default, Debug)]
 pub struct HidReading {
     pub gyro_x: f32,
@@ -1414,6 +1434,9 @@ fn parse_switch_pro(buf: &[u8], calib: Option<&SwitchProCalib>) -> Option<HidRea
     }
     let gs = SWITCH_GYRO_DPS_PER_LSB / GYRO_REF_DPS;
     let as_ = SWITCH_ACCEL_G_PER_LSB / ACCEL_REF_G;
+    // Switch Pro IS the canonical reference (see `HidReading`): its raw report
+    // already lands in (forward, side, vertical), so accel passes straight
+    // through and the Sony parser is the one that permutes to match this.
     Some(HidReading {
         gyro_x:  (gx / 3) as f32 * gs,
         gyro_y: -(gy / 3) as f32 * gs,
@@ -1429,17 +1452,28 @@ fn parse_switch_pro(buf: &[u8], calib: Option<&SwitchProCalib>) -> Option<HidRea
 fn build(buf: &[u8], gyro_off: usize, accel_off: usize, gyro_dps_per_lsb: f32, accel_g_per_lsb: f32) -> HidReading {
     let gs  = gyro_dps_per_lsb  / GYRO_REF_DPS;
     let as_ = accel_g_per_lsb   / ACCEL_REF_G;
-    // DS4/DualSense raw byte order is (pitch, yaw, roll) — remap to standard (roll, pitch, yaw)
-    // so that gyro_x=roll, gyro_y=pitch, gyro_z=yaw matches Switch Pro and the 3DOF module.
-    // Accel raw order is (side, vertical, fwd-tilt) — move vertical to z so that accel_z is
-    // the gravity axis (≈ +1 when flat face-up), matching Switch Pro's accel_z orientation.
+    // Sony (DS4 + DualSense — same IMU mounting, one parser) → the canonical
+    // frame documented on `HidReading`. Raw gyro order is (pitch, yaw, roll) at
+    // offsets [0,+2,+4]; raw accel order is (side, vertical, fwd-tilt).
+    //
+    // Gyro maps to (roll, pitch, yaw) with roll/yaw negated so its polarity
+    // matches the Switch Pro (verified against a DualSense; DS4 shares this
+    // exact path and Sony mounting, so it follows but was not measured here).
+    //
+    // Accel is permuted AND signed to the canonical (forward, side, vertical)
+    // frame — this is the axis swap that was wrong before: the raw side axis
+    // fed accel_x while the gyro frame has roll (forward) on x, so accel and
+    // gyro disagreed on every Sony pad. Now:
+    //   accel_x (forward, + nose-up)      = -raw fwd-tilt
+    //   accel_y (side,    + right-grip)   = -raw side
+    //   accel_z (vertical,+ flat)         =  raw vertical
     HidReading {
-        gyro_x: -ri16(buf, gyro_off + 4)  as f32 * gs,   // raw[2] roll, negated to match Switch Pro's roll polarity
+        gyro_x: -ri16(buf, gyro_off + 4)  as f32 * gs,   // raw[2] roll, negated to match Switch Pro
         gyro_y:  ri16(buf, gyro_off)      as f32 * gs,   // raw[0] pitch
         gyro_z: -ri16(buf, gyro_off + 2)  as f32 * gs,   // raw[1] yaw, negated: right=positive
-        accel_x: ri16(buf, accel_off)     as f32 * as_,  // raw[0] side
-        accel_y: ri16(buf, accel_off + 4) as f32 * as_,  // raw[2] fwd-tilt
-        accel_z: ri16(buf, accel_off + 2) as f32 * as_,  // raw[1] vertical → z (+1 when flat)
+        accel_x: -ri16(buf, accel_off + 4) as f32 * as_, // -raw[2] fwd-tilt → forward, + nose-up
+        accel_y: -ri16(buf, accel_off)     as f32 * as_, // -raw[0] side     → side, + right-grip-down
+        accel_z:  ri16(buf, accel_off + 2) as f32 * as_, //  raw[1] vertical → vertical, + flat
         ..HidReading::default()
     }
 }
@@ -1898,6 +1932,38 @@ fn preferred_interface(kind: &KindTag) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a Sony HID buffer carrying raw accel `(r0 side, r1 vertical,
+    /// r2 fwd-tilt)` and return the canonical accel `build` produces.
+    fn sony_canonical_accel(r_side: i16, r_vert: i16, r_fwd: i16) -> (f32, f32, f32) {
+        let mut buf = [0u8; 16];
+        // accel_off = 6, three LE i16 at [0]=side, [+2]=vertical, [+4]=fwd-tilt.
+        buf[6..8].copy_from_slice(&r_side.to_le_bytes());
+        buf[8..10].copy_from_slice(&r_vert.to_le_bytes());
+        buf[10..12].copy_from_slice(&r_fwd.to_le_bytes());
+        let r = build(&buf, 0, 6, DS4_GYRO_DPS_PER_LSB, DS4_ACCEL_G_PER_LSB);
+        (r.accel_x, r.accel_y, r.accel_z)
+    }
+
+    /// The Sony accel permutation must land in the canonical frame documented on
+    /// `HidReading`, matching what the Switch Pro emits raw. Raw physical signs
+    /// come from a DualSense measurement: raw side + = left grip down,
+    /// raw vertical + = flat, raw fwd-tilt + = USB down.
+    #[test]
+    fn sony_accel_maps_to_canonical_frame() {
+        // Flat, face up: only vertical → canonical +Z.
+        let (x, y, z) = sony_canonical_accel(0, 8000, 0);
+        assert!(x.abs() < 1e-3 && y.abs() < 1e-3 && z > 0.0, "flat → +Z, got ({x},{y},{z})");
+
+        // Nose (USB) up: raw fwd-tilt negative → canonical +X (forward, nose-up).
+        let (x, y, z) = sony_canonical_accel(0, 0, -8000);
+        assert!(x > 0.0 && y.abs() < 1e-3 && z.abs() < 1e-3, "nose-up → +X, got ({x},{y},{z})");
+
+        // Right grip down: raw side negative (side + is LEFT grip) → canonical
+        // +Y (side, + right-grip-down).
+        let (x, y, z) = sony_canonical_accel(-8000, 0, 0);
+        assert!(y > 0.0 && x.abs() < 1e-3 && z.abs() < 1e-3, "right-grip-down → +Y, got ({x},{y},{z})");
+    }
 
     #[test]
     fn am_full_amp_at_phase_peak() {

@@ -94,6 +94,17 @@ pub(crate) fn compute_gyro_3dof(
     let ax = pin_or(5, ax_am) * inv("inv_accel_x");
     let ay = pin_or(6, ay_am) * inv("inv_accel_y");
     let az = pin_or(7, az_am) * inv("inv_accel_z");
+    // Canonical → legacy accel frame. The device layer delivers accel in the
+    // canonical AutoMap frame (x = forward/+nose-up, y = side/+right-grip-down,
+    // z = vertical/+flat — see `HidReading`), identical for every pad. The math
+    // below predates that contract and is written for the older layout where x
+    // was the side axis; this one device-AGNOSTIC line adapts it, so a single
+    // body serves every device unchanged. It is NOT a per-device transform —
+    // those live in the device layer — and on a Sony pad it exactly undoes the
+    // device-layer permutation, leaving that pad's behaviour identical to
+    // before the canonicalisation while a Switch Pro now feeds these paths the
+    // correct channels instead of the swapped ones.
+    let (ax, ay, az) = (-ay, -ax, az);
     // (Spike suppression moved to the device polling layer — see
     // `flexinput_devices::gyro::apply_spike_filter`. The engine sees an
     // already-clean IMU stream.)
@@ -251,11 +262,11 @@ pub(crate) fn compute_gyro_3dof(
     // Lean is the controller's signed side-tilt as a fraction of full
     // sideways. Magnitude in [0, 1] where 1 ≈ on its side.
     //
-    // SIDE tilt is accel X. The device layer normalizes every pad to
-    // (x = side, y = forward-tilt, z = vertical/gravity) — see the axis remap
-    // in `flexinput_devices::gyro::build`. This read `ay` until 2026-07, which
-    // is FORWARD tilt, so lean tracked pitch: it fired when the controller was
-    // tipped toward or away from the player rather than rolled left/right.
+    // SIDE tilt is `ax` in the LEGACY frame this block uses (the adapter above
+    // maps the canonical device frame onto it, so `ax` here is the side axis,
+    // + when the LEFT grip drops). This read `ay` until 2026-07, which is
+    // forward tilt, so lean tracked pitch — it fired when the pad was tipped
+    // toward or away from the player rather than rolled left/right.
     //
     // This is derived from accel ONLY, not gyro rate, so:
     //   - Holding a tilted controller produces a STEADY non-zero lean.
@@ -279,11 +290,11 @@ pub(crate) fn compute_gyro_3dof(
     // Gating scales rather than cuts, so a pad drifting out of its assumed
     // orientation loses lean smoothly instead of dropping it at a boundary.
     let acc_mag_full = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
-    // Negated: +accel X corresponds to a LEFT lean on real hardware, and lean
-    // is positive-is-right. Established by testing, not derived — working the
-    // rotation through the documented device frame predicts the opposite sign,
-    // so one of the accel polarities upstream does not match the frame the
-    // comments describe. Change this only against a physical pad.
+    // Legacy `ax` is + when the LEFT grip drops; lean is positive-is-right, so
+    // negate. In canonical terms this is just `+accel_y` (side, + right-grip),
+    // which is why the adapter and this sign agree with the frame contract now
+    // that both devices deliver that frame — the earlier apparent contradiction
+    // was the Sony accel being X/Y-swapped against its own gyro.
     let lean_side = -ax / acc_mag_full;
     // Split the smoothed gravity into "along forward" vs "through the face",
     // ignoring its side component — that one is what the gesture moves.

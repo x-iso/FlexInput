@@ -2381,9 +2381,10 @@ mod lean_axis_tests {
         lean
     }
 
-    // Gravity in the pad's frame for the two ways it gets held, tilted
-    // sideways by ~45°. Axes are (side, forward, vertical).
-    const FLAT_TILTED: [f32; 3] = [0.707, 0.0, 0.707];      // held flat, rolled
+    // Gravity in the CANONICAL frame — the accel pins carry it now:
+    // (x = forward/+nose-up, y = side/+right-grip-down, z = vertical/+flat),
+    // tilted sideways by ~45°.
+    const FLAT_TILTED: [f32; 3] = [0.0, 0.707, 0.707];      // held flat, rolled
     const UPRIGHT_TILTED: [f32; 3] = [0.707, 0.707, 0.0];   // nose-up, grips down
 
     /// Pitch+Yaw assumes the pad points forward, so it leans on roll — and
@@ -2430,39 +2431,40 @@ mod lean_axis_tests {
         }
     }
 
-    /// Whatever the mode, forward tilt is pitch and must never read as lean.
+    /// Whatever the mode, forward tilt is pitch (canonical X) and must never
+    /// read as lean — lean is the side (Y) component alone.
     #[test]
     fn no_mode_leans_on_forward_tilt() {
         for axis in ["pitch_yaw", "pitch_roll", "player", "world"] {
             assert!(
-                settled_lean(axis, [0.0, 0.707, 0.707]).abs() < 0.1,
-                "{axis} leaned on a forward tilt",
+                settled_lean(axis, [0.707, 0.0, 0.707]).abs() < 0.1,
+                "{axis} leaned on a nose-up tilt",
             );
         }
     }
 
-    /// The device layer normalizes every pad to (x = side, y = forward-tilt,
-    /// z = vertical) — see `flexinput_devices::gyro::build`. Lean means SIDE
-    /// tilt, so it must follow X and ignore Y. It read Y until 2026-07, which
-    /// made leaning fire on pitch.
+    /// Lean means SIDE tilt — canonical accel Y, with X (forward) and Z
+    /// (vertical) ignored. It read forward tilt until 2026-07, which made
+    /// leaning fire on pitch. (The accel pins carry the canonical frame; the
+    /// module adapts it internally, so these feed canonical directly.)
     #[test]
     fn lean_follows_side_tilt_not_forward_tilt() {
         // Flat: gravity straight down the vertical axis, no lean.
         assert!(lean_for([0.0, 0.0, 1.0]).abs() < 1e-3, "flat must not lean");
 
-        // Tipped forward/back — pitch. Lean must stay silent.
+        // Tipped nose up / nose down — pitch (canonical X). Lean stays silent.
         assert!(
-            lean_for([0.0, 0.7, 0.7]).abs() < 1e-3,
-            "forward tilt is pitch, not lean",
+            lean_for([0.7, 0.0, 0.7]).abs() < 1e-3,
+            "nose-up tilt is pitch, not lean",
         );
         assert!(
-            lean_for([0.0, -0.7, 0.7]).abs() < 1e-3,
-            "backward tilt is pitch, not lean",
+            lean_for([-0.7, 0.0, 0.7]).abs() < 1e-3,
+            "nose-down tilt is pitch, not lean",
         );
 
-        // Rolled onto its side — this is what lean means.
-        let right = lean_for([0.7, 0.0, 0.7]);
-        let left = lean_for([-0.7, 0.0, 0.7]);
+        // Rolled onto its side (canonical Y) — this is what lean means.
+        let right = lean_for([0.0, 0.7, 0.7]);
+        let left = lean_for([0.0, -0.7, 0.7]);
         assert!(right.abs() > 0.5, "side tilt must lean, got {right}");
         assert!(left.abs() > 0.5, "side tilt must lean, got {left}");
         assert!(
@@ -2470,17 +2472,19 @@ mod lean_axis_tests {
             "opposite side tilts must lean opposite ways ({right} vs {left})",
         );
 
-        // Fully on its side reads as full deflection.
-        assert!((lean_for([1.0, 0.0, 0.0]).abs() - 1.0).abs() < 1e-3);
+        // Nearly on its side (a little vertical left so Pitch+Yaw still trusts
+        // the pose) reads as strong deflection.
+        assert!(lean_for([0.0, 0.99, 0.14]).abs() > 0.9);
     }
 
-    /// Which way is positive. Verified against a physical pad — deriving it
-    /// from the documented device frame gives the opposite answer, so this is
-    /// pinned here rather than left to a comment that can drift.
+    /// Which way is positive: canonical +Y is the right grip dropping, which is
+    /// a right lean → positive. Verified against a physical pad and pinned so
+    /// the sign can't drift behind a comment.
     #[test]
     fn positive_lean_is_a_right_lean() {
-        // +accel X is the pad leaning LEFT, so lean reads negative.
-        assert!(lean_for([0.707, 0.0, 0.707]) < 0.0, "+X side tilt is a left lean");
-        assert!(lean_for([-0.707, 0.0, 0.707]) > 0.0, "-X side tilt is a right lean");
+        // +Y (right grip down) → right lean, positive.
+        assert!(lean_for([0.0, 0.707, 0.707]) > 0.0, "right grip down is a right lean");
+        // -Y (left grip down) → left lean, negative.
+        assert!(lean_for([0.0, -0.707, 0.707]) < 0.0, "left grip down is a left lean");
     }
 }
