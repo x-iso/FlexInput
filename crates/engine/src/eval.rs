@@ -689,13 +689,7 @@ pub fn eval_graph_tick(
                     .filter(|p| !p.is_empty() && p.as_str() != "automap_out")
                     .map(|p| p.as_str())
                     .collect();
-                let is_collector = src_dev.starts_with("collector:")
-                    || src_dev.starts_with("forksel:")
-                    || src_dev.starts_with("remap:")
-                    || src_dev.starts_with("combiner:")
-                    || src_dev.starts_with("lean:")
-                    || src_dev.starts_with("touchmap:")
-                    || src_dev.starts_with("menumap:");
+                let is_collector = is_namespaced_source(src_dev);
                 // Digital→analog trigger bridges (`btn_lt_dig`→`left_trigger`,
                 // `btn_rt_dig`→`right_trigger`) are a LOWEST-PRIORITY fallback:
                 // they only fill the analog trigger when no primary source — the

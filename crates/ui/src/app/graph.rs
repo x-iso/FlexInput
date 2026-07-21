@@ -787,17 +787,11 @@ pub(crate) fn build_processing_graph_rec(
                         // _automap_device_id = real physical device (fallback when upstream is a collector/forksel).
                         let real_id = fallback.unwrap_or_else(|| dev_id.clone());
                         params.insert("_automap_device_id".to_string(), serde_json::Value::String(real_id));
-                        // _automap_collector_id = virtual collector key to read from collector_sigs first.
-                        // Covers automap_collect ("collector:"), fork/selector ("forksel:"),
-                        // combiner ("combiner:"), remapper ("remap:"), and gyro lean ("lean:").
-                        if dev_id.starts_with("collector:")
-                            || dev_id.starts_with("forksel:")
-                            || dev_id.starts_with("combiner:")
-                            || dev_id.starts_with("remap:")
-                            || dev_id.starts_with("touchmap:")
-                            || dev_id.starts_with("menumap:")
-                            || dev_id.starts_with("lean:")
-                        {
+                        // _automap_collector_id = virtual collector key to read
+                        // from collector_sigs first. The engine owns the list of
+                        // node-produced source prefixes, so both sides classify
+                        // a source the same way by construction.
+                        if flexinput_engine::eval::is_namespaced_source(&dev_id) {
                             params.insert("_automap_collector_id".to_string(),
                                 serde_json::Value::String(dev_id));
                         }

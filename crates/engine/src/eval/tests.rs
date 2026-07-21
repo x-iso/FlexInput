@@ -2284,3 +2284,34 @@ mod menu_eval_tests {
             "macro-style targets must not leak onto the menu's bus key");
     }
 }
+
+#[cfg(test)]
+mod source_namespace_tests {
+    use super::*;
+
+    #[test]
+    fn every_prefix_is_recognised() {
+        for p in NAMESPACED_SOURCE_PREFIXES {
+            assert!(
+                is_namespaced_source(&format!("{p}42")),
+                "{p} is listed but not recognised"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_devices_are_not_namespaced() {
+        // Real ids the graph carries alongside node-produced ones. If a device
+        // backend ever adopts one of these prefixes, the engine would start
+        // routing it through collector_sigs instead of the device bus.
+        for id in [
+            "gilrs:dualsense:0",
+            "gilrs:xinput:v0",
+            "midi_in:0",
+            "virtual.hm.xinput",
+            "virtual.keymouse",
+        ] {
+            assert!(!is_namespaced_source(id), "{id} must read as a physical source");
+        }
+    }
+}

@@ -4,6 +4,31 @@
 
 use super::*;
 
+/// The `prefix:` namespaces a signal source id carries when a NODE produced it
+/// rather than a physical device — collectors, fork/selector, Remapper,
+/// Combiner, gyro Lean, Touch Zones and Menu.
+///
+/// The engine reads them to route a source through `collector_sigs`, and the UI
+/// reads them to decide whether a node needs an `_automap_collector_id`. Both
+/// used to spell the list out inline, seven `starts_with` arms each; adding an
+/// eighth producer meant finding both, and missing one would have left the
+/// graph builder and the evaluator disagreeing about what a source IS.
+pub const NAMESPACED_SOURCE_PREFIXES: &[&str] = &[
+    "collector:",
+    "forksel:",
+    "remap:",
+    "combiner:",
+    "lean:",
+    "touchmap:",
+    "menumap:",
+];
+
+/// Is this source id produced by a node (see [`NAMESPACED_SOURCE_PREFIXES`])
+/// rather than by a physical device?
+pub fn is_namespaced_source(id: &str) -> bool {
+    NAMESPACED_SOURCE_PREFIXES.iter().any(|p| id.starts_with(p))
+}
+
 /// Stable module id for the Audio Stream Haptics node (audio-loopback → rumble).
 pub const AUDIO_STREAM_HAPTICS_ID: &str = "module.audio_stream_haptics";
 
