@@ -265,21 +265,18 @@ pub(crate) fn eval_touch_zones_map_node(
         // contact itself drives them. A per-card response `curve` (points over the
         // 0..1 deflection MAGNITUDE) reshapes the response while keeping direction
         // — the touch-zone analog can't have a Response Curve module wired onto it.
-        let curve_pts: Vec<[f32; 2]> = card.get("curve").and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|p| {
-                let q = p.as_array()?;
-                Some([q.first()?.as_f64()? as f32, q.get(1)?.as_f64()? as f32])
-            }).collect())
-            .unwrap_or_default();
+        let shape = MappingShape::from_card(card);
         let deflect = analog_by_zone.get(&(field, zone)).copied().map(|(ax, ay)| {
-            if curve_pts.len() >= 2 {
-                let mag = (ax * ax + ay * ay).sqrt().min(1.0);
-                if mag > 1e-4 {
-                    let m2 = sample_curve(&curve_pts, mag, &[]).clamp(0.0, 1.0);
-                    let s = m2 / mag;
-                    (ax * s, ay * s)
-                } else { (ax, ay) }
-            } else { (ax, ay) }
+            // Reshape the MAGNITUDE and rescale, so the curve changes how far
+            // the zone pushes without rotating which way it points. Without a
+            // curve `shaped` is the identity, so the scale falls out to 1.
+            let mag = (ax * ax + ay * ay).sqrt().min(1.0);
+            if mag > 1e-4 {
+                let s = shape.shaped(mag) / mag;
+                (ax * s, ay * s)
+            } else {
+                (ax, ay)
+            }
         });
         for p in card.get("out").and_then(|v| v.as_array()).into_iter().flatten()
             .filter_map(|v| v.as_str())

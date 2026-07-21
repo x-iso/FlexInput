@@ -173,8 +173,10 @@ pub(crate) fn eval_remapper_node(
                 // cardinal derivation / 0.5 trigger coercion: each analog in
                 // pin gates on the card's curve-shaped magnitude crossing the
                 // line, releasing the moment it dips back below.
-                let thr = mapping_threshold(m);
-                let raw_held = if let (Some(required), None) = (gesture_required_bits(&in_pins), thr) {
+                let shape = MappingShape::from_card(m);
+                let raw_held = if let (Some(required), None) =
+                    (gesture_required_bits(&in_pins), shape.threshold)
+                {
                     let buttons_held = in_pins.iter().all(|p| {
                         if gesture_pin_to_bit(p).is_some() { return true; }
                         read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
@@ -182,10 +184,9 @@ pub(crate) fn eval_remapper_node(
                     let visited = gesture_state_get(ns, i);
                     buttons_held && gesture_tick(required, visited, &upstream)
                 } else {
-                    let curve = mapping_curve_pts(m);
                     in_pins.iter().all(|p| {
-                        if let (Some(t), Some(v)) = (thr, analog_in_value(&upstream, p)) {
-                            return shape_mag(&curve, v) >= t;
+                        if let Some(passed) = shape.analog_gate(&upstream, p) {
+                            return passed;
                         }
                         read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
                     })
@@ -216,11 +217,10 @@ pub(crate) fn eval_remapper_node(
                 // With a manual threshold, suppression tracks the same
                 // shaped-magnitude gate as activation so a below-threshold
                 // deflection doesn't consume the input it isn't firing on.
-                let thr = mapping_threshold(m);
-                let curve = mapping_curve_pts(m);
+                let shape = MappingShape::from_card(m);
                 in_pins.iter().all(|p| {
-                    if let (Some(t), Some(v)) = (thr, analog_in_value(&upstream, p)) {
-                        return shape_mag(&curve, v) >= t;
+                    if let Some(passed) = shape.analog_gate(&upstream, p) {
+                        return passed;
                     }
                     if analog_axis_for_cardinal(p).is_some() {
                         analog_cardinal_input_value(&upstream, p) > 0.0
@@ -374,8 +374,7 @@ pub(crate) fn eval_remapper_node(
                 // reshapes every magnitude this mapping emits (axis, trigger,
                 // macro, pulse rate); the threshold turns digital outs into a
                 // plain hold gate on the shaped value (see the button arm).
-                let curve = mapping_curve_pts(m);
-                let thr = mapping_threshold(m);
+                let shape = MappingShape::from_card(m);
                 // Zip in↔out by index; drop the excess from whichever side
                 // is longer.
                 let n = in_pins.len().min(out_pins.len());
@@ -392,7 +391,7 @@ pub(crate) fn eval_remapper_node(
                         } else {
                             1.0 // gate buttons all held (checked by effective[])
                         };
-                        let mag = shape_mag(&curve, mag);
+                        let mag = shape.shaped(mag);
                         if mag > 0.0 {
                             merge_macro_scalar(collector_sigs, out_p, Signal::Float(mag.min(1.0)));
                         }
@@ -411,7 +410,7 @@ pub(crate) fn eval_remapper_node(
                         // non-cardinal buttons are held).
                         1.0
                     };
-                    let mag_from_input = shape_mag(&curve, mag_from_input);
+                    let mag_from_input = shape.shaped(mag_from_input);
                     if let Some((axis_pin, sign)) = out_axis_opt {
                         let contrib = sign * mag_from_input;
                         // Sum across all (mapping × in/out pair) contributions.
@@ -433,7 +432,7 @@ pub(crate) fn eval_remapper_node(
                         // a freq-modulated tap train (or PWM under Hold) so the
                         // digital destination reflects HOW FAR the stick is
                         // pushed — matching the 3DOF-Lean analog→digital path.
-                        let active = if let Some(t) = thr {
+                        let active = if let Some(t) = shape.threshold {
                             press.turbo_only(mag_from_input >= t, slots, dt)
                         } else {
                             press.analog_pulse(mag_from_input, slots, dt)

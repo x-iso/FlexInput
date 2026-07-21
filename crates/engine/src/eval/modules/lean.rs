@@ -75,13 +75,12 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
             // the curve-shaped OUTPUT (dips below → release). `side_sign_ok`
             // is the raw side test (any magnitude), so a card threshold can
             // sit below the node threshold too.
-            let curve = mapping_curve_pts(m);
-            let thr = mapping_threshold(m);
-            let shaped = shape_mag(&curve, lean_mag);
+            let shape = MappingShape::from_card(m);
+            let shaped = shape.shaped(lean_mag);
             let side_sign_ok = if side_idx == 0 { lean_val < 0.0 } else { lean_val > 0.0 };
 
             let (held_now, analog_val_opt): (bool, Option<f32>) = if press.is_analog() {
-                let gate = match thr {
+                let gate = match shape.threshold {
                     Some(t) => side_sign_ok && shaped >= t,
                     None => *active && lean_mag >= 0.01,
                 };
@@ -95,14 +94,14 @@ pub(crate) fn lean_dispatch_into_collector_sigs(
                     // frequency, plain → tap train whose frequency tracks the
                     // shaped magnitude. Float destinations ignore `pulse_on`
                     // and use the shaped magnitude directly below.
-                    let pulse_on = match thr {
+                    let pulse_on = match shape.threshold {
                         Some(_) => press.turbo_only(true, slots, dt),
                         None => press.analog_pulse(shaped, slots, dt),
                     };
                     (pulse_on, Some(shaped))
                 }
             } else {
-                let card_active = match thr {
+                let card_active = match shape.threshold {
                     Some(t) => side_sign_ok && shaped >= t,
                     None => *active,
                 };

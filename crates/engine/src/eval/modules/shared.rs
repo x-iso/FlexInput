@@ -48,6 +48,46 @@ pub(crate) fn analog_cardinal_input_value(upstream: &HashMap<String, Signal>, pi
 //              point). Absent = legacy behaviour (derived cardinal bools /
 //              0.5 trigger coercion / freq-modulated pulse train).
 
+/// A mapping card's response curve and its optional manual threshold.
+///
+/// They belong together because the threshold is always compared against the
+/// CURVE-SHAPED magnitude, never the raw one — a card that reshapes its input
+/// and then gates on the unshaped value would fire at the wrong deflection.
+/// Four sites used to read the pair separately and re-spell that comparison by
+/// hand; `analog_gate` is now the only place it is written.
+pub(crate) struct MappingShape {
+    pub(crate) curve: Vec<[f32; 2]>,
+    pub(crate) threshold: Option<f32>,
+}
+
+impl MappingShape {
+    pub(crate) fn from_card(m: &Value) -> Self {
+        Self {
+            curve: mapping_curve_pts(m),
+            threshold: mapping_threshold(m),
+        }
+    }
+
+    /// Reshape a magnitude through this card's curve (identity without one).
+    pub(crate) fn shaped(&self, mag: f32) -> f32 {
+        shape_mag(&self.curve, mag)
+    }
+
+    /// Threshold verdict for one analog input pin. `None` means this card has
+    /// no threshold, or the pin carries no analog value — the caller then falls
+    /// back to the pin's plain held state.
+    pub(crate) fn analog_gate(
+        &self,
+        upstream: &HashMap<String, Signal>,
+        pin: &str,
+    ) -> Option<bool> {
+        match (self.threshold, analog_in_value(upstream, pin)) {
+            (Some(t), Some(v)) => Some(self.shaped(v) >= t),
+            _ => None,
+        }
+    }
+}
+
 /// The card's `curve` points, or empty when absent/malformed.
 pub(crate) fn mapping_curve_pts(m: &Value) -> Vec<[f32; 2]> {
     m.get("curve").and_then(|v| v.as_array())
