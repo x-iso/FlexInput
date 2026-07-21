@@ -446,14 +446,22 @@ pub(crate) fn input_pin_glow(
         return Some(automap_glow(i));
     }
     // Walk upstream: take the live value from whatever feeds this input.
+    //
+    // Nothing wired means nothing to glow, and we return here rather than
+    // falling through. `last_signals` is only guaranteed to hold this node's
+    // INPUTS for nodes that don't repurpose the slot — `generator.envelope`
+    // stores [output, phase] there for its playhead, and `processing.gyro_3dof`
+    // used to store its whole output vector. Reading it for an unwired pin lit
+    // those pins up with unrelated values, in whatever colour the borrowed
+    // signal's type happened to be.
     let pin_id = InPinId { node: node_id, input: in_idx };
     let pin = snarl.in_pin(pin_id);
-    if let Some(src) = pin.remotes.first().copied() {
-        if let Some(glow) = output_pin_glow(live_signals, snarl, src.node, src.output, automap_parent) {
-            return Some(glow);
-        }
+    let src = pin.remotes.first().copied()?;
+    if let Some(glow) = output_pin_glow(live_signals, snarl, src.node, src.output, automap_parent) {
+        return Some(glow);
     }
-    // Fallback: most-recently evaluated input value stashed on the node itself.
+    // Wired, but the source produced no glow of its own: fall back to the value
+    // this node last evaluated for the pin.
     let sig = node.extra.last_signals.get(in_idx).and_then(|s| s.as_ref())?;
     Some(glow_of(sig))
 }

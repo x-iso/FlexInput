@@ -354,9 +354,6 @@ fn eval_subgraph(
             "module.twoway_response_curve" => {
                 last_inputs.insert(ns_uid, inputs.clone());
             }
-            "processing.gyro_3dof" => {
-                last_inputs.insert(ns_uid, node_outputs.clone());
-            }
             "generator.envelope" => {
                 last_inputs.insert(ns_uid, node_state.last_signals.clone());
             }
@@ -942,10 +939,6 @@ pub fn eval_graph_tick(
             "generator.envelope" => {
                 // last_signals = [output, phase]; UI reads phase from index 1 for playhead
                 last_inputs.insert(snap.node_uid, node_state.last_signals.clone());
-            }
-            // Export outputs (not inputs) so the UI body can show a live readout.
-            "processing.gyro_3dof" => {
-                last_inputs.insert(snap.node_uid, node_outputs.clone());
             }
             _ => {}
         }

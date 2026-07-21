@@ -52,9 +52,9 @@ pub(crate) fn show_gyro_3dof_body(
     let orient_drift      = snap.and_then(|n| n.params.get("orient_drift").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
     let yaw_recenter      = snap.and_then(|n| n.params.get("orient_auto_recenter").and_then(|v| v.as_bool())).unwrap_or(false);
     let yaw_thresh        = snap.and_then(|n| n.params.get("orient_recenter_thresh").and_then(|v| v.as_f64())).unwrap_or(0.005) as f32;
-    let out_x = snap.and_then(|n| match n.extra.last_signals.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
-    let out_y = snap.and_then(|n| match n.extra.last_signals.get(2) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
-    let lean_v = snap.and_then(|n| match n.extra.last_signals.get(3) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
+    let out_x = snap.and_then(|n| match n.extra.last_out.get(1) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
+    let out_y = snap.and_then(|n| match n.extra.last_out.get(2) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
+    let lean_v = snap.and_then(|n| match n.extra.last_out.get(3) { Some(Some(Signal::Float(f))) => Some(*f), _ => None }).unwrap_or(0.0);
 
     let mut family = family;
     let mut axis = axis;
@@ -679,9 +679,9 @@ pub(crate) fn show_gyro_lean_mapping_section(
     ui.spacing_mut().item_spacing.y = 2.0;
     let reorder_enabled = filter.kind == MapFilterKind::All;
     // Live lean magnitude for THIS side (gyro output slot 3, exported to the
-    // UI via last_signals) — the preview dot on any open card curve editor.
+    // UI via last_out) — the preview dot on any open card curve editor.
     let lean_live: Option<f32> = snarl.get_node(node_id)
-        .and_then(|n| n.extra.last_signals.get(3).copied().flatten())
+        .and_then(|n| n.extra.last_out.get(3).copied().flatten())
         .map(|s| s.as_float())
         .map(|v| if side == "left" { (-v).max(0.0) } else { v.max(0.0) });
     let mut rv = ReorderView::begin(
