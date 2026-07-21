@@ -279,7 +279,12 @@ pub(crate) fn compute_gyro_3dof(
     // Gating scales rather than cuts, so a pad drifting out of its assumed
     // orientation loses lean smoothly instead of dropping it at a boundary.
     let acc_mag_full = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
-    let lean_side = ax / acc_mag_full;
+    // Negated: +accel X corresponds to a LEFT lean on real hardware, and lean
+    // is positive-is-right. Established by testing, not derived — working the
+    // rotation through the documented device frame predicts the opposite sign,
+    // so one of the accel polarities upstream does not match the frame the
+    // comments describe. Change this only against a physical pad.
+    let lean_side = -ax / acc_mag_full;
     // Split the smoothed gravity into "along forward" vs "through the face",
     // ignoring its side component — that one is what the gesture moves.
     let hold_ref = (g_hat.y * g_hat.y + g_hat.z * g_hat.z).sqrt().max(1e-3);

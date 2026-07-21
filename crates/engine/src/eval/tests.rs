@@ -2473,4 +2473,14 @@ mod lean_axis_tests {
         // Fully on its side reads as full deflection.
         assert!((lean_for([1.0, 0.0, 0.0]).abs() - 1.0).abs() < 1e-3);
     }
+
+    /// Which way is positive. Verified against a physical pad — deriving it
+    /// from the documented device frame gives the opposite answer, so this is
+    /// pinned here rather than left to a comment that can drift.
+    #[test]
+    fn positive_lean_is_a_right_lean() {
+        // +accel X is the pad leaning LEFT, so lean reads negative.
+        assert!(lean_for([0.707, 0.0, 0.707]) < 0.0, "+X side tilt is a left lean");
+        assert!(lean_for([-0.707, 0.0, 0.707]) > 0.0, "-X side tilt is a right lean");
+    }
 }
