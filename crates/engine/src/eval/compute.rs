@@ -5,6 +5,7 @@
 
 use super::*;
 
+// ── Per-node dispatch ─────────────────────────────────────────────────────────
 pub(crate) fn compute_node(
     snap: &NodeSnap,
     inputs: &[Option<Signal>],
