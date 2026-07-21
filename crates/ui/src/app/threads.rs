@@ -27,6 +27,9 @@ pub(crate) fn spawn_io_thread(
     device_rates: flexinput_engine::DeviceRates,
     scope_taps: flexinput_engine::ScopeTaps,
     spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
+    // Global "route every pad through SDL" switch — pushed to every backend
+    // each iteration so a live toggle re-arbitrates without a restart.
+    sdl_all_pads: Arc<AtomicBool>,
     ping_requests: Arc<Mutex<Vec<String>>>,
 ) {
     use std::time::{Duration, Instant};
@@ -150,6 +153,15 @@ pub(crate) fn spawn_io_thread(
                     }
                 }
                 mark!("spike_filter");
+
+                // Push the global-SDL switch before enumerate/poll so a live
+                // toggle takes effect this iteration.
+                {
+                    let on = sdl_all_pads.load(Ordering::Relaxed);
+                    for backend in &mut backends {
+                        backend.set_sdl_all_pads(on);
+                    }
+                }
 
                 // ── Poll physical inputs ──────────────────────────────────────
                 let mut signals: HashMap<(String, String), Signal> = HashMap::new();

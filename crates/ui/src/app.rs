@@ -399,6 +399,10 @@ pub struct FlexInputApp {
     sample_rate_hz: Arc<AtomicU32>,
     /// Live device polling rate handed to the I/O thread.
     polling_hz: Arc<AtomicU32>,
+    /// Global "route every pad through SDL" switch, shared with the I/O thread
+    /// so the Settings toggle re-arbitrates backends live. Mirrors
+    /// `app_settings.sdl_all_pads`.
+    sdl_all_pads: Arc<AtomicBool>,
     /// Per-device measured polling rates (device_id → Hz). Written by the
     /// I/O thread, read by the canvas viewer to show live per-device Hz.
     pub device_rates: flexinput_engine::DeviceRates,
@@ -624,6 +628,7 @@ impl FlexInputApp {
         app_settings.polling_hz = settings::snap_polling_hz(app_settings.polling_hz);
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
+        let sdl_all_pads   = Arc::new(AtomicBool::new(app_settings.sdl_all_pads));
         // Mirror the polling rate to flexinput-virtual so HIDMaestro XInput pads
         // set their XUSB companion's pump period to match (see
         // requested_poll_interval_ms). Pushed again on every slider change.
@@ -793,6 +798,7 @@ impl FlexInputApp {
             Arc::clone(&device_rates),
             Arc::clone(&scope_taps),
             Arc::clone(&spike_filter_settings),
+            Arc::clone(&sdl_all_pads),
             Arc::clone(&ping_requests),
         );
 
@@ -945,6 +951,7 @@ impl FlexInputApp {
             gamepad_nav: crate::gamepad_nav::GamepadNav::default(),
             sample_rate_hz,
             polling_hz,
+            sdl_all_pads,
             device_rates,
             scope_taps,
             spike_filter_settings,

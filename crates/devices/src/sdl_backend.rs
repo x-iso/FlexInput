@@ -169,6 +169,10 @@ pub struct SdlBackend {
     /// Ids are per-connection: a reconnect gets a fresh id and a fresh probe.
     /// Pruned alongside `pads` when a device disappears.
     rejected_ids: std::collections::HashSet<JoystickId>,
+    /// Global "route every pad through SDL" switch (see
+    /// `DeviceBackend::set_sdl_all_pads`). When set, `sync_open_pads` claims
+    /// EVERY gamepad, not just the ones kind-detect calls `Generic`.
+    sdl_all_pads: bool,
 }
 
 impl SdlBackend {
@@ -180,6 +184,7 @@ impl SdlBackend {
             last_sig: HashMap::new(),
             init_failed: false,
             rejected_ids: std::collections::HashSet::new(),
+            sdl_all_pads: false,
         }
     }
 
@@ -231,6 +236,7 @@ impl SdlBackend {
     /// `self.pads`. Called from `poll()`/`enumerate()` so the open set tracks the
     /// live device set.
     fn sync_open_pads(&mut self) {
+        let sdl_all = self.sdl_all_pads;
         let Some(state) = self.state.as_mut() else { return };
         // Split the borrow: `gamepad_subsystem` (read) vs `pads` (write) are
         // distinct fields, so take them separately to satisfy the borrow checker.
@@ -274,11 +280,15 @@ impl SdlBackend {
             // above costs an SDL_OpenGamepad (device I/O, ~140 ms on a cold BT
             // pad), and re-probing the same id every 2 s enumerate was a
             // periodic io-thread stall.
+            //
+            // …unless the global-SDL switch is on, where SDL deliberately claims
+            // every pad — including ones gilrs would normally own — so a native
+            // pad can be read through SDL for comparison.
             let vid = gamepad.vendor_id();
             let pid = gamepad.product_id();
             let name = gamepad.name().unwrap_or_default();
             let kind = ControllerKind::detect(&name, vid, pid);
-            if kind != ControllerKind::Generic {
+            if !sdl_all && kind != ControllerKind::Generic {
                 // Close (drop) and leave it to gilrs.
                 rejected.insert(id);
                 continue;
@@ -328,6 +338,22 @@ impl Default for SdlBackend {
 }
 
 impl DeviceBackend for SdlBackend {
+    fn set_sdl_all_pads(&mut self, on: bool) {
+        if on == self.sdl_all_pads {
+            return;
+        }
+        self.sdl_all_pads = on;
+        // The gate verdict is remembered per id, and a mode change flips which
+        // pads pass it. Clear the rejections AND drop every already-opened pad
+        // so the next `sync_open_pads` re-probes the full set under the new rule
+        // — otherwise a native pad SDL grabbed while ON would stay open (and keep
+        // SDL_CloseGamepad from handing it back to gilrs) after switching OFF.
+        self.rejected_ids.clear();
+        if let Some(state) = self.state.as_mut() {
+            state.pads.clear();
+        }
+    }
+
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
         puffin::profile_function!();
         if !self.ensure_init() {

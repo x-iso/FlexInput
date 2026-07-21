@@ -66,6 +66,15 @@ pub trait DeviceBackend: Send {
     /// current UI settings (cheap no-op if unchanged). Backends without
     /// a raw IMU stream should ignore this.
     fn set_spike_filter(&mut self, _device_id: &str, _enabled: bool, _sensitivity_pct: f32) {}
+    /// Global "route every pad through SDL" switch, pushed from the I/O loop
+    /// each tick (cheap no-op when unchanged). When on, the SDL backend claims
+    /// ALL gamepads (not just the ones kind-detect calls `Generic`) and the
+    /// gilrs backend emits + enumerates nothing, so a controller's inputs come
+    /// entirely from SDL. Primarily a verification switch — it lets a pad with a
+    /// native parser (DualSense / Switch Pro) be read through SDL and compared
+    /// against its canonical-correct native path. Changes device IDs
+    /// (`gilrs:…` → `sdl:…`), so existing wiring does not follow the switch.
+    fn set_sdl_all_pads(&mut self, _on: bool) {}
 }
 
 pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {

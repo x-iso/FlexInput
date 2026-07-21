@@ -287,6 +287,16 @@ impl FlexInputApp {
 
                 ui.add_space(8.0);
 
+                if ui.checkbox(&mut self.settings.sdl_all_pads, "Route all pads through SDL")
+                    .on_hover_text("Diagnostic: read EVERY controller through SDL instead of the native gilrs/HID paths. Lets a pad with a native parser be compared against SDL, and surfaces SDL-only devices. Changes device IDs, so re-wire after toggling. Off = normal native handling.")
+                    .changed()
+                {
+                    self.sdl_all_pads.store(self.settings.sdl_all_pads, Ordering::Relaxed);
+                    dirty = true;
+                }
+
+                ui.add_space(8.0);
+
                 ui.horizontal(|ui| {
                     ui.label("MIDI devices");
                     if ui.button("Refresh MIDI").clicked() {

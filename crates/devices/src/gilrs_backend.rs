@@ -146,6 +146,10 @@ pub struct GilrsBackend {
     /// XInput user index (0-3) for each `gilrs:<kind>:<inst>` device_id string.
     /// Rebuilt at the start of each poll() call from the same kind_seen counter
     /// used for the dev-string, so indices never drift on reconnect.
+    /// Global "route every pad through SDL" switch (see
+    /// `DeviceBackend::set_sdl_all_pads`). When set, `poll()`/`enumerate()`
+    /// return nothing so the SDL backend owns every controller.
+    sdl_all_pads: bool,
     xinput_idx: HashMap<String, u32>,
     /// Last-written rumble state per XInput slot to avoid redundant XInputSetState calls.
     /// (left_motor_byte, right_motor_byte) in 0-255 range.
@@ -268,6 +272,7 @@ impl GilrsBackend {
         Some(Self {
             gilrs,
             gyro,
+            sdl_all_pads: false,
             xinput_idx: HashMap::new(),
             xinput_rumble: HashMap::new(),
             event_counts: HashMap::new(),
@@ -414,8 +419,17 @@ impl GilrsBackend {
 }
 
 impl DeviceBackend for GilrsBackend {
+    fn set_sdl_all_pads(&mut self, on: bool) {
+        self.sdl_all_pads = on;
+    }
+
     fn enumerate(&mut self) -> Vec<PhysicalDevice> {
         puffin::profile_function!();
+        // SDL owns every pad in the global-SDL mode — surface none from here so
+        // controllers aren't listed twice.
+        if self.sdl_all_pads {
+            return Vec::new();
+        }
         // Own-virtual classification is rebuilt ONLY when the device set actually
         // changed (`dev_set_dirty`, set by poll() on a Connected/Disconnected/
         // Dropped event, by a gyro open retry wanting a fresh list, and on first
@@ -549,6 +563,12 @@ impl DeviceBackend for GilrsBackend {
 
     fn poll(&mut self) -> Vec<(String, String, Signal)> {
         puffin::profile_function!();
+        // SDL owns every pad in the global-SDL mode — drain gilrs's own event
+        // queue so it doesn't back up, but emit nothing.
+        if self.sdl_all_pads {
+            while self.gilrs.next_event().is_some() {}
+            return Vec::new();
+        }
         // Rebuild XInput slot map at the start of each poll so it stays in sync
         // with kind_seen even after device reconnects.
         self.xinput_idx.clear();

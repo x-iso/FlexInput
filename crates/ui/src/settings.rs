@@ -339,6 +339,13 @@ pub struct AppSettings {
     /// values throttle each lane: 500 / 250 / 125 Hz. See `BRAID_RATE_STEPS`.
     #[serde(default = "default_mixed_braid_rate_hz")]
     pub mixed_braid_rate_hz: u32,
+    /// Route EVERY controller through the SDL backend instead of the native
+    /// gilrs/raw-HID paths. A diagnostic switch: it lets a pad with a native
+    /// parser be read via SDL and compared against its native behaviour, and
+    /// surfaces SDL-only devices uniformly. Changes device IDs (`gilrs:…` →
+    /// `sdl:…`), so wiring doesn't follow the toggle. Off by default.
+    #[serde(default)]
+    pub sdl_all_pads: bool,
 }
 
 pub const MOUSE_SUPPRESS_RELEASE_MS_MIN: u32 = 50;
@@ -493,6 +500,7 @@ impl Default for AppSettings {
             mouse_suppress_release_ms: MOUSE_SUPPRESS_RELEASE_MS_DEFAULT,
             mixed_braid_enabled: false,
             mixed_braid_rate_hz: MIXED_BRAID_RATE_HZ_DEFAULT,
+            sdl_all_pads: false,
         }
     }
 }
