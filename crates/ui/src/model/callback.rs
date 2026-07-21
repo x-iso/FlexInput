@@ -90,7 +90,7 @@ impl ControllerLive {
     /// identity when the part isn't animated. Rotations pivot about the part's
     /// own placement so sticks/triggers hinge in place. Touch points are handled
     /// separately in `prepare` (they also change colour / visibility).
-    fn part_xform(&self, name: &str, part_tf: &Mat4, footprint: f32) -> Mat4 {
+    fn part_xform(&self, name: &str, part_tf: &Mat4, height: f32) -> Mat4 {
         let n = name.to_ascii_lowercase();
         // Pivot = the part's placed origin (translation column of its transform).
         let pivot = part_tf.w_axis.truncate();
@@ -98,10 +98,16 @@ impl ControllerLive {
             Mat4::from_translation(pivot) * Mat4::from_quat(r) * Mat4::from_translation(-pivot)
         };
         // Buttons: depress while held. Bumpers hinge back into the shell (+Z);
-        // the rest indent into their top face (−Y). Travel scales with the
-        // button's horizontal footprint so the tiny Home/Capture/± caps sink
-        // barely at all instead of disappearing into the shell — the highlight
-        // glow carries most of the visual feedback anyway.
+        // the rest indent into their top face (−Y). Travel is a fraction of the
+        // button's own HEIGHT, so nothing can sink far enough to vanish into
+        // the shell — the highlight glow carries most of the feedback anyway.
+        //
+        // Height rather than the horizontal footprint this used to scale by:
+        // footprint barely varies between buttons (every DualSense button
+        // measures 0.10-0.14, so `footprint * 0.12` saturated the clamp ceiling
+        // for all of them and the scaling did nothing), while height spans 5x
+        // over the same set. The shallow Create/Options pair at 0.027 was
+        // sinking 43% of its own height against a face button's 27%.
         if let Some(&press) = self.buttons.get(n.as_str()) {
             if press <= 0.001 {
                 return Mat4::IDENTITY;
@@ -109,8 +115,10 @@ impl ControllerLive {
             if n.contains("bumper") {
                 return Mat4::from_translation(Vec3::new(0.0, 0.0, 0.04 * press));
             }
-            let travel = if footprint > 1e-4 {
-                (footprint * 0.12).clamp(0.002, 0.012)
+            let travel = if height > 1e-4 {
+                // 0.25 holds the face buttons at the depth they already had
+                // (a_button: 0.045 height -> 0.0113, was 0.0120).
+                (height * 0.25).clamp(0.002, 0.012)
             } else {
                 0.012
             };
@@ -163,9 +171,9 @@ pub struct PartData {
     pub centroid: Vec3,
     /// Assembled-space average outward normal (normalized; ZERO if degenerate).
     pub avg_normal: Vec3,
-    /// Horizontal footprint (max of assembled-space X/Z extents) — scales the
-    /// press-travel so small buttons don't vanish into the shell.
-    pub footprint: f32,
+    /// Assembled-space vertical extent — scales the press travel so a button
+    /// never sinks further than a fraction of its own height.
+    pub height: f32,
     /// Evenly-strided `(position, normal)` samples in LOCAL space (the same
     /// space as `vertices`, i.e. before `transform`), capped at
     /// `VIS_SAMPLES_PER_PART`. The x-ray visibility test projects these against
@@ -407,14 +415,10 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
             n_verts += 1;
             i += 6;
         }
-        // Horizontal footprint (assembled space, Y up) — scales the press
-        // travel so tiny buttons (Home/Capture/±) barely sink while the big
-        // face buttons keep their full travel.
-        let footprint = if n_verts > 0 {
-            (p_max.x - p_min.x).max(p_max.z - p_min.z)
-        } else {
-            0.0
-        };
+        // Vertical extent (assembled space, Y up) — scales the press travel so
+        // the shallow menu buttons and the near-flat stick caps sink in
+        // proportion to how tall they actually are.
+        let height = if n_verts > 0 { p_max.y - p_min.y } else { 0.0 };
         let centroid = if n_verts > 0 { pos_sum / n_verts as f32 } else { Vec3::ZERO };
         let avg_normal = if nrm_sum.length_squared() > 1e-8 {
             nrm_sum.normalize()
@@ -459,7 +463,7 @@ fn build_loaded_model(name: &str) -> Option<Arc<LoadedModel>> {
             group: crate::model::material::group_for_part(&p.name) as usize,
             centroid,
             avg_normal,
-            footprint,
+            height,
             samples,
         });
     }
@@ -981,7 +985,7 @@ impl CallbackTrait for MeshRenderState {
                 },
                 None => {
                     // Animate presses/tilts/pulls via the part's extra transform.
-                    let fp = part.map(|p| p.footprint).unwrap_or(0.0);
+                    let fp = part.map(|p| p.height).unwrap_or(0.0);
                     let model_m = orient * self.live.part_xform(name, &part_tf, fp) * part_tf;
                     // Relay the live LED colour onto the LED-strip group (emissive).
                     let is_led = g == crate::model::material::MaterialGroup::Led as usize;
@@ -1589,7 +1593,7 @@ mod vis_tests {
             group: 0,
             centroid: Vec3::ZERO,
             avg_normal: n,
-            footprint: 1.0,
+            height: 1.0,
             samples,
         }
     }
