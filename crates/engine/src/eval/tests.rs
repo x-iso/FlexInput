@@ -2350,6 +2350,97 @@ mod lean_axis_tests {
         }
     }
 
+    /// Run the module until its smoothed gravity settles, then report lean.
+    /// `axis` picks the mode; `accel` is held steady throughout.
+    fn settled_lean(axis: &str, accel: [f32; 3]) -> f32 {
+        let inputs: Vec<Option<Signal>> = vec![
+            None, None,
+            Some(Signal::Float(0.0)),
+            Some(Signal::Float(0.0)),
+            Some(Signal::Float(0.0)),
+            Some(Signal::Float(accel[0])),
+            Some(Signal::Float(accel[1])),
+            Some(Signal::Float(accel[2])),
+        ];
+        let mut params = HashMap::new();
+        params.insert("family".to_string(), Value::String("pointer".into()));
+        params.insert("axis".to_string(), Value::String(axis.into()));
+        let mut state = NodeState::default();
+        let mut lean = 0.0;
+        // 10 s at 60 Hz — past the longest smoothing tau (World, 3 s).
+        for _ in 0..600 {
+            let out = compute_gyro_3dof(
+                &inputs, &mut state, &params,
+                &HashMap::new(), &HashMap::new(), 1.0 / 60.0,
+            );
+            lean = match out.get(LEAN_OUT) {
+                Some(Some(Signal::Float(f))) => *f,
+                other => panic!("lean output slot held {other:?}"),
+            };
+        }
+        lean
+    }
+
+    // Gravity in the pad's frame for the two ways it gets held, tilted
+    // sideways by ~45°. Axes are (side, forward, vertical).
+    const FLAT_TILTED: [f32; 3] = [0.707, 0.0, 0.707];      // held flat, rolled
+    const UPRIGHT_TILTED: [f32; 3] = [0.707, 0.707, 0.0];   // nose-up, grips down
+
+    /// Pitch+Yaw assumes the pad points forward, so it leans on roll — and
+    /// should go quiet if the pad is actually being held nose-up, where the
+    /// same side tilt means something else to the player.
+    #[test]
+    fn pitch_yaw_leans_when_held_flat_only() {
+        assert!(
+            settled_lean("pitch_yaw", FLAT_TILTED).abs() > 0.5,
+            "held flat and rolled: this is Pitch+Yaw's lean",
+        );
+        assert!(
+            settled_lean("pitch_yaw", UPRIGHT_TILTED).abs() < 0.1,
+            "held nose-up: not the orientation this mode assumes",
+        );
+    }
+
+    /// Pitch+Roll assumes a handheld / ceiling-pointing pad, where the lean the
+    /// player performs reads to them as a yaw. Same accel axis, opposite gate.
+    #[test]
+    fn pitch_roll_leans_when_held_nose_up_only() {
+        assert!(
+            settled_lean("pitch_roll", UPRIGHT_TILTED).abs() > 0.5,
+            "held nose-up and tilted: this is Pitch+Roll's lean",
+        );
+        assert!(
+            settled_lean("pitch_roll", FLAT_TILTED).abs() < 0.1,
+            "held flat: not the orientation this mode assumes",
+        );
+    }
+
+    /// Player and World adapt to however the pad is held, so they lean in both.
+    #[test]
+    fn adaptive_modes_lean_however_the_pad_is_held() {
+        for axis in ["player", "world"] {
+            assert!(
+                settled_lean(axis, FLAT_TILTED).abs() > 0.5,
+                "{axis} must lean when held flat",
+            );
+            assert!(
+                settled_lean(axis, UPRIGHT_TILTED).abs() > 0.5,
+                "{axis} must lean when held nose-up",
+            );
+        }
+    }
+
+    /// Whatever the mode, forward tilt is pitch and must never read as lean.
+    #[test]
+    fn no_mode_leans_on_forward_tilt() {
+        for axis in ["pitch_yaw", "pitch_roll", "player", "world"] {
+            assert!(
+                settled_lean(axis, [0.0, 0.707, 0.707]).abs() < 0.1,
+                "{axis} leaned on a forward tilt",
+            );
+        }
+    }
+
     /// The device layer normalizes every pad to (x = side, y = forward-tilt,
     /// z = vertical) — see `flexinput_devices::gyro::build`. Lean means SIDE
     /// tilt, so it must follow X and ignore Y. It read Y until 2026-07, which

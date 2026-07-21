@@ -116,6 +116,40 @@ pub(crate) fn compute_gyro_3dof(
     //   [16] gyro-still time accumulator for the yaw auto re-center
     while state.aux_f32.len() < 17 { state.aux_f32.push(0.0); }
 
+    // ── Smoothed gravity: how is the pad being HELD? ──────────────────────
+    //
+    // Low-passed accel direction. Gravity is the only sustained acceleration a
+    // hand-held pad sees, so this settles onto "down" in the pad's own frame,
+    // and therefore describes the pad's resting orientation independently of
+    // whatever gesture is happening right now.
+    //
+    // That independence is the point. The lean gate below has to ask "is the
+    // pad held flat, or nose-up?", and asking the INSTANTANEOUS accel would let
+    // a lean answer its own question — tilting far enough always rotates the
+    // pad out of the orientation being tested, so confidence would collapse at
+    // exactly the extremes of the gesture. The smoothed estimate lags the
+    // gesture and keeps the answer about how the pad is being held.
+    //
+    // Player/World already needed this to project out yaw; the longer their
+    // taus the more world-anchored they feel, so those keep their own.
+    let tau = match axis {
+        "world" => 3.0_f32,
+        "player" => 1.0_f32,
+        _ => 2.0_f32,
+    };
+    let accel_v = glam::Vec3::new(ax, ay, az);
+    let acc_len = accel_v.length();
+    if acc_len > 0.01 {
+        let alpha = 1.0 - (-dt / tau).exp();
+        let norm = accel_v / acc_len;
+        state.aux_f32[2] += alpha * (norm.x - state.aux_f32[2]);
+        state.aux_f32[3] += alpha * (norm.y - state.aux_f32[3]);
+        state.aux_f32[4] += alpha * (norm.z - state.aux_f32[4]);
+    }
+    let sg = glam::Vec3::new(state.aux_f32[2], state.aux_f32[3], state.aux_f32[4]);
+    let sg_len = sg.length();
+    let g_hat = if sg_len > 0.01 { sg / sg_len } else { glam::Vec3::new(0.0, 0.0, 1.0) };
+
     // ── Axis selection: decide which gyro components feed X / Y ───────────
     //
     // For Player/World we project gyro onto the gravity-corrected frame.
@@ -129,19 +163,6 @@ pub(crate) fn compute_gyro_3dof(
         "pitch_roll" => (gx, gy, gz),
         "player" | "world" => {
             let gyro  = glam::Vec3::new(gx, gy, gz);
-            let accel = glam::Vec3::new(ax, ay, az);
-            let tau = if axis == "world" { 3.0_f32 } else { 1.0_f32 };
-            let alpha = 1.0 - (-dt / tau).exp();
-            let acc_mag = accel.length();
-            if acc_mag > 0.01 {
-                let norm = accel / acc_mag;
-                state.aux_f32[2] += alpha * (norm.x - state.aux_f32[2]);
-                state.aux_f32[3] += alpha * (norm.y - state.aux_f32[3]);
-                state.aux_f32[4] += alpha * (norm.z - state.aux_f32[4]);
-            }
-            let sg = glam::Vec3::new(state.aux_f32[2], state.aux_f32[3], state.aux_f32[4]);
-            let sg_len = sg.length();
-            let g_hat = if sg_len > 0.01 { sg / sg_len } else { glam::Vec3::new(0.0, 0.0, 1.0) };
             let world_yaw   = gyro.dot(g_hat);
             let gyro_no_yaw = gyro - world_yaw * g_hat;
             (world_yaw, gyro_no_yaw.y, 0.0)
@@ -241,12 +262,33 @@ pub(crate) fn compute_gyro_3dof(
     //   - Returning to neutral smoothly ramps back to 0 (no spurious
     //     opposite spike like raw gyro rate would give).
     //
-    // For Pitch+Roll / Player / World modes the rotation around gravity
-    // is not directly observable from accel; we still use the same side-
-    // tilt measure since "is the controller tilted sideways" is the
-    // intuitive lean axis regardless of how X/Y are derived.
+    // Every mode reads the SAME axis. `ax` is gravity along the pad's side
+    // axis, which measures "tilted sideways" whether the pad is held flat (the
+    // player feels a roll) or nose-up (they feel a yaw — grips swinging down).
+    // The gesture is the same motion in the pad's own frame either way.
+    //
+    // What differs per mode is whether the pad is being held the way that mode
+    // assumes, judged from the SMOOTHED gravity above so a lean cannot answer
+    // its own question:
+    //
+    //   Pitch+Yaw   assumes flat / pointing forward — gravity through the face
+    //   Pitch+Roll  assumes nose-up (handheld, or a pad aimed at the ceiling) —
+    //               gravity along the forward axis
+    //   Player/World adapt to however the pad is held, so they never gate
+    //
+    // Gating scales rather than cuts, so a pad drifting out of its assumed
+    // orientation loses lean smoothly instead of dropping it at a boundary.
     let acc_mag_full = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
-    let lean_val = (ax / acc_mag_full).clamp(-1.0, 1.0);
+    let lean_side = ax / acc_mag_full;
+    // Split the smoothed gravity into "along forward" vs "through the face",
+    // ignoring its side component — that one is what the gesture moves.
+    let hold_ref = (g_hat.y * g_hat.y + g_hat.z * g_hat.z).sqrt().max(1e-3);
+    let hold_conf = match axis {
+        "pitch_yaw" => (g_hat.z / hold_ref).abs(),
+        "pitch_roll" => (g_hat.y / hold_ref).abs(),
+        _ => 1.0,
+    };
+    let lean_val = (lean_side * hold_conf).clamp(-1.0, 1.0);
     let lean_threshold = pf("lean_threshold", 0.3).clamp(0.01, 4.0);
     let lean_active = lean_val.abs() >= lean_threshold;
 
