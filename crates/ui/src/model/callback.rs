@@ -609,12 +609,27 @@ const GHOST_VIS_HIGH: f32 = 0.12;
 /// it still has to clear the band to flip anything.
 const GHOST_DEBOUNCE: u8 = 1;
 
+/// Fewest camera-facing samples an object needs before its visibility fraction
+/// is worth believing.
+///
+/// The fraction's denominator is however many samples face the camera and land
+/// in frame, and that shrinks to nothing as a part turns away — so the estimate
+/// gets noisier exactly as it approaches being unmeasurable. Below this the
+/// verdict is "don't know", and the latch holds whatever it had.
+const VIS_MIN_SAMPLES: u32 = 8;
+
 /// Advance one part's ghost latch with a freshly measured visibility fraction.
 ///
 /// `ghosted` is the latched state the renderer reads; `streak` counts how many
 /// consecutive readbacks have disagreed with it. Hysteresis picks the bar
 /// (harder to leave x-ray than to enter it) and the streak supplies the delay.
-fn update_ghost_latch(frac: f32, ghosted: &mut bool, streak: &mut u8) {
+fn update_ghost_latch(frac: Option<f32>, ghosted: &mut bool, streak: &mut u8) {
+    // No usable measurement: hold. Treating absence as "visible" would invert
+    // the verdict at the exact moment a part is least visible.
+    let Some(frac) = frac else {
+        *streak = 0;
+        return;
+    };
     let want = if *ghosted {
         frac < GHOST_VIS_HIGH
     } else {
@@ -728,16 +743,21 @@ fn part_visibility_counts(
 /// camera always has such a mesh. Summing weighs each mesh by the surface it
 /// actually presents, so an unmeasurable one contributes nothing either way.
 ///
-/// An object with no facing samples anywhere reports 1.0, which also makes the
-/// measurement fail SAFE: if it ever stops producing data the model renders
-/// normally, rather than every input turning permanently to glass the way a
-/// silently-dead occlusion query did.
+/// An object with too little facing surface in frame to judge reports `None`
+/// and the caller holds its previous verdict. Deliberately NOT "fully visible":
+/// a part rotating out of view loses facing samples as it goes, so a 1.0 there
+/// would un-ghost it at the moment it is least visible — which reads as flicker.
+///
+/// The fail-safe lives in the latch's initial state instead. An object never
+/// measured is not ghosted, so a measurement that stops producing data leaves
+/// the model rendering normally rather than turning every input to glass the
+/// way a silently-dead occlusion query did.
 fn object_visibility_fractions(
     parts: &[PartData],
     obj: &[u32],
     pose: &VisPose,
     depth: &[f32],
-) -> Vec<f32> {
+) -> Vec<Option<f32>> {
     let key_of = |i: usize| obj.get(i).copied().unwrap_or(i as u32);
     let mut sums: std::collections::HashMap<u32, (u32, u32)> = std::collections::HashMap::new();
     for (i, part) in parts.iter().enumerate() {
@@ -749,8 +769,8 @@ fn object_visibility_fractions(
     }
     (0..parts.len())
         .map(|i| match sums.get(&key_of(i)).copied().unwrap_or((0, 0)) {
-            (_, 0) => 1.0,
-            (vis, tot) => vis as f32 / tot as f32,
+            (vis, tot) if tot >= VIS_MIN_SAMPLES => Some(vis as f32 / tot as f32),
+            _ => None,
         })
         .collect()
 }
@@ -1330,8 +1350,14 @@ impl CallbackTrait for MeshRenderState {
                             gh.resize(vm.n_parts, false);
                             st.resize(vm.n_parts, 0);
                             for i in 0..vm.n_parts {
-                                fr[i] = measured.get(i).copied().unwrap_or(1.0);
-                                update_ghost_latch(fr[i], &mut gh[i], &mut st[i]);
+                                let m = measured.get(i).copied().flatten();
+                                // Keep the last believable reading for anything
+                                // reading `fractions`; the latch is told the
+                                // truth, absence included.
+                                if let Some(f) = m {
+                                    fr[i] = f;
+                                }
+                                update_ghost_latch(m, &mut gh[i], &mut st[i]);
                             }
                         }
                         vm.staging.unmap();
@@ -1637,7 +1663,7 @@ mod vis_tests {
         let pose = pose(Mat4::IDENTITY);
         let depth = self_depth(&part, &pose);
         let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
-        assert_eq!(f[0], 1.0, "a part alone in front of the camera is fully visible");
+        assert_eq!(f[0], Some(1.0), "a part alone in front of the camera is fully visible");
     }
 
     #[test]
@@ -1647,8 +1673,8 @@ mod vis_tests {
         // Something solid much closer to the camera covers the whole frame.
         let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
         let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
-        assert_eq!(f[0], 0.0, "fully covered part must read as hidden");
-        assert!(f[0] < GHOST_VIS_LOW, "and must cross the ghost threshold");
+        assert_eq!(f[0], Some(0.0), "fully covered part must read as hidden");
+        assert!(f[0].unwrap() < GHOST_VIS_LOW, "and must cross the ghost threshold");
     }
 
     #[test]
@@ -1665,35 +1691,43 @@ mod vis_tests {
         }
         let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
         assert!(
-            (f[0] - 0.5).abs() < 0.1,
-            "half-occluded part should read near 0.5, got {}",
+            (f[0].unwrap() - 0.5).abs() < 0.1,
+            "half-occluded part should read near 0.5, got {:?}",
             f[0]
         );
     }
 
     #[test]
-    fn part_outside_the_frame_fails_safe_to_visible() {
+    fn part_outside_the_frame_is_unmeasurable() {
         let part = facing_quad(false);
         // Push it far to the side: nothing projects inside the viewport.
         let pose = pose(Mat4::from_translation(Vec3::new(50.0, 0.0, 0.0)));
         let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
         let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
-        assert_eq!(
-            f[0], 1.0,
-            "off-screen parts have nothing to reveal — ghosting them is noise"
-        );
+        assert_eq!(f[0], None, "nothing in frame is not a visibility reading");
     }
 
     #[test]
-    fn part_turned_away_fails_safe_to_visible() {
-        // Every sample faces away from the camera, so none counts toward the
-        // total. That must not read as "hidden" — there is no facing surface to
-        // x-ray through in the first place.
+    fn part_turned_away_is_unmeasurable() {
+        // Every sample faces away, so none counts toward the total. That is an
+        // absence of evidence, not evidence of visibility.
         let part = facing_quad(true);
         let pose = pose(Mat4::IDENTITY);
         let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
         let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
-        assert_eq!(f[0], 1.0);
+        assert_eq!(f[0], None);
+    }
+
+    /// The fail-safe that the old blanket 1.0 was reaching for, in its proper
+    /// place: a part never successfully measured is not ghosted, so if the
+    /// measurement stops producing data the model just renders normally.
+    #[test]
+    fn an_object_never_measured_is_not_ghosted() {
+        let (mut ghosted, mut streak) = (false, 0u8);
+        for _ in 0..50 {
+            update_ghost_latch(None, &mut ghosted, &mut streak);
+        }
+        assert!(!ghosted, "no measurement must leave the model rendering normally");
     }
 
     /// The stick regression: a multi-mesh occlusion object whose meshes are all
@@ -1715,16 +1749,16 @@ mod vis_tests {
         // Both meshes in ONE object, the way a stick's dome/cap/rim are.
         let grouped = object_visibility_fractions(&parts, &[7, 7], &pose, &depth);
         assert_eq!(
-            grouped[0], 0.0,
+            grouped[0], Some(0.0),
             "group is entirely hidden; the mesh that measured nothing must not lift it"
         );
-        assert!(grouped[0] < GHOST_VIS_LOW, "so the stick actually ghosts");
+        assert!(grouped[0].unwrap() < GHOST_VIS_LOW, "so the stick actually ghosts");
 
         // The same meshes as independent objects: the turned-away one still
         // reads visible alone, since there is genuinely nothing to x-ray.
         let separate = object_visibility_fractions(&parts, &[0, 1], &pose, &depth);
-        assert_eq!(separate[0], 0.0);
-        assert_eq!(separate[1], 1.0);
+        assert_eq!(separate[0], Some(0.0));
+        assert_eq!(separate[1], None, "a mesh with no facing surface has no reading");
     }
 
     /// Grouping must weigh meshes by the surface they present, not one vote
@@ -1754,18 +1788,18 @@ mod vis_tests {
         }
         let f = object_visibility_fractions(&parts, &[3, 3], &pose, &depth);
         assert!(
-            f[0] > 0.8,
-            "group dominated by its large visible mesh should read visible, got {}",
+            f[0].unwrap() > 0.8,
+            "group dominated by its large visible mesh should read visible, got {:?}",
             f[0]
         );
-        assert!(f[0] < 1.0, "the covered mesh must still count against it");
+        assert!(f[0].unwrap() < 1.0, "the covered mesh must still count against it");
     }
 
     /// Readbacks needed for the latch to flip, feeding it a steady `frac`.
     fn readbacks_to_flip(from_ghosted: bool, frac: f32) -> u32 {
         let (mut ghosted, mut streak) = (from_ghosted, 0u8);
         for n in 1..100 {
-            update_ghost_latch(frac, &mut ghosted, &mut streak);
+            update_ghost_latch(Some(frac), &mut ghosted, &mut streak);
             if ghosted != from_ghosted {
                 return n;
             }
@@ -1794,7 +1828,7 @@ mod vis_tests {
     fn a_reading_in_the_band_never_flips_a_visible_part() {
         let (mut ghosted, mut streak) = (false, 0u8);
         for frac in [1.0, 0.08, 1.0, 0.06, 0.11, 1.0] {
-            update_ghost_latch(frac, &mut ghosted, &mut streak);
+            update_ghost_latch(Some(frac), &mut ghosted, &mut streak);
             assert!(!ghosted, "only a reading under LOW may engage x-ray");
         }
     }
@@ -1807,10 +1841,73 @@ mod vis_tests {
         for start in [false, true] {
             let (mut ghosted, mut streak) = (start, 0u8);
             for _ in 0..20 {
-                update_ghost_latch(mid, &mut ghosted, &mut streak);
+                update_ghost_latch(Some(mid), &mut ghosted, &mut streak);
             }
             assert_eq!(ghosted, start, "edge-of-occlusion part must hold its state");
         }
+    }
+
+    /// The self-occlusion guard, but for parts AWAY from the model centre.
+    ///
+    /// `depth_eps` is derived once, from a small step toward the camera at the
+    /// centre — and depth is non-linear, so the NDC delta that step produces is
+    /// not the delta the same step produces nearer or further away. If the
+    /// tolerance is too tight out at the model's edges, a part's own recorded
+    /// surface starts reading as an occluder of itself, which shows up as x-ray
+    /// flickering on the outlying parts (triggers, bumpers) rather than a clean
+    /// verdict either way.
+    #[test]
+    fn an_offset_part_never_occludes_itself() {
+        for dx in [-1.0f32, -0.5, 0.0, 0.5, 1.0] {
+            for dz in [-1.0f32, -0.5, 0.0, 0.5, 1.0] {
+                let part = facing_quad(false);
+                let m = Mat4::from_translation(Vec3::new(dx, 0.0, dz));
+                let pose = pose(m);
+                let depth = self_depth(&part, &pose);
+                let f = object_visibility_fractions(
+                    std::slice::from_ref(&part), &[0], &pose, &depth,
+                );
+                assert_eq!(
+                    f[0], Some(1.0),
+                    "part offset ({dx}, {dz}) reads as occluding itself                      — depth epsilon too tight away from the centre",
+                );
+            }
+        }
+    }
+
+    /// A hidden part rotating out of the camera's view must not pop back to
+    /// "visible" as its last camera-facing sample disappears.
+    ///
+    /// The fraction is `visible / facing-and-in-frame`. As a part turns away
+    /// that denominator shrinks, so the estimate gets noisier on fewer and
+    /// fewer samples, and at zero it hits the "nothing to reveal" fail-safe of
+    /// 1.0 — inverting the verdict at the exact moment the part is LEAST
+    /// visible. Sweeping the part past edge-on reproduces it.
+    #[test]
+    fn a_part_turning_away_does_not_flip_to_visible() {
+        let mut flips = 0;
+        let mut prev: Option<bool> = None;
+        let (mut ghosted, mut streak) = (true, 0u8);
+        // Rotate from face-on toward edge-on and past it.
+        for step in 0..=40 {
+            let deg = 60.0 + step as f32 * 1.0; // 60° … 100°, crossing edge-on
+            let part = facing_quad(false);
+            let pose = pose(Mat4::from_rotation_y(deg.to_radians()));
+            // Something nearer covers everything: the part IS hidden throughout.
+            let depth = vec![0.0f32; (VIS_RES * VIS_RES) as usize];
+            let f = object_visibility_fractions(
+                std::slice::from_ref(&part), &[0], &pose, &depth,
+            );
+            update_ghost_latch(f[0], &mut ghosted, &mut streak);
+            if prev.is_some_and(|p| p != ghosted) {
+                flips += 1;
+            }
+            prev = Some(ghosted);
+        }
+        assert_eq!(
+            flips, 0,
+            "x-ray flipped {flips}x while the part stayed hidden and merely              turned away — the sample count fell through the fail-safe",
+        );
     }
 
     #[test]
@@ -1824,7 +1921,7 @@ mod vis_tests {
             let pose = pose(m);
             let depth = self_depth(&part, &pose);
             let f = object_visibility_fractions(std::slice::from_ref(&part), &[0], &pose, &depth);
-            assert_eq!(f[0], 1.0, "self-occlusion at {deg}° — depth epsilon too tight");
+            assert_eq!(f[0], Some(1.0), "self-occlusion at {deg}° — depth epsilon too tight");
         }
     }
 }
