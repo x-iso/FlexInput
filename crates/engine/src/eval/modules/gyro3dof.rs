@@ -91,20 +91,19 @@ pub(crate) fn compute_gyro_3dof(
     let gx = pin_or(2, gx_am) * inv("inv_roll");
     let gy = pin_or(3, gy_am);
     let gz = pin_or(4, gz_am);
+    // Accel arrives in the canonical AutoMap frame (see `HidReading`):
+    //   x = forward  (+ nose/USB up)
+    //   y = side     (+ right grip down)
+    //   z = vertical (+ flat, face up)
+    // — identical for every pad, and the SAME frame the gyro vector uses (roll
+    // about x, pitch about y, yaw about z). Player/World projects gyro onto this
+    // gravity direction, so accel and gyro MUST share a frame; the module works
+    // in canonical throughout to guarantee that. (It used to assume a legacy
+    // layout with x = side, which only matched the gyro frame on the Switch Pro
+    // — hence the slanted Player/World response on Sony pads.)
     let ax = pin_or(5, ax_am) * inv("inv_accel_x");
     let ay = pin_or(6, ay_am) * inv("inv_accel_y");
     let az = pin_or(7, az_am) * inv("inv_accel_z");
-    // Canonical → legacy accel frame. The device layer delivers accel in the
-    // canonical AutoMap frame (x = forward/+nose-up, y = side/+right-grip-down,
-    // z = vertical/+flat — see `HidReading`), identical for every pad. The math
-    // below predates that contract and is written for the older layout where x
-    // was the side axis; this one device-AGNOSTIC line adapts it, so a single
-    // body serves every device unchanged. It is NOT a per-device transform —
-    // those live in the device layer — and on a Sony pad it exactly undoes the
-    // device-layer permutation, leaving that pad's behaviour identical to
-    // before the canonicalisation while a Switch Pro now feeds these paths the
-    // correct channels instead of the swapped ones.
-    let (ax, ay, az) = (-ay, -ax, az);
     // (Spike suppression moved to the device polling layer — see
     // `flexinput_devices::gyro::apply_spike_filter`. The engine sees an
     // already-clean IMU stream.)
@@ -200,27 +199,30 @@ pub(crate) fn compute_gyro_3dof(
         state.aux_f32[0] += raw_x * dt;
         state.aux_f32[1] += raw_y * dt;
 
-        // X recenter — gated by axis (yaw isn't observable when flat).
-        //   Pitch+Yaw  : heading = atan2(ay, ax), weight ≈ |sin tilt|
-        //   Pitch+Roll : heading = atan2(ay, az), weight ≈ cos pitch
+        // X recenter — gated by axis (yaw isn't observable when flat). The
+        // heading is the azimuth of the tilt, in canonical accel components:
+        //   Pitch+Yaw  : tilt in the (forward, side) plane, weight ≈ |sin tilt|
+        //   Pitch+Roll : tilt in the (forward, vertical) plane, weight ≈ cos pitch
         //   Player/World: skipped (azimuth around gravity unobservable
         //                  from accel alone).
+        // The `-forward, -side` / `-forward` arguments keep the exact heading
+        // convention this was tuned with (the pre-canonical frame had forward
+        // and side on the negated opposite channels); only the frame notation
+        // changed, not the numbers.
         //
-        // Y recenter is intentionally NOT implemented as an independent
-        // atan2 — the per-axis approach couples X and Y badly (Y motion
-        // → large ax → atan2(ay, ax) whiplash → spurious X drift). The
-        // proper fix is to maintain a continuous 3DOF pose estimate and
-        // project both axes from it; that rework is pending. Until then,
-        // Y centers only via the manual reset (ease_in).
+        // Y recenter is intentionally NOT implemented as an independent atan2 —
+        // the per-axis approach couples X and Y badly. The proper fix is a
+        // continuous 3DOF pose estimate projecting both axes; pending. Until
+        // then, Y centers only via the manual reset (ease_in).
         if recenter_strength > 0.0 && (axis == "pitch_yaw" || axis == "pitch_roll") {
             let acc_mag = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
             let (heading, weight) = if axis == "pitch_roll" {
-                let w = (ay * ay + az * az).sqrt() / acc_mag;
-                (ay.atan2(az), w)
+                let w = (ax * ax + az * az).sqrt() / acc_mag;
+                ((-ax).atan2(az), w)
             } else {
                 // pitch_yaw
                 let w = (ax * ax + ay * ay).sqrt() / acc_mag;
-                (ay.atan2(ax), w)
+                ((-ax).atan2(-ay), w)
             };
             let two_pi = std::f32::consts::TAU;
             let mut delta = heading - state.aux_f32[0];
@@ -262,11 +264,9 @@ pub(crate) fn compute_gyro_3dof(
     // Lean is the controller's signed side-tilt as a fraction of full
     // sideways. Magnitude in [0, 1] where 1 ≈ on its side.
     //
-    // SIDE tilt is `ax` in the LEGACY frame this block uses (the adapter above
-    // maps the canonical device frame onto it, so `ax` here is the side axis,
-    // + when the LEFT grip drops). This read `ay` until 2026-07, which is
-    // forward tilt, so lean tracked pitch — it fired when the pad was tipped
-    // toward or away from the player rather than rolled left/right.
+    // SIDE tilt is canonical `ay`. This read the wrong axis until 2026-07 (first
+    // forward tilt, then a legacy adapter), so lean tracked pitch — it fired
+    // when the pad was tipped toward or away from the player rather than rolled.
     //
     // This is derived from accel ONLY, not gyro rate, so:
     //   - Holding a tilted controller produces a STEADY non-zero lean.
@@ -290,18 +290,18 @@ pub(crate) fn compute_gyro_3dof(
     // Gating scales rather than cuts, so a pad drifting out of its assumed
     // orientation loses lean smoothly instead of dropping it at a boundary.
     let acc_mag_full = (ax * ax + ay * ay + az * az).sqrt().max(1e-3);
-    // Legacy `ax` is + when the LEFT grip drops; lean is positive-is-right, so
-    // negate. In canonical terms this is just `+accel_y` (side, + right-grip),
-    // which is why the adapter and this sign agree with the frame contract now
-    // that both devices deliver that frame — the earlier apparent contradiction
-    // was the Sony accel being X/Y-swapped against its own gyro.
-    let lean_side = -ax / acc_mag_full;
-    // Split the smoothed gravity into "along forward" vs "through the face",
-    // ignoring its side component — that one is what the gesture moves.
-    let hold_ref = (g_hat.y * g_hat.y + g_hat.z * g_hat.z).sqrt().max(1e-3);
+    // Lean is the side component: canonical `ay`, + when the right grip drops =
+    // + right lean. (Verified against a physical pad and pinned by a test.)
+    let lean_side = ay / acc_mag_full;
+    // Confidence that the pad is held as the mode assumes, from the smoothed
+    // gravity — using the forward (x) and vertical (z) components and ignoring
+    // side (y), which is the axis the lean gesture itself moves:
+    //   Pitch+Yaw  assumes flat    → gravity through the vertical axis (z)
+    //   Pitch+Roll assumes nose-up → gravity along the forward axis   (x)
+    let hold_ref = (g_hat.x * g_hat.x + g_hat.z * g_hat.z).sqrt().max(1e-3);
     let hold_conf = match axis {
         "pitch_yaw" => (g_hat.z / hold_ref).abs(),
-        "pitch_roll" => (g_hat.y / hold_ref).abs(),
+        "pitch_roll" => (g_hat.x / hold_ref).abs(),
         _ => 1.0,
     };
     let lean_val = (lean_side * hold_conf).clamp(-1.0, 1.0);

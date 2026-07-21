@@ -2416,6 +2416,44 @@ mod lean_axis_tests {
         );
     }
 
+    /// Player/World project the gyro onto the gravity direction to split yaw
+    /// from the rest, so the accel (gravity) and gyro vectors MUST be read in
+    /// the same body frame. When they weren't, a rotation about gravity leaked
+    /// into the other output axis — the "slant" where a yaw drifted the cursor
+    /// diagonally. Frames matched on the Switch Pro but not on Sony pads.
+    ///
+    /// Roll the pad onto its right side (gravity along +Y = side), then rotate
+    /// about that same axis (pure pitch gyro = rotation about Y = about
+    /// gravity). That is a world-yaw, so it must land in X alone. With mixed
+    /// frames it would appear in Y instead.
+    #[test]
+    fn player_yaw_about_gravity_stays_out_of_the_other_axis() {
+        let inputs: Vec<Option<Signal>> = vec![
+            None, None,
+            Some(Signal::Float(0.0)),  // gyro x (roll)
+            Some(Signal::Float(0.6)),  // gyro y (pitch) — about the side axis
+            Some(Signal::Float(0.0)),  // gyro z (yaw)
+            Some(Signal::Float(0.0)),  // accel x (forward)
+            Some(Signal::Float(1.0)),  // accel y (side) — gravity, right side down
+            Some(Signal::Float(0.0)),  // accel z (vertical)
+        ];
+        let mut params = HashMap::new();
+        params.insert("family".to_string(), Value::String("pointer".into()));
+        params.insert("axis".to_string(), Value::String("player".into()));
+        let mut state = NodeState::default();
+        let mut out = Vec::new();
+        for _ in 0..600 {
+            out = compute_gyro_3dof(
+                &inputs, &mut state, &params,
+                &HashMap::new(), &HashMap::new(), 1.0 / 60.0,
+            );
+        }
+        let x = match out.get(1) { Some(Some(Signal::Float(f))) => *f, o => panic!("x: {o:?}") };
+        let y = match out.get(2) { Some(Some(Signal::Float(f))) => *f, o => panic!("y: {o:?}") };
+        assert!(x.abs() > 0.3, "rotation about gravity must drive X, got {x}");
+        assert!(y.abs() < 0.05, "and must NOT leak into Y (the slant), got {y}");
+    }
+
     /// Player and World adapt to however the pad is held, so they lean in both.
     #[test]
     fn adaptive_modes_lean_however_the_pad_is_held() {
