@@ -266,7 +266,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         // which hardware this node maps to.
                         NodeIconSpec::Single(bytes) if is_device_source
                             && self.ping_requests.is_some()
-                            && dev_id_str.starts_with("gilrs:") =>
+                            && crate::canvas::remapper_icons::phys_pad_slug(dev_id_str).is_some() =>
                         {
                             if ping_device_icon(ui, bytes, ICON_H).clicked() {
                                 if let Some(q) = self.ping_requests {

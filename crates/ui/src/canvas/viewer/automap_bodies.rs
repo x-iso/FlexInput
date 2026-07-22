@@ -66,8 +66,9 @@ pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool,
     if dev_id.starts_with("midi_in") || dev_id.starts_with("midi_out") {
         return (false, false, false);
     }
-    if let Some(rest) = dev_id.strip_prefix("gilrs:") {
-        let slug = rest.split(':').next().unwrap_or("");
+    // Same slug table for gilrs and SDL pads — a DualSense read through SDL
+    // gets the same deadzone/gyro/stick calibration surface as a native one.
+    if let Some(slug) = crate::canvas::remapper_icons::phys_pad_slug(dev_id) {
         return match slug {
             "xinput"                          => (true, false, true),
             "ds4" | "dualsense" | "switch_pro" => (true, true,  true),

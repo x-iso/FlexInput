@@ -53,10 +53,22 @@ impl Skin {
 /// Best-effort skin inference from a `device_id` string. Skin governs only
 /// gamepad chip rendering — KBM has no controller equivalent, so a keyboard
 /// upstream falls back to Xbox icons (which are the visual default).
+/// The kind slug of a PHYSICAL gamepad device id, whether it came from gilrs
+/// (`gilrs:<slug>:<inst>`) or SDL (`sdl:<slug>:<inst>`). `None` for anything
+/// else (MIDI, virtual, unknown). Both backends use the same
+/// `ControllerKind::id_slug` values, so downstream code (icon, calibration
+/// caps) treats a pad the same regardless of which backend surfaced it.
+pub fn phys_pad_slug(dev_id: &str) -> Option<&str> {
+    dev_id
+        .strip_prefix("gilrs:")
+        .or_else(|| dev_id.strip_prefix("sdl:"))
+        .and_then(|rest| rest.split(':').next())
+}
+
 pub fn skin_from_device_id(dev_id: &str) -> Skin {
     let d = dev_id.to_ascii_lowercase();
     if d.contains("switch")               { return Skin::SwitchPro; }
-    if d.contains("dualshock") || d.contains("dualsense")
+    if d.contains("dualshock") || d.contains("dualsense") || d.contains("ds4")
         || d.contains("playstation") || d.contains("ps4") || d.contains("ps5") {
         return Skin::Playstation;
     }
@@ -385,8 +397,7 @@ pub enum NodeIconSpec {
 /// - `virtual.xinput:<inst>` / `virtual.ds4:<inst>` virtual gamepad
 /// - `virtual.keymouse[:<inst>]` virtual keyboard + mouse (pair)
 pub fn device_node_icon_for_id(dev_id: &str) -> Option<NodeIconSpec> {
-    if let Some(rest) = dev_id.strip_prefix("gilrs:") {
-        let slug = rest.split(':').next()?;
+    if let Some(slug) = phys_pad_slug(dev_id) {
         return Some(NodeIconSpec::Single(match slug {
             "xinput"     => DEV_XBOX,
             "ds4"        => DEV_PS4,

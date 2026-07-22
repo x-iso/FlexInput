@@ -125,9 +125,15 @@ struct OpenPad {
     /// of a closed gamepad, and rumble/sensor calls need it open. Dropping it
     /// calls `SDL_CloseGamepad`.
     gamepad: Gamepad,
-    /// Stable device id string (`sdl:generic:<inst>`). Assigned once at open so
-    /// it survives re-enumeration as long as the pad stays connected.
+    /// Stable device id string (`sdl:<kind>:<inst>`). Assigned once at open so
+    /// it survives re-enumeration as long as the pad stays connected. The kind
+    /// slug is what `skin_from_device_id` matches on for the icon / 3D model, so
+    /// a DualSense-through-SDL reads `sdl:dualsense:N`, not `sdl:generic:N`.
     dev_id: String,
+    /// Detected controller kind — drives the pin layout, icon, 3D model and the
+    /// kind-gated device UI (calibration, card options). `Generic` unless the
+    /// global-SDL switch is on and SDL opened a pad a native parser would own.
+    kind: ControllerKind,
     /// Whether this pad reports a gyroscope/accelerometer (checked once at open;
     /// sensors were enabled then too). Gates the per-poll sensor reads.
     has_gyro: bool,
@@ -290,7 +296,9 @@ impl SdlBackend {
                 continue;
             }
 
-            let dev_id = format!("{ID_PREFIX}:generic:{}", *next_inst);
+            // Id carries the detected kind so the UI's skin/model/icon
+            // resolution (which string-matches the id) picks the right one.
+            let dev_id = format!("{ID_PREFIX}:{}:{}", kind.id_slug(), *next_inst);
             *next_inst += 1;
 
             // Enable IMU sensors if present so per-poll reads return data. SDL's
@@ -317,6 +325,7 @@ impl SdlBackend {
                 OpenPad {
                     gamepad,
                     dev_id,
+                    kind,
                     has_gyro,
                     has_accel,
                     num_touchpads,
@@ -364,9 +373,9 @@ impl DeviceBackend for SdlBackend {
             result.push(PhysicalDevice {
                 id: pad.dev_id.clone(),
                 display_name: name,
-                kind: ControllerKind::Generic,
-                outputs: layouts::outputs_for(ControllerKind::Generic),
-                inputs: layouts::inputs_for(ControllerKind::Generic),
+                kind: pad.kind,
+                outputs: layouts::outputs_for(pad.kind),
+                inputs: layouts::inputs_for(pad.kind),
                 instance_path: None,
                 vid: pad.gamepad.vendor_id(),
                 pid: pad.gamepad.product_id(),
