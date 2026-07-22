@@ -41,43 +41,39 @@ use sdl3::{GamepadSubsystem, Sdl};
 /// unambiguous. Full form: `sdl:generic:<inst>`.
 const ID_PREFIX: &str = "sdl";
 
-/// Rotate SDL's sensor frame into FlexInput's canonical IMU frame.
-///
-/// SDL and FlexInput use DIFFERENT body frames, so SDL sensor data cannot be
-/// copied onto the `gyro_*`/`accel_*` pins directly — doing so lands every axis
-/// on the wrong pin with the wrong sign. This is the SDL-side equivalent of the
-/// permutation the Sony parser does (`flexinput_devices::gyro::build`).
-///
-/// SDL's gamepad-sensor frame (controller held in front of you), per SDL3's
-/// `SDL_sensor.h`:
-/// - `d[0]` X: left → right
-/// - `d[1]` Y: bottom → top   (a pad at rest reads +Y ≈ 1 g on the accel)
-/// - `d[2]` Z: farther → closer (toward you)
-///
-/// Canonical frame (see `HidReading`):
-/// - x = forward  (+ nose up)
-/// - y = side     (+ right grip down)
-/// - z = vertical (+ flat, face up)
-///
-/// Mapping, by physical axis (forward = away from you = −SDL Z; side/right =
-/// −SDL X because rolling the right grip down tilts the up-vector toward SDL −X;
-/// vertical = +SDL Y):
-///
-/// ```text
-/// canonical = [ -d[2], -d[0], d[1] ]
-/// ```
-///
-/// The matrix is a proper rotation (determinant +1), so angular velocity (a
-/// pseudovector) transforms by the SAME mapping — gyro and accel share it.
-///
-/// VERIFICATION PENDING: the axis assignment is solid, but the exact per-axis
-/// SIGNS — the gyro handedness in particular — are derived from SDL's docs, not
-/// measured, and sign derivations in this area have been wrong before. The
-/// intended check is the "route all pads through SDL" toggle: a DualSense read
-/// through SDL must match the same pad read through the (canonical-correct)
-/// native parser. Any axis that comes out inverted is a one-line negation here.
-fn sdl_imu_axes_to_canonical(d: [f32; 3]) -> [f32; 3] {
+// ── SDL sensor frame → FlexInput's canonical IMU frame ─────────────────────
+//
+// SDL and FlexInput use DIFFERENT body frames, so SDL sensor data cannot be
+// copied onto the `gyro_*`/`accel_*` pins directly — doing so lands every axis
+// on the wrong pin with the wrong sign. This is the SDL-side equivalent of the
+// permutation the Sony parser does (`flexinput_devices::gyro::build`).
+//
+// SDL's gamepad-sensor frame (controller held in front of you), per SDL3's
+// `SDL_sensor.h`:
+//   d[0] X: left → right
+//   d[1] Y: bottom → top   (a pad at rest reads +Y ≈ 1 g on the accel)
+//   d[2] Z: farther → closer (toward you)
+//
+// Canonical frame (see `HidReading`): x = forward (+nose up), y = side
+// (+right grip down), z = vertical (+flat).
+//
+// Both mappings were VERIFIED against a DualSense read through SDL and compared
+// to its native (canonical-correct) parser. Accel matched the docs-derived
+// permutation; gyro needed pitch and yaw inverted, because canonical's gyro
+// convention is empirically clockwise-positive on roll/yaw rather than the pure
+// right-handed rotation of the accel frame — so the pseudovector picks up two
+// sign flips a single shared matrix can't carry. Hence two functions.
+
+/// Accelerometer: SDL `[x,y,z]` → canonical `[forward, side, vertical]`.
+fn sdl_accel_to_canonical(d: [f32; 3]) -> [f32; 3] {
     [-d[2], -d[0], d[1]]
+}
+
+/// Gyroscope: SDL `[x,y,z]` → canonical `[roll, pitch, yaw]`. Same axis
+/// assignment as accel; pitch (y) and yaw (z) carry the opposite sign (verified
+/// on hardware — see the note above).
+fn sdl_gyro_to_canonical(d: [f32; 3]) -> [f32; 3] {
+    [-d[2], d[0], -d[1]]
 }
 
 /// Thread-confinement wrapper for SDL's `!Send` handles.
@@ -491,7 +487,7 @@ impl DeviceBackend for SdlBackend {
                 if g.sensor_get_data(SensorType::Gyroscope, &mut d).is_ok() {
                     // SDL's frame → canonical, THEN scale. SDL gyro is rad/s;
                     // convert to deg/s and normalize to the ±ref scale.
-                    let c = sdl_imu_axes_to_canonical(d);
+                    let c = sdl_gyro_to_canonical(d);
                     let to_norm = |rad_s: f32| (rad_s.to_degrees() / GYRO_REF_DPS).clamp(-1.0, 1.0);
                     out.push((dev.clone(), "gyro_x".into(), Signal::Float(to_norm(c[0]))));
                     out.push((dev.clone(), "gyro_y".into(), Signal::Float(to_norm(c[1]))));
@@ -503,7 +499,7 @@ impl DeviceBackend for SdlBackend {
                 if g.sensor_get_data(SensorType::Accelerometer, &mut d).is_ok() {
                     // SDL's frame → canonical, THEN scale. SDL accel is m/s²;
                     // convert to G and normalize to the ±ref scale.
-                    let c = sdl_imu_axes_to_canonical(d);
+                    let c = sdl_accel_to_canonical(d);
                     const G: f32 = 9.806_65;
                     let to_norm = |ms2: f32| ((ms2 / G) / ACCEL_REF_G).clamp(-1.0, 1.0);
                     out.push((dev.clone(), "accel_x".into(), Signal::Float(to_norm(c[0]))));
@@ -524,8 +520,11 @@ impl DeviceBackend for SdlBackend {
             let emit_finger = |out: &mut Vec<_>, f: Option<(f32, f32)>,
                                pin_x: &str, pin_y: &str, pin_a: &str| {
                 if let Some(f) = f {
+                    // Y is negated: SDL reports the touchpad top as 0, but the
+                    // canonical touch pins (matching the native DualSense path)
+                    // put +Y at the top. Verified against the native path.
                     out.push((dev.clone(), pin_x.to_string(), Signal::Float(f.0 * 2.0 - 1.0)));
-                    out.push((dev.clone(), pin_y.to_string(), Signal::Float(f.1 * 2.0 - 1.0)));
+                    out.push((dev.clone(), pin_y.to_string(), Signal::Float(1.0 - f.1 * 2.0)));
                     out.push((dev.clone(), pin_a.to_string(), Signal::Bool(true)));
                 } else {
                     out.push((dev.clone(), pin_a.to_string(), Signal::Bool(false)));
@@ -656,36 +655,28 @@ fn hash_signals(slice: &[(String, String, Signal)]) -> u64 {
 mod tests {
     use super::*;
 
-    /// The SDL→canonical axis remap, pinned so a stray edit can't silently
-    /// re-scramble every SDL device's IMU. Frames per the fn's own docs.
+    /// The SDL→canonical accel remap, pinned so a stray edit can't silently
+    /// re-scramble every SDL device's accel. Verified on hardware.
     #[test]
-    fn sdl_axes_map_to_canonical() {
+    fn sdl_accel_maps_to_canonical() {
         // Exact permutation: canonical = [-z, -x, y].
-        assert_eq!(sdl_imu_axes_to_canonical([1.0, 2.0, 3.0]), [-3.0, -1.0, 2.0]);
-
-        // A pad at rest reads +1 g up the SDL Y axis; canonical must put that on
-        // Z (vertical, + flat), leaving forward and side at zero.
-        assert_eq!(sdl_imu_axes_to_canonical([0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
-
-        // SDL +Z is "toward you"; forward is away, so it lands on canonical
-        // −X (nose-down), i.e. SDL +Z → canonical x < 0.
-        assert_eq!(sdl_imu_axes_to_canonical([0.0, 0.0, 1.0]), [-1.0, 0.0, 0.0]);
-
-        // SDL +X is "right"; rolling the right grip down tilts the up-vector to
-        // SDL −X, so SDL +X → canonical −Y.
-        assert_eq!(sdl_imu_axes_to_canonical([1.0, 0.0, 0.0]), [0.0, -1.0, 0.0]);
+        assert_eq!(sdl_accel_to_canonical([1.0, 2.0, 3.0]), [-3.0, -1.0, 2.0]);
+        // A pad at rest reads +1 g up SDL Y → canonical +Z (vertical, flat).
+        assert_eq!(sdl_accel_to_canonical([0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
     }
 
-    /// The mapping must be a proper rotation (det +1), or angular velocity — a
-    /// pseudovector — would need a sign flip that copying the accel map misses.
+    /// The gyro remap shares the accel axis assignment but inverts pitch (y) and
+    /// yaw (z) — canonical gyro is clockwise-positive, not the accel frame's
+    /// right-handed rotation. Verified on hardware (DualSense through SDL vs
+    /// native).
     #[test]
-    fn sdl_map_is_a_proper_rotation() {
-        let e = |v: [f32; 3]| sdl_imu_axes_to_canonical(v);
-        let (cx, cy, cz) = (e([1.0, 0.0, 0.0]), e([0.0, 1.0, 0.0]), e([0.0, 0.0, 1.0]));
-        // det of the matrix whose columns are the images of the basis vectors.
-        let det = cx[0] * (cy[1] * cz[2] - cy[2] * cz[1])
-            - cy[0] * (cx[1] * cz[2] - cx[2] * cz[1])
-            + cz[0] * (cx[1] * cy[2] - cx[2] * cy[1]);
-        assert!((det - 1.0).abs() < 1e-6, "expected a proper rotation, det = {det}");
+    fn sdl_gyro_maps_to_canonical() {
+        assert_eq!(sdl_gyro_to_canonical([1.0, 2.0, 3.0]), [-3.0, 1.0, -2.0]);
+        // Roll (canonical x) keeps the accel sign; pitch/yaw are flipped.
+        let a = sdl_accel_to_canonical([4.0, 5.0, 6.0]);
+        let g = sdl_gyro_to_canonical([4.0, 5.0, 6.0]);
+        assert_eq!(g[0], a[0], "roll matches accel");
+        assert_eq!(g[1], -a[1], "pitch is inverted vs accel");
+        assert_eq!(g[2], -a[2], "yaw is inverted vs accel");
     }
 }
