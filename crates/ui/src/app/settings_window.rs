@@ -187,7 +187,14 @@ impl FlexInputApp {
                 let in_pin = snarl.in_pin(InPinId { node: node_id, input: i });
                 for &src in &in_pin.remotes {
                     if let Some(dev_id) = find_automap_device_id_for_viewer(snarl, src, None) {
-                        if dev_id.starts_with("gilrs:") {
+                        // Both backend prefixes are real physical pads that need
+                        // cloaking: `gilrs:` (native path) and `sdl:` (the
+                        // route-all-through-SDL switch). Without `sdl:` here, a
+                        // pad read through SDL was never blacklisted, so HidHide
+                        // silently did nothing in SDL mode and Steam kept seeing
+                        // the physical device. The vid/pid → instance-id lookup
+                        // downstream already handles both USB and Bluetooth.
+                        if dev_id.starts_with("gilrs:") || dev_id.starts_with("sdl:") {
                             phys_ids.insert(dev_id);
                         }
                     }
