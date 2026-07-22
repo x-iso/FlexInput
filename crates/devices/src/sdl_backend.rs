@@ -622,29 +622,36 @@ impl DeviceBackend for SdlBackend {
         let Some(pad) = state.pads.values_mut().find(|p| p.dev_id == device_id) else {
             return;
         };
+        // Which motor (if any) this pin drives. SDL exposes only two rumble
+        // motors (low-freq "strong", high-freq "weak"), so every haptic pin a
+        // pad's layout declares is collapsed onto those two:
+        //   • rumble_strong/weak — the XInput-style pins (DS4/DualSense layouts).
+        //   • hd_l_amp/hd_r_amp + legacy hd_rumble_l/r — the HD-rumble AMPLITUDE
+        //     pins. SDL can't reproduce true dual-band HD rumble, but mapping
+        //     per-side amplitude onto the two motors means a Switch Pro through
+        //     SDL still rumbles at all: its layout has NO rumble_strong/weak pin,
+        //     so without this it was silent. Left side → strong (low) motor,
+        //     right side → weak (high) motor.
+        // Frequency/second-carrier HD pins have no SDL analogue and are dropped.
+        let rumble_motor = match pin_id {
+            "rumble_strong" | "hd_l_amp" | "hd_rumble_l" => Some(0),
+            "rumble_weak" | "hd_r_amp" | "hd_rumble_r" => Some(1),
+            _ => None,
+        };
+        if let Some(motor) = rumble_motor {
+            if motor == 0 { pad.last_rumble.0 = byte; } else { pad.last_rumble.1 = byte; }
+            // SDL rumble takes 0..65535 per motor. Re-arm with a long duration so
+            // it persists between updates (games send a steady stream; we refresh
+            // on every change). low = strong (low-freq motor), high = weak.
+            let (strong, weak) = pad.last_rumble;
+            let _ = pad.gamepad.set_rumble(
+                (strong as u16).saturating_mul(257),
+                (weak as u16).saturating_mul(257),
+                1000, // 1s; the next change re-arms it well before expiry.
+            );
+            return;
+        }
         match pin_id {
-            "rumble_strong" => {
-                pad.last_rumble.0 = byte;
-                // SDL rumble takes 0..65535 per motor. Re-arm with a long
-                // duration so it persists between updates (games send a steady
-                // stream; we refresh on every change). low = strong (low-freq
-                // motor), high = weak (high-freq).
-                let (strong, weak) = pad.last_rumble;
-                let _ = pad.gamepad.set_rumble(
-                    (strong as u16).saturating_mul(257),
-                    (weak as u16).saturating_mul(257),
-                    1000, // 1s; the next change re-arms it well before expiry.
-                );
-            }
-            "rumble_weak" => {
-                pad.last_rumble.1 = byte;
-                let (strong, weak) = pad.last_rumble;
-                let _ = pad.gamepad.set_rumble(
-                    (strong as u16).saturating_mul(257),
-                    (weak as u16).saturating_mul(257),
-                    1000,
-                );
-            }
             // Lightbar (DualSense / DS4). SDL drives it via SDL_SetGamepadLED;
             // a pad without an LED just returns an error we ignore. Only push
             // on a real change so we don't spam the HID endpoint.
