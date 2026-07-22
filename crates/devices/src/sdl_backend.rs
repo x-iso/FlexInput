@@ -144,6 +144,9 @@ struct OpenPad {
     /// `set_rumble` calls. SDL rumble is re-armed with a long duration each
     /// change and refreshed periodically so it doesn't auto-expire.
     last_rumble: (u8, u8),
+    /// Last-sent lightbar colour (r, g, b), to skip redundant `set_led` calls.
+    /// SDL drives the DualSense/DS4 lightbar (and player LEDs on some pads).
+    last_led: (u8, u8, u8),
 }
 
 pub struct SdlBackend {
@@ -330,6 +333,7 @@ impl SdlBackend {
                     has_accel,
                     num_touchpads,
                     last_rumble: (0, 0),
+                    last_led: (0, 0, 0),
                 },
             );
         }
@@ -587,18 +591,42 @@ impl DeviceBackend for SdlBackend {
             return;
         };
         match pin_id {
-            "rumble_strong" => pad.last_rumble.0 = byte,
-            "rumble_weak" => pad.last_rumble.1 = byte,
-            _ => return,
+            "rumble_strong" => {
+                pad.last_rumble.0 = byte;
+                // SDL rumble takes 0..65535 per motor. Re-arm with a long
+                // duration so it persists between updates (games send a steady
+                // stream; we refresh on every change). low = strong (low-freq
+                // motor), high = weak (high-freq).
+                let (strong, weak) = pad.last_rumble;
+                let _ = pad.gamepad.set_rumble(
+                    (strong as u16).saturating_mul(257),
+                    (weak as u16).saturating_mul(257),
+                    1000, // 1s; the next change re-arms it well before expiry.
+                );
+            }
+            "rumble_weak" => {
+                pad.last_rumble.1 = byte;
+                let (strong, weak) = pad.last_rumble;
+                let _ = pad.gamepad.set_rumble(
+                    (strong as u16).saturating_mul(257),
+                    (weak as u16).saturating_mul(257),
+                    1000,
+                );
+            }
+            // Lightbar (DualSense / DS4). SDL drives it via SDL_SetGamepadLED;
+            // a pad without an LED just returns an error we ignore. Only push
+            // on a real change so we don't spam the HID endpoint.
+            "lightbar_r" | "lightbar_g" | "lightbar_b" => {
+                match pin_id {
+                    "lightbar_r" => pad.last_led.0 = byte,
+                    "lightbar_g" => pad.last_led.1 = byte,
+                    _ => pad.last_led.2 = byte,
+                }
+                let (r, g, b) = pad.last_led;
+                let _ = pad.gamepad.set_led(r, g, b);
+            }
+            _ => {}
         }
-        // SDL rumble takes 0..65535 per motor. Re-arm with a long duration so it
-        // persists between updates (games send a steady stream; we refresh on
-        // every change). low = strong (low-freq motor), high = weak (high-freq).
-        let (strong, weak) = pad.last_rumble;
-        let lo = (strong as u16).saturating_mul(257);
-        let hi = (weak as u16).saturating_mul(257);
-        // 1s duration; the next change re-arms it well before expiry.
-        let _ = pad.gamepad.set_rumble(lo, hi, 1000);
     }
 
     fn take_event_counts(&mut self) -> Vec<(String, u32)> {
