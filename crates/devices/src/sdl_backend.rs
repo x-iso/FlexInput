@@ -300,9 +300,24 @@ impl SdlBackend {
             }
 
             // Id carries the detected kind so the UI's skin/model/icon
-            // resolution (which string-matches the id) picks the right one.
-            let dev_id = format!("{ID_PREFIX}:{}:{}", kind.id_slug(), *next_inst);
-            *next_inst += 1;
+            // resolution (which string-matches the id) picks the right one. The
+            // instance suffix is the pad's SERIAL NUMBER when SDL exposes one, so
+            // the id is STABLE across a disconnect/reconnect — the canvas node
+            // bound to `sdl:dualsense:<serial>` re-attaches to the same physical
+            // pad instead of a fresh `:<n>` that orphans the mapping. Two identical
+            // pads keep distinct ids because their serials differ. Serial-less pads
+            // fall back to the monotonic counter (unstable across reconnect, but
+            // still unique this session — the best we can do without a serial).
+            let serial = gamepad.serial_number();
+            let inst = match serial.as_deref().map(sanitize_inst) {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    let n = *next_inst;
+                    *next_inst += 1;
+                    format!("i{n}")
+                }
+            };
+            let dev_id = format!("{ID_PREFIX}:{}:{}", kind.id_slug(), inst);
 
             // Enable IMU sensors if present so per-poll reads return data. SDL's
             // sensor API is compiled in because we enable the `sdl3` crate's
@@ -318,9 +333,22 @@ impl SdlBackend {
             }
             let num_touchpads = gamepad.touchpads_count();
 
+            // Diagnostics: connection_state() distinguishes Wired vs Wireless
+            // (the Switch Pro streams gyro/accel over USB but freezes them over
+            // Bluetooth — this confirms which link we're on), and path() reveals
+            // whether an own-virtual (HIDMaestro/ViGEm) pad carries a recognizable
+            // marker we can filter on. Cheap, logged once per open.
+            let conn = match gamepad.connection_state() {
+                Ok(sdl3::joystick::ConnectionState::Wired) => "wired",
+                Ok(sdl3::joystick::ConnectionState::Wireless) => "wireless",
+                Ok(_) => "unknown",
+                Err(_) => "err",
+            };
+            let path = gamepad.path();
             eprintln!(
-                "[sdl] opened generic pad {dev_id} name={name:?} vid={vid:04X?} pid={pid:04X?} \
-                 gyro={has_gyro} accel={has_accel} touchpads={num_touchpads}"
+                "[sdl] opened pad {dev_id} name={name:?} vid={vid:04X?} pid={pid:04X?} \
+                 conn={conn} gyro={has_gyro} accel={has_accel} touchpads={num_touchpads} \
+                 serial={serial:?} path={path:?}"
             );
 
             pads.insert(
@@ -709,6 +737,18 @@ fn read_touchpad_fingers(id: JoystickId, touchpad: i32) -> Vec<Option<(f32, f32)
     out
 }
 
+/// Sanitize a pad serial for use as the `:<inst>` segment of a device id.
+/// Keeps only ASCII alphanumerics (lowercased) so the result can't contain a
+/// `:` — a serial like a Bluetooth MAC (`AA:BB:CC:…`) would otherwise break the
+/// `sdl:<slug>:<inst>` split that `phys_pad_slug` and the id parsers rely on.
+fn sanitize_inst(serial: &str) -> String {
+    serial
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 /// Cheap order-independent-ish hash of a signal slice, for change detection only
 /// (not correctness-critical). Quantizes floats so tiny jitter doesn't count as
 /// a change every poll.
@@ -739,6 +779,17 @@ mod tests {
         assert_eq!(sdl_accel_to_canonical([1.0, 2.0, 3.0]), [-3.0, -1.0, 2.0]);
         // A pad at rest reads +1 g up SDL Y → canonical +Z (vertical, flat).
         assert_eq!(sdl_accel_to_canonical([0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
+    }
+
+    /// A serial with colons (e.g. a Bluetooth MAC) must not survive into the id
+    /// segment — it would break the `sdl:<slug>:<inst>` split.
+    #[test]
+    fn sanitize_inst_strips_separators() {
+        assert_eq!(sanitize_inst("AA:BB:CC:DD:EE:FF"), "aabbccddeeff");
+        assert_eq!(sanitize_inst("Pro-Ctrl_01"), "proctrl01");
+        assert_eq!(sanitize_inst(""), "");
+        // No `:` can ever appear, so the id always splits into exactly 3 fields.
+        assert!(!sanitize_inst("a:b:c").contains(':'));
     }
 
     /// The gyro remap shares the accel axis assignment but inverts pitch (y) and
