@@ -61,8 +61,12 @@ impl CalCaps {
 }
 
 pub fn caps_for(dev_id: &str) -> CalCaps {
-    if let Some(rest) = dev_id.strip_prefix("gilrs:") {
-        let slug = rest.split(':').next().unwrap_or("");
+    // Accept both the native (`gilrs:`) and the SDL (`sdl:`) pad-id prefixes: a
+    // DualSense routed through SDL gets the same calibration surface as a native
+    // one (matches `device_source_caps`, which gates the Calibrate button). Only
+    // handling `gilrs:` here is why the button appeared but the window stayed
+    // empty for SDL pads.
+    if let Some(slug) = crate::canvas::remapper_icons::phys_pad_slug(dev_id) {
         return match slug {
             // XInput: analog sticks + analog triggers, no IMU.
             "xinput"     => CalCaps { gyro: false, sticks: true,  triggers: true  },

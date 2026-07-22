@@ -436,21 +436,35 @@ impl DeviceBackend for SdlBackend {
             out.push((dev.clone(), "btn_rt_dig".into(), Signal::Bool(rt > 0.117)));
 
             // ── Face / shoulder / stick-click / menu buttons ───────────────────
-            // Pin names follow the GENERIC layout (gamepad::standard_outputs):
-            // note btn_lstick/btn_rstick (not _ls/_rs) and btn_select/btn_mode
-            // (not _back/_guide). Emitting the wrong names silently breaks routing.
+            // Pin names MUST match what `enumerate()` advertised for this pad,
+            // i.e. `layouts::outputs_for(pad.kind)`. The generic layout names the
+            // stick-clicks/menu buttons btn_lstick/btn_rstick/btn_select/btn_mode;
+            // the native layouts (XInput/DS4/DualSense/Switch) name the SAME
+            // physical buttons btn_ls/btn_rs/btn_back/btn_guide. When the global
+            // "route all pads through SDL" switch turns a native pad into an
+            // `sdl:<kind>:N` device, enumerate advertises the native vocabulary —
+            // so poll must emit the native names too, or those buttons silently
+            // fail to route (they land on pins no sink declares). Face/shoulder/
+            // dpad/stick/trigger names are identical across layouts, so only the
+            // four kind-varying names branch here.
             let b = |btn: Button| g.button(btn);
+            let native = pad.kind != ControllerKind::Generic;
+            let (ls_pin, rs_pin, back_pin, guide_pin) = if native {
+                ("btn_ls", "btn_rs", "btn_back", "btn_guide")
+            } else {
+                ("btn_lstick", "btn_rstick", "btn_select", "btn_mode")
+            };
             out.push((dev.clone(), "btn_south".into(), Signal::Bool(b(Button::South))));
             out.push((dev.clone(), "btn_east".into(),  Signal::Bool(b(Button::East))));
             out.push((dev.clone(), "btn_west".into(),  Signal::Bool(b(Button::West))));
             out.push((dev.clone(), "btn_north".into(), Signal::Bool(b(Button::North))));
             out.push((dev.clone(), "btn_lb".into(), Signal::Bool(b(Button::LeftShoulder))));
             out.push((dev.clone(), "btn_rb".into(), Signal::Bool(b(Button::RightShoulder))));
-            out.push((dev.clone(), "btn_lstick".into(), Signal::Bool(b(Button::LeftStick))));
-            out.push((dev.clone(), "btn_rstick".into(), Signal::Bool(b(Button::RightStick))));
-            out.push((dev.clone(), "btn_start".into(),  Signal::Bool(b(Button::Start))));
-            out.push((dev.clone(), "btn_select".into(), Signal::Bool(b(Button::Back))));
-            out.push((dev.clone(), "btn_mode".into(),   Signal::Bool(b(Button::Guide))));
+            out.push((dev.clone(), ls_pin.into(), Signal::Bool(b(Button::LeftStick))));
+            out.push((dev.clone(), rs_pin.into(), Signal::Bool(b(Button::RightStick))));
+            out.push((dev.clone(), "btn_start".into(), Signal::Bool(b(Button::Start))));
+            out.push((dev.clone(), back_pin.into(),  Signal::Bool(b(Button::Back))));
+            out.push((dev.clone(), guide_pin.into(), Signal::Bool(b(Button::Guide))));
 
             // ── D-Pad: SDL exposes it as discrete buttons. Emit discrete +
             // reconstruct the axis/Vec2 (√2/2 on diagonals) like the raw paths. ─
@@ -473,18 +487,36 @@ impl DeviceBackend for SdlBackend {
             out.push((dev.clone(), "dpad_y".into(), Signal::Float(ndy)));
             out.push((dev.clone(), "dpad".into(), Signal::Vec2(Vec2::new(ndx, ndy))));
 
-            // ── Extra buttons (rear paddles / misc). Only meaningful on pads that
-            // have them; SDL returns false for absent buttons, harmless to emit. ─
-            out.push((dev.clone(), "btn_paddle_l1".into(), Signal::Bool(b(Button::LeftPaddle1))));
-            out.push((dev.clone(), "btn_paddle_r1".into(), Signal::Bool(b(Button::RightPaddle1))));
-            out.push((dev.clone(), "btn_paddle_l2".into(), Signal::Bool(b(Button::LeftPaddle2))));
-            out.push((dev.clone(), "btn_paddle_r2".into(), Signal::Bool(b(Button::RightPaddle2))));
-            out.push((dev.clone(), "btn_misc1".into(), Signal::Bool(b(Button::Misc1))));
-            out.push((dev.clone(), "btn_misc2".into(), Signal::Bool(b(Button::Misc2))));
-            out.push((dev.clone(), "btn_misc3".into(), Signal::Bool(b(Button::Misc3))));
-            out.push((dev.clone(), "btn_misc4".into(), Signal::Bool(b(Button::Misc4))));
-            out.push((dev.clone(), "btn_misc5".into(), Signal::Bool(b(Button::Misc5))));
-            out.push((dev.clone(), "btn_misc6".into(), Signal::Bool(b(Button::Misc6))));
+            // ── Extra "Misc1" button. SDL routes the pad's share-class button to
+            // Button::Misc1 (Xbox Share, PS5 mic-mute, Switch Capture, etc.). The
+            // native layouts give it a kind-specific pin name — btn_mute on the
+            // DualSense, btn_capture on the Switch Pro — while the generic layout
+            // exposes it (plus the rear paddles and Misc2-6) under the generic
+            // btn_misc* names. Emit under the name the advertised layout declares.
+            match pad.kind {
+                ControllerKind::DualSense => {
+                    out.push((dev.clone(), "btn_mute".into(), Signal::Bool(b(Button::Misc1))));
+                }
+                ControllerKind::SwitchPro => {
+                    out.push((dev.clone(), "btn_capture".into(), Signal::Bool(b(Button::Misc1))));
+                }
+                ControllerKind::Generic => {
+                    // Rear paddles + misc buttons live only on the generic layout;
+                    // SDL returns false for absent buttons, harmless to emit.
+                    out.push((dev.clone(), "btn_paddle_l1".into(), Signal::Bool(b(Button::LeftPaddle1))));
+                    out.push((dev.clone(), "btn_paddle_r1".into(), Signal::Bool(b(Button::RightPaddle1))));
+                    out.push((dev.clone(), "btn_paddle_l2".into(), Signal::Bool(b(Button::LeftPaddle2))));
+                    out.push((dev.clone(), "btn_paddle_r2".into(), Signal::Bool(b(Button::RightPaddle2))));
+                    out.push((dev.clone(), "btn_misc1".into(), Signal::Bool(b(Button::Misc1))));
+                    out.push((dev.clone(), "btn_misc2".into(), Signal::Bool(b(Button::Misc2))));
+                    out.push((dev.clone(), "btn_misc3".into(), Signal::Bool(b(Button::Misc3))));
+                    out.push((dev.clone(), "btn_misc4".into(), Signal::Bool(b(Button::Misc4))));
+                    out.push((dev.clone(), "btn_misc5".into(), Signal::Bool(b(Button::Misc5))));
+                    out.push((dev.clone(), "btn_misc6".into(), Signal::Bool(b(Button::Misc6))));
+                }
+                // XInput / DS4 have no extra share-class pin in their layout.
+                _ => {}
+            }
             // Touchpad click is a Button in SDL. NOTE: SDL2's GameController API
             // has only ONE touchpad button, so a two-pad device (Steam Controller)
             // reports a single click here — there is no distinct second-pad click
