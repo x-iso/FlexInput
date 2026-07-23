@@ -277,7 +277,20 @@ impl SdlBackend {
             }
             // Only SDL-classified GAMEPADS (have a mapping); raw joysticks without
             // a gamepad mapping are skipped — FlexInput's pin model is gamepad-shaped.
+            // A device that lands here (e.g. a DInput pad SDL has no mapping for)
+            // falls through to gilrs's WGI handling, which only exposes the standard
+            // gamepad axes — its extra/raw axes are invisible. This log is the recon
+            // hook for the planned SDL joystick-API fallback (raw numbered axes): it
+            // fires ONCE per connection (the rejected set skips it thereafter), so
+            // plugging such a pad in reveals its SDL guid without spamming.
             if !gs.is_gamepad(id) {
+                // The guid string encodes bus/vid/pid — the device signature we'd
+                // need to add a mapping or match it for the joystick-API fallback.
+                eprintln!(
+                    "[sdl] non-gamepad joystick rejected (no SDL mapping) guid={} \
+                     — falls through to gilrs; raw axes not exposed",
+                    gs.guid_for_id(id)
+                );
                 rejected.insert(id);
                 continue;
             }
