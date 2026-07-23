@@ -26,26 +26,87 @@ pub fn vigem_available() -> bool {
 /// first-run deploy is possible). This drives whether the HIDMaestro output
 /// cards are enabled.
 ///
+/// A **half-installed** DriverStore reports `false`: a first-run deploy cannot
+/// repair it (installing over the top leaves the stranded package), so treating
+/// it as available is what produced "everything connected, nothing emitted".
+/// Call [`hidmaestro_status`] to tell that case apart from a clean absence.
+///
 /// Debug builds honour `FLEXINPUT_FAKE_NO_HIDMAESTRO=1` to force "missing".
 pub fn hidmaestro_available() -> bool {
+    matches!(hidmaestro_status(), HidMaestroStatus::Ok)
+}
+
+/// Why the HIDMaestro backend is unusable, when it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HidMaestroStatus {
+    /// Installed and complete, or installable via the bundled helper.
+    Ok,
+    /// Not installed and no helper to install it.
+    Missing,
+    /// Half-installed: one of the two driver packages is in the DriverStore
+    /// without the other. Output silently does nothing in this state, and the
+    /// stranded package makes WUDFHost fault, so it must be reported rather
+    /// than folded into `Missing` — a reinstall over the top will not fix it.
+    HalfInstalled { has_main: bool, has_xusb: bool },
+}
+
+impl HidMaestroStatus {
+    /// One-line, user-facing explanation. `None` when [`HidMaestroStatus::Ok`].
+    pub fn message(self) -> Option<String> {
+        match self {
+            HidMaestroStatus::Ok => None,
+            HidMaestroStatus::Missing => {
+                Some("HIDMaestro driver is not installed.".to_string())
+            }
+            HidMaestroStatus::HalfInstalled { has_main, .. } => {
+                let missing = if has_main {
+                    "the XInput companion package is missing"
+                } else {
+                    "the main driver package is missing"
+                };
+                Some(format!(
+                    "HIDMaestro is half-installed — {missing}. Virtual pads will \
+                     accept connections but emit nothing. Use 'Reinstall drivers' \
+                     to remove both packages and install cleanly."
+                ))
+            }
+        }
+    }
+}
+
+/// Classify the HIDMaestro backend's usability, distinguishing a half-installed
+/// DriverStore from a clean absence. [`hidmaestro_available`] collapses both to
+/// `false`/`true` for callers that only gate UI enablement; use this when the
+/// user needs to be told *why*.
+pub fn hidmaestro_status() -> HidMaestroStatus {
     #[cfg(debug_assertions)]
     {
         if fake_driver_missing("FLEXINPUT_FAKE_NO_HIDMAESTRO") {
-            return false;
+            return HidMaestroStatus::Missing;
+        }
+        if fake_driver_missing("FLEXINPUT_FAKE_HALF_HIDMAESTRO") {
+            return HidMaestroStatus::HalfInstalled { has_main: false, has_xusb: true };
         }
     }
     #[cfg(windows)]
     {
-        if flexinput_hidmaestro::hidmaestro_available() {
-            return true;
+        match flexinput_hidmaestro::driver_state() {
+            flexinput_hidmaestro::DriverState::Complete => HidMaestroStatus::Ok,
+            flexinput_hidmaestro::DriverState::Partial { has_main, has_xusb } => {
+                HidMaestroStatus::HalfInstalled { has_main, has_xusb }
+            }
+            flexinput_hidmaestro::DriverState::Missing => {
+                if helper_exe_present() {
+                    HidMaestroStatus::Ok
+                } else {
+                    HidMaestroStatus::Missing
+                }
+            }
         }
-        // Driver not yet installed — but if the helper is bundled, first-run
-        // deploy can install it, so treat the backend as available.
-        helper_exe_present()
     }
     #[cfg(not(windows))]
     {
-        false
+        HidMaestroStatus::Missing
     }
 }
 

@@ -204,6 +204,10 @@ fn run_info() {
     let avail = flexinput_hidmaestro::hidmaestro_available();
     let inf = flexinput_hidmaestro::installed_inf_path();
     println!("hidmaestro_available = {avail}");
+    // Distinguishes a half-installed DriverStore from a clean absence — both
+    // report `available = false`, but only the latter is fixed by installing.
+    println!("driver_state         = {:?}", flexinput_hidmaestro::driver_state());
+    println!("packages_to_remove   = {:?}", flexinput_hidmaestro::installed_inf_names());
     match inf {
         Some(p) => println!("installed_inf_path   = {}", p.display()),
         None => println!("installed_inf_path   = (not found)"),

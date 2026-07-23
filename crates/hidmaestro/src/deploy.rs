@@ -20,7 +20,7 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-use crate::install::hidmaestro_available;
+use crate::install::{driver_state, DriverState};
 
 /// The vendored, pre-signed driver payload, embedded at compile time so the
 /// helper can stage it to a temp dir regardless of cwd.
@@ -49,6 +49,11 @@ pub enum DeployError {
     CertStore(&'static str, u32),
     /// `pnputil /add-driver` ran but the package isn't in the DriverStore.
     InstallUnverified,
+    /// Exactly one of the two packages is present in the DriverStore. A
+    /// published-but-unbacked companion INF makes WUDFHost fault (`c0000005`)
+    /// on every load, so this is reported distinctly from
+    /// [`DeployError::InstallUnverified`] rather than as "not installed".
+    PartialInstall { has_main: bool, has_xusb: bool },
     /// pnputil could not be launched.
     Pnputil(std::io::Error),
 }
@@ -60,6 +65,17 @@ impl std::fmt::Display for DeployError {
             DeployError::CertStore(s, e) => write!(f, "cert store '{s}' failed (err {e})"),
             DeployError::InstallUnverified => {
                 write!(f, "pnputil ran but HIDMaestro not present in DriverStore")
+            }
+            DeployError::PartialInstall { has_main, has_xusb } => {
+                let present = if *has_main { "hidmaestro.inf" } else { "hidmaestro_xusb.inf" };
+                let missing = if *has_main { "hidmaestro_xusb.inf" } else { "hidmaestro.inf" };
+                let _ = has_xusb;
+                write!(
+                    f,
+                    "HIDMaestro is half-installed: {present} is in the DriverStore but \
+                     {missing} is not. Run 'Reinstall drivers' to remove both and \
+                     reinstall cleanly."
+                )
             }
             DeployError::Pnputil(e) => write!(f, "could not run pnputil: {e}"),
         }
@@ -78,17 +94,27 @@ impl From<std::io::Error> for DeployError {
 /// `Ok(true)` if a fresh install happened, `Ok(false)` if already present.
 /// **Requires elevation.**
 pub fn ensure_driver_installed() -> Result<bool, DeployError> {
-    if hidmaestro_available() {
-        return Ok(false);
+    match driver_state() {
+        DriverState::Complete => return Ok(false),
+        // Installing over a half-installed state leaves the stranded package in
+        // place; the caller must go through `reinstall_driver_force` (which
+        // removes both first) rather than silently stacking on top of it.
+        DriverState::Partial { has_main, has_xusb } => {
+            return Err(DeployError::PartialInstall { has_main, has_xusb })
+        }
+        DriverState::Missing => {}
     }
     trust_signer_cert()?;
     let dir = stage_payload()?;
     install_inf(&dir.join("hidmaestro.inf"))?;
     install_inf(&dir.join("hidmaestro_xusb.inf"))?;
-    if !hidmaestro_available() {
-        return Err(DeployError::InstallUnverified);
+    match driver_state() {
+        DriverState::Complete => Ok(true),
+        DriverState::Partial { has_main, has_xusb } => {
+            Err(DeployError::PartialInstall { has_main, has_xusb })
+        }
+        DriverState::Missing => Err(DeployError::InstallUnverified),
     }
-    Ok(true)
 }
 
 /// Force a clean reinstall: remove every installed HIDMaestro driver package
@@ -108,10 +134,13 @@ pub fn reinstall_driver_force() -> Result<(), DeployError> {
     let dir = stage_payload()?;
     install_inf(&dir.join("hidmaestro.inf"))?;
     install_inf(&dir.join("hidmaestro_xusb.inf"))?;
-    if !hidmaestro_available() {
-        return Err(DeployError::InstallUnverified);
+    match driver_state() {
+        DriverState::Complete => Ok(()),
+        DriverState::Partial { has_main, has_xusb } => {
+            Err(DeployError::PartialInstall { has_main, has_xusb })
+        }
+        DriverState::Missing => Err(DeployError::InstallUnverified),
     }
-    Ok(())
 }
 
 /// Remove the HIDMaestro driver entirely: delete every installed package from the
@@ -126,10 +155,16 @@ pub fn reinstall_driver_force() -> Result<(), DeployError> {
 /// authoritative.
 pub fn uninstall_driver() -> Result<(), DeployError> {
     uninstall_all_hidmaestro_packages();
-    if hidmaestro_available() {
-        return Err(DeployError::InstallUnverified);
+    // `Missing` is the only success here. Checking `!hidmaestro_available()`
+    // instead would report a half-removed state as a clean uninstall — the
+    // exact failure that strands the companion INF and crashes WUDFHost.
+    match driver_state() {
+        DriverState::Missing => Ok(()),
+        DriverState::Partial { has_main, has_xusb } => {
+            Err(DeployError::PartialInstall { has_main, has_xusb })
+        }
+        DriverState::Complete => Err(DeployError::InstallUnverified),
     }
-    Ok(())
 }
 
 /// `pnputil /delete-driver <oemNN.inf> /uninstall /force` for every published

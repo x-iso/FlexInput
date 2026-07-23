@@ -37,7 +37,10 @@ pub mod shm;
 
 pub use descriptor::{parse_descriptor, InputField, InputReport};
 pub use encode::{encode_report, encode_report_into, gip_from_state, GamepadState, Hat, PinState};
-pub use install::{hidmaestro_available, installed_inf_path, installed_xusb_inf_path};
+pub use install::{
+    driver_state, hidmaestro_available, installed_inf_names, installed_inf_path,
+    installed_xusb_inf_path, DriverState,
+};
 pub use orchestrator::{
     create_device_node, create_xusb_companion_node, list_hidmaestro_devices, node_diag,
     remove_all_hidmaestro_devices, remove_device_node, remove_orphan_hid_children,

@@ -11,19 +11,43 @@
 
 use std::path::{Path, PathBuf};
 
-/// Returns true if the HIDMaestro driver is present in the Windows DriverStore.
+/// Installed state of the HIDMaestro driver package in the Windows DriverStore.
 ///
-/// Mirrors `DriverStoreContainsHidMaestro`: both `hidmaestro.inf_amd64_<hash>`
-/// and `hidmaestro_xusb.inf_amd64_<hash>` directories must exist under
+/// The distinction that matters is [`DriverState::Partial`]: exactly one of the
+/// two packages present. A plain present/absent boolean reports that state as
+/// "not installed", which silently mis-reports a broken machine as a clean one
+/// (uninstall claims success; reinstall can never verify). Callers that act on
+/// the result must handle `Partial` explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverState {
+    /// Neither package present — a clean machine.
+    Missing,
+    /// Exactly one package present. The other was removed or failed to install,
+    /// leaving a published-but-unbacked INF behind.
+    Partial { has_main: bool, has_xusb: bool },
+    /// Both packages present.
+    Complete,
+}
+
+/// Classify the HIDMaestro driver packages present in the Windows DriverStore.
+///
+/// Mirrors `DriverStoreContainsHidMaestro`: looks for `hidmaestro.inf_amd64_<hash>`
+/// and `hidmaestro_xusb.inf_amd64_<hash>` directories under
 /// `%SystemRoot%\System32\DriverStore\FileRepository`. (The XUSB companion INF is
 /// part of the standard install even though FlexInput's plain-HID path doesn't
 /// use it yet — its presence is the same completeness signal the SDK checks.)
-pub fn hidmaestro_available() -> bool {
+pub fn driver_state() -> DriverState {
     let Some(repo) = driverstore_file_repository() else {
-        return false;
+        return DriverState::Missing;
     };
-    let Ok(entries) = std::fs::read_dir(&repo) else {
-        return false;
+    driver_state_in(&repo)
+}
+
+/// [`driver_state`] against an arbitrary FileRepository directory, so the scan
+/// can be tested against fixtures instead of the live DriverStore.
+fn driver_state_in(repo: &Path) -> DriverState {
+    let Ok(entries) = std::fs::read_dir(repo) else {
+        return DriverState::Missing;
     };
     let mut has_main = false;
     let mut has_xusb = false;
@@ -37,10 +61,22 @@ pub fn hidmaestro_available() -> bool {
             has_xusb = true;
         }
         if has_main && has_xusb {
-            return true;
+            return DriverState::Complete;
         }
     }
-    has_main && has_xusb
+    match (has_main, has_xusb) {
+        (false, false) => DriverState::Missing,
+        (true, true) => DriverState::Complete,
+        (has_main, has_xusb) => DriverState::Partial { has_main, has_xusb },
+    }
+}
+
+/// Returns true if the HIDMaestro driver is fully present in the Windows
+/// DriverStore. Thin wrapper over [`driver_state`]; note that a `Partial`
+/// install reads as `false` here, so anything that needs to tell "half
+/// installed" apart from "not installed" must call [`driver_state`] directly.
+pub fn hidmaestro_available() -> bool {
+    matches!(driver_state(), DriverState::Complete)
 }
 
 /// Discover the published OEM INF path for the HIDMaestro driver
@@ -96,12 +132,26 @@ pub fn installed_xusb_inf_path() -> Option<PathBuf> {
 /// `pnputil /delete-driver <name> /uninstall` expects (not full paths). Used by
 /// the force-reinstall path to remove every installed package. Empty when none
 /// are present.
+///
+/// **Both** the main INF and the XUSB companion are returned, with the
+/// **companion first**. Ordering is load-bearing: the companion reads the main
+/// driver's per-instance shared memory, so removing the main package first
+/// strands the companion — its INF stays published and bound while its backing
+/// `HMXInput.dll` is gone, and WUDFHost then faults with `c0000005` on every
+/// load attempt.
 pub fn installed_inf_names() -> Vec<String> {
-    let inf_dir = windir().join("INF");
-    let Ok(entries) = std::fs::read_dir(&inf_dir) else {
+    inf_names_in(&windir().join("INF"))
+}
+
+/// [`installed_inf_names`] against an arbitrary INF directory, so the scan can be
+/// tested against fixtures instead of the live `%SystemRoot%\INF`.
+fn inf_names_in(inf_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(inf_dir) else {
         return Vec::new();
     };
-    let mut names = Vec::new();
+    // Companion INFs first, then main INFs — see the ordering note above.
+    let mut xusb = Vec::new();
+    let mut main = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let file = entry.file_name();
@@ -109,11 +159,19 @@ pub fn installed_inf_names() -> Vec<String> {
         if !(lower.starts_with("oem") && lower.ends_with(".inf")) {
             continue;
         }
-        if inf_is_hidmaestro(&path) {
-            names.push(file.to_string_lossy().into_owned());
+        if !inf_is_hidmaestro(&path) {
+            continue;
+        }
+        if inf_is_hidmaestro_xusb(&path) {
+            xusb.push(file.to_string_lossy().into_owned());
+        } else {
+            main.push(file.to_string_lossy().into_owned());
         }
     }
-    names
+    xusb.sort();
+    main.sort();
+    xusb.extend(main);
+    xusb
 }
 
 /// Cheap content sniff: an INF belongs to HIDMaestro if its (ASCII-ish) text
@@ -189,5 +247,89 @@ mod tests {
             bytes.extend_from_slice(&ch.to_le_bytes());
         }
         assert!(decode_inf(&bytes).to_ascii_lowercase().contains("hidmaestro"));
+    }
+
+    /// Unique temp dir for a fixture; avoids a dev-dependency on `tempfile`.
+    fn fixture_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flexinput_install_test_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        dir
+    }
+
+    const MAIN_INF: &str = "[Version]\nProvider=HIDMaestro\nCatalogFile=hidmaestro.cat\n";
+    const XUSB_INF: &str =
+        "[Version]\nProvider=HIDMaestro\n[UMDriverCopy]\nHMXInput.dll\n[HW]\nXusbMode\n";
+
+    #[test]
+    fn inf_names_lists_both_with_companion_first() {
+        let dir = fixture_dir("both");
+        // Written so the MAIN inf sorts first by filename — the companion must
+        // still come out first, proving the order is by role, not by name.
+        std::fs::write(dir.join("oem10.inf"), MAIN_INF).unwrap();
+        std::fs::write(dir.join("oem99.inf"), XUSB_INF).unwrap();
+        std::fs::write(dir.join("oem50.inf"), "[Version]\nProvider=Unrelated\n").unwrap();
+
+        let names = inf_names_in(&dir);
+        assert_eq!(
+            names,
+            vec!["oem99.inf".to_string(), "oem10.inf".to_string()],
+            "companion must be removed before the main package it depends on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inf_names_includes_lone_companion() {
+        // The exact state that stranded the companion: the old filter returned
+        // only main INFs, so an orphaned companion was never removed.
+        let dir = fixture_dir("lone_xusb");
+        std::fs::write(dir.join("oem101.inf"), XUSB_INF).unwrap();
+
+        assert_eq!(inf_names_in(&dir), vec!["oem101.inf".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn driver_state_detects_partial_xusb_only() {
+        // Matches the broken machine: companion in the DriverStore, main gone.
+        let dir = fixture_dir("store_xusb_only");
+        std::fs::create_dir_all(dir.join("hidmaestro_xusb.inf_amd64_e069e15e2f1d9e77")).unwrap();
+
+        assert_eq!(
+            driver_state_in(&dir),
+            DriverState::Partial { has_main: false, has_xusb: true }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn driver_state_detects_partial_main_only() {
+        let dir = fixture_dir("store_main_only");
+        std::fs::create_dir_all(dir.join("hidmaestro.inf_amd64_abc123")).unwrap();
+
+        assert_eq!(
+            driver_state_in(&dir),
+            DriverState::Partial { has_main: true, has_xusb: false }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn driver_state_complete_and_missing() {
+        let complete = fixture_dir("store_complete");
+        std::fs::create_dir_all(complete.join("hidmaestro.inf_amd64_abc123")).unwrap();
+        std::fs::create_dir_all(complete.join("hidmaestro_xusb.inf_amd64_def456")).unwrap();
+        assert_eq!(driver_state_in(&complete), DriverState::Complete);
+        let _ = std::fs::remove_dir_all(&complete);
+
+        let empty = fixture_dir("store_empty");
+        std::fs::create_dir_all(empty.join("some_other_driver.inf_amd64_x")).unwrap();
+        assert_eq!(driver_state_in(&empty), DriverState::Missing);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 }

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, Color32, RichText};
 use flexinput_virtual::{
     available_device_kinds,
-    driver_availability::hidmaestro_available,
+    driver_availability::{hidmaestro_status, HidMaestroStatus},
     kind_prefix,
     VirtualDevice,
 };
@@ -195,7 +195,16 @@ impl VirtualDevicePanel {
                 ui.label(RichText::new("Add virtual output").strong());
                 ui.separator();
 
-                let hidmaestro_ok = hidmaestro_available();
+                let hidmaestro_state = hidmaestro_status();
+                // A half-installed DriverStore can't be repaired by the on-demand
+                // deploy — surface it up-front instead of letting the user wire up
+                // a device that will silently emit nothing.
+                if let HidMaestroStatus::HalfInstalled { .. } = hidmaestro_state {
+                    if let Some(msg) = hidmaestro_state.message() {
+                        ui.colored_label(ui.visuals().error_fg_color, msg);
+                        ui.separator();
+                    }
+                }
                 for kind in available_device_kinds() {
                     let already = if kind.allows_multiple {
                         false
@@ -210,7 +219,10 @@ impl VirtualDevicePanel {
                     // the progress overlay. We just show an inline hint so the user
                     // knows the first add will prompt to install the driver.
                     let needs_hidmaestro = kind.kind_id.starts_with("virtual.hm.");
-                    let will_install_driver = needs_hidmaestro && !hidmaestro_ok;
+                    // Only a clean absence is fixed by the on-demand install; a
+                    // half-installed store needs the full remove-then-reinstall.
+                    let will_install_driver =
+                        needs_hidmaestro && matches!(hidmaestro_state, HidMaestroStatus::Missing);
 
                     ui.horizontal(|ui| {
                     if already {
