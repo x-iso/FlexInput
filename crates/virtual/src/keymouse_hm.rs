@@ -169,6 +169,12 @@ pub struct VirtualKeyMouseHm {
     // Desired state accumulated by send(), consumed by flush().
     mouse_vel_x: f32,
     mouse_vel_y: f32,
+    // Absolute-displacement pointer move (mouse_move*): a one-shot px displacement
+    // applied DIRECTLY to the carry each flush (NOT integrated over dt like the
+    // velocity), so trackpad motion is exact and can't fly off when flush timing
+    // drifts. Accumulated by send(), drained (once) by flush().
+    mouse_disp_x: f32,
+    mouse_disp_y: f32,
     scroll_delta: i32,   // vertical digital scroll clicks (scroll_up/down)
     hscroll_delta: i32,  // horizontal digital scroll clicks (scroll_left/right)
     scroll_vel_v: f32,   // analog vertical scroll rate (scroll_y), +up
@@ -228,6 +234,8 @@ impl VirtualKeyMouseHm {
             muted: false,
             mouse_vel_x: 0.0,
             mouse_vel_y: 0.0,
+            mouse_disp_x: 0.0,
+            mouse_disp_y: 0.0,
             scroll_delta: 0,
             hscroll_delta: 0,
             scroll_vel_v: 0.0,
@@ -297,6 +305,10 @@ impl VirtualDevice for VirtualKeyMouseHm {
             "mouse" => { if let Signal::Vec2(v) = value { self.mouse_vel_x += v.x; self.mouse_vel_y += -v.y; } }
             "mouse_x"       => { if let Signal::Float(f) = value { self.mouse_vel_x += f; } }
             "mouse_y"       => { if let Signal::Float(f) = value { self.mouse_vel_y += -f; } }
+            // Absolute pointer move (+Y up, so negate for screen y-down like "mouse").
+            "mouse_move"    => { if let Signal::Vec2(v) = value { self.mouse_disp_x += v.x; self.mouse_disp_y += -v.y; } }
+            "mouse_move_x"  => { if let Signal::Float(f) = value { self.mouse_disp_x += f; } }
+            "mouse_move_y"  => { if let Signal::Float(f) = value { self.mouse_disp_y += -f; } }
             "scroll_up"     => { if matches!(value, Signal::Bool(true)) { self.scroll_delta += 1; } }
             "scroll_down"   => { if matches!(value, Signal::Bool(true)) { self.scroll_delta -= 1; } }
             "scroll_right"  => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta += 1; } }
@@ -355,6 +367,8 @@ impl VirtualDevice for VirtualKeyMouseHm {
 
         let vel_x = std::mem::take(&mut self.mouse_vel_x);
         let vel_y = std::mem::take(&mut self.mouse_vel_y);
+        let disp_x = std::mem::take(&mut self.mouse_disp_x);
+        let disp_y = std::mem::take(&mut self.mouse_disp_y);
         let scroll = std::mem::take(&mut self.scroll_delta);
         let hscroll = std::mem::take(&mut self.hscroll_delta);
         let scroll_vel_v = std::mem::take(&mut self.scroll_vel_v);
@@ -372,8 +386,9 @@ impl VirtualDevice for VirtualKeyMouseHm {
 
         let mut rep = [0u8; 7];
         if !self.muted && !suppressed {
-            self.carry_x += vel_x * REF * dt;
-            self.carry_y += vel_y * REF * dt;
+            // Velocity → integrated over dt; displacement → applied once as-is.
+            self.carry_x += vel_x * REF * dt + disp_x;
+            self.carry_y += vel_y * REF * dt + disp_y;
             let (mut dx, mut dy) = (0i32, 0i32);
             if emit_move {
                 dx = (self.carry_x.trunc() as i32).clamp(-32767, 32767);
@@ -427,6 +442,8 @@ impl VirtualDevice for VirtualKeyMouseHm {
     fn reset_outputs(&mut self) {
         self.mouse_vel_x = 0.0;
         self.mouse_vel_y = 0.0;
+        self.mouse_disp_x = 0.0;
+        self.mouse_disp_y = 0.0;
         self.scroll_delta = 0;
         self.hscroll_delta = 0;
         self.scroll_vel_v = 0.0;

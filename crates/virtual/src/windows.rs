@@ -940,6 +940,11 @@ struct MouseShared {
     /// The mouse thread converts to pixels via the REAL elapsed dt each tick.
     vel_x: f32,
     vel_y: f32,
+    /// Accumulated one-shot pointer DISPLACEMENT in px — applied directly to the
+    /// carry (not integrated over dt) and consumed (zeroed) by the mouse thread,
+    /// exactly like scroll_pending. The trackpad path; robust to tick jitter.
+    disp_x: f32,
+    disp_y: f32,
     /// Accumulated scroll clicks — consumed (zeroed) by the mouse thread.
     scroll_pending: i32,   // vertical (+up)
     hscroll_pending: i32,  // horizontal (+right)
@@ -1020,6 +1025,8 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
             let snap = s.clone();
             s.scroll_pending = 0;
             s.hscroll_pending = 0;
+            s.disp_x = 0.0;
+            s.disp_y = 0.0;
             snap
         };
 
@@ -1083,8 +1090,8 @@ fn mouse_thread(shared: Arc<Mutex<MouseShared>>) {
                 // cursor speed stays wall-clock-correct under scheduler jitter.
                 // Always accumulate the true desired distance so braiding never
                 // loses motion — only the SendInput timing is gated by emit_move.
-                carry_x += state.vel_x * REF * dt;
-                carry_y += state.vel_y * REF * dt;
+                carry_x += state.vel_x * REF * dt + state.disp_x;
+                carry_y += state.vel_y * REF * dt + state.disp_y;
                 if emit_move {
                     let dx = carry_x.trunc() as i32;
                     let dy = carry_y.trunc() as i32;
@@ -1145,6 +1152,9 @@ pub struct VirtualKeyMouse {
     // Desired per-frame velocity / state set by send()
     mouse_vel_x: f32,
     mouse_vel_y: f32,
+    // One-shot pointer displacement (mouse_move*): applied once, not integrated.
+    mouse_disp_x: f32,
+    mouse_disp_y: f32,
     scroll_delta: i32,   // vertical digital scroll clicks (scroll_up/down)
     hscroll_delta: i32,  // horizontal digital scroll clicks (scroll_left/right)
     scroll_vel_v: f32,   // analog vertical scroll rate (scroll_y), +up
@@ -1186,6 +1196,8 @@ impl VirtualKeyMouse {
             muted: false,
             mouse_vel_x: 0.0,
             mouse_vel_y: 0.0,
+            mouse_disp_x: 0.0,
+            mouse_disp_y: 0.0,
             scroll_delta: 0,
             hscroll_delta: 0,
             scroll_vel_v: 0.0,
@@ -1226,6 +1238,10 @@ impl VirtualDevice for VirtualKeyMouse {
             "mouse" => { if let Signal::Vec2(v) = value { self.mouse_vel_x += v.x; self.mouse_vel_y += -v.y; } }
             "mouse_x"       => { if let Signal::Float(f) = value { self.mouse_vel_x += f; } }
             "mouse_y"       => { if let Signal::Float(f) = value { self.mouse_vel_y += -f; } }
+            // Absolute pointer move (+Y up → negate for screen y-down like "mouse").
+            "mouse_move"    => { if let Signal::Vec2(v) = value { self.mouse_disp_x += v.x; self.mouse_disp_y += -v.y; } }
+            "mouse_move_x"  => { if let Signal::Float(f) = value { self.mouse_disp_x += f; } }
+            "mouse_move_y"  => { if let Signal::Float(f) = value { self.mouse_disp_y += -f; } }
             "scroll_up"     => { if matches!(value, Signal::Bool(true)) { self.scroll_delta += 1; } }
             "scroll_down"   => { if matches!(value, Signal::Bool(true)) { self.scroll_delta -= 1; } }
             "scroll_right"  => { if matches!(value, Signal::Bool(true)) { self.hscroll_delta += 1; } }
@@ -1251,6 +1267,8 @@ impl VirtualDevice for VirtualKeyMouse {
         if let Ok(mut s) = self.mouse_shared.lock() {
             s.vel_x               = std::mem::take(&mut self.mouse_vel_x);
             s.vel_y               = std::mem::take(&mut self.mouse_vel_y);
+            s.disp_x             += std::mem::take(&mut self.mouse_disp_x);
+            s.disp_y             += std::mem::take(&mut self.mouse_disp_y);
             s.scroll_pending     += std::mem::take(&mut self.scroll_delta);
             s.hscroll_pending    += std::mem::take(&mut self.hscroll_delta);
             s.scroll_vel_v        = std::mem::take(&mut self.scroll_vel_v);
@@ -1334,6 +1352,8 @@ impl VirtualDevice for VirtualKeyMouse {
     fn reset_outputs(&mut self) {
         self.mouse_vel_x = 0.0;
         self.mouse_vel_y = 0.0;
+        self.mouse_disp_x = 0.0;
+        self.mouse_disp_y = 0.0;
         self.scroll_delta = 0;
         self.hscroll_delta = 0;
         self.scroll_vel_v = 0.0;

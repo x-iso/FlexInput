@@ -890,6 +890,46 @@ mod trigger_tests {
         assert!(getf(&c, "scroll_x") > 0.0, "rightward deflection → scroll right (scroll_x > 0)");
     }
 
+    // Touchpad mode routes a "mouse" card to the DISPLACEMENT pins (mouse_move*),
+    // NOT the velocity pin: nonzero while the finger moves, zero when it holds
+    // still, and never the plain "mouse" pin (which would fly the cursor off).
+    #[test]
+    fn touch_zones_touchpad_mode_emits_displacement() {
+        let mut n = empty_node(1, "module.touch_zones");
+        n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+        n.params.insert("col_edges".into(), serde_json::json!([]));
+        n.params.insert("row_edges".into(), serde_json::json!([]));
+        n.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["mouse"],"mode":"analog","tp_mode":"touchpad"},
+        ]));
+        let finger = |px: f32| {
+            let mut m: HashMap<(String, String), Signal> = HashMap::new();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(true));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+            m
+        };
+        let getv = |c: &HashMap<(String, String), Signal>, pin: &str| match
+            c.get(&("touchmap:1".to_string(), pin.to_string())) {
+                Some(Signal::Vec2(v)) => Some((v.x, v.y)), _ => None };
+        let mut state = HashMap::new();
+        // Touchdown (delta seeds 0), then slide right, then hold still.
+        let mut c = HashMap::new();
+        eval_touch_zones_map_node(&n, 1, &finger(0.0), &mut c, &mut state, 0.016);
+        c.clear();
+        eval_touch_zones_map_node(&n, 1, &finger(0.2), &mut c, &mut state, 0.016);
+        let (mx, _) = getv(&c, "mouse_move").expect("touchpad → mouse_move published");
+        assert!(mx > 1.0, "moving right → positive x displacement (got {mx})");
+        assert!(!c.contains_key(&("touchmap:1".to_string(), "mouse".to_string())),
+            "touchpad mode must NOT publish the velocity 'mouse' pin");
+        // Hold still → displacement collapses to ~0 (cursor stops dead).
+        c.clear();
+        eval_touch_zones_map_node(&n, 1, &finger(0.2), &mut c, &mut state, 0.016);
+        let (sx, sy) = getv(&c, "mouse_move").unwrap_or((0.0, 0.0));
+        assert!(sx.abs() < 1e-3 && sy.abs() < 1e-3, "still finger → no move (got {sx},{sy})");
+    }
+
     // A zone can carry BOTH an analog (tz_touch) card and a click (tz_click) card;
     // clicking must still fire the click mapping while the analog output runs.
     #[test]

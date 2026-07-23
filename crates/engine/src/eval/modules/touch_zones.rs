@@ -119,6 +119,13 @@ pub(crate) fn eval_touch_zones_map_node(
     let mut mouse_dx = 0.0f32;
     let mut mouse_dy = 0.0f32;
     let mut mouse_active = false;
+    // Absolute pointer-MOVE accumulator (px, +Y up) for Touchpad mode: the finger's
+    // per-frame displacement, published on the mouse_move* pins (applied once by the
+    // sink, NOT integrated as a velocity) so trackpad motion is exact and never
+    // flies off when the async mouse-emit timing drifts.
+    let mut move_dx = 0.0f32;
+    let mut move_dy = 0.0f32;
+    let mut move_active = false;
     // Analog scroll rate from a zone deflection (+Y up, +X right). Published as
     // the Float scroll_y/scroll_x pins; the KB/M sink integrates them over time.
     let mut scroll_vx = 0.0f32;
@@ -392,21 +399,21 @@ pub(crate) fn eval_touch_zones_map_node(
                 "mouse" | "mouse_x" | "mouse_y" => {
                     if touchpad {
                         if let Some(&(dx, dy)) = touchpad_by_zone.get(&(field, zone)) {
-                            // The mouse pin is a VELOCITY (sink integrates vel×REF×dt,
-                            // REF=60). A touchpad wants pointer motion ∝ finger
-                            // DISPLACEMENT, so feed the finger's SPEED (delta/dt): the
-                            // sink's ∫vel·dt then yields displacement×gain, frame-rate
-                            // independent (the dt cancels). Net screen travel for a
-                            // finger move of Δ (unit pad coords) ≈ Δ·TP_GAIN·REF, so at
-                            // mouse_speed 1 a full-pad sweep (Δ≈1) ≈ TP_GAIN·60 px — set
-                            // TP_GAIN so that lands near one screen width; mouse_speed
-                            // tunes from there. (Was 0.18 via mouse_gain×TP_ACCEL — ~50×
-                            // too weak, so the pointer barely moved.)
-                            const TP_GAIN: f32 = 16.0;
-                            let g = mouse_speed * TP_GAIN / dt.max(1e-4);
-                            if p == "mouse" || p == "mouse_x" { mouse_dx += dx * g; }
-                            if p == "mouse" || p == "mouse_y" { mouse_dy += dy * g; }
-                            mouse_active = true;
+                            // Trackpad: emit the finger's per-frame DISPLACEMENT as an
+                            // absolute pointer MOVE (px) on the mouse_move* pins — the
+                            // sink applies it directly (not integrated over dt), so the
+                            // cursor tracks the finger exactly, stops dead when the
+                            // finger stops, and can't fly off when the emit thread's
+                            // timing drifts (the old velocity path did — a finger
+                            // "velocity" of ~50 re-integrated by the async thread flung
+                            // the cursor off-screen / left a ghost). TP_GAIN_PX = px per
+                            // unit of pad travel at speed 1 (a full sweep ≈ that many
+                            // px); mouse_speed tunes from there.
+                            const TP_GAIN_PX: f32 = 1100.0;
+                            let g = mouse_speed * TP_GAIN_PX;
+                            if p == "mouse" || p == "mouse_x" { move_dx += dx * g; }
+                            if p == "mouse" || p == "mouse_y" { move_dy += dy * g; }
+                            move_active = true;
                         }
                     } else if let Some((ax, ay)) = deflect {
                         if p == "mouse" || p == "mouse_x" { mouse_dx += ax * mouse_gain; }
@@ -491,6 +498,12 @@ pub(crate) fn eval_touch_zones_map_node(
         collector_sigs.insert((key.clone(), "mouse".to_string()), Signal::Vec2(Vec2::new(mouse_dx, mouse_dy)));
         collector_sigs.insert((key.clone(), "mouse_x".to_string()), Signal::Float(mouse_dx));
         collector_sigs.insert((key.clone(), "mouse_y".to_string()), Signal::Float(mouse_dy));
+    }
+    // Publish the absolute pointer-move (Touchpad mode) on the mouse_move* pins.
+    if move_active {
+        collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(Vec2::new(move_dx, move_dy)));
+        collector_sigs.insert((key.clone(), "mouse_move_x".to_string()), Signal::Float(move_dx));
+        collector_sigs.insert((key.clone(), "mouse_move_y".to_string()), Signal::Float(move_dy));
     }
     // Publish analog scroll rate while a finger drives it; else fall back upstream.
     if scroll_active {

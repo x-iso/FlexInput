@@ -77,8 +77,14 @@ pub static KEYMOUSE_DEFAULT_PINS: &[SinkPin] = &[
     sp!("mouse",   "Mouse XY (delta)", SignalType::Vec2),
     sp!("mouse_x", "Mouse X (delta)",  SignalType::Float),
     sp!("mouse_y", "Mouse Y (delta)",  SignalType::Float),
-    // Auto-map bus port — last so existing pin indices stay stable.
+    // Auto-map bus port — kept at this index so existing saved wires stay stable
+    // (new pins are appended AFTER it, never before).
     sp!("automap_in", "Auto-Map", SignalType::AutoMap),
+    // Absolute pointer MOVE (px displacement applied once, not a velocity) — the
+    // trackpad path; robust to the async emit timing. Appended last on purpose.
+    sp!("mouse_move",   "Mouse XY (move)", SignalType::Vec2),
+    sp!("mouse_move_x", "Mouse X (move)",  SignalType::Float),
+    sp!("mouse_move_y", "Mouse Y (move)",  SignalType::Float),
 ];
 
 pub static XINPUT_SINK_PINS: &[SinkPin] = &[

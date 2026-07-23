@@ -244,6 +244,13 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "mouse",         display_name: "Mouse: XY (delta)",    signal_type: SignalType::Vec2 },
     AutoMapPin { id: "mouse_x",       display_name: "Mouse: X (delta)",     signal_type: SignalType::Float },
     AutoMapPin { id: "mouse_y",       display_name: "Mouse: Y (delta)",     signal_type: SignalType::Float },
+    // Absolute-displacement pointer move (trackpad feel): the value is a one-shot
+    // pixel DISPLACEMENT applied directly, NOT a velocity integrated over dt — so
+    // it's robust to the async mouse-emit timing (a velocity here flings the cursor
+    // when the emit thread re-integrates it). Touch Zones' Touchpad mode drives this.
+    AutoMapPin { id: "mouse_move",    display_name: "Mouse: XY (move)",     signal_type: SignalType::Vec2 },
+    AutoMapPin { id: "mouse_move_x",  display_name: "Mouse: X (move)",      signal_type: SignalType::Float },
+    AutoMapPin { id: "mouse_move_y",  display_name: "Mouse: Y (move)",      signal_type: SignalType::Float },
 ];
 
 /// Family-specific button glyph for a cross-family pin, or `None` if the pin
