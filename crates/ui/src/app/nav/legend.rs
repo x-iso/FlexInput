@@ -174,19 +174,15 @@ impl FlexInputApp {
             EditLevel::TzCards => {
                 // Two-row nav (actions + cards + optional curve), mirroring the
                 // Remapper. West/LT-RT only shown when relevant.
-                let ids = self.nav_active_outer_id()
-                    .and_then(|o| self.nav_selected_inner_node(o).map(|i| (o, i)));
-                let has_mouse = ids.map(|(o, i)| self.nav_tz_has_mouse_card(o, i)).unwrap_or(false);
-                let has_analog = ids.map(|(o, i)| self.nav_tz_has_analog_card(o, i)).unwrap_or(false);
+                let has_mouse = self.nav_active_outer_id()
+                    .and_then(|o| self.nav_selected_inner_node(o).map(|i| (o, i)))
+                    .map(|(o, i)| self.nav_tz_has_mouse_card(o, i)).unwrap_or(false);
                 let mut v = vec![
                     (hint_move(), "Navigate"),
                     (vec!["btn_south"], "Select / Enter"),
                     (vec!["btn_west"], "Delete card"),
                     (vec!["btn_lb", "btn_rb"], "Zone"),
                 ];
-                // LT/RT nudge whichever value row is focused (relative_center or
-                // mouse_speed); show the hint when either exists.
-                if has_analog { v.push((vec!["left_trigger", "right_trigger"], "Relative center")); }
                 if has_mouse { v.push((vec!["left_trigger", "right_trigger"], "Mouse speed")); }
                 v.push((vec!["btn_east"], "Back"));
                 v
