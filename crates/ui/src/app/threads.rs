@@ -420,7 +420,13 @@ pub(crate) fn spawn_io_thread(
                 // default frequency injected below so they're audible on Switch
                 // Pro (whose HD motors need a non-zero frequency).
                 for ((device_id, pin_id), &signal) in &sink_outputs {
-                    if device_id.starts_with("gilrs:") {
+                    // Forward feedback to any PHYSICAL-backend pad — gilrs: (native)
+                    // OR sdl: (route-all-through-SDL). Gating on gilrs: alone meant
+                    // no mapped rumble/lightbar/HD-rumble ever reached an SDL pad
+                    // (the "ping" worked only because it sends to backends directly,
+                    // bypassing this loop). Each backend's send() ignores ids that
+                    // aren't its own prefix, so fanning out to all is safe.
+                    if device_id.starts_with("gilrs:") || device_id.starts_with("sdl:") {
                         for backend in &mut backends {
                             backend.send(device_id, pin_id, signal);
                         }
@@ -434,7 +440,8 @@ pub(crate) fn spawn_io_thread(
                 // what the manual ping pulse does.
                 for (amp_pin, freq_pin) in [("hd_l_amp", "hd_l_freq"), ("hd_r_amp", "hd_r_freq")] {
                     for ((device_id, pin_id), &signal) in &sink_outputs {
-                        if !device_id.starts_with("gilrs:") || pin_id != amp_pin { continue; }
+                        let is_phys = device_id.starts_with("gilrs:") || device_id.starts_with("sdl:");
+                        if !is_phys || pin_id != amp_pin { continue; }
                         let amp = signal.as_float();
                         let has_freq = sink_outputs
                             .get(&(device_id.clone(), freq_pin.to_string()))
@@ -462,10 +469,10 @@ pub(crate) fn spawn_io_thread(
                     }
                 }
                 // Snapshot this tick's physical-pad outputs for next-tick drop
-                // detection (gilrs feedback pins only).
+                // detection (gilrs: and sdl: feedback pins).
                 last_phys_haptics.clear();
                 for ((device_id, pin_id), &signal) in &sink_outputs {
-                    if device_id.starts_with("gilrs:") {
+                    if device_id.starts_with("gilrs:") || device_id.starts_with("sdl:") {
                         last_phys_haptics.insert((device_id.clone(), pin_id.clone()), signal);
                     }
                 }
