@@ -1204,7 +1204,7 @@ fn is_ps_family(vid: u16, pid: u16) -> bool {
 /// "Xbox 360 Controller[ for Windows]" and never matches, so this cleanly separates
 /// ours from physical with no slot/correlation guessing. The name check is the primary
 /// signal; the 0x02FF PID is belt-and-suspenders (and the reason the profile keeps it).
-fn is_hidmaestro_virtual_xinput(vid: u16, pid: u16, name: &str) -> bool {
+pub(crate) fn is_hidmaestro_virtual_xinput(vid: u16, pid: u16, name: &str) -> bool {
     (vid == 0x045E && pid == 0x02FF) || name.to_ascii_lowercase().contains("hidmaestro")
 }
 

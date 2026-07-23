@@ -293,6 +293,18 @@ impl SdlBackend {
             let pid = gamepad.product_id();
             let name = gamepad.name().unwrap_or_default();
             let kind = ControllerKind::detect(&name, vid, pid);
+
+            // Never surface FlexInput's OWN HIDMaestro virtual XInput companion
+            // (vid 045E / pid 02FF, or a "HIDMaestro"-named pad) through SDL —
+            // regardless of the sdl_all switch. Reading our own emulated output
+            // back as input would create a feedback loop, and it must never appear
+            // as a real controller. Remember the verdict so we don't re-probe it.
+            if let (Some(v), Some(p)) = (vid, pid) {
+                if crate::gilrs_backend::is_hidmaestro_virtual_xinput(v, p, &name) {
+                    rejected.insert(id);
+                    continue;
+                }
+            }
             if !sdl_all && kind != ControllerKind::Generic {
                 // Close (drop) and leave it to gilrs.
                 rejected.insert(id);
