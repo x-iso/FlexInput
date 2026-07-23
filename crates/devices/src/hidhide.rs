@@ -516,9 +516,11 @@ pub fn physical_count_for_vid_pid(vid: u16, pid: u16) -> usize {
         };
         if hdevinfo == INVALID_HANDLE_VALUE || hdevinfo.is_null() { return 0; }
         // USB HID:       HID\VID_057E&PID_2009\...
-        // Bluetooth HID: BTHENUM\{GUID}_VID&02057E_PID&2009_REV&...
+        // Bluetooth HID: 4-digit source (VID&0002057E, the HID node) or 2-digit
+        // (VID&02057E, some BTHENUM parents) — match both. See instance_id_for_vid_pid.
         let needle_usb = format!("VID_{:04X}&PID_{:04X}", vid, pid);
         let needle_bt  = format!("VID&02{:04X}_PID&{:04X}", vid, pid);
+        let needle_bt4 = format!("VID&0002{:04X}_PID&{:04X}", vid, pid);
         let mut count = 0usize;
         let mut idx = 0u32;
         loop {
@@ -543,7 +545,7 @@ pub fn physical_count_for_vid_pid(vid: u16, pid: u16) -> usize {
             let hw_ids = from_wide_multi(&hw_words);
             if !hw_ids.iter().any(|id| {
                 let up = id.to_uppercase();
-                up.contains(&needle_usb) || up.contains(&needle_bt)
+                up.contains(&needle_usb) || up.contains(&needle_bt) || up.contains(&needle_bt4)
             }) { continue; }
             // Exclude our own HIDMaestro pad from the REAL-controller count on
             // EITHER signal: the `SWD\HIDMAESTRO` instance-id marker
@@ -594,9 +596,16 @@ pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
         }
 
         // USB HID:       HID\VID_057E&PID_2009\...
-        // Bluetooth HID: BTHENUM\{GUID}_VID&02057E_PID&2009_REV&...
+        // Bluetooth HID: the vendor-ID SOURCE prefix varies by enumeration. The
+        // HID interface node (what SDL/hidapi and SetupAPI report for a paired
+        // controller) uses a 4-digit source: `..._VID&0002057E_PID&2009...`
+        // (0002 = USB-IF). A 2-digit `VID&02057E` form also appears on some
+        // BTHENUM parent nodes. Match BOTH — the 4-digit form is the one that was
+        // silently missed, so a Bluetooth Switch Pro never got a hideable instance
+        // id (instance_id_for_vid_pid returned None → HidHide cloaked nothing).
         let needle_usb = format!("VID_{:04X}&PID_{:04X}", vid, pid);
         let needle_bt  = format!("VID&02{:04X}_PID&{:04X}", vid, pid);
+        let needle_bt4 = format!("VID&0002{:04X}_PID&{:04X}", vid, pid);
         let mut hid_result: Option<String> = None;
         let mut other_result: Option<String> = None;
         let mut idx = 0u32;
@@ -631,7 +640,7 @@ pub fn instance_id_for_vid_pid(vid: u16, pid: u16) -> Option<String> {
 
             if !hw_ids.iter().any(|id| {
                 let up = id.to_uppercase();
-                up.contains(&needle_usb) || up.contains(&needle_bt)
+                up.contains(&needle_usb) || up.contains(&needle_bt) || up.contains(&needle_bt4)
             }) { continue; }
 
             // Fetch device instance ID
