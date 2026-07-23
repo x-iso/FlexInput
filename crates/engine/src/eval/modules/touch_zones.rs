@@ -382,11 +382,18 @@ pub(crate) fn eval_touch_zones_map_node(
         let held = press.gate(raw_held, press_state_get(ns, i), dt);
 
         // Touchpad-mode STICK deflection = the leaky-integrator trackball (finger
-        // motion → deflection, self-centres when the finger stops), scaled by the
-        // per-zone mouse_speed. Present only while a finger drives the zone.
+        // motion → deflection, self-centres when the finger stops), amplified by a
+        // fixed TZ_STICK_GAIN then the per-zone mouse_speed. Present only while a
+        // finger drives the zone. The raw trackball value is small (~0.1 for a firm
+        // flick), so without the gain a stick barely deflects; TZ_STICK_GAIN lifts a
+        // firm flick to near-full deflection at mouse_speed 1, and mouse_speed tunes
+        // it 0.1–10× from there. This is INDEPENDENT of the mouse-velocity path (its
+        // TZ_TRACKBALL_BASE), so amplifying the stick doesn't speed up the pointer.
+        const TZ_STICK_GAIN: f32 = 8.0;
         let tp_stick = if touchpad {
             stick_by_zone.get(&(field, zone)).map(|&(x, y)| {
-                ((x * mouse_speed).clamp(-1.0, 1.0), (y * mouse_speed).clamp(-1.0, 1.0))
+                let g = TZ_STICK_GAIN * mouse_speed;
+                ((x * g).clamp(-1.0, 1.0), (y * g).clamp(-1.0, 1.0))
             })
         } else {
             None
