@@ -608,27 +608,9 @@ pub(crate) fn tz_zone_adaptive(zone_maps: &[Value], field: usize, idx: usize) ->
         .map(|v| (v as f32).clamp(0.0, 1.0)).unwrap_or(0.30)
 }
 
-/// Store the adaptive-centre inner fraction on the first analog card of the zone.
-pub(crate) fn tz_set_zone_adaptive(snarl: &mut Snarl<NodeData>, node_id: NodeId,
-    field: usize, idx: usize, val: f32)
-{
-    let is_analog = tz_out_pin_is_analog;
-    let Some(node) = snarl.get_node_mut(node_id) else { return };
-    let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) else { return };
-    for c in cards.iter_mut() {
-        let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        if f != field || z != idx { continue; }
-        let analog = c.get("out").and_then(|v| v.as_array())
-            .map(|a| a.iter().any(|p| p.as_str().map(is_analog).unwrap_or(false)))
-            .unwrap_or(false);
-        if !analog { continue; }
-        if let Some(obj) = c.as_object_mut() {
-            obj.insert("adaptive".to_string(), Value::from(val.clamp(0.0, 1.0) as f64));
-        }
-        return;
-    }
-}
+// (tz_set_zone_adaptive removed: the "Relative center" control is now node-global
+//  via `tp_relative`. The per-zone override — step 3 of the touchpad-mode plan —
+//  will reintroduce a per-zone writer when the sync toggle is added.)
 
 /// True when zone `(field, zone)` is marked "hold" (a gesture starting there
 /// stays bound to it even if the finger slides into a neighbouring zone).
@@ -2454,6 +2436,15 @@ pub(crate) fn render_touch_zone_cards(
             .map(|a| a.iter().any(|p| matches!(p.as_str(), Some("mouse") | Some("mouse_x") | Some("mouse_y"))))
             .unwrap_or(false)))
         .unwrap_or(false);
+    // Whether ANY card drives an analog output (stick/mouse/scroll) — gates the
+    // node-global "Relative center" control (absolute-vs-relative deflection
+    // applies to every analog output, not just mouse).
+    let has_analog_card = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
+        .map(|cards| cards.iter().any(|c| c.get("out").and_then(|o| o.as_array())
+            .map(|a| a.iter().any(|p| p.as_str().map(tz_out_pin_is_analog).unwrap_or(false)))
+            .unwrap_or(false)))
+        .unwrap_or(false);
 
     // ── Header ────────────────────────────────────────────────────────────
     // Row 1: which zone + capture STATUS (listening / registered trigger →
@@ -2530,6 +2521,7 @@ pub(crate) fn render_touch_zone_cards(
     // captured=[assign, gamepad, add, cancel].
     let mut act_rects: Vec<egui::Rect> = Vec::new();
     let mut mouse_rect: Option<egui::Rect> = None;
+    let mut rel_rect: Option<egui::Rect> = None;
     ui.allocate_ui_with_layout(
         egui::vec2(TZ_CARD_W, ui.spacing().interact_size.y.max(20.0)),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -2630,24 +2622,44 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
         }
-        // Node-global relative-mouse speed, right-aligned. Only when a card
-        // actually drives a mouse output.
-        if has_mouse_card {
+        // Node-global analog controls, right-aligned: the "Relative center"
+        // (absolute↔relative deflection, any analog output) plus the relative-mouse
+        // speed (only when a card drives the mouse). Both are gamepad-nav targets;
+        // rects are published rel → mouse → hold to match `nav_tz_action_items`.
+        if has_analog_card {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut spd = getp(snarl, "mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-                let dv = ui.add(egui::DragValue::new(&mut spd).speed(0.02).range(0.1..=10.0).prefix("🖱 "))
-                    .on_hover_text("Relative-mouse speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and nudge with LT/RT.");
-                // Gamepad-nav target — appended LAST in action order (matches
-                // `nav_tz_action_items` when has_mouse_card).
-                mouse_rect = Some(dv.rect);
-                if dv.changed() {
+                // Mouse-speed sits rightmost (added first in a right-to-left row).
+                if has_mouse_card {
+                    let mut spd = getp(snarl, "mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    let dv = ui.add(egui::DragValue::new(&mut spd).speed(0.02).range(0.1..=10.0).prefix("🖱 "))
+                        .on_hover_text("Relative-mouse speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and nudge with LT/RT.");
+                    mouse_rect = Some(dv.rect);
+                    if dv.changed() {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            node.params.insert("mouse_speed".into(), Value::from(spd as f64));
+                        }
+                    }
+                }
+                // Relative-center %: 0 = absolute deflection from the fixed zone
+                // centre, 100 = wherever the finger lands becomes the centre. This
+                // is node-global; once set it overrides the legacy per-zone value.
+                // Default shown = 30% (the engine's default when unset).
+                let mut relp = getp(snarl, "tp_relative").and_then(|v| v.as_f64())
+                    .unwrap_or(0.30) as f32 * 100.0;
+                let rv = ui.add(egui::DragValue::new(&mut relp).speed(1.0).range(0.0..=100.0)
+                    .suffix("%").fixed_decimals(0).prefix("⌖ "))
+                    .on_hover_text("Relative center: how much of a zone acts as a relative centre for analog deflection. 0% = the fixed zone centre (absolute); 100% = wherever your finger first lands becomes the centre (fully relative). Applies to the whole node. Gamepad: focus it and nudge with LT/RT.");
+                rel_rect = Some(rv.rect);
+                if rv.changed() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
-                        node.params.insert("mouse_speed".into(), Value::from(spd as f64));
+                        node.params.insert("tp_relative".into(), Value::from((relp / 100.0) as f64));
                     }
                 }
             });
         }
     });
+    // Order MUST match `nav_tz_action_items`: relative_center, mouse_speed, hold.
+    if let Some(r) = rel_rect { act_rects.push(r); }
     if let Some(r) = mouse_rect { act_rects.push(r); }
     if let Some(r) = hold_rect { act_rects.push(r); }
     // Publish the action-button rects (scope "zone_maps") so the gamepad-nav
@@ -2758,25 +2770,10 @@ pub(crate) fn render_touch_zone_cards(
         }
     }
 
-    // The response curve now lives ON each analog card (expander strip in the
-    // loop above). Only the zone-level Relative-center slider stays here — the
-    // adaptive centre is a per-zone property, not per-card.
-    let zmaps_now = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
-        .unwrap_or_default();
-    if tz_zone_is_analog(&zmaps_now, sel_f, sel_z) {
-        ui.add_space(4.0);
-        // Adaptive-centre inner %: 0 = absolute deflection from the zone centre,
-        // 100 = wherever your finger lands becomes the centre (fully relative).
-        let mut pct = tz_zone_adaptive(&zmaps_now, sel_f, sel_z) * 100.0;
-        if ui.add(egui::Slider::new(&mut pct, 0.0..=100.0)
-            .text("Relative center").suffix("%").fixed_decimals(0))
-            .on_hover_text("How much of the zone acts as a relative centre for analog deflection. 0% = the fixed zone centre (absolute across the whole zone); 100% = wherever your finger first lands becomes the centre (fully relative). In between, only a touch landing within that inner fraction re-centres.")
-            .changed()
-        {
-            tz_set_zone_adaptive(snarl, node_id, sel_f, sel_z, pct / 100.0);
-        }
-    }
+    // The per-zone "Relative center" slider that used to live here has moved to the
+    // node-global control in the action row (next to mouse-speed) so it's reachable
+    // by gamepad navigation. The engine reads node-global `tp_relative`, falling
+    // back to any legacy per-zone `adaptive` value for patches predating the move.
 }
 
 /// UI-side trigger capture during Learn: track the primary finger (touch1) from

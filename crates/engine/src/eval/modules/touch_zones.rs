@@ -161,7 +161,17 @@ pub(crate) fn eval_touch_zones_map_node(
     // (absolute deflection across the whole zone); 1 = wherever you land is the
     // centre (fully relative). Stored on the zone's analog card ("adaptive"),
     // edited below the response-curve graph. Default 0.30.
+    // Node-global adaptive-centre inner fraction (the consolidated "Relative
+    // center" control next to mouse-speed): 0 = absolute deflection from the fixed
+    // zone centre, >0 = deflection from the finger's landing point. When the node
+    // param `tp_relative` is ABSENT (patch predates the control), fall back to the
+    // legacy PER-ZONE `adaptive` key so existing setups keep their behaviour.
+    let node_relative = snap.params.get("tp_relative").and_then(|v| v.as_f64())
+        .map(|v| (v as f32).clamp(0.0, 1.0));
     let adaptive_for = |field: usize, zone: usize| -> f32 {
+        if let Some(r) = node_relative {
+            return r;
+        }
         cards.iter().filter(|c|
             c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
             c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zone as u64)

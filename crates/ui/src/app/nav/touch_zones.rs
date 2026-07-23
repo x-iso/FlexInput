@@ -276,15 +276,17 @@ impl FlexInputApp {
     /// control is appended LAST (matching the right-aligned DragValue), navigable
     /// like a button and nudged with LT/RT. Keeping this identical to the body
     /// keeps the nav glow on the right item.
-    pub(crate) fn nav_tz_action_items(phase: &str, has_mouse: bool) -> Vec<&'static str> {
+    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, has_mouse: bool) -> Vec<&'static str> {
         let mut v = match phase {
             "idle"     => vec!["learn"],
             "learning" => vec!["cancel"],
             _          => vec!["assign", "gamepad", "add", "cancel"], // captured
         };
+        // Order MUST match the body's act_rects push order: relative_center,
+        // mouse_speed, then hold LAST (any zone can hold). relative_center is a
+        // VALUE nudged with LT/RT (like mouse_speed), not a South-activated button.
+        if has_analog { v.push("relative_center"); }
         if has_mouse { v.push("mouse_speed"); }
-        // "hold" is always available (any zone can hold); it sits LAST, matching
-        // the Hold checkbox's rect appended last in the body.
         v.push("hold");
         v
     }
@@ -329,6 +331,33 @@ impl FlexInputApp {
         n.params.insert("mouse_speed".into(), serde_json::Value::from(next as f64));
     }
 
+    /// Nudge the node-global `tp_relative` fraction (the "Relative center" control),
+    /// clamped 0..1. Starts from 0.30 (the shown default) when the param is unset —
+    /// writing it switches the engine from any legacy per-zone value to node-global.
+    pub(crate) fn nav_tz_nudge_relative(&mut self, outer: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, delta: f32)
+    {
+        let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
+            .and_then(|n| n.subpatch.as_mut()) else { return; };
+        let Some(n) = sp.snarl.get_node_mut(inner) else { return; };
+        let cur = n.params.get("tp_relative").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
+        let next = (cur + delta).clamp(0.0, 1.0);
+        n.params.insert("tp_relative".into(), serde_json::Value::from(next as f64));
+    }
+
+    /// Whether any card drives an analog output (stick/mouse/scroll) — gates the
+    /// relative_center nav item, mirroring the body's `has_analog_card`.
+    pub(crate) fn nav_tz_has_analog_card(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+        self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
+            .map(|cards| cards.iter().any(|c| c.get("out").and_then(|o| o.as_array())
+                .map(|a| a.iter().any(|p| p.as_str()
+                    .map(crate::canvas::viewer::tz_out_pin_is_analog).unwrap_or(false)))
+                .unwrap_or(false)))
+            .unwrap_or(false)
+    }
+
     /// Whether the SELECTED zone has an editable response curve (i.e. it drives an
     /// analog output) — gates the curve pseudo-row in the TzCards nav.
     pub(crate) fn nav_tz_zone_has_curve(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
@@ -369,8 +398,9 @@ impl FlexInputApp {
     pub(crate) fn nav_tz_publish_selection(&self, ctx: &egui::Context,
         outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, phase: &str)
     {
+        let has_analog = self.nav_tz_has_analog_card(outer, inner);
         let has_mouse = self.nav_tz_has_mouse_card(outer, inner);
-        let n_actions = Self::nav_tz_action_items(phase, has_mouse).len();
+        let n_actions = Self::nav_tz_action_items(phase, has_analog, has_mouse).len();
         let card_idxs = self.nav_tz_zone_card_indices(outer, inner);
         let sel = self.gamepad_nav.card_index;
         let entered = matches!(self.gamepad_nav.edit_level,
@@ -419,6 +449,7 @@ impl FlexInputApp {
         };
         let phase = self.picker_target_param_str(&[outer_id.0], inner, "_tz_phase")
             .unwrap_or_else(|| "idle".into());
+        let has_analog = self.nav_tz_has_analog_card(outer_id, inner);
         let has_mouse = self.nav_tz_has_mouse_card(outer_id, inner);
 
         // INERT while gamepad-learn is armed: the raw button must reach the body's
@@ -451,7 +482,7 @@ impl FlexInputApp {
 
         // Two-row cursor: [0..n_actions) = action buttons, [n_actions..total) =
         // the selected zone's cards.
-        let actions = Self::nav_tz_action_items(&phase, has_mouse);
+        let actions = Self::nav_tz_action_items(&phase, has_analog, has_mouse);
         let n_actions = actions.len();
         let card_idxs = self.nav_tz_zone_card_indices(outer_id, inner);
         let count = card_idxs.len();
@@ -491,6 +522,10 @@ impl FlexInputApp {
             if actions[sel] == "mouse_speed" {
                 let d = if rt_rising { 0.1 } else if lt_rising { -0.1 } else { 0.0 };
                 if d != 0.0 { self.nav_tz_nudge_mouse_speed(outer_id, inner, d); }
+            }
+            if actions[sel] == "relative_center" {
+                let d = if rt_rising { 0.05 } else if lt_rising { -0.05 } else { 0.0 };
+                if d != 0.0 { self.nav_tz_nudge_relative(outer_id, inner, d); }
             }
             // An action button is focused → South activates it.
             if nav.is_rising("btn_south") {
