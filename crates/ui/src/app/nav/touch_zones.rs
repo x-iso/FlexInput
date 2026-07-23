@@ -331,19 +331,37 @@ impl FlexInputApp {
         n.params.insert("mouse_speed".into(), serde_json::Value::from(next as f64));
     }
 
-    /// Cycle the node "Touchpad mode" param (synced → percard → touchpad → …) by
-    /// `dir` (+1 / −1), for the gamepad-nav path (mirrors the body ComboBox).
+    /// Cycle the SELECTED ZONE's "Touchpad mode" (synced → percard → touchpad → …)
+    /// by `dir` (+1 / −1), for the gamepad-nav path (mirrors the body ComboBox).
+    /// Stored per-zone on that zone's cards.
     pub(crate) fn nav_tz_cycle_mode(&mut self, outer: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, dir: i32)
     {
         let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
             .and_then(|n| n.subpatch.as_mut()) else { return; };
         let Some(n) = sp.snarl.get_node_mut(inner) else { return; };
+        let sel_f = n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let sel_z = n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         const MODES: [&str; 3] = ["synced", "percard", "touchpad"];
-        let cur = n.params.get("tp_mode").and_then(|v| v.as_str()).unwrap_or("synced");
+        let in_zone = |c: &serde_json::Value| -> bool {
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize == sel_f
+                && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize == sel_z
+        };
+        let cur = n.params.get("zone_maps").and_then(|v| v.as_array())
+            .and_then(|cards| cards.iter().filter(|c| in_zone(c))
+                .find_map(|c| c.get("tp_mode").and_then(|v| v.as_str()).map(String::from)))
+            .unwrap_or_else(|| "synced".into());
         let i = MODES.iter().position(|m| *m == cur).unwrap_or(0) as i32;
         let next = MODES[(((i + dir) % 3 + 3) % 3) as usize];
-        n.params.insert("tp_mode".into(), serde_json::Value::from(next));
+        if let Some(cards) = n.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) {
+            for c in cards.iter_mut() {
+                if in_zone(c) {
+                    if let Some(o) = c.as_object_mut() {
+                        o.insert("tp_mode".into(), serde_json::Value::from(next));
+                    }
+                }
+            }
+        }
     }
 
     /// Whether any card drives an analog output (stick/mouse/scroll) — gates the

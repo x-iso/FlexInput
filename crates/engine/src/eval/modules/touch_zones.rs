@@ -175,9 +175,15 @@ pub(crate) fn eval_touch_zones_map_node(
     //              the finger's landing point, per card, in the card loop below).
     //   touchpad → the MOUSE output tracks the finger's frame-to-frame delta (a
     //              laptop-touchpad feel); stick/scroll keep using deflection.
-    let tp_mode = snap.params.get("tp_mode").and_then(|v| v.as_str()).unwrap_or("synced");
-    let touchpad = tp_mode == "touchpad";
-    let percard = tp_mode == "percard";
+    // PER-ZONE mode: read from the zone's first card's `tp_mode` (stored like
+    // `adaptive`), default "synced". Each zone picks its own synced/percard/touchpad.
+    let mode_for = |field: usize, zone: usize| -> String {
+        cards.iter().filter(|c|
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
+            c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zone as u64)
+            .find_map(|c| c.get("tp_mode").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_else(|| "synced".into())
+    };
     let card_adaptive = |card: &Value| -> f32 {
         card.get("adaptive").and_then(|v| v.as_f64())
             .map(|v| (v as f32).clamp(0.0, 1.0)).unwrap_or(0.30)
@@ -284,6 +290,10 @@ pub(crate) fn eval_touch_zones_map_node(
     for (i, card) in cards.iter().enumerate() {
         let field = card.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let zone = card.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        // This card's zone mode governs how its analog deflection is derived.
+        let zmode = mode_for(field, zone);
+        let touchpad = zmode == "touchpad";
+        let percard = zmode == "percard";
         let hit = zone_hit.get(&(field, zone)).copied();
         let trigger = card.get("in").and_then(|v| v.as_array())
             .and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("tz_touch");
@@ -353,8 +363,15 @@ pub(crate) fn eval_touch_zones_map_node(
                 "mouse" | "mouse_x" | "mouse_y" => {
                     if touchpad {
                         if let Some(&(dx, dy)) = touchpad_by_zone.get(&(field, zone)) {
-                            const TZ_TOUCHPAD_BASE: f32 = 12.0;
-                            let g = mouse_speed * TZ_TOUCHPAD_BASE;
+                            // The mouse pin is a VELOCITY (sink integrates vel×REF×dt).
+                            // A touchpad wants pointer motion ∝ finger DISPLACEMENT, so
+                            // feed the finger's SPEED (delta/dt): the sink's ∫vel·dt then
+                            // yields displacement×gain, frame-rate independent (the dt
+                            // cancels). Reusing mouse_gain means it inherits the same
+                            // proven scaling as the gyro/right-stick mouse; mouse_speed
+                            // tunes it. TP_ACCEL lifts it toward a modern-trackpad ratio.
+                            const TP_ACCEL: f32 = 6.0;
+                            let g = mouse_gain * TP_ACCEL / dt.max(1e-4);
                             if p == "mouse" || p == "mouse_x" { mouse_dx += dx * g; }
                             if p == "mouse" || p == "mouse_y" { mouse_dy += dy * g; }
                             mouse_active = true;

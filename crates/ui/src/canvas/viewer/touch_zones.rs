@@ -2443,8 +2443,14 @@ pub(crate) fn render_touch_zone_cards(
             .map(|a| a.iter().any(|p| p.as_str().map(tz_out_pin_is_analog).unwrap_or(false)))
             .unwrap_or(false)))
         .unwrap_or(false);
-    // Current node "Touchpad mode" (synced / percard / touchpad; default synced).
-    let tp_mode: String = getp(snarl, "tp_mode").and_then(|v| v.as_str().map(String::from))
+    // Current SELECTED-ZONE "Touchpad mode" (synced / percard / touchpad; default
+    // synced). Stored per-zone on that zone's cards (like `adaptive`).
+    let tp_mode: String = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
+        .and_then(|cards| cards.iter()
+            .filter(|c| c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == sel_f as u64
+                     && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == sel_z as u64)
+            .find_map(|c| c.get("tp_mode").and_then(|v| v.as_str()).map(String::from)))
         .unwrap_or_else(|| "synced".into());
 
     // ── Header ────────────────────────────────────────────────────────────
@@ -2664,8 +2670,19 @@ pub(crate) fn render_touch_zone_cards(
                     let mode_resp = cb.response.on_hover_text("How a zone's analog deflection is derived. Synced: every card in a zone uses the top card's relative/absolute setting. Per-card: each card uses its own. Touchpad: the mouse pointer follows the finger's motion like a laptop touchpad (stick/scroll still use deflection). Gamepad: focus it and cycle with LT/RT.");
                     mode_rect = Some(mode_resp.rect);
                     if let Some(m) = chosen {
+                        // Write the mode onto every card of the SELECTED zone.
                         if let Some(node) = snarl.get_node_mut(node_id) {
-                            node.params.insert("tp_mode".into(), Value::from(m));
+                            if let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) {
+                                for c in cards.iter_mut() {
+                                    let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                    let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                    if f == sel_f && z == sel_z {
+                                        if let Some(o) = c.as_object_mut() {
+                                            o.insert("tp_mode".into(), Value::from(m));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
