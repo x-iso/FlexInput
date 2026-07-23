@@ -271,6 +271,20 @@ pub(crate) fn spawn_io_thread(
                             match bi { 0 => "enum_b0", 1 => "enum_b1", _ => "enum_bN" };
                         sect_marks.push((name, bt.elapsed()));
                     }
+                    // Cross-backend dedup: SDL owns the Generic pads it can open;
+                    // gilrs's WGI layer surfaces the SAME physical pad too (a DInput
+                    // pad showed up twice — "Game Controller for PC" via SDL AND "PC
+                    // Controller" via gilrs). When SDL surfaced a pad, drop gilrs's
+                    // copy of the same vid/pid. This only fires on an ACTUAL match, so
+                    // a generic SDL couldn't open never vanishes (gilrs keeps it).
+                    let sdl_vp: std::collections::HashSet<(u16, u16)> = devs.iter()
+                        .filter(|d| d.id.starts_with("sdl:"))
+                        .filter_map(|d| Some((d.vid?, d.pid?)))
+                        .collect();
+                    if !sdl_vp.is_empty() {
+                        devs.retain(|d| !(d.id.starts_with("gilrs:")
+                            && d.vid.zip(d.pid).is_some_and(|vp| sdl_vp.contains(&vp))));
+                    }
                     // Append MIDI device list maintained by the MIDI watch thread.
                     devs.extend(shared_midi_devices.read().unwrap().iter().cloned());
                     *shared_devices.write().unwrap() = devs;
