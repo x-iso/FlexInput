@@ -2637,13 +2637,32 @@ pub(crate) fn render_touch_zone_cards(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Mouse-speed sits rightmost (added first in a right-to-left row).
                 if has_mouse_card {
-                    let mut spd = getp(snarl, "mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    // Per-zone speed (stored on the selected zone's cards like
+                    // tp_mode/adaptive), migrating from the old node-global value.
+                    let mut spd = snarl.get_node(node_id)
+                        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
+                        .and_then(|cards| cards.iter()
+                            .filter(|c| c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == sel_f as u64
+                                     && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == sel_z as u64)
+                            .find_map(|c| c.get("mouse_speed").and_then(|v| v.as_f64())))
+                        .or_else(|| getp(snarl, "mouse_speed").and_then(|v| v.as_f64()))
+                        .unwrap_or(1.0) as f32;
                     let dv = ui.add(egui::DragValue::new(&mut spd).speed(0.02).range(0.1..=10.0).prefix("🖱 "))
-                        .on_hover_text("Relative-mouse speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and nudge with LT/RT.");
+                        .on_hover_text("This zone's relative-mouse speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection, or roughly a 1:1 touchpad sweep). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and change with the d-pad / left stick.");
                     mouse_rect = Some(dv.rect);
                     if dv.changed() {
                         if let Some(node) = snarl.get_node_mut(node_id) {
-                            node.params.insert("mouse_speed".into(), Value::from(spd as f64));
+                            if let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) {
+                                for c in cards.iter_mut() {
+                                    let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                    let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                    if f == sel_f && z == sel_z {
+                                        if let Some(o) = c.as_object_mut() {
+                                            o.insert("mouse_speed".into(), Value::from(spd as f64));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2724,18 +2743,34 @@ pub(crate) fn render_touch_zone_cards(
     let reorder_enabled = display.len() > 1;
     // Live deflection magnitude of the selected zone — the preview dot on any
     // open card curve editor. Computed once for the whole card list.
-    let tz_live_mag: Option<f32> = if menu_mode {
+    // Raw adaptive-centre deflection (dfx, dfy) of the selected zone, in y-down unit
+    // space (published by tz_live_hits). Kept as the 2D vector so each card can
+    // derive the RIGHT preview input: an analog card wants the magnitude, but a
+    // swipe-direction card is a 1-D gesture — it must show only the component along
+    // its own axis (matching the engine's `dir`), so the preview dot and the
+    // threshold line agree with what actually fires.
+    let tz_live_defl: Option<(f32, f32)> = if menu_mode {
         // Menu zones have no touch deflection; the curve preview dot stays put.
         None
     } else {
-        // Adaptive-centre deflection magnitude of the selected zone (published by
-        // tz_live_hits), so the preview dot's input matches the engine — relative
-        // or absolute per the zone's setting, not a raw absolute position.
         let _ = tz_live_hits(snarl, node_id, live_signals, automap_parent, ui.ctx());
         ui.ctx().data(|d| d.get_temp::<(u64, std::collections::HashMap<(usize, usize), (f32, f32)>)>(
                 egui::Id::new(("tz_live_defl", node_id.0))))
             .and_then(|(_, mp)| mp.get(&(sel_f, sel_z)).copied())
-            .map(|(dx, dy)| (dx * dx + dy * dy).sqrt().min(1.0))
+    };
+    // Preview input for a card: swipe cards → 1-D directional value along the swipe
+    // axis (engine ax=dfx, ay=−dfy; up→−dfy, down→dfy, left→−dfx, right→dfx),
+    // clamped ≥0; analog cards → 2-D deflection magnitude.
+    let card_live_mag = |in_pins: &[String]| -> Option<f32> {
+        tz_live_defl.map(|(dfx, dfy)| {
+            match in_pins.first().map(String::as_str) {
+                Some("tz_swipe_up")    => (-dfy).clamp(0.0, 1.0),
+                Some("tz_swipe_down")  => (dfy).clamp(0.0, 1.0),
+                Some("tz_swipe_left")  => (-dfx).clamp(0.0, 1.0),
+                Some("tz_swipe_right") => (dfx).clamp(0.0, 1.0),
+                _ => (dfx * dfx + dfy * dfy).sqrt().min(1.0),
+            }
+        })
     };
     // Gamepad nav still edits ONE curve per zone (the shared driver has a
     // single geometry channel per node) — attach it to the FIRST analog card,
@@ -2781,7 +2816,7 @@ pub(crate) fn render_touch_zone_cards(
                 if card_analog || is_swipe {
                     mapping_card_curve_section(
                         ui, node_id, "zone_maps", i, &mut working,
-                        is_swipe, tz_live_mag, if card_analog { nav_uid } else { None },
+                        is_swipe, card_live_mag(&in_pins), if card_analog { nav_uid } else { None },
                     );
                     // Per-card relative/absolute (adaptive centre / off-centre
                     // tolerance). Hidden in Touchpad mode. Analog cards follow the

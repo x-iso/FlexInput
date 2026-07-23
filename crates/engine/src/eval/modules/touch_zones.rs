@@ -131,8 +131,9 @@ pub(crate) fn eval_touch_zones_map_node(
     // same sink sensitivity; the per-node `mouse_speed` multiplier (default 1.0)
     // tunes it from there.
     const TZ_MOUSE_BASE: f32 = 0.03;
-    let mouse_speed = snap.params.get("mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-    let mouse_gain = mouse_speed * TZ_MOUSE_BASE;
+    // Legacy node-global speed, kept only as the migration fallback for patches
+    // saved before the multiplier became per-zone.
+    let node_mouse_speed = snap.params.get("mouse_speed").and_then(|v| v.as_f64()).map(|v| v as f32);
     // Analog scroll shares the same node multiplier so the "Relative sensitivity"
     // slider also scales max scroll speed. The sink applies the per-notch base
     // rate (SCROLL_REF), so here we pass the shaped deflection × the multiplier.
@@ -187,6 +188,17 @@ pub(crate) fn eval_touch_zones_map_node(
     let card_adaptive = |card: &Value| -> f32 {
         card.get("adaptive").and_then(|v| v.as_f64())
             .map(|v| (v as f32).clamp(0.0, 1.0)).unwrap_or(0.30)
+    };
+    // Per-zone relative-mouse / scroll speed multiplier, stored on the zone's cards
+    // like `tp_mode`/`adaptive` (default 1.0, migrating from the old node-global
+    // value). Each zone tunes its own pointer/scroll speed.
+    let mouse_speed_for = |field: usize, zone: usize| -> f32 {
+        cards.iter().filter(|c|
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
+            c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zone as u64)
+            .find_map(|c| c.get("mouse_speed").and_then(|v| v.as_f64()).map(|v| v as f32))
+            .unwrap_or_else(|| node_mouse_speed.unwrap_or(1.0))
+            .clamp(0.1, 10.0)
     };
     // Adaptive centre from a landing point + zone rect (both-axes rule, matching the
     // touchdown capture): landing inside the inner region → relative centre, else
@@ -294,6 +306,9 @@ pub(crate) fn eval_touch_zones_map_node(
         let zmode = mode_for(field, zone);
         let touchpad = zmode == "touchpad";
         let percard = zmode == "percard";
+        // Per-zone pointer/scroll speed (see mouse_speed_for).
+        let mouse_speed = mouse_speed_for(field, zone);
+        let mouse_gain = mouse_speed * TZ_MOUSE_BASE;
         let hit = zone_hit.get(&(field, zone)).copied();
         let trigger = card.get("in").and_then(|v| v.as_array())
             .and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("tz_touch");
@@ -377,15 +392,18 @@ pub(crate) fn eval_touch_zones_map_node(
                 "mouse" | "mouse_x" | "mouse_y" => {
                     if touchpad {
                         if let Some(&(dx, dy)) = touchpad_by_zone.get(&(field, zone)) {
-                            // The mouse pin is a VELOCITY (sink integrates vel×REF×dt).
-                            // A touchpad wants pointer motion ∝ finger DISPLACEMENT, so
-                            // feed the finger's SPEED (delta/dt): the sink's ∫vel·dt then
-                            // yields displacement×gain, frame-rate independent (the dt
-                            // cancels). Reusing mouse_gain means it inherits the same
-                            // proven scaling as the gyro/right-stick mouse; mouse_speed
-                            // tunes it. TP_ACCEL lifts it toward a modern-trackpad ratio.
-                            const TP_ACCEL: f32 = 6.0;
-                            let g = mouse_gain * TP_ACCEL / dt.max(1e-4);
+                            // The mouse pin is a VELOCITY (sink integrates vel×REF×dt,
+                            // REF=60). A touchpad wants pointer motion ∝ finger
+                            // DISPLACEMENT, so feed the finger's SPEED (delta/dt): the
+                            // sink's ∫vel·dt then yields displacement×gain, frame-rate
+                            // independent (the dt cancels). Net screen travel for a
+                            // finger move of Δ (unit pad coords) ≈ Δ·TP_GAIN·REF, so at
+                            // mouse_speed 1 a full-pad sweep (Δ≈1) ≈ TP_GAIN·60 px — set
+                            // TP_GAIN so that lands near one screen width; mouse_speed
+                            // tunes from there. (Was 0.18 via mouse_gain×TP_ACCEL — ~50×
+                            // too weak, so the pointer barely moved.)
+                            const TP_GAIN: f32 = 16.0;
+                            let g = mouse_speed * TP_GAIN / dt.max(1e-4);
                             if p == "mouse" || p == "mouse_x" { mouse_dx += dx * g; }
                             if p == "mouse" || p == "mouse_y" { mouse_dy += dy * g; }
                             mouse_active = true;
