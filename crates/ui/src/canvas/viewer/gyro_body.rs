@@ -684,6 +684,9 @@ pub(crate) fn show_gyro_lean_mapping_section(
         .and_then(|n| n.extra.last_out.get(3).copied().flatten())
         .map(|s| s.as_float())
         .map(|v| if side == "left" { (-v).max(0.0) } else { v.max(0.0) });
+    // Output-conflict scan (once): a lean card whose out pin is also driven by
+    // another card in this patch gets a ⚠ badge.
+    let conflicts = scan_mapping_conflicts(snarl);
     let mut rv = ReorderView::begin(
         ui, egui::Id::new(("fxi_lean_reorder", node_id.0, side)), reorder_enabled,
     );
@@ -694,6 +697,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
             .unwrap_or_default();
 
         if !mapping_passes_filter(&filter, &out_pins) { continue; }
+        let card_conf = card_conflict_for(&conflicts, node_id, key, i, &out_pins);
 
         if let Some(h) = rv.gap_before(slot) { draw_insertion_gap(ui, h); }
 
@@ -714,6 +718,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                         ui, node_id, i, &mut working,
                         &out_pins, None, skin, true,
                         reorder_enabled, drag_off, key, true,
+                        card_conf.as_ref(),
                     );
                     if result.delete_clicked { to_remove = Some(i); }
                     if result.changed { working_changed = true; }

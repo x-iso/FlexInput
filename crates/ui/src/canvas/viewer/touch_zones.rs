@@ -2826,6 +2826,11 @@ pub(crate) fn render_touch_zone_cards(
     // (cards render top-to-bottom, so it's set before any driven card below reads it)
     // — the value Synced non-top cards display grayed.
     let mut driver_adaptive = 0.30f32;
+    // Output-conflict scan (once): a zone card whose out pin is ALSO driven by
+    // another card (a Menu, another zone, a Remapper…) gets a ⚠ badge — this is
+    // the exact case the feature was asked for (a swipe→"2" silently overridden
+    // by a Virtual Menu also bound to "2").
+    let conflicts = scan_mapping_conflicts(snarl);
     let mut rv = ReorderView::begin(
         ui, egui::Id::new(("fxi_tz_reorder", node_id.0, sel_f, sel_z)), reorder_enabled);
     for (slot, &i) in display.iter().enumerate() {
@@ -2836,6 +2841,7 @@ pub(crate) fn render_touch_zone_cards(
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
         let out_pins: Vec<String> = working.get("out").and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+        let card_conf = card_conflict_for(&conflicts, node_id, "zone_maps", i, &out_pins);
         let drag_off = rv.offset_for(slot);
         let card_analog = out_pins.iter().any(|p| tz_out_pin_is_analog(p));
         let nav_uid = if card_analog && !nav_curve_given {
@@ -2855,6 +2861,7 @@ pub(crate) fn render_touch_zone_cards(
                     ui, node_id, i, &mut working,
                     &in_pins, Some(&out_pins), skin,
                     true, reorder_enabled, drag_off, "zone_maps", card_analog,
+                    card_conf.as_ref(),
                 );
                 if result.delete_clicked { remove = Some(i); }
                 rv.observe(slot, &result);

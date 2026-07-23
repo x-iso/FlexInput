@@ -589,6 +589,9 @@ pub(crate) fn show_remapper_body(
             // filter is narrowing the visible set (so the dragged index maps
             // 1:1 to the underlying array).
             let reorder_enabled = filter.kind == MapFilterKind::All;
+            // Output-conflict scan (once): which of this patch's cards write each
+            // bus pin, so a card whose out pin is ALSO driven elsewhere gets a ⚠.
+            let conflicts = scan_mapping_conflicts(snarl);
             let mut rv = ReorderView::begin(
                 ui, egui::Id::new(("fxi_remap_reorder", node_id.0)), reorder_enabled,
             );
@@ -602,6 +605,7 @@ pub(crate) fn show_remapper_body(
                     .unwrap_or_default();
 
                 if !mapping_passes_filter(&filter, &in_pins) { continue; }
+                let card_conf = card_conflict_for(&conflicts, node_id, "mappings", i, &out_pins);
 
                 if let Some(h) = rv.gap_before(slot) { draw_insertion_gap(ui, h); }
 
@@ -627,6 +631,7 @@ pub(crate) fn show_remapper_body(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin,
                                     true, reorder_enabled, drag_off, "mappings", card_analog,
+                                    card_conf.as_ref(),
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }
@@ -1101,6 +1106,7 @@ pub(crate) fn show_map_action_body(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin,
                                     true, reorder_enabled, drag_off, "mappings", false,
+                                    None, // Map Action rows aren't bus writers (out_pins None)
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
                                 if result.changed { working_changed = true; }

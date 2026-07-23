@@ -45,6 +45,8 @@ pub(crate) fn remapper_mapping_card_pixel(
                                     // — disambiguates the two Lean lists sharing one node
     has_curve_below: bool,          // a response-curve section is rendered flush below this card
                                     // → square the bottom corners so the two read as ONE card
+    conflict: Option<&CardConflict>, // Some → another card also drives one of this card's out
+                                     // pins; paint a ⚠ badge + amber outline (Issue: silent override)
 ) -> MappingCardResult {
     // ── Figma palette ─────────────────────────────────────────────────────
     const C_CARD_BG:   Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);  // outer
@@ -547,6 +549,40 @@ pub(crate) fn remapper_mapping_card_pixel(
                 (pass, body_delta)));
             request_repaint_throttled(ui.ctx());
         }
+    }
+
+    // ── Output-conflict badge ──────────────────────────────────────────────
+    // Another card drives one of this card's out pins; the engine's collector
+    // merge keeps only one, so the loser silently does nothing. Ring the card
+    // amber and drop a ⚠ in the bottom-right (out-row) corner with a tooltip
+    // naming the colliding pin(s) + other module(s).
+    if let Some(cf) = conflict {
+        const C_WARN: Color32 = Color32::from_rgb(0xF2, 0xB0, 0x2E); // amber
+        let warn_cr = if has_curve_below {
+            egui::CornerRadius { nw: radius_i, ne: radius_i, sw: 0, se: 0 }
+        } else {
+            egui::CornerRadius::same(radius_i)
+        };
+        painter.rect_stroke(
+            card_rect, warn_cr,
+            egui::Stroke::new(1.5, C_WARN),
+            egui::epaint::StrokeKind::Inside,
+        );
+        let bsz = 18.0 * s;
+        let badge_rect = egui::Rect::from_min_size(
+            card_rect.right_bottom() + egui::vec2(-(bsz + 5.0 * s), -(bsz + 5.0 * s)),
+            egui::vec2(bsz, bsz),
+        );
+        painter.circle_filled(badge_rect.center(), bsz * 0.5, Color32::from_black_alpha(160));
+        painter.text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "⚠",
+            egui::FontId::proportional(13.0 * s),
+            C_WARN,
+        );
+        ui.interact(badge_rect, ui.id().with(("conflict", mapping_idx)), egui::Sense::hover())
+            .on_hover_text(cf.tooltip());
     }
 
     MappingCardResult {
