@@ -1021,6 +1021,20 @@ pub(crate) fn curve_nav_uid(ctx: &egui::Context, node_id: NodeId, scope: &str, i
 /// `nav_uid`: forwarded to the editor AND force-opens the section while the
 /// gamepad-nav curve row is focused/entered (the Touch Zones controller flow
 /// needs the graph visible to ring it).
+///
+/// `adaptive`: Touch Zones only — the per-card "Rel. center" row, rendered as the
+/// LAST row INSIDE the opened card body (under the curve + threshold). None for the
+/// Remapper/Lean/Map-Action, which have no adaptive centre.
+pub(crate) struct AdaptiveRow {
+    /// Current 0..1 value to display (this card's own, or the zone's top card's
+    /// when this one is driven).
+    pub value: f32,
+    /// Editable here (top card in Synced, every card in Per-card, swipe cards).
+    pub editable: bool,
+    /// Show "(driven by first mapping card)" — a non-top card in Synced mode.
+    pub driven: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mapping_card_curve_section(
     ui: &mut egui::Ui,
@@ -1031,6 +1045,7 @@ pub(crate) fn mapping_card_curve_section(
     show_threshold: bool,
     live_mag: Option<f32>,
     nav_uid: Option<usize>,
+    adaptive: Option<AdaptiveRow>,
 ) -> bool {
     // Render as a flush continuation of the header card above: zero the inter-item
     // gap (on THIS child ui only) and wrap the content in a frame with the card's
@@ -1117,7 +1132,7 @@ pub(crate) fn mapping_card_curve_section(
     let mut thr: Option<f32> = working.get("threshold").and_then(|v| v.as_f64()).map(|v| v as f32);
 
     let vis = ui.visuals().clone();
-    let changed = mapping_curve_editor(
+    let mut changed = mapping_curve_editor(
         ui, open_id.with("ed"), &mut pts,
         if show_threshold { Some(&mut thr) } else { None },
         live_mag, accent, &vis, nav_uid, nav_field,
@@ -1133,6 +1148,32 @@ pub(crate) fn mapping_card_curve_section(
             Some(t) => { working.insert("threshold".into(), Value::Number(t)); }
             None => { working.remove("threshold"); }
         }
+    }
+    // Rel. center (adaptive) — the LAST row of the card body, under the curve +
+    // threshold. Driven (non-top Synced) cards show it GRAYED with a note; the
+    // driver/per-card/swipe cards edit it. Gamepad field 7 rings + edits it.
+    if let Some(a) = adaptive {
+        let mut ap = a.value * 100.0;
+        let hover = "How much of the zone acts as a relative centre for analog deflection. 0% = the fixed zone centre (absolute); 100% = wherever your finger first lands becomes the centre (fully relative). In Synced mode the first (top) card drives every card in the zone. Gamepad: enter the card, cycle to this field, change with up/down.";
+        let focused = nav_field == Some(7);
+        ui.horizontal(|ui| {
+            let sl = ui.add_enabled(a.editable,
+                egui::Slider::new(&mut ap, 0.0..=100.0)
+                    .text("Rel. center").suffix("%").fixed_decimals(0))
+                .on_hover_text(hover);
+            if a.driven {
+                ui.label(egui::RichText::new("driven by first card").italics().weak().size(10.0));
+            }
+            if focused {
+                ui.painter().rect_stroke(sl.rect.expand(2.0), 3.0,
+                    egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+                sl.scroll_to_me(None);
+            }
+            if a.editable && sl.changed() {
+                working.insert("adaptive".into(), Value::from((ap / 100.0) as f64));
+                changed = true;
+            }
+        });
     }
     changed
     });
@@ -2776,6 +2817,10 @@ pub(crate) fn render_touch_zone_cards(
     // single geometry channel per node) — attach it to the FIRST analog card,
     // matching what `tz_zone_curve`/`tz_set_zone_curve` in the nav path edit.
     let mut nav_curve_given = false;
+    // The zone's TOP analog card's Rel.-center value, captured as the loop passes it
+    // (cards render top-to-bottom, so it's set before any driven card below reads it)
+    // — the value Synced non-top cards display grayed.
+    let mut driver_adaptive = 0.30f32;
     let mut rv = ReorderView::begin(
         ui, egui::Id::new(("fxi_tz_reorder", node_id.0, sel_f, sel_z)), reorder_enabled);
     for (slot, &i) in display.iter().enumerate() {
@@ -2808,57 +2853,33 @@ pub(crate) fn render_touch_zone_cards(
                 );
                 if result.delete_clicked { remove = Some(i); }
                 rv.observe(slot, &result);
-                // Response curve + threshold. Analog cards shape the zone's
-                // deflection (no threshold — the gate is touch presence). Swipe
-                // cards ALSO get the curve, WITH the activation threshold: it gates
-                // the swipe's directional magnitude into a hold (see the engine).
+                // Response curve + threshold + Rel.-center, all INSIDE the card's
+                // opened body. Analog cards shape the zone's deflection (no
+                // threshold — the gate is touch presence). Swipe cards ALSO get the
+                // curve, WITH the activation threshold: it gates the swipe's
+                // directional magnitude into a hold (see the engine).
                 let is_swipe = in_pins.first().map(|t| t.starts_with("tz_swipe")).unwrap_or(false);
                 if card_analog || is_swipe {
+                    let own = working.get("adaptive").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
+                    if is_top_analog { driver_adaptive = own; }
+                    // Rel.-center visibility/edit rules (mirror the engine): hidden in
+                    // Touchpad mode; swipe + Per-card + the Synced TOP card edit it;
+                    // Synced NON-top cards show it GRAYED as "driven by first card".
+                    let adaptive = if tp_mode == "touchpad" {
+                        None
+                    } else if is_swipe || tp_mode == "percard" {
+                        Some(AdaptiveRow { value: own, editable: true, driven: false })
+                    } else if is_top_analog {
+                        Some(AdaptiveRow { value: own, editable: true, driven: false })
+                    } else {
+                        // Synced non-top analog card: driven by the top card.
+                        Some(AdaptiveRow { value: driver_adaptive, editable: false, driven: true })
+                    };
                     mapping_card_curve_section(
                         ui, node_id, "zone_maps", i, &mut working,
-                        is_swipe, card_live_mag(&in_pins), if card_analog { nav_uid } else { None },
+                        is_swipe, card_live_mag(&in_pins),
+                        if card_analog { nav_uid } else { None }, adaptive,
                     );
-                    // Per-card relative/absolute (adaptive centre / off-centre
-                    // tolerance). Hidden in Touchpad mode. Analog cards follow the
-                    // mode (Synced → only the zone's top card shows it, driving the
-                    // rest); swipe cards always show their own.
-                    let show_adaptive = if is_swipe {
-                        tp_mode != "touchpad"
-                    } else {
-                        match tp_mode.as_str() {
-                            "touchpad" => false,
-                            "synced"   => is_top_analog,
-                            _          => true, // percard
-                        }
-                    };
-                    if show_adaptive {
-                        let mut ap = working.get("adaptive").and_then(|v| v.as_f64())
-                            .unwrap_or(0.30) as f32 * 100.0;
-                        let label = if tp_mode == "synced" { "Rel. center (drives zone)" } else { "Rel. center" };
-                        // Gamepad focus: this is card field 7 (see nav_drive_remap_card).
-                        // Ring + scroll-to it when the entered card focuses that field.
-                        let pass = ui.ctx().cumulative_pass_nr();
-                        let adaptive_focused = ui.ctx()
-                            .data(|d| d.get_temp::<(u64, usize, bool)>(
-                                egui::Id::new(("gp_nav_remap_card", node_id.0, "zone_maps"))))
-                            .filter(|(p, sel, ent)| *ent && *sel == i && pass.saturating_sub(*p) <= 1)
-                            .and_then(|_| ui.ctx().data(|d| d.get_temp::<(u64, u64)>(
-                                egui::Id::new(("gp_nav_remap_card_field", node_id.0, "zone_maps")))))
-                            .map(|(p, f)| f == 7 && pass.saturating_sub(p) <= 1)
-                            .unwrap_or(false);
-                        let sl = ui.add(egui::Slider::new(&mut ap, 0.0..=100.0)
-                                .text(label).suffix("%").fixed_decimals(0))
-                            .on_hover_text("How much of the zone acts as a relative centre for THIS card's analog deflection. 0% = the fixed zone centre (absolute); 100% = wherever your finger first lands becomes the centre (fully relative). In Synced mode the top card's value drives every card in the zone. Gamepad: enter the card and cycle to this field, then change with up/down.");
-                        if adaptive_focused {
-                            let accent = ui.visuals().selection.stroke.color;
-                            ui.painter().rect_stroke(sl.rect.expand(2.0), 3.0,
-                                egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
-                            sl.scroll_to_me(None);
-                        }
-                        if sl.changed() {
-                            working.insert("adaptive".into(), Value::from((ap / 100.0) as f64));
-                        }
-                    }
                 }
             },
         );

@@ -725,7 +725,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                     let nav_uid = curve_nav_uid(ui.ctx(), node_id, key, i);
                     if mapping_card_curve_section(
                         ui, node_id, key, i, &mut working,
-                        true, lean_live, nav_uid,
+                        true, lean_live, nav_uid, None,
                     ) {
                         working_changed = true;
                     }

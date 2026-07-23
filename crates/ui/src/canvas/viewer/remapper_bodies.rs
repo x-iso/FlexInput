@@ -637,7 +637,7 @@ pub(crate) fn show_remapper_body(
                                     let nav_uid = curve_nav_uid(ui.ctx(), node_id, "mappings", i);
                                     if mapping_card_curve_section(
                                         ui, node_id, "mappings", i, &mut working,
-                                        true, live, nav_uid,
+                                        true, live, nav_uid, None,
                                     ) {
                                         working_changed = true;
                                     }
