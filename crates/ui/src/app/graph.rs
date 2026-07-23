@@ -715,11 +715,26 @@ pub(crate) fn build_processing_graph_rec(
         // For device.sink: build the full routing metadata.
         let sink_target = if is_sink {
             let sink_dev_id = device_id.clone().unwrap_or_default();
-            let pin_ids: Vec<String> = node.params
+            let mut pin_ids: Vec<String> = node.params
                 .get("input_pin_ids")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
                 .unwrap_or_default();
+            // `input_pin_ids` is FROZEN at node creation, so sink pins added to a
+            // device's layout AFTER a node was saved (e.g. mouse_move on the keymouse
+            // sink) are missing — the AutoMap bus then can't route to them ("touchpad
+            // mouse does nothing"). Append any current device sink-pin id not already
+            // present: it gains no direct-wire slot (multi_sources is shorter, so the
+            // direct path skips it) but becomes automap-routable off the bus.
+            if let Some((sinks, _, _)) = flexinput_virtual::kind_pin_metadata(
+                &flexinput_virtual::kind_prefix(&sink_dev_id), 0)
+            {
+                for sp in sinks {
+                    if !pin_ids.iter().any(|p| p == sp.id) {
+                        pin_ids.push(sp.id.to_string());
+                    }
+                }
+            }
 
             // For each direct-wire input: collect ALL remotes (multi-source, combined additively).
             let multi_sources: Vec<Vec<(usize, usize)>> = (0..node.inputs.len())

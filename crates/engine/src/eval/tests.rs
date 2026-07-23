@@ -1328,6 +1328,53 @@ mod trigger_tests {
         assert!(lmb, "touch→mouse_left must reach the keymouse sink");
     }
 
+    // End-to-end: touchpad-mode mouse must reach the sink on mouse_move, and a
+    // touchpad-mode stick on right_stick, as the finger slides across two ticks.
+    // (The real app's sink pin_ids must include mouse_move — graph.rs appends the
+    // device's current sink pins so an old node's frozen list can't drop it.)
+    #[test]
+    fn touch_zone_touchpad_reaches_keymouse_sink() {
+        let dev = "pad";
+        let tz_uid = 2usize;
+        let mut tz = empty_node(tz_uid, "module.touch_zones");
+        tz.params.insert("zone_mode".into(), Value::String("mapping".into()));
+        tz.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        tz.params.insert("col_edges".into(), serde_json::json!([]));
+        tz.params.insert("row_edges".into(), serde_json::json!([]));
+        tz.params.insert("zone_maps".into(), serde_json::json!([
+            {"f":0,"z":0,"in":["tz_touch"],"out":["mouse","right_stick"],"mode":"analog","tp_mode":"touchpad"},
+        ]));
+        let mut sink = empty_node(3, "device.sink");
+        sink.sink_target = Some(SinkTarget {
+            device_id: "virtual.keymouse:0".to_string(),
+            pin_ids: canonical_pins(),
+            multi_sources: vec![Vec::new(); canonical_pins().len()],
+            automap_source: Some((format!("touchmap:{tz_uid}"), canonical_pins())),
+            automap_fallback_dev: None,
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+        });
+        let graph = ProcessingGraph { nodes: vec![tz, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let finger = |px: f32| {
+            let mut m = HashMap::new();
+            m.insert((dev.to_string(), "touch1_active".to_string()), Signal::Bool(true));
+            m.insert((dev.to_string(), "touch1_x".to_string()), Signal::Float(px));
+            m.insert((dev.to_string(), "touch1_y".to_string()), Signal::Float(0.0));
+            m
+        };
+        eval_graph_tick(&graph, &mut state, &finger(0.0), 0.016, &mut out);
+        eval_graph_tick(&graph, &mut state, &finger(0.3), 0.016, &mut out);
+        let mv = out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "mouse_move".to_string()))
+            .and_then(|s| if let Signal::Vec2(v) = s { Some(v.x) } else { None });
+        assert!(mv.is_some_and(|x| x > 1.0),
+            "touchpad mouse must reach the sink on mouse_move with a rightward move (got {mv:?})");
+        assert!(out.sink_outputs.contains_key(&("virtual.keymouse:0".to_string(), "right_stick".to_string())),
+            "touchpad stick must reach the sink on right_stick");
+    }
+
     #[test]
     fn analog_stick_to_key_respects_source_deadzone() {
         let dev = "gilrs:xinput:0";
