@@ -302,26 +302,12 @@ pub(crate) fn eval_touch_zones_map_node(
             "tz_swipe_left" => Some(3), "tz_swipe_right" => Some(4),
             _ => None,
         };
-        let raw_held = match swipe_code {
-            Some(code) => swipes.iter().any(|&(f, z, d)| f == field && z == zone && d == code),
-            None => match trigger {
-                "tz_click" => hit.is_some() && click(field),
-                _          => hit.is_some(), // tz_touch (default)
-            },
-        };
-
-        let press = PressParams::from_card(card);
-        let held = press.gate(raw_held, press_state_get(ns, i), dt);
-
-        // Relative analog deflection for this card's zone (present only while a
-        // finger is down in it). Analog outputs ignore the press-mode gate — the
-        // contact itself drives them. A per-card response `curve` (points over the
-        // 0..1 deflection MAGNITUDE) reshapes the response while keeping direction
-        // — the touch-zone analog can't have a Response Curve module wired onto it.
+        // Response curve + raw deflection, needed BEFORE the swipe gate (a
+        // thresholded swipe reads the directional deflection). percard recomputes
+        // the centre from THIS card's own adaptive value; synced reuses the shared
+        // per-zone value (the zone's top analog card). Present only while a finger
+        // is down in the zone.
         let shape = MappingShape::from_card(card);
-        // Raw deflection for this card's zone. percard recomputes the centre from
-        // THIS card's own adaptive value; synced reuses the shared per-zone value
-        // (the zone's top analog card). Present only while a finger is down in it.
         let raw_defl = if percard {
             zone_finger.get(&(field, zone)).map(|&(lx, ly, cxr, cyr)| {
                 let zrect = trees[field].zone_rect(zone as u32).unwrap_or([0.0, 0.0, 1.0, 1.0]);
@@ -334,6 +320,34 @@ pub(crate) fn eval_touch_zones_map_node(
         } else {
             analog_by_zone.get(&(field, zone)).copied()
         };
+
+        // A swipe-direction card with a per-card `threshold` becomes a HOLD gated by
+        // how far the finger is pushed IN that direction: the curve-shaped directional
+        // deflection ≥ threshold ("swipe → directional analog, thresholded"; the
+        // adaptive/relative setting decides how off-centre the landing may be). With
+        // no threshold it keeps the original one-shot flick detection.
+        let swipe_threshold: Option<f32> =
+            card.get("threshold").and_then(|v| v.as_f64()).map(|v| v as f32);
+        let raw_held = match swipe_code {
+            Some(code) => match swipe_threshold {
+                Some(thr) => {
+                    let (ax, ay) = raw_defl.unwrap_or((0.0, 0.0));
+                    let dir = (match code { 1 => ay, 2 => -ay, 3 => -ax, _ => ax }).clamp(0.0, 1.0);
+                    shape.shaped(dir) >= thr
+                }
+                None => swipes.iter().any(|&(f, z, d)| f == field && z == zone && d == code),
+            },
+            None => match trigger {
+                "tz_click" => hit.is_some() && click(field),
+                _          => hit.is_some(), // tz_touch (default)
+            },
+        };
+
+        let press = PressParams::from_card(card);
+        let held = press.gate(raw_held, press_state_get(ns, i), dt);
+
+        // Relative analog deflection (curve-shaped magnitude) for analog outputs.
+        // Analog outputs ignore the press-mode gate — the contact itself drives them.
         let deflect = raw_defl.map(|(ax, ay)| {
             // Reshape the MAGNITUDE and rescale, so the curve changes how far
             // the zone pushes without rotating which way it points. Without a

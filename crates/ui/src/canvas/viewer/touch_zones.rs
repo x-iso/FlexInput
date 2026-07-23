@@ -2773,22 +2773,28 @@ pub(crate) fn render_touch_zone_cards(
                 );
                 if result.delete_clicked { remove = Some(i); }
                 rv.observe(slot, &result);
-                // Per-card response curve (analog outputs shape the zone's
-                // deflection). Thresholds don't apply to TZ triggers — the
-                // gate is touch presence, not a magnitude.
-                if card_analog {
+                // Response curve + threshold. Analog cards shape the zone's
+                // deflection (no threshold — the gate is touch presence). Swipe
+                // cards ALSO get the curve, WITH the activation threshold: it gates
+                // the swipe's directional magnitude into a hold (see the engine).
+                let is_swipe = in_pins.first().map(|t| t.starts_with("tz_swipe")).unwrap_or(false);
+                if card_analog || is_swipe {
                     mapping_card_curve_section(
                         ui, node_id, "zone_maps", i, &mut working,
-                        false, tz_live_mag, nav_uid,
+                        is_swipe, tz_live_mag, if card_analog { nav_uid } else { None },
                     );
-                    // Per-card relative/absolute (adaptive centre). Hidden in
-                    // Touchpad mode (deflection unused). In Synced mode only the
-                    // zone's TOP analog card shows it — it drives the rest. In
-                    // Per-card mode every analog card exposes its own.
-                    let show_adaptive = match tp_mode.as_str() {
-                        "touchpad" => false,
-                        "synced"   => is_top_analog,
-                        _          => true, // percard
+                    // Per-card relative/absolute (adaptive centre / off-centre
+                    // tolerance). Hidden in Touchpad mode. Analog cards follow the
+                    // mode (Synced → only the zone's top card shows it, driving the
+                    // rest); swipe cards always show their own.
+                    let show_adaptive = if is_swipe {
+                        tp_mode != "touchpad"
+                    } else {
+                        match tp_mode.as_str() {
+                            "touchpad" => false,
+                            "synced"   => is_top_analog,
+                            _          => true, // percard
+                        }
                     };
                     if show_adaptive {
                         let mut ap = working.get("adaptive").and_then(|v| v.as_f64())
