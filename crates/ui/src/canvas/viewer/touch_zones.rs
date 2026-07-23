@@ -608,27 +608,8 @@ pub(crate) fn tz_zone_adaptive(zone_maps: &[Value], field: usize, idx: usize) ->
         .map(|v| (v as f32).clamp(0.0, 1.0)).unwrap_or(0.30)
 }
 
-/// Store the adaptive-centre inner fraction on the first analog card of the zone.
-pub(crate) fn tz_set_zone_adaptive(snarl: &mut Snarl<NodeData>, node_id: NodeId,
-    field: usize, idx: usize, val: f32)
-{
-    let is_analog = tz_out_pin_is_analog;
-    let Some(node) = snarl.get_node_mut(node_id) else { return };
-    let Some(cards) = node.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) else { return };
-    for c in cards.iter_mut() {
-        let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        if f != field || z != idx { continue; }
-        let analog = c.get("out").and_then(|v| v.as_array())
-            .map(|a| a.iter().any(|p| p.as_str().map(is_analog).unwrap_or(false)))
-            .unwrap_or(false);
-        if !analog { continue; }
-        if let Some(obj) = c.as_object_mut() {
-            obj.insert("adaptive".to_string(), Value::from(val.clamp(0.0, 1.0) as f64));
-        }
-        return;
-    }
-}
+// (tz_set_zone_adaptive removed: the relative/absolute setting is now edited
+//  per-card directly on each analog card via the card's own `adaptive` key.)
 
 /// True when zone `(field, zone)` is marked "hold" (a gesture starting there
 /// stays bound to it even if the finger slides into a neighbouring zone).
@@ -2454,6 +2435,17 @@ pub(crate) fn render_touch_zone_cards(
             .map(|a| a.iter().any(|p| matches!(p.as_str(), Some("mouse") | Some("mouse_x") | Some("mouse_y"))))
             .unwrap_or(false)))
         .unwrap_or(false);
+    // Whether ANY card drives an analog output (stick/mouse/scroll) — gates the
+    // "Touchpad mode" dropdown (relative/absolute + touchpad apply to analog).
+    let has_analog_card = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
+        .map(|cards| cards.iter().any(|c| c.get("out").and_then(|o| o.as_array())
+            .map(|a| a.iter().any(|p| p.as_str().map(tz_out_pin_is_analog).unwrap_or(false)))
+            .unwrap_or(false)))
+        .unwrap_or(false);
+    // Current node "Touchpad mode" (synced / percard / touchpad; default synced).
+    let tp_mode: String = getp(snarl, "tp_mode").and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "synced".into());
 
     // ── Header ────────────────────────────────────────────────────────────
     // Row 1: which zone + capture STATUS (listening / registered trigger →
@@ -2530,6 +2522,7 @@ pub(crate) fn render_touch_zone_cards(
     // captured=[assign, gamepad, add, cancel].
     let mut act_rects: Vec<egui::Rect> = Vec::new();
     let mut mouse_rect: Option<egui::Rect> = None;
+    let mut mode_rect: Option<egui::Rect> = None;
     ui.allocate_ui_with_layout(
         egui::vec2(TZ_CARD_W, ui.spacing().interact_size.y.max(20.0)),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -2630,24 +2623,57 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
         }
-        // Node-global relative-mouse speed, right-aligned. Only when a card
-        // actually drives a mouse output.
-        if has_mouse_card {
+        // Node-global analog controls, right-aligned: the "Touchpad mode" dropdown
+        // (relative/absolute + touchpad, shown for any analog card) and the mouse-
+        // speed multiplier (only when a card drives the mouse). Both are gamepad
+        // targets; rects publish mode → mouse → hold, matching nav_tz_action_items.
+        if has_analog_card || has_mouse_card {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut spd = getp(snarl, "mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-                let dv = ui.add(egui::DragValue::new(&mut spd).speed(0.02).range(0.1..=10.0).prefix("🖱 "))
-                    .on_hover_text("Relative-mouse speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and nudge with LT/RT.");
-                // Gamepad-nav target — appended LAST in action order (matches
-                // `nav_tz_action_items` when has_mouse_card).
-                mouse_rect = Some(dv.rect);
-                if dv.changed() {
-                    if let Some(node) = snarl.get_node_mut(node_id) {
-                        node.params.insert("mouse_speed".into(), Value::from(spd as f64));
+                // Mouse-speed sits rightmost (added first in a right-to-left row).
+                if has_mouse_card {
+                    let mut spd = getp(snarl, "mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    let dv = ui.add(egui::DragValue::new(&mut spd).speed(0.02).range(0.1..=10.0).prefix("🖱 "))
+                        .on_hover_text("Relative-mouse speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and nudge with LT/RT.");
+                    mouse_rect = Some(dv.rect);
+                    if dv.changed() {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            node.params.insert("mouse_speed".into(), Value::from(spd as f64));
+                        }
+                    }
+                }
+                // "Touchpad mode": how analog deflection is derived. A ComboBox for
+                // mouse; gamepad cycles it in place with LT/RT (see nav). The
+                // relative/absolute VALUE lives per-card (below); this picks whether
+                // the top card drives all (Synced), each card is independent
+                // (Per-card), or the pointer tracks finger motion (Touchpad).
+                if has_analog_card {
+                    let label = match tp_mode.as_str() {
+                        "percard" => "⌖ Per-card",
+                        "touchpad" => "⌖ Touchpad",
+                        _ => "⌖ Synced",
+                    };
+                    let mut chosen: Option<&str> = None;
+                    let cb = egui::ComboBox::from_id_salt(("tz_tp_mode", node_id.0))
+                        .selected_text(egui::RichText::new(label).size(11.0))
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(tp_mode == "synced", "Synced (top card drives all)").clicked() { chosen = Some("synced"); }
+                            if ui.selectable_label(tp_mode == "percard", "Per-card (each independent)").clicked() { chosen = Some("percard"); }
+                            if ui.selectable_label(tp_mode == "touchpad", "Touchpad (finger motion)").clicked() { chosen = Some("touchpad"); }
+                        });
+                    let mode_resp = cb.response.on_hover_text("How a zone's analog deflection is derived. Synced: every card in a zone uses the top card's relative/absolute setting. Per-card: each card uses its own. Touchpad: the mouse pointer follows the finger's motion like a laptop touchpad (stick/scroll still use deflection). Gamepad: focus it and cycle with LT/RT.");
+                    mode_rect = Some(mode_resp.rect);
+                    if let Some(m) = chosen {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            node.params.insert("tp_mode".into(), Value::from(m));
+                        }
                     }
                 }
             });
         }
     });
+    // Order MUST match nav_tz_action_items: mode, mouse_speed, hold.
+    if let Some(r) = mode_rect { act_rects.push(r); }
     if let Some(r) = mouse_rect { act_rects.push(r); }
     if let Some(r) = hold_rect { act_rects.push(r); }
     // Publish the action-button rects (scope "zone_maps") so the gamepad-nav
@@ -2716,6 +2742,9 @@ pub(crate) fn render_touch_zone_cards(
         } else {
             None
         };
+        // The first analog card of the zone is the "top" card that drives the
+        // others in Synced mode (matches the engine's adaptive_for).
+        let is_top_analog = nav_uid.is_some();
         ui.allocate_ui_with_layout(
             egui::vec2(TZ_CARD_W, 1.0),
             egui::Layout::top_down(egui::Align::Min),
@@ -2735,6 +2764,27 @@ pub(crate) fn render_touch_zone_cards(
                         ui, node_id, "zone_maps", i, &mut working,
                         false, tz_live_mag, nav_uid,
                     );
+                    // Per-card relative/absolute (adaptive centre). Hidden in
+                    // Touchpad mode (deflection unused). In Synced mode only the
+                    // zone's TOP analog card shows it — it drives the rest. In
+                    // Per-card mode every analog card exposes its own.
+                    let show_adaptive = match tp_mode.as_str() {
+                        "touchpad" => false,
+                        "synced"   => is_top_analog,
+                        _          => true, // percard
+                    };
+                    if show_adaptive {
+                        let mut ap = working.get("adaptive").and_then(|v| v.as_f64())
+                            .unwrap_or(0.30) as f32 * 100.0;
+                        let label = if tp_mode == "synced" { "Rel. center (drives zone)" } else { "Rel. center" };
+                        if ui.add(egui::Slider::new(&mut ap, 0.0..=100.0)
+                                .text(label).suffix("%").fixed_decimals(0))
+                            .on_hover_text("How much of the zone acts as a relative centre for THIS card's analog deflection. 0% = the fixed zone centre (absolute); 100% = wherever your finger first lands becomes the centre (fully relative). In Synced mode the top card's value drives every card in the zone.")
+                            .changed()
+                        {
+                            working.insert("adaptive".into(), Value::from((ap / 100.0) as f64));
+                        }
+                    }
                 }
             },
         );
@@ -2758,25 +2808,11 @@ pub(crate) fn render_touch_zone_cards(
         }
     }
 
-    // The response curve now lives ON each analog card (expander strip in the
-    // loop above). Only the zone-level Relative-center slider stays here — the
-    // adaptive centre is a per-zone property, not per-card.
-    let zmaps_now = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
-        .unwrap_or_default();
-    if tz_zone_is_analog(&zmaps_now, sel_f, sel_z) {
-        ui.add_space(4.0);
-        // Adaptive-centre inner %: 0 = absolute deflection from the zone centre,
-        // 100 = wherever your finger lands becomes the centre (fully relative).
-        let mut pct = tz_zone_adaptive(&zmaps_now, sel_f, sel_z) * 100.0;
-        if ui.add(egui::Slider::new(&mut pct, 0.0..=100.0)
-            .text("Relative center").suffix("%").fixed_decimals(0))
-            .on_hover_text("How much of the zone acts as a relative centre for analog deflection. 0% = the fixed zone centre (absolute across the whole zone); 100% = wherever your finger first lands becomes the centre (fully relative). In between, only a touch landing within that inner fraction re-centres.")
-            .changed()
-        {
-            tz_set_zone_adaptive(snarl, node_id, sel_f, sel_z, pct / 100.0);
-        }
-    }
+    // The zone-level "Relative center" slider that used to sit here is gone: the
+    // relative/absolute setting is now PER-CARD (a control on each analog card in
+    // the loop above), governed by the node "Touchpad mode" dropdown in the action
+    // row (Synced = top card drives the zone; Per-card = each independent; Touchpad
+    // = finger-motion pointer).
 }
 
 /// UI-side trigger capture during Learn: track the primary finger (touch1) from

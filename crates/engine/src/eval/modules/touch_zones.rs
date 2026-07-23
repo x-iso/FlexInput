@@ -54,7 +54,7 @@ pub(crate) fn eval_touch_zones_map_node(
     // Resolve which zone each active finger occupies, per field, keeping local
     // coords — identical to the ports-mode arm in compute_node.
     let split = snap.params.get("field_mode").and_then(|v| v.as_str()) == Some("split");
-    const SLOTS_PER: usize = 9; // per-finger aux slots (see per-finger loop below)
+    const SLOTS_PER: usize = 11; // per-finger aux slots: 0-8 as below, 9-10 = previous-frame pos (touchpad mode)
     // Zones the user marked "hold": once a gesture STARTS in one, that finger
     // stays attributed to it for the whole touch even if it slides into a
     // neighbour — so the neighbour doesn't also fire ("hold zone" option). Only
@@ -168,10 +168,41 @@ pub(crate) fn eval_touch_zones_map_node(
             .find_map(|c| c.get("adaptive").and_then(|v| v.as_f64()))
             .map(|v| (v as f32).clamp(0.0, 1.0)).unwrap_or(0.30)
     };
+    // Node "Touchpad mode": how analog deflection is derived.
+    //   synced   → every card in a zone uses the zone's TOP analog card's adaptive
+    //              value (adaptive_for above) — the pre-existing behaviour.
+    //   percard  → each card uses its OWN `adaptive` value (centre recomputed from
+    //              the finger's landing point, per card, in the card loop below).
+    //   touchpad → the MOUSE output tracks the finger's frame-to-frame delta (a
+    //              laptop-touchpad feel); stick/scroll keep using deflection.
+    let tp_mode = snap.params.get("tp_mode").and_then(|v| v.as_str()).unwrap_or("synced");
+    let touchpad = tp_mode == "touchpad";
+    let percard = tp_mode == "percard";
+    let card_adaptive = |card: &Value| -> f32 {
+        card.get("adaptive").and_then(|v| v.as_f64())
+            .map(|v| (v as f32).clamp(0.0, 1.0)).unwrap_or(0.30)
+    };
+    // Adaptive centre from a landing point + zone rect (both-axes rule, matching the
+    // touchdown capture): landing inside the inner region → relative centre, else
+    // the zone's geometric centre. Used to recompute a per-card centre.
+    let centre_for = |landing: (f32, f32), zrect: [f32; 4], a: f32| -> (f32, f32) {
+        let [x0, y0, x1, y1] = zrect;
+        let (zcx, zcy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        let (hw, hh) = ((x1 - x0) * 0.5, (y1 - y0) * 0.5);
+        if (landing.0 - zcx).abs() <= a * hw && (landing.1 - zcy).abs() <= a * hh {
+            landing
+        } else {
+            (zcx, zcy)
+        }
+    };
     let slots_per = SLOTS_PER;
     while ns.aux_f32.len() < 2 * slots_per { ns.aux_f32.push(0.0); }
     let mut swipes: Vec<(usize, usize, u8)> = Vec::new(); // (field, zone, dir 1=U 2=D 3=L 4=R)
     let mut analog_by_zone: HashMap<(usize, usize), (f32, f32)> = HashMap::new(); // deflection, +Y up
+    // Raw finger data per zone for percard deflection: (landing_x, landing_y, cur_x, cur_y).
+    let mut zone_finger: HashMap<(usize, usize), (f32, f32, f32, f32)> = HashMap::new();
+    // Per-zone frame delta for touchpad mode: (dx, dy), +Y up.
+    let mut touchpad_by_zone: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
     for finger in 0..2 {
         let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
                             ("touch2_x", "touch2_y", "touch2_active")][finger];
@@ -203,6 +234,10 @@ pub(crate) fn eval_touch_zones_map_node(
                 ns.aux_f32[base + 6] = 0.0;
                 ns.aux_f32[base + 7] = cx;
                 ns.aux_f32[base + 8] = cy;
+                // Seed the touchpad prev-frame position to the landing so the first
+                // frame's delta is 0 (no pointer jump on touchdown).
+                ns.aux_f32[base + 9] = ux;
+                ns.aux_f32[base + 10] = uy;
             } else if ns.aux_f32[base + 5] < 0.5 {
                 let dx = ux - ns.aux_f32[base + 1];
                 let dy = uy - ns.aux_f32[base + 2];
@@ -227,6 +262,14 @@ pub(crate) fn eval_touch_zones_map_node(
             let ax = ((ux - cx) / hw).clamp(-1.0, 1.0);
             let ay = (-(uy - cy) / hh).clamp(-1.0, 1.0); // +Y up
             analog_by_zone.insert((field, sz), (ax, ay));
+            // Raw landing + current for percard deflection (centre recomputed per
+            // card in the card loop). Landing lives in base+1/2 (set at touchdown).
+            zone_finger.insert((field, sz), (ns.aux_f32[base + 1], ns.aux_f32[base + 2], ux, uy));
+            // Touchpad frame delta (+Y up): current − previous frame. Update prev.
+            let (dpx, dpy) = (ux - ns.aux_f32[base + 9], uy - ns.aux_f32[base + 10]);
+            touchpad_by_zone.insert((field, sz), (dpx, -dpy));
+            ns.aux_f32[base + 9] = ux;
+            ns.aux_f32[base + 10] = uy;
         } else {
             ns.aux_f32[base] = 0.0;
         }
@@ -266,7 +309,22 @@ pub(crate) fn eval_touch_zones_map_node(
         // 0..1 deflection MAGNITUDE) reshapes the response while keeping direction
         // — the touch-zone analog can't have a Response Curve module wired onto it.
         let shape = MappingShape::from_card(card);
-        let deflect = analog_by_zone.get(&(field, zone)).copied().map(|(ax, ay)| {
+        // Raw deflection for this card's zone. percard recomputes the centre from
+        // THIS card's own adaptive value; synced reuses the shared per-zone value
+        // (the zone's top analog card). Present only while a finger is down in it.
+        let raw_defl = if percard {
+            zone_finger.get(&(field, zone)).map(|&(lx, ly, cxr, cyr)| {
+                let zrect = trees[field].zone_rect(zone as u32).unwrap_or([0.0, 0.0, 1.0, 1.0]);
+                let (cex, cey) = centre_for((lx, ly), zrect, card_adaptive(card));
+                let [x0, y0, x1, y1] = zrect;
+                let hw = ((x1 - x0) * 0.5).max(1e-3);
+                let hh = ((y1 - y0) * 0.5).max(1e-3);
+                (((cxr - cex) / hw).clamp(-1.0, 1.0), (-(cyr - cey) / hh).clamp(-1.0, 1.0))
+            })
+        } else {
+            analog_by_zone.get(&(field, zone)).copied()
+        };
+        let deflect = raw_defl.map(|(ax, ay)| {
             // Reshape the MAGNITUDE and rescale, so the curve changes how far
             // the zone pushes without rotating which way it points. Without a
             // curve `shaped` is the identity, so the scale falls out to 1.
@@ -287,10 +345,21 @@ pub(crate) fn eval_touch_zones_map_node(
                         sticks.insert(if p == "left_stick" { "left_stick" } else { "right_stick" }, (ax, ay));
                     }
                 }
-                // Relative mouse: deflection → velocity, +Y up (the sink flips to
-                // screen). "mouse" drives both axes.
+                // Relative mouse. Two derivations:
+                //  • touchpad mode → the pointer follows the finger's frame delta
+                //    (laptop-touchpad feel), scaled by TZ_TOUCHPAD_BASE × mouse_speed.
+                //  • otherwise → deflection → velocity, +Y up (the sink flips to
+                //    screen). "mouse" drives both axes.
                 "mouse" | "mouse_x" | "mouse_y" => {
-                    if let Some((ax, ay)) = deflect {
+                    if touchpad {
+                        if let Some(&(dx, dy)) = touchpad_by_zone.get(&(field, zone)) {
+                            const TZ_TOUCHPAD_BASE: f32 = 12.0;
+                            let g = mouse_speed * TZ_TOUCHPAD_BASE;
+                            if p == "mouse" || p == "mouse_x" { mouse_dx += dx * g; }
+                            if p == "mouse" || p == "mouse_y" { mouse_dy += dy * g; }
+                            mouse_active = true;
+                        }
+                    } else if let Some((ax, ay)) = deflect {
                         if p == "mouse" || p == "mouse_x" { mouse_dx += ax * mouse_gain; }
                         if p == "mouse" || p == "mouse_y" { mouse_dy += ay * mouse_gain; }
                         mouse_active = true;
