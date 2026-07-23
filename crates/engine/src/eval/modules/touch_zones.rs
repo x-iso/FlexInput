@@ -54,7 +54,7 @@ pub(crate) fn eval_touch_zones_map_node(
     // Resolve which zone each active finger occupies, per field, keeping local
     // coords — identical to the ports-mode arm in compute_node.
     let split = snap.params.get("field_mode").and_then(|v| v.as_str()) == Some("split");
-    const SLOTS_PER: usize = 11; // per-finger aux slots: 0-8 as below, 9-10 = previous-frame pos (touchpad mode)
+    const SLOTS_PER: usize = 13; // per-finger aux: 0-8 as below, 9-10 = prev-frame pos (touchpad), 11-12 = trackball stick accumulator
     // Zones the user marked "hold": once a gesture STARTS in one, that finger
     // stays attributed to it for the whole touch even if it slides into a
     // neighbour — so the neighbour doesn't also fire ("hold zone" option). Only
@@ -228,6 +228,11 @@ pub(crate) fn eval_touch_zones_map_node(
     let mut zone_finger: HashMap<(usize, usize), (f32, f32, f32, f32)> = HashMap::new();
     // Per-zone frame delta for touchpad mode: (dx, dy), +Y up.
     let mut touchpad_by_zone: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
+    // Per-zone touchpad-mode STICK trackball (leaky integrator, +Y up, ±1): finger
+    // delta accumulated with per-tick decay, so a stick follows finger MOTION and
+    // self-centres when the finger stops — robust to touch-sensor aliasing (the raw
+    // delta/dt is spiky: 0 on most 500 Hz ticks, a jump on the rare sensor update).
+    let mut stick_by_zone: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
     for finger in 0..2 {
         let (px, py, pa) = [("touch1_x", "touch1_y", "touch1_active"),
                             ("touch2_x", "touch2_y", "touch2_active")][finger];
@@ -263,6 +268,9 @@ pub(crate) fn eval_touch_zones_map_node(
                 // frame's delta is 0 (no pointer jump on touchdown).
                 ns.aux_f32[base + 9] = ux;
                 ns.aux_f32[base + 10] = uy;
+                // Fresh touch → stick trackball starts centred.
+                ns.aux_f32[base + 11] = 0.0;
+                ns.aux_f32[base + 12] = 0.0;
             } else if ns.aux_f32[base + 5] < 0.5 {
                 let dx = ux - ns.aux_f32[base + 1];
                 let dy = uy - ns.aux_f32[base + 2];
@@ -295,8 +303,22 @@ pub(crate) fn eval_touch_zones_map_node(
             touchpad_by_zone.insert((field, sz), (dpx, -dpy));
             ns.aux_f32[base + 9] = ux;
             ns.aux_f32[base + 10] = uy;
+            // Stick trackball: leaky integrator of the finger delta (+Y up). Decays
+            // toward centre each tick, so it self-centres when the finger stops and
+            // its steady value ≈ finger speed (deltas sum, immune to sensor aliasing).
+            // The accumulator is bounded so the return-to-centre lag stays tiny.
+            const STICK_DECAY: f32 = 0.82;
+            const STICK_ACC_GAIN: f32 = 3.2;
+            ns.aux_f32[base + 11] =
+                (ns.aux_f32[base + 11] * STICK_DECAY + dpx * STICK_ACC_GAIN).clamp(-1.5, 1.5);
+            ns.aux_f32[base + 12] =
+                (ns.aux_f32[base + 12] * STICK_DECAY + (-dpy) * STICK_ACC_GAIN).clamp(-1.5, 1.5);
+            stick_by_zone.insert((field, sz),
+                (ns.aux_f32[base + 11].clamp(-1.0, 1.0), ns.aux_f32[base + 12].clamp(-1.0, 1.0)));
         } else {
             ns.aux_f32[base] = 0.0;
+            ns.aux_f32[base + 11] = 0.0;
+            ns.aux_f32[base + 12] = 0.0;
         }
         if ns.aux_f32[base + 6] > 0.0 {
             swipes.push((ns.aux_f32[base + 3] as usize,
@@ -368,15 +390,12 @@ pub(crate) fn eval_touch_zones_map_node(
         let press = PressParams::from_card(card);
         let held = press.gate(raw_held, press_state_get(ns, i), dt);
 
-        // Touchpad-mode analog for STICK targets: the finger's VELOCITY (speed &
-        // direction) → deflection, clamped ±1, so a stick follows finger MOTION and
-        // recentres when the finger stops (a trackball feel) instead of holding a
-        // position deflection. Frame-rate independent (delta/dt). mouse_speed tunes.
+        // Touchpad-mode STICK deflection = the leaky-integrator trackball (finger
+        // motion → deflection, self-centres when the finger stops), scaled by the
+        // per-zone mouse_speed. Present only while a finger drives the zone.
         let tp_stick = if touchpad {
-            touchpad_by_zone.get(&(field, zone)).map(|&(dx, dy)| {
-                const TP_STICK_GAIN: f32 = 0.25;
-                let s = mouse_speed * TP_STICK_GAIN / dt.max(1e-4);
-                ((dx * s).clamp(-1.0, 1.0), (dy * s).clamp(-1.0, 1.0))
+            stick_by_zone.get(&(field, zone)).map(|&(x, y)| {
+                ((x * mouse_speed).clamp(-1.0, 1.0), (y * mouse_speed).clamp(-1.0, 1.0))
             })
         } else {
             None
