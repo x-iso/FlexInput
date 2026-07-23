@@ -2835,11 +2835,27 @@ pub(crate) fn render_touch_zone_cards(
                         let mut ap = working.get("adaptive").and_then(|v| v.as_f64())
                             .unwrap_or(0.30) as f32 * 100.0;
                         let label = if tp_mode == "synced" { "Rel. center (drives zone)" } else { "Rel. center" };
-                        if ui.add(egui::Slider::new(&mut ap, 0.0..=100.0)
+                        // Gamepad focus: this is card field 7 (see nav_drive_remap_card).
+                        // Ring + scroll-to it when the entered card focuses that field.
+                        let pass = ui.ctx().cumulative_pass_nr();
+                        let adaptive_focused = ui.ctx()
+                            .data(|d| d.get_temp::<(u64, usize, bool)>(
+                                egui::Id::new(("gp_nav_remap_card", node_id.0, "zone_maps"))))
+                            .filter(|(p, sel, ent)| *ent && *sel == i && pass.saturating_sub(*p) <= 1)
+                            .and_then(|_| ui.ctx().data(|d| d.get_temp::<(u64, u64)>(
+                                egui::Id::new(("gp_nav_remap_card_field", node_id.0, "zone_maps")))))
+                            .map(|(p, f)| f == 7 && pass.saturating_sub(p) <= 1)
+                            .unwrap_or(false);
+                        let sl = ui.add(egui::Slider::new(&mut ap, 0.0..=100.0)
                                 .text(label).suffix("%").fixed_decimals(0))
-                            .on_hover_text("How much of the zone acts as a relative centre for THIS card's analog deflection. 0% = the fixed zone centre (absolute); 100% = wherever your finger first lands becomes the centre (fully relative). In Synced mode the top card's value drives every card in the zone.")
-                            .changed()
-                        {
+                            .on_hover_text("How much of the zone acts as a relative centre for THIS card's analog deflection. 0% = the fixed zone centre (absolute); 100% = wherever your finger first lands becomes the centre (fully relative). In Synced mode the top card's value drives every card in the zone. Gamepad: enter the card and cycle to this field, then change with up/down.");
+                        if adaptive_focused {
+                            let accent = ui.visuals().selection.stroke.color;
+                            ui.painter().rect_stroke(sl.rect.expand(2.0), 3.0,
+                                egui::Stroke::new(1.5, accent), egui::StrokeKind::Outside);
+                            sl.scroll_to_me(None);
+                        }
+                        if sl.changed() {
                             working.insert("adaptive".into(), Value::from((ap / 100.0) as f64));
                         }
                     }

@@ -9,8 +9,9 @@ impl FlexInputApp {
     /// Whether the entered card carries a per-card response curve section, and if
     /// so whether it also offers an activation THRESHOLD (`Some(show_threshold)`).
     /// Mirrors the body's gating: Remapper cards with any analog in pin, and Lean
-    /// cards (always). Map Action ("mappings" on a non-Remapper node) and Touch
-    /// Zones (own curve nav flow) return `None`.
+    /// cards (always); Touch Zones cards get a curve when analog (no threshold) or
+    /// a swipe direction (with threshold), matching the body's `card_analog ||
+    /// is_swipe`. Map Action ("mappings" on a non-Remapper node) returns `None`.
     pub(crate) fn nav_card_curve_shape(&self, outer_id: egui_snarl::NodeId, idx: usize) -> Option<bool> {
         let scope = self.nav_remap_mappings_key(outer_id);
         let inner = self.nav_selected_inner_node(outer_id)?;
@@ -28,7 +29,21 @@ impl FlexInputApp {
                     .unwrap_or(false);
                 if analog { Some(true) } else { None }
             }
-            _ => None, // zone_maps → handled by the Touch Zones curve flow
+            "zone_maps" => {
+                if node.module_id != "module.touch_zones" { return None; }
+                let card = node.params.get("zone_maps").and_then(|v| v.as_array())
+                    .and_then(|a| a.get(idx))?;
+                let is_swipe = card.get("in").and_then(|v| v.as_array())
+                    .and_then(|a| a.first()).and_then(|v| v.as_str())
+                    .map(|t| t.starts_with("tz_swipe")).unwrap_or(false);
+                let analog = card.get("out").and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str())
+                        .any(crate::canvas::viewer::tz_out_pin_is_analog))
+                    .unwrap_or(false);
+                // Swipe → curve WITH threshold; analog → curve only; else no curve.
+                if is_swipe { Some(true) } else if analog { Some(false) } else { None }
+            }
+            _ => None,
         }
     }
 
@@ -74,7 +89,7 @@ impl FlexInputApp {
         -> Option<(egui_snarl::NodeId, Vec<[f32; 2]>)>
     {
         let scope = self.nav_remap_mappings_key(outer_id);
-        if !matches!(scope, "mappings" | "lean_left" | "lean_right") { return None; }
+        if !matches!(scope, "mappings" | "lean_left" | "lean_right" | "zone_maps") { return None; }
         let inner = self.nav_selected_inner_node(outer_id)?;
         let idx = self.gamepad_nav.remap_card;
         let canvas = &self.tabs[self.active_tab].canvas;

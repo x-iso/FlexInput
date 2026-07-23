@@ -1022,15 +1022,13 @@ impl FlexInputApp {
         let applies = [true, gap_applies, hold_applies, turbo_applies];
 
         // Response-curve section fields extend past the header for analog cards
-        // (Touch Zones keep their own per-zone curve nav flow, so skip them here):
-        // 4 = show/hide graph, 5 = enter dot editing (only when shown), 6 =
-        // threshold toggle (only when shown + applicable).
+        // (and, for Touch Zones, swipe-direction cards): 4 = show/hide graph, 5 =
+        // enter dot editing (only when shown), 6 = threshold toggle (only when
+        // shown + applicable). Touch Zones cards reach their curve/threshold the
+        // SAME way as the Remapper — this shared driver, not a separate flow.
         let scope = self.nav_remap_mappings_key(outer_id);
-        let curve_shape = if matches!(ret, EditLevel::TzCards) {
-            None
-        } else {
-            self.nav_card_curve_shape(outer_id, idx)
-        };
+        let is_tz = matches!(ret, EditLevel::TzCards);
+        let curve_shape = self.nav_card_curve_shape(outer_id, idx);
         let curve_open = curve_shape.is_some()
             && self.nav_card_curve_open(ctx, inner, scope, idx);
         // Ordered list of reachable field ids for this card.
@@ -1041,6 +1039,12 @@ impl FlexInputApp {
                 nav_fields.push(5);
                 if show_threshold { nav_fields.push(6); }
             }
+        }
+        // Field 7 (Touch Zones only): the per-card "Rel. center" (adaptive) slider,
+        // shown for the same cards the body reveals it on — so it's finally gamepad-
+        // reachable, changed with up/down like any other field.
+        if is_tz && self.nav_tz_card_shows_adaptive(outer_id, inner, idx) {
+            nav_fields.push(7);
         }
 
         // Left/right move within the reachable field list (wrapping).
@@ -1171,6 +1175,20 @@ impl FlexInputApp {
                     if delta != 0.0 {
                         self.nav_nudge_card_threshold(outer_id, idx, delta);
                     }
+                }
+            }
+            7 => {
+                // Touch Zones "Rel. center" (adaptive): up/down + stick-Y nudge 0..1.
+                let mut delta = 0.0f32;
+                if mag > 0.5 {
+                    let accel = self.settings.cursor_accel.max(1.0);
+                    let c = nav.lstick.y;
+                    delta += c.signum() * c.abs().powf(accel) * 0.6 * dt;
+                } else if edit_press != 0 {
+                    delta += edit_press as f32 * 0.05;
+                }
+                if delta != 0.0 {
+                    self.nav_tz_nudge_adaptive(outer_id, idx, delta);
                 }
             }
             _ => {}

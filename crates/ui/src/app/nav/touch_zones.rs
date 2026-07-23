@@ -319,16 +319,90 @@ impl FlexInputApp {
             .unwrap_or(false)
     }
 
-    /// Nudge the node-global `mouse_speed` param, clamped to the UI range.
+    /// Nudge the SELECTED zone's `mouse_speed` (per-zone, stored on the zone's cards
+    /// like the body's DragValue), clamped to the UI range.
     pub(crate) fn nav_tz_nudge_mouse_speed(&mut self, outer: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, delta: f32)
     {
         let Some(sp) = self.tabs[self.active_tab].canvas.snarl.get_node_mut(outer)
             .and_then(|n| n.subpatch.as_mut()) else { return; };
         let Some(n) = sp.snarl.get_node_mut(inner) else { return; };
-        let cur = n.params.get("mouse_speed").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let sel_f = n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let sel_z = n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let in_zone = |c: &serde_json::Value| -> bool {
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize == sel_f
+                && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize == sel_z
+        };
+        let cur = n.params.get("zone_maps").and_then(|v| v.as_array())
+            .and_then(|cards| cards.iter().filter(|c| in_zone(c))
+                .find_map(|c| c.get("mouse_speed").and_then(|v| v.as_f64())))
+            .or_else(|| n.params.get("mouse_speed").and_then(|v| v.as_f64()))
+            .unwrap_or(1.0) as f32;
         let next = (cur + delta).clamp(0.1, 10.0);
-        n.params.insert("mouse_speed".into(), serde_json::Value::from(next as f64));
+        if let Some(cards) = n.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) {
+            for c in cards.iter_mut() {
+                if in_zone(c) {
+                    if let Some(o) = c.as_object_mut() {
+                        o.insert("mouse_speed".into(), serde_json::Value::from(next as f64));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nudge the entered card's per-card `adaptive` (Rel. center) value 0..1 — the
+    /// gamepad path for the "Rel. center" slider (RemapCard field 7).
+    pub(crate) fn nav_tz_nudge_adaptive(&mut self, outer: egui_snarl::NodeId, idx: usize, delta: f32) {
+        self.nav_remap_card_obj_mut(outer, idx, |m| {
+            let cur = m.get("adaptive").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
+            let next = (cur + delta).clamp(0.0, 1.0);
+            m.insert("adaptive".to_string(), serde_json::json!(next as f64));
+            true
+        });
+    }
+
+    /// Whether the card at absolute `zone_maps` index `idx` shows its own "Rel.
+    /// center" (adaptive) slider — mirrors the body's `show_adaptive` gating so the
+    /// gamepad field list matches what's on screen. Swipe cards show it unless the
+    /// zone is in Touchpad mode; analog cards show it per mode (synced → only the
+    /// zone's TOP analog card; percard → all; touchpad → none).
+    pub(crate) fn nav_tz_card_shows_adaptive(&self, outer: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, idx: usize) -> bool
+    {
+        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let Some(node) = node else { return false; };
+        let cards = node.params.get("zone_maps").and_then(|v| v.as_array());
+        let Some(cards) = cards else { return false; };
+        let Some(card) = cards.get(idx) else { return false; };
+        let f = card.get("f").and_then(|v| v.as_u64()).unwrap_or(0);
+        let z = card.get("z").and_then(|v| v.as_u64()).unwrap_or(0);
+        let is_swipe = card.get("in").and_then(|v| v.as_array())
+            .and_then(|a| a.first()).and_then(|v| v.as_str())
+            .map(|t| t.starts_with("tz_swipe")).unwrap_or(false);
+        let analog = card.get("out").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str())
+                .any(crate::canvas::viewer::tz_out_pin_is_analog)).unwrap_or(false);
+        if !is_swipe && !analog { return false; }
+        let in_zone = |c: &&serde_json::Value| -> bool {
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == f
+                && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == z
+        };
+        let tp_mode = cards.iter().filter(in_zone)
+            .find_map(|c| c.get("tp_mode").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_else(|| "synced".into());
+        if is_swipe { return tp_mode != "touchpad"; }
+        // The zone's top analog card is the first in-zone card driving an analog out.
+        let top_analog_idx = cards.iter().enumerate().find(|(_, c)| in_zone(c)
+            && c.get("out").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str())
+                    .any(crate::canvas::viewer::tz_out_pin_is_analog)).unwrap_or(false))
+            .map(|(i, _)| i);
+        match tp_mode.as_str() {
+            "touchpad" => false,
+            "synced"   => top_analog_idx == Some(idx),
+            _          => true, // percard
+        }
     }
 
     /// Cycle the SELECTED ZONE's "Touchpad mode" (synced → percard → touchpad → …)
@@ -375,18 +449,6 @@ impl FlexInputApp {
                     .map(crate::canvas::viewer::tz_out_pin_is_analog).unwrap_or(false)))
                 .unwrap_or(false)))
             .unwrap_or(false)
-    }
-
-    /// Whether the SELECTED zone has an editable response curve (i.e. it drives an
-    /// analog output) — gates the curve pseudo-row in the TzCards nav.
-    pub(crate) fn nav_tz_zone_has_curve(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
-        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
-            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
-        let Some(node) = node else { return false; };
-        let field = node.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let zone = node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let zm = node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        crate::canvas::viewer::tz_zone_is_analog(&zm, field, zone)
     }
 
     /// Full-array indices into the node's `zone_maps` that belong to the SELECTED
@@ -505,11 +567,11 @@ impl FlexInputApp {
         let n_actions = actions.len();
         let card_idxs = self.nav_tz_zone_card_indices(outer_id, inner);
         let count = card_idxs.len();
-        // A trailing "curve" pseudo-row when the selected zone drives an analog
-        // output (the response-curve editor shown below the cards). South enters
-        // the shared curve dot-editor (CurveDots).
-        let has_curve = self.nav_tz_zone_has_curve(outer_id, inner);
-        let total = n_actions + count + if has_curve { 1 } else { 0 };
+        // The response curve, threshold and Rel.-center are reached by ENTERING a
+        // card (South) and cycling its fields — exactly like the Remapper — so there
+        // is no separate curve row here.
+        let total = n_actions + count;
+        let _ = (rt_rising, lt_rising); // no LT/RT actions at this level anymore
         if total == 0 {
             self.nav_tz_publish_selection(ctx, outer_id, inner, &phase);
             ctx.request_repaint();
@@ -519,34 +581,37 @@ impl FlexInputApp {
 
         let cur = self.gamepad_nav.card_index;
         let on_actions = cur < n_actions;
+        // Mode / mouse-speed are VALUE items in the action row: focus them with
+        // left/right like the buttons, then change with up/down (dpad or left
+        // stick) — the same select-then-U/D pattern as the entered-card fields.
+        let cur_is_value = on_actions && matches!(actions[cur], "tp_mode" | "mouse_speed");
+        if cur_is_value {
+            let d = match step_dir { Some(NavDir::Up) => 1i32, Some(NavDir::Down) => -1, _ => 0 };
+            if d != 0 {
+                match actions[cur] {
+                    "tp_mode" => self.nav_tz_cycle_mode(outer_id, inner, d),
+                    "mouse_speed" => self.nav_tz_nudge_mouse_speed(outer_id, inner, d as f32 * 0.1),
+                    _ => {}
+                }
+            }
+        }
         let new_cur = match step_dir {
             Some(NavDir::Left) if on_actions => cur.saturating_sub(1),
             Some(NavDir::Right) if on_actions => (cur + 1).min(n_actions.saturating_sub(1)),
-            Some(NavDir::Down) => {
-                if on_actions { n_actions.min(total - 1) } else { (cur + 1).min(total - 1) }
-            }
-            Some(NavDir::Up) => {
-                if on_actions { cur }
-                else if cur == n_actions { 0 }
-                else { cur - 1 }
-            }
+            // Down leaves the action row for the cards — but on a value item it
+            // edits the value instead of transitioning (stay put).
+            Some(NavDir::Down) if on_actions => if cur_is_value { cur } else { n_actions.min(total - 1) },
+            Some(NavDir::Up) if on_actions => cur,
+            Some(NavDir::Down) => (cur + 1).min(total - 1),
+            Some(NavDir::Up) => if cur == n_actions { 0 } else { cur - 1 },
             _ => cur,
         };
         self.gamepad_nav.card_index = new_cur;
         let sel = new_cur;
 
         if sel < n_actions {
-            // The mouse-speed item is a VALUE, not a button: LT/RT nudge it in
-            // place (no enter). Everything else activates on South.
-            if actions[sel] == "mouse_speed" {
-                let d = if rt_rising { 0.1 } else if lt_rising { -0.1 } else { 0.0 };
-                if d != 0.0 { self.nav_tz_nudge_mouse_speed(outer_id, inner, d); }
-            }
-            if actions[sel] == "tp_mode" {
-                let dir = if rt_rising { 1 } else if lt_rising { -1 } else { 0 };
-                if dir != 0 { self.nav_tz_cycle_mode(outer_id, inner, dir); }
-            }
-            // An action button is focused → South activates it.
+            // An action button is focused → South activates it (value items are
+            // changed with up/down above, so South does nothing on them).
             if nav.is_rising("btn_south") {
                 match actions[sel] {
                     "learn" => {
@@ -583,11 +648,10 @@ impl FlexInputApp {
                         }
                     }
                     "hold" => self.nav_tz_toggle_hold(outer_id, inner),
-                    // "mouse_speed" is nudged with LT/RT above — South does nothing.
                     _ => {}
                 }
             }
-        } else if sel < n_actions + count {
+        } else {
             // A card is focused → West deletes, South ENTERS it for field editing
             // (shared RemapCard driver, returning to TzCards on exit).
             let card_idx = card_idxs[sel - n_actions];
@@ -601,20 +665,6 @@ impl FlexInputApp {
                 self.gamepad_nav.card_return_level = EditLevel::TzCards;
                 self.gamepad_nav.remap_card = card_idx;
                 self.gamepad_nav.card_field = 0;
-                self.gamepad_nav.edit_baseline = Some(Box::new(
-                    self.tabs[self.active_tab].canvas.snapshot_for_undo()));
-            }
-        } else {
-            // The curve pseudo-row is focused → publish a focus flag so the graph
-            // rings itself; South ENTERS the shared curve dot-editor (returns to
-            // TzCards on exit).
-            let pass = ctx.cumulative_pass_nr();
-            ctx.data_mut(|d| d.insert_temp(
-                egui::Id::new(("gp_nav_tz_curve_focus", inner.0)), pass));
-            if nav.is_rising("btn_south") {
-                self.gamepad_nav.edit_level = EditLevel::CurveDots;
-                self.gamepad_nav.curve_return_level = EditLevel::TzCards;
-                self.gamepad_nav.curve_dot = 0;
                 self.gamepad_nav.edit_baseline = Some(Box::new(
                     self.tabs[self.active_tab].canvas.snapshot_for_undo()));
             }
