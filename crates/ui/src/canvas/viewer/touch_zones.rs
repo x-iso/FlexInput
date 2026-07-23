@@ -2677,7 +2677,12 @@ pub(crate) fn render_touch_zone_cards(
         if has_analog_card || has_mouse_card {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Mouse-speed sits rightmost (added first in a right-to-left row).
-                if has_mouse_card {
+                // Shown for a mouse card, OR for a touchpad-mode stick zone — there the
+                // multiplier scales the trackball deflection, so RS/LS can be amplified
+                // too (the user's "mouse scale doesn't apply to RS" report). In non-
+                // touchpad stick modes it wouldn't affect the stick, so it stays hidden.
+                let show_speed = has_mouse_card || (has_analog_card && tp_mode == "touchpad");
+                if show_speed {
                     // Per-zone speed (stored on the selected zone's cards like
                     // tp_mode/adaptive), migrating from the old node-global value.
                     let mut spd = snarl.get_node(node_id)
@@ -2689,7 +2694,7 @@ pub(crate) fn render_touch_zone_cards(
                         .or_else(|| getp(snarl, "mouse_speed").and_then(|v| v.as_f64()))
                         .unwrap_or(1.0) as f32;
                     let dv = ui.add(egui::DragValue::new(&mut spd).speed(0.02).range(0.1..=10.0).prefix("🖱 "))
-                        .on_hover_text("This zone's relative-mouse speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection, or roughly a 1:1 touchpad sweep). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and change with the d-pad / left stick.");
+                        .on_hover_text("This zone's speed multiplier (1.0 ≈ a firm gyro/right-stick flick at full zone deflection, or roughly a 1:1 touchpad sweep). Scales the relative-mouse velocity, and in Touchpad mode also the stick deflection (so RS/LS can be amplified). The sink's own mouse sensitivity still applies on top. Gamepad: focus it and change with the d-pad / left stick.");
                     mouse_rect = Some(dv.rect);
                     if dv.changed() {
                         if let Some(node) = snarl.get_node_mut(node_id) {

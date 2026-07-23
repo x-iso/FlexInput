@@ -890,11 +890,12 @@ mod trigger_tests {
         assert!(getf(&c, "scroll_x") > 0.0, "rightward deflection → scroll right (scroll_x > 0)");
     }
 
-    // Touchpad mode routes a "mouse" card to the DISPLACEMENT pins (mouse_move*),
-    // NOT the velocity pin: nonzero while the finger moves, zero when it holds
-    // still, and never the plain "mouse" pin (which would fly the cursor off).
+    // Touchpad mode routes a "mouse" card to the VELOCITY pin ("mouse") via the
+    // leaky-integrator trackball — a SUSTAINED signal (not a per-tick displacement,
+    // which the last-tick-wins sink publish would discard). Positive while the finger
+    // slides right, and it decays back toward zero once the finger holds still.
     #[test]
-    fn touch_zones_touchpad_mode_emits_displacement() {
+    fn touch_zones_touchpad_mode_emits_velocity() {
         let mut n = empty_node(1, "module.touch_zones");
         n.params.insert("zone_mode".into(), Value::String("mapping".into()));
         n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
@@ -914,20 +915,21 @@ mod trigger_tests {
             c.get(&("touchmap:1".to_string(), pin.to_string())) {
                 Some(Signal::Vec2(v)) => Some((v.x, v.y)), _ => None };
         let mut state = HashMap::new();
-        // Touchdown (delta seeds 0), then slide right, then hold still.
+        // Touchdown (delta seeds 0), then slide right → positive x velocity.
         let mut c = HashMap::new();
         eval_touch_zones_map_node(&n, 1, &finger(0.0), &mut c, &mut state, 0.016);
         c.clear();
         eval_touch_zones_map_node(&n, 1, &finger(0.2), &mut c, &mut state, 0.016);
-        let (mx, _) = getv(&c, "mouse_move").expect("touchpad → mouse_move published");
-        assert!(mx > 1.0, "moving right → positive x displacement (got {mx})");
-        assert!(!c.contains_key(&("touchmap:1".to_string(), "mouse".to_string())),
-            "touchpad mode must NOT publish the velocity 'mouse' pin");
-        // Hold still → displacement collapses to ~0 (cursor stops dead).
-        c.clear();
-        eval_touch_zones_map_node(&n, 1, &finger(0.2), &mut c, &mut state, 0.016);
-        let (sx, sy) = getv(&c, "mouse_move").unwrap_or((0.0, 0.0));
-        assert!(sx.abs() < 1e-3 && sy.abs() < 1e-3, "still finger → no move (got {sx},{sy})");
+        let (mx, _) = getv(&c, "mouse").expect("touchpad → 'mouse' velocity published");
+        assert!(mx > 0.1, "moving right → positive x velocity (got {mx})");
+        // Hold still for several ticks → the trackball decays back toward ~0 (cursor
+        // coasts to a stop rather than latching a constant velocity).
+        for _ in 0..40 {
+            c.clear();
+            eval_touch_zones_map_node(&n, 1, &finger(0.2), &mut c, &mut state, 0.016);
+        }
+        let (sx, sy) = getv(&c, "mouse").unwrap_or((0.0, 0.0));
+        assert!(sx.abs() < 1e-2 && sy.abs() < 1e-2, "still finger → velocity decays to ~0 (got {sx},{sy})");
     }
 
     // A zone can carry BOTH an analog (tz_touch) card and a click (tz_click) card;
@@ -1328,10 +1330,11 @@ mod trigger_tests {
         assert!(lmb, "touch→mouse_left must reach the keymouse sink");
     }
 
-    // End-to-end: touchpad-mode mouse must reach the sink on mouse_move, and a
-    // touchpad-mode stick on right_stick, as the finger slides across two ticks.
-    // (The real app's sink pin_ids must include mouse_move — graph.rs appends the
-    // device's current sink pins so an old node's frozen list can't drop it.)
+    // End-to-end: touchpad-mode mouse must reach the sink as a SUSTAINED velocity on
+    // the "mouse" pin (NOT a per-tick mouse_move displacement — the engine publishes
+    // only the last sub-tick's sink_outputs, so a displacement banked on earlier ticks
+    // is discarded and the cursor never moves). The same trackball value also drives
+    // right_stick, so both are present as the finger slides.
     #[test]
     fn touch_zone_touchpad_reaches_keymouse_sink() {
         let dev = "pad";
@@ -1367,10 +1370,12 @@ mod trigger_tests {
         };
         eval_graph_tick(&graph, &mut state, &finger(0.0), 0.016, &mut out);
         eval_graph_tick(&graph, &mut state, &finger(0.3), 0.016, &mut out);
-        let mv = out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "mouse_move".to_string()))
+        // The rightward slide drives the "mouse" velocity pin (+X), sustained via the
+        // trackball, so it survives the last-tick-wins publish.
+        let mv = out.sink_outputs.get(&("virtual.keymouse:0".to_string(), "mouse".to_string()))
             .and_then(|s| if let Signal::Vec2(v) = s { Some(v.x) } else { None });
-        assert!(mv.is_some_and(|x| x > 1.0),
-            "touchpad mouse must reach the sink on mouse_move with a rightward move (got {mv:?})");
+        assert!(mv.is_some_and(|x| x > 0.1),
+            "touchpad mouse must reach the sink as a rightward velocity on the \"mouse\" pin (got {mv:?})");
         assert!(out.sink_outputs.contains_key(&("virtual.keymouse:0".to_string(), "right_stick".to_string())),
             "touchpad stick must reach the sink on right_stick");
     }

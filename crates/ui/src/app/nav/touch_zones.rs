@@ -276,7 +276,7 @@ impl FlexInputApp {
     /// control is appended LAST (matching the right-aligned DragValue), navigable
     /// like a button and nudged with LT/RT. Keeping this identical to the body
     /// keeps the nav glow on the right item.
-    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, has_mouse: bool) -> Vec<&'static str> {
+    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, show_mouse_speed: bool) -> Vec<&'static str> {
         let mut v = match phase {
             "idle"     => vec!["learn"],
             "learning" => vec!["cancel"],
@@ -284,11 +284,35 @@ impl FlexInputApp {
         };
         // Order MUST match the body's act_rects push order: tp_mode, mouse_speed,
         // then hold LAST. tp_mode is a VALUE cycled with LT/RT (like mouse_speed),
-        // not a South-activated button.
+        // not a South-activated button. `show_mouse_speed` mirrors the body's
+        // `show_speed` gate (a mouse card, or a touchpad-mode stick zone).
         if has_analog { v.push("tp_mode"); }
-        if has_mouse { v.push("mouse_speed"); }
+        if show_mouse_speed { v.push("mouse_speed"); }
         v.push("hold");
         v
+    }
+
+    /// Whether the SELECTED zone is in Touchpad mode (its first card's `tp_mode`).
+    /// Used with `has_analog`/`has_mouse` to mirror the body's mouse-speed gate.
+    pub(crate) fn nav_tz_selected_zone_touchpad(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+        let node = self.tabs[self.active_tab].canvas.snarl.get_node(outer)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner));
+        let Some(node) = node else { return false; };
+        let sel_f = node.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0);
+        let sel_z = node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0);
+        node.params.get("zone_maps").and_then(|v| v.as_array())
+            .and_then(|cards| cards.iter()
+                .filter(|c| c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == sel_f
+                         && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == sel_z)
+                .find_map(|c| c.get("tp_mode").and_then(|v| v.as_str())))
+            .map(|m| m == "touchpad").unwrap_or(false)
+    }
+
+    /// Mirrors the body's `show_speed`: a mouse card, OR a touchpad-mode stick zone.
+    pub(crate) fn nav_tz_shows_mouse_speed(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+        self.nav_tz_has_mouse_card(outer, inner)
+            || (self.nav_tz_has_analog_card(outer, inner)
+                && self.nav_tz_selected_zone_touchpad(outer, inner))
     }
 
     /// Toggle the SELECTED zone's "hold" flag in the `hold_zones` param (mirrors
@@ -480,8 +504,8 @@ impl FlexInputApp {
         outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, phase: &str)
     {
         let has_analog = self.nav_tz_has_analog_card(outer, inner);
-        let has_mouse = self.nav_tz_has_mouse_card(outer, inner);
-        let n_actions = Self::nav_tz_action_items(phase, has_analog, has_mouse).len();
+        let show_speed = self.nav_tz_shows_mouse_speed(outer, inner);
+        let n_actions = Self::nav_tz_action_items(phase, has_analog, show_speed).len();
         let card_idxs = self.nav_tz_zone_card_indices(outer, inner);
         let sel = self.gamepad_nav.card_index;
         let entered = matches!(self.gamepad_nav.edit_level,
@@ -531,7 +555,7 @@ impl FlexInputApp {
         let phase = self.picker_target_param_str(&[outer_id.0], inner, "_tz_phase")
             .unwrap_or_else(|| "idle".into());
         let has_analog = self.nav_tz_has_analog_card(outer_id, inner);
-        let has_mouse = self.nav_tz_has_mouse_card(outer_id, inner);
+        let show_speed = self.nav_tz_shows_mouse_speed(outer_id, inner);
 
         // INERT while gamepad-learn is armed: the raw button must reach the body's
         // capture (baseline-ignore there stops the arming button self-capturing).
@@ -563,7 +587,7 @@ impl FlexInputApp {
 
         // Two-row cursor: [0..n_actions) = action buttons, [n_actions..total) =
         // the selected zone's cards.
-        let actions = Self::nav_tz_action_items(&phase, has_analog, has_mouse);
+        let actions = Self::nav_tz_action_items(&phase, has_analog, show_speed);
         let n_actions = actions.len();
         let card_idxs = self.nav_tz_zone_card_indices(outer_id, inner);
         let count = card_idxs.len();

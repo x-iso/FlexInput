@@ -119,13 +119,6 @@ pub(crate) fn eval_touch_zones_map_node(
     let mut mouse_dx = 0.0f32;
     let mut mouse_dy = 0.0f32;
     let mut mouse_active = false;
-    // Absolute pointer-MOVE accumulator (px, +Y up) for Touchpad mode: the finger's
-    // per-frame displacement, published on the mouse_move* pins (applied once by the
-    // sink, NOT integrated as a velocity) so trackpad motion is exact and never
-    // flies off when the async mouse-emit timing drifts.
-    let mut move_dx = 0.0f32;
-    let mut move_dy = 0.0f32;
-    let mut move_active = false;
     // Analog scroll rate from a zone deflection (+Y up, +X right). Published as
     // the Float scroll_y/scroll_x pins; the KB/M sink integrates them over time.
     let mut scroll_vx = 0.0f32;
@@ -226,8 +219,6 @@ pub(crate) fn eval_touch_zones_map_node(
     let mut analog_by_zone: HashMap<(usize, usize), (f32, f32)> = HashMap::new(); // deflection, +Y up
     // Raw finger data per zone for percard deflection: (landing_x, landing_y, cur_x, cur_y).
     let mut zone_finger: HashMap<(usize, usize), (f32, f32, f32, f32)> = HashMap::new();
-    // Per-zone frame delta for touchpad mode: (dx, dy), +Y up.
-    let mut touchpad_by_zone: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
     // Per-zone touchpad-mode STICK trackball (leaky integrator, +Y up, ±1): finger
     // delta accumulated with per-tick decay, so a stick follows finger MOTION and
     // self-centres when the finger stops — robust to touch-sensor aliasing (the raw
@@ -299,8 +290,8 @@ pub(crate) fn eval_touch_zones_map_node(
             // card in the card loop). Landing lives in base+1/2 (set at touchdown).
             zone_finger.insert((field, sz), (ns.aux_f32[base + 1], ns.aux_f32[base + 2], ux, uy));
             // Touchpad frame delta (+Y up): current − previous frame. Update prev.
+            // Feeds the trackball leaky integrator below (finger MOTION → deflection).
             let (dpx, dpy) = (ux - ns.aux_f32[base + 9], uy - ns.aux_f32[base + 10]);
-            touchpad_by_zone.insert((field, sz), (dpx, -dpy));
             ns.aux_f32[base + 9] = ux;
             ns.aux_f32[base + 10] = uy;
             // Stick trackball: leaky integrator of the finger delta (+Y up). Decays
@@ -425,33 +416,34 @@ pub(crate) fn eval_touch_zones_map_node(
                         sticks.insert(if p == "left_stick" { "left_stick" } else { "right_stick" }, (ax, ay));
                     }
                 }
-                // Relative mouse. Two derivations:
-                //  • touchpad mode → the pointer follows the finger's frame delta
-                //    (laptop-touchpad feel), scaled by TZ_TOUCHPAD_BASE × mouse_speed.
-                //  • otherwise → deflection → velocity, +Y up (the sink flips to
-                //    screen). "mouse" drives both axes.
+                // Relative mouse. Two derivations, BOTH emitted as a VELOCITY on the
+                // "mouse" pins (the sink integrates it over its own dt):
+                //  • touchpad mode → the leaky-integrator trackball value (a bounded
+                //    finger-SPEED proxy, +Y up), scaled by TZ_TRACKBALL_BASE × mouse_speed.
+                //    This MUST be a sustained velocity, not a per-tick displacement: the
+                //    engine runs several sub-ticks per wakeup but publishes ONLY the last
+                //    tick's sink_outputs, so a displacement banked on ticks 0..N-1 is
+                //    discarded — the cursor never moved. A velocity is present on every
+                //    finger-down tick, so the last-tick sample carries the current speed.
+                //    (Same value drives right_stick above, so mouse & stick stay in sync.)
+                //  • otherwise → position deflection → velocity, +Y up. "mouse" drives
+                //    both axes.
                 "mouse" | "mouse_x" | "mouse_y" => {
-                    if touchpad {
-                        if let Some(&(dx, dy)) = touchpad_by_zone.get(&(field, zone)) {
-                            // Trackpad: emit the finger's per-frame DISPLACEMENT as an
-                            // absolute pointer MOVE (px) on the mouse_move* pins — the
-                            // sink applies it directly (not integrated over dt), so the
-                            // cursor tracks the finger exactly, stops dead when the
-                            // finger stops, and can't fly off when the emit thread's
-                            // timing drifts (the old velocity path did — a finger
-                            // "velocity" of ~50 re-integrated by the async thread flung
-                            // the cursor off-screen / left a ghost). TP_GAIN_PX = px per
-                            // unit of pad travel at speed 1 (a full sweep ≈ that many
-                            // px); mouse_speed tunes from there.
-                            const TP_GAIN_PX: f32 = 1100.0;
-                            let g = mouse_speed * TP_GAIN_PX;
-                            if p == "mouse" || p == "mouse_x" { move_dx += dx * g; }
-                            if p == "mouse" || p == "mouse_y" { move_dy += dy * g; }
-                            move_active = true;
-                        }
-                    } else if let Some((ax, ay)) = deflect {
-                        if p == "mouse" || p == "mouse_x" { mouse_dx += ax * mouse_gain; }
-                        if p == "mouse" || p == "mouse_y" { mouse_dy += ay * mouse_gain; }
+                    // Trackball value is RAW (un-speed-scaled); mouse_speed is applied
+                    // once here. TZ_TRACKBALL_BASE tunes the finger-speed→cursor-speed
+                    // ratio (tunable; the per-zone mouse_speed multiplies it further).
+                    const TZ_TRACKBALL_BASE: f32 = 1.0;
+                    let vel = if touchpad {
+                        stick_by_zone.get(&(field, zone)).map(|&(vx, vy)| {
+                            let g = mouse_speed * TZ_TRACKBALL_BASE;
+                            (vx * g, vy * g)
+                        })
+                    } else {
+                        deflect.map(|(ax, ay)| (ax * mouse_gain, ay * mouse_gain))
+                    };
+                    if let Some((vx, vy)) = vel {
+                        if p == "mouse" || p == "mouse_x" { mouse_dx += vx; }
+                        if p == "mouse" || p == "mouse_y" { mouse_dy += vy; }
                         mouse_active = true;
                     }
                 }
@@ -532,12 +524,6 @@ pub(crate) fn eval_touch_zones_map_node(
         collector_sigs.insert((key.clone(), "mouse".to_string()), Signal::Vec2(Vec2::new(mouse_dx, mouse_dy)));
         collector_sigs.insert((key.clone(), "mouse_x".to_string()), Signal::Float(mouse_dx));
         collector_sigs.insert((key.clone(), "mouse_y".to_string()), Signal::Float(mouse_dy));
-    }
-    // Publish the absolute pointer-move (Touchpad mode) on the mouse_move* pins.
-    if move_active {
-        collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(Vec2::new(move_dx, move_dy)));
-        collector_sigs.insert((key.clone(), "mouse_move_x".to_string()), Signal::Float(move_dx));
-        collector_sigs.insert((key.clone(), "mouse_move_y".to_string()), Signal::Float(move_dy));
     }
     // Publish analog scroll rate while a finger drives it; else fall back upstream.
     if scroll_active {
