@@ -138,6 +138,15 @@ struct OpenPad {
     /// sensors were enabled then too). Gates the per-poll sensor reads.
     has_gyro: bool,
     has_accel: bool,
+    /// Remaining sensor-enable RE-ASSERTS for a wireless pad. Over Bluetooth the
+    /// mode-switch subcommand that puts a Switch Pro into full-report mode (0x30,
+    /// the report that carries IMU) can silently fail if it races the cold BT
+    /// link settling — the pad stays in simple mode (0x3F: buttons/sticks fine,
+    /// gyro/accel frozen) even though `sensor_enabled` reports true. Re-asserting
+    /// the enable a few times over the first several seconds (once per ~2 s
+    /// enumerate) gives it a chance to take once the link is stable. Set to 0 for
+    /// wired pads (their enable sticks immediately) so they're never disturbed.
+    sensor_retries: u8,
     /// Number of touchpads SDL reports for this pad (0 for most generic pads).
     num_touchpads: u16,
     /// Last-sent rumble (strong, weak) as 0-255 bytes, to skip redundant
@@ -363,6 +372,10 @@ impl SdlBackend {
                  serial={serial:?} path={path:?}"
             );
 
+            // Wireless pads with a sensor get a handful of enable re-asserts (see
+            // the field doc); wired pads and sensor-less pads get none.
+            let sensor_retries = if conn == "wireless" && (has_gyro || has_accel) { 8 } else { 0 };
+
             pads.insert(
                 id,
                 OpenPad {
@@ -371,10 +384,34 @@ impl SdlBackend {
                     kind,
                     has_gyro,
                     has_accel,
+                    sensor_retries,
                     num_touchpads,
                     last_rumble: (0, 0),
                     last_led: (0, 0, 0),
                 },
+            );
+        }
+
+        // Re-assert sensor enable for wireless pads with retries left (see
+        // OpenPad::sensor_retries). Runs once per enumerate (~2 s): a Switch Pro
+        // whose full-report mode-switch didn't take at cold BT connect gets more
+        // chances once the link settles. Wired pads have 0 retries so are never
+        // touched. A pad freshly opened this cycle was just enabled above, so the
+        // first re-assert is redundant but harmless.
+        for pad in pads.values_mut() {
+            if pad.sensor_retries == 0 {
+                continue;
+            }
+            pad.sensor_retries -= 1;
+            if pad.has_gyro {
+                let _ = pad.gamepad.sensor_set_enabled(SensorType::Gyroscope, true);
+            }
+            if pad.has_accel {
+                let _ = pad.gamepad.sensor_set_enabled(SensorType::Accelerometer, true);
+            }
+            eprintln!(
+                "[sdl] re-assert sensors {} (retries left {})",
+                pad.dev_id, pad.sensor_retries
             );
         }
     }
