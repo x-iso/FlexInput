@@ -368,6 +368,20 @@ pub(crate) fn eval_touch_zones_map_node(
         let press = PressParams::from_card(card);
         let held = press.gate(raw_held, press_state_get(ns, i), dt);
 
+        // Touchpad-mode analog for STICK targets: the finger's VELOCITY (speed &
+        // direction) → deflection, clamped ±1, so a stick follows finger MOTION and
+        // recentres when the finger stops (a trackball feel) instead of holding a
+        // position deflection. Frame-rate independent (delta/dt). mouse_speed tunes.
+        let tp_stick = if touchpad {
+            touchpad_by_zone.get(&(field, zone)).map(|&(dx, dy)| {
+                const TP_STICK_GAIN: f32 = 0.25;
+                let s = mouse_speed * TP_STICK_GAIN / dt.max(1e-4);
+                ((dx * s).clamp(-1.0, 1.0), (dy * s).clamp(-1.0, 1.0))
+            })
+        } else {
+            None
+        };
+
         // Relative analog deflection (curve-shaped magnitude) for analog outputs.
         // Analog outputs ignore the press-mode gate — the contact itself drives them.
         let deflect = raw_defl.map(|(ax, ay)| {
@@ -387,7 +401,8 @@ pub(crate) fn eval_touch_zones_map_node(
         {
             match p {
                 "left_stick" | "right_stick" => {
-                    if let Some((ax, ay)) = deflect {
+                    // Touchpad mode → finger-velocity trackball; else position deflection.
+                    if let Some((ax, ay)) = if touchpad { tp_stick } else { deflect } {
                         sticks.insert(if p == "left_stick" { "left_stick" } else { "right_stick" }, (ax, ay));
                     }
                 }
