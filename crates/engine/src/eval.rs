@@ -23,6 +23,7 @@ mod config;
 mod curves;
 mod device_cal;
 mod modules;
+mod registry;
 #[cfg(test)]
 mod tests;
 mod publish;
@@ -33,6 +34,7 @@ pub use config::*;
 pub use curves::*;
 pub use device_cal::*;
 pub use modules::*;
+pub(crate) use registry::*;
 // Every publisher is crate-internal — nothing outside the engine publishes
 // into the bus — so this one glob is narrowed rather than `pub`.
 pub(crate) use publish::*;
@@ -265,13 +267,14 @@ fn eval_subgraph(
             computed[idx] = out;
             continue;
         }
-        // Audio Stream Haptics inside a sub-patch. Publish under the NAMESPACED uid
-        // (ns_uid) so it matches both the capture manager's nested registration and
-        // the downstream sink's collector lookup. Without this arm ASTH did nothing
-        // when nested — the reported "doesn't work inside a sub-patch".
-        if snap.module_id == AUDIO_STREAM_HAPTICS_ID {
-            // output[0] = AutoMap passthrough; output[1..] = raw band EFs + freqs.
-            let out = audio_stream_haptics_publish(snap, ns_uid, dev_sigs, collector_sigs);
+        // Module-registry seam (Phase C): a module that registered an injector
+        // publisher is dispatched here BEFORE the hardcoded arms below (which stay
+        // as fallback for un-migrated modules). Nested case: publish under the
+        // NAMESPACED uid (ns_uid) so it matches the capture manager's nested
+        // registration and the downstream sink's collector lookup. Migrated: Audio
+        // Stream Haptics (was a doesn't-work-when-nested bug before it got this uid).
+        if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish) {
+            let out = publish(snap, ns_uid, dev_sigs, collector_sigs);
             computed[idx] = out.clone();
             last_outputs.insert(ns_uid, out);
             continue;
@@ -597,12 +600,15 @@ pub fn eval_graph_tick(
             computed[idx] = out;
             continue;
         }
-        // ── module.audio_stream_haptics: pass the AutoMap bus through, then
-        //    inject audio-derived HD rumble into the target pad's feedback. ────
-        if snap.module_id == AUDIO_STREAM_HAPTICS_ID {
-            // output[0] = AutoMap passthrough (no scalar); output[1..] = raw band
-            // EFs + band carrier freqs (Hz), see audio_stream_haptics_publish.
-            let out = audio_stream_haptics_publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
+        // Module-registry seam (Phase C): a module with a registered injector
+        // publisher is dispatched here before the hardcoded arms below (fallback
+        // for un-migrated modules). Migrated: module.audio_stream_haptics — passes
+        // the AutoMap bus through, then injects audio-derived HD rumble into the
+        // target pad's feedback (output[0] = passthrough, output[1..] = band EFs +
+        // carrier freqs; see audio_stream_haptics_publish). Publishes under the
+        // node's top-level uid here.
+        if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish) {
+            let out = publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
             last_outputs.insert(snap.node_uid, out.clone());
             computed[idx] = out;
             continue;
