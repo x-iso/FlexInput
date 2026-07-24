@@ -69,6 +69,8 @@ fn default_pin_shortcut() -> PinShortcut { PinShortcut::default() }
 fn default_cursor_max_speed() -> f32 { 4000.0 }
 fn default_cursor_accel() -> f32 { 2.0 }
 fn default_pin_guide_double_tap() -> bool { true }
+fn default_config_via_guide() -> bool { true }
+fn default_config_guide_double_tap() -> bool { true }
 fn default_focus_flip_flop() -> bool { true }
 fn default_ui_mode() -> UiMode { UiMode::Easy }
 
@@ -183,9 +185,26 @@ pub struct AppSettings {
     /// — uses RegisterHotKey under the hood (see `pin_hotkey.rs`).
     #[serde(default = "default_pin_shortcut")]
     pub pin_shortcut: PinShortcut,
-    /// If true, the controller Guide/PS button also toggles the pin.
+    /// Legacy: the controller Guide/PS button once toggled the pin. Superseded
+    /// by `config_via_guide` (the Guide button now summons the config overlay by
+    /// default). Kept for serde back-compat; no longer wired.
     #[serde(default)]
     pub pin_via_guide: bool,
+    /// If true, the controller Guide / PS / Home button summons the config
+    /// overlay (via the global guide-watcher thread — the one path that works
+    /// while a game holds focus). Default on: this is the primary way to bring
+    /// up the overlay mid-game. The pin's old Guide binding was a stop-gap.
+    #[serde(default = "default_config_via_guide")]
+    pub config_via_guide: bool,
+    /// If true, the Guide→config summon requires a double-tap (within ~300ms);
+    /// else a single tap fires. Default true to avoid colliding with the Game
+    /// Bar / Steam overlay's own single-press Guide handling.
+    #[serde(default = "default_config_guide_double_tap")]
+    pub config_guide_double_tap: bool,
+    /// Optional chord button required IN ADDITION to Guide for the config summon
+    /// (e.g. `"btn_lb"`). Captured via AutoMap-style learn. None = Guide alone.
+    #[serde(default)]
+    pub config_guide_chord: Option<String>,
     /// Default nav-mode state for newly-seen gamepads. Per-device runtime
     /// overrides live in `FlexInputApp::gamepad_nav.mode` (not persisted).
     /// When on, the controller drives FlexInput's own UI (with mapped output
@@ -288,6 +307,16 @@ pub struct AppSettings {
     /// None = unassigned.
     #[serde(default)]
     pub overlay_chord: Option<Vec<String>>,
+    /// Optional gamepad button combo that toggles the PIN (always-on-top). The
+    /// pin's old Guide binding moved here so the user picks their own button /
+    /// combo. Focus-gated like the other chords. None = unassigned.
+    #[serde(default)]
+    pub pin_chord: Option<Vec<String>>,
+    /// Optional gamepad button combo that toggles the CONFIG overlay. A second
+    /// path in addition to the default Guide summon (`config_via_guide`), for
+    /// users who prefer a non-Guide combo. None = unassigned.
+    #[serde(default)]
+    pub config_overlay_chord: Option<Vec<String>>,
     /// Whether the info overlay was visible on exit — restored on launch
     /// (mirrors `see_through_active`; the live state lives in a ctx temp
     /// slot that `update()` syncs back here).
@@ -486,6 +515,9 @@ impl Default for AppSettings {
             pin_active: false,
             pin_shortcut: PinShortcut::default(),
             pin_via_guide: false,
+            config_via_guide: true,
+            config_guide_double_tap: true,
+            config_guide_chord: None,
             gamepad_ui_nav_default: false,
             cursor_max_speed: 4000.0,
             cursor_accel: 2.0,
@@ -504,6 +536,8 @@ impl Default for AppSettings {
             seethrough_chord: None,
             panic_chord: None,
             overlay_chord: None,
+            pin_chord: None,
+            config_overlay_chord: None,
             overlay_visible: false,
             overlay_shortcut: default_overlay_shortcut(),
             overlay_fps: OVERLAY_FPS_DEFAULT,

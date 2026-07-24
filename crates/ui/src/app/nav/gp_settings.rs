@@ -57,6 +57,10 @@ impl FlexInputApp {
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Panic }, suffix: "" },
             GpSettingRow { label: "Shortcut: Overlay".into(),
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Overlay }, suffix: "" },
+            GpSettingRow { label: "Shortcut: Config overlay".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::ConfigOverlay }, suffix: "" },
+            GpSettingRow { label: "Shortcut: Pin".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Pin }, suffix: "" },
         ]
     }
 
@@ -211,9 +215,11 @@ impl FlexInputApp {
                 if let GpSettingKind::ChordLearn { target } = &row.kind {
                     use crate::gamepad_nav::ChordTarget;
                     match target {
-                        ChordTarget::SeeThrough => self.settings.seethrough_chord = None,
-                        ChordTarget::Panic      => self.settings.panic_chord = None,
-                        ChordTarget::Overlay    => self.settings.overlay_chord = None,
+                        ChordTarget::SeeThrough    => self.settings.seethrough_chord = None,
+                        ChordTarget::Panic         => self.settings.panic_chord = None,
+                        ChordTarget::Overlay       => self.settings.overlay_chord = None,
+                        ChordTarget::Pin           => self.settings.pin_chord = None,
+                        ChordTarget::ConfigOverlay => self.settings.config_overlay_chord = None,
                     }
                     self.settings_dirty = true;
                 }
@@ -354,6 +360,8 @@ impl FlexInputApp {
                                     ChordTarget::SeeThrough => self.settings.seethrough_chord.as_ref(),
                                     ChordTarget::Panic => self.settings.panic_chord.as_ref(),
                                     ChordTarget::Overlay => self.settings.overlay_chord.as_ref(),
+                                    ChordTarget::Pin => self.settings.pin_chord.as_ref(),
+                                    ChordTarget::ConfigOverlay => self.settings.config_overlay_chord.as_ref(),
                                 };
                                 match assigned {
                                     Some(c) if !c.is_empty() => { combo_icons = Some(c.clone()); String::new() }

@@ -850,10 +850,13 @@ impl FlexInputApp {
         // single edge to consume each frame.
         let pin_toggle_requested = Arc::new(AtomicBool::new(false));
         let pin_shortcut_shared  = Arc::new(RwLock::new(app_settings.pin_shortcut.clone()));
+        // The Guide / PS / Home button now summons the CONFIG overlay (its old
+        // pin binding was a stop-gap). Configured from the `config_*_guide`
+        // settings; drives `config_overlay_toggle_requested` (spawned below).
         let pin_guide_cfg        = Arc::new(RwLock::new(GuideWatchConfig {
-            enabled: app_settings.pin_via_guide,
-            require_double_tap: app_settings.pin_guide_double_tap,
-            chord_signal: app_settings.pin_guide_chord.clone(),
+            enabled: app_settings.config_via_guide,
+            require_double_tap: app_settings.config_guide_double_tap,
+            chord_signal: app_settings.config_guide_chord.clone(),
         }));
         let pin_learn_chord      = Arc::new(AtomicBool::new(false));
         let pin_learned_chord    = Arc::new(Mutex::new(None));
@@ -883,7 +886,7 @@ impl FlexInputApp {
         );
         spawn_guide_watcher(
             Arc::clone(&pin_guide_cfg),
-            Arc::clone(&pin_toggle_requested),
+            Arc::clone(&config_overlay_toggle_requested),
             Arc::clone(&proc_device_signals),
             Arc::clone(&pin_learn_chord),
             Arc::clone(&pin_learned_chord),
@@ -3878,9 +3881,11 @@ impl FlexInputApp {
         use crate::gamepad_nav::ChordTarget;
         self.gamepad_nav.chord_arm_idle = false;
         match self.gamepad_nav.chord_learn.take() {
-            Some(ChordTarget::SeeThrough) => self.settings.seethrough_chord = Some(chord),
-            Some(ChordTarget::Panic)      => self.settings.panic_chord = Some(chord),
-            Some(ChordTarget::Overlay)    => self.settings.overlay_chord = Some(chord),
+            Some(ChordTarget::SeeThrough)    => self.settings.seethrough_chord = Some(chord),
+            Some(ChordTarget::Panic)         => self.settings.panic_chord = Some(chord),
+            Some(ChordTarget::Overlay)       => self.settings.overlay_chord = Some(chord),
+            Some(ChordTarget::Pin)           => self.settings.pin_chord = Some(chord),
+            Some(ChordTarget::ConfigOverlay) => self.settings.config_overlay_chord = Some(chord),
             None => {}
         }
         self.settings_dirty = true;
@@ -3928,6 +3933,21 @@ impl FlexInputApp {
             fired = true;
         }
         self.gamepad_nav.overlay_chord_down = ov_now;
+        // Pin.
+        let pin_now = chord_held(&self.settings.pin_chord);
+        if pin_now && !self.gamepad_nav.pin_chord_down {
+            self.pin_toggle_requested.store(true, Ordering::Relaxed);
+            fired = true;
+        }
+        self.gamepad_nav.pin_chord_down = pin_now;
+        // Config overlay.
+        let cfg_now = chord_held(&self.settings.config_overlay_chord);
+        if cfg_now && !self.gamepad_nav.config_chord_down {
+            let on = crate::config_overlay::config_overlay_visible(ctx);
+            crate::config_overlay::set_config_overlay_visible(ctx, !on);
+            fired = true;
+        }
+        self.gamepad_nav.config_chord_down = cfg_now;
         fired
     }
 
@@ -3941,10 +3961,14 @@ impl FlexInputApp {
         if self.settings.seethrough_chord.is_none()
             && self.settings.panic_chord.is_none()
             && self.settings.overlay_chord.is_none()
+            && self.settings.pin_chord.is_none()
+            && self.settings.config_overlay_chord.is_none()
         {
             self.gamepad_nav.seethrough_chord_down = false;
             self.gamepad_nav.panic_chord_down = false;
             self.gamepad_nav.overlay_chord_down = false;
+            self.gamepad_nav.pin_chord_down = false;
+            self.gamepad_nav.config_chord_down = false;
             return;
         }
         let excluded = self.own_virtual_device_ids();
@@ -3980,6 +4004,17 @@ impl FlexInputApp {
             crate::overlay::set_overlay_visible(ctx, !crate::overlay::overlay_visible(ctx));
         }
         self.gamepad_nav.overlay_chord_down = ov_now;
+        let pin_now = any_holds(&self.settings.pin_chord);
+        if pin_now && !self.gamepad_nav.pin_chord_down {
+            self.pin_toggle_requested.store(true, Ordering::Relaxed);
+        }
+        self.gamepad_nav.pin_chord_down = pin_now;
+        let cfg_now = any_holds(&self.settings.config_overlay_chord);
+        if cfg_now && !self.gamepad_nav.config_chord_down {
+            let on = crate::config_overlay::config_overlay_visible(ctx);
+            crate::config_overlay::set_config_overlay_visible(ctx, !on);
+        }
+        self.gamepad_nav.config_chord_down = cfg_now;
     }
 
     /// Update the right-stick + gyro cursor overlay position/visibility.

@@ -39,6 +39,8 @@ pub enum ChordTarget {
     SeeThrough,
     Panic,
     Overlay,
+    Pin,
+    ConfigOverlay,
 }
 
 /// Selection model levels.
@@ -193,6 +195,12 @@ pub struct GamepadNav {
     /// Highlighted control-point index while inside a response curve
     /// (`CurveDots`/`CurveDot`). Clamped to the curve's point count each frame.
     pub curve_dot: usize,
+    /// True while the user is holding North to bend the segment (bias mode) at
+    /// `CurveDot` level this frame. The config overlay reads it to republish the
+    /// `gp_nav_curve_bias` handle-visibility flag with its OWN viewport pass —
+    /// `nav_drive_curve_dot` stamps the root viewport's pass, which never matches
+    /// the overlay viewport's. Reset each frame the dot editor runs.
+    pub curve_bias: bool,
     /// RemapScroll cursor — spans the action buttons (Learn/Special/Add) then
     /// the mapping cards. Up/down moves it; South activates / enters.
     pub card_index: usize,
@@ -277,6 +285,8 @@ pub struct GamepadNav {
     pub seethrough_chord_down: bool,
     pub panic_chord_down: bool,
     pub overlay_chord_down: bool,
+    pub pin_chord_down: bool,
+    pub config_chord_down: bool,
     /// Config overlay (M3.5): index into this frame's published config-pin
     /// targets of the gamepad-focused tweak-pin. `None` = no focus yet (seeds to
     /// the top-left pin on first directional input). The focused pin's upstream
@@ -331,6 +341,7 @@ impl Default for GamepadNav {
             settings_editing: false,
             field_index: 0,
             curve_dot: 0,
+            curve_bias: false,
             card_index: 0,
             remap_card: 0,
             card_field: 0,
@@ -358,6 +369,8 @@ impl Default for GamepadNav {
             seethrough_chord_down: false,
             panic_chord_down: false,
             overlay_chord_down: false,
+            pin_chord_down: false,
+            config_chord_down: false,
             #[cfg(windows)]
             key_tapper: None,
         }
