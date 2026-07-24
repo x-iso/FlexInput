@@ -753,6 +753,57 @@ impl FlexInputApp {
                 }
 
                 ui.add_space(4.0);
+
+                // Config-overlay toggle shortcut (M3; mirrors the overlay binder).
+                ui.horizontal(|ui| {
+                    ui.label("Config overlay shortcut:");
+                    let btn_text = if self.config_overlay_learning {
+                        "Press chord…".to_string()
+                    } else {
+                        self.settings.config_overlay_shortcut.label()
+                    };
+                    let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+                    if self.config_overlay_learning {
+                        btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
+                                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                    }
+                    let resp = ui.add(btn).on_hover_text(
+                        if self.config_overlay_learning {
+                            "Press the new shortcut (modifier + key).\nClick again to cancel."
+                        } else {
+                            "Click to re-bind. Press the shortcut anywhere on the system to show/hide the config overlay."
+                        }
+                    );
+                    if resp.clicked() {
+                        self.config_overlay_learning = !self.config_overlay_learning;
+                    }
+                });
+                if self.config_overlay_learning {
+                    let pressed: Option<egui::Key> = ctx.input(|i| {
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                            _ => None,
+                        })
+                    });
+                    if let Some(key) = pressed {
+                        let m = ctx.input(|i| i.modifiers);
+                        let key_name = format!("{:?}", key);
+                        self.settings.config_overlay_shortcut = settings::PinShortcut {
+                            ctrl:  m.ctrl,
+                            shift: m.shift,
+                            alt:   m.alt,
+                            win:   m.command && !m.ctrl,
+                            key:   Some(key_name),
+                        };
+                        if let Ok(mut s) = self.config_overlay_shortcut_shared.write() {
+                            *s = self.settings.config_overlay_shortcut.clone();
+                        }
+                        self.config_overlay_learning = false;
+                        dirty = true;
+                    }
+                }
+
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("Overlay frame rate")
                         .on_hover_text("Repaint rate of the overlay while it's visible. Separate from the background repaint rate — the overlay animates on top of your game.");

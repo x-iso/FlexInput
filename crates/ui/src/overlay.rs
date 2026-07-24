@@ -114,7 +114,7 @@ pub fn with_overlay_not_topmost<R>(f: impl FnOnce() -> R) -> R {
 /// is what lets edit mode decide, each frame, whether the cursor sits over an
 /// interactive region (toolbar / pinned item) and flip passthrough accordingly.
 #[cfg(windows)]
-fn os_cursor_in_points(pixels_per_point: f32) -> Option<egui::Pos2> {
+pub(crate) fn os_cursor_in_points(pixels_per_point: f32) -> Option<egui::Pos2> {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
     let mut p = POINT { x: 0, y: 0 };
@@ -127,7 +127,7 @@ fn os_cursor_in_points(pixels_per_point: f32) -> Option<egui::Pos2> {
 }
 
 #[cfg(not(windows))]
-fn os_cursor_in_points(_pixels_per_point: f32) -> Option<egui::Pos2> {
+pub(crate) fn os_cursor_in_points(_pixels_per_point: f32) -> Option<egui::Pos2> {
     None
 }
 

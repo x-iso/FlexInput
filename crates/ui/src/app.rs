@@ -448,6 +448,13 @@ pub struct FlexInputApp {
     overlay_shortcut_shared: Arc<RwLock<PinShortcut>>,
     /// True while the overlay shortcut button is in Learn mode in Settings.
     overlay_learning: bool,
+    /// Raised by the CONFIG-overlay hotkey listener thread; consumed once per
+    /// frame to flip the config overlay's visible flag (M3).
+    config_overlay_toggle_requested: Arc<AtomicBool>,
+    /// Live snapshot of the config-overlay chord shared with its listener thread.
+    config_overlay_shortcut_shared: Arc<RwLock<PinShortcut>>,
+    /// True while the config-overlay shortcut button is in Learn mode in Settings.
+    config_overlay_learning: bool,
     /// HWND of whatever foreground window we left when the pin was last
     /// engaged. Used by the focus flip-flop feature to restore focus to
     /// that window so the user can immediately test their changes.
@@ -846,6 +853,15 @@ impl FlexInputApp {
             Arc::clone(&overlay_shortcut_shared),
             Arc::clone(&overlay_toggle_requested),
         );
+        // Config-overlay visibility hotkey — same pattern, own id (M3).
+        let config_overlay_toggle_requested = Arc::new(AtomicBool::new(false));
+        let config_overlay_shortcut_shared  = Arc::new(RwLock::new(app_settings.config_overlay_shortcut.clone()));
+        spawn_pin_hotkey_listener(
+            crate::pin_hotkey::HOTKEY_ID_CONFIG,
+            "config-overlay-hotkey",
+            Arc::clone(&config_overlay_shortcut_shared),
+            Arc::clone(&config_overlay_toggle_requested),
+        );
         spawn_guide_watcher(
             Arc::clone(&pin_guide_cfg),
             Arc::clone(&pin_toggle_requested),
@@ -864,6 +880,10 @@ impl FlexInputApp {
         // Same for the info overlay's visible flag (▣ toggle).
         if app_settings.overlay_visible {
             crate::overlay::set_overlay_visible(&cc.egui_ctx, true);
+        }
+        // And the config overlay's visible flag (M3).
+        if app_settings.config_overlay_visible {
+            crate::config_overlay::set_config_overlay_visible(&cc.egui_ctx, true);
         }
 
         // Pick `next_untitled` high enough that any restored "Untitled N" tab
@@ -965,6 +985,9 @@ impl FlexInputApp {
             overlay_toggle_requested,
             overlay_shortcut_shared,
             overlay_learning: false,
+            config_overlay_toggle_requested,
+            config_overlay_shortcut_shared,
+            config_overlay_learning: false,
             pin_prev_foreground_hwnd: None,
             pin_last_external_hwnd: None,
             pin_pending_yield: None,
@@ -1415,6 +1438,14 @@ impl eframe::App for FlexInputApp {
                 self.settings_dirty = true;
             }
         }
+        // Config overlay visibility persists the same way (M3).
+        {
+            let from_slot = crate::config_overlay::config_overlay_visible(ctx);
+            if from_slot != self.settings.config_overlay_visible {
+                self.settings.config_overlay_visible = from_slot;
+                self.settings_dirty = true;
+            }
+        }
 
         // ── Pin / always-on-top toggle ────────────────────────────────────
         // The keyboard listener thread AND the Guide-button watcher share
@@ -1432,6 +1463,12 @@ impl eframe::App for FlexInputApp {
         // here on the UI thread (show_overlay reads it later this frame).
         if self.overlay_toggle_requested.swap(false, Ordering::Relaxed) {
             crate::overlay::set_overlay_visible(ctx, !crate::overlay::overlay_visible(ctx));
+        }
+
+        // ── Config overlay visibility toggle (global hotkey, M3) ──────────
+        if self.config_overlay_toggle_requested.swap(false, Ordering::Relaxed) {
+            let on = crate::config_overlay::config_overlay_visible(ctx);
+            crate::config_overlay::set_config_overlay_visible(ctx, !on);
         }
 
         // Deferred pin-off foreground handoff. Scheduled by `toggle_pin` on
@@ -2567,6 +2604,14 @@ impl eframe::App for FlexInputApp {
         {
             puffin::profile_scope!("show_menu_overlay");
             crate::menu_overlay::show_menu_overlay(self, ctx);
+        }
+
+        // ── Config overlay ────────────────────────────────────────────────────
+        // A THIRD transparent viewport (M3): shortcut-summoned, interactive over
+        // its panel + click-through elsewhere, for live parameter tweaking.
+        {
+            puffin::profile_scope!("show_config_overlay");
+            crate::config_overlay::show_config_overlay(self, ctx);
         }
 
         // Repaint scheduling:

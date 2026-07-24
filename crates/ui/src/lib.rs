@@ -8,6 +8,7 @@ mod guide_watcher;
 mod macro_icons;
 mod module_ui_info;
 mod menu_overlay;
+mod config_overlay;
 mod overlay;
 mod panels;
 mod panic_hotkey;

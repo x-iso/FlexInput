@@ -303,6 +303,15 @@ pub struct AppSettings {
     /// OVERLAY_FPS_MIN..=MAX.
     #[serde(default = "default_overlay_fps")]
     pub overlay_fps: u32,
+    /// Whether the CONFIG overlay was visible on exit — restored on launch
+    /// (mirrors `overlay_visible`; live state lives in a ctx temp slot synced
+    /// back by `update()`).
+    #[serde(default)]
+    pub config_overlay_visible: bool,
+    /// Global keyboard chord toggling the CONFIG overlay's visibility. Own
+    /// RegisterHotKey id (`HOTKEY_ID_CONFIG`); shares the overlay frame rate.
+    #[serde(default = "default_config_overlay_shortcut")]
+    pub config_overlay_shortcut: PinShortcut,
     /// When true, the see-through / panic gamepad combos above only fire while
     /// the driving gamepad is in UI-navigation mode (so the same buttons stay
     /// free for in-game mappings otherwise). When false, they fire whenever
@@ -451,6 +460,10 @@ fn default_overlay_shortcut() -> PinShortcut {
     // (Ctrl+Backtick) defaults.
     PinShortcut { ctrl: true, shift: true, alt: false, win: false, key: Some("O".to_string()) }
 }
+fn default_config_overlay_shortcut() -> PinShortcut {
+    // Ctrl+Shift+C — "config"; clear of pin/overlay/panic defaults.
+    PinShortcut { ctrl: true, shift: true, alt: false, win: false, key: Some("C".to_string()) }
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -494,6 +507,8 @@ impl Default for AppSettings {
             overlay_visible: false,
             overlay_shortcut: default_overlay_shortcut(),
             overlay_fps: OVERLAY_FPS_DEFAULT,
+            config_overlay_visible: false,
+            config_overlay_shortcut: default_config_overlay_shortcut(),
             gamepad_chords_nav_only: true,
             bg_repaint_hz: BG_REPAINT_HZ_DEFAULT,
             mouse_suppression_enabled: true,

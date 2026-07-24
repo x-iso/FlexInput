@@ -17,6 +17,8 @@ use crate::settings::PinShortcut;
 pub const HOTKEY_ID_PIN: i32 = 0xF1E2;
 /// HOTKEY_ID for the info-overlay visibility chord.
 pub const HOTKEY_ID_OVERLAY: i32 = 0xF1E3;
+/// HOTKEY_ID for the config-overlay visibility chord (M3).
+pub const HOTKEY_ID_CONFIG: i32 = 0xF1E4;
 
 pub fn spawn_pin_hotkey_listener(
     hotkey_id: i32,
