@@ -48,6 +48,40 @@ pub(crate) fn spawn_io_thread(
                 let r = windows_sys::Win32::Media::timeBeginPeriod(1);
                 eprintln!("[device-io] timeBeginPeriod(1) -> {} (0 == TIMERR_NOERROR)", r);
 
+                // Windows 11 honors a raised timer resolution (the timeBeginPeriod(1)
+                // above) ONLY while the process is in the FOREGROUND — a backgrounded
+                // process is throttled back to the ~15.6 ms system default. That
+                // collapses BOTH the engine tick and this I/O loop from kHz down to
+                // ~64 Hz whenever FlexInput loses focus, so a gyro-/stick-driven mouse
+                // — used precisely while another app is focused — gets coarse velocity
+                // samples and the cursor draws straight-line segments between them
+                // ("losing packets / interpolating"). Opt out of the background timer
+                // throttle so our resolution request stays honored unfocused. Process-
+                // wide, so it also covers the engine thread. Win11+ only; on older
+                // Windows the call fails harmlessly (the flag is unknown → no-op).
+                {
+                    use windows_sys::Win32::System::Threading::{
+                        GetCurrentProcess, SetProcessInformation, ProcessPowerThrottling,
+                        PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                    };
+                    let state = PROCESS_POWER_THROTTLING_STATE {
+                        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                        // Take control of the ignore-timer-resolution behavior…
+                        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                        // …and set it OFF: do NOT ignore our timer resolution in the
+                        // background (bit set here would THROTTLE us — this is the opt-out).
+                        StateMask: 0,
+                    };
+                    let ok = SetProcessInformation(
+                        GetCurrentProcess(),
+                        ProcessPowerThrottling,
+                        &state as *const _ as *const core::ffi::c_void,
+                        core::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                    );
+                    eprintln!("[device-io] SetProcessInformation(keep timer res in background) -> {} (nonzero == ok; pre-Win11 fails harmlessly)", ok);
+                }
+
                 // Input must win over UI rendering. This thread polls physical
                 // inputs and flushes the virtual-device outputs — the hard
                 // real-time leg of the input→output path. Pin it above the UI
