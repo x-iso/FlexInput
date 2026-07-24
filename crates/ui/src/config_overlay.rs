@@ -37,10 +37,15 @@ pub const CONFIG_OVERLAY_EDIT_KEY: &str = "fxi_config_overlay_edit";
 /// "not tweakable" hint chip can fade after a couple seconds.
 const CONFIG_REJECT_KEY: &str = "fxi_config_pick_rejected";
 /// Ctx temp-data slot: the physical device id whose input should PASS THROUGH to
-/// the game right now — the upstream device of the tweak-pin under the cursor
-/// (M3.4). Empty string = nothing passing through. Written by the overlay each
-/// frame; read by `FlexInputApp::update` when building the source-block set.
+/// the game right now — the upstream device of the ACTIVE tweak-pin (the one
+/// under the cursor, or the gamepad-focused one). Empty string = nothing passing
+/// through. Written by the overlay each frame; read by `FlexInputApp::update`
+/// when building the source-block set. (M3.4 mouse, M3.5 gamepad.)
 pub const CONFIG_PASSTHROUGH_DEV_KEY: &str = "fxi_config_passthrough_dev";
+/// Ctx temp-data slot: this frame's gamepad-navigable config pins, as
+/// `(pass_nr, Vec<(item_index, screen_rect)>)`. Published by the overlay in live
+/// mode; read by `nav_drive_config_overlay` to move focus between pins.
+pub const CONFIG_NAV_TARGETS_KEY: &str = "fxi_config_nav_targets";
 
 fn visible_id() -> egui::Id {
     egui::Id::new(CONFIG_OVERLAY_VISIBLE_KEY)
@@ -62,11 +67,24 @@ fn passthrough_dev_id() -> egui::Id {
 }
 
 /// The physical device the config overlay wants passed through to the game right
-/// now (the tweak-pin under the cursor's upstream device), or `None`. Read by
-/// `update()` to poke a hole in the source-block set.
+/// now (the active tweak-pin's upstream device), or `None`. Read by `update()`
+/// to poke a hole in the source-block set.
 pub fn config_passthrough_dev(ctx: &egui::Context) -> Option<String> {
     ctx.data(|d| d.get_temp::<String>(passthrough_dev_id()))
         .filter(|s| !s.is_empty())
+}
+
+fn nav_targets_id() -> egui::Id {
+    egui::Id::new(CONFIG_NAV_TARGETS_KEY)
+}
+
+/// This frame's gamepad-navigable config-pin targets: `(item_index, screen_rect)`
+/// for each Module pin. Empty when the overlay isn't showing pins (hidden, edit,
+/// or pick mode). Read by `nav_drive_config_overlay`.
+pub fn config_nav_targets(ctx: &egui::Context) -> Vec<(usize, egui::Rect)> {
+    ctx.data(|d| d.get_temp::<(u64, Vec<(usize, egui::Rect)>)>(nav_targets_id()))
+        .map(|(_, t)| t)
+        .unwrap_or_default()
 }
 
 pub fn config_overlay_visible(ctx: &egui::Context) -> bool {
@@ -102,6 +120,9 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     }
     let edit = config_overlay_edit(ctx);
     let frame_interval = Duration::from_secs_f64(1.0 / app.overlay_fps() as f64);
+    // The gamepad-focused tweak-pin index (M3.5), read before the tab borrow.
+    // Acts as the active pin when the mouse isn't hovering one.
+    let gp_focus = app.config_nav_focus();
 
     // A pick is only ours if it was armed by the config overlay. It's only
     // meaningful while editing (entered from the toolbar) — clear a stray one.
@@ -203,54 +224,85 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             }
         }
 
-        // Passthrough: click-through EXCEPT while the cursor is over the toolbar
-        // or a pinned item (so the game stays reachable and the pins/toolbar stay
-        // usable), or while a drag/popup is in flight. During a pick the window
-        // goes fully click-through so the pin click lands on FlexInput behind it.
         const HIT_MARGIN: f32 = 14.0;
+        let live = !edit && !pick;
+        let item_rect = |it: &LayoutItem| {
+            let (p, s) = it.bbox();
+            egui::Rect::from_min_size(
+                egui::pos2(p[0], p[1]),
+                egui::vec2(s[0].max(8.0), s[1].max(8.0)),
+            )
+        };
+        // OS cursor in overlay-local points (the overlay fills the monitor at
+        // origin, so screen points == item coords). None during a pick.
+        let cursor = if pick {
+            None
+        } else {
+            crate::overlay::os_cursor_in_points(vctx.pixels_per_point())
+        };
+
+        // Publish the gamepad-navigable pin targets (Module pins) each live frame.
+        if live {
+            let targets: Vec<(usize, egui::Rect)> = config_layout
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| matches!(it, LayoutItem::Module(_)))
+                .map(|(i, it)| (i, item_rect(it)))
+                .collect();
+            let pass = vctx.cumulative_pass_nr();
+            vctx.data_mut(|d| d.insert_temp(nav_targets_id(), (pass, targets)));
+        }
+
+        // The ACTIVE tweak-pin: the topmost Module pin under the cursor (items
+        // paint bottom→top, so the LAST match is on top), else the gamepad-focused
+        // pin. Its upstream physical device passes through to the game (M3.4/M3.5)
+        // — you feel/steer the parameter while adjusting and its live graph dot
+        // keeps moving.
+        let hovered_module_idx = cursor.and_then(|c| {
+            config_layout.items.iter().enumerate().rev().find_map(|(i, it)| {
+                matches!(it, LayoutItem::Module(_))
+                    .then(|| item_rect(it).expand(HIT_MARGIN).contains(c))
+                    .filter(|&hit| hit)
+                    .map(|_| i)
+            })
+        });
+        let gp_active = gp_focus.filter(|&i| {
+            matches!(config_layout.items.get(i), Some(LayoutItem::Module(_)))
+        });
+        let active_idx = if live { hovered_module_idx.or(gp_active) } else { None };
+        let passthrough_dev = active_idx.and_then(|i| match &config_layout.items[i] {
+            LayoutItem::Module(m) => {
+                crate::app::config_passthrough_device(tab_snarl, &m.source_path, m.inner_node_id)
+            }
+            _ => None,
+        });
+        let dragging = vctx.input(|i| i.pointer.any_down()) || vctx.is_using_pointer();
+        if live && (active_idx.is_some() || !dragging) {
+            // Overwrite the passthrough device — but not on a stray cursor-off-pin
+            // frame mid-drag, so a fast drag keeps the pin's input flowing.
+            vctx.data_mut(|d| d.insert_temp(passthrough_dev_id(), passthrough_dev.clone().unwrap_or_default()));
+        } else if !live {
+            vctx.data_mut(|d| d.insert_temp(passthrough_dev_id(), String::new()));
+        }
+
+        // Passthrough (window click-through): interactive over the toolbar or any
+        // pinned item, or during a drag/popup; click-through elsewhere so the game
+        // stays reachable. During a pick the window is fully click-through so the
+        // pin click lands on FlexInput behind it.
         let interactive = if pick {
             false
-        } else if egui::Popup::is_any_open(vctx)
-            || vctx.input(|i| i.pointer.any_down())
-            || vctx.is_using_pointer()
-        {
-            true
         } else {
-            match crate::overlay::os_cursor_in_points(vctx.pixels_per_point()) {
-                None => true, // can't read cursor → stay interactive (never worse)
-                Some(c) => {
-                    let over_toolbar = vctx
-                        .data(|d| d.get_temp::<egui::Rect>(toolbar_rect_id()))
+            let over_toolbar = cursor
+                .and_then(|c| {
+                    vctx.data(|d| d.get_temp::<egui::Rect>(toolbar_rect_id()))
                         .map(|r| r.expand(4.0).contains(c))
-                        .unwrap_or(false);
-                    // Topmost tweak-pin under the cursor (items paint bottom→top,
-                    // so the LAST match is on top). In live tweak mode its
-                    // upstream physical device passes through to the game (M3.4)
-                    // — you feel the parameter's effect while adjusting and the
-                    // pin's live graph dot keeps moving.
-                    let active_item = config_layout.items.iter().rev().find(|it| {
-                        let (p, s) = it.bbox();
-                        egui::Rect::from_min_size(
-                            egui::pos2(p[0], p[1]),
-                            egui::vec2(s[0].max(8.0), s[1].max(8.0)),
-                        )
-                        .expand(HIT_MARGIN)
-                        .contains(c)
-                    });
-                    let dev = if !edit {
-                        active_item.and_then(|it| match it {
-                            LayoutItem::Module(m) => crate::app::config_passthrough_device(
-                                tab_snarl, &m.source_path, m.inner_node_id,
-                            ),
-                            _ => None,
-                        })
-                    } else {
-                        None
-                    };
-                    vctx.data_mut(|d| d.insert_temp(passthrough_dev_id(), dev.unwrap_or_default()));
-                    over_toolbar || active_item.is_some()
-                }
-            }
+                })
+                .unwrap_or(false);
+            let over_item = cursor
+                .map(|c| config_layout.items.iter().any(|it| item_rect(it).expand(HIT_MARGIN).contains(c)))
+                .unwrap_or(false);
+            egui::Popup::is_any_open(vctx) || dragging || over_toolbar || over_item || cursor.is_none()
         };
         let pt_id = egui::Id::new("fxi_config_passthrough_applied");
         let want_passthrough = !interactive;
@@ -300,6 +352,18 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     ui, rect, tab_snarl, config_layout, edit,
                     live_signals, &panic_shortcut,
                 );
+
+                // Focus ring on the active pin (its input is passing through).
+                // Drawn after the body so it sits on top; the &mut borrow above
+                // has ended, so reading the item back is safe.
+                if let Some(it) = active_idx.and_then(|i| config_layout.items.get(i)) {
+                    let (p, s) = it.bbox();
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(p[0], p[1]),
+                        egui::vec2(s[0].max(8.0), s[1].max(8.0)),
+                    );
+                    paint_focus_ring(ui, r);
+                }
 
                 paint_reject_hint(ui, rect);
 
@@ -404,6 +468,27 @@ fn config_toolbar(
             });
     });
     ui.ctx().data_mut(|d| d.insert_temp(toolbar_rect_id(), area_resp.response.rect));
+}
+
+/// Outward glow ring around the ACTIVE tweak-pin — the one whose upstream input
+/// is currently passing through to the game. Concentric outside strokes with
+/// falling alpha fake an outer bloom (same technique the layout/left-panel focus
+/// rings use), so the pin's own widget stays fully visible underneath.
+fn paint_focus_ring(ui: &mut egui::Ui, rect: egui::Rect) {
+    let base = egui::Color32::from_rgb(120, 200, 255);
+    let p = ui.painter();
+    for (grow, width, alpha) in [
+        (1.0_f32, 2.0_f32, 230.0_f32),
+        (4.0, 3.0, 110.0),
+        (8.0, 4.0, 45.0),
+    ] {
+        p.rect_stroke(
+            rect.expand(grow),
+            6.0,
+            egui::Stroke::new(width, egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha as u8)),
+            egui::StrokeKind::Outside,
+        );
+    }
 }
 
 /// Flash a "not tweakable" chip for a couple seconds after a rejected pick.

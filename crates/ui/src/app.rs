@@ -2957,6 +2957,10 @@ impl FlexInputApp {
         let raw_focused = ctx.input(|i| i.focused);
         let easy_mode = self.settings.ui_mode == settings::UiMode::Easy;
         let nav_default = self.settings.gamepad_ui_nav_default;
+        // The config overlay (M3) can be summoned in any UI mode, and its own
+        // viewport (not the root) holds focus while the user drives it — so it
+        // enables nav regardless of easy-mode / root focus.
+        let config_visible = crate::config_overlay::config_overlay_visible(ctx);
 
         // The driver also runs when the app is pinned on-top (Windows may report
         // it unfocused even though it's visible and the user is driving it) and
@@ -2970,7 +2974,8 @@ impl FlexInputApp {
         // whenever pin + see-through were both on, treating see-through as a
         // pass-through intent that was never implemented. That left the window
         // pinned, on top, and visible but with nav dead. Removed.
-        let focused = raw_focused || self.settings.pin_active || self.gamepad_nav.alt_tab_active;
+        let focused = raw_focused || self.settings.pin_active
+            || self.gamepad_nav.alt_tab_active || config_visible;
 
         // Determine the active nav device. ALL nav-enabled physical gamepads can
         // drive the UI simultaneously by a last-active-input-takes-over rule:
@@ -2981,7 +2986,7 @@ impl FlexInputApp {
         // excluded: MIDI, and FlexInput's own loopback virtuals (feedback loop).
         let mut active_dev: Option<String> = None;
         let mut active_input: Option<gn::NavInput> = None;
-        if focused && easy_mode {
+        if focused && (easy_mode || config_visible) {
             // FlexInput's own loopback virtuals — excluded from nav to avoid a
             // feedback loop driving the UI from our own output.
             let nav_excluded_ids = self.own_virtual_device_ids();
@@ -3043,7 +3048,13 @@ impl FlexInputApp {
         // physical source). Suppress mapped output while focused + nav-enabled
         // so the controller drives only the UI.
         let any_nav_enabled = active_dev.is_some();
-        self.ui_nav_suppress.store(any_nav_enabled, Ordering::Relaxed);
+        // The config overlay suppresses input SELECTIVELY via its own engine
+        // source-block (blocking every physical device EXCEPT the tweak-pin's
+        // passthrough). The global `ui_nav_suppress`/`io_bypass` gate would drop
+        // ALL output — including the passthrough — so it must stay off while the
+        // overlay owns nav.
+        self.ui_nav_suppress
+            .store(any_nav_enabled && !config_visible, Ordering::Relaxed);
         if let Some(dev) = &active_dev {
             let pass = ctx.cumulative_pass_nr();
             ctx.data_mut(|data| {
@@ -3138,6 +3149,18 @@ impl FlexInputApp {
         if nav.is_rising("btn_back") {
             self.enter_alt_tab(&dev_id, ctx);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Config overlay (M3.5): owns nav while summoned ───────────────────
+        // Takes precedence over sub-patch / left-panel / settings nav so the pad
+        // drives the overlay's tweak-pins. (Select→Alt-Tab above still works.)
+        if config_visible {
+            self.nav_drive_config_overlay(ctx, &nav);
+            self.gamepad_nav.prev_pressed = nav.pressed.clone();
+            self.gamepad_nav.prev_lt = nav.lt > 0.5;
+            self.gamepad_nav.prev_rt = nav.rt > 0.5;
             ctx.request_repaint();
             return;
         }

@@ -67,6 +67,12 @@ impl FlexInputApp {
         }
     }
 
+    /// The gamepad-focused config tweak-pin index (M3.5), for the config
+    /// overlay to light up + pass through. `None` = no gamepad focus.
+    pub(crate) fn config_nav_focus(&self) -> Option<usize> {
+        self.gamepad_nav.config_index
+    }
+
     /// The overlay's live repaint rate (clamped to the settings bounds).
     pub(crate) fn overlay_fps(&self) -> u32 {
         self.settings.overlay_fps

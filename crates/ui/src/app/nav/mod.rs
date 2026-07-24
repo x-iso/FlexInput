@@ -7,6 +7,7 @@
 
 use super::*;
 
+mod config;
 mod curves;
 mod fields;
 mod gp_settings;

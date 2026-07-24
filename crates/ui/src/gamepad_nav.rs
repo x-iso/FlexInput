@@ -277,6 +277,12 @@ pub struct GamepadNav {
     pub seethrough_chord_down: bool,
     pub panic_chord_down: bool,
     pub overlay_chord_down: bool,
+    /// Config overlay (M3.5): index into this frame's published config-pin
+    /// targets of the gamepad-focused tweak-pin. `None` = no focus yet (seeds to
+    /// the top-left pin on first directional input). The focused pin's upstream
+    /// device passes through to the game, so you feel/steer the parameter you're
+    /// adjusting. Clamped to the target count each frame.
+    pub config_index: Option<usize>,
     /// UI-thread keyboard tapper for the Alt+Tab switcher. Independent of the
     /// device pool (which the I/O thread resets while nav-suppression is on).
     #[cfg(windows)]
@@ -310,6 +316,7 @@ impl Default for GamepadNav {
             prev_rt: false,
             left_edit: None,
             left_selected: None,
+            config_index: None,
             settings_open: false,
             settings_index: 0,
             settings_editing: false,
