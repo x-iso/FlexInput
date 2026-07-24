@@ -320,6 +320,10 @@ pub struct UiPatch {
     /// pre-overlay .fxp files keep loading.
     #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
     pub overlay: OverlayLayout,
+    /// Config-overlay layout (curated editable tweak-pins, M3). Default-empty
+    /// and skipped when empty so pre-config `.fxp` files keep loading.
+    #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
+    pub config: OverlayLayout,
 }
 
 #[derive(Clone)]
@@ -1712,6 +1716,7 @@ impl Canvas {
         auto_bypass: bool,
         easy_preset_path: Option<std::path::PathBuf>,
         overlay: OverlayLayout,
+        config: OverlayLayout,
     ) -> Option<std::path::PathBuf> {
         let path = crate::overlay::with_overlay_not_topmost(|| {
             rfd::FileDialog::new()
@@ -1728,6 +1733,7 @@ impl Canvas {
             auto_bypass,
             easy_preset_path,
             overlay,
+            config,
         };
         if let Ok(json) = serde_json::to_string_pretty(&patch) {
             let _ = std::fs::write(&path, json);
@@ -1746,6 +1752,7 @@ impl Canvas {
         bool,
         std::path::PathBuf,
         Option<std::path::PathBuf>,
+        OverlayLayout,
         OverlayLayout,
     )> {
         // Accept both `.fxp` (full patches) and `.fxsp` (sub-patch
@@ -1816,6 +1823,7 @@ impl Canvas {
                 Some(path),    // record fxsp path so Easy mode's
                                // restore_preset_link can re-link
                 OverlayLayout::default(), // presets carry no overlay
+                OverlayLayout::default(), // …and no config overlay
             ));
         }
 
@@ -1844,6 +1852,7 @@ impl Canvas {
             path,
             patch.easy_preset_path,
             patch.overlay,
+            patch.config,
         ))
     }
 }

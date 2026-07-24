@@ -602,6 +602,98 @@ pub(crate) fn render_pinned_element_impl(
     ui.label(egui::RichText::new("Re-pin via Layout mode").small().weak());
 }
 
+/// Whether a pinned `(module_id, element_id)` is an INTERACTIVE parameter
+/// control — a slider / curve / toggle / dropdown / numeric row the user can
+/// tweak, as opposed to a pure display (viewers, scopes, readouts, previews,
+/// labels, images) or a whole-module body. The config overlay (M3) consults
+/// this to curate its tweak-pin pick flow: only editable elements may be
+/// pinned there, so a config pin is always something you can actually adjust
+/// live over a game.
+///
+/// This is an explicit allow-list keyed to the interactive arms of
+/// [`render_pinned_element_impl`]'s dispatch. Anything not listed — display
+/// elements, `whole_module` bodies, and unknown/legacy ids — is treated as
+/// non-editable. The table is expanded in later M3 phases as more element
+/// types are verified to render + write correctly standalone.
+pub(crate) fn is_editable_element(module_id: &str, element_id: &str) -> bool {
+    // Audio Stream Haptics: the mode row and any calibration row are editable;
+    // the scope is display-only.
+    if module_id == "module.audio_stream_haptics" {
+        return element_id == "asth_mode_row"
+            || AsthRow::from_element_id(element_id).is_some();
+    }
+    matches!(
+        (module_id, element_id),
+        // Bare scalar / choice widgets.
+        ("module.knob", "value")
+            | ("module.constant", "value")
+            | ("module.dropdown", "selection")
+            | ("module.switch", "toggle")
+            // Gyro 3DOF rows.
+            | ("processing.gyro_3dof", "mode")
+            | ("processing.gyro_3dof", "pointer_mode")
+            | ("processing.gyro_3dof", "steering_mode")
+            | ("processing.gyro_3dof", "steering_opts")
+            | ("processing.gyro_3dof", "lean_threshold")
+            | ("processing.gyro_3dof", "gyro_invert")
+            | ("processing.gyro_3dof", "accel_invert")
+            // Response curves (regular / vec / two-way): the curve canvas + rows.
+            | ("module.response_curve", "curve")
+            | ("module.response_curve", "scale_row")
+            | ("module.response_curve", "range_row")
+            | ("module.response_curve", "grid_row")
+            | ("module.response_curve", "grid_options_row")
+            | ("module.vec_response_curve", "curve")
+            | ("module.vec_response_curve", "scale_row")
+            | ("module.vec_response_curve", "range_row")
+            | ("module.vec_response_curve", "grid_row")
+            | ("module.vec_response_curve", "grid_options_row")
+            | ("module.twoway_response_curve", "curve")
+            | ("module.twoway_response_curve", "scale_row")
+            | ("module.twoway_response_curve", "range_row")
+            | ("module.twoway_response_curve", "grid_row")
+            | ("module.twoway_response_curve", "grid_options_row")
+            | ("module.twoway_response_curve", "hyst_row")
+            | ("module.twoway_response_curve", "interp_row")
+            | ("module.twoway_response_curve", "lane_toggle")
+            // Vec Reshaper.
+            | ("module.vec_reshape", "pad")
+            | ("module.vec_reshape", "curve")
+            | ("module.vec_reshape", "target_row")
+            | ("module.vec_reshape", "options_row")
+            | ("module.vec_reshape", "range_row")
+            | ("module.vec_reshape", "grid_row")
+            | ("module.vec_reshape", "preset_row")
+            // Average / Delay / DC Filter DragValue rows.
+            | ("module.average", "samples")
+            | ("module.average", "spike_mad")
+            | ("module.delay", "ms")
+            | ("module.dc_filter", "window_ms")
+            | ("module.dc_filter", "decay_ms")
+            // Counter / Logic Delay rows.
+            | ("logic.counter", "mode")
+            | ("logic.counter", "range_mode")
+            | ("logic.counter", "step")
+            | ("logic.counter", "min_max")
+            | ("logic.delay", "mode")
+            | ("logic.delay", "time")
+            // Oscillator (preview is display-only).
+            | ("generator.oscillator", "shape")
+            | ("generator.oscillator", "freq")
+            | ("generator.oscillator", "phase")
+            // Envelope Generator rows.
+            | ("generator.envelope", "curve")
+            | ("generator.envelope", "time_row")
+            | ("generator.envelope", "mode_row")
+            | ("generator.envelope", "sustain_row")
+            | ("generator.envelope", "grid_row")
+            | ("generator.envelope", "grid_options_row")
+            // Scope control rows (the display halves are display-only).
+            | ("display.oscilloscope", "controls")
+            | ("display.trigscope", "controls")
+    )
+}
+
 // ── Whole-module pinned renderers (Remapper / Map Action) ─────────────────────
 //
 // Renders the full module body scaled to the user-chosen container width and
@@ -2118,7 +2210,51 @@ pub(crate) fn estimate_device_body_width(ui: &egui::Ui, node: &NodeData) -> f32 
     in_w + out_w + pin_size * 2.0 + gap
 }
 
+#[cfg(test)]
+mod editable_element_tests {
+    use super::is_editable_element;
 
+    #[test]
+    fn interactive_controls_are_editable() {
+        // A representative slice of the adjustable-control allow-list.
+        for (m, e) in [
+            ("module.knob", "value"),
+            ("module.switch", "toggle"),
+            ("module.dropdown", "selection"),
+            ("module.response_curve", "curve"),
+            ("module.twoway_response_curve", "lane_toggle"),
+            ("module.vec_reshape", "pad"),
+            ("processing.gyro_3dof", "pointer_mode"),
+            ("logic.counter", "step"),
+            ("generator.oscillator", "freq"),
+            ("module.audio_stream_haptics", "asth_mode_row"),
+        ] {
+            assert!(is_editable_element(m, e), "{m}/{e} should be editable");
+        }
+    }
+
+    #[test]
+    fn display_and_whole_module_elements_are_not_editable() {
+        for (m, e) in [
+            // Pure displays.
+            ("module.input_viewer", "viewer"),
+            ("display.controller3d", "viewer"),
+            ("display.readout", "value"),
+            ("display.oscilloscope", "display"),
+            ("module.svg", "image"),
+            ("generator.oscillator", "preview"),
+            ("module.audio_stream_haptics", "asth_scope"),
+            // Whole-module bodies (too big to be a single tweak).
+            ("module.remapper", "whole_module"),
+            ("module.map_action", "whole_module"),
+            // Unknown / legacy.
+            ("module.knob", "default"),
+            ("module.nonexistent", "value"),
+        ] {
+            assert!(!is_editable_element(m, e), "{m}/{e} should NOT be editable");
+        }
+    }
+}
 
 
 

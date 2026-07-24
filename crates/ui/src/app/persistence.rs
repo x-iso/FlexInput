@@ -19,6 +19,7 @@ impl FlexInputApp {
             easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
             view_salt: t.view_salt,
             overlay: t.overlay.clone(),
+            config: t.config.clone(),
         }).collect();
         PersistedWorkspace {
             version: 1,

@@ -127,6 +127,11 @@ pub struct PatchTab {
     /// Screen-overlay layout (pinned module elements + decorations on the
     /// transparent info overlay). Persisted with the tab (workspace + .fxp).
     pub overlay: crate::canvas::OverlayLayout,
+    /// Config-overlay layout (curated, editable tweak-pins on the transparent
+    /// config overlay — M3). Same `OverlayLayout` shape as `overlay`, but its
+    /// pins are the module's INTERACTIVE elements (sliders/curves/toggles),
+    /// tweaked live over a game. Persisted with the tab (workspace + .fxp).
+    pub config: crate::canvas::OverlayLayout,
 }
 
 /// Per-tab transient state used only when Easy mode is active. Holds the
@@ -162,6 +167,7 @@ impl PatchTab {
             easy_state: EasyState::default(),
             view_salt,
             overlay: Default::default(),
+            config: Default::default(),
         }
     }
 }
@@ -708,6 +714,7 @@ impl FlexInputApp {
                 easy_state,
                 view_salt,
                 overlay: pt.overlay,
+                config: pt.config,
             }
         };
         // A crash-recovery snapshot takes precedence over the opt-in workspace:
@@ -1860,8 +1867,9 @@ impl eframe::App for FlexInputApp {
             let preset_path = self.tabs[self.active_tab]
                 .easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone());
             let overlay = self.tabs[self.active_tab].overlay.clone();
+            let config = self.tabs[self.active_tab].config.clone();
             if let Some(saved_path) = self.tabs[self.active_tab].canvas
-                .save_patch(vids, bound, auto_bypass, preset_path, overlay)
+                .save_patch(vids, bound, auto_bypass, preset_path, overlay, config)
             {
                 let tab = &mut self.tabs[self.active_tab];
                 tab.title = saved_path.file_stem()
@@ -1871,7 +1879,7 @@ impl eframe::App for FlexInputApp {
             }
         }
         if do_load {
-            if let Some((new_canvas, vids, bound, auto_bypass, path, preset_path, overlay)) =
+            if let Some((new_canvas, vids, bound, auto_bypass, path, preset_path, overlay, config)) =
                 crate::canvas::Canvas::load_patch()
             {
                 // If the loaded file was a .fxsp wrapped into an
@@ -1899,6 +1907,7 @@ impl eframe::App for FlexInputApp {
                 tab.bound_exes = bound;
                 tab.auto_bypass = auto_bypass;
                 tab.overlay = overlay;
+                tab.config = config;
                 // Restore Easy-mode preset link: rederive content hash
                 // from the live sub-patch. If the saved path is gone,
                 // EasyState will fall back to hash-matching against the
@@ -2003,6 +2012,7 @@ impl eframe::App for FlexInputApp {
                             easy_state,
                             view_salt,
                             overlay: pt.overlay,
+                            config: pt.config,
                         }
                     }).collect();
                     if !new_tabs.is_empty() {

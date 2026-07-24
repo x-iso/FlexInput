@@ -655,6 +655,10 @@ pub struct PersistedTab {
     /// keep loading.
     #[serde(default)]
     pub overlay: crate::canvas::OverlayLayout,
+    /// Config-overlay layout (curated editable tweak-pins, M3). Default-empty
+    /// so pre-config workspaces keep loading.
+    #[serde(default)]
+    pub config: crate::canvas::OverlayLayout,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -34,9 +34,27 @@ pub(crate) const OVERLAY_PICK_RESULT_KEY:  &str = "fxi_overlay_pick_result";
 // can't address (paths are one level deep). Those editors set this around
 // their canvas render so their elements stay cold instead of amber-but-dead.
 pub(crate) const OVERLAY_PICK_SUPPRESSED_KEY: &str = "fxi_overlay_pick_suppressed";
+// Pick DESTINATION discriminator. The info overlay and the config overlay (M3)
+// both drive `register_exposable_element` through the SAME armed-pick state (so
+// the amber highlights + the app.rs/subpatch.rs PENDING→RESULT path resolution
+// are shared verbatim). This flag says WHICH overlay armed the current pick, so
+// only that overlay consumes the resolved result. `false`/absent = info overlay
+// (the pre-M3 default); `true` = config overlay.
+pub(crate) const OVERLAY_PICK_DEST_CONFIG_KEY: &str = "fxi_overlay_pick_dest_config";
 
 pub fn set_overlay_pick_suppressed(ctx: &egui::Context, on: bool) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY), on));
+}
+
+/// Mark the currently-armed pick as destined for the config overlay (`true`) or
+/// the info overlay (`false`). Set right after `set_overlay_pick_active(ctx, true)`.
+pub fn set_overlay_pick_dest_config(ctx: &egui::Context, is_config: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(OVERLAY_PICK_DEST_CONFIG_KEY), is_config));
+}
+
+/// Is the armed pick destined for the config overlay? Absent = info overlay.
+pub fn overlay_pick_dest_config(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_DEST_CONFIG_KEY))).unwrap_or(false)
 }
 
 pub fn set_overlay_pick_active(ctx: &egui::Context, active: bool) {
@@ -46,6 +64,9 @@ pub fn set_overlay_pick_active(ctx: &egui::Context, active: bool) {
         ctx.data_mut(|d| {
             d.remove_temp::<(usize, String, [f32; 2])>(egui::Id::new(OVERLAY_PICK_PENDING_KEY));
             d.remove_temp::<(Vec<usize>, usize, String, [f32; 2])>(egui::Id::new(OVERLAY_PICK_RESULT_KEY));
+            // Reset the destination back to the info-overlay default so a
+            // cancelled config pick can't leak into a later info pick.
+            d.remove_temp::<bool>(egui::Id::new(OVERLAY_PICK_DEST_CONFIG_KEY));
         });
     }
 }

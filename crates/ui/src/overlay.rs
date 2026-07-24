@@ -229,8 +229,11 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // `bg_repaint_hz` cadence (which would look awful over a game).
     let frame_interval = Duration::from_secs_f64(1.0 / app.overlay_fps() as f64);
     // Pick mode is only meaningful while editing (it's entered from the edit
-    // toolbar); anything else left it stale — clear it.
-    let mut pick = crate::canvas::viewer::overlay_pick_active(ctx);
+    // toolbar); anything else left it stale — clear it. A pick armed by the
+    // CONFIG overlay shares the same armed state but is destined elsewhere, so
+    // the info overlay ignores it here (never cancels or consumes it).
+    let mut pick = crate::canvas::viewer::overlay_pick_active(ctx)
+        && !crate::canvas::viewer::overlay_pick_dest_config(ctx);
     if pick && !edit {
         crate::canvas::viewer::set_overlay_pick_active(ctx, false);
         pick = false;
@@ -430,7 +433,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 /// Pick-state visuals: a pulsing amber border frame hugging the screen edge
 /// (the "pin mode" indicator) plus a hint chip below the top edge. Painted on
 /// a click-through window, so nothing here can intercept the pick click.
-fn paint_pick_frame(ui: &mut egui::Ui, rect: egui::Rect) {
+pub(crate) fn paint_pick_frame(ui: &mut egui::Ui, rect: egui::Rect) {
     let t = ui.input(|i| i.time);
     // Slow pulse 0..1 — enough to read as "armed", not enough to distract.
     let pulse = (0.5 + 0.5 * (t * 2.2).sin()) as f32;
@@ -511,6 +514,7 @@ fn overlay_edit_toolbar(
                             .clicked()
                         {
                             crate::canvas::viewer::set_overlay_pick_active(ui.ctx(), true);
+                            crate::canvas::viewer::set_overlay_pick_dest_config(ui.ctx(), false);
                             // Bring the main window forward so the highlighted
                             // elements are actually visible/clickable.
                             ui.ctx().send_viewport_cmd_to(
