@@ -3157,7 +3157,7 @@ impl FlexInputApp {
         // Takes precedence over sub-patch / left-panel / settings nav so the pad
         // drives the overlay's tweak-pins. (Select→Alt-Tab above still works.)
         if config_visible {
-            self.nav_drive_config_overlay(ctx, &nav);
+            self.nav_drive_config_overlay(ctx, &nav, dt);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             self.gamepad_nav.prev_lt = nav.lt > 0.5;
             self.gamepad_nav.prev_rt = nav.rt > 0.5;

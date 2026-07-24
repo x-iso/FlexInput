@@ -80,6 +80,12 @@ impl FlexInputApp {
         (self.gamepad_nav.config_editing, self.gamepad_nav.active_dev.is_some())
     }
 
+    /// The right-stick virtual cursor position + visibility (M3.6), for the
+    /// config overlay to draw it in its own viewport.
+    pub(crate) fn config_cursor(&self) -> (egui::Pos2, bool) {
+        (self.gamepad_nav.cursor_pos, self.gamepad_nav.cursor_visible)
+    }
+
     /// The overlay's live repaint rate (clamped to the settings bounds).
     pub(crate) fn overlay_fps(&self) -> u32 {
         self.settings.overlay_fps

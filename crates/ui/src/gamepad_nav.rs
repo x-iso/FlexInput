@@ -287,6 +287,9 @@ pub struct GamepadNav {
     /// with the gamepad (entered with South, exited with East). While editing,
     /// d-pad/stick adjust the pin's value instead of moving focus.
     pub config_editing: bool,
+    /// Config overlay (M3.6): selected control-point index while editing a
+    /// pinned response curve. Clamped to the point count each frame.
+    pub config_curve_dot: usize,
     /// UI-thread keyboard tapper for the Alt+Tab switcher. Independent of the
     /// device pool (which the I/O thread resets while nav-suppression is on).
     #[cfg(windows)]
@@ -322,6 +325,7 @@ impl Default for GamepadNav {
             left_selected: None,
             config_index: None,
             config_editing: false,
+            config_curve_dot: 0,
             settings_open: false,
             settings_index: 0,
             settings_editing: false,

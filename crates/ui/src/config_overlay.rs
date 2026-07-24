@@ -125,6 +125,8 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let gp_focus = app.config_nav_focus();
     // Gamepad state for the legend: (value-editing?, a pad is driving?).
     let (gp_editing, gp_pad_active) = app.config_nav_state();
+    // Right-stick virtual cursor (drawn in the overlay viewport).
+    let (gp_cursor_pos, gp_cursor_vis) = app.config_cursor();
 
     // A pick is only ours if it was armed by the config overlay. It's only
     // meaningful while editing (entered from the toolbar) — clear a stray one.
@@ -378,6 +380,10 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 if !edit {
                     paint_config_legend(ui, rect, gp_editing, gp_pad_active);
                 }
+                // Right-stick virtual cursor.
+                if gp_cursor_vis && !pick {
+                    paint_nav_cursor(ui, gp_cursor_pos);
+                }
             });
     });
 
@@ -475,6 +481,30 @@ fn config_toolbar(
             });
     });
     ui.ctx().data_mut(|d| d.insert_temp(toolbar_rect_id(), area_resp.response.rect));
+}
+
+/// Right-stick virtual cursor: a target-ring reticle at `pos`. Drawn directly
+/// (no texture upload) so it works inside the overlay viewport with no asset
+/// plumbing. Purely visual — the nav driver reads `cursor_pos` to focus pins.
+fn paint_nav_cursor(ui: &mut egui::Ui, pos: egui::Pos2) {
+    let accent = ui.visuals().selection.stroke.color;
+    let p = ui.painter();
+    // Soft outer halo.
+    for (r, a) in [(13.0_f32, 45.0_f32), (10.0, 90.0)] {
+        p.circle_stroke(
+            pos,
+            r,
+            egui::Stroke::new(3.0, egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), a as u8)),
+        );
+    }
+    p.circle_stroke(pos, 8.0, egui::Stroke::new(2.0, accent));
+    p.circle_filled(pos, 2.0, accent);
+    // Crosshair ticks.
+    let tick = egui::Stroke::new(1.5, accent);
+    for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+        let d = egui::vec2(dx, dy);
+        p.line_segment([pos + d * 8.0, pos + d * 13.0], tick);
+    }
 }
 
 /// Bottom-centered gamepad hint bar. Text-based (skin-agnostic) so it's cheap
