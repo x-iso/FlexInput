@@ -320,6 +320,16 @@ pub struct FlexInputApp {
     /// written by the processing thread. The UI reads it to RELAY live LED
     /// colours into displays (3D viewer LED strip) — never to route hardware.
     sink_bus: SinkBus,
+    /// UI→engine source-block channel (config overlay, M3). The UI writes the
+    /// physical device pins to suppress from the game while the config overlay
+    /// is open; the processing thread zeroes them in `dev_sigs` each tick. The
+    /// overlay's own navigation reads the RAW `last_signals`, so this never
+    /// starves nav. See [`flexinput_engine::UiSourceBlock`].
+    ui_source_block: flexinput_engine::UiSourceBlock,
+    /// Last set written to `ui_source_block`, so `update()` only takes the write
+    /// lock when the block set actually changes (device connect/disconnect or
+    /// the overlay opening/closing) rather than every frame.
+    ui_source_block_cache: std::collections::HashSet<(String, String)>,
     // ── I/O thread shared state ───────────────────────────────────────────────
     /// App-level shared pool of virtual output devices. Same instance of
     /// `virtual.xinput.0` is reused across every tab that references it.
@@ -669,12 +679,14 @@ impl FlexInputApp {
         let proc_device_signals = flexinput_engine::new_arc_signals();
         let proc_outputs        = Arc::new(Mutex::new(ProcessingOutput::default()));
         let sink_bus: SinkBus   = Arc::new(RwLock::new(HashMap::new()));
+        let ui_source_block     = flexinput_engine::new_ui_source_block();
         spawn_processing_thread(
             Arc::clone(&proc_graph),
             Arc::clone(&proc_device_signals),
             Arc::clone(&proc_outputs),
             Arc::clone(&sink_bus),
             Arc::clone(&sample_rate_hz),
+            Arc::clone(&ui_source_block),
         );
 
         // Restore workspace if the user opted in; otherwise start with one empty tab.
@@ -947,6 +959,8 @@ impl FlexInputApp {
             proc_device_signals,
             proc_outputs,
             sink_bus: Arc::clone(&sink_bus),
+            ui_source_block,
+            ui_source_block_cache: std::collections::HashSet::new(),
             shared_virtual_devices,
             device_ops,
             pending_device_ids,
@@ -1217,6 +1231,38 @@ impl eframe::App for FlexInputApp {
             let snap = self.proc_device_signals.load_full();
             self.last_signals = (*snap).clone();
         }
+
+        // Config overlay (M3): while it's summoned, suppress the physical input
+        // devices from the game so the inputs used to navigate/tweak it don't
+        // also drive the game. The overlay's own navigation reads the RAW
+        // `last_signals` above (unaffected by the engine's internal block), so
+        // this never starves nav. Full block first (M3.3) — every physical
+        // input device pin present this frame; M3.4 pokes a hole for the pin
+        // the focused tweak-pin actually affects. Only take the write lock when
+        // the set changes (device hotplug or the overlay opening/closing).
+        {
+            let want: std::collections::HashSet<(String, String)> =
+                if crate::config_overlay::config_overlay_visible(ctx) {
+                    self.last_signals
+                        .keys()
+                        .filter(|(dev, _)| {
+                            dev.starts_with("gilrs:")
+                                || dev.starts_with("sdl:")
+                                || dev.starts_with("midi_in:")
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+            if want != self.ui_source_block_cache {
+                if let Ok(mut g) = self.ui_source_block.write() {
+                    *g = want.clone();
+                }
+                self.ui_source_block_cache = want;
+            }
+        }
+
         // Merge live LED/lightbar feedback into the signal map so displays can
         // relay it (the 3D viewer's LED strip). These are sink-bound OUTPUT
         // pins ("lightbar_*"), so they never collide with input pin names.

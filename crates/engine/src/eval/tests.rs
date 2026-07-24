@@ -1274,6 +1274,68 @@ mod trigger_tests {
         assert!(v > 0.01, "stick past deadzone must reach sink, got {v}");
     }
 
+    // The UI→engine source-block (config overlay, M3.3): a `(device, pin)` the
+    // UI injects into `state[MACRO_CARRY_UID].source_block` before a tick is
+    // zeroed in that tick's `dev_sigs` view, so a sink reading the device pin
+    // gets nothing — the same tick-start apply the Virtual Menu's block uses,
+    // reached without any node in the graph. Mirrors how
+    // `spawn_processing_thread` re-injects the block before EVERY tick.
+    #[test]
+    fn ui_source_block_zeroes_device_pin_at_sink() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0); // no deadzone — raw passthrough
+        let sink = sink_node(2, "virtual.xinput:0", dev, false);
+        let graph = ProcessingGraph { nodes: vec![src, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        let dev_sigs = || {
+            let mut m = HashMap::new();
+            m.insert((dev.to_string(), "left_stick_x".to_string()), Signal::Float(0.9));
+            m
+        };
+        let sink_x = |out: &TickOutput| -> f32 {
+            out.sink_outputs
+                .get(&("virtual.xinput:0".to_string(), "left_stick_x".to_string()))
+                .map(|s| s.as_float())
+                .or_else(|| out.sink_outputs
+                    .get(&("virtual.xinput:0".to_string(), "left_stick".to_string()))
+                    .and_then(|s| if let Signal::Vec2(v) = s { Some(v.x) } else { None }))
+                .unwrap_or(0.0)
+        };
+        // Inject the block for the stick pins the way the proc thread does.
+        let block = |state: &mut HashMap<usize, crate::state::NodeState>| {
+            let carry = state.entry(MACRO_CARRY_UID).or_default();
+            for pin in ["left_stick", "left_stick_x", "left_stick_y"] {
+                carry.source_block.insert((dev.to_string(), pin.to_string()));
+            }
+        };
+
+        // Baseline: no block → the stick reaches the sink.
+        eval_graph_tick(&graph, &mut state, &dev_sigs(), 0.016, &mut out);
+        assert!(sink_x(&out) > 0.5,
+            "without a block the stick must reach the sink, got {}", sink_x(&out));
+
+        // Blocked tick → the sink reads zero.
+        block(&mut state);
+        eval_graph_tick(&graph, &mut state, &dev_sigs(), 0.016, &mut out);
+        assert!(sink_x(&out).abs() < 1e-4,
+            "an injected UI source-block must zero the device pin at the sink, got {}", sink_x(&out));
+
+        // The block is one-tick (tick-end clears `source_block`): without a
+        // re-inject the stick passes again — exactly why the proc thread
+        // re-injects before every tick of a catch-up burst.
+        eval_graph_tick(&graph, &mut state, &dev_sigs(), 0.016, &mut out);
+        assert!(sink_x(&out) > 0.5,
+            "block must not latch on its own — proc thread re-injects each tick, got {}", sink_x(&out));
+
+        // Re-inject → blocked again.
+        block(&mut state);
+        eval_graph_tick(&graph, &mut state, &dev_sigs(), 0.016, &mut out);
+        assert!(sink_x(&out).abs() < 1e-4,
+            "a re-injected block must zero the pin again, got {}", sink_x(&out));
+    }
+
     /// device.source → Remapper (analog stick-cardinal → key) → keymouse sink.
     /// Reproduces the user-reported case: WASD via analog-mode stick mapping.
     fn keymouse_sink_from_remap(uid: usize, remap_uid: usize) -> NodeSnap {

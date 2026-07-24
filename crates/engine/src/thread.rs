@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -193,6 +193,23 @@ pub struct ProcessingOutput {
 /// so the I/O thread never contends on the UI/processing mutex.
 pub type SinkBus = Arc<RwLock<HashMap<(String, String), Signal>>>;
 
+/// UI→engine source-block channel. The UI writes the set of physical device
+/// `(device_id, pin)` pairs to suppress from the game while the config overlay
+/// is open; the processing thread unions it into `state[MACRO_CARRY_UID].source_block`
+/// before every tick, so the existing tick-start apply zeroes them in `dev_sigs`
+/// (the same path the Virtual Menu's source-block uses). Empty = nothing blocked.
+///
+/// This is deliberately separate from any node-published block: it lets the UI
+/// suppress inputs it is consuming for on-screen navigation (config overlay,
+/// M3) without a node in the graph, and the config-overlay nav reads the RAW
+/// `proc_device_signals` snapshot, so blocking here never starves the nav.
+pub type UiSourceBlock = Arc<RwLock<HashSet<(String, String)>>>;
+
+/// Fresh, empty [`UiSourceBlock`] handle for the UI to share with the thread.
+pub fn new_ui_source_block() -> UiSourceBlock {
+    Arc::new(RwLock::new(HashSet::new()))
+}
+
 // ── Spawn ─────────────────────────────────────────────────────────────────────
 
 /// Spawns the processing thread and returns the shared state handles.
@@ -206,6 +223,7 @@ pub fn spawn_processing_thread(
     output: Arc<Mutex<ProcessingOutput>>,
     sink_bus: SinkBus,
     sample_rate: Arc<AtomicU32>,
+    ui_source_block: UiSourceBlock,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Raise this thread above the UI/render threads. The engine ticks at
@@ -316,9 +334,27 @@ pub fn spawn_processing_thread(
 
                 scope_acc.clear();
 
+                // Snapshot the UI source-block once per wakeup (cheap; usually
+                // empty). Re-injected before EACH tick below, because the
+                // tick-end pass clears `source_block` and repopulates it from
+                // node-published `__src_block__:` keys — so a once-per-wakeup
+                // injection would only cover the first tick of a catch-up burst,
+                // and the LAST tick (whose sink outputs are published) could
+                // leak the blocked input to the game.
+                let ui_block: Vec<(String, String)> = ui_source_block
+                    .read()
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+
                 {
                     puffin::profile_scope!("eval_ticks");
                     for _ in 0..ticks {
+                        if !ui_block.is_empty() {
+                            let carry = state.entry(crate::eval::MACRO_CARRY_UID).or_default();
+                            for k in &ui_block {
+                                carry.source_block.insert(k.clone());
+                            }
+                        }
                         eval_graph_tick(&graph_snap, &mut state, &dev_sigs, dt, &mut tick_out);
                         // Drain scope samples each tick — eval_graph_tick
                         // clears tick_out on entry, so we must move (not
