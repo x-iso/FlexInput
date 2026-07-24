@@ -125,6 +125,7 @@ impl FlexInputApp {
             ],
             EditLevel::CurveDot => vec![
                 (hint_move(), "Move dot"),
+                (vec!["btn_north"], "Hold: bend"),
                 (vec!["btn_west"], "Fine"),
                 (vec!["btn_east"], "Back"),
             ],

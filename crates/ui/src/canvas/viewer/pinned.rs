@@ -624,8 +624,15 @@ pub(crate) fn is_editable_element(module_id: &str, element_id: &str) -> bool {
     }
     matches!(
         (module_id, element_id),
+        // Mapping modules: the whole body is pinnable so you can Learn/assign a
+        // mapping live over a game. The config overlay passes NOTHING through
+        // while you navigate/map these — only the input of the card whose
+        // response curve you're editing passes (see `config_passthrough_pins_for`)
+        // — so mapping a button never leaks it to the game.
+        ("module.remapper", "whole_module")
+            | ("module.map_action", "whole_module")
         // Bare scalar / choice widgets.
-        ("module.knob", "value")
+            | ("module.knob", "value")
             | ("module.constant", "value")
             | ("module.dropdown", "selection")
             | ("module.switch", "toggle")
@@ -2228,6 +2235,9 @@ mod editable_element_tests {
             ("logic.counter", "step"),
             ("generator.oscillator", "freq"),
             ("module.audio_stream_haptics", "asth_mode_row"),
+            // Mapping-family whole bodies (Learn/assign live).
+            ("module.remapper", "whole_module"),
+            ("module.map_action", "whole_module"),
         ] {
             assert!(is_editable_element(m, e), "{m}/{e} should be editable");
         }
@@ -2244,9 +2254,11 @@ mod editable_element_tests {
             ("module.svg", "image"),
             ("generator.oscillator", "preview"),
             ("module.audio_stream_haptics", "asth_scope"),
-            // Whole-module bodies (too big to be a single tweak).
-            ("module.remapper", "whole_module"),
-            ("module.map_action", "whole_module"),
+            // Whole-module bodies of non-mapping modules stay non-editable
+            // (Remapper / Map Action are now allowed — mapping-family bodies are
+            // pinnable so you can Learn/assign live; see the other test).
+            ("module.automap_combiner", "whole_module"),
+            ("module.network_send", "whole_module"),
             // Unknown / legacy.
             ("module.knob", "default"),
             ("module.nonexistent", "value"),

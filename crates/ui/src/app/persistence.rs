@@ -104,6 +104,37 @@ impl FlexInputApp {
         }
     }
 
+    /// Inner node id of the config curve pin whose segment-curvature (bias)
+    /// handles should be shown this frame (the user is holding North to bend).
+    /// The overlay republishes `gp_nav_curve_bias` with ITS OWN viewport pass so
+    /// the pinned curve renderer paints the handles — `nav_drive_curve_dot`
+    /// stamps the root viewport's pass, which never matches the overlay's. `None`
+    /// when not bending a curve segment.
+    pub(crate) fn config_curve_bias(&self) -> Option<usize> {
+        use crate::gamepad_nav::EditLevel;
+        let (_, inner, _) = self.gamepad_nav.config_nav_sel.as_ref()?;
+        (self.gamepad_nav.edit_level == EditLevel::CurveDot && self.gamepad_nav.curve_bias)
+            .then_some(inner.0)
+    }
+
+    /// When the focused config pin is a mapping module (Remapper / Map Action)
+    /// AND the user is editing a mapping card's response curve, the entered
+    /// card's index — so the overlay passes THAT card's input through (and
+    /// nothing else). `None` otherwise (a mapping pin blocks everything).
+    pub(crate) fn config_remapper_card_edit(&self) -> Option<usize> {
+        use crate::gamepad_nav::EditLevel;
+        let (outer, _, _) = self.gamepad_nav.config_nav_sel.as_ref()?;
+        if !matches!(
+            self.gamepad_nav.edit_level,
+            EditLevel::CurveDots | EditLevel::CurveDot
+        ) {
+            return None;
+        }
+        let mid = self.nav_selected_module_id(*outer)?;
+        matches!(mid.as_str(), "module.remapper" | "module.map_action")
+            .then_some(self.gamepad_nav.remap_card)
+    }
+
     /// The overlay's live repaint rate (clamped to the settings bounds).
     pub(crate) fn overlay_fps(&self) -> u32 {
         self.settings.overlay_fps

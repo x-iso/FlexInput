@@ -416,6 +416,80 @@ pub(crate) fn config_passthrough_pins(
     Some((device, pins))
 }
 
+/// Config-overlay passthrough that knows about MAPPING modules. A Remapper /
+/// Map Action pin passes NOTHING through while you navigate or Learn a mapping
+/// (so pressing a button to map it never leaks that press to the game). Only
+/// while you're editing a mapping card's response curve — `card_edit ==
+/// Some(card_idx)` — does that ONE card's physical input pass through, so you
+/// feel the curve you're shaping live. Every other module keeps the plain
+/// per-pin passthrough of [`config_passthrough_pins`].
+pub(crate) fn config_passthrough_pins_for(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+    card_edit: Option<usize>,
+) -> Option<(String, Vec<String>)> {
+    let is_mapping = matches!(
+        pin_module_id(tab_snarl, source_path, inner_node_id).as_deref(),
+        Some("module.remapper") | Some("module.map_action")
+    );
+    if is_mapping {
+        // Block everything unless a mapping card's curve is being edited.
+        let card = card_edit?;
+        let device = config_passthrough_device(tab_snarl, source_path, inner_node_id)?;
+        let pins = config_card_in_pins(tab_snarl, source_path, inner_node_id, card)?;
+        return Some((device, pins));
+    }
+    config_passthrough_pins(tab_snarl, source_path, inner_node_id)
+}
+
+/// The `module_id` of the node a config pin references (resolved through the
+/// pin's `source_path` into the owning snarl).
+fn pin_module_id(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+) -> Option<String> {
+    let node_id = NodeId(inner_node_id);
+    let resolve = |snarl: &Snarl<NodeData>| snarl.get_node(node_id).map(|n| n.module_id.clone());
+    match source_path {
+        [] => resolve(tab_snarl),
+        [sp] => resolve(&tab_snarl.get_node(NodeId(*sp))?.subpatch.as_ref()?.snarl),
+        _ => None,
+    }
+}
+
+/// The physical input pin group of a mapping module's card at `card_idx` — the
+/// pins listed in the card's `"in"` array, each expanded to its axis group. The
+/// input passes through while that card's response curve is being tweaked.
+fn config_card_in_pins(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+    card_idx: usize,
+) -> Option<Vec<String>> {
+    let node_id = NodeId(inner_node_id);
+    let resolve = |snarl: &Snarl<NodeData>| -> Option<Vec<String>> {
+        let node = snarl.get_node(node_id)?;
+        let mappings = node.params.get("mappings")?.as_array()?;
+        let ins = mappings.get(card_idx)?.get("in")?.as_array()?;
+        let mut pins = Vec::new();
+        for p in ins {
+            if let Some(s) = p.as_str() {
+                pins.extend(expand_pin_group(s));
+            }
+        }
+        pins.sort();
+        pins.dedup();
+        (!pins.is_empty()).then_some(pins)
+    };
+    match source_path {
+        [] => resolve(tab_snarl),
+        [sp] => resolve(&tab_snarl.get_node(NodeId(*sp))?.subpatch.as_ref()?.snarl),
+        _ => None,
+    }
+}
+
 /// The physical pin group a config pin's module reads on its first connected
 /// input, resolved from the upstream node's `output_pin_ids` (both device.source
 /// and AutoMap Splitter store the pin IDs there, indexed by output pin). Expands

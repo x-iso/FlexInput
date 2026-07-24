@@ -500,6 +500,8 @@ impl FlexInputApp {
         };
         self.nav_keep_card_curve_focus(ctx, outer_id, inner);
         let i = self.gamepad_nav.curve_dot.min(pts.len() - 1);
+        // Cleared each frame; set true below only while North is held (bias mode).
+        self.gamepad_nav.curve_bias = false;
 
         // East / South → back to dot navigation.
         if nav.is_rising("btn_east") || nav.is_rising("btn_south") {
@@ -520,6 +522,7 @@ impl FlexInputApp {
         // full-deflection hold takes several seconds to cross the range, and
         // fine is much slower again for precise shaping.
         if nav.pressed.contains("btn_north") {
+            self.gamepad_nav.curve_bias = true;
             let mut db = 0.0f32;
             let s = if fine { 0.003 } else { 0.012 }; // per dpad press
             // Discrete: dpad rising edges only (stick is the continuous path).

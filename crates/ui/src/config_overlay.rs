@@ -139,6 +139,11 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let legend = if gp_pad_active { app.config_legend_specs(ctx) } else { Vec::new() };
     // Curve-dot highlight to republish with the overlay's own viewport pass.
     let curve_sel = app.config_curve_sel();
+    // Inner node of the curve whose bias (bend) handles should show this frame.
+    let curve_bias = app.config_curve_bias();
+    // For a focused mapping-module pin: the card whose curve is being edited (so
+    // its input passes through). `None` = block everything (default for mapping).
+    let remapper_card_edit = app.config_remapper_card_edit();
     // Right-stick virtual cursor (drawn in the overlay viewport) — the SAME
     // reticle texture the main-window nav cursor uses, for visual consistency.
     let (gp_cursor_pos, gp_cursor_vis) = app.config_cursor();
@@ -290,11 +295,24 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         let gp_active = gp_focus.filter(|&i| {
             matches!(config_layout.items.get(i), Some(LayoutItem::Module(_)))
         });
-        let active_idx = if live { hovered_module_idx.or(gp_active) } else { None };
+        // When a gamepad owns the config focus (`config_index`, set only from the
+        // gamepad's own RS cursor / d-pad — never from the OS pointer), IT is
+        // authoritative for the passthrough target. The OS cursor may itself be
+        // our virtual mouse (e.g. a gyro→mouse passthrough the user is testing);
+        // letting it hover-steal onto another pin would suppress the very input
+        // being tweaked. A pure-mouse session (no gamepad focus) still hover-picks
+        // the pin under the cursor.
+        let active_idx = if !live {
+            None
+        } else if gp_focus.is_some() {
+            gp_active
+        } else {
+            hovered_module_idx.or(gp_active)
+        };
         let passthrough = active_idx.and_then(|i| match &config_layout.items[i] {
-            LayoutItem::Module(m) => {
-                crate::app::config_passthrough_pins(tab_snarl, &m.source_path, m.inner_node_id)
-            }
+            LayoutItem::Module(m) => crate::app::config_passthrough_pins_for(
+                tab_snarl, &m.source_path, m.inner_node_id, remapper_card_edit,
+            ),
             _ => None,
         });
         let dragging = vctx.input(|i| i.pointer.any_down()) || vctx.is_using_pointer();
@@ -380,6 +398,14 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     let pass = ui.ctx().cumulative_pass_nr();
                     ui.ctx().data_mut(|d| {
                         d.insert_temp(egui::Id::new(("gp_nav_curve_sel", inner)), (pass, dot, editing));
+                    });
+                }
+                // Same per-viewport republish for the bias-handle visibility flag
+                // so the curve shows its bend handles while North is held.
+                if let Some(inner) = curve_bias {
+                    let pass = ui.ctx().cumulative_pass_nr();
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new(("gp_nav_curve_bias", inner)), pass);
                     });
                 }
 

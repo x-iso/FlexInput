@@ -116,6 +116,16 @@ impl FlexInputApp {
                         ctx.request_repaint();
                         return;
                     }
+                    NavWidgetKind::Remapper => {
+                        // Remapper / Map Action whole-module pin: enter scroll mode
+                        // (Learn/assign a mapping live). Delegation to
+                        // `nav_drive_subpatch` handles the rest via the override.
+                        self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+                        self.gamepad_nav.edit_baseline =
+                            Some(Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+                        ctx.request_repaint();
+                        return;
+                    }
                     _ => {}
                 }
             }
