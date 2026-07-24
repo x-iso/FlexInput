@@ -37,28 +37,21 @@ pub(crate) fn spawn_io_thread(
     std::thread::Builder::new()
         .name("device-io".into())
         .spawn(move || {
-            // Bump the Windows system timer resolution to 1 ms so
-            // `thread::sleep(Duration::from_millis(1))` actually sleeps
-            // ~1 ms instead of the default ~15.6 ms. Without this, the
-            // requested polling rate is capped at ~64 Hz regardless of
-            // setting. Process-wide effect; matches what game-input
-            // libraries do internally.
+            // This loop (and the engine tick) pace themselves with a HIGH-RESOLUTION
+            // waitable timer (flexinput_engine::HrWaiter), NOT timeBeginPeriod. The
+            // old 1 ms global timer raise had two problems on Windows 11: (a) it is
+            // honored only for the FOREGROUND process, so backgrounded both loops
+            // collapsed to ~64 Hz and a gyro-driven mouse drew straight-line segments
+            // ("losing packets"); and (b) it raises the SYSTEM-WIDE timer resolution,
+            // adding DPC latency that stutters other high-rate input (an I2C-HID
+            // laptop trackpad). The per-timer high-resolution waiter gives ~0.5 ms
+            // precision without either penalty — see hr_timer.
             #[cfg(windows)]
             unsafe {
-                let r = windows_sys::Win32::Media::timeBeginPeriod(1);
-                eprintln!("[device-io] timeBeginPeriod(1) -> {} (0 == TIMERR_NOERROR)", r);
-
-                // Windows 11 honors a raised timer resolution (the timeBeginPeriod(1)
-                // above) ONLY while the process is in the FOREGROUND — a backgrounded
-                // process is throttled back to the ~15.6 ms system default. That
-                // collapses BOTH the engine tick and this I/O loop from kHz down to
-                // ~64 Hz whenever FlexInput loses focus, so a gyro-/stick-driven mouse
-                // — used precisely while another app is focused — gets coarse velocity
-                // samples and the cursor draws straight-line segments between them
-                // ("losing packets / interpolating"). Opt out of the background timer
-                // throttle so our resolution request stays honored unfocused. Process-
-                // wide, so it also covers the engine thread. Win11+ only; on older
-                // Windows the call fails harmlessly (the flag is unknown → no-op).
+                // Belt-and-suspenders: ask Win11 not to throttle our timer resolution
+                // when backgrounded, so the high-resolution waiter stays precise while
+                // another app is focused. Process-wide (covers the engine thread);
+                // Win11+ only, fails harmlessly on older Windows.
                 {
                     use windows_sys::Win32::System::Threading::{
                         GetCurrentProcess, SetProcessInformation, ProcessPowerThrottling,
@@ -87,15 +80,18 @@ pub(crate) fn spawn_io_thread(
                 // real-time leg of the input→output path. Pin it above the UI
                 // and render threads so a busy frame can never delay an input
                 // flush. TIME_CRITICAL (not just ABOVE_NORMAL) because the loop
-                // is a tight bounded poll-and-sleep: it yields the CPU every
-                // iteration via `thread::sleep`, so it can't starve other
-                // threads, but while runnable it should preempt them.
+                // is a tight bounded poll-and-wait: it yields the CPU every
+                // iteration via the high-resolution waiter, so it can't starve
+                // other threads, but while runnable it should preempt them.
                 use windows_sys::Win32::System::Threading::{
                     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
                 };
                 let ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
                 eprintln!("[device-io] SetThreadPriority(TIME_CRITICAL) -> {} (nonzero == ok)", ok);
             }
+            // High-resolution waiter for the per-iteration pacing wait below —
+            // precise without raising the global timer resolution (see hr_timer).
+            let waiter = flexinput_engine::HrWaiter::new();
             let mut last_enum = Instant::now() - Duration::from_secs(10);
             let mut last_midi_out: HashMap<(String, String), Signal> = HashMap::new();
             // Physical-pad haptic outputs we drove last tick (rumble, HD amp,
@@ -632,7 +628,7 @@ pub(crate) fn spawn_io_thread(
 
                 let elapsed = t0.elapsed();
                 if elapsed < interval {
-                    std::thread::sleep(interval - elapsed);
+                    waiter.wait(interval - elapsed);
                 }
 
                 // Measured per-loop Hz via inter-iteration interval. EMA

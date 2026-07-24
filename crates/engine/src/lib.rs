@@ -5,9 +5,12 @@ use uuid::Uuid;
 
 pub mod eval;
 pub mod graph;
+pub mod hr_timer;
 pub mod router;
 pub mod state;
 pub mod thread;
+
+pub use hr_timer::HrWaiter;
 
 pub use eval::{
     analog_axis_for_cardinal,

@@ -247,6 +247,12 @@ pub fn spawn_processing_thread(
         // reused thereafter.
         let mut scope_acc: Vec<(usize, Vec<Option<f32>>)> = Vec::new();
 
+        // High-resolution waiter for the sub-tick sleep below — precise without
+        // raising the global timer resolution (see hr_timer). The device-I/O
+        // thread no longer calls timeBeginPeriod, so a plain thread::sleep here
+        // would round up to ~15.6 ms and collapse the tick rate.
+        let waiter = crate::hr_timer::HrWaiter::new();
+
         loop {
             puffin::GlobalProfiler::lock().new_frame();
             puffin::profile_scope!("proc_thread_iter");
@@ -370,7 +376,7 @@ pub fn spawn_processing_thread(
             if next_tick > now2 {
                 let gap = next_tick - now2;
                 let sleep_for = gap.min(Duration::from_millis(1));
-                thread::sleep(sleep_for);
+                waiter.wait(sleep_for);
             }
         }
     })
