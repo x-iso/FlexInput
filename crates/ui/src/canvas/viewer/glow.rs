@@ -193,8 +193,7 @@ pub(crate) fn resolve_automap_glow_output(
         // AutoMap output (their zone behaviour goes onto the bus / typed ports);
         // without this they fell to the `_` arm, whose `last_out[0]` is None for
         // the passthrough slot — so the port never lit despite live signals.
-        "module.automap_split" | "module.automap_collect" | "module.remapper"
-        | "module.audio_stream_haptics" | "module.touch_zones" => {
+        m if crate::module_ui_info::glows_from_automap_input(m) => {
             let am_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)?;
             walk_automap_input(live_signals, snarl, src.node, am_idx, parent)
         }

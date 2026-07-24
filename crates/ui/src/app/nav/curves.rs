@@ -180,9 +180,7 @@ impl FlexInputApp {
             if pts.len() < 2 { return None; }
             return Some((inner, pts));
         }
-        if !matches!(node.module_id.as_str(),
-            "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
-            | "module.audio_stream_haptics" | "module.vec_reshape")
+        if !crate::module_ui_info::has_nav_response_curve(&node.module_id)
         { return None; }
         let (pts_key, _) = self.nav_curve_keys(outer_id, inner);
         let pts: Vec<[f32; 2]> = node.params.get(pts_key)?.as_array()?

@@ -6,6 +6,7 @@ mod gamepad_nav;
 mod kbm_picker;
 mod guide_watcher;
 mod macro_icons;
+mod module_ui_info;
 mod menu_overlay;
 mod overlay;
 mod panels;

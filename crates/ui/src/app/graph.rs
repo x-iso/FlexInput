@@ -231,15 +231,10 @@ pub fn find_automap_device_id_for_viewer(
                 .iter().map(|p| p.id.to_string()).collect();
             return Some((collector_id, canonical_pins, None));
         }
-        // automap_collect AND audio_stream_haptics both re-publish the AutoMap bus
-        // into their OWN `collector:{uid}` key (the ASTH eval block mirrors the
-        // Collector's phase-1 copy), so a node downstream of either must read from
-        // that collector key — not recurse past it like feedback_control does.
-        if node.module_id == "module.automap_collect"
-            || node.module_id == "module.audio_stream_haptics"
-            || node.module_id == "module.network_send"
-            || node.module_id == "module.network_recv"
-        {
+        // Modules that re-publish the AutoMap bus into their OWN `collector:{uid}`
+        // key (see module_ui_info): a node downstream of one must read from that
+        // collector key — not recurse past it like feedback_control does.
+        if crate::module_ui_info::republishes_automap_bus(&node.module_id) {
             let upstream_dev_id = node.inputs.iter()
                 .position(|p| p.signal_type == SignalType::AutoMap)
                 .and_then(|am_idx| {
@@ -409,16 +404,11 @@ pub(crate) fn find_automap_device_rec(
             .iter().map(|p| p.id.to_string()).collect();
         return Some((collector_id, canonical_pins, None));
     }
-    // automap_collect AND audio_stream_haptics both re-publish the AutoMap bus into
-    // their own `collector:{uid}` key (ASTH's eval block mirrors the Collector's
-    // phase-1 copy), so a downstream node must read from that collector key. Without
-    // this arm, ASTH fell through unhandled → its AutoMap output resolved to nothing
-    // → the port produced no signal.
-    if node.module_id == "module.automap_collect"
-        || node.module_id == "module.audio_stream_haptics"
-        || node.module_id == "module.network_send"
-        || node.module_id == "module.network_recv"
-    {
+    // Modules that re-publish the AutoMap bus into their own `collector:{uid}` key
+    // (see module_ui_info): a downstream node must read from that collector key.
+    // Without this arm, ASTH fell through unhandled → its AutoMap output resolved
+    // to nothing → the port produced no signal.
+    if crate::module_ui_info::republishes_automap_bus(&node.module_id) {
         let upstream_dev_id = node.inputs.iter()
             .position(|p| p.signal_type == SignalType::AutoMap)
             .and_then(|am_idx| {
