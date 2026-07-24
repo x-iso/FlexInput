@@ -4086,6 +4086,12 @@ impl FlexInputApp {
         if !self.gamepad_nav.cursor_visible {
             return;
         }
+        // The config overlay draws its OWN cursor in its viewport; skip the
+        // main-window one while it's summoned, or both show at once (the same
+        // `cursor_pos` painted in two viewports).
+        if crate::config_overlay::config_overlay_visible(ctx) {
+            return;
+        }
         if self.nav_cursor_tex(ctx).is_none() {
             return;
         }

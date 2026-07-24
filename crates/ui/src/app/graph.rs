@@ -496,27 +496,53 @@ fn config_card_in_pins(
 /// a resolved pin to its whole axis group (Vec2 base + `_x`/`_y`/`_z`) so a stick
 /// mapping still passes fully. `None` = couldn't resolve (caller uses whole
 /// device).
+/// The physical IMU pins a gyro processor (`processing.gyro_3dof`) reads off the
+/// AutoMap bus. A curve tweaked DOWNSTREAM of the gyro processor must pass these
+/// (so you feel the gyro drive the mouse) while everything else — e.g. a right
+/// stick that's also summed into the same mouse delta — stays blocked.
+const GYRO_IMU_PINS: &[&str] = &[
+    "gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z",
+];
+
 fn config_consumed_pins(
     tab_snarl: &Snarl<NodeData>,
     source_path: &[usize],
     inner_node_id: usize,
 ) -> Option<Vec<String>> {
-    let node_id = NodeId(inner_node_id);
+    // Walk up from the tweaked node toward its physical source, narrowing to the
+    // pin group it actually consumes. Resolves a direct device.source / splitter
+    // pin (via `output_pin_ids`), a gyro processor (the IMU group), and hops
+    // through passthrough/processing nodes in between. Bounded to avoid cycles.
     let resolve = |snarl: &Snarl<NodeData>| -> Option<Vec<String>> {
-        let node = snarl.get_node(node_id)?;
-        for i in 0..node.inputs.len() {
-            let in_pin = snarl.in_pin(InPinId { node: node_id, input: i });
-            if let Some(&remote) = in_pin.remotes.first() {
-                if let Some(pid) = snarl
-                    .get_node(remote.node)
-                    .and_then(|up| up.params.get("output_pin_ids"))
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.get(remote.output))
-                    .and_then(|v| v.as_str())
-                {
-                    if pid != "automap_pass" && !pid.is_empty() {
-                        return Some(expand_pin_group(pid));
+        let mut cur = NodeId(inner_node_id);
+        for _ in 0..32 {
+            let node = snarl.get_node(cur)?;
+            // First connected input's upstream output.
+            let remote = (0..node.inputs.len()).find_map(|i| {
+                snarl.in_pin(InPinId { node: cur, input: i }).remotes.first().copied()
+            })?;
+            let up = snarl.get_node(remote.node)?;
+            match up.module_id.as_str() {
+                // A gyro processor terminates the walk: it consumes exactly the
+                // IMU pins, so pass those and nothing else.
+                "processing.gyro_3dof" => {
+                    return Some(GYRO_IMU_PINS.iter().map(|s| s.to_string()).collect());
+                }
+                _ => {
+                    // device.source / splitter (or anything storing pin ids):
+                    // a resolvable, non-passthrough pin ends the walk.
+                    if let Some(pid) = up.params.get("output_pin_ids")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.get(remote.output))
+                        .and_then(|v| v.as_str())
+                    {
+                        if pid != "automap_pass" && !pid.is_empty() {
+                            return Some(expand_pin_group(pid));
+                        }
                     }
+                    // Passthrough / unresolved (an intermediate curve, a splitter's
+                    // bus output…): keep walking up toward the device.
+                    cur = remote.node;
                 }
             }
         }

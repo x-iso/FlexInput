@@ -176,12 +176,12 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         if let Some((source_path, inner_uid, eid, size)) =
             crate::canvas::viewer::take_overlay_pick_result(ctx)
         {
-            let editable = crate::canvas::overlay_body::resolve_overlay_module(
+            let pinnable = crate::canvas::overlay_body::resolve_overlay_module(
                 tab_snarl, &source_path, inner_uid,
             )
-            .map(|n| crate::canvas::viewer::is_editable_element(&n.module_id, &eid))
+            .map(|n| crate::canvas::viewer::is_pinnable_element(&n.module_id, &eid))
             .unwrap_or(false);
-            if editable {
+            if pinnable {
                 let init_size = if size[0] >= 1.0 && size[1] >= 1.0 { size } else { [220.0, 100.0] };
                 let n = config_layout.items.len() as f32;
                 let cascade = (n % 8.0) * 28.0;

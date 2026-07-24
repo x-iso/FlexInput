@@ -117,10 +117,25 @@ impl FlexInputApp {
                         return;
                     }
                     NavWidgetKind::Remapper => {
-                        // Remapper / Map Action whole-module pin: enter scroll mode
-                        // (Learn/assign a mapping live). Delegation to
+                        // Remapper / Map Action / Combiner whole-module pin: enter
+                        // scroll mode (Learn/assign a mapping live). Delegation to
                         // `nav_drive_subpatch` handles the rest via the override.
                         self.gamepad_nav.edit_level = EditLevel::RemapScroll;
+                        self.gamepad_nav.edit_baseline =
+                            Some(Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+                        ctx.request_repaint();
+                        return;
+                    }
+                    NavWidgetKind::TouchZones => {
+                        // Touch Zones pad: enter line editing (seeds the focused
+                        // line + snapshots one coalesced undo, like Easy mode).
+                        self.nav_tz_enter(outer);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    NavWidgetKind::TouchZoneCards => {
+                        // Touch Zones mapping list: enter the zone-tab + Learn flow.
+                        self.gamepad_nav.edit_level = EditLevel::TzCards;
                         self.gamepad_nav.edit_baseline =
                             Some(Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo()));
                         ctx.request_repaint();
