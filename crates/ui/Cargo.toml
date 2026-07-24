@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 build   = "build.rs"
 
+[features]
+# Audio Stream Haptics — optional module (Phase C pilot). On by default; forwards
+# to the modules crate so the ASTH node is absent from the palette when off.
+default = ["asth"]
+asth = ["flexinput-modules/asth"]
+
 [dependencies]
 flexinput-core    = { workspace = true }
 flexinput-engine  = { workspace = true }

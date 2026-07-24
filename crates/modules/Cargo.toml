@@ -7,3 +7,9 @@ edition.workspace = true
 flexinput-core = { workspace = true }
 smallvec       = { workspace = true }
 glam           = { workspace = true }
+
+[features]
+# Audio Stream Haptics (WASAPI loopback → HD rumble). Optional module — the
+# Phase C registry pilot. On by default; the app keeps it enabled via the engine.
+default = ["asth"]
+asth = []

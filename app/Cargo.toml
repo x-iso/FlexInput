@@ -9,6 +9,13 @@ build   = "build.rs"
 # separate run target — the app re-execs itself with `--hidmaestro-helper`.
 default-run = "flexinput"
 
+[features]
+# Audio Stream Haptics — optional module (Phase C pilot). Forwarded from the UI
+# down to the modules crate. `cargo build` keeps it on; build the app with
+# `--no-default-features` to ship without the ASTH node.
+default = ["asth"]
+asth = ["flexinput-ui/asth"]
+
 [dependencies]
 flexinput-ui = { workspace = true }
 eframe       = { workspace = true }

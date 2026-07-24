@@ -30,8 +30,11 @@ flexinput-devices = { path = "crates/devices" }
 flexinput-virtual = { path = "crates/virtual" }
 flexinput-hidmaestro = { path = "crates/hidmaestro" }
 flexinput-net     = { path = "crates/net" }
-flexinput-modules = { path = "crates/modules" }
-flexinput-ui      = { path = "crates/ui" }
+# default-features off so the optional `asth` module feature is controlled by
+# forwarding (ui → modules, app → ui); the default build re-enables it. Overriding
+# default-features on a workspace-inherited dep only takes effect when set here.
+flexinput-modules = { path = "crates/modules", default-features = false }
+flexinput-ui      = { path = "crates/ui", default-features = false }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"

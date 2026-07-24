@@ -2,7 +2,8 @@ use flexinput_core::{Module, ModuleDescriptor, ModuleRegistration, PinDescriptor
 use smallvec::SmallVec;
 
 pub fn registrations() -> Vec<ModuleRegistration> {
-    vec![
+    #[allow(unused_mut)]
+    let mut v = vec![
         reg::<DelayModule>(),
         reg::<AverageModule>(),
         reg::<DcFilterModule>(),
@@ -21,8 +22,26 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<RemapperModule>(),
         reg::<MapActionModule>(),
         reg::<FeedbackControlModule>(),
-        reg::<AudioStreamHapticsModule>(),
-    ]
+    ];
+    // Audio Stream Haptics is an optional module (Phase C pilot): the WASAPI
+    // loopback + audio→haptics path compiles out with the `asth` feature off.
+    #[cfg(feature = "asth")]
+    v.push(reg::<AudioStreamHapticsModule>());
+    v
+}
+
+#[cfg(test)]
+mod feature_tests {
+    #[test]
+    fn asth_descriptor_presence_tracks_feature() {
+        let has = super::registrations()
+            .iter()
+            .any(|r| r.descriptor.id == "module.audio_stream_haptics");
+        #[cfg(feature = "asth")]
+        assert!(has, "with the `asth` feature the module must be registered");
+        #[cfg(not(feature = "asth"))]
+        assert!(!has, "without the `asth` feature the module must be absent");
+    }
 }
 
 fn reg<M: Module + Default + 'static>() -> ModuleRegistration {
@@ -287,9 +306,11 @@ impl Module for AutoMapCollectModule {
 /// All real work is in eval.rs (`module.audio_stream_haptics`); params:
 ///   `asth_mode` (process|focused|system), `asth_target_name`, `asth_include_tree`,
 ///   `asth_modulator` (0=gate by std rumble, 0.5=boost, 1=replace).
+#[cfg(feature = "asth")]
 #[derive(Default)]
 pub struct AudioStreamHapticsModule;
 
+#[cfg(feature = "asth")]
 impl Module for AudioStreamHapticsModule {
     fn descriptor() -> ModuleDescriptor {
         ModuleDescriptor {
