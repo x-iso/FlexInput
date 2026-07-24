@@ -405,10 +405,32 @@ impl FlexInputApp {
         }
     }
 
+    /// Config-overlay nav override (M3.6): when the config overlay is editing a
+    /// tweak-pin, the shared nav resolvers point at THAT pin instead of the
+    /// sub-patch's own `selected_item`, so the existing widget/curve drivers edit
+    /// the config pin with identical UX. Returns `(inner node, module_id,
+    /// element_id)` when the override is active for `outer_id`.
+    fn nav_config_override(
+        &self,
+        outer_id: egui_snarl::NodeId,
+    ) -> Option<(egui_snarl::NodeId, String, String)> {
+        let (o, inner, elem) = self.gamepad_nav.config_nav_sel.as_ref()?;
+        if *o != outer_id {
+            return None;
+        }
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+        let mid = sp.snarl.get_node(*inner)?.module_id.clone();
+        Some((*inner, mid, elem.clone()))
+    }
+
     /// Resolve the inner module id of the selected sub-patch item, if it's a
     /// Module item.
     #[allow(dead_code)]
     pub(crate) fn nav_selected_module_id(&self, outer_id: egui_snarl::NodeId) -> Option<String> {
+        if let Some((_, mid, _)) = self.nav_config_override(outer_id) {
+            return Some(mid);
+        }
         let canvas = &self.tabs[self.active_tab].canvas;
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         let sel = sp.selected_item?;
@@ -424,6 +446,9 @@ impl FlexInputApp {
     /// Resolve the inner node id of the selected sub-patch item, if it's a
     /// Module item.
     pub(crate) fn nav_selected_inner_node(&self, outer_id: egui_snarl::NodeId) -> Option<egui_snarl::NodeId> {
+        if let Some((inner, _, _)) = self.nav_config_override(outer_id) {
+            return Some(inner);
+        }
         let canvas = &self.tabs[self.active_tab].canvas;
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         let sel = sp.selected_item?;
@@ -436,6 +461,9 @@ impl FlexInputApp {
 
     /// (module_id, element_id) of the selected sub-patch item.
     pub(crate) fn nav_selected_element(&self, outer_id: egui_snarl::NodeId) -> Option<(String, String)> {
+        if let Some((_, mid, elem)) = self.nav_config_override(outer_id) {
+            return Some((mid, elem));
+        }
         let canvas = &self.tabs[self.active_tab].canvas;
         let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
         let sel = sp.selected_item?;
@@ -679,7 +707,9 @@ impl FlexInputApp {
         // The selected item's element_id: a curve module can be pinned as the
         // dot-graph ("curve") or as separate scale/range/grid rows — only the
         // graph element supports dot editing.
-        let elem = {
+        let elem = if let Some((_, _, e)) = self.nav_config_override(outer_id) {
+            Some(e)
+        } else {
             let canvas = &self.tabs[self.active_tab].canvas;
             canvas.snarl.get_node(outer_id)
                 .and_then(|n| n.subpatch.as_ref())

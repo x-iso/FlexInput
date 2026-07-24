@@ -125,8 +125,10 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let gp_focus = app.config_nav_focus();
     // Gamepad state for the legend: (value-editing?, a pad is driving?).
     let (gp_editing, gp_pad_active) = app.config_nav_state();
-    // Right-stick virtual cursor (drawn in the overlay viewport).
+    // Right-stick virtual cursor (drawn in the overlay viewport) — the SAME
+    // reticle texture the main-window nav cursor uses, for visual consistency.
     let (gp_cursor_pos, gp_cursor_vis) = app.config_cursor();
+    let cursor_tex = if gp_cursor_vis { app.nav_cursor_tex(ctx) } else { None };
 
     // A pick is only ours if it was armed by the config overlay. It's only
     // meaningful while editing (entered from the toolbar) — clear a stray one.
@@ -380,9 +382,22 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 if !edit {
                     paint_config_legend(ui, rect, gp_editing, gp_pad_active);
                 }
-                // Right-stick virtual cursor.
+                // Right-stick virtual cursor — the shared reticle texture (falls
+                // back to a drawn ring only if the texture failed to load).
                 if gp_cursor_vis && !pick {
-                    paint_nav_cursor(ui, gp_cursor_pos);
+                    match &cursor_tex {
+                        Some(tex) => {
+                            let size = egui::vec2(56.0, 56.0);
+                            let r = egui::Rect::from_center_size(gp_cursor_pos, size);
+                            ui.painter().image(
+                                tex.id(),
+                                r,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                        None => paint_nav_cursor(ui, gp_cursor_pos),
+                    }
                 }
             });
     });

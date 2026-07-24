@@ -2961,6 +2961,13 @@ impl FlexInputApp {
         // viewport (not the root) holds focus while the user drives it — so it
         // enables nav regardless of easy-mode / root focus.
         let config_visible = crate::config_overlay::config_overlay_visible(ctx);
+        // Closing the overlay mid-edit must not leave the shared nav state
+        // (edit_level + the config override) pointed at a config pin — that would
+        // hijack the main sub-patch nav. Reset on close.
+        if !config_visible && self.gamepad_nav.config_nav_sel.is_some() {
+            self.gamepad_nav.config_nav_sel = None;
+            self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::Widget;
+        }
 
         // The driver also runs when the app is pinned on-top (Windows may report
         // it unfocused even though it's visible and the user is driving it) and
@@ -4010,13 +4017,10 @@ impl FlexInputApp {
         }
     }
 
-    /// Draw the right-stick/gyro cursor overlay when visible.
-    fn draw_nav_cursor(&mut self, ctx: &egui::Context) {
-        if !self.gamepad_nav.cursor_visible {
-            return;
-        }
-        // Lazily rasterize + upload the circular target SVG, tinted with the
-        // selection accent.
+    /// The RS/gyro cursor reticle texture, lazily rasterized + uploaded (tinted
+    /// with the selection accent). Shared by the main-window cursor and the
+    /// config overlay so both draw the SAME cursor. Returns a cheap handle clone.
+    pub(crate) fn nav_cursor_tex(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
         if self.gamepad_nav.cursor_tex.is_none() {
             const CURSOR_SVG: &str =
                 include_str!("../../../app/assets/flair_circle_target_с.svg");
@@ -4027,6 +4031,17 @@ impl FlexInputApp {
                 let tex = ctx.load_texture("gp_nav_cursor", img, egui::TextureOptions::LINEAR);
                 self.gamepad_nav.cursor_tex = Some(tex);
             }
+        }
+        self.gamepad_nav.cursor_tex.clone()
+    }
+
+    /// Draw the right-stick/gyro cursor overlay when visible.
+    fn draw_nav_cursor(&mut self, ctx: &egui::Context) {
+        if !self.gamepad_nav.cursor_visible {
+            return;
+        }
+        if self.nav_cursor_tex(ctx).is_none() {
+            return;
         }
         let Some(tex) = &self.gamepad_nav.cursor_tex else { return; };
         let painter = ctx.layer_painter(egui::LayerId::new(

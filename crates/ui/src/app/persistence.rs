@@ -73,11 +73,13 @@ impl FlexInputApp {
         self.gamepad_nav.config_index
     }
 
-    /// Whether the gamepad is value-editing the focused config pin (M3.6) and
-    /// whether a nav-enabled gamepad is currently driving — for the overlay's
-    /// legend to show the right hints (and only while a pad is active).
+    /// Whether the gamepad is editing the focused config pin (M3.6) and whether
+    /// a nav-enabled gamepad is currently driving — for the overlay's legend to
+    /// show the right hints (and only while a pad is active).
     pub(crate) fn config_nav_state(&self) -> (bool, bool) {
-        (self.gamepad_nav.config_editing, self.gamepad_nav.active_dev.is_some())
+        let editing = self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Widget
+            && self.gamepad_nav.config_nav_sel.is_some();
+        (editing, self.gamepad_nav.active_dev.is_some())
     }
 
     /// The right-stick virtual cursor position + visibility (M3.6), for the

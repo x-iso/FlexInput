@@ -283,13 +283,14 @@ pub struct GamepadNav {
     /// device passes through to the game, so you feel/steer the parameter you're
     /// adjusting. Clamped to the target count each frame.
     pub config_index: Option<usize>,
-    /// Config overlay (M3.6): true while the focused pin is being VALUE-EDITED
-    /// with the gamepad (entered with South, exited with East). While editing,
-    /// d-pad/stick adjust the pin's value instead of moving focus.
-    pub config_editing: bool,
-    /// Config overlay (M3.6): selected control-point index while editing a
-    /// pinned response curve. Clamped to the point count each frame.
-    pub config_curve_dot: usize,
+    /// Config overlay (M3.6): while a config tweak-pin is being EDITED with the
+    /// gamepad, this points the shared nav resolvers (`nav_selected_inner_node`
+    /// / `nav_selected_element` / `nav_selected_kind`) at the pin instead of the
+    /// sub-patch's own `selected_item`, so the existing widget/curve drivers
+    /// (`nav_drive_fields`, `nav_drive_curve_dots`/`_dot`) edit the config pin
+    /// with identical UX. `(outer sub-patch node, inner node, element_id)`.
+    /// `None` = not editing a config pin (sub-patch nav resolves normally).
+    pub config_nav_sel: Option<(egui_snarl::NodeId, egui_snarl::NodeId, String)>,
     /// UI-thread keyboard tapper for the Alt+Tab switcher. Independent of the
     /// device pool (which the I/O thread resets while nav-suppression is on).
     #[cfg(windows)]
@@ -324,8 +325,7 @@ impl Default for GamepadNav {
             left_edit: None,
             left_selected: None,
             config_index: None,
-            config_editing: false,
-            config_curve_dot: 0,
+            config_nav_sel: None,
             settings_open: false,
             settings_index: 0,
             settings_editing: false,

@@ -1,16 +1,17 @@
-//! Gamepad navigation + value-editing of the config overlay (M3.5 / M3.6).
+//! Gamepad navigation + editing of the config overlay (M3.5 / M3.6).
 //!
-//! Focus: d-pad / left-stick move focus between the pinned tweak-pins, and the
-//! right stick drives a virtual cursor that also focuses whatever pin it hovers.
-//! The focused pin's upstream physical device passes through to the game (the
-//! overlay resolves passthrough from `gamepad_nav.config_index`), so you feel and
-//! steer the parameter while adjusting it.
+//! This is deliberately a THIN layer over the existing Easy-mode nav so the UX
+//! is identical: d-pad / left-stick (and the shared RS cursor) move focus
+//! between the pinned tweak-pins, then South enters the SAME widget/curve
+//! editors the sub-patch canvas uses. It does that by pointing the shared nav
+//! resolvers at the focused config pin via `gamepad_nav.config_nav_sel` (see
+//! `nav_config_override`) and, once editing, delegating straight to
+//! `nav_drive_subpatch` — so response curves get the full dot nav (highlight,
+//! cursor-grab, add/delete, bias, undo), knobs/dropdowns the field editor, etc.
 //!
-//! South acts on the focused pin: a Switch toggles, a Dropdown cycles, a Knob
-//! enters value-edit (stick/d-pad adjust), and a Response Curve enters curve-edit
-//! (d-pad selects a control point, left-stick moves it) — reusing the curve
-//! renderer's published geometry (`gp_nav_curve_geom`) and selection-highlight
-//! channel (`gp_nav_curve_sel`). East exits an edit.
+//! Reuse requires a sub-patch `outer_id`, so only pins that live inside a
+//! first-level sub-patch (`source_path == [sp]`, the Easy-mode norm) are
+//! editable; top-level pins are focus-only for now.
 //!
 //! Output suppression here is the config overlay's own SELECTIVE engine
 //! source-block, NOT `ui_nav_suppress`/`io_bypass` (which drop ALL output and
@@ -19,7 +20,7 @@
 use super::*;
 
 impl FlexInputApp {
-    /// Drive config-overlay focus + value-edit with the resolved nav device.
+    /// Drive config-overlay focus + editing with the resolved nav device.
     /// Called from `run_gamepad_nav` while the overlay is visible; owns the frame.
     pub(crate) fn nav_drive_config_overlay(
         &mut self,
@@ -27,87 +28,100 @@ impl FlexInputApp {
         nav: &crate::gamepad_nav::NavInput,
         dt: f32,
     ) {
-        use crate::gamepad_nav::{self as gn, NavDir};
+        use crate::gamepad_nav::{self as gn, EditLevel, NavDir};
 
         let targets = crate::config_overlay::config_nav_targets(ctx);
         if targets.is_empty() {
             self.gamepad_nav.config_index = None;
-            self.gamepad_nav.config_editing = false;
+            self.gamepad_nav.config_nav_sel = None;
+            self.gamepad_nav.edit_level = EditLevel::Widget;
             self.gamepad_nav.repeat_dir = None;
             return;
         }
         if let Some(i) = self.gamepad_nav.config_index {
             if !targets.iter().any(|(idx, _)| *idx == i) {
                 self.gamepad_nav.config_index = None;
-                self.gamepad_nav.config_editing = false;
+                self.gamepad_nav.config_nav_sel = None;
+                self.gamepad_nav.edit_level = EditLevel::Widget;
             }
         }
 
-        // ── Right-stick virtual cursor ───────────────────────────────────────
+        // Shared RS/gyro cursor (drives `cursor_pos`, monitor-clamped for the
+        // fullscreen overlay). The shared editors read `cursor_pos` in screen
+        // space — exactly the space the overlay + pin renderers publish in.
         self.config_update_cursor(ctx, nav, dt);
-        // While NOT editing, the cursor focuses whatever pin it hovers (a
-        // pointer-style alternative to d-pad stepping).
-        if !self.gamepad_nav.config_editing && self.gamepad_nav.cursor_visible {
+
+        // ── Editing: delegate to the shared sub-patch nav dispatch ───────────
+        // The override (config_nav_sel) makes `nav_drive_subpatch`'s resolvers
+        // target the config pin, so the real curve/field/toggle drivers edit it
+        // with identical UX. Its Widget-level branch is skipped here (edit_level
+        // != Widget), so it never touches the sub-patch's own selection.
+        if self.gamepad_nav.edit_level != EditLevel::Widget {
+            if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
+                let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
+                let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
+                self.nav_drive_subpatch(ctx, outer, nav, dt, rt_rising, lt_rising);
+            } else {
+                self.gamepad_nav.edit_level = EditLevel::Widget;
+            }
+            return;
+        }
+
+        // ── Widget level: focus nav between config pins ──────────────────────
+        // The cursor focuses whatever pin it hovers (pointer-style pick).
+        if self.gamepad_nav.cursor_visible {
             let cp = self.gamepad_nav.cursor_pos;
             if let Some((idx, _)) = targets.iter().rev().find(|(_, r)| r.contains(cp)) {
                 self.gamepad_nav.config_index = Some(*idx);
             }
         }
 
-        let focused = self.config_focused_pin();
+        // Point the shared resolvers at the focused pin (drives South-enter's
+        // `nav_selected_kind`, and the editors once entered). None for top-level
+        // pins — they can't drive the sub-patch-keyed editors.
+        self.gamepad_nav.config_nav_sel = self.config_pin_outer_inner_elem();
 
-        // ── Editing modes ────────────────────────────────────────────────────
-        if self.gamepad_nav.config_editing {
-            if let Some((m, e, sp, inner)) = focused {
-                if e == "curve" && is_curve_module(&m) {
-                    self.nav_config_curve_edit(ctx, nav, dt, &sp, inner);
-                    return;
-                }
-                // Knob value-edit: stick / d-pad adjust; East|South exit.
-                if nav.is_rising("btn_east") || nav.is_rising("btn_south") {
-                    self.gamepad_nav.config_editing = false;
-                    ctx.request_repaint();
-                    return;
-                }
-                let fine = nav.pressed.contains("btn_west");
-                let coarse = if fine { 0.01 } else { 0.05 };
-                let mut delta = 0.0f32;
-                if nav.lstick.x.abs() > 0.2 {
-                    delta += nav.lstick.x * (if fine { 0.005 } else { 0.02 });
-                }
-                if nav.is_rising("dpad_right") { delta += coarse; }
-                if nav.is_rising("dpad_left") { delta -= coarse; }
-                if delta != 0.0 {
-                    if let Some(node) = self.config_pin_node_mut(&sp, inner) {
-                        nav_config_adjust_scalar(node, &m, &e, delta);
-                    }
-                }
-            } else {
-                self.gamepad_nav.config_editing = false;
-            }
-            ctx.request_repaint();
-            return;
-        }
-
-        // ── Nav: South acts on the focused pin ───────────────────────────────
-        if nav.is_rising("btn_south") {
-            if let Some((m, e, sp, inner)) = focused.clone() {
-                if (m == "module.knob" && e == "value") || (e == "curve" && is_curve_module(&m)) {
-                    self.gamepad_nav.config_editing = true;
-                    self.gamepad_nav.config_curve_dot = 0;
-                    ctx.request_repaint();
-                    return;
-                }
-                if let Some(node) = self.config_pin_node_mut(&sp, inner) {
-                    if nav_config_activate(node, &m, &e) {
+        // South / RT → enter the SAME editor the sub-patch canvas would, chosen
+        // by widget kind (mirrors the Widget-level enters in nav_drive_subpatch).
+        if nav.is_rising("btn_south") || (nav.rt > 0.5 && !self.gamepad_nav.prev_rt) {
+            if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
+                match self.nav_selected_kind(outer) {
+                    NavWidgetKind::Curve => {
+                        self.gamepad_nav.edit_level = EditLevel::CurveDots;
+                        self.gamepad_nav.curve_return_level = EditLevel::Widget;
+                        self.gamepad_nav.curve_dot = 0;
+                        self.gamepad_nav.edit_baseline =
+                            Some(Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo()));
                         ctx.request_repaint();
                         return;
                     }
+                    NavWidgetKind::Value | NavWidgetKind::Dropdown | NavWidgetKind::MultiField => {
+                        let kind = self.nav_selected_kind(outer);
+                        self.gamepad_nav.edit_level = EditLevel::Editing;
+                        self.gamepad_nav.fine_increment = false;
+                        self.gamepad_nav.field_index = 0;
+                        self.gamepad_nav.edit_baseline =
+                            Some(Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo()));
+                        if matches!(kind, NavWidgetKind::Dropdown) {
+                            self.nav_set_dropdown_popup(ctx, outer, true);
+                        }
+                        ctx.request_repaint();
+                        return;
+                    }
+                    NavWidgetKind::Toggle => {
+                        let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+                        if self.nav_toggle_switch(outer) {
+                            self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+                        }
+                        ctx.request_repaint();
+                        return;
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // ── Nav: move focus (d-pad edges, else left-stick step on engage) ────
+        // Directional focus move (d-pad edges, else left-stick step on engage).
         let mut dir: Option<NavDir> = None;
         if nav.is_rising("dpad_up") {
             dir = Some(NavDir::Up);
@@ -144,7 +158,7 @@ impl FlexInputApp {
 
     /// Right-stick virtual cursor, clamped to the monitor (the overlay covers it
     /// at origin). Mirrors `update_nav_cursor` but bounds to the whole screen
-    /// rather than the main window's content rect.
+    /// rather than the main window's content rect, driving the shared cursor.
     fn config_update_cursor(&mut self, ctx: &egui::Context, nav: &crate::gamepad_nav::NavInput, dt: f32) {
         let mon = ctx
             .input(|i| i.viewport().monitor_size)
@@ -175,185 +189,22 @@ impl FlexInputApp {
         }
     }
 
-    /// Curve-edit a pinned response curve: d-pad L/R select a control point,
-    /// left-stick moves it (in graph units, read from the renderer's published
-    /// geometry); East exits. Publishes the selection so the curve highlights it.
-    fn nav_config_curve_edit(
-        &mut self,
-        ctx: &egui::Context,
-        nav: &crate::gamepad_nav::NavInput,
-        dt: f32,
-        source_path: &[usize],
-        inner: usize,
-    ) {
-        if nav.is_rising("btn_east") {
-            self.gamepad_nav.config_editing = false;
-            ctx.request_repaint();
-            return;
-        }
-        // Graph rect + axis bounds published by the curve renderer last frame.
-        let geom: Option<(u64, egui::Rect, f32, f32, f32, f32)> =
-            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_geom", inner))));
-        let Some((_, _rect, x_lo, x_hi, y_lo, y_hi)) = geom else {
-            ctx.request_repaint();
-            return;
-        };
-        let mut pts = self.config_curve_points(source_path, inner);
-        if pts.len() < 2 {
-            ctx.request_repaint();
-            return;
-        }
-        // Select a dot.
-        let mut sel = self.gamepad_nav.config_curve_dot.min(pts.len() - 1);
-        if nav.is_rising("dpad_right") && sel + 1 < pts.len() { sel += 1; }
-        if nav.is_rising("dpad_left") && sel > 0 { sel -= 1; }
-        self.gamepad_nav.config_curve_dot = sel;
-
-        // Move the selected dot with the left stick, in graph units. Endpoints
-        // keep their fixed X (only Y moves); interior points move in both axes,
-        // clamped to stay between their neighbours (monotonic X).
-        let fine = nav.pressed.contains("btn_west");
-        let rate = if fine { 0.25 } else { 0.9 }; // fraction of range / sec
-        let (dx, dy) = (nav.lstick.x, nav.lstick.y);
-        if dx.abs() > 0.15 || dy.abs() > 0.15 {
-            let is_endpoint = sel == 0 || sel + 1 == pts.len();
-            let mut p = pts[sel];
-            if !is_endpoint && dx.abs() > 0.15 {
-                p[0] = (p[0] + dx * (x_hi - x_lo) * rate * dt).clamp(x_lo, x_hi);
-                let lo_n = pts[sel - 1][0];
-                let hi_n = pts[sel + 1][0];
-                p[0] = p[0].clamp(lo_n, hi_n);
-            }
-            if dy.abs() > 0.15 {
-                p[1] = (p[1] + dy * (y_hi - y_lo) * rate * dt).clamp(y_lo, y_hi);
-            }
-            pts[sel] = p;
-            self.config_curve_write_points(source_path, inner, &pts);
-        }
-
-        // Publish the selection so the curve renderer highlights the dot THIS
-        // frame (the overlay renders after this driver in `update`).
-        let pass = ctx.cumulative_pass_nr();
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("gp_nav_curve_sel", inner)), (pass, sel, true)));
-        ctx.request_repaint();
-    }
-
-    /// Read a curve pin's `points` param as `Vec<[f32; 2]>`.
-    fn config_curve_points(&self, source_path: &[usize], inner: usize) -> Vec<[f32; 2]> {
-        self.config_pin_node(source_path, inner)
-            .and_then(|n| n.params.get("points"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| {
-                        let a = p.as_array()?;
-                        Some([a.first()?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Write a curve pin's `points` (same length — only moves existing dots, so
-    /// the segment `biases` stay valid and need no resync).
-    fn config_curve_write_points(&mut self, source_path: &[usize], inner: usize, pts: &[[f32; 2]]) {
-        if let Some(node) = self.config_pin_node_mut(source_path, inner) {
-            let arr: Vec<serde_json::Value> = pts
-                .iter()
-                .map(|p| serde_json::json!([p[0] as f64, p[1] as f64]))
-                .collect();
-            node.params.insert("points".to_string(), serde_json::Value::Array(arr));
-        }
-    }
-
-    /// Identity of the gamepad-focused config pin:
-    /// `(module_id, element_id, source_path, inner_node_id)`.
-    fn config_focused_pin(&self) -> Option<(String, String, Vec<usize>, usize)> {
+    /// `(outer sub-patch node, inner node, element_id)` for the gamepad-focused
+    /// config pin, or `None` for a top-level pin (no sub-patch outer to drive
+    /// the shared editors) or no focus.
+    fn config_pin_outer_inner_elem(&self) -> Option<(egui_snarl::NodeId, egui_snarl::NodeId, String)> {
         use crate::canvas::node::LayoutItem;
         let i = self.gamepad_nav.config_index?;
         let tab = self.tabs.get(self.active_tab)?;
         let LayoutItem::Module(m) = tab.config.items.get(i)? else { return None };
-        let node = crate::canvas::overlay_body::resolve_overlay_module(
-            &tab.canvas.snarl,
-            &m.source_path,
-            m.inner_node_id,
-        )?;
-        Some((node.module_id.clone(), m.element_id.clone(), m.source_path.clone(), m.inner_node_id))
-    }
-
-    /// Immutable access to a config pin's inner node.
-    fn config_pin_node(&self, source_path: &[usize], inner_node_id: usize) -> Option<&crate::canvas::NodeData> {
-        crate::canvas::overlay_body::resolve_overlay_module(
-            &self.tabs.get(self.active_tab)?.canvas.snarl,
-            source_path,
-            inner_node_id,
-        )
-    }
-
-    /// Mutable access to a config pin's inner node (tab canvas or first-level
-    /// sub-patch).
-    fn config_pin_node_mut(
-        &mut self,
-        source_path: &[usize],
-        inner_node_id: usize,
-    ) -> Option<&mut crate::canvas::NodeData> {
-        let snarl = &mut self.tabs[self.active_tab].canvas.snarl;
-        match source_path {
-            [] => snarl.get_node_mut(egui_snarl::NodeId(inner_node_id)),
-            [sp] => snarl
-                .get_node_mut(egui_snarl::NodeId(*sp))
-                .and_then(|n| n.subpatch.as_mut())
-                .and_then(|s| s.snarl.get_node_mut(egui_snarl::NodeId(inner_node_id))),
+        match m.source_path.as_slice() {
+            [sp] => Some((
+                egui_snarl::NodeId(*sp),
+                egui_snarl::NodeId(m.inner_node_id),
+                m.element_id.clone(),
+            )),
             _ => None,
         }
-    }
-}
-
-/// The response-curve module family whose `curve` element is gamepad-editable.
-fn is_curve_module(module_id: &str) -> bool {
-    matches!(
-        module_id,
-        "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
-    )
-}
-
-/// Nudge a scalar pin's value by `delta` (normalized units) — the Knob's `value`.
-fn nav_config_adjust_scalar(
-    node: &mut crate::canvas::NodeData,
-    module_id: &str,
-    element_id: &str,
-    delta: f32,
-) {
-    if (module_id, element_id) == ("module.knob", "value") {
-        let bipolar = node.params.get("bipolar").and_then(|v| v.as_bool()).unwrap_or(false);
-        let (lo, hi) = if bipolar { (-1.0f32, 1.0f32) } else { (0.0f32, 1.0f32) };
-        let v = node.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        let nv = (v + delta * (hi - lo)).clamp(lo, hi);
-        if let Some(n) = serde_json::Number::from_f64(nv as f64) {
-            node.params.insert("value".to_string(), serde_json::Value::Number(n));
-        }
-    }
-}
-
-/// Act on a pin with South (no edit mode): toggle a Switch, cycle a Dropdown.
-/// Returns true if the press was consumed.
-fn nav_config_activate(node: &mut crate::canvas::NodeData, module_id: &str, element_id: &str) -> bool {
-    match (module_id, element_id) {
-        ("module.switch", "toggle") => {
-            let active = crate::canvas::viewer::read_switch_active(node);
-            node.params.insert("active".to_string(), serde_json::Value::Bool(!active));
-            true
-        }
-        ("module.dropdown", "selection") => {
-            let options = crate::canvas::viewer::dropdown_read_options(node);
-            if options.is_empty() {
-                return false;
-            }
-            let cur = crate::canvas::viewer::dropdown_read_selected(node, options.len());
-            crate::canvas::viewer::dropdown_write_selected(node, (cur + 1) % options.len());
-            true
-        }
-        _ => false,
     }
 }
 
