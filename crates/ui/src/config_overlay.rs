@@ -78,6 +78,15 @@ fn nav_targets_id() -> egui::Id {
     egui::Id::new(CONFIG_NAV_TARGETS_KEY)
 }
 
+/// One legend glyph: a rasterized controller-button icon (skin-specific) or a
+/// text token fallback. Built by `FlexInputApp::config_legend_specs` from the
+/// shared `gp_legend_hints` + `gp_legend_glyph`, so the config overlay's legend
+/// matches the Easy-mode bottom bar (same icons, same per-state hints).
+pub(crate) enum ConfigGlyph {
+    Tex(egui::TextureHandle),
+    Token(String),
+}
+
 /// This frame's gamepad-navigable config-pin targets: `(item_index, screen_rect)`
 /// for each Module pin. Empty when the overlay isn't showing pins (hidden, edit,
 /// or pick mode). Read by `nav_drive_config_overlay`.
@@ -124,7 +133,9 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // Acts as the active pin when the mouse isn't hovering one.
     let gp_focus = app.config_nav_focus();
     // Gamepad state for the legend: (value-editing?, a pad is driving?).
-    let (gp_editing, gp_pad_active) = app.config_nav_state();
+    let (_gp_editing, gp_pad_active) = app.config_nav_state();
+    // Controller-icon legend groups, matching the Easy-mode bottom bar.
+    let legend = if gp_pad_active { app.config_legend_specs(ctx) } else { Vec::new() };
     // Right-stick virtual cursor (drawn in the overlay viewport) — the SAME
     // reticle texture the main-window nav cursor uses, for visual consistency.
     let (gp_cursor_pos, gp_cursor_vis) = app.config_cursor();
@@ -378,9 +389,10 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     &mut exit_edit, &mut enter_edit, &mut close,
                 );
 
-                // Gamepad navigation legend along the bottom (live mode only).
-                if !edit {
-                    paint_config_legend(ui, rect, gp_editing, gp_pad_active);
+                // Gamepad navigation legend along the bottom (live mode only) —
+                // controller icons + per-state hints, matching Easy mode.
+                if !edit && !legend.is_empty() {
+                    paint_config_legend(ui, rect, &legend);
                 }
                 // Right-stick virtual cursor — the shared reticle texture (falls
                 // back to a drawn ring only if the texture failed to load).
@@ -522,65 +534,129 @@ fn paint_nav_cursor(ui: &mut egui::Ui, pos: egui::Pos2) {
     }
 }
 
-/// Bottom-centered gamepad hint bar. Text-based (skin-agnostic) so it's cheap
-/// to paint on the click-through overlay. Shows adjust hints while value-editing
-/// a pin, navigation hints otherwise; a mouse/shortcut reminder is always shown.
-fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, gp_editing: bool, gp_active: bool) {
-    let mut parts: Vec<&str> = Vec::new();
-    if gp_active {
-        if gp_editing {
-            parts.extend(["Stick / D-pad  Adjust", "West  Fine", "East  Back"]);
-        } else {
-            parts.extend([
-                "Stick / D-pad  Move",
-                "South  Toggle / Edit",
-                "East  Exit edit",
-                "Select  Alt-Tab",
-            ]);
-        }
-    }
-    parts.push("Mouse  drag to tweak");
-    parts.push("Shortcut  close");
-    let text = parts.join("     ·     ");
-
-    let font = egui::FontId::proportional(14.0);
+/// Bottom-centered gamepad legend: controller-button icons + labels per group,
+/// with `/` between multi-glyph groups and a divider between groups — the same
+/// visual language as Easy mode's `draw_gp_legend_bar`, painted inside the
+/// overlay viewport from pre-rasterized glyph handles.
+fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, legend: &[(Vec<ConfigGlyph>, String)]) {
+    const GLYPH: f32 = 22.0;
+    const LABEL_GAP: f32 = 4.0;
+    const SLASH_GAP: f32 = 4.0;
+    const DIV_GAP: f32 = 10.0;
+    let label_font = egui::FontId::proportional(14.0);
+    let tok_font = egui::FontId::proportional(14.0);
     let p = ui.painter();
-    let galley = p.layout_no_wrap(text, font, egui::Color32::from_gray(220));
-    let pad = egui::vec2(16.0, 7.0);
-    let size = galley.size() + pad * 2.0;
+    let measure = |s: &str, f: &egui::FontId| {
+        p.layout_no_wrap(s.to_string(), f.clone(), egui::Color32::WHITE).size().x
+    };
+    let slash_w = measure("/", &tok_font);
+
+    // Measure total width to center the bar.
+    let mut total = 0.0f32;
+    for (gi, (glyphs, label)) in legend.iter().enumerate() {
+        if gi > 0 {
+            total += DIV_GAP * 2.0 + 1.0;
+        }
+        for (j, g) in glyphs.iter().enumerate() {
+            if j > 0 {
+                total += SLASH_GAP * 2.0 + slash_w;
+            }
+            total += match g {
+                ConfigGlyph::Tex(_) => GLYPH,
+                ConfigGlyph::Token(t) => measure(t, &tok_font),
+            };
+        }
+        total += LABEL_GAP + measure(label, &label_font);
+    }
+    let pad = egui::vec2(16.0, 8.0);
     let bar = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.bottom() - size.y * 0.5 - 10.0),
-        size,
+        egui::pos2(rect.center().x, rect.bottom() - (GLYPH + pad.y * 2.0) * 0.5 - 10.0),
+        egui::vec2(total + pad.x * 2.0, GLYPH + pad.y * 2.0),
     );
-    p.rect_filled(bar, 8.0, egui::Color32::from_rgba_unmultiplied(16, 18, 26, 220));
+    p.rect_filled(bar, 8.0, egui::Color32::from_rgba_unmultiplied(16, 18, 26, 225));
     p.rect_stroke(
         bar,
         8.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 140, 200, 160)),
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 140, 200, 150)),
         egui::StrokeKind::Inside,
     );
-    p.galley(bar.min + pad, galley, egui::Color32::from_gray(220));
+
+    // Lay out left→right, vertically centered in the bar.
+    let cy = bar.center().y;
+    let mut x = bar.min.x + pad.x;
+    let div_col = ui.visuals().weak_text_color();
+    let label_col = egui::Color32::from_gray(225);
+    for (gi, (glyphs, label)) in legend.iter().enumerate() {
+        if gi > 0 {
+            x += DIV_GAP;
+            p.vline(x, (cy - GLYPH * 0.5)..=(cy + GLYPH * 0.5), egui::Stroke::new(1.0, div_col));
+            x += DIV_GAP;
+        }
+        for (j, g) in glyphs.iter().enumerate() {
+            if j > 0 {
+                x += SLASH_GAP;
+                let gal = p.layout_no_wrap("/".to_string(), tok_font.clone(), div_col);
+                p.galley(egui::pos2(x, cy - gal.size().y * 0.5), gal, div_col);
+                x += slash_w + SLASH_GAP;
+            }
+            match g {
+                ConfigGlyph::Tex(tex) => {
+                    let r = egui::Rect::from_min_size(
+                        egui::pos2(x, cy - GLYPH * 0.5),
+                        egui::vec2(GLYPH, GLYPH),
+                    );
+                    p.image(
+                        tex.id(),
+                        r,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    x += GLYPH;
+                }
+                ConfigGlyph::Token(t) => {
+                    let gal = p.layout_no_wrap(t.clone(), tok_font.clone(), egui::Color32::WHITE);
+                    let sz = gal.size();
+                    p.galley(egui::pos2(x, cy - sz.y * 0.5), gal, egui::Color32::WHITE);
+                    x += sz.x;
+                }
+            }
+        }
+        x += LABEL_GAP;
+        let gal = p.layout_no_wrap(label.clone(), label_font.clone(), label_col);
+        let sz = gal.size();
+        p.galley(egui::pos2(x, cy - sz.y * 0.5), gal, label_col);
+        x += sz.x;
+    }
 }
 
-/// Outward glow ring around the ACTIVE tweak-pin — the one whose upstream input
-/// is currently passing through to the game. Concentric outside strokes with
-/// falling alpha fake an outer bloom (same technique the layout/left-panel focus
-/// rings use), so the pin's own widget stays fully visible underneath.
+/// Outward accent bloom around the ACTIVE tweak-pin — the same selection-accent
+/// glow the Easy-mode field HUD draws on a focused widget (6 outward rings in the
+/// theme selection color with falling alpha), so focus reads identically here.
 fn paint_focus_ring(ui: &mut egui::Ui, rect: egui::Rect) {
-    let base = egui::Color32::from_rgb(120, 200, 255);
+    let accent = ui.visuals().selection.stroke.color;
+    let [r, g, b, _] = accent.to_array();
     let p = ui.painter();
-    for (grow, width, alpha) in [
-        (1.0_f32, 2.0_f32, 230.0_f32),
-        (4.0, 3.0, 110.0),
-        (8.0, 4.0, 45.0),
-    ] {
+    let rings = 6;
+    for i in 0..rings {
+        let t = (i as f32 + 1.0) / rings as f32;
+        let grow = t * 7.0;
+        let a = (150.0 * (1.0 - t)).round() as u8;
+        if a == 0 {
+            continue;
+        }
         p.rect_stroke(
             rect.expand(grow),
-            6.0,
-            egui::Stroke::new(width, egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha as u8)),
+            5.0 + grow,
+            egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
             egui::StrokeKind::Outside,
         );
     }
+    p.rect_stroke(
+        rect.expand(1.5),
+        5.0,
+        egui::Stroke::new(2.0, accent),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// Flash a "not tweakable" chip for a couple seconds after a rejected pick.

@@ -204,6 +204,48 @@ impl FlexInputApp {
             .map(|(id, _)| id)
     }
 
+    /// Legend hint groups for the CONFIG OVERLAY, pre-rasterized to controller
+    /// icons so the overlay (a separate viewport, drawn without `&self`) can
+    /// paint the SAME bar as Easy mode. While editing a pin the shared
+    /// `gp_legend_hints` already returns the right per-state hints (CurveDots,
+    /// Editing…); at focus level we show config-specific move/select hints. Empty
+    /// when no nav-enabled pad is driving. Each group is `(glyphs, label)`.
+    pub(crate) fn config_legend_specs(
+        &self,
+        ctx: &egui::Context,
+    ) -> Vec<(Vec<crate::config_overlay::ConfigGlyph>, String)> {
+        use crate::config_overlay::ConfigGlyph;
+        let Some(dev) = self.gamepad_nav.active_dev.clone() else { return Vec::new(); };
+        let skin = crate::canvas::remapper_icons::skin_from_device_id(&dev);
+        let hints: Vec<(Vec<&'static str>, &'static str)> =
+            if self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Widget {
+                // Editing a pin: reuse the shared per-state hints verbatim.
+                self.gp_legend_hints()
+            } else {
+                // Focus level: move between pins, cursor-pick, enter, exit.
+                vec![
+                    (vec!["left_stick", "dpad"], "Move"),
+                    (vec!["right_stick"], "Cursor"),
+                    (vec!["btn_south", "right_trigger"], "Select / Edit"),
+                    (vec!["btn_east"], "Exit edit"),
+                    (vec!["btn_back"], "Alt-Tab"),
+                ]
+            };
+        hints
+            .into_iter()
+            .map(|(pins, label)| {
+                let glyphs = pins
+                    .iter()
+                    .map(|pin| match self.gp_legend_glyph(ctx, skin, pin) {
+                        Some(t) => ConfigGlyph::Tex(t),
+                        None => ConfigGlyph::Token(gp_pin_token(pin).to_string()),
+                    })
+                    .collect();
+                (glyphs, label.to_string())
+            })
+            .collect()
+    }
+
     /// Bottom legend bar listing the active gamepad's button actions for the
     /// current nav context. Visible only while a nav-enabled gamepad drives the
     /// UI (`active_dev` set this frame by `run_gamepad_nav`).
