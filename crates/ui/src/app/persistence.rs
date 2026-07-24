@@ -88,6 +88,22 @@ impl FlexInputApp {
         (self.gamepad_nav.cursor_pos, self.gamepad_nav.cursor_visible)
     }
 
+    /// Curve-dot selection to highlight while editing a config curve pin:
+    /// `(inner_node_id, dot_index, is_moving_dot)`. The overlay republishes this
+    /// on `gp_nav_curve_sel` with ITS OWN viewport pass so the pinned curve
+    /// renderer highlights the dot — `run_gamepad_nav` stamps the root viewport's
+    /// pass, which never matches the overlay viewport's. `None` when not editing
+    /// a curve.
+    pub(crate) fn config_curve_sel(&self) -> Option<(usize, usize, bool)> {
+        use crate::gamepad_nav::EditLevel;
+        let (_, inner, _) = self.gamepad_nav.config_nav_sel.as_ref()?;
+        match self.gamepad_nav.edit_level {
+            EditLevel::CurveDots => Some((inner.0, self.gamepad_nav.curve_dot, false)),
+            EditLevel::CurveDot => Some((inner.0, self.gamepad_nav.curve_dot, true)),
+            _ => None,
+        }
+    }
+
     /// The overlay's live repaint rate (clamped to the settings bounds).
     pub(crate) fn overlay_fps(&self) -> u32 {
         self.settings.overlay_fps

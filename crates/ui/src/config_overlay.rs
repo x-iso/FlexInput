@@ -132,10 +132,12 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // The gamepad-focused tweak-pin index (M3.5), read before the tab borrow.
     // Acts as the active pin when the mouse isn't hovering one.
     let gp_focus = app.config_nav_focus();
-    // Gamepad state for the legend: (value-editing?, a pad is driving?).
-    let (_gp_editing, gp_pad_active) = app.config_nav_state();
+    // Gamepad state for the legend: (editing?, a pad is driving?).
+    let (gp_editing, gp_pad_active) = app.config_nav_state();
     // Controller-icon legend groups, matching the Easy-mode bottom bar.
     let legend = if gp_pad_active { app.config_legend_specs(ctx) } else { Vec::new() };
+    // Curve-dot highlight to republish with the overlay's own viewport pass.
+    let curve_sel = app.config_curve_sel();
     // Right-stick virtual cursor (drawn in the overlay viewport) — the SAME
     // reticle texture the main-window nav cursor uses, for visual consistency.
     let (gp_cursor_pos, gp_cursor_vis) = app.config_cursor();
@@ -365,12 +367,24 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     }
                 }
 
+                // Republish the curve-dot highlight with THIS viewport's pass so
+                // the pinned curve renderer (below) rings the selected dot — the
+                // pass stamped in run_gamepad_nav is the root viewport's and never
+                // matches here.
+                if let Some((inner, dot, editing)) = curve_sel {
+                    let pass = ui.ctx().cumulative_pass_nr();
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new(("gp_nav_curve_sel", inner)), (pass, dot, editing));
+                    });
+                }
+
                 crate::canvas::overlay_body::show_overlay_body(
                     ui, rect, tab_snarl, config_layout, edit,
                     live_signals, &panic_shortcut,
                 );
 
-                // Focus ring on the active pin (its input is passing through).
+                // Focus ring on the active pin (its input is passing through);
+                // brighter + larger while it's being edited, like Easy mode.
                 // Drawn after the body so it sits on top; the &mut borrow above
                 // has ended, so reading the item back is safe.
                 if let Some(it) = active_idx.and_then(|i| config_layout.items.get(i)) {
@@ -379,7 +393,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         egui::pos2(p[0], p[1]),
                         egui::vec2(s[0].max(8.0), s[1].max(8.0)),
                     );
-                    paint_focus_ring(ui, r);
+                    paint_focus_ring(ui, r, gp_editing);
                 }
 
                 paint_reject_hint(ui, rect);
@@ -632,29 +646,30 @@ fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, legend: &[(Vec<Confi
 /// Outward accent bloom around the ACTIVE tweak-pin — the same selection-accent
 /// glow the Easy-mode field HUD draws on a focused widget (6 outward rings in the
 /// theme selection color with falling alpha), so focus reads identically here.
-fn paint_focus_ring(ui: &mut egui::Ui, rect: egui::Rect) {
+fn paint_focus_ring(ui: &mut egui::Ui, rect: egui::Rect, editing: bool) {
     let accent = ui.visuals().selection.stroke.color;
     let [r, g, b, _] = accent.to_array();
     let p = ui.painter();
-    let rings = 6;
+    // Editing reads as a stronger, wider bloom than plain focus.
+    let (rings, spread, peak) = if editing { (8, 12.0f32, 210.0f32) } else { (6, 7.0, 150.0) };
     for i in 0..rings {
         let t = (i as f32 + 1.0) / rings as f32;
-        let grow = t * 7.0;
-        let a = (150.0 * (1.0 - t)).round() as u8;
+        let grow = t * spread;
+        let a = (peak * (1.0 - t)).round() as u8;
         if a == 0 {
             continue;
         }
         p.rect_stroke(
             rect.expand(grow),
             5.0 + grow,
-            egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+            egui::Stroke::new(if editing { 2.5 } else { 2.0 }, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
             egui::StrokeKind::Outside,
         );
     }
     p.rect_stroke(
         rect.expand(1.5),
         5.0,
-        egui::Stroke::new(2.0, accent),
+        egui::Stroke::new(if editing { 2.5 } else { 2.0 }, accent),
         egui::StrokeKind::Outside,
     );
 }
