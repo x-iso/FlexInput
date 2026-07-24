@@ -1243,15 +1243,26 @@ impl eframe::App for FlexInputApp {
         {
             let want: std::collections::HashSet<(String, String)> =
                 if crate::config_overlay::config_overlay_visible(ctx) {
-                    // The tweak-pin under the cursor asks for its upstream device
-                    // to PASS THROUGH (M3.4), so it's excluded from the block —
-                    // everything else physical stays suppressed from the game.
-                    let passthrough = crate::config_overlay::config_passthrough_dev(ctx);
+                    // The active tweak-pin asks for the SPECIFIC pins it reads to
+                    // PASS THROUGH (M3.4/M3.6) — everything else physical stays
+                    // suppressed. Narrowing to those pins (not the whole device)
+                    // is what stops e.g. the gyro leaking to the game mouse while
+                    // you tweak a stick curve. Empty pin list = whole device.
+                    let passthrough = crate::config_overlay::config_passthrough(ctx);
                     self.last_signals
                         .keys()
-                        .filter(|(dev, _)| {
-                            graph::is_physical_input_device(dev)
-                                && passthrough.as_deref() != Some(dev.as_str())
+                        .filter(|(dev, pin)| {
+                            if !graph::is_physical_input_device(dev) {
+                                return false;
+                            }
+                            match &passthrough {
+                                Some((pdev, pins)) if pdev == dev => {
+                                    // Passed through: whole device if no specific
+                                    // pins, else only the listed pin group.
+                                    !(pins.is_empty() || pins.contains(pin))
+                                }
+                                _ => true, // fully blocked
+                            }
                         })
                         .cloned()
                         .collect()

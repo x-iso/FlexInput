@@ -66,12 +66,13 @@ fn passthrough_dev_id() -> egui::Id {
     egui::Id::new(CONFIG_PASSTHROUGH_DEV_KEY)
 }
 
-/// The physical device the config overlay wants passed through to the game right
-/// now (the active tweak-pin's upstream device), or `None`. Read by `update()`
-/// to poke a hole in the source-block set.
-pub fn config_passthrough_dev(ctx: &egui::Context) -> Option<String> {
-    ctx.data(|d| d.get_temp::<String>(passthrough_dev_id()))
-        .filter(|s| !s.is_empty())
+/// What the config overlay wants passed through to the game right now, as
+/// `(device, pins)` — the active tweak-pin's upstream device and the SPECIFIC
+/// pins of it the module reads (empty = whole device). Read by `update()` to
+/// poke a hole in the source-block set. `None` = nothing passing through.
+pub fn config_passthrough(ctx: &egui::Context) -> Option<(String, Vec<String>)> {
+    ctx.data(|d| d.get_temp::<(String, Vec<String>)>(passthrough_dev_id()))
+        .filter(|(dev, _)| !dev.is_empty())
 }
 
 fn nav_targets_id() -> egui::Id {
@@ -108,7 +109,7 @@ pub fn set_config_overlay_visible(ctx: &egui::Context, on: bool) {
     if !on {
         ctx.data_mut(|d| {
             d.remove_temp::<bool>(edit_id());
-            d.remove_temp::<String>(passthrough_dev_id());
+            d.remove_temp::<(String, Vec<String>)>(passthrough_dev_id());
         });
     }
 }
@@ -290,19 +291,23 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             matches!(config_layout.items.get(i), Some(LayoutItem::Module(_)))
         });
         let active_idx = if live { hovered_module_idx.or(gp_active) } else { None };
-        let passthrough_dev = active_idx.and_then(|i| match &config_layout.items[i] {
+        let passthrough = active_idx.and_then(|i| match &config_layout.items[i] {
             LayoutItem::Module(m) => {
-                crate::app::config_passthrough_device(tab_snarl, &m.source_path, m.inner_node_id)
+                crate::app::config_passthrough_pins(tab_snarl, &m.source_path, m.inner_node_id)
             }
             _ => None,
         });
         let dragging = vctx.input(|i| i.pointer.any_down()) || vctx.is_using_pointer();
         if live && (active_idx.is_some() || !dragging) {
-            // Overwrite the passthrough device — but not on a stray cursor-off-pin
-            // frame mid-drag, so a fast drag keeps the pin's input flowing.
-            vctx.data_mut(|d| d.insert_temp(passthrough_dev_id(), passthrough_dev.clone().unwrap_or_default()));
+            // Overwrite the passthrough — but not on a stray cursor-off-pin frame
+            // mid-drag, so a fast drag keeps the pin's input flowing.
+            vctx.data_mut(|d| {
+                d.insert_temp(passthrough_dev_id(), passthrough.clone().unwrap_or_default())
+            });
         } else if !live {
-            vctx.data_mut(|d| d.insert_temp(passthrough_dev_id(), String::new()));
+            vctx.data_mut(|d| {
+                d.insert_temp(passthrough_dev_id(), (String::new(), Vec::<String>::new()))
+            });
         }
 
         // Passthrough (window click-through): interactive over the toolbar or any

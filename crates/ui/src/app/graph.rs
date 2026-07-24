@@ -401,6 +401,82 @@ pub(crate) fn config_passthrough_device(
     traced.or_else(|| tab_physical_source_device(tab_snarl))
 }
 
+/// Config-overlay passthrough as `(device, pins)` — the device to pass through
+/// and the SPECIFIC pins of it the tweak-pin's module actually consumes (empty =
+/// whole device). Narrowing to the consumed pins is what stops e.g. the gyro
+/// (→ mouse) leaking to the game while you tweak a stick curve. Falls back to
+/// whole-device when the exact pin can't be resolved.
+pub(crate) fn config_passthrough_pins(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+) -> Option<(String, Vec<String>)> {
+    let device = config_passthrough_device(tab_snarl, source_path, inner_node_id)?;
+    let pins = config_consumed_pins(tab_snarl, source_path, inner_node_id).unwrap_or_default();
+    Some((device, pins))
+}
+
+/// The physical pin group a config pin's module reads on its first connected
+/// input, resolved from the upstream node's `output_pin_ids` (both device.source
+/// and AutoMap Splitter store the pin IDs there, indexed by output pin). Expands
+/// a resolved pin to its whole axis group (Vec2 base + `_x`/`_y`/`_z`) so a stick
+/// mapping still passes fully. `None` = couldn't resolve (caller uses whole
+/// device).
+fn config_consumed_pins(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+) -> Option<Vec<String>> {
+    let node_id = NodeId(inner_node_id);
+    let resolve = |snarl: &Snarl<NodeData>| -> Option<Vec<String>> {
+        let node = snarl.get_node(node_id)?;
+        for i in 0..node.inputs.len() {
+            let in_pin = snarl.in_pin(InPinId { node: node_id, input: i });
+            if let Some(&remote) = in_pin.remotes.first() {
+                if let Some(pid) = snarl
+                    .get_node(remote.node)
+                    .and_then(|up| up.params.get("output_pin_ids"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.get(remote.output))
+                    .and_then(|v| v.as_str())
+                {
+                    if pid != "automap_pass" && !pid.is_empty() {
+                        return Some(expand_pin_group(pid));
+                    }
+                }
+            }
+        }
+        None
+    };
+    match source_path {
+        [] => resolve(tab_snarl),
+        [sp] => {
+            let inner = tab_snarl.get_node(NodeId(*sp))?.subpatch.as_ref()?;
+            resolve(&inner.snarl)
+        }
+        _ => None,
+    }
+}
+
+/// A pin id and its whole axis group: the Vec2 base + `_x`/`_y`/`_z` components,
+/// so passing e.g. `right_stick_y` also passes `right_stick` + `right_stick_x`
+/// (a game mapping may read the Vec2 or either component). Non-existent members
+/// are harmless — they simply aren't in the block set.
+fn expand_pin_group(pin_id: &str) -> Vec<String> {
+    let base = pin_id
+        .strip_suffix("_x")
+        .or_else(|| pin_id.strip_suffix("_y"))
+        .or_else(|| pin_id.strip_suffix("_z"))
+        .unwrap_or(pin_id);
+    let mut v = vec![pin_id.to_string(), base.to_string()];
+    for suf in ["_x", "_y", "_z"] {
+        v.push(format!("{base}{suf}"));
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// The first physical `device.source` device id on the tab canvas, if any.
 /// Used as the config-overlay passthrough fallback (single-device patches).
 pub(crate) fn tab_physical_source_device(tab_snarl: &Snarl<NodeData>) -> Option<String> {
