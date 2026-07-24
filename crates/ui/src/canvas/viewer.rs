@@ -760,7 +760,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // See `digital_trigger_toggle` in easy::io_panel for the semantics —
             // forced ON + disabled for digital-only pads (Switch Pro), opt-in
             // elsewhere. Stored on the node's `digital_triggers` param.
-            if is_device_source && dev_id_str.starts_with("gilrs:") {
+            // Both gilrs AND sdl physical pads (phys_pad_slug handles both
+            // prefixes) — an SDL-surfaced pad needs the same digital-trigger
+            // option as its gilrs twin (was gilrs-only: the toggle vanished when
+            // dedup kept the SDL node of a DInput pad).
+            if is_device_source
+                && crate::canvas::remapper_icons::phys_pad_slug(dev_id_str).is_some()
+            {
                 digital_trigger_header_toggle(ui, snarl, node, dev_id_str);
             }
 

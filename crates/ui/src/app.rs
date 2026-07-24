@@ -1227,7 +1227,7 @@ impl eframe::App for FlexInputApp {
             let resolved: Option<(String, Option<u16>, Option<u16>)> =
                 if card == crate::easy::io_panel::XINPUT_CARD_OUTPUT {
                     self.active_virtual_xinput_device_id().map(|id| (id, None, None))
-                } else if card.starts_with("gilrs:") {
+                } else if card.starts_with("gilrs:") || card.starts_with("sdl:") {
                     // Physical source — find its VID/PID from the live device list.
                     let vp = self.devices.iter()
                         .find(|d| d.id == card)

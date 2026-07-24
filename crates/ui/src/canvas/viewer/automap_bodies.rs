@@ -16,9 +16,9 @@ use super::*;
 /// triggers. Switch Pro (digital-only ZL/ZR) returns false. Unknown slugs are
 /// treated as analog-capable (conservative — they keep the opt-in toggle).
 pub(crate) fn slug_has_analog_triggers(dev_id: &str) -> bool {
-    let slug = dev_id.strip_prefix("gilrs:")
-        .and_then(|r| r.split(':').next())
-        .unwrap_or("");
+    // phys_pad_slug handles both gilrs: and sdl: — so an SDL-surfaced Switch Pro
+    // is correctly treated as digital-only (forced ON), not analog-capable.
+    let slug = crate::canvas::remapper_icons::phys_pad_slug(dev_id).unwrap_or("");
     slug != "switch_pro"
 }
 
@@ -83,9 +83,9 @@ pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool,
 /// "switch_pro", "xinput") or None if the device family is irrelevant for
 /// button-glyph labelling.
 pub(crate) fn family_slug_from_device_id(dev_id: &str) -> Option<&'static str> {
-    // Physical: gilrs:<slug>:<inst>
-    if let Some(rest) = dev_id.strip_prefix("gilrs:") {
-        let slug = rest.split(':').next()?;
+    // Physical: gilrs:<slug>:<inst> OR sdl:<slug>:<inst> (same slug table, so an
+    // SDL-surfaced DualSense gets its own glyphs, not the Xbox fallback).
+    if let Some(slug) = crate::canvas::remapper_icons::phys_pad_slug(dev_id) {
         return match slug {
             "dualsense"  => Some("dualsense"),
             "ds4"        => Some("ds4"),

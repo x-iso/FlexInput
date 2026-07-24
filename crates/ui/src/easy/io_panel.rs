@@ -990,8 +990,9 @@ fn xinput_slot_circles(
 /// (`gilrs:xinput:*`) or one of our Virtual Xbox sinks (`virtual.xinput*` /
 /// `virtual.hm.xinput*`). Only these carry an XInput player slot.
 pub fn device_id_is_xinput(device_id: &str) -> bool {
-    if let Some(rest) = device_id.strip_prefix("gilrs:") {
-        return rest.split(':').next() == Some("xinput");
+    // Physical xinput pad from either backend (gilrs:xinput:* / sdl:xinput:*).
+    if let Some(slug) = crate::canvas::remapper_icons::phys_pad_slug(device_id) {
+        return slug == "xinput";
     }
     device_id.starts_with("virtual.xinput") || device_id.starts_with("virtual.hm.xinput")
 }

@@ -156,6 +156,7 @@ pub(crate) fn sync_display_state_into(dst: &mut Snarl<NodeData>, src: &Snarl<Nod
 /// underlying physical device for feedback (reverse) routing.
 pub(crate) fn is_real_device_id(id: &str) -> bool {
     id.starts_with("gilrs:")
+        || id.starts_with("sdl:")
         || id.starts_with("midi_in:")
         || id.starts_with("midi_out:")
         || id.starts_with("virtual.")
@@ -625,8 +626,9 @@ pub(crate) fn build_processing_graph_rec(
         if node.module_id != "device.source" { continue; }
         let Some(dev_id) = node.params.get("device_id").and_then(|v| v.as_str()) else { continue; };
         let opted_in = node.params.get("digital_triggers").and_then(|v| v.as_bool()).unwrap_or(false);
-        let digital_only = dev_id.strip_prefix("gilrs:")
-            .and_then(|r| r.split(':').next()) == Some("switch_pro");
+        // Both backends: an SDL-surfaced Switch Pro is digital-only too.
+        let digital_only =
+            crate::canvas::remapper_icons::phys_pad_slug(dev_id) == Some("switch_pro");
         if opted_in || digital_only {
             digital_trigger_devs.insert(dev_id.to_string());
         }
