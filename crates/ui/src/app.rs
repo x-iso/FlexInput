@@ -1243,12 +1243,15 @@ impl eframe::App for FlexInputApp {
         {
             let want: std::collections::HashSet<(String, String)> =
                 if crate::config_overlay::config_overlay_visible(ctx) {
+                    // The tweak-pin under the cursor asks for its upstream device
+                    // to PASS THROUGH (M3.4), so it's excluded from the block —
+                    // everything else physical stays suppressed from the game.
+                    let passthrough = crate::config_overlay::config_passthrough_dev(ctx);
                     self.last_signals
                         .keys()
                         .filter(|(dev, _)| {
-                            dev.starts_with("gilrs:")
-                                || dev.starts_with("sdl:")
-                                || dev.starts_with("midi_in:")
+                            graph::is_physical_input_device(dev)
+                                && passthrough.as_deref() != Some(dev.as_str())
                         })
                         .cloned()
                         .collect()

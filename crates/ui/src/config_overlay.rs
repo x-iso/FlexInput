@@ -36,6 +36,11 @@ pub const CONFIG_OVERLAY_EDIT_KEY: &str = "fxi_config_overlay_edit";
 /// Ctx temp-data slot: wall-clock time a non-editable pick was rejected, so the
 /// "not tweakable" hint chip can fade after a couple seconds.
 const CONFIG_REJECT_KEY: &str = "fxi_config_pick_rejected";
+/// Ctx temp-data slot: the physical device id whose input should PASS THROUGH to
+/// the game right now — the upstream device of the tweak-pin under the cursor
+/// (M3.4). Empty string = nothing passing through. Written by the overlay each
+/// frame; read by `FlexInputApp::update` when building the source-block set.
+pub const CONFIG_PASSTHROUGH_DEV_KEY: &str = "fxi_config_passthrough_dev";
 
 fn visible_id() -> egui::Id {
     egui::Id::new(CONFIG_OVERLAY_VISIBLE_KEY)
@@ -52,6 +57,17 @@ fn toolbar_rect_id() -> egui::Id {
 fn reject_id() -> egui::Id {
     egui::Id::new(CONFIG_REJECT_KEY)
 }
+fn passthrough_dev_id() -> egui::Id {
+    egui::Id::new(CONFIG_PASSTHROUGH_DEV_KEY)
+}
+
+/// The physical device the config overlay wants passed through to the game right
+/// now (the tweak-pin under the cursor's upstream device), or `None`. Read by
+/// `update()` to poke a hole in the source-block set.
+pub fn config_passthrough_dev(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|d| d.get_temp::<String>(passthrough_dev_id()))
+        .filter(|s| !s.is_empty())
+}
 
 pub fn config_overlay_visible(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<bool>(visible_id())).unwrap_or(false)
@@ -59,9 +75,14 @@ pub fn config_overlay_visible(ctx: &egui::Context) -> bool {
 
 pub fn set_config_overlay_visible(ctx: &egui::Context, on: bool) {
     ctx.data_mut(|d| d.insert_temp(visible_id(), on));
-    // Leaving the overlay drops edit mode too (mirrors set_overlay_visible).
+    // Leaving the overlay drops edit mode too (mirrors set_overlay_visible),
+    // and clears any lingering passthrough request so a closed overlay can't
+    // keep a device unblocked.
     if !on {
-        ctx.data_mut(|d| d.remove_temp::<bool>(edit_id()));
+        ctx.data_mut(|d| {
+            d.remove_temp::<bool>(edit_id());
+            d.remove_temp::<String>(passthrough_dev_id());
+        });
     }
 }
 
@@ -202,7 +223,12 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         .data(|d| d.get_temp::<egui::Rect>(toolbar_rect_id()))
                         .map(|r| r.expand(4.0).contains(c))
                         .unwrap_or(false);
-                    let over_item = config_layout.items.iter().any(|it| {
+                    // Topmost tweak-pin under the cursor (items paint bottom→top,
+                    // so the LAST match is on top). In live tweak mode its
+                    // upstream physical device passes through to the game (M3.4)
+                    // — you feel the parameter's effect while adjusting and the
+                    // pin's live graph dot keeps moving.
+                    let active_item = config_layout.items.iter().rev().find(|it| {
                         let (p, s) = it.bbox();
                         egui::Rect::from_min_size(
                             egui::pos2(p[0], p[1]),
@@ -211,7 +237,18 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         .expand(HIT_MARGIN)
                         .contains(c)
                     });
-                    over_toolbar || over_item
+                    let dev = if !edit {
+                        active_item.and_then(|it| match it {
+                            LayoutItem::Module(m) => crate::app::config_passthrough_device(
+                                tab_snarl, &m.source_path, m.inner_node_id,
+                            ),
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    };
+                    vctx.data_mut(|d| d.insert_temp(passthrough_dev_id(), dev.unwrap_or_default()));
+                    over_toolbar || active_item.is_some()
                 }
             }
         };

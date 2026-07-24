@@ -329,6 +329,71 @@ pub(crate) fn fold_outer_uid_app(p: &crate::canvas::viewer::AutomapGlowParent<'_
     }
 }
 
+/// A physical INPUT device id (a blockable source), as opposed to a virtual
+/// sink (`virtual.*`), a MIDI *output*, or a synthetic AutoMap-bus key
+/// (`collector:`, `remap:`, `combiner:`…). The config overlay's source-block
+/// and passthrough (M3) operate only on these.
+pub(crate) fn is_physical_input_device(id: &str) -> bool {
+    id.starts_with("gilrs:") || id.starts_with("sdl:") || id.starts_with("midi_in:")
+}
+
+/// Resolve the upstream PHYSICAL input device that a config tweak-pin's module
+/// reads, so the config overlay can pass that device through while the pin is
+/// being tweaked (M3.4): you feel the parameter's effect in-game and the pin's
+/// live graph dot keeps moving, while every OTHER device stays blocked. Returns
+/// the physical device id, or `None` for a source-like pin with no upstream
+/// device (a Knob / Constant / Dropdown) or an unresolvable chain — in which
+/// case the full block stands.
+///
+/// M3.4 grain is the WHOLE upstream device (every pin). Narrowing to the exact
+/// consumed pin(s) is a later refinement; whole-device is the plan's sanctioned
+/// fallback and is what makes the feature testable. Handles tweak-pins on the
+/// tab canvas (`source_path == []`) and inside a first-level sub-patch (`[sp]`),
+/// reusing [`find_automap_device_id_for_viewer`] to walk the AutoMap chain (it
+/// pops back to the outer snarl through the sub-patch inlet on its own).
+pub(crate) fn config_passthrough_device(
+    tab_snarl: &Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+) -> Option<String> {
+    // Trace the module's FIRST connected input back to a physical device. A
+    // module reads its driving signal on that input (a Response Curve's scalar,
+    // a Reshaper's Vec, a gyro's AutoMap bus…); source-like modules with no
+    // inputs (Knob/Constant) simply resolve to None.
+    fn trace(
+        snarl: &Snarl<NodeData>,
+        node_id: NodeId,
+        parent: Option<&crate::canvas::viewer::AutomapGlowParent<'_>>,
+    ) -> Option<String> {
+        let node = snarl.get_node(node_id)?;
+        for i in 0..node.inputs.len() {
+            let in_pin = snarl.in_pin(InPinId { node: node_id, input: i });
+            if let Some(&remote) = in_pin.remotes.first() {
+                if let Some(dev) = find_automap_device_id_for_viewer(snarl, remote, parent) {
+                    if is_physical_input_device(&dev) {
+                        return Some(dev);
+                    }
+                }
+            }
+        }
+        None
+    }
+    match source_path {
+        [] => trace(tab_snarl, NodeId(inner_node_id), None),
+        [sp] => {
+            let sp_node = NodeId(*sp);
+            let inner = tab_snarl.get_node(sp_node)?.subpatch.as_ref()?;
+            let frame = crate::canvas::viewer::AutomapGlowParent {
+                snarl: tab_snarl,
+                subpatch_node_id: sp_node,
+                prev: None,
+            };
+            trace(&inner.snarl, NodeId(inner_node_id), Some(&frame))
+        }
+        _ => None,
+    }
+}
+
 /// Walk an AutoMap wire chain from `src` back to the originating device.source.
 /// Returns (source_dev_id, source_pin_ids, fallback_dev_id).
 /// - For device.source: (real_dev_id, output_pins, None).
