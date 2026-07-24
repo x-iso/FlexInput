@@ -1,19 +1,22 @@
-//! Gamepad navigation of the config overlay (M3.5): move focus between the
-//! pinned tweak-pins. The focused pin's upstream physical device passes through
-//! to the game (the overlay resolves passthrough from `gamepad_nav.config_index`),
-//! so you feel and steer the parameter you're adjusting while every other input
-//! stays suppressed. Value editing via the gamepad is M3.6 — for now the mouse
-//! adjusts while the gamepad focuses/steers.
+//! Gamepad navigation + value-editing of the config overlay (M3.5 / M3.6).
 //!
-//! Unlike the main-UI nav areas, this one relies on the config overlay's own
-//! selective source-block for output suppression (NOT `ui_nav_suppress` /
-//! `io_bypass`, which drop ALL output and would also kill the passthrough).
+//! Nav level: d-pad / left-stick move focus between the pinned tweak-pins; the
+//! focused pin's upstream physical device passes through to the game (the
+//! overlay resolves passthrough from `gamepad_nav.config_index`), so you feel
+//! and steer the parameter while adjusting it. South acts on the focused pin:
+//! a Switch toggles, a Dropdown cycles, a Knob enters value-edit (stick/d-pad
+//! adjust, East exits). Other pin types (response curves…) stay mouse-edited
+//! for now — the passthrough still lets you feel them.
+//!
+//! Unlike the main-UI nav areas, output suppression here is the config overlay's
+//! own SELECTIVE engine source-block, NOT `ui_nav_suppress`/`io_bypass` (which
+//! drop ALL output and would also kill the passthrough).
 
 use super::*;
 
 impl FlexInputApp {
-    /// Drive config-overlay focus with the resolved nav device. Called from
-    /// `run_gamepad_nav` while the config overlay is visible; owns the frame.
+    /// Drive config-overlay focus + value-edit with the resolved nav device.
+    /// Called from `run_gamepad_nav` while the overlay is visible; owns the frame.
     pub(crate) fn nav_drive_config_overlay(
         &mut self,
         ctx: &egui::Context,
@@ -25,18 +28,63 @@ impl FlexInputApp {
         let targets = crate::config_overlay::config_nav_targets(ctx);
         if targets.is_empty() {
             self.gamepad_nav.config_index = None;
+            self.gamepad_nav.config_editing = false;
             self.gamepad_nav.repeat_dir = None;
             return;
         }
-        // Drop focus if the focused item is no longer a published target.
+        // Drop focus/edit if the focused item is no longer a published target.
         if let Some(i) = self.gamepad_nav.config_index {
             if !targets.iter().any(|(idx, _)| *idx == i) {
                 self.gamepad_nav.config_index = None;
+                self.gamepad_nav.config_editing = false;
+            }
+        }
+        let focused = self.config_focused_pin();
+
+        // ── Value-edit a scalar (Knob): stick / d-pad adjust; East|South exit ──
+        if self.gamepad_nav.config_editing {
+            if nav.is_rising("btn_east") || nav.is_rising("btn_south") {
+                self.gamepad_nav.config_editing = false;
+                ctx.request_repaint();
+                return;
+            }
+            if let Some((m, e, sp, inner)) = focused {
+                let fine = nav.pressed.contains("btn_west");
+                let coarse = if fine { 0.01 } else { 0.05 };
+                let mut delta = 0.0f32;
+                if nav.lstick.x.abs() > 0.2 {
+                    delta += nav.lstick.x * (if fine { 0.005 } else { 0.02 });
+                }
+                if nav.is_rising("dpad_right") { delta += coarse; }
+                if nav.is_rising("dpad_left") { delta -= coarse; }
+                if delta != 0.0 {
+                    if let Some(node) = self.config_pin_node_mut(&sp, inner) {
+                        nav_config_adjust_scalar(node, &m, &e, delta);
+                    }
+                }
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        // ── Nav: South acts on the focused pin ───────────────────────────────
+        if nav.is_rising("btn_south") {
+            if let Some((m, e, sp, inner)) = focused.clone() {
+                if m == "module.knob" && e == "value" {
+                    self.gamepad_nav.config_editing = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                if let Some(node) = self.config_pin_node_mut(&sp, inner) {
+                    if nav_config_activate(node, &m, &e) {
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
             }
         }
 
-        // Directional intent: d-pad edges, else a left-stick step on engage
-        // (simple re-arm auto-repeat, matching the picker feel).
+        // ── Nav: move focus (d-pad edges, else left-stick step on engage) ────
         let mut dir: Option<NavDir> = None;
         if nav.is_rising("dpad_up") {
             dir = Some(NavDir::Up);
@@ -58,9 +106,7 @@ impl FlexInputApp {
                 None => self.gamepad_nav.repeat_dir = None,
             }
         }
-
         if let Some(dir) = dir {
-            // `config_index` is an ITEM index; map to/from the target position.
             let cur_pos = self
                 .gamepad_nav
                 .config_index
@@ -71,8 +117,85 @@ impl FlexInputApp {
             }
             ctx.request_repaint();
         }
-        // The overlay reads `config_index` to light up the focused pin and pass
-        // its upstream device through; nothing else to do here (value edit = M3.6).
+    }
+
+    /// Identity of the gamepad-focused config pin:
+    /// `(module_id, element_id, source_path, inner_node_id)`.
+    fn config_focused_pin(&self) -> Option<(String, String, Vec<usize>, usize)> {
+        use crate::canvas::node::LayoutItem;
+        let i = self.gamepad_nav.config_index?;
+        let tab = self.tabs.get(self.active_tab)?;
+        let LayoutItem::Module(m) = tab.config.items.get(i)? else { return None };
+        let node = crate::canvas::overlay_body::resolve_overlay_module(
+            &tab.canvas.snarl,
+            &m.source_path,
+            m.inner_node_id,
+        )?;
+        Some((node.module_id.clone(), m.element_id.clone(), m.source_path.clone(), m.inner_node_id))
+    }
+
+    /// Mutable access to a config pin's inner node (tab canvas or first-level
+    /// sub-patch).
+    fn config_pin_node_mut(
+        &mut self,
+        source_path: &[usize],
+        inner_node_id: usize,
+    ) -> Option<&mut crate::canvas::NodeData> {
+        let snarl = &mut self.tabs[self.active_tab].canvas.snarl;
+        match source_path {
+            [] => snarl.get_node_mut(egui_snarl::NodeId(inner_node_id)),
+            [sp] => snarl
+                .get_node_mut(egui_snarl::NodeId(*sp))
+                .and_then(|n| n.subpatch.as_mut())
+                .and_then(|s| s.snarl.get_node_mut(egui_snarl::NodeId(inner_node_id))),
+            _ => None,
+        }
+    }
+}
+
+/// Nudge a scalar pin's value by `delta` (in normalized units). Currently the
+/// Knob's `value` (clamped to its bipolar/unipolar range).
+fn nav_config_adjust_scalar(
+    node: &mut crate::canvas::NodeData,
+    module_id: &str,
+    element_id: &str,
+    delta: f32,
+) {
+    if (module_id, element_id) == ("module.knob", "value") {
+        let bipolar = node.params.get("bipolar").and_then(|v| v.as_bool()).unwrap_or(false);
+        let (lo, hi) = if bipolar { (-1.0f32, 1.0f32) } else { (0.0f32, 1.0f32) };
+        let v = node.params.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let nv = (v + delta * (hi - lo)).clamp(lo, hi);
+        if let Some(n) = serde_json::Number::from_f64(nv as f64) {
+            node.params.insert("value".to_string(), serde_json::Value::Number(n));
+        }
+    }
+}
+
+/// Act on a pin with South (no edit mode): toggle a Switch, cycle a Dropdown.
+/// Returns true if the press was consumed.
+fn nav_config_activate(
+    node: &mut crate::canvas::NodeData,
+    module_id: &str,
+    element_id: &str,
+) -> bool {
+    match (module_id, element_id) {
+        ("module.switch", "toggle") => {
+            let active = crate::canvas::viewer::read_switch_active(node);
+            node.params.insert("active".to_string(), serde_json::Value::Bool(!active));
+            true
+        }
+        ("module.dropdown", "selection") => {
+            let options = crate::canvas::viewer::dropdown_read_options(node);
+            if options.is_empty() {
+                return false;
+            }
+            let cur = crate::canvas::viewer::dropdown_read_selected(node, options.len());
+            let next = (cur + 1) % options.len();
+            crate::canvas::viewer::dropdown_write_selected(node, next);
+            true
+        }
+        _ => false,
     }
 }
 

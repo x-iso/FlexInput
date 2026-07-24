@@ -123,6 +123,8 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // The gamepad-focused tweak-pin index (M3.5), read before the tab borrow.
     // Acts as the active pin when the mouse isn't hovering one.
     let gp_focus = app.config_nav_focus();
+    // Gamepad state for the legend: (value-editing?, a pad is driving?).
+    let (gp_editing, gp_pad_active) = app.config_nav_state();
 
     // A pick is only ours if it was armed by the config overlay. It's only
     // meaningful while editing (entered from the toolbar) — clear a stray one.
@@ -371,6 +373,11 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     ui, tab_snarl, config_layout, edit,
                     &mut exit_edit, &mut enter_edit, &mut close,
                 );
+
+                // Gamepad navigation legend along the bottom (live mode only).
+                if !edit {
+                    paint_config_legend(ui, rect, gp_editing, gp_pad_active);
+                }
             });
     });
 
@@ -468,6 +475,46 @@ fn config_toolbar(
             });
     });
     ui.ctx().data_mut(|d| d.insert_temp(toolbar_rect_id(), area_resp.response.rect));
+}
+
+/// Bottom-centered gamepad hint bar. Text-based (skin-agnostic) so it's cheap
+/// to paint on the click-through overlay. Shows adjust hints while value-editing
+/// a pin, navigation hints otherwise; a mouse/shortcut reminder is always shown.
+fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, gp_editing: bool, gp_active: bool) {
+    let mut parts: Vec<&str> = Vec::new();
+    if gp_active {
+        if gp_editing {
+            parts.extend(["Stick / D-pad  Adjust", "West  Fine", "East  Back"]);
+        } else {
+            parts.extend([
+                "Stick / D-pad  Move",
+                "South  Toggle / Edit",
+                "East  Exit edit",
+                "Select  Alt-Tab",
+            ]);
+        }
+    }
+    parts.push("Mouse  drag to tweak");
+    parts.push("Shortcut  close");
+    let text = parts.join("     ·     ");
+
+    let font = egui::FontId::proportional(14.0);
+    let p = ui.painter();
+    let galley = p.layout_no_wrap(text, font, egui::Color32::from_gray(220));
+    let pad = egui::vec2(16.0, 7.0);
+    let size = galley.size() + pad * 2.0;
+    let bar = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.bottom() - size.y * 0.5 - 10.0),
+        size,
+    );
+    p.rect_filled(bar, 8.0, egui::Color32::from_rgba_unmultiplied(16, 18, 26, 220));
+    p.rect_stroke(
+        bar,
+        8.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 140, 200, 160)),
+        egui::StrokeKind::Inside,
+    );
+    p.galley(bar.min + pad, galley, egui::Color32::from_gray(220));
 }
 
 /// Outward glow ring around the ACTIVE tweak-pin — the one whose upstream input

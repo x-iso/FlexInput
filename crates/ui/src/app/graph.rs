@@ -378,20 +378,47 @@ pub(crate) fn config_passthrough_device(
         }
         None
     }
-    match source_path {
+    let traced = match source_path {
         [] => trace(tab_snarl, NodeId(inner_node_id), None),
         [sp] => {
             let sp_node = NodeId(*sp);
-            let inner = tab_snarl.get_node(sp_node)?.subpatch.as_ref()?;
-            let frame = crate::canvas::viewer::AutomapGlowParent {
-                snarl: tab_snarl,
-                subpatch_node_id: sp_node,
-                prev: None,
-            };
-            trace(&inner.snarl, NodeId(inner_node_id), Some(&frame))
+            tab_snarl.get_node(sp_node).and_then(|n| n.subpatch.as_ref()).and_then(|inner| {
+                let frame = crate::canvas::viewer::AutomapGlowParent {
+                    snarl: tab_snarl,
+                    subpatch_node_id: sp_node,
+                    prev: None,
+                };
+                trace(&inner.snarl, NodeId(inner_node_id), Some(&frame))
+            })
         }
         _ => None,
-    }
+    };
+    // Fallback: when the per-pin trace can't follow the chain (an input type the
+    // AutoMap walker doesn't model, an odd wiring…), pass the tab's own physical
+    // device.source through. For the common single-device patch this is exactly
+    // the device the pin depends on, and it guarantees the tweaked input is
+    // never left blocked. Top-level device.source feeds sub-patch pins too.
+    traced.or_else(|| tab_physical_source_device(tab_snarl))
+}
+
+/// The first physical `device.source` device id on the tab canvas, if any.
+/// Used as the config-overlay passthrough fallback (single-device patches).
+pub(crate) fn tab_physical_source_device(tab_snarl: &Snarl<NodeData>) -> Option<String> {
+    tab_snarl
+        .nodes_ids_data()
+        .filter_map(|(_, n)| {
+            if n.value.module_id == "device.source" {
+                n.value
+                    .params
+                    .get("device_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|d| is_physical_input_device(d))
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .next()
 }
 
 /// Walk an AutoMap wire chain from `src` back to the originating device.source.

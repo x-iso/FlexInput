@@ -283,6 +283,10 @@ pub struct GamepadNav {
     /// device passes through to the game, so you feel/steer the parameter you're
     /// adjusting. Clamped to the target count each frame.
     pub config_index: Option<usize>,
+    /// Config overlay (M3.6): true while the focused pin is being VALUE-EDITED
+    /// with the gamepad (entered with South, exited with East). While editing,
+    /// d-pad/stick adjust the pin's value instead of moving focus.
+    pub config_editing: bool,
     /// UI-thread keyboard tapper for the Alt+Tab switcher. Independent of the
     /// device pool (which the I/O thread resets while nav-suppression is on).
     #[cfg(windows)]
@@ -317,6 +321,7 @@ impl Default for GamepadNav {
             left_edit: None,
             left_selected: None,
             config_index: None,
+            config_editing: false,
             settings_open: false,
             settings_index: 0,
             settings_editing: false,
