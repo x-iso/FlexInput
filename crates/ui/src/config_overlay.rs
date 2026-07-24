@@ -140,7 +140,11 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 config_layout.cycle_pos = None;
             } else {
                 // Not an adjustable control (a viewer, scope, readout, label…).
-                ctx.data_mut(|d| d.insert_temp(reject_id(), ctx.input(|i| i.time)));
+                // Read the clock BEFORE taking the data lock — `ctx.input` and
+                // `ctx.data_mut` both lock the same Context RwLock, so nesting
+                // them self-deadlocks (epaint's 10s watchdog then panics).
+                let now = ctx.input(|i| i.time);
+                ctx.data_mut(|d| d.insert_temp(reject_id(), now));
             }
             crate::canvas::viewer::set_overlay_pick_active(ctx, false);
             pick = false;
