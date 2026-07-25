@@ -4,6 +4,106 @@
 
 use super::*;
 
+/// Paint the mapping-card selection glow from the pass-stamped rect channels the
+/// remapper/TZ body published this frame. Viewport-agnostic: it reads only ctx
+/// temps and paints on whichever `ctx`'s foreground layer you hand it — the main
+/// window (via [`FlexInputApp::nav_draw_remap_card_glow`]) or the config-overlay
+/// viewport. `inner` is the mapping node; `scope` its mappings key
+/// (`"mappings"` / `"zone_maps"` / `"lean_*"`).
+pub(crate) fn draw_remap_card_glow(
+    ctx: &egui::Context,
+    outer_id: egui_snarl::NodeId,
+    inner: egui_snarl::NodeId,
+    scope: &str,
+) {
+    let cur_pass = ctx.cumulative_pass_nr();
+    let accent = ctx.style().visuals.selection.stroke.color;
+    let [r, g, b, _] = accent.to_array();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0))));
+    let ring = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
+        if !rect.is_finite() || rect.width() < 1.0 { return; }
+        let n = 6;
+        for i in 0..n {
+            let t = (i as f32 + 1.0) / n as f32;
+            let grow = t * max_grow;
+            let a = (peak * (1.0 - t)).round() as u8;
+            if a == 0 { continue; }
+            painter.rect_stroke(rect.expand(grow), round + grow,
+                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                egui::StrokeKind::Outside);
+        }
+        painter.rect_stroke(rect.expand(1.0), round,
+            egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+    };
+
+    // Card glow (selected/entered card + focused header field). Extend the
+    // ring to also enclose the response-curve section (published separately)
+    // so the header + its expanded curve read as ONE bordered card, not two.
+    // Clip it to the card-list viewport so a tall expanded card scrolled partly
+    // out of view has its ring cropped at the visible edge, not spilling past.
+    if let Some((pass, card, field, entered)) = ctx.data(|d|
+        d.get_temp::<(u64, egui::Rect, Option<egui::Rect>, bool)>(
+            egui::Id::new(("gp_nav_remap_card_rects", inner.0, scope))))
+    {
+        if cur_pass.saturating_sub(pass) <= 2 {
+            let mut whole = card;
+            if let Some((sp, sect)) = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
+                egui::Id::new(("gp_nav_card_section_rect", inner.0, scope))))
+            {
+                // Only union when the section actually butts the bottom of THIS
+                // card (flush, 0-gap) — rejects a rect left over from a
+                // previously-selected card before its owner stops publishing.
+                if cur_pass.saturating_sub(sp) <= 2 && sect.is_finite()
+                    && (sect.top() - card.bottom()).abs() < 6.0
+                {
+                    whole = whole.union(sect);
+                }
+            }
+            let clipped = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
+                    egui::Id::new(("gp_nav_remap_viewport", inner.0, scope))))
+                .filter(|(p, r)| cur_pass.saturating_sub(*p) <= 2 && r.is_finite())
+                .map(|(_, vp)| painter.with_clip_rect(vp));
+            let cp = clipped.as_ref().unwrap_or(&painter);
+            let ring_c = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
+                if !rect.is_finite() || rect.width() < 1.0 { return; }
+                let n = 6;
+                for i in 0..n {
+                    let t = (i as f32 + 1.0) / n as f32;
+                    let grow = t * max_grow;
+                    let a = (peak * (1.0 - t)).round() as u8;
+                    if a == 0 { continue; }
+                    cp.rect_stroke(rect.expand(grow), round + grow,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                        egui::StrokeKind::Outside);
+                }
+                cp.rect_stroke(rect.expand(1.0), round,
+                    egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+            };
+            ring_c(whole, 5.0, if entered { 130.0 } else { 90.0 }, 7.0);
+            if entered {
+                if let Some(fr) = field { ring_c(fr, 4.0, 160.0, 6.0); }
+            }
+        }
+    }
+
+    // Action-button glow (Learn / Special / Add) when an action is focused.
+    let act_sel: Option<usize> = ctx.data(|d|
+        d.get_temp::<(u64, usize)>(egui::Id::new(("gp_nav_remap_action", inner.0, scope))))
+        .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 2)
+        .map(|(_, i)| i)
+        .filter(|i| *i != usize::MAX);
+    if let Some(ai) = act_sel {
+        if let Some((pass, rects)) = ctx.data(|d|
+            d.get_temp::<(u64, Vec<egui::Rect>)>(egui::Id::new(("gp_nav_action_rects", inner.0, scope))))
+        {
+            if cur_pass.saturating_sub(pass) <= 2 {
+                if let Some(rect) = rects.get(ai) { ring(*rect, 4.0, 130.0, 6.0); }
+            }
+        }
+    }
+}
+
 impl FlexInputApp {
 
     /// Draw the mapping-card selection glow at top level using the GLOBAL rects
@@ -13,92 +113,7 @@ impl FlexInputApp {
     pub(crate) fn nav_draw_remap_card_glow(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
         let scope = self.nav_remap_mappings_key(outer_id);
-        let cur_pass = ctx.cumulative_pass_nr();
-        let accent = ctx.style().visuals.selection.stroke.color;
-        let [r, g, b, _] = accent.to_array();
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0))));
-        let ring = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
-            if !rect.is_finite() || rect.width() < 1.0 { return; }
-            let n = 6;
-            for i in 0..n {
-                let t = (i as f32 + 1.0) / n as f32;
-                let grow = t * max_grow;
-                let a = (peak * (1.0 - t)).round() as u8;
-                if a == 0 { continue; }
-                painter.rect_stroke(rect.expand(grow), round + grow,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
-                    egui::StrokeKind::Outside);
-            }
-            painter.rect_stroke(rect.expand(1.0), round,
-                egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
-        };
-
-        // Card glow (selected/entered card + focused header field). Extend the
-        // ring to also enclose the response-curve section (published separately)
-        // so the header + its expanded curve read as ONE bordered card, not two.
-        // Clip it to the card-list viewport so a tall expanded card scrolled partly
-        // out of view has its ring cropped at the visible edge, not spilling past.
-        if let Some((pass, card, field, entered)) = ctx.data(|d|
-            d.get_temp::<(u64, egui::Rect, Option<egui::Rect>, bool)>(
-                egui::Id::new(("gp_nav_remap_card_rects", inner.0, scope))))
-        {
-            if cur_pass.saturating_sub(pass) <= 2 {
-                let mut whole = card;
-                if let Some((sp, sect)) = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
-                    egui::Id::new(("gp_nav_card_section_rect", inner.0, scope))))
-                {
-                    // Only union when the section actually butts the bottom of THIS
-                    // card (flush, 0-gap) — rejects a rect left over from a
-                    // previously-selected card before its owner stops publishing.
-                    if cur_pass.saturating_sub(sp) <= 2 && sect.is_finite()
-                        && (sect.top() - card.bottom()).abs() < 6.0
-                    {
-                        whole = whole.union(sect);
-                    }
-                }
-                let clipped = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(
-                        egui::Id::new(("gp_nav_remap_viewport", inner.0, scope))))
-                    .filter(|(p, r)| cur_pass.saturating_sub(*p) <= 2 && r.is_finite())
-                    .map(|(_, vp)| painter.with_clip_rect(vp));
-                let cp = clipped.as_ref().unwrap_or(&painter);
-                let ring_c = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
-                    if !rect.is_finite() || rect.width() < 1.0 { return; }
-                    let n = 6;
-                    for i in 0..n {
-                        let t = (i as f32 + 1.0) / n as f32;
-                        let grow = t * max_grow;
-                        let a = (peak * (1.0 - t)).round() as u8;
-                        if a == 0 { continue; }
-                        cp.rect_stroke(rect.expand(grow), round + grow,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
-                            egui::StrokeKind::Outside);
-                    }
-                    cp.rect_stroke(rect.expand(1.0), round,
-                        egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
-                };
-                ring_c(whole, 5.0, if entered { 130.0 } else { 90.0 }, 7.0);
-                if entered {
-                    if let Some(fr) = field { ring_c(fr, 4.0, 160.0, 6.0); }
-                }
-            }
-        }
-
-        // Action-button glow (Learn / Special / Add) when an action is focused.
-        let act_sel: Option<usize> = ctx.data(|d|
-            d.get_temp::<(u64, usize)>(egui::Id::new(("gp_nav_remap_action", inner.0, scope))))
-            .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 2)
-            .map(|(_, i)| i)
-            .filter(|i| *i != usize::MAX);
-        if let Some(ai) = act_sel {
-            if let Some((pass, rects)) = ctx.data(|d|
-                d.get_temp::<(u64, Vec<egui::Rect>)>(egui::Id::new(("gp_nav_action_rects", inner.0, scope))))
-            {
-                if cur_pass.saturating_sub(pass) <= 2 {
-                    if let Some(rect) = rects.get(ai) { ring(*rect, 4.0, 130.0, 6.0); }
-                }
-            }
-        }
+        draw_remap_card_glow(ctx, outer_id, inner, scope);
     }
 
     /// Mappings array key for the selected remapper-family node. Remapper /

@@ -255,10 +255,28 @@ impl FlexInputApp {
         }
     }
 
+    /// While a Remapper / Touch Zones mapping-list pin is being card-navigated in
+    /// the config overlay, `(outer, inner, mappings-scope)` so the overlay can
+    /// republish the selection channels with ITS viewport pass and draw the card
+    /// glow on ITS layer (the shared drawer is viewport-agnostic; the nav driver
+    /// stamps the root viewport's pass, which never matches the overlay's).
+    pub(crate) fn config_remap_glow(&self) -> Option<(egui_snarl::NodeId, egui_snarl::NodeId, String)> {
+        use crate::gamepad_nav::EditLevel;
+        if !matches!(
+            self.gamepad_nav.edit_level,
+            EditLevel::RemapScroll | EditLevel::RemapCard | EditLevel::TzCards
+        ) {
+            return None;
+        }
+        let (outer, inner, _) = self.gamepad_nav.config_nav_sel.as_ref()?;
+        let scope = self.nav_remap_mappings_key(*outer).to_string();
+        Some((*outer, *inner, scope))
+    }
+
     /// Whether the currently-focused config pin's tweaked parameter is driven by
     /// the LEFT stick (so the left stick is its passthrough and shouldn't also
     /// drive the editor). Reads the pin's resolved passthrough pin group.
-    fn config_pin_ls_driven(&self) -> bool {
+    pub(crate) fn config_pin_ls_driven(&self) -> bool {
         let Some((outer, inner, _)) = self.gamepad_nav.config_nav_sel.as_ref() else {
             return false;
         };

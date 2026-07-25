@@ -218,8 +218,9 @@ impl FlexInputApp {
         use crate::config_overlay::ConfigGlyph;
         let Some(dev) = self.gamepad_nav.active_dev.clone() else { return Vec::new(); };
         let skin = crate::canvas::remapper_icons::skin_from_device_id(&dev);
+        let editing = self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Widget;
         let hints: Vec<(Vec<&'static str>, &'static str)> =
-            if self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Widget {
+            if editing {
                 // Editing a pin: reuse the shared per-state hints verbatim.
                 self.gp_legend_hints()
             } else {
@@ -232,14 +233,30 @@ impl FlexInputApp {
                     (vec!["btn_back"], "Alt-Tab"),
                 ]
             };
+        // When editing an LS-driven param the editor is driven by the RIGHT stick
+        // (the left one is the passthrough) — advertise that in the icons so the
+        // legend matches the actual control.
+        let swap_ls = editing && self.config_pin_ls_driven();
+        let remap = move |pin: &'static str| -> &'static str {
+            if !swap_ls { return pin; }
+            match pin {
+                "left_stick" => "right_stick",
+                "left_stick_horizontal" => "right_stick_horizontal",
+                "left_stick_vertical" => "right_stick_vertical",
+                other => other,
+            }
+        };
         hints
             .into_iter()
             .map(|(pins, label)| {
                 let glyphs = pins
                     .iter()
-                    .map(|pin| match self.gp_legend_glyph(ctx, skin, pin) {
-                        Some(t) => ConfigGlyph::Tex(t),
-                        None => ConfigGlyph::Token(gp_pin_token(pin).to_string()),
+                    .map(|pin| {
+                        let pin = remap(pin);
+                        match self.gp_legend_glyph(ctx, skin, pin) {
+                            Some(t) => ConfigGlyph::Tex(t),
+                            None => ConfigGlyph::Token(gp_pin_token(pin).to_string()),
+                        }
                     })
                     .collect();
                 (glyphs, label.to_string())

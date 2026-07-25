@@ -46,6 +46,7 @@ pub(crate) use chrome::*;
 pub use chrome::render_app_icon;
 pub(crate) use devices_pool::*;
 pub(crate) use graph::*;
+pub(crate) use nav::draw_remap_card_glow;
 pub(crate) use subpatch::*;
 pub(crate) use threads::*;
 

@@ -144,6 +144,9 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // For a focused mapping-module pin: the card whose curve is being edited (so
     // its input passes through). `None` = block everything (default for mapping).
     let remapper_card_edit = app.config_remapper_card_edit();
+    // While card-navigating a pinned Remapper / TZ list: (outer, inner, scope) so
+    // the overlay republishes the selection with its own pass + draws the glow.
+    let remap_glow = app.config_remap_glow();
     // Right-stick virtual cursor (drawn in the overlay viewport) — the SAME
     // reticle texture the main-window nav cursor uses, for visual consistency.
     let (gp_cursor_pos, gp_cursor_vis) = app.config_cursor();
@@ -408,11 +411,39 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         d.insert_temp(egui::Id::new(("gp_nav_curve_bias", inner)), pass);
                     });
                 }
+                // Republish the mapping-card selection channels with THIS pass so
+                // the pinned Remapper / TZ body highlights the selected card and
+                // publishes its rects (the drawer below reads them). Same cross-
+                // viewport pass gap as the curve dots.
+                if let Some((_, inner, scope)) = &remap_glow {
+                    let pass = ui.ctx().cumulative_pass_nr();
+                    ui.ctx().data_mut(|d| {
+                        let id_c = egui::Id::new(("gp_nav_remap_card", inner.0, scope.as_str()));
+                        if let Some((_, i, e)) = d.get_temp::<(u64, usize, bool)>(id_c) {
+                            d.insert_temp(id_c, (pass, i, e));
+                        }
+                        let id_a = egui::Id::new(("gp_nav_remap_action", inner.0, scope.as_str()));
+                        if let Some((_, a)) = d.get_temp::<(u64, usize)>(id_a) {
+                            d.insert_temp(id_a, (pass, a));
+                        }
+                        let id_f = egui::Id::new(("gp_nav_remap_card_field", inner.0, scope.as_str()));
+                        if let Some((_, f)) = d.get_temp::<(u64, u64)>(id_f) {
+                            d.insert_temp(id_f, (pass, f));
+                        }
+                    });
+                }
 
                 crate::canvas::overlay_body::show_overlay_body(
                     ui, rect, tab_snarl, config_layout, edit,
                     live_signals, &panic_shortcut,
                 );
+
+                // Draw the mapping-card selection glow on THIS viewport (the
+                // shared drawer is viewport-agnostic; run here so the ring appears
+                // over the overlay, not behind it in the main window).
+                if let Some((outer, inner, scope)) = &remap_glow {
+                    crate::app::draw_remap_card_glow(ui.ctx(), *outer, *inner, scope);
+                }
 
                 // Focus ring on the active pin (its input is passing through);
                 // brighter + larger while it's being edited, like Easy mode.
