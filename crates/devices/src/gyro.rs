@@ -223,6 +223,12 @@ struct HidEntry {
     spike_sensitivity: f32,
     spike_anchor: Option<HidReading>,
     spike_pending: Option<HidReading>,
+    /// Diagnostics for the "frozen until reconnect" report (a Switch Pro paired
+    /// over Bluetooth BEFORE launch comes up dead). `last_report_at` is the last
+    /// time a report actually parsed; `stalled` latches so the stall onset /
+    /// recovery is logged once, not every poll.
+    last_report_at: std::time::Instant,
+    stalled: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -394,6 +400,8 @@ impl GyroManager {
                         spike_sensitivity: 50.0,
                         spike_anchor: None,
                         spike_pending: None,
+                        last_report_at: Instant::now(),
+                        stalled: false,
                     });
                 }
                 Some(_) => {} // key already live again — drop the duplicate handle
@@ -459,6 +467,23 @@ impl GyroManager {
         if !ok {
             self.devices.remove(&(vid, pid, idx));
             return None;
+        }
+        // Stall diagnostic: the handle is open and reads succeed (no error), but
+        // no report has parsed for a while → the "frozen until reconnect" signature.
+        // Because the read returns 0 bytes rather than erroring, the device is
+        // never dropped, so input just silently stops. Prime suspect: HidHide
+        // cloaking the pad AFTER we opened its raw-HID handle (the init log shows
+        // 0x30 reports flowing, then HidHide applies). Reconnecting re-enumerates
+        // and re-opens with the cloak already in place, which recovers.
+        if !entry.stalled && entry.last_report_at.elapsed() >= std::time::Duration::from_millis(2000) {
+            entry.stalled = true;
+            eprintln!(
+                "[gyro] {vid:04X}:{pid:04X} idx={idx} STALLED: no HID reports for {:.1}s \
+                 but the handle is still open (reads return 0 bytes, no error). This is the \
+                 'frozen until reconnect' signature — suspect HidHide cloaking the pad while \
+                 we hold its raw-HID handle. Reconnect forces re-enumeration + a fresh open.",
+                entry.last_report_at.elapsed().as_secs_f32()
+            );
         }
         Some(entry.last)
     }
@@ -1094,6 +1119,11 @@ fn drain_reports(entry: &mut HidEntry) -> bool {
                         entry.spike_pending = None;
                         r
                     };
+                    entry.last_report_at = std::time::Instant::now();
+                    if entry.stalled {
+                        entry.stalled = false;
+                        eprintln!("[gyro] HID reports RESUMED (was a transient stall, not the permanent freeze)");
+                    }
                 }
             }
         }
