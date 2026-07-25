@@ -88,6 +88,19 @@ impl FlexInputApp {
         (self.gamepad_nav.cursor_pos, self.gamepad_nav.cursor_visible)
     }
 
+    /// Config overlay pass-through policy (top-bar checkbox). `false` (default) =
+    /// input passes only while a pin is being tweaked; `true` = focused pin always
+    /// passes.
+    pub(crate) fn config_passthrough_default(&self) -> bool {
+        self.settings.config_overlay_passthrough_default
+    }
+
+    /// Persist the pass-through policy from the overlay's top-bar checkbox.
+    pub(crate) fn set_config_passthrough_default(&mut self, v: bool) {
+        self.settings.config_overlay_passthrough_default = v;
+        self.settings_dirty = true;
+    }
+
     /// The nav device driving the config overlay this frame, if any. The overlay
     /// republishes `("gp_nav_active", dev)` with ITS viewport pass so pinned
     /// module bodies (Remapper / Map Action auto-capture, gyro, sub-patch…) see

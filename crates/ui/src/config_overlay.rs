@@ -150,6 +150,9 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // The nav device driving the overlay — republished as "gp_nav_active" so
     // pinned bodies (Remapper capture, gyro, …) see UI-nav owns it this frame.
     let nav_active_dev = app.config_nav_active_dev();
+    // Pass-through policy: OFF (default) = input reaches the game only while a pin
+    // is actually being tweaked; ON = the focused pin's input always passes.
+    let passthrough_default = app.config_passthrough_default();
     // Right-stick virtual cursor (drawn in the overlay viewport) — the SAME
     // reticle texture the main-window nav cursor uses, for visual consistency.
     let (gp_cursor_pos, gp_cursor_vis) = app.config_cursor();
@@ -241,6 +244,8 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let mut exit_edit = false;
     let mut enter_edit = false;
     let mut close = false;
+    // Set by the top-bar checkbox to the new pass-through-default value.
+    let mut set_passthrough_default: Option<bool> = None;
 
     ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Geometry self-correction from inside the viewport (see overlay.rs):
@@ -315,13 +320,20 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         } else {
             hovered_module_idx.or(gp_active)
         };
-        let passthrough = active_idx.and_then(|i| match &config_layout.items[i] {
+        let raw_passthrough = active_idx.and_then(|i| match &config_layout.items[i] {
             LayoutItem::Module(m) => crate::app::config_passthrough_pins_for(
                 tab_snarl, &m.source_path, m.inner_node_id, remapper_card_edit,
             ),
             _ => None,
         });
         let dragging = vctx.input(|i| i.pointer.any_down()) || vctx.is_using_pointer();
+        // Pass-through gating: by default the focused pin's input reaches the game
+        // ONLY while it's actually being tweaked (gamepad-editing, or mouse-
+        // dragging a control) — so merely navigating the overlay never drives the
+        // game. The top-bar checkbox restores always-on passthrough for the
+        // focused pin.
+        let tweaking = gp_editing || dragging;
+        let passthrough = if passthrough_default || tweaking { raw_passthrough } else { None };
         if live && (active_idx.is_some() || !dragging) {
             // Overwrite the passthrough — but not on a stray cursor-off-pin frame
             // mid-drag, so a fast drag keeps the pin's input flowing.
@@ -477,6 +489,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 config_toolbar(
                     ui, tab_snarl, config_layout, edit,
                     &mut exit_edit, &mut enter_edit, &mut close,
+                    passthrough_default, &mut set_passthrough_default,
                 );
 
                 // Gamepad navigation legend along the bottom (live mode only) —
@@ -514,6 +527,9 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     if close {
         set_config_overlay_visible(ctx, false);
     }
+    if let Some(v) = set_passthrough_default {
+        app.set_config_passthrough_default(v);
+    }
     // Pace the parent context (immediate viewports render with the parent).
     ctx.request_repaint_after(frame_interval);
 }
@@ -529,6 +545,8 @@ fn config_toolbar(
     exit_edit: &mut bool,
     enter_edit: &mut bool,
     close: &mut bool,
+    passthrough_default: bool,
+    set_passthrough_default: &mut Option<bool>,
 ) {
     let area = egui::Area::new(egui::Id::new("fxi_config_toolbar"))
         .order(egui::Order::Foreground)
@@ -567,6 +585,20 @@ fn config_toolbar(
                             .clicked()
                         {
                             *close = true;
+                        }
+                        ui.separator();
+                        let mut pt = passthrough_default;
+                        if ui
+                            .checkbox(&mut pt, "Pass-through")
+                            .on_hover_text(
+                                "OFF (default): input reaches the game only while a pin is\n\
+                                 actually being tweaked — navigating the overlay is fully\n\
+                                 suppressed.\nON: the focused pin's input always passes through\n\
+                                 (navigating also drives the game).",
+                            )
+                            .changed()
+                        {
+                            *set_passthrough_default = Some(pt);
                         }
                         if edit {
                             ui.separator();

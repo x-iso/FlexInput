@@ -341,6 +341,13 @@ pub struct AppSettings {
     /// RegisterHotKey id (`HOTKEY_ID_CONFIG`); shares the overlay frame rate.
     #[serde(default = "default_config_overlay_shortcut")]
     pub config_overlay_shortcut: PinShortcut,
+    /// Config overlay: when true, the focused pin's input passes through to the
+    /// game the whole time it's focused (navigating drives the game). When false
+    /// (default), input only passes while a pin is actually BEING TWEAKED
+    /// (gamepad-editing or mouse-dragging) — so plain navigation is fully
+    /// suppressed. Toggled from the overlay top bar.
+    #[serde(default)]
+    pub config_overlay_passthrough_default: bool,
     /// When true, the see-through / panic gamepad combos above only fire while
     /// the driving gamepad is in UI-navigation mode (so the same buttons stay
     /// free for in-game mappings otherwise). When false, they fire whenever
@@ -543,6 +550,7 @@ impl Default for AppSettings {
             overlay_fps: OVERLAY_FPS_DEFAULT,
             config_overlay_visible: false,
             config_overlay_shortcut: default_config_overlay_shortcut(),
+            config_overlay_passthrough_default: false,
             gamepad_chords_nav_only: true,
             bg_repaint_hz: BG_REPAINT_HZ_DEFAULT,
             mouse_suppression_enabled: true,
