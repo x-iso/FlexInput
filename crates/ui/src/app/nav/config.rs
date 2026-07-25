@@ -46,21 +46,44 @@ impl FlexInputApp {
             }
         }
 
+        // When the tweaked param is driven by the LEFT stick, the left stick is
+        // the passthrough (you feel its effect in-game) — so it must NOT also
+        // drive the editor. Repurpose the RIGHT stick as the nav stick (dot
+        // select/move, field adjust) and free the left stick. D-pad still works
+        // as the discrete alternative either way.
+        let editing = self.gamepad_nav.edit_level != EditLevel::Widget;
+        let ls_driven = editing && self.config_pin_ls_driven();
+
         // Shared RS/gyro cursor (drives `cursor_pos`, monitor-clamped for the
         // fullscreen overlay). The shared editors read `cursor_pos` in screen
         // space — exactly the space the overlay + pin renderers publish in.
-        self.config_update_cursor(ctx, nav, dt);
+        // Freeze it while the RS is repurposed to drive the editor (LS-driven).
+        if ls_driven {
+            let mut cnav = nav.clone();
+            cnav.rstick = egui::Vec2::ZERO;
+            self.config_update_cursor(ctx, &cnav, dt);
+        } else {
+            self.config_update_cursor(ctx, nav, dt);
+        }
 
         // ── Editing: delegate to the shared sub-patch nav dispatch ───────────
         // The override (config_nav_sel) makes `nav_drive_subpatch`'s resolvers
         // target the config pin, so the real curve/field/toggle drivers edit it
         // with identical UX. Its Widget-level branch is skipped here (edit_level
         // != Widget), so it never touches the sub-patch's own selection.
-        if self.gamepad_nav.edit_level != EditLevel::Widget {
+        if editing {
             if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
                 let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
                 let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
-                self.nav_drive_subpatch(ctx, outer, nav, dt, rt_rising, lt_rising);
+                if ls_driven {
+                    // RS → the editor's "left stick" role; LS freed for passthrough.
+                    let mut dnav = nav.clone();
+                    dnav.lstick = nav.rstick;
+                    dnav.rstick = egui::Vec2::ZERO;
+                    self.nav_drive_subpatch(ctx, outer, &dnav, dt, rt_rising, lt_rising);
+                } else {
+                    self.nav_drive_subpatch(ctx, outer, nav, dt, rt_rising, lt_rising);
+                }
             } else {
                 self.gamepad_nav.edit_level = EditLevel::Widget;
             }
@@ -230,6 +253,19 @@ impl FlexInputApp {
             )),
             _ => None,
         }
+    }
+
+    /// Whether the currently-focused config pin's tweaked parameter is driven by
+    /// the LEFT stick (so the left stick is its passthrough and shouldn't also
+    /// drive the editor). Reads the pin's resolved passthrough pin group.
+    fn config_pin_ls_driven(&self) -> bool {
+        let Some((outer, inner, _)) = self.gamepad_nav.config_nav_sel.as_ref() else {
+            return false;
+        };
+        let snarl = &self.tabs[self.active_tab].canvas.snarl;
+        crate::app::config_passthrough_pins(snarl, &[outer.0], inner.0)
+            .map(|(_, pins)| pins.iter().any(|p| p.starts_with("left_stick")))
+            .unwrap_or(false)
     }
 }
 
