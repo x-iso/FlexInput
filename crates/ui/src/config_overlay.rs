@@ -147,6 +147,9 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // While card-navigating a pinned Remapper / TZ list: (outer, inner, scope) so
     // the overlay republishes the selection with its own pass + draws the glow.
     let remap_glow = app.config_remap_glow();
+    // The nav device driving the overlay — republished as "gp_nav_active" so
+    // pinned bodies (Remapper capture, gyro, …) see UI-nav owns it this frame.
+    let nav_active_dev = app.config_nav_active_dev();
     // Right-stick virtual cursor (drawn in the overlay viewport) — the SAME
     // reticle texture the main-window nav cursor uses, for visual consistency.
     let (gp_cursor_pos, gp_cursor_vis) = app.config_cursor();
@@ -411,6 +414,17 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                         d.insert_temp(egui::Id::new(("gp_nav_curve_bias", inner)), pass);
                     });
                 }
+                // Republish "gp_nav_active" for the driving device with THIS
+                // viewport's pass so pinned bodies see that UI-nav owns it —
+                // without this the Remapper / Map Action auto-capture runs every
+                // frame (impossible to use) instead of only after Learn.
+                if let Some(dev) = &nav_active_dev {
+                    let pass = ui.ctx().cumulative_pass_nr();
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new(("gp_nav_active", dev.clone())), pass);
+                    });
+                }
+
                 // Republish the mapping-card selection channels with THIS pass so
                 // the pinned Remapper / TZ body highlights the selected card and
                 // publishes its rects (the drawer below reads them). Same cross-

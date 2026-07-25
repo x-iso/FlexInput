@@ -88,6 +88,16 @@ impl FlexInputApp {
         (self.gamepad_nav.cursor_pos, self.gamepad_nav.cursor_visible)
     }
 
+    /// The nav device driving the config overlay this frame, if any. The overlay
+    /// republishes `("gp_nav_active", dev)` with ITS viewport pass so pinned
+    /// module bodies (Remapper / Map Action auto-capture, gyro, sub-patch…) see
+    /// that UI-nav owns the device — `run_gamepad_nav` stamps the root pass,
+    /// which never matches the overlay's, so without this the Remapper's capture
+    /// state machine runs every frame instead of only on Learn.
+    pub(crate) fn config_nav_active_dev(&self) -> Option<String> {
+        self.gamepad_nav.active_dev.clone()
+    }
+
     /// Curve-dot selection to highlight while editing a config curve pin:
     /// `(inner_node_id, dot_index, is_moving_dot)`. The overlay republishes this
     /// on `gp_nav_curve_sel` with ITS OWN viewport pass so the pinned curve
