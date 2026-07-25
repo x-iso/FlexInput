@@ -871,14 +871,14 @@ fn init_switch_pro(device: &HidDevice, counter: &mut u8, calib: &mut Option<Swit
         return false;
     }
     *counter = counter.wrapping_add(1);
-    wait_for_ack(device, 0x21, &mut buf);
+    let ack_vibration = wait_for_ack(device, 0x21, &mut buf);
 
     // Subcommand 0x40 0x01 — enable IMU.
     if device.write(&subcommand(*counter, 0x40, &[0x01])).is_err() {
         return false;
     }
     *counter = counter.wrapping_add(1);
-    wait_for_ack(device, 0x21, &mut buf);
+    let ack_imu = wait_for_ack(device, 0x21, &mut buf);
 
     // Read stick calibration from SPI flash before switching to full report mode —
     // SPI reads come back in a 0x21 ack with the requested data, and that's harder
@@ -928,19 +928,52 @@ fn init_switch_pro(device: &HidDevice, counter: &mut u8, calib: &mut Option<Swit
         return false;
     }
     *counter = counter.wrapping_add(1);
-    wait_for_ack(device, 0x21, &mut buf);
+    let ack_full_mode = wait_for_ack(device, 0x21, &mut buf);
+
+    // ── Diagnostics: confirm the pad actually came up (the BT-before-launch
+    // freeze) ────────────────────────────────────────────────────────────────
+    // Suspicion: over a Bluetooth link that hasn't settled (the pad was paired
+    // BEFORE FlexInput launched), the handshake subcommands are written but the
+    // pad never processes them, so it stays in simple/no-report mode — "frozen"
+    // until a reconnect forces a fresh link + init. Sample the report stream
+    // right after init: 0x30 = full mode w/ IMU (healthy); 0x3F = simple mode
+    // (buttons/sticks only, IMU dead); EMPTY = no reports at all (fully frozen).
+    let cal_ok = calib.is_some();
+    let mut post_ids: Vec<u8> = Vec::new();
+    for _ in 0..8 {
+        if let Ok(n) = device.read_timeout(&mut buf, 50) {
+            if n > 0 { post_ids.push(buf[0]); }
+        }
+    }
+    let full_reports = post_ids.iter().any(|&id| id == 0x30);
+    if !(ack_vibration && ack_imu && ack_full_mode && cal_ok && full_reports) {
+        eprintln!(
+            "[gyro] Switch Pro init DEGRADED: ack(vibration={ack_vibration}, \
+             imu={ack_imu}, full_mode={ack_full_mode}) cal={cal_ok} \
+             post_init_report_ids={post_ids:02X?} — expected acks + 0x30 reports. \
+             Empty ids = no data (fully frozen); all 0x3F = stuck in simple mode. \
+             Likely a cold BT link at launch racing the handshake; reconnecting \
+             the pad forces a fresh init."
+        );
+    } else {
+        eprintln!("[gyro] Switch Pro init OK (all acks, cal present, 0x30 reports flowing)");
+    }
 
     true
 }
 
-fn wait_for_ack(device: &HidDevice, expected_id: u8, buf: &mut [u8; 64]) {
+/// Wait for a subcommand acknowledgement (`expected_id`, normally 0x21).
+/// Returns `true` if the ack arrived, `false` on timeout — the caller uses that
+/// to diagnose a handshake that a cold Bluetooth link swallowed.
+fn wait_for_ack(device: &HidDevice, expected_id: u8, buf: &mut [u8; 64]) -> bool {
     for _ in 0..15 {
         if let Ok(n) = device.read_timeout(buf, 50) {
             if n > 0 && buf[0] == expected_id {
-                return;
+                return true;
             }
         }
     }
+    false
 }
 
 /// Issue an SPI flash read subcommand (0x10) at `addr` for `len` bytes.
