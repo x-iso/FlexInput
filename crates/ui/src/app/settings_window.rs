@@ -681,15 +681,6 @@ impl FlexInputApp {
                     dirty = true;
                 }
 
-
-                // Push live state changes to the Guide watcher (which now summons
-                // the CONFIG overlay) whenever the user toggles its options below.
-                if let Ok(mut cfg) = self.pin_guide_cfg.write() {
-                    cfg.enabled = self.settings.config_via_guide;
-                    cfg.require_double_tap = self.settings.config_guide_double_tap;
-                    cfg.chord_signal = self.settings.config_guide_chord.clone();
-                }
-
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -849,86 +840,6 @@ impl FlexInputApp {
                         dirty = true;
                     }
                 }
-
-                ui.add_space(4.0);
-                // Guide-button summon for the config overlay. Unlike the gamepad
-                // shortcut chords below (which only fire while FlexInput is
-                // focused), this watches every pad from a background thread, so it
-                // works while a GAME holds focus — the intended way to bring up the
-                // overlay mid-play. Default on; the pin's old Guide binding moved
-                // to a user-assignable gamepad chord (Settings → Gamepad shortcuts).
-                if ui.checkbox(&mut self.settings.config_via_guide,
-                    "Summon config overlay with controller Guide / PS / Home button")
-                    .on_hover_text(
-                        "Watches every connected gamepad for a Guide-button press, even \
-                         while a game is focused.\nStandard XInput on Windows does NOT expose \
-                         the Guide bit on Xbox controllers — it works for DualSense via HID, \
-                         virtual ViGEm pads, and most non-Microsoft controllers."
-                    )
-                    .changed()
-                {
-                    dirty = true;
-                }
-                ui.add_enabled_ui(self.settings.config_via_guide, |ui| {
-                    if ui.checkbox(&mut self.settings.config_guide_double_tap,
-                        "    Require double-tap")
-                        .on_hover_text(
-                            "Recommended: dodges collisions with Steam / Game Bar's own \
-                             single-press Guide-button handling.\nTwo taps within ~300 ms."
-                        )
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-
-                    // Optional chord button held WITH Guide (AutoMap-style learn).
-                    ui.horizontal(|ui| {
-                        ui.label("    Chord button:");
-                        let learning = self.pin_learn_chord.load(Ordering::Relaxed);
-                        let face = if learning {
-                            "Press a button…".to_string()
-                        } else {
-                            self.settings.config_guide_chord
-                                .as_deref()
-                                .map(pretty_chord_name)
-                                .unwrap_or_else(|| "(none)".to_string())
-                        };
-                        let mut btn = egui::Button::new(
-                            egui::RichText::new(face).size(12.0));
-                        if learning {
-                            btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                                .stroke(egui::Stroke::new(1.0,
-                                    egui::Color32::from_rgb(200, 160, 80)));
-                        }
-                        let resp = ui.add(btn).on_hover_text(
-                            "Optional button that must be held WITH the Guide press\n\
-                             for the overlay to summon. Useful to dodge Steam / Game Bar.\n\
-                             Click to (re)bind; press any controller button to capture.");
-                        if resp.clicked() {
-                            let new_state = !learning;
-                            self.pin_learn_chord.store(new_state, Ordering::Relaxed);
-                            if let Ok(mut g) = self.pin_learned_chord.lock() {
-                                *g = None;
-                            }
-                        }
-                        if self.settings.config_guide_chord.is_some()
-                            && ui.small_button("✕")
-                                .on_hover_text("Clear chord — Guide alone fires")
-                                .clicked()
-                        {
-                            self.settings.config_guide_chord = None;
-                            dirty = true;
-                        }
-                    });
-
-                    // Consume any newly-learned chord this frame.
-                    let learned: Option<String> = self.pin_learned_chord
-                        .lock().ok().and_then(|mut g| g.take());
-                    if let Some(name) = learned {
-                        self.settings.config_guide_chord = Some(name);
-                        dirty = true;
-                    }
-                });
 
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {

@@ -14,7 +14,7 @@ use crate::{
     canvas::{Canvas, NodeData},
     canvas::node::{ExposedModule, UiSubPatch},
     canvas::ClipboardData,
-    guide_watcher::{spawn_guide_watcher, GuideWatchConfig},
+    guide_watcher::{spawn_chord_watcher, ChordWatchConfig},
     panels::{physical_devices, virtual_devices::{SharedDevicePool, VirtualDevicePanel}},
     panic_hotkey::{load_panic_shortcut, save_panic_shortcut, spawn_panic_hotkey_listener},
     pin_hotkey::spawn_pin_hotkey_listener,
@@ -444,17 +444,10 @@ pub struct FlexInputApp {
     /// Live snapshot of the pin keyboard chord shared with the hotkey
     /// listener thread. Updated whenever the user re-binds in Settings.
     pin_shortcut_shared: Arc<RwLock<PinShortcut>>,
-    /// Live snapshot of the Guide-button watcher config (enabled +
-    /// double-tap mode + chord). The watcher reads this each poll
-    /// iteration.
-    pin_guide_cfg: Arc<RwLock<GuideWatchConfig>>,
-    /// AutoMap-style chord learn: set true to ask the watcher to
-    /// capture the next pressed button on any device. Watcher clears
-    /// it when a capture lands.
-    pin_learn_chord: Arc<AtomicBool>,
-    /// Result slot for `pin_learn_chord`. Watcher writes the captured
-    /// signal name here; UI consumes it on the next frame.
-    pin_learned_chord: Arc<Mutex<Option<String>>>,
+    /// Live snapshot of the background config-overlay chord watcher config
+    /// (combo + press mode + gap). Republished from settings each frame; the
+    /// watcher reads it each poll to summon the overlay while a game is focused.
+    config_chord_cfg: Arc<RwLock<ChordWatchConfig>>,
     /// True while the pin shortcut button is in Learn mode in Settings.
     pin_learning: bool,
     /// Raised by the overlay hotkey listener thread; the UI loop consumes
@@ -858,16 +851,16 @@ impl FlexInputApp {
         // single edge to consume each frame.
         let pin_toggle_requested = Arc::new(AtomicBool::new(false));
         let pin_shortcut_shared  = Arc::new(RwLock::new(app_settings.pin_shortcut.clone()));
-        // The Guide / PS / Home button now summons the CONFIG overlay (its old
-        // pin binding was a stop-gap). Configured from the `config_*_guide`
-        // settings; drives `config_overlay_toggle_requested` (spawned below).
-        let pin_guide_cfg        = Arc::new(RwLock::new(GuideWatchConfig {
-            enabled: app_settings.config_via_guide,
-            require_double_tap: app_settings.config_guide_double_tap,
-            chord_signal: app_settings.config_guide_chord.clone(),
+        // Background config-overlay chord watcher config: the user's assigned
+        // gamepad combo/mode/gap, detected globally so the overlay can be
+        // summoned while a game holds focus. Republished from settings each
+        // frame; drives `config_overlay_toggle_requested` (spawned below).
+        let config_chord_cfg = Arc::new(RwLock::new(ChordWatchConfig {
+            enabled: app_settings.config_overlay_chord.is_some(),
+            combo: app_settings.config_overlay_chord.clone().unwrap_or_default(),
+            mode: app_settings.config_overlay_chord_mode.clone(),
+            gap_ms: app_settings.config_overlay_chord_gap_ms,
         }));
-        let pin_learn_chord      = Arc::new(AtomicBool::new(false));
-        let pin_learned_chord    = Arc::new(Mutex::new(None));
         spawn_pin_hotkey_listener(
             crate::pin_hotkey::HOTKEY_ID_PIN,
             "pin-hotkey",
@@ -901,12 +894,10 @@ impl FlexInputApp {
             Arc::clone(&edit_overlay_shortcut_shared),
             Arc::clone(&edit_overlay_toggle_requested),
         );
-        spawn_guide_watcher(
-            Arc::clone(&pin_guide_cfg),
+        spawn_chord_watcher(
+            Arc::clone(&config_chord_cfg),
             Arc::clone(&config_overlay_toggle_requested),
             Arc::clone(&proc_device_signals),
-            Arc::clone(&pin_learn_chord),
-            Arc::clone(&pin_learned_chord),
         );
         // Seed the see-through data slot so the eye button reflects the
         // persisted value on first frame.
@@ -1019,9 +1010,7 @@ impl FlexInputApp {
             ping_requests,
             pin_toggle_requested,
             pin_shortcut_shared,
-            pin_guide_cfg,
-            pin_learn_chord,
-            pin_learned_chord,
+            config_chord_cfg,
             pin_learning: false,
             overlay_toggle_requested,
             overlay_shortcut_shared,
@@ -1570,6 +1559,28 @@ impl eframe::App for FlexInputApp {
                 crate::overlay::set_overlay_visible(ctx, true);
             }
             crate::overlay::set_overlay_edit(ctx, !editing);
+        }
+
+        // Republish the config-overlay chord to the background watcher so it
+        // stays in sync however the binding changed (Settings row OR gamepad
+        // chord-capture). Only writes when something actually differs — the
+        // combo/mode/gap change rarely, so this is a cheap read most frames.
+        {
+            let combo = self.settings.config_overlay_chord.clone().unwrap_or_default();
+            let stale = self.config_chord_cfg.read().map(|c|
+                c.enabled != self.settings.config_overlay_chord.is_some()
+                    || c.combo != combo
+                    || c.mode != self.settings.config_overlay_chord_mode
+                    || c.gap_ms != self.settings.config_overlay_chord_gap_ms
+            ).unwrap_or(true);
+            if stale {
+                if let Ok(mut c) = self.config_chord_cfg.write() {
+                    c.enabled = self.settings.config_overlay_chord.is_some();
+                    c.combo = combo;
+                    c.mode = self.settings.config_overlay_chord_mode.clone();
+                    c.gap_ms = self.settings.config_overlay_chord_gap_ms;
+                }
+            }
         }
 
         // Deferred pin-off foreground handoff. Scheduled by `toggle_pin` on
@@ -3986,15 +3997,9 @@ impl FlexInputApp {
             self.pin_toggle_requested.store(true, Ordering::Relaxed);
             fired = true;
         }
-        // Config overlay.
-        let cfg_held = held(&self.settings.config_overlay_chord);
-        if chord_fire(&mut self.gamepad_nav.config_chord_st, cfg_held,
-            &self.settings.config_overlay_chord_mode, self.settings.config_overlay_chord_gap_ms, now)
-        {
-            let on = crate::config_overlay::config_overlay_visible(ctx);
-            crate::config_overlay::set_config_overlay_visible(ctx, !on);
-            fired = true;
-        }
+        // Config overlay is NOT handled here: the background chord watcher owns
+        // it (fires globally, even while a game is focused). Evaluating it on
+        // this focus-gated path too would double-toggle when FlexInput is focused.
         fired
     }
 
@@ -4015,7 +4020,6 @@ impl FlexInputApp {
             self.gamepad_nav.panic_chord_st = Default::default();
             self.gamepad_nav.overlay_chord_st = Default::default();
             self.gamepad_nav.pin_chord_st = Default::default();
-            self.gamepad_nav.config_chord_st = Default::default();
             return;
         }
         let now = std::time::Instant::now();
@@ -4062,13 +4066,8 @@ impl FlexInputApp {
         {
             self.pin_toggle_requested.store(true, Ordering::Relaxed);
         }
-        let cfg_held = any_holds(&self.settings.config_overlay_chord);
-        if chord_fire(&mut self.gamepad_nav.config_chord_st, cfg_held,
-            &self.settings.config_overlay_chord_mode, self.settings.config_overlay_chord_gap_ms, now)
-        {
-            let on = crate::config_overlay::config_overlay_visible(ctx);
-            crate::config_overlay::set_config_overlay_visible(ctx, !on);
-        }
+        // Config overlay is owned by the global background watcher — see the
+        // note in `process_shortcut_chords`.
     }
 
     /// Update the right-stick + gyro cursor overlay position/visibility.

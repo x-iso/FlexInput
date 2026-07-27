@@ -371,7 +371,6 @@ pub struct GamepadNav {
     pub panic_chord_st: ChordFireState,
     pub overlay_chord_st: ChordFireState,
     pub pin_chord_st: ChordFireState,
-    pub config_chord_st: ChordFireState,
     /// Config overlay (M3.5): index into this frame's published config-pin
     /// targets of the gamepad-focused tweak-pin. `None` = no focus yet (seeds to
     /// the top-left pin on first directional input). The focused pin's upstream
@@ -455,7 +454,6 @@ impl Default for GamepadNav {
             panic_chord_st: ChordFireState::default(),
             overlay_chord_st: ChordFireState::default(),
             pin_chord_st: ChordFireState::default(),
-            config_chord_st: ChordFireState::default(),
             #[cfg(windows)]
             key_tapper: None,
         }

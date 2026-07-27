@@ -192,19 +192,18 @@ pub struct AppSettings {
     /// default). Kept for serde back-compat; no longer wired.
     #[serde(default)]
     pub pin_via_guide: bool,
-    /// If true, the controller Guide / PS / Home button summons the config
-    /// overlay (via the global guide-watcher thread — the one path that works
-    /// while a game holds focus). Default on: this is the primary way to bring
-    /// up the overlay mid-game. The pin's old Guide binding was a stop-gap.
+    /// Legacy: the controller Guide button once summoned the config overlay via
+    /// a dedicated background watcher. Superseded by the user-assignable
+    /// `config_overlay_chord` (detected globally with a press mode). Kept for
+    /// serde back-compat; no longer wired.
     #[serde(default = "default_config_via_guide")]
     pub config_via_guide: bool,
-    /// If true, the Guide→config summon requires a double-tap (within ~300ms);
-    /// else a single tap fires. Default true to avoid colliding with the Game
-    /// Bar / Steam overlay's own single-press Guide handling.
+    /// Legacy companion to `config_via_guide` (double-tap requirement). No longer
+    /// wired — the config chord carries its own press mode now.
     #[serde(default = "default_config_guide_double_tap")]
     pub config_guide_double_tap: bool,
-    /// Optional chord button required IN ADDITION to Guide for the config summon
-    /// (e.g. `"btn_lb"`). Captured via AutoMap-style learn. None = Guide alone.
+    /// Legacy companion to `config_via_guide` (optional held chord button). No
+    /// longer wired — the config chord is a full combo now.
     #[serde(default)]
     pub config_guide_chord: Option<String>,
     /// Default nav-mode state for newly-seen gamepads. Per-device runtime
