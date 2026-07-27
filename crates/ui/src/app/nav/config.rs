@@ -56,25 +56,29 @@ impl FlexInputApp {
             }
         }
 
-        // When the tweaked param is driven by the LEFT stick, the left stick is
-        // the passthrough (you feel its effect in-game) — so it must NOT also
-        // drive the editor. Repurpose the RIGHT stick as the nav stick (dot
-        // select/move, field adjust) and free the left stick. D-pad still works
-        // as the discrete alternative either way.
+        // A physical stick that passes through (so the tweak's effect is FELT in
+        // game) must NOT also drive the editor. Pick the control input from the
+        // pin's passthrough set: right-stick felt → LEFT adjusts; left felt →
+        // RIGHT adjusts; BOTH felt → the D-pad adjusts and neither stick is
+        // repurposed. D-pad works as the discrete alternative in every case.
+        use crate::app::ControlInput;
         let editing = self.gamepad_nav.edit_level != EditLevel::Widget;
-        let ls_driven = editing && self.config_pin_ls_driven();
+        let control = if editing { self.config_control_input() } else { ControlInput::LeftStick };
 
         // Shared RS/gyro cursor (drives `cursor_pos`, monitor-clamped for the
         // fullscreen overlay). The shared editors read `cursor_pos` in screen
         // space — exactly the space the overlay + pin renderers publish in.
-        // Freeze it while the RS is repurposed to drive the editor (LS-driven).
-        if ls_driven {
-            let mut cnav = nav.clone();
-            cnav.rstick = egui::Vec2::ZERO;
-            self.config_update_cursor(ctx, &cnav, dt);
-        } else {
-            self.config_update_cursor(ctx, nav, dt);
-        }
+        // Freeze the RS while it's repurposed to drive the editor (or when both
+        // sticks pass through) so aiming the game doesn't fling the cursor.
+        let cursor_nav = match control {
+            ControlInput::LeftStick => nav.clone(),
+            ControlInput::RightStick | ControlInput::Dpad => {
+                let mut n = nav.clone();
+                n.rstick = egui::Vec2::ZERO;
+                n
+            }
+        };
+        self.config_update_cursor(ctx, &cursor_nav, dt);
 
         // ── Editing: delegate to the shared sub-patch nav dispatch ───────────
         // The override (config_nav_sel) makes `nav_drive_subpatch`'s resolvers
@@ -85,15 +89,26 @@ impl FlexInputApp {
             if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
                 let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
                 let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
-                if ls_driven {
+                let dnav = match control {
+                    // LS already drives the editor's stick role.
+                    ControlInput::LeftStick => nav.clone(),
                     // RS → the editor's "left stick" role; LS freed for passthrough.
-                    let mut dnav = nav.clone();
-                    dnav.lstick = nav.rstick;
-                    dnav.rstick = egui::Vec2::ZERO;
-                    self.nav_drive_subpatch(ctx, outer, &dnav, dt, rt_rising, lt_rising);
-                } else {
-                    self.nav_drive_subpatch(ctx, outer, nav, dt, rt_rising, lt_rising);
-                }
+                    ControlInput::RightStick => {
+                        let mut n = nav.clone();
+                        n.lstick = nav.rstick;
+                        n.rstick = egui::Vec2::ZERO;
+                        n
+                    }
+                    // Both sticks pass through: zero them so only the D-pad
+                    // (still live via `step_dir`) adjusts the param.
+                    ControlInput::Dpad => {
+                        let mut n = nav.clone();
+                        n.lstick = egui::Vec2::ZERO;
+                        n.rstick = egui::Vec2::ZERO;
+                        n
+                    }
+                };
+                self.nav_drive_subpatch(ctx, outer, &dnav, dt, rt_rising, lt_rising);
             } else {
                 self.gamepad_nav.edit_level = EditLevel::Widget;
             }
@@ -283,17 +298,20 @@ impl FlexInputApp {
         Some((*outer, *inner, scope))
     }
 
-    /// Whether the currently-focused config pin's tweaked parameter is driven by
-    /// the LEFT stick (so the left stick is its passthrough and shouldn't also
-    /// drive the editor). Reads the pin's resolved passthrough pin group.
-    pub(crate) fn config_pin_ls_driven(&self) -> bool {
+    /// Which physical input adjusts the currently-focused config pin, so it
+    /// doesn't collide with the stick(s) passing through to be felt. Derived
+    /// from the pin's resolved passthrough set (which already accounts for the
+    /// live topology — see `config_route::control_input_from_pins`).
+    pub(crate) fn config_control_input(&self) -> crate::app::ControlInput {
+        use crate::app::ControlInput;
         let Some((outer, inner, _)) = self.gamepad_nav.config_nav_sel.as_ref() else {
-            return false;
+            return ControlInput::LeftStick;
         };
         let snarl = &self.tabs[self.active_tab].canvas.snarl;
-        crate::app::config_passthrough_pins(snarl, &[outer.0], inner.0)
-            .map(|(_, pins)| pins.iter().any(|p| p.starts_with("left_stick")))
-            .unwrap_or(false)
+        match crate::app::config_passthrough_pins(snarl, &[outer.0], inner.0) {
+            Some((_, pins)) => crate::app::control_input_from_pins(&pins),
+            None => ControlInput::LeftStick,
+        }
     }
 }
 

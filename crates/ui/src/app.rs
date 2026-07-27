@@ -31,6 +31,7 @@ use crate::{
 // private items exactly as they did when they lived here.
 mod bind_window;
 mod chrome;
+mod config_route;
 mod devices_pool;
 mod graph;
 mod hidhide_ui;
@@ -41,6 +42,7 @@ mod subpatch;
 mod threads;
 
 pub(crate) use chrome::*;
+pub(crate) use config_route::*;
 // Re-exported at crate level by lib.rs, so it needs to stay `pub` here — the
 // glob above would otherwise narrow it to pub(crate).
 pub use chrome::render_app_icon;

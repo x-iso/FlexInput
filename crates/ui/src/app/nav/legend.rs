@@ -233,17 +233,24 @@ impl FlexInputApp {
                     (vec!["btn_back"], "Alt-Tab"),
                 ]
             };
-        // When editing an LS-driven param the editor is driven by the RIGHT stick
-        // (the left one is the passthrough) — advertise that in the icons so the
-        // legend matches the actual control.
-        let swap_ls = editing && self.config_pin_ls_driven();
+        // Advertise the actual control input in the icons: when a stick passes
+        // through (felt in game) the editor is driven by the OTHER stick, or by
+        // the D-pad when both pass through. Remap the left-stick glyphs to match.
+        use crate::app::ControlInput;
+        let control = if editing { self.config_control_input() } else { ControlInput::LeftStick };
         let remap = move |pin: &'static str| -> &'static str {
-            if !swap_ls { return pin; }
-            match pin {
-                "left_stick" => "right_stick",
-                "left_stick_horizontal" => "right_stick_horizontal",
-                "left_stick_vertical" => "right_stick_vertical",
-                other => other,
+            match control {
+                ControlInput::LeftStick => pin,
+                ControlInput::RightStick => match pin {
+                    "left_stick" => "right_stick",
+                    "left_stick_horizontal" => "right_stick_horizontal",
+                    "left_stick_vertical" => "right_stick_vertical",
+                    other => other,
+                },
+                ControlInput::Dpad => match pin {
+                    "left_stick" | "left_stick_horizontal" | "left_stick_vertical" => "dpad",
+                    other => other,
+                },
             }
         };
         hints

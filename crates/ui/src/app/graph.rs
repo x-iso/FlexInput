@@ -412,8 +412,59 @@ pub(crate) fn config_passthrough_pins(
     inner_node_id: usize,
 ) -> Option<(String, Vec<String>)> {
     let device = config_passthrough_device(tab_snarl, source_path, inner_node_id)?;
-    let pins = config_consumed_pins(tab_snarl, source_path, inner_node_id).unwrap_or_default();
+
+    // Input-driven pin (a stick curve, a mapping card…): trace UPSTREAM to the
+    // physical pin(s) it reads.
+    if let Some(pins) = config_consumed_pins(tab_snarl, source_path, inner_node_id) {
+        return Some((device, pins));
+    }
+
+    // Source-like tweak params (a Knob/Constant with no physical UPSTREAM) can't
+    // be traced up to a device — their effect is decided DOWNSTREAM by the patch
+    // (which virtual stick a gyro↔stick mix currently drives, chosen live by
+    // Selector/Split gates). Derive their passthrough from what they modulate in
+    // the current selection state (see `config_route`), so you feel the tweak on
+    // the affected stick while the OTHER stick is free to adjust the param.
+    //
+    // NOTE: co-inputs are assumed to share ONE physical device (the tab's pad),
+    // matching the single-`(device, pins)` block channel — true for the gyro↔
+    // stick case. A mix spanning two physical devices would need a set channel.
+    let pins = resolve_inner_snarl_node(tab_snarl, source_path, inner_node_id)
+        .map(|(snarl, node)| source_passthrough_pins(snarl, node))
+        .unwrap_or_default();
+    // CRITICAL: for a source-like pin an EMPTY result must BLOCK ALL physical
+    // input, never fall through to whole-device (an empty pin list means "whole
+    // device" to the block filter) — otherwise the stick used to adjust the
+    // param would leak into the game. A sentinel that matches no real pin makes
+    // the passthrough device pass nothing; every other device is blocked too.
+    let pins = if pins.is_empty() {
+        vec![CONFIG_BLOCK_ALL_PIN.to_string()]
+    } else {
+        pins
+    };
     Some((device, pins))
+}
+
+/// Sentinel "pin" that matches no real device pin — used as a source-like pin's
+/// passthrough when nothing should pass, so the block filter suppresses the
+/// whole device instead of interpreting an empty list as whole-device.
+pub(crate) const CONFIG_BLOCK_ALL_PIN: &str = "__fxi_block_all__";
+
+/// The snarl owning a config pin and the pin's node id: the tab snarl for a
+/// top-level pin (`[]`), or the first-level sub-patch's inner snarl for `[sp]`.
+pub(crate) fn resolve_inner_snarl_node<'a>(
+    tab_snarl: &'a Snarl<NodeData>,
+    source_path: &[usize],
+    inner_node_id: usize,
+) -> Option<(&'a Snarl<NodeData>, NodeId)> {
+    match source_path {
+        [] => Some((tab_snarl, NodeId(inner_node_id))),
+        [sp] => {
+            let inner = &tab_snarl.get_node(NodeId(*sp))?.subpatch.as_ref()?.snarl;
+            Some((inner, NodeId(inner_node_id)))
+        }
+        _ => None,
+    }
 }
 
 /// Config-overlay passthrough that knows about MAPPING modules. A Remapper /
@@ -500,7 +551,7 @@ fn config_card_in_pins(
 /// AutoMap bus. A curve tweaked DOWNSTREAM of the gyro processor must pass these
 /// (so you feel the gyro drive the mouse) while everything else — e.g. a right
 /// stick that's also summed into the same mouse delta — stays blocked.
-const GYRO_IMU_PINS: &[&str] = &[
+pub(crate) const GYRO_IMU_PINS: &[&str] = &[
     "gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z",
 ];
 
@@ -562,7 +613,7 @@ fn config_consumed_pins(
 /// so passing e.g. `right_stick_y` also passes `right_stick` + `right_stick_x`
 /// (a game mapping may read the Vec2 or either component). Non-existent members
 /// are harmless — they simply aren't in the block set.
-fn expand_pin_group(pin_id: &str) -> Vec<String> {
+pub(crate) fn expand_pin_group(pin_id: &str) -> Vec<String> {
     let base = pin_id
         .strip_suffix("_x")
         .or_else(|| pin_id.strip_suffix("_y"))
