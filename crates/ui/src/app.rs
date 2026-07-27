@@ -3939,16 +3939,20 @@ impl FlexInputApp {
     /// driver to be active, but that's the same code path. The nav-only flag
     /// therefore gates whether we evaluate at all vs. always (see caller note).
     fn process_shortcut_chords(&mut self, ctx: &egui::Context, nav: &crate::gamepad_nav::NavInput) -> bool {
-        let chord_held = |chord: &Option<Vec<String>>| -> bool {
+        let now = std::time::Instant::now();
+        let held = |chord: &Option<Vec<String>>| -> bool {
             match chord {
                 Some(c) if !c.is_empty() => c.iter().all(|p| nav.pressed.contains(p)),
                 _ => false,
             }
         };
+        use crate::gamepad_nav::chord_fire;
         let mut fired = false;
         // See-through.
-        let st_now = chord_held(&self.settings.seethrough_chord);
-        if st_now && !self.gamepad_nav.seethrough_chord_down {
+        let st_held = held(&self.settings.seethrough_chord);
+        if chord_fire(&mut self.gamepad_nav.seethrough_chord_st, st_held,
+            &self.settings.seethrough_chord_mode, self.settings.seethrough_chord_gap_ms, now)
+        {
             let next = !self.settings.see_through_active;
             self.settings.see_through_active = next;
             self.settings_dirty = true;
@@ -3958,36 +3962,39 @@ impl FlexInputApp {
                 egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY), next));
             fired = true;
         }
-        self.gamepad_nav.seethrough_chord_down = st_now;
         // Panic.
-        let pn_now = chord_held(&self.settings.panic_chord);
-        if pn_now && !self.gamepad_nav.panic_chord_down {
+        let pn_held = held(&self.settings.panic_chord);
+        if chord_fire(&mut self.gamepad_nav.panic_chord_st, pn_held,
+            &self.settings.panic_chord_mode, self.settings.panic_chord_gap_ms, now)
+        {
             self.panic_active = !self.panic_active;
             fired = true;
         }
-        self.gamepad_nav.panic_chord_down = pn_now;
         // Overlay.
-        let ov_now = chord_held(&self.settings.overlay_chord);
-        if ov_now && !self.gamepad_nav.overlay_chord_down {
+        let ov_held = held(&self.settings.overlay_chord);
+        if chord_fire(&mut self.gamepad_nav.overlay_chord_st, ov_held,
+            &self.settings.overlay_chord_mode, self.settings.overlay_chord_gap_ms, now)
+        {
             crate::overlay::set_overlay_visible(ctx, !crate::overlay::overlay_visible(ctx));
             fired = true;
         }
-        self.gamepad_nav.overlay_chord_down = ov_now;
         // Pin.
-        let pin_now = chord_held(&self.settings.pin_chord);
-        if pin_now && !self.gamepad_nav.pin_chord_down {
+        let pin_held = held(&self.settings.pin_chord);
+        if chord_fire(&mut self.gamepad_nav.pin_chord_st, pin_held,
+            &self.settings.pin_chord_mode, self.settings.pin_chord_gap_ms, now)
+        {
             self.pin_toggle_requested.store(true, Ordering::Relaxed);
             fired = true;
         }
-        self.gamepad_nav.pin_chord_down = pin_now;
         // Config overlay.
-        let cfg_now = chord_held(&self.settings.config_overlay_chord);
-        if cfg_now && !self.gamepad_nav.config_chord_down {
+        let cfg_held = held(&self.settings.config_overlay_chord);
+        if chord_fire(&mut self.gamepad_nav.config_chord_st, cfg_held,
+            &self.settings.config_overlay_chord_mode, self.settings.config_overlay_chord_gap_ms, now)
+        {
             let on = crate::config_overlay::config_overlay_visible(ctx);
             crate::config_overlay::set_config_overlay_visible(ctx, !on);
             fired = true;
         }
-        self.gamepad_nav.config_chord_down = cfg_now;
         fired
     }
 
@@ -4004,13 +4011,14 @@ impl FlexInputApp {
             && self.settings.pin_chord.is_none()
             && self.settings.config_overlay_chord.is_none()
         {
-            self.gamepad_nav.seethrough_chord_down = false;
-            self.gamepad_nav.panic_chord_down = false;
-            self.gamepad_nav.overlay_chord_down = false;
-            self.gamepad_nav.pin_chord_down = false;
-            self.gamepad_nav.config_chord_down = false;
+            self.gamepad_nav.seethrough_chord_st = Default::default();
+            self.gamepad_nav.panic_chord_st = Default::default();
+            self.gamepad_nav.overlay_chord_st = Default::default();
+            self.gamepad_nav.pin_chord_st = Default::default();
+            self.gamepad_nav.config_chord_st = Default::default();
             return;
         }
+        let now = std::time::Instant::now();
         let excluded = self.own_virtual_device_ids();
         let any_holds = |chord: &Option<Vec<String>>| -> bool {
             let Some(c) = chord else { return false; };
@@ -4025,36 +4033,42 @@ impl FlexInputApp {
                         .map(|s| s.as_bool()).unwrap_or(false)
                 }))
         };
-        let st_now = any_holds(&self.settings.seethrough_chord);
-        if st_now && !self.gamepad_nav.seethrough_chord_down {
+        use crate::gamepad_nav::chord_fire;
+        let st_held = any_holds(&self.settings.seethrough_chord);
+        if chord_fire(&mut self.gamepad_nav.seethrough_chord_st, st_held,
+            &self.settings.seethrough_chord_mode, self.settings.seethrough_chord_gap_ms, now)
+        {
             let next = !self.settings.see_through_active;
             self.settings.see_through_active = next;
             self.settings_dirty = true;
             ctx.data_mut(|d| d.insert_temp(
                 egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY), next));
         }
-        self.gamepad_nav.seethrough_chord_down = st_now;
-        let pn_now = any_holds(&self.settings.panic_chord);
-        if pn_now && !self.gamepad_nav.panic_chord_down {
+        let pn_held = any_holds(&self.settings.panic_chord);
+        if chord_fire(&mut self.gamepad_nav.panic_chord_st, pn_held,
+            &self.settings.panic_chord_mode, self.settings.panic_chord_gap_ms, now)
+        {
             self.panic_active = !self.panic_active;
         }
-        self.gamepad_nav.panic_chord_down = pn_now;
-        let ov_now = any_holds(&self.settings.overlay_chord);
-        if ov_now && !self.gamepad_nav.overlay_chord_down {
+        let ov_held = any_holds(&self.settings.overlay_chord);
+        if chord_fire(&mut self.gamepad_nav.overlay_chord_st, ov_held,
+            &self.settings.overlay_chord_mode, self.settings.overlay_chord_gap_ms, now)
+        {
             crate::overlay::set_overlay_visible(ctx, !crate::overlay::overlay_visible(ctx));
         }
-        self.gamepad_nav.overlay_chord_down = ov_now;
-        let pin_now = any_holds(&self.settings.pin_chord);
-        if pin_now && !self.gamepad_nav.pin_chord_down {
+        let pin_held = any_holds(&self.settings.pin_chord);
+        if chord_fire(&mut self.gamepad_nav.pin_chord_st, pin_held,
+            &self.settings.pin_chord_mode, self.settings.pin_chord_gap_ms, now)
+        {
             self.pin_toggle_requested.store(true, Ordering::Relaxed);
         }
-        self.gamepad_nav.pin_chord_down = pin_now;
-        let cfg_now = any_holds(&self.settings.config_overlay_chord);
-        if cfg_now && !self.gamepad_nav.config_chord_down {
+        let cfg_held = any_holds(&self.settings.config_overlay_chord);
+        if chord_fire(&mut self.gamepad_nav.config_chord_st, cfg_held,
+            &self.settings.config_overlay_chord_mode, self.settings.config_overlay_chord_gap_ms, now)
+        {
             let on = crate::config_overlay::config_overlay_visible(ctx);
             crate::config_overlay::set_config_overlay_visible(ctx, !on);
         }
-        self.gamepad_nav.config_chord_down = cfg_now;
     }
 
     /// Update the right-stick + gyro cursor overlay position/visibility.

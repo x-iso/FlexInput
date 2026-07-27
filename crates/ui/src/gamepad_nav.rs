@@ -43,6 +43,90 @@ pub enum ChordTarget {
     ConfigOverlay,
 }
 
+/// Per-shortcut edge/timing state carried between frames by `chord_fire`.
+#[derive(Clone, Debug, Default)]
+pub struct ChordFireState {
+    /// Were all the combo's buttons held last frame? (Rising-edge tracker.)
+    pub down: bool,
+    /// When the combo was first fully held (for `long`).
+    pressed_at: Option<Instant>,
+    /// When the last tap fired (for `double`).
+    last_tap_at: Option<Instant>,
+    /// Latch so `long` fires once per hold, not every frame past the threshold.
+    fired_this_hold: bool,
+}
+
+/// Decide whether a shortcut chord should fire this frame.
+///
+/// `held` = every button in the chord is currently pressed. `mode` selects the
+/// firing condition, mirroring the remapper cards' discrete modes:
+///  * `"down"` (default) — fire on the press edge (all-held rising edge).
+///  * `"long"` — fire once after the combo is held for `gap_ms`.
+///  * `"double"` — fire on a second press within `gap_ms` of the first.
+///
+/// `st` carries the timing/edge state between calls. Returns true exactly on
+/// the frame the shortcut should toggle.
+pub fn chord_fire(st: &mut ChordFireState, held: bool, mode: &str,
+    gap_ms: f32, now: Instant) -> bool
+{
+    let gap = std::time::Duration::from_millis(gap_ms.max(1.0) as u64);
+    let rising = held && !st.down;
+    let falling = !held && st.down;
+    let mut fired = false;
+    match mode {
+        "long" => {
+            if rising { st.pressed_at = Some(now); st.fired_this_hold = false; }
+            if held && !st.fired_this_hold {
+                if let Some(t) = st.pressed_at {
+                    if now.duration_since(t) >= gap {
+                        fired = true;
+                        st.fired_this_hold = true;
+                    }
+                }
+            }
+            if falling { st.pressed_at = None; st.fired_this_hold = false; }
+        }
+        "double" => {
+            if rising {
+                let is_double = st.last_tap_at
+                    .map(|t| now.duration_since(t) < gap)
+                    .unwrap_or(false);
+                if is_double { fired = true; st.last_tap_at = None; }
+                else { st.last_tap_at = Some(now); }
+            }
+        }
+        // "down" and any unknown mode.
+        _ => { if rising { fired = true; } }
+    }
+    st.down = held;
+    fired
+}
+
+/// The discrete press modes offered for gamepad shortcut chords, as
+/// `(value, glyph, label)`. A subset of the remapper card modes — the
+/// analog/turbo/edge variants don't apply to a one-shot toggle.
+pub const SHORTCUT_PRESS_MODES: &[(&str, &str, &str)] = &[
+    ("down",   "↓", "On press"),
+    ("long",   "⇓", "Long press"),
+    ("double", "↡", "Double tap"),
+];
+
+/// Human label for a shortcut press-mode value (for the button face/tooltip).
+pub fn shortcut_press_mode_label(mode: &str) -> &'static str {
+    SHORTCUT_PRESS_MODES.iter()
+        .find(|(v, _, _)| *v == mode)
+        .map(|(_, _, l)| *l)
+        .unwrap_or("On press")
+}
+
+/// Glyph for a shortcut press-mode value.
+pub fn shortcut_press_mode_glyph(mode: &str) -> &'static str {
+    SHORTCUT_PRESS_MODES.iter()
+        .find(|(v, _, _)| *v == mode)
+        .map(|(_, g, _)| *g)
+        .unwrap_or("↓")
+}
+
 /// Selection model levels.
 /// - `Widget`: moving the selection between sub-patch widgets.
 /// - `Editing`: editing a scalar/dropdown widget's value.
@@ -280,13 +364,14 @@ pub struct GamepadNav {
     /// once true, so the South press that STARTED the learn (or any held button)
     /// isn't swept into the chord.
     pub chord_arm_idle: bool,
-    /// Edge trackers: was each shortcut combo fully satisfied last frame? Used
-    /// to fire the toggle once per press, not every frame the combo is held.
-    pub seethrough_chord_down: bool,
-    pub panic_chord_down: bool,
-    pub overlay_chord_down: bool,
-    pub pin_chord_down: bool,
-    pub config_chord_down: bool,
+    /// Per-shortcut edge/timing state (press-mode aware). Drives `chord_fire`
+    /// so each combo fires once per press per its configured mode, not every
+    /// frame the combo is held.
+    pub seethrough_chord_st: ChordFireState,
+    pub panic_chord_st: ChordFireState,
+    pub overlay_chord_st: ChordFireState,
+    pub pin_chord_st: ChordFireState,
+    pub config_chord_st: ChordFireState,
     /// Config overlay (M3.5): index into this frame's published config-pin
     /// targets of the gamepad-focused tweak-pin. `None` = no focus yet (seeds to
     /// the top-left pin on first directional input). The focused pin's upstream
@@ -366,11 +451,11 @@ impl Default for GamepadNav {
             chord_learn: None,
             chord_draft: Vec::new(),
             chord_arm_idle: false,
-            seethrough_chord_down: false,
-            panic_chord_down: false,
-            overlay_chord_down: false,
-            pin_chord_down: false,
-            config_chord_down: false,
+            seethrough_chord_st: ChordFireState::default(),
+            panic_chord_st: ChordFireState::default(),
+            overlay_chord_st: ChordFireState::default(),
+            pin_chord_st: ChordFireState::default(),
+            config_chord_st: ChordFireState::default(),
             #[cfg(windows)]
             key_tapper: None,
         }
@@ -645,5 +730,57 @@ pub fn stick_dir(v: egui::Vec2) -> Option<NavDir> {
     } else {
         // Screen Y grows downward; gamepad up-stick is +y in our convention.
         Some(if v.y >= 0.0 { NavDir::Up } else { NavDir::Down })
+    }
+}
+
+#[cfg(test)]
+mod chord_fire_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn down_fires_once_on_press_edge() {
+        let mut st = ChordFireState::default();
+        let t = Instant::now();
+        // First frame held → fire; subsequent held frames → no fire.
+        assert!(chord_fire(&mut st, true, "down", 200.0, t));
+        assert!(!chord_fire(&mut st, true, "down", 200.0, t));
+        // Release then press again → fires again.
+        assert!(!chord_fire(&mut st, false, "down", 200.0, t));
+        assert!(chord_fire(&mut st, true, "down", 200.0, t));
+    }
+
+    #[test]
+    fn long_fires_once_after_hold_elapses() {
+        let mut st = ChordFireState::default();
+        let t0 = Instant::now();
+        // Press: no immediate fire.
+        assert!(!chord_fire(&mut st, true, "long", 200.0, t0));
+        // Still held, before the gap: no fire.
+        assert!(!chord_fire(&mut st, true, "long", 200.0, t0 + Duration::from_millis(100)));
+        // Past the gap: fires exactly once.
+        assert!(chord_fire(&mut st, true, "long", 200.0, t0 + Duration::from_millis(250)));
+        assert!(!chord_fire(&mut st, true, "long", 200.0, t0 + Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn double_needs_two_taps_within_gap() {
+        let mut st = ChordFireState::default();
+        let t0 = Instant::now();
+        // First tap (press+release): no fire.
+        assert!(!chord_fire(&mut st, true, "double", 300.0, t0));
+        assert!(!chord_fire(&mut st, false, "double", 300.0, t0 + Duration::from_millis(50)));
+        // Second press within the gap: fires.
+        assert!(chord_fire(&mut st, true, "double", 300.0, t0 + Duration::from_millis(150)));
+    }
+
+    #[test]
+    fn double_too_slow_does_not_fire() {
+        let mut st = ChordFireState::default();
+        let t0 = Instant::now();
+        assert!(!chord_fire(&mut st, true, "double", 300.0, t0));
+        assert!(!chord_fire(&mut st, false, "double", 300.0, t0 + Duration::from_millis(50)));
+        // Second press after the gap: treated as a fresh first tap, no fire.
+        assert!(!chord_fire(&mut st, true, "double", 300.0, t0 + Duration::from_millis(500)));
     }
 }

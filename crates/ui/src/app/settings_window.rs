@@ -64,6 +64,76 @@ impl FlexInputApp {
                 if learning { self.gamepad_nav.chord_learn = None; }
                 changed = true;
             }
+
+            // ── Press mode + time gap (mirrors the remapper card controls) ──
+            use crate::gamepad_nav::{SHORTCUT_PRESS_MODES, shortcut_press_mode_label,
+                shortcut_press_mode_glyph};
+            let mut mode_now = match target {
+                ChordTarget::SeeThrough    => self.settings.seethrough_chord_mode.clone(),
+                ChordTarget::Panic         => self.settings.panic_chord_mode.clone(),
+                ChordTarget::Overlay       => self.settings.overlay_chord_mode.clone(),
+                ChordTarget::Pin           => self.settings.pin_chord_mode.clone(),
+                ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_mode.clone(),
+            };
+            egui::ComboBox::from_id_salt(("fxi_shortcut_mode", label))
+                .width(110.0)
+                .selected_text(format!("{}  {}",
+                    shortcut_press_mode_glyph(&mode_now),
+                    shortcut_press_mode_label(&mode_now)))
+                .show_ui(ui, |ui| {
+                    for (val, glyph, mlabel) in SHORTCUT_PRESS_MODES {
+                        if ui.selectable_label(mode_now == *val,
+                            format!("{glyph}  {mlabel}")).clicked()
+                        {
+                            mode_now = (*val).to_string();
+                        }
+                    }
+                });
+            let apply_mode = |s: &mut settings::AppSettings, m: String| match target {
+                ChordTarget::SeeThrough    => s.seethrough_chord_mode = m,
+                ChordTarget::Panic         => s.panic_chord_mode = m,
+                ChordTarget::Overlay       => s.overlay_chord_mode = m,
+                ChordTarget::Pin           => s.pin_chord_mode = m,
+                ChordTarget::ConfigOverlay => s.config_overlay_chord_mode = m,
+            };
+            let prev_mode = match target {
+                ChordTarget::SeeThrough    => &self.settings.seethrough_chord_mode,
+                ChordTarget::Panic         => &self.settings.panic_chord_mode,
+                ChordTarget::Overlay       => &self.settings.overlay_chord_mode,
+                ChordTarget::Pin           => &self.settings.pin_chord_mode,
+                ChordTarget::ConfigOverlay => &self.settings.config_overlay_chord_mode,
+            };
+            if *prev_mode != mode_now {
+                apply_mode(&mut self.settings, mode_now.clone());
+                changed = true;
+            }
+
+            // Time gap applies to long / double (mirrors remapper `window_ms`).
+            let gap_applies = mode_now != "down";
+            let mut gap_ms = match target {
+                ChordTarget::SeeThrough    => self.settings.seethrough_chord_gap_ms,
+                ChordTarget::Panic         => self.settings.panic_chord_gap_ms,
+                ChordTarget::Overlay       => self.settings.overlay_chord_gap_ms,
+                ChordTarget::Pin           => self.settings.pin_chord_gap_ms,
+                ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_gap_ms,
+            };
+            ui.add_enabled_ui(gap_applies, |ui| {
+                let resp = ui.add(
+                    egui::DragValue::new(&mut gap_ms)
+                        .speed(5.0).range(10.0f32..=5000.0)
+                        .custom_formatter(|n, _| format!("{n:.0} ms")),
+                ).on_hover_text("Long-press hold time / double-tap max gap.");
+                if resp.changed() {
+                    match target {
+                        ChordTarget::SeeThrough    => self.settings.seethrough_chord_gap_ms = gap_ms,
+                        ChordTarget::Panic         => self.settings.panic_chord_gap_ms = gap_ms,
+                        ChordTarget::Overlay       => self.settings.overlay_chord_gap_ms = gap_ms,
+                        ChordTarget::Pin           => self.settings.pin_chord_gap_ms = gap_ms,
+                        ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_gap_ms = gap_ms,
+                    }
+                    changed = true;
+                }
+            });
         });
         changed
     }

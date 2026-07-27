@@ -71,6 +71,8 @@ fn default_cursor_accel() -> f32 { 2.0 }
 fn default_pin_guide_double_tap() -> bool { true }
 fn default_config_via_guide() -> bool { true }
 fn default_config_guide_double_tap() -> bool { true }
+fn default_chord_mode() -> String { "down".to_string() }
+fn default_chord_gap_ms() -> f32 { 200.0 }
 fn default_focus_flip_flop() -> bool { true }
 fn default_ui_mode() -> UiMode { UiMode::Easy }
 
@@ -312,11 +314,37 @@ pub struct AppSettings {
     /// combo. Focus-gated like the other chords. None = unassigned.
     #[serde(default)]
     pub pin_chord: Option<Vec<String>>,
-    /// Optional gamepad button combo that toggles the CONFIG overlay. A second
-    /// path in addition to the default Guide summon (`config_via_guide`), for
-    /// users who prefer a non-Guide combo. None = unassigned.
+    /// Optional gamepad button combo that toggles the CONFIG overlay. Detected
+    /// globally by the background watcher (fires even while a game holds focus),
+    /// so it's the primary controller path to summon the overlay mid-play.
+    /// None = unassigned.
     #[serde(default)]
     pub config_overlay_chord: Option<Vec<String>>,
+    /// Press mode for each gamepad shortcut chord above (`"down"` = on press,
+    /// `"long"` = hold for the gap, `"double"` = double-tap within the gap).
+    /// Mirrors the remapper card press modes; see `gamepad_nav::chord_fire`.
+    #[serde(default = "default_chord_mode")]
+    pub seethrough_chord_mode: String,
+    #[serde(default = "default_chord_mode")]
+    pub panic_chord_mode: String,
+    #[serde(default = "default_chord_mode")]
+    pub overlay_chord_mode: String,
+    #[serde(default = "default_chord_mode")]
+    pub pin_chord_mode: String,
+    #[serde(default = "default_chord_mode")]
+    pub config_overlay_chord_mode: String,
+    /// Time gap (ms) each shortcut chord's press mode reads: the hold duration
+    /// for `long`, the max inter-tap gap for `double`. Ignored by `down`.
+    #[serde(default = "default_chord_gap_ms")]
+    pub seethrough_chord_gap_ms: f32,
+    #[serde(default = "default_chord_gap_ms")]
+    pub panic_chord_gap_ms: f32,
+    #[serde(default = "default_chord_gap_ms")]
+    pub overlay_chord_gap_ms: f32,
+    #[serde(default = "default_chord_gap_ms")]
+    pub pin_chord_gap_ms: f32,
+    #[serde(default = "default_chord_gap_ms")]
+    pub config_overlay_chord_gap_ms: f32,
     /// Whether the info overlay was visible on exit — restored on launch
     /// (mirrors `see_through_active`; the live state lives in a ctx temp
     /// slot that `update()` syncs back here).
@@ -554,6 +582,16 @@ impl Default for AppSettings {
             overlay_chord: None,
             pin_chord: None,
             config_overlay_chord: None,
+            seethrough_chord_mode: default_chord_mode(),
+            panic_chord_mode: default_chord_mode(),
+            overlay_chord_mode: default_chord_mode(),
+            pin_chord_mode: default_chord_mode(),
+            config_overlay_chord_mode: default_chord_mode(),
+            seethrough_chord_gap_ms: default_chord_gap_ms(),
+            panic_chord_gap_ms: default_chord_gap_ms(),
+            overlay_chord_gap_ms: default_chord_gap_ms(),
+            pin_chord_gap_ms: default_chord_gap_ms(),
+            config_overlay_chord_gap_ms: default_chord_gap_ms(),
             overlay_visible: false,
             overlay_shortcut: default_overlay_shortcut(),
             edit_overlay_shortcut: default_edit_overlay_shortcut(),
