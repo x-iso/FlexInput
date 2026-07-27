@@ -69,6 +69,10 @@ impl FlexInputApp {
             ChordTarget::ConfigOverlay => self.settings.config_overlay_chord.clone(),
         }.unwrap_or_default();
         let has_assigned = !combo_now.is_empty();
+        // A single-button shortcut (a standalone Guide/Capture/Mic) may NOT use
+        // "on press": the same button is meant to also be combinable in other
+        // shortcuts, and an on-press single would fire the instant it's touched.
+        let is_single = combo_now.len() == 1;
         let skin = self.shortcut_display_skin();
         ui.horizontal(|ui| {
             ui.label(format!("{label}:"));
@@ -109,6 +113,11 @@ impl FlexInputApp {
                 ChordTarget::Pin           => self.settings.pin_chord_mode.clone(),
                 ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_mode.clone(),
             };
+            // Single-button shortcuts can't be "on press" — migrate a stored
+            // "down" to "long" so the value shown (and persisted below) is valid.
+            if is_single && mode_now == "down" {
+                mode_now = "long".to_string();
+            }
             egui::ComboBox::from_id_salt(("fxi_shortcut_mode", label))
                 .width(110.0)
                 .selected_text(format!("{}  {}",
@@ -116,6 +125,8 @@ impl FlexInputApp {
                     shortcut_press_mode_label(&mode_now)))
                 .show_ui(ui, |ui| {
                     for (val, glyph, mlabel) in SHORTCUT_PRESS_MODES {
+                        // Hide "on press" for single-button shortcuts.
+                        if is_single && *val == "down" { continue; }
                         if ui.selectable_label(mode_now == *val,
                             format!("{glyph}  {mlabel}")).clicked()
                         {

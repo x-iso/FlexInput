@@ -3856,9 +3856,38 @@ impl FlexInputApp {
         "btn_south", "btn_east", "btn_west", "btn_north",
         "btn_lb", "btn_rb", "btn_lt_dig", "btn_rt_dig",
         "btn_ls", "btn_rs", "btn_start", "btn_back",
-        "btn_guide", "btn_touchpad", "btn_mute",
+        "btn_guide", "btn_touchpad", "btn_mute", "btn_capture",
         "dpad_up", "dpad_down", "dpad_left", "dpad_right",
     ];
+
+    /// System buttons allowed to bind a shortcut ON THEIR OWN (no combo): the
+    /// Guide/PS/Home button and the Capture / Mic-mute button. These are almost
+    /// never used by in-game mappings, so a single press is safe — unless the
+    /// user HAS mapped one, in which case `chord_draft_acceptable` still requires
+    /// a combo. Every other button must be part of a 2+ combo.
+    const STANDALONE_CHORD_PINS: &[&str] = &["btn_guide", "btn_mute", "btn_capture"];
+
+    /// True when a captured chord draft may be committed: a 2+ combo always, or a
+    /// single standalone-allowed system button that isn't already used by a
+    /// mapping in any tab. A single ordinary button is rejected (keep listening).
+    fn chord_draft_acceptable(&self, draft: &[String]) -> bool {
+        match draft.len() {
+            0 => false,
+            1 => {
+                let pin = draft[0].as_str();
+                Self::STANDALONE_CHORD_PINS.contains(&pin)
+                    && !self.shortcut_button_taken(pin)
+            }
+            _ => true,
+        }
+    }
+
+    /// True when `pin` is read as a mapping input in any tab's patch (top-level
+    /// or a nested sub-patch), so it shouldn't double as a standalone shortcut.
+    fn shortcut_button_taken(&self, pin: &str) -> bool {
+        self.tabs.iter().any(|t|
+            crate::canvas::viewer::pin_used_as_mapping_input(&t.canvas.snarl, pin))
+    }
 
     /// Shortcut-chord capture for the DESKTOP Settings window (mouse-started
     /// learn, gamepad panel closed). Aggregates held chord pins across all
@@ -3893,9 +3922,10 @@ impl FlexInputApp {
         }
         if !held_any && !self.gamepad_nav.chord_draft.is_empty() {
             let draft = std::mem::take(&mut self.gamepad_nav.chord_draft);
-            // Same rule as the panel: combos only (>= 2). East-alone cancels;
-            // any other single button is rejected (keep listening).
-            if draft.len() < 2 {
+            // Combos (>= 2) always latch; a single Guide/Capture/Mic button
+            // latches only if it isn't already mapped. East-alone cancels; any
+            // other single button is rejected (keep listening).
+            if !self.chord_draft_acceptable(&draft) {
                 self.gamepad_nav.chord_arm_idle = false;
                 if draft == ["btn_east"] {
                     self.gamepad_nav.chord_learn = None;
@@ -3940,10 +3970,10 @@ impl FlexInputApp {
         // On full release, interpret the captured draft.
         if !held_any && !self.gamepad_nav.chord_draft.is_empty() {
             let draft = std::mem::take(&mut self.gamepad_nav.chord_draft);
-            // Shortcuts MUST be combos (>= 2 buttons). A single button never
-            // latches: East-alone cancels the capture (back); any other single
-            // button is simply rejected and we keep listening.
-            if draft.len() < 2 {
+            // Combos (>= 2) always latch; a single Guide/Capture/Mic button
+            // latches only if it isn't already mapped. East-alone cancels the
+            // capture (back); any other single button is rejected (keep listening).
+            if !self.chord_draft_acceptable(&draft) {
                 self.gamepad_nav.chord_arm_idle = false;
                 if draft == ["btn_east"] {
                     self.gamepad_nav.chord_learn = None; // cancel
@@ -3959,13 +3989,31 @@ impl FlexInputApp {
     fn commit_chord(&mut self, chord: Vec<String>) {
         use crate::gamepad_nav::ChordTarget;
         self.gamepad_nav.chord_arm_idle = false;
-        match self.gamepad_nav.chord_learn.take() {
+        let single = chord.len() == 1;
+        let target = self.gamepad_nav.chord_learn.take();
+        match target {
             Some(ChordTarget::SeeThrough)    => self.settings.seethrough_chord = Some(chord),
             Some(ChordTarget::Panic)         => self.settings.panic_chord = Some(chord),
             Some(ChordTarget::Overlay)       => self.settings.overlay_chord = Some(chord),
             Some(ChordTarget::Pin)           => self.settings.pin_chord = Some(chord),
             Some(ChordTarget::ConfigOverlay) => self.settings.config_overlay_chord = Some(chord),
             None => {}
+        }
+        // A single-button shortcut can't be "on press" (it would fire the instant
+        // the button is touched, even as part of another combo). Nudge a
+        // default/"down" mode to "long" so a standalone Guide/Capture is safe.
+        if single {
+            let mode = match target {
+                Some(ChordTarget::SeeThrough)    => Some(&mut self.settings.seethrough_chord_mode),
+                Some(ChordTarget::Panic)         => Some(&mut self.settings.panic_chord_mode),
+                Some(ChordTarget::Overlay)       => Some(&mut self.settings.overlay_chord_mode),
+                Some(ChordTarget::Pin)           => Some(&mut self.settings.pin_chord_mode),
+                Some(ChordTarget::ConfigOverlay) => Some(&mut self.settings.config_overlay_chord_mode),
+                None => None,
+            };
+            if let Some(m) = mode {
+                if m == "down" { *m = "long".to_string(); }
+            }
         }
         self.settings_dirty = true;
     }

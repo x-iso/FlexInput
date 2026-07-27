@@ -83,6 +83,34 @@ pub(crate) fn scan_mapping_conflicts(snarl: &Snarl<NodeData>) -> ConflictMap {
     map
 }
 
+/// True when `pin` (a canonical button id like `"btn_guide"`) is used as a
+/// mapping INPUT anywhere in `snarl` or its nested sub-patches — i.e. a Remapper
+/// card reads it. Used to decide whether a single system button (Guide / Capture
+/// / Mic) is free to bind as a standalone shortcut, or already spoken for. Only
+/// Remapper `in` pins are checked: Touch Zones / Menu take touch/zone inputs and
+/// Lean is gyro-driven, so a face/system button is never their source.
+pub(crate) fn pin_used_as_mapping_input(snarl: &Snarl<NodeData>, pin: &str) -> bool {
+    for (_id, n) in snarl.nodes_ids_data() {
+        let data = &n.value;
+        if data.module_id == "module.remapper" {
+            if let Some(arr) = data.params.get("mappings").and_then(|v| v.as_array()) {
+                for card in arr {
+                    if card.get("in").and_then(|v| v.as_array())
+                        .map(|ins| ins.iter().filter_map(|v| v.as_str()).any(|p| p == pin))
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Some(sp) = &data.subpatch {
+            if pin_used_as_mapping_input(&sp.snarl, pin) { return true; }
+        }
+    }
+    false
+}
+
 /// Build the per-card conflict view for the card identified by
 /// (`node`, `param_key`, `idx`) with the given `out_pins`. Returns `None` when
 /// no out-pin of this card is also written by another card. The owner labels
