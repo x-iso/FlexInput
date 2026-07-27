@@ -114,6 +114,15 @@ pub fn set_config_overlay_visible(ctx: &egui::Context, on: bool) {
     }
 }
 
+/// Dedicated always-on-top viewport for the KB/M "Special" picker when it's
+/// summoned from a pinned Remapper / Touch Zones body in the config overlay.
+/// The main-window picker would draw behind the game (unreachable); this one
+/// floats over it like the overlay itself. Distinct from the overlay viewport
+/// so it doesn't clash with `show_config_overlay`'s own immediate viewport.
+pub fn picker_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("fxi_config_kbm_picker")
+}
+
 pub fn config_overlay_edit(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<bool>(edit_id())).unwrap_or(false)
 }

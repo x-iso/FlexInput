@@ -97,9 +97,81 @@ impl FlexInputApp {
     /// and control hints. Input is handled in `drive_kbm_picker`; this is
     /// display-only. Rendered top-level (not in a sublayer), so painting here is
     /// safe.
+    /// Resolve the picker's spatial-nav step this frame: D-pad = one discrete
+    /// step per press; left stick = continuous auto-repeat whose rate rises with
+    /// deflection (so a big push scrolls fast, a small one steps slowly). Uses
+    /// the shared `stick_dir` for direction so up/down match every other nav
+    /// (no Y inversion). Shared by the main-window picker loop and the config
+    /// overlay's (which owns nav while summoned).
+    pub(crate) fn picker_step_dir(
+        &mut self,
+        nav: &crate::gamepad_nav::NavInput,
+        dt: f32,
+    ) -> Option<crate::gamepad_nav::NavDir> {
+        use crate::gamepad_nav::{self as gn, NavDir};
+        if nav.is_rising("dpad_up") { self.gamepad_nav.repeat_dir = None; return Some(NavDir::Up); }
+        if nav.is_rising("dpad_down") { self.gamepad_nav.repeat_dir = None; return Some(NavDir::Down); }
+        if nav.is_rising("dpad_left") { self.gamepad_nav.repeat_dir = None; return Some(NavDir::Left); }
+        if nav.is_rising("dpad_right") { self.gamepad_nav.repeat_dir = None; return Some(NavDir::Right); }
+        match gn::stick_dir(nav.lstick) {
+            Some(d) => {
+                if self.gamepad_nav.repeat_dir != Some(d) {
+                    self.gamepad_nav.repeat_dir = Some(d);
+                    self.gamepad_nav.repeat_accum = 1.0; // immediate first step
+                }
+                let mag = nav.lstick.length();
+                let rate = 5.0 + ((mag - 0.5) / 0.5).clamp(0.0, 1.0) * 13.0; // ~5..18 cells/s
+                self.gamepad_nav.repeat_accum += dt * rate;
+                if self.gamepad_nav.repeat_accum >= 1.0 {
+                    self.gamepad_nav.repeat_accum -= 1.0;
+                    return Some(d);
+                }
+                None
+            }
+            None => {
+                self.gamepad_nav.repeat_dir = None;
+                self.gamepad_nav.repeat_accum = 0.0;
+                None
+            }
+        }
+    }
+
     pub(crate) fn draw_kbm_picker(&mut self, ctx: &egui::Context) {
         let (clicked_pin, done) = self.kbm_picker_window(ctx);
         self.apply_kbm_picker_result(clicked_pin, done);
+    }
+
+    /// Render the KB/M picker in its OWN always-on-top viewport, floating over the
+    /// game — used when the picker was summoned from a pinned body in the config
+    /// overlay (the main-window picker would be behind the game, unreachable).
+    /// Fullscreen transparent + interactable so the centered picker window shows
+    /// over the game while the rest stays see-through; the config overlay's own
+    /// nav still drives it (gamepad reads raw signals, not egui focus).
+    pub(crate) fn draw_kbm_picker_over_game(&mut self, ctx: &egui::Context) {
+        let monitor = ctx
+            .input(|i| i.viewport().monitor_size)
+            .filter(|s| s.x > 1.0 && s.y > 1.0)
+            .unwrap_or(egui::vec2(1920.0, 1080.0));
+        let builder = egui::ViewportBuilder::default()
+            .with_title("FlexInput KB/M Picker")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_taskbar(false)
+            .with_resizable(false)
+            .with_has_shadow(false)
+            .with_active(false)
+            .with_position(egui::pos2(0.0, 0.0))
+            .with_inner_size(monitor);
+        let mut result: (Option<String>, bool) = (None, false);
+        ctx.show_viewport_immediate(
+            crate::config_overlay::picker_viewport_id(),
+            builder,
+            |vctx, _class| {
+                result = self.kbm_picker_window(vctx);
+            },
+        );
+        self.apply_kbm_picker_result(result.0, result.1);
     }
 
     /// Apply a picker interaction collected by `kbm_picker_window` — split out

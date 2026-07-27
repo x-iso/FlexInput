@@ -549,7 +549,15 @@ impl FlexInputApp {
                     self.gamepad_nav.kbm_picker_path = vec![outer_id.0];
                     self.gamepad_nav.kbm_picker_touch_zones = false;
                     self.gamepad_nav.kbm_picker_exclude = None;
-                    self.gamepad_nav.kbm_picker_viewport = None;
+                    // When the config overlay owns nav (config_nav_sel set), draw
+                    // the picker in its own always-on-top viewport over the game,
+                    // not the main window (which is behind the game).
+                    self.gamepad_nav.kbm_picker_viewport =
+                        if self.gamepad_nav.config_nav_sel.is_some() {
+                            Some(crate::config_overlay::picker_viewport_id())
+                        } else {
+                            None
+                        };
                     self.gamepad_nav.kbm_picker_draft_key =
                         lean_draft.unwrap_or("draft_output").to_string();
                     self.gamepad_nav.kbm_picker_phase_key =

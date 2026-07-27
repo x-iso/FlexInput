@@ -1827,14 +1827,28 @@ impl eframe::App for FlexInputApp {
 
         // KB/M picker: drawn here only when the main window owns the session.
         // Editor-owned sessions render inside their own viewport (see
-        // show_subpatch_editors); if the owning editor has closed, fall back to
-        // the main window so the modal can't become unreachable.
+        // show_subpatch_editors); config-overlay sessions render in a dedicated
+        // always-on-top viewport over the game. If the owning surface has closed,
+        // fall back to the main window so the modal can't become unreachable.
+        let picker_vp = crate::config_overlay::picker_viewport_id();
         if let Some(vp) = self.gamepad_nav.kbm_picker_viewport {
-            let owner_open = self.sub_patch_editors.iter().any(|e| egui::ViewportId::from_hash_of(
-                ("subpatch_editor", e.tab_idx, e.node_id.0)) == vp);
-            if !owner_open { self.gamepad_nav.kbm_picker_viewport = None; }
+            if vp == picker_vp {
+                // Config-overlay picker is valid only while the overlay is up.
+                if !crate::config_overlay::config_overlay_visible(ctx) {
+                    self.gamepad_nav.kbm_picker_open = false;
+                    self.gamepad_nav.kbm_picker_viewport = None;
+                }
+            } else {
+                let owner_open = self.sub_patch_editors.iter().any(|e| egui::ViewportId::from_hash_of(
+                    ("subpatch_editor", e.tab_idx, e.node_id.0)) == vp);
+                if !owner_open { self.gamepad_nav.kbm_picker_viewport = None; }
+            }
         }
-        if self.gamepad_nav.kbm_picker_viewport.is_none() {
+        if self.gamepad_nav.kbm_picker_open
+            && self.gamepad_nav.kbm_picker_viewport == Some(picker_vp)
+        {
+            self.draw_kbm_picker_over_game(ctx);
+        } else if self.gamepad_nav.kbm_picker_viewport.is_none() {
             self.draw_kbm_picker(ctx);
         }
         self.draw_press_mode_picker(ctx);
@@ -2687,6 +2701,15 @@ impl eframe::App for FlexInputApp {
             puffin::profile_scope!("show_config_overlay");
             crate::config_overlay::show_config_overlay(self, ctx);
         }
+        // A mouse "Special…" click on a pinned Remapper body inside the config
+        // overlay emitted a picker request during the pass above; drain it here
+        // (before the main-window drain grabs it next frame with no viewport) and
+        // route it to the picker's own over-the-game viewport.
+        if crate::config_overlay::config_overlay_visible(ctx) {
+            if let Some(req) = crate::canvas::viewer::take_special_picker_request(ctx) {
+                self.open_special_picker(req, Some(crate::config_overlay::picker_viewport_id()));
+            }
+        }
 
         // Repaint scheduling:
         //   Focused → vsync (or 100 ms fallback for empty patch). The user
@@ -3227,21 +3250,7 @@ impl FlexInputApp {
 
         // ── Virtual KB/M picker (modal: captures dpad/LS/South/North/East) ────
         if self.gamepad_nav.kbm_picker_open {
-            let mut step_dir: Option<gn::NavDir> = None;
-            if nav.is_rising("dpad_up") { step_dir = Some(gn::NavDir::Up); }
-            else if nav.is_rising("dpad_down") { step_dir = Some(gn::NavDir::Down); }
-            else if nav.is_rising("dpad_left") { step_dir = Some(gn::NavDir::Left); }
-            else if nav.is_rising("dpad_right") { step_dir = Some(gn::NavDir::Right); }
-            if step_dir.is_none() {
-                if let Some(d) = gn::stick_dir(nav.lstick) {
-                    if self.gamepad_nav.repeat_dir != Some(d) {
-                        self.gamepad_nav.repeat_dir = Some(d);
-                        step_dir = Some(d);
-                    }
-                } else {
-                    self.gamepad_nav.repeat_dir = None;
-                }
-            }
+            let step_dir = self.picker_step_dir(&nav, dt);
             self.drive_kbm_picker(step_dir, &nav);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
