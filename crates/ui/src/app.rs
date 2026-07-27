@@ -14,7 +14,7 @@ use crate::{
     canvas::{Canvas, NodeData},
     canvas::node::{ExposedModule, UiSubPatch},
     canvas::ClipboardData,
-    guide_watcher::{spawn_chord_watcher, ChordWatchConfig},
+    guide_watcher::{spawn_chord_watcher, ChordWatchConfig, ShortcutSpec, ShortcutToggles},
     panels::{physical_devices, virtual_devices::{SharedDevicePool, VirtualDevicePanel}},
     panic_hotkey::{load_panic_shortcut, save_panic_shortcut, spawn_panic_hotkey_listener},
     pin_hotkey::spawn_pin_hotkey_listener,
@@ -49,6 +49,31 @@ pub(crate) use graph::*;
 pub(crate) use nav::draw_remap_card_glow;
 pub(crate) use subpatch::*;
 pub(crate) use threads::*;
+
+/// Build a `ShortcutSpec` from a target's saved combo/mode/gap, or `None` if
+/// the combo is unassigned/empty.
+fn shortcut_spec_from(
+    combo: &Option<Vec<String>>, mode: &str, gap_ms: f32,
+) -> Option<ShortcutSpec> {
+    combo.as_ref()
+        .filter(|c| !c.is_empty())
+        .map(|c| ShortcutSpec { combo: c.clone(), mode: mode.to_string(), gap_ms })
+}
+
+/// Resolve which shortcut chords the background watcher should detect. The
+/// config-overlay chord is always watched globally (its purpose is mid-game
+/// summon); the four window shortcuts are watched here only when nav-only is
+/// OFF — when it's ON the focus-gated nav path owns them instead.
+fn chord_watch_config_from(s: &AppSettings) -> ChordWatchConfig {
+    let gate = |spec: Option<ShortcutSpec>| if s.gamepad_chords_nav_only { None } else { spec };
+    ChordWatchConfig {
+        seethrough: gate(shortcut_spec_from(&s.seethrough_chord, &s.seethrough_chord_mode, s.seethrough_chord_gap_ms)),
+        panic:      gate(shortcut_spec_from(&s.panic_chord, &s.panic_chord_mode, s.panic_chord_gap_ms)),
+        overlay:    gate(shortcut_spec_from(&s.overlay_chord, &s.overlay_chord_mode, s.overlay_chord_gap_ms)),
+        pin:        gate(shortcut_spec_from(&s.pin_chord, &s.pin_chord_mode, s.pin_chord_gap_ms)),
+        config:     shortcut_spec_from(&s.config_overlay_chord, &s.config_overlay_chord_mode, s.config_overlay_chord_gap_ms),
+    }
+}
 
 /// When set, internal `request_repaint_throttled()` callers (scope
 /// renderers, animation widgets, etc.) skip their repaint request,
@@ -398,6 +423,10 @@ pub struct FlexInputApp {
     /// Set by the global hotkey listener when the configured chord fires.
     /// UI consumes this each frame and toggles `panic_active`.
     panic_toggle_requested: Arc<AtomicBool>,
+    /// Raised by the background shortcut watcher when the see-through chord
+    /// fires; consumed each frame to flip `see_through_active`. See-through has
+    /// no keyboard hotkey, so this is its only cross-thread toggle path.
+    seethrough_toggle_requested: Arc<AtomicBool>,
     /// Live snapshot of the shortcut for the global hotkey listener thread.
     /// Updated whenever the user changes the binding.
     panic_shortcut_shared: Arc<RwLock<PanicShortcut>>,
@@ -851,16 +880,12 @@ impl FlexInputApp {
         // single edge to consume each frame.
         let pin_toggle_requested = Arc::new(AtomicBool::new(false));
         let pin_shortcut_shared  = Arc::new(RwLock::new(app_settings.pin_shortcut.clone()));
-        // Background config-overlay chord watcher config: the user's assigned
-        // gamepad combo/mode/gap, detected globally so the overlay can be
-        // summoned while a game holds focus. Republished from settings each
-        // frame; drives `config_overlay_toggle_requested` (spawned below).
-        let config_chord_cfg = Arc::new(RwLock::new(ChordWatchConfig {
-            enabled: app_settings.config_overlay_chord.is_some(),
-            combo: app_settings.config_overlay_chord.clone().unwrap_or_default(),
-            mode: app_settings.config_overlay_chord_mode.clone(),
-            gap_ms: app_settings.config_overlay_chord_gap_ms,
-        }));
+        // Background gamepad-shortcut watcher config: the user's assigned combos
+        // /modes/gaps, detected globally so shortcuts fire while a game holds
+        // focus. Republished from settings each frame (nav-only gating resolved
+        // in `chord_watch_config_from`). Drives the toggle flags below.
+        let config_chord_cfg = Arc::new(RwLock::new(chord_watch_config_from(&app_settings)));
+        let seethrough_toggle_requested = Arc::new(AtomicBool::new(false));
         spawn_pin_hotkey_listener(
             crate::pin_hotkey::HOTKEY_ID_PIN,
             "pin-hotkey",
@@ -896,7 +921,13 @@ impl FlexInputApp {
         );
         spawn_chord_watcher(
             Arc::clone(&config_chord_cfg),
-            Arc::clone(&config_overlay_toggle_requested),
+            ShortcutToggles {
+                seethrough: Arc::clone(&seethrough_toggle_requested),
+                panic: Arc::clone(&panic_toggle_requested),
+                overlay: Arc::clone(&overlay_toggle_requested),
+                pin: Arc::clone(&pin_toggle_requested),
+                config: Arc::clone(&config_overlay_toggle_requested),
+            },
             Arc::clone(&proc_device_signals),
         );
         // Seed the see-through data slot so the eye button reflects the
@@ -996,6 +1027,7 @@ impl FlexInputApp {
             panic_active: false,
             panic_learning: false,
             panic_toggle_requested,
+            seethrough_toggle_requested,
             panic_shortcut_shared,
             settings: app_settings,
             settings_open: false,
@@ -1376,13 +1408,10 @@ impl eframe::App for FlexInputApp {
             self.drive_chord_learn_desktop();
         }
 
-        // Global (non-nav-only) shortcut-chord toggles: when the user has opted
-        // out of nav-only, the see-through / panic combos fire from ANY connected
-        // gamepad whenever FlexInput is focused — independent of nav mode. The
-        // nav-only path lives inside run_gamepad_nav (driving device only).
-        if !self.settings.gamepad_chords_nav_only && self.gamepad_nav.chord_learn.is_none() {
-            self.check_shortcut_chords_global(ctx);
-        }
+        // When nav-only is OFF, the background shortcut watcher fires the combos
+        // globally (even while a game is focused) — no in-app scan needed here.
+        // When nav-only is ON, the focus-gated path inside run_gamepad_nav
+        // (driving device only) owns them; the watcher only handles config.
 
         // Publish the set of `midi_in:N` / `midi_out:N` IDs referenced by
         // canvas device.source / device.sink nodes (across all tabs and
@@ -1492,6 +1521,15 @@ impl eframe::App for FlexInputApp {
         if self.panic_toggle_requested.swap(false, Ordering::Relaxed) {
             self.panic_active = !self.panic_active;
         }
+        // See-through chord (background watcher) flips the same state the eye
+        // toggle drives; write the data slot too so the canvas frame agrees.
+        if self.seethrough_toggle_requested.swap(false, Ordering::Relaxed) {
+            let next = !self.settings.see_through_active;
+            self.settings.see_through_active = next;
+            self.settings_dirty = true;
+            ctx.data_mut(|d| d.insert_temp(
+                egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY), next));
+        }
 
         // ── See-through: mirror the eye-toggle data slot into settings ────
         // The zoom-overlay button writes the new state into a temp data
@@ -1561,25 +1599,15 @@ impl eframe::App for FlexInputApp {
             crate::overlay::set_overlay_edit(ctx, !editing);
         }
 
-        // Republish the config-overlay chord to the background watcher so it
-        // stays in sync however the binding changed (Settings row OR gamepad
-        // chord-capture). Only writes when something actually differs — the
-        // combo/mode/gap change rarely, so this is a cheap read most frames.
+        // Republish the shortcut chords to the background watcher so it stays in
+        // sync however a binding changed (Settings row OR gamepad chord-capture
+        // OR the nav-only toggle). Only writes when something differs — bindings
+        // change rarely, so this is a cheap compare most frames.
         {
-            let combo = self.settings.config_overlay_chord.clone().unwrap_or_default();
-            let stale = self.config_chord_cfg.read().map(|c|
-                c.enabled != self.settings.config_overlay_chord.is_some()
-                    || c.combo != combo
-                    || c.mode != self.settings.config_overlay_chord_mode
-                    || c.gap_ms != self.settings.config_overlay_chord_gap_ms
-            ).unwrap_or(true);
+            let want = chord_watch_config_from(&self.settings);
+            let stale = self.config_chord_cfg.read().map(|c| *c != want).unwrap_or(true);
             if stale {
-                if let Ok(mut c) = self.config_chord_cfg.write() {
-                    c.enabled = self.settings.config_overlay_chord.is_some();
-                    c.combo = combo;
-                    c.mode = self.settings.config_overlay_chord_mode.clone();
-                    c.gap_ms = self.settings.config_overlay_chord_gap_ms;
-                }
+                if let Ok(mut c) = self.config_chord_cfg.write() { *c = want; }
             }
         }
 
@@ -4001,73 +4029,6 @@ impl FlexInputApp {
         // it (fires globally, even while a game is focused). Evaluating it on
         // this focus-gated path too would double-toggle when FlexInput is focused.
         fired
-    }
-
-    /// Non-nav-only shortcut-chord detection: scan every eligible gamepad
-    /// (non-MIDI, not our own loopback virtual) for the assigned see-through /
-    /// panic combos and fire once per full press. Only called when FlexInput is
-    /// focused and `gamepad_chords_nav_only` is false.
-    fn check_shortcut_chords_global(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.focused) { return; }
-        // Nothing to do if no combos are assigned.
-        if self.settings.seethrough_chord.is_none()
-            && self.settings.panic_chord.is_none()
-            && self.settings.overlay_chord.is_none()
-            && self.settings.pin_chord.is_none()
-            && self.settings.config_overlay_chord.is_none()
-        {
-            self.gamepad_nav.seethrough_chord_st = Default::default();
-            self.gamepad_nav.panic_chord_st = Default::default();
-            self.gamepad_nav.overlay_chord_st = Default::default();
-            self.gamepad_nav.pin_chord_st = Default::default();
-            return;
-        }
-        let now = std::time::Instant::now();
-        let excluded = self.own_virtual_device_ids();
-        let any_holds = |chord: &Option<Vec<String>>| -> bool {
-            let Some(c) = chord else { return false; };
-            if c.is_empty() { return false; }
-            self.devices.iter()
-                .filter(|d| !matches!(d.kind,
-                    flexinput_devices::ControllerKind::MidiIn
-                    | flexinput_devices::ControllerKind::MidiOut))
-                .filter(|d| !excluded.contains(&d.id))
-                .any(|d| c.iter().all(|pin| {
-                    self.last_signals.get(&(d.id.clone(), pin.clone()))
-                        .map(|s| s.as_bool()).unwrap_or(false)
-                }))
-        };
-        use crate::gamepad_nav::chord_fire;
-        let st_held = any_holds(&self.settings.seethrough_chord);
-        if chord_fire(&mut self.gamepad_nav.seethrough_chord_st, st_held,
-            &self.settings.seethrough_chord_mode, self.settings.seethrough_chord_gap_ms, now)
-        {
-            let next = !self.settings.see_through_active;
-            self.settings.see_through_active = next;
-            self.settings_dirty = true;
-            ctx.data_mut(|d| d.insert_temp(
-                egui::Id::new(crate::canvas::SEE_THROUGH_DATA_KEY), next));
-        }
-        let pn_held = any_holds(&self.settings.panic_chord);
-        if chord_fire(&mut self.gamepad_nav.panic_chord_st, pn_held,
-            &self.settings.panic_chord_mode, self.settings.panic_chord_gap_ms, now)
-        {
-            self.panic_active = !self.panic_active;
-        }
-        let ov_held = any_holds(&self.settings.overlay_chord);
-        if chord_fire(&mut self.gamepad_nav.overlay_chord_st, ov_held,
-            &self.settings.overlay_chord_mode, self.settings.overlay_chord_gap_ms, now)
-        {
-            crate::overlay::set_overlay_visible(ctx, !crate::overlay::overlay_visible(ctx));
-        }
-        let pin_held = any_holds(&self.settings.pin_chord);
-        if chord_fire(&mut self.gamepad_nav.pin_chord_st, pin_held,
-            &self.settings.pin_chord_mode, self.settings.pin_chord_gap_ms, now)
-        {
-            self.pin_toggle_requested.store(true, Ordering::Relaxed);
-        }
-        // Config overlay is owned by the global background watcher — see the
-        // note in `process_shortcut_chords`.
     }
 
     /// Update the right-stick + gyro cursor overlay position/visibility.
