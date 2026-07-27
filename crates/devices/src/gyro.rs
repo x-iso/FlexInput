@@ -40,6 +40,14 @@ const SWITCH_ACCEL_G_PER_LSB: f32  = 8.0   / 32767.0;
 // Retry open no more than once per N seconds to avoid hammering HidHide.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// A stalled handle (open, reads succeed, but no report parses) is logged at 2s
+/// but only auto-reopened after this longer window — comfortably past the Switch
+/// Pro's known transient ~3s Bluetooth input gaps, which recover on their own.
+/// Past this, the stall is the permanent "HidHide cloaked the pad after we
+/// opened its raw-HID handle" freeze, so we drop the handle and let the open
+/// worker re-open it (now with the cloak in place) — what a manual reconnect does.
+const STALL_REOPEN: Duration = Duration::from_millis(5000);
+
 /// Monotonic epoch for the Switch HD-rumble amplitude-modulation phase. Set on the
 /// first rumble flush; the AM flutter phase is `elapsed_secs * 2π·rate_hz` so it
 /// stays smooth and continuous regardless of when individual packets are sent.
@@ -468,24 +476,37 @@ impl GyroManager {
             self.devices.remove(&(vid, pid, idx));
             return None;
         }
-        // Stall diagnostic: the handle is open and reads succeed (no error), but
-        // no report has parsed for a while → the "frozen until reconnect" signature.
+        // Stall handling: the handle is open and reads succeed (no error), but no
+        // report has parsed for a while → the "frozen until reconnect" signature.
         // Because the read returns 0 bytes rather than erroring, the device is
-        // never dropped, so input just silently stops. Prime suspect: HidHide
-        // cloaking the pad AFTER we opened its raw-HID handle (the init log shows
-        // 0x30 reports flowing, then HidHide applies). Reconnecting re-enumerates
-        // and re-opens with the cloak already in place, which recovers.
-        if !entry.stalled && entry.last_report_at.elapsed() >= std::time::Duration::from_millis(2000) {
+        // never dropped, so input just silently stops. Prime suspect (confirmed on
+        // this machine): HidHide cloaking the pad AFTER we opened its raw-HID
+        // handle (the init log shows 0x30 reports flowing, then HidHide applies).
+        let elapsed = entry.last_report_at.elapsed();
+        if !entry.stalled && elapsed >= Duration::from_millis(2000) {
             entry.stalled = true;
             eprintln!(
                 "[gyro] {vid:04X}:{pid:04X} idx={idx} STALLED: no HID reports for {:.1}s \
-                 but the handle is still open (reads return 0 bytes, no error). This is the \
-                 'frozen until reconnect' signature — suspect HidHide cloaking the pad while \
-                 we hold its raw-HID handle. Reconnect forces re-enumeration + a fresh open.",
-                entry.last_report_at.elapsed().as_secs_f32()
+                 but the handle is still open (reads return 0 bytes, no error). Suspect \
+                 HidHide cloaking the pad while we hold its raw-HID handle; will auto-reopen \
+                 if it doesn't recover.",
+                elapsed.as_secs_f32()
             );
         }
-        Some(entry.last)
+        let last = entry.last; // ends the &mut borrow so we can drop the entry
+        // Past STALL_REOPEN it's not one of the Switch Pro's transient BT gaps —
+        // drop the handle so the open worker re-opens it with the cloak already
+        // in place (whitelisted), automating what a manual reconnect does.
+        if elapsed >= STALL_REOPEN {
+            eprintln!(
+                "[gyro] {vid:04X}:{pid:04X} idx={idx} auto-reopening after {:.1}s stall \
+                 (HidHide-cloak-after-open recovery)",
+                elapsed.as_secs_f32()
+            );
+            self.devices.remove(&(vid, pid, idx));
+            return None;
+        }
+        Some(last)
     }
 
     pub fn remove(&mut self, vid: u16, pid: u16, idx: usize) {
