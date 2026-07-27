@@ -1,19 +1,19 @@
 //! Background gamepad-shortcut chord watcher, driven by the shared
 //! `proc_device_signals` map.
 //!
-//! This is the path that lets gamepad shortcuts fire while a *game* holds
-//! focus: the in-app evaluator (`process_shortcut_chords`) is focus-gated to
-//! nav mode, so it can only fire while FlexInput is foreground. This watcher
-//! runs on its own thread and reads the same signal map the I/O thread
-//! publishes, so it detects the user's assigned chords regardless of focus.
+//! This thread is the single engine for gamepad shortcuts, so they fire even
+//! while a *game* holds focus. It runs on its own thread and reads the same
+//! signal map the I/O thread publishes, detecting the user's assigned chords
+//! regardless of which window is foreground.
 //!
-//! Which shortcuts this thread owns depends on the "only in gamepad navigation"
-//! setting, resolved by the UI when it republishes [`ChordWatchConfig`]:
-//!  * The **config-overlay** chord is ALWAYS watched here (its whole purpose is
-//!    to be summonable mid-game).
-//!  * The other four (see-through / panic / info-overlay / pin) are watched
-//!    here only when nav-only is OFF; when it's ON the UI hands us `None` for
-//!    them and the focus-gated nav path handles them instead.
+//! The "only in gamepad navigation" setting scopes WHICH pad may fire the four
+//! window shortcuts (see-through / panic / info-overlay / pin), via
+//! [`ChordWatchConfig::nav_only`] + the nav-device set the UI publishes:
+//!  * OFF — they fire from ANY connected pad, unconditionally.
+//!  * ON  — they fire only from a pad currently selected for UI navigation; if
+//!    none is selected, they don't fire.
+//! The **config-overlay** chord ignores the setting and always fires from any
+//! pad (its whole purpose is to be summonable mid-game).
 //!
 //! Why the shared map and not a private `Gilrs` instance: DualSense's PS button
 //! and Switch's Home aren't exposed through gilrs's standard XInput/HID mapping
@@ -30,7 +30,7 @@
 //! window and a per-target post-fire refractory absorb BT-handshake noise and
 //! duplicate-device echoes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -52,10 +52,14 @@ pub struct ShortcutSpec {
 }
 
 /// Live config for the watcher, shared with the UI thread (which republishes it
-/// whenever a binding changes). A `None` target is not watched here — either
-/// unassigned, or (for the four window shortcuts) handled by the nav path.
+/// whenever a binding changes). A `None` target is unassigned.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChordWatchConfig {
+    /// When true, the four window shortcuts (all but config overlay) fire only
+    /// from a gamepad currently selected for UI navigation — restricted to the
+    /// device set the UI publishes. When no nav device is selected they don't
+    /// fire at all. The config-overlay chord ignores this and fires from any pad.
+    pub nav_only: bool,
     pub seethrough: Option<ShortcutSpec>,
     pub panic: Option<ShortcutSpec>,
     pub overlay: Option<ShortcutSpec>,
@@ -96,12 +100,17 @@ struct TargetWatch {
 type SignalMap = HashMap<(String, String), Signal>;
 
 /// True when some single non-virtual device holds every button in `combo`.
-fn combo_held(snap: &SignalMap, combo: &[String]) -> bool {
+/// When `device_filter` is `Some`, only devices in that set are considered (used
+/// to restrict the four window shortcuts to the nav-selected pads).
+fn combo_held(snap: &SignalMap, combo: &[String], device_filter: Option<&HashSet<String>>) -> bool {
     if combo.is_empty() { return false; }
     // Tally, per device, how many of the combo's buttons are currently true.
     let mut per_dev: HashMap<&str, usize> = HashMap::new();
     for ((dev, sig), val) in snap.iter() {
         if crate::app::is_own_virtual_gilrs_id(dev) { continue; }
+        if let Some(filter) = device_filter {
+            if !filter.contains(dev) { continue; }
+        }
         if !matches!(val, Signal::Bool(true)) { continue; }
         if combo.iter().any(|p| p == sig) {
             *per_dev.entry(dev.as_str()).or_insert(0) += 1;
@@ -111,12 +120,14 @@ fn combo_held(snap: &SignalMap, combo: &[String]) -> bool {
 }
 
 /// Evaluate one target: if its chord fires (past grace + refractory), raise the
-/// toggle flag. Resets edge state when the target is unassigned.
+/// toggle flag. Resets edge state when the target is unassigned. `device_filter`
+/// restricts which pads may fire it (`None` = any pad).
 fn service_target(
     tw: &mut TargetWatch,
     spec: &Option<ShortcutSpec>,
     toggle: &AtomicBool,
     snap: &SignalMap,
+    device_filter: Option<&HashSet<String>>,
     started_at: Instant,
 ) {
     let Some(spec) = spec else {
@@ -126,7 +137,7 @@ fn service_target(
         return;
     };
     if spec.combo.is_empty() { return; }
-    let held = combo_held(snap, &spec.combo);
+    let held = combo_held(snap, &spec.combo, device_filter);
     let now = Instant::now();
     if chord_fire(&mut tw.fire_state, held, &spec.mode, spec.gap_ms, now) {
         let in_grace = now.duration_since(started_at)
@@ -144,6 +155,9 @@ fn service_target(
 pub fn spawn_chord_watcher(
     config: Arc<RwLock<ChordWatchConfig>>,
     toggles: ShortcutToggles,
+    // Devices currently selected for UI navigation, republished by the UI each
+    // frame. Consulted only when `nav_only` is set.
+    nav_devices: Arc<RwLock<HashSet<String>>>,
     proc_device_signals: flexinput_engine::ArcSignals,
 ) {
     std::thread::Builder::new()
@@ -164,11 +178,16 @@ pub fn spawn_chord_watcher(
                 // without contending the I/O thread.
                 let snap = proc_device_signals.load_full();
 
-                service_target(&mut w_seethrough, &cfg.seethrough, &toggles.seethrough, &snap, started_at);
-                service_target(&mut w_panic, &cfg.panic, &toggles.panic, &snap, started_at);
-                service_target(&mut w_overlay, &cfg.overlay, &toggles.overlay, &snap, started_at);
-                service_target(&mut w_pin, &cfg.pin, &toggles.pin, &snap, started_at);
-                service_target(&mut w_config, &cfg.config, &toggles.config, &snap, started_at);
+                // The four window shortcuts restrict to the nav-selected pads
+                // when nav-only is on; the config chord always fires from any.
+                let nav_set = nav_devices.read().map(|s| s.clone()).unwrap_or_default();
+                let window_filter = if cfg.nav_only { Some(&nav_set) } else { None };
+
+                service_target(&mut w_seethrough, &cfg.seethrough, &toggles.seethrough, &snap, window_filter, started_at);
+                service_target(&mut w_panic, &cfg.panic, &toggles.panic, &snap, window_filter, started_at);
+                service_target(&mut w_overlay, &cfg.overlay, &toggles.overlay, &snap, window_filter, started_at);
+                service_target(&mut w_pin, &cfg.pin, &toggles.pin, &snap, window_filter, started_at);
+                service_target(&mut w_config, &cfg.config, &toggles.config, &snap, None, started_at);
 
                 std::thread::sleep(POLL_INTERVAL);
             }

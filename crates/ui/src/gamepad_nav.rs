@@ -364,13 +364,6 @@ pub struct GamepadNav {
     /// once true, so the South press that STARTED the learn (or any held button)
     /// isn't swept into the chord.
     pub chord_arm_idle: bool,
-    /// Per-shortcut edge/timing state (press-mode aware). Drives `chord_fire`
-    /// so each combo fires once per press per its configured mode, not every
-    /// frame the combo is held.
-    pub seethrough_chord_st: ChordFireState,
-    pub panic_chord_st: ChordFireState,
-    pub overlay_chord_st: ChordFireState,
-    pub pin_chord_st: ChordFireState,
     /// Config overlay (M3.5): index into this frame's published config-pin
     /// targets of the gamepad-focused tweak-pin. `None` = no focus yet (seeds to
     /// the top-left pin on first directional input). The focused pin's upstream
@@ -450,10 +443,6 @@ impl Default for GamepadNav {
             chord_learn: None,
             chord_draft: Vec::new(),
             chord_arm_idle: false,
-            seethrough_chord_st: ChordFireState::default(),
-            panic_chord_st: ChordFireState::default(),
-            overlay_chord_st: ChordFireState::default(),
-            pin_chord_st: ChordFireState::default(),
             #[cfg(windows)]
             key_tapper: None,
         }
