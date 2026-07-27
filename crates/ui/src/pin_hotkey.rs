@@ -19,6 +19,8 @@ pub const HOTKEY_ID_PIN: i32 = 0xF1E2;
 pub const HOTKEY_ID_OVERLAY: i32 = 0xF1E3;
 /// HOTKEY_ID for the config-overlay visibility chord (M3).
 pub const HOTKEY_ID_CONFIG: i32 = 0xF1E4;
+/// HOTKEY_ID for the info-overlay EDIT-mode chord.
+pub const HOTKEY_ID_OVERLAY_EDIT: i32 = 0xF1E5;
 
 pub fn spawn_pin_hotkey_listener(
     hotkey_id: i32,

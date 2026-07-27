@@ -472,6 +472,13 @@ pub struct FlexInputApp {
     config_overlay_shortcut_shared: Arc<RwLock<PinShortcut>>,
     /// True while the config-overlay shortcut button is in Learn mode in Settings.
     config_overlay_learning: bool,
+    /// Raised by the info-overlay EDIT-mode hotkey listener thread; consumed
+    /// once per frame to flip the overlay's edit-mode flag (and show it).
+    edit_overlay_toggle_requested: Arc<AtomicBool>,
+    /// Live snapshot of the edit-overlay chord shared with its listener thread.
+    edit_overlay_shortcut_shared: Arc<RwLock<PinShortcut>>,
+    /// True while the edit-overlay shortcut button is in Learn mode in Settings.
+    edit_overlay_learning: bool,
     /// HWND of whatever foreground window we left when the pin was last
     /// engaged. Used by the focus flip-flop feature to restore focus to
     /// that window so the user can immediately test their changes.
@@ -885,6 +892,15 @@ impl FlexInputApp {
             Arc::clone(&config_overlay_shortcut_shared),
             Arc::clone(&config_overlay_toggle_requested),
         );
+        // Info-overlay EDIT-mode hotkey — same pattern, own id.
+        let edit_overlay_toggle_requested = Arc::new(AtomicBool::new(false));
+        let edit_overlay_shortcut_shared  = Arc::new(RwLock::new(app_settings.edit_overlay_shortcut.clone()));
+        spawn_pin_hotkey_listener(
+            crate::pin_hotkey::HOTKEY_ID_OVERLAY_EDIT,
+            "overlay-edit-hotkey",
+            Arc::clone(&edit_overlay_shortcut_shared),
+            Arc::clone(&edit_overlay_toggle_requested),
+        );
         spawn_guide_watcher(
             Arc::clone(&pin_guide_cfg),
             Arc::clone(&config_overlay_toggle_requested),
@@ -1013,6 +1029,9 @@ impl FlexInputApp {
             config_overlay_toggle_requested,
             config_overlay_shortcut_shared,
             config_overlay_learning: false,
+            edit_overlay_toggle_requested,
+            edit_overlay_shortcut_shared,
+            edit_overlay_learning: false,
             pin_prev_foreground_hwnd: None,
             pin_last_external_hwnd: None,
             pin_pending_yield: None,
@@ -1540,6 +1559,17 @@ impl eframe::App for FlexInputApp {
         if self.config_overlay_toggle_requested.swap(false, Ordering::Relaxed) {
             let on = crate::config_overlay::config_overlay_visible(ctx);
             crate::config_overlay::set_config_overlay_visible(ctx, !on);
+        }
+
+        // ── Info overlay EDIT-mode toggle (global hotkey) ─────────────────
+        // Flip the overlay's edit-mode slot; entering edit also makes the
+        // overlay visible (you can't arrange pins you can't see).
+        if self.edit_overlay_toggle_requested.swap(false, Ordering::Relaxed) {
+            let editing = crate::overlay::overlay_edit(ctx);
+            if !editing {
+                crate::overlay::set_overlay_visible(ctx, true);
+            }
+            crate::overlay::set_overlay_edit(ctx, !editing);
         }
 
         // Deferred pin-off foreground handoff. Scheduled by `toggle_pin` on

@@ -326,6 +326,11 @@ pub struct AppSettings {
     /// `pin_shortcut` — RegisterHotKey under the hood (see `pin_hotkey.rs`).
     #[serde(default = "default_overlay_shortcut")]
     pub overlay_shortcut: PinShortcut,
+    /// Global keyboard chord toggling the info overlay's EDIT mode (the
+    /// layout-editing toolbar). Own RegisterHotKey id (`HOTKEY_ID_OVERLAY_EDIT`);
+    /// mirrors `overlay_shortcut`. Turning edit on also makes the overlay visible.
+    #[serde(default = "default_edit_overlay_shortcut")]
+    pub edit_overlay_shortcut: PinShortcut,
     /// Repaint rate of the info overlay while it's visible. Deliberately
     /// separate from `bg_repaint_hz`: the overlay animates on top of a game,
     /// where the low background cadence would look terrible. Range
@@ -500,6 +505,10 @@ fn default_config_overlay_shortcut() -> PinShortcut {
     // Ctrl+Shift+C — "config"; clear of pin/overlay/panic defaults.
     PinShortcut { ctrl: true, shift: true, alt: false, win: false, key: Some("C".to_string()) }
 }
+fn default_edit_overlay_shortcut() -> PinShortcut {
+    // Ctrl+Shift+E — "edit"; clear of the other overlay/pin/panic defaults.
+    PinShortcut { ctrl: true, shift: true, alt: false, win: false, key: Some("E".to_string()) }
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -547,6 +556,7 @@ impl Default for AppSettings {
             config_overlay_chord: None,
             overlay_visible: false,
             overlay_shortcut: default_overlay_shortcut(),
+            edit_overlay_shortcut: default_edit_overlay_shortcut(),
             overlay_fps: OVERLAY_FPS_DEFAULT,
             config_overlay_visible: false,
             config_overlay_shortcut: default_config_overlay_shortcut(),

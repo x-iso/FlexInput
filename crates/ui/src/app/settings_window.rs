@@ -624,13 +624,13 @@ impl FlexInputApp {
                 ui.separator();
                 ui.add_space(6.0);
 
-                // ── Info overlay ────────────────────────────────────────
-                ui.label(egui::RichText::new("Info overlay").strong());
+                // ── Overlays ────────────────────────────────────────────
+                ui.label(egui::RichText::new("Overlays").strong());
                 ui.add_space(4.0);
 
-                // Global toggle shortcut (mirrors the pin binder above).
+                // Show info-overlay shortcut (mirrors the pin binder above).
                 ui.horizontal(|ui| {
-                    ui.label("Overlay shortcut:");
+                    ui.label("Show info overlay:");
                     let btn_text = if self.overlay_learning {
                         "Press chord…".to_string()
                     } else {
@@ -679,9 +679,61 @@ impl FlexInputApp {
 
                 ui.add_space(4.0);
 
+                // Edit info-overlay shortcut (mirrors the show binder; toggles
+                // the overlay's layout-edit mode and shows it).
+                ui.horizontal(|ui| {
+                    ui.label("Edit info overlay:");
+                    let btn_text = if self.edit_overlay_learning {
+                        "Press chord…".to_string()
+                    } else {
+                        self.settings.edit_overlay_shortcut.label()
+                    };
+                    let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(12.0));
+                    if self.edit_overlay_learning {
+                        btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
+                                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
+                    }
+                    let resp = ui.add(btn).on_hover_text(
+                        if self.edit_overlay_learning {
+                            "Press the new shortcut (modifier + key).\nClick again to cancel."
+                        } else {
+                            "Click to re-bind. Press the shortcut anywhere on the system to enter/exit the overlay's edit mode."
+                        }
+                    );
+                    if resp.clicked() {
+                        self.edit_overlay_learning = !self.edit_overlay_learning;
+                    }
+                });
+                if self.edit_overlay_learning {
+                    let pressed: Option<egui::Key> = ctx.input(|i| {
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+                            _ => None,
+                        })
+                    });
+                    if let Some(key) = pressed {
+                        let m = ctx.input(|i| i.modifiers);
+                        let key_name = format!("{:?}", key);
+                        self.settings.edit_overlay_shortcut = settings::PinShortcut {
+                            ctrl:  m.ctrl,
+                            shift: m.shift,
+                            alt:   m.alt,
+                            win:   m.command && !m.ctrl,
+                            key:   Some(key_name),
+                        };
+                        if let Ok(mut s) = self.edit_overlay_shortcut_shared.write() {
+                            *s = self.settings.edit_overlay_shortcut.clone();
+                        }
+                        self.edit_overlay_learning = false;
+                        dirty = true;
+                    }
+                }
+
+                ui.add_space(4.0);
+
                 // Config-overlay toggle shortcut (M3; mirrors the overlay binder).
                 ui.horizontal(|ui| {
-                    ui.label("Config overlay shortcut:");
+                    ui.label("Show config overlay:");
                     let btn_text = if self.config_overlay_learning {
                         "Press chord…".to_string()
                     } else {
