@@ -3,6 +3,49 @@
 
 use super::*;
 
+/// A clickable gamepad shortcut display: the assigned combo rendered as button
+/// icon chips (like the remapper chords), a "(none)" pill when unassigned, or an
+/// amber "capturing" pill while learning. Clicking anywhere on it (re)binds.
+fn shortcut_chord_widget(
+    ui: &mut egui::Ui, combo: &[String], learning: bool,
+    skin: crate::canvas::remapper_icons::Skin,
+) -> egui::Response {
+    if learning {
+        return ui.add(egui::Button::new(
+            egui::RichText::new("Hold combo, release…").size(12.0))
+            .fill(egui::Color32::from_rgb(80, 60, 30))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80))));
+    }
+    if combo.is_empty() {
+        return ui.add(egui::Button::new(egui::RichText::new("(none)").size(12.0)));
+    }
+    let chip_h = 20.0;
+    let gap = 4.0;
+    let pad = 4.0;
+    let w = combo.len() as f32 * chip_h
+        + combo.len().saturating_sub(1) as f32 * gap
+        + pad * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(w, chip_h + pad * 2.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        let bg = if resp.hovered() {
+            egui::Color32::from_gray(64)
+        } else {
+            egui::Color32::from_gray(46)
+        };
+        painter.rect_filled(rect, 3.0, bg);
+        let mut x = rect.left() + pad;
+        let y = rect.top() + pad;
+        for pin in combo {
+            let cw = crate::canvas::viewer::paint_chord_chip_to_rect(
+                &painter, ui.ctx(), egui::pos2(x, y), chip_h, pin, skin);
+            x += cw + gap;
+        }
+    }
+    resp
+}
+
 impl FlexInputApp {
 
 
@@ -16,33 +59,24 @@ impl FlexInputApp {
         use crate::gamepad_nav::ChordTarget;
         let mut changed = false;
         let learning = self.gamepad_nav.chord_learn == Some(target);
-        // Snapshot the assigned combo + presence as owned values so no borrow of
+        // Snapshot the assigned combo as an owned value so no borrow of
         // self.settings is held across the closure (which mutates self).
-        let (assigned_label, has_assigned) = {
-            let assigned: Option<&Vec<String>> = match target {
-                ChordTarget::SeeThrough    => self.settings.seethrough_chord.as_ref(),
-                ChordTarget::Panic         => self.settings.panic_chord.as_ref(),
-                ChordTarget::Overlay       => self.settings.overlay_chord.as_ref(),
-                ChordTarget::Pin           => self.settings.pin_chord.as_ref(),
-                ChordTarget::ConfigOverlay => self.settings.config_overlay_chord.as_ref(),
-            };
-            (assigned.map(|c| pretty_chord_combo(c)), assigned.is_some())
-        };
-        let face = if learning {
-            "Hold 2+ buttons, release…".to_string()
-        } else {
-            assigned_label.unwrap_or_else(|| "(none)".to_string())
-        };
+        let combo_now: Vec<String> = match target {
+            ChordTarget::SeeThrough    => self.settings.seethrough_chord.clone(),
+            ChordTarget::Panic         => self.settings.panic_chord.clone(),
+            ChordTarget::Overlay       => self.settings.overlay_chord.clone(),
+            ChordTarget::Pin           => self.settings.pin_chord.clone(),
+            ChordTarget::ConfigOverlay => self.settings.config_overlay_chord.clone(),
+        }.unwrap_or_default();
+        let has_assigned = !combo_now.is_empty();
+        let skin = self.shortcut_display_skin();
         ui.horizontal(|ui| {
             ui.label(format!("{label}:"));
-            let mut btn = egui::Button::new(egui::RichText::new(face).size(12.0));
-            if learning {
-                btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 80)));
-            }
-            if ui.add(btn).on_hover_text(
-                "Click, then hold a 2+ button gamepad combo and release it to bind.\n\
-                 Captured while held; latches when you let go. \
+            let resp = shortcut_chord_widget(ui, &combo_now, learning, skin);
+            if resp.on_hover_text(
+                "Click, then hold a gamepad combo and release it to bind.\n\
+                 A single Guide or Capture/Mic button is allowed; otherwise use \
+                 2+ buttons. Captured while held; latches when you let go. \
                  (Press East alone to cancel.)").clicked()
             {
                 // Toggle learn for this target; clear any in-flight draft and
@@ -136,6 +170,17 @@ impl FlexInputApp {
             });
         });
         changed
+    }
+
+    /// Skin used to render gamepad shortcut chord icons: inferred from the first
+    /// connected physical pad so the glyphs match the user's controller, falling
+    /// back to Xbox when none is present.
+    pub(crate) fn shortcut_display_skin(&self) -> crate::canvas::remapper_icons::Skin {
+        use crate::canvas::remapper_icons::{phys_pad_slug, skin_from_device_id, Skin};
+        self.devices.iter()
+            .find(|d| phys_pad_slug(&d.id).is_some())
+            .map(|d| skin_from_device_id(&d.id))
+            .unwrap_or(Skin::Xbox)
     }
 
 
