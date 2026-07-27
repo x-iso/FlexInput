@@ -2542,6 +2542,8 @@ pub fn group_into_subpatch(
         pins_out,
         snarl: Box::new(inner_snarl),
         items: vec![],
+        overlay_items: vec![],
+        config_items: vec![],
         exposed_modules: vec![],
         decorations: vec![],
         snap_enabled: false,

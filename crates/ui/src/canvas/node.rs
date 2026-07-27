@@ -432,6 +432,18 @@ pub struct UiSubPatch {
     /// decorations share one Z-order list.
     #[serde(default)]
     pub items: Vec<LayoutItem>,
+    /// Info-overlay pins contributed BY this sub-patch — the pins a tab's info
+    /// overlay exposes from elements inside this sub-patch. Stored here (rather
+    /// than only on the tab) so they travel with the sub-patch into a `.fxsp`
+    /// preset. `source_path` is empty (they reference `inner_node_id` inside this
+    /// sub-patch's own `snarl`); the tab re-materializes them with the outer
+    /// node's id. See `attribute_overlays_into_subpatches` /
+    /// `materialize_subpatch_overlays`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlay_items: Vec<LayoutItem>,
+    /// Config-overlay counterpart to `overlay_items` (the M3 tweak-pins).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_items: Vec<LayoutItem>,
     /// Legacy fields, read only — drained into `items` on first frame, then
     /// never written back (skip_serializing_if).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -534,6 +546,124 @@ impl UiSubPatch {
     }
 }
 
+// ── Overlay-pin ↔ sub-patch attribution ─────────────────────────────────────
+//
+// Info/config overlay pins live on the tab (`OverlayLayout`) during a session,
+// but pins whose `source_path == [sp]` reference a first-level sub-patch node.
+// So overlays travel with a `.fxsp` preset, these two inverse transforms move
+// such pins into the sub-patch on SAVE and restore them on LOAD. Tab-canvas pins
+// (`source_path == []`) and decorations always stay on the tab.
+
+/// SAVE side: move every overlay/config pin that references a first-level
+/// sub-patch node into that node's `overlay_items` / `config_items` (clearing
+/// `source_path`). Tab-canvas pins stay. Orphan pins (source_path points at a
+/// node that is missing or not a sub-patch) are dropped — they can't render.
+/// Operate on a CLONE of the snarl + layouts at serialize time; never the live
+/// state.
+pub fn attribute_overlays_into_subpatches(
+    snarl: &mut Snarl<NodeData>,
+    overlay: &mut OverlayLayout,
+    config: &mut OverlayLayout,
+) {
+    // The tab overlays are the live source of truth. A sub-patch node may still
+    // carry stale `overlay_items` from when it was loaded; clear them so the
+    // rebuild below can't duplicate, and so a pin the user deleted on the tab
+    // actually disappears from the preset.
+    let ids: Vec<egui_snarl::NodeId> = snarl.nodes_ids_data().map(|(id, _)| id).collect();
+    for id in ids {
+        if let Some(subp) = snarl.get_node_mut(id).and_then(|n| n.subpatch.as_mut()) {
+            subp.overlay_items.clear();
+            subp.config_items.clear();
+        }
+    }
+    attribute_layout_into_subpatches(snarl, &mut overlay.items, false);
+    attribute_layout_into_subpatches(snarl, &mut config.items, true);
+}
+
+fn attribute_layout_into_subpatches(
+    snarl: &mut Snarl<NodeData>,
+    items: &mut Vec<LayoutItem>,
+    into_config: bool,
+) {
+    for item in std::mem::take(items) {
+        // Only single-level module pins are attributable; decorations and
+        // tab-canvas pins (empty source_path) stay on the tab.
+        let sp = match &item {
+            LayoutItem::Module(m) if m.source_path.len() == 1 => Some(m.source_path[0]),
+            _ => None,
+        };
+        let Some(sp) = sp else { items.push(item); continue; };
+        let subp = snarl.get_node_mut(egui_snarl::NodeId(sp))
+            .and_then(|n| n.subpatch.as_mut());
+        match (subp, item) {
+            (Some(subp), LayoutItem::Module(mut m)) => {
+                m.source_path.clear();
+                if into_config { subp.config_items.push(LayoutItem::Module(m)); }
+                else { subp.overlay_items.push(LayoutItem::Module(m)); }
+            }
+            // Node missing or not a sub-patch → orphan, drop.
+            _ => {}
+        }
+    }
+}
+
+/// LOAD side: for each first-level sub-patch node, append its stored
+/// `overlay_items` / `config_items` onto the tab's `overlay` / `config` with
+/// `source_path` set to that node's id. Deduped by
+/// `(source_path, inner_node_id, element_id)` so re-materializing (or loading a
+/// preset already present) never doubles pins.
+pub fn materialize_subpatch_overlays(
+    snarl: &Snarl<NodeData>,
+    overlay: &mut OverlayLayout,
+    config: &mut OverlayLayout,
+) {
+    for (node_id, n) in snarl.nodes_ids_data() {
+        let Some(subp) = n.value.subpatch.as_ref() else { continue };
+        materialize_layout(&subp.overlay_items, &mut overlay.items, node_id.0);
+        materialize_layout(&subp.config_items, &mut config.items, node_id.0);
+    }
+}
+
+/// COPY (not move) a tab's overlay/config pins that reference sub-patch node
+/// `sp_id` into `target`'s stored item lists (source_path cleared), for baking a
+/// `.fxsp` preset without disturbing the live tab overlays. Clear `target`'s
+/// lists first if you want the tab overlays to be the sole source of truth.
+pub fn collect_overlays_for_subpatch(
+    sp_id: usize,
+    overlay: &OverlayLayout,
+    config: &OverlayLayout,
+    target: &mut UiSubPatch,
+) {
+    collect_layout_for(sp_id, &overlay.items, &mut target.overlay_items);
+    collect_layout_for(sp_id, &config.items, &mut target.config_items);
+}
+
+fn collect_layout_for(sp_id: usize, src: &[LayoutItem], dst: &mut Vec<LayoutItem>) {
+    for item in src {
+        if let LayoutItem::Module(m) = item {
+            if m.source_path == [sp_id] {
+                let mut m = m.clone();
+                m.source_path.clear();
+                dst.push(LayoutItem::Module(m));
+            }
+        }
+    }
+}
+
+fn materialize_layout(src: &[LayoutItem], dst: &mut Vec<LayoutItem>, sp: usize) {
+    for item in src {
+        let LayoutItem::Module(m) = item else { continue };
+        let dup = dst.iter().any(|it| matches!(it, LayoutItem::Module(e)
+            if e.source_path == [sp]
+            && e.inner_node_id == m.inner_node_id
+            && e.element_id == m.element_id));
+        if dup { continue; }
+        let mut m = m.clone();
+        m.source_path = vec![sp];
+        dst.push(LayoutItem::Module(m));
+    }
+}
+
 fn default_snap_grid_px() -> u32 { 8 }
 
 fn default_inner_snarl() -> Box<Snarl<NodeData>> {
@@ -548,6 +678,8 @@ impl Default for UiSubPatch {
             pins_out: vec![],
             snarl: default_inner_snarl(),
             items: vec![],
+            overlay_items: vec![],
+            config_items: vec![],
             exposed_modules: vec![],
             decorations: vec![],
             snap_enabled: false,
@@ -676,5 +808,86 @@ mod tests {
             }
             other => panic!("expected Module, got {other:?}"),
         }
+    }
+
+    fn subpatch_node() -> NodeData {
+        NodeData {
+            module_id: "subpatch".into(),
+            display_name: "SP".into(),
+            category: "Patch".into(),
+            inputs: vec![],
+            outputs: vec![],
+            params: HashMap::new(),
+            subpatch: Some(Box::new(UiSubPatch::default())),
+            extra: NodeExtra::default(),
+        }
+    }
+
+    fn overlay_pin(inner: usize, source_path: Vec<usize>) -> LayoutItem {
+        LayoutItem::Module(ExposedModule {
+            inner_node_id: inner,
+            element_id: "value".into(),
+            pos: [0.0, 0.0],
+            size: [40.0, 20.0],
+            text_override: None,
+            switch_override: None,
+            graph_override: None,
+            source_path,
+            iv_style_override: None,
+            menu_style_override: None,
+        })
+    }
+
+    #[test]
+    fn overlay_pins_attribute_and_materialize_round_trip() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let sp_id = snarl.insert_node(eframe::egui::pos2(0.0, 0.0), subpatch_node());
+        let sp = sp_id.0;
+
+        let mut overlay = OverlayLayout::default();
+        let mut config = OverlayLayout::default();
+        overlay.items.push(overlay_pin(7, vec![sp])); // sub-patch-sourced
+        overlay.items.push(overlay_pin(3, vec![]));   // tab-canvas
+        config.items.push(overlay_pin(9, vec![sp]));
+
+        attribute_overlays_into_subpatches(&mut snarl, &mut overlay, &mut config);
+
+        // Sub-patch pin left the tab (with source_path cleared); tab-canvas stays.
+        assert_eq!(overlay.items.len(), 1);
+        assert!(matches!(&overlay.items[0],
+            LayoutItem::Module(m) if m.source_path.is_empty() && m.inner_node_id == 3));
+        assert!(config.items.is_empty());
+        let subp = snarl.get_node(sp_id).unwrap().subpatch.as_ref().unwrap();
+        assert_eq!(subp.overlay_items.len(), 1);
+        assert!(matches!(&subp.overlay_items[0],
+            LayoutItem::Module(m) if m.source_path.is_empty() && m.inner_node_id == 7));
+        assert_eq!(subp.config_items.len(), 1);
+
+        // Materialize onto a fresh tab → the pin reappears with source_path=[sp].
+        let mut o2 = OverlayLayout::default();
+        let mut c2 = OverlayLayout::default();
+        materialize_subpatch_overlays(&snarl, &mut o2, &mut c2);
+        assert_eq!(o2.items.len(), 1);
+        assert!(matches!(&o2.items[0],
+            LayoutItem::Module(m) if m.source_path == [sp] && m.inner_node_id == 7));
+        assert_eq!(c2.items.len(), 1);
+
+        // Dedup: a second materialize adds nothing.
+        materialize_subpatch_overlays(&snarl, &mut o2, &mut c2);
+        assert_eq!(o2.items.len(), 1);
+        assert_eq!(c2.items.len(), 1);
+    }
+
+    #[test]
+    fn attribute_drops_orphan_and_keeps_tab_canvas() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let mut overlay = OverlayLayout::default();
+        let mut config = OverlayLayout::default();
+        overlay.items.push(overlay_pin(1, vec![999])); // orphan (no such node)
+        overlay.items.push(overlay_pin(2, vec![]));    // tab-canvas
+        attribute_overlays_into_subpatches(&mut snarl, &mut overlay, &mut config);
+        assert_eq!(overlay.items.len(), 1);
+        assert!(matches!(&overlay.items[0],
+            LayoutItem::Module(m) if m.inner_node_id == 2));
     }
 }

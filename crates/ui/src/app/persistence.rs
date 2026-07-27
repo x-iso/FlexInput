@@ -10,16 +10,26 @@ impl FlexInputApp {
     /// by the opt-in workspace save and the always-on crash-recovery save so
     /// both serialize identical state.
     pub(crate) fn build_persisted_workspace(&self) -> PersistedWorkspace {
-        let tabs: Vec<PersistedTab> = self.tabs.iter().map(|t| PersistedTab {
-            title: t.title.clone(),
-            file_path: t.file_path.clone(),
-            bound_exes: t.bound_exes.clone(),
-            auto_bypass: t.auto_bypass,
-            snarl: crate::canvas::sanitize_snarl_for_save(&t.canvas.snarl),
-            easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
-            view_salt: t.view_salt,
-            overlay: t.overlay.clone(),
-            config: t.config.clone(),
+        let tabs: Vec<PersistedTab> = self.tabs.iter().map(|t| {
+            // Attribute sub-patch-sourced overlay pins into their sub-patches so
+            // they travel with a preset. Operate on the serialize-time clones —
+            // never the live snarl/overlays.
+            let mut snarl = crate::canvas::sanitize_snarl_for_save(&t.canvas.snarl);
+            let mut overlay = t.overlay.clone();
+            let mut config = t.config.clone();
+            crate::canvas::node::attribute_overlays_into_subpatches(
+                &mut snarl, &mut overlay, &mut config);
+            PersistedTab {
+                title: t.title.clone(),
+                file_path: t.file_path.clone(),
+                bound_exes: t.bound_exes.clone(),
+                auto_bypass: t.auto_bypass,
+                snarl,
+                easy_preset_path: t.easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone()),
+                view_salt: t.view_salt,
+                overlay,
+                config,
+            }
         }).collect();
         PersistedWorkspace {
             version: 1,

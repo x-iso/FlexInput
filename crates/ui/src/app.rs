@@ -175,6 +175,10 @@ pub struct EasyState {
     /// compared against the live sub-patch hash each frame to detect
     /// dirty state.
     pub loaded_preset: Option<(std::path::PathBuf, u64)>,
+    /// Transient: set by a preset / sub-patch load to the outer sub-patch node
+    /// id whose stored overlay/config pins should be re-materialized onto the
+    /// tab's info + config overlays. Consumed once by `center_panel::show`.
+    pub overlay_reload_node: Option<usize>,
 }
 
 impl PatchTab {
@@ -748,6 +752,12 @@ impl FlexInputApp {
                 loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
                 ..EasyState::default()
             };
+            // Re-materialize overlay/config pins that a sub-patch carries (from a
+            // preset or an earlier attributed save) back onto the tab.
+            let mut overlay = pt.overlay;
+            let mut config = pt.config;
+            crate::canvas::node::materialize_subpatch_overlays(
+                &canvas.snarl, &mut overlay, &mut config);
             PatchTab {
                 title: pt.title,
                 file_path: pt.file_path,
@@ -758,8 +768,8 @@ impl FlexInputApp {
                 auto_bypass: pt.auto_bypass,
                 easy_state,
                 view_salt,
-                overlay: pt.overlay,
-                config: pt.config,
+                overlay,
+                config,
             }
         };
         // A crash-recovery snapshot takes precedence over the opt-in workspace:
@@ -2173,6 +2183,10 @@ impl eframe::App for FlexInputApp {
                             loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
                             ..EasyState::default()
                         };
+                        let mut overlay = pt.overlay;
+                        let mut config = pt.config;
+                        crate::canvas::node::materialize_subpatch_overlays(
+                            &canvas.snarl, &mut overlay, &mut config);
                         PatchTab {
                             title: pt.title,
                             file_path: pt.file_path,
@@ -2183,8 +2197,8 @@ impl eframe::App for FlexInputApp {
                             auto_bypass: pt.auto_bypass,
                             easy_state,
                             view_salt,
-                            overlay: pt.overlay,
-                            config: pt.config,
+                            overlay,
+                            config,
                         }
                     }).collect();
                     if !new_tabs.is_empty() {
@@ -2311,8 +2325,9 @@ impl eframe::App for FlexInputApp {
         // preset-dropdown navigation.
         let gamepad_nav = &mut self.gamepad_nav;
         let tab = &mut self.tabs[self.active_tab];
-        let (virtual_panel, canvas, easy_state) =
-            (&mut tab.virtual_panel, &mut tab.canvas, &mut tab.easy_state);
+        let (virtual_panel, canvas, easy_state, tab_overlay, tab_config) =
+            (&mut tab.virtual_panel, &mut tab.canvas, &mut tab.easy_state,
+             &mut tab.overlay, &mut tab.config);
 
         // Device panels use a darker fill so they read as separate from the
         // canvas surface and the floating heading tabs visually integrate.
@@ -2645,6 +2660,8 @@ impl eframe::App for FlexInputApp {
                         ui,
                         canvas,
                         easy_state,
+                        tab_overlay,
+                        tab_config,
                         user_presets_folder.as_deref(),
                         device_defaults_for_easy,
                         &descriptors_for_easy,

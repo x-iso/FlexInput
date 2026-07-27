@@ -37,6 +37,8 @@ pub fn show(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
     easy_state: &mut EasyState,
+    tab_overlay: &mut crate::canvas::OverlayLayout,
+    tab_config: &mut crate::canvas::OverlayLayout,
     user_presets_folder: Option<&Path>,
     defaults: DeviceParamDefaults,
     descriptors: &[ModuleDescriptor],
@@ -64,8 +66,23 @@ pub fn show(
     // Resolve gamepad preset-nav state (open flag + highlight) BEFORE the
     // dropdown renders, so the body can glow the highlighted row this frame.
     show_gamepad_preset_nav(ui, canvas, easy_state, &presets, favorites, gamepad_nav);
-    show_preset_picker(ui, canvas, easy_state, &presets, favorites);
+    show_preset_picker(ui, canvas, easy_state, tab_overlay, tab_config, &presets, favorites);
     show_pending_modal(ui, canvas, easy_state, &presets);
+
+    // A preset / sub-patch load just replaced a sub-patch node — swap that
+    // node's overlay/config pins for the freshly-loaded ones (the preset ships
+    // its own). Replace (not merge): drop the previous preset's pins for the
+    // node, then materialize the new set.
+    if let Some(sp) = easy_state.overlay_reload_node.take() {
+        let drop_old = |items: &mut Vec<crate::canvas::node::LayoutItem>| {
+            items.retain(|it| !matches!(it,
+                crate::canvas::node::LayoutItem::Module(m) if m.source_path == [sp]));
+        };
+        drop_old(&mut tab_overlay.items);
+        drop_old(&mut tab_config.items);
+        crate::canvas::node::materialize_subpatch_overlays(
+            &canvas.snarl, tab_overlay, tab_config);
+    }
 
     // Layout-editing properties panel — directly below the preset bar, only
     // while 🎨 (layout edit) is active and a sub-patch exists. This mirrors the
@@ -180,6 +197,8 @@ fn show_preset_picker(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
     easy_state: &mut EasyState,
+    tab_overlay: &crate::canvas::OverlayLayout,
+    tab_config: &crate::canvas::OverlayLayout,
     presets: &[PresetInfo],
     favorites: &mut Vec<PathBuf>,
 ) {
@@ -341,8 +360,17 @@ fn show_preset_picker(
         {
             if let Some(oid) = outer_id {
                 if let Some(sp) = canvas.snarl.get_node(oid).and_then(|n| n.subpatch.as_ref()) {
-                    if let Some(path) = crate::app::save_subpatch_file(sp) {
-                        let hash = hash_subpatch(sp);
+                    // Bake THIS tab's overlay/config pins for this sub-patch into
+                    // the saved copy (the tab overlays are the live source of
+                    // truth), so the preset ships its overlays. The live tab
+                    // overlays are untouched.
+                    let mut sp = sp.clone();
+                    sp.overlay_items.clear();
+                    sp.config_items.clear();
+                    crate::canvas::node::collect_overlays_for_subpatch(
+                        oid.0, tab_overlay, tab_config, &mut sp);
+                    if let Some(path) = crate::app::save_subpatch_file(&sp) {
+                        let hash = hash_subpatch(&sp);
                         easy_state.loaded_preset = Some((path, hash));
                     }
                 }
@@ -1100,6 +1128,7 @@ fn apply_subpatch_inline(
     }
     let hash = hash_subpatch(sp);
     easy_state.loaded_preset = source_path.map(|p| (p, hash));
+    easy_state.overlay_reload_node = Some(node_id.0);
     super::wiring::rewire(canvas);
     super::layout::reposition_io_nodes(canvas);
 }
@@ -1626,6 +1655,9 @@ fn apply_preset(canvas: &mut Canvas, easy_state: &mut EasyState, p: &PresetInfo)
     }
 
     easy_state.loaded_preset = Some((p.path.clone(), p.content_hash));
+    // The freshly-loaded sub-patch carries its own overlay/config pins — ask
+    // `show` to re-materialize them onto the tab overlays for this node.
+    easy_state.overlay_reload_node = Some(node_id.0);
     super::wiring::rewire(canvas);
     super::layout::reposition_io_nodes(canvas);
 }
