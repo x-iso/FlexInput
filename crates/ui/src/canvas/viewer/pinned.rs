@@ -548,7 +548,7 @@ pub(crate) fn render_pinned_element_impl(
         }
         // Audio Stream Haptics — the scope widget, or any single calibration row.
         ("module.audio_stream_haptics", "asth_scope") => {
-            render_asth_pinned_scope(inner_id, ui, inner_snarl, container_size, bridged_parent);
+            render_asth_pinned_scope(inner_id, ui, inner_snarl, container_size, bridged_parent, graph_ov_ref);
             return;
         }
         ("module.audio_stream_haptics", "asth_mode_row") => {

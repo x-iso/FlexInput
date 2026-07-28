@@ -485,7 +485,13 @@ pub(crate) fn render_asth_pinned_scope(
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
     bridged_parent: Option<&AutomapGlowParent<'_>>,
+    graph_ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) {
+    // Per-pin background + outline override (shared with the other graph pins).
+    let (bg, outline) = super::chrome::graph_chrome(graph_ov);
+    let frame_rect = egui::Rect::from_min_size(ui.cursor().min, container);
+    ui.painter().rect_filled(frame_rect, 2.0, bg);
+
     let uid = effective_publish_uid(inner_id, bridged_parent);
     let a = asth_params_from_node(snarl, inner_id);
     let mut eq = snarl.get_node(inner_id)
@@ -517,6 +523,10 @@ pub(crate) fn render_asth_pinned_scope(
                 .map(|p| serde_json::json!([p[0], p[1]])).collect());
             n.params.insert("asth_eq_points".into(), arr);
         }
+    }
+    // Outline on top of the scope content (drawn last so it frames everything).
+    if let Some(stroke) = outline {
+        ui.painter().rect_stroke(frame_rect, 2.0, stroke, egui::StrokeKind::Inside);
     }
 }
 

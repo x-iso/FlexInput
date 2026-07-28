@@ -683,14 +683,24 @@ impl FlexInputApp {
                             self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "menu_sel");
                             self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
                         }
-                        // Gamepad-navigable KB/M picker on the main window.
+                        // Exclude the menu's OWN output pins so a zone can't map to
+                        // itself (mirrors the mouse menu path's `menu_excl`).
+                        let exclude_pin_prefix = if menu {
+                            self.get_subpatch_param_str(outer_id, inner, "menu_id")
+                                .map(|id| format!("menu:{id}"))
+                        } else {
+                            None
+                        };
+                        // Gamepad-navigable KB/M picker (routed over the game when
+                        // the config overlay is up — see the central promotion in
+                        // update()).
                         self.open_special_picker(crate::canvas::viewer::SpecialPickerRequest {
                             inner,
                             path: vec![outer_id.0],
                             draft_key: "_tz_draft_out".to_string(),
                             phase_key: None,
                             touch_zones: true,
-                            exclude_pin_prefix: None,
+                            exclude_pin_prefix,
                         }, None);
                     }
                     "gamepad" => {

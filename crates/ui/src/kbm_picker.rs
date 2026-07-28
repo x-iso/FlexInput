@@ -182,15 +182,18 @@ pub fn picker_cells(tz: bool, macros: &[crate::macro_icons::MacroDisplayEntry]) 
             .filter(|c| !hidden(c.pin)).map(PickerCell::from).collect();
         // Analog outputs placed in the vacated touchpad columns: mouse-delta and the
         // full analog sticks (touch position → deflection). The KB/M grid has no
-        // stick keys, so they live here — and stay navigable.
-        cells.push((&c("mouse_x", TOUCH_X, 1.0)).into());
-        cells.push((&c("mouse_y", TOUCH_X + 1.0, 1.0)).into());
-        cells.push((&c("mouse", TOUCH_X, 2.0)).into());
-        cells.push((&c("left_stick", TOUCH_X, 3.0)).into());
-        cells.push((&c("right_stick", TOUCH_X + 1.0, 3.0)).into());
+        // stick keys, so they live here — and stay navigable. Marked analog-only so
+        // they are greyed for targets where analog output makes no sense (a Virtual
+        // Menu zone triggers a DISCRETE selection); a touch/touchpad zone keeps them
+        // enabled (`picker_analog_input_ok` returns true for non-menu touch zones).
+        cells.push((&ca("mouse_x", TOUCH_X, 1.0)).into());
+        cells.push((&ca("mouse_y", TOUCH_X + 1.0, 1.0)).into());
+        cells.push((&ca("mouse", TOUCH_X, 2.0)).into());
+        cells.push((&ca("left_stick", TOUCH_X, 3.0)).into());
+        cells.push((&ca("right_stick", TOUCH_X + 1.0, 3.0)).into());
         // Analog (variable-speed) scroll — the touch-zone deflection sets the rate.
-        cells.push((&c("scroll_y", TOUCH_X, 4.0)).into());
-        cells.push((&c("scroll_x", TOUCH_X + 1.0, 4.0)).into());
+        cells.push((&ca("scroll_y", TOUCH_X, 4.0)).into());
+        cells.push((&ca("scroll_x", TOUCH_X + 1.0, 4.0)).into());
         cells
     };
     for (i, entry) in macros.iter().enumerate() {
@@ -231,13 +234,22 @@ fn cell_center(cell: &PickerCell) -> (f32, f32) {
 /// unit direction: e.g. right = (1, 0), up = (0, -1)). Returns the current index
 /// if no cell lies in that direction. Scores by primary-axis distance plus a
 /// cross-axis penalty so navigation favors the same row/column.
-pub fn nearest_in_dir(cells: &[PickerCell], from: usize, dx: f32, dy: f32) -> usize {
+pub fn nearest_in_dir(
+    cells: &[PickerCell],
+    from: usize,
+    dx: f32,
+    dy: f32,
+    usable: impl Fn(&PickerCell) -> bool,
+) -> usize {
     let from = clamp_index(cells, from);
     let (cx, cy) = cell_center(&cells[from]);
     let mut best = from;
     let mut best_score = f32::INFINITY;
     for (i, cell) in cells.iter().enumerate() {
-        if i == from { continue; }
+        // Skip the current cell and any DISABLED cell (analog output on a
+        // discrete target, or a self-target), so focus can't land on — and
+        // therefore can't map — a greyed cell.
+        if i == from || !usable(cell) { continue; }
         let (ox, oy) = cell_center(cell);
         let vx = ox - cx;
         let vy = oy - cy;

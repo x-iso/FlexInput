@@ -183,11 +183,20 @@ impl FlexInputApp {
         if !crate::module_ui_info::has_nav_response_curve(&node.module_id)
         { return None; }
         let (pts_key, _) = self.nav_curve_keys(outer_id, inner);
-        let pts: Vec<[f32; 2]> = node.params.get(pts_key)?.as_array()?
-            .iter().filter_map(|p| {
+        let pts: Vec<[f32; 2]> = match node.params.get(pts_key).and_then(|v| v.as_array()) {
+            Some(arr) => arr.iter().filter_map(|p| {
                 let a = p.as_array()?;
                 Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
-            }).collect();
+            }).collect(),
+            // The Audio Stream Haptics EQ isn't persisted until first edited (the
+            // scope renderer only writes `asth_eq_points` on change), so gamepad
+            // editing must start from the SAME default the renderer shows —
+            // otherwise the driver reads None and bails out immediately ("the EQ
+            // graph won't enter editing"). The first dot move persists it via
+            // `nav_curve_write_points`.
+            None if pts_key == "asth_eq_points" => vec![[0.0, 0.5], [1.0, 0.5]],
+            None => return None,
+        };
         if pts.len() < 2 { return None; }
         Some((inner, pts))
     }

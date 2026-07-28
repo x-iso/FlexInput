@@ -23,12 +23,21 @@ impl FlexInputApp {
         // Touch-Zones variant hides the touchpad cluster and adds analog outputs),
         // so focus never lands on a hidden cell and the analog cells are reachable.
         let cells = picker_cells(self.gamepad_nav.kbm_picker_touch_zones, &self.macro_display_entries());
+        // A cell is usable (focusable + mappable) unless it's an analog output on
+        // a discrete target (analog not OK) or one of the target's own pins. Same
+        // predicate the renderer uses to grey cells — so grey == unreachable.
+        let analog_ok = self.picker_analog_input_ok();
+        let excl = self.gamepad_nav.kbm_picker_exclude.clone();
+        let usable = |cell: &crate::kbm_picker::PickerCell| {
+            let self_target = excl.as_deref().is_some_and(|p| cell.pin.starts_with(p));
+            !((cell.analog_only && !analog_ok) || self_target)
+        };
         let mut idx = clamp_index(&cells, self.gamepad_nav.kbm_picker_idx);
         idx = match step_dir {
-            Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0),
-            Some(NavDir::Right) => nearest_in_dir(&cells, idx, 1.0, 0.0),
-            Some(NavDir::Up)    => nearest_in_dir(&cells, idx, 0.0, -1.0),
-            Some(NavDir::Down)  => nearest_in_dir(&cells, idx, 0.0, 1.0),
+            Some(NavDir::Left)  => nearest_in_dir(&cells, idx, -1.0, 0.0, &usable),
+            Some(NavDir::Right) => nearest_in_dir(&cells, idx, 1.0, 0.0, &usable),
+            Some(NavDir::Up)    => nearest_in_dir(&cells, idx, 0.0, -1.0, &usable),
+            Some(NavDir::Down)  => nearest_in_dir(&cells, idx, 0.0, 1.0, &usable),
             None => idx,
         };
         self.gamepad_nav.kbm_picker_idx = idx;
@@ -50,13 +59,9 @@ impl FlexInputApp {
         // capture machine (so the South used to pick isn't swept into the chord).
         // Analog-only cells (swipe) are ignored when the input isn't analog;
         // excluded cells (a menu's own targets) are never appendable.
-        if nav.is_rising("btn_south") {
+        if nav.is_rising("btn_south") && usable(&cells[idx]) {
             let pin = cells[idx].pin.clone();
-            let excluded = self.gamepad_nav.kbm_picker_exclude.as_deref()
-                .is_some_and(|p| pin.starts_with(p));
-            if !excluded {
-                self.picker_append_pin(&pin);
-            }
+            self.picker_append_pin(&pin);
         }
     }
 

@@ -188,6 +188,10 @@ pub(crate) fn layout_inspector_strip_core(
             | Some("display.vectorscope")
             | Some("display.trigscope")
             | Some("generator.envelope")
+            // The Audio Stream Haptics scope pin honors background + outline (the
+            // EQ/spectrum draw their own contents, so gridline/channel controls
+            // are inert on it — same "only some fields apply" rule as the pad pins).
+            | Some("module.audio_stream_haptics")
     );
     let graph_channels = sel_module.as_ref().map(|(_, ch)| *ch).unwrap_or(1);
 

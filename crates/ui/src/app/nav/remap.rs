@@ -799,7 +799,13 @@ impl FlexInputApp {
     pub(crate) fn picker_analog_input_ok(&self) -> bool {
         let Some(inner) = self.gamepad_nav.kbm_picker_node else { return false; };
         if self.gamepad_nav.kbm_picker_touch_zones {
-            return true; // Touch-zone position is inherently analog.
+            // A Touch Zones / touchpad zone yields a continuous position, so
+            // analog outputs (stick deflection, mouse-delta) apply. A Virtual
+            // Menu zone instead triggers a DISCRETE selection, so analog outputs
+            // make no sense — grey them out for menus only.
+            let is_menu = self.picker_node(&self.gamepad_nav.kbm_picker_path.clone(), inner)
+                .map(|n| n.module_id == "module.menu").unwrap_or(false);
+            return !is_menu;
         }
         if self.gamepad_nav.kbm_picker_phase_key.is_some() {
             return true; // Lean: the gesture itself is analog.
