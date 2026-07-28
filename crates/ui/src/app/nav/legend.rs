@@ -145,33 +145,51 @@ impl FlexInputApp {
                 (vec!["btn_east"], "Back"),
             ],
             EditLevel::TzLines => {
-                // Add/remove only shown in mapping mode (ports mode is move-only).
+                // The spatial walk alternates zone ↔ border/seam; the hints track
+                // what's currently focused. Add/remove/divide only in mapping mode.
+                use crate::gamepad_nav::TzFocus;
                 let mapping = self.nav_active_outer_id()
                     .and_then(|o| self.nav_selected_inner_node(o).map(|i| self.tz_is_mapping(o, i)))
                     .unwrap_or(false);
                 let split = self.nav_active_outer_id()
                     .and_then(|o| self.nav_selected_inner_node(o).map(|i| self.tz_n_fields(o, i) > 1))
                     .unwrap_or(false);
-                let mut v = vec![
-                    (hint_horiz(), "Col line"),
-                    (hint_vert(), "Row line"),
-                    (vec!["btn_south"], "Grab"),
-                    (vec!["btn_north"], "Recenter"),
-                ];
-                if mapping {
-                    v.push((vec!["btn_west"], "Remove"));
-                    v.push((vec!["left_trigger", "right_trigger"], "Add line"));
+                let mut v = vec![(hint_move(), "Walk zones/borders")];
+                match self.gamepad_nav.tz_focus {
+                    TzFocus::Zone(_) => {
+                        // Divide works in both modes (mapping subdivides the zone;
+                        // ports inserts a grid cut through its band).
+                        v.push((vec!["left_trigger", "right_trigger"], "Divide zone"));
+                    }
+                    TzFocus::Border => {
+                        v.push((vec!["btn_south"], "Grab"));
+                        v.push((vec!["btn_north"], "Recenter"));
+                        if mapping { v.push((vec!["btn_west"], "Remove")); }
+                    }
+                    TzFocus::Seam => {
+                        v.push((vec!["btn_south"], "Rotate ring"));
+                    }
                 }
                 if split { v.push((vec!["btn_lb", "btn_rb"], "Pad")); }
                 v.push((vec!["btn_east"], "Back"));
                 v
             }
-            EditLevel::TzGrab => vec![
-                (hint_move(), "Move line"),
-                (vec!["btn_north"], "Recenter"),
-                (vec!["btn_south"], "Drop"),
-                (vec!["btn_east"], "Drop"),
-            ],
+            EditLevel::TzGrab => {
+                if matches!(self.gamepad_nav.tz_focus, crate::gamepad_nav::TzFocus::Seam) {
+                    vec![
+                        (hint_move(), "Rotate"),
+                        (vec!["btn_south"], "Done"),
+                        (vec!["btn_east"], "Done"),
+                    ]
+                } else {
+                    vec![
+                        (hint_move(), "Move line"),
+                        (vec!["btn_north"], "Recenter"),
+                        (vec!["btn_south"], "Drop"),
+                        (vec!["btn_east"], "Drop"),
+                    ]
+                }
+            }
             EditLevel::TzCards => {
                 // Two-row nav (actions + cards + optional curve), mirroring the
                 // Remapper. West/LT-RT only shown when relevant.

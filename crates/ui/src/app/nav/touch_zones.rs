@@ -3,6 +3,30 @@
 
 use super::*;
 
+/// Pick the nearest candidate point strictly in screen direction `dir` from
+/// `cur`, using the same primary-axis + cross-penalty scorer the picker/left-panel
+/// nav use. Returns the index into `cands`. Screen-space, so radial angular wrap
+/// is handled naturally (a sector across 12 o'clock is just screen-adjacent).
+fn nav_tz_nearest_in_dir(cur: egui::Pos2, dir: crate::gamepad_nav::NavDir,
+    cands: &[(usize, egui::Pos2)]) -> Option<usize>
+{
+    use crate::gamepad_nav::NavDir;
+    let mut best: Option<(usize, f32)> = None;
+    for &(idx, o) in cands {
+        let (dx, dy) = (o.x - cur.x, o.y - cur.y);
+        let (primary, cross) = match dir {
+            NavDir::Right => (dx, dy),
+            NavDir::Left => (-dx, dy),
+            NavDir::Down => (dy, dx),
+            NavDir::Up => (-dy, dx),
+        };
+        if primary <= 0.5 { continue; }
+        let score = primary + 2.0 * cross.abs();
+        if best.map(|(_, s)| score < s).unwrap_or(true) { best = Some((idx, score)); }
+    }
+    best.map(|(i, _)| i)
+}
+
 impl FlexInputApp {
 
     /// Enter line editing from Widget level: focus the first interior divider of
@@ -58,6 +82,7 @@ impl FlexInputApp {
             TzFocus::Zone(z) => z as u64,
             _ => u64::MAX,
         };
+        let seam_focus = matches!(self.gamepad_nav.tz_focus, TzFocus::Seam);
         ctx.data_mut(|d| {
             d.insert_temp(
                 egui::Id::new(("gp_nav_tz", inner.0)),
@@ -67,33 +92,84 @@ impl FlexInputApp {
             d.insert_temp(
                 egui::Id::new(("gp_nav_tz_zone", inner.0)),
                 (pass, self.gamepad_nav.tz_field as u64, zone));
+            // Radial "root border" (origin seam) focus highlight.
+            d.insert_temp(
+                egui::Id::new(("gp_nav_tz_seam", inner.0)),
+                (pass, seam_focus));
         });
         ctx.request_repaint();
     }
 
-    /// Hit-test the RS/gyro cursor against the divider hit-rects the pinned pad
-    /// published (both pads). Returns (field, axis, line) of the divider under
-    /// the cursor. Rects are slightly expanded so thin lines are easy to target.
-    pub(crate) fn nav_tz_cursor_hit(&self, ctx: &egui::Context, inner: egui_snarl::NodeId, n_fields: usize)
-        -> Option<(usize, u8, usize)>
+    /// Read the field's gamepad nav-walk targets (global space), published by the
+    /// field renderer: `(kind, a, b, center)` where kind 0 = zone (a = zone id),
+    /// 1 = border (a = axis, b = per-axis line), 2 = seam. Stamped with the
+    /// viewport-agnostic nav pass so this matches even when the field renders in
+    /// the config overlay's own viewport.
+    pub(crate) fn nav_tz_targets(&self, ctx: &egui::Context, inner: egui_snarl::NodeId, field: usize)
+        -> Vec<(u8, u32, u32, egui::Pos2)>
     {
-        let cursor = self.gamepad_nav.cursor_pos;
-        let cur_pass = ctx.cumulative_pass_nr();
-        let mut best: Option<(f32, usize, u8, usize)> = None; // (dist, field, axis, line)
-        for field in 0..n_fields {
-            let entry: Option<(u64, Vec<(u8, u32, egui::Rect)>)> = ctx.data(|d|
-                d.get_temp(egui::Id::new(("gp_nav_tz_lines", inner.0, field))));
-            let Some((pass, rects)) = entry else { continue; };
-            if cur_pass.saturating_sub(pass) > 3 { continue; }
-            for (axis, line, rect) in rects {
-                if !rect.expand(6.0).contains(cursor) { continue; }
-                let d = (rect.center() - cursor).length();
-                if best.map_or(true, |(bd, ..)| d < bd) {
-                    best = Some((d, field, axis, line as usize));
+        ctx.data(|d| d.get_temp::<(u64, Vec<(u8, u32, u32, egui::Pos2)>)>(
+                egui::Id::new(("gp_nav_tz_targets", inner.0, field))))
+            .filter(|(p, _)| crate::widgets::nav_pass_matches(ctx, *p))
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    /// The screen point of the CURRENT focus, looked up in this frame's published
+    /// targets (geometry can shift between frames, and the focused divider/zone may
+    /// have been removed — `None` then, so the walk re-seeds).
+    fn nav_tz_focus_point(&self, targets: &[(u8, u32, u32, egui::Pos2)]) -> Option<egui::Pos2> {
+        use crate::gamepad_nav::TzFocus;
+        match self.gamepad_nav.tz_focus {
+            TzFocus::Zone(z) => targets.iter()
+                .find(|t| t.0 == 0 && t.1 == z as u32).map(|t| t.3),
+            TzFocus::Seam => targets.iter().find(|t| t.0 == 2).map(|t| t.3),
+            TzFocus::Border => targets.iter().find(|t| t.0 == 1
+                && t.1 == self.gamepad_nav.tz_axis as u32
+                && t.2 == self.gamepad_nav.tz_line as u32).map(|t| t.3),
+        }
+    }
+
+    /// Apply a focused nav target to the focus model (and, for a zone, the
+    /// mapping-card context `sel_zone`/`sel_field`). `field` is the pad the
+    /// target belongs to.
+    fn nav_tz_focus_target(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, t: (u8, u32, u32, egui::Pos2))
+    {
+        use crate::gamepad_nav::TzFocus;
+        self.gamepad_nav.tz_field = field;
+        match t.0 {
+            0 => {
+                self.gamepad_nav.tz_focus = TzFocus::Zone(t.1 as usize);
+                // Focusing a zone re-targets the separate cards widget live.
+                if let Some(sp) = self.tabs[self.active_tab].canvas.snarl
+                    .get_node_mut(outer).and_then(|n| n.subpatch.as_mut())
+                {
+                    if let Some(n) = sp.snarl.get_node_mut(inner) {
+                        n.params.insert("sel_field".into(), serde_json::Value::from(field as u64));
+                        n.params.insert("sel_zone".into(), serde_json::Value::from(t.1 as u64));
+                    }
                 }
             }
+            2 => { self.gamepad_nav.tz_focus = TzFocus::Seam; }
+            _ => {
+                self.gamepad_nav.tz_focus = TzFocus::Border;
+                self.gamepad_nav.tz_axis = t.1 as u8;
+                self.gamepad_nav.tz_line = t.2 as usize;
+            }
         }
-        best.map(|(_, f, a, l)| (f, a, l))
+    }
+
+    /// Rotate a radial menu's origin seam by `delta` fraction (wraps 0..1).
+    pub(crate) fn nav_menu_rotate_origin(&mut self, outer: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, delta: f32)
+    {
+        let Some(sp) = self.tabs[self.active_tab].canvas.snarl
+            .get_node_mut(outer).and_then(|n| n.subpatch.as_mut()) else { return; };
+        let Some(n) = sp.snarl.get_node_mut(inner) else { return; };
+        let cur = n.params.get("menu_radial_origin").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        n.params.insert("menu_radial_origin".into(),
+            serde_json::json!((cur + delta).rem_euclid(1.0) as f64));
     }
 
     /// Drive Touch Zones line editing (`TzLines`/`TzGrab`). See the EditLevel
@@ -155,56 +231,110 @@ impl FlexInputApp {
         match self.gamepad_nav.edit_level {
             EditLevel::TzLines => {
                 if nav.is_rising("btn_east") { self.nav_tz_exit(); return; }
+                use crate::gamepad_nav::TzFocus;
 
-                // RS/gyro cursor hover-select: when the cursor is visible and
-                // over a divider (across either pad), focus it — the visual
-                // pointer picks a line without dpad cycling.
-                if self.gamepad_nav.cursor_visible {
-                    if let Some((f, a, l)) = self.nav_tz_cursor_hit(ctx, inner, n_fields) {
-                        self.gamepad_nav.tz_field = f;
-                        self.gamepad_nav.tz_axis = a;
-                        self.gamepad_nav.tz_line = l;
-                        self.gamepad_nav.tz_focus = crate::gamepad_nav::TzFocus::Border;
+                // Screen-space nav targets for the focused pad (kind 0 = zone,
+                // 1 = border, 2 = seam). The spatial walk and cursor hover both
+                // pick from these, so grid + radial share one geometry path.
+                let targets = self.nav_tz_targets(ctx, inner, field);
+
+                // RS/gyro cursor hover-select: the visual pointer picks a target
+                // directly — a border/seam within reach wins, else the nearest
+                // zone centroid. (Zone rects aren't published, so nearest-centroid
+                // is the approximation; borders keep their tolerance.)
+                if self.gamepad_nav.cursor_visible && !targets.is_empty() {
+                    let cur = self.gamepad_nav.cursor_pos;
+                    let near_border = targets.iter()
+                        .filter(|t| t.0 != 0)
+                        .map(|t| (*t, (t.3 - cur).length()))
+                        .filter(|(_, d)| *d <= 16.0)
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(t, _)| t);
+                    let pick = near_border.or_else(|| targets.iter()
+                        .filter(|t| t.0 == 0)
+                        .map(|t| (*t, (t.3 - cur).length()))
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(t, _)| t));
+                    if let Some(t) = pick {
+                        self.nav_tz_focus_target(outer_id, inner, field, t);
                     }
                 }
 
-                // Left/Right → column dividers; Up/Down → row dividers.
-                // (P2 will make this a border↔zone spatial walk; for now dpad still
-                // walks dividers, but focusing a divider updates the focus model so
-                // the highlight is coherent with the seeded-zone highlight.)
-                match step_dir {
-                    Some(NavDir::Left)  => self.nav_tz_cycle(0, -1, n_col, n_row),
-                    Some(NavDir::Right) => self.nav_tz_cycle(0,  1, n_col, n_row),
-                    Some(NavDir::Up)    => self.nav_tz_cycle(1, -1, n_col, n_row),
-                    Some(NavDir::Down)  => self.nav_tz_cycle(1,  1, n_col, n_row),
-                    None => {}
-                }
-                if step_dir.is_some() {
-                    self.gamepad_nav.tz_focus = crate::gamepad_nav::TzFocus::Border;
-                }
-
-                let has_line = axis_len(self.gamepad_nav.tz_axis) > 0;
-                if nav.is_rising("btn_south") && has_line {
-                    self.gamepad_nav.edit_level = EditLevel::TzGrab;
-                }
-                if nav.is_rising("btn_north") && has_line {
-                    recenter(self, field);
-                }
-                if mapping && nav.is_rising("btn_west") && has_line {
-                    if let Some((_, _, _, path)) = self.tz_tree_sel(outer_id, inner, field) {
-                        self.tz_tree_remove(outer_id, inner, field, &path);
+                // Spatial-alternating walk: from a ZONE, a dpad/LS direction picks
+                // the nearest BORDER/SEAM in that screen direction; from a
+                // BORDER/SEAM it picks the nearest ZONE. Because a border sits
+                // between adjacent zones, this yields zone↔border↔zone everywhere.
+                if let Some(dir) = step_dir {
+                    let on_zone = matches!(self.gamepad_nav.tz_focus, TzFocus::Zone(_));
+                    let cur_pt = self.nav_tz_focus_point(&targets);
+                    if let Some(cur) = cur_pt {
+                        let cands: Vec<(usize, egui::Pos2)> = targets.iter().enumerate()
+                            .filter(|(_, t)| if on_zone { t.0 != 0 } else { t.0 == 0 })
+                            .map(|(i, t)| (i, t.3))
+                            .collect();
+                        if let Some(ti) = nav_tz_nearest_in_dir(cur, dir, &cands) {
+                            self.nav_tz_focus_target(outer_id, inner, field, targets[ti]);
+                        }
+                    } else if let Some(&t) = targets.first() {
+                        // Focus was orphaned (target vanished) — re-seed.
+                        self.nav_tz_focus_target(outer_id, inner, field, t);
                     }
                 }
-                // RT/LT subdivide the selected zone (vertical / horizontal).
-                if mapping && (rt_rising || lt_rising) {
-                    use flexinput_core::touchzones::Axis;
-                    let axis = if rt_rising { Axis::V } else { Axis::H };
-                    self.tz_tree_add(outer_id, inner, field, axis);
+
+                // Actions depend on what's focused.
+                match self.gamepad_nav.tz_focus {
+                    TzFocus::Border => {
+                        let has_line = axis_len(self.gamepad_nav.tz_axis) > 0;
+                        if nav.is_rising("btn_south") && has_line {
+                            self.gamepad_nav.edit_level = EditLevel::TzGrab;
+                        }
+                        if nav.is_rising("btn_north") && has_line {
+                            recenter(self, field);
+                        }
+                        if mapping && nav.is_rising("btn_west") && has_line {
+                            if let Some((_, _, _, path)) = self.tz_tree_sel(outer_id, inner, field) {
+                                self.tz_tree_remove(outer_id, inner, field, &path);
+                            }
+                        }
+                    }
+                    TzFocus::Seam => {
+                        // South grabs the seam to rotate the whole ring.
+                        if nav.is_rising("btn_south") {
+                            self.gamepad_nav.edit_level = EditLevel::TzGrab;
+                        }
+                    }
+                    TzFocus::Zone(z) => {
+                        // RT/LT divide the FOCUSED zone (V = radius line / vertical =
+                        // "straight from centre"; H = ring arc / horizontal = "along
+                        // the circle"). Mapping mode subdivides just that zone via the
+                        // BSP tree; ports mode has no tree, so it inserts a full grid
+                        // cut through the zone's band (mirrors the mouse "+").
+                        if rt_rising || lt_rising {
+                            use flexinput_core::touchzones::Axis;
+                            let axis = if rt_rising { Axis::V } else { Axis::H };
+                            if mapping {
+                                self.tz_tree_add(outer_id, inner, field, axis);
+                            } else {
+                                self.tz_ports_divide(outer_id, inner, field, z, axis);
+                            }
+                        }
+                    }
                 }
             }
             EditLevel::TzGrab => {
                 if nav.is_rising("btn_south") || nav.is_rising("btn_east") {
                     self.gamepad_nav.edit_level = EditLevel::TzLines;
+                } else if matches!(self.gamepad_nav.tz_focus, crate::gamepad_nav::TzFocus::Seam) {
+                    // Seam grabbed → dpad/LS rotates the ring's origin.
+                    const RSTEP: f32 = 0.02;
+                    let delta = match step_dir {
+                        Some(NavDir::Left) | Some(NavDir::Down) => -RSTEP,
+                        Some(NavDir::Right) | Some(NavDir::Up) => RSTEP,
+                        None => 0.0,
+                    };
+                    if delta != 0.0 {
+                        self.nav_menu_rotate_origin(outer_id, inner, delta);
+                    }
                 } else if nav.is_rising("btn_north") {
                     recenter(self, field);
                 } else {
@@ -232,20 +362,6 @@ impl FlexInputApp {
             _ => {}
         }
         self.nav_tz_publish(ctx, inner);
-    }
-
-    /// Move the line selection: set the focused axis and step within it. A no-op
-    /// when the requested axis has no dividers.
-    pub(crate) fn nav_tz_cycle(&mut self, axis: u8, dir: i32, n_cols: usize, n_rows: usize) {
-        let n = if axis == 0 { n_cols } else { n_rows };
-        if n == 0 { return; }
-        if self.gamepad_nav.tz_axis != axis {
-            self.gamepad_nav.tz_axis = axis;
-            self.gamepad_nav.tz_line = if dir >= 0 { 0 } else { n - 1 };
-        } else {
-            let next = (self.gamepad_nav.tz_line as i32 + dir).clamp(0, n as i32 - 1);
-            self.gamepad_nav.tz_line = next as usize;
-        }
     }
 
     /// Nudge the focused divider by `delta` (clamped between its neighbours,

@@ -1550,6 +1550,15 @@ pub(crate) fn tz_draw_field(
     let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
         .unwrap_or(egui::emath::TSTransform::IDENTITY);
     let mut nav_line_rects: Vec<(u8, u32, egui::Rect)> = Vec::new();
+    // Zone-centroid + border nav targets (global space) for the gamepad spatial
+    // walk: kind 0 = zone (a = zone id), 1 = border (a = axis, b = per-axis line),
+    // 2 = seam (radial only). Stamped with the viewport-agnostic nav pass so the
+    // ROOT nav driver matches them even when this field renders in the config
+    // overlay's own viewport.
+    let mut nav_targets: Vec<(u8, u32, u32, egui::Pos2)> = zones.iter()
+        .map(|&(id, [x0, y0, x1, y1])| (0u8, id as u32, 0u32,
+            to_global * egui::pos2(to_x((x0 + x1) * 0.5), to_y((y0 + y1) * 0.5))))
+        .collect();
 
     // ── Mapping mode: partial dividers from the tree (drag to move, right-click
     // to remove/merge). Ports mode falls through to the full-cut grid editing. ──
@@ -1589,7 +1598,9 @@ pub(crate) fn tz_draw_field(
             };
             let axis_idx = if axis_v { let i = vcount; vcount += 1; i }
                            else       { let i = hcount; hcount += 1; i };
-            nav_line_rects.push((if axis_v { 0 } else { 1 }, axis_idx, to_global * hitr));
+            let ghit = to_global * hitr;
+            nav_line_rects.push((if axis_v { 0 } else { 1 }, axis_idx, ghit));
+            nav_targets.push((1, if axis_v { 0 } else { 1 }, axis_idx, ghit.center()));
             // Union the (up to two) segments flanking the button into one response.
             let r = segs.iter().enumerate().fold(None::<egui::Response>, |acc, (si, seg)| {
                 let resp = ui.interact(*seg, ui.id().with((node_id, id_salt, "tzdiv", field, di, si)),
@@ -1635,9 +1646,13 @@ pub(crate) fn tz_draw_field(
         if let Some(path) = want_remove { tz_request_or_apply_merge(snarl, node_id, field, tree, &path); }
 
         let pass_nr = ui.ctx().cumulative_pass_nr();
-        ui.ctx().data_mut(|d| d.insert_temp(
-            egui::Id::new(("gp_nav_tz_lines", node_id.0, field)),
-            (pass_nr, nav_line_rects)));
+        let nav_pass_now = crate::widgets::nav_pass(ui.ctx());
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(egui::Id::new(("gp_nav_tz_lines", node_id.0, field)),
+                (pass_nr, nav_line_rects));
+            d.insert_temp(egui::Id::new(("gp_nav_tz_targets", node_id.0, field)),
+                (nav_pass_now, nav_targets));
+        });
         return;
     }
 
@@ -1646,7 +1661,9 @@ pub(crate) fn tz_draw_field(
     for i in 0..col_edges.len() {
         let x = to_x(col_edges[i]);
         let hit = egui::Rect::from_min_max(egui::pos2(x - 4.0, rect.top()), egui::pos2(x + 4.0, rect.bottom()));
-        nav_line_rects.push((0, i as u32, to_global * hit));
+        let ghit = to_global * hit;
+        nav_line_rects.push((0, i as u32, ghit));
+        nav_targets.push((1, 0, i as u32, ghit.center()));
         let r = ui.interact(hit, ui.id().with((node_id, id_salt, "col", field, i)), egui::Sense::click_and_drag());
         let hot = r.hovered() || r.dragged();
         if hot { r.clone().on_hover_cursor(egui::CursorIcon::ResizeHorizontal); }
@@ -1681,7 +1698,9 @@ pub(crate) fn tz_draw_field(
     for i in 0..row_edges.len() {
         let y = to_y(row_edges[i]);
         let hit = egui::Rect::from_min_max(egui::pos2(rect.left(), y - 4.0), egui::pos2(rect.right(), y + 4.0));
-        nav_line_rects.push((1, i as u32, to_global * hit));
+        let ghit = to_global * hit;
+        nav_line_rects.push((1, i as u32, ghit));
+        nav_targets.push((1, 1, i as u32, ghit.center()));
         let r = ui.interact(hit, ui.id().with((node_id, id_salt, "row", field, i)), egui::Sense::click_and_drag());
         let hot = r.hovered() || r.dragged();
         if hot { r.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical); }
@@ -1717,9 +1736,13 @@ pub(crate) fn tz_draw_field(
     // NOTE: read the pass number BEFORE `data_mut` — calling a ctx accessor
     // inside the data lock re-enters it and deadlocks epaint's RwLock.
     let pass_nr = ui.ctx().cumulative_pass_nr();
-    ui.ctx().data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_tz_lines", node_id.0, field)),
-        (pass_nr, nav_line_rects)));
+    let nav_pass_now = crate::widgets::nav_pass(ui.ctx());
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(egui::Id::new(("gp_nav_tz_lines", node_id.0, field)),
+            (pass_nr, nav_line_rects));
+        d.insert_temp(egui::Id::new(("gp_nav_tz_targets", node_id.0, field)),
+            (nav_pass_now, nav_targets));
+    });
 }
 
 /// Pinned-widget renderer (Easy-mode sub-patch layout). Ports mode shows the
@@ -1778,7 +1801,7 @@ pub(crate) fn render_touch_zones_pinned(
             && n.params.get("menu_radial").and_then(|v| v.as_bool()).unwrap_or(false))
         .unwrap_or(false);
     if radial_menu {
-        let (rect, resp) = ui.allocate_exact_size(container, egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(container, egui::Sense::click_and_drag());
         let zones = tz_field_tree(inner_snarl, inner_id, 0).zones();
         let (deadzone, origin, sel_zone, zone_maps) = inner_snarl.get_node(inner_id)
             .map(|n| (
@@ -1816,7 +1839,14 @@ pub(crate) fn render_touch_zones_pinned(
             if mapping { Some(sel_zone) } else { None },
             &zone_maps, &zone_meta, colors, resp.interact_pointer_pos(), ptr,
         );
-        if mapping && resp.clicked() {
+        // Full mouse border editor (drag dividers, rotate the origin seam,
+        // recenter, ± add/remove) + the gamepad-nav focus highlight — shared with
+        // the node body so the pinned & config-overlay radial field edits
+        // identically. Previously this field only click-selected a zone with the
+        // mouse (no divider move / seam rotate over the game).
+        let suppress = crate::canvas::menu_body::radial_border_editor(
+            ui, inner_id, inner_snarl, mapping, rect, deadzone, origin, &resp, accent, &visuals);
+        if mapping && resp.clicked() && !suppress {
             if let Some(z) = picked {
                 if tz_pick_kind(inner_snarl, inner_id).is_some() {
                     tz_apply_pick(inner_snarl, inner_id, z);
@@ -1826,11 +1856,6 @@ pub(crate) fn render_touch_zones_pinned(
                 }
             }
         }
-        // Gamepad-nav focused-border highlight: the pinned radial field paints the
-        // ring itself (no node-body border editor), so draw the focus highlight +
-        // RS-cursor hit-rects here too — otherwise you edit a divider blind.
-        crate::canvas::menu_body::paint_radial_nav_focus(
-            ui, inner_id, inner_snarl, rect, deadzone, origin, mapping);
         return;
     }
 

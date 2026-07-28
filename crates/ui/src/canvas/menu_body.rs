@@ -1231,9 +1231,28 @@ pub(crate) fn paint_radial_nav_focus(
     }
 
     let mut nav_line_rects: Vec<(u8, u32, egui::Rect)> = Vec::new();
+    // Nav targets for the gamepad spatial walk (global space): kind 0 = zone,
+    // 1 = border, 2 = seam. Zone centroids come from the same polar projection
+    // the ring painter uses.
+    let mut nav_targets: Vec<(u8, u32, u32, egui::Pos2)> =
+        super::viewer::tz_field_tree(snarl, node_id, 0).zones().into_iter()
+            .map(|(id, [x0, y0, x1, y1])| (0u8, id, 0u32,
+                to_global * geom.point((x0 + x1) * 0.5, (y0 + y1) * 0.5)))
+            .collect();
+    // The seam sits at tree-u 0, mid-radius (the ring's 12-o'clock reference edge).
+    nav_targets.push((2, 0, 0, to_global * geom.point(0.0, 0.5)));
+    // Seam focus highlight (the "root border"): the nav driver publishes it as a
+    // simple bool so the ring's reference edge lights up when walked onto.
+    let seam_focus: Option<(u64, bool)> =
+        ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_tz_seam", node_id.0))));
+    let seam_hot = matches!(seam_focus,
+        Some((p, true)) if nav_focus_pass.saturating_sub(p) <= 2);
     let (mut vcount, mut hcount) = (0u32, 0u32);
     for b in &borders {
         if b.seam {
+            if seam_hot {
+                paint_ring_border(&painter, &geom, b, egui::Stroke::new(4.0, style.accent));
+            }
             continue;
         }
         let axis: u8 = if b.angular { 0 } else { 1 };
@@ -1241,7 +1260,9 @@ pub(crate) fn paint_radial_nav_focus(
                    else         { let n = hcount; hcount += 1; n };
         let mid = (b.span_lo + b.span_hi) * 0.5;
         let c = if b.angular { geom.point(b.pos, mid) } else { geom.point(mid, b.pos) };
-        nav_line_rects.push((axis, line, to_global * egui::Rect::from_center_size(c, egui::vec2(18.0, 18.0))));
+        let gc = to_global * c;
+        nav_line_rects.push((axis, line, egui::Rect::from_center_size(gc, egui::vec2(18.0, 18.0))));
+        nav_targets.push((1, axis as u32, line, gc));
         let grab = match nav_tz {
             Some((pass, f, a, l, g))
                 if nav_focus_pass.saturating_sub(pass) <= 2
@@ -1254,65 +1275,40 @@ pub(crate) fn paint_radial_nav_focus(
         }
     }
     let pass_nr = ui.ctx().cumulative_pass_nr();
-    ui.ctx().data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_tz_lines", node_id.0, 0usize)),
-        (pass_nr, nav_line_rects)));
+    let nav_pass_now = crate::widgets::nav_pass(ui.ctx());
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(egui::Id::new(("gp_nav_tz_lines", node_id.0, 0usize)),
+            (pass_nr, nav_line_rects));
+        d.insert_temp(egui::Id::new(("gp_nav_tz_targets", node_id.0, 0usize)),
+            (nav_pass_now, nav_targets));
+    });
 }
 
-/// The radial zone field on the node body: paints the polar projection of the
-/// zone tree with the live hover (from the eval mirror), click-selects a zone
-/// in mapping mode, and hosts the border editor — drag borders to move them,
-/// "−" removes one, "+" adds a sector cut or ring next to the hovered border
-/// (ports mode) or splits the hovered zone from its nearest edge (mapping
-/// mode), matching the flat field's editing model.
-fn render_radial_field(
-    node_id: NodeId,
-    mapping: bool,
+/// The radial menu field's MOUSE border editor: drag dividers to move them, drag
+/// the origin seam to rotate the whole ring, double-click to recenter, and the
+/// hover "−"/"+" buttons to remove/add. Extracted so the node body AND the pinned
+/// / config-overlay field share ONE editor — the pinned radial field previously
+/// only click-selected a zone (no divider move / seam rotate over the game), which
+/// is why the mouse "could only select a zone" there. `resp` is the field's
+/// `click_and_drag` response. Returns whether a zone click-select should be
+/// SUPPRESSED (a border sits under the click, or a border drag is in progress).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn radial_border_editor(
     ui: &mut egui::Ui,
+    node_id: NodeId,
     snarl: &mut Snarl<NodeData>,
-    zone_live: &HashMap<(usize, usize), (f32, f32, bool)>,
-    colors: ZoneColors,
-    field_w: f32,
-    field_h: f32,
-) -> egui::Rect {
+    mapping: bool,
+    rect: egui::Rect,
+    deadzone: f32,
+    origin: f32,
+    resp: &egui::Response,
+    accent: egui::Color32,
+    visuals: &egui::Visuals,
+) -> bool {
     use flexinput_core::touchzones as tz;
-    let visuals = ui.visuals().clone();
-    // Editor affordances (border grips, +/- buttons) use the crisp opaque
-    // accent; the ring itself paints from the full `colors` (opacity/blend).
-    let accent = colors.accent;
     let tree = super::viewer::tz_field_tree(snarl, node_id, 0);
-    let (deadzone, origin, sel_zone, zone_maps) = {
-        let Some(node) = snarl.get_node(node_id) else {
-            return ui.allocate_exact_size(egui::vec2(field_w, field_h), egui::Sense::hover()).0;
-        };
-        (
-            pf32(node, "pointer_deadzone", 0.25),
-            pf32(node, "menu_radial_origin", 0.0),
-            node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
-        )
-    };
-    let (zone_meta, ptr) = snarl.get_node(node_id)
-        .map(|n| (menu_zone_meta(n), menu_pointer(n)))
-        .unwrap_or_default();
-    let size = field_w.min(field_h.max(160.0)).max(160.0);
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(field_w.max(size), size),
-        egui::Sense::click_and_drag(),
-    );
     let geom = RingGeom::of(rect, deadzone, origin);
-    let hover = zone_live.iter()
-        .find(|((_, _), (_, _, act))| *act)
-        .map(|((_, z), _)| *z as i32)
-        .unwrap_or(-1);
     let zones = tree.zones();
-    let picked = paint_radial_ring(
-        ui, rect, &zones, deadzone, origin, hover,
-        if mapping { Some(sel_zone) } else { None },
-        &zone_maps, &zone_meta, colors, resp.interact_pointer_pos(), ptr,
-    );
-
-    // ── Border editor ─────────────────────────────────────────────────────
     // col/row edges are kept as locals for the drag + double-click math below;
     // the draggable border list (seam first, then dividers/edges) comes from the
     // shared builder so the pinned field indexes borders identically.
@@ -1459,7 +1455,7 @@ fn render_radial_field(
             let mid = (b.span_lo + b.span_hi) * 0.5;
             let c = if b.angular { geom.point(b.pos, mid) } else { geom.point(mid, b.pos) };
             if super::viewer::tz_mini_button(ui, &painter,
-                ui.id().with((node_id, "vmrm", bi)), c, "−", accent, &visuals)
+                ui.id().with((node_id, "vmrm", bi)), c, "−", accent, visuals)
             {
                 tree_rem = Some(b.key.clone());
             }
@@ -1492,7 +1488,7 @@ fn render_radial_field(
                             (geom.point((x0 + x1) * 0.5, y1 - inset_v), tz::Axis::H, false)
                         };
                         if super::viewer::tz_mini_button(ui, &painter,
-                            ui.id().with((node_id, "vmrp")), pos, "+", accent, &visuals)
+                            ui.id().with((node_id, "vmrp")), pos, "+", accent, visuals)
                         {
                             tree_sub = Some((cx, cy, axis, new_low));
                         }
@@ -1534,13 +1530,13 @@ fn render_radial_field(
                  tz::GridOp::RemoveRow(line - 1))
             };
             if super::viewer::tz_mini_button(ui, &painter,
-                ui.id().with((node_id, "vmpa", bi)), c_plus_a, "+", accent, &visuals)
+                ui.id().with((node_id, "vmpa", bi)), c_plus_a, "+", accent, visuals)
             { grid_op = Some(ins_lo); }
             if super::viewer::tz_mini_button(ui, &painter,
-                ui.id().with((node_id, "vmpb", bi)), c_plus_b, "+", accent, &visuals)
+                ui.id().with((node_id, "vmpb", bi)), c_plus_b, "+", accent, visuals)
             { grid_op = Some(ins_hi); }
             if super::viewer::tz_mini_button(ui, &painter,
-                ui.id().with((node_id, "vm-", bi)), c_minus, "−", accent, &visuals)
+                ui.id().with((node_id, "vm-", bi)), c_minus, "−", accent, visuals)
             { grid_op = Some(rem); }
         } else if (0.0..=1.05).contains(&v) {
             let mag = (p - geom.center).length();
@@ -1550,14 +1546,14 @@ fn render_radial_field(
                 if super::viewer::tz_mini_button(ui, &painter,
                     ui.id().with((node_id, "vmbr")),
                     geom.point(uc, 1.0 - 14.0 / (geom.r_out - geom.r_in).max(1e-3)),
-                    "+", accent, &visuals)
+                    "+", accent, visuals)
                 { grid_op = Some(tz::GridOp::InsertRow(rows - 1)); }
             } else if mag - geom.r_in < 16.0 && mag > geom.r_in - 8.0 {
                 // Near the hub edge → add an inner ring.
                 if super::viewer::tz_mini_button(ui, &painter,
                     ui.id().with((node_id, "vmbh")),
                     geom.point(uc, 14.0 / (geom.r_out - geom.r_in).max(1e-3)),
-                    "+", accent, &visuals)
+                    "+", accent, visuals)
                 { grid_op = Some(tz::GridOp::InsertRow(0)); }
             } else {
                 // Near the 12-o'clock seam → first/next sector cut.
@@ -1568,7 +1564,7 @@ fn render_radial_field(
                     if super::viewer::tz_mini_button(ui, &painter,
                         ui.id().with((node_id, "vmbs")),
                         geom.point(if uc < 0.5 { side } else { 1.0 - side }, vv),
-                        "+", accent, &visuals)
+                        "+", accent, visuals)
                     {
                         grid_op = Some(tz::GridOp::InsertCol(
                             if uc < 0.5 { 0 } else { cols - 1 }));
@@ -1589,10 +1585,70 @@ fn render_radial_field(
         regenerate_menu_ports(node_id, snarl);
     }
 
-    // Zone click-select (mapping mode) — only when not grabbing a border.
-    if mapping && resp.clicked() && drag.is_none()
-        && resp.interact_pointer_pos().map(|p| hit_at(p).is_none()).unwrap_or(false)
-    {
+    drag.is_some()
+        || (resp.clicked()
+            && resp.interact_pointer_pos().and_then(|p| hit_at(p)).is_some())
+}
+
+/// The radial zone field on the node body: paints the polar projection of the
+/// zone tree with the live hover (from the eval mirror), click-selects a zone
+/// in mapping mode, and hosts the border editor — drag borders to move them,
+/// "−" removes one, "+" adds a sector cut or ring next to the hovered border
+/// (ports mode) or splits the hovered zone from its nearest edge (mapping
+/// mode), matching the flat field's editing model.
+fn render_radial_field(
+    node_id: NodeId,
+    mapping: bool,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    zone_live: &HashMap<(usize, usize), (f32, f32, bool)>,
+    colors: ZoneColors,
+    field_w: f32,
+    field_h: f32,
+) -> egui::Rect {
+    let visuals = ui.visuals().clone();
+    // Editor affordances (border grips, +/- buttons) use the crisp opaque
+    // accent; the ring itself paints from the full `colors` (opacity/blend).
+    let accent = colors.accent;
+    let tree = super::viewer::tz_field_tree(snarl, node_id, 0);
+    let (deadzone, origin, sel_zone, zone_maps) = {
+        let Some(node) = snarl.get_node(node_id) else {
+            return ui.allocate_exact_size(egui::vec2(field_w, field_h), egui::Sense::hover()).0;
+        };
+        (
+            pf32(node, "pointer_deadzone", 0.25),
+            pf32(node, "menu_radial_origin", 0.0),
+            node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            node.params.get("zone_maps").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+        )
+    };
+    let (zone_meta, ptr) = snarl.get_node(node_id)
+        .map(|n| (menu_zone_meta(n), menu_pointer(n)))
+        .unwrap_or_default();
+    let size = field_w.min(field_h.max(160.0)).max(160.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(field_w.max(size), size),
+        egui::Sense::click_and_drag(),
+    );
+    let hover = zone_live.iter()
+        .find(|((_, _), (_, _, act))| *act)
+        .map(|((_, z), _)| *z as i32)
+        .unwrap_or(-1);
+    let zones = tree.zones();
+    let picked = paint_radial_ring(
+        ui, rect, &zones, deadzone, origin, hover,
+        if mapping { Some(sel_zone) } else { None },
+        &zone_maps, &zone_meta, colors, resp.interact_pointer_pos(), ptr,
+    );
+
+    // Border editor (drag dividers / rotate the origin seam / recenter / hover
+    // ± add-remove) — shared with the pinned & config-overlay field so every
+    // surface edits identically (the pinned radial field used to only zone-select).
+    let suppress = radial_border_editor(
+        ui, node_id, snarl, mapping, rect, deadzone, origin, &resp, accent, &visuals);
+    // Zone click-select (mapping mode) — only when the click missed all borders
+    // and no border drag is in progress.
+    if mapping && resp.clicked() && !suppress {
         if let Some(z) = picked {
             if let Some(node) = snarl.get_node_mut(node_id) {
                 node.params.insert("sel_field".into(), serde_json::json!(0u64));
@@ -1600,6 +1656,9 @@ fn render_radial_field(
             }
         }
     }
+
+    // Painter for the resize grip below (the border editor kept its own).
+    let painter = ui.painter_at(rect.expand(4.0));
 
     // ── Resize grip (bottom-right corner) — same affordance as the flat
     // field, writing the shared field size (the ring diameter follows the

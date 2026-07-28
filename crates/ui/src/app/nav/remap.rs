@@ -398,6 +398,25 @@ impl FlexInputApp {
         }
     }
 
+    /// Divide the focused zone in PORTS mode (no BSP tree): insert a full grid cut
+    /// through the zone's own column/row band — the same `GridOp` the mouse "+"
+    /// applies, so typed zone-port wiring is remapped/reconnected identically.
+    pub(crate) fn tz_ports_divide(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        field: usize, zone: usize, axis: flexinput_core::touchzones::Axis)
+    {
+        use flexinput_core::touchzones::{Axis, GridOp};
+        let ncols = self.tz_edges(outer, inner, field, "col_edges").len() + 1;
+        let op = match axis {
+            Axis::V => GridOp::InsertCol(zone % ncols),
+            Axis::H => GridOp::InsertRow(zone / ncols),
+        };
+        if let Some(sp) = self.tabs[self.active_tab].canvas.snarl
+            .get_node_mut(outer).and_then(|n| n.subpatch.as_mut())
+        {
+            crate::canvas::viewer::tz_restructure(inner, field, op, &mut sp.snarl);
+        }
+    }
+
     /// Subdivide the currently-selected zone along `axis` (gamepad "add"), the new
     /// cell on the high side — same primitive as the mouse "+".
     pub(crate) fn tz_tree_add(&mut self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId,
