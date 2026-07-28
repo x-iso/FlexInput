@@ -17,24 +17,14 @@ pub(crate) fn draw_remap_card_glow(
     scope: &str,
 ) {
     let cur_pass = ctx.cumulative_pass_nr();
-    let accent = ctx.style().visuals.selection.stroke.color;
-    let [r, g, b, _] = accent.to_array();
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0))));
+    let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
+    // The action-button glow uses the full-screen painter (the action row sits at
+    // the top of the body and never scrolls); the card glow below re-clips to the
+    // card-list viewport so a card scrolled partly out is cropped at its edge.
+    let painter = crate::widgets::nav_highlight_painter(
+        ctx, egui::Id::new(("gp_nav_remap_card_glow", outer_id.0)), ctx.content_rect());
     let ring = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
-        if !rect.is_finite() || rect.width() < 1.0 { return; }
-        let n = 6;
-        for i in 0..n {
-            let t = (i as f32 + 1.0) / n as f32;
-            let grow = t * max_grow;
-            let a = (peak * (1.0 - t)).round() as u8;
-            if a == 0 { continue; }
-            painter.rect_stroke(rect.expand(grow), round + grow,
-                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
-                egui::StrokeKind::Outside);
-        }
-        painter.rect_stroke(rect.expand(1.0), round,
-            egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+        crate::widgets::paint_nav_bloom(&painter, rect, accent, round, peak, max_grow, 6, 2.0, 1.0, 2.0);
     };
 
     // Card glow (selected/entered card + focused header field). Extend the
@@ -66,19 +56,7 @@ pub(crate) fn draw_remap_card_glow(
                 .map(|(_, vp)| painter.with_clip_rect(vp));
             let cp = clipped.as_ref().unwrap_or(&painter);
             let ring_c = |rect: egui::Rect, round: f32, peak: f32, max_grow: f32| {
-                if !rect.is_finite() || rect.width() < 1.0 { return; }
-                let n = 6;
-                for i in 0..n {
-                    let t = (i as f32 + 1.0) / n as f32;
-                    let grow = t * max_grow;
-                    let a = (peak * (1.0 - t)).round() as u8;
-                    if a == 0 { continue; }
-                    cp.rect_stroke(rect.expand(grow), round + grow,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
-                        egui::StrokeKind::Outside);
-                }
-                cp.rect_stroke(rect.expand(1.0), round,
-                    egui::Stroke::new(2.0, accent), egui::StrokeKind::Outside);
+                crate::widgets::paint_nav_bloom(cp, rect, accent, round, peak, max_grow, 6, 2.0, 1.0, 2.0);
             };
             ring_c(whole, 5.0, if entered { 130.0 } else { 90.0 }, 7.0);
             if entered {
@@ -87,10 +65,12 @@ pub(crate) fn draw_remap_card_glow(
         }
     }
 
-    // Action-button glow (Learn / Special / Add) when an action is focused.
+    // Action-button glow (Learn / Special / Add) when an action is focused. The
+    // action index is nav-published, so gate it against the viewport-agnostic nav
+    // pass (the rect channels below stay same-viewport on `cur_pass`).
     let act_sel: Option<usize> = ctx.data(|d|
         d.get_temp::<(u64, usize)>(egui::Id::new(("gp_nav_remap_action", inner.0, scope))))
-        .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 2)
+        .filter(|(p, _)| crate::widgets::nav_pass_matches(ctx, *p))
         .map(|(_, i)| i)
         .filter(|i| *i != usize::MAX);
     if let Some(ai) = act_sel {
@@ -123,10 +103,12 @@ impl FlexInputApp {
         match self.nav_selected_element(outer_id).as_ref().map(|(m, e)| (m.as_str(), e.as_str())) {
             Some((_, "lean_left")) => "lean_left",
             Some((_, "lean_right")) => "lean_right",
-            // Touch Zones cards live in `zone_maps`. Routing them through the same
-            // key lets the shared Remapper card machinery (glow, scroll, field
-            // editing) operate on them unchanged.
-            Some(("module.touch_zones", "cards")) => "zone_maps",
+            // Touch Zones AND Virtual Menu cards live in `zone_maps`. Routing them
+            // through the same key lets the shared Remapper card machinery (glow,
+            // scroll, field editing) operate on them unchanged. (Missing the menu
+            // case published the selection highlight under the wrong scope, so the
+            // menu's card glow never matched — the recurring "no highlight" report.)
+            Some(("module.touch_zones", "cards")) | Some(("module.menu", "cards")) => "zone_maps",
             _ => "mappings",
         }
     }

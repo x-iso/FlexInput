@@ -381,7 +381,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
     let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
         let stamp: Option<u64> = ui.ctx().data(|d|
             d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
-        stamp == Some(ui.ctx().cumulative_pass_nr())
+        stamp.map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p))
     }).unwrap_or(false);
     let nav_capture_armed = snarl.get_node(node_id)
         .and_then(|n| n.params.get(armed_key)).and_then(|v| v.as_bool()).unwrap_or(false);

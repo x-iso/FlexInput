@@ -111,44 +111,10 @@ impl FlexInputApp {
         self.settings_dirty = true;
     }
 
-    /// The nav device driving the config overlay this frame, if any. The overlay
-    /// republishes `("gp_nav_active", dev)` with ITS viewport pass so pinned
-    /// module bodies (Remapper / Map Action auto-capture, gyro, sub-patch…) see
-    /// that UI-nav owns the device — `run_gamepad_nav` stamps the root pass,
-    /// which never matches the overlay's, so without this the Remapper's capture
-    /// state machine runs every frame instead of only on Learn.
-    pub(crate) fn config_nav_active_dev(&self) -> Option<String> {
-        self.gamepad_nav.active_dev.clone()
-    }
-
-    /// Curve-dot selection to highlight while editing a config curve pin:
-    /// `(inner_node_id, dot_index, is_moving_dot)`. The overlay republishes this
-    /// on `gp_nav_curve_sel` with ITS OWN viewport pass so the pinned curve
-    /// renderer highlights the dot — `run_gamepad_nav` stamps the root viewport's
-    /// pass, which never matches the overlay viewport's. `None` when not editing
-    /// a curve.
-    pub(crate) fn config_curve_sel(&self) -> Option<(usize, usize, bool)> {
-        use crate::gamepad_nav::EditLevel;
-        let (_, inner, _) = self.gamepad_nav.config_nav_sel.as_ref()?;
-        match self.gamepad_nav.edit_level {
-            EditLevel::CurveDots => Some((inner.0, self.gamepad_nav.curve_dot, false)),
-            EditLevel::CurveDot => Some((inner.0, self.gamepad_nav.curve_dot, true)),
-            _ => None,
-        }
-    }
-
-    /// Inner node id of the config curve pin whose segment-curvature (bias)
-    /// handles should be shown this frame (the user is holding North to bend).
-    /// The overlay republishes `gp_nav_curve_bias` with ITS OWN viewport pass so
-    /// the pinned curve renderer paints the handles — `nav_drive_curve_dot`
-    /// stamps the root viewport's pass, which never matches the overlay's. `None`
-    /// when not bending a curve segment.
-    pub(crate) fn config_curve_bias(&self) -> Option<usize> {
-        use crate::gamepad_nav::EditLevel;
-        let (_, inner, _) = self.gamepad_nav.config_nav_sel.as_ref()?;
-        (self.gamepad_nav.edit_level == EditLevel::CurveDot && self.gamepad_nav.curve_bias)
-            .then_some(inner.0)
-    }
+    // config_nav_active_dev / config_curve_sel / config_curve_bias were removed:
+    // the pinned bodies now gate `gp_nav_active` / `gp_nav_curve_sel` /
+    // `gp_nav_curve_bias` against `crate::widgets::nav_pass` (the root nav pass,
+    // readable from any viewport), so the overlay no longer republishes them.
 
     /// When the focused config pin is a mapping module (Remapper / Map Action)
     /// AND the user is editing a mapping card's response curve, the entered

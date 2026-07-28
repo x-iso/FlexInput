@@ -35,30 +35,16 @@ impl FlexInputApp {
         // editing. The bloom is concentric outside-strokes with falling alpha (a
         // true outward gradient). `editing` brightens + widens it.
         let glow = |rect: egui::Rect, editing: bool| {
-            let accent = ctx.style().visuals.selection.stroke.color;
-            let [r, g, b, _] = accent.to_array();
-            let round = 10.0_f32;
+            let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground, egui::Id::new("gp_nav_left_glow")));
-            // Outward bloom: a handful of expanding rings fading to transparent.
-            let rings = 7;
+            // Outward bloom: a handful of expanding rings fading to transparent,
+            // plus a crisp edge ring. Thicker + brighter while editing.
             let max_grow = if editing { 9.0 } else { 6.0 };
             let peak = if editing { 150.0 } else { 90.0 };
-            for i in 0..rings {
-                let t = (i as f32 + 1.0) / rings as f32; // 0..1 outward
-                let grow = t * max_grow;
-                let a = (peak * (1.0 - t)).round() as u8;
-                if a == 0 { continue; }
-                painter.rect_stroke(
-                    rect.expand(grow), round + grow,
-                    egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
-                    egui::StrokeKind::Outside,
-                );
-            }
-            // Crisp edge ring on the widget border.
-            painter.rect_stroke(rect.expand(1.0), round,
-                egui::Stroke::new(if editing { 2.0 } else { 1.25 }, accent),
-                egui::StrokeKind::Outside);
+            crate::widgets::paint_nav_bloom(
+                &painter, rect, accent, 10.0, peak, max_grow, 7, 2.0, 1.0,
+                if editing { 2.0 } else { 1.25 });
         };
 
         // ── Editing a left-panel slider ──────────────────────────────────

@@ -172,21 +172,9 @@ impl FlexInputApp {
     /// root-viewport draw never reaches it. No-op on a degenerate rect.
     pub(crate) fn paint_field_glow_ring(ctx: &egui::Context, fr: egui::Rect, accent: egui::Color32) {
         if !fr.is_finite() || fr.width() <= 0.5 { return; }
-        let [r, g, b, _] = accent.to_array();
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground, egui::Id::new("gp_nav_field_glow")));
-        let rings = 6;
-        for i in 0..rings {
-            let t = (i as f32 + 1.0) / rings as f32;
-            let grow = t * 7.0;
-            let a = (150.0 * (1.0 - t)).round() as u8;
-            if a == 0 { continue; }
-            p.rect_stroke(fr.expand(grow), 5.0 + grow,
-                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
-                egui::StrokeKind::Outside);
-        }
-        p.rect_stroke(fr.expand(1.5), 5.0, egui::Stroke::new(2.0, accent),
-            egui::StrokeKind::Outside);
+        crate::widgets::paint_nav_bloom(&p, fr, accent, 5.0, 150.0, 7.0, 6, 2.0, 1.5, 2.0);
     }
 
     /// Publish the multi-field focus HUD (pass-stamped) for the renderer overlay
@@ -222,7 +210,7 @@ impl FlexInputApp {
         };
         let rect = rects.and_then(|(_, rs)| sel.and_then(|s| rs.iter().find(|(i,_)| *i == s).map(|(_,r)| *r)));
         let Some(rect) = rect else { return; };
-        let accent = ctx.style().visuals.selection.stroke.color;
+        let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
 
         // Per-field inner glow: if the row renderer published per-control rects
         // this frame, draw an outward bloom ring on the focused field's rect so
@@ -285,6 +273,17 @@ impl FlexInputApp {
         let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
         if let Some(node) = sp.snarl.get_node_mut(inner) {
             node.params.insert(key.to_string(), serde_json::Value::Bool(val));
+        }
+    }
+    /// Remove a param on a sub-patch inner node (mirrors the mouse handlers'
+    /// `node.params.remove(k)` for capture-state keys the nav needs to clear).
+    pub(crate) fn remove_subpatch_param(&mut self, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, key: &str)
+    {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
+        if let Some(node) = sp.snarl.get_node_mut(inner) {
+            node.params.remove(key);
         }
     }
     pub(crate) fn get_subpatch_param_bool(&self, outer_id: egui_snarl::NodeId,

@@ -841,7 +841,7 @@ pub(crate) fn draw_asth_spectrum_eq_sized(node_id: NodeId, uid: usize, ui: &mut 
     // response-curve bodies use, so the EQ reuses the whole curve-dot nav path.
     let nav_sel: Option<(u64, usize, bool)> = ui.ctx().data(|d|
         d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
-    let nav_sel = nav_sel.filter(|(pass, _, _)| *pass == ui.ctx().cumulative_pass_nr());
+    let nav_sel = nav_sel.filter(|(pass, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *pass));
     for (i, pt) in eq_points.iter().enumerate() {
         let c = egui::pos2(x_of(pt[0]), y_of(pt[1]));
         let hot = drag_idx == Some(i);

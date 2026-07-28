@@ -777,12 +777,12 @@ pub(crate) fn mapping_curve_editor(
             (pass, to_global * g, 0.0f32, 1.0f32, 0.0f32, 1.0f32)));
         let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
             .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", uid))));
-        let nav_sel = nav_sel.filter(|(p, _, _)| pass.saturating_sub(*p) <= 1);
+        let nav_sel = nav_sel.filter(|(p, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *p));
         nav_sel_dot = nav_sel.map(|(_, i, _)| i);
         nav_editing = nav_sel.map(|(_, _, e)| e).unwrap_or(false);
         let nav_focused: bool = ui.ctx()
             .data(|d| d.get_temp::<u64>(egui::Id::new(("gp_nav_tz_curve_focus", uid))))
-            .map(|p| pass.saturating_sub(p) <= 1).unwrap_or(false);
+            .map(|p| crate::widgets::nav_pass_matches(ui.ctx(), p)).unwrap_or(false);
         if nav_focused || nav_sel_dot.is_some() {
             painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.5, accent), egui::StrokeKind::Inside);
         }
@@ -1006,10 +1006,9 @@ pub(crate) fn mapping_curve_editor(
 /// while being dot-edited. Only the entered card publishes (one per node), so the
 /// per-node geometry channel never collides across cards.
 pub(crate) fn curve_nav_uid(ctx: &egui::Context, node_id: NodeId, scope: &str, idx: usize) -> Option<usize> {
-    let pass = ctx.cumulative_pass_nr();
     ctx.data(|d| d.get_temp::<(u64, usize, bool)>(
             egui::Id::new(("gp_nav_remap_card", node_id.0, scope))))
-        .filter(|(p, sel, ent)| *ent && *sel == idx && pass.saturating_sub(*p) <= 1)
+        .filter(|(p, sel, ent)| *ent && *sel == idx && crate::widgets::nav_pass_matches(ctx, *p))
         .map(|_| node_id.0)
 }
 
@@ -1061,18 +1060,20 @@ pub(crate) fn mapping_card_curve_section(
     // ONE ring, drawn by the nav driver — not a second border here). `nav_field` =
     // the focused curve field on the ENTERED card (4 toggle / 5 graph / 6
     // threshold), driving the per-element highlights inside.
+    // Local pass for the section-rect publish below (a same-viewport channel);
+    // the card SELECTION reads gate on the viewport-agnostic nav pass.
     let pass = ui.ctx().cumulative_pass_nr();
     let card_sel: Option<(usize, bool)> = ui.ctx()
         .data(|d| d.get_temp::<(u64, usize, bool)>(
             egui::Id::new(("gp_nav_remap_card", node_id.0, scope))))
-        .filter(|(p, _, _)| pass.saturating_sub(*p) <= 1)
+        .filter(|(p, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *p))
         .map(|(_, sel, ent)| (sel, ent));
     let selected_here = card_sel.map(|(sel, _)| sel == idx).unwrap_or(false);
     let entered_here = card_sel.map(|(sel, ent)| ent && sel == idx).unwrap_or(false);
     let nav_field: Option<u64> = if !entered_here { None } else {
         ui.ctx().data(|d| d.get_temp::<(u64, u64)>(
                 egui::Id::new(("gp_nav_remap_card_field", node_id.0, scope))))
-            .filter(|(p, f)| *f >= 4 && pass.saturating_sub(*p) <= 1)
+            .filter(|(p, f)| *f >= 4 && crate::widgets::nav_pass_matches(ui.ctx(), *p))
             .map(|(_, f)| f)
     };
     let out = egui::Frame::default()
@@ -1084,13 +1085,12 @@ pub(crate) fn mapping_card_curve_section(
     let open_id = egui::Id::new(("card_curve_open", node_id.0, scope.to_string(), idx));
     let mut open = ui.ctx().data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
     if let Some(uid) = nav_uid {
-        let pass = ui.ctx().cumulative_pass_nr();
         let focus = ui.ctx()
             .data(|d| d.get_temp::<u64>(egui::Id::new(("gp_nav_tz_curve_focus", uid))))
-            .map(|p| pass.saturating_sub(p) <= 1).unwrap_or(false);
+            .map(|p| crate::widgets::nav_pass_matches(ui.ctx(), p)).unwrap_or(false);
         let entered = ui.ctx()
             .data(|d| d.get_temp::<(u64, usize, bool)>(egui::Id::new(("gp_nav_curve_sel", uid))))
-            .map(|(p, _, _)| pass.saturating_sub(p) <= 1).unwrap_or(false);
+            .map(|(p, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), p)).unwrap_or(false);
         if focus || entered { open = true; }
     }
 
@@ -1513,7 +1513,9 @@ pub(crate) fn tz_draw_field(
     // the in-canvas body (different node-id space) never false-matches.
     let nav_tz: Option<(u64, u64, u64, u64, bool)> =
         ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_tz", node_id.0))));
-    let cur_pass = ui.ctx().cumulative_pass_nr();
+    // Gate the field-focus highlight against the viewport-agnostic nav pass so it
+    // shows in the config overlay's own viewport too (see `crate::widgets::nav_pass`).
+    let cur_pass = crate::widgets::nav_pass(ui.ctx());
     let nav_focus = move |axis: u64, line: usize| -> Option<bool> {
         match nav_tz {
             Some((pass, f, a, l, grabbed))
@@ -1522,8 +1524,9 @@ pub(crate) fn tz_draw_field(
             _ => None,
         }
     };
+    let grabbed_col = crate::widgets::NavHighlightStyle::of(ui.ctx()).grabbed;
     let nav_stroke = |grabbed: bool| -> (f32, egui::Color32) {
-        if grabbed { (3.0, egui::Color32::from_rgb(90, 220, 120)) } else { (3.0, accent) }
+        if grabbed { (3.0, grabbed_col) } else { (3.0, accent) }
     };
     // Per-divider global-space hit-rects, published for the gamepad RS-cursor
     // hover-select in `nav_drive_touch_zones`. (axis: 0=col/1=row, index, rect).
@@ -1806,6 +1809,11 @@ pub(crate) fn render_touch_zones_pinned(
                 }
             }
         }
+        // Gamepad-nav focused-border highlight: the pinned radial field paints the
+        // ring itself (no node-body border editor), so draw the focus highlight +
+        // RS-cursor hit-rects here too — otherwise you edit a divider blind.
+        crate::canvas::menu_body::paint_radial_nav_focus(
+            ui, inner_id, inner_snarl, rect, deadzone, origin, mapping);
         return;
     }
 
@@ -2411,7 +2419,22 @@ pub(crate) fn render_touch_zone_cards(
         let base: Option<Vec<String>> = getp(snarl, "_tz_gp_base")
             .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()));
         let base = match base {
-            Some(b) => b,
+            Some(b) => {
+                // Prune baseline pins that have since been RELEASED. Without this
+                // the button used to ARM the capture stays excluded forever — a
+                // problem unique to gamepad nav, where you press South to trigger
+                // "Learn", so South is in the baseline and could never be bound as
+                // the output. Once released it leaves the baseline, so pressing it
+                // again is a fresh press and captures normally.
+                let pruned: Vec<String> = b.iter().filter(|p| pressed_now.contains(*p)).cloned().collect();
+                if pruned.len() != b.len() {
+                    if let Some(node) = snarl.get_node_mut(node_id) {
+                        node.params.insert("_tz_gp_base".into(),
+                            Value::Array(pruned.iter().map(|p| Value::from(p.as_str())).collect()));
+                    }
+                }
+                pruned
+            }
             None => {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     node.params.insert("_tz_gp_base".into(),

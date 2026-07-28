@@ -146,26 +146,16 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let (gp_editing, gp_pad_active) = app.config_nav_state();
     // Controller-icon legend groups, matching the Easy-mode bottom bar.
     let legend = if gp_pad_active { app.config_legend_specs(ctx) } else { Vec::new() };
-    // Curve-dot highlight to republish with the overlay's own viewport pass.
-    let curve_sel = app.config_curve_sel();
-    // Inner node of the curve whose bias (bend) handles should show this frame.
-    let curve_bias = app.config_curve_bias();
     // For a focused mapping-module pin: the card whose curve is being edited (so
     // its input passes through). `None` = block everything (default for mapping).
     let remapper_card_edit = app.config_remapper_card_edit();
     // While card-navigating a pinned Remapper / TZ list: (outer, inner, scope) so
-    // the overlay republishes the selection with its own pass + draws the glow.
+    // the overlay draws the card glow (the selection now gates via nav_pass, so
+    // no per-channel republish is needed — see the note in the closure below).
     let remap_glow = app.config_remap_glow();
-    // While line-editing a pinned TZ / Virtual Menu field: the inner node whose
-    // `gp_nav_tz` focus channel must be republished with the overlay pass so the
-    // focused grid line / radial border highlights over the game.
-    let tz_glow = app.config_tz_glow();
     // Focused value-field to draw a glow ring on (computed here — the closure
     // can't borrow `app`); redrawn in the overlay viewport by the closure.
     let field_glow_target = app.config_field_glow_target();
-    // The nav device driving the overlay — republished as "gp_nav_active" so
-    // pinned bodies (Remapper capture, gyro, …) see UI-nav owns it this frame.
-    let nav_active_dev = app.config_nav_active_dev();
     // Pass-through policy: OFF (default) = input reaches the game only while a pin
     // is actually being tweaked; ON = the focused pin's input always passes.
     let passthrough_default = app.config_passthrough_default();
@@ -436,68 +426,12 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     }
                 }
 
-                // Republish the curve-dot highlight with THIS viewport's pass so
-                // the pinned curve renderer (below) rings the selected dot — the
-                // pass stamped in run_gamepad_nav is the root viewport's and never
-                // matches here.
-                if let Some((inner, dot, editing)) = curve_sel {
-                    let pass = ui.ctx().cumulative_pass_nr();
-                    ui.ctx().data_mut(|d| {
-                        d.insert_temp(egui::Id::new(("gp_nav_curve_sel", inner)), (pass, dot, editing));
-                    });
-                }
-                // Same per-viewport republish for the bias-handle visibility flag
-                // so the curve shows its bend handles while North is held.
-                if let Some(inner) = curve_bias {
-                    let pass = ui.ctx().cumulative_pass_nr();
-                    ui.ctx().data_mut(|d| {
-                        d.insert_temp(egui::Id::new(("gp_nav_curve_bias", inner)), pass);
-                    });
-                }
-                // Republish "gp_nav_active" for the driving device with THIS
-                // viewport's pass so pinned bodies see that UI-nav owns it —
-                // without this the Remapper / Map Action auto-capture runs every
-                // frame (impossible to use) instead of only after Learn.
-                if let Some(dev) = &nav_active_dev {
-                    let pass = ui.ctx().cumulative_pass_nr();
-                    ui.ctx().data_mut(|d| {
-                        d.insert_temp(egui::Id::new(("gp_nav_active", dev.clone())), pass);
-                    });
-                }
-
-                // Republish the mapping-card selection channels with THIS pass so
-                // the pinned Remapper / TZ body highlights the selected card and
-                // publishes its rects (the drawer below reads them). Same cross-
-                // viewport pass gap as the curve dots.
-                // Republish the TZ / Virtual Menu field-line focus with THIS
-                // pass so the pinned field body highlights the focused grid line
-                // or radial border (same cross-viewport pass gap as the curves).
-                if let Some(inner) = tz_glow {
-                    let pass = ui.ctx().cumulative_pass_nr();
-                    ui.ctx().data_mut(|d| {
-                        let id = egui::Id::new(("gp_nav_tz", inner));
-                        if let Some((_, f, a, l, g)) = d.get_temp::<(u64, u64, u64, u64, bool)>(id) {
-                            d.insert_temp(id, (pass, f, a, l, g));
-                        }
-                    });
-                }
-                if let Some((_, inner, scope)) = &remap_glow {
-                    let pass = ui.ctx().cumulative_pass_nr();
-                    ui.ctx().data_mut(|d| {
-                        let id_c = egui::Id::new(("gp_nav_remap_card", inner.0, scope.as_str()));
-                        if let Some((_, i, e)) = d.get_temp::<(u64, usize, bool)>(id_c) {
-                            d.insert_temp(id_c, (pass, i, e));
-                        }
-                        let id_a = egui::Id::new(("gp_nav_remap_action", inner.0, scope.as_str()));
-                        if let Some((_, a)) = d.get_temp::<(u64, usize)>(id_a) {
-                            d.insert_temp(id_a, (pass, a));
-                        }
-                        let id_f = egui::Id::new(("gp_nav_remap_card_field", inner.0, scope.as_str()));
-                        if let Some((_, f)) = d.get_temp::<(u64, u64)>(id_f) {
-                            d.insert_temp(id_f, (pass, f));
-                        }
-                    });
-                }
+                // NOTE: the per-channel highlight re-stamps that used to live here
+                // (curve dots/bias, gp_nav_active, gp_nav_tz, remapper card/field/
+                // action) are gone — the pinned bodies now gate those channels via
+                // `crate::widgets::nav_pass`, which returns the ROOT nav pass in any
+                // viewport, so the highlights match in this overlay viewport with no
+                // republishing. New highlight channels get this for free.
 
                 crate::canvas::overlay_body::show_overlay_body(
                     ui, rect, tab_snarl, config_layout, edit,

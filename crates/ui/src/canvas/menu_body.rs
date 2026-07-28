@@ -1147,6 +1147,97 @@ fn paint_ring_border(p: &egui::Painter, geom: &RingGeom, b: &RingBorder, stroke:
     }
 }
 
+/// Materialize the ring's borders — the origin seam first, then either the
+/// mapping-tree dividers or the ports-mode col/row edges. Shared by the node-body
+/// editor (`render_radial_field`) and the pinned field so both index borders
+/// identically for the gamepad-nav focus highlight.
+fn radial_nav_borders(snarl: &Snarl<NodeData>, node_id: NodeId, mapping: bool) -> Vec<RingBorder> {
+    use flexinput_core::touchzones as tz;
+    const SEAM_KEY: u8 = 254;
+    let mut borders: Vec<RingBorder> = vec![RingBorder {
+        angular: true, pos: 0.0, span_lo: 0.0, span_hi: 1.0,
+        lo: 0.0, hi: 1.0, key: vec![SEAM_KEY], seam: true,
+    }];
+    if mapping {
+        let tree = super::viewer::tz_field_tree(snarl, node_id, 0);
+        borders.extend(tree.dividers().iter().map(|d| RingBorder {
+            angular: matches!(d.axis, tz::Axis::V),
+            pos: d.pos, span_lo: d.span_lo, span_hi: d.span_hi,
+            lo: d.lo, hi: d.hi, key: d.path.clone(), seam: false,
+        }));
+    } else {
+        let col_edges = super::viewer::tz_read_field_edges(snarl, node_id, 0, "col_edges");
+        let row_edges = super::viewer::tz_read_field_edges(snarl, node_id, 0, "row_edges");
+        borders.extend(col_edges.iter().enumerate().map(|(i, &e)| RingBorder {
+            angular: true, pos: e, span_lo: 0.0, span_hi: 1.0,
+            lo: if i == 0 { 0.02 } else { col_edges[i - 1] + 0.04 },
+            hi: if i + 1 == col_edges.len() { 0.98 } else { col_edges[i + 1] - 0.04 },
+            key: vec![i as u8], seam: false,
+        }));
+        borders.extend(row_edges.iter().enumerate().map(|(i, &e)| RingBorder {
+            angular: false, pos: e, span_lo: 0.0, span_hi: 1.0,
+            lo: if i == 0 { 0.05 } else { row_edges[i - 1] + 0.06 },
+            hi: if i + 1 == row_edges.len() { 0.95 } else { row_edges[i + 1] - 0.06 },
+            key: vec![i as u8], seam: false,
+        }));
+    }
+    borders
+}
+
+/// Draw the gamepad-nav focused-border highlight on a radial menu field and
+/// publish per-border midpoint hit-rects for the RS cursor (keyed by `node_id`,
+/// field 0). Angular borders are the "column"/V axis, radial rings the "row"/H
+/// axis, counted per axis to match the TZ nav driver's (axis, line) index model.
+/// Shared by the node body AND the pinned field renderer so both show which
+/// divider is being edited over the game. Gates against the viewport-agnostic
+/// `nav_pass` so it shows in the config overlay's own viewport.
+pub(crate) fn paint_radial_nav_focus(
+    ui: &egui::Ui,
+    node_id: NodeId,
+    snarl: &Snarl<NodeData>,
+    rect: egui::Rect,
+    deadzone: f32,
+    origin: f32,
+    mapping: bool,
+) {
+    let nav_tz: Option<(u64, u64, u64, u64, bool)> =
+        ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_tz", node_id.0))));
+    let nav_focus_pass = crate::widgets::nav_pass(ui.ctx());
+    let geom = RingGeom::of(rect, deadzone, origin);
+    let borders = radial_nav_borders(snarl, node_id, mapping);
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let painter = ui.painter_at(rect.expand(4.0));
+    let style = crate::widgets::NavHighlightStyle::of(ui.ctx());
+    let mut nav_line_rects: Vec<(u8, u32, egui::Rect)> = Vec::new();
+    let (mut vcount, mut hcount) = (0u32, 0u32);
+    for b in &borders {
+        if b.seam {
+            continue;
+        }
+        let axis: u8 = if b.angular { 0 } else { 1 };
+        let line = if b.angular { let n = vcount; vcount += 1; n }
+                   else         { let n = hcount; hcount += 1; n };
+        let mid = (b.span_lo + b.span_hi) * 0.5;
+        let c = if b.angular { geom.point(b.pos, mid) } else { geom.point(mid, b.pos) };
+        nav_line_rects.push((axis, line, to_global * egui::Rect::from_center_size(c, egui::vec2(18.0, 18.0))));
+        let grab = match nav_tz {
+            Some((pass, f, a, l, g))
+                if nav_focus_pass.saturating_sub(pass) <= 2
+                    && f == 0 && a == axis as u64 && l == line as u64 => Some(g),
+            _ => None,
+        };
+        if let Some(g) = grab {
+            let col = if g { style.grabbed } else { style.accent };
+            paint_ring_border(&painter, &geom, b, egui::Stroke::new(3.0, col));
+        }
+    }
+    let pass_nr = ui.ctx().cumulative_pass_nr();
+    ui.ctx().data_mut(|d| d.insert_temp(
+        egui::Id::new(("gp_nav_tz_lines", node_id.0, 0usize)),
+        (pass_nr, nav_line_rects)));
+}
+
 /// The radial zone field on the node body: paints the polar projection of the
 /// zone tree with the live hover (from the eval mirror), click-selects a zone
 /// in mapping mode, and hosts the border editor — drag borders to move them,
@@ -1201,51 +1292,12 @@ fn render_radial_field(
     );
 
     // ── Border editor ─────────────────────────────────────────────────────
+    // col/row edges are kept as locals for the drag + double-click math below;
+    // the draggable border list (seam first, then dividers/edges) comes from the
+    // shared builder so the pinned field indexes borders identically.
     let col_edges = super::viewer::tz_read_field_edges(snarl, node_id, 0, "col_edges");
     let row_edges = super::viewer::tz_read_field_edges(snarl, node_id, 0, "row_edges");
-    // The origin seam (tree-u 0) is always present as a draggable border —
-    // dragging it rotates the whole ring. It's drawn thicker to mark the
-    // menu's angular origin. `key = [SEAM_KEY]` distinguishes it from real
-    // dividers (no real divider path/edge index ever reaches 254).
-    const SEAM_KEY: u8 = 254;
-    let seam = RingBorder {
-        angular: true, pos: 0.0, span_lo: 0.0, span_hi: 1.0,
-        lo: 0.0, hi: 1.0, key: vec![SEAM_KEY], seam: true,
-    };
-    let mut borders: Vec<RingBorder> = vec![seam];
-    if mapping {
-        borders.extend(tree.dividers().iter().map(|d| RingBorder {
-            angular: matches!(d.axis, tz::Axis::V),
-            pos: d.pos,
-            span_lo: d.span_lo,
-            span_hi: d.span_hi,
-            lo: d.lo,
-            hi: d.hi,
-            key: d.path.clone(),
-            seam: false,
-        }));
-    } else {
-        borders.extend(col_edges.iter().enumerate().map(|(i, &e)| RingBorder {
-            angular: true,
-            pos: e,
-            span_lo: 0.0,
-            span_hi: 1.0,
-            lo: if i == 0 { 0.02 } else { col_edges[i - 1] + 0.04 },
-            hi: if i + 1 == col_edges.len() { 0.98 } else { col_edges[i + 1] - 0.04 },
-            key: vec![i as u8],
-            seam: false,
-        }));
-        borders.extend(row_edges.iter().enumerate().map(|(i, &e)| RingBorder {
-            angular: false,
-            pos: e,
-            span_lo: 0.0,
-            span_hi: 1.0,
-            lo: if i == 0 { 0.05 } else { row_edges[i - 1] + 0.06 },
-            hi: if i + 1 == row_edges.len() { 0.95 } else { row_edges[i + 1] - 0.06 },
-            key: vec![i as u8],
-            seam: false,
-        }));
-    }
+    let borders = radial_nav_borders(snarl, node_id, mapping);
 
     let painter = ui.painter_at(rect.expand(4.0));
     let from_global = ui.ctx().layer_transform_to_global(ui.layer_id())
@@ -1350,50 +1402,13 @@ fn render_radial_field(
         }
     }
 
-    // Gamepad-nav focus: the shared TZ line editor (`nav_drive_touch_zones`)
-    // drives radial borders by the SAME (axis, line) index model as the flat
-    // field — angular borders are the "column"/V axis (0), radial rings the
-    // "row"/H axis (1), each counted per axis in border order (which matches the
-    // driver's `dividers()` walk in mapping mode and the edge-array index in
-    // ports mode). Read the published focus to highlight the divider, and expose
-    // per-border hit-rects for the RS cursor: a small box at each border's
-    // midpoint (an arc has no useful bounding rect, so a point target replaces
-    // the flat field's full-span strip). The origin seam is never a nav divider.
-    let nav_tz: Option<(u64, u64, u64, u64, bool)> =
-        ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_tz", node_id.0))));
-    let cur_pass = ui.ctx().cumulative_pass_nr();
-    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
-        .unwrap_or(egui::emath::TSTransform::IDENTITY);
-    let mut nav_line_rects: Vec<(u8, u32, egui::Rect)> = Vec::new();
-    let (mut vcount, mut hcount) = (0u32, 0u32);
-
     // Border strokes (hot = hovered or mid-drag). The origin seam is drawn
     // thicker so it reads as the ring's reference edge.
     for (i, b) in borders.iter().enumerate() {
         let hot = dragged_border == Some(i)
             || (dragged_border.is_none()
                 && ptr.and_then(hit_at) == Some(i));
-        // Per-axis nav index + midpoint cursor hit-box for non-seam borders.
-        let nav_ax_line = if b.seam {
-            None
-        } else {
-            let axis: u8 = if b.angular { 0 } else { 1 };
-            let line = if b.angular { let n = vcount; vcount += 1; n }
-                       else         { let n = hcount; hcount += 1; n };
-            let mid = (b.span_lo + b.span_hi) * 0.5;
-            let c = if b.angular { geom.point(b.pos, mid) } else { geom.point(mid, b.pos) };
-            nav_line_rects.push((axis, line, to_global * egui::Rect::from_center_size(c, egui::vec2(18.0, 18.0))));
-            Some((axis as u64, line as u64))
-        };
-        let nav_grab = match (nav_tz, nav_ax_line) {
-            (Some((pass, f, a, l, g)), Some((ax, ln)))
-                if cur_pass.saturating_sub(pass) <= 2 && f == 0 && a == ax && l == ln => Some(g),
-            _ => None,
-        };
-        let stroke = if let Some(grabbed) = nav_grab {
-            egui::Stroke::new(3.0,
-                if grabbed { egui::Color32::from_rgb(90, 220, 120) } else { accent })
-        } else if hot {
+        let stroke = if hot {
             egui::Stroke::new(if b.seam { 4.0 } else { 2.0 }, accent)
         } else if b.seam {
             egui::Stroke::new(3.0, visuals.weak_text_color().gamma_multiply(1.4))
@@ -1402,12 +1417,13 @@ fn render_radial_field(
         };
         paint_ring_border(&painter, &geom, b, stroke);
     }
-    ui.ctx().data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_tz_lines", node_id.0, 0usize)),
-        (cur_pass, nav_line_rects)));
     if dragged_border.is_some() || ptr.and_then(hit_at).is_some() {
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
     }
+
+    // Gamepad-nav focused-border highlight + RS-cursor hit-rects, shared with the
+    // pinned field renderer so both surfaces show which divider is being edited.
+    paint_radial_nav_focus(ui, node_id, snarl, rect, deadzone, origin, mapping);
 
     // "−" / "+" mini buttons.
     let mut grid_op: Option<tz::GridOp> = None;

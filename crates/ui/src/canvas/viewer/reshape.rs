@@ -553,7 +553,7 @@ pub(crate) fn draw_reshape_curve_editor(
                 (pass, screen_rect, x_lo, x_hi, 0.0f32, y_max)));
             let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
                 .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
-            if let Some((_, idx, editing)) = nav_sel.filter(|(pp, _, _)| *pp == pass) {
+            if let Some((_, idx, editing)) = nav_sel.filter(|(pp, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *pp)) {
                 if let Some(&[px, py]) = pts.get(idx) {
                     let ring = if editing { Color32::from_rgb(255, 210, 80) } else { Color32::from_rgb(120, 200, 255) };
                     painter.circle_stroke(c2s(px, py), 7.0, egui::Stroke::new(1.5, ring));

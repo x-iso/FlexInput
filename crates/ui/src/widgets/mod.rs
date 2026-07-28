@@ -174,3 +174,112 @@ pub(crate) fn fxi_color_swatch(
     );
     changed
 }
+
+// ── Gamepad-nav highlight subsystem ─────────────────────────────────────────
+// One place for the selection/focus glow so (a) it looks identical everywhere,
+// (b) a future restyle is a single edit, and (c) the viewport-pass gating that
+// makes highlights show in the separate config-overlay window lives in one
+// helper instead of scattered per-channel re-stamps.
+
+/// Ctx-data slot holding the pass number the nav driver stamps its highlight
+/// channels with each frame (see `nav_pass`). Written once per `run_gamepad_nav`.
+pub(crate) const NAV_PASS_KEY: &str = "gp_nav_pass";
+
+/// The pass all nav highlights are stamped with this frame. `egui`'s `data` map
+/// is shared across viewports but `cumulative_pass_nr()` is PER-viewport, so a
+/// pinned body rendered in the config-overlay viewport must gate its highlight
+/// against THIS (the root nav pass) rather than its own viewport's counter —
+/// otherwise the highlight silently mismatches over the game. Falls back to the
+/// local pass when the nav driver hasn't run (e.g. no gamepad), which is fine
+/// because no highlight channel is published on those frames either.
+pub(crate) fn nav_pass(ctx: &egui::Context) -> u64 {
+    ctx.data(|d| d.get_temp::<u64>(egui::Id::new(NAV_PASS_KEY)))
+        .unwrap_or_else(|| ctx.cumulative_pass_nr())
+}
+
+/// True if a highlight channel stamped with `pass` is current this frame,
+/// tolerant of a small lag (mirrors the existing `saturating_sub(pass) <= 2`
+/// gates). Use at every SELECTION/focus channel read that a pinned body or glow
+/// painter performs, in place of `pass == ui.ctx().cumulative_pass_nr()`.
+pub(crate) fn nav_pass_matches(ctx: &egui::Context, pass: u64) -> bool {
+    nav_pass(ctx).saturating_sub(pass) <= 2
+}
+
+/// Centralized appearance of every gamepad-nav highlight. Built from the active
+/// egui visuals so it tracks the theme; the single seam a future custom theme
+/// would override to restyle all highlights at once.
+#[derive(Clone, Copy)]
+pub(crate) struct NavHighlightStyle {
+    /// Focused/selected ring colour.
+    pub accent: egui::Color32,
+    /// Ring colour while a divider/handle is grabbed (being dragged by nav).
+    pub grabbed: egui::Color32,
+}
+
+impl NavHighlightStyle {
+    pub(crate) fn from_visuals(v: &egui::Visuals) -> Self {
+        Self {
+            accent: v.selection.stroke.color,
+            grabbed: egui::Color32::from_rgb(90, 220, 120),
+        }
+    }
+    pub(crate) fn of(ctx: &egui::Context) -> Self {
+        Self::from_visuals(&ctx.style().visuals)
+    }
+}
+
+/// The standard "on top, clipped to its container" painter for a post-hoc glow:
+/// a `Foreground`-layer painter cropped to `clip`, so a highlight on content
+/// inside a `ScrollArea` (e.g. a Remapper card scrolled partly out of view) is
+/// cropped at the visible edge instead of spilling over the hidden part. Inline
+/// callers pass `ui.clip_rect()`; post-hoc callers pass their published
+/// container rect (or the full rect when there is no scroll container).
+pub(crate) fn nav_highlight_painter(ctx: &egui::Context, id: egui::Id, clip: egui::Rect) -> egui::Painter {
+    ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, id))
+        .with_clip_rect(clip)
+}
+
+/// Outward-bloom highlight on `rect`: `rings` expanding strokes fading from
+/// `peak` alpha (the outermost grows `max_grow` px), then a crisp inner ring.
+/// All geometry is explicit so each existing highlight reproduces exactly;
+/// `color` is normally `style.accent` (or `style.grabbed`). Draws on `painter`,
+/// which the caller has already set to the right layer + clip.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_nav_bloom(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+    round: f32,
+    peak: f32,
+    max_grow: f32,
+    rings: usize,
+    ring_stroke: f32,
+    inner_expand: f32,
+    inner_stroke: f32,
+) {
+    if !rect.is_finite() || rect.width() < 1.0 {
+        return;
+    }
+    let [r, g, b, _] = color.to_array();
+    let n = rings.max(1);
+    for i in 0..n {
+        let t = (i as f32 + 1.0) / n as f32; // 0..1 outward
+        let grow = t * max_grow;
+        let a = (peak * (1.0 - t)).round() as u8;
+        if a == 0 {
+            continue;
+        }
+        painter.rect_stroke(
+            rect.expand(grow),
+            round + grow,
+            egui::Stroke::new(ring_stroke, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+            egui::StrokeKind::Outside,
+        );
+    }
+    painter.rect_stroke(
+        rect.expand(inner_expand),
+        round,
+        egui::Stroke::new(inner_stroke, color),
+        egui::StrokeKind::Outside,
+    );
+}

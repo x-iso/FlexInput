@@ -67,7 +67,7 @@ pub(crate) fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, sc
     // row sits at the top of the body, so this brings the buttons back on-screen
     // when the user navigates up from the cards.
     let act_sel = action_sel
-        .filter(|(p, _)| pass.saturating_sub(*p) <= 2)
+        .filter(|(p, _)| crate::widgets::nav_pass_matches(ui.ctx(), *p))
         .map(|(_, i)| i)
         .filter(|i| *i != usize::MAX);
     if let Some(ai) = act_sel {

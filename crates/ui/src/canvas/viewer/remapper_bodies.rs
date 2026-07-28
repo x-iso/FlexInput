@@ -52,7 +52,7 @@ pub(crate) fn show_remapper_body(
     let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
         let stamp: Option<u64> = ui.ctx().data(|d|
             d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
-        stamp == Some(ui.ctx().cumulative_pass_nr())
+        stamp.map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p))
     }).unwrap_or(false);
 
     // While UI-nav is active, the auto-capture state machine is suppressed (the
@@ -730,7 +730,7 @@ pub(crate) fn show_map_action_body(
     let nav_active_for_device = upstream_dev_id.as_deref().map(|dev| {
         let stamp: Option<u64> = ui.ctx().data(|d|
             d.get_temp(egui::Id::new(("gp_nav_active", dev.to_string()))));
-        stamp == Some(ui.ctx().cumulative_pass_nr())
+        stamp.map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p))
     }).unwrap_or(false);
     // One-shot capture arm: in nav mode, auto-capture is suppressed so the
     // gamepad can drive the UI without polluting the mapping. The "Capture"

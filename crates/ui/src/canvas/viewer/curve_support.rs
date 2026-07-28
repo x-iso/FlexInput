@@ -502,7 +502,7 @@ pub(crate) fn paint_response_curve_graph(
     // Bias handles show on mouse Alt OR gamepad bias mode (hold-North).
     let nav_bias = ui.ctx().data(|d|
         d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
-        == Some(ui.ctx().cumulative_pass_nr());
+        .map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p));
     let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
     if alt_held && new_points.len() >= 2 {
         while new_biases.len() < new_points.len() - 1 { new_biases.push(0.0); }
@@ -578,7 +578,7 @@ pub(crate) fn paint_response_curve_graph(
         let sel: Option<(u64, usize, bool)> = ui.ctx().data(|d|
             d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
         if let Some((pass, sel_i, editing_dot)) = sel {
-            if pass == ui.ctx().cumulative_pass_nr() && sel_i == i {
+            if crate::widgets::nav_pass_matches(ui.ctx(), pass) && sel_i == i {
                 let accent = ui.visuals().selection.stroke.color;
                 let [r8, g8, b8, _] = accent.to_array();
                 for k in 0..5 {

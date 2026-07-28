@@ -1938,6 +1938,17 @@ impl eframe::App for FlexInputApp {
         // always-on-top viewport over the game. If the owning surface has closed,
         // fall back to the main window so the modal can't become unreachable.
         let picker_vp = crate::config_overlay::picker_viewport_id();
+        // Universal routing: while the config overlay is up the main window is
+        // behind the game and unreachable, so ANY picker opened without an
+        // explicit viewport (gamepad "Assign", a body "Special…" click, …) must
+        // render OVER THE GAME. Promote it here, in the one central spot, so no
+        // individual picker entry point has to special-case the overlay.
+        if self.gamepad_nav.kbm_picker_open
+            && self.gamepad_nav.kbm_picker_viewport.is_none()
+            && crate::config_overlay::config_overlay_visible(ctx)
+        {
+            self.gamepad_nav.kbm_picker_viewport = Some(picker_vp);
+        }
         if let Some(vp) = self.gamepad_nav.kbm_picker_viewport {
             if vp == picker_vp {
                 // Config-overlay picker is valid only while the overlay is up.
@@ -3110,6 +3121,15 @@ impl FlexInputApp {
     /// window focus, so alt-tabbing to a game restores normal mappings.
     fn run_gamepad_nav(&mut self, ctx: &egui::Context) {
         use crate::gamepad_nav as gn;
+
+        // Publish the pass every nav highlight is stamped with this frame, so a
+        // pinned body / glow painter can gate against it from ANY viewport — the
+        // config overlay renders in its own viewport whose `cumulative_pass_nr`
+        // differs from the root's, which is why highlights kept mismatching over
+        // the game. Read via `crate::widgets::nav_pass`. (Compute the pass BEFORE
+        // taking the data lock — nesting the two ctx locks self-deadlocks.)
+        let nav_pass_now = ctx.cumulative_pass_nr();
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(crate::widgets::NAV_PASS_KEY), nav_pass_now));
 
         let raw_focused = ctx.input(|i| i.focused);
         let easy_mode = self.settings.ui_mode == settings::UiMode::Easy;

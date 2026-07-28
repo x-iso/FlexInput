@@ -120,7 +120,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
                     .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
                 let nav_sel_dot: Option<usize> = nav_sel
-                    .filter(|(p, _, _)| *p == pass)
+                    .filter(|(p, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *p))
                     .map(|(_, i, _)| i);
                 // Compute grid node positions (including 0 and 1 endpoints) in
                 // normalized [0,1] graph space, with redistribution of crowded lines.
@@ -301,7 +301,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                 // bias mode this frame (hold-North in CurveDot level).
                 let nav_bias = ui.ctx().data(|d|
                     d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
-                    == Some(ui.ctx().cumulative_pass_nr());
+                    .map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p));
                 let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
                 if alt_held && new_points.len() >= 2 {
                     while new_biases.len() < new_points.len() - 1 { new_biases.push(0.0); }
@@ -1274,7 +1274,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
                     .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
                 let nav_sel_dot: Option<usize> = nav_sel
-                    .filter(|(p, _, _)| *p == pass)
+                    .filter(|(p, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *p))
                     .map(|(_, i, _)| i);
                 let nav_editing_dot: bool = nav_sel.map(|(_, _, e)| e).unwrap_or(false);
 
@@ -1372,7 +1372,7 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                 // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
                 let nav_bias = ui.ctx().data(|d|
                     d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
-                    == Some(ui.ctx().cumulative_pass_nr());
+                    .map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p));
                 let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
                 if alt_held && new_edit_pts.len() >= 2 {
                     while new_edit_biases.len() < new_edit_pts.len() - 1 { new_edit_biases.push(0.0); }
@@ -1842,10 +1842,10 @@ pub(crate) fn paint_twoway_curve_graph(
         (pass, to_global * rect, x_lo, x_hi, y_lo, y_hi)));
     let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
         .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
-    let nav_sel_dot: Option<usize> = nav_sel.filter(|(p,_,_)| *p == pass).map(|(_,i,_)| i);
+    let nav_sel_dot: Option<usize> = nav_sel.filter(|(p,_,_)| crate::widgets::nav_pass_matches(ui.ctx(), *p)).map(|(_,i,_)| i);
     let nav_editing_dot: bool = nav_sel.map(|(_,_,e)| e).unwrap_or(false);
     let nav_bias = ui.ctx().data(|d|
-        d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0)))) == Some(pass);
+        d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0)))).map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p));
 
     let painter = ui.painter_at(rect);
     let (graph_bg, graph_outline) = graph_chrome(graph_ov);

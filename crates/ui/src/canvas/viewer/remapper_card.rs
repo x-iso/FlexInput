@@ -180,7 +180,10 @@ pub(crate) fn remapper_mapping_card_pixel(
     // and (pass, field) for the focused header field. We glow the selected card
     // and (when entered) the focused field; field rects are captured below as
     // each header control is laid out: [press-mode, time-gap, hold, turbo].
-    let cur_pass = ui.ctx().cumulative_pass_nr();
+    // Viewport-agnostic nav pass so the card highlight shows in the config
+    // overlay's own viewport (see `crate::widgets::nav_pass`). Distinct from the
+    // local `pass` used below to publish the card RECTS (a same-viewport channel).
+    let cur_pass = crate::widgets::nav_pass(ui.ctx());
     let (nav_card_sel, nav_card_entered) = ui.ctx()
         .data(|d| d.get_temp::<(u64, usize, bool)>(egui::Id::new(("gp_nav_remap_card", node_id.0, nav_scope))))
         .filter(|(p, _, _)| cur_pass.saturating_sub(*p) <= 1)

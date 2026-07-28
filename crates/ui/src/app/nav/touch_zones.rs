@@ -276,11 +276,16 @@ impl FlexInputApp {
     /// control is appended LAST (matching the right-aligned DragValue), navigable
     /// like a button and nudged with LT/RT. Keeping this identical to the body
     /// keeps the nav glow on the right item.
-    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, show_mouse_speed: bool) -> Vec<&'static str> {
-        let mut v = match phase {
-            "idle"     => vec!["learn"],
-            "learning" => vec!["cancel"],
-            _          => vec!["assign", "gamepad", "add", "cancel"], // captured
+    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, show_mouse_speed: bool, menu: bool) -> Vec<&'static str> {
+        // A Virtual Menu zone is triggered by its own selection (no touch/swipe),
+        // so it skips the touch-"learning" phase: idle offers Learn (arm a
+        // gamepad-button capture) AND Assign (pick a specific output) directly,
+        // matching the mouse menu card. Touch Zones demonstrates a gesture first.
+        let mut v = match (menu, phase) {
+            (true, "idle")  => vec!["learn", "assign"],
+            (false, "idle") => vec!["learn"],
+            (_, "learning") => vec!["cancel"],
+            _               => vec!["assign", "gamepad", "add", "cancel"], // captured
         };
         // Order MUST match the body's act_rects push order: tp_mode, mouse_speed,
         // then hold LAST. tp_mode is a VALUE cycled with LT/RT (like mouse_speed),
@@ -288,7 +293,9 @@ impl FlexInputApp {
         // `show_speed` gate (a mouse card, or a touchpad-mode stick zone).
         if has_analog { v.push("tp_mode"); }
         if show_mouse_speed { v.push("mouse_speed"); }
-        v.push("hold");
+        // Hold-zone is a Touch Zones concept; the menu card body omits the Hold
+        // checkbox, so the action row must not reserve a slot for it.
+        if !menu { v.push("hold"); }
         v
     }
 
@@ -505,7 +512,8 @@ impl FlexInputApp {
     {
         let has_analog = self.nav_tz_has_analog_card(outer, inner);
         let show_speed = self.nav_tz_shows_mouse_speed(outer, inner);
-        let n_actions = Self::nav_tz_action_items(phase, has_analog, show_speed).len();
+        let menu = self.nav_selected_module_id(outer).as_deref() == Some("module.menu");
+        let n_actions = Self::nav_tz_action_items(phase, has_analog, show_speed, menu).len();
         let card_idxs = self.nav_tz_zone_card_indices(outer, inner);
         let sel = self.gamepad_nav.card_index;
         let entered = matches!(self.gamepad_nav.edit_level,
@@ -556,6 +564,7 @@ impl FlexInputApp {
             .unwrap_or_else(|| "idle".into());
         let has_analog = self.nav_tz_has_analog_card(outer_id, inner);
         let show_speed = self.nav_tz_shows_mouse_speed(outer_id, inner);
+        let menu = self.nav_selected_module_id(outer_id).as_deref() == Some("module.menu");
 
         // INERT while gamepad-learn is armed: the raw button must reach the body's
         // capture (baseline-ignore there stops the arming button self-capturing).
@@ -587,7 +596,7 @@ impl FlexInputApp {
 
         // Two-row cursor: [0..n_actions) = action buttons, [n_actions..total) =
         // the selected zone's cards.
-        let actions = Self::nav_tz_action_items(&phase, has_analog, show_speed);
+        let actions = Self::nav_tz_action_items(&phase, has_analog, show_speed, menu);
         let n_actions = actions.len();
         let card_idxs = self.nav_tz_zone_card_indices(outer_id, inner);
         let count = card_idxs.len();
@@ -639,8 +648,23 @@ impl FlexInputApp {
             if nav.is_rising("btn_south") {
                 match actions[sel] {
                     "learn" => {
-                        self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "learning");
-                        self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "");
+                        if menu {
+                            // Menu: the trigger is the zone's own selection, so
+                            // arm a gamepad-button capture of the OUTPUT (mirrors
+                            // the mouse menu "Learn"). No touch demonstration. The
+                            // driver goes INERT while `_tz_gp_arm` is set so the
+                            // next button press reaches the body's capture; clear
+                            // the stale baseline/seen so it re-captures fresh.
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "menu_sel");
+                            self.set_subpatch_param_bool(outer_id, inner, "_tz_gp_arm", true);
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+                            self.remove_subpatch_param(outer_id, inner, "_tz_gp_base");
+                            self.remove_subpatch_param(outer_id, inner, "_tz_gp_seen");
+                        } else {
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "learning");
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "");
+                        }
                         self.gamepad_nav.card_index = 0; // action list changed
                     }
                     "cancel" => {
@@ -650,6 +674,15 @@ impl FlexInputApp {
                         self.gamepad_nav.card_index = 0;
                     }
                     "assign" => {
+                        // Menu idle→Assign commits the captured phase with the
+                        // menu-select trigger first (the mouse menu "Assign…"
+                        // flow), so picking outputs binds them to the zone's
+                        // selection. Touch Zones is already in `captured` here.
+                        if menu {
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
+                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", "menu_sel");
+                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
+                        }
                         // Gamepad-navigable KB/M picker on the main window.
                         self.open_special_picker(crate::canvas::viewer::SpecialPickerRequest {
                             inner,
