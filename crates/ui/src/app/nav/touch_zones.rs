@@ -22,6 +22,13 @@ impl FlexInputApp {
         else if rows > 0 { self.gamepad_nav.tz_axis = 1; }
         else { self.gamepad_nav.tz_axis = 0; }
         self.gamepad_nav.tz_line = 0;
+        // The spatial walk starts on the current zone (so the cards widget's
+        // context is set from the moment you enter the field).
+        let sel_zone = self.tabs[self.active_tab].canvas.snarl.get_node(outer_id)
+            .and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner))
+            .and_then(|n| n.params.get("sel_zone").and_then(|v| v.as_u64()))
+            .unwrap_or(0) as usize;
+        self.gamepad_nav.tz_focus = crate::gamepad_nav::TzFocus::Zone(sel_zone);
         self.gamepad_nav.edit_level = EditLevel::TzLines;
         self.gamepad_nav.edit_baseline = Some(Box::new(
             self.tabs[self.active_tab].canvas.snapshot_for_undo()));
@@ -38,12 +45,29 @@ impl FlexInputApp {
     /// Publish the focused/grabbed divider so the pinned field renderer can
     /// highlight it (keyed by inner node id; consumed by `tz_draw_field`).
     pub(crate) fn nav_tz_publish(&self, ctx: &egui::Context, inner: egui_snarl::NodeId) {
+        use crate::gamepad_nav::TzFocus;
         let grabbed = matches!(self.gamepad_nav.edit_level, crate::gamepad_nav::EditLevel::TzGrab);
         let pass = ctx.cumulative_pass_nr();
-        ctx.data_mut(|d| d.insert_temp(
-            egui::Id::new(("gp_nav_tz", inner.0)),
-            (pass, self.gamepad_nav.tz_field as u64, self.gamepad_nav.tz_axis as u64,
-             self.gamepad_nav.tz_line as u64, grabbed)));
+        // A border highlights only while a BORDER is focused; when a zone/seam is
+        // focused we publish an out-of-range (axis,line) so no divider matches.
+        let (b_axis, b_line) = match self.gamepad_nav.tz_focus {
+            TzFocus::Border => (self.gamepad_nav.tz_axis as u64, self.gamepad_nav.tz_line as u64),
+            _ => (u64::MAX, u64::MAX),
+        };
+        let zone = match self.gamepad_nav.tz_focus {
+            TzFocus::Zone(z) => z as u64,
+            _ => u64::MAX,
+        };
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(("gp_nav_tz", inner.0)),
+                (pass, self.gamepad_nav.tz_field as u64, b_axis, b_line, grabbed));
+            // Focused-zone highlight channel (usize::MAX as u64 = none). Read by
+            // both field renderers, gated via the viewport-agnostic nav pass.
+            d.insert_temp(
+                egui::Id::new(("gp_nav_tz_zone", inner.0)),
+                (pass, self.gamepad_nav.tz_field as u64, zone));
+        });
         ctx.request_repaint();
     }
 
@@ -140,16 +164,23 @@ impl FlexInputApp {
                         self.gamepad_nav.tz_field = f;
                         self.gamepad_nav.tz_axis = a;
                         self.gamepad_nav.tz_line = l;
+                        self.gamepad_nav.tz_focus = crate::gamepad_nav::TzFocus::Border;
                     }
                 }
 
                 // Left/Right → column dividers; Up/Down → row dividers.
+                // (P2 will make this a border↔zone spatial walk; for now dpad still
+                // walks dividers, but focusing a divider updates the focus model so
+                // the highlight is coherent with the seeded-zone highlight.)
                 match step_dir {
                     Some(NavDir::Left)  => self.nav_tz_cycle(0, -1, n_col, n_row),
                     Some(NavDir::Right) => self.nav_tz_cycle(0,  1, n_col, n_row),
                     Some(NavDir::Up)    => self.nav_tz_cycle(1, -1, n_col, n_row),
                     Some(NavDir::Down)  => self.nav_tz_cycle(1,  1, n_col, n_row),
                     None => {}
+                }
+                if step_dir.is_some() {
+                    self.gamepad_nav.tz_focus = crate::gamepad_nav::TzFocus::Border;
                 }
 
                 let has_line = axis_len(self.gamepad_nav.tz_axis) > 0;

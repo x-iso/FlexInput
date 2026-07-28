@@ -1209,6 +1209,27 @@ pub(crate) fn paint_radial_nav_focus(
         .unwrap_or(egui::emath::TSTransform::IDENTITY);
     let painter = ui.painter_at(rect.expand(4.0));
     let style = crate::widgets::NavHighlightStyle::of(ui.ctx());
+
+    // Focused-zone highlight: a translucent accent sector over the focused zone,
+    // drawn BEFORE the borders so the divider highlights sit on top. Keyed by the
+    // zone id the nav publishes (usize::MAX = none).
+    let nav_zone: Option<(u64, u64, u64)> =
+        ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_tz_zone", node_id.0))));
+    if let Some((zpass, zfield, zid)) = nav_zone {
+        if zfield == 0 && zid != u64::MAX && crate::widgets::nav_pass_matches(ui.ctx(), zpass) {
+            let zones = super::viewer::tz_field_tree(snarl, node_id, 0).zones();
+            if let Some((_, band)) = zones.into_iter().find(|(id, _)| *id as u64 == zid) {
+                if let Some((r0, r1, a0, a1)) = radial_band_geom(&geom, band) {
+                    let fill = style.accent.gamma_multiply(0.22);
+                    let stroke = egui::Stroke::new(2.5, style.accent);
+                    for s in radial_sector_shapes(geom.center, r0, r1, a0, a1, fill, stroke) {
+                        painter.add(s);
+                    }
+                }
+            }
+        }
+    }
+
     let mut nav_line_rects: Vec<(u8, u32, egui::Rect)> = Vec::new();
     let (mut vcount, mut hcount) = (0u32, 0u32);
     for b in &borders {

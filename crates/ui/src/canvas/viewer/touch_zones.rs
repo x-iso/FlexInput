@@ -1496,6 +1496,23 @@ pub(crate) fn tz_draw_field(
                 egui::FontId::proportional(12.0), visuals.weak_text_color());
         }
     }
+    // Gamepad-nav focused-zone highlight (accent overlay), drawn over the zone
+    // content. Gated via the viewport-agnostic nav pass so it shows in the config
+    // overlay; the focused DIVIDER (if any) is highlighted separately below.
+    let nav_zone: Option<(u64, u64, u64)> =
+        ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_tz_zone", node_id.0))));
+    if let Some((zpass, zfield, zid)) = nav_zone {
+        if zfield == field as u64 && zid != u64::MAX && crate::widgets::nav_pass_matches(&ctx, zpass) {
+            if let Some(&(_, [x0, y0, x1, y1])) = zones.iter().find(|(id, _)| *id as u64 == zid) {
+                let zr = egui::Rect::from_min_max(
+                    egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
+                let accent = crate::widgets::NavHighlightStyle::of(&ctx).accent;
+                painter.rect_filled(zr.shrink(1.0), 2.0, accent.gamma_multiply(0.22));
+                painter.rect_stroke(zr.shrink(1.0), 2.0,
+                    egui::Stroke::new(2.5, accent), egui::StrokeKind::Inside);
+            }
+        }
+    }
     for (&(f, idx), &(lx, ly, act)) in zone_live {
         if f != field || !act { continue; }
         if let Some(&(_, [x0, y0, x1, y1])) = zones.iter().find(|(zid, _)| *zid == idx) {

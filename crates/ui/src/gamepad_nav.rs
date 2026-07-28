@@ -207,6 +207,19 @@ pub fn left_targets_id() -> egui::Id {
     egui::Id::new("gp_nav_left_targets")
 }
 
+/// What the Touch Zones / Virtual Menu FIELD nav currently has focused. The
+/// spatial walk alternates `Border` ↔ `Zone`; `Seam` is the radial origin. The
+/// `Border` case reuses `tz_field`/`tz_axis`/`tz_line`; `Zone` carries the
+/// zone id (drives `sel_zone` + the divide target); `Seam` rotates the ring.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TzFocus {
+    Border,
+    Zone(usize),
+    /// Radial origin seam — constructed by the P2/P3 walk (rotate the ring).
+    #[allow(dead_code)]
+    Seam,
+}
+
 /// All gamepad-nav runtime state. Runtime-only — never serialized. Lives on
 /// `FlexInputApp`.
 pub struct GamepadNav {
@@ -315,6 +328,9 @@ pub struct GamepadNav {
     pub tz_field: usize,
     pub tz_axis: u8,
     pub tz_line: usize,
+    /// Which field element the spatial walk has focused (Border reuses
+    /// tz_axis/tz_line; Zone/Seam are the new targets). See [`TzFocus`].
+    pub tz_focus: TzFocus,
     /// Virtual KB/M picker (opened from a Remapper's Special slot). When open,
     /// the modal grid captures nav input: LS/dpad move the cursor, South appends
     /// the focused pin to the output chord, North resets it, East closes.
@@ -432,6 +448,7 @@ impl Default for GamepadNav {
             tz_field: 0,
             tz_axis: 0,
             tz_line: 0,
+            tz_focus: TzFocus::Zone(0),
             kbm_picker_open: false,
             kbm_picker_idx: 0,
             kbm_picker_node: None,
