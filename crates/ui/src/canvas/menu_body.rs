@@ -1350,13 +1350,50 @@ fn render_radial_field(
         }
     }
 
+    // Gamepad-nav focus: the shared TZ line editor (`nav_drive_touch_zones`)
+    // drives radial borders by the SAME (axis, line) index model as the flat
+    // field — angular borders are the "column"/V axis (0), radial rings the
+    // "row"/H axis (1), each counted per axis in border order (which matches the
+    // driver's `dividers()` walk in mapping mode and the edge-array index in
+    // ports mode). Read the published focus to highlight the divider, and expose
+    // per-border hit-rects for the RS cursor: a small box at each border's
+    // midpoint (an arc has no useful bounding rect, so a point target replaces
+    // the flat field's full-span strip). The origin seam is never a nav divider.
+    let nav_tz: Option<(u64, u64, u64, u64, bool)> =
+        ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_tz", node_id.0))));
+    let cur_pass = ui.ctx().cumulative_pass_nr();
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let mut nav_line_rects: Vec<(u8, u32, egui::Rect)> = Vec::new();
+    let (mut vcount, mut hcount) = (0u32, 0u32);
+
     // Border strokes (hot = hovered or mid-drag). The origin seam is drawn
     // thicker so it reads as the ring's reference edge.
     for (i, b) in borders.iter().enumerate() {
         let hot = dragged_border == Some(i)
             || (dragged_border.is_none()
                 && ptr.and_then(hit_at) == Some(i));
-        let stroke = if hot {
+        // Per-axis nav index + midpoint cursor hit-box for non-seam borders.
+        let nav_ax_line = if b.seam {
+            None
+        } else {
+            let axis: u8 = if b.angular { 0 } else { 1 };
+            let line = if b.angular { let n = vcount; vcount += 1; n }
+                       else         { let n = hcount; hcount += 1; n };
+            let mid = (b.span_lo + b.span_hi) * 0.5;
+            let c = if b.angular { geom.point(b.pos, mid) } else { geom.point(mid, b.pos) };
+            nav_line_rects.push((axis, line, to_global * egui::Rect::from_center_size(c, egui::vec2(18.0, 18.0))));
+            Some((axis as u64, line as u64))
+        };
+        let nav_grab = match (nav_tz, nav_ax_line) {
+            (Some((pass, f, a, l, g)), Some((ax, ln)))
+                if cur_pass.saturating_sub(pass) <= 2 && f == 0 && a == ax && l == ln => Some(g),
+            _ => None,
+        };
+        let stroke = if let Some(grabbed) = nav_grab {
+            egui::Stroke::new(3.0,
+                if grabbed { egui::Color32::from_rgb(90, 220, 120) } else { accent })
+        } else if hot {
             egui::Stroke::new(if b.seam { 4.0 } else { 2.0 }, accent)
         } else if b.seam {
             egui::Stroke::new(3.0, visuals.weak_text_color().gamma_multiply(1.4))
@@ -1365,6 +1402,9 @@ fn render_radial_field(
         };
         paint_ring_border(&painter, &geom, b, stroke);
     }
+    ui.ctx().data_mut(|d| d.insert_temp(
+        egui::Id::new(("gp_nav_tz_lines", node_id.0, 0usize)),
+        (cur_pass, nav_line_rects)));
     if dragged_border.is_some() || ptr.and_then(hit_at).is_some() {
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
     }

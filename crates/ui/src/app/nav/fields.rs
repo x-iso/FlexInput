@@ -350,6 +350,12 @@ impl FlexInputApp {
             // Remapper-family mapping widgets (filter cycle + in-body capture).
             ("module.remapper", _) | ("module.map_action", _)
             | ("module.automap_combiner", _) => true,
+            // Touch Zones AND Virtual Menu: "field" = grid/ring line editing,
+            // "cards" = the zone-tab mapping list. The menu reuses TZ's storage
+            // (col_edges/row_edges/tree/zone_maps), so both drive the same nav.
+            // MUST mirror the corresponding arms in `nav_selected_kind`.
+            ("module.touch_zones", "field") | ("module.touch_zones", "cards")
+            | ("module.menu", "field") | ("module.menu", "cards") => true,
             ("processing.gyro_3dof", "lean_left")
             | ("processing.gyro_3dof", "lean_right") => true,
             // Everything else is a field row — targetable iff it has fields.
@@ -793,8 +799,12 @@ impl FlexInputApp {
             | Some("module.automap_combiner") => NavWidgetKind::Remapper,
             // Touch Zones pad "field" element = the grid → line editing; the
             // "cards" element = the mapping list → zone-tab + Learn/Assign flow.
-            Some("module.touch_zones") if elem.as_deref() == Some("field") => NavWidgetKind::TouchZones,
-            Some("module.touch_zones") if elem.as_deref() == Some("cards") => NavWidgetKind::TouchZoneCards,
+            // Virtual Menu shares both: its field (grid OR radial ring) and its
+            // zone-tab cards drive the same TZ nav over the same storage.
+            Some("module.touch_zones") | Some("module.menu")
+                if elem.as_deref() == Some("field") => NavWidgetKind::TouchZones,
+            Some("module.touch_zones") | Some("module.menu")
+                if elem.as_deref() == Some("cards") => NavWidgetKind::TouchZoneCards,
             // Gyro lean sections are remapper-family mapping rows (Learn/capture +
             // filter), unlike gyro's other elements which are plain field rows.
             Some("processing.gyro_3dof")

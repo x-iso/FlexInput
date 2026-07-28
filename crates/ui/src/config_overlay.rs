@@ -156,6 +156,10 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // While card-navigating a pinned Remapper / TZ list: (outer, inner, scope) so
     // the overlay republishes the selection with its own pass + draws the glow.
     let remap_glow = app.config_remap_glow();
+    // While line-editing a pinned TZ / Virtual Menu field: the inner node whose
+    // `gp_nav_tz` focus channel must be republished with the overlay pass so the
+    // focused grid line / radial border highlights over the game.
+    let tz_glow = app.config_tz_glow();
     // Focused value-field to draw a glow ring on (computed here — the closure
     // can't borrow `app`); redrawn in the overlay viewport by the closure.
     let field_glow_target = app.config_field_glow_target();
@@ -465,6 +469,18 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 // the pinned Remapper / TZ body highlights the selected card and
                 // publishes its rects (the drawer below reads them). Same cross-
                 // viewport pass gap as the curve dots.
+                // Republish the TZ / Virtual Menu field-line focus with THIS
+                // pass so the pinned field body highlights the focused grid line
+                // or radial border (same cross-viewport pass gap as the curves).
+                if let Some(inner) = tz_glow {
+                    let pass = ui.ctx().cumulative_pass_nr();
+                    ui.ctx().data_mut(|d| {
+                        let id = egui::Id::new(("gp_nav_tz", inner));
+                        if let Some((_, f, a, l, g)) = d.get_temp::<(u64, u64, u64, u64, bool)>(id) {
+                            d.insert_temp(id, (pass, f, a, l, g));
+                        }
+                    });
+                }
                 if let Some((_, inner, scope)) = &remap_glow {
                     let pass = ui.ctx().cumulative_pass_nr();
                     ui.ctx().data_mut(|d| {

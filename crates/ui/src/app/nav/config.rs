@@ -299,6 +299,20 @@ impl FlexInputApp {
         Some((*outer, *inner, scope))
     }
 
+    /// While line-editing a pinned Touch Zones / Virtual Menu FIELD in the
+    /// config overlay, the inner node id whose `gp_nav_tz` focus channel must be
+    /// republished with the overlay's own viewport pass — the driver stamps the
+    /// root pass (see `nav_tz_publish`), which never matches the overlay, so the
+    /// focused divider highlight (grid line or radial border) would be invisible
+    /// over the game. `None` unless actively line-editing.
+    pub(crate) fn config_tz_glow(&self) -> Option<usize> {
+        use crate::gamepad_nav::EditLevel;
+        if !matches!(self.gamepad_nav.edit_level, EditLevel::TzLines | EditLevel::TzGrab) {
+            return None;
+        }
+        self.gamepad_nav.config_nav_sel.as_ref().map(|(_, inner, _)| inner.0)
+    }
+
     /// Which physical input adjusts the currently-focused config pin, so it
     /// doesn't collide with the stick(s) passing through to be felt. Derived
     /// from the pin's resolved passthrough set (which already accounts for the
