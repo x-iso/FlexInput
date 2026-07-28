@@ -331,6 +331,13 @@ pub(crate) fn paint_envelope_curve_graph(
     }
 
     // Control points
+    // Gamepad-nav: is the SUSTAIN line focused (dpad up/down toggle)? When so,
+    // the dot highlight is suppressed and the sustain line is emphasised instead.
+    let sustain_focused = ui.ctx().data(|d| {
+        d.get_temp::<(u64, bool)>(egui::Id::new(("gp_nav_curve_sustain", node_id.0)))
+            .map(|(_, f)| f)
+            .unwrap_or(false)
+    });
     let mut remove_idx: Option<usize> = None;
     for i in 0..new_points.len() {
         let [px, py] = new_points[i];
@@ -367,6 +374,29 @@ pub(crate) fn paint_envelope_curve_graph(
         let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { Color32::from_gray(190) };
         painter.circle_filled(screen, 5.0, col);
         painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
+
+        // Gamepad-nav dot highlight — mirror the response curve painter so the
+        // user sees which ADSR point is selected (works in sub-patch AND config
+        // overlay, which re-stamps `gp_nav_curve_sel` with its own viewport pass).
+        let sel: Option<(u64, usize, bool)> = ui.ctx().data(|d|
+            d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+        if let Some((pass, sel_i, editing_dot)) = sel {
+            if pass == ui.ctx().cumulative_pass_nr() && sel_i == i && !sustain_focused {
+                let accent = ui.visuals().selection.stroke.color;
+                let [r8, g8, b8, _] = accent.to_array();
+                for k in 0..5 {
+                    let t = (k as f32 + 1.0) / 5.0;
+                    let rr = (if editing_dot { 16.0 } else { 12.0 }) * t;
+                    let a = ((if editing_dot { 170.0 } else { 120.0 }) * (1.0 - t)) as u8;
+                    if a == 0 { continue; }
+                    painter.circle_stroke(screen, rr,
+                        egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(r8, g8, b8, a)));
+                }
+                painter.circle_filled(screen, if editing_dot { 6.0 } else { 5.0 }, accent);
+                painter.circle_stroke(screen, if editing_dot { 6.0 } else { 5.0 },
+                    egui::Stroke::new(1.5, Color32::WHITE));
+            }
+        }
     }
 
     // Double-click adds a point
@@ -396,10 +426,25 @@ pub(crate) fn paint_envelope_curve_graph(
 
     // Sustain vertical line (orange). `sustain_snapped` was computed up front
     // (snaps to nearest control point so it follows the dots on edit/load).
+    // While the gamepad nav has the sustain line FOCUSED (dpad up/down toggle),
+    // draw it thicker/brighter so the user sees left/right will move it
+    // (`sustain_focused` was read up front, before the dot loop).
     let sus_x = rect.left() + sustain_snapped.clamp(0.0, 1.0) * rect.width();
+    let (sus_w, sus_col) = if sustain_focused {
+        (3.0, Color32::from_rgb(255, 190, 60))
+    } else {
+        (1.5, Color32::from_rgba_unmultiplied(255, 155, 30, 200))
+    };
+    if sustain_focused {
+        // Soft glow behind the line.
+        painter.line_segment(
+            [egui::pos2(sus_x, rect.top()), egui::pos2(sus_x, rect.bottom())],
+            egui::Stroke::new(7.0, Color32::from_rgba_unmultiplied(255, 155, 30, 60)),
+        );
+    }
     painter.line_segment(
         [egui::pos2(sus_x, rect.top()), egui::pos2(sus_x, rect.bottom())],
-        egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 155, 30, 200)),
+        egui::Stroke::new(sus_w, sus_col),
     );
 
     // Playhead line + live trail dot (phase position along the curve)
@@ -747,15 +792,19 @@ pub(crate) fn render_envelope_time_row(
     let mut time_mul = time_mul;
     let mut changed  = false;
 
-    let mut fr: Vec<egui::Rect> = Vec::with_capacity(4);
+    // Two nav fields: the whole timebase segment (one Enum) then the value box.
+    // The three unit buttons publish as ONE rect (their union) so the gamepad
+    // field-index (0=unit, 1=value) lines up 1:1 with `nav_element_fields`.
+    let mut unit_rect = egui::Rect::NOTHING;
+    let mut value_rect = egui::Rect::NOTHING;
     ui.horizontal(|ui| {
         let old_tb = timebase.clone();
         let r_ms = ui.selectable_value(&mut timebase, "ms".into(), egui::RichText::new("ms").small());
-        fr.push(r_ms.rect);
+        unit_rect = unit_rect.union(r_ms.rect);
         let r_s  = ui.selectable_value(&mut timebase, "s".into(),  egui::RichText::new("s").small());
-        fr.push(r_s.rect);
+        unit_rect = unit_rect.union(r_s.rect);
         let r_hz = ui.selectable_value(&mut timebase, "hz".into(), egui::RichText::new("Hz").small());
-        fr.push(r_hz.rect);
+        unit_rect = unit_rect.union(r_hz.rect);
         if r_ms.changed() || r_s.changed() || r_hz.changed() {
             let period_ms: f32 = match old_tb.as_str() {
                 "s"  => time_mul * 1000.0,
@@ -777,10 +826,10 @@ pub(crate) fn render_envelope_time_row(
         let mut shown = if time_wired { live_time.unwrap_or(time_mul) } else { time_mul };
         let r = ui.add_enabled(!time_wired,
             egui::DragValue::new(&mut shown).speed(spd).range(lo..=hi).max_decimals(3));
-        fr.push(r.rect);
+        value_rect = r.rect;
         if !time_wired { time_mul = shown; changed |= r.changed(); }
     });
-    publish_nav_field_rects(ui, inner_id, &fr);
+    publish_nav_field_rects(ui, inner_id, &[unit_rect, value_rect]);
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("timebase".into(), Value::String(timebase));
@@ -875,8 +924,9 @@ pub(crate) fn render_envelope_sustain_row(
             changed = true;
         }
         let pct_lbl = format!("{:.0}%", sustain * 100.0);
-        let r = ui.label(egui::RichText::new(pct_lbl).small().weak());
-        fr.push(r.rect);
+        // Read-only %: NOT a nav field, so its rect is not published (field rects
+        // must be 1:1 with `nav_element_fields`, editable controls only).
+        ui.label(egui::RichText::new(pct_lbl).small().weak());
     });
     publish_nav_field_rects(ui, inner_id, &fr);
     if changed {
@@ -911,8 +961,9 @@ pub(crate) fn render_envelope_grid_row(
 
     let mut fr: Vec<egui::Rect> = Vec::with_capacity(3);
     ui.horizontal(|ui| {
-        let r = ui.label(egui::RichText::new("Grid").small().weak());
-        fr.push(r.rect);
+        // "Grid" caption is NOT a nav field — don't publish its rect (field rects
+        // must be 1:1 with `nav_element_fields`: grid_x, grid_y, snap).
+        ui.label(egui::RichText::new("Grid").small().weak());
         let r = ui.add(egui::DragValue::new(&mut gx_f).speed(0.25)
             .range(1.0..=20.0).max_decimals(0).prefix("H "));
         fr.push(r.rect); changed |= r.changed();

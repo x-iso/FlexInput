@@ -279,6 +279,10 @@ pub struct GamepadNav {
     /// Highlighted control-point index while inside a response curve
     /// (`CurveDots`/`CurveDot`). Clamped to the curve's point count each frame.
     pub curve_dot: usize,
+    /// Envelope curve only: while `true`, the SUSTAIN line is focused instead of
+    /// the dots (dpad up/down toggles). In this mode left/right moves the sustain
+    /// x rather than walking dots. Reset to `false` on each curve entry.
+    pub curve_sustain_focus: bool,
     /// True while the user is holding North to bend the segment (bias mode) at
     /// `CurveDot` level this frame. The config overlay reads it to republish the
     /// `gp_nav_curve_bias` handle-visibility flag with its OWN viewport pass —
@@ -418,6 +422,7 @@ impl Default for GamepadNav {
             settings_editing: false,
             field_index: 0,
             curve_dot: 0,
+            curve_sustain_focus: false,
             curve_bias: false,
             card_index: 0,
             remap_card: 0,
@@ -596,9 +601,21 @@ fn item_center(item: &LayoutItem) -> egui::Vec2 {
 /// direction `dir` using body-local centres. Returns the top-left-most item
 /// when there is no current selection. `None` when no candidate lies in the
 /// pressed direction.
-pub fn nearest_in_dir(items: &[LayoutItem], cur: Option<usize>, dir: NavDir) -> Option<usize> {
-    // Only Module items are "navigable widgets"; decorations are passive.
-    let navigable = |i: usize| matches!(items.get(i), Some(LayoutItem::Module(_)));
+///
+/// `editable(i)` gates whether Module item `i` is a gamepad-editable widget
+/// (vs a purely visual pin like a scope/vector/oscilloscope display or 3D
+/// viewer) — visual pins are pinnable for feedback but must never intercept
+/// directional focus. Callers resolve editability against the sub-patch's inner
+/// snarl (see `FlexInputApp::sp_item_is_editable`).
+pub fn nearest_in_dir(
+    items: &[LayoutItem],
+    cur: Option<usize>,
+    dir: NavDir,
+    editable: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    // Only editable Module items are "navigable widgets"; decorations and
+    // visual-only pins are passive.
+    let navigable = |i: usize| matches!(items.get(i), Some(LayoutItem::Module(_))) && editable(i);
 
     let cur = match cur.filter(|&i| i < items.len()) {
         Some(i) => i,

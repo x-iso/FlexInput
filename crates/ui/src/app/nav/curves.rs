@@ -371,8 +371,15 @@ impl FlexInputApp {
     pub(crate) fn nav_publish_curve_sel(&self, ctx: &egui::Context, inner: egui_snarl::NodeId, editing: bool) {
         let pass = ctx.cumulative_pass_nr();
         let idx = self.gamepad_nav.curve_dot;
-        ctx.data_mut(|d| d.insert_temp(
-            egui::Id::new(("gp_nav_curve_sel", inner.0)), (pass, idx, editing)));
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(("gp_nav_curve_sel", inner.0)), (pass, idx, editing));
+            // Envelope sustain-line focus (dpad up/down toggle) — the painter reads
+            // this to highlight the sustain line and dim the dots when focused.
+            d.insert_temp(
+                egui::Id::new(("gp_nav_curve_sustain", inner.0)),
+                (pass, self.gamepad_nav.curve_sustain_focus),
+            );
+        });
     }
 
     /// While dot-editing a Remapper/Lean PER-CARD curve, keep the entered-card
@@ -426,6 +433,34 @@ impl FlexInputApp {
             if let Some(b) = self.gamepad_nav.edit_baseline.take() {
                 self.tabs[self.active_tab].canvas.commit_undo_if_changed(*b);
             }
+            return;
+        }
+
+        // Envelope only: dpad up/down toggles focus between the SUSTAIN line and
+        // the dots; while the sustain line is focused, left/right MOVES it instead
+        // of walking dots (and add/delete/enter-dot are suppressed).
+        let is_env =
+            self.nav_selected_module_id(outer_id).as_deref() == Some("generator.envelope");
+        if !is_env {
+            self.gamepad_nav.curve_sustain_focus = false;
+        } else if matches!(step_dir, Some(NavDir::Up) | Some(NavDir::Down)) {
+            self.gamepad_nav.curve_sustain_focus = !self.gamepad_nav.curve_sustain_focus;
+            self.nav_publish_curve_sel(ctx, inner, false);
+            return;
+        }
+        if is_env && self.gamepad_nav.curve_sustain_focus {
+            let d = match step_dir {
+                Some(NavDir::Left) => -1.0,
+                Some(NavDir::Right) => 1.0,
+                _ => 0.0,
+            };
+            if d != 0.0 {
+                let step = if self.gamepad_nav.fine_increment { 0.01 } else { 0.03 };
+                let cur = self.get_subpatch_param_f32(outer_id, inner, "sustain").unwrap_or(0.5);
+                let next = (cur + d * step).clamp(0.0, 1.0);
+                self.set_subpatch_param_f32(outer_id, inner, "sustain", next);
+            }
+            self.nav_publish_curve_sel(ctx, inner, false);
             return;
         }
 

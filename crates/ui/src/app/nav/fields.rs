@@ -135,6 +135,9 @@ impl FlexInputApp {
                 let span = (hi - lo).abs().max(f32::EPSILON);
                 span * if fine { 0.005 } else { 0.02 }
             }
+            NavStep::Fixed(coarse) => {
+                if fine { coarse * 0.1 } else { coarse }
+            }
         };
         let accel = self.settings.cursor_accel.max(1.0);
         let cont_curved = cont.signum() * cont.abs().clamp(0.0, 1.0).powf(accel);
@@ -162,11 +165,41 @@ impl FlexInputApp {
         self.set_subpatch_param_f32(outer_id, inner, key, next);
     }
 
+    /// Outward-bloom ring on a focused sub-control's rect, drawn on the given
+    /// context's Foreground layer. Shared by `nav_publish_field_hud` (main window)
+    /// and the config overlay (`config_draw_field_glow`) so the value-field glow
+    /// shows in BOTH viewports — the overlay is a separate window, so nav's own
+    /// root-viewport draw never reaches it. No-op on a degenerate rect.
+    pub(crate) fn paint_field_glow_ring(ctx: &egui::Context, fr: egui::Rect, accent: egui::Color32) {
+        if !fr.is_finite() || fr.width() <= 0.5 { return; }
+        let [r, g, b, _] = accent.to_array();
+        let p = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground, egui::Id::new("gp_nav_field_glow")));
+        let rings = 6;
+        for i in 0..rings {
+            let t = (i as f32 + 1.0) / rings as f32;
+            let grow = t * 7.0;
+            let a = (150.0 * (1.0 - t)).round() as u8;
+            if a == 0 { continue; }
+            p.rect_stroke(fr.expand(grow), 5.0 + grow,
+                egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
+                egui::StrokeKind::Outside);
+        }
+        p.rect_stroke(fr.expand(1.5), 5.0, egui::Stroke::new(2.0, accent),
+            egui::StrokeKind::Outside);
+    }
+
     /// Publish the multi-field focus HUD (pass-stamped) for the renderer overlay
     /// + a foreground text label so the user sees the focused field.
     pub(crate) fn nav_publish_field_hud(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, fields: &[NavFieldDef], idx: usize, fine: bool)
     {
+        // While the config overlay is up it draws its OWN field glow + HUD in its
+        // viewport (`draw_config_field_glow`); drawing here too would double the
+        // ring as a ghost on the main window when it sits in front of the overlay.
+        if crate::config_overlay::config_overlay_visible(ctx) {
+            return;
+        }
         let def = &fields[idx];
         // Read the focused field's current value as a string for the HUD.
         let val_str = match &def.field {
@@ -202,23 +235,7 @@ impl FlexInputApp {
             ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner.0, element))));
         if let Some((_, frs)) = field_rects {
             if let Some(fr) = frs.get(idx) {
-                if fr.is_finite() && fr.width() > 0.5 {
-                    let [r, g, b, _] = accent.to_array();
-                    let p = ctx.layer_painter(egui::LayerId::new(
-                        egui::Order::Foreground, egui::Id::new(("gp_nav_field_glow", outer_id.0))));
-                    let rings = 6;
-                    for i in 0..rings {
-                        let t = (i as f32 + 1.0) / rings as f32;
-                        let grow = t * 7.0;
-                        let a = (150.0 * (1.0 - t)).round() as u8;
-                        if a == 0 { continue; }
-                        p.rect_stroke(fr.expand(grow), 5.0 + grow,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, a)),
-                            egui::StrokeKind::Outside);
-                    }
-                    p.rect_stroke(fr.expand(1.5), 5.0, egui::Stroke::new(2.0, accent),
-                        egui::StrokeKind::Outside);
-                }
+                Self::paint_field_glow_ring(ctx, *fr, accent);
             }
         }
         let painter = ctx.layer_painter(egui::LayerId::new(
@@ -325,7 +342,9 @@ impl FlexInputApp {
             ("module.response_curve", "curve")
             | ("module.vec_response_curve", "curve")
             | ("module.vec_reshape", "curve")
-            | ("module.twoway_response_curve", "curve") => true,
+            | ("module.twoway_response_curve", "curve")
+            // Envelope's ADSR graph shares the dot-editing path (+ a sustain line).
+            | ("generator.envelope", "curve") => true,
             // ASTH scope's EQ is dot-editable via the shared curve-dot path.
             ("module.audio_stream_haptics", "asth_scope") => true,
             // Remapper-family mapping widgets (filter cycle + in-body capture).
@@ -370,7 +389,11 @@ impl FlexInputApp {
             | ("module.twoway_response_curve", "grid_row") | ("module.twoway_response_curve", "grid_options_row")
             | ("module.twoway_response_curve", "hyst_row") | ("module.twoway_response_curve", "interp_row")
             | ("module.twoway_response_curve", "lane_toggle")
+            | ("generator.envelope", "time_row") | ("generator.envelope", "sustain_row")
+            | ("generator.envelope", "mode_row") | ("generator.envelope", "grid_row")
+            | ("generator.envelope", "grid_options_row")
             | ("display.oscilloscope", "controls")
+            | ("display.trigscope", "controls")
             | ("module.audio_stream_haptics", "asth_mode_row")
             | ("module.audio_stream_haptics", "asth_volume")
             | ("module.audio_stream_haptics", "asth_release")
@@ -544,7 +567,7 @@ impl FlexInputApp {
     /// functions' param keys.
     pub(crate) fn nav_element_fields(&self, outer_id: egui_snarl::NodeId) -> Vec<NavFieldDef> {
         use NavField::*;
-        use NavStep::{Decade, Linear};
+        use NavStep::{Decade, Fixed, Linear};
         let Some((mid, elem)) = self.nav_selected_element(outer_id) else { return vec![]; };
         // Gyro axis options (family, axis) for the pointer/steering mode rows.
         const GYRO_PTR: &[(&str, &str, &str)] = &[
@@ -611,15 +634,17 @@ impl FlexInputApp {
                 f!("Log/Exp", v("scale_t",-1.0,1.0,0.0,Linear)),
                 f!("Snap", Toggle{key:"snap"}),
             ],
+            // Bounds are ±100 to allow extremes, but tuning happens near ±1 — use a
+            // fixed 0.1 step (fine 0.01) so dpad/stick can fine-tune, not span-scaled.
             ("module.response_curve", "range_row") | ("module.twoway_response_curve", "range_row") => vec![
-                f!("In↓", v("in_min",-100.0,100.0,-1.0,Linear)),
-                f!("In↑", v("in_max",-100.0,100.0,1.0,Linear)),
-                f!("Out↓", v("out_min",-100.0,100.0,-1.0,Linear)),
-                f!("Out↑", v("out_max",-100.0,100.0,1.0,Linear)),
+                f!("In↓", v("in_min",-100.0,100.0,-1.0,Fixed(0.1))),
+                f!("In↑", v("in_max",-100.0,100.0,1.0,Fixed(0.1))),
+                f!("Out↓", v("out_min",-100.0,100.0,-1.0,Fixed(0.1))),
+                f!("Out↑", v("out_max",-100.0,100.0,1.0,Fixed(0.1))),
             ],
             ("module.vec_response_curve", "range_row") => vec![
-                f!("In max", v("in_max",-100.0,100.0,1.0,Linear)),
-                f!("Out max", v("out_max",-100.0,100.0,1.0,Linear)),
+                f!("In max", v("in_max",-100.0,100.0,1.0,Fixed(0.1))),
+                f!("Out max", v("out_max",-100.0,100.0,1.0,Fixed(0.1))),
             ],
             // ── Vec Reshaper option rows ──
             ("module.vec_reshape", "target_row") => vec![
@@ -649,6 +674,37 @@ impl FlexInputApp {
             | ("module.twoway_response_curve", "grid_options_row") => vec![
                 f!("Scale grid", Toggle{key:"show_scaled_grid"}),
                 f!("Labels", Toggle{key:"show_grid_labels"}),
+            ],
+            // ── Envelope Generator option rows ──
+            // Field order MUST match render_envelope_time_row's published rects:
+            // [unit segment, value box] left→right.
+            ("generator.envelope", "time_row") => vec![
+                f!("Base", Enum{key:"timebase", opts:&["ms","s","hz"]}),
+                f!("Time", v("time_mul", 0.01, 60_000.0, 500.0, Decade)),
+            ],
+            ("generator.envelope", "sustain_row") => vec![
+                f!("Sustain", v("sustain", 0.0, 1.0, 0.3, Fixed(0.02))),
+            ],
+            ("generator.envelope", "mode_row") => vec![
+                f!("Hold", Toggle{key:"hold"}),
+                f!("Bounce", Toggle{key:"bounce"}),
+                f!("Loop", Toggle{key:"loop"}),
+            ],
+            ("generator.envelope", "grid_row") => vec![
+                f!("Grid H", v("grid_x",1.0,20.0,4.0,Linear)),
+                f!("Grid V", v("grid_y",1.0,20.0,4.0,Linear)),
+                f!("Snap", Toggle{key:"snap"}),
+            ],
+            ("generator.envelope", "grid_options_row") => vec![
+                f!("Grid", Toggle{key:"show_grid"}),
+                f!("Labels", Toggle{key:"show_grid_labels"}),
+            ],
+            // ── Trigger scope controls (mirror the oscilloscope controls row) ──
+            ("display.trigscope", "controls") => vec![
+                f!("Win ms", v("ts_win_ms",10.0,10_000.0,200.0,Decade)),
+                f!("Scale", v("ts_scale",0.001,100.0,1.0,Decade)),
+                f!("Auto", Toggle{key:"ts_auto"}),
+                f!("Uni", Toggle{key:"ts_uni"}),
             ],
             ("module.twoway_response_curve", "hyst_row") => vec![
                 f!("Hyst %", v("hysteresis_pct",0.001,10.0,0.5,Linear)),
@@ -727,6 +783,7 @@ impl FlexInputApp {
             | Some("module.vec_response_curve")
             | Some("module.vec_reshape")
             | Some("module.twoway_response_curve")
+            | Some("generator.envelope")
                 if elem.as_deref() == Some("curve") => NavWidgetKind::Curve,
             // Audio Stream Haptics scope: its EQ points are dot-editable exactly
             // like a response curve (shared curve-dot nav path).
@@ -822,6 +879,9 @@ impl FlexInputApp {
             NavStep::Linear => {
                 let span = (hi - lo).abs().max(f32::EPSILON);
                 span * if fine { 0.005 } else { 0.02 }
+            }
+            NavStep::Fixed(coarse) => {
+                if fine { coarse * 0.1 } else { coarse }
             }
         };
 

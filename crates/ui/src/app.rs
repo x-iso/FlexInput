@@ -49,6 +49,7 @@ pub use chrome::render_app_icon;
 pub(crate) use devices_pool::*;
 pub(crate) use graph::*;
 pub(crate) use nav::draw_remap_card_glow;
+pub(crate) use nav::draw_config_field_glow;
 pub(crate) use subpatch::*;
 pub(crate) use threads::*;
 
@@ -3034,6 +3035,11 @@ pub(crate) enum NavStep {
     Decade,
     /// Plain proportional (0..1-style params like phase): fraction of the value.
     Linear,
+    /// Explicit per-press step magnitude (coarse); fine = ×0.1. For params whose
+    /// BOUNDS are far wider than the useful editing granularity (e.g. a response
+    /// curve's in/out min-max are ±100 to allow extremes but are tuned near ±1),
+    /// where `Linear`'s span-proportional step is uselessly huge.
+    Fixed(f32),
 }
 
 /// Numeric-edit descriptor for a generic nav-editable widget element.
@@ -3588,8 +3594,14 @@ impl FlexInputApp {
                             let canvas = &self.tabs[self.active_tab].canvas;
                             canvas.snarl.get_node(outer_id)
                                 .and_then(|n| n.subpatch.as_ref())
-                                .map(|sp| sp.selected_item.is_some()
-                                    && gn::nearest_in_dir(&sp.items, sp.selected_item, NavDir::Left).is_none())
+                                .map(|sp| {
+                                    let editable: Vec<bool> = (0..sp.items.len())
+                                        .map(|i| Self::sp_item_is_editable(sp, i))
+                                        .collect();
+                                    sp.selected_item.is_some()
+                                        && gn::nearest_in_dir(&sp.items, sp.selected_item, NavDir::Left,
+                                            |i| editable.get(i).copied().unwrap_or(false)).is_none()
+                                })
                                 .unwrap_or(false)
                         };
                         if at_left_edge {
@@ -3614,12 +3626,19 @@ impl FlexInputApp {
                         .get_node_mut(outer_id)
                         .and_then(|n| n.subpatch.as_mut())
                     {
-                        if let Some(next) = gn::nearest_in_dir(&sp.items, sp.selected_item, dir) {
+                        // Editability bitmap (visual-only pins are non-navigable),
+                        // computed once and closed over so the shared `&sp.items`
+                        // arg and the predicate don't both borrow `sp`.
+                        let editable: Vec<bool> = (0..sp.items.len())
+                            .map(|i| Self::sp_item_is_editable(sp, i))
+                            .collect();
+                        let is_editable = |i: usize| editable.get(i).copied().unwrap_or(false);
+                        if let Some(next) = gn::nearest_in_dir(&sp.items, sp.selected_item, dir, &is_editable) {
                             sp.selected_item = Some(next);
                             sp.selected_items = vec![next];
                         } else if sp.selected_item.is_none() {
                             // Seed selection at the first navigable item.
-                            if let Some(seed) = gn::nearest_in_dir(&sp.items, None, dir) {
+                            if let Some(seed) = gn::nearest_in_dir(&sp.items, None, dir, &is_editable) {
                                 sp.selected_item = Some(seed);
                                 sp.selected_items = vec![seed];
                             }
@@ -3654,6 +3673,7 @@ impl FlexInputApp {
                         self.gamepad_nav.edit_level = EditLevel::CurveDots;
                         self.gamepad_nav.curve_return_level = EditLevel::Widget;
                         self.gamepad_nav.curve_dot = 0;
+                        self.gamepad_nav.curve_sustain_focus = false;
                         self.gamepad_nav.edit_baseline = Some(Box::new(
                             self.tabs[self.active_tab].canvas.snapshot_for_undo()));
                     }

@@ -138,6 +138,7 @@ impl FlexInputApp {
                         self.gamepad_nav.edit_level = EditLevel::CurveDots;
                         self.gamepad_nav.curve_return_level = EditLevel::Widget;
                         self.gamepad_nav.curve_dot = 0;
+                        self.gamepad_nav.curve_sustain_focus = false;
                         self.gamepad_nav.edit_baseline =
                             Some(Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo()));
                         ctx.request_repaint();
@@ -312,6 +313,39 @@ impl FlexInputApp {
             Some((_, pins)) => crate::app::control_input_from_pins(&pins),
             None => ControlInput::LeftStick,
         }
+    }
+
+    /// The focused value-field the config overlay should draw a glow ring on:
+    /// `(inner_node_id, element_id, field_index)`, or `None` when not
+    /// field-editing a config pin. Computed BEFORE the overlay viewport closure
+    /// (which can't borrow `app`); the closure feeds it to `draw_config_field_glow`.
+    pub(crate) fn config_field_glow_target(&self) -> Option<(usize, String, usize)> {
+        if self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Editing {
+            return None;
+        }
+        let (_, inner, elem) = self.gamepad_nav.config_nav_sel.as_ref()?;
+        Some((inner.0, elem.clone(), self.gamepad_nav.field_index))
+    }
+}
+
+/// Redraw the focused value-field's bloom ring in the config overlay's OWN
+/// viewport. `nav_publish_field_hud` draws it on the main window, which never
+/// reaches the overlay (a separate always-on-top window rendered after nav runs)
+/// — so the "glow on specific values" was invisible over the game. The renderer
+/// publishes the per-field rects in this viewport's pass, so reading them here
+/// and painting on the overlay ctx lands the glow in the right spot. Free fn (not
+/// a method) so it can run inside the viewport closure, like `draw_remap_card_glow`.
+pub(crate) fn draw_config_field_glow(ctx: &egui::Context, target: Option<(usize, String, usize)>) {
+    let Some((inner_uid, elem, field_idx)) = target else { return };
+    let field_rects: Option<(u64, Vec<egui::Rect>)> =
+        ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner_uid, elem))));
+    let Some((pass, frs)) = field_rects else { return };
+    if pass != ctx.cumulative_pass_nr() {
+        return;
+    }
+    if let Some(fr) = frs.get(field_idx) {
+        let accent = ctx.style().visuals.selection.stroke.color;
+        FlexInputApp::paint_field_glow_ring(ctx, *fr, accent);
     }
 }
 

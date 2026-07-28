@@ -156,6 +156,9 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // While card-navigating a pinned Remapper / TZ list: (outer, inner, scope) so
     // the overlay republishes the selection with its own pass + draws the glow.
     let remap_glow = app.config_remap_glow();
+    // Focused value-field to draw a glow ring on (computed here — the closure
+    // can't borrow `app`); redrawn in the overlay viewport by the closure.
+    let field_glow_target = app.config_field_glow_target();
     // The nav device driving the overlay — republished as "gp_nav_active" so
     // pinned bodies (Remapper capture, gyro, …) see UI-nav owns it this frame.
     let nav_active_dev = app.config_nav_active_dev();
@@ -286,14 +289,26 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             crate::overlay::os_cursor_in_points(vctx.pixels_per_point())
         };
 
-        // Publish the gamepad-navigable pin targets (Module pins) each live frame.
+        // Publish the gamepad-navigable pin targets each live frame. Only pins
+        // whose element is actually a nav-editable widget qualify — a purely
+        // visual pin (scope/vector/oscilloscope display, 3D viewer, label, SVG)
+        // is pinnable for feedback but must NOT steal gamepad focus (else a scope
+        // stacked over a real control would intercept LS/dpad selection, leaving
+        // only the RS cursor able to reach the control beneath it).
         if live {
             let targets: Vec<(usize, egui::Rect)> = config_layout
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, it)| matches!(it, LayoutItem::Module(_)))
-                .map(|(i, it)| (i, item_rect(it)))
+                .filter_map(|(i, it)| {
+                    let LayoutItem::Module(m) = it else { return None };
+                    let editable = crate::canvas::overlay_body::resolve_overlay_module(
+                        tab_snarl, &m.source_path, m.inner_node_id,
+                    )
+                    .map(|n| FlexInputApp::elem_is_nav_target(&n.module_id, &m.element_id))
+                    .unwrap_or(false);
+                    editable.then(|| (i, item_rect(it)))
+                })
                 .collect();
             let pass = vctx.cumulative_pass_nr();
             vctx.data_mut(|d| d.insert_temp(nav_targets_id(), (pass, targets)));
@@ -479,6 +494,10 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 if let Some((outer, inner, scope)) = &remap_glow {
                     crate::app::draw_remap_card_glow(ui.ctx(), *outer, *inner, scope);
                 }
+
+                // Value-field bloom ring (knob / min-max / range rows). nav draws
+                // this on the main window; redraw it here so it shows over the game.
+                crate::app::draw_config_field_glow(ui.ctx(), field_glow_target.clone());
 
                 // Focus ring on the active pin (its input is passing through);
                 // brighter + larger while it's being edited, like Easy mode.

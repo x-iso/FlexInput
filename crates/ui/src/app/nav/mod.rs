@@ -20,3 +20,4 @@ mod touch_zones;
 // Viewport-agnostic free fns the config overlay reuses (drawn on the overlay
 // viewport, not just the main window).
 pub(crate) use remap::draw_remap_card_glow;
+pub(crate) use config::draw_config_field_glow;

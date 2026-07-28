@@ -214,6 +214,10 @@ pub(crate) fn show_overlay_body(
     let mut multi_drag_delta: Option<[f32; 2]> = None;
     // Selection changes requested by clicks this frame: (index, shift_held).
     let mut click_select: Option<(usize, bool)> = None;
+    // Screen pos of a plain (non-drag) click this frame, so the apply step can
+    // recompute the full hit-stack and cycle through overlapping items — parity
+    // with the sub-patch layout editor. `None` for drag-select (no cycling).
+    let mut click_pos: Option<egui::Pos2> = None;
 
     let selected_idx = overlay.selected_item;
     let selected_set: Vec<usize> = overlay.selected_items.clone();
@@ -350,6 +354,7 @@ pub(crate) fn show_overlay_body(
             );
             if resp.clicked() {
                 click_select = Some((idx, shift_held));
+                click_pos = resp.interact_pointer_pos();
             }
             if in_set && resp.dragged_by(egui::PointerButton::Primary) {
                 let dd = resp.drag_delta();
@@ -405,6 +410,7 @@ pub(crate) fn show_overlay_body(
             );
             if resp.clicked() {
                 click_select = Some((idx, shift_held));
+                click_pos = resp.interact_pointer_pos();
             }
             if resp.drag_started() {
                 ui.ctx().data_mut(|d| d.insert_temp(drag_pos_id(idx), [lp[0], lp[1], 0.0f32, 0.0f32]));
@@ -524,6 +530,34 @@ pub(crate) fn show_overlay_body(
                 overlay.selected_item = Some(idx);
             }
             overlay.cycle_pos = None;
+        } else if let Some(cp) = click_pos {
+            // Plain click: cycle through overlapping items at the same spot,
+            // replacing the whole selection with the single chosen item — parity
+            // with `show_subpatch_body`. `hits` is topmost-first (items paint
+            // bottom→top, so `.rev()` yields top→bottom).
+            let cur_local = [cp.x - origin.x, cp.y - origin.y];
+            let hits: Vec<usize> = items.iter().enumerate().rev()
+                .filter_map(|(i, it)| it.hit_test(cur_local).then_some(i))
+                .collect();
+            let hits = if hits.is_empty() { vec![idx] } else { hits };
+            let near_prev = overlay.cycle_pos.map(|q| {
+                ((q[0]-cur_local[0]).powi(2) + (q[1]-cur_local[1]).powi(2)).sqrt() < 6.0
+            }).unwrap_or(false);
+            // Only cycle when the current single selection is one of the hits (so
+            // clicking a stack you already have selected steps through it).
+            let single = overlay.selected_items.len() <= 1;
+            let cur_sel = overlay.selected_item;
+            let new_sel = if single && near_prev && hits.len() > 1 {
+                match cur_sel.and_then(|s| hits.iter().position(|&h| h == s)) {
+                    Some(pos) => hits[(pos + 1) % hits.len()],
+                    None      => hits[0],
+                }
+            } else {
+                hits[0]
+            };
+            overlay.selected_item = Some(new_sel);
+            overlay.selected_items = vec![new_sel];
+            overlay.cycle_pos = Some(cur_local);
         } else {
             overlay.selected_item = Some(idx);
             overlay.selected_items = vec![idx];

@@ -1172,6 +1172,7 @@ impl FlexInputApp {
                     self.gamepad_nav.edit_level = EditLevel::CurveDots;
                     self.gamepad_nav.curve_return_level = EditLevel::RemapCard;
                     self.gamepad_nav.curve_dot = 0;
+                    self.gamepad_nav.curve_sustain_focus = false;
                     if self.gamepad_nav.edit_baseline.is_none() {
                         self.gamepad_nav.edit_baseline = Some(Box::new(
                             self.tabs[self.active_tab].canvas.snapshot_for_undo()));

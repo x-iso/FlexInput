@@ -52,6 +52,7 @@ pub(crate) fn has_nav_response_curve(module_id: &str) -> bool {
             | "module.twoway_response_curve"
             | "module.audio_stream_haptics"
             | "module.vec_reshape"
+            | "generator.envelope"
     )
 }
 
