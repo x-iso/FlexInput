@@ -227,6 +227,9 @@ pub(crate) fn show_overlay_body(
     let drag_size_id = |i: usize| egui::Id::new(("fxi_ov_drag_size", i));
     let drag_a_id    = |i: usize| egui::Id::new(("fxi_ov_drag_la", i));
     let drag_b_id    = |i: usize| egui::Id::new(("fxi_ov_drag_lb", i));
+    // Per-drag-session resolved target: which item a drag STARTED on the
+    // topmost item `i` should actually move (see the body drag block below).
+    let drag_tgt_id  = |i: usize| egui::Id::new(("fxi_ov_drag_tgt", i));
 
     for (idx, it) in items.iter().enumerate() {
         let (lp, ls) = it.bbox();
@@ -412,26 +415,59 @@ pub(crate) fn show_overlay_body(
                 click_select = Some((idx, shift_held));
                 click_pos = resp.interact_pointer_pos();
             }
+            // egui hands the drag to the TOPMOST item under the pointer (`idx`),
+            // but the user may have click-cycled the selection to a LOWER item in
+            // a stack. Resolve which item a drag actually manipulates ONCE at
+            // press time: the selected item when it sits under the press point
+            // (honour the cycled selection), else the surface item. Without this,
+            // dragging any stack always grabbed + re-selected the surface item,
+            // ignoring the selection (the reported bug).
+            let hit_at = |i: usize, p: egui::Pos2| -> bool {
+                let (bp, bs) = items[i].bbox();
+                egui::Rect::from_min_size(
+                    origin + egui::vec2(bp[0], bp[1]),
+                    egui::vec2(bs[0].max(8.0), bs[1].max(8.0)),
+                )
+                .contains(p)
+            };
             if resp.drag_started() {
-                ui.ctx().data_mut(|d| d.insert_temp(drag_pos_id(idx), [lp[0], lp[1], 0.0f32, 0.0f32]));
+                let p = resp.interact_pointer_pos().unwrap_or(item_rect.center());
+                let target = match selected_idx {
+                    Some(sel) if sel != idx && hit_at(sel, p) => sel,
+                    _ => idx,
+                };
+                let (tp, _) = items[target].bbox();
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(drag_tgt_id(idx), target);
+                    d.insert_temp(drag_pos_id(target), [tp[0], tp[1], 0.0f32, 0.0f32]);
+                });
             }
             if resp.dragged_by(egui::PointerButton::Primary) {
-                // Dragging an unselected item selects it first (single).
-                if !in_set && !is_primary {
-                    click_select = Some((idx, false));
-                }
-                let prev = ui.ctx().data(|d| d.get_temp::<[f32; 4]>(drag_pos_id(idx)))
-                    .unwrap_or([lp[0], lp[1], 0.0, 0.0]);
+                let target = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<usize>(drag_tgt_id(idx)))
+                    .unwrap_or(idx);
                 let dd = resp.drag_delta();
-                if is_multi && in_set {
+                // Move the whole multi-selection when the drag belongs to it
+                // (topmost item is in the set, or the resolved target is a member).
+                if is_multi && (in_set || selected_set.contains(&target)) {
                     let prev_acc = multi_drag_delta.unwrap_or([0.0, 0.0]);
                     multi_drag_delta = Some([prev_acc[0] + dd.x, prev_acc[1] + dd.y]);
                 } else {
+                    // Grabbing the surface item directly (target == the topmost,
+                    // and it wasn't already selected) selects it; a redirect to a
+                    // cycled selection leaves the selection untouched.
+                    if target == idx && !in_set && !is_primary {
+                        click_select = Some((idx, false));
+                    }
+                    let (tp, _) = items[target].bbox();
+                    let prev = ui.ctx().data(|d| d.get_temp::<[f32; 4]>(drag_pos_id(target)))
+                        .unwrap_or([tp[0], tp[1], 0.0, 0.0]);
                     ui.ctx().data_mut(|d| d.insert_temp(
-                        drag_pos_id(idx), [prev[0], prev[1], prev[2] + dd.x, prev[3] + dd.y]));
+                        drag_pos_id(target), [prev[0], prev[1], prev[2] + dd.x, prev[3] + dd.y]));
                     let tx = snap(prev[0] + prev[2] + dd.x).max(0.0);
                     let ty = snap(prev[1] + prev[3] + dd.y).max(0.0);
-                    new_pos[idx] = Some([tx, ty]);
+                    new_pos[target] = Some([tx, ty]);
                 }
             }
             resp.context_menu(|ui| {
