@@ -106,6 +106,9 @@ pub fn migrate_vigem_device_id(id: &str) -> Option<String> {
 ///   wires are preserved; the migrated id then deploys via the HIDMaestro path
 ///   (which prompts to install the driver if needed). Idempotent — already-
 ///   HIDMaestro ids are left alone.
+/// - Negate → Inverse: the `math.negate` module kept its id but gained a new
+///   display name. Nodes still carrying the old stock title are retitled;
+///   user-renamed nodes are left alone.
 ///
 /// Recurses into sub-patches.
 pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
@@ -162,6 +165,11 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
                 node.value.params.insert("rumble_exp".into(), Value::from(RUMBLE_LEGACY_EXP as f64));
             }
         }
+        // "Negate" was renamed to "Inverse" (module id unchanged). Only rewrite
+        // the stock title — a node the user renamed keeps their name.
+        if node.value.module_id == "math.negate" && node.value.display_name == "Negate" {
+            node.value.display_name = "Inverse".to_string();
+        }
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
         }
@@ -193,6 +201,44 @@ mod migration_tests {
         // Prefix-only false positive guard: a longer kind that merely starts
         // with "virtual.ds4" must NOT match.
         assert_eq!(migrate_vigem_device_id("virtual.ds4x"), None);
+    }
+
+    /// Negate → Inverse retitles only nodes still carrying the stock name;
+    /// a hand-renamed node keeps the user's title. Recurses into sub-patches.
+    #[test]
+    fn migrate_retitles_stock_negate_but_not_renamed_nodes() {
+        fn negate(display_name: &str) -> NodeData {
+            NodeData {
+                module_id: "math.negate".to_string(),
+                display_name: display_name.to_string(),
+                category: "Math".to_string(),
+                inputs: vec![],
+                outputs: vec![],
+                params: HashMap::new(),
+                subpatch: None,
+                extra: Default::default(),
+            }
+        }
+
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let stock  = snarl.insert_node(egui::Pos2::ZERO, negate("Negate"));
+        let custom = snarl.insert_node(egui::pos2(10.0, 0.0), negate("Flip Trigger"));
+
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let nested = inner.insert_node(egui::Pos2::ZERO, negate("Negate"));
+        let mut sp = UiSubPatch::default();
+        sp.snarl = Box::new(inner);
+        let mut host = negate("Host");
+        host.module_id = "subpatch".to_string();
+        host.subpatch = Some(Box::new(sp));
+        let host_id = snarl.insert_node(egui::pos2(20.0, 0.0), host);
+
+        migrate_loaded_snarl(&mut snarl);
+
+        assert_eq!(snarl.get_node(stock).unwrap().display_name, "Inverse");
+        assert_eq!(snarl.get_node(custom).unwrap().display_name, "Flip Trigger");
+        let inner_sp = snarl.get_node(host_id).unwrap().subpatch.as_ref().unwrap();
+        assert_eq!(inner_sp.snarl.get_node(nested).unwrap().display_name, "Inverse");
     }
 
     /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,

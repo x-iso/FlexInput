@@ -52,9 +52,9 @@ Carry the AutoMap gamepad bus between two FlexInput instances over the network:
 | Category | Modules |
 |----------|---------|
 | **Utility** | Constant, Switch, Knob, Selector, Dropdown, Text, SVG, Split, Sub-patch |
-| **Math** | Add, Subtract, Multiply, Divide, Clamp, Abs, Negate, Map Range |
+| **Math** | Add, Subtract, Multiply, Divide, Clamp, Abs, Inverse, Min/Max, Quantize, Map Range |
 | **Logic** | AND, OR, NOT, XOR, Equal, NotEqual, GreaterThan, LessThan, Has Changed, Logic Delay, Counter |
-| **Processing** | Delay, Average, DC Filter, Response Curve, Vec Response Curve, Vec Reshaper, Two-way Response Curve, Vec→Axis, Axis→Vec, Gyro 3DOF |
+| **Processing** | Delay, Average, DC Filter, Response Curve, Vec Response Curve, Vec Reshaper, Two-way Response Curve, Vec→Axis, Axis→Vec, Vec→Deflection, Gyro 3DOF |
 | **Display** | Readout, Oscilloscope, Trigger Scope, Vectorscope |
 | **Generator** | Oscillator, Envelope |
 | **AutoMap** | AutoMap Splitter, AutoMap Collector, AutoMap Fork, AutoMap Selector, AutoMap Combiner, Touch Zones, Remapper, Map Action, Feedback Control, Audio Stream Haptics |

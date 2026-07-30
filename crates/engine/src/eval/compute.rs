@@ -427,10 +427,78 @@ pub fn eval_pure(
             Some(Signal::Vec2(v)) => Some(Signal::Vec2(v.abs())),
             other => Some(Signal::Float(other.map(|s| s.as_float()).unwrap_or(0.0).abs())),
         },
-        "math.negate" => match inputs.get(0).and_then(|s| *s) {
-            Some(Signal::Vec2(v)) => Some(Signal::Vec2(-v)),
-            other => Some(Signal::Float(-other.map(|s| s.as_float()).unwrap_or(0.0))),
-        },
+        // Inverse (id kept as "math.negate" for patch compatibility).
+        "math.negate" => {
+            let unipolar = params.get("unipolar").and_then(|v| v.as_bool()).unwrap_or(false);
+            if unipolar {
+                // Mirror inside 0..=max, clipping outside instead of going negative.
+                let max = param_f("unipolar_max", 1.0);
+                let inv = |v: f32| if max <= 0.0 { 0.0 } else { (max - v).clamp(0.0, max) };
+                match inputs.get(0).and_then(|s| *s) {
+                    Some(Signal::Vec2(v)) => Some(Signal::Vec2(Vec2::new(inv(v.x), inv(v.y)))),
+                    other => Some(Signal::Float(inv(other.map(|s| s.as_float()).unwrap_or(0.0)))),
+                }
+            } else {
+                match inputs.get(0).and_then(|s| *s) {
+                    Some(Signal::Vec2(v)) => Some(Signal::Vec2(-v)),
+                    other => Some(Signal::Float(-other.map(|s| s.as_float()).unwrap_or(0.0))),
+                }
+            }
+        }
+        // Min/Max — out 0 = max, out 1 = min, over the WIRED inputs only, so an
+        // unwired spare pin doesn't drag the min down to 0.
+        "math.min_max" => {
+            let vec_mode = inputs.iter().any(|s| matches!(s, Some(Signal::Vec2(_))));
+            let mut lo_f: Option<f32> = None;
+            let mut hi_f: Option<f32> = None;
+            let mut lo_v: Option<Vec2> = None;
+            let mut hi_v: Option<Vec2> = None;
+            for (i, sig) in inputs.iter().enumerate() {
+                if sig.is_none() { continue; }
+                if vec_mode {
+                    let v = get_v2(inputs, i, 0.0);
+                    lo_v = Some(lo_v.map_or(v, |c: Vec2| c.min(v)));
+                    hi_v = Some(hi_v.map_or(v, |c: Vec2| c.max(v)));
+                } else {
+                    let v = get_f(inputs, i, 0.0);
+                    lo_f = Some(lo_f.map_or(v, |c: f32| c.min(v)));
+                    hi_f = Some(hi_f.map_or(v, |c: f32| c.max(v)));
+                }
+            }
+            match (vec_mode, out_idx) {
+                (true, 0)  => Some(Signal::Vec2(hi_v.unwrap_or(Vec2::ZERO))),
+                (true, 1)  => Some(Signal::Vec2(lo_v.unwrap_or(Vec2::ZERO))),
+                (false, 0) => Some(Signal::Float(hi_f.unwrap_or(0.0))),
+                (false, 1) => Some(Signal::Float(lo_f.unwrap_or(0.0))),
+                _ => None,
+            }
+        }
+        // Quantize — snap to a grid of `factor` steps per unit (1 = integers,
+        // 2 = halves, …). The wired Factor pin wins over the body's value.
+        "math.quantize" => {
+            let factor = if inputs.get(1).and_then(|s| *s).is_some() {
+                get_f(inputs, 1, 1.0)
+            } else {
+                param_f("factor", 1.0)
+            };
+            let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("round");
+            let q = |v: f32| -> f32 {
+                // A non-positive factor has no grid — pass the value through.
+                if !factor.is_finite() || factor <= 0.0 || !v.is_finite() { return v; }
+                let scaled = v * factor;
+                let snapped = match mode {
+                    "floor" => scaled.floor(),
+                    "ceil"  => scaled.ceil(),
+                    "trunc" => scaled.trunc(),
+                    _       => scaled.round(),
+                };
+                snapped / factor
+            };
+            match inputs.first().and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => Some(Signal::Vec2(Vec2::new(q(v.x), q(v.y)))),
+                other => Some(Signal::Float(q(other.map(|s| s.as_float()).unwrap_or(0.0)))),
+            }
+        }
         "math.clamp"  => {
             let min = if inputs.get(1).and_then(|s| *s).is_some() { get_f(inputs, 1, -1.0) } else { param_f("min", -1.0) };
             let max = if inputs.get(2).and_then(|s| *s).is_some() { get_f(inputs, 2,  1.0) } else { param_f("max",  1.0) };
@@ -579,6 +647,26 @@ pub fn eval_pure(
                 _ => glam::Vec2::ZERO,
             };
             match out_idx { 0 => Some(Signal::Float(vec.x)), 1 => Some(Signal::Float(vec.y)), _ => None }
+        }
+        // Vec → polar. Angle 0 = straight up, growing clockwise; it wraps back to
+        // 0 at the theoretical max (1.0 or 360.0) since that's the same direction.
+        "module.vec_to_deflection" => {
+            let vec = match inputs.first().and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => v,
+                _ => Vec2::ZERO,
+            };
+            match out_idx {
+                0 => Some(Signal::Float(vec.length())),
+                1 => {
+                    let degrees = params.get("degrees").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let full = if degrees { 360.0 } else { 1.0 };
+                    // atan2(x, y), not (y, x): puts the zero on +Y and turns clockwise.
+                    let turns = vec.x.atan2(vec.y) / std::f32::consts::TAU;
+                    let wrapped = (turns * full).rem_euclid(full);
+                    Some(Signal::Float(if wrapped >= full { 0.0 } else { wrapped }))
+                }
+                _ => None,
+            }
         }
         "module.axis_to_vec" => {
             if out_idx != 0 { return None; }

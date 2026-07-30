@@ -229,9 +229,10 @@ eval/modules/*.rs  → Specialized evaluators (lean, map_action, remapper, etc.)
 ```
 lib.rs              → all_modules() registration aggregator
 controls.rs         → Constant, Switch, Knob, Selector, Dropdown, Text (module.label), SVG, Split
-math.rs             → Add, Subtract, Multiply, Divide, Clamp, Abs, Negate, MapRange
+math.rs             → Add, Subtract, Multiply, Divide, Clamp, Abs, Inverse, MinMax, Quantize, MapRange
 logic.rs            → AND, OR, NOT, XOR, Equal, NotEqual, GreaterThan, LessThan, HasChanged, LogicDelay, Counter
-processing.rs       → Delay, Average, DCFilter, response curves, VecReshape, Gyro3DOF, VecToAxis/AxisToVec,
+processing.rs       → Delay, Average, DCFilter, response curves, VecReshape, Gyro3DOF,
+                      VecToAxis/AxisToVec/VecToDeflection,
                       AND the AutoMap/mapping modules: automap_split/collect/fork/selector/combiner,
                       Remapper, MapAction, FeedbackControl, AudioStreamHaptics
 display.rs          → Readout, Oscilloscope, TriggerScope, Vectorscope, Controller3D

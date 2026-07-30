@@ -1557,6 +1557,125 @@ pub(crate) fn show_logic_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &
     }
 }
 
+/// Inverse (module id `math.negate`): bipolar `-v` by default, or a unipolar
+/// mirror inside `0..max` when the checkbox is ticked. The max box is greyed
+/// out while unipolar is off since it has no effect there.
+pub(crate) fn show_inverse_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (unipolar, max) = snarl.get_node(node_id).map(|n| {
+        let unipolar = n.params.get("unipolar").and_then(|v| v.as_bool()).unwrap_or(false);
+        let max = n.params.get("unipolar_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        (unipolar, max)
+    }).unwrap_or((false, 1.0));
+
+    let mut unipolar = unipolar;
+    let mut max = max;
+    let mut changed = false;
+
+    let r = ui.vertical(|ui| {
+        changed |= ui
+            .checkbox(&mut unipolar, egui::RichText::new("Unipolar").small())
+            .on_hover_text("Mirror the signal inside 0..max instead of flipping its sign")
+            .changed();
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(unipolar, |ui| {
+                ui.label(egui::RichText::new("max").small());
+                changed |= ui
+                    .add(egui::DragValue::new(&mut max).speed(0.01).range(0.0..=1000.0))
+                    .on_hover_text("Input value that maps to 0; also the output at input 0")
+                    .changed();
+            });
+        });
+    });
+    register_exposable_element(ui, node_id, "unipolar", r.response.rect);
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("unipolar".into(), Value::Bool(unipolar));
+            if let Some(n) = Number::from_f64(max as f64) {
+                node.params.insert("unipolar_max".into(), Value::Number(n));
+            }
+        }
+    }
+}
+
+/// Quantize (`math.quantize`): grid factor + rounding mode. The factor box is
+/// greyed out while the Factor pin is wired, since the wire wins.
+pub(crate) fn show_quantize_body(
+    node_id: NodeId,
+    inputs: &[InPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+) {
+    let (factor, mode) = snarl.get_node(node_id).map(|n| {
+        let f = n.params.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let m = n.params.get("mode").and_then(|v| v.as_str()).unwrap_or("round").to_string();
+        (f, m)
+    }).unwrap_or((1.0, "round".to_string()));
+
+    let factor_wired = inputs.get(1).map(|p| !p.remotes.is_empty()).unwrap_or(false);
+
+    let mut factor = factor;
+    let mut mode = mode;
+    let mut changed = false;
+
+    let r1 = ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("factor").small());
+        ui.add_enabled_ui(!factor_wired, |ui| {
+            changed |= ui
+                .add(egui::DragValue::new(&mut factor).speed(0.05).range(0.0..=10_000.0))
+                .on_hover_text("Steps per unit: 1 = integers, 2 = halves, 4 = quarters")
+                .changed();
+        });
+        if factor_wired {
+            ui.label(egui::RichText::new("(wired)").small().weak());
+        }
+    });
+    let r2 = ui.horizontal(|ui| {
+        changed |= ui.selectable_value(&mut mode, "round".into(), egui::RichText::new("Round").small()).changed();
+        changed |= ui.selectable_value(&mut mode, "floor".into(), egui::RichText::new("Floor").small()).changed();
+        changed |= ui.selectable_value(&mut mode, "ceil".into(),  egui::RichText::new("Ceil").small()).changed();
+        changed |= ui.selectable_value(&mut mode, "trunc".into(), egui::RichText::new("Trunc").small()).changed();
+    });
+    register_exposable_element(ui, node_id, "factor", r1.response.rect);
+    register_exposable_element(ui, node_id, "mode",   r2.response.rect);
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("mode".into(), Value::String(mode));
+            if let Some(n) = Number::from_f64(factor as f64) {
+                node.params.insert("factor".into(), Value::Number(n));
+            }
+        }
+    }
+}
+
+/// Vec to Deflection (`module.vec_to_deflection`): pick the Angle output's unit.
+pub(crate) fn show_vec_to_deflection_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let degrees = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("degrees").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let mut degrees = degrees;
+    let mut changed = false;
+
+    let r = ui.horizontal(|ui| {
+        changed |= ui
+            .selectable_value(&mut degrees, false, egui::RichText::new("0..1").small())
+            .on_hover_text("Angle as a fraction of a full turn, wrapping to 0 at 1")
+            .changed();
+        changed |= ui
+            .selectable_value(&mut degrees, true, egui::RichText::new("0..360°").small())
+            .on_hover_text("Angle in degrees, wrapping to 0 at 360")
+            .changed();
+    });
+    register_exposable_element(ui, node_id, "angle_unit", r.response.rect);
+
+    if changed {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("degrees".into(), Value::Bool(degrees));
+        }
+    }
+}
+
 pub(crate) fn show_or_equal_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let or_equal = snarl
         .get_node(node_id)

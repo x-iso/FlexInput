@@ -2497,6 +2497,256 @@ mod menu_eval_tests {
 }
 
 #[cfg(test)]
+mod inverse_tests {
+    use super::*;
+
+    fn inverse(v: Signal, params: &[(&str, serde_json::Value)]) -> Option<Signal> {
+        let params: HashMap<String, serde_json::Value> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        eval_pure("math.negate", 0, &[Some(v)], &params, 1)
+    }
+
+    #[test]
+    fn bipolar_is_a_plain_sign_flip() {
+        assert_eq!(inverse(Signal::Float(0.25), &[]), Some(Signal::Float(-0.25)));
+        assert_eq!(
+            inverse(Signal::Vec2(glam::Vec2::new(0.5, -0.5)), &[]),
+            Some(Signal::Vec2(glam::Vec2::new(-0.5, 0.5)))
+        );
+        // Explicit unipolar=false behaves the same as no param at all.
+        assert_eq!(
+            inverse(Signal::Float(0.25), &[("unipolar", false.into())]),
+            Some(Signal::Float(-0.25))
+        );
+    }
+
+    #[test]
+    fn unipolar_mirrors_within_max_and_clips_outside() {
+        let on: &[(&str, serde_json::Value)] = &[("unipolar", true.into())];
+        // Default max = 1: 0 → 1, 1 → 0, midpoint holds.
+        assert_eq!(inverse(Signal::Float(0.0), on), Some(Signal::Float(1.0)));
+        assert_eq!(inverse(Signal::Float(1.0), on), Some(Signal::Float(0.0)));
+        assert_eq!(inverse(Signal::Float(0.25), on), Some(Signal::Float(0.75)));
+        // Past either end clips instead of going negative / above max.
+        assert_eq!(inverse(Signal::Float(1.5), on), Some(Signal::Float(0.0)));
+        assert_eq!(inverse(Signal::Float(-0.5), on), Some(Signal::Float(1.0)));
+    }
+
+    #[test]
+    fn unipolar_max_rescales_the_mirror() {
+        let on: &[(&str, serde_json::Value)] =
+            &[("unipolar", true.into()), ("unipolar_max", (2.0_f64).into())];
+        assert_eq!(inverse(Signal::Float(0.0), on), Some(Signal::Float(2.0)));
+        assert_eq!(inverse(Signal::Float(2.0), on), Some(Signal::Float(0.0)));
+        assert_eq!(inverse(Signal::Float(0.5), on), Some(Signal::Float(1.5)));
+        assert_eq!(inverse(Signal::Float(3.0), on), Some(Signal::Float(0.0)));
+        // Vec2 mirrors component-wise.
+        assert_eq!(
+            inverse(Signal::Vec2(glam::Vec2::new(0.0, 2.0)), on),
+            Some(Signal::Vec2(glam::Vec2::new(2.0, 0.0)))
+        );
+    }
+
+    #[test]
+    fn nonpositive_max_degenerates_to_zero() {
+        let on: &[(&str, serde_json::Value)] =
+            &[("unipolar", true.into()), ("unipolar_max", (0.0_f64).into())];
+        assert_eq!(inverse(Signal::Float(0.0), on), Some(Signal::Float(0.0)));
+        assert_eq!(inverse(Signal::Float(0.5), on), Some(Signal::Float(0.0)));
+    }
+}
+
+#[cfg(test)]
+mod min_max_tests {
+    use super::*;
+
+    /// (max, min) — output 0 is the max, output 1 is the min.
+    fn min_max(inputs: &[Option<Signal>]) -> (Option<Signal>, Option<Signal>) {
+        let p = HashMap::new();
+        (
+            eval_pure("math.min_max", 0, inputs, &p, 2),
+            eval_pure("math.min_max", 1, inputs, &p, 2),
+        )
+    }
+
+    fn f(v: f32) -> Option<Signal> { Some(Signal::Float(v)) }
+
+    #[test]
+    fn reports_extremes_of_two_inputs() {
+        assert_eq!(min_max(&[f(0.2), f(0.9)]), (f(0.9), f(0.2)));
+        // Order doesn't matter, and negatives sort correctly.
+        assert_eq!(min_max(&[f(-1.0), f(0.5)]), (f(0.5), f(-1.0)));
+    }
+
+    #[test]
+    fn scales_past_the_default_two_pins() {
+        assert_eq!(min_max(&[f(0.3), f(-0.7), f(1.2), f(0.0)]), (f(1.2), f(-0.7)));
+    }
+
+    /// An unwired spare pin must not count as a 0 — otherwise adding a pin you
+    /// haven't connected yet would silently pin the min at 0.
+    #[test]
+    fn unwired_pins_are_ignored() {
+        assert_eq!(min_max(&[f(0.4), None, f(0.9)]), (f(0.9), f(0.4)));
+        // Nothing wired at all → both outputs rest at 0.
+        assert_eq!(min_max(&[None, None]), (f(0.0), f(0.0)));
+    }
+
+    #[test]
+    fn vec2_extremes_are_component_wise() {
+        let a = Some(Signal::Vec2(glam::Vec2::new(0.8, -0.2)));
+        let b = Some(Signal::Vec2(glam::Vec2::new(-0.1, 0.6)));
+        assert_eq!(
+            min_max(&[a, b]),
+            (
+                Some(Signal::Vec2(glam::Vec2::new(0.8, 0.6))),
+                Some(Signal::Vec2(glam::Vec2::new(-0.1, -0.2))),
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod quantize_tests {
+    use super::*;
+
+    fn quantize(inputs: &[Option<Signal>], params: &[(&str, serde_json::Value)]) -> Option<Signal> {
+        let params: HashMap<String, serde_json::Value> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        eval_pure("math.quantize", 0, inputs, &params, 1)
+    }
+
+    fn at(v: f32, factor: f64) -> Option<Signal> {
+        quantize(&[Some(Signal::Float(v)), None], &[("factor", factor.into())])
+    }
+
+    #[test]
+    fn factor_one_snaps_to_integers() {
+        assert_eq!(at(0.4, 1.0), Some(Signal::Float(0.0)));
+        assert_eq!(at(0.6, 1.0), Some(Signal::Float(1.0)));
+        assert_eq!(at(-0.6, 1.0), Some(Signal::Float(-1.0)));
+        assert_eq!(at(2.5, 1.0), Some(Signal::Float(3.0)));
+    }
+
+    #[test]
+    fn factor_two_snaps_to_halves_and_four_to_quarters() {
+        assert_eq!(at(0.3, 2.0), Some(Signal::Float(0.5)));
+        assert_eq!(at(0.2, 2.0), Some(Signal::Float(0.0)));
+        assert_eq!(at(0.8, 2.0), Some(Signal::Float(1.0)));
+        assert_eq!(at(0.3, 4.0), Some(Signal::Float(0.25)));
+        assert_eq!(at(0.4, 4.0), Some(Signal::Float(0.5)));
+    }
+
+    #[test]
+    fn modes_pick_which_grid_line_a_value_falls_to() {
+        let go = |v: f32, mode: &str| quantize(
+            &[Some(Signal::Float(v)), None],
+            &[("factor", (1.0_f64).into()), ("mode", mode.into())],
+        );
+        assert_eq!(go(1.7, "round"), Some(Signal::Float(2.0)));
+        assert_eq!(go(1.7, "floor"), Some(Signal::Float(1.0)));
+        assert_eq!(go(1.2, "ceil"),  Some(Signal::Float(2.0)));
+        // Floor vs trunc only differ below zero.
+        assert_eq!(go(-1.2, "floor"), Some(Signal::Float(-2.0)));
+        assert_eq!(go(-1.2, "trunc"), Some(Signal::Float(-1.0)));
+        // An unknown mode string degrades to Round rather than dropping output.
+        assert_eq!(go(1.7, "wat"), Some(Signal::Float(2.0)));
+    }
+
+    #[test]
+    fn wired_factor_pin_overrides_the_body_value() {
+        let out = quantize(
+            &[Some(Signal::Float(0.3)), Some(Signal::Float(2.0))],
+            &[("factor", (1.0_f64).into())],
+        );
+        assert_eq!(out, Some(Signal::Float(0.5)), "pin factor 2 must win over param 1");
+    }
+
+    #[test]
+    fn nonpositive_factor_passes_through_unquantized() {
+        assert_eq!(at(0.37, 0.0), Some(Signal::Float(0.37)));
+        assert_eq!(at(0.37, -2.0), Some(Signal::Float(0.37)));
+    }
+
+    #[test]
+    fn vec2_quantizes_component_wise() {
+        let out = quantize(
+            &[Some(Signal::Vec2(glam::Vec2::new(0.3, -0.8))), None],
+            &[("factor", (2.0_f64).into())],
+        );
+        assert_eq!(out, Some(Signal::Vec2(glam::Vec2::new(0.5, -1.0))));
+    }
+}
+
+#[cfg(test)]
+mod vec_to_deflection_tests {
+    use super::*;
+
+    fn out(v: glam::Vec2, degrees: bool) -> (f32, f32) {
+        let mut params = HashMap::new();
+        params.insert("degrees".to_string(), serde_json::Value::Bool(degrees));
+        let inputs = [Some(Signal::Vec2(v))];
+        let g = |i| match eval_pure("module.vec_to_deflection", i, &inputs, &params, 2) {
+            Some(Signal::Float(f)) => f,
+            other => panic!("expected Float, got {other:?}"),
+        };
+        (g(0), g(1))
+    }
+
+    #[test]
+    fn deflection_is_distance_from_centre() {
+        assert!((out(glam::Vec2::new(0.0, 1.0), false).0 - 1.0).abs() < 1e-5);
+        assert!((out(glam::Vec2::new(3.0, 4.0), false).0 - 5.0).abs() < 1e-5);
+        assert_eq!(out(glam::Vec2::ZERO, false).0, 0.0);
+    }
+
+    /// Up is 0 and the angle grows clockwise, so right is a quarter turn.
+    #[test]
+    fn angle_zero_is_up_and_turns_clockwise() {
+        let a = |x: f32, y: f32| out(glam::Vec2::new(x, y), false).1;
+        assert!((a(0.0,  1.0) - 0.00).abs() < 1e-5, "up");
+        assert!((a(1.0,  0.0) - 0.25).abs() < 1e-5, "right");
+        assert!((a(0.0, -1.0) - 0.50).abs() < 1e-5, "down");
+        assert!((a(-1.0, 0.0) - 0.75).abs() < 1e-5, "left");
+    }
+
+    #[test]
+    fn degrees_mode_spans_the_same_circle() {
+        let a = |x: f32, y: f32| out(glam::Vec2::new(x, y), true).1;
+        assert!((a(0.0,  1.0) -   0.0).abs() < 1e-3, "up");
+        assert!((a(1.0,  0.0) -  90.0).abs() < 1e-3, "right");
+        assert!((a(0.0, -1.0) - 180.0).abs() < 1e-3, "down");
+        assert!((a(-1.0, 0.0) - 270.0).abs() < 1e-3, "left");
+    }
+
+    /// The theoretical max and 0 are the same direction — the output must land
+    /// on 0, never on 1.0 / 360.0, so downstream wrapping stays continuous.
+    #[test]
+    fn angle_wraps_to_zero_at_the_top_of_the_range() {
+        for degrees in [false, true] {
+            let full = if degrees { 360.0 } else { 1.0 };
+            // A hair clockwise of "up" from the negative side.
+            let just_under = glam::Vec2::new(-1e-6, 1.0);
+            let a = out(just_under, degrees).1;
+            assert!(a >= 0.0 && a < full, "angle {a} must stay inside [0, {full})");
+            // Dead up reads exactly 0.
+            assert_eq!(out(glam::Vec2::new(0.0, 1.0), degrees).1, 0.0);
+        }
+    }
+
+    /// A zero vector has no direction; report 0 rather than NaN.
+    #[test]
+    fn zero_vector_has_zero_angle() {
+        assert_eq!(out(glam::Vec2::ZERO, false).1, 0.0);
+        assert_eq!(out(glam::Vec2::ZERO, true).1, 0.0);
+    }
+}
+
+#[cfg(test)]
 mod source_namespace_tests {
     use super::*;
 

@@ -408,6 +408,9 @@ impl FlexInputApp {
             | ("module.audio_stream_haptics", "asth_swap_row")
             | ("module.audio_stream_haptics", "asth_rumble_mix")
             | ("module.menu", "options")
+            | ("math.negate", "unipolar")
+            | ("math.quantize", "factor") | ("math.quantize", "mode")
+            | ("module.vec_to_deflection", "angle_unit")
         )
     }
 
@@ -523,6 +526,7 @@ impl FlexInputApp {
             ("module.dc_filter", "window_ms") => ("window_ms",  10.0, 60_000.0, 500.0, Decade),
             ("module.dc_filter", "decay_ms")  => ("decay_ms",   10.0, 60_000.0, 200.0, Decade),
             ("logic.delay", "time")           => ("time",       0.0,  60_000.0, 100.0, Decade),
+            ("math.quantize", "factor")       => ("factor",     0.0,  10_000.0, 1.0,   Decade),
             ("generator.oscillator", "freq")  => ("freq_param", 0.01, 200.0,    1.0,   Decade),
             ("generator.oscillator", "phase") => ("phase_param",0.0,  1.0,      0.0,   Linear),
             ("logic.counter", "step")         => ("step_param", 0.001,10_000.0, 1.0,   Decade),
@@ -605,6 +609,14 @@ impl FlexInputApp {
             ("processing.gyro_3dof", "lean_threshold") => vec![f!("Lean", v("lean_threshold",0.01,4.0,0.3,Linear))],
             // ── multi-field rows ──
             ("logic.counter", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
+            ("math.negate", "unipolar") => vec![
+                f!("Unipolar", Toggle{key:"unipolar"}),
+                f!("Max", v("unipolar_max",0.0,1000.0,1.0,Linear)),
+            ],
+            ("math.quantize", "factor") => vec![f!("Factor", v("factor",0.0,10_000.0,1.0,Decade))],
+            ("math.quantize", "mode")   =>
+                vec![f!("Mode", Enum{key:"mode",opts:&["round","floor","ceil","trunc"]})],
+            ("module.vec_to_deflection", "angle_unit") => vec![f!("Degrees", Toggle{key:"degrees"})],
             ("logic.counter", "range_mode") => vec![f!("Normalized", Toggle{key:"normalized"})],
             ("logic.counter", "step") => vec![f!("Step", v("step_param",0.001,10_000.0,1.0,Decade))],
             ("logic.counter", "min_max") => vec![

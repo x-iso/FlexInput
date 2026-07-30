@@ -11,7 +11,9 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<Multiply>(),
         reg::<Divide>(),
         reg::<Abs>(),
-        reg::<Negate>(),
+        reg::<Inverse>(),
+        reg::<MinMax>(),
+        reg::<Quantize>(),
         reg::<MapRange>(),
         ModuleRegistration {
             descriptor: Clamp::descriptor(),
@@ -193,22 +195,181 @@ impl Module for Abs {
     }
 }
 
-// ── Negate ───────────────────────────────────────────────────────────────────
+// ── Inverse ──────────────────────────────────────────────────────────────────
 
-#[derive(Default)]
-pub struct Negate;
-impl Module for Negate {
+/// Polarity flip. Bipolar (default) is a plain `-v`; unipolar mirrors the signal
+/// inside `0..max` instead, so a 0→max ramp comes out as max→0 and anything past
+/// the ends clips rather than going negative.
+pub struct Inverse { pub unipolar: bool, pub max: f32 }
+
+impl Default for Inverse {
+    fn default() -> Self { Self { unipolar: false, max: 1.0 } }
+}
+
+/// Mirror `v` within `0..=max`, clipping outside. `max <= 0` degenerates to 0.
+pub fn unipolar_invert(v: f32, max: f32) -> f32 {
+    if max <= 0.0 { return 0.0; }
+    (max - v).clamp(0.0, max)
+}
+
+impl Module for Inverse {
     fn descriptor() -> ModuleDescriptor {
+        // `id` stays "math.negate" so patches saved before the rename still load.
         ModuleDescriptor {
-            id: "math.negate", display_name: "Negate", category: "Math",
+            id: "math.negate", display_name: "Inverse", category: "Math",
             inputs: vec![PinDescriptor::new("in", SignalType::Any)],
             outputs: vec![PinDescriptor::new("out", SignalType::Any)],
         }
     }
     fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
-        match inputs.get(0).and_then(|s| *s) {
-            Some(Signal::Vec2(v)) => out_v(-v),
-            other => out_f(-other.map(|s| s.as_float()).unwrap_or(0.0)),
+        if self.unipolar {
+            let max = self.max;
+            match inputs.first().and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => out_v(Vec2::new(
+                    unipolar_invert(v.x, max),
+                    unipolar_invert(v.y, max),
+                )),
+                other => out_f(unipolar_invert(other.map(|s| s.as_float()).unwrap_or(0.0), max)),
+            }
+        } else {
+            match inputs.first().and_then(|s| *s) {
+                Some(Signal::Vec2(v)) => out_v(-v),
+                other => out_f(-other.map(|s| s.as_float()).unwrap_or(0.0)),
+            }
+        }
+    }
+}
+
+// ── Min/Max ──────────────────────────────────────────────────────────────────
+
+/// Variadic extremum: reports the largest and smallest of all wired inputs.
+/// Unwired pins contribute nothing, so a partly-wired node still reports the
+/// extremes of what it actually sees rather than being dragged toward 0.
+#[derive(Default)]
+pub struct MinMax;
+impl Module for MinMax {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "math.min_max", display_name: "Min/Max", category: "Math",
+            inputs: vec![
+                PinDescriptor::new("a", SignalType::Any),
+                PinDescriptor::new("b", SignalType::Any),
+            ],
+            outputs: vec![
+                PinDescriptor::new("max", SignalType::Any),
+                PinDescriptor::new("min", SignalType::Any),
+            ],
+        }
+    }
+    fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        let mut out = SmallVec::new();
+        if has_vec2(inputs) {
+            let (mn, mx) = min_max_v2(inputs);
+            out.push(Signal::Vec2(mx));
+            out.push(Signal::Vec2(mn));
+        } else {
+            let (mn, mx) = min_max_f32(inputs);
+            out.push(Signal::Float(mx));
+            out.push(Signal::Float(mn));
+        }
+        out
+    }
+}
+
+/// `(min, max)` over the wired scalar inputs; `(0, 0)` when nothing is wired.
+pub fn min_max_f32(inputs: &[Option<Signal>]) -> (f32, f32) {
+    let mut lo: Option<f32> = None;
+    let mut hi: Option<f32> = None;
+    for s in inputs.iter().flatten() {
+        let v = s.as_float();
+        lo = Some(lo.map_or(v, |c: f32| c.min(v)));
+        hi = Some(hi.map_or(v, |c: f32| c.max(v)));
+    }
+    (lo.unwrap_or(0.0), hi.unwrap_or(0.0))
+}
+
+/// Component-wise `(min, max)` once any input is a Vec2; scalars splat.
+pub fn min_max_v2(inputs: &[Option<Signal>]) -> (Vec2, Vec2) {
+    let mut lo: Option<Vec2> = None;
+    let mut hi: Option<Vec2> = None;
+    for s in inputs.iter().flatten() {
+        let v = to_vec2(Some(*s), 0.0);
+        lo = Some(lo.map_or(v, |c: Vec2| c.min(v)));
+        hi = Some(hi.map_or(v, |c: Vec2| c.max(v)));
+    }
+    (lo.unwrap_or(Vec2::ZERO), hi.unwrap_or(Vec2::ZERO))
+}
+
+// ── Quantize ─────────────────────────────────────────────────────────────────
+
+/// Snap a signal to a grid of `factor` steps per unit: factor 1 lands on whole
+/// integers, 2 on halves, 4 on quarters. `mode` picks which way a value between
+/// two grid lines falls.
+pub struct Quantize { pub factor: f32, pub mode: QuantizeMode }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum QuantizeMode {
+    /// Nearest grid line (ties away from zero).
+    #[default]
+    Round,
+    /// Toward −∞.
+    Floor,
+    /// Toward +∞.
+    Ceil,
+    /// Toward zero.
+    Trunc,
+}
+
+impl QuantizeMode {
+    /// Parse the persisted param string; unknown values fall back to `Round`.
+    pub fn from_param(s: &str) -> Self {
+        match s {
+            "floor" => Self::Floor,
+            "ceil"  => Self::Ceil,
+            "trunc" => Self::Trunc,
+            _       => Self::Round,
+        }
+    }
+}
+
+impl Default for Quantize {
+    fn default() -> Self { Self { factor: 1.0, mode: QuantizeMode::Round } }
+}
+
+/// Snap `v` to a grid of `factor` steps per unit. A non-positive factor has no
+/// meaningful grid, so the value passes through untouched.
+pub fn quantize(v: f32, factor: f32, mode: QuantizeMode) -> f32 {
+    if !factor.is_finite() || factor <= 0.0 || !v.is_finite() { return v; }
+    let scaled = v * factor;
+    let snapped = match mode {
+        QuantizeMode::Round => scaled.round(),
+        QuantizeMode::Floor => scaled.floor(),
+        QuantizeMode::Ceil  => scaled.ceil(),
+        QuantizeMode::Trunc => scaled.trunc(),
+    };
+    snapped / factor
+}
+
+impl Module for Quantize {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "math.quantize", display_name: "Quantize", category: "Math",
+            inputs: vec![
+                PinDescriptor::new("in", SignalType::Any),
+                PinDescriptor::new("factor", SignalType::Float).optional(),
+            ],
+            outputs: vec![PinDescriptor::new("out", SignalType::Any)],
+        }
+    }
+    fn process(&mut self, inputs: &[Option<Signal>]) -> SmallVec<[Signal; 4]> {
+        let factor = get_float(inputs, 1, self.factor);
+        let mode = self.mode;
+        match inputs.first().and_then(|s| *s) {
+            Some(Signal::Vec2(v)) => out_v(Vec2::new(
+                quantize(v.x, factor, mode),
+                quantize(v.y, factor, mode),
+            )),
+            other => out_f(quantize(other.map(|s| s.as_float()).unwrap_or(0.0), factor, mode)),
         }
     }
 }

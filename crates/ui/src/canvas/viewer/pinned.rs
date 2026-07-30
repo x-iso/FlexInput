@@ -513,6 +513,16 @@ pub(crate) fn render_pinned_element_impl(
         // Logic Delay — mode + time.
         ("logic.delay", "mode") => { render_logic_delay_mode(inner_id, ui, inner_snarl, container_size); return; }
         ("logic.delay", "time") => { render_logic_delay_time(inner_id, ui, inner_snarl, container_size); return; }
+        // Inverse — unipolar toggle + max box.
+        ("math.negate", "unipolar") => { render_inverse_unipolar(inner_id, ui, inner_snarl, container_size); return; }
+        // Quantize — grid factor + rounding mode.
+        ("math.quantize", "factor") => { render_quantize_factor(inner_id, ui, inner_snarl, container_size); return; }
+        ("math.quantize", "mode")   => { render_quantize_mode(inner_id, ui, inner_snarl, container_size); return; }
+        // Vec to Deflection — angle unit.
+        ("module.vec_to_deflection", "angle_unit") => {
+            render_deflection_angle_unit(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Oscillator — per-row + bare preview.
         ("generator.oscillator", "shape")   => { render_oscillator_shape(inner_id, ui, inner_snarl, container_size); return; }
         ("generator.oscillator", "freq")    => { render_oscillator_freq(inner_id, ui, inner_snarl, container_size);  return; }
@@ -1990,6 +2000,102 @@ pub(crate) fn render_logic_delay_time(inner_id: NodeId, ui: &mut egui::Ui, snarl
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("unit".into(), Value::String(unit));
             if let Some(n) = Number::from_f64(time as f64) { node.params.insert("time".into(), Value::Number(n)); }
+        }
+    }
+}
+
+// ── Inverse ───────────────────────────────────────────────────────────────────
+
+/// Unipolar toggle + its max box, pinned as one row. The max box greys out
+/// while unipolar is off, same as in the node body.
+pub(crate) fn render_inverse_unipolar(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let (mut unipolar, mut max) = snarl.get_node(inner_id).map(|n| {
+        let u = n.params.get("unipolar").and_then(|v| v.as_bool()).unwrap_or(false);
+        let m = n.params.get("unipolar_max").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        (u, m)
+    }).unwrap_or((false, 1.0));
+    let mut changed = false;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(170.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 2];
+    ui.horizontal(|ui| {
+        let r = ui.checkbox(&mut unipolar, egui::RichText::new("Unipolar"));
+        fr[0] = r.rect; changed |= r.changed();
+        ui.add_enabled_ui(unipolar, |ui| {
+            ui.label(egui::RichText::new("max"));
+            let r = ui.add(egui::DragValue::new(&mut max).speed(0.01).range(0.0..=1000.0));
+            fr[1] = r.rect; changed |= r.changed();
+        });
+    });
+    publish_nav_field_rects(ui, inner_id, &fr);
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("unipolar".into(), Value::Bool(unipolar));
+            if let Some(n) = Number::from_f64(max as f64) {
+                node.params.insert("unipolar_max".into(), Value::Number(n));
+            }
+        }
+    }
+}
+
+// ── Quantize ──────────────────────────────────────────────────────────────────
+
+pub(crate) fn render_quantize_factor(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let mut factor = snarl.get_node(inner_id)
+        .and_then(|n| n.params.get("factor").and_then(|v| v.as_f64()))
+        .unwrap_or(1.0) as f32;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(140.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 1];
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Factor").weak());
+        let r = ui.add(egui::DragValue::new(&mut factor).speed(0.05).range(0.0..=10_000.0));
+        fr[0] = r.rect;
+        if r.changed() {
+            if let (Some(node), Some(n)) = (snarl.get_node_mut(inner_id), Number::from_f64(factor as f64)) {
+                node.params.insert("factor".into(), Value::Number(n));
+            }
+        }
+    });
+    publish_nav_field_rects(ui, inner_id, &fr);
+}
+
+pub(crate) fn render_quantize_mode(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let mut mode = snarl.get_node(inner_id)
+        .and_then(|n| n.params.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "round".to_string());
+    let mut changed = false;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(200.0, 22.0));
+    ui.horizontal(|ui| {
+        changed |= ui.selectable_value(&mut mode, "round".into(), egui::RichText::new("Round")).changed();
+        changed |= ui.selectable_value(&mut mode, "floor".into(), egui::RichText::new("Floor")).changed();
+        changed |= ui.selectable_value(&mut mode, "ceil".into(),  egui::RichText::new("Ceil")).changed();
+        changed |= ui.selectable_value(&mut mode, "trunc".into(), egui::RichText::new("Trunc")).changed();
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("mode".into(), Value::String(mode));
+        }
+    }
+}
+
+// ── Vec to Deflection ─────────────────────────────────────────────────────────
+
+pub(crate) fn render_deflection_angle_unit(inner_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, container: egui::Vec2) {
+    let mut degrees = snarl.get_node(inner_id)
+        .and_then(|n| n.params.get("degrees").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let mut changed = false;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(130.0, 22.0));
+    ui.horizontal(|ui| {
+        changed |= ui.selectable_value(&mut degrees, false, egui::RichText::new("0..1")).changed();
+        changed |= ui.selectable_value(&mut degrees, true,  egui::RichText::new("0..360°")).changed();
+    });
+    if changed {
+        if let Some(node) = snarl.get_node_mut(inner_id) {
+            node.params.insert("degrees".into(), Value::Bool(degrees));
         }
     }
 }

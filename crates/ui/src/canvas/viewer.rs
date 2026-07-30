@@ -928,7 +928,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
                 | "display.controller3d"
                 | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
-                | "math.add" | "math.subtract" | "math.multiply" | "math.divide"
+                | "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.negate"
+                | "math.min_max" | "math.quantize" | "module.vec_to_deflection"
                 | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
                 | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
                 | "generator.oscillator" | "generator.envelope" | "processing.gyro_3dof"
@@ -1002,9 +1003,12 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     self.push_undo_request = true;
                 }
             }
-            "math.add" | "math.subtract" | "math.multiply" | "math.divide" => {
+            "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.min_max" => {
                 show_math_variadic_body(node_id, inputs, ui, snarl);
             }
+            "math.negate" => show_inverse_body(node_id, ui, snarl),
+            "math.quantize" => show_quantize_body(node_id, inputs, ui, snarl),
+            "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl),
             "module.selector" => show_selector_body(node_id, inputs, ui, snarl),
             "module.split"    => show_split_body(node_id, outputs, ui, snarl),
             "module.dropdown" => show_dropdown_body(node_id, ui, snarl),

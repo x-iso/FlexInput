@@ -13,6 +13,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<TwowayResponseCurveModule>(),
         reg::<VecToAxisModule>(),
         reg::<AxisToVecModule>(),
+        reg::<VecToDeflectionModule>(),
         reg::<Gyro3DOFModule>(),
         reg::<AutoMapSplitModule>(),
         reg::<AutoMapCollectModule>(),
@@ -240,6 +241,31 @@ impl Module for AxisToVecModule {
             outputs: vec![PinDescriptor::new("Out", SignalType::Vec2)],
         }
     }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── Vec to Deflection ─────────────────────────────────────────────────────────
+
+/// Cartesian → polar: how far the vector is pushed, and which way it points.
+/// Angle 0 is straight up (+Y) and grows clockwise, so right is a quarter turn.
+#[derive(Default)]
+pub struct VecToDeflectionModule;
+
+impl Module for VecToDeflectionModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "module.vec_to_deflection",
+            display_name: "Vec to Deflection",
+            category: "Converters",
+            inputs: vec![PinDescriptor::new("In", SignalType::Vec2)],
+            outputs: vec![
+                PinDescriptor::new("Deflection", SignalType::Float),
+                PinDescriptor::new("Angle", SignalType::Float),
+            ],
+        }
+    }
+    // Like its Converters siblings, the evaluation lives in the engine
+    // (`eval_pure`) — this descriptor exists to publish the pins.
     fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
 }
 

@@ -168,14 +168,46 @@ pub struct ModuleDescriptor {
   - Vec2: component-wise abs
   - Float: |value|
 
-#### Negate
-- **ID:** `math.negate`
-- **Purpose:** Inverts signal polarity
+#### Inverse
+- **ID:** `math.negate` (id kept from the old "Negate" name for patch compatibility;
+  patches load with the node retitled unless it was renamed by hand)
+- **Purpose:** Inverts a signal — sign flip, or a unipolar mirror inside `0..max`
 - **Inputs:** Input signal
-- **Outputs:** Negated signal
-- **Behavior:** 
-  - Vec2: (-x, -y)
-  - Float: -value
+- **Outputs:** Inverted signal
+- **Params:** `unipolar` (bool, default false), `unipolar_max` (float, default 1.0)
+- **Behavior:**
+  - Bipolar (default) — Vec2: `(-x, -y)`; Float: `-value`
+  - Unipolar — `clamp(max - value, 0, max)`, component-wise for Vec2. A `0 → max`
+    ramp comes out as `max → 0`; input past either end clips instead of going
+    negative. `max <= 0` outputs 0.
+
+#### Min/Max
+- **ID:** `math.min_max`
+- **Purpose:** Reports the largest and smallest of all its inputs
+- **Inputs:** A, B, ... (Any) — variadic, `+`/`−` on the body adds or removes pins
+- **Outputs:**
+  - Output 0: `max`
+  - Output 1: `min`
+- **Behavior:**
+  - Only **wired** inputs are considered, so an unconnected spare pin doesn't
+    peg the min at 0. Nothing wired at all → both outputs are 0.
+  - Vec2: component-wise min/max (scalars splat); Float otherwise
+
+#### Quantize
+- **ID:** `math.quantize`
+- **Purpose:** Snaps a signal to a grid
+- **Inputs:**
+  - Input 0: Value to quantize
+  - Input 1 (optional): Factor — overrides the body value while wired
+- **Outputs:** Quantized value
+- **Parameters:**
+  - `factor: f64` - Grid steps per unit (1.0). 1 = whole integers, 2 = halves,
+    4 = quarters; non-integer factors are fine.
+  - `mode: String` - `"round"` (default, nearest), `"floor"`, `"ceil"`, `"trunc"`
+- **Behavior:**
+  - `snap(value × factor) / factor`; Vec2 quantizes component-wise
+  - `floor` and `trunc` differ only below zero (−1.2 → −2 vs −1)
+  - A factor of 0 or less has no grid — the value passes through untouched
 
 #### Map Range
 - **ID:** `math.map_range`
@@ -383,6 +415,30 @@ pub struct ModuleDescriptor {
   - `lean_left: Array<Mapping>` - Left lean mappings
   - `lean_right: Array<Mapping>` - Right lean mappings
   - Each Mapping: `{ out, mode, window_ms, sustain, turbo }`
+
+#### Vec to Axis / Axis to Vec
+- **IDs:** `module.vec_to_axis`, `module.axis_to_vec`
+- **Category:** Converters
+- **Purpose:** Split a Vec2 into X/Y floats, or recombine two floats into a Vec2
+
+#### Vec to Deflection
+- **ID:** `module.vec_to_deflection`
+- **Category:** Converters
+- **Purpose:** Cartesian → polar: how far a vector is pushed, and which way
+- **Inputs:** Input 0: In (Vec2)
+- **Outputs:**
+  - Output 0: `Deflection` — the vector's distance from centre (`length()`,
+    raw, so a square-gated stick can exceed 1.0 in the corners)
+  - Output 1: `Angle`
+- **Parameters:**
+  - `degrees: bool` - `false` (default) outputs the angle as `0..1` of a full
+    turn; `true` outputs `0..360`
+- **Behavior:**
+  - Angle 0 is straight **up** (+Y) and grows **clockwise**, so right is
+    0.25 / 90°, down 0.5 / 180°, left 0.75 / 270°
+  - The top of the range is the same direction as 0, so the output wraps back
+    to 0 — it is always in `[0, 1)` / `[0, 360)`, never exactly 1.0 / 360.0
+  - A zero vector has no direction: both outputs read 0 (no NaN)
 
 ---
 
