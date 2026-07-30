@@ -1147,40 +1147,24 @@ fn paint_ring_border(p: &egui::Painter, geom: &RingGeom, b: &RingBorder, stroke:
     }
 }
 
-/// Materialize the ring's borders — the origin seam first, then either the
-/// mapping-tree dividers or the ports-mode col/row edges. Shared by the node-body
-/// editor (`render_radial_field`) and the pinned field so both index borders
-/// identically for the gamepad-nav focus highlight.
-fn radial_nav_borders(snarl: &Snarl<NodeData>, node_id: NodeId, mapping: bool) -> Vec<RingBorder> {
+/// Materialize the ring's borders — the origin seam first, then the zone-tree
+/// dividers (partial, per-zone). Both mapping AND ports mode use the tree now (a
+/// pure-grid ports menu migrates losslessly), so the border editor is identical
+/// and radial-ports edits correctly. Shared by `render_radial_field`, the pinned
+/// field, and the gamepad-nav focus highlight so they index borders identically.
+fn radial_nav_borders(snarl: &Snarl<NodeData>, node_id: NodeId) -> Vec<RingBorder> {
     use flexinput_core::touchzones as tz;
     const SEAM_KEY: u8 = 254;
     let mut borders: Vec<RingBorder> = vec![RingBorder {
         angular: true, pos: 0.0, span_lo: 0.0, span_hi: 1.0,
         lo: 0.0, hi: 1.0, key: vec![SEAM_KEY], seam: true,
     }];
-    if mapping {
-        let tree = super::viewer::tz_field_tree(snarl, node_id, 0);
-        borders.extend(tree.dividers().iter().map(|d| RingBorder {
-            angular: matches!(d.axis, tz::Axis::V),
-            pos: d.pos, span_lo: d.span_lo, span_hi: d.span_hi,
-            lo: d.lo, hi: d.hi, key: d.path.clone(), seam: false,
-        }));
-    } else {
-        let col_edges = super::viewer::tz_read_field_edges(snarl, node_id, 0, "col_edges");
-        let row_edges = super::viewer::tz_read_field_edges(snarl, node_id, 0, "row_edges");
-        borders.extend(col_edges.iter().enumerate().map(|(i, &e)| RingBorder {
-            angular: true, pos: e, span_lo: 0.0, span_hi: 1.0,
-            lo: if i == 0 { 0.02 } else { col_edges[i - 1] + 0.04 },
-            hi: if i + 1 == col_edges.len() { 0.98 } else { col_edges[i + 1] - 0.04 },
-            key: vec![i as u8], seam: false,
-        }));
-        borders.extend(row_edges.iter().enumerate().map(|(i, &e)| RingBorder {
-            angular: false, pos: e, span_lo: 0.0, span_hi: 1.0,
-            lo: if i == 0 { 0.05 } else { row_edges[i - 1] + 0.06 },
-            hi: if i + 1 == row_edges.len() { 0.95 } else { row_edges[i + 1] - 0.06 },
-            key: vec![i as u8], seam: false,
-        }));
-    }
+    let tree = super::viewer::tz_field_tree(snarl, node_id, 0);
+    borders.extend(tree.dividers().iter().map(|d| RingBorder {
+        angular: matches!(d.axis, tz::Axis::V),
+        pos: d.pos, span_lo: d.span_lo, span_hi: d.span_hi,
+        lo: d.lo, hi: d.hi, key: d.path.clone(), seam: false,
+    }));
     borders
 }
 
@@ -1198,13 +1182,12 @@ pub(crate) fn paint_radial_nav_focus(
     rect: egui::Rect,
     deadzone: f32,
     origin: f32,
-    mapping: bool,
 ) {
     let nav_tz: Option<(u64, u64, u64, u64, bool)> =
         ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_tz", node_id.0))));
     let nav_focus_pass = crate::widgets::nav_pass(ui.ctx());
     let geom = RingGeom::of(rect, deadzone, origin);
-    let borders = radial_nav_borders(snarl, node_id, mapping);
+    let borders = radial_nav_borders(snarl, node_id);
     let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
         .unwrap_or(egui::emath::TSTransform::IDENTITY);
     let painter = ui.painter_at(rect.expand(4.0));
@@ -1297,7 +1280,6 @@ pub(crate) fn radial_border_editor(
     ui: &mut egui::Ui,
     node_id: NodeId,
     snarl: &mut Snarl<NodeData>,
-    mapping: bool,
     rect: egui::Rect,
     deadzone: f32,
     origin: f32,
@@ -1309,12 +1291,9 @@ pub(crate) fn radial_border_editor(
     let tree = super::viewer::tz_field_tree(snarl, node_id, 0);
     let geom = RingGeom::of(rect, deadzone, origin);
     let zones = tree.zones();
-    // col/row edges are kept as locals for the drag + double-click math below;
-    // the draggable border list (seam first, then dividers/edges) comes from the
-    // shared builder so the pinned field indexes borders identically.
-    let col_edges = super::viewer::tz_read_field_edges(snarl, node_id, 0, "col_edges");
-    let row_edges = super::viewer::tz_read_field_edges(snarl, node_id, 0, "row_edges");
-    let borders = radial_nav_borders(snarl, node_id, mapping);
+    // Border list (seam first, then tree dividers) from the shared builder so the
+    // pinned field indexes borders identically. Both modes drive the tree now.
+    let borders = radial_nav_borders(snarl, node_id);
 
     let painter = ui.painter_at(rect.expand(4.0));
     let from_global = ui.ctx().layer_transform_to_global(ui.layer_id())
@@ -1358,21 +1337,11 @@ pub(crate) fn radial_border_editor(
         } else {
             let (u, v) = geom.unit(p);
             let want = if b.angular { u } else { v };
-            let (lo, hi) = if mapping { (b.lo + 0.03, b.hi - 0.03) } else { (b.lo, b.hi) };
+            let (lo, hi) = (b.lo + 0.03, b.hi - 0.03);
             let t = if lo <= hi { want.clamp(lo, hi) } else { (b.lo + b.hi) * 0.5 };
-            if mapping {
-                let mut nt = tree.clone();
-                if nt.set_divider_t(&b.key, t) {
-                    super::viewer::tz_set_field_tree(snarl, node_id, 0, &nt);
-                }
-            } else if let Some(node) = snarl.get_node_mut(node_id) {
-                let (key, mut edges) = if b.angular {
-                    ("col_edges", col_edges.clone())
-                } else {
-                    ("row_edges", row_edges.clone())
-                };
-                if let Some(e) = edges.get_mut(b.key[0] as usize) { *e = t; }
-                node.params.insert(key.to_string(), serde_json::json!(edges));
+            let mut nt = tree.clone();
+            if nt.set_divider_t(&b.key, t) {
+                super::viewer::tz_set_field_tree(snarl, node_id, 0, &nt);
             }
         }
     }
@@ -1387,34 +1356,14 @@ pub(crate) fn radial_border_editor(
             .filter(|&bi| !borders[bi].seam)
         {
             let b = &borders[bi];
-            if mapping {
-                // Recentre between the divider's IMMEDIATE neighbours (mirrors
-                // the rectangular editor; the naïve parent-span midpoint
-                // overshoots and squashes the next zone in a 3+-zone tree).
-                let target = tree.centered_divider_pos(&b.key)
-                    .unwrap_or((b.lo + b.hi) * 0.5);
-                let mut nt = tree.clone();
-                if nt.set_divider_t(&b.key, target) {
-                    super::viewer::tz_set_field_tree(snarl, node_id, 0, &nt);
-                }
-            } else {
-                // Ports mode: recenter between the neighbouring edges (or the
-                // hub/rim at the ends), mirroring the flat editor.
-                let i = b.key[0] as usize;
-                let (key, src) = if b.angular {
-                    ("col_edges", &col_edges)
-                } else {
-                    ("row_edges", &row_edges)
-                };
-                let lo = if i == 0 { 0.0 } else { src[i - 1] };
-                let hi = if i + 1 == src.len() { 1.0 } else { src[i + 1] };
-                let mut edges = src.clone();
-                if let Some(e) = edges.get_mut(i) {
-                    *e = (lo + hi) * 0.5;
-                }
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert(key.to_string(), serde_json::json!(edges));
-                }
+            // Recentre between the divider's IMMEDIATE neighbours (mirrors the
+            // rectangular editor; the naïve parent-span midpoint overshoots and
+            // squashes the next zone in a 3+-zone tree).
+            let target = tree.centered_divider_pos(&b.key)
+                .unwrap_or((b.lo + b.hi) * 0.5);
+            let mut nt = tree.clone();
+            if nt.set_divider_t(&b.key, target) {
+                super::viewer::tz_set_field_tree(snarl, node_id, 0, &nt);
             }
         }
     }
@@ -1440,134 +1389,55 @@ pub(crate) fn radial_border_editor(
 
     // Gamepad-nav focused-border highlight + RS-cursor hit-rects, shared with the
     // pinned field renderer so both surfaces show which divider is being edited.
-    paint_radial_nav_focus(ui, node_id, snarl, rect, deadzone, origin, mapping);
+    paint_radial_nav_focus(ui, node_id, snarl, rect, deadzone, origin);
 
-    // "−" / "+" mini buttons.
-    let mut grid_op: Option<tz::GridOp> = None;
+    // "−" / "+" mini buttons — per-zone tree ops in BOTH modes. Hovering a divider
+    // offers "−" to remove/merge it; hovering a zone away from dividers offers "+"
+    // to split near the closest edge. The origin seam is never removable — it just
+    // rotates.
     let mut tree_sub: Option<(f32, f32, tz::Axis, bool)> = None;
     let mut tree_rem: Option<Vec<u8>> = None;
-    if mapping {
-        // Both affordances are dynamic: hovering a divider offers "−" to remove
-        // it; hovering a zone away from dividers offers "+" to split near the
-        // closest edge. The origin seam is never removable — it just rotates.
-        if let Some(bi) = ptr.and_then(hit_at).filter(|&bi| !borders[bi].seam) {
-            let b = &borders[bi];
-            let mid = (b.span_lo + b.span_hi) * 0.5;
-            let c = if b.angular { geom.point(b.pos, mid) } else { geom.point(mid, b.pos) };
-            if super::viewer::tz_mini_button(ui, &painter,
-                ui.id().with((node_id, "vmrm", bi)), c, "−", accent, visuals)
-            {
-                tree_rem = Some(b.key.clone());
-            }
-        } else if let Some(p) = ptr {
-            let (u, v) = geom.unit(p);
-            if (0.0..1.0).contains(&v) {
-                let uc = u.min(0.9999);
-                if let Some(&(_, [x0, y0, x1, y1])) = zones.iter().find(
-                    |(_, [x0, y0, x1, y1])| uc >= *x0 && uc < *x1 && v >= *y0 && v < *y1)
-                {
-                    let r_here = geom.radius(v);
-                    let tau = std::f32::consts::TAU;
-                    // px distances to the four polar edges of the zone
-                    let d_a0 = (uc - x0) * tau * r_here;
-                    let d_a1 = (x1 - uc) * tau * r_here;
-                    let d_r0 = (v - y0) * (geom.r_out - geom.r_in);
-                    let d_r1 = (y1 - v) * (geom.r_out - geom.r_in);
-                    let m = d_a0.min(d_a1).min(d_r0).min(d_r1);
-                    if m <= 24.0 {
-                        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-                        let inset_u = 14.0 / (tau * r_here).max(1e-3);
-                        let inset_v = 14.0 / (geom.r_out - geom.r_in).max(1e-3);
-                        let (pos, axis, new_low) = if m == d_a0 {
-                            (geom.point(x0 + inset_u, (y0 + y1) * 0.5), tz::Axis::V, true)
-                        } else if m == d_a1 {
-                            (geom.point(x1 - inset_u, (y0 + y1) * 0.5), tz::Axis::V, false)
-                        } else if m == d_r0 {
-                            (geom.point((x0 + x1) * 0.5, y0 + inset_v), tz::Axis::H, true)
-                        } else {
-                            (geom.point((x0 + x1) * 0.5, y1 - inset_v), tz::Axis::H, false)
-                        };
-                        if super::viewer::tz_mini_button(ui, &painter,
-                            ui.id().with((node_id, "vmrp")), pos, "+", accent, visuals)
-                        {
-                            tree_sub = Some((cx, cy, axis, new_low));
-                        }
-                    }
-                }
-            }
+    if let Some(bi) = ptr.and_then(hit_at).filter(|&bi| !borders[bi].seam) {
+        let b = &borders[bi];
+        let mid = (b.span_lo + b.span_hi) * 0.5;
+        let c = if b.angular { geom.point(b.pos, mid) } else { geom.point(mid, b.pos) };
+        if super::viewer::tz_mini_button(ui, &painter,
+            ui.id().with((node_id, "vmrm", bi)), c, "−", accent, visuals)
+        {
+            tree_rem = Some(b.key.clone());
         }
     } else if let Some(p) = ptr {
-        // Ports mode: full cuts only. The −/+ cluster appears AT the pointer
-        // when it hovers near a border (a fixed spot makes no sense on a
-        // circle); the rim, the hub edge, and the 12-o'clock seam grow "+"
-        // for the first ring / sector cut.
         let (u, v) = geom.unit(p);
-        let cols = col_edges.len() + 1;
-        let rows = row_edges.len() + 1;
-        // The seam only rotates — skip its −/+ cluster (fall through to the
-        // rim/hub/seam add affordances below).
-        if let Some(bi) = hit_at(p).filter(|&bi| !borders[bi].seam) {
-            let b = &borders[bi];
-            let line = b.key[0] as usize + 1; // grid line index (1-based band boundary)
-            let (c_minus, c_plus_a, c_plus_b) = if b.angular {
-                let vv = v.clamp(0.1, 0.9);
-                let off = 20.0 / (std::f32::consts::TAU * geom.radius(vv)).max(1e-3);
-                (geom.point(b.pos, vv),
-                 geom.point(b.pos - off, vv),
-                 geom.point(b.pos + off, vv))
-            } else {
-                let uu = u.min(0.9999);
-                let off = 20.0 / (geom.r_out - geom.r_in).max(1e-3);
-                (geom.point(uu, b.pos),
-                 geom.point(uu, (b.pos - off).max(0.02)),
-                 geom.point(uu, (b.pos + off).min(0.98)))
-            };
-            let (ins_lo, ins_hi, rem) = if b.angular {
-                (tz::GridOp::InsertCol(line - 1), tz::GridOp::InsertCol(line),
-                 tz::GridOp::RemoveCol(line - 1))
-            } else {
-                (tz::GridOp::InsertRow(line - 1), tz::GridOp::InsertRow(line),
-                 tz::GridOp::RemoveRow(line - 1))
-            };
-            if super::viewer::tz_mini_button(ui, &painter,
-                ui.id().with((node_id, "vmpa", bi)), c_plus_a, "+", accent, visuals)
-            { grid_op = Some(ins_lo); }
-            if super::viewer::tz_mini_button(ui, &painter,
-                ui.id().with((node_id, "vmpb", bi)), c_plus_b, "+", accent, visuals)
-            { grid_op = Some(ins_hi); }
-            if super::viewer::tz_mini_button(ui, &painter,
-                ui.id().with((node_id, "vm-", bi)), c_minus, "−", accent, visuals)
-            { grid_op = Some(rem); }
-        } else if (0.0..=1.05).contains(&v) {
-            let mag = (p - geom.center).length();
+        if (0.0..1.0).contains(&v) {
             let uc = u.min(0.9999);
-            if geom.r_out - mag < 22.0 && mag < geom.r_out + 8.0 {
-                // Near the rim → add an outer ring.
-                if super::viewer::tz_mini_button(ui, &painter,
-                    ui.id().with((node_id, "vmbr")),
-                    geom.point(uc, 1.0 - 14.0 / (geom.r_out - geom.r_in).max(1e-3)),
-                    "+", accent, visuals)
-                { grid_op = Some(tz::GridOp::InsertRow(rows - 1)); }
-            } else if mag - geom.r_in < 16.0 && mag > geom.r_in - 8.0 {
-                // Near the hub edge → add an inner ring.
-                if super::viewer::tz_mini_button(ui, &painter,
-                    ui.id().with((node_id, "vmbh")),
-                    geom.point(uc, 14.0 / (geom.r_out - geom.r_in).max(1e-3)),
-                    "+", accent, visuals)
-                { grid_op = Some(tz::GridOp::InsertRow(0)); }
-            } else {
-                // Near the 12-o'clock seam → first/next sector cut.
-                let du = uc.min(1.0 - uc);
-                let vv = v.clamp(0.1, 0.9);
-                if du * std::f32::consts::TAU * geom.radius(vv) < 20.0 {
-                    let side = 16.0 / (std::f32::consts::TAU * geom.radius(vv)).max(1e-3);
+            if let Some(&(_, [x0, y0, x1, y1])) = zones.iter().find(
+                |(_, [x0, y0, x1, y1])| uc >= *x0 && uc < *x1 && v >= *y0 && v < *y1)
+            {
+                let r_here = geom.radius(v);
+                let tau = std::f32::consts::TAU;
+                // px distances to the four polar edges of the zone
+                let d_a0 = (uc - x0) * tau * r_here;
+                let d_a1 = (x1 - uc) * tau * r_here;
+                let d_r0 = (v - y0) * (geom.r_out - geom.r_in);
+                let d_r1 = (y1 - v) * (geom.r_out - geom.r_in);
+                let m = d_a0.min(d_a1).min(d_r0).min(d_r1);
+                if m <= 24.0 {
+                    let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+                    let inset_u = 14.0 / (tau * r_here).max(1e-3);
+                    let inset_v = 14.0 / (geom.r_out - geom.r_in).max(1e-3);
+                    let (pos, axis, new_low) = if m == d_a0 {
+                        (geom.point(x0 + inset_u, (y0 + y1) * 0.5), tz::Axis::V, true)
+                    } else if m == d_a1 {
+                        (geom.point(x1 - inset_u, (y0 + y1) * 0.5), tz::Axis::V, false)
+                    } else if m == d_r0 {
+                        (geom.point((x0 + x1) * 0.5, y0 + inset_v), tz::Axis::H, true)
+                    } else {
+                        (geom.point((x0 + x1) * 0.5, y1 - inset_v), tz::Axis::H, false)
+                    };
                     if super::viewer::tz_mini_button(ui, &painter,
-                        ui.id().with((node_id, "vmbs")),
-                        geom.point(if uc < 0.5 { side } else { 1.0 - side }, vv),
-                        "+", accent, visuals)
+                        ui.id().with((node_id, "vmrp")), pos, "+", accent, visuals)
                     {
-                        grid_op = Some(tz::GridOp::InsertCol(
-                            if uc < 0.5 { 0 } else { cols - 1 }));
+                        tree_sub = Some((cx, cy, axis, new_low));
                     }
                 }
             }
@@ -1580,10 +1450,9 @@ pub(crate) fn radial_border_editor(
     if let Some(path) = tree_rem {
         super::viewer::tz_request_or_apply_merge(snarl, node_id, 0, &tree, &path);
     }
-    if let Some(op) = grid_op {
-        super::viewer::tz_restructure(node_id, 0, op, snarl);
-        regenerate_menu_ports(node_id, snarl);
-    }
+    // Port sync + wiring preservation is handled by `tz_set_field_tree` (called
+    // inside the subdivide/merge above), so no explicit `regenerate_menu_ports`
+    // here.
 
     drag.is_some()
         || (resp.clicked()
@@ -1645,7 +1514,7 @@ fn render_radial_field(
     // ± add-remove) — shared with the pinned & config-overlay field so every
     // surface edits identically (the pinned radial field used to only zone-select).
     let suppress = radial_border_editor(
-        ui, node_id, snarl, mapping, rect, deadzone, origin, &resp, accent, &visuals);
+        ui, node_id, snarl, rect, deadzone, origin, &resp, accent, &visuals);
     // Zone click-select (mapping mode) — only when the click missed all borders
     // and no border drag is in progress.
     if mapping && resp.clicked() && !suppress {

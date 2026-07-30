@@ -101,13 +101,24 @@ pub(crate) fn compute_node(
             let split = snap.params.get("field_mode").and_then(|v| v.as_str()) == Some("split");
             let n_fields = if split { 2 } else { 1 };
 
-            // Resolve which zone each active finger occupies, per field, keeping
-            // per-zone local coords. In single mode touch1 is processed last so it
-            // wins when both fingers land in the same zone.
+            // Zone geometry from the BSP tree (partial per-zone dividers), migrating
+            // the legacy grid losslessly when no tree is stored — leaf ids == the old
+            // row-major indices, so existing ports keep binding. This is the SAME
+            // source of truth mapping mode uses, so a Ports-mode zone can be split
+            // per-zone (not just full grid cuts) and its `zone_pin_id` stays stable.
+            let field_tree = |field: usize| -> tz::ZoneNode {
+                let key = if field == 0 { "zone_tree".to_string() } else { format!("zone_tree{field}") };
+                snap.params.get(&key).and_then(tz::ZoneNode::from_value)
+                    .unwrap_or_else(|| tz::ZoneNode::from_grid(
+                        &read_edges(field, "col_edges"), &read_edges(field, "row_edges")))
+            };
+
+            // Resolve which zone (tree leaf) each active finger occupies, per field,
+            // keeping per-zone local coords. In single mode touch1 is processed last
+            // so it wins when both fingers land in the same zone.
             let mut zone_hit: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
             for field in 0..n_fields {
-                let col_edges = read_edges(field, "col_edges");
-                let row_edges = read_edges(field, "row_edges");
+                let tree = field_tree(field);
                 let fingers: &[(&str, &str, &str)] = if split {
                     if field == 0 { &[("touch1_x", "touch1_y", "touch1_active")] }
                     else          { &[("touch2_x", "touch2_y", "touch2_active")] }
@@ -121,8 +132,8 @@ pub(crate) fn compute_node(
                         read(px).map(|s| s.as_float()).unwrap_or(0.0),
                         read(py).map(|s| s.as_float()).unwrap_or(0.0),
                     );
-                    let (idx, lx, ly) = tz::locate_unit(x, y, &col_edges, &row_edges);
-                    zone_hit.insert((field, idx), (lx, ly));
+                    let (id, lx, ly) = tree.locate(x, y);
+                    zone_hit.insert((field, id as usize), (lx, ly));
                 }
             }
 

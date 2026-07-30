@@ -230,6 +230,10 @@ pub(crate) fn tz_set_field_tree(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     if let Some(node) = snarl.get_node_mut(node_id) {
         node.params.insert(key, tree.to_value());
     }
+    // Keep typed zone ports (ports mode) in sync with the new tree, preserving
+    // downstream wiring by stable leaf id. No-op in mapping mode and on a plain
+    // divider move (the port set is unchanged).
+    tz_regen_ports_preserving(node_id, snarl);
 }
 
 /// Cards (this field) bound to any of `zones`.
@@ -1390,8 +1394,6 @@ pub(crate) fn tz_draw_field(
     snarl: &mut Snarl<NodeData>,
     painter: &egui::Painter,
     rect: egui::Rect,
-    col_edges: &[f32],
-    row_edges: &[f32],
     zone_live: &std::collections::HashMap<(usize, usize), (f32, f32, bool)>,
     visuals: &egui::Visuals,
     accent: egui::Color32,
@@ -1452,20 +1454,13 @@ pub(crate) fn tz_draw_field(
     let skin = remapper_resolve_skin(snarl, node_id, "auto", None);
     let ctx = ui.ctx().clone();
 
-    // Zone rects: from the BSP tree in mapping mode (supports partial dividers),
-    // else the legacy grid (ports mode). `idx` is the tree leaf id (== the old
-    // grid index after migration), which is also the card `z`.
-    let tree = if mapping { Some(tz_field_tree(snarl, node_id, field)) } else { None };
-    let zones: Vec<(usize, [f32; 4])> = match &tree {
-        Some(t) => t.zones().into_iter().map(|(id, r)| (id as usize, r)).collect(),
-        None => {
-            let zn = tz::zone_count(col_edges, row_edges);
-            (0..zn).map(|idx| {
-                let (x0, y0, x1, y1) = tz::zone_rect(idx, col_edges, row_edges);
-                (idx, [x0, y0, x1, y1])
-            }).collect()
-        }
-    };
+    // Zone rects come from the BSP tree in BOTH modes (partial per-zone dividers).
+    // A pure-grid ports node migrates losslessly (leaf id == old row-major index),
+    // so `col_edges`/`row_edges` are now only the migration seed. `idx` is the tree
+    // leaf id, which is also the card `z` and the typed zone-port id.
+    let tree = tz_field_tree(snarl, node_id, field);
+    let zones: Vec<(usize, [f32; 4])> = tree.zones()
+        .into_iter().map(|(id, r)| (id as usize, r)).collect();
     for &(idx, [x0, y0, x1, y1]) in &zones {
         let zr = egui::Rect::from_min_max(egui::pos2(to_x(x0), to_y(y0)), egui::pos2(to_x(x1), to_y(y1)));
         let live = zone_live.get(&(field, idx)).copied();
@@ -1560,9 +1555,9 @@ pub(crate) fn tz_draw_field(
             to_global * egui::pos2(to_x((x0 + x1) * 0.5), to_y((y0 + y1) * 0.5))))
         .collect();
 
-    // ── Mapping mode: partial dividers from the tree (drag to move, right-click
-    // to remove/merge). Ports mode falls through to the full-cut grid editing. ──
-    if let Some(tree) = &tree {
+    // ── Partial dividers from the tree (both modes): drag to move,
+    // right-click to remove/merge. Ports migrates from the grid losslessly.
+    {
         let mut edited: Option<tz::ZoneNode> = None;
         let mut want_remove: Option<Vec<u8>> = None;
         // Per-axis divider index (V's and H's counted separately) so the gamepad
@@ -1643,7 +1638,7 @@ pub(crate) fn tz_draw_field(
             painter.line_segment([p0, p1], egui::Stroke::new(w, c));
         }
         if let Some(t) = edited { tz_set_field_tree(snarl, node_id, field, &t); }
-        if let Some(path) = want_remove { tz_request_or_apply_merge(snarl, node_id, field, tree, &path); }
+        if let Some(path) = want_remove { tz_request_or_apply_merge(snarl, node_id, field, &tree, &path); }
 
         let pass_nr = ui.ctx().cumulative_pass_nr();
         let nav_pass_now = crate::widgets::nav_pass(ui.ctx());
@@ -1653,96 +1648,7 @@ pub(crate) fn tz_draw_field(
             d.insert_temp(egui::Id::new(("gp_nav_tz_targets", node_id.0, field)),
                 (nav_pass_now, nav_targets));
         });
-        return;
     }
-
-    let mut new_cols = col_edges.to_vec();
-    let mut cols_changed = false;
-    for i in 0..col_edges.len() {
-        let x = to_x(col_edges[i]);
-        let hit = egui::Rect::from_min_max(egui::pos2(x - 4.0, rect.top()), egui::pos2(x + 4.0, rect.bottom()));
-        let ghit = to_global * hit;
-        nav_line_rects.push((0, i as u32, ghit));
-        nav_targets.push((1, 0, i as u32, ghit.center()));
-        let r = ui.interact(hit, ui.id().with((node_id, id_salt, "col", field, i)), egui::Sense::click_and_drag());
-        let hot = r.hovered() || r.dragged();
-        if hot { r.clone().on_hover_cursor(egui::CursorIcon::ResizeHorizontal); }
-        if r.dragged() {
-            if let Some(p) = r.interact_pointer_pos() {
-                let lo = if i == 0 { 0.05 } else { new_cols[i - 1] + 0.04 };
-                let hi = if i + 1 == col_edges.len() { 0.95 } else { col_edges[i + 1] - 0.04 };
-                let want = (p.x - rect.left()) / rect.width();
-                // Crowded neighbours can invert lo/hi — clamp would panic; pin to
-                // the midpoint instead.
-                new_cols[i] = if lo <= hi { want.clamp(lo, hi) } else { (lo + hi) * 0.5 };
-                cols_changed = true;
-            }
-        }
-        // Double-click the line (away from the "−") → recenter between its two
-        // adjacent borders (neighbouring dividers or the field edge). Mirrors the
-        // gamepad "recenter" (North) action.
-        if r.double_clicked() {
-            let lo = if i == 0 { 0.0 } else { col_edges[i - 1] };
-            let hi = if i + 1 == col_edges.len() { 1.0 } else { col_edges[i + 1] };
-            new_cols[i] = (lo + hi) * 0.5;
-            cols_changed = true;
-        }
-        let (w, c) = if let Some(grabbed) = nav_focus(0, i) {
-            nav_stroke(grabbed)
-        } else if hot { (2.0, accent) } else { (1.0, visuals.weak_text_color()) };
-        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(w, c));
-    }
-    let mut new_rows = row_edges.to_vec();
-    let mut rows_changed = false;
-    for i in 0..row_edges.len() {
-        let y = to_y(row_edges[i]);
-        let hit = egui::Rect::from_min_max(egui::pos2(rect.left(), y - 4.0), egui::pos2(rect.right(), y + 4.0));
-        let ghit = to_global * hit;
-        nav_line_rects.push((1, i as u32, ghit));
-        nav_targets.push((1, 1, i as u32, ghit.center()));
-        let r = ui.interact(hit, ui.id().with((node_id, id_salt, "row", field, i)), egui::Sense::click_and_drag());
-        let hot = r.hovered() || r.dragged();
-        if hot { r.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical); }
-        if r.dragged() {
-            if let Some(p) = r.interact_pointer_pos() {
-                let lo = if i == 0 { 0.05 } else { new_rows[i - 1] + 0.04 };
-                let hi = if i + 1 == row_edges.len() { 0.95 } else { row_edges[i + 1] - 0.04 };
-                let want = (p.y - rect.top()) / rect.height();
-                new_rows[i] = if lo <= hi { want.clamp(lo, hi) } else { (lo + hi) * 0.5 };
-                rows_changed = true;
-            }
-        }
-        if r.double_clicked() {
-            let lo = if i == 0 { 0.0 } else { row_edges[i - 1] };
-            let hi = if i + 1 == row_edges.len() { 1.0 } else { row_edges[i + 1] };
-            new_rows[i] = (lo + hi) * 0.5;
-            rows_changed = true;
-        }
-        let (w, c) = if let Some(grabbed) = nav_focus(1, i) {
-            nav_stroke(grabbed)
-        } else if hot { (2.0, accent) } else { (1.0, visuals.weak_text_color()) };
-        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(w, c));
-    }
-    if cols_changed || rows_changed {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            if cols_changed { tz_write_field_edges(node, field, "col_edges", &new_cols); }
-            if rows_changed { tz_write_field_edges(node, field, "row_edges", &new_rows); }
-        }
-    }
-    // Publish this pad's divider hit-rects (global space) for gamepad RS-cursor
-    // hover-select. Keyed per (node, field) so split pads don't clobber each other.
-    // NOTE: read the pass number BEFORE `data_mut` — calling a ctx accessor
-    // inside the data lock re-enters it and deadlocks epaint's RwLock.
-    let pass_nr = ui.ctx().cumulative_pass_nr();
-    let nav_pass_now = crate::widgets::nav_pass(ui.ctx());
-    ui.ctx().data_mut(|d| {
-        d.insert_temp(egui::Id::new(("gp_nav_tz_lines", node_id.0, field)),
-            (pass_nr, nav_line_rects));
-        d.insert_temp(egui::Id::new(("gp_nav_tz_targets", node_id.0, field)),
-            (nav_pass_now, nav_targets));
-    });
 }
 
 /// Pinned-widget renderer (Easy-mode sub-patch layout). Ports mode shows the
@@ -1845,7 +1751,7 @@ pub(crate) fn render_touch_zones_pinned(
         // identically. Previously this field only click-selected a zone with the
         // mouse (no divider move / seam rotate over the game).
         let suppress = crate::canvas::menu_body::radial_border_editor(
-            ui, inner_id, inner_snarl, mapping, rect, deadzone, origin, &resp, accent, &visuals);
+            ui, inner_id, inner_snarl, rect, deadzone, origin, &resp, accent, &visuals);
         if mapping && resp.clicked() && !suppress {
             if let Some(z) = picked {
                 if tz_pick_kind(inner_snarl, inner_id).is_some() {
@@ -1934,13 +1840,12 @@ pub(crate) fn render_touch_zones_pinned(
     let inactive_alpha = matches!(vis, ZoneVisibility::TouchedZones).then_some(0.2_f32);
 
     let draw = |field: usize, r: egui::Rect, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>| {
-        let col = tz_read_field_edges(snarl, inner_id, field, "col_edges");
-        let row = tz_read_field_edges(snarl, inner_id, field, "row_edges");
         let to_x = |u: f32| r.left() + u * r.width();
         let to_y = |u: f32| r.top() + u * r.height();
-        // Mapping mode: click a zone → select it (registered BEFORE the
-        // dividers so those thin drag handles stay on top and win clicks).
-        let mtree = if mapping { Some(tz_field_tree(snarl, inner_id, field)) } else { None };
+        // Click a zone → select it (registered BEFORE the dividers so those thin
+        // drag handles stay on top and win clicks). Both modes use the tree now,
+        // so zone select + per-zone divide work in ports mode too.
+        let mtree = Some(tz_field_tree(snarl, inner_id, field));
         if let Some(tree) = &mtree {
             let mut clicked: Option<usize> = None;
             for (id, [x0, y0, x1, y1]) in tree.zones() {
@@ -1958,7 +1863,7 @@ pub(crate) fn render_touch_zones_pinned(
                 }
             }
         }
-        tz_draw_field(inner_id, field, ui, snarl, &painter, r, &col, &row, &zone_live, &visuals, accent, main_c32, inactive_alpha, "pin");
+        tz_draw_field(inner_id, field, ui, snarl, &painter, r, &zone_live, &visuals, accent, main_c32, inactive_alpha, "pin");
         if mapping { tz_pick_banner(inner_id, ui, snarl, &painter, r, accent); }
         // Selected-zone outline on top of the pad fill.
         if let Some(tree) = &mtree {
@@ -1969,13 +1874,9 @@ pub(crate) fn render_touch_zones_pinned(
                 }
             }
         }
-        // Hover-revealed +/- handles: tree ops in mapping mode, full-cut grid in
-        // ports mode.
-        if mapping {
-            tz_tree_line_overlay(inner_id, field, ui, snarl, &painter, r, accent, &visuals);
-        } else {
-            tz_line_edit_overlay(inner_id, field, ui, snarl, &painter, r, &col, &row, accent, &visuals);
-        }
+        // Hover-revealed +/- handles: per-zone tree split/merge in BOTH modes
+        // (ports used to be full-cut grid only).
+        tz_tree_line_overlay(inner_id, field, ui, snarl, &painter, r, accent, &visuals);
     };
 
     if split {
@@ -2043,9 +1944,12 @@ pub(crate) fn regenerate_touch_zone_ports(node_id: NodeId, snarl: &mut Snarl<Nod
     let mapping = node.params.get("zone_mode").and_then(|v| v.as_str()) == Some("mapping");
     if !mapping {
     for field in 0..n_fields {
-        let col = tz_node_edges(node, field, "col_edges");
-        let row = tz_node_edges(node, field, "row_edges");
-        for idx in 0..tz::zone_count(&col, &row) {
+        // Zones from the BSP tree (leaf id, traversal order). A pure grid migrates
+        // to leaf ids == row-major indices in row-major order, so an un-edited
+        // patch produces byte-identical pin ids + order; a per-zone split adds a
+        // fresh leaf id at its spatial position.
+        for (id, _rect) in tz_field_tree(snarl, node_id, field).zones() {
+            let idx = id as usize;
             for comp in [tz::ZoneComp::X, tz::ZoneComp::Y, tz::ZoneComp::Active] {
                 want_ids.push(tz::zone_pin_id(field, idx, comp));
                 let ty = if matches!(comp, tz::ZoneComp::Active) { SignalType::Bool } else { SignalType::Float };
@@ -2080,57 +1984,42 @@ pub(crate) fn regenerate_touch_zone_ports(node_id: NodeId, snarl: &mut Snarl<Nod
     }
 }
 
-/// Perform a relative grid edit on `field`, PRESERVING existing port wiring: a
-/// wire to a surviving zone follows that zone to its new index. Snapshots all
-/// output connections by stable pin id, rewrites the grid, rebuilds the ports,
-/// then reconnects — remapping only the mutated field's zones (other fields and
-/// the click ports keep their ids). Index remap math lives in
-/// `flexinput_core::touchzones::apply_grid_op` (unit-tested there).
-pub(crate) fn tz_restructure(node_id: NodeId, field: usize, op: flexinput_core::touchzones::GridOp, snarl: &mut Snarl<NodeData>) {
-    use flexinput_core::touchzones as tz;
-    let col = tz_read_field_edges(snarl, node_id, field, "col_edges");
-    let row = tz_read_field_edges(snarl, node_id, field, "row_edges");
-    let Some((new_col, new_row, remap)) = tz::apply_grid_op(op, &col, &row) else { return };
-
-    // Snapshot current connections keyed by stable pin id (before regen drops them).
-    let ids_before: Vec<String> = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("output_pin_ids").and_then(|v| v.as_array()))
-        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-        .unwrap_or_default();
-    let mut snapshot: std::collections::HashMap<String, Vec<egui_snarl::InPinId>> = std::collections::HashMap::new();
+/// Regenerate a Touch Zones / Virtual Menu node's typed zone ports (ports mode)
+/// while PRESERVING downstream wiring by stable pin id. Tree edits keep existing
+/// leaf ids, so a surviving zone's port reconnects to the same remotes; a split's
+/// new leaf gets empty ports and a merged leaf's wiring drops. It's a no-op (no
+/// rebuild, no reconnect) when the port set is unchanged, so it's safe to call
+/// after ANY tree write — including a plain divider drag — and in mapping mode
+/// (which has no typed zone ports). Dispatches to the module's own tree-based
+/// builder (`regenerate_touch_zone_ports` / `regenerate_menu_ports`).
+pub(crate) fn tz_regen_ports_preserving(node_id: NodeId, snarl: &mut Snarl<NodeData>) {
+    let read_ids = |snarl: &Snarl<NodeData>| -> Vec<String> {
+        snarl.get_node(node_id)
+            .and_then(|n| n.params.get("output_pin_ids").and_then(|v| v.as_array()))
+            .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+            .unwrap_or_default()
+    };
+    let ids_before = read_ids(snarl);
+    let mut snapshot: std::collections::HashMap<String, Vec<egui_snarl::InPinId>> =
+        std::collections::HashMap::new();
     for (i, id) in ids_before.iter().enumerate() {
         let remotes = snarl.out_pin(OutPinId { node: node_id, output: i }).remotes.clone();
-        if !remotes.is_empty() {
-            snapshot.insert(id.clone(), remotes);
-        }
+        if !remotes.is_empty() { snapshot.insert(id.clone(), remotes); }
     }
-
-    if let Some(node) = snarl.get_node_mut(node_id) {
-        tz_write_field_edges(node, field, "col_edges", &new_col);
-        tz_write_field_edges(node, field, "row_edges", &new_row);
+    let is_menu = snarl.get_node(node_id).map(|n| n.module_id == "module.menu").unwrap_or(false);
+    if is_menu {
+        crate::canvas::menu_body::regenerate_menu_ports(node_id, snarl);
+    } else {
+        regenerate_touch_zone_ports(node_id, snarl);
     }
-    regenerate_touch_zone_ports(node_id, snarl);
-
-    // Reconnect: for the mutated field, map new zone idx → old id via the inverse
-    // remap; everything else keeps its id.
-    let inv: std::collections::HashMap<usize, usize> = remap.iter().map(|(&o, &n)| (n, o)).collect();
-    let ids_after: Vec<String> = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("output_pin_ids").and_then(|v| v.as_array()))
-        .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-        .unwrap_or_default();
+    let ids_after = read_ids(snarl);
+    // Unchanged port set → the builder returned early without dropping anything,
+    // so existing wiring is intact and nothing needs reconnecting.
+    if ids_before == ids_after { return; }
     for (i, id) in ids_after.iter().enumerate() {
-        let src_id: Option<String> = match tz::parse_pin(id) {
-            Some(tz::Pin::Zone { field: f, idx: nidx, comp }) if f == field => {
-                inv.get(&nidx).map(|&oidx| tz::zone_pin_id(field, oidx, comp))
-            }
-            Some(_) => Some(id.clone()),
-            None => None,
-        };
-        if let Some(remotes) = src_id.and_then(|s| snapshot.get(&s)) {
+        if let Some(remotes) = snapshot.get(id) {
             let out = OutPinId { node: node_id, output: i };
-            for &rem in remotes {
-                snarl.connect(out, rem);
-            }
+            for &rem in remotes { snarl.connect(out, rem); }
         }
     }
 }
@@ -3045,134 +2934,6 @@ pub(crate) fn tz_learn_capture(
     result
 }
 
-/// Hover-revealed +/- line-editing overlay over one pad `rect` (local layer
-/// space). Only "−" marks show at rest (one per interior divider per crossing
-/// band); hovering reveals flanking "+"; border "+" appears near a field edge.
-/// Applies the resulting grid op wire-preservingly via `tz_restructure`. Shared
-/// by the in-canvas body and the pinned widget (mapping mode). See
-/// `render_touch_field` for the original prose.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn tz_line_edit_overlay(
-    node_id: NodeId,
-    field: usize,
-    ui: &mut egui::Ui,
-    snarl: &mut Snarl<NodeData>,
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    col_edges: &[f32],
-    row_edges: &[f32],
-    accent: egui::Color32,
-    visuals: &egui::Visuals,
-) {
-    use flexinput_core::touchzones as tz;
-    let to_x = |u: f32| rect.left() + u * rect.width();
-    let to_y = |u: f32| rect.top() + u * rect.height();
-    let cols = tz::cols(col_edges);
-    let rows = tz::rows(row_edges);
-    let mut op: Option<tz::GridOp> = None;
-
-    let off = 18.0;      // "+" flanking distance from the "−"
-    let edge = 30.0;     // border-proximity threshold (px)
-    let inset = 12.0;    // border "+" inset so it sits fully inside the field
-    let from_global = ui.ctx().layer_transform_to_global(ui.layer_id())
-        .unwrap_or(egui::emath::TSTransform::IDENTITY)
-        .inverse();
-    let ptr = ui.input(|i| i.pointer.hover_pos()).map(|p| from_global * p);
-    let band_mid = |b: usize, n: usize, edges: &[f32]| -> f32 {
-        let lo = if b == 0 { 0.0 } else { edges[b - 1] };
-        let hi = if b == n - 1 { 1.0 } else { edges[b] };
-        (lo + hi) * 0.5
-    };
-    let band_of = |u: f32, edges: &[f32]| edges.iter().filter(|e| u >= **e).count();
-
-    for line in 1..cols {
-        let x = to_x(col_edges[line - 1]);
-        for band in 0..rows {
-            let y = to_y(band_mid(band, rows, row_edges));
-            let c = egui::pos2(x, y);
-            let pill = egui::Rect::from_center_size(c, egui::vec2(2.0 * off + 20.0, 22.0));
-            let expanded = ptr.is_some_and(|p| pill.contains(p));
-            if expanded {
-                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzcL", field, line, band)),
-                    egui::pos2(x - off, y), "+", accent, visuals) {
-                    op = Some(tz::GridOp::InsertCol(line - 1));
-                }
-                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzcR", field, line, band)),
-                    egui::pos2(x + off, y), "+", accent, visuals) {
-                    op = Some(tz::GridOp::InsertCol(line));
-                }
-                // "−" shows with the flanking "+", only on hover (dynamic).
-                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzc-", field, line, band)),
-                    c, "−", accent, visuals) {
-                    op = Some(tz::GridOp::RemoveCol(line - 1));
-                }
-            }
-        }
-    }
-
-    for line in 1..rows {
-        let y = to_y(row_edges[line - 1]);
-        for band in 0..cols {
-            let x = to_x(band_mid(band, cols, col_edges));
-            let c = egui::pos2(x, y);
-            let pill = egui::Rect::from_center_size(c, egui::vec2(22.0, 2.0 * off + 20.0));
-            let expanded = ptr.is_some_and(|p| pill.contains(p));
-            if expanded {
-                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzrU", field, line, band)),
-                    egui::pos2(x, y - off), "+", accent, visuals) {
-                    op = Some(tz::GridOp::InsertRow(line - 1));
-                }
-                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzrD", field, line, band)),
-                    egui::pos2(x, y + off), "+", accent, visuals) {
-                    op = Some(tz::GridOp::InsertRow(line));
-                }
-                // "−" shows with the flanking "+", only on hover (dynamic).
-                if tz_mini_button(ui, painter, ui.id().with((node_id, "tzr-", field, line, band)),
-                    c, "−", accent, visuals) {
-                    op = Some(tz::GridOp::RemoveRow(line - 1));
-                }
-            }
-        }
-    }
-
-    if let Some(p) = ptr.filter(|p| rect.contains(*p)) {
-        let ux = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        let uy = ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-        if p.x - rect.left() < edge {
-            let y = to_y(band_mid(band_of(uy, row_edges), rows, row_edges));
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzbL", field)),
-                egui::pos2(rect.left() + inset, y), "+", accent, visuals) {
-                op = Some(tz::GridOp::InsertCol(0));
-            }
-        }
-        if rect.right() - p.x < edge {
-            let y = to_y(band_mid(band_of(uy, row_edges), rows, row_edges));
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzbR", field)),
-                egui::pos2(rect.right() - inset, y), "+", accent, visuals) {
-                op = Some(tz::GridOp::InsertCol(cols - 1));
-            }
-        }
-        if p.y - rect.top() < edge {
-            let x = to_x(band_mid(band_of(ux, col_edges), cols, col_edges));
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzbT", field)),
-                egui::pos2(x, rect.top() + inset), "+", accent, visuals) {
-                op = Some(tz::GridOp::InsertRow(0));
-            }
-        }
-        if rect.bottom() - p.y < edge {
-            let x = to_x(band_mid(band_of(ux, col_edges), cols, col_edges));
-            if tz_mini_button(ui, painter, ui.id().with((node_id, "tzbB", field)),
-                egui::pos2(x, rect.bottom() - inset), "+", accent, visuals) {
-                op = Some(tz::GridOp::InsertRow(rows - 1));
-            }
-        }
-    }
-
-    if let Some(op) = op {
-        tz_restructure(node_id, field, op, snarl);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_touch_field(
     node_id: NodeId,
@@ -3190,9 +2951,6 @@ pub(crate) fn render_touch_field(
 ) -> egui::Rect {
     use flexinput_core::touchzones as tz;
 
-    let col_edges = tz_read_field_edges(snarl, node_id, field, "col_edges");
-    let row_edges = tz_read_field_edges(snarl, node_id, field, "row_edges");
-
     if !single {
         ui.label(egui::RichText::new(format!("Pad {} — touch {}", tz::field_letter(field), field + 1))
             .small().strong().color(accent));
@@ -3203,11 +2961,12 @@ pub(crate) fn render_touch_field(
     let to_x = |u: f32| rect.left() + u * rect.width();
     let to_y = |u: f32| rect.top() + u * rect.height();
 
-    // Mapping mode: clicking a zone selects it (the card list below filters to
-    // the selected zone — the "tab per zone" model). Registered BEFORE the
-    // dividers / +/- overlay so those thin controls stay on top and win clicks.
+    // Clicking a zone selects it (the card list below filters to the selected
+    // zone — the "tab per zone" model). Registered BEFORE the dividers / +/-
+    // overlay so those thin controls stay on top and win clicks. Both modes use
+    // the tree now, so ports zones are click-selectable + per-zone splittable.
     let (sel_field, sel_zone) = tz_read_selection(snarl, node_id);
-    let mtree = if mapping { Some(tz_field_tree(snarl, node_id, field)) } else { None };
+    let mtree = Some(tz_field_tree(snarl, node_id, field));
     if let Some(tree) = &mtree {
         let mut clicked: Option<usize> = None;
         for (id, [x0, y0, x1, y1]) in tree.zones() {
@@ -3226,8 +2985,8 @@ pub(crate) fn render_touch_field(
         }
     }
 
-    // Pad visuals + dividers (tree-aware in mapping mode; grid in ports mode).
-    tz_draw_field(node_id, field, ui, snarl, &painter, rect, &col_edges, &row_edges, zone_live, visuals, accent, None, None, "canvas");
+    // Pad visuals + dividers (tree-driven in both modes).
+    tz_draw_field(node_id, field, ui, snarl, &painter, rect, zone_live, visuals, accent, None, None, "canvas");
     if mapping { tz_pick_banner(node_id, ui, snarl, &painter, rect, accent); }
 
     // Selected-zone outline (mapping mode) — drawn on top of the pad fill.
@@ -3240,14 +2999,9 @@ pub(crate) fn render_touch_field(
         }
     }
 
-    // Line editing: same hover-revealed +/- handles in both modes. Mapping mode
-    // drives the tree (+ subdivides that zone, − removes/merges); ports mode drives
-    // the full-cut grid.
-    if mapping {
-        tz_tree_line_overlay(node_id, field, ui, snarl, &painter, rect, accent, visuals);
-    } else {
-        tz_line_edit_overlay(node_id, field, ui, snarl, &painter, rect, &col_edges, &row_edges, accent, visuals);
-    }
+    // Line editing: hover-revealed +/- handles drive the tree in BOTH modes now
+    // (+ subdivides that zone, − removes/merges) — ports used to be full-cut grid.
+    tz_tree_line_overlay(node_id, field, ui, snarl, &painter, rect, accent, visuals);
 
     // ── Resize grip (bottom-right corner). In split mode only the right pad
     // shows it; it writes the SHARED field size so both pads resize together. ─
@@ -3283,9 +3037,76 @@ pub(crate) fn render_touch_field(
     rect
 }
 
+#[cfg(test)]
+mod tz_ports_tree_tests {
+    use super::*;
+    use egui_snarl::{InPinId, Snarl};
+    use flexinput_core::touchzones as tz;
+    use flexinput_core::{PinDescriptor, SignalType};
 
+    fn plain(module_id: &str, n_in: usize, n_out: usize) -> NodeData {
+        NodeData {
+            module_id: module_id.to_string(),
+            display_name: module_id.to_string(),
+            category: "test".to_string(),
+            inputs: (0..n_in)
+                .map(|i| PinDescriptor::new(format!("in{i}"), SignalType::Any))
+                .collect(),
+            outputs: (0..n_out)
+                .map(|i| PinDescriptor::new(format!("out{i}"), SignalType::Any))
+                .collect(),
+            params: std::collections::HashMap::new(),
+            subpatch: None,
+            extra: crate::canvas::node::NodeExtra::default(),
+        }
+    }
 
+    // Splitting a Ports-mode zone rebuilds the typed ports from the tree while
+    // PRESERVING a surviving zone's downstream wiring (keyed by stable leaf id),
+    // and exposes the new leaf's ports.
+    #[test]
+    fn subdivide_ports_zone_preserves_wiring_and_adds_leaf() {
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let p = egui::Pos2::ZERO;
+        // Ports Touch Zones: 2-col grid (leaves 0 = left, 1 = right), one output
+        // (the AutoMap passthrough) — regen appends the per-zone ports.
+        let tz_node = {
+            let mut n = plain("module.touch_zones", 1, 1);
+            n.params.insert("zone_mode".into(), Value::String("ports".into()));
+            n.params.insert("col_edges".into(), serde_json::json!([0.5]));
+            n.params.insert("output_pin_ids".into(),
+                serde_json::json!([tz::PASS_PIN_ID]));
+            s.insert_node(p, n)
+        };
+        let sink = s.insert_node(p, plain("device.sink", 1, 0));
+        regenerate_touch_zone_ports(tz_node, &mut s);
 
+        // Wire leaf 1's Active pin to the sink.
+        let z1_act = tz::zone_pin_id(0, 1, tz::ZoneComp::Active);
+        let slot = |s: &Snarl<NodeData>, id: &str| -> Option<usize> {
+            s.get_node(tz_node)?.params.get("output_pin_ids")?.as_array()?
+                .iter().position(|v| v.as_str() == Some(id))
+        };
+        let s1 = slot(&s, &z1_act).expect("leaf 1 active port exists");
+        s.connect(OutPinId { node: tz_node, output: s1 }, InPinId { node: sink, input: 0 });
+        assert!(!s.out_pin(OutPinId { node: tz_node, output: s1 }).remotes.is_empty(),
+            "leaf 1 wired before the split");
+
+        // Subdivide leaf 0 (left half) vertically → leaf 0 keeps the a-side, a
+        // fresh leaf id appears; leaf 1 is untouched.
+        tz_subdivide_at(&mut s, tz_node, 0, 0.25, 0.5, tz::Axis::V, false);
+
+        // Leaf 1's wire survived (found again by its stable pin id).
+        let s1b = slot(&s, &z1_act).expect("leaf 1 active port still exists");
+        let remotes = s.out_pin(OutPinId { node: tz_node, output: s1b }).remotes.clone();
+        assert!(remotes.contains(&InPinId { node: sink, input: 0 }),
+            "leaf 1 wiring preserved across the split");
+
+        // A new leaf (id 2) got its own ports.
+        let z2_act = tz::zone_pin_id(0, 2, tz::ZoneComp::Active);
+        assert!(slot(&s, &z2_act).is_some(), "new leaf 2 active port added");
+    }
+}
 
 
 

@@ -303,20 +303,16 @@ impl FlexInputApp {
                             self.gamepad_nav.edit_level = EditLevel::TzGrab;
                         }
                     }
-                    TzFocus::Zone(z) => {
-                        // RT/LT divide the FOCUSED zone (V = radius line / vertical =
-                        // "straight from centre"; H = ring arc / horizontal = "along
-                        // the circle"). Mapping mode subdivides just that zone via the
-                        // BSP tree; ports mode has no tree, so it inserts a full grid
-                        // cut through the zone's band (mirrors the mouse "+").
+                    TzFocus::Zone(_) => {
+                        // RT/LT divide the FOCUSED zone via the BSP tree in BOTH modes
+                        // (V = radius line / vertical = "straight from centre";
+                        // H = ring arc / horizontal = "along the circle"). Ports mode
+                        // used to do a full grid cut; now it splits just this zone and
+                        // its typed ports are rebuilt with wiring preserved.
                         if rt_rising || lt_rising {
                             use flexinput_core::touchzones::Axis;
                             let axis = if rt_rising { Axis::V } else { Axis::H };
-                            if mapping {
-                                self.tz_tree_add(outer_id, inner, field, axis);
-                            } else {
-                                self.tz_ports_divide(outer_id, inner, field, z, axis);
-                            }
+                            self.tz_tree_add(outer_id, inner, field, axis);
                         }
                     }
                 }

@@ -365,6 +365,63 @@ mod trigger_tests {
         assert_eq!(out[0], Some(Signal::Bool(true)), "Bool port follows the gate");
     }
 
+    // Ports mode reads zones from the BSP tree, so a PER-ZONE split (a partial
+    // divider the flat grid can't express) emits X/Y/Active for the right leaf.
+    #[test]
+    fn ports_touch_zones_partial_split_emits_leaf() {
+        use flexinput_core::touchzones as tz;
+        let dev = "dev";
+        // Left half = one tall zone (leaf 0); right half split top/bottom
+        // (leaf 1 top, leaf 2 bottom) — not a pure grid.
+        let tree = serde_json::json!({
+            "axis": "v", "t": 0.5,
+            "a": { "id": 0 },
+            "b": { "axis": "h", "t": 0.5, "a": { "id": 1 }, "b": { "id": 2 } }
+        });
+        let mut n = empty_node(1, "module.touch_zones");
+        n.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        n.params.insert("zone_tree".into(), tree);
+        // Output pins: passthrough + leaf 2's X/Y/Active + leaf 0/1 Active.
+        let z = |id, comp| tz::zone_pin_id(0, id, comp);
+        n.output_pin_ids = vec![
+            tz::PASS_PIN_ID.to_string(),
+            z(2, tz::ZoneComp::Active), z(2, tz::ZoneComp::X), z(2, tz::ZoneComp::Y),
+            z(0, tz::ZoneComp::Active), z(1, tz::ZoneComp::Active),
+        ];
+        n.n_outputs = n.output_pin_ids.len();
+
+        // Finger at pad (0.5, -0.5) → unit (0.75, 0.75) → bottom-right = leaf 2.
+        let mut dev_sigs = HashMap::new();
+        dev_sigs.insert((dev.to_string(), "touch1_x".to_string()), Signal::Float(0.5));
+        dev_sigs.insert((dev.to_string(), "touch1_y".to_string()), Signal::Float(-0.5));
+        dev_sigs.insert((dev.to_string(), "touch1_active".to_string()), Signal::Bool(true));
+
+        let mut ns = NodeState::default();
+        let c = HashMap::new();
+        let out = compute_node(&n, &[], &mut ns, &dev_sigs, &c, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(true)), "leaf 2 active");
+        assert!(matches!(out[2], Some(Signal::Float(f)) if (f - 0.5).abs() < 1e-4),
+            "leaf 2 local x = 0.5, got {:?}", out[2]);
+        assert!(matches!(out[3], Some(Signal::Float(f)) if (f - 0.5).abs() < 1e-4),
+            "leaf 2 local y = 0.5, got {:?}", out[3]);
+        assert_eq!(out[4], Some(Signal::Bool(false)), "leaf 0 inactive");
+        assert_eq!(out[5], Some(Signal::Bool(false)), "leaf 1 inactive");
+
+        // Pure grid (no zone_tree): migrates to leaf ids == row-major, so the
+        // same finger lands in the right column of a 2-col grid = leaf 1.
+        let mut g = empty_node(1, "module.touch_zones");
+        g.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        g.params.insert("col_edges".into(), serde_json::json!([0.5]));
+        g.output_pin_ids = vec![
+            tz::PASS_PIN_ID.to_string(),
+            z(0, tz::ZoneComp::Active), z(1, tz::ZoneComp::Active),
+        ];
+        g.n_outputs = g.output_pin_ids.len();
+        let out = compute_node(&g, &[], &mut ns, &dev_sigs, &c, 0.016);
+        assert_eq!(out[1], Some(Signal::Bool(false)), "grid leaf 0 (left) inactive");
+        assert_eq!(out[2], Some(Signal::Bool(true)), "grid leaf 1 (right) active");
+    }
+
     // 3DOF-Lean mappings targeting macro pins: analog mode passes the live
     // lean magnitude; digital (down) mode asserts while the side is active.
     #[test]
