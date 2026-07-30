@@ -1879,17 +1879,27 @@ pub(crate) fn show_menu_options_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &
         )
     };
     let mut set: Vec<(&str, serde_json::Value)> = Vec::new();
+    // Per-field interactive rects for the gamepad-nav focus glow, captured in the
+    // SAME order (and with the SAME conditional touch/gyro gating) as this
+    // element's `nav_element_fields` arm — see that arm's lockstep note.
+    let mut field_rects: Vec<egui::Rect> = Vec::new();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Driven by").small().weak())
             .on_hover_text("Which analog inputs point at zones while the menu is open —\nevery checked source ADDS UP, so a stick and the gyro can steer\ntogether. The wired Pointer inlet overrides them all.");
         let mut b = src_ls;
-        if ui.checkbox(&mut b, "LS").changed() { set.push(("ptr_ls", serde_json::json!(b))); }
+        let r = ui.checkbox(&mut b, "LS");
+        if r.changed() { set.push(("ptr_ls", serde_json::json!(b))); }
+        field_rects.push(r.rect);
         let mut b = src_rs;
-        if ui.checkbox(&mut b, "RS").changed() { set.push(("ptr_rs", serde_json::json!(b))); }
+        let r = ui.checkbox(&mut b, "RS");
+        if r.changed() { set.push(("ptr_rs", serde_json::json!(b))); }
+        field_rects.push(r.rect);
         let mut b = src_touch;
-        if ui.checkbox(&mut b, "Touch").changed() { set.push(("ptr_touch", serde_json::json!(b))); }
+        let r = ui.checkbox(&mut b, "Touch");
+        if r.changed() { set.push(("ptr_touch", serde_json::json!(b))); }
+        field_rects.push(r.rect);
         if src_touch {
-            egui::ComboBox::from_id_salt((node_id, "menu_touch_which"))
+            let r = egui::ComboBox::from_id_salt((node_id, "menu_touch_which"))
                 .selected_text(if touch_which == "touch2" { "Touch 2" } else { "Touch 1" })
                 .width(74.0)
                 .show_ui(ui, |ui| {
@@ -1899,13 +1909,15 @@ pub(crate) fn show_menu_options_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &
                         }
                     }
                 });
+            field_rects.push(r.response.rect);
         }
         let mut b = src_gyro;
-        if ui.checkbox(&mut b, "Gyro")
-            .on_hover_text("Tilt to point: rotation accumulates while the menu is open and\nresets on every open, so the pointer always starts centered.")
-            .changed() { set.push(("ptr_gyro", serde_json::json!(b))); }
+        let r = ui.checkbox(&mut b, "Gyro")
+            .on_hover_text("Tilt to point: rotation accumulates while the menu is open and\nresets on every open, so the pointer always starts centered.");
+        if r.changed() { set.push(("ptr_gyro", serde_json::json!(b))); }
+        field_rects.push(r.rect);
         if src_gyro {
-            egui::ComboBox::from_id_salt((node_id, "menu_gyro_axes"))
+            let r = egui::ComboBox::from_id_salt((node_id, "menu_gyro_axes"))
                 .selected_text(if gyro_axes == "pitch_roll" { "Pitch+Roll" } else { "Pitch+Yaw" })
                 .width(92.0)
                 .show_ui(ui, |ui| {
@@ -1915,14 +1927,15 @@ pub(crate) fn show_menu_options_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &
                         }
                     }
                 });
+            field_rects.push(r.response.rect);
             ui.label(egui::RichText::new("×").small().weak());
             let mut sens = gyro_sens;
-            if ui.add(egui::DragValue::new(&mut sens).range(0.5..=8.0).speed(0.05))
-                .on_hover_text("Gyro pointer sensitivity. 1 ≈ 10× the raw rotation rate;\nraise it if the gyro feels too weak to reach the zones.")
-                .changed()
-            {
+            let r = ui.add(egui::DragValue::new(&mut sens).range(0.5..=8.0).speed(0.05))
+                .on_hover_text("Gyro pointer sensitivity. 1 ≈ 10× the raw rotation rate;\nraise it if the gyro feels too weak to reach the zones.");
+            if r.changed() {
                 set.push(("ptr_gyro_sens", serde_json::json!(sens)));
             }
+            field_rects.push(r.rect);
         }
     });
 
@@ -1940,7 +1953,7 @@ pub(crate) fn show_menu_options_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Show").small().weak())
             .on_hover_text("How the Show input opens the menu.\nHold: open while held. Toggle: press opens, press closes.\nTouch: open while a finger rests on the touchpad.");
-        egui::ComboBox::from_id_salt((node_id, "menu_act"))
+        let r = egui::ComboBox::from_id_salt((node_id, "menu_act"))
             .selected_text(match act.as_str() { "toggle" => "Toggle", "touch" => "Touch", _ => "Hold" })
             .width(70.0)
             .show_ui(ui, |ui| {
@@ -1950,9 +1963,10 @@ pub(crate) fn show_menu_options_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &
                     }
                 }
             });
+        field_rects.push(r.response.rect);
         ui.label(egui::RichText::new("Select").small().weak())
             .on_hover_text("What commits the highlighted zone.\nRelease: letting go of Show/touch. Press: the Select input.\nClick: the touchpad click.");
-        egui::ComboBox::from_id_salt((node_id, "menu_sel_on"))
+        let r = egui::ComboBox::from_id_salt((node_id, "menu_sel_on"))
             .selected_text(match sel_on.as_str() { "press" => "Press", "click" => "Click", _ => "Release" })
             .width(76.0)
             .show_ui(ui, |ui| {
@@ -1962,30 +1976,32 @@ pub(crate) fn show_menu_options_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &
                     }
                 }
             });
+        field_rects.push(r.response.rect);
         ui.label(egui::RichText::new("Deadzone").small().weak());
         let mut dz_val = dz;
-        if ui.add(egui::DragValue::new(&mut dz_val).range(0.0..=0.9).speed(0.01))
-            .on_hover_text("Pointer deflection below this doesn't move the highlight.")
-            .changed()
-        {
+        let r = ui.add(egui::DragValue::new(&mut dz_val).range(0.0..=0.9).speed(0.01))
+            .on_hover_text("Pointer deflection below this doesn't move the highlight.");
+        if r.changed() {
             set.push(("pointer_deadzone", serde_json::json!(dz_val)));
         }
+        field_rects.push(r.rect);
         ui.label(egui::RichText::new("Linger").small().weak());
         let mut lin = linger;
-        if ui.add(egui::DragValue::new(&mut lin).range(0.0..=10.0).speed(0.05).suffix(" s"))
-            .on_hover_text("After a selection is accepted the menu hides immediately, but the\nchosen zone cell stays on screen this long, then fades out.\n0 = the whole menu disappears at once.")
-            .changed()
-        {
+        let r = ui.add(egui::DragValue::new(&mut lin).range(0.0..=10.0).speed(0.05).suffix(" s"))
+            .on_hover_text("After a selection is accepted the menu hides immediately, but the\nchosen zone cell stays on screen this long, then fades out.\n0 = the whole menu disappears at once.");
+        if r.changed() {
             set.push(("select_linger", serde_json::json!(lin)));
         }
+        field_rects.push(r.rect);
         let mut stk = sticky;
-        if ui.checkbox(&mut stk, "Sticky")
-            .on_hover_text("Keep the last highlighted zone when the pointer returns to the\ndeadzone, so flick-and-release selection works. Off: the highlight\nclears, and releasing inside the deadzone selects nothing.")
-            .changed()
-        {
+        let r = ui.checkbox(&mut stk, "Sticky")
+            .on_hover_text("Keep the last highlighted zone when the pointer returns to the\ndeadzone, so flick-and-release selection works. Off: the highlight\nclears, and releasing inside the deadzone selects nothing.");
+        if r.changed() {
             set.push(("hover_sticky", serde_json::json!(stk)));
         }
+        field_rects.push(r.rect);
     });
+    super::viewer::publish_nav_field_rects(ui, node_id, &field_rects);
     if !set.is_empty() {
         if let Some(node) = snarl.get_node_mut(node_id) {
             for (k, v) in set { node.params.insert(k.to_string(), v); }

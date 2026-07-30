@@ -24,7 +24,7 @@ pub struct ModuleDescriptor {
 
 ## Module Categories
 
-### 1. Utility Modules (`crates/modules/src/util.rs`)
+### 1. Utility / Control Modules (`crates/modules/src/controls.rs`)
 
 #### Constant
 - **ID:** `module.constant`
@@ -74,11 +74,11 @@ pub struct ModuleDescriptor {
   - `options: Array<String>` - List of option labels
   - `selected_index: u64` - Currently selected index
 
-#### Text
-- **ID:** `module.text`
-- **Purpose:** Displays or edits text strings
+#### Text (Label)
+- **ID:** `module.label` (display name "Text")
+- **Purpose:** Displays or edits a text label
 - **Inputs:** None
-- **Outputs:** String (via UI binding)
+- **Outputs:** None (display-only)
 - **Parameters:**
   - `text: String` - Current text content
 
@@ -462,7 +462,11 @@ pub struct ModuleDescriptor {
 
 ---
 
-### 7. AutoMap Modules (`crates/modules/src/automap.rs`)
+### 7. AutoMap / Mapping Modules (`crates/modules/src/processing.rs`)
+
+> Registered in `processing.rs` (alongside the response-curve / gyro / reshape modules),
+> not a separate `automap.rs`. The AutoMap PIN VOCABULARY (`ALL_PINS`, `resolve_mapping`,
+> feedback pairs) lives in `crates/core/src/automap.rs` — see AUTOMAP_SYSTEM.md.
 
 #### AutoMap Splitter
 - **ID:** `module.automap_split`
@@ -524,8 +528,41 @@ pub struct ModuleDescriptor {
 - **Parameters:**
   - `zone_mode: String` - "ports" or "mapping"
   - `field_mode: String` - "single" or "split"
-  - `col_edges_N: Array<f64>` - Column divider positions for field N
-  - `row_edges_N: Array<f64>` - Row divider positions for field N
+  - `zone_tree{N}: Object` - **Authoritative** BSP zone tree for field N
+    (`flexinput_core::touchzones::ZoneNode`). Both **ports** and **mapping** modes run
+    on this tree — per-zone (partial) dividers with stable leaf ids. The engine resolves
+    a touch via `tree.locate(x,y) -> (leaf_id, lx, ly)`; ports/pins are keyed by leaf id.
+  - `col_edges{N}: Array<f64>` / `row_edges{N}: Array<f64>` - Legacy full-width/height
+    grid dividers. **Migration source only** — present on un-edited/old patches;
+    `ZoneNode::from_grid` migrates them losslessly (leaf id == row-major grid index) the
+    first time a field is read, and the first structural edit persists `zone_tree{N}`,
+    which is authoritative thereafter. Never deleted from a patch (kept as the migration
+    source). See DEVELOPMENT_GUIDELINES.md → *"Touch Zones / Virtual Menu geometry"*.
+  - `zone_maps: Array<Mapping>` - Per-zone mapping cards (mapping mode; shared card
+    schema with Remapper, incl. per-card `curve`/`threshold`).
+  - `zone_meta: Array<Object>` - Per-zone icon + name overrides (shared with Virtual
+    Menu). Icons use the shared `icon_key` scheme, including dynamic `gp:<pin>` glyphs.
+
+#### Virtual Menu
+- **ID:** `module.menu`
+- **Purpose:** A summoned on-screen radial/grid menu whose zones are pointed at with an
+  analog source and selected to fire mappings. Shares the BSP zone tree, per-zone
+  mapping cards, and `zone_meta` icon/name overrides with Touch Zones.
+- **Inputs:** touch/pointer X/Y/active + Show/Select gate pins (plus an optional wired
+  Pointer inlet that overrides the configured sources).
+- **Outputs:** per-zone signals + menu state; drives the menu overlay viewport.
+- **Geometry:** same `zone_tree{N}` / `col_edges`/`row_edges` migration story as Touch
+  Zones. `menu_radial: bool` switches between the grid and radial ring layouts;
+  `menu_radial_origin: f64` rotates the radial ring's origin seam. **Both** ports and
+  mapping modes render on the tree (a `ports { grid } else { tree }` split used to break
+  radial-ports — do not reintroduce it).
+- **Key parameters (the pinnable `options` element, gamepad-field-editable):**
+  - Pointer sources (additive): `ptr_ls`, `ptr_rs`, `ptr_touch` (+ `ptr_touch_which`),
+    `ptr_gyro` (+ `ptr_gyro_axes`, `ptr_gyro_sens`). Absent flags fall back to the legacy
+    single-choice `pointer_source`.
+  - Session behaviour: `activation_mode` (hold/toggle/touch), `select_on`
+    (release/press/click), `pointer_deadzone`, `select_linger`, `hover_sticky`.
+  - Header: `menu_name`, `menu_icon`/`menu_icon_svg`.
 
 #### Remapper
 - **ID:** `module.remapper`

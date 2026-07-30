@@ -407,6 +407,7 @@ impl FlexInputApp {
             | ("module.audio_stream_haptics", "asth_balance")
             | ("module.audio_stream_haptics", "asth_swap_row")
             | ("module.audio_stream_haptics", "asth_rumble_mix")
+            | ("module.menu", "options")
         )
     }
 
@@ -759,6 +760,43 @@ impl FlexInputApp {
                 f!("Min", v("min_param",-1_000_000.0,1_000_000.0,0.0,Linear)),
                 f!("Max", v("max_param",-1_000_000.0,1_000_000.0,10.0,Linear)),
             ],
+            // ── Virtual Menu "options" element (the TWO-row session block) ──
+            // Field order MUST match `show_menu_options_row`'s published rects,
+            // INCLUDING the conditional touch/gyro sub-fields — both this arm and
+            // the renderer gate on the SAME derived `src_touch`/`src_gyro` (with
+            // the legacy `pointer_source` fallback), so the lists stay in lockstep
+            // however the checkboxes are set. Enum option orders mirror the
+            // renderer's ComboBox value lists exactly.
+            ("module.menu", "options") => {
+                let Some(inner) = self.nav_selected_inner_node(outer_id) else { return vec![]; };
+                // Same legacy-derived defaults as the renderer, so a pre-checkbox
+                // patch exposes the same conditional fields the body shows.
+                let legacy = self.get_subpatch_param_str(outer_id, inner, "pointer_source")
+                    .unwrap_or_else(|| "left_stick".to_string());
+                let src_touch = self.get_subpatch_param_bool(outer_id, inner, "ptr_touch")
+                    .unwrap_or(legacy == "touch1" || legacy == "touch2");
+                let src_gyro = self.get_subpatch_param_bool(outer_id, inner, "ptr_gyro")
+                    .unwrap_or(false);
+                let mut fs = vec![
+                    f!("LS", Toggle{key:"ptr_ls"}),
+                    f!("RS", Toggle{key:"ptr_rs"}),
+                    f!("Touch", Toggle{key:"ptr_touch"}),
+                ];
+                if src_touch {
+                    fs.push(f!("Touch#", Enum{key:"ptr_touch_which",opts:&["touch1","touch2"]}));
+                }
+                fs.push(f!("Gyro", Toggle{key:"ptr_gyro"}));
+                if src_gyro {
+                    fs.push(f!("Gyro ax", Enum{key:"ptr_gyro_axes",opts:&["pitch_yaw","pitch_roll"]}));
+                    fs.push(f!("Gyro ×", v("ptr_gyro_sens",0.5,8.0,4.0,Linear)));
+                }
+                fs.push(f!("Show", Enum{key:"activation_mode",opts:&["hold","toggle","touch"]}));
+                fs.push(f!("Select", Enum{key:"select_on",opts:&["release","press","click"]}));
+                fs.push(f!("Deadzone", v("pointer_deadzone",0.0,0.9,0.25,Linear)));
+                fs.push(f!("Linger", v("select_linger",0.0,10.0,0.5,Fixed(0.05))));
+                fs.push(f!("Sticky", Toggle{key:"hover_sticky"}));
+                fs
+            }
             _ => vec![],
         }
     }

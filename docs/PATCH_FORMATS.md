@@ -2,643 +2,301 @@
 
 ## Overview
 
-FlexInput uses three file formats for persistence:
-- **`.fxp`** - Full patch files (graph, nodes, wires, parameters)
-- **`.fxsp`** - Sub-patch preset files (reusable complex blocks)
-- **`.fxc`** - Response curve files (shared curve definitions)
+FlexInput persists to JSON via serde. The on-disk formats are:
 
-All formats use JSON serialization with serde. The engine maintains backward compatibility across versions via migration functions.
+| File | Extension / name | Root type | Where defined |
+|------|------------------|-----------|---------------|
+| Full patch | `.fxp` | `UiPatch` | `crates/ui/src/canvas/mod.rs` |
+| Sub-patch preset | `.fxsp` | `SubPatchFile` | `crates/ui/src/app/subpatch.rs` |
+| Response curve | `.fxc` | `CurveFile` | `crates/ui/src/canvas/viewer/curve_support.rs` |
+| Workspace autosave | `workspace.json` | `PersistedWorkspace` | `crates/ui/src/settings.rs` |
+| Crash recovery | `recovery.json` | `PersistedWorkspace` | `crates/ui/src/settings.rs` |
+| Settings | `settings.json` | `AppSettings` | `crates/ui/src/settings.rs` |
+
+> **The graph is a serialized egui-snarl `Snarl<NodeData>`, NOT `core::Patch`.**
+> This is the single most common misconception. `crates/core/src/patch.rs` DOES
+> define `Patch` / `NodeInstance` (with a `Uuid` id) / `Wire` (with `from_pin`/`to_pin`
+> names) and `PATCH_VERSION`, but those types are **legacy** and are *not* used by the
+> file formats above (the vestigial `flexinput_engine::Engine` struct still carries a
+> `core::Patch` field, but the live processing path builds a `ProcessingGraph` from the
+> snarl instead — see ENGINE_INTERNALS.md). Do not hand-author graph JSON against the
+> `core::Patch` schema; it will not load.
+
+All graph files store the graph as an egui-snarl `Snarl<NodeData>`
+(`vendor/egui-snarl/src/lib.rs`): `{ nodes: Slab<Node<NodeData>>, wires: <set of
+Wire> }`. Nodes are keyed by an **integer slab index** (`NodeId(usize)`), and a wire is
+a pair of `(out_node_index, out_pin_index)` → `(in_node_index, in_pin_index)` — there
+are **no UUIDs and no pin-name wires**. FlexInput never writes this JSON by hand; it is
+produced by snarl's own `Serialize`/`Deserialize`.
 
 ---
 
-## Patch File Format (`.fxp`)
+## Full Patch Format (`.fxp`)
 
-### Structure
-
-```json
-{
-  "version": 1,
-  "nodes": [
-    {
-      "id": "550e8400-e29b-41d4-a716-446655440000",
-      "module_id": "math.add",
-      "position": [100.0, 200.0],
-      "params": {
-        "value": 0.5
-      }
-    },
-    {
-      "id": "61a9f400-f39c-42e5-b827-557766551111",
-      "module_id": "device.source",
-      "position": [50.0, 100.0],
-      "params": {
-        "device_id": "gilrs:dualsense:0"
-      }
-    },
-    {
-      "id": "72b0e500-a4ad-53f6-c938-668877662222",
-      "module_id": "subpatch",
-      "position": [300.0, 150.0],
-      "params": {},
-      "subpatch": {
-        "display_name": "Gyro Pre-processing",
-        "pins_in": [
-          {"name": "X", "signal_type": "Float"},
-          {"name": "Y", "signal_type": "Float"}
-        ],
-        "pins_out": [
-          {"name": "Out X", "signal_type": "Float"},
-          {"name": "Out Y", "signal_type": "Float"}
-        ],
-        "patch": {
-          "version": 1,
-          "nodes": [...],
-          "wires": [...]
-        }
-      }
-    }
-  ],
-  "wires": [
-    {
-      "from_node": "550e8400-e29b-41d4-a716-446655440000",
-      "from_pin": "A",
-      "to_node": "61a9f400-f39c-42e5-b827-557766551111",
-      "to_pin": "left_stick_x"
-    }
-  ]
-}
-```
-
-### Node Instance Schema
+### Root type — `UiPatch`
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeInstance {
-    pub id: Uuid,                          // Unique identifier
-    pub module_id: String,                 // Matches ModuleDescriptor::id
-    pub position: [f32; 2],               // Canvas coordinates (x, y)
-    
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub params: HashMap<String, serde_json::Value>,  // Configurable parameters
-    
-    /// Inline sub-patch definition (only for module_id == "subpatch")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subpatch: Option<Box<SubPatch>>,
+// crates/ui/src/canvas/mod.rs
+pub struct UiPatch {
+    pub version: u32,                 // currently 1
+    pub snarl: Snarl<NodeData>,       // the whole graph (egui-snarl serialization)
+    pub virtual_device_ids: Vec<String>,   // e.g. ["virtual.xinput.0"]
+    #[serde(default)]
+    pub bound_exes: Vec<String>,      // auto-switch exe filenames, e.g. ["game.exe"]
+    #[serde(default)]
+    pub auto_bypass: bool,            // bypass output when bound process unfocused
+    #[serde(default)]
+    pub easy_preset_path: Option<PathBuf>,  // re-link the Easy-mode preset on reopen
+    #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
+    pub overlay: OverlayLayout,       // info-overlay pinned elements
+    #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
+    pub config: OverlayLayout,        // config-overlay tweak-pins
 }
 ```
 
-### Wire Schema
+Written by `Canvas::save_patch(..)`, read by `Canvas::load_patch()` (which also accepts
+`.fxsp`, see below). On load the snarl is passed through `migrate_loaded_snarl` +
+`migrate_ds4_pin_ids`. On save it is passed through `sanitize_snarl_for_save` (strips
+transient/secret fields such as network passphrases — see `sanitize_node_for_save`).
+
+### Node schema — `NodeData`
+
+Each snarl node's value is a `NodeData` (`crates/ui/src/canvas/node.rs`):
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Wire {
-    pub from_node: Uuid,
-    pub from_pin: String,       // Pin name (e.g., "A", "left_stick_x")
-    pub to_node: Uuid,
-    pub to_pin: String,         // Pin name on destination node
+pub struct NodeData {
+    pub module_id: String,            // matches ModuleDescriptor::id, or "subpatch"
+    pub display_name: String,
+    pub category: String,
+    pub inputs: Vec<PinDescriptor>,   // {name, signal_type, optional}
+    pub outputs: Vec<PinDescriptor>,
+    pub params: HashMap<String, serde_json::Value>,  // all module config lives here
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpatch: Option<Box<UiSubPatch>>,  // present only when module_id == "subpatch"
+    #[serde(skip)]
+    pub extra: NodeExtra,             // LIVE-ONLY (last_signals, scope history, …) — never persisted
 }
 ```
 
-### Special Node Types
+Notes that matter:
+- **`inputs`/`outputs` are serialized on the node**, so a patch remembers a node's pin
+  set even if the module descriptor later changes — this is why `migrate_loaded_snarl`
+  rewrites pin lists for modules that gained pins (Map Action's Analog output, ASTH's
+  raw-analysis outputs).
+- **`extra` is `#[serde(skip)]`** — live signal values, scope history, status dots and
+  AutoMap glow are runtime state and are never written to disk.
+- All tunable module configuration is untyped `params` (JSON values), keyed by string.
+  See MODULES_REFERENCE.md for per-module keys.
 
-#### device.source
+### `device.source` / `device.sink`
 
-Physical input device node:
-```json
-{
-  "id": "...",
-  "module_id": "device.source",
-  "position": [50.0, 100.0],
-  "params": {
-    "device_id": "gilrs:dualsense:0"
-  }
-}
-```
+These are ordinary `NodeData` nodes distinguished by `module_id`; their config lives in
+`params`:
+- `device.source`: `device_id` (`"{backend}:{family}:{instance}"`, e.g.
+  `"gilrs:dualsense:0"`), plus optional per-device calibration keys (deadzone, gyro,
+  invert, …).
+- `device.sink`: `device_id` (`"virtual.{kind}.{n}"`, e.g. `"virtual.xinput.0"`), plus
+  output-shaping keys (rumble floor/max/exp, mouse sensitivity for KB/M sinks, …).
 
-**Parameters:**
-- `device_id` - Device identifier (format: `{backend}:{family}:{instance}`)
-- `deadzone` - Stick deadzone radius (optional, defaults to settings)
-- `gyro_multiplier` - Gyro sensitivity scale (optional)
+### Migration — `migrate_loaded_snarl`
 
-#### device.sink
-
-Virtual output device node:
-```json
-{
-  "id": "...",
-  "module_id": "device.sink",
-  "position": [400.0, 200.0],
-  "params": {
-    "device_id": "virtual.hm.xinput.0"
-  }
-}
-```
-
-**Parameters:**
-- `device_id` - Virtual device identifier (format: `virtual.{kind}.{id}`)
-- `deadzone` - Output stick deadzone (optional)
-- `mouse_sensitivity` - KB/M mouse sensitivity multiplier (optional)
-- `rumble_floor`, `rumble_max`, `rumble_exp` - Rumble shaping parameters
-
-#### subpatch
-
-Inline sub-patch definition:
-```json
-{
-  "id": "...",
-  "module_id": "subpatch",
-  "position": [300.0, 150.0],
-  "params": {},
-  "subpatch": {
-    "display_name": "My Sub-patch",
-    "pins_in": [
-      {"name": "Input A", "signal_type": "Float"},
-      {"name": "Input B", "signal_type": "Vec2"}
-    ],
-    "pins_out": [
-      {"name": "Output X", "signal_type": "Float"}
-    ],
-    "patch": {
-      "version": 1,
-      "nodes": [...],
-      "wires": [...]
-    }
-  }
-}
-```
-
-### Migration Functions
-
-Loaded patches are migrated to current schema via `migrate_loaded_snarl()`:
+`crates/ui/src/canvas/mod.rs`. Runs on every load, recursing into sub-patch snarls:
 
 ```rust
 pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
-    for (_, node) in snarl.nodes_ids_data_mut() {
-        // Map Action gained second output (out_analog)
-        if node.value.module_id == "module.map_action" 
-            && node.value.outputs.len() < 2 
-        {
-            node.value.outputs.push(PinDescriptor::new("Analog", SignalType::Float));
-        }
-        
-        // Audio Stream Haptics gained raw-analysis outputs
-        if node.value.module_id == "module.audio_stream_haptics" 
-            && node.value.outputs.len() < 7 
-        {
-            let want = [
-                ("AutoMap", SignalType::AutoMap),
-                ("LF EF L", SignalType::Float),
-                ("HF EF L", SignalType::Float),
-                // ... more outputs
-            ];
-            node.value.outputs = want.iter()
-                .map(|(name, ty)| PinDescriptor::new(*name, *ty))
-                .collect();
-        }
-        
-        // ViGEm → HIDMaestro device ID migration
-        if matches!(node.value.module_id.as_str(), "device.sink" | "device.source") {
-            if let Some(new_id) = node.value.params.get("device_id")
-                .and_then(|v| v.as_str())
-                .and_then(migrate_vigem_device_id) 
-            {
-                node.value.params.insert("device_id".into(), Value::from(new_id));
-            }
-        }
-        
-        // Backfill legacy rumble defaults for old virtual pads
-        if node.value.module_id == "device.sink" {
-            let dev = node.value.params.get("device_id")
-                .and_then(|v| v.as_str()).unwrap_or("");
-            if dev.starts_with("virtual.") && !dev.starts_with("virtual.keymouse")
-                && !node.value.params.contains_key("rumble_floor") 
-            {
-                node.value.params.insert("rumble_floor".into(), Value::from(0.35));
-                node.value.params.insert("rumble_max".into(), Value::from(1.0));
-                node.value.params.insert("rumble_exp".into(), Value::from(0.6));
-            }
-        }
-        
-        // Recurse into nested sub-patches
-        if let Some(sp) = node.value.subpatch.as_mut() {
-            migrate_loaded_snarl(&mut sp.snarl);
+    for node in snarl.nodes_mut() {
+        // e.g. backfill outputs for modules that gained pins, rewrite legacy
+        // ViGEm device ids → HIDMaestro, backfill rumble defaults, …
+        if let Some(sp) = node.subpatch.as_mut() {
+            migrate_loaded_snarl(&mut sp.snarl);   // recurse
         }
     }
 }
 ```
+
+`migrate_ds4_pin_ids` similarly rewrites older DualShock4 pin ids. Add migrations here
+(never a version bump alone) when a param key or pin set changes.
 
 ---
 
 ## Sub-Patch Preset Format (`.fxsp`)
 
-### Structure
+### Root type — `SubPatchFile`
 
-Sub-patch presets are simplified `.fxp` files containing only a single sub-patch node:
-
-```json
-{
-  "version": 1,
-  "nodes": [
-    {
-      "id": "preset-root-node-id",
-      "module_id": "subpatch",
-      "position": [0.0, 0.0],
-      "params": {},
-      "subpatch": {
-        "display_name": "Easy Mode Preset",
-        "pins_in": [
-          {"name": "Source", "signal_type": "AutoMap"}
-        ],
-        "pins_out": [
-          {"name": "Destination", "signal_type": "AutoMap"}
-        ],
-        "patch": {
-          "version": 1,
-          "nodes": [...],
-          "wires": [...]
-        }
-      }
-    }
-  ],
-  "wires": []
-}
-```
-
-### Easy Mode Compatibility Check
-
-When loading a `.fxsp` file, the UI checks if it's compatible with Easy mode:
+A `.fxsp` is **not** a `UiPatch`. It carries one `UiSubPatch` directly:
 
 ```rust
-fn is_easy_compatible_canvas(canvas: &Canvas) -> bool {
-    use flexinput_core::SignalType;
-    
-    let mut subpatch_node: Option<&NodeData> = None;
-    
-    for (_, n) in canvas.snarl.nodes_ids_data() {
-        match n.value.module_id.as_str() {
-            "subpatch" => {
-                if subpatch_node.is_some() { return false; }  // Only one allowed
-                subpatch_node = Some(&n.value);
-            }
-            "device.source" | "device.sink" => {}  // Allowed
-            _ => return false,  // No foreign nodes
-        }
-    }
-    
-    let Some(node) = subpatch_node else { return false; };
-    let Some(sp) = node.subpatch.as_ref() else { return false; };
-    
-    // Must have AutoMap inlet AND outlet
-    let has_in  = sp.pins_in.iter().any(|p| p.signal_type == SignalType::AutoMap);
-    let has_out = sp.pins_out.iter().any(|p| p.signal_type == SignalType::AutoMap);
-    
-    // Must have non-empty layout (items) for center panel rendering
-    has_in && has_out && !sp.items.is_empty()
+// crates/ui/src/app/subpatch.rs
+pub(crate) struct SubPatchFile {
+    pub(crate) version: u32,
+    pub(crate) sub_patch: UiSubPatch,
 }
 ```
 
-### Factory Presets
+```rust
+// crates/ui/src/canvas/node.rs
+pub struct UiSubPatch {
+    pub display_name: String,
+    pub pins_in: Vec<SubPatchPin>,    // {name, signal_type}
+    pub pins_out: Vec<SubPatchPin>,
+    pub snarl: Box<Snarl<NodeData>>,  // the inner graph
+    pub items: Vec<LayoutItem>,       // pinned widgets + decorations on the body
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlay_items: Vec<LayoutItem>,  // info-overlay pins that travel with the preset
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_items: Vec<LayoutItem>,   // config-overlay tweak-pins that travel with it
+}
+```
 
-Shipping presets are located in `app/assets/sub-patches/`:
-- `default.fxp` - Basic pass-through mapping
-- `mouse_mode.fxp` - Stick-to-mouse conversion
-- `gyro_aim.fxp` - Gyro aiming assist
+`LayoutItem` is the unified Z-ordered body/overlay element list:
 
-Users can save custom presets via File → Save Sub-Patch Preset.
+```rust
+pub enum LayoutItem {
+    Module(ExposedModule),   // { inner_node_id: usize, element_id: String, pos, size, … }
+    Deco(LayoutDecoration),  // text / svg / image / shape decorations
+}
+```
+
+`overlay_items`/`config_items` are how a preset ships built-in overlays: on save,
+tab-level overlay pins sourced from a sub-patch are *attributed* into that sub-patch
+(`attribute_overlays_into_subpatches`); on load they are *materialized* back onto the tab
+(`materialize_subpatch_overlays`). First-level sub-patches only.
+
+### Loading a `.fxsp`
+
+`Canvas::load_patch()` accepts both `.fxp` and `.fxsp`. For a `.fxsp` it builds an empty
+canvas and inserts a single `subpatch` node whose `UiSubPatch` is the loaded preset,
+with the outer node's pin descriptors mirrored from `pins_in`/`pins_out`. If the result
+is Easy-mode-compatible (`is_easy_compatible_canvas` in `app.rs` — exactly one
+`subpatch` node plus only `device.source`/`device.sink`, an AutoMap inlet AND outlet,
+and a non-empty `items` layout) the app switches to Easy mode.
 
 ---
 
 ## Response Curve Format (`.fxc`)
 
-### Structure
+### Root type — `CurveFile`
 
-Response curves are standalone files that can be loaded into any curve module:
-
-```json
-{
-  "points": [
-    [-1.0, -1.0],
-    [-0.5, -0.8],
-    [0.0, 0.0],
-    [0.5, 0.6],
-    [1.0, 1.0]
-  ],
-  "biases": [
-    0.0,  // Between point 0 and 1
-    0.0,  // Between point 1 and 2
-    0.0,  // Between point 2 and 3
-    0.0   // Between point 3 and 4
-  ],
-  "absolute": true,
-  "in_min": -1.0,
-  "in_max": 1.0,
-  "out_min": -1.0,
-  "out_max": 1.0
+```rust
+// crates/ui/src/canvas/viewer/curve_support.rs — every field #[serde(default …)]
+pub(crate) struct CurveFile {
+    pub points: Vec<[f64; 2]>,   // control points in [-1,1]² (or in-range) space
+    pub biases: Vec<f64>,        // one per segment (points.len()-1); segment curvature
+    pub absolute: bool,          // default true; mirror the curve about the origin
+    pub in_min: f64, pub in_max: f64,    // input range (defaults -1 / 1)
+    pub out_min: f64, pub out_max: f64,  // output range (defaults -1 / 1)
+    pub grid_x: i64, pub grid_y: i64,    // editor grid (defaults 4)
+    pub snap: bool,
+    pub scale_t: f64,            // log/exp pre-warp (-1..1)
+    pub trail_ms: i64,           // live-dot trail length (default 300)
+    pub show_scaled_grid: bool,
+    pub show_grid_labels: bool,
 }
 ```
 
-### Loading into Modules
+One `.fxc` is cross-compatible across the scalar / vec / two-way curve modules and the
+envelope generator — each reads the fields it uses and ignores the rest. Curve data on a
+node lives in that node's `params` (points/biases/etc.), not as a file path; `.fxc` is an
+import/export convenience, loaded/saved from the curve editor's context menu.
 
-Response curve modules accept `.fxc` file paths:
+### Evaluation
 
-```rust
-// In module.params:
-"curve_file": "/path/to/preset.fxc"
-
-// Engine loads and merges params:
-let loaded = serde_json::from_str::<CurveFile>(&fs::read_to_string(path)?);
-params.extend(loaded.points.into_iter().map(|p| (format!("point_{}", p.0), Value::Number(p.1))));
-```
-
-### Curve Evaluation
-
-Curves are evaluated via `apply_curve()` in `crates/engine/src/eval/curves.rs`:
+`crates/engine/src/eval/curves.rs`:
 
 ```rust
 pub fn apply_curve(
-    x: f32,
-    points: &[[f32; 2]],
-    biases: &[f32],
-    absolute: bool,
-    in_min: f32,
-    in_max: f32,
-    out_min: f32,
-    out_max: f32,
-    scale_t: f32,
-) -> f32 {
-    if points.is_empty() { return 0.0; }
-    
-    // Normalize input to [0, 1] range
-    let t = (x - in_min) / (in_max - in_min);
-    let t = t.clamp(0.0, 1.0);
-    
-    // Find enclosing segment
-    let seg_idx = (t * (points.len() as f32 - 1.0)).floor() as usize;
-    let seg_idx = seg_idx.min(points.len() - 2);
-    
-    // Interpolate within segment
-    let seg_t = (t * (points.len() as f32 - 1.0) - seg_idx as f32).clamp(0.0, 1.0);
-    let p0 = points[seg_idx];
-    let p1 = points[seg_idx + 1];
-    
-    // Apply bias (cubic interpolation control)
-    let bias = if biases.len() > seg_idx { biases[seg_idx] } else { 0.0 };
-    let y = cubic_interpolate(p0[1], p1[1], bias, seg_t);
-    
-    // Scale output to range
-    ((y - out_min) / (out_max - out_min)).clamp(0.0, 1.0) * scale_t + out_min
-}
+    x: f32, pts: &[[f32; 2]], biases: &[f32],
+    absolute: bool, in_min: f32, in_max: f32, out_min: f32, out_max: f32, scale_t: f32,
+) -> f32;
 ```
+
+In `absolute` mode it folds the input about the origin, applies the `scale_t` warp,
+samples the point list (`sample_curve`) with per-segment `biases`, inverts the warp, and
+rescales to the output range preserving sign. See the source for the exact math.
 
 ---
 
-## Workspace Format (`workspace.json`)
+## Workspace / Recovery Format
 
-### Structure
+`workspace.json` (opt-in tab persistence) and `recovery.json` (always-on crash-recovery
+autosave) share one root type:
 
-The workspace file stores multiple tabs and their settings:
+```rust
+// crates/ui/src/settings.rs
+pub struct PersistedWorkspace {
+    pub version: u32,                 // currently 1
+    pub active_tab: usize,
+    pub tabs: Vec<PersistedTab>,
+}
 
-```json
-{
-  "active_tab": 0,
-  "tabs": [
-    {
-      "title": "Main Patch",
-      "file_path": "/path/to/patch.fxp",
-      "bound_exes": ["game.exe"],
-      "snarl": { /* Full Snarl<NodeData> serialization */ },
-      "easy_preset_path": null,
-      "overlay": { /* OverlayLayout */ },
-      "config": { /* OverlayLayout */ }
-    },
-    {
-      "title": "Untitled 2",
-      "file_path": null,
-      "bound_exes": [],
-      "snarl": { /* ... */ },
-      "easy_preset_path": null,
-      "overlay": {},
-      "config": {}
-    }
-  ]
+pub struct PersistedTab {
+    pub title: String,
+    #[serde(default)] pub file_path: Option<PathBuf>,
+    #[serde(default)] pub bound_exes: Vec<String>,
+    #[serde(default)] pub auto_bypass: bool,
+    pub snarl: Snarl<NodeData>,       // same graph serialization as .fxp
+    #[serde(default)] pub easy_preset_path: Option<PathBuf>,
+    #[serde(default)] pub view_salt: u64,      // stable pan/zoom key for this tab
+    #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")] pub overlay: OverlayLayout,
+    #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")] pub config: OverlayLayout,
 }
 ```
 
-### Persistence Triggers
+Both are produced by `FlexInputApp::build_persisted_workspace()`
+(`crates/ui/src/app/persistence.rs`), which sanitizes each snarl and attributes
+sub-patch overlay pins before serializing — it never mutates the live state.
 
-Workspace is saved:
-- On application exit (`on_exit()`)
-- When `keep_workspace` setting is enabled and tabs change
-- During GPU recovery relaunch (before snapshot)
+**Save triggers:**
+- `workspace.json`: `save_workspace_now()` — only when the `keep_workspace` setting is on.
+- `recovery.json`: `maybe_write_recovery_snapshot()` — once per frame, but only when a
+  settled edit changed `total_mutation_gen()` since the last write (debounced), and
+  independent of `keep_workspace` so a GPU-loss relaunch never loses work. The write is
+  atomic (temp + rename).
+
+**Recovery flow:** GPU loss / relaunch → `load_workspace`/recovery restores the tabs →
+recovery snapshot is cleared once the restore succeeds.
 
 ---
 
-## Crash Recovery Format (`recovery.json`)
+## Troubleshooting
 
-### Structure
+### Patch won't load / "invalid" after an update
+A module's pin set or param keys changed without a matching migration. Add the fixup to
+`migrate_loaded_snarl` (rewrite pin lists / rename params / backfill defaults) — recall it
+recurses into sub-patch snarls. A bare `version` bump does **not** migrate anything.
 
-Identical to workspace format but consumed exactly once:
+### Wires lost after reload
+Snarl wires are index pairs, not pin names — they break only if a node's pin **order**
+changed. Fix by preserving pin order in the migration (append new pins; never reorder),
+or rebuild the pin list in `migrate_loaded_snarl` so old indices still resolve.
 
-```rust
-// In settings.rs
-pub fn save_recovery(ws: &Workspace) {
-    let path = appdata_dir().join("recovery.json");
-    serde_json::to_writer_pretty(&File::create(path).unwrap(), ws).unwrap();
-}
+### Module params reset to defaults
+The param key was renamed. Migrate it (`params.remove(old)` → `params.insert(new, val)`)
+in `migrate_loaded_snarl`; unknown keys are otherwise dropped on the next save.
 
-pub fn load_recovery() -> Option<Workspace> {
-    let path = appdata_dir().join("recovery.json");
-    if path.exists() {
-        let ws: Workspace = serde_json::from_reader(File::open(path).ok()?).ok()?;
-        Some(ws)
-    } else {
-        None
-    }
-}
+### Corrupted `recovery.json` crashes launch
+Delete `%APPDATA%\FlexInput\recovery.json` and relaunch. (The atomic write makes a
+half-written file impossible, but a schema mismatch from a downgrade can still fail to
+deserialize.)
 
-pub fn delete_recovery() {
-    let path = appdata_dir().join("recovery.json");
-    let _ = std::fs::remove_file(path);
-}
-```
-
-### Recovery Flow
-
-1. **GPU loss detected** → `save_recovery()` called
-2. **App relaunches** → `load_recovery()` returns snapshot
-3. **Tabs restored** from recovery data
-4. **`delete_recovery()`** called after successful restore
-
----
-
-## Serialization Details
-
-### Serde Attributes
-
-Key serde attributes used throughout:
-
-```rust
-#[derive(Serialize, Deserialize)]
-pub struct NodeInstance {
-    // Skip empty HashMaps to reduce file size
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub params: HashMap<String, Value>,
-    
-    // Skip None subpatch (only present for subpatch nodes)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subpatch: Option<Box<SubPatch>>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SubPatch {
-    // Required fields (no defaults)
-    pub display_name: String,
-    pub pins_in: Vec<SubPatchPin>,
-    pub pins_out: Vec<SubPatchPin>,
-    
-    // Nested patch (always present for valid subpatch)
-    pub patch: Patch,
-}
-```
-
-### Version Field
-
-All patch files include a `version` field for future compatibility:
-
-```rust
-pub const PATCH_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-pub struct Patch {
-    pub version: u32,
-    pub nodes: Vec<NodeInstance>,
-    pub wires: Vec<Wire>,
-}
-```
-
-**Migration strategy:**
-- Increment `PATCH_VERSION` for breaking changes
-- Check version on load, apply migration if needed
-- Maintain backward compatibility for at least 2 versions
-
----
-
-## File I/O Operations
-
-### Save Patch
-
-```rust
-// In Canvas::save_patch():
-pub fn save_patch(&mut self, vids: Vec<String>, bound: Vec<String>, ...) -> Option<PathBuf> {
-    let path = rfd::FileDialog::new()
-        .add_filter("FlexInput Patch", &["fxp"])
-        .set_file_name("patch.fxp")
-        .save_file()?;
-    
-    let ui_patch = UiPatch {
-        version: PATCH_VERSION,
-        snarl: self.snarl.clone(),
-        virtual_device_ids: vids,
-        bound_exes: bound,
-        // ... other fields
-    };
-    
-    let json = serde_json::to_string_pretty(&ui_patch).unwrap();
-    fs::write(&path, json).ok()?;
-    
-    Some(path)
-}
-```
-
-### Load Patch
-
-```rust
-// In Canvas::load_patch():
-pub fn load_patch() -> Option<(Canvas, Vec<String>, ...)> {
-    let path = rfd::FileDialog::new()
-        .add_filter("FlexInput Patch", &["fxp"])
-        .pick_file()?;
-    
-    let json = fs::read_to_string(&path).ok()?;
-    let ui_patch: UiPatch = serde_json::from_str(&json).ok()?;
-    
-    // Migrate loaded snarl to current schema
-    let mut canvas = Canvas::new();
-    canvas.snarl = ui_patch.snarl;
-    migrate_loaded_snarl(&mut canvas.snarl);
-    
-    Some((canvas, ui_patch.virtual_device_ids, ...))
-}
-```
-
----
-
-## Common Issues & Troubleshooting
-
-### 1. Missing Parameters After Load
-
-**Symptom:** Module parameters reset to defaults after loading patch.
-
-**Cause:** Parameter name changed between versions (e.g., `deadzone` → `stick_deadzone`).
-
-**Fix:** Add migration in `migrate_loaded_snarl()` to rename old keys:
-```rust
-if let Some(old_val) = node.value.params.remove("deadzone") {
-    node.value.params.insert("stick_deadzone".into(), old_val);
-}
-```
-
-### 2. Sub-patch Node Missing After Load
-
-**Symptom:** `subpatch` nodes appear as empty rectangles in canvas.
-
-**Cause:** Inline sub-patch definition not serialized (only present when `module_id == "subpatch"`).
-
-**Fix:** Ensure `subpatch` field is included during serialization:
-```rust
-#[serde(skip_serializing_if = "Option::is_none")]
-pub subpatch: Option<Box<SubPatch>>,
-```
-
-### 3. Wire Connections Lost After Reload
-
-**Symptom:** Nodes present but wires missing.
-
-**Cause:** Pin names changed (e.g., `"A"` → `"Input A"`) without migration.
-
-**Fix:** Map old pin names to new in `migrate_loaded_snarl()`:
-```rust
-for wire in &mut snarl.wires {
-    if wire.from_pin == "A" { wire.from_pin = "Input A".into(); }
-    if wire.to_pin == "B" { wire.to_pin = "Output B".into(); }
-}
-```
-
-### 4. Large File Sizes
-
-**Symptom:** `.fxp` files unexpectedly large (>1 MB).
-
-**Cause:** `params` HashMap includes all default values (even when unchanged).
-
-**Fix:** Use `skip_serializing_if` for optional fields:
-```rust
-#[serde(skip_serializing_if = "Option::is_none")]
-pub deadzone: Option<f32>,  // Only serialize if non-None
-```
-
-### 5. Corrupted Recovery Snapshot
-
-**Symptom:** App crashes on launch after GPU loss recovery.
-
-**Cause:** `recovery.json` contains invalid JSON or schema mismatch.
-
-**Fix:** Delete `%APPDATA%\FlexInput\recovery.json` and restart app normally.
+### `.fxp` files unexpectedly large
+Expected: the snarl serializes every node's full `inputs`/`outputs`/`params`. Live state
+(`NodeExtra`) is skipped, so size scales with graph size, not runtime.
 
 ---
 
 ## References
 
-- Patch types: `crates/core/src/patch.rs`
-- Migration: `crates/ui/src/canvas/mod.rs` (`migrate_loaded_snarl`)
-- File I/O: `crates/ui/src/app/persistence.rs`
-- Settings persistence: `crates/ui/src/settings.rs`
+- `.fxp` / `UiPatch` / migration / sanitize: `crates/ui/src/canvas/mod.rs`
+- `.fxsp` / `SubPatchFile`: `crates/ui/src/app/subpatch.rs`
+- `NodeData` / `UiSubPatch` / `LayoutItem` / `OverlayLayout` / overlay attribute+materialize:
+  `crates/ui/src/canvas/node.rs`
+- `.fxc` / `CurveFile`: `crates/ui/src/canvas/viewer/curve_support.rs`
+- `PersistedWorkspace` / `PersistedTab` / save/load: `crates/ui/src/settings.rs`
+- Workspace/recovery orchestration: `crates/ui/src/app/persistence.rs`
+- Snarl serialization: `vendor/egui-snarl/src/lib.rs`
+- Legacy (non-persistence) types: `crates/core/src/patch.rs`
+
+---
+
+*Last updated: 2026-07-30*

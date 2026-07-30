@@ -45,13 +45,18 @@ pub struct PhysicalDevice {
     pub is_connected: bool,
 }
 
+// crates/devices/src/identification.rs
 pub enum ControllerKind {
     XInput,
-    DS4,
+    DualShock4,   // NOT "DS4"
     DualSense,
     SwitchPro,
     Generic,
+    MidiIn,
+    MidiOut,
 }
+// Detected via `ControllerKind::detect(name, vid, pid)` — VID/PID is authoritative
+// when available, name-sniffing is the fallback.
 ```
 
 **Signal Polling:**
@@ -152,22 +157,24 @@ pub fn haptic_inputs(kind: &ControllerKind) -> Vec<FeedbackInlet> {
 ### VirtualDevice Trait
 
 ```rust
+// crates/virtual/src/lib.rs
 pub trait VirtualDevice: Send {
     fn id(&self) -> &str;
-    fn kind(&self) -> DeviceKind;
-    fn is_connected(&self) -> bool;
-    fn send(&mut self, signals: &HashMap<String, Signal>);
-    fn reset_outputs(&mut self);  // Zero all outputs (bypass mode)
-    fn persist_on_drop(&mut self);  // Keep device alive across app exit
-}
-
-pub enum DeviceKind {
-    XInput,
-    DS4,
-    DualSense,
-    KeyMouse,
+    fn display_name(&self) -> &str;
+    fn sink_pins(&self) -> &'static [SinkPin];      // ordered input pin layout
+    fn send(&mut self, pin: &str, value: Signal);   // ONE pin at a time…
+    fn flush(&mut self);                            // …then commit (submit HID report)
+    fn reset_outputs(&mut self) {}                  // zero + flush (bypass)
+    fn is_connected(&self) -> bool { true }
+    fn output_pins(&self) -> &'static [FeedbackOutlet] { &[] }  // feedback back into graph
+    // …persistence is handled by the HIDMaestro helper, not a trait method…
 }
 ```
+
+> There is no `DeviceKind { XInput, DS4, DualSense, KeyMouse }` enum on the trait, and
+> `send` does NOT take a whole `HashMap` — the I/O thread calls `send(pin, value)` per
+> pin, then `flush()`. Device kind is a `ControllerKind` (above) / the device id prefix,
+> not a separate virtual enum.
 
 ### Virtual Device Implementations
 
@@ -178,20 +185,21 @@ Emulates Xbox 360 controller via HIDMaestro:
 - Maps signals to XInput report structure
 - Supports rumble feedback (strong/weak motors)
 
-**Signal Mapping:**
+**Signal Mapping:** each `send(pin, value)` writes one field of an internal report
+struct (stick axes → i16, triggers → u8, buttons → bit flags, rumble → motor bytes);
+`flush()` then submits the assembled HID report to the driver. Conceptually:
+
 ```rust
-// In send():
-let report = XInputReport {
-    left_x: signals["left_stick_x"].as_float() as i16,
-    left_y: signals["left_stick_y"].as_float() as i16,
-    right_x: signals["right_stick_x"].as_float() as i16,
-    right_y: signals["right_stick_y"].as_float() as i16,
-    triggers: [signals["left_trigger"].as_float() as u8, ...],
-    buttons: encode_buttons(signals),
-    rumble_left: signals["rumble_weak"].as_float() as u8,
-    rumble_right: signals["rumble_strong"].as_float() as u8,
-};
-self.device.send_report(&report);
+fn send(&mut self, pin: &str, value: Signal) {
+    match pin {
+        "left_stick_x"  => self.report.left_x  = to_i16(value),
+        "left_trigger"  => self.report.lt      = to_u8(value),
+        "btn_south"     => self.report.set_button(BTN_A, value.as_bool()),
+        // …rumble_strong/weak come back via output_pins()…
+        _ => {}
+    }
+}
+fn flush(&mut self) { self.device.send_report(&self.report); }
 ```
 
 #### DualShock 4 / DualSense Virtual Pads
@@ -237,22 +245,23 @@ HIDMaestro is a pure-Rust UMDF2 (User-Mode Driver Framework 2) client that creat
 
 ### Helper Communication (`helper_ipc.rs`)
 
+The real IPC enum is `Request` (with a matching `Response`) in
+`crates/hidmaestro/src/helper_ipc.rs` — there is no `HelperMessage`/`DeviceKind`; the
+device kind is carried inside `profile_json`, and the helper allocates the controller
+index itself:
+
 ```rust
-pub enum HelperMessage {
-    CreateDevice { kind: DeviceKind, id: String },
-    DestroyDevice { id: String },
-    SetPersist { persist: bool },
-    AssignXinputSlot { device_id: String, slot: u8 },
-    ReinstallDriver,
-}
-
-pub struct HelperClient {
-    pipe: NamedPipeClient,
-}
-
-impl HelperClient {
-    pub fn send(&mut self, msg: HelperMessage) -> Result<HelperResponse>;
-    pub fn receive_response(&mut self) -> Result<HelperResponse>;
+pub enum Request {
+    Hello { parent_pid: u32, persist: bool },   // first msg: watch parent, set persistence
+    Ping,
+    EnsureDriver,                               // install driver if missing (idempotent)
+    ReinstallDriver,                            // clean reinstall
+    UninstallDriver,
+    Create { device_id: String, profile_json: String, index_hint: u32, /* +poll_interval_ms */ },
+    Destroy { instance_id: String },
+    ListDevices,                                // reclaim-on-startup enumeration
+    HidHideApply { /* whitelist, blacklist, active */ },
+    // …
 }
 ```
 
@@ -552,6 +561,16 @@ Feedback signals flow **backward** along AutoMap wires:
 - ASTH output → physical pad HD rumble
 
 This is handled automatically by `resolve_feedback_pin()` in automap.rs.
+
+### 7. Changing a virtual device's HID report descriptor requires a PID bump
+
+The HIDMaestro helper reclaims persisted virtual devices by `device_id` and never
+re-applies the report descriptor to an existing node. If you change a virtual device's
+HID report descriptor (e.g. widen a mouse report to add a scroll field), you MUST also
+bump that profile's PID — otherwise the stale-node guard keeps the OLD device and the
+driver desyncs from the new report layout (this once broke LMB/RMB after a mouse report
+change). Bumping the PID forces destroy+recreate. See DEVELOPMENT_GUIDELINES.md →
+*"HIDMaestro … requires a PID bump"*.
 
 ---
 

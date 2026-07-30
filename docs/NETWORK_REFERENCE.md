@@ -5,11 +5,28 @@
 FlexInput's network subsystem enables bidirectional gamepad state sharing between two FlexInput instances over a LAN, internet (with encryption), or NAT traversal (P2P). It carries the complete AutoMap bus including all canonical pins and haptic feedback signals.
 
 **Key Characteristics:**
-- Three transport tiers: LAN (UDP), PSK (encrypted UDP), P2P (iroh)
+- Three transport tiers: LAN (raw UDP), PSK (encrypted UDP), P2P (iroh QUIC)
 - Bidirectional haptics - rumble, lightbar, adaptive triggers travel back
 - Fail-safe neutral frame on connection loss
-- Configurable staleness window (default 200 ms)
+- Configurable staleness window
 - Integrated with AutoMap system via Network Send/Receive modules
+
+> ⚠️ **Accuracy caveat.** This document is the most aspirational of the set: several
+> code blocks below (frame structs like `UdpFrame`/`PskFrame`/`CompactFrame`,
+> `encode_signal`, `ConnectionState`, the P2P `generate_code`/`dial` snippet) are
+> ILLUSTRATIVE pseudo-code, not real APIs, and the "Future Enhancements" section is
+> unbuilt. Ground truth for the real API:
+> - `crates/net/src/`: `frame.rs`, `crypto.rs` (ChaCha20-Poly1305), `protocol.rs`,
+>   `manager.rs`, `transport/{mod,udp,p2p}.rs`. There is **no `transport/psk.rs`** —
+>   PSK is a mode of the UDP transport plus `crypto.rs`, not a separate file.
+> - The transport enum is `Transport { Lan, Psk, P2p }` (`manager.rs`); the string
+>   `"quic"` is a back-compat alias for `P2p` (raw-QUIC was replaced by the iroh tier).
+> - P2P uses **iroh**: you dial a peer by its `EndpointId` (the peer's public key IS the
+>   address); iroh's own TLS provides auth+encryption, with relay fallback for NAT
+>   traversal. It is gated behind the `p2p` cargo feature.
+> - Engine publish hooks: `net_send_publish` / `net_recv_publish` in `eval/publish.rs`.
+> - `module.network_send` passes the bus through; `module.network_recv` injects received
+>   signals into `collector_sigs` under a synthetic device id.
 
 ---
 
@@ -68,15 +85,12 @@ pub struct PskFrame {
 
 **Use Case:** NAT traversal, CGNAT environments, VPNs
 
-**Connection Establishment:**
-```rust
-// Sender generates a code:
-let code = iroh::Node::generate_code();
-println!("Connect to me: {}", code);
-
-// Receiver dials in:
-let relay = iroh::Node::dial(code).await?;
-```
+**Connection Establishment (iroh):** a peer is addressed by its `EndpointId` — the
+public key IS the address. The receiver publishes its EndpointId; the sender dials it.
+iroh handles NAT hole-punching with relay fallback and provides TLS auth/encryption
+keyed by the endpoint identity (so P2P frames need no separate PSK layer). See
+`crates/net/src/transport/p2p.rs` for the real `Endpoint`/`EndpointId` usage (illustrative
+`generate_code`/`dial` calls are not the actual API).
 
 **Frame Format:**
 Same as LAN transport but wrapped in iroh's reliable delivery layer.
@@ -105,10 +119,11 @@ pub struct NetworkSendParams {
     pub peer_code: Option<String>,   // P2P connection code
 }
 
-pub enum TransportType {
-    Lan,
-    Psk,
-    P2p,
+// Real enum name is `Transport` (crates/net/src/manager.rs), not `TransportType`:
+pub enum Transport {
+    Lan,   // raw UDP
+    Psk,   // UDP + ChaCha20-Poly1305 (crypto.rs)
+    P2p,   // iroh QUIC (feature `p2p`); "quic" is a back-compat string alias
 }
 ```
 
@@ -508,10 +523,11 @@ pub struct AdaptiveBandwidth {
 
 ## References
 
-- Transport traits: `crates/net/src/transport/mod.rs`
-- LAN implementation: `crates/net/src/transport/udp.rs`
-- PSK implementation: `crates/net/src/transport/psk.rs` (hypothetical)
-- P2P implementation: `crates/net/src/transport/p2p.rs`
+- Transport trait + tiers: `crates/net/src/transport/mod.rs`
+- LAN + PSK (encrypted UDP): `crates/net/src/transport/udp.rs` + `crates/net/src/crypto.rs`
+  (there is NO `transport/psk.rs`)
+- P2P (iroh QUIC, feature `p2p`): `crates/net/src/transport/p2p.rs`
+- Transport enum + staleness: `crates/net/src/manager.rs`, `crates/net/src/lib.rs`
 - Network modules: `crates/modules/src/network.rs`
 - Publish hooks: `crates/engine/src/eval/publish.rs` (`net_send_publish`, `net_recv_publish`)
-- Frame format: `crates/net/src/frame.rs`
+- Frame format / protocol: `crates/net/src/frame.rs`, `crates/net/src/protocol.rs`

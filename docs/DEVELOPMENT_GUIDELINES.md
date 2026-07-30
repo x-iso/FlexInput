@@ -57,14 +57,15 @@ fn resolve_input_signal(...) -> Option<Signal> { ... }
 ///
 /// # Arguments
 /// * `graph` - Topologically-sorted node graph snapshot
-/// * `state` - Per-node mutable state (grows lazily)
+/// * `state` - Per-node mutable state (grows lazily); source-block suppression is
+///             read from state[MACRO_CARRY_UID].source_block (not a param)
 /// * `dev_sigs` - Raw device signals from I/O thread
 /// * `dt` - Delta time in seconds since last tick
 ///
 /// # Example
 /// ```ignore
 /// let mut out = TickOutput::default();
-/// eval_graph_tick(&graph, &mut state, &dev_sigs, dt, &ui_block, &mut out);
+/// eval_graph_tick(&graph, &mut state, &dev_sigs, dt, &mut out);  // 5 args
 /// ```
 pub fn eval_graph_tick(...) { ... }
 ```
@@ -94,7 +95,7 @@ pub enum DeviceError {
 ```rust
 fn create_virtual_device(id: &str) -> Result<Box<dyn VirtualDevice>> {
     let helper = HelperClient::new()?;  // Propagate connection error
-    let response = helper.create_device(DeviceKind::XInput, id)?;  // Propagate IPC error
+    let response = helper.send(Request::Create { device_id: id.into(), .. })?;  // Propagate IPC error
     
     if !response.success {
         return Err(DeviceError::CreationFailed(response.message));
@@ -356,9 +357,9 @@ fn test_simple_add_graph() {
     let mut state = HashMap::new();
     let mut out = TickOutput::default();
     
-    eval_graph_tick(&graph, &mut state, &dev_sigs, 0.001, &UiSourceBlock::default(), &mut out);
+    eval_graph_tick(&graph, &mut state, &dev_sigs, 0.001, &mut out);  // 5 args
     
-    assert_eq!(out.outputs[&(0, 0)], Some(Signal::Float(3.0)));  // 1.0 + 2.0
+    assert_eq!(out.outputs[&(0, 0)], Some(Some(Signal::Float(3.0))));  // outputs is Option<Signal>
 }
 ```
 
@@ -526,6 +527,157 @@ state.delay_bufs.clear();
 state.avg_bufs.clear();
 state.dc_fast.clear();
 ```
+
+---
+
+## UI Pitfalls Learned the Hard Way (egui / gamepad-nav / overlays)
+
+These are project-specific traps that have each cost more than one debugging
+session. Read this section before touching gamepad-nav, overlays, or any pinned
+widget — the same handful of mistakes keep resurfacing in new places.
+
+### 6. Nav highlight invisible in the config overlay (the recurring one)
+
+**Symptom:** A selection glow/ring (curve dot, TZ/menu divider, remapper card,
+value-field ring) shows on the main canvas but is INVISIBLE when the same element
+is pinned to the config overlay — fixed once per channel, then breaks again for the
+next channel.
+
+**Root cause:** `egui::Context::data`/`data_mut` is **shared across all viewports**,
+but `ctx.cumulative_pass_nr()` is **per-viewport**. The gamepad-nav driver
+(`run_gamepad_nav`) runs in the ROOT viewport and stamps every highlight channel
+with the root pass number. Renderers gate `channel_pass == ui.ctx().cumulative_pass_nr()`.
+The config overlay renders in its OWN viewport whose pass counter differs, so every
+pass-gated selection highlight mismatches there.
+
+**Solution — the classification rule (mechanical):** there are two channel classes;
+do NOT blanket-swap them.
+- **Selection/focus channels** are *nav-driver-stamped* and read cross-viewport
+  (`gp_nav_curve_sel`, `gp_nav_tz`, `gp_nav_tz_zone`, `gp_nav_tz_seam`,
+  `gp_nav_remap_card`, `gp_nav_active`, …). Gate these with
+  `crate::widgets::nav_pass(ctx)` / `nav_pass_matches(ctx, pass)`, which returns the
+  driver's stored pass (`gp_nav_pass`, a shared-data slot) and so matches in every
+  viewport.
+- **Rect channels** are *renderer-stamped* for same-viewport use (`gp_nav_field_rects`,
+  `gp_nav_tz_lines`, `gp_nav_item_rects`, `gp_nav_remap_card_rects`, …). Keep these on
+  `cumulative_pass_nr()` — publisher and reader are in the same viewport.
+
+The test is literally *"does the nav driver stamp this channel?"* → `nav_pass`.
+*"Does a renderer stamp it for a reader in the same viewport?"* → `cumulative_pass_nr`.
+Never re-stamp channels inside `config_overlay.rs` to paper over this — that scattered
+re-stamp pattern is what kept regressing; the `nav_pass` gate is the single fix.
+
+### 7. NEVER nest egui `ctx` lock acquisitions (hard freeze)
+
+**Symptom:** The whole app freezes (epaint deadlock), often only under gamepad nav.
+
+**Cause:** `ctx.cumulative_pass_nr()`, `ctx.data(..)` and `ctx.data_mut(..)` each take
+the egui context lock. Calling one inside another's closure re-enters the lock and
+deadlocks epaint.
+
+**Solution:** Read every ctx value into a plain local FIRST, then operate on locals:
+```rust
+// BAD — data_mut closure calls cumulative_pass_nr(), which re-locks ctx:
+ctx.data_mut(|d| d.insert_temp(id, (ctx.cumulative_pass_nr(), rects)));
+
+// GOOD — read the pass into a local first:
+let pass = ctx.cumulative_pass_nr();
+ctx.data_mut(|d| d.insert_temp(id, (pass, rects)));
+```
+
+### 8. Gamepad field-editor lockstep triad
+
+Any pinned multi-control row that is gamepad-editable is governed by THREE things
+that must agree exactly, or the focus ring lands on the wrong control (or the wrong
+field edits):
+
+1. `nav_element_fields(outer)` — the ordered `Vec<NavFieldDef>` the unified
+   multi-field editor (`nav_drive_fields`) walks. (`crates/ui/src/app/nav/fields.rs`)
+2. `publish_nav_field_rects(ui, inner_id, &rects)` — the renderer must push one rect
+   per field in the **same order**. (`crates/ui/src/canvas/viewer/scale.rs`)
+3. `elem_has_fields(mid, elem)` — a static `matches!` mirror of #1's coverage, used by
+   the cursor hit-test which has no selection context.
+
+If a row has **conditional** sub-fields (e.g. the Virtual Menu `options` element only
+shows Touch#/Gyro-axes/Gyro-× when the Touch/Gyro checkboxes are on), then #1 and #2
+must gate on the **same derived condition** — including any legacy-default fallback the
+renderer uses — so the field list and the rect list stay index-aligned however the
+toggles are set. The multi-field editor clamps `field_index` to the current length each
+frame, so a shrinking list is safe, but a MIS-ORDERED list is not.
+
+Adding a new editable element = add an arm to #1 + the mirror entry in #3 + a
+`publish_nav_field_rects` call in its renderer. The MultiField widget kind is picked up
+automatically for any element with a non-empty field list (`nav_selected_kind`'s
+fallback), and works in both the sub-patch canvas and the config overlay for free.
+
+### 9. Reuse the Easy-mode nav machinery — don't reinvent it
+
+Config-overlay gamepad editing MUST reuse the existing nav machinery (`EditLevel`
+state machine, the unified field editor, curve/TZ drivers, cursor, highlight channels).
+The overlay drives the *same* editors the sub-patch canvas does via
+`config_nav_sel`/`nav_config_override`; it only differs in how the target element is
+selected and in the passthrough it applies. Building a parallel editor for the overlay
+is how divergence bugs start.
+
+### 10. Transparent overlay windows need `WS_EX_NOREDIRECTIONBITMAP`
+
+`WS_EX_TRANSPARENT` + `WS_EX_LAYERED` alone is NOT enough on this stack: without
+`WS_EX_NOREDIRECTIONBITMAP` the DWM composites an opaque white sheet UNDER the
+transparent window (observed on Win11). The extended style is applied via the vendored
+`egui-winit` patch — if you touch overlay viewport creation, preserve it.
+
+---
+
+## Design Decisions Worth Knowing (recent)
+
+### Touch Zones / Virtual Menu geometry = one BSP tree, both modes
+
+Zone geometry has a single authoritative backend: the **BSP zone tree**
+(`flexinput_core::touchzones::ZoneNode`, persisted per field as `zone_tree{N}`).
+Both **Ports** and **Mapping** modes, and both **grid** and **radial** menu layouts,
+run on this tree. The legacy grid (`col_edges{N}`/`row_edges{N}`) is kept ONLY as a
+migration source: `ZoneNode::from_grid` migrates a grid losslessly (leaf id ==
+row-major grid index; `zones()` returns leaves in row-major order), so an un-edited
+patch yields byte-identical pin ids/order and existing wiring is undisturbed. The
+first structural edit persists `zone_tree{N}`, which then becomes authoritative.
+
+Consequences to respect:
+- Per-zone divides are per-leaf (partial dividers), never full-width/height cuts.
+- Port regeneration after a structural edit must be **wiring-preserving keyed by pin
+  id** (`tz_regen_ports_preserving`): snapshot out-pin remotes by id → rebuild →
+  reconnect surviving ids. Surviving leaves keep their wiring; a subdivide's new leaf
+  gets empty ports; a merged leaf's wiring drops.
+- Do NOT reintroduce a `if mapping { tree } else { grid }` split in any editor/renderer
+  — that split was the source of the "ports mode only does full cuts" and "radial ports
+  is broken" bugs.
+
+### Dynamic gamepad-glyph icons (`gp:<pin>`)
+
+Any icon slot (Macro port, Menu/TZ per-zone override, SVG layout decoration, the shared
+`icon_picker_button`) can hold the abstract key **`gp:<pin>`** (e.g. `gp:btn_south`) —
+a gamepad control glyph that renders in the CURRENTLY-connected pad's family style and
+**restyles live** when the pad changes.
+- Resolution funnels through `macro_icons::macro_port_icon_texture` →
+  `icon_key_svg_bytes(key, skin)` → `remapper_icons::gp_pin_svg(skin, pin)`. Texture
+  cache is keyed by (skin, pin, size) so a pad change re-rasterizes everywhere with zero
+  per-site work. Pins the current family lacks fall back to their NATIVE style (a
+  DualSense touchpad glyph stays PlayStation-style under a Switch Pro).
+- The ambient skin is published once per frame to the ctx slot `fxi_current_gp_skin` and
+  read via `current_gp_skin(ctx)`.
+- **Derive the skin from the physical pad's VID/PID `ControllerKind`, NOT from the
+  device-id string.** A re-enumerated virtual DualSense enumerates as "Wireless
+  Controller", which matches no PlayStation keyword and silently fell back to Xbox — the
+  cause of the "shows Xbox glyphs while a Switch Pro is connected" bug. Skip
+  own-virtual (`is_own_virtual_gilrs_id`) and MIDI devices when choosing the source pad.
+
+### HIDMaestro: changing a virtual device's HID report descriptor requires a PID bump
+
+The helper reclaims persisted virtual devices by `device_id` and never re-applies the
+report descriptor to an existing node. So if you change a virtual device's HID report
+descriptor (e.g. mouse 6→7 byte report for a scroll field), you MUST also bump the
+profile PID — otherwise the stale-node guard keeps the old device and the driver desyncs
+from the new report layout (this once killed LMB/RMB). Bumping the PID forces
+destroy+recreate.
 
 ---
 

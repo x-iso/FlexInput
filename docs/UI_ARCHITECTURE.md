@@ -18,7 +18,13 @@ The UI crate (`crates/ui`) implements the entire user interface using egui (embe
 
 ### FlexInputApp State (~4600 lines)
 
-The main application struct holds all persistent state:
+> The struct listings in this document are **representative, not exhaustive or
+> field-exact** — `FlexInputApp`, `Canvas`, and `AppSettings` each carry far more fields
+> than shown, and field names drift. Treat the source files as authoritative; the
+> listings here are for orientation. (Sections that give exact serialized shapes — e.g.
+> `NodeData`, `ProcessingOutput`, the persistence types — ARE kept field-accurate.)
+
+The main application struct holds the live UI state (a subset):
 
 ```rust
 pub struct FlexInputApp {
@@ -134,7 +140,7 @@ pub struct Canvas {
 
 ### NodeData Structure
 
-UI-specific node metadata extending the core `NodeInstance`:
+The snarl node payload — the UI's node type (independent of the legacy `core::NodeInstance`):
 
 ```rust
 pub struct NodeData {
@@ -143,26 +149,31 @@ pub struct NodeData {
     pub category: String,
     pub inputs: Vec<PinDescriptor>,
     pub outputs: Vec<PinDescriptor>,
-    pub params: HashMap<String, Value>,
-    pub subpatch: Option<Box<UiSubPatch>>,  // Inline sub-patch definition
-    
-    // Live signal data (not persisted)
-    pub extra: NodeExtra,
-}
-
-pub struct NodeExtra {
-    pub last_signals: Vec<Option<Signal>>,      // Last evaluated outputs
-    pub history: HashMap<usize, Vec<f32>>,       // Scope sample history
-    pub status: NodeStatus,                      // Live/disconnected indicator
-    pub automap_glow: Option<AUTOMAP_GLOW>,      // AutoMap bus glow effect
-}
-
-pub enum NodeStatus {
-    Live,              // Green dot - device connected and active
-    Disconnected,      // Red dot - no signal flow
-    Error(String),     // Error state with message
+    pub params: HashMap<String, serde_json::Value>,  // ALL module config
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpatch: Option<Box<UiSubPatch>>,  // present only when module_id == "subpatch"
+    #[serde(skip)]
+    pub extra: NodeExtra,                    // live-only, NEVER persisted
 }
 ```
+
+`NodeExtra` is transient per-frame state fed from the processing thread's outputs — it
+is `#[serde(skip)]`, so none of it lands in a `.fxp`. Representative fields (see
+`canvas/node.rs` for the full set):
+
+```rust
+pub struct NodeExtra {
+    pub last_signals: Vec<Option<Signal>>,          // latest input signals (readout/body)
+    pub last_out: Vec<Option<Signal>>,              // latest captured outputs (e.g. two-way curve)
+    pub history: VecDeque<Vec<Option<f32>>>,        // scope / vectorscope rolling samples
+    pub layout_unlocked: bool,                      // body is in layout-edit mode
+    pub trig_capture: Option<Vec<Vec<Option<f32>>>>,// frozen trigger-scope waveform
+    // … aux_f32 (counter reset), trig_* accumulation, repaint-gate hashes, …
+}
+```
+
+> There is no `NodeStatus` enum or `automap_glow` field on `NodeData` — the live/
+> disconnected dot and AutoMap glow are derived at render time, not stored here.
 
 ### UiSubPatch Structure
 
@@ -174,15 +185,22 @@ pub struct UiSubPatch {
     pub pins_in: Vec<SubPatchPin>,
     pub pins_out: Vec<SubPatchPin>,
     pub snarl: Box<Snarl<NodeData>>,  // Inner graph
-    pub items: Vec<PinnedItem>,        // Pinned widgets on body
+    pub items: Vec<LayoutItem>,        // pinned widgets + decorations (paint order)
+    pub overlay_items: Vec<LayoutItem>,// info-overlay pins that travel with the preset
+    pub config_items: Vec<LayoutItem>, // config-overlay tweak-pins that travel with it
 }
 
-pub struct PinnedItem {
-    pub node_id: usize,                // Index into inner snarl
-    pub position: egui::Pos2,          // Position on sub-patch body
-    pub size: egui::Vec2,              // Measured widget size
+// One Z-ordered list mixes exposed module widgets and decorations:
+pub enum LayoutItem {
+    Module(ExposedModule),  // { inner_node_id: usize, element_id: String, pos, size, … }
+    Deco(LayoutDecoration), // text / svg / image / shape
 }
 ```
+
+> There is no `PinnedItem` type. A pinned widget is a `LayoutItem::Module(ExposedModule)`,
+> where `element_id` selects WHICH part of the module body to expose (`"default"` = the
+> whole body). The same `LayoutItem`/`ExposedModule` shape is reused for the info and
+> config overlays (`OverlayLayout.items`).
 
 ### Canvas Operations
 
@@ -215,7 +233,10 @@ Transparent always-on-top viewport showing:
 - Pinned module widgets from `OverlayLayout`
 
 **Window Properties:**
-- `WS_EX_TRANSPARENT` + `WS_EX_LAYERED` for see-through effect
+- `WS_EX_TRANSPARENT` + `WS_EX_LAYERED` for see-through effect, PLUS
+  `WS_EX_NOREDIRECTIONBITMAP` — without the latter the DWM composites an opaque white
+  sheet under the window (applied via the vendored egui-winit patch; see
+  DEVELOPMENT_GUIDELINES.md pitfall #10)
 - Click-through input handling
 - Independent repaint rate (10-60 Hz configurable)
 
@@ -231,7 +252,30 @@ Second transparent viewport for gamepad navigation:
 Third transparent viewport for live parameter tweaking:
 - Summoned by keyboard chord or Guide button
 - Interactive over its panel, click-through elsewhere
-- Suppresses specific physical input pins based on focused context
+- Renders the SAME pinned elements the sub-patch body does (`render_pinned_element`)
+  and drives them through the SAME nav editors (see the reuse rule in
+  DEVELOPMENT_GUIDELINES.md pitfall #9); any element with a non-empty
+  `nav_element_fields` list is editable here for free.
+
+**Live-topology passthrough (`app/config_route.rs`).** The overlay's defining trick:
+while you tweak a param over a running game, the inputs used to NAVIGATE the overlay
+are suppressed, but the input the tweaked param actually affects PASSES THROUGH so you
+feel the change live. For source-like params (a Knob/Constant with no physical
+upstream) this can't be derived by tracing upstream, so the resolver traces DOWNSTREAM
+from the tweak node to the virtual sink pin(s) it modulates — honoring **live
+selection** at gate nodes (Selector/Switch/Dropdown/fork, read from
+`node.extra.last_signals`) — then collects the physical inputs feeding those sinks.
+A physical stick that doesn't currently resolve to any virtual stick is "free" to be
+the tweak control; if both sticks are routed, the D-pad drives the editor
+(`ControlInput` / `control_input_from_pins` in `config_route.rs`). The passthrough
+channel is a `HashSet<(device, pin)>`, not a single device.
+
+**Overlay pins travel with the sub-patch preset.** Config/Info overlay pins are stored
+per-tab (`PatchTab.overlay`/`config`), but a pin exposed from inside a sub-patch is
+attributed into that sub-patch's `UiSubPatch.overlay_items`/`config_items` on save and
+materialized back onto the tab on load (`attribute_overlays_into_subpatches` /
+`materialize_subpatch_overlays` in `canvas/node.rs`). So a factory `.fxsp` preset can
+ship built-in overlays. First-level sub-patches only.
 
 ---
 
@@ -316,27 +360,75 @@ Full node-based graph editor:
 
 ---
 
-## Gamepad UI Navigation (`gamepad_nav.rs`)
+## Gamepad UI Navigation (`gamepad_nav.rs` + `app/nav/*.rs`)
 
-### NavDevice Structure
+### GamepadNav state + the EditLevel machine
 
-Tracks which physical device is driving the UI:
+All nav state lives in one runtime-only (never serialized) struct, `GamepadNav`, on
+`FlexInputApp`. The core is an **`EditLevel` state machine** — the current level
+decides what dpad/sticks/buttons do:
 
 ```rust
-pub struct NavDevice {
-    pub id: String,                    // Device ID (e.g., "gilrs:dualsense:0")
-    pub enabled: bool,                 // Nav active for this device
-    pub mode: NavMode,                 // Current navigation state
-}
-
-pub enum NavMode {
-    Idle,                              // No interaction
-    Cursor,                            // Moving selection cursor
-    EditValue,                         // Editing a numeric value
-    SelectCard,                        // Selecting mapping card
-    OpenMenu,                          // Navigating menu system
+pub enum EditLevel {
+    Widget,       // moving selection between sub-patch widgets
+    Editing,      // editing a scalar/dropdown/multi-field widget
+    CurveDots,    // inside a response curve: highlight a dot, RT/LT add/remove
+    CurveDot,     // moving the highlighted dot in X/Y; hold-North edits curvature
+    RemapScroll,  // inside a remapper-family widget: move/reset/delete/Learn cards
+    RemapCard,    // inside one entered card: left/right fields, up/down edits
+    TzLines,      // inside a Touch Zones / Virtual Menu FIELD (see TzFocus below)
+    TzGrab,       // a focused divider is grabbed and being nudged
+    TzCards,      // inside the TZ/menu mapping CARDS widget (zone tab + Learn flow)
 }
 ```
+
+Key runtime fields: `mode: HashMap<String,bool>` (per-device nav-enabled),
+`field_index` (focused field in the multi-field editor), `tz_focus`, `cursor_pos`/
+`cursor_visible` (RS/gyro pointer), `config_nav_sel` (the config-overlay's selected
+`(outer, inner, element)`).
+
+> The older `NavDevice { id, enabled, mode }` / `NavMode { Idle, Cursor, … }` shape
+> described in earlier drafts of this doc does not exist — `EditLevel` + `GamepadNav`
+> is the real model.
+
+### Touch Zones / Virtual Menu field nav — spatial walk
+
+Inside a TZ/menu field (`EditLevel::TzLines`), focus is a `TzFocus`:
+
+```rust
+pub enum TzFocus { Border, Zone(usize), Seam /* radial origin */ }
+```
+
+The walk is **spatial and geometry-based** (no grid/tree special-casing): each frame
+the renderer publishes `gp_nav_tz_targets` = (pass, `Vec<(kind, a, b, center)>`) in
+global screen space (kind 0=zone, 1=border, 2=seam), stamped with `nav_pass`. A dpad/LS
+press moves to the nearest target of the OPPOSITE type in that screen direction, so
+focus alternates zone↔border in any layout (radial angular wrap is free in screen
+space). Actions by focus: a **Border** grabs/recenters/removes a divider; a **Zone**
+sets `sel_zone` (retargeting the cards widget) and RT/LT divide it along each axis; the
+**Seam** rotates the radial origin. The shared radial mouse editor is
+`menu_body::radial_border_editor` (used by both the pinned body and the config overlay,
+so radial fields are mouse-editable everywhere).
+
+### The unified multi-field editor
+
+Most editable rows are NOT bespoke — they route through one generic editor,
+`nav_drive_fields`, driven by a per-element field table `nav_element_fields`
+(`app/nav/fields.rs`). Left/right walk fields; up/down (or South/RT) edit the focused
+one (`Value` nudge, `Enum`/`EnumPair` cycle, `Toggle` flip); West=fine, North=reset.
+See DEVELOPMENT_GUIDELINES.md → *"Gamepad field-editor lockstep triad"* for the
+invariant every editable row must satisfy (`nav_element_fields` ↔
+`publish_nav_field_rects` ↔ `elem_has_fields`, including conditional sub-fields).
+
+### Viewport-agnostic highlight pass (`nav_pass`)
+
+Selection highlights are published by the nav driver in the ROOT viewport but must
+also render in the config-overlay viewport. Because `ctx.data` is shared across
+viewports while `cumulative_pass_nr()` is per-viewport, selection channels gate on
+`crate::widgets::nav_pass(ctx)` (the driver's stored pass), while renderer-published
+rect channels stay on `cumulative_pass_nr()`. This is the single most-regressed bug
+class in the UI — see DEVELOPMENT_GUIDELINES.md → pitfall #6 for the classification
+rule before adding any new highlight.
 
 ### Navigation Controls
 
@@ -455,7 +547,7 @@ self.proc_graph.store(Arc::new(graph_snap));  // ArcSwap publish
 2. Resolve wire connections to `input_sources` indices
 3. Extract device source/sink metadata
 4. Recursively build inline subgraphs
-5. Return `(ProcessingGraph, HashSet<usize>)` with dirty node UIDs
+5. Return `(ProcessingGraph, Vec<usize>)` — the graph plus the list of dirty node UIDs
 
 ### Processing → UI (Output Reading)
 
@@ -473,15 +565,18 @@ match self.proc_outputs.try_lock() {  // Non-blocking read
 }
 ```
 
-**`ProcessingOutput` structure:**
+**`ProcessingOutput` structure** (`crates/engine/src/thread.rs`):
 ```rust
 pub struct ProcessingOutput {
-    pub node_outputs: HashMap<(usize, usize), Signal>,  // (uid, pin) → signal
+    pub node_outputs: HashMap<(usize, usize), Option<Signal>>,  // (node_uid, pin) → signal
     pub last_inputs: HashMap<usize, Vec<Option<Signal>>>,
-    pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,
+    pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,      // captured outputs (two-way curve)
     pub scope_pending: Vec<(usize, Vec<Option<f32>>)>,
 }
 ```
+
+Sink routing to the I/O thread goes through a SEPARATE lock (`SinkBus`), not
+`ProcessingOutput`, so the I/O thread never contends on the UI/processing mutex.
 
 ### I/O → UI (Device Signals)
 
@@ -543,33 +638,74 @@ Per-module-type renderers in `canvas/viewer/` subdirectory:
 
 ---
 
+## Icon System (`macro_icons.rs`, `canvas/remapper_icons.rs`, `menu_body.rs`)
+
+Every icon site — Macro ports, the shared `icon_picker_button` (Menu header + per-zone
+overrides, Touch Zones per-zone overrides, Macro-output body, SVG layout decorations) —
+funnels through ONE resolver: `macro_icons::macro_port_icon_texture(ctx, icon_key,
+icon_svg, size)`. An `icon_key` is one of:
+- a **build-time SVG file stem** (`ALL_ICONS`, grouped by sub-folder into
+  `ICON_CATEGORIES`), or
+- an empty key with `icon_svg` carrying a user-loaded custom SVG, or
+- the dynamic **`gp:<pin>`** gamepad-glyph scheme (see below).
+
+### Dynamic gamepad glyphs (`gp:<pin>`)
+
+A `gp:<pin>` key (e.g. `gp:btn_south`, `gp:touchpad_touch`) renders in the currently
+connected pad's family style and restyles live when the pad changes. The picker's
+synthetic **"Gamepad inputs"** category lists `remapper_icons::GAMEPAD_INPUT_PINS`
+(faces, dpad, bumpers/triggers, sticks+clicks, menu/system, touchpad click/touch/swipe,
+paddles). Resolution: `macro_port_icon_texture`'s `gp:` branch →
+`icon_key_svg_bytes(key, current_gp_skin(ctx))` → `remapper_icons::gp_pin_svg(skin,
+pin)`, with the texture cached by (skin, pin, size). See DEVELOPMENT_GUIDELINES.md →
+*"Dynamic gamepad-glyph icons"* for the native-fallback rule and the VID/PID-vs-id-string
+skin-derivation gotcha.
+
+---
+
 ## Window Management
 
 ### Main Window Properties
 
+Configured in `app/src/main.rs` as an `eframe::NativeOptions` with a `ViewportBuilder`:
+
 ```rust
-// In build_eframe_options()
-eframe::Frame {
-    with_decorations: false,      // Custom title bar
-    transparent: true,            // See-through support
-    resizable: true,
-    fullscreen: false,
-}
+let native_options = eframe::NativeOptions {
+    viewport: egui::ViewportBuilder::default()
+        .with_title("FlexInput")
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([800.0, 500.0])
+        .with_decorations(false)   // custom title bar
+        .with_resizable(true)
+        .with_transparent(true)    // see-through canvas support
+        .with_icon(icon),
+    depth_buffer: 32,              // 3D Controller viewer depth testing
+    wgpu_options,
+    ..Default::default()
+};
 ```
 
 ### Overlay Viewport Creation
 
-Each overlay uses a separate `egui::Viewport`:
+Each overlay is a deferred/immediate egui viewport keyed by a stable id
+(`overlay.rs`, `menu_overlay.rs`, `config_overlay.rs`):
 
 ```rust
-let viewport = egui::ViewportBuilder::default()
-    .with_titlebar_visible(false)
-    .with_always_on_top(true)
+let viewport_id = egui::ViewportId::from_hash_of("fxi_overlay");
+let builder = egui::ViewportBuilder::default()
+    .with_title_shown(false)
+    .with_always_on_top()
     .with_transparent(true)
-    .with_resizable(false);
-
-egui::Viewports::try_new(ctx, viewport).unwrap();
+    .with_taskbar(false)
+    // + WS_EX_NOREDIRECTIONBITMAP / click-through via the vendored egui-winit patch
+    ;
+ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
+    // render overlay contents into `vctx`
+});
 ```
+
+(There is no `egui::Viewports::try_new` API — the real entry point is
+`ctx.show_viewport_immediate` / `show_viewport_deferred`.)
 
 ### GPU Loss Recovery
 
@@ -879,5 +1015,5 @@ Also handles platform-specific resource compilation.
 
 ---
 
-*Last updated: 2026-07-25*  
+*Last updated: 2026-07-30*  
 *Blueprint version: 1.0*

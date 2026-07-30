@@ -201,7 +201,7 @@ This directory contains comprehensive reference documentation for the FlexInput 
 ```
 signal.rs      → Signal, SignalType enums + coercion rules
 module.rs      → Module trait, ModuleDescriptor, PinDescriptor
-patch.rs       → Patch, NodeInstance, Wire, SubPatch structs
+patch.rs       → Patch, NodeInstance, Wire, SubPatch (LEGACY types — NOT the .fxp format; see PATCH_FORMATS.md)
 automap.rs     → ALL_PINS, FEEDBACK_PAIRS, resolve_mapping()
 macros.rs      → Macro namespace constants and helpers
 menu.rs        → Menu pin parsing (Pin::Open, Pin::Hover, etc.)
@@ -228,9 +228,12 @@ eval/modules/*.rs  → Specialized evaluators (lean, map_action, remapper, etc.)
 ### Modules (crates/modules)
 ```
 lib.rs              → all_modules() registration aggregator
+controls.rs         → Constant, Switch, Knob, Selector, Dropdown, Text (module.label), SVG, Split
 math.rs             → Add, Subtract, Multiply, Divide, Clamp, Abs, Negate, MapRange
 logic.rs            → AND, OR, NOT, XOR, Equal, NotEqual, GreaterThan, LessThan, HasChanged, LogicDelay, Counter
-processing.rs       → Delay, Average, DCFilter, ResponseCurve, VecResponseCurve, VecReshape, TwoWayResponseCurve, Gyro3DOF
+processing.rs       → Delay, Average, DCFilter, response curves, VecReshape, Gyro3DOF, VecToAxis/AxisToVec,
+                      AND the AutoMap/mapping modules: automap_split/collect/fork/selector/combiner,
+                      Remapper, MapAction, FeedbackControl, AudioStreamHaptics
 display.rs          → Readout, Oscilloscope, TriggerScope, Vectorscope, Controller3D
 generator.rs        → Oscillator, Envelope
 network.rs          → NetworkSend, NetworkReceive module definitions
@@ -239,7 +242,7 @@ menu.rs             → Virtual Menu module
 macro_module.rs     → Macro Output module
 subpatch.rs         → Inlet, Outlet module definitions
 input_viewer.rs     → Input Viewer display module
-util.rs             → Constant, Switch, Knob, Selector, Dropdown, Text, SVG, Split modules
+util.rs             → shared helpers (registers no modules)
 ```
 
 ### UI (crates/ui)
@@ -432,6 +435,6 @@ When asked to fix a bug or add a feature:
 
 ---
 
-*Documentation last updated: 2026-07-25*  
+*Documentation last updated: 2026-07-30*  
 *Blueprint version: 1.0*  
 *Maintained by: FlexInput development team*

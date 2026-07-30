@@ -24,61 +24,44 @@ The engine crate (`crates/engine`) implements the real-time signal processing pi
 4. Publish scope samples and display state back to UI
 
 **Thread Loop:**
+Real signature (`crates/engine/src/thread.rs`) — returns the `JoinHandle`:
+
 ```rust
 pub fn spawn_processing_thread(
-    proc_graph: ArcGraph,           // UI→Processing graph (ArcSwap)
-    proc_device_signals: ArcSignals, // I/O→Processing signals (ArcSwap)
-    proc_outputs: Arc<Mutex<ProcessingOutput>>,  // Processing→UI outputs
-    sink_bus: SinkBus,              // Processing→I/O signals
-    sample_rate_hz: Arc<AtomicU32>,
-    ui_source_block: UiSourceBlock,
-) {
-    std::thread::spawn(move || {
-        let mut state = HashMap::<usize, NodeState>::new();
-        let mut last_tick = Instant::now();
-        
-        loop {
-            // 1. Read current graph snapshot (lock-free ArcSwap load)
-            let graph = proc_graph.load();
-            
-            // 2. Read latest device signals
-            let dev_sigs = proc_device_signals.load_full();
-            
-            // 3. Compute delta time from last tick
-            let now = Instant::now();
-            let dt = now.duration_since(last_tick).as_secs_f32();
-            last_tick = now;
-            
-            // 4. Evaluate one graph tick
-            let mut out = TickOutput::default();
-            eval_graph_tick(&graph, &mut state, &dev_sigs, dt, &ui_source_block, &mut out);
-            
-            // 5. Publish results to I/O thread and UI thread
-            sink_bus.write(|bus| {
-                for ((dev_id, pin), sig) in out.sink_outputs {
-                    bus.insert((dev_id, pin), sig);
-                }
-            });
-            
-            // Write display state (last_inputs, last_outputs, scope samples)
-            if let Ok(mut proc_out) = proc_outputs.lock() {
-                *proc_out = out.into();
-            }
-            
-            // 6. Sleep until next tick (catchup mechanism handles drift)
-            let target_period = 1.0 / sample_rate_hz.load(Ordering::Relaxed) as f32;
-            let elapsed = now.elapsed().as_secs_f32();
-            if elapsed < target_period {
-                thread::sleep(Duration::from_secs_f32(target_period - elapsed));
-            } else {
-                // Catchup: evaluate multiple ticks to recover from UI frame hiccups
-                let catchup_ticks = (elapsed / target_period).min(16.0) as usize;
-                for _ in 0..catchup_ticks {
-                    eval_graph_tick(&graph, &mut state, &dev_sigs, dt, &ui_source_block, &mut out);
-                }
-            }
+    graph: ArcGraph,                            // UI→Processing graph (ArcSwap)
+    device_signals: ArcSignals,                 // I/O→Processing signals (ArcSwap)
+    output: Arc<Mutex<ProcessingOutput>>,       // Processing→UI display state
+    sink_bus: SinkBus,                          // Processing→I/O signals (Arc<RwLock<…>>)
+    sample_rate: Arc<AtomicU32>,
+    ui_source_block: UiSourceBlock,             // Arc<RwLock<HashSet<(String,String)>>>
+) -> std::thread::JoinHandle<()>;
+```
+
+Simplified loop (pacing details elided):
+
+```rust
+let mut state = HashMap::<usize, NodeState>::new();
+let mut tick_out = TickOutput::default();   // reused; eval_graph_tick clears it internally
+loop {
+    let graph_snap = graph.load();                  // lock-free ArcSwap load
+    let dev_sigs   = device_signals.load_full();
+    // Merge the UI's source-block set into engine state BEFORE the tick.
+    // NOTE: eval_graph_tick does NOT take ui_source_block — the block is applied
+    // via state[MACRO_CARRY_UID].source_block, which the tick reads and the
+    // tick-end pass repopulates from collector_sigs.
+    {
+        let carry = state.entry(eval::MACRO_CARRY_UID).or_default();
+        carry.source_block.clear();
+        for k in ui_source_block.read().unwrap().iter() {
+            carry.source_block.insert(k.clone());
         }
-    });
+    }
+    eval_graph_tick(&graph_snap, &mut state, &dev_sigs, dt, &mut tick_out);   // 5 args
+    // Hand sink signals to the I/O thread (direct assignment under the RwLock):
+    *sink_bus.write().unwrap() = tick_out.sink_outputs.clone();
+    // Publish display state to the UI (non-blocking):
+    if let Ok(mut o) = output.try_lock() { /* copy scope_samples/last_inputs/… */ }
+    // …pace to `sample_rate`…
 }
 ```
 
@@ -121,14 +104,18 @@ pub fn eval_graph_tick(
     state: &mut HashMap<usize, NodeState>,
     dev_sigs: &HashMap<(String, String), Signal>,
     dt: f32,
-    ui_source_block: &UiSourceBlock,
-    out: &mut TickOutput,
+    out: &mut TickOutput,        // NOTE: no ui_source_block param — see below
 ) {
+    out.clear();                 // eval clears its own output (reused buffer)
+
     // 1. Apply per-device source-side post-processing
     let mut dev_sigs_owned = preprocess_dev_sigs(graph, dev_sigs);
     
-    // 2. Apply Virtual Menu source-block suppression
-    apply_source_block_suppression(&mut dev_sigs_owned, ui_source_block, state);
+    // 2. Zero the blocked physical pins (menu-open / config-overlay suppression).
+    //    The block set is read from state[MACRO_CARRY_UID].source_block, which the
+    //    processing thread populated from the UI's ui_source_block BEFORE this call
+    //    — it is NOT a parameter of eval_graph_tick. Blocked pins are replaced with
+    //    a neutral value (pointer_block_off) and their pre-block values snapshotted.
     
     // 3. Destructure TickOutput for mutable access
     let TickOutput {
@@ -149,10 +136,15 @@ pub fn eval_graph_tick(
 - Scales gyro signals by multiplier from settings
 - Filters noise spikes if spike filter enabled
 
-**`apply_source_block_suppression()`:**
-- When Virtual Menu is open, zero specific physical input pins
-- Prevents game from receiving navigation inputs while menu is active
-- Uses `UiSourceBlock` channel from UI thread
+**Source-block suppression (menu / config-overlay):**
+- When a Virtual Menu is open OR the config overlay is tweaking a param, specific
+  physical input pins are zeroed so the game doesn't receive nav inputs.
+- The block set lives in `state[MACRO_CARRY_UID].source_block`. Two feeders populate it:
+  the processing thread unions the UI's `ui_source_block` in before each tick, and the
+  tick-end pass repopulates it from `collector_sigs` entries under `SRC_BLOCK_PREFIX`
+  (nodes like the menu publish their own blocks).
+- Blocked pins are replaced with a neutral value (`pointer_block_off`); the pre-block
+  values are snapshotted so nav can still read raw input.
 
 ### Phase 2: Main Node Loop
 
@@ -493,6 +485,11 @@ pub fn namespaced_uid(outer: usize, inner: usize) -> usize {
 
 ### Structure
 
+> Representative fields (see `crates/engine/src/state.rs` for the exact set). The real
+> struct also carries `press_state`, `gesture_state`, and turbo/gesture bookkeeping;
+> some types differ from below (`dc_blend: Vec<f64>`, `twoway_lane: Vec<i8>`). All state
+> vectors grow lazily per channel.
+
 ```rust
 pub struct NodeState {
     // Auxiliary floating-point state (module-specific usage)
@@ -719,11 +716,12 @@ last_outputs.insert(ns_uid, node_outputs.clone());
 ### Definition
 
 ```rust
+// crates/engine/src/eval/config.rs
 pub struct TickOutput {
-    pub outputs: HashMap<(usize, usize), Signal>,           // (uid, pin) → signal
-    pub scope_samples: Vec<(usize, Vec<Option<f32>>)>,      // (uid, samples)
+    pub outputs: HashMap<(usize, usize), Option<Signal>>,   // (node_uid, pin) → signal
+    pub scope_samples: Vec<(usize, Vec<Option<f32>>)>,      // (uid, per-channel samples)
     pub last_inputs: HashMap<usize, Vec<Option<Signal>>>,   // uid → inputs
-    pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,  // uid → outputs
+    pub last_outputs: HashMap<usize, Vec<Option<Signal>>>,  // uid → captured outputs
     pub sink_outputs: HashMap<(String, String), Signal>,    // (device_id, pin) → signal
 }
 
@@ -744,13 +742,13 @@ impl TickOutput {
 
 ```rust
 // In processing thread loop:
-let mut out = TickOutput::default();  // Allocated once, cleared each tick
+let mut out = TickOutput::default();  // Allocated once, reused each tick
 
 loop {
-    out.clear();  // Retains capacity, just resets lengths
-    eval_graph_tick(&graph, &mut state, &dev_sigs, dt, &ui_source_block, &mut out);
-    
-    // Publish out to I/O thread and UI thread
+    // eval_graph_tick calls out.clear() itself (retains capacity) — no need to
+    // clear beforehand, and note the 5-arg signature (no ui_source_block).
+    eval_graph_tick(&graph, &mut state, &dev_sigs, dt, &mut out);
+    // Publish out to I/O thread (sink_outputs) and UI thread (display state)
 }
 ```
 
@@ -855,8 +853,8 @@ Apply via UI knob/counter reset button and observe output change.
 | `src/eval/modules/lean.rs` | 3DOF lean mapping evaluation | ~400 |
 | `src/eval/modules/map_action.rs` | Map Action card evaluation | ~300 |
 | `src/eval/modules/remapper.rs` | Remapper override publishing | ~250 |
-| `src/eval/modules/share.rs` | Shared AutoMap helpers | ~200 |
-| `src/eval/modules/touch.rs` | Touch Zones mapping mode | ~350 |
+| `src/eval/modules/shared.rs` | Shared AutoMap / mapping helpers | ~200 |
+| `src/eval/modules/touch_zones.rs` | Touch Zones + Virtual Menu zone eval | ~350 |
 | `src/eval/modules/menu.rs` | Virtual Menu state machine | ~400 |
 | `src/eval/modules/gyro3dof.rs` | Gyro 3DOF processing | ~500 |
 

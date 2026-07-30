@@ -618,16 +618,21 @@ for key in &req {
 
 ### Macro Namespace
 
-Mapping evaluators (Remapper, Touch Zones cards, 3DOF-Lean) publish signals into named macro namespaces:
+Mapping evaluators (Remapper, Touch Zones cards, 3DOF-Lean) publish signals into named
+macro namespaces. The actual constant VALUES (verify before hard-coding a key):
 
 ```rust
-pub const SIGS_NS: &str = "macro_sigs";       // Scalar macros
-pub const SIGS_NS_VEC2: &str = "macro_sigs_vec2";  // Vec2 macros
-pub const SRC_BLOCK_PREFIX: &str = "src_block:";    // Source block pins
+// crates/core/src/macros.rs
+pub const SIGS_NS: &str      = "macro";       // scalar macros    (NOT "macro_sigs")
+pub const SIGS_NS_VEC2: &str = "macro#v2";    // Vec2 macros      (NOT "macro_sigs_vec2")
+
+// crates/engine/src/eval/publish.rs
+pub(crate) const SRC_BLOCK_PREFIX: &str = "__src_block__:";  // source-block pins
+pub(crate) const MACRO_CARRY_UID: usize = usize::MAX;        // synthetic state key
 
 // In macro_output evaluation:
 let scalar = collector_sigs.get(&(SIGS_NS.to_string(), pin_id.to_string())).copied();
-let vec2 = collector_sigs.get(&(SIGS_NS_VEC2.to_string(), pin_id.to_string())).copied();
+let vec2   = collector_sigs.get(&(SIGS_NS_VEC2.to_string(), pin_id.to_string())).copied();
 ```
 
 ---

@@ -81,31 +81,13 @@ pub trait Module: Send + 'static {
 
 ### Patch System
 
-**`Patch`** - Serialized graph document (`.fxp` files):
-```rust
-pub struct Patch {
-    pub version: u32,               // PATCH_VERSION = 1
-    pub nodes: Vec<NodeInstance>,
-    pub wires: Vec<Wire>,
-}
-```
-
-**`NodeInstance`** - Runtime node with parameters:
-- `id: Uuid` - Unique identifier
-- `module_id: String` - Matches `ModuleDescriptor::id` or special types ("subpatch", "device.source", "device.sink")
-- `position: [f32; 2]` - Canvas coordinates
-- `params: HashMap<String, serde_json::Value>` - Configurable parameters
-- `subpatch: Option<Box<SubPatch>>` - Inline sub-patch definition
-
-**`Wire`** - Connection between nodes:
-```rust
-pub struct Wire {
-    pub from_node: Uuid,
-    pub from_pin: String,
-    pub to_node: Uuid,
-    pub to_pin: String,
-}
-```
+`crates/core/src/patch.rs` defines `Patch` / `NodeInstance` (with `id: Uuid`) / `Wire`
+(with `from_pin`/`to_pin` names) and `PATCH_VERSION`. **These are LEGACY types and are
+NOT the on-disk format.** The actual graph lives in an egui-snarl `Snarl<NodeData>`, and
+the `.fxp` file is a `UiPatch` wrapping that snarl (integer-indexed nodes, index-pair
+wires — no UUIDs, no pin-name wires). See PATCH_FORMATS.md for the real schema. The only
+place `core::Patch` is still referenced is the vestigial `flexinput_engine::Engine`
+struct; the live processing path builds a `ProcessingGraph` from the snarl instead.
 
 ---
 
@@ -315,22 +297,24 @@ pub trait DeviceBackend: Send {
 
 ### Virtual Devices
 
-**`VirtualDevice` trait:**
+**`VirtualDevice` trait** (`crates/virtual/src/lib.rs`):
 ```rust
 pub trait VirtualDevice: Send {
     fn id(&self) -> &str;
-    fn kind(&self) -> DeviceKind;
-    fn is_connected(&self) -> bool;
-    fn send(&mut self, signals: &HashMap<String, Signal>);
-    fn reset_outputs(&mut self);
+    fn display_name(&self) -> &str;
+    fn sink_pins(&self) -> &'static [SinkPin];    // ordered input pins
+    fn send(&mut self, pin: &str, value: Signal); // one pin at a time…
+    fn flush(&mut self);                          // …then commit the HID report
+    fn reset_outputs(&mut self) {}
+    fn is_connected(&self) -> bool { true }
+    fn output_pins(&self) -> &'static [FeedbackOutlet] { &[] }  // feedback into the graph
 }
 ```
 
-**Device kinds:**
-- `XInput` - Virtual Xbox 360 controller via HIDMaestro
-- `DS4` - Virtual DualShock 4
-- `DualSense` - Virtual DualSense
-- `KeyMouse` - Virtual keyboard/mouse
+**Virtual device kinds** (identified by id prefix `virtual.{kind}.{n}`, and by the
+physical-side `ControllerKind`): virtual Xbox 360 (XInput), DualShock 4, DualSense, and
+keyboard/mouse. There is no `DeviceKind` enum on the trait, and `send` is per-pin (not a
+whole `HashMap`).
 
 ### HIDMaestro Integration (`crates/hidmaestro`)
 
@@ -444,13 +428,13 @@ Hardware Output
 
 ### Signal Combination
 
-Multi-source sinks combine signals additively:
+Multi-source sinks combine signals additively (real fn takes/returns `Option<Signal>`):
 ```rust
-fn combine_signals(a: Signal, b: Signal) -> Signal {
+fn combine_signals(a: Option<Signal>, b: Option<Signal>) -> Option<Signal> {
     match (a, b) {
-        (Signal::Float(x), Signal::Float(y)) => Signal::Float(x + y),
-        (Signal::Vec2(x), Signal::Vec2(y)) => Signal::Vec2(x + y),
-        _ => a,  // Fallback: first wins
+        (Some(Signal::Float(x)), Some(Signal::Float(y))) => Some(Signal::Float(x + y)),
+        (Some(Signal::Vec2(x)),  Some(Signal::Vec2(y)))  => Some(Signal::Vec2(x + y)),
+        (a, _) => a,  // Fallback: first wins
     }
 }
 ```
@@ -472,18 +456,12 @@ Persisted to `%APPDATA%\FlexInput\settings.json`:
 
 ### Patch Files
 
-**`.fxp`** - Full patch with graph, positions, params:
-```json
-{
-  "version": 1,
-  "nodes": [...],
-  "wires": [...]
-}
-```
+**`.fxp`** - Full patch: a `UiPatch { version, snarl: Snarl<NodeData>, virtual_device_ids,
+bound_exes, auto_bypass, easy_preset_path, overlay, config }`. The graph is the serialized
+snarl (NOT a `{nodes, wires}` document). See PATCH_FORMATS.md.
 
-**`.fxsp`** - Sub-patch preset (Easy mode):
-- Single sub-patch node with AutoMap inlet/outlet
-- Factory presets in `app/assets/sub-patches/`
+**`.fxsp`** - Sub-patch preset (Easy mode): a `SubPatchFile { version, sub_patch: UiSubPatch }`
+— a single `UiSubPatch`, typically with an AutoMap inlet/outlet.
 
 **`.fxc`** - Response curve files (reusable across patches)
 
@@ -638,5 +616,5 @@ Live parameter tweaking overlay summoned by keyboard chord or Guide button. Supp
 
 ---
 
-*Last updated: 2026-07-25*  
+*Last updated: 2026-07-30*  
 *Blueprint version: 1.0*
