@@ -1360,6 +1360,15 @@ impl eframe::App for FlexInputApp {
             self.devices = self.shared_devices.read().unwrap().clone();
         }
 
+        // Publish the current gamepad skin (VID/PID kind of the connected physical
+        // pad, skipping our own virtual outputs; else Xbox) so dynamic `gp:<pin>`
+        // icons resolve — and restyle — to whatever controller is in use. Read by
+        // `macro_icons::current_gp_skin`.
+        {
+            let skin = self.current_gamepad_skin();
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("fxi_current_gp_skin"), skin));
+        }
+
         // Keep HidHide masking in sync with the live patch + device set. Cheap and
         // debounced (only acts when the remapped-physical set actually changes).
         self.reconcile_hidhide();

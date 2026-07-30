@@ -273,6 +273,11 @@ pub enum LayoutDecoration {
         tint_mode: String,
         stroke: [u8; 4],
         stroke_px: f32,
+        /// Chosen shared-set / `gp:<pin>` icon key ("" = use `svg_data`). When set,
+        /// it wins over `svg_data` and resolves dynamically (gp icons restyle to
+        /// the current pad) — the unified icon picker writes one or the other.
+        #[serde(default)]
+        icon_key: String,
     },
     Rect {
         pos: [f32; 2],

@@ -194,6 +194,26 @@ impl FlexInputApp {
             .unwrap_or(Skin::Xbox)
     }
 
+    /// Skin of the currently-connected PHYSICAL gamepad, from its VID/PID-detected
+    /// `ControllerKind` (robust where the id string is ambiguous, e.g. a Switch Pro
+    /// whose gilrs name isn't "switch"), skipping our OWN re-enumerated virtual
+    /// outputs (a virtual DualSense sink would otherwise mask the real pad) and
+    /// MIDI. Drives dynamic `gp:<pin>` icon rendering; falls back to Xbox.
+    pub(crate) fn current_gamepad_skin(&self) -> crate::canvas::remapper_icons::Skin {
+        use crate::canvas::remapper_icons::{phys_pad_slug, Skin};
+        use flexinput_devices::ControllerKind as CK;
+        self.devices.iter()
+            .find(|d| phys_pad_slug(&d.id).is_some()
+                && !crate::app::is_own_virtual_gilrs_id(&d.id)
+                && !matches!(d.kind, CK::MidiIn | CK::MidiOut))
+            .map(|d| match d.kind {
+                CK::DualShock4 | CK::DualSense => Skin::Playstation,
+                CK::SwitchPro => Skin::SwitchPro,
+                _ => Skin::Xbox,
+            })
+            .unwrap_or(Skin::Xbox)
+    }
+
 
     /// Device id of a deployed virtual XInput (Virtual Xbox) sink in the active
     /// patch, if any — the target for a player-slot re-arrive.

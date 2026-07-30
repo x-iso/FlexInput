@@ -73,6 +73,27 @@ pub fn macro_icon_svg(key: &str) -> Option<&'static [u8]> {
     ALL_ICONS.iter().find(|(k, _, _, _)| *k == key).map(|(_, _, _, b)| *b)
 }
 
+/// The gamepad `Skin` used to render dynamic `gp:<pin>` icons this frame — the
+/// current connected pad's family, published each frame by the app (else Xbox).
+pub fn current_gp_skin(ctx: &egui::Context) -> crate::canvas::remapper_icons::Skin {
+    ctx.data(|d| d.get_temp::<crate::canvas::remapper_icons::Skin>(
+        egui::Id::new("fxi_current_gp_skin")))
+        .unwrap_or(crate::canvas::remapper_icons::Skin::Xbox)
+}
+
+/// Resolve an icon KEY to SVG bytes, understanding the dynamic `gp:<pin>` scheme
+/// (a gamepad-input glyph in `skin`'s style, native fallback) in addition to the
+/// build-time icon set. THE single place that knows the `gp:` prefix; used by the
+/// texture path and the SVG-decoration rasterize path alike.
+pub fn icon_key_svg_bytes(icon_key: &str, skin: crate::canvas::remapper_icons::Skin)
+    -> Option<&'static [u8]>
+{
+    if let Some(pin) = icon_key.strip_prefix("gp:") {
+        return crate::canvas::remapper_icons::gp_pin_svg(skin, pin);
+    }
+    macro_icon_svg(icon_key)
+}
+
 /// Rasterize a macro icon to a cached white-on-transparent texture, sized for
 /// a cell/chip of `size_pts` logical pixels (mirrors `kbm_cell_texture`).
 pub fn macro_icon_texture(
@@ -104,6 +125,14 @@ pub fn macro_port_icon_texture(
         let mut h = std::collections::hash_map::DefaultHasher::new();
         icon_svg.hash(&mut h);
         return svg_texture_cached(ctx, icon_svg, h.finish(), size_pts);
+    }
+    // Dynamic gamepad-input glyph (`gp:<pin>`): resolve for the CURRENT pad skin.
+    // The cache salt is the resolved bytes' pointer, which differs per skin, so a
+    // pad change re-rasterizes → every gp icon restyles with no per-site work.
+    if icon_key.starts_with("gp:") {
+        let bytes = icon_key_svg_bytes(icon_key, current_gp_skin(ctx))?;
+        let text = std::str::from_utf8(bytes).ok()?;
+        return svg_texture_cached(ctx, text, bytes.as_ptr() as usize as u64, size_pts);
     }
     macro_icon_texture(ctx, icon_key, size_pts)
 }

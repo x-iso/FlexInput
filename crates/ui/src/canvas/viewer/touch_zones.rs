@@ -1444,11 +1444,9 @@ pub(crate) fn tz_draw_field(
             .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()).cloned())
             .unwrap_or_default()
     } else { Vec::new() };
-    // Virtual Menu per-zone icon/name overrides (empty for Touch Zones — the
-    // icon override then shows on the module body + pinned grid too, matching
-    // the overlay).
+    // Per-zone icon/name overrides (`zone_meta`) — shared by Virtual Menu AND
+    // Touch Zones now, so a TZ zone can wear a chosen icon like a menu zone.
     let zone_meta = snarl.get_node(node_id)
-        .filter(|n| n.module_id == "module.menu")
         .map(crate::canvas::menu_body::menu_zone_meta)
         .unwrap_or_default();
     let skin = remapper_resolve_skin(snarl, node_id, "auto", None);
@@ -2218,13 +2216,71 @@ pub(crate) fn show_touch_zones_body(
         // Confirm popup for a divider removal that would drop mapped zones.
         if mapping { tz_render_merge_popup(ui, snarl, node_id); }
 
-        // ── Mapping mode: zone-tab card list (separately pinnable) ──────────
+        // ── Mapping mode: per-zone icon/name override + zone-tab card list ──
         if mapping {
+            tz_zone_icon_row(node_id, ui, snarl);
             ui.add_space(6.0);
             let cards_area = ui.vertical(|ui| {
                 render_touch_zone_cards(node_id, ui, snarl, &visuals, accent, live_signals, automap_parent);
             }).response.rect;
             register_exposable_element(ui, node_id, "cards", cards_area);
+        }
+    });
+}
+
+/// Per-zone icon + name override row for the Touch Zones body — reuses the SAME
+/// `zone_meta` storage + shared picker Virtual Menu zones use, so a TZ zone can
+/// wear a chosen icon (set / Gamepad-input glyph / custom SVG) + name instead of
+/// its raw mapping-output icons. Bound to the current `sel_zone`.
+fn tz_zone_icon_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    use crate::canvas::menu_body::{icon_picker_button, menu_zone_meta, write_zone_meta_entry, ZoneMeta};
+    let (sel_f, sel) = tz_read_selection(snarl, node_id);
+    let ids = tz_field_tree(snarl, node_id, sel_f).ids();
+    let max_id = ids.iter().copied().max().unwrap_or(0);
+    let zone = if ids.contains(&(sel as u32)) { sel as u32 } else { ids.first().copied().unwrap_or(0) };
+    let meta = snarl.get_node(node_id)
+        .map(|n| menu_zone_meta(n).get(&zone).cloned().unwrap_or_default())
+        .unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Zone").small().weak());
+        let mut z_edit = zone as u64;
+        if ui.add(egui::DragValue::new(&mut z_edit).range(0..=max_id as u64).speed(0.05))
+            .on_hover_text("Which zone the icon/name override applies to.\nClicking a zone in the field selects it too.")
+            .changed()
+        {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("sel_field".into(), serde_json::json!(sel_f as u64));
+                node.params.insert("sel_zone".into(), serde_json::json!(z_edit));
+            }
+        }
+        ui.label(egui::RichText::new("icon").small().weak())
+            .on_hover_text("Override this zone's shown icon with one picked icon\n(shared set, a Gamepad-input glyph, or a custom SVG embedded into the patch).");
+        if let Some((k, s)) = icon_picker_button(
+            ui, egui::Id::new((node_id, "tz_zone_icon", zone)), &meta.icon, &meta.svg)
+        {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                write_zone_meta_entry(node, zone, &ZoneMeta { icon: k, svg: s, label: meta.label.clone() });
+            }
+        }
+        ui.label(egui::RichText::new("name").small().weak())
+            .on_hover_text("Zone name, drawn on the zone alongside its icon.");
+        let mut label_edit = meta.label.clone();
+        if ui.add(egui::TextEdit::singleline(&mut label_edit)
+            .desired_width(90.0)
+            .id_salt((node_id, "tz_zone_name", zone)))
+            .changed()
+        {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                write_zone_meta_entry(node, zone, &ZoneMeta {
+                    icon: meta.icon.clone(), svg: meta.svg.clone(), label: label_edit });
+            }
+        }
+        if (!meta.icon.is_empty() || !meta.svg.is_empty() || !meta.label.is_empty())
+            && ui.small_button("✕").on_hover_text("Remove this zone's icon + name override").clicked()
+        {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                write_zone_meta_entry(node, zone, &ZoneMeta::default());
+            }
         }
     });
 }

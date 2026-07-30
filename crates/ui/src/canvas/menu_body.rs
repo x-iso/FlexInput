@@ -279,8 +279,8 @@ pub(crate) fn menu_zone_meta(node: &NodeData) -> HashMap<u32, ZoneMeta> {
 }
 
 /// Write (or clear) one zone's `zone_meta` entry, dropping the param entirely
-/// when the last entry goes away.
-fn write_zone_meta_entry(node: &mut NodeData, zone: u32, meta: &ZoneMeta) {
+/// when the last entry goes away. Shared with the Touch Zones per-zone icon row.
+pub(crate) fn write_zone_meta_entry(node: &mut NodeData, zone: u32, meta: &ZoneMeta) {
     let mut obj = node.params.get("zone_meta")
         .and_then(|v| v.as_object()).cloned()
         .unwrap_or_default();
@@ -1570,6 +1570,9 @@ fn render_radial_field(
 /// custom SVG…" (embedded into the patch) and "No icon". Returns
 /// `Some((icon key, custom svg))` when the user picked something — both
 /// empty = cleared. Reused by the menu header and the per-zone icon override.
+/// Synthetic icon-picker category name for dynamic gamepad-control glyphs.
+pub(crate) const GP_ICON_CATEGORY: &str = "Gamepad inputs";
+
 pub(crate) fn icon_picker_button(
     ui: &mut egui::Ui,
     grid_id: egui::Id,
@@ -1643,6 +1646,11 @@ pub(crate) fn icon_picker_button(
                             sel_cat = (*cat).to_string();
                         }
                     }
+                    // Synthetic category: gamepad-control glyphs rendered in the
+                    // CURRENT pad's style (stored as `gp:<pin>`, restyle on pad change).
+                    if ui.selectable_label(sel_cat == GP_ICON_CATEGORY, GP_ICON_CATEGORY).clicked() {
+                        sel_cat = GP_ICON_CATEGORY.to_string();
+                    }
                 });
             ui.add(egui::TextEdit::singleline(&mut search)
                 .hint_text("Search…")
@@ -1667,32 +1675,64 @@ pub(crate) fn icon_picker_button(
                 // Filtered index drives row wrapping — NOT the global index —
                 // so a partial category/search still forms a full 10-wide grid.
                 let mut shown = 0usize;
-                for (key, label, cat, _) in crate::macro_icons::ALL_ICONS.iter() {
-                    if !sel_cat.is_empty() && *cat != sel_cat { continue; }
-                    if !q.is_empty()
-                        && !key.to_ascii_lowercase().contains(&q)
-                        && !label.to_ascii_lowercase().contains(&q)
-                    {
-                        continue;
+                let cell = egui::vec2(CELL - 6.0, CELL - 6.0);
+                if sel_cat == GP_ICON_CATEGORY {
+                    // Gamepad-control glyphs: rendered per the CURRENT pad style
+                    // (macro_port_icon_texture resolves `gp:<pin>` dynamically) and
+                    // stored as that key, so a pad swap restyles every placed icon.
+                    for (pin, label) in crate::canvas::remapper_icons::GAMEPAD_INPUT_PINS {
+                        if !q.is_empty()
+                            && !pin.to_ascii_lowercase().contains(&q)
+                            && !label.to_ascii_lowercase().contains(&q)
+                        {
+                            continue;
+                        }
+                        let key = format!("gp:{pin}");
+                        let selected = icon_svg.is_empty() && icon == key;
+                        let btn = if let Some(tex) = crate::macro_icons::macro_port_icon_texture(
+                            ui.ctx(), &key, "", CELL - 6.0)
+                        {
+                            egui::Button::image(egui::Image::new(&tex)
+                                .fit_to_exact_size(cell).tint(egui::Color32::WHITE))
+                                .min_size(egui::vec2(CELL, CELL))
+                                .selected(selected)
+                        } else {
+                            egui::Button::new(*label).selected(selected)
+                        };
+                        if ui.add(btn).on_hover_text(format!("{label}\n{GP_ICON_CATEGORY}")).clicked() {
+                            new_icon = Some((key, String::new()));
+                            ui.close();
+                        }
+                        shown += 1;
+                        if shown % COLS == 0 { ui.end_row(); }
                     }
-                    let selected = icon_svg.is_empty() && icon == *key;
-                    let btn = if let Some(tex) =
-                        crate::macro_icons::macro_icon_texture(ui.ctx(), key, CELL - 6.0)
-                    {
-                        egui::Button::image(egui::Image::new(&tex)
-                            .fit_to_exact_size(egui::vec2(CELL - 6.0, CELL - 6.0))
-                            .tint(egui::Color32::WHITE))
-                            .min_size(egui::vec2(CELL, CELL))
-                            .selected(selected)
-                    } else {
-                        egui::Button::new(*label).selected(selected)
-                    };
-                    if ui.add(btn).on_hover_text(format!("{label}\n{cat}")).clicked() {
-                        new_icon = Some((key.to_string(), String::new()));
-                        ui.close();
+                } else {
+                    for (key, label, cat, _) in crate::macro_icons::ALL_ICONS.iter() {
+                        if !sel_cat.is_empty() && *cat != sel_cat { continue; }
+                        if !q.is_empty()
+                            && !key.to_ascii_lowercase().contains(&q)
+                            && !label.to_ascii_lowercase().contains(&q)
+                        {
+                            continue;
+                        }
+                        let selected = icon_svg.is_empty() && icon == *key;
+                        let btn = if let Some(tex) =
+                            crate::macro_icons::macro_icon_texture(ui.ctx(), key, CELL - 6.0)
+                        {
+                            egui::Button::image(egui::Image::new(&tex)
+                                .fit_to_exact_size(cell).tint(egui::Color32::WHITE))
+                                .min_size(egui::vec2(CELL, CELL))
+                                .selected(selected)
+                        } else {
+                            egui::Button::new(*label).selected(selected)
+                        };
+                        if ui.add(btn).on_hover_text(format!("{label}\n{cat}")).clicked() {
+                            new_icon = Some((key.to_string(), String::new()));
+                            ui.close();
+                        }
+                        shown += 1;
+                        if shown % COLS == 0 { ui.end_row(); }
                     }
-                    shown += 1;
-                    if shown % COLS == 0 { ui.end_row(); }
                 }
                 if shown == 0 {
                     ui.label(egui::RichText::new("No matching icons").weak());

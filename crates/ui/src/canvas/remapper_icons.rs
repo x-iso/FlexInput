@@ -673,6 +673,73 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
     }
 }
 
+/// SVG bytes for a gamepad-input glyph under `skin`, falling back to the FIRST
+/// family that defines it when `skin` doesn't — so a family-specific control
+/// (a PlayStation touchpad/mute, a Switch capture) keeps its NATIVE style even
+/// under a pad whose set lacks it. Powers the dynamic `gp:<pin>` icon category.
+pub fn gp_pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
+    if let Some(b) = pin_svg(skin, pin_id) {
+        return Some(b);
+    }
+    for s in [Skin::Playstation, Skin::SwitchPro, Skin::Xbox] {
+        if s == skin {
+            continue;
+        }
+        if let Some(b) = pin_svg(s, pin_id) {
+            return Some(b);
+        }
+    }
+    None
+}
+
+/// Curated pins offered in the icon picker's "Gamepad inputs" category, as
+/// `(pin_id, human label)`. Each renders via [`gp_pin_svg`] in the CURRENT pad's
+/// style (see `macro_icons::current_gp_skin`) and is stored as the key
+/// `gp:<pin_id>`, so already-placed icons restyle when the connected pad changes.
+pub const GAMEPAD_INPUT_PINS: &[(&str, &str)] = &[
+    // Face buttons
+    ("btn_south", "South button"),
+    ("btn_east", "East button"),
+    ("btn_west", "West button"),
+    ("btn_north", "North button"),
+    // D-pad
+    ("dpad", "D-pad"),
+    ("dpad_up", "D-pad up"),
+    ("dpad_down", "D-pad down"),
+    ("dpad_left", "D-pad left"),
+    ("dpad_right", "D-pad right"),
+    // Shoulders + triggers
+    ("btn_lb", "Left bumper"),
+    ("btn_rb", "Right bumper"),
+    ("left_trigger", "Left trigger"),
+    ("right_trigger", "Right trigger"),
+    // Sticks
+    ("left_stick", "Left stick"),
+    ("right_stick", "Right stick"),
+    ("btn_ls", "Left stick (click)"),
+    ("btn_rs", "Right stick (click)"),
+    // Menu / system
+    ("btn_start", "Start / Options / +"),
+    ("btn_back", "Back / Share / −"),
+    ("btn_guide", "Guide / Home"),
+    ("btn_capture", "Capture / Share"),
+    ("btn_mute", "Mute"),
+    // Touchpad (family-agnostic glyphs — always render in their native PS style)
+    ("btn_touchpad", "Touchpad (click)"),
+    ("tz_touch", "Touchpad (touch)"),
+    ("touch_swipe_x", "Touchpad swipe X"),
+    ("touch_swipe_y", "Touchpad swipe Y"),
+    ("tz_swipe_up", "Touchpad swipe up"),
+    ("tz_swipe_down", "Touchpad swipe down"),
+    ("tz_swipe_left", "Touchpad swipe left"),
+    ("tz_swipe_right", "Touchpad swipe right"),
+    ("touchpad_left", "Touchpad left"),
+    ("touchpad_right", "Touchpad right"),
+    // Rear paddles
+    ("btn_paddle_l1", "Left paddle"),
+    ("btn_paddle_r1", "Right paddle"),
+];
+
 /// Short on-icon label for an extra button (rear paddle), or `None` for pins
 /// that aren't extra buttons. Painted over the generic paddle glyph so the same
 /// left/right glyph can represent both paddle rows. Generic (device-agnostic)
@@ -686,6 +753,34 @@ pub fn extra_button_label(pin_id: &str) -> Option<&'static str> {
         "btn_paddle_l2" => Some("PL2"),
         "btn_paddle_r2" => Some("PR2"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gp_pin_svg_native_fallback_and_coverage() {
+        // A pin the current skin DOES define resolves to that skin's glyph.
+        assert_eq!(gp_pin_svg(Skin::Xbox, "btn_south"), pin_svg(Skin::Xbox, "btn_south"));
+
+        // `btn_capture` exists for Xbox + Switch but NOT PlayStation → a PS pad
+        // still gets a glyph, in the native style of a family that defines it.
+        assert!(pin_svg(Skin::Playstation, "btn_capture").is_none());
+        let fb = gp_pin_svg(Skin::Playstation, "btn_capture");
+        assert!(fb.is_some(), "capture falls back to a family that has it");
+        assert_eq!(fb, pin_svg(Skin::SwitchPro, "btn_capture"));
+
+        // Family-agnostic control (mute) keeps its intended (PS) style under any pad.
+        assert_eq!(gp_pin_svg(Skin::SwitchPro, "btn_mute"), pin_svg(Skin::Xbox, "btn_mute"));
+
+        // Every curated picker pin resolves under every family (no dead entries).
+        for (pin, _) in GAMEPAD_INPUT_PINS {
+            for skin in [Skin::Xbox, Skin::Playstation, Skin::SwitchPro] {
+                assert!(gp_pin_svg(skin, pin).is_some(), "{pin} unresolved under {skin:?}");
+            }
+        }
     }
 }
 

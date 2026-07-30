@@ -396,6 +396,7 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             tint_mode: "override".to_string(),
             stroke: [0, 0, 0, 0],
             stroke_px: 0.0,
+            icon_key: String::new(),
         },
         _ => LayoutDecoration::Rect {
             pos: [16.0, 16.0],
@@ -619,22 +620,17 @@ pub(crate) fn decoration_inspector_strip_item(
                 ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.1f32..=12.0).suffix("px"))
                     .on_hover_text("Line thickness");
             }
-            LayoutDecoration::Svg { tint, tint_mode, stroke, stroke_px, svg_data, rev, .. } => {
-                if ui.small_button("Load…").on_hover_text("Load SVG file").clicked() {
-                    // This inspector strip is reachable from the overlay's edit
-                    // toolbar, where the always-on-top overlay would otherwise
-                    // sit ON TOP of the (owner-less) native file dialog and hide
-                    // it. Drop the overlay's topmost bit around the blocking
-                    // pick_file so the dialog is reachable (no-op elsewhere).
-                    let picked = crate::overlay::with_overlay_not_topmost(|| {
-                        rfd::FileDialog::new().add_filter("SVG", &["svg"]).pick_file()
-                    });
-                    if let Some(path) = picked {
-                        if let Ok(text) = std::fs::read_to_string(&path) {
-                            *svg_data = text;
-                            *rev = rev.wrapping_add(1);
-                        }
-                    }
+            LayoutDecoration::Svg { tint, tint_mode, stroke, stroke_px, svg_data, rev, icon_key, .. } => {
+                // Unified icon picker (shared set + "Gamepad inputs" glyphs + the
+                // custom-SVG loader), replacing the old Load-only button. It returns
+                // (icon_key, custom_svg) — mutually exclusive; a gp icon restyles to
+                // the current pad because paint resolves the key dynamically.
+                if let Some((k, s)) = crate::canvas::menu_body::icon_picker_button(
+                    ui, egui::Id::new(("deco_svg_icon", idx)), icon_key, svg_data)
+                {
+                    *icon_key = k;
+                    *svg_data = s;
+                    *rev = rev.wrapping_add(1);
                 }
                 color_button(ui, "tint", tint);
                 egui::ComboBox::from_id_salt(("deco_svg_mode", idx))
@@ -1174,7 +1170,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                 fcol,
             );
         }
-        LayoutDecoration::Svg { pos, size, svg_data, rev, tint, tint_mode, stroke, stroke_px } => {
+        LayoutDecoration::Svg { pos, size, svg_data, rev, tint, tint_mode, stroke, stroke_px, icon_key } => {
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
                 egui::vec2(size[0].max(8.0), size[1].max(8.0)),
@@ -1185,7 +1181,23 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                     egui::Stroke::new(*stroke_px, scol),
                     egui::StrokeKind::Inside);
             }
-            if svg_data.is_empty() {
+            let ctx = painter.ctx();
+            // A chosen set/`gp:` icon key wins over a loaded custom SVG and resolves
+            // dynamically (gp glyphs restyle to the current pad); else the raw
+            // svg_data. `salt` keys the texture cache and, for gp icons, differs per
+            // skin so a pad change re-rasterizes.
+            let (svg_src, salt): (&str, usize) = if !icon_key.is_empty() {
+                match crate::macro_icons::icon_key_svg_bytes(
+                    icon_key, crate::macro_icons::current_gp_skin(ctx))
+                    .and_then(|b| std::str::from_utf8(b).ok().map(|s| (s, b.as_ptr() as usize)))
+                {
+                    Some(pair) => pair,
+                    None => (svg_data.as_str(), svg_data.as_ptr() as usize),
+                }
+            } else {
+                (svg_data.as_str(), svg_data.as_ptr() as usize)
+            };
+            if svg_src.is_empty() {
                 painter.rect_stroke(r, 2.0,
                     egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
                     egui::StrokeKind::Inside);
@@ -1195,16 +1207,15 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
             }
             let pw = (r.width().round() as u32).max(1);
             let ph = (r.height().round() as u32).max(1);
-            let ctx = painter.ctx();
             let cache_key = egui::Id::new((
-                "deco_svg_tex", svg_data.as_ptr() as usize, *rev, pw, ph, tint_mode.as_str(),
+                "deco_svg_tex", salt, *rev, pw, ph, tint_mode.as_str(),
                 tint[0], tint[1], tint[2], tint[3],
             ));
             let cached = ctx.data(|d| d.get_temp::<egui::TextureHandle>(cache_key));
             let tex = match cached {
                 Some(t) => Some(t),
                 None => {
-                    rasterize_svg_recolored(svg_data, pw, ph, tint_mode, rgba_to_color32(*tint))
+                    rasterize_svg_recolored(svg_src, pw, ph, tint_mode, rgba_to_color32(*tint))
                         .map(|img| {
                             let h = ctx.load_texture(
                                 format!("deco-svg-{}-{}", *rev, pw),
