@@ -430,7 +430,7 @@ When asked to fix a bug or add a feature:
 
 - **Source code:** [GitHub Repository](https://github.com/x-iso/FlexInput)
 - **Issue tracker:** [GitHub Issues](https://github.com/x-iso/FlexInput/issues)
-- **Discord community:** [FlexInput Discord](https://discord.gg/flexinput) (if available)
+- **Discord community:** [FlexInput Discord](https://discord.gg/v4aN2BhQWh)
 - **Vendor libraries:** `vendor/egui-snarl/`, `vendor/egui-wgpu/`, `vendor/egui-winit/`
 
 ---
