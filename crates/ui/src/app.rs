@@ -1984,6 +1984,10 @@ impl eframe::App for FlexInputApp {
         // Modal device-op overlay — painted last so it sits above everything and
         // swallows input while a create/remove/reinstall is in flight.
         self.draw_device_op_overlay(ctx);
+        // Capture the window's settled position/size so the next launch reopens
+        // where it was (fixes the down-right cascade). Marks settings_dirty on a
+        // genuine change, which the block just below flushes to settings.json.
+        self.persist_window_geometry(ctx);
         if self.settings_dirty {
             settings::save_settings(&self.settings);
             self.settings_dirty = false;
@@ -3122,6 +3126,58 @@ pub(crate) struct GpSettingRow {
 }
 
 impl FlexInputApp {
+    /// Persist the main window's position/size/maximized state into settings so
+    /// the next launch restores it (see `main.rs` + `startup_window_geometry`).
+    /// Called each frame; only marks `settings_dirty` on a real change.
+    ///
+    /// While maximized, the stored pos/size are LEFT at the last restored-down
+    /// geometry (so un-maximizing returns there) and only the flag is updated.
+    /// Position/size are captured only when the pointer is up, so an in-progress
+    /// custom-chrome move/resize (which drags with the button held) records just
+    /// the final settled rect rather than every intermediate frame.
+    fn persist_window_geometry(&mut self, ctx: &egui::Context) {
+        let (outer, inner, maximized, minimized) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.outer_rect, vp.inner_rect, vp.maximized, vp.minimized)
+        });
+        if minimized == Some(true) {
+            return;
+        }
+        let is_max = maximized == Some(true);
+        if is_max != self.settings.window_maximized {
+            self.settings.window_maximized = is_max;
+            self.settings_dirty = true;
+        }
+        if is_max {
+            return; // preserve the restored-down geometry while maximized
+        }
+        if ctx.input(|i| i.pointer.any_down()) {
+            return; // wait for the move/resize to settle
+        }
+        let pos_rect = outer.or(inner);
+        let size_rect = inner.or(outer);
+        if let (Some(pr), Some(sr)) = (pos_rect, size_rect) {
+            let pos = [pr.min.x, pr.min.y];
+            let size = [sr.width(), sr.height()];
+            if size[0] < 100.0 || size[1] < 100.0 {
+                return; // ignore degenerate/transient sizes
+            }
+            let pos_changed = self
+                .settings
+                .window_pos
+                .map_or(true, |p| (p[0] - pos[0]).abs() > 1.0 || (p[1] - pos[1]).abs() > 1.0);
+            let size_changed = self
+                .settings
+                .window_size
+                .map_or(true, |s| (s[0] - size[0]).abs() > 1.0 || (s[1] - size[1]).abs() > 1.0);
+            if pos_changed || size_changed {
+                self.settings.window_pos = Some(pos);
+                self.settings.window_size = Some(size);
+                self.settings_dirty = true;
+            }
+        }
+    }
+
     /// Per-frame gamepad UI-navigation driver. Reads the active nav device's
     /// signals, drives FlexInput's own UI (selection / edit / tabs / menus /
     /// cursor / Alt+Tab), and publishes the output-suppression flag.

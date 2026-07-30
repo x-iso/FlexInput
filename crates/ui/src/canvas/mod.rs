@@ -1031,6 +1031,57 @@ impl Canvas {
             self.last_view_center_canvas = Some(egui::pos2(canvas_center.x, canvas_center.y));
         }
 
+        // ── Edge auto-scroll while dragging a wire ──────────────────────────
+        // When the user drags a new wire out of an inlet/outlet pin and the
+        // cursor approaches a viewport edge, pan the canvas toward that edge so
+        // a distant module that doesn't fit on screen (at a usable zoom) can be
+        // reached without zooming out. Gated on an in-progress wire drag
+        // (`SnarlState::has_new_wires`) per the request; the pan speed scales
+        // with how deep the cursor is into the edge band and is framerate-
+        // independent (dt-scaled), and we request a repaint so it keeps
+        // scrolling smoothly while the cursor is held near the edge.
+        {
+            use egui_snarl::ui::SnarlState;
+            let mut st = SnarlState::load(ui.ctx(), snarl_id, &self.snarl, snarl_rect, 0.2, 2.0);
+            if st.has_new_wires() {
+                let cursor = ui.ctx().input(|i| i.pointer.latest_pos());
+                // Edge band = 15% of each axis (the "10-20%" the request asked
+                // for). Only auto-scroll while the cursor is near the canvas
+                // (inside the rect expanded by one band), so dragging far into
+                // another panel doesn't pan.
+                let band = egui::vec2(snarl_rect.width() * 0.15, snarl_rect.height() * 0.15);
+                if let Some(c) = cursor.filter(|c| snarl_rect.expand2(band).contains(*c)) {
+                    let mut dir = egui::Vec2::ZERO;
+                    if c.x < snarl_rect.left() + band.x {
+                        dir.x += ((snarl_rect.left() + band.x - c.x) / band.x).clamp(0.0, 1.0);
+                    } else if c.x > snarl_rect.right() - band.x {
+                        dir.x -= ((c.x - (snarl_rect.right() - band.x)) / band.x).clamp(0.0, 1.0);
+                    }
+                    if c.y < snarl_rect.top() + band.y {
+                        dir.y += ((snarl_rect.top() + band.y - c.y) / band.y).clamp(0.0, 1.0);
+                    } else if c.y > snarl_rect.bottom() - band.y {
+                        dir.y -= ((c.y - (snarl_rect.bottom() - band.y)) / band.y).clamp(0.0, 1.0);
+                    }
+                    if dir != egui::Vec2::ZERO {
+                        // Max ~900 logical px/sec at the very edge. Panning the
+                        // view toward an edge = translating the graph the other
+                        // way (translation maps graph→screen), so a positive
+                        // `dir` at the left edge (content to the left) moves the
+                        // graph right, revealing it.
+                        const MAX_SPEED: f32 = 900.0;
+                        let dt = ui.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 30.0);
+                        let t = st.to_global();
+                        st.set_to_global(egui::emath::TSTransform {
+                            translation: t.translation + dir * MAX_SPEED * dt,
+                            scaling: t.scaling,
+                        });
+                        st.store(&self.snarl, ui.ctx());
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+        }
+
         // ── One-shot view action (e.g. center / zoom-to-fit after patch load) ─
         if let Some(action) = self.pending_view_action.take() {
             use egui_snarl::ui::{NodeState, SnarlState};

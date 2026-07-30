@@ -247,6 +247,16 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Single interactive instance per session: if another FlexInput is already
+    // running, focus it and exit (avoids virtual-device / helper conflicts from a
+    // second copy). A GPU-loss / monitor-loss / renderer-cascade relaunch is let
+    // through — it sets FLEXINPUT_GPU_RECOVERY and must not block on its own dying
+    // parent (see `try_become_primary_instance`). The helper subprocess already
+    // returned above, so it never reaches here.
+    if !flexinput_ui::try_become_primary_instance() {
+        return Ok(());
+    }
+
     install_gpu_panic_hook();
 
     // Route `log` records from wgpu/winit/egui to stderr. warn+ by default —
@@ -365,15 +375,28 @@ fn main() -> eframe::Result<()> {
         SurfaceErrorAction::SkipFrame
     });
 
+    // Restore the persisted window geometry (position + size + maximized) so the
+    // window reopens where it last was instead of cascading down-right each
+    // launch. An off-screen saved position (monitor unplugged) is dropped by
+    // `startup_window_geometry` while keeping the size.
+    let win_geom = flexinput_ui::startup_window_geometry();
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("FlexInput")
+        .with_inner_size(win_geom.size.unwrap_or([1280.0, 800.0]))
+        .with_min_inner_size([800.0, 500.0])
+        .with_decorations(false)
+        .with_resizable(true)
+        .with_transparent(true)
+        .with_icon(icon);
+    if let Some(pos) = win_geom.pos {
+        viewport = viewport.with_position(pos);
+    }
+    if win_geom.maximized {
+        viewport = viewport.with_maximized(true);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("FlexInput")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([800.0, 500.0])
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_transparent(true)
-            .with_icon(icon),
+        viewport,
         wgpu_options,
         // 32-bit depth buffer for egui's render pass (Depth32Float). egui's own
         // pipeline ignores it (depth_compare: Always, no write), so 2D UI is

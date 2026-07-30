@@ -423,6 +423,42 @@ pub struct AppSettings {
     /// `sdl:…`), so wiring doesn't follow the toggle. Off by default.
     #[serde(default)]
     pub sdl_all_pads: bool,
+
+    /// Persisted main-window geometry (logical points, as egui/eframe report and
+    /// consume them), restored on the next launch so the window reopens where it
+    /// was instead of cascading down-right each time. `window_pos` is the outer
+    /// (top-left) position; `window_size` is the inner size. `None` until the
+    /// window has been shown once. While maximized, pos/size keep the last
+    /// *restored-down* geometry (so un-maximizing returns there) and
+    /// `window_maximized` is set.
+    #[serde(default)]
+    pub window_pos: Option<[f32; 2]>,
+    #[serde(default)]
+    pub window_size: Option<[f32; 2]>,
+    #[serde(default)]
+    pub window_maximized: bool,
+}
+
+/// Startup window geometry resolved from persisted settings, for the app
+/// binary's `main` to feed into the `ViewportBuilder`. Position is dropped when
+/// it would land off every current monitor (see [`crate::onscreen_position`]).
+#[derive(Clone, Copy, Debug)]
+pub struct WindowGeometry {
+    pub pos: Option<[f32; 2]>,
+    pub size: Option<[f32; 2]>,
+    pub maximized: bool,
+}
+
+/// Load the persisted window geometry for `main` to apply before creating the
+/// window. Returns `None` when nothing was saved yet (first ever launch).
+pub fn startup_window_geometry() -> WindowGeometry {
+    let s = load_settings();
+    let pos = s.window_pos.and_then(crate::onscreen_position);
+    WindowGeometry {
+        pos,
+        size: s.window_size,
+        maximized: s.window_maximized,
+    }
 }
 
 pub const MOUSE_SUPPRESS_RELEASE_MS_MIN: u32 = 50;
@@ -605,6 +641,9 @@ impl Default for AppSettings {
             mixed_braid_enabled: false,
             mixed_braid_rate_hz: MIXED_BRAID_RATE_HZ_DEFAULT,
             sdl_all_pads: false,
+            window_pos: None,
+            window_size: None,
+            window_maximized: false,
         }
     }
 }
