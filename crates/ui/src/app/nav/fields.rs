@@ -152,6 +152,29 @@ impl FlexInputApp {
         // whole unit in the press direction.
         let whole = matches!(key, "buf_size" | "grid_x" | "grid_y" | "trail_ms");
         let mut next = (cur + delta).clamp(lo, hi);
+
+        // Fixed-step fields SNAP onto their step grid on a discrete dpad press,
+        // so a value lands cleanly (RWS → 5.0, 6.0; fine → 5.1; FOV → whole
+        // degrees) instead of drifting to 4.999 as a span-scaled linear step
+        // would. Continuous stick adjustment stays smooth, and the mouse
+        // DragValue still accepts any typed value for edge cases.
+        if press != 0.0 {
+            if let NavStep::Fixed(_) = step {
+                let s = press_step.max(1e-6);
+                let idx = cur / s;
+                let on_grid = (idx.round() * s - cur).abs() < s * 0.25;
+                let target = if on_grid {
+                    idx.round() + press.signum()
+                } else if press > 0.0 {
+                    idx.ceil()
+                } else {
+                    idx.floor()
+                };
+                // Round to the step's own precision to shed float fuzz.
+                let m = if s >= 1.0 { 1.0 } else { 10f32.powf((-s.log10()).ceil().max(0.0)) };
+                next = (((target * s) * m).round() / m).clamp(lo, hi);
+            }
+        }
         if whole {
             next = next.round();
             if press != 0.0 && (next - cur.round()).abs() < 0.5 {
@@ -411,6 +434,7 @@ impl FlexInputApp {
             | ("processing.rws", "scale") | ("processing.rws", "rws")
             | ("processing.rws", "input") | ("processing.rws", "cal")
             | ("processing.rws", "field") | ("processing.rws", "style")
+            | ("processing.rws", "flick") | ("processing.rws", "suppress")
             | ("math.negate", "unipolar")
             | ("math.quantize", "factor") | ("math.quantize", "mode")
             | ("module.vec_to_deflection", "angle_unit")
@@ -614,28 +638,43 @@ impl FlexInputApp {
             // The pinned ruler ("field") carries the full calibration control set
             // so it can be run AND stopped from the gamepad with only the ruler
             // pinned (mouse output is busy driving the game during calibration).
-            ("processing.rws", "scale") => vec![f!("Scale", v("scale",0.0,100_000.0,100.0,Decade))],
-            ("processing.rws", "rws")   => vec![f!("RWS", v("rws",0.01,50.0,1.0,Linear))],
+            // Fixed steps → clean stepping: coarse lands on integers, fine on the
+            // 0.1 (or 1) grid. `scale` fine (0.1) matters for calibration; the
+            // °/s fields step by 10 coarse / 1 fine (whole degrees per second).
+            ("processing.rws", "scale") => vec![f!("Scale", v("scale",0.0,100_000.0,100.0,Fixed(1.0)))],
+            ("processing.rws", "rws")   => vec![
+                f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0))),
+                f!("Stick °/s", v("stick_out_dps",1.0,100_000.0,360.0,Fixed(10.0))),
+            ],
             ("processing.rws", "input") => vec![
                 f!("Input", Enum{key:"input_mode",opts:&["gyro","stick_rate"]}),
-                f!("Max °/s", v("max_rate_dps",1.0,100_000.0,360.0,Decade)),
+                f!("Max °/s", v("max_rate_dps",1.0,100_000.0,360.0,Fixed(10.0))),
             ],
             ("processing.rws", "cal") => vec![
                 f!("Calibrate", Toggle{key:"calibrating"}),
                 f!("Speed", v("cal_speed",0.05,10.0,0.5,Linear)),
             ],
             ("processing.rws", "field") => vec![
-                f!("Scale", v("scale",0.0,100_000.0,100.0,Decade)),
+                f!("Scale", v("scale",0.0,100_000.0,100.0,Fixed(1.0))),
                 f!("Calibrate", Toggle{key:"calibrating"}),
                 f!("Speed", v("cal_speed",0.05,10.0,0.5,Linear)),
-                f!("RWS", v("rws",0.01,50.0,1.0,Linear)),
+                f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0))),
             ],
+            // FOV strictly whole degrees (Fixed(10) → 10 coarse / 1 fine).
             ("processing.rws", "style") => vec![
                 f!("View", Enum{key:"field_mode",opts:&["ruler","room","both"]}),
-                f!("FOV", v("field_fov",30.0,140.0,90.0,Linear)),
+                f!("FOV", v("field_fov",30.0,140.0,90.0,Fixed(10.0))),
                 f!("BG", v("field_bg_alpha",0.0,1.0,0.0,Linear)),
-                f!("Ticks°", v("field_tick_deg",5.0,90.0,15.0,Linear)),
+                f!("Ticks°", v("field_tick_deg",5.0,90.0,15.0,Fixed(5.0))),
                 f!("Labels", Toggle{key:"field_labels"}),
+            ],
+            ("processing.rws", "flick") => vec![
+                f!("Flick", Toggle{key:"flick_enabled"}),
+                f!("Deadzone", v("flick_deadzone",0.1,0.99,0.85,Linear)),
+                f!("Smooth ms", v("flick_smooth_ms",0.0,500.0,100.0,Fixed(10.0))),
+            ],
+            ("processing.rws", "suppress") => vec![
+                f!("Suppress", Enum{key:"suppress_source",opts:&["off","full","deadzone"]}),
             ],
             // ── multi-field rows ──
             ("logic.counter", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],

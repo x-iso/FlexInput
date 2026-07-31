@@ -407,6 +407,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let input_mode = snarl.get_node(node)
                         .and_then(|n| n.params.get("input_mode").and_then(|v| v.as_str()))
                         .unwrap_or("gyro").to_string();
+                    ui.label(egui::RichText::new("Input mode").small().weak())
+                        .on_hover_text("How the Rotation input is read:\n• Gyro — a true angular rate (±1 = ±2000 °/s), for 1:1 calibration.\n• Stick (rate) — a stick deflection driven as a turn rate up to Max °/s.");
                     let combo = egui::ComboBox::from_id_salt((node, "rws_hdr_input"))
                         .selected_text(if input_mode == "stick_rate" { "Stick" } else { "Gyro" })
                         .width(72.0)

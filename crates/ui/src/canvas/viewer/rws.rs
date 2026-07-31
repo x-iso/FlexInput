@@ -31,14 +31,15 @@ fn rws_field_style(snarl: &Snarl<NodeData>, node_id: NodeId) -> (f32, f32, bool)
 }
 
 pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (scale, rws) = snarl
+    let (scale, rws, stick_max) = snarl
         .get_node(node_id)
         .map(|n| {
             let scale = n.params.get("scale").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32;
             let rws = n.params.get("rws").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-            (scale, rws)
+            let stick_max = n.params.get("stick_out_dps").and_then(|v| v.as_f64()).unwrap_or(360.0) as f32;
+            (scale, rws, stick_max)
         })
-        .unwrap_or((100.0, 1.0));
+        .unwrap_or((100.0, 1.0, 360.0));
     let (bg_alpha, tick_deg, labels) = rws_field_style(snarl, node_id);
 
     let mut set: Vec<(&str, Value)> = Vec::new();
@@ -66,6 +67,15 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
         let mut v = rws;
         if ui.add(egui::DragValue::new(&mut v).speed(0.01).range(0.01..=50.0)).changed() {
             if let Some(n) = Number::from_f64(v as f64) { set.push(("rws", Value::Number(n))); }
+        }
+        // Right-stick output scaling: the game's camera turn rate at full stick.
+        ui.label(egui::RichText::new("Stick").small().weak());
+        let mut sm = stick_max;
+        if ui.add(egui::DragValue::new(&mut sm).speed(5.0).range(1.0..=100_000.0).suffix(" °/s"))
+            .on_hover_text("Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.")
+            .changed()
+        {
+            if let Some(n) = Number::from_f64(sm as f64) { set.push(("stick_out_dps", Value::Number(n))); }
         }
     });
     register_exposable_element(ui, node_id, "rws", r_rws.response.rect);
@@ -122,6 +132,67 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     });
     register_exposable_element(ui, node_id, "style", r_style.response.rect);
 
+    // Flick stick (input 2, optional): push to flick, hold + rotate to track.
+    let (flick_on, flick_dz, flick_sm) = snarl.get_node(node_id).map(|n| {
+        (
+            n.params.get("flick_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            n.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32,
+            n.params.get("flick_smooth_ms").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
+        )
+    }).unwrap_or((false, 0.85, 100.0));
+    let r_flick = ui.horizontal(|ui| {
+        let mut fe = flick_on;
+        if ui.checkbox(&mut fe, egui::RichText::new("Flick").small())
+            .on_hover_text("Flick stick on input 2: push the stick past the deadzone to\nsnap the camera to that direction; hold it out and rotate to track.\nFlicks are 1:1 (RWS does not apply).")
+            .changed()
+        {
+            set.push(("flick_enabled", Value::Bool(fe)));
+        }
+        if flick_on {
+            ui.label(egui::RichText::new("dz").small().weak());
+            let mut dz = flick_dz;
+            if ui.add(egui::DragValue::new(&mut dz).speed(0.01).range(0.1..=0.99))
+                .on_hover_text("Deadzone — stick magnitude needed to engage a flick.")
+                .changed()
+            {
+                if let Some(n) = Number::from_f64(dz as f64) { set.push(("flick_deadzone", Value::Number(n))); }
+            }
+            ui.label(egui::RichText::new("smooth").small().weak());
+            let mut sm = flick_sm;
+            if ui.add(egui::DragValue::new(&mut sm).speed(1.0).range(0.0..=500.0).suffix(" ms"))
+                .on_hover_text("Smoothing window for the initial flick snap (0 = instant).")
+                .changed()
+            {
+                if let Some(n) = Number::from_f64(sm as f64) { set.push(("flick_smooth_ms", Value::Number(n))); }
+            }
+        }
+    });
+    register_exposable_element(ui, node_id, "flick", r_flick.response.rect);
+
+    // Flick-stick source suppression: the stick wired into Flick is auto-detected
+    // and blocked downstream (so it can't leak to its default mapping, e.g. the
+    // virtual Right Stick), while this module keeps reading it internally.
+    let suppress = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("suppress_source").and_then(|v| v.as_str()))
+        .unwrap_or("off").to_string();
+    let r_sup = ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Suppress flick stick").small().weak())
+            .on_hover_text("Block the stick wired into Flick from leaking to its default\nmapping (e.g. the virtual Right Stick). Auto-detected from the wire;\nthis module still reads it (via the pre-block snapshot, like the\nVirtual Menu).\n• Off — no block.\n• Full — always block while Flick is enabled.\n• In deadzone — block only past the deadzone, so small movements\n  inside the deadzone still reach the default mapping.");
+        egui::ComboBox::from_id_salt((node_id, "rws_suppress"))
+            .selected_text(match suppress.as_str() {
+                "full" => "Full", "deadzone" => "In deadzone", _ => "Off",
+            })
+            .width(104.0)
+            .show_ui(ui, |ui| {
+                for (val, lbl) in [("off", "Off"), ("full", "Full"), ("deadzone", "In deadzone")] {
+                    if ui.selectable_label(suppress == val, lbl).clicked() {
+                        set.push(("suppress_source", Value::String(val.to_string())));
+                    }
+                }
+            });
+    });
+    register_exposable_element(ui, node_id, "suppress", r_sup.response.rect);
+
     ui.label(egui::RichText::new("→ wire Mouse to KB/M “Mouse XY (move)”").small().weak())
         .on_hover_text("RWS drives the mouse via the displacement pin, which ignores the\nKB/M card's mouse sensitivity — so the calibration is portable.");
     }); // ui.vertical
@@ -150,8 +221,9 @@ pub(crate) fn render_rws_input(
         .to_string();
     let mut set: Vec<(&str, Value)> = Vec::new();
     ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(150.0, 22.0));
+    apply_widget_scale(ui, container, egui::vec2(170.0, 22.0));
     ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Input mode").small().weak());
         egui::ComboBox::from_id_salt((node_id, "rws_pin_input"))
             .selected_text(if input_mode == "stick_rate" { "Stick" } else { "Gyro" })
             .width(72.0)
@@ -171,6 +243,85 @@ pub(crate) fn render_rws_input(
                 if let Some(n) = Number::from_f64(mr as f64) { set.push(("max_rate_dps", Value::Number(n))); }
             }
         }
+    });
+    if !set.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for (k, v) in set { node.params.insert(k.to_string(), v); }
+        }
+    }
+}
+
+/// Flick-stick row (enable + deadzone + smoothing), as a standalone pinnable
+/// element.
+pub(crate) fn render_rws_flick(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let (flick_on, flick_dz, flick_sm) = snarl.get_node(node_id).map(|n| {
+        (
+            n.params.get("flick_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            n.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32,
+            n.params.get("flick_smooth_ms").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
+        )
+    }).unwrap_or((false, 0.85, 100.0));
+    let mut set: Vec<(&str, Value)> = Vec::new();
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(190.0, 22.0));
+    ui.horizontal(|ui| {
+        let mut fe = flick_on;
+        if ui.checkbox(&mut fe, egui::RichText::new("Flick").small()).changed() {
+            set.push(("flick_enabled", Value::Bool(fe)));
+        }
+        if flick_on {
+            ui.label(egui::RichText::new("dz").small().weak());
+            let mut dz = flick_dz;
+            if ui.add(egui::DragValue::new(&mut dz).speed(0.01).range(0.1..=0.99)).changed() {
+                if let Some(n) = Number::from_f64(dz as f64) { set.push(("flick_deadzone", Value::Number(n))); }
+            }
+            ui.label(egui::RichText::new("ms").small().weak());
+            let mut sm = flick_sm;
+            if ui.add(egui::DragValue::new(&mut sm).speed(1.0).range(0.0..=500.0)).changed() {
+                if let Some(n) = Number::from_f64(sm as f64) { set.push(("flick_smooth_ms", Value::Number(n))); }
+            }
+        }
+    });
+    if !set.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for (k, v) in set { node.params.insert(k.to_string(), v); }
+        }
+    }
+}
+
+/// Source-suppression dropdown (None / Left / Right / Both stick), as a
+/// standalone pinnable element.
+pub(crate) fn render_rws_suppress(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let suppress = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("suppress_source").and_then(|v| v.as_str()))
+        .unwrap_or("off").to_string();
+    let mut set: Vec<(&str, Value)> = Vec::new();
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(160.0, 22.0));
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Suppress").small().weak());
+        egui::ComboBox::from_id_salt((node_id, "rws_pin_suppress"))
+            .selected_text(match suppress.as_str() {
+                "full" => "Full", "deadzone" => "In deadzone", _ => "Off",
+            })
+            .width(96.0)
+            .show_ui(ui, |ui| {
+                for (val, lbl) in [("off", "Off"), ("full", "Full"), ("deadzone", "In deadzone")] {
+                    if ui.selectable_label(suppress == val, lbl).clicked() {
+                        set.push(("suppress_source", Value::String(val.to_string())));
+                    }
+                }
+            });
     });
     if !set.is_empty() {
         if let Some(node) = snarl.get_node_mut(node_id) {
@@ -488,7 +639,7 @@ fn paint_rws_ruler(
     while d <= phase + half {
         let x = cx + (d - phase) * ppd;
         painter.line_segment([egui::pos2(x, cy - major_h), egui::pos2(x, cy + major_h)], major_stroke);
-        if labels && !compact {
+        if labels {
             let deg = (d.rem_euclid(360.0)).round() as i32 % 360;
             painter.text(
                 egui::pos2(x, cy + major_h + 1.0),

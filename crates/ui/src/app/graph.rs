@@ -900,6 +900,51 @@ pub(crate) fn find_automap_dest_sink_rec(
 /// Builds a topologically-sorted [`ProcessingGraph`] from the current Snarl state.
 /// Also returns the UIDs of any counter nodes whose reset was just requested
 /// (caller must clear the `aux_f32_dirty` flag on those nodes after writing the snapshot).
+/// Trace an RWS module's Flick input (pin 1) up to the physical stick feeding it,
+/// returning `(device_id, stick_name)` where `stick_name` is `"left_stick"` or
+/// `"right_stick"`. Walks through intermediate processing; resolves the device
+/// from a direct `device.source` or via `find_automap_device_rec` for an AutoMap
+/// splitter. `None` if the source isn't a recognisable stick.
+fn trace_rws_flick_source(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    parents: Option<&AutomapParent<'_>>,
+) -> Option<(String, String)> {
+    const FLICK_INPUT: usize = 1;
+    let mut cur = snarl.in_pin(InPinId { node: node_id, input: FLICK_INPUT }).remotes.first().copied()?;
+    for _ in 0..32 {
+        let up = snarl.get_node(cur.node)?;
+        // device.source / splitter store their output pin ids; a stick output ends
+        // the walk.
+        let pid = up.params.get("output_pin_ids")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.get(cur.output))
+            .and_then(|v| v.as_str());
+        if let Some(pid) = pid {
+            let base = pid.strip_suffix("_x").or_else(|| pid.strip_suffix("_y")).unwrap_or(pid);
+            if base == "left_stick" || base == "right_stick" {
+                let dev = if up.module_id == "device.source" {
+                    up.params.get("device_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                } else {
+                    // AutoMap splitter (or similar): resolve via its AutoMap input.
+                    up.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap)
+                        .and_then(|i| snarl.in_pin(InPinId { node: cur.node, input: i }).remotes.first().copied())
+                        .and_then(|s| find_automap_device_rec(snarl, s, parents))
+                        .map(|(id, _, fb)| fb.unwrap_or(id))
+                };
+                if let Some(dev) = dev {
+                    return Some((dev, base.to_string()));
+                }
+            }
+        }
+        // Otherwise keep walking up through the first connected input.
+        let next = (0..up.inputs.len())
+            .find_map(|i| snarl.in_pin(InPinId { node: cur.node, input: i }).remotes.first().copied())?;
+        cur = next;
+    }
+    None
+}
+
 pub(crate) fn build_processing_graph(
     snarl: &Snarl<NodeData>,
     defaults: crate::canvas::DeviceParamDefaults,
@@ -1097,6 +1142,15 @@ pub(crate) fn build_processing_graph_rec(
 
         // For modules that read device signals by name, inject the originating device_id.
         let mut params = node.params.clone();
+        // RWS Aim: trace the Flick input (pin 1) to the physical stick feeding it
+        // so the engine can source-block that stick downstream while still reading
+        // it internally (from the pre-block snapshot).
+        if node.module_id == "processing.rws" {
+            if let Some((dev, stick)) = trace_rws_flick_source(snarl, *node_id, parents) {
+                params.insert("_rws_flick_device".to_string(), serde_json::Value::String(dev));
+                params.insert("_rws_flick_stick".to_string(), serde_json::Value::String(stick));
+            }
+        }
         if matches!(node.module_id.as_str(),
             "processing.gyro_3dof" | "module.automap_split"
             | "module.automap_fork" | "module.automap_selector"

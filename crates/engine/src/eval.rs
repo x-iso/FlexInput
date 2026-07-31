@@ -221,6 +221,19 @@ fn eval_subgraph(
             continue;
         }
 
+        // RWS Aim nested in a sub-patch — intercepted so its flick-stick
+        // source-suppression can publish under the namespaced uid.
+        if snap.module_id == "processing.rws" {
+            let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+                .map(|src| src.and_then(|(si, op)| {
+                    computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+                }))
+                .collect();
+            computed[idx] = eval_rws_node(snap, ns_uid, &inputs, collector_sigs, state, dt);
+            last_outputs.insert(ns_uid, computed[idx].clone());
+            continue;
+        }
+
         // module.map_action inside subpatch: mirror top-level behaviour but
         // write last_outputs keyed by the namespaced UID so UI/outer bodies
         // can observe inner output state.
@@ -485,6 +498,19 @@ pub fn eval_graph_tick(
                 .collect();
             computed[idx] = eval_menu_node(
                 snap, snap.node_uid, &inputs, dev_sigs, &mut collector_sigs, state, dt);
+            last_outputs.insert(snap.node_uid, computed[idx].clone());
+            continue;
+        }
+
+        // ── processing.rws: flick-stick source-suppression (block the flick
+        // stick downstream, read it from the pre-block snapshot) + the aim math.
+        if snap.module_id == "processing.rws" {
+            let inputs: Vec<Option<Signal>> = snap.input_sources.iter()
+                .map(|src| src.and_then(|(si, op)| {
+                    computed.get(si).and_then(|v| v.get(op)).copied().flatten()
+                }))
+                .collect();
+            computed[idx] = eval_rws_node(snap, snap.node_uid, &inputs, &mut collector_sigs, state, dt);
             last_outputs.insert(snap.node_uid, computed[idx].clone());
             continue;
         }

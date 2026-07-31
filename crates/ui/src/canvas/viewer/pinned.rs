@@ -335,6 +335,16 @@ pub(crate) fn render_pinned_element_impl(
             render_rws_style(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        // Flick stick (enable / deadzone / smoothing).
+        ("processing.rws", "flick") => {
+            render_rws_flick(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        // Source stick suppression (None / Left / Right / Both).
+        ("processing.rws", "suppress") => {
+            render_rws_suppress(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Calibration viewport: scrolling degree ruler + editable centre Scale
         // box. Whole-container display (sizes itself; no widget-scale cache).
         ("processing.rws", "field") => {

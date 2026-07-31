@@ -32,9 +32,22 @@ window/quality-of-life fixes.
   - **Safety:** Calibrate is disabled on the module itself — it takes over your
     real mouse — so it must be pinned to the Config Overlay and run from there
     with a gamepad. A ⚠ on the node explains why.
-  - Every control (Scale, RWS, input mode, calibrate + speed, view / FOV / style)
-    is a pinnable, gamepad-editable element; the input-mode dropdown and the
-    Calibrate button live in the node header.
+  - **Right-stick output.** A second `Stick` output emits a right-stick deflection
+    (desired turn rate ÷ the game's full-deflection rate, clamped) for stick-aim
+    games — wire it to a virtual Right Stick.
+  - **Flick stick** on a second input: push past the deadzone to snap the camera to
+    the stick's heading (smoothed), hold it out and rotate to track the camera 1:1.
+    Flicks are 1:1 (RWS doesn't apply). Tracking is smoothed so a stick that polls
+    slower than the eval loop doesn't reach the mouse as pulses; brief input
+    dropouts hold the heading instead of dropping/re-firing the flick.
+  - **Flick-stick source suppression** (modelled on the Virtual Menu): the stick
+    feeding Flick is auto-detected and blocked downstream so it can't leak to its
+    default mapping (e.g. the virtual Right Stick), while the module keeps steering
+    from it via the pre-block snapshot. Off / Full / In-deadzone (block only past
+    the deadzone).
+  - Every control is a pinnable, gamepad-editable element; the input-mode dropdown
+    and the Calibrate button live in the node header. Gamepad value stepping lands
+    on clean numbers (RWS integers / 0.1 fine; FOV whole degrees).
 - **Window geometry persistence.** The app restores its previous position, size
   and maximized state on launch (across new versions too), instead of cascading
   down-right each time.

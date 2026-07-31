@@ -3014,9 +3014,32 @@ mod rws_tests {
             }
             _ => panic!("expected Vec2 output"),
         }
-        // Convenience float outputs mirror the Vec2 components.
-        assert_eq!(out[1], Some(Signal::Float(ex)));
-        assert_eq!(out[2], Some(Signal::Float(ey)));
+    }
+
+    // Stick output: the desired turn rate (rws applied) normalized by the game's
+    // full-deflection turn rate, clamped to the unit range.
+    #[test]
+    fn stick_output_normalizes_rate_by_max() {
+        let mut st = NodeState::default();
+        let p = params(&[
+            ("scale", serde_json::json!(100.0)), // irrelevant to the stick output
+            ("rws", serde_json::json!(1.0)),
+            ("stick_out_dps", serde_json::json!(2000.0)),
+        ]);
+        // yaw 0.5 → 1000 deg/s; deflection = 1000 / 2000 = 0.5. pitch −0.1 → −0.1.
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::new(0.5, -0.1)))];
+        let out = compute_rws(&inputs, &mut st, &p, 0.01);
+        match out[1] {
+            Some(Signal::Vec2(v)) => {
+                assert!((v.x - 0.5).abs() < 1e-3, "sx {}", v.x);
+                assert!((v.y - (-0.1)).abs() < 1e-3, "sy {}", v.y);
+            }
+            _ => panic!("expected Stick Vec2 output"),
+        }
+        // Beyond full deflection it clamps to the unit range.
+        let fast = vec![Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
+        let out2 = compute_rws(&fast, &mut st, &p, 0.01);
+        assert!(matches!(out2[1], Some(Signal::Vec2(v)) if (v.x - 1.0).abs() < 1e-6));
     }
 
     // Stick-rate mode: a bounded deflection is treated as a rate up to max_rate_dps.
@@ -3059,6 +3082,278 @@ mod rws_tests {
                 assert!((v.x - (360.0 * 0.01 * 2.0)).abs() < 1e-3, "x {}", v.x);
                 assert!(v.y.abs() < 1e-6, "pitch stays 0 while calibrating: {}", v.y);
             }
+            _ => panic!("expected Vec2 output"),
+        }
+    }
+
+    fn flick_params(smooth_ms: f32, scale: f32, rws: f32) -> HashMap<String, serde_json::Value> {
+        params(&[
+            ("flick_enabled", serde_json::json!(true)),
+            ("flick_deadzone", serde_json::json!(0.85)),
+            ("flick_smooth_ms", serde_json::json!(smooth_ms)),
+            ("scale", serde_json::json!(scale)),
+            ("rws", serde_json::json!(rws)),
+        ])
+    }
+
+    // Pushing the stick RIGHT past the deadzone flicks the camera +90°, mapped
+    // 1:1 through `scale` ONLY — `rws` must NOT scale a flick.
+    #[test]
+    fn flick_engage_snaps_by_stick_angle_ignoring_rws() {
+        let mut st = NodeState::default();
+        let p = flick_params(0.0, 2.0, 5.0); // instant (no smoothing), rws=5
+        let inputs = vec![
+            Some(Signal::Vec2(glam::Vec2::ZERO)),        // rotation input: none
+            Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0))), // flick: full right
+        ];
+        let out = compute_rws(&inputs, &mut st, &p, 0.01);
+        match out[0] {
+            // 90° flick × scale(2), rws ignored → 180 (NOT ×5).
+            Some(Signal::Vec2(v)) => assert!((v.x - 180.0).abs() < 1e-1, "x {}", v.x),
+            _ => panic!("expected Vec2 output"),
+        }
+    }
+
+    // While engaged, rotating the stick tracks the camera 1:1 by the shortest arc
+    // (delivered as a smoothed stream, so sum the pay-out).
+    #[test]
+    fn flick_tracks_rotation_while_engaged() {
+        let mut st = NodeState::default();
+        let p = flick_params(0.0, 1.0, 1.0);
+        // Engage pointing forward (up) → 0° flick.
+        let up = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(0.0, 1.0)))];
+        let o1 = compute_rws(&up, &mut st, &p, 0.01);
+        assert!(matches!(o1[0], Some(Signal::Vec2(v)) if v.x.abs() < 1e-3), "engage forward = 0");
+        // Rotate to point right; the +90° tracks out over the smoothing window.
+        let right = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
+        let mut total = 0.0_f32;
+        for _ in 0..20 {
+            if let Some(Signal::Vec2(v)) = compute_rws(&right, &mut st, &p, 0.01)[0] {
+                total += v.x;
+            }
+        }
+        assert!((total - 90.0).abs() < 1.0, "tracked ~90°, got {total}");
+    }
+
+    // A SUSTAINED release disengages, but a brief release does not.
+    #[test]
+    fn flick_disengages_after_sustained_release() {
+        let mut st = NodeState::default();
+        let p = flick_params(0.0, 1.0, 1.0);
+        let right = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
+        compute_rws(&right, &mut st, &p, 0.01); // engage
+        assert!(st.aux_f32[0] > 0.5, "engaged after crossing deadzone");
+        // One centred frame (< the 60 ms disengage hold) must NOT disengage.
+        let center = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
+        let out = compute_rws(&center, &mut st, &p, 0.01);
+        assert!(st.aux_f32[0] > 0.5, "a brief release keeps the flick engaged");
+        assert!(matches!(out[0], Some(Signal::Vec2(v)) if v.x.abs() < 1e-3), "no spurious rotation while released");
+        // Sustained release (> 60 ms) finally disengages.
+        for _ in 0..8 {
+            compute_rws(&center, &mut st, &p, 0.01);
+        }
+        assert!(st.aux_f32[0] < 0.5, "sustained release disengages");
+    }
+
+    // A brief input dropout (stick momentarily reads ~0, e.g. a Bluetooth gap)
+    // must NOT yank the camera toward 0° or drop the flick — tracking resumes
+    // from the held heading when the stick recovers.
+    #[test]
+    fn flick_survives_brief_dropout() {
+        let mut st = NodeState::default();
+        let p = flick_params(0.0, 1.0, 1.0);
+        // Engage pointing up (0°).
+        compute_rws(
+            &vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(0.0, 1.0)))],
+            &mut st, &p, 0.01,
+        );
+        // One-frame dropout: no rotation, still engaged.
+        let gap = compute_rws(
+            &vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))],
+            &mut st, &p, 0.01,
+        );
+        assert!(st.aux_f32[0] > 0.5, "dropout keeps engagement");
+        assert!(matches!(gap[0], Some(Signal::Vec2(v)) if v.x.abs() < 1e-3), "no yank toward 0° on a dropout");
+        // Recover pointing right → tracks the +90° swing from the held heading
+        // (smoothed pay-out).
+        let right = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
+        let mut total = 0.0_f32;
+        for _ in 0..20 {
+            if let Some(Signal::Vec2(v)) = compute_rws(&right, &mut st, &p, 0.01)[0] {
+                total += v.x;
+            }
+        }
+        assert!((total - 90.0).abs() < 1.0, "resumes tracking after the gap, got {total}");
+    }
+
+    // Rolling the stick a full turn around the rim accumulates a full 360° of
+    // tracked rotation (no drops, no double-counting through the ±180° wrap).
+    #[test]
+    fn flick_continuous_roll_accumulates_full_turn() {
+        let mut st = NodeState::default();
+        let p = flick_params(0.0, 1.0, 1.0); // no smoothing, scale 1
+        // Engage pointing up (0° flick, no initial jump).
+        compute_rws(
+            &vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(0.0, 1.0)))],
+            &mut st, &p, 0.001,
+        );
+        // Roll clockwise through 24 positions (15° each) = 360°, then hold to let
+        // the smoothed tracking finish paying out.
+        let mut total = 0.0_f32;
+        let mut push = |stick: glam::Vec2, st: &mut NodeState, total: &mut f32| {
+            let out = compute_rws(
+                &vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(stick))],
+                st, &p, 0.01,
+            );
+            if let Some(Signal::Vec2(v)) = out[0] {
+                *total += v.x;
+            }
+        };
+        for step in 1..=24 {
+            let ang = (step as f32) * 15.0_f32.to_radians(); // heading from up, CW
+            push(glam::Vec2::new(ang.sin(), ang.cos()), &mut st, &mut total); // atan2(x,y)==ang
+        }
+        for _ in 0..30 {
+            push(glam::Vec2::new(0.0, 1.0), &mut st, &mut total); // hold at 360° (up) to drain
+        }
+        assert!((total - 360.0).abs() < 1.0, "full roll should track ~360°, got {total}");
+    }
+
+    // Hysteresis: once engaged, a magnitude dip below the deadzone but above the
+    // release threshold keeps TRACKING (doesn't disengage → re-flick) so a sweep
+    // around the rim rotates smoothly.
+    #[test]
+    fn flick_stays_engaged_through_magnitude_dip() {
+        let mut st = NodeState::default();
+        let p = flick_params(0.0, 1.0, 1.0); // deadzone 0.85 → release ~0.68
+        // Engage at full right (angle +90°).
+        compute_rws(
+            &vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))],
+            &mut st, &p, 0.01,
+        );
+        assert!(st.aux_f32[0] > 0.5, "engaged after crossing the deadzone");
+        // Sweep to point up, magnitude 0.75 (< 0.85 deadzone, > release floor).
+        let dip = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(0.0, 0.75)))];
+        let mut total = 0.0_f32;
+        for _ in 0..20 {
+            if let Some(Signal::Vec2(v)) = compute_rws(&dip, &mut st, &p, 0.01)[0] {
+                total += v.x;
+            }
+        }
+        assert!(st.aux_f32[0] > 0.5, "must stay engaged through a dip above the release threshold");
+        // It TRACKED the −90° swing (right→up), not re-flicked to the new heading (0).
+        assert!((total - (-90.0)).abs() < 1.0, "tracked swing, got {total}");
+    }
+
+    // A smoothed flick pays out its full angle across the smoothing window.
+    #[test]
+    fn flick_smoothing_pays_out_full_angle() {
+        let mut st = NodeState::default();
+        let p = flick_params(100.0, 1.0, 1.0); // 100 ms window
+        let right = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
+        let mut sum = 0.0_f32;
+        // Hold the stick out; the angle is constant so tracking adds 0 and only
+        // the smoothed flick contributes. 50 × 10 ms far exceeds the window.
+        for _ in 0..50 {
+            if let Some(Signal::Vec2(v)) = compute_rws(&right, &mut st, &p, 0.01)[0] {
+                sum += v.x;
+            }
+        }
+        assert!((sum - 90.0).abs() < 1.0, "smoothed flick summed to {sum}, expected ~90");
+    }
+
+    // ── Flick-stick source suppression (eval_rws_node) ──
+    fn rws_snap(uid: usize, suppress: &str) -> NodeSnap {
+        let mut n = NodeSnap {
+            node_uid: uid,
+            module_id: "processing.rws".to_string(),
+            params: HashMap::new(),
+            n_outputs: 2,
+            input_sources: Vec::new(),
+            device_id: None,
+            output_pin_ids: vec!["mouse".to_string(), "stick".to_string()],
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        };
+        n.params.insert("flick_enabled".into(), Value::Bool(true));
+        n.params.insert("suppress_source".into(), Value::String(suppress.into()));
+        n.params.insert("_rws_flick_device".into(), Value::String("dev".into()));
+        n.params.insert("_rws_flick_stick".into(), Value::String("right_stick".into()));
+        n
+    }
+
+    // Full mode blocks the flick stick (and only that stick) at the source.
+    #[test]
+    fn rws_full_suppress_publishes_block() {
+        let snap = rws_snap(21, "full");
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
+        eval_rws_node(&snap, 21, &inputs, &mut c, &mut state, 0.016);
+        let sk = format!("{SRC_BLOCK_PREFIX}dev");
+        for pin in ["right_stick", "right_stick_x", "right_stick_y"] {
+            assert_eq!(
+                c.get(&(sk.clone(), pin.to_string())).map(|s| s.as_bool()),
+                Some(true), "{pin} must be source-blocked in full mode",
+            );
+        }
+        assert!(c.get(&(sk, "left_stick".to_string())).is_none(), "the other stick is untouched");
+    }
+
+    // Off → nothing published.
+    #[test]
+    fn rws_suppress_off_publishes_nothing() {
+        let snap = rws_snap(22, "off");
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state = HashMap::new();
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
+        eval_rws_node(&snap, 22, &inputs, &mut c, &mut state, 0.016);
+        assert!(c.is_empty(), "off mode must publish no source-block");
+    }
+
+    // Deadzone mode blocks only while the stick is past the flick deadzone.
+    #[test]
+    fn rws_deadzone_suppress_gates_on_magnitude() {
+        let snap = rws_snap(23, "deadzone");
+        let sk = format!("{SRC_BLOCK_PREFIX}dev");
+        // Inside the deadzone (0.85) → not blocked, still reaches the game.
+        let mut c1: HashMap<(String, String), Signal> = HashMap::new();
+        let mut s1 = HashMap::new();
+        let inside = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(0.1, 0.0)))];
+        eval_rws_node(&snap, 23, &inside, &mut c1, &mut s1, 0.016);
+        assert!(c1.get(&(sk.clone(), "right_stick".to_string())).is_none(), "inside deadzone: not blocked");
+        // Past the deadzone → blocked.
+        let mut c2: HashMap<(String, String), Signal> = HashMap::new();
+        let mut s2 = HashMap::new();
+        let past = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::new(1.0, 0.0)))];
+        eval_rws_node(&snap, 23, &past, &mut c2, &mut s2, 0.016);
+        assert_eq!(
+            c2.get(&(sk, "right_stick".to_string())).map(|s| s.as_bool()),
+            Some(true), "past deadzone: blocked",
+        );
+    }
+
+    // The module keeps steering from the flick stick via the pre-block snapshot
+    // even when the resolved input is zeroed (the block is live).
+    #[test]
+    fn rws_reads_flick_from_preblock_snapshot() {
+        let mut snap = rws_snap(24, "full");
+        snap.params.insert("scale".into(), serde_json::json!(1.0));
+        snap.params.insert("flick_smooth_ms".into(), serde_json::json!(0.0));
+        let mut c: HashMap<(String, String), Signal> = HashMap::new();
+        let mut state: HashMap<usize, NodeState> = HashMap::new();
+        // Block is active: the resolved Flick input is zeroed, but the snapshot
+        // holds the real stick (pushed full right).
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        carry.unblocked_src.insert(("dev".into(), "right_stick_x".into()), Signal::Float(1.0));
+        carry.unblocked_src.insert(("dev".into(), "right_stick_y".into()), Signal::Float(0.0));
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
+        let out = eval_rws_node(&snap, 24, &inputs, &mut c, &mut state, 0.016);
+        // Flick engaged from the snapshot (full right ≈ +90° × scale 1) despite the
+        // zeroed resolved input.
+        match out[0] {
+            Some(Signal::Vec2(v)) => assert!(v.x > 45.0, "flick must engage from the snapshot, dx={}", v.x),
             _ => panic!("expected Vec2 output"),
         }
     }

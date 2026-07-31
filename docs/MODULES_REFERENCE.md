@@ -416,6 +416,63 @@ pub struct ModuleDescriptor {
   - `lean_right: Array<Mapping>` - Right lean mappings
   - Each Mapping: `{ out, mode, window_ms, sustain, turbo }`
 
+#### RWS Aim
+- **ID:** `processing.rws` — display name "RWS Aim"
+- **Purpose:** Real-World-Sensitivity camera aiming. Scales a rotation-rate Vec2
+  so a **physical** controller rotation maps 1:1 to the in-game camera once
+  calibrated; `rws` is then a user multiplier on that ground truth. Also does
+  flick-stick.
+- **Inputs:**
+  - Input 0: `Rotation` (Vec2) — the aim rate. In `gyro` mode it's a true angular
+    rate (`±1 == ±GYRO_REF_DPS` = ±2000 °/s); in `stick_rate` mode a stick
+    deflection treated as a rate up to `max_rate_dps` at full tilt.
+  - Input 1: `Flick` (Vec2, optional) — stick position for flick-stick.
+- **Outputs:**
+  - Output 0: `Mouse` (Vec2) — per-tick mouse **displacement**; wire to the KB/M
+    `mouse_move` sink (which is NOT scaled by the card's `mouse_sensitivity`, so
+    the calibration is portable).
+  - Output 1: `Stick` (Vec2) — right-stick **deflection** (unit range) for
+    stick-aim games: desired turn rate ÷ `stick_out_dps`, clamped to ±1. Wire to
+    a virtual Right Stick.
+- **Key parameters:**
+  - `scale: f32` (default 100) — mouse counts per degree (THE calibrated value).
+  - `rws: f32` (default 1) — sensitivity multiplier over the calibrated ground truth.
+  - `input_mode: "gyro" | "stick_rate"`, `max_rate_dps: f32` (stick_rate turn rate).
+  - `stick_out_dps: f32` (default 360) — game camera turn rate at full stick, for
+    the Stick output.
+  - `calibrating: bool`, `cal_speed: f32` (rev/s) — calibration spin (below).
+  - `flick_enabled: bool`, `flick_deadzone: f32` (default 0.85),
+    `flick_smooth_ms: f32` (default 100) — flick-stick.
+  - `suppress_source: "off" | "full" | "deadzone"` — flick-stick source suppression.
+  - `field_mode: "ruler" | "room" | "both"`, `field_fov`, `field_bg_alpha`,
+    `field_tick_deg`, `field_labels` — the calibration viewport style.
+  - `_rws_flick_device` / `_rws_flick_stick` — injected at graph-build time (the
+    physical device + stick feeding the Flick input); DO NOT set by hand.
+- **Evaluation:** intercepted in **both** eval loops (`eval_rws_node`), NOT plain
+  `compute_node`, mirroring the Virtual Menu — so it can publish a source-block
+  and read the pre-block snapshot. Core math is `compute_rws`
+  (`crates/engine/src/eval/modules/rws.rs`). `dx = yaw_dps·dt·scale·rws +
+  flick_deg·scale` (flick is 1:1 through `scale` only — `rws` does NOT apply to a
+  flick). Flick state lives in `NodeState::aux_f32[0..6]`.
+- **Calibration viewport:** a pinnable element (`field`) rendered to the Config
+  Overlay — a scrolling degree **ruler**, a painter-based perspective **cube room**
+  (FOV-matched to the game), or **both**. **Calibrate** (disabled on the module
+  itself for safety — mouse hijack; run it from the overlay) spins the reference
+  at a known `cal_speed` (scale-independent); dial `scale` until the game matches.
+  When stopped it follows the live input rate (RWS applied).
+- **Flick-stick:** pushing Flick past `flick_deadzone` snaps the camera to the
+  stick heading (`atan2(x, y)`, up = 0°, right = +90°), smoothed over
+  `flick_smooth_ms`; holding it out and rotating traces the camera 1:1. Tracking
+  is accumulated and paid out over a short window so poll-rate quantization
+  doesn't reach the mouse as pulses; a brief input dropout holds the heading
+  (only a sustained release disengages).
+- **Source suppression (like the Virtual Menu):** with `suppress_source` ≠ `off`,
+  the stick feeding Flick (auto-detected at build time) is source-blocked
+  downstream so it can't leak to its default mapping (e.g. the virtual Right
+  Stick), while THIS module keeps steering from it via `unblocked_src`. `full` =
+  always block while Flick is on; `deadzone` = block only past the deadzone
+  (small movements inside still reach the default mapping).
+
 #### Vec to Axis / Axis to Vec
 - **IDs:** `module.vec_to_axis`, `module.axis_to_vec`
 - **Category:** Converters

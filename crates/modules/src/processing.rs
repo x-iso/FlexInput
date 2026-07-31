@@ -536,11 +536,15 @@ impl Module for Gyro3DOFModule {
 // The "Mouse" output is meant to be wired to the KB/M `mouse_move` sink pin: that
 // pin is applied once per tick (displacement, not integrated) and is NOT scaled
 // by the device card's mouse_sensitivity — so a preset carrying this module feels
-// identical regardless of the user's KB/M sensitivity setting. Real evaluation is
-// `compute_rws` in the engine (eval/modules/rws.rs); process() stays empty.
+// identical regardless of the user's KB/M sensitivity setting. The "Stick" output
+// is a right-stick DEFLECTION (unit range) for stick-aim games: the desired turn
+// rate normalized by the game's full-deflection turn rate (`stick_out_dps`); wire
+// it to a virtual Right Stick. Real evaluation is `compute_rws` in the engine
+// (eval/modules/rws.rs); process() stays empty.
 //
 // Params (node.params): scale, rws, input_mode ("gyro"|"stick_rate"),
-// max_rate_dps, cal_speed, calibrating, flick_enabled, flick_deadzone.
+// max_rate_dps, cal_speed, calibrating, flick_enabled, flick_deadzone,
+// flick_smooth_ms, stick_out_dps.
 #[derive(Default)]
 pub struct RwsModule;
 
@@ -556,8 +560,7 @@ impl Module for RwsModule {
             ],
             outputs: vec![
                 PinDescriptor::new("Mouse", SignalType::Vec2),
-                PinDescriptor::new("X", SignalType::Float),
-                PinDescriptor::new("Y", SignalType::Float),
+                PinDescriptor::new("Stick", SignalType::Vec2),
             ],
         }
     }
