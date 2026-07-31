@@ -2987,3 +2987,79 @@ mod lean_axis_tests {
         assert!(lean_for([0.0, -0.707, 0.707]) < 0.0, "left grip down is a left lean");
     }
 }
+
+#[cfg(test)]
+mod rws_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn params(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    // Gyro mode: input Vec2 is angular rate in ±1 == ±GYRO_REF_DPS deg/s. The
+    // per-tick mouse displacement = deg/s * dt * scale(counts/deg) * rws.
+    #[test]
+    fn gyro_rate_scales_to_mouse_displacement() {
+        let mut st = NodeState::default();
+        let p = params(&[("scale", serde_json::json!(2.0)), ("rws", serde_json::json!(3.0))]);
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::new(0.5, -0.25)))];
+        let out = compute_rws(&inputs, &mut st, &p, 0.01);
+        let ex = 0.5 * GYRO_REF_DPS * 0.01 * 2.0 * 3.0;
+        let ey = -0.25 * GYRO_REF_DPS * 0.01 * 2.0 * 3.0;
+        match out[0] {
+            Some(Signal::Vec2(v)) => {
+                assert!((v.x - ex).abs() < 1e-3, "x {} vs {}", v.x, ex);
+                assert!((v.y - ey).abs() < 1e-3, "y {} vs {}", v.y, ey);
+            }
+            _ => panic!("expected Vec2 output"),
+        }
+        // Convenience float outputs mirror the Vec2 components.
+        assert_eq!(out[1], Some(Signal::Float(ex)));
+        assert_eq!(out[2], Some(Signal::Float(ey)));
+    }
+
+    // Stick-rate mode: a bounded deflection is treated as a rate up to max_rate_dps.
+    #[test]
+    fn stick_rate_mode_uses_max_rate() {
+        let mut st = NodeState::default();
+        let p = params(&[
+            ("input_mode", serde_json::json!("stick_rate")),
+            ("max_rate_dps", serde_json::json!(360.0)),
+            ("scale", serde_json::json!(1.0)),
+            ("rws", serde_json::json!(1.0)),
+        ]);
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::new(1.0, 0.5)))];
+        let out = compute_rws(&inputs, &mut st, &p, 0.01);
+        match out[0] {
+            Some(Signal::Vec2(v)) => {
+                assert!((v.x - 3.6).abs() < 1e-4, "x {}", v.x);
+                assert!((v.y - 1.8).abs() < 1e-4, "y {}", v.y);
+            }
+            _ => panic!("expected Vec2 output"),
+        }
+    }
+
+    // Calibration: ignore inputs and spin yaw at cal_speed revolutions/sec so the
+    // game turns at a known rate. cal_speed 1.0 => 360 deg/s.
+    #[test]
+    fn calibration_outputs_constant_regardless_of_input() {
+        let mut st = NodeState::default();
+        let p = params(&[
+            ("calibrating", serde_json::json!(true)),
+            ("cal_speed", serde_json::json!(1.0)),
+            ("scale", serde_json::json!(2.0)),
+            ("rws", serde_json::json!(1.0)),
+        ]);
+        // Non-zero input must be ignored while calibrating.
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::new(0.9, 0.9)))];
+        let out = compute_rws(&inputs, &mut st, &p, 0.01);
+        match out[0] {
+            Some(Signal::Vec2(v)) => {
+                assert!((v.x - (360.0 * 0.01 * 2.0)).abs() < 1e-3, "x {}", v.x);
+                assert!(v.y.abs() < 1e-6, "pitch stays 0 while calibrating: {}", v.y);
+            }
+            _ => panic!("expected Vec2 output"),
+        }
+    }
+}

@@ -308,6 +308,39 @@ pub(crate) fn render_pinned_element_impl(
             render_constant_value(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        // RWS Aim: the calibrated scale + the RWS multiplier as editable boxes
+        // (pinnable to the config overlay for live calibration).
+        ("processing.rws", "scale") => {
+            render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
+                "Scale", "scale", 100.0, 0.05, 0.0..=100_000.0, Some(3));
+            return;
+        }
+        ("processing.rws", "rws") => {
+            render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
+                "RWS", "rws", 1.0, 0.01, 0.01..=50.0, Some(3));
+            return;
+        }
+        // Input-mode combo (+ max °/s when stick-rate).
+        ("processing.rws", "input") => {
+            render_rws_input(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        // Calibration Start/Stop + spin speed.
+        ("processing.rws", "cal") => {
+            render_rws_cal(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        // Ruler style (BG opacity / tick spacing / labels).
+        ("processing.rws", "style") => {
+            render_rws_style(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
+        // Calibration viewport: scrolling degree ruler + editable centre Scale
+        // box. Whole-container display (sizes itself; no widget-scale cache).
+        ("processing.rws", "field") => {
+            let _ = render_rws_field(inner_id, ui, inner_snarl, container_size, true);
+            return;
+        }
         // Dropdown: just the ComboBox, sized to the pinned container.
         ("module.dropdown", "selection") => {
             render_dropdown_selection(inner_id, ui, inner_snarl, container_size);

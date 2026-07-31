@@ -5,6 +5,342 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-07-31
+
+Adds the **RWS Aim** module — gyro/stick camera aiming with a physically-grounded,
+portable sensitivity you calibrate against an on-screen reference — plus a set of
+window/quality-of-life fixes.
+
+### Added
+
+- **RWS Aim module** (`processing.rws`, Processing). Takes a rotation-rate Vec2
+  (gyro axes, or a stick treated as a turn rate) and outputs per-tick mouse
+  displacement — wire it to the KB/M **Mouse XY (move)** sink — scaled so a
+  physical controller rotation maps **1:1** to the in-game camera once calibrated.
+  **RWS** is then a plain multiplier on that ground truth. It drives the mouse via
+  the displacement pin, which bypasses the device card's mouse-sensitivity, so the
+  calibration is portable across presets.
+  - **Calibration viewport**, pinnable to the Config Overlay in three views: a
+    scrolling **degree ruler**, a perspective **3D cube room** (FOV-matched to
+    your game so the on-screen turn rate reads 1:1 when calibrated), or **both**.
+    Hit **Calibrate** and the reference spins at a known rate (`cal_speed` rev/s,
+    independent of Scale) while the game turns via the output — dial **Scale**
+    until the two match. Stop, and the reference follows live input with RWS
+    applied, so you can confirm the lock still holds at any speed. The room is
+    depth-shaded (bright head-on, dark at grazing corners); background opacity,
+    FOV, tick spacing and labels are all adjustable.
+  - **Safety:** Calibrate is disabled on the module itself — it takes over your
+    real mouse — so it must be pinned to the Config Overlay and run from there
+    with a gamepad. A ⚠ on the node explains why.
+  - Every control (Scale, RWS, input mode, calibrate + speed, view / FOV / style)
+    is a pinnable, gamepad-editable element; the input-mode dropdown and the
+    Calibrate button live in the node header.
+- **Window geometry persistence.** The app restores its previous position, size
+  and maximized state on launch (across new versions too), instead of cascading
+  down-right each time.
+- **Single-instance guard.** Launching a second copy focuses the running window
+  rather than starting a conflicting instance (skipped during GPU-recovery
+  relaunch so recovery isn't blocked).
+- **Wire-drag edge-scroll.** Dragging a wire from an inlet/outlet toward the
+  canvas edge auto-pans the view, so you can connect modules that don't fit on
+  screen at a usable zoom.
+
+### Fixed
+
+- **Config Overlay stacked-item drag** — with objects stacked, dragging now moves
+  the click-cycled *selected* item instead of always grabbing the top surface one.
+
+## [0.13.0] - 2026-07-30
+
+The headline is the **Config Overlay**: summon FlexInput's own controls over a
+running game with a gamepad chord, adjust a response curve, a deadzone, or a
+whole mapping card with the pad, and feel the change immediately — every other
+input stays suppressed so tweaking never leaks into the game. Alongside it: a
+full SDL controller backend that can take over every pad, one canonical IMU
+frame so gyro behaves identically on every controller, Touch Zones "Touchpad
+mode", and four new/reworked Math modules.
+
+### Added
+
+- **Config Overlay** — a transparent, always-on-top, click-through overlay that
+  hosts editable module controls over whatever is on screen. Summon it with a
+  global keyboard shortcut (default `Ctrl+Shift+C`, re-bindable) or a
+  user-assigned gamepad chord that fires even while a game holds focus; dismiss
+  with Esc, the Done button, or the same shortcut. Visibility persists across
+  restart, like the info overlay.
+  - **Pin any widget.** Arm "add element", click a control in the FlexInput
+    window (pinnable elements light up amber), and it appears on the overlay.
+    Sliders, response curves, toggles, dropdowns and numeric rows are
+    interactive there; Touch Zones pads and mapping lists, Remapper / Map
+    Action cards and the Virtual Menu field are fully editable; pure displays
+    (3D view, scopes, readouts, SVG) pin as static reference. Layout edit mode
+    reuses the info overlay's toolbar, snap grid and inspector.
+  - **Selective input suppression.** While the overlay is up, physical input is
+    blocked at the source so navigating it can't drive the game — except for
+    exactly the pins the focused control depends on, which pass through so you
+    feel what you are adjusting. The resolver traces the tweaked pin upstream
+    to its physical device and narrows to that pin's axis group; a gyro curve
+    passes the IMU pins only (the right stick, summed into the same mouse
+    delta, stays blocked); a source-like knob with no upstream is traced
+    *downstream* through the live selection state to the sinks it modulates and
+    back to the physical inputs feeding them, so a gyro↔stick mix bias passes
+    only the gyro and the currently routed stick.
+  - **Pass-through toggle** (top bar, persisted, OFF by default): input reaches
+    the game only while a pin is actually being tweaked, not while merely
+    navigating. Turn it on for the always-on behaviour.
+  - **Full gamepad navigation**, reusing the Easy-mode nav machinery rather than
+    a parallel one — d-pad/left-stick spatial movement, a right-stick cursor
+    clamped to the whole monitor, South to enter, value editing on knobs,
+    switches and dropdowns, control-point editing on response curves (including
+    hold-North bend handles), and RemapScroll into a mapping card. When the
+    focused parameter is driven by the *left* stick, the editor swaps to the
+    **right** stick so the left one stays free as the passthrough. The
+    keyboard/mouse "Special" picker opens in its own always-on-top viewport so
+    it is reachable over the game.
+  - Icon-based gamepad legend and the Easy-mode selection bloom, so the overlay
+    looks and reads like the rest of the app.
+  - Config pins exposed from inside a sub-patch **save within that sub-patch**,
+    so Easy-mode presets and shared `.fxsp` files can ship built-in overlays.
+    The same applies to info-overlay pins.
+- **Gamepad shortcut chords, reworked.** Every shortcut (see-through, panic,
+  info overlay, config overlay, pin) carries a **press mode** — On press / Long
+  press / Double tap — plus a time gap (hold duration, or max inter-tap gap),
+  mirroring the remapper card controls. A background watcher is now the single
+  engine for all five, so they fire while a game holds focus.
+  - **"Only in gamepad navigation" now means by device, not by focus**:
+    unchecked, shortcuts fire from any pad; checked, only from a pad currently
+    selected for UI navigation. Either way they still work globally.
+  - **Single-button shortcuts** are allowed for Guide, Capture and Mic-mute (the
+    system buttons games don't use), unless that button is already read by a
+    mapping — then a combo is still required. Single-button bindings can't use
+    "on press" (it would fire mid-combo) and are nudged to "long press".
+  - Assigned chords render as **controller button icons** in Settings, skinned
+    to the connected pad, instead of plain text.
+  - New **Overlays** settings group, plus a global shortcut (default
+    `Ctrl+Shift+E`) that toggles the info overlay's layout-edit mode.
+- **SDL controller backend** — a Settings switch, **"Route all pads through
+  SDL"** (default off), reads every controller through SDL instead of the native
+  gilrs/raw-HID paths, and re-arbitrates live without a restart. SDL pads are now
+  first-class:
+  - Real identity: the detected controller kind drives the device id
+    (`sdl:dualsense:<serial>`), so the node icon, 3D model/skin, pin layout and
+    calibration surface all match — a DualSense through SDL exposes its touchpad
+    and gyro pins.
+  - **Stable ids across reconnect** from the pad's serial number, so a canvas
+    node re-attaches to the same physical pad instead of being orphaned.
+  - **Lightbar** via `SDL_SetGamepadLED` on the same `lightbar_r/g/b` pins the
+    native path uses, pushed only on an actual colour change.
+  - **Rumble**, including pads whose layout declares only HD-rumble pins (a
+    Switch Pro's per-side amplitudes collapse onto SDL's two motors).
+  - Button/pin-name parity with the native layouts, HidHide cloaking, mapped
+    feedback routing, digital-trigger handling and per-family button glyphs.
+  - Not reachable through SDL, by design: DualSense adaptive-trigger resistance
+    and true HD/voice-coil haptics, which need the raw-HID effect payloads the
+    native path uses.
+- **Touch Zones: Touchpad mode.** A per-node "Touchpad mode" dropdown next to
+  mouse speed selects how the relative/absolute centre is applied — **Synced**
+  (every card in a zone follows the top analog card, the old behaviour),
+  **Per-card** (each analog card uses its own "Rel. center %"), or **Touchpad**
+  (the pointer follows the finger's motion like a laptop touchpad). In Touchpad
+  mode a stick target becomes a **finger-velocity trackball**: it tilts in the
+  direction and speed you move and recentres when the finger stops.
+  - **Threshold + response curve on swipe-direction cards.** With a threshold
+    set, a swipe card becomes a *held* press gated by the curve-shaped
+    deflection in that direction, rather than a one-shot flick; without one, the
+    original flick detection is unchanged.
+  - Touch Zones mapping cards are now gamepad-navigated **exactly like the
+    Remapper's** — response curve (field 4), dot editor (5), threshold (6) and
+    the per-card "Rel. center" slider (7), with mode and mouse speed changed by
+    up/down instead of LT/RT.
+  - The relative-mouse speed multiplier is **per zone**, matching the Touchpad
+    mode dropdown beside it (it was node-global while the dropdown was not), and
+    touchpad-mode mouse gain is usable out of the box — it was ~50× too weak, so
+    a full-pad finger sweep moved the cursor about 11 px and read as "the
+    multiplier does nothing".
+- **New and reworked Math / Converter modules:**
+  - **Min/Max** (`math.min_max`) — variadic node reporting the largest and
+    smallest of its inputs on separate outlets. Only *wired* inputs count, so a
+    spare pin doesn't peg the minimum at 0.
+  - **Quantize** (`math.quantize`) — snaps to a grid of `factor` steps per unit
+    (1 = integers, 2 = halves, 4 = quarters) with round / floor / ceil / trunc
+    modes. An optional Factor pin overrides the body value while wired.
+  - **Vec to Deflection** (`module.vec_to_deflection`, Converters) — splits a
+    Vec2 into distance-from-centre and heading. Angle 0 is up and grows
+    clockwise; the unit toggles between 0..1 and 0..360. A zero vector reads 0
+    on both outputs rather than NaN.
+  - All three are pinnable and gamepad-editable.
+- **Mapping-output conflict warning** — when two mapping cards drive the same
+  bus/sink pin the engine's merge keeps only one and the loser silently does
+  nothing. Colliding cards now paint an amber outline and a ⚠ badge whose
+  tooltip names the pin and the other module. Covers Remapper, Touch Zones,
+  Virtual Menu and Lean; Macro ports and Virtual Menu targets are excluded
+  because they merge by design.
+- **Icon picker: "Gamepad inputs" category** — gamepad-control glyphs (faces,
+  d-pad, bumpers/triggers, sticks and clicks, menu/system, touchpad click /
+  touch / swipes / segments, paddles) that render in the *connected* pad's style
+  and restyle live when you swap controllers. Available in every picker that
+  already hosts the shared icon browser.
+- **Window and canvas quality of life:**
+  - Main window position, size and maximized state persist across launches (no
+    more down-right cascade). A saved position on a monitor that is no longer
+    present is dropped while keeping the size.
+  - **Single interactive instance** per session: a second launch focuses the
+    existing window and exits, so two copies can't fight over virtual devices
+    and the elevated helper. GPU/monitor-loss recovery relaunches are exempt.
+  - **Edge-scroll while dragging a wire** — the canvas pans when the cursor
+    nears a viewport edge, so distant modules can be connected at a usable zoom.
+
+### Changed
+
+- **Negate is now "Inverse"** and gained a **unipolar** mode: instead of
+  flipping the sign it mirrors inside `0..max`, so a 0→max ramp comes out
+  max→0 and input past either end clips rather than going negative. The module
+  id stays `math.negate`, so existing patches keep loading; a load migration
+  retitles nodes still carrying the stock "Negate" name and leaves hand-renamed
+  ones alone.
+- **Touch Zones and Virtual Menu Ports mode now share one BSP zone tree.** Ports
+  mode was the last hold-out computing zones from the raw grid, so dividing a
+  Ports-mode zone made a full-width cut instead of a per-zone split and a
+  Ports-mode radial menu edited incorrectly. An un-edited patch emits
+  byte-identical port pin ids in the same order, and structural edits now
+  preserve the downstream wiring of every surviving zone.
+- **Touch Zones / Virtual Menu field navigation** was redesigned around a focus
+  model (border / zone / seam) with a translucent highlight on the focused zone
+  and a spatial, alternating zone↔border walk shared by the grid and radial
+  renderers. The radial border editor (drag dividers, rotate the origin seam,
+  double-click to recentre, +/− to add/remove) is now shared, so a pinned or
+  overlaid radial field edits exactly like the node body.
+- **Lean** is side tilt, not forward tilt, with the polarity corrected against
+  real hardware, and it is now **gated on how the pad is actually being held**:
+  each mode's gate reads the *smoothed* gravity estimate, so tilting far enough
+  to rotate the pad out of the tested orientation can no longer collapse the
+  gesture at its own extremes.
+- The Guide-button summon for the config overlay was replaced by a
+  user-assignable gamepad chord (the legacy settings fields are kept inert for
+  back-compat).
+- **Every pinnable value is now gamepad-editable**, wherever it is pinned: the
+  Envelope's ADSR dots (with a sustain-line sub-mode) and all five of its
+  setting rows, the Trigger Scope controls, the Virtual Menu "options" block and
+  the Audio Stream Haptics EQ. Visual-only pins (scopes, vectorscope, 3D viewer,
+  labels, SVG) stay pinnable for feedback but are no longer navigation targets,
+  so a scope stacked over a real control can't intercept selection.
+- Menu zone pickers exclude the menu's own pins (a zone could map to itself) and
+  grey out analog outputs that make no sense for discrete zone selection —
+  gamepad nav now honours the disable instead of mapping them anyway.
+
+### Fixed
+
+- **IMU frame, unified across every pad.** DualSense and Switch Pro delivered
+  different accel frames, so the same physical tilt produced different values
+  depending on the controller. The Sony parser had been swapping accel X/Y
+  against its own gyro since April; the device layer now normalizes every pad to
+  one canonical frame (x = forward, y = side, z = vertical).
+  - The Gyro 3DOF module runs entirely in that frame, so Player/World modes no
+    longer slant — a flat-on-table yaw stopped drifting the cursor up-and-over.
+  - SDL sensor data is rotated into the canonical frame too (verified against the
+    native parser rather than SDL's docs: accel and gyro need different sign
+    permutations), and SDL touchpad Y is no longer flipped.
+- **Switch Pro over Bluetooth.**
+  - Gyro/accel no longer stream frozen values: the sensor-enable subcommand is
+    re-asserted a few times over the first ~16 s after a wireless pad opens,
+    giving the report-mode switch another chance once the link has settled.
+  - The "frozen until reconnect" freeze is fixed: a raw-HID handle whose reads
+    start returning 0 bytes after HidHide cloaks the device is now dropped and
+    re-opened automatically once the stall passes 5 s (comfortably past the
+    pad's transient ~3 s gaps), automating what a manual reconnect did.
+- **HidHide cloaking for wireless pads.** The Bluetooth hardware-id needle used
+  a 2-digit vendor source (`VID&02…`) while Windows reports a 4-digit one
+  (`VID&0002…`) for paired controllers, so instance lookup returned nothing and
+  wireless pads were never cloaked. Both forms match now.
+- **Device enumeration.** A DInput pad surfaced by both SDL and gilrs is deduped
+  at the merge (SDL wins, and a pad SDL can't open still comes through gilrs);
+  SDL no longer opens FlexInput's own HIDMaestro XInput companion, which had
+  been looping emulated output back in as a physical input.
+- **HIDMaestro partial-install state** no longer strands the XUSB companion INF
+  bound with its DLL gone (WUDFHost faulted on every load, and uninstall
+  reported success while reinstall could never verify).
+- **AutoMap bus reaches sink pins added after a node was saved** — a keymouse
+  node saved before the `mouse_move` pins existed had them missing from its
+  frozen pin list, so Touch Zones touchpad mouse silently did nothing. Current
+  sink pins are now appended when building the target, with no patch migration.
+- **3D controller viewer.**
+  - Every viewer gets its own GPU state. Two visible viewers of the same model
+    were sharing one slot, so with a sub-patch editor open beside an overlay pin
+    the two cameras measured occlusion into the same query set and the overlay
+    x-rayed everything.
+  - X-ray line of sight is measured without occlusion queries (they return zero
+    on some drivers), engages as fast as it clears, and no longer flickers when a
+    part turns away from the camera.
+  - Per-pin colour and model overrides live on the pin instead of a shared
+    channel, so overlay swatch edits stick, alpha is preserved, and a pinned
+    instance can't swallow a module-side `.fxcol` load.
+  - A viewer inside a sub-patch now resolves its device instead of rendering an
+    inert model with only gyro animating; button press travel scales by height
+    rather than horizontal footprint.
+- **Timer resolution and loop pacing.** `timeBeginPeriod(1)` raised the *global*
+  system timer resolution, which Windows 11 honours only for the foreground
+  process — backgrounded, the engine tick and device-I/O loop collapsed to
+  ~64 Hz, so a gyro- or stick-driven mouse drew straight-line segments while
+  another app was focused — and its system-wide 1 ms tick added DPC latency that
+  stuttered other high-rate input such as an I2C-HID laptop trackpad. Both loops
+  now wait on a per-thread high-resolution waitable timer (~0.5 ms precision, no
+  global raise), with a process-level opt-out of timer throttling as backup.
+- A swipe card's response-curve preview now traces the 1-D value along its own
+  direction instead of the 2-D deflection magnitude, so the preview dot and the
+  threshold line agree with what actually fires.
+- Unwired input pins no longer glow with borrowed signals — the Gyro 3DOF module
+  lit its Gyro and Accel pins in mismatched colours because two modules reuse the
+  per-node signal slot for their own UI readouts.
+- A pinned Remapper or Map Action in the config overlay no longer auto-captures
+  input every frame; the mapping-card selection glow, curve dot highlight and
+  bend handles now appear there (all of them were a per-viewport pass-counter
+  mismatch, now handled once by a viewport-agnostic highlight subsystem).
+- Rejecting a non-adjustable config pick no longer deadlocks and panics the app.
+- In the overlay layout editors, clicking through a stack of overlapping items
+  selects the one you cycled to — and dragging now moves *that* item instead of
+  handing the drag to whatever sits on top.
+- The overlay drops always-on-top around **every** blocking file dialog, not just
+  one.
+
+### Internal
+
+- **Modular split.** `viewer.rs` went from 25,115 lines to a 1,255-line facade
+  over 22 focused modules plus a crate-level `widgets` library; `app.rs` from
+  14,981 to 5,866, with the I/O threads, graph building, window chrome, device
+  pool, sub-patch editors, settings window and the whole gamepad-nav cluster
+  moved out; `eval.rs` split into `eval/` with the module evaluators and tests
+  lifted into their own files. Every move was verified verbatim, and all
+  pre-split paths still resolve through glob re-exports.
+- **Module registry seam** — engine eval dispatch, UI classification and the
+  modules crate now meet through a registry, with Audio Stream Haptics gated
+  behind a default-on `asth` cargo feature as the pilot for optional modules.
+- **Documentation** — ten reference documents under `docs/` (architecture
+  blueprint, engine internals, AutoMap system, UI architecture, devices, modules
+  and network references, patch formats, development guidelines, and a docs
+  README), followed by a full accuracy pass verifying every claim against source.
+
+## [0.12.0-hotfix] - 2026-07-19
+
+### Fixed
+
+- **Virtual Menu driver suppression now happens at the source.** An open menu
+  publishes a block request applied on the next tick, so its analog drivers
+  reach only the menu's own navigation — not a mouse mapping, another module in
+  the patch, or any sink — while the menu keeps steering off a pre-block
+  snapshot. Four suppression modes: **Passthrough**, **Active** (block only
+  drivers actually in use; gyro latches off its cursor leaving the deadzone,
+  not raw rate), **Latch** (the first engaged driver owns the menu exclusively
+  until it disengages), and **Full** (all enabled drivers while open).
+- Selected zone cards fire a clean pulse and release — an off-bus output pin no
+  longer latches pressed on the virtual pad.
+- Press-mode Select works from a downstream Remapper (via a 1-tick macro
+  carry-over, since a menu upstream of its own Select mapping is a feedback
+  cycle).
+- Editing a menu no longer resets its overlay size and placement: the rect
+  write-back also lands in open sub-patch editors instead of being clobbered by
+  their snapshot.
+- Output AutoMap glow excludes suppressed driver pins.
+
 ## [0.12.0] - 2026-07-18
 
 ### Added

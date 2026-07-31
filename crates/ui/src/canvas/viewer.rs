@@ -39,6 +39,7 @@ mod remapper_filter;
 mod remapper_reorder;
 mod remapper_support;
 mod reshape;
+mod rws;
 mod scale;
 mod simple_bodies;
 mod subpatch_body;
@@ -66,6 +67,7 @@ pub(crate) use remapper_filter::*;
 pub(crate) use remapper_reorder::*;
 pub(crate) use remapper_support::*;
 pub(crate) use reshape::*;
+pub(crate) use rws::*;
 pub(crate) use scale::*;
 pub(crate) use simple_bodies::*;
 pub(crate) use subpatch_body::*;
@@ -255,6 +257,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 || n.module_id == "module.twoway_response_curve"
         }).unwrap_or(false);
         let curve_is_float    = snarl.get_node(node).map(|n| n.module_id == "module.response_curve").unwrap_or(false);
+        let is_rws            = snarl.get_node(node).map(|n| n.module_id == "processing.rws").unwrap_or(false);
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
@@ -394,6 +397,65 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     if ui.small_button("Reset").on_hover_text("Reset to default (undoable)").clicked() {
                         curve_header_reset(node, curve_is_float, snarl);
                         self.push_undo_request = true;
+                    }
+                }
+
+                // RWS Aim: input-mode dropdown + Calibrate Start/Stop live in the
+                // header so the body stays clean for the knobs + ruler. Both are
+                // still registered as pinnable elements ("input"/"cal").
+                if is_rws {
+                    let input_mode = snarl.get_node(node)
+                        .and_then(|n| n.params.get("input_mode").and_then(|v| v.as_str()))
+                        .unwrap_or("gyro").to_string();
+                    let combo = egui::ComboBox::from_id_salt((node, "rws_hdr_input"))
+                        .selected_text(if input_mode == "stick_rate" { "Stick" } else { "Gyro" })
+                        .width(72.0)
+                        .show_ui(ui, |ui| {
+                            for (val, lbl) in [("gyro", "Gyro"), ("stick_rate", "Stick (rate)")] {
+                                if ui.selectable_label(input_mode == val, lbl).clicked() {
+                                    if let Some(n) = snarl.get_node_mut(node) {
+                                        n.params.insert("input_mode".into(), Value::String(val.to_string()));
+                                    }
+                                }
+                            }
+                        });
+                    crate::canvas::viewer::register_exposable_element(ui, node, "input", combo.response.rect);
+                    // Turn rate at full stick deflection — only meaningful in stick mode.
+                    if input_mode == "stick_rate" {
+                        let mut mr = snarl.get_node(node)
+                            .and_then(|n| n.params.get("max_rate_dps").and_then(|v| v.as_f64()))
+                            .unwrap_or(360.0) as f32;
+                        if ui.add(egui::DragValue::new(&mut mr).speed(5.0).range(1.0..=100_000.0).suffix(" °/s"))
+                            .on_hover_text("Turn rate at full stick deflection.")
+                            .changed()
+                        {
+                            if let (Some(n), Some(num)) = (snarl.get_node_mut(node), Number::from_f64(mr as f64)) {
+                                n.params.insert("max_rate_dps".into(), Value::Number(num));
+                            }
+                        }
+                    }
+                    // Calibrate is DISABLED on the module for safety: it drives
+                    // your real mouse, so it must be pinned to the Config Overlay
+                    // and run from there (where a gamepad, not the busy mouse,
+                    // controls it). A ⚠ explains why.
+                    ui.label(egui::RichText::new("⚠").color(Color32::from_rgb(230, 180, 60)))
+                        .on_hover_text("Calibration takes over your real mouse.\nPin this button (or the ruler) to the Config Overlay and run it from there with a gamepad.");
+                    let cal_btn = ui.add_enabled(
+                        false,
+                        egui::Button::new(egui::RichText::new("▶ Calibrate").color(Color32::from_gray(140))),
+                    ).on_disabled_hover_text("Pin to the Config Overlay to calibrate — it takes over your mouse.");
+                    crate::canvas::viewer::register_exposable_element(ui, node, "cal", cal_btn.rect);
+                    // Spin speed is a plain number — safe to set here.
+                    let mut cs = snarl.get_node(node)
+                        .and_then(|n| n.params.get("cal_speed").and_then(|v| v.as_f64()))
+                        .unwrap_or(0.5) as f32;
+                    if ui.add(egui::DragValue::new(&mut cs).speed(0.01).range(0.05..=10.0).suffix(" rev/s"))
+                        .on_hover_text("Calibration spin speed (revolutions per second).")
+                        .changed()
+                    {
+                        if let (Some(n), Some(num)) = (snarl.get_node_mut(node), Number::from_f64(cs as f64)) {
+                            n.params.insert("cal_speed".into(), Value::Number(num));
+                        }
                     }
                 }
 
@@ -933,6 +995,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
                 | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
                 | "generator.oscillator" | "generator.envelope" | "processing.gyro_3dof"
+                | "processing.rws"
                 | "module.automap_split" | "module.automap_collect"
                 | "module.automap_fork" | "module.automap_selector"
                 | "module.automap_combiner" | "module.audio_stream_haptics"
@@ -980,6 +1043,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl),
             "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl),
             "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
+            "processing.rws"   => show_rws_body(node_id, ui, snarl),
             "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl),
             "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl),
             "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl),

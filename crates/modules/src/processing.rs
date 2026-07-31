@@ -15,6 +15,7 @@ pub fn registrations() -> Vec<ModuleRegistration> {
         reg::<AxisToVecModule>(),
         reg::<VecToDeflectionModule>(),
         reg::<Gyro3DOFModule>(),
+        reg::<RwsModule>(),
         reg::<AutoMapSplitModule>(),
         reg::<AutoMapCollectModule>(),
         reg::<AutoMapFork>(),
@@ -519,6 +520,44 @@ impl Module for Gyro3DOFModule {
                 // Same contract as Remapper: pin injection happens in
                 // eval.rs.
                 PinDescriptor::new("Map",    SignalType::AutoMap),
+            ],
+        }
+    }
+    fn process(&mut self, _: &[Option<Signal>]) -> SmallVec<[Signal; 4]> { SmallVec::new() }
+}
+
+// ── RWS Aim (Real-World Sensitivity) ─────────────────────────────────────────
+//
+// Scales a rotation-rate Vec2 (gyro axes or a stick) into per-tick MOUSE
+// DISPLACEMENT, so a physical rotation maps 1:1 to in-game camera rotation once
+// the `scale` (counts-per-degree) is calibrated; `rws` is the user multiplier on
+// that ground truth. A second Vec2 input drives flick-stick (stick angle → yaw).
+//
+// The "Mouse" output is meant to be wired to the KB/M `mouse_move` sink pin: that
+// pin is applied once per tick (displacement, not integrated) and is NOT scaled
+// by the device card's mouse_sensitivity — so a preset carrying this module feels
+// identical regardless of the user's KB/M sensitivity setting. Real evaluation is
+// `compute_rws` in the engine (eval/modules/rws.rs); process() stays empty.
+//
+// Params (node.params): scale, rws, input_mode ("gyro"|"stick_rate"),
+// max_rate_dps, cal_speed, calibrating, flick_enabled, flick_deadzone.
+#[derive(Default)]
+pub struct RwsModule;
+
+impl Module for RwsModule {
+    fn descriptor() -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "processing.rws",
+            display_name: "RWS Aim",
+            category: "Processing",
+            inputs: vec![
+                PinDescriptor::new("Rotation", SignalType::Vec2),
+                PinDescriptor::new("Flick", SignalType::Vec2).optional(),
+            ],
+            outputs: vec![
+                PinDescriptor::new("Mouse", SignalType::Vec2),
+                PinDescriptor::new("X", SignalType::Float),
+                PinDescriptor::new("Y", SignalType::Float),
             ],
         }
     }

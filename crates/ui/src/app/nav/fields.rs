@@ -408,6 +408,9 @@ impl FlexInputApp {
             | ("module.audio_stream_haptics", "asth_swap_row")
             | ("module.audio_stream_haptics", "asth_rumble_mix")
             | ("module.menu", "options")
+            | ("processing.rws", "scale") | ("processing.rws", "rws")
+            | ("processing.rws", "input") | ("processing.rws", "cal")
+            | ("processing.rws", "field") | ("processing.rws", "style")
             | ("math.negate", "unipolar")
             | ("math.quantize", "factor") | ("math.quantize", "mode")
             | ("module.vec_to_deflection", "angle_unit")
@@ -607,6 +610,33 @@ impl FlexInputApp {
             ("generator.oscillator", "phase") => vec![f!("Phase", v("phase_param",0.0,1.0,0.0,Linear))],
             ("generator.oscillator", "shape") => vec![f!("Shape", Enum{key:"shape",opts:&["sine","triangle","saw","square"]})],
             ("processing.gyro_3dof", "lean_threshold") => vec![f!("Lean", v("lean_threshold",0.01,4.0,0.3,Linear))],
+            // ── RWS Aim ──
+            // The pinned ruler ("field") carries the full calibration control set
+            // so it can be run AND stopped from the gamepad with only the ruler
+            // pinned (mouse output is busy driving the game during calibration).
+            ("processing.rws", "scale") => vec![f!("Scale", v("scale",0.0,100_000.0,100.0,Decade))],
+            ("processing.rws", "rws")   => vec![f!("RWS", v("rws",0.01,50.0,1.0,Linear))],
+            ("processing.rws", "input") => vec![
+                f!("Input", Enum{key:"input_mode",opts:&["gyro","stick_rate"]}),
+                f!("Max °/s", v("max_rate_dps",1.0,100_000.0,360.0,Decade)),
+            ],
+            ("processing.rws", "cal") => vec![
+                f!("Calibrate", Toggle{key:"calibrating"}),
+                f!("Speed", v("cal_speed",0.05,10.0,0.5,Linear)),
+            ],
+            ("processing.rws", "field") => vec![
+                f!("Scale", v("scale",0.0,100_000.0,100.0,Decade)),
+                f!("Calibrate", Toggle{key:"calibrating"}),
+                f!("Speed", v("cal_speed",0.05,10.0,0.5,Linear)),
+                f!("RWS", v("rws",0.01,50.0,1.0,Linear)),
+            ],
+            ("processing.rws", "style") => vec![
+                f!("View", Enum{key:"field_mode",opts:&["ruler","room","both"]}),
+                f!("FOV", v("field_fov",30.0,140.0,90.0,Linear)),
+                f!("BG", v("field_bg_alpha",0.0,1.0,0.0,Linear)),
+                f!("Ticks°", v("field_tick_deg",5.0,90.0,15.0,Linear)),
+                f!("Labels", Toggle{key:"field_labels"}),
+            ],
             // ── multi-field rows ──
             ("logic.counter", "mode") => vec![f!("Mode", Enum{key:"mode",opts:&["loop","limit","bounce","unlimited"]})],
             ("math.negate", "unipolar") => vec![

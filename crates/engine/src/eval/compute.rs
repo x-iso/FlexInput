@@ -328,6 +328,11 @@ pub(crate) fn compute_node(
             state.last_signals = out.clone();
             out
         }
+        "processing.rws" => {
+            let out = compute_rws(inputs, state, &snap.params, dt);
+            state.last_signals = out.clone();
+            out
+        }
         "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" => {
             state.last_signals = inputs.to_vec();
             (0..snap.n_outputs).map(|out_idx| {
