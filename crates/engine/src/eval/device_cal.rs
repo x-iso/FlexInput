@@ -88,6 +88,12 @@ pub(crate) struct DeviceCal {
     /// Written by the Calibration window's yellow pin. Defaults to 0.5.
     ltrig_threshold: f32,
     rtrig_threshold: f32,
+    /// "Suppress touch + misc" opt-in (device.source `suppress_touch_misc`
+    /// param). Mutes every pin in `automap::TOUCH_MISC_PINS` so a pad whose
+    /// capacitive sensors fire on their own (Steam Controller trackpads and
+    /// thumb-rest) can be mapped without them hijacking the capture. The UI
+    /// masks the SAME pins out of `last_signals`, so Learn and routing agree.
+    suppress_touch_misc: bool,
 }
 
 /// Default digital-trigger threshold. Mirrors the Calibration UI's
@@ -140,6 +146,7 @@ impl Default for DeviceCal {
             digital_triggers: false,
             ltrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
             rtrig_threshold:  TRIG_DIGITAL_THRESHOLD_DEFAULT,
+            suppress_touch_misc: false,
         }
     }
 }
@@ -244,6 +251,8 @@ pub(crate) fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
             .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
         rtrig_threshold: params.get("rtrig_digital_threshold").and_then(|v| v.as_f64())
             .map(|v| v as f32).unwrap_or(TRIG_DIGITAL_THRESHOLD_DEFAULT),
+        suppress_touch_misc: params.get("suppress_touch_misc")
+            .and_then(|v| v.as_bool()).unwrap_or(false),
     }
 }
 
@@ -476,6 +485,28 @@ pub(crate) fn preprocess_dev_sigs(
             let over = v >= thr.max(f32::EPSILON);
             out.insert(key, Signal::Float(if over { 1.0 } else { 0.0 }));
             out.insert((dev_id.clone(), dig_pin.to_string()), Signal::Bool(over));
+        }
+    }
+
+    // ── Pass 4: touch + misc mute ───────────────────────────────────────────
+    //
+    // "Suppress touch + misc" on a device.source: zero every pin in
+    // `TOUCH_MISC_PINS` so a pad whose capacitive sensors fire on their own
+    // (Steam Controller trackpads / thumb rest, which sit on the SDL misc pins)
+    // stops driving anything while the user builds a mapping. Zeroed rather
+    // than removed so presence probes still see the pad's real shape.
+    //
+    // The UI applies the same mask to `last_signals` (see `mask_suppressed_pins`
+    // in app.rs) — that half is what stops a Remapper / Touch Zones / Lean
+    // "Learn" from capturing the sensor instead of the button the user pressed.
+    // Both halves read this one param, so they cannot disagree.
+    for (dev_id, (_, _, cal)) in &params {
+        if !cal.suppress_touch_misc { continue; }
+        for pin in flexinput_core::automap::TOUCH_MISC_PINS {
+            let key = (dev_id.clone(), (*pin).to_string());
+            if let Some(sig) = out.get(&key).copied() {
+                out.insert(key, sig.zeroed());
+            }
         }
     }
 

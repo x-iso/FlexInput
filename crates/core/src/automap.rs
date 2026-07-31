@@ -86,6 +86,44 @@ pub struct AutoMapPin {
 
 use crate::SignalType;
 
+/// Pins gated by a `device.source`'s "Suppress touch + misc" toggle
+/// (`suppress_touch_misc` param).
+///
+/// These are the CAPACITIVE / auxiliary inputs a pad reports whether or not the
+/// user meant to press anything. On a Steam Controller both trackpads and the
+/// thumb-rest sensor land here, and they fire continuously just from holding the
+/// controller — which hijacks a Remapper / Touch Zones / Lean "Learn" capture
+/// before the user can press the button they actually wanted, and keeps firing
+/// any mapping already bound to them. The toggle is a temporary mute so a
+/// mapping session can be completed, then switched back off.
+///
+/// Two deliberate exclusions:
+/// - `btn_touchpad` — the touchpad CLICK is a real switch under the pad, a
+///   deliberate press, and stays mappable independently of the finger sensing
+///   above it. Suppressing the touch point should not cost you the click.
+/// - `btn_paddle_*` — rear paddles are mechanical switches on every pad that
+///   has them and never fire on their own.
+///
+/// The whole `btn_misc*` group goes, not a subset: SDL hands out those slots
+/// generically and a pad can put capacitive touch buttons or grip sensors on
+/// any of them, so there is no reliable way to keep "the real ones".
+///
+/// Both consumers gate on the same list so the UI and the engine agree:
+/// - UI: `app.rs` masks these out of `last_signals` (Learn capture, pin glow,
+///   card previews) for every suppressed device.
+/// - Engine: `preprocess_dev_sigs` zeroes them so nothing downstream routes.
+pub const TOUCH_MISC_PINS: &[&str] = &[
+    "touch1_x", "touch1_y", "touch1_active",
+    "touch2_x", "touch2_y", "touch2_active",
+    "btn_misc1", "btn_misc2", "btn_misc3",
+    "btn_misc4", "btn_misc5", "btn_misc6",
+];
+
+/// Whether `pin` is muted by the "Suppress touch + misc" toggle.
+pub fn is_touch_misc_pin(pin: &str) -> bool {
+    TOUCH_MISC_PINS.contains(&pin)
+}
+
 /// Every haptic / feedback INPUT port across all controller families — the
 /// universal set of injection targets exposed as inlets by the Feedback Control
 /// module. This is the union of all `inputs_for(kind)` families in

@@ -61,6 +61,55 @@ pub(crate) fn digital_trigger_header_toggle(
     });
 }
 
+/// Whether the "Suppress touch + misc" toggle is worth showing for this device.
+///
+/// SDL-backed pads only. SDL is the backend that surfaces a pad's touchpad
+/// fingers and its `btn_misc1..6` extras generically, and those pins are where a
+/// Steam Controller's CAPACITIVE sensors (both trackpads, thumb rest) land —
+/// they assert continuously just from holding the pad. The natively-parsed
+/// families don't need it: a DS4 / DualSense touchpad CLICK and a Switch Pro's
+/// Capture button are deliberate presses, not always-on sensors.
+///
+/// This also covers a native pad routed through SDL by the global `sdl_all_pads`
+/// switch (its id becomes `sdl:<kind>:…`), which is harmless — the toggle is
+/// opt-in and defaults OFF.
+pub(crate) fn has_touch_misc_suppression(dev_id: &str) -> bool {
+    dev_id.starts_with("sdl:")
+}
+
+/// Advanced-mode device.source body toggle muting the capacitive / auxiliary
+/// pins while the user builds a mapping. Stored on `suppress_touch_misc`;
+/// consumed by the UI signal mask (Learn / previews) and the engine's
+/// `preprocess_dev_sigs` (routing) from that one param.
+pub(crate) fn touch_misc_header_toggle(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node: NodeId,
+) {
+    let mut checked = snarl.get_node(node)
+        .and_then(|n| n.params.get("suppress_touch_misc"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let resp = ui.checkbox(
+        &mut checked,
+        egui::RichText::new("Suppress touch + misc").small(),
+    );
+    if resp.changed() {
+        if let Some(n) = snarl.get_node_mut(node) {
+            n.params.insert("suppress_touch_misc".into(), Value::Bool(checked));
+        }
+    }
+    resp.on_hover_text(
+        "Mute this pad's touchpad fingers and all Misc 1-6 buttons.\n\
+         Capacitive sensors (e.g. the Steam Controller's trackpads and thumb rest) \
+         fire just from holding the controller, which steals Learn captures and \
+         triggers mappings you didn't press. Turn this on while you build the \
+         mapping, then off to use those inputs.\n\
+         Touchpad click and the rear paddles are real switches and stay live.",
+    );
+}
+
 pub(crate) fn device_source_caps(dev_id: &str, is_device_source: bool) -> (bool, bool, bool) {
     if !is_device_source { return (false, false, false); }
     if dev_id.starts_with("midi_in") || dev_id.starts_with("midi_out") {

@@ -55,6 +55,20 @@ impl Signal {
             _ => false,
         }
     }
+
+    /// The rest/idle value of this signal's own type. Used to MUTE a pin
+    /// without dropping it from a signal map — consumers that probe for a
+    /// pin's presence (`contains_key`) keep seeing the device's real shape,
+    /// they just read it as unpressed / centered.
+    pub fn zeroed(self) -> Signal {
+        match self {
+            Signal::Float(_) => Signal::Float(0.0),
+            Signal::Bool(_)  => Signal::Bool(false),
+            Signal::Vec2(_)  => Signal::Vec2(Vec2::ZERO),
+            Signal::Vec4(_)  => Signal::Vec4(Vec4::ZERO),
+            Signal::Int(_)   => Signal::Int(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1295,6 +1295,26 @@ impl eframe::App for FlexInputApp {
             self.last_signals = (*snap).clone();
         }
 
+        // "Suppress touch + misc" (device.source toggle): mute the capacitive /
+        // auxiliary pins of every device that opted in, BEFORE anything in the
+        // UI reads them. This is the half that lets a mapping session finish —
+        // a Steam Controller's trackpads and thumb-rest sensor otherwise win
+        // every Remapper / Touch Zones / Lean "Learn" capture just from the user
+        // holding the pad. The engine mutes the same pins from the same param
+        // (`preprocess_dev_sigs` pass 4), so what you can Learn and what
+        // actually routes stay in agreement.
+        //
+        // Scanned from the ACTIVE tab only: it owns the device pins this frame,
+        // matching how `active_tab_device_ids` gates output.
+        {
+            puffin::profile_scope!("mask_touch_misc");
+            let mut suppressed = std::collections::HashSet::new();
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                devices_pool::collect_touch_misc_suppressed(&tab.canvas.snarl, &mut suppressed);
+            }
+            devices_pool::mask_touch_misc_pins(&mut self.last_signals, &suppressed);
+        }
+
         // Config overlay (M3): while it's summoned, suppress the physical input
         // devices from the game so the inputs used to navigate/tweak it don't
         // also drive the game. The overlay's own navigation reads the RAW

@@ -834,6 +834,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 digital_trigger_header_toggle(ui, snarl, node, dev_id_str);
             }
 
+            // Capacitive/auxiliary input mute — SDL pads only (see
+            // `has_touch_misc_suppression`). Sits next to the digital-trigger
+            // toggle because both are per-device input-conditioning opt-ins.
+            if is_device_source && has_touch_misc_suppression(dev_id_str) {
+                touch_misc_header_toggle(ui, snarl, node);
+            }
+
             // Second header row — only visible while in Layout mode for this
             // sub-patch. Snap settings live on the sub-patch itself (they
             // belong to its body's drag/resize behavior, not to the editor).

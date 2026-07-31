@@ -1272,6 +1272,69 @@ mod trigger_tests {
             Some(true), "above threshold must fire the digital button");
     }
 
+    // "Suppress touch + misc": every capacitive/auxiliary pin reads as rest
+    // while the toggle is on, so a Steam Controller's trackpads and thumb-rest
+    // sensor stop driving mappings mid-configuration. Mechanical switches must
+    // pass through untouched — including the touchpad CLICK, which stays
+    // mappable independently of the finger sensing above it, and the rear
+    // paddles. The whole misc group goes: SDL hands those slots out generically
+    // and a pad can put a capacitive grip on any of them.
+    #[test]
+    fn suppress_touch_misc_mutes_only_the_capacitive_pins() {
+        let dev_id = "sdl:generic:i0";
+        let mut src = empty_node(1, "device.source");
+        src.device_id = Some(dev_id.to_string());
+        src.params.insert("suppress_touch_misc".into(), Value::Bool(true));
+        let graph = ProcessingGraph { nodes: vec![src] };
+
+        let k = |pin: &str| (dev_id.to_string(), pin.to_string());
+        let mut dev = HashMap::new();
+        dev.insert(k("touch1_x"),      Signal::Float(0.8));
+        dev.insert(k("touch1_active"), Signal::Bool(true));
+        dev.insert(k("touch2_active"), Signal::Bool(true));
+        dev.insert(k("btn_touchpad"),  Signal::Bool(true));
+        dev.insert(k("btn_misc1"),     Signal::Bool(true));
+        dev.insert(k("btn_misc6"),     Signal::Bool(true));
+        dev.insert(k("btn_paddle_l1"), Signal::Bool(true));
+        dev.insert(k("btn_south"),     Signal::Bool(true));
+
+        let out = preprocess_dev_sigs(&graph, &dev);
+        for pin in ["touch1_active", "touch2_active", "btn_misc1", "btn_misc6"] {
+            assert_eq!(out.get(&k(pin)).map(|s| s.as_bool()), Some(false),
+                "`{pin}` must read as unpressed while suppression is on");
+        }
+        assert_eq!(out.get(&k("touch1_x")).map(|s| s.as_float()), Some(0.0),
+            "touch coordinates must zero too, not just the active flag");
+        // Muted, NOT removed — presence probes must still see the pad's shape.
+        assert!(out.contains_key(&k("btn_misc1")),
+            "suppressed pins must stay present in the map, just zeroed");
+        assert_eq!(out.get(&k("btn_touchpad")).map(|s| s.as_bool()), Some(true),
+            "the touchpad CLICK is a real switch — it must stay mappable while \
+             the finger sensing above it is muted");
+        assert_eq!(out.get(&k("btn_paddle_l1")).map(|s| s.as_bool()), Some(true),
+            "rear paddles are mechanical switches and must NOT be suppressed");
+        assert_eq!(out.get(&k("btn_south")).map(|s| s.as_bool()), Some(true),
+            "ordinary buttons must be unaffected");
+    }
+
+    // Toggle off (param absent) → every touch/misc pin passes through.
+    #[test]
+    fn suppress_touch_misc_off_passes_through() {
+        let dev_id = "sdl:generic:i0";
+        let mut src = empty_node(1, "device.source");
+        src.device_id = Some(dev_id.to_string());
+        let graph = ProcessingGraph { nodes: vec![src] };
+
+        let k = |pin: &str| (dev_id.to_string(), pin.to_string());
+        let mut dev = HashMap::new();
+        dev.insert(k("btn_misc1"),     Signal::Bool(true));
+        dev.insert(k("touch1_active"), Signal::Bool(true));
+
+        let out = preprocess_dev_sigs(&graph, &dev);
+        assert_eq!(out.get(&k("btn_misc1")).map(|s| s.as_bool()), Some(true));
+        assert_eq!(out.get(&k("touch1_active")).map(|s| s.as_bool()), Some(true));
+    }
+
     // With "Digital triggers" OFF the analog trigger passes through unchanged —
     // no thresholding, full continuous travel.
     #[test]

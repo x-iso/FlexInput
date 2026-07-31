@@ -94,7 +94,9 @@ These are ordinary `NodeData` nodes distinguished by `module_id`; their config l
 `params`:
 - `device.source`: `device_id` (`"{backend}:{family}:{instance}"`, e.g.
   `"gilrs:dualsense:0"`), plus optional per-device calibration keys (deadzone, gyro,
-  invert, …).
+  invert, …) and input-conditioning opt-ins: `digital_triggers` and
+  `suppress_touch_misc` (mutes `automap::TOUCH_MISC_PINS` — read by BOTH the UI
+  signal mask and the engine's `preprocess_dev_sigs`, so Learn and routing agree).
 - `device.sink`: `device_id` (`"virtual.{kind}.{n}"`, e.g. `"virtual.xinput.0"`), plus
   output-shaping keys (rumble floor/max/exp, mouse sensitivity for KB/M sinks, …).
 

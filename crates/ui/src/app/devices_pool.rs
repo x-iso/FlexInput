@@ -25,6 +25,51 @@ pub(crate) fn snarl_virtual_device_ids(snarl: &Snarl<NodeData>) -> Vec<String> {
         .collect()
 }
 
+/// Collect the `device_id` of every `device.source` node with the
+/// "Suppress touch + misc" toggle on. Recurses into sub-patches — a device
+/// node can live inside one.
+///
+/// Pairs with [`mask_touch_misc_pins`]: the UI masks these pins out of
+/// `last_signals` so a Remapper / Touch Zones / Lean "Learn" can't capture a
+/// capacitive sensor instead of the button the user meant, and the card
+/// previews match what the engine routes. The engine reads the SAME param in
+/// `preprocess_dev_sigs` (pass 4) for the routing half.
+pub(crate) fn collect_touch_misc_suppressed(
+    snarl: &Snarl<NodeData>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for (_, n) in snarl.nodes_ids_data() {
+        let node = &n.value;
+        if node.module_id == "device.source"
+            && node.params.get("suppress_touch_misc").and_then(|v| v.as_bool()).unwrap_or(false)
+        {
+            if let Some(id) = node.params.get("device_id").and_then(|v| v.as_str()) {
+                out.insert(id.to_string());
+            }
+        }
+        if let Some(sp) = node.subpatch.as_ref() {
+            collect_touch_misc_suppressed(&sp.snarl, out);
+        }
+    }
+}
+
+/// Zero every touch/misc pin belonging to a suppressed device. Zeroed rather
+/// than removed so presence probes (`contains_key`, e.g. the analog-trigger
+/// detection in `remapper_pressed_now`) still see the pad's real shape.
+pub(crate) fn mask_touch_misc_pins(
+    signals: &mut HashMap<(String, String), Signal>,
+    suppressed: &std::collections::HashSet<String>,
+) {
+    if suppressed.is_empty() { return; }
+    for dev in suppressed {
+        for pin in flexinput_core::automap::TOUCH_MISC_PINS {
+            if let Some(sig) = signals.get_mut(&(dev.clone(), (*pin).to_string())) {
+                *sig = sig.zeroed();
+            }
+        }
+    }
+}
+
 /// True if a `gilrs:<kind>:<inst>` PHYSICAL device id is one of FlexInput's own
 /// emulated HIDMaestro pads — the input enumerator tags those with a `v`-prefixed
 /// instance (`gilrs:dualsense:v0`). Used to filter the loopback devices out of
