@@ -114,8 +114,15 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
 }
 ```
 
-`migrate_ds4_pin_ids` similarly rewrites older DualShock4 pin ids. Add migrations here
-(never a version bump alone) when a param key or pin set changes.
+`migrate_ds4_pin_ids` similarly rewrites older DualShock4 pin ids (on `device.sink`
+`input_pin_ids`), and `migrate_generic_button_pin` rewrites the legacy Generic-pad
+stick-click / menu ids on `device.source` `output_pin_ids` (`btn_lstick` → `btn_ls`,
+`btn_rstick` → `btn_rs`, `btn_select` → `btn_back`, `btn_mode` → `btn_guide`). Add
+migrations here (never a version bump alone) when a param key or pin set changes.
+
+Note that `migrate_ds4_pin_ids` runs only on the `.fxp` load path, while
+`migrate_loaded_snarl` also runs on workspace restore — put anything that must survive
+an app restart in the latter.
 
 ---
 

@@ -277,6 +277,69 @@ fn all_pins_covers_generic_extra_buttons() {
     }
 }
 
+/// Generalises `all_pins_covers_generic_extra_buttons` to EVERY button pin of
+/// EVERY kind. The AutoMap bus fills itself by looking up each `ALL_PINS` id in
+/// the device sample map, so a layout that names a button anything else drops it
+/// from every AutoMap path (Remapper, Splitter, Collector, virtual-pad wire)
+/// while direct pin-to-pin wires keep working — which is exactly how the Generic
+/// layout's `btn_lstick`/`btn_rstick`/`btn_select`/`btn_mode` hid for so long
+/// (Steam Controller and every other third-party pad lost LS/RS click, Select
+/// and Guide). Any new layout button must be positional and in the bus.
+#[test]
+fn layout_button_pins_are_in_automap_bus() {
+    use flexinput_core::automap::ALL_PINS;
+    let bus: std::collections::HashSet<&str> = ALL_PINS.iter().map(|p| p.id).collect();
+    for kind in [
+        ControllerKind::XInput,
+        ControllerKind::DualShock4,
+        ControllerKind::DualSense,
+        ControllerKind::SwitchPro,
+        ControllerKind::Generic,
+    ] {
+        for pin in layouts::outputs_for(kind) {
+            if !pin.id.starts_with("btn_") && !pin.id.starts_with("dpad_") { continue; }
+            assert!(
+                bus.contains(pin.id.as_str()),
+                "{kind:?} layout declares button pin `{}` which is not in \
+                 automap::ALL_PINS — it will route on a direct wire but vanish \
+                 from every AutoMap path. Use the positional name, or add it to \
+                 crates/core/src/automap.rs",
+                pin.id,
+            );
+        }
+    }
+}
+
+/// The stick-click / menu buttons specifically: every kind must expose them
+/// under the SAME ids, so a patch behaves identically whichever pad is plugged
+/// in and whichever backend (gilrs or SDL) owns it.
+#[test]
+fn all_kinds_share_stick_click_and_menu_pin_ids() {
+    for kind in [
+        ControllerKind::XInput,
+        ControllerKind::DualShock4,
+        ControllerKind::DualSense,
+        ControllerKind::SwitchPro,
+        ControllerKind::Generic,
+    ] {
+        let outputs = layouts::outputs_for(kind);
+        for pin in ["btn_ls", "btn_rs", "btn_start", "btn_back", "btn_guide"] {
+            assert!(
+                outputs.iter().any(|p| p.id == pin),
+                "{kind:?} must expose `{pin}` — positional ids are shared across \
+                 all controller families",
+            );
+        }
+        for legacy in ["btn_lstick", "btn_rstick", "btn_select", "btn_mode"] {
+            assert!(
+                !outputs.iter().any(|p| p.id == legacy),
+                "{kind:?} still declares the legacy pin `{legacy}`; use the \
+                 positional name (see migrate_generic_button_pin)",
+            );
+        }
+    }
+}
+
 #[test]
 fn all_supported_kinds_have_sensor_outputs() {
     for kind in [

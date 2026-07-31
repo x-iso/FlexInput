@@ -92,6 +92,22 @@ pub fn migrate_vigem_device_id(id: &str) -> Option<String> {
     None
 }
 
+/// Map a legacy Generic-pad button pin id to its positional replacement, or
+/// `None` when the id needs no rewrite (already positional, or not a button).
+///
+/// The Generic layout was the last one using a private vocabulary for these
+/// four buttons; the AutoMap bus only ever knew the positional names, so these
+/// pins were invisible to Remapper / Splitter / Collector / gamepad-nav.
+pub fn migrate_generic_button_pin(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "btn_lstick" => "btn_ls",
+        "btn_rstick" => "btn_rs",
+        "btn_select" => "btn_back",
+        "btn_mode"   => "btn_guide",
+        _ => return None,
+    })
+}
+
 /// Bring a loaded `Snarl` up to date with the current module descriptors for
 /// pin-layout changes that can't be expressed through `#[serde(default)]`, and
 /// migrate legacy ViGEm device ids to their HIDMaestro equivalents.
@@ -109,6 +125,13 @@ pub fn migrate_vigem_device_id(id: &str) -> Option<String> {
 /// - Negate → Inverse: the `math.negate` module kept its id but gained a new
 ///   display name. Nodes still carrying the old stock title are retitled;
 ///   user-renamed nodes are left alone.
+/// - Generic-pad pin vocabulary: the Generic device layout used to name the
+///   stick-clicks / menu buttons `btn_lstick`/`btn_rstick`/`btn_select`/
+///   `btn_mode` while every other layout (and both backends) used the
+///   positional `btn_ls`/`btn_rs`/`btn_back`/`btn_guide`. A `device.source`
+///   node persists its pin ids in `output_pin_ids`, so a patch saved against
+///   the old names must be rewritten or those four pins route to nothing.
+///   Position in the list is unchanged, so wires stay on their pins.
 ///
 /// Recurses into sub-patches.
 pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
@@ -170,6 +193,17 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         if node.value.module_id == "math.negate" && node.value.display_name == "Negate" {
             node.value.display_name = "Inverse".to_string();
         }
+        // Generic-pad stick-click / menu pins → positional names. Applies to
+        // ANY device.source (the old ids only ever existed on Generic pads, so
+        // a native pad simply has nothing to rewrite). Idempotent.
+        if node.value.module_id == "device.source" {
+            if let Some(Value::Array(ids)) = node.value.params.get_mut("output_pin_ids") {
+                for id in ids.iter_mut() {
+                    let Some(new) = id.as_str().and_then(migrate_generic_button_pin) else { continue };
+                    *id = Value::String(new.to_string());
+                }
+            }
+        }
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
         }
@@ -201,6 +235,62 @@ mod migration_tests {
         // Prefix-only false positive guard: a longer kind that merely starts
         // with "virtual.ds4" must NOT match.
         assert_eq!(migrate_vigem_device_id("virtual.ds4x"), None);
+    }
+
+    /// A patch saved when the Generic layout still used `btn_lstick` &co gets
+    /// its `device.source` pin ids rewritten in place — same positions, so
+    /// existing wires stay on their pins. Idempotent, recurses into sub-patches,
+    /// and leaves non-button ids alone.
+    #[test]
+    fn migrate_rewrites_legacy_generic_button_pin_ids() {
+        fn generic_source() -> NodeData {
+            let mut params = HashMap::new();
+            params.insert("device_id".to_string(), Value::String("sdl:generic:i0".to_string()));
+            params.insert("output_pin_ids".to_string(), Value::Array(
+                ["left_stick", "btn_south", "btn_lstick", "btn_rstick",
+                 "btn_start", "btn_select", "btn_mode", "automap_out"]
+                    .iter().map(|s| Value::String(s.to_string())).collect(),
+            ));
+            NodeData {
+                module_id: "device.source".to_string(),
+                display_name: "Steam Controller".to_string(),
+                category: "Device".to_string(),
+                inputs: vec![],
+                outputs: vec![],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            }
+        }
+        let ids_of = |n: &NodeData| -> Vec<String> {
+            n.params["output_pin_ids"].as_array().unwrap().iter()
+                .map(|v| v.as_str().unwrap().to_string()).collect()
+        };
+        let expected: Vec<String> = ["left_stick", "btn_south", "btn_ls", "btn_rs",
+             "btn_start", "btn_back", "btn_guide", "automap_out"]
+            .iter().map(|s| s.to_string()).collect();
+
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let pad = snarl.insert_node(egui::Pos2::ZERO, generic_source());
+
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let nested = inner.insert_node(egui::Pos2::ZERO, generic_source());
+        let mut sp = UiSubPatch::default();
+        sp.snarl = Box::new(inner);
+        let mut host = generic_source();
+        host.module_id = "subpatch".to_string();
+        host.params.remove("output_pin_ids");
+        host.subpatch = Some(Box::new(sp));
+        let host_id = snarl.insert_node(egui::pos2(20.0, 0.0), host);
+
+        migrate_loaded_snarl(&mut snarl);
+        assert_eq!(ids_of(snarl.get_node(pad).unwrap()), expected);
+        let inner_sp = snarl.get_node(host_id).unwrap().subpatch.as_ref().unwrap();
+        assert_eq!(ids_of(inner_sp.snarl.get_node(nested).unwrap()), expected);
+
+        // Idempotent: a second pass over already-migrated ids is a no-op.
+        migrate_loaded_snarl(&mut snarl);
+        assert_eq!(ids_of(snarl.get_node(pad).unwrap()), expected);
     }
 
     /// Negate → Inverse retitles only nodes still carrying the stock name;

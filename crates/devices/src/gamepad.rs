@@ -5,6 +5,16 @@ use crate::DevicePin;
 
 /// Standard output pins exposed by a gamepad source node.
 /// Order here determines display order in the panel and canvas node.
+///
+/// Pin IDs are POSITIONAL and identical to the native layouts in `layouts.rs`
+/// (`btn_ls`/`btn_rs`/`btn_back`/`btn_guide`, not the old `btn_lstick`/
+/// `btn_rstick`/`btn_select`/`btn_mode`). This is load-bearing, not cosmetic:
+/// the AutoMap bus (`core::automap::ALL_PINS`) fills itself by looking up each
+/// canonical pin id in the device's sample map, so a Generic pad using its own
+/// vocabulary silently drops those buttons from every AutoMap path — Remapper,
+/// Splitter, Collector, virtual-pad wire — and from `gamepad_nav::NAV_BUTTONS`.
+/// Direct pin-to-pin wires still worked, which is what made it look device-
+/// specific. Guarded by `layout_button_pins_are_in_automap_bus`.
 pub fn standard_outputs() -> Vec<DevicePin> {
     vec![
         // Bundled Vec2 sticks (most useful for direct routing)
@@ -31,12 +41,12 @@ pub fn standard_outputs() -> Vec<DevicePin> {
         pin("btn_lt_dig",    "LT dig. / L2",  SignalType::Bool),
         pin("btn_rt_dig",    "RT dig. / R2",  SignalType::Bool),
         // Stick clicks
-        pin("btn_lstick",    "L.Stick Click", SignalType::Bool),
-        pin("btn_rstick",    "R.Stick Click", SignalType::Bool),
+        pin("btn_ls",        "LS (L.Stick Click)", SignalType::Bool),
+        pin("btn_rs",        "RS (R.Stick Click)", SignalType::Bool),
         // Menu / system
         pin("btn_start",     "Start / ≡",     SignalType::Bool),
-        pin("btn_select",    "Select / ⧉",    SignalType::Bool),
-        pin("btn_mode",      "Mode / PS / ⊙", SignalType::Bool),
+        pin("btn_back",      "Back / Select / ⧉", SignalType::Bool),
+        pin("btn_guide",     "Guide / Mode / ⊙",  SignalType::Bool),
         // D-pad as discrete buttons (when not exposed as axis)
         pin("dpad_up",       "D-Pad Up",      SignalType::Bool),
         pin("dpad_down",     "D-Pad Down",    SignalType::Bool),
@@ -83,11 +93,11 @@ pub const BUTTON_MAP: &[(Button, &str)] = &[
     (Button::RightTrigger,  "btn_rb"),
     (Button::LeftTrigger2,  "btn_lt_dig"),
     (Button::RightTrigger2, "btn_rt_dig"),
-    (Button::LeftThumb,     "btn_lstick"),
-    (Button::RightThumb,    "btn_rstick"),
+    (Button::LeftThumb,     "btn_ls"),
+    (Button::RightThumb,    "btn_rs"),
     (Button::Start,         "btn_start"),
-    (Button::Select,        "btn_select"),
-    (Button::Mode,          "btn_mode"),
+    (Button::Select,        "btn_back"),
+    (Button::Mode,          "btn_guide"),
     (Button::DPadUp,        "dpad_up"),
     (Button::DPadDown,      "dpad_down"),
     (Button::DPadLeft,      "dpad_left"),

@@ -11,8 +11,8 @@
 //! `io_bypass` gate via a shared `ui_nav_suppress` atomic set in `update()`.
 //!
 //! Pin ids come from `flexinput_devices::gamepad` (verified): buttons
-//! `btn_south/east/west/north`, `btn_lb/rb`, `btn_lstick/rstick`,
-//! `btn_start/select`, `dpad_up/down/left/right`; sticks `left_stick` /
+//! `btn_south/east/west/north`, `btn_lb/rb`, `btn_ls/rs`,
+//! `btn_start/back`, `dpad_up/down/left/right`; sticks `left_stick` /
 //! `right_stick` (Vec2); triggers `left_trigger` / `right_trigger` (Float).
 //! Gyro is `gyro_y` (pitch) / `gyro_z` (yaw) per the gilrs backend.
 
@@ -473,10 +473,12 @@ impl Default for GamepadNav {
 
 /// Canonical bool pins we track for navigation (face/shoulder/stick-click/
 /// menu/dpad buttons). Triggers and sticks are read as analog, separately.
-// NOTE: pin ids must match what the gilrs backend actually emits
-// (`crates/devices/src/gilrs_backend.rs` BUTTON_MAP_*), NOT the names in
-// `gamepad.rs::standard_outputs()` — the backend uses `btn_ls`/`btn_rs` for
-// stick clicks, `btn_back` for Select/minus, and `btn_guide` for Mode/Home.
+// NOTE: pin ids must match what the backends actually emit
+// (`gilrs_backend.rs` BUTTON_MAP_*, `sdl_backend.rs` poll) — `btn_ls`/`btn_rs`
+// for stick clicks, `btn_back` for Select/minus, `btn_guide` for Mode/Home.
+// `gamepad.rs::standard_outputs()` (the Generic layout) agrees with these now;
+// it used to name them btn_lstick/btn_rstick/btn_select/btn_mode, which is why
+// nav ignored those buttons on third-party pads.
 pub const NAV_BUTTONS: &[&str] = &[
     "btn_south",
     "btn_east",

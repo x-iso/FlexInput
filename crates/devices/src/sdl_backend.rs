@@ -527,34 +527,26 @@ impl DeviceBackend for SdlBackend {
 
             // ── Face / shoulder / stick-click / menu buttons ───────────────────
             // Pin names MUST match what `enumerate()` advertised for this pad,
-            // i.e. `layouts::outputs_for(pad.kind)`. The generic layout names the
-            // stick-clicks/menu buttons btn_lstick/btn_rstick/btn_select/btn_mode;
-            // the native layouts (XInput/DS4/DualSense/Switch) name the SAME
-            // physical buttons btn_ls/btn_rs/btn_back/btn_guide. When the global
-            // "route all pads through SDL" switch turns a native pad into an
-            // `sdl:<kind>:N` device, enumerate advertises the native vocabulary —
-            // so poll must emit the native names too, or those buttons silently
-            // fail to route (they land on pins no sink declares). Face/shoulder/
-            // dpad/stick/trigger names are identical across layouts, so only the
-            // four kind-varying names branch here.
+            // i.e. `layouts::outputs_for(pad.kind)`. Every layout — Generic
+            // included — now uses the positional vocabulary, so this block is
+            // kind-independent. It briefly wasn't: the Generic layout named the
+            // stick-clicks/menu buttons btn_lstick/btn_rstick/btn_select/btn_mode
+            // and this emitted the native names only for non-Generic kinds. Those
+            // Generic-only ids aren't in `automap::ALL_PINS`, so LS/RS/Select/
+            // Guide vanished from every AutoMap path on a Steam Controller (or any
+            // third-party pad) while direct wires kept working.
             let b = |btn: Button| g.button(btn);
-            let native = pad.kind != ControllerKind::Generic;
-            let (ls_pin, rs_pin, back_pin, guide_pin) = if native {
-                ("btn_ls", "btn_rs", "btn_back", "btn_guide")
-            } else {
-                ("btn_lstick", "btn_rstick", "btn_select", "btn_mode")
-            };
             out.push((dev.clone(), "btn_south".into(), Signal::Bool(b(Button::South))));
             out.push((dev.clone(), "btn_east".into(),  Signal::Bool(b(Button::East))));
             out.push((dev.clone(), "btn_west".into(),  Signal::Bool(b(Button::West))));
             out.push((dev.clone(), "btn_north".into(), Signal::Bool(b(Button::North))));
             out.push((dev.clone(), "btn_lb".into(), Signal::Bool(b(Button::LeftShoulder))));
             out.push((dev.clone(), "btn_rb".into(), Signal::Bool(b(Button::RightShoulder))));
-            out.push((dev.clone(), ls_pin.into(), Signal::Bool(b(Button::LeftStick))));
-            out.push((dev.clone(), rs_pin.into(), Signal::Bool(b(Button::RightStick))));
+            out.push((dev.clone(), "btn_ls".into(), Signal::Bool(b(Button::LeftStick))));
+            out.push((dev.clone(), "btn_rs".into(), Signal::Bool(b(Button::RightStick))));
             out.push((dev.clone(), "btn_start".into(), Signal::Bool(b(Button::Start))));
-            out.push((dev.clone(), back_pin.into(),  Signal::Bool(b(Button::Back))));
-            out.push((dev.clone(), guide_pin.into(), Signal::Bool(b(Button::Guide))));
+            out.push((dev.clone(), "btn_back".into(),  Signal::Bool(b(Button::Back))));
+            out.push((dev.clone(), "btn_guide".into(), Signal::Bool(b(Button::Guide))));
 
             // ── D-Pad: SDL exposes it as discrete buttons. Emit discrete +
             // reconstruct the axis/Vec2 (√2/2 on diagonals) like the raw paths. ─
