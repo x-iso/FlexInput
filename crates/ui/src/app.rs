@@ -297,6 +297,22 @@ pub struct FlexInputApp {
     hidhide_last_device_sig: u64,
     /// Last time the reconcile walk ran (throttle for patch-wiring edits).
     hidhide_last_reconcile: std::time::Instant,
+    /// Session cache of `physical device id → (vid, pid)`, refreshed from the
+    /// live device list on every reconcile. Only read when the `hidhide_sticky`
+    /// setting is on: it lets a pad that's still wired in the patch keep its
+    /// mask while it's momentarily missing from enumeration, instead of being
+    /// unhidden system-wide until it comes back. Cleared on app exit with the
+    /// process; nothing persists it.
+    hidhide_vidpid_cache: HashMap<String, (u16, u16)>,
+    /// Session cache of `(vid, pid) → HID instance id`, filled by each apply's
+    /// worker thread (the SetupAPI lookup is slow, so it runs off the UI
+    /// thread). Also only used by the sticky path: while the pad is away
+    /// `instance_id_for_vid_pid` finds nothing, so without a remembered
+    /// instance id a "sticky" target would still fall out of the blacklist.
+    /// Re-listing the id of an absent device is harmless — HidHide just holds
+    /// the string, and the pad is masked the moment it comes back rather than
+    /// being visible for the ~2 s until our next enumeration.
+    hidhide_instance_cache: std::sync::Arc<std::sync::Mutex<HashMap<(u16, u16), String>>>,
     bottom_panel_height: f32,
     /// Summed `mutation_gen` across all tabs as of the last crash-recovery
     /// snapshot write. The recovery snapshot (`recovery.json`) is rewritten
@@ -994,6 +1010,8 @@ impl FlexInputApp {
             hidhide_dirty: true, // reconcile once at startup (apply default-on masking)
             hidhide_last_device_sig: 0,
             hidhide_last_reconcile: std::time::Instant::now(),
+            hidhide_vidpid_cache: HashMap::new(),
+            hidhide_instance_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             bottom_panel_height: 220.0,
             // Seeded below from the restored tabs so the first frame doesn't
             // pointlessly rewrite the recovery snapshot we may have just loaded.

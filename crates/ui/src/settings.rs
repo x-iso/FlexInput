@@ -263,6 +263,18 @@ pub struct AppSettings {
     /// `hide_originals.unwrap_or(hidhide_installed)`.
     #[serde(default)]
     pub hide_originals: Option<bool>,
+    /// Keep a remapped controller hidden while it's momentarily absent from
+    /// enumeration (Bluetooth dropout, reconnect-while-blacklisted) instead of
+    /// un-hiding it. Off = legacy behaviour: the mask is recomputed purely from
+    /// the devices present *right now*, so a pad that blips out is unhidden
+    /// system-wide until it returns — which exposes it to a running game and
+    /// makes the game's input arbiter flip between the physical pad and the
+    /// virtual one. On = a pad still wired in the patch keeps its mask through
+    /// the gap; the mask is still dropped when the wiring goes away, when
+    /// `hide_originals` is turned off, and always on app exit (the helper
+    /// clears everything at teardown), so nothing stays hidden after a close.
+    #[serde(default)]
+    pub hidhide_sticky: bool,
     /// Render backend selection, applied at startup in `app/src/main.rs`
     /// (changing it requires an app restart). Auto = Vulkan except when the
     /// machine's GPU is AMD on Windows, where the Vulkan swapchain stalls for
@@ -606,6 +618,7 @@ impl Default for AppSettings {
             show_own_virtuals_as_physical: false,
             persist_virtual_devices: false,
             hide_originals: None,
+            hidhide_sticky: false,
             renderer: RendererChoice::Auto,
             on_patch_load: OnPatchLoad::Off,
             profiler_enabled: false,

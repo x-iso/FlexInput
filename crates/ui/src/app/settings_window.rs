@@ -261,6 +261,27 @@ impl FlexInputApp {
         self.hidhide_last_device_sig = device_sig;
         self.hidhide_last_reconcile = std::time::Instant::now();
 
+        // Refresh the session vid/pid cache from the devices present right now.
+        // Entries are never evicted while the app runs — that's the point: a pad
+        // that drops out of enumeration must still resolve to a vid/pid so the
+        // sticky path in `remapped_physical_hid_targets` can keep masking it.
+        // Only maskable pads go in, so a cache hit needs no further filtering:
+        // same exclusions as the live path (Xbox's XUSB face can't be hidden,
+        // MIDI has no vid/pid).
+        for dev in &self.devices {
+            if matches!(
+                dev.kind,
+                flexinput_devices::ControllerKind::XInput
+                    | flexinput_devices::ControllerKind::MidiIn
+                    | flexinput_devices::ControllerKind::MidiOut
+            ) {
+                continue;
+            }
+            if let (Some(vid), Some(pid)) = (dev.vid, dev.pid) {
+                self.hidhide_vidpid_cache.insert(dev.id.clone(), (vid, pid));
+            }
+        }
+
         let installed = self.hidhide_installed;
         let active = self.settings.hide_originals.unwrap_or(installed);
         let mut targets: Vec<(u16, u16)> = if active && installed {
@@ -285,12 +306,30 @@ impl FlexInputApp {
 
         // FlexInput's own exe stays whitelisted so it keeps reading the hidden pads.
         let whitelist: Vec<String> = HidHideClient::current_exe_path().into_iter().collect();
+        let sticky = self.settings.hidhide_sticky;
+        let inst_cache = std::sync::Arc::clone(&self.hidhide_instance_cache);
         std::thread::spawn(move || {
             // (vid,pid) → HID instance id (slow SetupAPI; safe off the UI/IO thread).
             let blacklist: Vec<String> = targets
                 .iter()
                 .filter_map(|(vid, pid)| {
                     let id = flexinput_devices::hidhide::instance_id_for_vid_pid(*vid, *pid);
+                    // Remember every id we resolve; when sticky is on and the pad
+                    // is currently absent, fall back to the remembered one so the
+                    // entry survives the gap instead of being unmasked.
+                    let id = match id {
+                        Some(id) => {
+                            if let Ok(mut c) = inst_cache.lock() {
+                                c.insert((*vid, *pid), id.clone());
+                            }
+                            Some(id)
+                        }
+                        None if sticky => inst_cache
+                            .lock()
+                            .ok()
+                            .and_then(|c| c.get(&(*vid, *pid)).cloned()),
+                        None => None,
+                    };
                     eprintln!(
                         "[hidhide] target {:04X}:{:04X} -> instance {:?}",
                         vid, pid, id
@@ -353,6 +392,7 @@ impl FlexInputApp {
         }
         // Map device ids → (vid,pid), keeping HID-class pads only.
         let mut out = Vec::new();
+        let mut resolved: HashSet<&str> = HashSet::new();
         for dev in &self.devices {
             if !phys_ids.contains(&dev.id) {
                 continue;
@@ -367,6 +407,26 @@ impl FlexInputApp {
             }
             if let (Some(vid), Some(pid)) = (dev.vid, dev.pid) {
                 out.push((vid, pid));
+                resolved.insert(dev.id.as_str());
+            }
+        }
+        // Sticky masking: a pad the patch still wires up but that isn't in the
+        // live list right now (Bluetooth dropout, or a reconnect that arrives
+        // already blacklisted and so never reaches our enumeration) keeps its
+        // mask, resolved from the session vid/pid cache. Without this the mask
+        // is dropped the instant the pad blips out — which UNHIDES it system-
+        // wide, handing a running game the physical pad alongside the virtual
+        // one until the pad returns and we re-hide it. The wiring is still the
+        // source of truth: a device removed from the patch drops out of
+        // `phys_ids` above and is unmasked normally.
+        if self.settings.hidhide_sticky {
+            for id in &phys_ids {
+                if resolved.contains(id.as_str()) {
+                    continue;
+                }
+                if let Some(&vp) = self.hidhide_vidpid_cache.get(id) {
+                    out.push(vp);
+                }
             }
         }
         out
@@ -1065,6 +1125,30 @@ impl FlexInputApp {
                          pad and the virtual one.",
                     ).small().color(egui::Color32::from_rgb(210, 150, 90)));
                 }
+
+                // ── Sticky masking (rides on the toggle above) ───────────────
+                ui.add_space(4.0);
+                let resp = ui.add_enabled(
+                    hidhide_installed && hide_effective,
+                    egui::Checkbox::new(
+                        &mut self.settings.hidhide_sticky,
+                        "Keep hiding through disconnects",
+                    ),
+                );
+                if resp.changed() {
+                    dirty = true;
+                    self.hidhide_dirty = true; // re-apply with the new policy
+                }
+                ui.label(egui::RichText::new(
+                    "Off (default): the mask is rebuilt from the controllers connected right now, so \
+                     a pad that briefly drops out \u{2014} a Bluetooth gap, or a reconnect that arrives \
+                     already hidden \u{2014} is UNHIDDEN for every app until it comes back. With a game \
+                     running that hands it the physical pad alongside the virtual one, which shows up \
+                     as button glyphs flickering between controller and keyboard.\n\
+                     On: a controller still mapped in your patch stays hidden across the gap, and is \
+                     masked the instant it reconnects. Unmapping it, turning the option above off, or \
+                     closing FlexInput still unhides it.",
+                ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
