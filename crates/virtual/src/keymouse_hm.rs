@@ -251,7 +251,12 @@ impl VirtualKeyMouseHm {
             scroll_carry_h: 0.0,
             last_emit: Instant::now(),
             last_mouse_report: [0; 7],
-            mouse_report_dirty: false,
+            // One neutral frame after the node comes up, then the flag latches
+            // off for good. Covers a RECLAIMED node (the helper can hand back a
+            // node left alive from a previous run, whose last delivered report
+            // isn't necessarily neutral) without arming a repeat — see
+            // `reset_outputs`, which deliberately does NOT re-arm it.
+            mouse_report_dirty: true,
             last_cursor: None,
             blocked_until: None,
             self_move_until: None,
@@ -455,9 +460,16 @@ impl VirtualDevice for VirtualKeyMouseHm {
         self.carry_y = 0.0;
         self.scroll_carry_v = 0.0;
         self.scroll_carry_h = 0.0;
-        // Force a neutral frame out even if the last report was already
-        // neutral-equal (e.g. first reset after reconnect).
-        self.mouse_report_dirty = true;
+        // Do NOT force a report here. The I/O thread calls reset_outputs() on
+        // this device EVERY TICK whenever it's bypassed or not referenced by the
+        // active tab, so arming `mouse_report_dirty` on each call made an idle
+        // virtual mouse write a zero-delta HID report at the full polling rate
+        // (up to 1 kHz). Games that pick their glyph set from "which device
+        // reported last" then see a permanently-active mouse racing the virtual
+        // pad — keyboard/gamepad glyph flicker, and a cursor re-lock (warp to
+        // screen centre) on every flip. `flush()` already emits the release
+        // frame on the neutral TRANSITION via `rep != last_mouse_report`; once
+        // neutral, silence is correct for a relative device.
         self.flush();
     }
 
