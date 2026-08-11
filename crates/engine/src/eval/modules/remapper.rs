@@ -592,6 +592,53 @@ pub(crate) fn eval_remapper_node(
                 }
             }
 
+            // ── D-pad analog synthesis ───────────────────────────────────
+            //
+            // The D-pad reaches sinks in three parallel forms: four direction
+            // Bools, `dpad_x`/`dpad_y` Floats, and the `dpad` Vec2. A mapping
+            // that outputs a direction Bool used to write ONLY the Bool,
+            // leaving the axis + Vec2 forms carrying the (unpressed)
+            // pass-through. Every sink derives all four hat bits from the Vec2
+            // when it has one — XInput's `"dpad"` arm sets UP/DOWN/LEFT/RIGHT
+            // from `v`, HIDMaestro's does the same — so the zeroed Vec2 landed
+            // after the Bool and silently cancelled it. Net effect: a
+            // `→ dpad_down` mapping lit up on the AutoMap splitter but never
+            // reached the virtual pad.
+            //
+            // `analog_axis_for_cardinal` deliberately excludes the D-pad (it's
+            // a quantized hat, not a continuous axis), so the stick Vec2 sync
+            // above never covers this case. Recompute the axis + Vec2 forms
+            // from the four Bools whenever this Remapper drives any of them,
+            // reading each direction's final published value so directions it
+            // doesn't own keep their pass-through state.
+            const DPAD_DIRS: [(&str, usize, f32); 4] = [
+                ("dpad_right", 0,  1.0),
+                ("dpad_left",  0, -1.0),
+                ("dpad_up",    1,  1.0),
+                ("dpad_down",  1, -1.0),
+            ];
+            let drives_dpad = DPAD_DIRS.iter().any(|(d, _, _)| {
+                digital_all_out_pins.contains(*d) || analog_button_out.contains(*d)
+            });
+            if drives_dpad {
+                let mut xy = [0.0f32; 2];
+                for (dir, axis, sign) in DPAD_DIRS {
+                    let on = collector_sigs
+                        .get(&(key.clone(), dir.to_string()))
+                        .or_else(|| upstream.get(dir))
+                        .copied()
+                        .map(|s| s.as_bool())
+                        .unwrap_or(false);
+                    if on { xy[axis] += sign; }
+                }
+                // Opposite directions cancel — an axis can't hold both.
+                let x = xy[0].clamp(-1.0, 1.0);
+                let y = xy[1].clamp(-1.0, 1.0);
+                collector_sigs.insert((key.clone(), "dpad_x".to_string()), Signal::Float(x));
+                collector_sigs.insert((key.clone(), "dpad_y".to_string()), Signal::Float(y));
+                collector_sigs.insert((key.clone(), "dpad".to_string()), Signal::Vec2(Vec2::new(x, y)));
+            }
+
             // ── Touchpad output synthesis (zones + analog swipe) ──────────
             //
             // If ANY mapping targets a touchpad zone/swipe pin, the Remapper owns

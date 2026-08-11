@@ -2012,6 +2012,55 @@ mod trigger_tests {
         assert!((eff_y - (-1.0)).abs() < 1e-4, "dpad_y (down) must be untouched, got {eff_y}");
     }
 
+    // D-pad OUTPUT synthesis: a mapping that drives a direction Bool must also
+    // move the axis + Vec2 forms. Sinks derive all four hat bits from the `dpad`
+    // Vec2 when they have one, so a Bool-only write was cancelled by the
+    // still-zero pass-through Vec2 landing after it — `btn_capture → dpad_down`
+    // lit up on the bus but never reached the virtual pad.
+    #[test]
+    fn dpad_direction_output_also_drives_axis_and_vec2() {
+        let dev = "gilrs:xinput:0";
+        let src = source_node(1, dev, 0.0);
+        let remap_uid = 2usize;
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_capture"], "out": ["dpad_down"], "mode": "down" }
+        ]));
+        let sink = sink_node(3, "virtual.xinput:0", &format!("remap:{remap_uid}"), false);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = Default::default();
+
+        // Physical D-pad fully at rest; the screenshot button is held.
+        let mut sigs = HashMap::new();
+        sigs.insert((dev.to_string(), "btn_capture".to_string()), Signal::Bool(true));
+        sigs.insert((dev.to_string(), "dpad_x".to_string()), Signal::Float(0.0));
+        sigs.insert((dev.to_string(), "dpad_y".to_string()), Signal::Float(0.0));
+        sigs.insert((dev.to_string(), "dpad".to_string()),   Signal::Vec2(Vec2::ZERO));
+        eval_graph_tick(&graph, &mut state, &sigs, 0.016, &mut out);
+
+        let get_b = |p: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), p.to_string())).map(|s| s.as_bool()).unwrap_or(false);
+        let get_f = |p: &str| out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), p.to_string())).map(|s| s.as_float()).unwrap_or(0.0);
+        let dpad_vec = || out.sink_outputs
+            .get(&("virtual.xinput:0".to_string(), "dpad".to_string()))
+            .and_then(|s| if let Signal::Vec2(v) = s { Some(*v) } else { None }).unwrap_or(Vec2::ZERO);
+
+        assert!(get_b("dpad_down"), "mapped dpad_down Bool must assert");
+        // Whichever form the sink kept must agree with the Bool.
+        let eff_y = if out.sink_outputs.contains_key(&("virtual.xinput:0".to_string(), "dpad_y".to_string())) {
+            get_f("dpad_y") } else { dpad_vec().y };
+        assert!((eff_y - (-1.0)).abs() < 1e-4,
+            "dpad_down output must drive the y axis to -1, got {eff_y}");
+        // Untouched directions stay at rest — synthesis must not invent an X.
+        let eff_x = if out.sink_outputs.contains_key(&("virtual.xinput:0".to_string(), "dpad_x".to_string())) {
+            get_f("dpad_x") } else { dpad_vec().x };
+        assert!(eff_x.abs() < 1e-4, "unmapped x axis must stay 0, got {eff_x}");
+        assert!(!get_b("dpad_up"), "dpad_up must stay released");
+    }
+
     // Vec2-authoritative: when the device provides a strong `left_stick` Vec2
     // but near-zero axis floats, a Collector forwards both, and the Remapper
     // must derive its axes (and cardinals) from the Vec2 — so an analog
