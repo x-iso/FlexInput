@@ -5,6 +5,43 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-08-11
+
+Three fixes for the same underlying trap: egui's `ctx.data()` and its layer→transform
+map are shared by *every* window, while all of FlexInput's hosts (main canvas,
+sub-patch editor, and the three overlays) report the same background layer id. Any
+state keyed only by node id therefore collided as soon as one node was visible in two
+places at once — and the host that painted last won. Plus a D-pad output fix.
+
+### Fixed
+
+- **Pinned Remapper cards disappearing or cropping past the widget border.** A
+  whole-module pin paints into its own transform layer, keyed by `(layer, node)` —
+  identical for the canvas and every overlay. Two hosts showing one node wrote a
+  single transform, so one host's cards were painted through the other's, landing
+  outside the clip band. Layer and scroll-state keys are now scoped per host
+  (viewport + layer + pin).
+- **Pinned Remapper clipping at a stale scroll position.** The clip rect was derived
+  from the pre-clamp scroll offset while the layer transform used the post-clamp,
+  post-scrollbar-drag one, so any frame where the clamp bit — a card expanding, a
+  mapping added, the pin resized, the scrollbar dragged — painted the body at one
+  offset and clipped it at another. Clip, transform and scrollbar now share one
+  offset frozen for the frame, clamped up front against the previous frame's height.
+- **Mapping-card drag-to-reorder doing nothing.** The drag's cross-frame state lives
+  in `ctx.data()` under the node id alone, so a Remapper open in a sub-patch editor
+  *and* pinned elsewhere had both hosts writing it. The non-dragging host stored
+  `pointer_y: None`, leaving the insertion target permanently unresolved: no
+  insertion line, no commit on release, and the drag lift reverted every frame.
+  Reorder state is now scoped per host as well.
+- **D-pad directions driven by a mapping never reaching the virtual pad.** The D-pad
+  crosses the bus as four direction Bools, `dpad_x`/`dpad_y`, and a `dpad` Vec2, and
+  sinks derive all four hat bits from the Vec2 when they have one — so a mapping that
+  wrote only the Bool was cancelled by the still-zero pass-through Vec2 landing after
+  it (visible as the Bool lighting up on an AutoMap splitter while the pad stayed
+  idle). The Remapper now synthesizes the axis and Vec2 forms from the direction
+  Bools whenever it drives any of them; directions it doesn't own keep passing
+  through, and opposite directions cancel.
+
 ## [0.13.2] - 2026-07-31
 
 Adds the **RWS Aim** module — gyro/stick camera aiming with a physically-grounded,
