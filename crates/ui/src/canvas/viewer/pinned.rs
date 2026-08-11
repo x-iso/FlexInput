@@ -697,11 +697,16 @@ pub(crate) fn remap_body_inputs_for(
 }
 
 /// Per-pinned-widget runtime state stashed in egui ctx data.
-///   (scroll_offset, last_draft_hash, last_mappings_hash)
+///   (scroll_offset, last_draft_hash, last_mappings_hash, last_body_height)
 ///
 /// Hashes (not lengths) so swapping one captured button for another — same
 /// count, different content — still triggers the auto-scroll-to-top.
-pub(crate) type RemapPinState = (f32, u64, u64);
+///
+/// `last_body_height` is the measured body height (body-space px) from the
+/// previous frame. It exists so the scroll offset can be clamped BEFORE the
+/// clip rect and the layer transform are derived from it — see the "one scroll
+/// value per frame" note in `render_remap_whole_module_impl`.
+pub(crate) type RemapPinState = (f32, u64, u64, f32);
 
 pub(crate) fn remap_hash_draft(node: &NodeData, with_output: bool) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -736,11 +741,32 @@ pub(crate) fn remap_hash_mappings(node: &NodeData) -> u64 {
     h.finish()
 }
 
-pub(crate) fn remap_pin_state_id(outer_layer: egui::LayerId, inner_id: NodeId, tag: &'static str) -> egui::Id {
-    egui::Id::new(("fxi_remap_pin_state", outer_layer, inner_id.0, tag))
+/// Discriminator that makes a whole-module pin's private layer + state keys
+/// unique per HOST, not merely per (parent layer, node).
+///
+/// `ui.layer_id()` alone is NOT enough. Every host renders its pins inside a
+/// `CentralPanel`, and egui hardcodes that panel to `LayerId::background()` —
+/// so the main canvas, the sub-patch window, and all three overlay viewports
+/// (info / menu / config) hand us the *same* `LayerId`. That collided because
+/// `Context::to_global` — the layer→transform map behind `set_transform_layer`
+/// — is one flat map shared by every viewport, unlike `Memory::areas` which is
+/// per-viewport. Two hosts showing the same node wrote a single key and the
+/// last writer of the frame won, so one host's shapes got painted through the
+/// other host's transform: cards vanishing, or cropping at a boundary with no
+/// relation to the pin's own border.
+///
+/// `ui.id()` additionally separates two pins of the SAME node within one host
+/// (the overlay salts each pin with `push_id(("fxi_ov_pin", idx))`, which moves
+/// `ui.id()` but never `ui.layer_id()`).
+pub(crate) fn pin_host_scope(ui: &egui::Ui) -> egui::Id {
+    egui::Id::new((ui.ctx().viewport_id(), ui.layer_id(), ui.id()))
 }
 
-pub(crate) fn remap_layer_id(outer_layer: egui::LayerId, inner_id: NodeId, tag: &'static str) -> egui::LayerId {
+pub(crate) fn remap_pin_state_id(ui: &egui::Ui, inner_id: NodeId, tag: &'static str) -> egui::Id {
+    egui::Id::new(("fxi_remap_pin_state", pin_host_scope(ui), inner_id.0, tag))
+}
+
+pub(crate) fn remap_layer_id(ui: &egui::Ui, inner_id: NodeId, tag: &'static str) -> egui::LayerId {
     // Child layer order MUST match parent_ui.layer_id().order — egui's
     // set_sublayer debug_asserts on mismatched orders (panic message:
     // "Trying to set sublayers across layers of different order").
@@ -748,8 +774,8 @@ pub(crate) fn remap_layer_id(outer_layer: egui::LayerId, inner_id: NodeId, tag: 
     // Order::Background, so hardcoding Middle here used to fire the
     // assert in debug builds whenever a sub-patch body rendered.
     egui::LayerId::new(
-        outer_layer.order,
-        egui::Id::new(("fxi_remap_pin_layer", outer_layer, inner_id.0, tag)),
+        ui.layer_id().order,
+        egui::Id::new(("fxi_remap_pin_layer", pin_host_scope(ui), inner_id.0, tag)),
     )
 }
 
@@ -986,12 +1012,13 @@ where
     // still tracked/persisted for potential future use, but does not gate the
     // re-snap. (For the Combiner, `draft_len_fn == map_len_fn`, so its
     // config-change rebase still fires through the draft path.)
-    let state_key = remap_pin_state_id(ui.layer_id(), inner_id, tag);
+    let state_key = remap_pin_state_id(ui, inner_id, tag);
     let (cur_draft_h, cur_map_h): (u64, u64) = inner_snarl.get_node(inner_id).map(|n| {
         (draft_len_fn(n), map_len_fn(n))
     }).unwrap_or((0, 0));
     let prev: Option<RemapPinState> = ui.ctx().data(|d| d.get_temp(state_key));
-    let (prev_offset, prev_draft, _prev_map) = prev.unwrap_or((0.0, cur_draft_h, cur_map_h));
+    let (prev_offset, prev_draft, _prev_map, prev_body_h) =
+        prev.unwrap_or((0.0, cur_draft_h, cur_map_h, 0.0));
     let any_capture_change = (cur_draft_h != prev_draft) && !is_layout_mode;
 
     // ── 3. Compute pointer-over check via raw input (the body layer above
@@ -1038,7 +1065,7 @@ where
     if !is_layout_mode {
         let drag_flag_id = egui::Id::new((
             "fxi_reorder_drag_active",
-            remap_layer_id(ui.layer_id(), inner_id, tag),
+            remap_layer_id(ui, inner_id, tag),
         ));
         let drag_active = ui.ctx().data(|d| d.get_temp::<bool>(drag_flag_id)).unwrap_or(false);
         if drag_active {
@@ -1066,13 +1093,32 @@ where
                     // while the body scrolls under it. (`begin` consumes it.)
                     let comp_id = egui::Id::new((
                         "fxi_reorder_scroll_comp",
-                        remap_layer_id(ui.layer_id(), inner_id, tag),
+                        remap_layer_id(ui, inner_id, tag),
                     ));
                     ui.ctx().data_mut(|d| d.insert_temp(comp_id, delta));
                 }
             }
         }
     }
+
+    // ── 4c. Freeze ONE scroll value for the whole frame ─────────────────────
+    // Everything downstream — the clip band, the layer transform, and the
+    // scrollbar geometry — must be derived from the SAME offset, or the body
+    // gets painted at one position and clipped at another (content cropping at
+    // a boundary unrelated to the pin's border, or vanishing entirely).
+    //
+    // That forces the clamp to happen HERE, before the body renders. This
+    // frame's body height isn't known yet, so we clamp against the previous
+    // frame's measurement; a body that just grew becomes scrollable to its new
+    // bottom one frame later, which is invisible. (Frame 1 has no measurement,
+    // but also starts at offset 0, so clamping to 0 is already correct.)
+    if prev_body_h > 0.0 {
+        let max_prev = (prev_body_h - container_h / scale).max(0.0);
+        scroll_offset_body = scroll_offset_body.clamp(0.0, max_prev);
+    } else {
+        scroll_offset_body = scroll_offset_body.max(0.0);
+    }
+    let render_scroll = scroll_offset_body;
 
     // ── 5. Render the body — two paths depending on mode ────────────────────
     //
@@ -1130,7 +1176,7 @@ where
         });
         body_h = inner.inner;
     } else {
-        let body_layer = remap_layer_id(ui.layer_id(), inner_id, tag);
+        let body_layer = remap_layer_id(ui, inner_id, tag);
         let body_max_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(REMAP_DESIGN_W, 100_000.0),
@@ -1141,7 +1187,7 @@ where
                 .max_rect(body_max_rect),
         );
         let visible_band = egui::Rect::from_min_size(
-            egui::pos2(0.0, scroll_offset_body),
+            egui::pos2(0.0, render_scroll),
             egui::vec2(REMAP_DESIGN_W, container_h / scale),
         );
         // Intersect with the parent UI's clip rect mapped into body-local
@@ -1153,11 +1199,15 @@ where
         // map it through only `local_xform.inverse()` — NOT through
         // `parent_to_global` — to reach body-local coords. Doing both
         // would over-transform and collapse the clip to an empty rect.
+        //
+        // `local_xform` is built once here from `render_scroll` and is the
+        // exact transform installed on the layer further down — deriving the
+        // clip from anything else is what let content and clip drift apart.
         let parent_clip_local = ui.clip_rect();
-        let local_translation_preview = container_rect.min.to_vec2()
-            - egui::vec2(0.0, scroll_offset_body * scale);
-        let local_xform_preview = egui::emath::TSTransform::new(local_translation_preview, scale);
-        let inv_local = local_xform_preview.inverse();
+        let local_translation = container_rect.min.to_vec2()
+            - egui::vec2(0.0, render_scroll * scale);
+        let local_xform = egui::emath::TSTransform::new(local_translation, scale);
+        let inv_local = local_xform.inverse();
         let parent_clip_body = egui::Rect::from_min_max(
             inv_local * parent_clip_local.min,
             inv_local * parent_clip_local.max,
@@ -1176,20 +1226,21 @@ where
         );
         body_h = body_ui.min_rect().height().max(1.0);
 
-        // Clamp scroll offset using actual body height before painting chrome.
+        // Now that the real body height is known, work out where the offset
+        // SHOULD settle. This never feeds back into this frame's clip or
+        // transform (see 4c) — it is the value handed to the next frame.
         let max_offset_body = (body_h - container_h / scale).max(0.0);
-        if scroll_offset_body < 0.0 { scroll_offset_body = 0.0; }
-        if scroll_offset_body > max_offset_body { scroll_offset_body = max_offset_body; }
 
         // ── Scrollbar — painted INTO the body layer so it shares the layer's
         //    z-order (always above the body widgets, never lost behind a
         //    sublayer). Coordinates are in body-space; we add `scroll_offset_body`
         //    to the Y so the scrollbar stays stationary on screen as the body
         //    scrolls (the body layer's translation includes -scroll_offset_body*scale).
-        let mut new_scroll = scroll_offset_body;
+        let mut new_scroll = render_scroll.clamp(0.0, max_offset_body);
         if max_offset_body > 0.5 {
-            // Visible band in body coords.
-            let band_top = scroll_offset_body;
+            // Visible band in body coords — must match the clip band above,
+            // so it uses `render_scroll`, not the settled `new_scroll`.
+            let band_top = render_scroll;
             let band_h_body = container_h / scale;
             // Scrollbar geometry, all in body-coords. Convert pixel sizes to
             // body-coords by dividing by `scale` so the on-screen size stays
@@ -1208,7 +1259,7 @@ where
             let visible_frac = (band_h_body / body_h).clamp(0.05, 1.0);
             let min_thumb_body = 14.0 / scale;
             let thumb_h = (track_h * visible_frac).max(min_thumb_body);
-            let scroll_frac = (scroll_offset_body / max_offset_body).clamp(0.0, 1.0);
+            let scroll_frac = (render_scroll / max_offset_body).clamp(0.0, 1.0);
             let thumb_y = track_y_min + (track_h - thumb_h) * scroll_frac;
             let thumb_rect = egui::Rect::from_min_size(
                 egui::pos2(track_x_min, thumb_y),
@@ -1216,10 +1267,13 @@ where
             );
 
             // Interaction on the body layer at thumb_rect (body-coords).
+            // A drag result lands in `new_scroll` and therefore takes effect on
+            // the NEXT frame — same-frame application would move the body out
+            // from under the clip band this frame's shapes were tessellated to.
             let drag_id = egui::Id::new(("fxi_remap_sb_drag", body_layer, inner_id.0));
             let thumb_resp = body_ui.interact(thumb_rect, drag_id, egui::Sense::click_and_drag());
             if thumb_resp.drag_started() {
-                body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (scroll_offset_body, 0.0f32)));
+                body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (render_scroll, 0.0f32)));
             }
             if thumb_resp.dragged() {
                 let track_travel = (track_h - thumb_h).max(1.0);
@@ -1227,7 +1281,7 @@ where
                 // the layer's inverse transform). track_travel in same coords.
                 let body_per_track_px = max_offset_body / track_travel;
                 let (start, acc) = body_ui.ctx().data(|d| d.get_temp::<(f32, f32)>(drag_id))
-                    .unwrap_or((scroll_offset_body, 0.0));
+                    .unwrap_or((render_scroll, 0.0));
                 let new_acc = acc + thumb_resp.drag_delta().y;
                 body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (start, new_acc)));
                 new_scroll = (start + new_acc * body_per_track_px)
@@ -1249,13 +1303,12 @@ where
             };
             painter.rect_filled(thumb_rect, 2.0 / scale, thumb_col);
         }
-        scroll_offset_body = new_scroll;
-
-        let local_translation = container_rect.min.to_vec2()
-            - egui::vec2(0.0, scroll_offset_body * scale);
-        let local_xform = egui::emath::TSTransform::new(local_translation, scale);
+        // Install the SAME `local_xform` the clip was derived from.
         ui.ctx().set_transform_layer(body_layer, parent_to_global * local_xform);
         ui.ctx().set_sublayer(ui.layer_id(), body_layer);
+
+        // Settled offset for the next frame (scrollbar drag + real-height clamp).
+        scroll_offset_body = new_scroll;
     }
 
     // ── 6. Re-clamp scroll offset (in layout-mode path it isn't set above) ──
@@ -1267,7 +1320,7 @@ where
     ui.ctx().data_mut(|d| {
         d.insert_temp::<RemapPinState>(
             state_key,
-            (scroll_offset_body, cur_draft_h, cur_map_h),
+            (scroll_offset_body, cur_draft_h, cur_map_h, body_h),
         );
     });
 }
@@ -1483,15 +1536,16 @@ pub(crate) fn render_label_text_pinned_scroll(
     let container_h = container_size.y.max(16.0);
     let scale = (container_w / design_w).clamp(0.25, 4.0);
 
-    // ── 4. State key (per layer + inner node) ───────────────────────────────
-    let state_key = egui::Id::new(("fxi_label_pin_state", ui.layer_id().id, inner_id.0));
-    type LabelPinState = (f32, u64); // (scroll_offset_body, text_hash)
+    // ── 4. State key (per HOST + inner node) — see `pin_host_scope` ─────────
+    let state_key = egui::Id::new(("fxi_label_pin_state", pin_host_scope(ui), inner_id.0));
+    // (scroll_offset_body, text_hash, last_body_height)
+    type LabelPinState = (f32, u64, f32);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     base_font.to_bits().hash(&mut hasher);
     let cur_text_hash = hasher.finish();
     let prev: Option<LabelPinState> = ui.ctx().data(|d| d.get_temp(state_key));
-    let (prev_offset, prev_hash) = prev.unwrap_or((0.0, cur_text_hash));
+    let (prev_offset, prev_hash, prev_body_h) = prev.unwrap_or((0.0, cur_text_hash, 0.0));
     let changed = (cur_text_hash != prev_hash) && !is_layout_mode;
 
     // ── 5. Pointer-over for wheel scroll ────────────────────────────────────
@@ -1509,6 +1563,17 @@ pub(crate) fn render_label_text_pinned_scroll(
             scroll_offset_body -= wheel / scale;
         }
     }
+
+    // Freeze one scroll value for clip + transform + scrollbar, clamped against
+    // last frame's measured height — see the same step in
+    // `render_remap_whole_module_impl` for why the clamp cannot wait.
+    if prev_body_h > 0.0 {
+        let max_prev = (prev_body_h - container_h / scale).max(0.0);
+        scroll_offset_body = scroll_offset_body.clamp(0.0, max_prev);
+    } else {
+        scroll_offset_body = scroll_offset_body.max(0.0);
+    }
+    let render_scroll = scroll_offset_body;
 
     // ── 6. Render — visual-transform path (layout) vs layer path (lock) ─────
     let render_body = |body_ui: &mut egui::Ui, content_w: f32| -> f32 {
@@ -1563,7 +1628,7 @@ pub(crate) fn render_label_text_pinned_scroll(
         let body_layer = egui::LayerId::new(
             // Match parent layer order — see remap_layer_id for rationale.
             ui.layer_id().order,
-            egui::Id::new(("fxi_label_pin_layer", ui.layer_id().id, inner_id.0)),
+            egui::Id::new(("fxi_label_pin_layer", pin_host_scope(ui), inner_id.0)),
         );
         let body_max_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
@@ -1573,17 +1638,18 @@ pub(crate) fn render_label_text_pinned_scroll(
             egui::UiBuilder::new().layer_id(body_layer).max_rect(body_max_rect),
         );
         let visible_band = egui::Rect::from_min_size(
-            egui::pos2(0.0, scroll_offset_body),
+            egui::pos2(0.0, render_scroll),
             egui::vec2(design_w, container_h / scale),
         );
         // Intersect with the parent UI's clip rect (parent-layer coords)
         // mapped into body-local via inverse local transform, so the
-        // body_layer cannot spill outside the canvas viewport.
+        // body_layer cannot spill outside the canvas viewport. `local_xform`
+        // is the exact transform installed on the layer below.
         let parent_clip_local = ui.clip_rect();
-        let local_translation_preview = container_rect.min.to_vec2()
-            - egui::vec2(0.0, scroll_offset_body * scale);
-        let local_xform_preview = egui::emath::TSTransform::new(local_translation_preview, scale);
-        let inv_local = local_xform_preview.inverse();
+        let local_translation = container_rect.min.to_vec2()
+            - egui::vec2(0.0, render_scroll * scale);
+        let local_xform = egui::emath::TSTransform::new(local_translation, scale);
+        let inv_local = local_xform.inverse();
         let parent_clip_body = egui::Rect::from_min_max(
             inv_local * parent_clip_local.min,
             inv_local * parent_clip_local.max,
@@ -1592,14 +1658,14 @@ pub(crate) fn render_label_text_pinned_scroll(
         body_ui.set_clip_rect(final_clip);
         body_h = render_body(&mut body_ui, design_w);
 
+        // Settles the offset for the NEXT frame only — this frame's clip and
+        // transform are already committed to `render_scroll`.
         let max_offset_body = (body_h - container_h / scale).max(0.0);
-        if scroll_offset_body < 0.0 { scroll_offset_body = 0.0; }
-        if scroll_offset_body > max_offset_body { scroll_offset_body = max_offset_body; }
 
         // Scrollbar painted into body layer with Y offset so it stays on screen.
-        let mut new_scroll = scroll_offset_body;
+        let mut new_scroll = render_scroll.clamp(0.0, max_offset_body);
         if max_offset_body > 0.5 {
-            let band_top = scroll_offset_body;
+            let band_top = render_scroll;
             let band_h_body = container_h / scale;
             let sb_w_body = 6.0 / scale;
             let sb_inset_body = 1.0 / scale;
@@ -1614,7 +1680,7 @@ pub(crate) fn render_label_text_pinned_scroll(
             let visible_frac = (band_h_body / body_h).clamp(0.05, 1.0);
             let min_thumb_body = 14.0 / scale;
             let thumb_h = (track_h * visible_frac).max(min_thumb_body);
-            let scroll_frac = (scroll_offset_body / max_offset_body).clamp(0.0, 1.0);
+            let scroll_frac = (render_scroll / max_offset_body).clamp(0.0, 1.0);
             let thumb_y = track_y_min + (track_h - thumb_h) * scroll_frac;
             let thumb_rect = egui::Rect::from_min_size(
                 egui::pos2(track_x_min, thumb_y),
@@ -1623,13 +1689,13 @@ pub(crate) fn render_label_text_pinned_scroll(
             let drag_id = egui::Id::new(("fxi_label_sb_drag", body_layer, inner_id.0));
             let thumb_resp = body_ui.interact(thumb_rect, drag_id, egui::Sense::click_and_drag());
             if thumb_resp.drag_started() {
-                body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (scroll_offset_body, 0.0f32)));
+                body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (render_scroll, 0.0f32)));
             }
             if thumb_resp.dragged() {
                 let track_travel = (track_h - thumb_h).max(1.0);
                 let body_per_track_px = max_offset_body / track_travel;
                 let (start, acc) = body_ui.ctx().data(|d| d.get_temp::<(f32, f32)>(drag_id))
-                    .unwrap_or((scroll_offset_body, 0.0));
+                    .unwrap_or((render_scroll, 0.0));
                 let new_acc = acc + thumb_resp.drag_delta().y;
                 body_ui.ctx().data_mut(|d| d.insert_temp(drag_id, (start, new_acc)));
                 new_scroll = (start + new_acc * body_per_track_px).clamp(0.0, max_offset_body);
@@ -1649,13 +1715,11 @@ pub(crate) fn render_label_text_pinned_scroll(
             };
             painter.rect_filled(thumb_rect, 2.0 / scale, thumb_col);
         }
-        scroll_offset_body = new_scroll;
-
-        let local_translation = container_rect.min.to_vec2()
-            - egui::vec2(0.0, scroll_offset_body * scale);
-        let local_xform = egui::emath::TSTransform::new(local_translation, scale);
+        // Install the SAME `local_xform` the clip was derived from.
         ui.ctx().set_transform_layer(body_layer, parent_to_global * local_xform);
         ui.ctx().set_sublayer(ui.layer_id(), body_layer);
+
+        scroll_offset_body = new_scroll;
     }
 
     let max_offset_body = (body_h - container_h / scale).max(0.0);
@@ -1663,7 +1727,7 @@ pub(crate) fn render_label_text_pinned_scroll(
     if scroll_offset_body > max_offset_body { scroll_offset_body = max_offset_body; }
 
     ui.ctx().data_mut(|d| {
-        d.insert_temp::<LabelPinState>(state_key, (scroll_offset_body, cur_text_hash));
+        d.insert_temp::<LabelPinState>(state_key, (scroll_offset_body, cur_text_hash, body_h));
     });
 }
 

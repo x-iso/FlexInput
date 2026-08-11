@@ -57,8 +57,32 @@ pub(crate) struct ReorderView {
     commit: Option<(usize, usize)>,
 }
 
+/// Host discriminator for the persisted drag state.
+///
+/// Callers key `state_id` on the NODE (`("fxi_remap_reorder", node_id.0)`), but
+/// `ctx.data()` is one map shared by every viewport — so the same node rendered
+/// in two places at once (a sub-patch editor window plus a whole-module pin of
+/// that node on the parent canvas or an overlay) had both hosts reading and
+/// writing a single `ReorderPersist`. The host that isn't being dragged records
+/// `pointer_y: None` and last frame's `dy`, and whichever renders last wins:
+/// `target` stays `None` forever, so no insertion gap is ever drawn and
+/// `commit` — which requires `Some(target)` — never fires, while the drag lift
+/// gets reverted each frame. Net effect: drag-to-reorder silently stops working
+/// the moment the node is visible in a second place.
+///
+/// `(viewport_id, layer_id)` separates them: different windows differ by
+/// viewport, the canvas and a pin differ by layer, and two pins of one node
+/// differ by layer too (see `pin_host_scope`). Deliberately NOT `ui.id()` —
+/// that moves more readily and would drop an in-flight drag.
+fn reorder_host_scope(ui: &egui::Ui) -> egui::Id {
+    egui::Id::new((ui.ctx().viewport_id(), ui.layer_id()))
+}
+
 impl ReorderView {
     pub(crate) fn begin(ui: &egui::Ui, state_id: egui::Id, enabled: bool) -> Self {
+        // Scoped here rather than at each call site so a new reorder list can't
+        // forget it (there are four: Remapper, Map Action, Touch Zones, Lean).
+        let state_id = state_id.with(reorder_host_scope(ui));
         let persist: ReorderPersist =
             ui.ctx().data(|d| d.get_temp(state_id)).unwrap_or_default();
         let mut drag = if enabled { persist.drag } else { None };
