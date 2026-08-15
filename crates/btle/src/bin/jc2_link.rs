@@ -148,9 +148,24 @@ fn init_controller(dongle: &Dongle, conn: u16) {
     send_cmd("player LED", cmd_frame(0x09, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0]));
 
     // Feature select: buttons | sticks | IMU | mouse | rumble = 0x37.
-    // This is the one that actually turns the stream on.
     send_cmd("feature select", cmd_frame(0x0C, 0x02, &[0x37, 0, 0, 0]));
     send_cmd("feature enable", cmd_frame(0x0C, 0x04, &[0x37, 0, 0, 0]));
+
+    // The vendor "report rate" descriptor (679d5510-…) on the input
+    // characteristic. Official software writes `85 00` here as its
+    // second-to-last init step, and the Bluetooth backend found this is what
+    // lifts the controller off its idle cadence — without it the stream stays
+    // stub reports, which is exactly what we are seeing.
+    //
+    // The handle is DERIVED, not captured: descriptors follow their
+    // characteristic value handle, so with the value at 0x000e and the CCCD at
+    // 0x000f this should be 0x0010. Sent as a Write Request so a wrong guess
+    // comes back as a visible ATT error instead of silence.
+    let pdu = acl::write_request(joycon::HANDLE_INPUT_REPORT_RATE, &joycon::REPORT_RATE_PAYLOAD);
+    match dongle.send_att(conn, &pdu) {
+        Ok(()) => println!("[link] init -> report-rate descriptor (handle {:#06x})", joycon::HANDLE_INPUT_REPORT_RATE),
+        Err(e) => eprintln!("[link] init -> report-rate descriptor FAILED: {e}"),
+    }
 }
 
 /// Write an ATT PDU, reporting the outcome.

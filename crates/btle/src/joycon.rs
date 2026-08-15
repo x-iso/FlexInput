@@ -25,6 +25,23 @@ pub const HANDLE_INPUT_VALUE: u16 = 0x000E;
 /// rather than captured.
 pub const HANDLE_INPUT_CCCD: u16 = HANDLE_INPUT_VALUE + 1;
 
+/// Vendor "report rate" descriptor on the input characteristic
+/// (`679d5510-5a24-4dee-9557-95df80486ecb`).
+///
+/// DERIVED, not captured: descriptors follow their characteristic's value
+/// handle, so with the value at `0x000e` and the CCCD at `0x000f` this is the
+/// next one along. Write it with an acknowledged Write Request so a wrong guess
+/// surfaces as an ATT error rather than silence.
+pub const HANDLE_INPUT_REPORT_RATE: u16 = HANDLE_INPUT_CCCD + 1;
+
+/// Payload for the descriptor above, copied verbatim from the captured init.
+///
+/// Official software writes this as its second-to-last init step; the research
+/// doc labels it "Set Report Rate?". Without it the controller keeps emitting
+/// STUB reports — counter incrementing, every field zero — which is
+/// indistinguishable from a parser bug.
+pub const REPORT_RATE_PAYLOAD: [u8; 2] = [0x85, 0x00];
+
 /// Command-response characteristic, per the Bluetooth notes in
 /// `flexinput-joycon2` (`CMD_RESP_HEADER_OFFSET` applies to its payloads).
 pub const HANDLE_CMD_RESPONSE: u16 = 0x001E;
