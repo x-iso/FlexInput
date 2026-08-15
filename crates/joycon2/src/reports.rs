@@ -33,7 +33,26 @@ const OFF_MOTION_TIMESTAMP: usize = OFF_MOTION;
 /// accel at `0x16`. That is wrong for report 0x07/0x08 over BLE: reading there
 /// produced one smooth axis and two channels of noise, and the field the doc
 /// calls `gyro y` was a slowly incrementing counter.
+/// Offsets below are for the RIGHT half. The LEFT half's report is identical
+/// but shifted one byte EARLIER — see [`left_shift`].
 const OFF_MOTION_ACCEL: usize = 0x22;
+
+/// The left half's report is offset one byte earlier than the right's.
+///
+/// Measured, not assumed: a guided motion sweep found the accelerometer at
+/// 33/37/41 on the left and 34/38/42 on the right, and every other responsive
+/// field showed the same one-byte difference. The right half carries one extra
+/// byte ahead of the motion block.
+///
+/// This was silently breaking the left half entirely. `motion_len` was read one
+/// byte late — 0x0b instead of 0x1e — which failed the length guard, so the
+/// left half's motion was never parsed at all.
+fn left_shift(side: Side) -> usize {
+    match side {
+        Side::Left => 1,
+        Side::Right => 0,
+    }
+}
 
 /// One IMU sample.
 ///
@@ -48,8 +67,14 @@ pub struct Motion {
     /// Increments by 12 per report.
     pub timestamp: u32,
     /// Accelerometer, raw signed LSB. **1 g = [`ACCEL_LSB_PER_G`]**, established
-    /// from hardware: at rest the three axes form a vector of constant
-    /// magnitude ≈4096 regardless of orientation.
+    /// from hardware: the three axes form a vector of constant magnitude ≈4096
+    /// in every orientation (measured error 2–5% across a full sweep).
+    ///
+    /// Each axis is an **i16 followed by two zero bytes**, on a 4-byte stride —
+    /// NOT an i32, despite the padding making it look like one. Reading it as
+    /// i32 works only for positive values: `aa ff 00 00` is −86 as i16 but
+    /// +65450 as i32, so every negative reading came out as a large positive
+    /// one. That is what made two axes look like "a mess".
     pub accel: [i32; 3],
     /// Gyro, raw signed LSB. **Not yet located in the report** — see
     /// [`parse_input`]. Always zero for now, deliberately: feeding the bytes we
@@ -215,23 +240,26 @@ pub fn parse_input(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
         };
     }
 
-    if payload.len() > OFF_MOTION_LEN {
-        snap.motion_len = payload[OFF_MOTION_LEN];
+    let sh = left_shift(side);
+    if payload.len() > OFF_MOTION_LEN - sh {
+        snap.motion_len = payload[OFF_MOTION_LEN - sh];
         // A full block is 30 bytes; the very first report after init carries 4
         // and no sensor data. Require enough length for the accel field rather
         // than for the (wrong) 18-byte layout the spec describes.
         let need = OFF_MOTION_ACCEL + 12 - OFF_MOTION;
         if snap.motion_len as usize >= need && payload.len() >= OFF_MOTION_ACCEL + 12 {
-            let t = OFF_MOTION_TIMESTAMP;
-            let a = OFF_MOTION_ACCEL;
+            let t = OFF_MOTION_TIMESTAMP - sh;
+            let a = OFF_MOTION_ACCEL - sh;
             snap.motion = Motion {
                 timestamp: u32::from_le_bytes([
                     payload[t], payload[t + 1], payload[t + 2], payload[t + 3],
                 ]),
+                // i16 on a 4-byte stride, widened for the caller. The two
+                // bytes after each axis are padding, not part of the value.
                 accel: [
-                    i32le(payload, a),
-                    i32le(payload, a + 4),
-                    i32le(payload, a + 8),
+                    i16le(payload, a) as i32,
+                    i16le(payload, a + 4) as i32,
+                    i16le(payload, a + 8) as i32,
                 ],
                 // Not located yet — see the note on `OFF_MOTION_ACCEL`.
                 // Deliberately left at zero rather than pointed at a guess: the
@@ -498,19 +526,63 @@ mod tests {
 
     #[test]
     fn motion_is_only_parsed_when_the_controller_reports_a_block() {
+        // Side::Right, because the module constants are the RIGHT half's
+        // offsets; the left half's report sits one byte earlier.
         let mut buf = vec![0u8; INPUT_REPORT_LEN];
         buf[OFF_MOTION_LEN] = 0; // IMU feature off
         buf[OFF_MOTION_ACCEL] = 0xFF; // stale bytes that must NOT be read
-        let s = parse_input(Side::Left, &buf).unwrap();
+        let s = parse_input(Side::Right, &buf).unwrap();
         assert_eq!(s.motion, Motion::default());
 
         buf[OFF_MOTION_LEN] = 30;
         buf[OFF_MOTION..OFF_MOTION + 4].copy_from_slice(&1234u32.to_le_bytes());
-        buf[OFF_MOTION_ACCEL..OFF_MOTION_ACCEL + 4].copy_from_slice(&(-500i32).to_le_bytes());
-        let s = parse_input(Side::Left, &buf).unwrap();
+        buf[OFF_MOTION_ACCEL..OFF_MOTION_ACCEL + 2].copy_from_slice(&(-500i16).to_le_bytes());
+        let s = parse_input(Side::Right, &buf).unwrap();
         assert_eq!(s.motion_len, 30);
         assert_eq!(s.motion.timestamp, 1234);
         assert_eq!(s.motion.accel[0], -500);
+    }
+
+    /// The left half's whole report is one byte earlier than the right's.
+    ///
+    /// Pinned because getting it wrong is SILENT and total: `motion_len` reads
+    /// the neighbouring byte, fails the length guard, and the left half's
+    /// motion is simply never parsed — no error, no warning, just a permanently
+    /// still accelerometer. That is exactly what shipped until a guided sweep
+    /// measured the accel at 33/37/41 on the left and 34/38/42 on the right.
+    #[test]
+    fn the_left_half_report_is_shifted_one_byte_earlier() {
+        let mut buf = vec![0u8; INPUT_REPORT_LEN];
+        buf[OFF_MOTION_LEN - 1] = 30;
+        buf[OFF_MOTION_ACCEL - 1..OFF_MOTION_ACCEL + 1]
+            .copy_from_slice(&(-86i16).to_le_bytes());
+        buf[OFF_MOTION_ACCEL + 7..OFF_MOTION_ACCEL + 9]
+            .copy_from_slice(&4136i16.to_le_bytes());
+
+        let l = parse_input(Side::Left, &buf).unwrap();
+        assert_eq!(l.motion_len, 30, "left reads motion_len one byte earlier");
+        assert_eq!(l.motion.accel[0], -86);
+        assert_eq!(l.motion.accel[2], 4136, "1 g on the vertical axis");
+
+        // The same bytes read as a RIGHT half must NOT produce that block.
+        let r = parse_input(Side::Right, &buf).unwrap();
+        assert_ne!(r.motion.accel[0], -86);
+    }
+
+    /// Negative accelerometer readings must survive.
+    ///
+    /// Each axis is an i16 followed by two ZERO bytes, so reading the field as
+    /// an i32 turns every negative value into a large positive one — `aa ff 00
+    /// 00` is −86 as i16 but +65450 as i32. That single mistake is what made
+    /// two of the three axes look like noise on hardware.
+    #[test]
+    fn negative_accel_axes_are_not_read_as_huge_positives() {
+        let mut buf = vec![0u8; INPUT_REPORT_LEN];
+        buf[OFF_MOTION_LEN] = 30;
+        // Exactly the bytes a controller sends: i16, then two zero pad bytes.
+        buf[OFF_MOTION_ACCEL..OFF_MOTION_ACCEL + 4].copy_from_slice(&[0xaa, 0xff, 0x00, 0x00]);
+        let s = parse_input(Side::Right, &buf).unwrap();
+        assert_eq!(s.motion.accel[0], -86);
     }
 
     /// Real capture (report #3 from a Joy-Con 2 (R) lying still on a desk).
