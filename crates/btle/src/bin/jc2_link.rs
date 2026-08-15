@@ -194,6 +194,17 @@ fn hold(dongle: &Dongle, conn: u16) {
     // completely different fixes, so they must be distinguishable.
     let mut acl_in = 0u64;
     let mut other_dumped = 0u32;
+    // Which byte offsets have EVER differed from the first report seen.
+    //
+    // Far more useful than dumping whole frames: it answers "is ANY input
+    // getting through" at a glance, and localises buttons, sticks and IMU to
+    // exact offsets without reading hex by eye. The previous version dumped
+    // only the first three reports, all of which arrive within ~50 ms of
+    // connecting — long before anyone can press a button — so a completely
+    // live controller looked identical to a dead one.
+    let mut baseline: Option<Vec<u8>> = None;
+    let mut changed = [false; 64];
+    let mut last_dump = Instant::now();
 
     loop {
         if start.elapsed() >= HOLD_TARGET {
@@ -236,9 +247,28 @@ fn hold(dongle: &Dongle, conn: u16) {
                     if n.handle == joycon::HANDLE_INPUT_VALUE {
                         notifications += 1;
                         last_notification = Some(Instant::now());
-                        if dumped < 3 {
+                        match &baseline {
+                            None => {
+                                println!("[link] first report ({} bytes): {:02x?}", n.value.len(), n.value);
+                                baseline = Some(n.value.clone());
+                            }
+                            Some(base) => {
+                                for (i, b) in n.value.iter().enumerate() {
+                                    // Offsets 0..4 are the report counter and a
+                                    // timestamp; they always change and would
+                                    // drown out the fields we care about.
+                                    if i >= 4 && i < changed.len() && base.get(i) != Some(b) {
+                                        changed[i] = true;
+                                    }
+                                }
+                            }
+                        }
+                        // Keep dumping past the opening burst so a deliberate
+                        // button press or rotation actually lands in the log.
+                        if dumped < 40 && last_dump.elapsed() >= Duration::from_millis(1500) {
                             dumped += 1;
-                            println!("[link] input report ({} bytes): {:02x?}", n.value.len(), n.value);
+                            last_dump = Instant::now();
+                            println!("[link] report: {:02x?}", &n.value[..n.value.len().min(32)]);
                         }
                     }
                 } else if pkt.payload.first() == Some(&acl::ATT_EXCHANGE_MTU_RESPONSE)
@@ -269,11 +299,22 @@ fn hold(dongle: &Dongle, conn: u16) {
             let quiet = last_notification
                 .map(|t| format!("{:.1}s ago", t.elapsed().as_secs_f32()))
                 .unwrap_or_else(|| "never".into());
+            let live: Vec<usize> = changed
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c)
+                .map(|(i, _)| i)
+                .collect();
             println!(
                 "[link] up {:.0}s  notifications={notifications} ({hz:.0} Hz)  acl_in={acl_in}  last={quiet}  mtu={}",
                 start.elapsed().as_secs_f32(),
                 mtu.map(|m| m.to_string()).unwrap_or_else(|| "default".into()),
             );
+            if live.is_empty() {
+                println!("[link]   NO byte past offset 4 has ever changed — stream is still stubbed");
+            } else {
+                println!("[link]   live offsets: {live:?}");
+            }
         }
     }
 
