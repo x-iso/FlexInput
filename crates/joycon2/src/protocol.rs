@@ -221,6 +221,16 @@ pub mod feature {
 
     /// What official software sends to a Joy-Con 2.
     pub const JOYCON2_DEFAULT: u8 = BUTTONS | STICKS | IMU | MOUSE | RUMBLE; // 0x37
+
+    /// `JOYCON2_DEFAULT` plus the magnetometer (0xB7).
+    ///
+    /// Official software does NOT set this bit, so whether a given half even
+    /// has a magnetometer is an open question — Joy-Con 2 is described as
+    /// 9-axis, but it is unclear whether both halves carry one or only the
+    /// right. Asking for it and seeing whether new bytes come alive in the
+    /// report is the cheapest way to find out; if a half has none, the extra
+    /// bit is expected to be ignored rather than rejected.
+    pub const JOYCON2_WITH_MAGNETOMETER: u8 = JOYCON2_DEFAULT | MAGNETOMETER;
 }
 
 /// Build an 8-byte command header followed by its data.
