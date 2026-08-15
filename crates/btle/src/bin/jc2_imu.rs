@@ -98,7 +98,84 @@ struct Link {
 /// per-offset summaries throw away. ~3000 frames per half is a few hundred KB.
 type Frames = Vec<Vec<u8>>;
 
+/// Serialise every captured frame so analysis can be re-run without hardware.
+///
+/// Each decoding idea otherwise costs a fresh 45-second physical sweep, which
+/// is the real bottleneck now that the accelerometer is settled: the gyro
+/// encoding will take many attempts, and they should be cheap.
+///
+/// Format: `[phases u8]` then per phase `[links u8]`, per link
+/// `[side u8][frames u32]` then each frame as `[len u8][bytes]`.
+fn save_capture(path: &str, links: &[Link], rec: &[HashMap<u16, Frames>]) -> std::io::Result<()> {
+    let mut out: Vec<u8> = vec![rec.len() as u8];
+    for phase in rec {
+        out.push(links.len() as u8);
+        for l in links {
+            out.push(if l.side == "RIGHT" { 1 } else { 0 });
+            let frames = phase.get(&l.conn).cloned().unwrap_or_default();
+            out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+            for f in frames {
+                out.push(f.len() as u8);
+                out.extend_from_slice(&f);
+            }
+        }
+    }
+    std::fs::write(path, out)
+}
+
+/// Reload a capture written by [`save_capture`].
+fn load_capture(path: &str) -> std::io::Result<(Vec<Link>, Vec<HashMap<u16, Frames>>)> {
+    let buf = std::fs::read(path)?;
+    let mut i = 0usize;
+    let take = |i: &mut usize, n: usize| -> &[u8] { let s = &buf[*i..*i + n]; *i += n; s };
+    let phases = buf[i]; i += 1;
+    let mut links: Vec<Link> = Vec::new();
+    let mut rec: Vec<HashMap<u16, Frames>> = Vec::new();
+    for p in 0..phases {
+        let nlinks = buf[i]; i += 1;
+        let mut map: HashMap<u16, Frames> = HashMap::new();
+        for l in 0..nlinks {
+            let side = if buf[i] == 1 { "RIGHT" } else { "LEFT" }; i += 1;
+            let count = u32::from_le_bytes(take(&mut i, 4).try_into().unwrap()) as usize;
+            // Synthetic handles: the capture only needs them to be distinct.
+            let conn = l as u16;
+            if p == 0 {
+                links.push(Link { conn, side });
+            }
+            let mut frames = Frames::new();
+            for _ in 0..count {
+                let len = buf[i] as usize; i += 1;
+                frames.push(take(&mut i, len).to_vec());
+            }
+            map.insert(conn, frames);
+        }
+        rec.push(map);
+    }
+    Ok((links, rec))
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let arg_after = |flag: &str| -> Option<String> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    };
+
+    // Re-analyse a saved capture: no dongle, no controllers, no sweep.
+    if let Some(path) = arg_after("--load") {
+        match load_capture(&path) {
+            Ok((links, rec)) => {
+                println!("[imu] loaded {path}: {} phases, {} halves", rec.len(), links.len());
+                for link in &links {
+                    analyse(link, &rec);
+                }
+                cross_check(&links, &rec);
+            }
+            Err(e) => eprintln!("[imu] cannot read {path}: {e}"),
+        }
+        return;
+    }
+    let save_path = arg_after("--save");
+
     let want_mag = std::env::args().any(|a| a == "--mag");
     // Echo the RESOLVED setting, not the raw argument. Three separate rounds of
     // this investigation were wasted on flags that silently never reached the
@@ -155,6 +232,13 @@ fn main() {
 
     for link in &links {
         let _ = dongle.disconnect(link.conn);
+    }
+    if let Some(path) = &save_path {
+        match save_capture(path, &links, &rec) {
+            Ok(()) => println!("
+[imu] capture saved to {path} — re-analyse with --load {path}"),
+            Err(e) => eprintln!("[imu] could not save {path}: {e}"),
+        }
     }
     for link in &links {
         analyse(link, &rec);
