@@ -80,9 +80,77 @@ fn main() {
     // there, and its silence vs the input channel's distinguishes "wrong input
     // handle" from "no ATT at all".
     send(&dongle, conn, "subscribe cmd-resp", &acl::write_request(joycon::HANDLE_CMD_RESPONSE_CCCD, &acl::CCCD_NOTIFY));
+    // Without this the controller streams STUB reports: the counter increments
+    // but every field past the header stays zero, which looks exactly like a
+    // parsing bug. The feature-select and calibration reads are what turn the
+    // stream into real input.
+    init_controller(&dongle, conn);
     println!("[link] holding…");
 
     hold(&dongle, conn);
+}
+
+/// Build a Joy-Con command frame for the vendor command characteristic.
+///
+/// Layout matches the Bluetooth framing in `flexinput-joycon2`: a 17-byte
+/// prefix (report id + a 16-byte rumble region) followed by the 8-byte header
+/// `[cmd][dir 0x91][transport 0x01][subcmd][unk][len][0][0]` and the payload.
+/// Duplicated here rather than depending on that crate, which would make the
+/// dependency circular once it gains a dongle transport of its own.
+fn cmd_frame(cmd: u8, sub: u8, data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; 17];
+    out.extend_from_slice(&[cmd, 0x91, 0x01, sub, 0x00, data.len() as u8, 0x00, 0x00]);
+    out.extend_from_slice(data);
+    out
+}
+
+/// Payload for a `0x02/0x04` controller-memory read.
+fn read_memory(size: u8, address: u32) -> Vec<u8> {
+    let mut d = vec![size, 0x7E, 0x00, 0x00];
+    d.extend_from_slice(&address.to_le_bytes());
+    d
+}
+
+/// Run the initialisation the controller needs before it sends real input.
+///
+/// Fire-and-forget with a small gap between writes. Waiting on each reply
+/// turned this into a ~40 s handshake in the Bluetooth backend, during which
+/// the controller powered itself off having never seen a completed init.
+fn init_controller(dongle: &Dongle, conn: u16) {
+    let send_cmd = |what: &str, frame: Vec<u8>| {
+        let pdu = acl::write_command(joycon::HANDLE_CMD_WRITE, &frame);
+        match dongle.send_att(conn, &pdu) {
+            Ok(()) => println!("[link] init -> {what}"),
+            Err(e) => eprintln!("[link] init -> {what} FAILED: {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    };
+
+    // Undocumented handshake steps official software always sends first.
+    send_cmd("0x07/0x01", cmd_frame(0x07, 0x01, &[]));
+    send_cmd("0x10/0x01", cmd_frame(0x10, 0x01, &[]));
+    send_cmd("0x16/0x01", cmd_frame(0x16, 0x01, &[]));
+
+    // Controller-memory reads. These carry factory calibration, and skipping
+    // them is reported to leave the controller emitting stub reports forever.
+    for (size, addr) in [
+        (0x40u8, 0x013000u32),
+        (0x40, 0x013080),
+        (0x40, 0x1FC040),
+        (0x10, 0x013040),
+        (0x18, 0x013100),
+        (0x20, 0x013060),
+    ] {
+        send_cmd("memory read", cmd_frame(0x02, 0x04, &read_memory(size, addr)));
+    }
+
+    // Player LED 1, so there is visible confirmation on the controller itself.
+    send_cmd("player LED", cmd_frame(0x09, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0]));
+
+    // Feature select: buttons | sticks | IMU | mouse | rumble = 0x37.
+    // This is the one that actually turns the stream on.
+    send_cmd("feature select", cmd_frame(0x0C, 0x02, &[0x37, 0, 0, 0]));
+    send_cmd("feature enable", cmd_frame(0x0C, 0x04, &[0x37, 0, 0, 0]));
 }
 
 /// Write an ATT PDU, reporting the outcome.
