@@ -19,9 +19,19 @@ pub const CID_ATT: u16 = 0x0004;
 
 /// Packet Boundary flag for the first fragment of an L2CAP message.
 ///
-/// `0b10` = "first automatically-flushable packet", which is what LE uses for
-/// the start of every higher-layer message. `0b01` marks a continuation.
-const PB_FIRST: u16 = 0b10;
+/// **`0b00`, not `0b10`.** Core spec Vol 4 Part E §5.4.2 defines `0b10` as
+/// "first *automatically-flushable* packet", which exists for BR/EDR; an LE-U
+/// link has no automatic flush, so the host sends `0b00` — "first
+/// non-automatically-flushable" — for the start of every L2CAP PDU, and `0b01`
+/// for continuations.
+///
+/// Getting this wrong is silent in the worst way: the controller accepts the
+/// USB bulk write, `write_bulk` reports success, and the packet is simply never
+/// put on air. The observed symptom was a healthy connection that held for 53
+/// seconds with **zero** ATT traffic in either direction — no MTU response, no
+/// ATT error, nothing — followed by the peripheral giving up and terminating
+/// the link itself.
+const PB_FIRST: u16 = 0b00;
 
 // ATT opcodes. Only what is actually sent or received here.
 pub const ATT_WRITE_REQUEST: u8 = 0x12;
@@ -146,8 +156,9 @@ mod tests {
         let att = write_command(0x0016, &[0xaa, 0xbb]);
         let acl = encode_acl(0x0040, CID_ATT, &att);
 
-        // handle 0x0040 with PB=0b10 -> 0x2040
-        assert_eq!(&acl[0..2], &[0x40, 0x20]);
+        // handle 0x0040 with PB=0b00 -> 0x0040. Pinned deliberately: 0x2040
+        // here (PB=0b10) is a BR/EDR flag that an LE controller drops silently.
+        assert_eq!(&acl[0..2], &[0x40, 0x00]);
         // total length = L2CAP header (4) + payload
         assert_eq!(u16::from_le_bytes([acl[2], acl[3]]) as usize, att.len() + 4);
 

@@ -66,21 +66,35 @@ fn main() {
 
     // Raise the ATT MTU first. At the 23-byte default a 63-byte input report
     // would arrive fragmented and every parser offset would be wrong.
-    if let Err(e) = dongle.send_att(conn, &acl::exchange_mtu_request(joycon::DESIRED_MTU)) {
-        eprintln!("[link] MTU request failed: {e}");
-    }
+    //
+    // The MTU exchange doubles as the ATT round-trip test: it is the one
+    // request every GATT server must answer regardless of handles, so a reply
+    // proves the ACL path works and no reply localises the fault to transport
+    // rather than to a wrong handle.
+    send(&dongle, conn, "MTU request", &acl::exchange_mtu_request(joycon::DESIRED_MTU));
 
     // Subscribe to input notifications. Write Request (acknowledged), so a
     // failed subscribe shows up as an error instead of silence.
-    if let Err(e) = dongle.send_att(
-        conn,
-        &acl::write_request(joycon::HANDLE_INPUT_CCCD, &acl::CCCD_NOTIFY),
-    ) {
-        eprintln!("[link] subscribe failed: {e}");
-    }
-    println!("[link] subscribed to input notifications, holding…");
+    send(&dongle, conn, "subscribe input", &acl::write_request(joycon::HANDLE_INPUT_CCCD, &acl::CCCD_NOTIFY));
+    // Also subscribe to the command-response characteristic: init replies land
+    // there, and its silence vs the input channel's distinguishes "wrong input
+    // handle" from "no ATT at all".
+    send(&dongle, conn, "subscribe cmd-resp", &acl::write_request(joycon::HANDLE_CMD_RESPONSE_CCCD, &acl::CCCD_NOTIFY));
+    println!("[link] holding…");
 
     hold(&dongle, conn);
+}
+
+/// Write an ATT PDU, reporting the outcome.
+///
+/// `write_bulk` succeeding says only that the dongle accepted the bytes over
+/// USB — never that they reached the peer. Logging it anyway is what separates
+/// "we never sent" from "we sent and got no answer".
+fn send(dongle: &Dongle, conn: u16, what: &str, pdu: &[u8]) {
+    match dongle.send_att(conn, pdu) {
+        Ok(()) => println!("[link] -> {what} ({} bytes)", pdu.len()),
+        Err(e) => eprintln!("[link] -> {what} FAILED: {e}"),
+    }
 }
 
 /// Pump the link, reporting throughput and reacting to a disconnect.
@@ -91,6 +105,12 @@ fn hold(dongle: &Dongle, conn: u16) {
     let mut last_notification: Option<Instant> = None;
     let mut mtu: Option<u16> = None;
     let mut dumped = 0u32;
+    // Counts EVERY inbound ACL packet, on any channel. Zero here means nothing
+    // is coming back at all, which is a transport fault; a non-zero count with
+    // no notifications means ATT works and a handle is wrong. Those need
+    // completely different fixes, so they must be distinguishable.
+    let mut acl_in = 0u64;
+    let mut other_dumped = 0u32;
 
     loop {
         if start.elapsed() >= HOLD_TARGET {
@@ -120,7 +140,15 @@ fn hold(dongle: &Dongle, conn: u16) {
         }
 
         match dongle.read_acl(Duration::from_millis(20)) {
-            Ok(Some(pkt)) if pkt.cid == acl::CID_ATT => {
+            Ok(Some(pkt)) if pkt.cid != acl::CID_ATT => {
+                acl_in += 1;
+                if other_dumped < 4 {
+                    other_dumped += 1;
+                    println!("[link] <- non-ATT cid={:#06x}: {:02x?}", pkt.cid, pkt.payload);
+                }
+            }
+            Ok(Some(pkt)) => {
+                acl_in += 1;
                 if let Some(n) = acl::parse_notification(&pkt.payload) {
                     if n.handle == joycon::HANDLE_INPUT_VALUE {
                         notifications += 1;
@@ -137,7 +165,12 @@ fn hold(dongle: &Dongle, conn: u16) {
                     mtu = Some(m);
                     println!("[link] ATT MTU negotiated: {m}");
                 } else if pkt.payload.first() == Some(&acl::ATT_ERROR_RESPONSE) {
-                    println!("[link] ATT error: {:02x?}", pkt.payload);
+                    // Handle, opcode and reason are all in here — an error is a
+                    // GOOD sign at this stage: it proves ATT round-trips.
+                    println!("[link] <- ATT error: {:02x?}", pkt.payload);
+                } else if other_dumped < 6 {
+                    other_dumped += 1;
+                    println!("[link] <- ATT pdu: {:02x?}", pkt.payload);
                 }
             }
             Ok(_) => {}
@@ -154,7 +187,7 @@ fn hold(dongle: &Dongle, conn: u16) {
                 .map(|t| format!("{:.1}s ago", t.elapsed().as_secs_f32()))
                 .unwrap_or_else(|| "never".into());
             println!(
-                "[link] up {:.0}s  notifications={notifications} ({hz:.0} Hz)  last={quiet}  mtu={}",
+                "[link] up {:.0}s  notifications={notifications} ({hz:.0} Hz)  acl_in={acl_in}  last={quiet}  mtu={}",
                 start.elapsed().as_secs_f32(),
                 mtu.map(|m| m.to_string()).unwrap_or_else(|| "default".into()),
             );
