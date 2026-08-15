@@ -147,6 +147,20 @@ fn main() {
     cross_check(&links, &rec);
 }
 
+/// Read an `i32` field from a frame, or `None` if it does not fit.
+///
+/// The motion block turned out to be 32-bit fields on a **4-byte stride**, not
+/// the packed `i16`s first assumed: an i16 scan produced strong hits exactly 4
+/// bytes apart with full-scale garbage on the offsets between them, which is
+/// the signature of reading across 32-bit boundaries.
+fn field32(frame: &[u8], off: usize) -> Option<i32> {
+    if off + 3 < frame.len() {
+        Some(i32::from_le_bytes([frame[off], frame[off + 1], frame[off + 2], frame[off + 3]]))
+    } else {
+        None
+    }
+}
+
 /// Read an `i16` field from a frame, or `None` if it does not fit.
 fn field(frame: &[u8], off: usize) -> Option<i16> {
     if off + 1 < frame.len() {
@@ -169,130 +183,133 @@ fn range_of(frames: &Frames, off: usize) -> i32 {
     if lo > hi { 0 } else { hi - lo }
 }
 
-fn mean_of(frames: &Frames, off: usize) -> i32 {
-    let mut sum = 0i64;
-    let mut n = 0i64;
+/// Score a consecutive 3-field i32 block as an accelerometer: how constant is
+/// its vector magnitude, relative to 1 g?
+///
+/// This is the identification that cannot be faked. Gravity's magnitude is
+/// fixed, so only the real accel triple holds a constant length through every
+/// orientation; nothing else in the report has a physically pinned magnitude.
+fn accel_error(all: &[Vec<u8>], base: usize, stride: usize) -> Option<f64> {
+    let (mut err, mut n) = (0.0f64, 0.0f64);
+    for f in all {
+        let (Some(x), Some(y), Some(z)) = (
+            field32(f, base),
+            field32(f, base + stride),
+            field32(f, base + 2 * stride),
+        ) else {
+            continue;
+        };
+        let m = ((x as f64).powi(2) + (y as f64).powi(2) + (z as f64).powi(2)).sqrt();
+        err += ((m - ONE_G) / ONE_G).powi(2);
+        n += 1.0;
+    }
+    if n < 50.0 {
+        return None;
+    }
+    Some((err / n).sqrt())
+}
+
+/// Range of an i32 field across frames.
+fn range32(frames: &Frames, off: usize) -> i64 {
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
     for f in frames {
-        if let Some(v) = field(f, off) {
+        if let Some(v) = field32(f, off) {
+            lo = lo.min(v as i64);
+            hi = hi.max(v as i64);
+        }
+    }
+    if lo > hi { 0 } else { hi - lo }
+}
+
+fn mean32(frames: &Frames, off: usize) -> i64 {
+    let (mut sum, mut n) = (0i64, 0i64);
+    for f in frames {
+        if let Some(v) = field32(f, off) {
             sum += v as i64;
             n += 1;
         }
     }
-    if n == 0 { 0 } else { (sum / n) as i32 }
-}
-
-/// Find the accelerometer triple: the three fields whose vector magnitude is
-/// closest to a constant 1 g across every frame of the whole run.
-///
-/// This is the identification that cannot be faked. Nothing else in the report
-/// has a physically pinned magnitude, so a triple scoring near zero error is
-/// the accelerometer with very high confidence.
-fn find_accel(all: &[Vec<u8>], candidates: &[usize]) -> Option<(usize, usize, usize, f64)> {
-    let mut best: Option<(usize, usize, usize, f64)> = None;
-    for (i, &a) in candidates.iter().enumerate() {
-        for (j, &b) in candidates.iter().enumerate().skip(i + 1) {
-            // Overlapping offsets share bytes and would correlate spuriously.
-            if b < a + 2 {
-                continue;
-            }
-            for &c in candidates.iter().skip(j + 1) {
-                if c < b + 2 {
-                    continue;
-                }
-                let mut err = 0.0f64;
-                let mut n = 0.0f64;
-                for f in all {
-                    let (Some(x), Some(y), Some(z)) = (field(f, a), field(f, b), field(f, c)) else {
-                        continue;
-                    };
-                    let m = ((x as f64).powi(2) + (y as f64).powi(2) + (z as f64).powi(2)).sqrt();
-                    err += ((m - ONE_G) / ONE_G).powi(2);
-                    n += 1.0;
-                }
-                if n < 50.0 {
-                    continue;
-                }
-                let rms = (err / n).sqrt();
-                if best.map_or(true, |(_, _, _, e)| rms < e) {
-                    best = Some((a, b, c, rms));
-                }
-            }
-        }
-    }
-    best
+    if n == 0 { 0 } else { sum / n }
 }
 
 fn analyse(link: &Link, rec: &[HashMap<u16, Frames>]) {
     let empty: Frames = Vec::new();
     let ph = |i: usize| rec[i].get(&link.conn).unwrap_or(&empty);
 
-    println!("\n\n========== {} HALF ==========", link.side);
+    println!("
 
-    // Offsets that move at all, above the resting noise floor.
-    let mut candidates: Vec<usize> = Vec::new();
-    for off in SEARCH_START..SEARCH_END {
-        let rest = range_of(ph(0), off);
-        let active = (1..PHASES.len()).map(|i| range_of(ph(i), off)).max().unwrap_or(0);
-        if active > 400 && active > rest * 4 {
-            candidates.push(off);
-        }
-    }
-    if candidates.is_empty() {
-        println!("no responsive fields found — was the controller actually moved?");
-        return;
-    }
-    println!("responsive offsets: {candidates:?}\n");
+========== {} HALF ==========", link.side);
 
-    // Accelerometer, by constant-magnitude search across every phase.
     let mut all: Vec<Vec<u8>> = Vec::new();
     for i in 0..PHASES.len() {
         all.extend(ph(i).iter().cloned());
     }
-    match find_accel(&all, &candidates) {
-        Some((a, b, c, rms)) if rms < 0.25 => {
-            println!("ACCELEROMETER: offsets {a}, {b}, {c}   (magnitude error {:.1}%)", rms * 100.0);
-            println!("  neutral means: {}={} {}={} {}={}",
-                a, mean_of(ph(0), a), b, mean_of(ph(0), b), c, mean_of(ph(0), c));
-            println!("  (flat on a table, one axis should read about +/-4096 and the other two ~0)");
-        }
-        Some((a, b, c, rms)) => {
-            println!("ACCELEROMETER: best triple {a},{b},{c} but magnitude error is {:.0}% —",
-                rms * 100.0);
-            println!("  too high to trust. Either the scale is not 4096 LSB/g on this hardware,");
-            println!("  or the fields are not 16-bit at these offsets.");
-        }
-        None => println!("ACCELEROMETER: no triple found among the responsive offsets"),
+
+    // Accelerometer: the ONE 3 x i32 block whose vector magnitude stays at 1 g.
+    // Searched on a 4-byte stride because that is the block's real layout —
+    // an i16 scan hits every 4 bytes with full-scale garbage in between, which
+    // is what reading across 32-bit boundaries looks like.
+    let mut accel: Vec<(usize, f64)> = (SEARCH_START..SEARCH_END.saturating_sub(11))
+        .filter_map(|b| accel_error(&all, b, 4).map(|e| (b, e)))
+        .collect();
+    accel.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    println!("
+-- ACCELEROMETER (3 x i32, stride 4, magnitude must hold at 4096) --");
+    for (b, e) in accel.iter().take(3) {
+        let verdict = if *e < 0.15 { "  <== ACCEL BLOCK" } else { "" };
+        println!("  base {:>3} [{} {} {}]  magnitude error {:>6.1}%{}",
+            b, b, b + 4, b + 8, e * 100.0, verdict);
+    }
+    if let Some((b, e)) = accel.first().filter(|(_, e)| *e < 0.15) {
+        println!("  neutral (flat) means: x={} y={} z={}",
+            mean32(ph(0), *b), mean32(ph(0), *b + 4), mean32(ph(0), *b + 8));
+        println!("  one axis should sit near +/-4096 (gravity), the other two near 0");
+        let _ = e;
+    } else {
+        println!("  no block held a constant magnitude — scale may not be 4096 LSB/g here");
     }
 
-    // Gyro: strong in exactly one sweep, quiet in the others.
-    println!("\nGYRO candidates (respond to ONE axis only):");
-    println!("{:>5} {:>8} {:>8} {:>8}   {:>9} {:>9}", "off", "roll", "pitch", "yaw", "min", "max");
-    let mut rows: Vec<(usize, [i32; 3], f64)> = Vec::new();
-    for &off in &candidates {
-        let r = [range_of(ph(1), off), range_of(ph(2), off), range_of(ph(3), off)];
-        let best = r.iter().copied().max().unwrap_or(0);
-        let others: i32 = r.iter().copied().sum::<i32>() - best;
-        // Selectivity: how much this field prefers its best axis over the rest.
-        let sel = best as f64 / (others.max(1) as f64);
-        rows.push((off, r, sel));
-    }
-    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-    for (off, r, sel) in rows.iter().take(10) {
-        let axis = (0..3).max_by_key(|i| r[*i]).unwrap();
-        let sweep = ph(axis + 1);
-        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
-        for f in sweep {
-            if let Some(v) = field(f, *off) {
-                lo = lo.min(v as i32);
-                hi = hi.max(v as i32);
+    // Gyro: 3 x i32 on the same stride, each field responding to ONE sweep.
+    println!("
+-- GYRO (3 x i32, stride 4; each field owns one rotation axis) --");
+    println!("{:>5} {:>10} {:>10} {:>10}  {:>12} {:>12}",
+        "off", "roll", "pitch", "yaw", "min", "max");
+    let accel_base = accel.first().filter(|(_, e)| *e < 0.15).map(|(b, _)| *b);
+    let mut rows: Vec<(usize, [i64; 3], f64)> = Vec::new();
+    for off in SEARCH_START..SEARCH_END.saturating_sub(3) {
+        // Skip the accel block itself — it responds to rotation too, via gravity.
+        if let Some(ab) = accel_base {
+            if off >= ab && off < ab + 12 {
+                continue;
             }
         }
-        let tag = if *sel > 2.5 { format!("<- GYRO {}", AXES[axis]) } else { String::new() };
-        println!("{off:>5} {:>8} {:>8} {:>8}   {lo:>9} {hi:>9}  sel={sel:.1} {tag}",
+        let rest = range32(ph(0), off);
+        let r = [range32(ph(1), off), range32(ph(2), off), range32(ph(3), off)];
+        let best = r.iter().copied().max().unwrap_or(0);
+        if best < 2000 || best < rest * 4 {
+            continue;
+        }
+        let others = r.iter().copied().sum::<i64>() - best;
+        rows.push((off, r, best as f64 / others.max(1) as f64));
+    }
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    for (off, r, sel) in rows.iter().take(8) {
+        let axis = (0..3).max_by_key(|i| r[*i]).unwrap();
+        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+        for f in ph(axis + 1) {
+            if let Some(v) = field32(f, *off) {
+                lo = lo.min(v as i64);
+                hi = hi.max(v as i64);
+            }
+        }
+        let tag = if *sel > 2.0 { format!("  <== GYRO {}", AXES[axis]) } else { String::new() };
+        println!("{off:>5} {:>10} {:>10} {:>10}  {lo:>12} {hi:>12}  sel={sel:.1}{tag}",
             r[0], r[1], r[2]);
     }
-    println!("\nA gyro axis has min and max of OPPOSITE sign — the sweep went both ways.");
-    println!("Offsets overlap by a byte, so a real field is a strong row with weak neighbours.");
+    println!("
+  A gyro axis has min and max of OPPOSITE sign (the sweep went both ways).");
+    println!("  Real fields sit 4 bytes apart; anything in between is a misaligned read.");
 }
 
 /// Compare the halves. They are bolted together and cannot rotate at different
