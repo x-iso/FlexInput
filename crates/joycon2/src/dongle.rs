@@ -185,7 +185,10 @@ fn run(shared: Arc<Shared>) {
 
 /// Scan for a Joy-Con 2 that is not already connected.
 fn discover(dongle: &Dongle, links: &[Link]) -> Option<([u8; 6], u8, Side)> {
-    if dongle.start_le_scan().is_err() {
+    if let Err(e) = dongle.start_le_scan() {
+        // Surfaced, not swallowed: a refused scan-enable is how "no controllers
+        // ever appear" happens, and it gives no other symptom.
+        eprintln!("[jc2-dongle] scan enable failed: {e}");
         return None;
     }
     let deadline = Instant::now() + SCAN_WINDOW;

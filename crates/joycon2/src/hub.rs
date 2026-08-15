@@ -507,6 +507,8 @@ async fn drive_pad(
     // Kept as a String rather than the boxed error: `Box<dyn Error>` is not
     // `Send`, and holding one across the backoff `await` below would make this
     // whole future non-Send and impossible to `tokio::spawn`.
+    // Only meaningful on the error path; the LinkLost path clears it.
+    #[allow(unused_assignments)]
     let mut last_err: Option<String> = None;
     // Counts CONSECUTIVE hard failures only. A link lost to Windows' ~30 s
     // reclaim resets it, because that is the normal steady state here, not an

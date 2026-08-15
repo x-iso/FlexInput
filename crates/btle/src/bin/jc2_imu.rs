@@ -375,7 +375,14 @@ fn connect_both(dongle: &Dongle, want_mag: bool) -> Vec<Link> {
 }
 
 fn scan_once(dongle: &Dongle, known: &[[u8; 6]]) -> Option<([u8; 6], u8, u16)> {
-    dongle.start_le_scan().ok()?;
+    // Report the failure rather than swallowing it. Silently returning None
+    // here turned a refused scan-enable into an endless "waiting for BOTH
+    // halves" with nothing to explain it.
+    if let Err(e) = dongle.start_le_scan() {
+        eprintln!("[imu] scan enable failed: {e}");
+        std::thread::sleep(Duration::from_millis(500));
+        return None;
+    }
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut found = None;
     while Instant::now() < deadline {

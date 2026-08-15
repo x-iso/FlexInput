@@ -159,10 +159,6 @@ pub struct PadSnapshot {
     pub motion_len: u8,
 }
 
-fn i32le(b: &[u8], off: usize) -> i32 {
-    i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
 fn i16le(b: &[u8], off: usize) -> i16 {
     i16::from_le_bytes([b[off], b[off + 1]])
 }

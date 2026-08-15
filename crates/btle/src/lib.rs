@@ -215,6 +215,17 @@ impl Dongle {
         Ok(())
     }
 
+    /// Cancel any connection attempt left pending.
+    ///
+    /// A failed `LE_Create_Connection` leaves the controller initiating, and
+    /// while it is initiating it will refuse to scan with "Command Disallowed"
+    /// — which previously manifested as the scanner finding nothing, forever,
+    /// with no error anywhere. Harmless when nothing is pending: the command
+    /// simply returns an error status, which is ignored.
+    pub fn cancel_pending_connect(&self) {
+        let _ = self.command_sync(hci::Opcode::LE_CREATE_CONNECTION_CANCEL, &[]);
+    }
+
     /// Begin an active LE scan.
     ///
     /// Active (not passive) because Joy-Con 2 controllers are only identifiable
@@ -226,6 +237,8 @@ impl Dongle {
     /// out of every ~60 ms: aggressive enough to find a controller quickly
     /// without monopolising a radio that will soon also be holding a link.
     pub fn start_le_scan(&self) -> Result<()> {
+        // Clear any half-finished initiator first, or scan-enable is refused.
+        self.cancel_pending_connect();
         let interval: u16 = 0x0060; // 60 × 0.625 ms = 60 ms
         let window: u16 = 0x0030; //   48 × 0.625 ms = 30 ms
         let mut params = Vec::with_capacity(7);
@@ -312,10 +325,23 @@ impl Dongle {
 
         self.send_command(hci::Opcode::LE_CREATE_CONNECTION, &p)?;
 
-        // Give the controller several event reads: connection setup takes as
-        // long as it takes the peripheral to advertise again.
+        // Short reads, not the default 2 s. A refused parameter set answers
+        // with Command Status and then nothing, so 40 iterations of a 2 s
+        // blocking read spent 80 SECONDS failing — long enough that the caller's
+        // own scan deadline expired and the whole probe looked dead.
         for _ in 0..40 {
-            match self.read_event()? {
+            match self.read_event_timeout(Duration::from_millis(250))? {
+                // A non-zero Command Status means the controller rejected the
+                // request outright; waiting for a Connection Complete that can
+                // never arrive is pointless.
+                Some(Event::CommandStatus { status, opcode })
+                    if opcode == hci::Opcode::LE_CREATE_CONNECTION && status != 0 =>
+                {
+                    let _ = self.command_sync(hci::Opcode::LE_CREATE_CONNECTION_CANCEL, &[]);
+                    return Err(Error::Protocol(format!(
+                        "LE_Create_Connection rejected, status {status:#04x}"
+                    )));
+                }
                 Some(Event::LeConnectionComplete {
                     status,
                     conn_handle,
