@@ -1,4 +1,4 @@
-//! Guided IMU field-mapping probe — both halves at once.
+//! Guided IMU field-mapping probe — both halves, one sweep per axis.
 //!
 //! The motion block's packing is documented as "unknown", the published layout
 //! for reports 0x07/0x08 is wrong over BLE, and the offsets currently in
@@ -9,25 +9,26 @@
 //!
 //! # Method
 //!
-//! Both halves are connected first, and nothing starts until both are
-//! streaming — with the halves clipped into the (unplugged) charging grip they
-//! are rigidly coupled, so one physical motion drives both and their readings
-//! are directly comparable. That coupling is the strongest cross-check
-//! available here: a genuine gyro axis must respond on BOTH halves with equal
-//! magnitude, because they physically cannot rotate at different rates.
+//! One continuous sweep per axis, and the two sensors are separated
+//! afterwards by analysis rather than by asking the operator to hold still at
+//! precise moments:
 //!
-//! Each axis is exercised as **90° counter-clockwise → hold → 90° clockwise →
-//! hold**, and motion phases are recorded separately from hold phases. That
-//! separation is what tells the two sensors apart:
+//! * **Accelerometer** is found by physics. Gravity has constant magnitude, so
+//!   the accel triple is the one set of three fields whose vector length stays
+//!   at 1 g (**4096 LSB**) through every orientation. Every candidate triple is
+//!   tested and scored on how constant its magnitude is; nothing else in the
+//!   report can fake that.
+//! * **Gyro** is then whatever responds strongly to exactly ONE sweep and is
+//!   quiet in the others — angular rate about one axis, by definition.
 //!
-//! * a **gyro** axis spikes while MOVING and returns to rest while HOLDING;
-//! * an **accelerometer** axis is quiet while moving at constant rate but
-//!   settles to a *different value* in each hold, because gravity has rotated
-//!   in the sensor's frame.
+//! Because a sweep goes one way and then the other, each gyro field's minimum
+//! and maximum are the two rotation directions, which recovers its **sign**.
 //!
-//! Recording counter-clockwise and clockwise separately also recovers the
-//! **sign** of each axis, which a symmetric shake cannot: the two directions
-//! must produce opposite-signed peaks.
+//! Both halves are recorded during the same physical motion. Clipped into the
+//! grip they are rigidly coupled and cannot rotate at different rates, so a
+//! genuine gyro axis must respond on both — and their neutral accelerometer
+//! readings differ only by the fixed mounting rotation, which is exactly the
+//! pivot offset a shared frame has to correct for.
 //!
 //! Usage:
 //!   cargo run -p flexinput-btle --bin jc2_imu
@@ -42,107 +43,60 @@ const DONGLE_VID: u16 = 0x0BDA;
 const DONGLE_PID: u16 = 0xA728;
 const NINTENDO_COMPANY_ID: u16 = 0x0553;
 
-/// Byte range searched, interpreted as overlapping little-endian `i16`s.
-/// The real alignment is unknown; assuming it would beg the question.
+/// Byte range searched, as overlapping little-endian `i16`s. The real alignment
+/// is unknown; assuming it would beg the question.
 const SEARCH_START: usize = 8;
 const SEARCH_END: usize = 61;
 
-/// What a phase is for, which decides how its numbers are read.
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
-    /// Stationary reference. Establishes the noise floor and the neutral value.
-    Neutral,
-    /// Rotating. Gyro axes spike here.
-    Move,
-    /// Held at 90°. Accelerometer axes settle to a new value here.
-    Hold,
-}
+/// 1 g in accelerometer LSB, established from an earlier hardware capture.
+const ONE_G: f64 = 4096.0;
 
 struct Phase {
     name: &'static str,
-    axis: usize, // 0 roll, 1 pitch, 2 yaw; usize::MAX for neutral
-    kind: Kind,
-    ccw: bool,
     instruction: &'static str,
     secs: u64,
 }
 
-const AXES: [&str; 3] = ["roll", "pitch", "yaw"];
-
+/// Index 0 is the reference; 1..=3 are the axis sweeps, in roll/pitch/yaw order.
 const PHASES: &[Phase] = &[
-    Phase { name: "neutral", axis: usize::MAX, kind: Kind::Neutral, ccw: false,
-        instruction: "Grip FLAT on the table, both halves attached. DO NOT TOUCH.", secs: 5 },
-
-    Phase { name: "roll_ccw", axis: 0, kind: Kind::Move, ccw: true,
-        instruction: "ROLL 90 deg COUNTER-CLOCKWISE: raise the LEFT edge until it stands on its side", secs: 4 },
-    Phase { name: "roll_ccw_hold", axis: 0, kind: Kind::Hold, ccw: true,
-        instruction: "HOLD it there, steady", secs: 3 },
-    Phase { name: "roll_cw", axis: 0, kind: Kind::Move, ccw: false,
-        instruction: "ROLL back through flat and 90 deg CLOCKWISE: raise the RIGHT edge", secs: 4 },
-    Phase { name: "roll_cw_hold", axis: 0, kind: Kind::Hold, ccw: false,
-        instruction: "HOLD it there, steady", secs: 3 },
-
-    Phase { name: "pitch_ccw", axis: 1, kind: Kind::Move, ccw: true,
-        instruction: "Return flat. PITCH 90 deg CCW: tip the FAR edge DOWN / near edge up", secs: 4 },
-    Phase { name: "pitch_ccw_hold", axis: 1, kind: Kind::Hold, ccw: true,
-        instruction: "HOLD it there, steady", secs: 3 },
-    Phase { name: "pitch_cw", axis: 1, kind: Kind::Move, ccw: false,
-        instruction: "PITCH back through flat and 90 deg CW: tip the FAR edge UP", secs: 4 },
-    Phase { name: "pitch_cw_hold", axis: 1, kind: Kind::Hold, ccw: false,
-        instruction: "HOLD it there, steady", secs: 3 },
-
-    Phase { name: "yaw_ccw", axis: 2, kind: Kind::Move, ccw: true,
-        instruction: "Lay it FLAT again. YAW 90 deg CCW: spin it left, flat on the table", secs: 4 },
-    Phase { name: "yaw_ccw_hold", axis: 2, kind: Kind::Hold, ccw: true,
-        instruction: "HOLD it there, steady", secs: 3 },
-    Phase { name: "yaw_cw", axis: 2, kind: Kind::Move, ccw: false,
-        instruction: "YAW back through neutral and 90 deg CW: spin it right", secs: 4 },
-    Phase { name: "yaw_cw_hold", axis: 2, kind: Kind::Hold, ccw: false,
-        instruction: "HOLD it there, steady", secs: 3 },
-
-    Phase { name: "neutral2", axis: usize::MAX, kind: Kind::Neutral, ccw: false,
-        instruction: "Return to FLAT neutral and let go (checks the rest reading repeats)", secs: 5 },
+    Phase {
+        name: "neutral",
+        instruction: "Lay the grip FLAT on the table, both halves attached. DO NOT TOUCH IT.",
+        secs: 5,
+    },
+    Phase {
+        name: "roll",
+        instruction: "ROLL: from flat, rotate 90 deg COUNTER-CLOCKWISE, then 180 deg the other way \
+                      to 90 deg CLOCKWISE, then back to flat. Slow and steady.",
+        secs: 12,
+    },
+    Phase {
+        name: "pitch",
+        instruction: "PITCH: from flat, rotate DOWN 90 deg (shoulder buttons pointing at the GROUND), \
+                      then 180 deg UP (shoulder buttons pointing at the CEILING), then back to flat.",
+        secs: 12,
+    },
+    Phase {
+        name: "yaw",
+        instruction: "YAW: keep it FLAT on the table. Spin 90 deg COUNTER-CLOCKWISE, then 180 deg \
+                      CLOCKWISE, then back to neutral.",
+        secs: 12,
+    },
 ];
 
-#[derive(Clone, Copy, Default)]
-struct Stat {
-    min: i32,
-    max: i32,
-    sum: i64,
-    n: u32,
-    seen: bool,
-}
-
-impl Stat {
-    fn push(&mut self, v: i16) {
-        let v = v as i32;
-        if !self.seen {
-            self.min = v;
-            self.max = v;
-            self.seen = true;
-        }
-        self.min = self.min.min(v);
-        self.max = self.max.max(v);
-        self.sum += v as i64;
-        self.n += 1;
-    }
-    fn range(&self) -> i32 {
-        if self.seen { self.max - self.min } else { 0 }
-    }
-    fn mean(&self) -> i32 {
-        if self.n == 0 { 0 } else { (self.sum / self.n as i64) as i32 }
-    }
-    /// Largest absolute excursion, keeping its sign — this is what recovers
-    /// axis direction from a counter-clockwise vs clockwise comparison.
-    fn signed_peak(&self) -> i32 {
-        if !self.seen { 0 } else if self.max.abs() >= self.min.abs() { self.max } else { self.min }
-    }
-}
+const AXES: [&str; 3] = ["roll", "pitch", "yaw"];
 
 struct Link {
     conn: u16,
     side: &'static str,
 }
+
+/// Raw reports kept per phase per link.
+///
+/// Whole frames rather than running statistics: the accelerometer test needs
+/// three fields *from the same sample* to compute a vector magnitude, which
+/// per-offset summaries throw away. ~3000 frames per half is a few hundred KB.
+type Frames = Vec<Vec<u8>>;
 
 fn main() {
     let want_mag = std::env::args().any(|a| a == "--mag");
@@ -156,52 +110,222 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Both halves before anything starts. Mapping one at a time would mean two
-    // separate physical runs whose motions cannot be compared, which throws
-    // away the rigid coupling that makes this measurement trustworthy.
     let links = connect_both(&dongle, want_mag);
     if links.is_empty() {
         eprintln!("[imu] no controllers connected");
         std::process::exit(1);
     }
     if links.len() < 2 {
-        println!("\n[imu] WARNING: only one half connected — the cross-check between");
-        println!("[imu] halves will not be available. Wake the other and rerun for the full map.\n");
+        println!("\n[imu] NOTE: only one half connected — no cross-check between halves.\n");
     }
 
-    println!("\n[imu] === guided sequence: ~55 s, follow each instruction ===");
-    println!("[imu] Keep BOTH halves clipped into the grip the whole time.\n");
+    println!("\n[imu] === {} phases, about 45 s total ===", PHASES.len());
+    println!("[imu] Keep BOTH halves clipped into the grip throughout.\n");
 
-    // phase -> conn -> per-offset stats
-    let mut recorded: Vec<HashMap<u16, Vec<Stat>>> = Vec::new();
+    // phase -> conn -> frames
+    let mut rec: Vec<HashMap<u16, Frames>> = Vec::new();
     for phase in PHASES {
-        println!("\n>>> {}", phase.instruction);
+        println!("\n>>> [{}] {}", phase.name, phase.instruction);
         for n in (1..=3).rev() {
             println!("    {n}…");
             std::thread::sleep(Duration::from_secs(1));
         }
-        // Phase name echoed so a run's console output can be lined up against
-        // the table afterwards without counting steps.
-        println!("    GO [{}] ({} s)", phase.name, phase.secs);
-        let (stats, samples) = record(&dongle, &links, Duration::from_secs(phase.secs));
-        println!("    done: {samples:?}");
-        recorded.push(stats);
+        println!("    GO — {} s", phase.secs);
+        let frames = record(&dongle, &links, Duration::from_secs(phase.secs));
+        for l in &links {
+            println!("    {}: {} frames", l.side, frames.get(&l.conn).map(|f| f.len()).unwrap_or(0));
+        }
+        rec.push(frames);
     }
 
     for link in &links {
         let _ = dongle.disconnect(link.conn);
     }
     for link in &links {
-        report(link, &recorded);
+        analyse(link, &rec);
     }
-    cross_check(&links, &recorded);
+    cross_check(&links, &rec);
 }
 
-/// Connect and initialise every Joy-Con we can find, up to a pair.
+/// Read an `i16` field from a frame, or `None` if it does not fit.
+fn field(frame: &[u8], off: usize) -> Option<i16> {
+    if off + 1 < frame.len() {
+        Some(i16::from_le_bytes([frame[off], frame[off + 1]]))
+    } else {
+        None
+    }
+}
+
+/// Range of an offset across a set of frames.
+fn range_of(frames: &Frames, off: usize) -> i32 {
+    let mut lo = i32::MAX;
+    let mut hi = i32::MIN;
+    for f in frames {
+        if let Some(v) = field(f, off) {
+            lo = lo.min(v as i32);
+            hi = hi.max(v as i32);
+        }
+    }
+    if lo > hi { 0 } else { hi - lo }
+}
+
+fn mean_of(frames: &Frames, off: usize) -> i32 {
+    let mut sum = 0i64;
+    let mut n = 0i64;
+    for f in frames {
+        if let Some(v) = field(f, off) {
+            sum += v as i64;
+            n += 1;
+        }
+    }
+    if n == 0 { 0 } else { (sum / n) as i32 }
+}
+
+/// Find the accelerometer triple: the three fields whose vector magnitude is
+/// closest to a constant 1 g across every frame of the whole run.
+///
+/// This is the identification that cannot be faked. Nothing else in the report
+/// has a physically pinned magnitude, so a triple scoring near zero error is
+/// the accelerometer with very high confidence.
+fn find_accel(all: &[Vec<u8>], candidates: &[usize]) -> Option<(usize, usize, usize, f64)> {
+    let mut best: Option<(usize, usize, usize, f64)> = None;
+    for (i, &a) in candidates.iter().enumerate() {
+        for (j, &b) in candidates.iter().enumerate().skip(i + 1) {
+            // Overlapping offsets share bytes and would correlate spuriously.
+            if b < a + 2 {
+                continue;
+            }
+            for &c in candidates.iter().skip(j + 1) {
+                if c < b + 2 {
+                    continue;
+                }
+                let mut err = 0.0f64;
+                let mut n = 0.0f64;
+                for f in all {
+                    let (Some(x), Some(y), Some(z)) = (field(f, a), field(f, b), field(f, c)) else {
+                        continue;
+                    };
+                    let m = ((x as f64).powi(2) + (y as f64).powi(2) + (z as f64).powi(2)).sqrt();
+                    err += ((m - ONE_G) / ONE_G).powi(2);
+                    n += 1.0;
+                }
+                if n < 50.0 {
+                    continue;
+                }
+                let rms = (err / n).sqrt();
+                if best.map_or(true, |(_, _, _, e)| rms < e) {
+                    best = Some((a, b, c, rms));
+                }
+            }
+        }
+    }
+    best
+}
+
+fn analyse(link: &Link, rec: &[HashMap<u16, Frames>]) {
+    let empty: Frames = Vec::new();
+    let ph = |i: usize| rec[i].get(&link.conn).unwrap_or(&empty);
+
+    println!("\n\n========== {} HALF ==========", link.side);
+
+    // Offsets that move at all, above the resting noise floor.
+    let mut candidates: Vec<usize> = Vec::new();
+    for off in SEARCH_START..SEARCH_END {
+        let rest = range_of(ph(0), off);
+        let active = (1..PHASES.len()).map(|i| range_of(ph(i), off)).max().unwrap_or(0);
+        if active > 400 && active > rest * 4 {
+            candidates.push(off);
+        }
+    }
+    if candidates.is_empty() {
+        println!("no responsive fields found — was the controller actually moved?");
+        return;
+    }
+    println!("responsive offsets: {candidates:?}\n");
+
+    // Accelerometer, by constant-magnitude search across every phase.
+    let mut all: Vec<Vec<u8>> = Vec::new();
+    for i in 0..PHASES.len() {
+        all.extend(ph(i).iter().cloned());
+    }
+    match find_accel(&all, &candidates) {
+        Some((a, b, c, rms)) if rms < 0.25 => {
+            println!("ACCELEROMETER: offsets {a}, {b}, {c}   (magnitude error {:.1}%)", rms * 100.0);
+            println!("  neutral means: {}={} {}={} {}={}",
+                a, mean_of(ph(0), a), b, mean_of(ph(0), b), c, mean_of(ph(0), c));
+            println!("  (flat on a table, one axis should read about +/-4096 and the other two ~0)");
+        }
+        Some((a, b, c, rms)) => {
+            println!("ACCELEROMETER: best triple {a},{b},{c} but magnitude error is {:.0}% —",
+                rms * 100.0);
+            println!("  too high to trust. Either the scale is not 4096 LSB/g on this hardware,");
+            println!("  or the fields are not 16-bit at these offsets.");
+        }
+        None => println!("ACCELEROMETER: no triple found among the responsive offsets"),
+    }
+
+    // Gyro: strong in exactly one sweep, quiet in the others.
+    println!("\nGYRO candidates (respond to ONE axis only):");
+    println!("{:>5} {:>8} {:>8} {:>8}   {:>9} {:>9}", "off", "roll", "pitch", "yaw", "min", "max");
+    let mut rows: Vec<(usize, [i32; 3], f64)> = Vec::new();
+    for &off in &candidates {
+        let r = [range_of(ph(1), off), range_of(ph(2), off), range_of(ph(3), off)];
+        let best = r.iter().copied().max().unwrap_or(0);
+        let others: i32 = r.iter().copied().sum::<i32>() - best;
+        // Selectivity: how much this field prefers its best axis over the rest.
+        let sel = best as f64 / (others.max(1) as f64);
+        rows.push((off, r, sel));
+    }
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    for (off, r, sel) in rows.iter().take(10) {
+        let axis = (0..3).max_by_key(|i| r[*i]).unwrap();
+        let sweep = ph(axis + 1);
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        for f in sweep {
+            if let Some(v) = field(f, *off) {
+                lo = lo.min(v as i32);
+                hi = hi.max(v as i32);
+            }
+        }
+        let tag = if *sel > 2.5 { format!("<- GYRO {}", AXES[axis]) } else { String::new() };
+        println!("{off:>5} {:>8} {:>8} {:>8}   {lo:>9} {hi:>9}  sel={sel:.1} {tag}",
+            r[0], r[1], r[2]);
+    }
+    println!("\nA gyro axis has min and max of OPPOSITE sign — the sweep went both ways.");
+    println!("Offsets overlap by a byte, so a real field is a strong row with weak neighbours.");
+}
+
+/// Compare the halves. They are bolted together and cannot rotate at different
+/// rates, so any axis identified on only one of them is suspect; and their
+/// neutral accelerometer readings differ purely by the mounting rotation.
+fn cross_check(links: &[Link], rec: &[HashMap<u16, Frames>]) {
+    if links.len() < 2 {
+        return;
+    }
+    println!("\n\n========== CROSS-CHECK ==========");
+    println!("Both halves saw the SAME motion, so gyro magnitudes should match per axis,");
+    println!("and any difference in the neutral accel vector IS the fixed mounting offset.");
+    let empty: Frames = Vec::new();
+    for (ai, axis) in AXES.iter().enumerate() {
+        println!("\n-- {axis} --");
+        for link in links {
+            let ph = |i: usize| rec[i].get(&link.conn).unwrap_or(&empty);
+            let best = (SEARCH_START..SEARCH_END)
+                .map(|off| (off, range_of(ph(ai + 1), off), range_of(ph(0), off)))
+                .filter(|(_, act, rest)| *act > 400 && *act > rest * 4)
+                .max_by_key(|(_, act, _)| *act);
+            match best {
+                Some((off, act, _)) => println!("  {:>5}: strongest offset {off:>3}, range {act}", link.side),
+                None => println!("  {:>5}: nothing responded", link.side),
+            }
+        }
+    }
+}
+
 fn connect_both(dongle: &Dongle, want_mag: bool) -> Vec<Link> {
     let mut links: Vec<Link> = Vec::new();
     let mut addrs: Vec<[u8; 6]> = Vec::new();
-    println!("[imu] looking for BOTH halves — wake them now (any button)");
+    println!("[imu] waiting for BOTH halves — wake them now (any button)");
 
     let deadline = Instant::now() + Duration::from_secs(40);
     while links.len() < 2 && Instant::now() < deadline {
@@ -243,16 +367,8 @@ fn scan_once(dongle: &Dongle, known: &[[u8; 6]]) -> Option<([u8; 6], u8, u16)> {
     found
 }
 
-/// Record one phase across every link at once.
-fn record(
-    dongle: &Dongle,
-    links: &[Link],
-    dur: Duration,
-) -> (HashMap<u16, Vec<Stat>>, HashMap<&'static str, u32>) {
-    let mut stats: HashMap<u16, Vec<Stat>> =
-        links.iter().map(|l| (l.conn, vec![Stat::default(); SEARCH_END])).collect();
-    let mut samples: HashMap<&'static str, u32> = links.iter().map(|l| (l.side, 0)).collect();
-
+fn record(dongle: &Dongle, links: &[Link], dur: Duration) -> HashMap<u16, Frames> {
+    let mut out: HashMap<u16, Frames> = links.iter().map(|l| (l.conn, Vec::new())).collect();
     let deadline = Instant::now() + dur;
     while Instant::now() < deadline {
         if let Ok(Some(Event::DisconnectionComplete { reason, .. })) =
@@ -268,141 +384,12 @@ fn record(
         if n.handle != jc::HANDLE_INPUT_VALUE {
             continue;
         }
-        // Demultiplex by connection handle: both halves stream into the same
-        // ACL pipe, and mixing them would describe neither.
-        let Some(s) = stats.get_mut(&pkt.conn_handle) else { continue };
-        if let Some(link) = links.iter().find(|l| l.conn == pkt.conn_handle) {
-            *samples.entry(link.side).or_default() += 1;
-        }
-        for off in SEARCH_START..SEARCH_END.min(n.value.len().saturating_sub(1)) {
-            s[off].push(i16::from_le_bytes([n.value[off], n.value[off + 1]]));
+        // Demultiplex by connection handle — both halves share one ACL pipe.
+        if let Some(v) = out.get_mut(&pkt.conn_handle) {
+            v.push(n.value);
         }
     }
-    (stats, samples)
-}
-
-/// Classification of one candidate offset.
-struct Verdict {
-    off: usize,
-    label: String,
-    rest: i32,
-    best_move: i32,
-    best_hold: i32,
-    axis: usize,
-    ccw_peak: i32,
-    cw_peak: i32,
-}
-
-fn classify(conn: u16, rec: &[HashMap<u16, Vec<Stat>>]) -> Vec<Verdict> {
-    let stat = |pi: usize, off: usize| -> Stat {
-        rec[pi].get(&conn).map(|v| v[off]).unwrap_or_default()
-    };
-    let neutral_idx: Vec<usize> = PHASES.iter().enumerate()
-        .filter(|(_, p)| p.kind == Kind::Neutral).map(|(i, _)| i).collect();
-
-    let mut out = Vec::new();
-    for off in SEARCH_START..SEARCH_END {
-        // Noise floor and neutral reference, from both stationary phases.
-        let rest = neutral_idx.iter().map(|i| stat(*i, off).range()).max().unwrap_or(0);
-        let neutral_mean = stat(neutral_idx[0], off).mean();
-
-        let mut best_move = 0;
-        let mut best_hold = 0;
-        let mut axis = 0usize;
-        let mut ccw_peak = 0;
-        let mut cw_peak = 0;
-
-        for a in 0..3 {
-            let mv: i32 = PHASES.iter().enumerate()
-                .filter(|(_, p)| p.axis == a && p.kind == Kind::Move)
-                .map(|(i, _)| stat(i, off).range()).max().unwrap_or(0);
-            // How far the HELD value drifts from neutral — the accelerometer's
-            // signature, since gravity has rotated in the sensor frame.
-            let hold: i32 = PHASES.iter().enumerate()
-                .filter(|(_, p)| p.axis == a && p.kind == Kind::Hold)
-                .map(|(i, _)| (stat(i, off).mean() - neutral_mean).abs()).max().unwrap_or(0);
-            if mv > best_move {
-                best_move = mv;
-                axis = a;
-                ccw_peak = PHASES.iter().enumerate()
-                    .find(|(_, p)| p.axis == a && p.kind == Kind::Move && p.ccw)
-                    .map(|(i, _)| stat(i, off).signed_peak()).unwrap_or(0);
-                cw_peak = PHASES.iter().enumerate()
-                    .find(|(_, p)| p.axis == a && p.kind == Kind::Move && !p.ccw)
-                    .map(|(i, _)| stat(i, off).signed_peak()).unwrap_or(0);
-            }
-            best_hold = best_hold.max(hold);
-        }
-
-        let floor = (rest * 4).max(300);
-        let label = if best_move > floor && best_move > best_hold * 2 {
-            format!("GYRO {}", AXES[axis])
-        } else if best_hold > floor {
-            "ACCEL".to_string()
-        } else {
-            "-".to_string()
-        };
-        out.push(Verdict { off, label, rest, best_move, best_hold, axis, ccw_peak, cw_peak });
-    }
-    out.sort_by_key(|v| -(v.best_move.max(v.best_hold)));
     out
-}
-
-fn report(link: &Link, rec: &[HashMap<u16, Vec<Stat>>]) {
-    println!("\n\n========== {} HALF — FIELD MAP ==========", link.side);
-    println!("{:>5} {:>11} {:>7} {:>9} {:>9} {:>9} {:>9}",
-        "off", "verdict", "rest", "move", "hold", "ccw_peak", "cw_peak");
-    for v in classify(link.conn, rec).iter().take(18) {
-        println!("{:>5} {:>11} {:>7} {:>9} {:>9} {:>9} {:>9}",
-            v.off, v.label, v.rest, v.best_move, v.best_hold, v.ccw_peak, v.cw_peak);
-    }
-    println!("\nGYRO rows: ccw_peak and cw_peak should have OPPOSITE signs. If they do not,");
-    println!("the field is probably not a gyro axis, or the motion was not clean.");
-    println!("ACCEL rows: 1 g = 4096 LSB, so a 90 deg tilt moves an axis by about that much.");
-    println!("Offsets overlap by a byte, so a real field is a strong row with weak neighbours.");
-}
-
-/// Compare the two halves.
-///
-/// They are bolted together, so they cannot rotate at different rates: a real
-/// gyro axis MUST respond on both with similar magnitude. Anything that only
-/// lights up on one half is a mis-identification. Their accelerometer readings
-/// at neutral differ only by the fixed mounting orientation, which is exactly
-/// the pivot offset needed to bring both into one frame.
-fn cross_check(links: &[Link], rec: &[HashMap<u16, Vec<Stat>>]) {
-    if links.len() < 2 {
-        return;
-    }
-    println!("\n\n========== CROSS-CHECK (halves are rigidly coupled) ==========");
-    for a in 0..3 {
-        println!("\n-- {} --", AXES[a]);
-        for link in links {
-            let best = classify(link.conn, rec).into_iter()
-                .filter(|v| v.label.starts_with("GYRO") && v.axis == a)
-                .max_by_key(|v| v.best_move);
-            match best {
-                Some(v) => println!(
-                    "  {:>5}: offset {:>3}  move={:<7} ccw={:<7} cw={:<7}",
-                    link.side, v.off, v.best_move, v.ccw_peak, v.cw_peak),
-                None => println!("  {:>5}: no gyro axis identified", link.side),
-            }
-        }
-    }
-
-    println!("\n-- neutral accelerometer values (the fixed mounting offset) --");
-    println!("Same physical orientation, so any difference between the halves IS the");
-    println!("mounting rotation, and is what a shared frame has to correct for.");
-    for link in links {
-        let accel: Vec<String> = classify(link.conn, rec).into_iter()
-            .filter(|v| v.label == "ACCEL")
-            .take(4)
-            .map(|v| {
-                let m = rec[0].get(&link.conn).map(|s| s[v.off].mean()).unwrap_or(0);
-                format!("off{}={m}", v.off)
-            })
-            .collect();
-        println!("  {:>5}: {}", link.side, accel.join("  "));
-    }
 }
 
 fn cmd_frame(cmd: u8, sub: u8, data: &[u8]) -> Vec<u8> {
