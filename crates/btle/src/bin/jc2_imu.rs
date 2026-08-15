@@ -100,6 +100,15 @@ type Frames = Vec<Vec<u8>>;
 
 fn main() {
     let want_mag = std::env::args().any(|a| a == "--mag");
+    // Echo the RESOLVED setting, not the raw argument. Three separate rounds of
+    // this investigation were wasted on flags that silently never reached the
+    // process, each time producing confident-looking but meaningless results.
+    // Printing what the code actually decided makes that impossible to miss.
+    println!(
+        "[imu] feature mask = {:#04x}{}",
+        if want_mag { 0xB7 } else { 0x37 },
+        if want_mag { "  (magnetometer bit REQUESTED)" } else { "  (stock; pass --mag to add magnetometer)" },
+    );
 
     let dongle = match Dongle::open(DONGLE_VID, DONGLE_PID) {
         Ok(d) => d,
@@ -133,7 +142,13 @@ fn main() {
         println!("    GO — {} s", phase.secs);
         let frames = record(&dongle, &links, Duration::from_secs(phase.secs));
         for l in &links {
-            println!("    {}: {} frames", l.side, frames.get(&l.conn).map(|f| f.len()).unwrap_or(0));
+            let f = frames.get(&l.conn);
+            // Report LENGTH is printed too: if the magnetometer bit is honoured,
+            // the controller has to put those readings somewhere, so a longer
+            // report is the most direct evidence that the bit did anything at
+            // all. Identical lengths with and without --mag means it did not.
+            let len = f.and_then(|v| v.first()).map(|r| r.len()).unwrap_or(0);
+            println!("    {}: {} frames, report len {len}", l.side, f.map(|v| v.len()).unwrap_or(0));
         }
         rec.push(frames);
     }
