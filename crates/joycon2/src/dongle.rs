@@ -154,42 +154,65 @@ fn run(shared: Arc<Shared>) {
     eprintln!("[jc2-dongle] dongle {vid:04x}:{pid:04x} ready");
 
     let mut links: Vec<Link> = Vec::new();
-    let mut last_scan = Instant::now() - SCAN_GAP;
+    // Scanning is a STATE, not a blocking call.
+    //
+    // It used to be a 2 s blocking `discover()` on this same thread, which left
+    // any already-connected half completely unserviced for the whole window —
+    // observed as a single controller cycling between 67 Hz and 0 Hz every few
+    // seconds, and only settling once the second half connected and scanning
+    // stopped. ACL now drains continuously while the scan runs.
+    let mut scanning = false;
+    let mut scan_deadline = Instant::now();
+    let mut last_scan_end = Instant::now() - SCAN_GAP;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
-        if links.len() < MAX_LINKS && last_scan.elapsed() >= SCAN_GAP {
-            last_scan = Instant::now();
-            if let Some((addr, addr_type, side)) = discover(&dongle, &links) {
-                match connect_and_init(&dongle, addr, addr_type, side) {
-                    // Reject a handle already in use: it means a stale
-                    // Connection Complete was returned rather than a new link,
-                    // and both pads would then mirror one controller.
-                    Ok(link) if links.iter().any(|l| l.conn == link.conn) => {
-                        eprintln!(
-                            "[jc2-dongle] {} got in-use handle {:#06x} — discarding",
-                            side.display_name(),
-                            link.conn,
-                        );
-                        dongle.cancel_pending_connect();
-                    }
-                    Ok(link) => {
-                        eprintln!(
-                            "[jc2-dongle] {} handle {:#06x}",
-                            side.display_name(),
-                            link.conn,
-                        );
-                        register(&shared, &link);
-                        links.push(link);
-                    }
-                    Err(e) => eprintln!("[jc2-dongle] {} connect failed: {e}", side.display_name()),
+        if links.len() < MAX_LINKS && !scanning && last_scan_end.elapsed() >= SCAN_GAP {
+            match dongle.start_le_scan() {
+                Ok(()) => {
+                    scanning = true;
+                    scan_deadline = Instant::now() + SCAN_WINDOW;
+                }
+                Err(e) => {
+                    eprintln!("[jc2-dongle] scan enable failed: {e}");
+                    last_scan_end = Instant::now();
                 }
             }
         }
+        if scanning && Instant::now() >= scan_deadline {
+            let _ = dongle.stop_le_scan();
+            scanning = false;
+            last_scan_end = Instant::now();
+        }
 
-        pump(&dongle, &shared, &mut links);
+        let found = pump(&dongle, &shared, &mut links, scanning);
 
-        if links.is_empty() {
-            // Nothing to service; avoid spinning the CPU between scans.
+        if let Some((addr, addr_type, side)) = found {
+            let _ = dongle.stop_le_scan();
+            scanning = false;
+            last_scan_end = Instant::now();
+            match connect_and_init(&dongle, addr, addr_type, side) {
+                // Reject a handle already in use: it means a stale Connection
+                // Complete was returned rather than a new link, and both pads
+                // would then mirror one controller.
+                Ok(link) if links.iter().any(|l| l.conn == link.conn) => {
+                    eprintln!(
+                        "[jc2-dongle] {} got in-use handle {:#06x} — discarding",
+                        side.display_name(),
+                        link.conn,
+                    );
+                    dongle.cancel_pending_connect();
+                }
+                Ok(link) => {
+                    eprintln!("[jc2-dongle] {} handle {:#06x}", side.display_name(), link.conn);
+                    register(&shared, &link);
+                    links.push(link);
+                }
+                Err(e) => eprintln!("[jc2-dongle] {} connect failed: {e}", side.display_name()),
+            }
+        }
+
+        if links.is_empty() && !scanning {
+            // Nothing to service; do not spin the CPU between scan windows.
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -199,42 +222,24 @@ fn run(shared: Arc<Shared>) {
     }
 }
 
-/// Scan for a Joy-Con 2 that is not already connected.
-fn discover(dongle: &Dongle, links: &[Link]) -> Option<([u8; 6], u8, Side)> {
-    if let Err(e) = dongle.start_le_scan() {
-        // Surfaced, not swallowed: a refused scan-enable is how "no controllers
-        // ever appear" happens, and it gives no other symptom.
-        eprintln!("[jc2-dongle] scan enable failed: {e}");
+/// Decide whether an advertising report is a Joy-Con 2 worth connecting to.
+fn advert_match(r: &flexinput_btle::hci::AdvReport, links: &[Link]) -> Option<([u8; 6], u8, Side)> {
+    let md = r.manufacturer_data()?;
+    // The company id is INCLUDED in this stack's manufacturer data (unlike
+    // btleplug, which strips it into a map key), so VID sits at 5 and PID at 7
+    // rather than 3 and 5.
+    if md.len() < 9 || u16::from_le_bytes([md[0], md[1]]) != protocol::NINTENDO_MANUFACTURER_ID {
         return None;
     }
-    let deadline = Instant::now() + SCAN_WINDOW;
-    let mut found = None;
-    while Instant::now() < deadline {
-        if let Ok(Some(Event::LeAdvertisingReport(r))) = dongle.read_event_timeout(Duration::from_millis(100)) {
-            let Some(md) = r.manufacturer_data() else { continue };
-            // Company id is INCLUDED in this stack's manufacturer data (unlike
-            // btleplug, which strips it into a map key), so VID sits at 5 and
-            // PID at 7 rather than 3 and 5.
-            if md.len() < 9 || u16::from_le_bytes([md[0], md[1]]) != protocol::NINTENDO_MANUFACTURER_ID {
-                continue;
-            }
-            if u16::from_le_bytes([md[5], md[6]]) != protocol::NINTENDO_VID {
-                continue;
-            }
-            let pid = u16::from_le_bytes([md[7], md[8]]);
-            let Some(side) = Side::from_pid(pid) else { continue };
-            if protocol::Side::is_safe_mode(pid) {
-                continue;
-            }
-            if links.iter().any(|l| l.key.address == r.address) {
-                continue;
-            }
-            found = Some((r.address, r.address_type, side));
-            break;
-        }
+    if u16::from_le_bytes([md[5], md[6]]) != protocol::NINTENDO_VID {
+        return None;
     }
-    let _ = dongle.stop_le_scan();
-    found
+    let pid = u16::from_le_bytes([md[7], md[8]]);
+    let side = Side::from_pid(pid)?;
+    if Side::is_safe_mode(pid) || links.iter().any(|l| l.key.address == r.address) {
+        return None;
+    }
+    Some((r.address, r.address_type, side))
 }
 
 /// Connect, subscribe and initialise one controller.
@@ -328,18 +333,30 @@ fn register(shared: &Arc<Shared>, link: &Link) {
 
 /// Service every live link: drain ACL, demultiplex by connection handle, and
 /// drop links that go quiet or disconnect.
-fn pump(dongle: &Dongle, shared: &Arc<Shared>, links: &mut Vec<Link>) {
+fn pump(
+    dongle: &Dongle,
+    shared: &Arc<Shared>,
+    links: &mut Vec<Link>,
+    scanning: bool,
+) -> Option<([u8; 6], u8, Side)> {
+    let mut found = None;
     // Events first — a disconnect must be noticed before its handle is reused.
     while let Ok(Some(evt)) = dongle.read_event_timeout(Duration::from_millis(1)) {
-        if let Event::DisconnectionComplete { conn_handle, reason } = evt {
-            if let Some(pos) = links.iter().position(|l| l.conn == conn_handle) {
-                let link = links.remove(pos);
-                eprintln!(
-                    "[jc2-dongle] {} disconnected (reason {reason:#04x})",
-                    link.key.side.display_name()
-                );
-                shared.pads.lock().unwrap().remove(&link.key);
+        match evt {
+            Event::DisconnectionComplete { conn_handle, reason } => {
+                if let Some(pos) = links.iter().position(|l| l.conn == conn_handle) {
+                    let link = links.remove(pos);
+                    eprintln!(
+                        "[jc2-dongle] {} disconnected (reason {reason:#04x})",
+                        link.key.side.display_name()
+                    );
+                    shared.pads.lock().unwrap().remove(&link.key);
+                }
             }
+            Event::LeAdvertisingReport(r) if scanning && found.is_none() => {
+                found = advert_match(&r, links);
+            }
+            _ => {}
         }
     }
 
@@ -390,6 +407,8 @@ fn pump(dongle: &Dongle, shared: &Arc<Shared>, links: &mut Vec<Link>) {
             i += 1;
         }
     }
+
+    found
 }
 
 #[cfg(test)]
