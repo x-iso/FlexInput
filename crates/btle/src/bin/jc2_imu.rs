@@ -406,17 +406,20 @@ fn record(dongle: &Dongle, links: &[Link], dur: Duration) -> HashMap<u16, Frames
         {
             eprintln!("[imu] a link dropped mid-phase (reason {reason:#04x})");
         }
-        let Ok(Some(pkt)) = dongle.read_acl(Duration::from_millis(10)) else { continue };
-        if pkt.cid != acl::CID_ATT {
-            continue;
-        }
-        let Some(n) = acl::parse_notification(&pkt.payload) else { continue };
-        if n.handle != jc::HANDLE_INPUT_VALUE {
-            continue;
-        }
-        // Demultiplex by connection handle — both halves share one ACL pipe.
-        if let Some(v) = out.get_mut(&pkt.conn_handle) {
-            v.push(n.value);
+        // Greedy drain: one packet per iteration starved whichever half was
+        // serviced second, badly enough to make its statistics meaningless.
+        for pkt in dongle.drain_acl(256) {
+            if pkt.cid != acl::CID_ATT {
+                continue;
+            }
+            let Some(n) = acl::parse_notification(&pkt.payload) else { continue };
+            if n.handle != jc::HANDLE_INPUT_VALUE {
+                continue;
+            }
+            // Demultiplex by connection handle — both halves share one pipe.
+            if let Some(v) = out.get_mut(&pkt.conn_handle) {
+                v.push(n.value);
+            }
         }
     }
     out

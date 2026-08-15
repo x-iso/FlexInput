@@ -246,7 +246,7 @@ fn connect_and_init(
         &acl::write_request(jc::HANDLE_CMD_RESPONSE_CCCD, &acl::CCCD_NOTIFY),
     )?;
 
-    let mut cmd = |c: u8, s: u8, data: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
+    let cmd = |c: u8, s: u8, data: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
         let frame = protocol::rumble_cmd_frame(c, s, data);
         dongle.send_att(conn, &acl::write_command(jc::HANDLE_CMD_WRITE, &frame))?;
         std::thread::sleep(INIT_GAP);
@@ -324,31 +324,34 @@ fn pump(dongle: &Dongle, shared: &Arc<Shared>, links: &mut Vec<Link>) {
         }
     }
 
-    // Then ACL. One short read per pass keeps both halves serviced evenly.
-    for _ in 0..16 {
-        match dongle.read_acl(Duration::from_millis(2)) {
-            Ok(Some(pkt)) if pkt.cid == acl::CID_ATT => {
-                let Some(n) = acl::parse_notification(&pkt.payload) else { continue };
-                if n.handle != jc::HANDLE_INPUT_VALUE {
-                    continue;
-                }
-                let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) else {
-                    continue;
-                };
-                let Some(snap) = reports::parse_input(link.key.side, &n.value) else { continue };
-                let stick = link.calib.normalize(snap.stick_raw);
-                let gyro = link.gyro_bias.correct(snap.motion.gyro);
-                link.last_input = Instant::now();
-                if let Some(pad) = shared.pads.lock().unwrap().get_mut(&link.key) {
-                    pad.streaming = true;
-                    pad.snapshot = snap;
-                    pad.stick = stick;
-                    pad.gyro = gyro;
-                    pad.events = pad.events.saturating_add(1);
-                }
-            }
-            Ok(_) => {}
-            Err(_) => break,
+    // Drain EVERYTHING waiting, not one packet per pass.
+    //
+    // Reading a single packet per iteration with a blocking timeout capped the
+    // whole process at roughly 90 packets a second shared between both links,
+    // and whichever half was serviced first took nearly all of it — the right
+    // half was observed at 6 Hz against the left's 60 Hz. Two halves at a 5 ms
+    // connection interval need 400 packets a second, so this has to be greedy.
+    for pkt in dongle.drain_acl(256) {
+        if pkt.cid != acl::CID_ATT {
+            continue;
+        }
+        let Some(n) = acl::parse_notification(&pkt.payload) else { continue };
+        if n.handle != jc::HANDLE_INPUT_VALUE {
+            continue;
+        }
+        let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) else {
+            continue;
+        };
+        let Some(snap) = reports::parse_input(link.key.side, &n.value) else { continue };
+        let stick = link.calib.normalize(snap.stick_raw);
+        let gyro = link.gyro_bias.correct(snap.motion.gyro);
+        link.last_input = Instant::now();
+        if let Some(pad) = shared.pads.lock().unwrap().get_mut(&link.key) {
+            pad.streaming = true;
+            pad.snapshot = snap;
+            pad.stick = stick;
+            pad.gyro = gyro;
+            pad.events = pad.events.saturating_add(1);
         }
     }
 

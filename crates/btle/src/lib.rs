@@ -267,11 +267,32 @@ impl Dongle {
     /// — the outcome arrives later as an `LE Connection Complete` sub-event, so
     /// `command_sync` is deliberately not used here.
     ///
-    /// The requested interval is 7.5–15 ms. The console drives these
-    /// controllers at 5 ms, which is below the 7.5 ms spec minimum and reachable
-    /// only through a vendor command; 7.5 ms is the fastest standard value and
-    /// already better than the 15 ms Windows negotiated.
+    /// Tries for the console's 5 ms interval first, then falls back.
+    ///
+    /// 5 ms is BELOW the 7.5 ms Bluetooth minimum — the console reaches it with
+    /// a vendor command — but many controllers honour it when asked directly,
+    /// and it is worth attempting because the interval is the hard ceiling on
+    /// report rate: one input report arrives per connection event, so 15 ms is
+    /// 66 Hz and 5 ms is 200 Hz. With two halves sharing the radio the
+    /// difference is the gap between usable and not.
     pub fn le_connect(&self, address: [u8; 6], address_type: u8) -> Result<u16> {
+        match self.le_connect_interval(address, address_type, 4, 6) {
+            Ok(h) => Ok(h),
+            Err(e) => {
+                log::debug!("btle: 5 ms interval refused ({e}); retrying at spec minimum");
+                self.le_connect_interval(address, address_type, 6, 12)
+            }
+        }
+    }
+
+    /// Connect with an explicit interval range, in 1.25 ms units.
+    pub fn le_connect_interval(
+        &self,
+        address: [u8; 6],
+        address_type: u8,
+        interval_min: u16,
+        interval_max: u16,
+    ) -> Result<u16> {
         let mut wire_addr = address;
         wire_addr.reverse();
 
@@ -282,8 +303,8 @@ impl Dongle {
         p.push(address_type);
         p.extend_from_slice(&wire_addr);
         p.push(0x00); // own address type: public
-        p.extend_from_slice(&0x0006u16.to_le_bytes()); // min interval: 7.5 ms
-        p.extend_from_slice(&0x000Cu16.to_le_bytes()); // max interval: 15 ms
+        p.extend_from_slice(&interval_min.to_le_bytes());
+        p.extend_from_slice(&interval_max.to_le_bytes());
         p.extend_from_slice(&0x0000u16.to_le_bytes()); // peripheral latency
         p.extend_from_slice(&0x01F4u16.to_le_bytes()); // supervision timeout: 5 s
         p.extend_from_slice(&0x0000u16.to_le_bytes()); // min CE length
@@ -338,6 +359,26 @@ impl Dongle {
         self.handle
             .write_bulk(self.acl_out_ep, &packet, self.timeout)?;
         Ok(())
+    }
+
+    /// Drain every ACL packet currently waiting, up to `limit`.
+    ///
+    /// Reading one packet per caller iteration is what starved the second
+    /// controller: with a 10 ms blocking read per packet the whole process
+    /// could not exceed ~90 packets a second, shared between both links, and
+    /// whichever half was serviced first took nearly all of it. Two halves at
+    /// 200 Hz need 400 packets a second, so the drain has to be greedy and the
+    /// timeout short.
+    pub fn drain_acl(&self, limit: usize) -> Vec<AclPacket> {
+        let mut out = Vec::new();
+        while out.len() < limit {
+            match self.read_acl(Duration::from_millis(1)) {
+                Ok(Some(p)) => out.push(p),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        out
     }
 
     /// Read one inbound ACL packet, or `Ok(None)` on timeout.
