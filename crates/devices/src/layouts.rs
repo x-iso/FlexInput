@@ -8,6 +8,8 @@ pub fn outputs_for(kind: ControllerKind) -> Vec<DevicePin> {
         ControllerKind::DualShock4 => ds4_outputs(),
         ControllerKind::DualSense  => dualsense_outputs(),
         ControllerKind::SwitchPro  => switch_pro_outputs(),
+        ControllerKind::JoyCon2L   => joycon2_left_outputs(),
+        ControllerKind::JoyCon2R   => joycon2_right_outputs(),
         ControllerKind::Generic    => generic_outputs(),
         // MIDI devices build their own pin lists; layouts not used.
         ControllerKind::MidiIn | ControllerKind::MidiOut => return vec![],
@@ -22,6 +24,8 @@ pub fn inputs_for(kind: ControllerKind) -> Vec<DevicePin> {
         ControllerKind::DualShock4 => ds4_inputs(),
         ControllerKind::DualSense  => dualsense_inputs(),
         ControllerKind::SwitchPro  => switch_pro_inputs(),
+        ControllerKind::JoyCon2L
+        | ControllerKind::JoyCon2R => joycon2_inputs(),
         _                          => standard_rumble_inputs(),
     }
 }
@@ -165,6 +169,106 @@ fn switch_pro_outputs() -> Vec<DevicePin> {
     ];
     pins.extend(imu_pins());
     pins
+}
+
+// ── Joy-Con 2 ─────────────────────────────────────────────────────────────────
+//
+// Each half is an independent BLE peripheral and gets its own device entry, so
+// these layouts describe ONE Joy-Con rather than a pair.
+//
+// The single stick is named for the half it lives on (`left_stick` on the L,
+// `right_stick` on the R) rather than always `left_stick`. That way merging the
+// two halves in the graph produces exactly the pin set of a normal two-stick
+// pad, with no renaming step.
+//
+// Face-button naming follows the Switch Pro layout above: positional ids, with
+// the Nintendo label in the display name. Nintendo's A is positional East, B is
+// South, X is North, Y is West.
+
+/// Pins common to both halves: IMU, the optical mouse sensor, and battery.
+fn joycon2_shared_outputs() -> Vec<DevicePin> {
+    let mut pins = imu_pins();
+    pins.extend(vec![
+        // Relative optical-mouse deltas, in report units per frame. Unlike
+        // every other Float pin here these are NOT normalised to −1..1: mouse
+        // travel has no natural full-scale, and clamping it would cap pointer
+        // speed. Scale them with a curve or the RWS module.
+        fl("mouse_dx", "Mouse ΔX (relative)"),
+        fl("mouse_dy", "Mouse ΔY (relative)"),
+        // 0 when the sensor is flat on a surface, rising as it lifts. The
+        // research notes mark the exact units unknown, so it is passed through
+        // raw for now and is mainly useful as a "is it on a desk" gate.
+        fl("mouse_liftoff", "Mouse Lift-off"),
+        fl("battery", "Battery (0–1)"),
+        bo("charging", "Charging"),
+    ]);
+    pins
+}
+
+fn joycon2_left_outputs() -> Vec<DevicePin> {
+    let mut pins = vec![
+        f2("left_stick", "Stick", SignalType::Vec2),
+        f2("dpad", "D-Pad", SignalType::Vec2),
+        fl("left_stick_x", "Stick X"),
+        fl("left_stick_y", "Stick Y"),
+        fl("dpad_x", "D-Pad X"),
+        fl("dpad_y", "D-Pad Y"),
+        bo("btn_lb", "L"),
+        bo("btn_lt_dig", "ZL (digital)"),
+        bo("btn_ls", "Stick Click"),
+        bo("btn_back", "Minus"),
+        bo("btn_capture", "Capture"),
+        // The rail buttons, only reachable when the Joy-Con is detached. No
+        // positional equivalent on a standard pad, so they keep their own ids.
+        bo("btn_sl", "SL"),
+        bo("btn_sr", "SR"),
+        bo("dpad_up", "D-Pad Up"),
+        bo("dpad_down", "D-Pad Down"),
+        bo("dpad_left", "D-Pad Left"),
+        bo("dpad_right", "D-Pad Right"),
+    ];
+    pins.extend(joycon2_shared_outputs());
+    pins
+}
+
+fn joycon2_right_outputs() -> Vec<DevicePin> {
+    let mut pins = vec![
+        f2("right_stick", "Stick", SignalType::Vec2),
+        fl("right_stick_x", "Stick X"),
+        fl("right_stick_y", "Stick Y"),
+        bo("btn_south", "South (B)"),
+        bo("btn_east", "East (A)"),
+        bo("btn_west", "West (Y)"),
+        bo("btn_north", "North (X)"),
+        bo("btn_rb", "R"),
+        bo("btn_rt_dig", "ZR (digital)"),
+        bo("btn_rs", "Stick Click"),
+        bo("btn_start", "Plus"),
+        bo("btn_guide", "Home"),
+        // New on Switch 2: the GameChat button.
+        bo("btn_c", "C (GameChat)"),
+        bo("btn_sl", "SL"),
+        bo("btn_sr", "SR"),
+    ];
+    pins.extend(joycon2_shared_outputs());
+    pins
+}
+
+/// Joy-Con 2 has a single LRA per half, driven by the same dual-carrier HD
+/// rumble encoding as the Switch Pro. The pin names match `switch_pro_inputs`
+/// so an Audio Stream Haptics patch built for a Pro Controller drives a Joy-Con
+/// unchanged — there is just one actuator instead of two, so only the `_l` pins
+/// exist regardless of which half this is.
+fn joycon2_inputs() -> Vec<DevicePin> {
+    vec![
+        fl("hd_l_amp", "HD Rumble: Amplitude (perceptual 0–1)"),
+        fl("hd_l_freq", "HD Rumble: Frequency (0=82Hz 0.5=320Hz 1=626Hz)"),
+        fl("hd2_l_amp", "HD Rumble: Amp (HF carrier)"),
+        fl("hd2_l_freq", "HD Rumble: Freq (HF carrier)"),
+        // player_led: bits 0–3 select which of the 4 LEDs light.
+        // 0=off, 0.25=P1, 0.5=P2, 0.75=P3, 1.0=P4 — same encoding as DualSense.
+        fl("player_led", "Player LED (0=off 0.25=P1 0.5=P2 0.75=P3 1=P4)"),
+    ]
 }
 
 // ── Generic fallback ──────────────────────────────────────────────────────────

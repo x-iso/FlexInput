@@ -13,8 +13,10 @@ default-run = "flexinput"
 # Audio Stream Haptics — optional module (Phase C pilot). Forwarded from the UI
 # down to the modules crate. `cargo build` keeps it on; build the app with
 # `--no-default-features` to ship without the ASTH node.
-default = ["asth"]
+default = ["asth", "joycon2"]
 asth = ["flexinput-ui/asth"]
+# Joy-Con 2 over Bluetooth LE — forwarded down to the devices crate.
+joycon2 = ["flexinput-ui/joycon2"]
 
 [dependencies]
 flexinput-ui = { workspace = true }

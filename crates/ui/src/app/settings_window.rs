@@ -277,6 +277,23 @@ impl FlexInputApp {
             ) {
                 continue;
             }
+            // Joy-Con 2 is read by OUR OWN hidapi transport (`joycon2::usb`),
+            // not by SDL/gilrs, so masking its HID interface hides it from
+            // FlexInput as well as from everything else. HidHide's per-app
+            // whitelist is unreliable on this machine, and the observed result
+            // is a pad that enumerates, opens, and then streams nothing at all
+            // — the exact "connected at 0 Hz" symptom. There is also nothing to
+            // gain: over USB the vendor protocol lives on interface 1, which no
+            // game reads, so a wired Joy-Con 2 does not produce the duplicate
+            // gamepad that hiding exists to suppress.
+            if matches!(
+                dev.kind,
+                flexinput_devices::ControllerKind::JoyCon2L
+                    | flexinput_devices::ControllerKind::JoyCon2R
+            ) {
+                self.hidhide_vidpid_cache.remove(&dev.id);
+                continue;
+            }
             if let (Some(vid), Some(pid)) = (dev.vid, dev.pid) {
                 self.hidhide_vidpid_cache.insert(dev.id.clone(), (vid, pid));
             }
@@ -383,6 +400,13 @@ impl FlexInputApp {
                         // silently did nothing in SDL mode and Steam kept seeing
                         // the physical device. The vid/pid → instance-id lookup
                         // downstream already handles both USB and Bluetooth.
+                        // NOT `jc2:` — deliberately. Joy-Con 2 speaks a vendor
+                        // BLE GATT protocol with no HID-over-GATT service, so
+                        // Windows binds no driver and creates no HID node.
+                        // There is no phantom gamepad for other apps to see and
+                        // nothing for HidHide to act on; adding the prefix here
+                        // would only send it hunting for an instance path that
+                        // does not exist.
                         if dev_id.starts_with("gilrs:") || dev_id.starts_with("sdl:") {
                             phys_ids.insert(dev_id);
                         }
@@ -404,6 +428,25 @@ impl FlexInputApp {
                     | flexinput_devices::ControllerKind::MidiOut
             ) {
                 continue; // Xbox/XInput can't be hidden; MIDI has no vid/pid
+            }
+            // Joy-Con 2 is excluded BY KIND, not by device-id prefix.
+            //
+            // The `jc2:` prefix check above is not enough and the comment there
+            // is now only half true: over USB (charging grip) a Joy-Con 2 DOES
+            // get a HID node, Windows binds it as a plain gamepad, and it
+            // reaches us as `sdl:`/`gilrs:` — so it sailed straight past the
+            // prefix gate and got masked. Masking it is actively harmful,
+            // because our own hidapi transport (`joycon2::usb`) is what reads
+            // it, and HidHide's per-app whitelist is unreliable here: the pad
+            // enumerates, opens, then streams nothing at all. Nothing is gained
+            // either — the vendor protocol lives on interface 1, which no game
+            // reads, so there is no phantom gamepad to suppress.
+            if matches!(
+                dev.kind,
+                flexinput_devices::ControllerKind::JoyCon2L
+                    | flexinput_devices::ControllerKind::JoyCon2R
+            ) {
+                continue;
             }
             if let (Some(vid), Some(pid)) = (dev.vid, dev.pid) {
                 out.push((vid, pid));
@@ -511,6 +554,28 @@ impl FlexInputApp {
                     self.sdl_all_pads.store(self.settings.sdl_all_pads, Ordering::Relaxed);
                     dirty = true;
                 }
+
+                ui.add_space(8.0);
+
+                if ui.checkbox(&mut self.settings.joycon2_pairing, "Pair Joy-Con 2 controllers")
+                    .on_hover_text(
+                        "Let Joy-Con 2 controllers complete Nintendo's Bluetooth pairing so they \
+                         reconnect on a button press instead of needing the Sync button every \
+                         session.\n\n\
+                         WARNING: pairing WRITES to the controller's internal memory, which stores \
+                         only two host addresses. Pairing to this PC can evict your Switch 2 \
+                         console's entry and force you to re-sync the controller on the console.\n\n\
+                         Off = the controller still works normally, it just won't wake-reconnect."
+                    )
+                    .changed()
+                {
+                    self.joycon2_pairing.store(self.settings.joycon2_pairing, Ordering::Relaxed);
+                    dirty = true;
+                }
+                ui.label(egui::RichText::new(
+                    "Joy-Con 2 works without this. Only enable it if you want wake-on-button, and \
+                     accept that the controller may need re-syncing on your Switch 2."
+                ).small().color(egui::Color32::from_gray(140)));
 
                 ui.add_space(8.0);
 

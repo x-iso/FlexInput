@@ -1,0 +1,64 @@
+[package]
+name    = "flexinput-joycon2"
+version.workspace = true
+edition.workspace = true
+
+# Joy-Con 2 (and Switch 2 protocol clones such as the Mobapad M12-S) over
+# Bluetooth LE. Kept in its own crate for the same reason `flexinput-net` is:
+# btleplug + tokio is a large transitive tree, and `flexinput-devices` is on the
+# hot path for every build. `flexinput-devices` depends on this ONLY behind its
+# `joycon2` feature, so a `--no-default-features` build never compiles any of it.
+#
+# Deliberately has no `flexinput-core` dependency: this crate speaks raw
+# controller state (`PadSnapshot`), and the devices crate is the single place
+# that turns that into `Signal`s. Keeps the protocol testable in isolation.
+
+[dependencies]
+# WinRT-backed BLE central on Windows (BlueZ on Linux, CoreBluetooth on macOS).
+# 0.12 is the first release whose Windows backend implements read_descriptor /
+# write_descriptor for real rather than returning NotSupported — required,
+# because Joy-Con 2 initialisation writes the vendor "report rate" descriptor
+# (`679d5510-…`) and not just the standard CCCDs.
+#
+# btleplug already pulls the `windows` crate on this target, so the host-address
+# lookup below reuses that major rather than adding a parallel COM runtime (see
+# the long note in devices/Cargo.toml for why that matters here).
+btleplug = "0.12"
+# Current-thread runtime driving the BLE state machine on ONE dedicated thread.
+# No `rt-multi-thread`: a single controller link is not CPU work, and keeping it
+# single-threaded means the whole hub is one OS thread the I/O loop never joins.
+tokio    = { version = "1", features = ["rt", "time", "sync", "macros"] }
+# `StreamExt::next` over btleplug's notification stream.
+futures  = { version = "0.3", default-features = false, features = ["std", "executor"] }
+uuid     = { workspace = true }
+# AES-128-ECB, used ONLY to verify the controller's LTK confirmation response
+# (B2 = AES(LTK, A2)). No traffic is encrypted by us.
+aes      = "0.8"
+log      = "0.4"
+# USB HID transport. Preferred over Bluetooth wherever a cable exists: Windows
+# reclaims unpaired BLE links on a ~30 s timer (proven by HCI capture) and no
+# GATT-client-side workaround stops it, whereas a wired Joy-Con 2 enumerates as
+# an ordinary HID gamepad. Same major as `crates/devices` so there is one
+# hidapi/libusb backend in the process, not two.
+hidapi   = "2"
+
+[target.'cfg(windows)'.dependencies]
+# Win32 Bluetooth radio enumeration, to read the host adapter's BD_ADDR for the
+# pairing address exchange. Bindings-only (no COM runtime), windows-sys 0.61 to
+# match crates/devices and crates/engine.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Bluetooth",
+] }
+# WinRT pairing (`win_pair`), to make Windows treat the controller as bonded so
+# it stops reclaiming the link on its ~30 s unpaired-connection timer. Version
+# pinned to the major btleplug already builds (0.62) so this shares its COM
+# runtime and type registrations rather than standing up a second one.
+windows = { version = "0.62", features = [
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    "Foundation",
+] }
+# `IAsyncOperation::await`. windows-rs moved async out of the main crate; this
+# is the same version btleplug uses.
+windows-future = "0.3"

@@ -62,6 +62,10 @@ pub fn phys_pad_slug(dev_id: &str) -> Option<&str> {
     dev_id
         .strip_prefix("gilrs:")
         .or_else(|| dev_id.strip_prefix("sdl:"))
+        // Joy-Con 2 over BLE. Its ids are `jc2:<slug>:<bt-address>` — the third
+        // field is an address rather than an index, but only the slug is read
+        // here so the shape matches.
+        .or_else(|| dev_id.strip_prefix("jc2:"))
         .and_then(|rest| rest.split(':').next())
 }
 
@@ -358,6 +362,12 @@ pub fn device_card_svg(kind: flexinput_devices::ControllerKind) -> &'static [u8]
         K::DualShock4 => DEV_PS4,
         K::DualSense  => DEV_PS5,
         K::SwitchPro  => DEV_SWITCH,
+        // Joy-Con 2 halves borrow the Switch Pro glyph for now. The
+        // `controller_switch_joycon_up/down.svg` assets are NOT per-side art —
+        // they are rail attach/detach direction glyphs (a body with an up or
+        // down arrow) — so using them here would be misleading. Dedicated
+        // left/right Joy-Con art is a follow-up.
+        K::JoyCon2L | K::JoyCon2R => DEV_SWITCH,
         K::Generic    => DEV_XBOX,
         K::MidiIn     => DEV_MIDI_IN,
         K::MidiOut    => DEV_MIDI_OUT,

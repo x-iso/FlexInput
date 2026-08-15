@@ -154,9 +154,21 @@ pub(crate) fn sync_display_state_into(dst: &mut Snarl<NodeData>, src: &Snarl<Nod
 /// sink) rather than a synthetic AutoMap-bus key (`collector:`, `remap:`,
 /// `forksel:`, `combiner:`, `lean:`). Used to decide when to fall back to the
 /// underlying physical device for feedback (reverse) routing.
+/// True when `id` names a physical GAMEPAD, whichever backend surfaced it:
+/// `gilrs:` (native), `sdl:` (the route-all-through-SDL switch), or `jc2:`
+/// (Joy-Con 2 over Bluetooth LE).
+///
+/// Prefer this over hand-written prefix checks. Every time a backend was added,
+/// the sites that forgot its prefix failed silently — a pad that produced input
+/// fine but could never receive rumble, or was never masked. Sites that
+/// deliberately cover only SOME backends spell that out inline instead of
+/// calling this.
+pub(crate) fn is_physical_pad_id(id: &str) -> bool {
+    id.starts_with("gilrs:") || id.starts_with("sdl:") || id.starts_with("jc2:")
+}
+
 pub(crate) fn is_real_device_id(id: &str) -> bool {
-    id.starts_with("gilrs:")
-        || id.starts_with("sdl:")
+    is_physical_pad_id(id)
         || id.starts_with("midi_in:")
         || id.starts_with("midi_out:")
         || id.starts_with("virtual.")
@@ -334,7 +346,7 @@ pub(crate) fn fold_outer_uid_app(p: &crate::canvas::viewer::AutomapGlowParent<'_
 /// (`collector:`, `remap:`, `combiner:`…). The config overlay's source-block
 /// and passthrough (M3) operate only on these.
 pub(crate) fn is_physical_input_device(id: &str) -> bool {
-    id.starts_with("gilrs:") || id.starts_with("sdl:") || id.starts_with("midi_in:")
+    is_physical_pad_id(id) || id.starts_with("midi_in:")
 }
 
 /// Resolve the upstream PHYSICAL input device that a config tweak-pin's module

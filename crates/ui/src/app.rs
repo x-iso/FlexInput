@@ -472,6 +472,10 @@ pub struct FlexInputApp {
     /// so the Settings toggle re-arbitrates backends live. Mirrors
     /// `app_settings.sdl_all_pads`.
     sdl_all_pads: Arc<AtomicBool>,
+    /// Joy-Con 2 Bluetooth pairing opt-in, shared with the I/O thread so the
+    /// Settings toggle applies live. Mirrors `app_settings.joycon2_pairing`.
+    /// Off by default — the handshake writes to controller flash.
+    joycon2_pairing: Arc<AtomicBool>,
     /// Per-device measured polling rates (device_id → Hz). Written by the
     /// I/O thread, read by the canvas viewer to show live per-device Hz.
     pub device_rates: flexinput_engine::DeviceRates,
@@ -708,6 +712,7 @@ impl FlexInputApp {
         let sample_rate_hz = Arc::new(AtomicU32::new(app_settings.sample_rate_hz));
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
         let sdl_all_pads   = Arc::new(AtomicBool::new(app_settings.sdl_all_pads));
+        let joycon2_pairing = Arc::new(AtomicBool::new(app_settings.joycon2_pairing));
         // Mirror the polling rate to flexinput-virtual so HIDMaestro XInput pads
         // set their XUSB companion's pump period to match (see
         // requested_poll_interval_ms). Pushed again on every slider change.
@@ -887,6 +892,7 @@ impl FlexInputApp {
             Arc::clone(&scope_taps),
             Arc::clone(&spike_filter_settings),
             Arc::clone(&sdl_all_pads),
+            Arc::clone(&joycon2_pairing),
             Arc::clone(&ping_requests),
         );
 
@@ -1072,6 +1078,7 @@ impl FlexInputApp {
             sample_rate_hz,
             polling_hz,
             sdl_all_pads,
+            joycon2_pairing,
             device_rates,
             scope_taps,
             spike_filter_settings,
@@ -1427,6 +1434,9 @@ impl eframe::App for FlexInputApp {
             let resolved: Option<(String, Option<u16>, Option<u16>)> =
                 if card == crate::easy::io_panel::XINPUT_CARD_OUTPUT {
                     self.active_virtual_xinput_device_id().map(|id| (id, None, None))
+                // NOT `jc2:` — a Joy-Con 2 has no XInput presence at all
+                // (Windows binds no driver to it), so there is no slot to
+                // assign and the HIDMaestro lookup would find nothing.
                 } else if card.starts_with("gilrs:") || card.starts_with("sdl:") {
                     // Physical source — find its VID/PID from the live device list.
                     let vp = self.devices.iter()

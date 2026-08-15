@@ -3,8 +3,19 @@ name    = "flexinput-devices"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Joy-Con 2 over Bluetooth LE. On by default; forwarded from the app through
+# the UI crate. Optional because it pulls btleplug + tokio, and a build that
+# doesn't want the BLE stack shouldn't pay for compiling it.
+default = ["joycon2"]
+joycon2 = ["dep:flexinput-joycon2"]
+
 [dependencies]
 flexinput-core = { workspace = true }
+# See crates/joycon2 — Switch 2 controllers speak a proprietary BLE GATT
+# protocol with no HID-over-GATT service, so gilrs/SDL/hidapi can never see
+# them and they need a backend of their own.
+flexinput-joycon2 = { workspace = true, optional = true }
 glam           = { workspace = true }
 gilrs          = "0.10"
 hidapi         = "2"

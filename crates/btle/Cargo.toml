@@ -1,0 +1,32 @@
+[package]
+name    = "flexinput-btle"
+version.workspace = true
+edition.workspace = true
+
+# A Bluetooth LE host stack driving a DEDICATED USB dongle directly, bypassing
+# the operating system's Bluetooth stack entirely.
+#
+# Why this exists: Windows reclaims unpaired BLE links on a ~30 s timer. That is
+# established from an HCI capture, not inferred — `HCI_Disconnect` with reason
+# 0x16 ("Connection Terminated by Local Host") exactly 31.1 s after
+# `LE Create Connection`, while notifications were still arriving every 15 ms.
+# `GattSession.MaintainConnection`, constant traffic, WinRT pairing at every
+# protection level, and a hand-injected registry link key all failed to stop it.
+# Joy-Con 2 controllers cannot be bonded by Windows either: their SMP exchange
+# ends in `Confirm Value Failed` because they use a non-zero legacy TK that
+# WinRT has no API to supply.
+#
+# Owning the radio removes both problems at once. There is no OS policy to fight
+# because the OS is not managing the link, and encryption can be started with
+# `HCI_LE_Enable_Encryption` using the LTK from the controller's own pseudo-OOB
+# GATT exchange — no SMP involved.
+#
+# Deliberately generic: nothing here knows what a Joy-Con is.
+
+[dependencies]
+# libusb bindings. On Windows these talk to a device bound to WinUSB (via Zadig),
+# which is exactly the arrangement this crate needs. Chosen over `nusb` for the
+# plain blocking API — an HCI transport is a request/response loop on its own
+# thread, so async buys nothing here and costs a runtime.
+rusb = "0.9"
+log  = "0.4"

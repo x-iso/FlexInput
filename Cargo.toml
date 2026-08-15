@@ -5,6 +5,8 @@ members = [
     "crates/devices",
     "crates/virtual",
     "crates/hidmaestro",
+    "crates/joycon2",
+    "crates/btle",
     "crates/net",
     "crates/modules",
     "crates/ui",
@@ -26,9 +28,14 @@ license = "MIT"
 [workspace.dependencies]
 flexinput-core    = { path = "crates/core" }
 flexinput-engine  = { path = "crates/engine" }
-flexinput-devices = { path = "crates/devices" }
+# default-features off so the optional `joycon2` backend is controlled by
+# forwarding (ui → devices, app → ui), the same way `asth` is handled below.
+# Overriding default-features on a workspace-inherited dep only takes effect
+# when set here; the default build re-enables it through the forwarding chain.
+flexinput-devices = { path = "crates/devices", default-features = false }
 flexinput-virtual = { path = "crates/virtual" }
 flexinput-hidmaestro = { path = "crates/hidmaestro" }
+flexinput-joycon2 = { path = "crates/joycon2" }
 flexinput-net     = { path = "crates/net" }
 # default-features off so the optional `asth` module feature is controlled by
 # forwarding (ui → modules, app → ui); the default build re-enables it. Overriding
@@ -95,6 +102,16 @@ puffin_http  = "0.17"
 arc-swap     = "1"
 
 [patch.crates-io]
+# Vendored for one missing line: the WinRT backend never sets
+# `GattSession.MaintainConnection`. Per Microsoft's docs a BLE connection is
+# initiated AND held by setting that, by uncached service discovery, or by a
+# read/write — and upstream's `connect()` does only the discovery, which opens a
+# link without asking Windows to keep it. Incoming notifications don't count as
+# the activity Windows looks for, so a device that merely streams (a gamepad) is
+# reclaimed after ~30 s while data is still flowing. This killed every Joy-Con 2
+# link at a near-constant 29 s regardless of scanning, pairing or pad count.
+# See the FLEXINPUT PATCH comment in vendor/btleplug/src/winrtble/ble/device.rs.
+btleplug = { path = "vendor/btleplug" }
 egui-snarl = { path = "vendor/egui-snarl" }
 # Vendored to fix the one unrecoverable GPU panic we hit: when a fullscreen
 # game resets the graphics device, egui-wgpu's `update_buffers` panics because

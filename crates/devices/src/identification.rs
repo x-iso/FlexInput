@@ -4,6 +4,12 @@ pub enum ControllerKind {
     DualShock4,
     DualSense,
     SwitchPro,
+    /// Joy-Con 2, left half. Reached only through the BLE backend — these never
+    /// appear to gilrs/SDL/hidapi because the controller implements no
+    /// HID-over-GATT service for Windows to bind a driver to.
+    JoyCon2L,
+    /// Joy-Con 2, right half.
+    JoyCon2R,
     Generic,
     MidiIn,
     MidiOut,
@@ -23,6 +29,14 @@ impl ControllerKind {
                 | (0x054C, 0x0DF2) => return Self::DualSense,
                 // Nintendo Switch Pro (USB and Bluetooth share PID 0x2009)
                 (0x057E, 0x2009) => return Self::SwitchPro,
+                // Joy-Con 2. MUST be matched before the Nintendo catch-all
+                // below, which would otherwise classify every Switch 2
+                // controller as a Switch Pro and hand it the wrong pin layout.
+                // `0x2066`/`0x2067` are normal mode; `0x2070`/`0x2071` are the
+                // safe mode the controller falls back to after a failed
+                // firmware update. Note R has the LOWER id.
+                (0x057E, 0x2066) | (0x057E, 0x2070) => return Self::JoyCon2R,
+                (0x057E, 0x2067) | (0x057E, 0x2071) => return Self::JoyCon2L,
                 // Any other Nintendo VID — catch BT paths where PID may differ
                 // or gilrs reports a variant PID not in the list above.
                 (0x057E, _) => return Self::SwitchPro,
@@ -66,6 +80,8 @@ impl ControllerKind {
             Self::DualShock4 => "ds4",
             Self::DualSense  => "dualsense",
             Self::SwitchPro  => "switch_pro",
+            Self::JoyCon2L   => "joycon2_l",
+            Self::JoyCon2R   => "joycon2_r",
             Self::Generic    => "generic",
             Self::MidiIn     => "midi_in",
             Self::MidiOut    => "midi_out",
@@ -78,16 +94,25 @@ impl ControllerKind {
             Self::DualShock4 => "DualShock 4",
             Self::DualSense  => "DualSense",
             Self::SwitchPro  => "Switch Pro Controller",
+            Self::JoyCon2L   => "Joy-Con 2 (L)",
+            Self::JoyCon2R   => "Joy-Con 2 (R)",
             Self::Generic    => "Generic Gamepad",
             Self::MidiIn     => "MIDI Input Port",
             Self::MidiOut    => "MIDI Output Port",
         }
     }
 
+    /// Whether this is one half of a Joy-Con 2 pair. Used by the UI to group
+    /// the two halves and by the BLE backend's device-id prefix checks.
+    pub fn is_joycon2(self) -> bool {
+        matches!(self, Self::JoyCon2L | Self::JoyCon2R)
+    }
+
     /// Whether this controller exposes pressure-sensitive analog triggers
     /// (LT/RT as a 0..1 axis). Switch Pro's ZL/ZR are digital-only buttons, so
     /// it returns false — the UI forces the digital-trigger override ON for it.
-    /// MIDI ports have no triggers and return false too.
+    /// Joy-Con 2's ZL/ZR are digital for the same reason. MIDI ports have no
+    /// triggers and return false too.
     pub fn has_analog_triggers(self) -> bool {
         matches!(self, Self::XInput | Self::DualShock4 | Self::DualSense | Self::Generic)
     }
