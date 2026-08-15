@@ -362,9 +362,18 @@ fn connect_both(dongle: &Dongle, want_mag: bool) -> Vec<Link> {
         let Some((addr, addr_type, pid)) = scan_once(dongle, &addrs) else { continue };
         let side = if pid == 0x2066 { "RIGHT" } else { "LEFT" };
         match dongle.le_connect(addr, addr_type) {
+            // A handle already in use means the connect returned a STALE
+            // Connection Complete belonging to the first controller rather than
+            // a new link. Accepting it silently makes both halves read the same
+            // stream — byte-identical frames, identical counters, identical
+            // everything — which looks like working data and is not.
+            Ok(conn) if links.iter().any(|l| l.conn == conn) => {
+                eprintln!("[imu] {side} returned handle {conn:#06x}, already in use — retrying");
+                dongle.cancel_pending_connect();
+            }
             Ok(conn) => {
                 init(dongle, conn, want_mag);
-                println!("[imu] {side} connected ({} of 2)", links.len() + 1);
+                println!("[imu] {side} connected as handle {conn:#06x} ({} of 2)", links.len() + 1);
                 addrs.push(addr);
                 links.push(Link { conn, side });
             }

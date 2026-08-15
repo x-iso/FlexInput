@@ -323,6 +323,13 @@ impl Dongle {
         p.extend_from_slice(&0x0000u16.to_le_bytes()); // min CE length
         p.extend_from_slice(&0x0000u16.to_le_bytes()); // max CE length
 
+        // Drain stale events BEFORE issuing the command. A Connection Complete
+        // left over from a previous link would otherwise be returned as this
+        // one's result, handing the caller a handle that is already in use —
+        // and two "links" reading the same stream look exactly like two working
+        // controllers until you notice their frames are byte-identical.
+        while let Ok(Some(_)) = self.read_event_timeout(Duration::from_millis(2)) {}
+
         self.send_command(hci::Opcode::LE_CREATE_CONNECTION, &p)?;
 
         // Short reads, not the default 2 s. A refused parameter set answers

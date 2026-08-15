@@ -161,7 +161,23 @@ fn run(shared: Arc<Shared>) {
             last_scan = Instant::now();
             if let Some((addr, addr_type, side)) = discover(&dongle, &links) {
                 match connect_and_init(&dongle, addr, addr_type, side) {
+                    // Reject a handle already in use: it means a stale
+                    // Connection Complete was returned rather than a new link,
+                    // and both pads would then mirror one controller.
+                    Ok(link) if links.iter().any(|l| l.conn == link.conn) => {
+                        eprintln!(
+                            "[jc2-dongle] {} got in-use handle {:#06x} — discarding",
+                            side.display_name(),
+                            link.conn,
+                        );
+                        dongle.cancel_pending_connect();
+                    }
                     Ok(link) => {
+                        eprintln!(
+                            "[jc2-dongle] {} handle {:#06x}",
+                            side.display_name(),
+                            link.conn,
+                        );
                         register(&shared, &link);
                         links.push(link);
                     }
