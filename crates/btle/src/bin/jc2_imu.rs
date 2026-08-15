@@ -440,6 +440,171 @@ fn bit_field(frame: &[u8], bit_off: usize, width: usize) -> Option<i64> {
     })
 }
 
+/// Angular rate implied by the accelerometer, in radians per frame.
+///
+/// Gravity's direction in the sensor frame gives absolute tilt, and the gyro is
+/// the DERIVATIVE of that tilt — so differentiating it produces a genuine
+/// angular-rate reference to score candidate decodings against. This is the
+/// discriminator that range-based scoring could never be: range found the
+/// accelerometer because gravity is large and slow, but it cannot characterise
+/// a rate signal at all, which is why five scans came up empty.
+///
+/// Only ROLL and PITCH can be recovered this way. Yaw rotates about the gravity
+/// vector, so gravity is invariant under it and the accelerometer is blind to
+/// it — the yaw axis has to be inferred afterwards as the remaining field at
+/// the same bit spacing.
+fn accel_rates(frames: &Frames, base: usize, axis_a: usize, axis_b: usize) -> Vec<f64> {
+    let read = |f: &[u8], i: usize| -> f64 {
+        field(f, base + i * 4).unwrap_or(0) as f64
+    };
+    let mut angles = Vec::with_capacity(frames.len());
+    for f in frames {
+        // atan2 against the vertical axis, so the angle is continuous through
+        // the whole 180 degree sweep rather than wrapping at the extremes.
+        angles.push(read(f, axis_a).atan2(read(f, axis_b)));
+    }
+    let mut rates = Vec::with_capacity(angles.len());
+    rates.push(0.0);
+    for i in 1..angles.len() {
+        let mut d = angles[i] - angles[i - 1];
+        // Unwrap: a jump of more than half a turn is the branch cut, not motion.
+        if d > std::f64::consts::PI {
+            d -= 2.0 * std::f64::consts::PI;
+        } else if d < -std::f64::consts::PI {
+            d += 2.0 * std::f64::consts::PI;
+        }
+        rates.push(d);
+    }
+    rates
+}
+
+/// Moving average, to make a differenced signal comparable at all.
+///
+/// Differencing a quantised angle once per frame at ~67 Hz produces a reference
+/// dominated by quantisation noise, which drags every correlation toward zero
+/// however correct the candidate decoding is. Smoothing both sides equally
+/// leaves any real relationship intact while removing the noise that hides it.
+fn smooth(v: &[f64], w: usize) -> Vec<f64> {
+    if v.len() < w || w < 2 {
+        return v.to_vec();
+    }
+    let mut out = Vec::with_capacity(v.len() - w + 1);
+    let mut acc: f64 = v[..w].iter().sum();
+    out.push(acc / w as f64);
+    for i in w..v.len() {
+        acc += v[i] - v[i - w];
+        out.push(acc / w as f64);
+    }
+    out
+}
+
+/// Pearson correlation. Returns 0 when either series is constant.
+fn correlate(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    if n < 20 {
+        return 0.0;
+    }
+    let (ma, mb) = (
+        a[..n].iter().sum::<f64>() / n as f64,
+        b[..n].iter().sum::<f64>() / n as f64,
+    );
+    let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
+    for i in 0..n {
+        let (x, y) = (a[i] - ma, b[i] - mb);
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    if da <= 0.0 || db <= 0.0 {
+        return 0.0;
+    }
+    num / (da * db).sqrt()
+}
+
+/// Score every candidate bit-field by how well it tracks the accelerometer's
+/// angular rate, and report the best per axis.
+fn rate_scan(phases: &[Frames], accel_base: usize, _start_byte: usize, _region_bits: usize) {
+    // Search the WHOLE report, not just the region before the accelerometer.
+    // Confining it there assumed the gyro sits next to the accel block, and
+    // that assumption has now produced five empty scans — it costs little to
+    // stop making it.
+    let start_byte = 8usize;
+    let region_bits = (accel_base.max(48) - start_byte) * 8;
+    const SMOOTH: usize = 7;
+    println!("
+-- RATE CORRELATION (vs accelerometer-derived angular rate) --");
+    println!("   Only roll and pitch can be scored: yaw rotates about gravity, so the");
+    println!("   accelerometer cannot see it. |r| near 1.0 is a real gyro axis.");
+    println!("{:>6} {:>6} {:>9} {:>9}", "bit", "width", "r(roll)", "r(pitch)");
+
+    // Roll tilts axis 1 against vertical; pitch tilts axis 0 against vertical.
+    let roll_ref = smooth(&accel_rates(&phases[1], accel_base, 1, 2), SMOOTH);
+    let pitch_ref = smooth(&accel_rates(&phases[2], accel_base, 0, 2), SMOOTH);
+
+    // Validate the REFERENCE before trusting a null result. If the derived
+    // angular rate is flat or absurd, no candidate can correlate with it and
+    // "nothing found" would say nothing about the encoding at all.
+    let stats = |v: &[f64]| -> (f64, f64, f64) {
+        if v.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        let sd = (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+        let peak = v.iter().cloned().fold(0.0f64, |a, b| a.max(b.abs()));
+        (m, sd, peak)
+    };
+    let (rm, rsd, rpk) = stats(&roll_ref);
+    let (pm, psd, ppk) = stats(&pitch_ref);
+    println!("   reference roll : n={} mean={rm:.5} sd={rsd:.5} peak={rpk:.5} rad/frame",
+        roll_ref.len());
+    println!("   reference pitch: n={} mean={pm:.5} sd={psd:.5} peak={ppk:.5} rad/frame",
+        pitch_ref.len());
+    println!("   (a 90 deg sweep over ~4 s at 67 Hz is about 0.006 rad/frame; a peak near");
+    println!("    zero means the reference is broken and the null result is meaningless)");
+
+    let series = |frames: &Frames, bit: usize, w: usize| -> Vec<f64> {
+        let raw: Vec<f64> = frames
+            .iter()
+            .map(|f| {
+                f.get(start_byte..)
+                    .and_then(|sl| bit_field(sl, bit, w))
+                    .unwrap_or(0) as f64
+            })
+            .collect();
+        smooth(&raw, SMOOTH)
+    };
+
+    let mut rows: Vec<(usize, usize, f64, f64)> = Vec::new();
+    for width in [10usize, 11, 12, 14, 16, 20, 21] {
+        for bit in 0..region_bits.saturating_sub(width) {
+            let r_roll = correlate(&series(&phases[1], bit, width), &roll_ref);
+            let r_pitch = correlate(&series(&phases[2], bit, width), &pitch_ref);
+            if r_roll.abs() > 0.45 || r_pitch.abs() > 0.45 {
+                rows.push((bit, width, r_roll, r_pitch));
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        b.2.abs().max(b.3.abs()).partial_cmp(&a.2.abs().max(a.3.abs())).unwrap()
+    });
+    if rows.is_empty() {
+        println!("   nothing correlated above 0.5 — the encoding is not a plain packed");
+        println!("   signed field, or the rate is differenced/scaled between samples");
+        return;
+    }
+    for (bit, width, rr, rp) in rows.iter().take(12) {
+        let tag = if rr.abs() > 0.8 {
+            "  <== GYRO roll"
+        } else if rp.abs() > 0.8 {
+            "  <== GYRO pitch"
+        } else {
+            ""
+        };
+        println!("{bit:>6} {width:>6} {rr:>9.3} {rp:>9.3}{tag}");
+    }
+    println!("   A negative r means the axis is inverted, which is information, not noise.");
+}
+
 /// Search the packed region between the timestamp and the accelerometer for
 /// bit-aligned signed fields that behave like gyro axes.
 ///
@@ -504,6 +669,8 @@ fn bit_scan(phases: &[Frames], accel_base: usize) {
     }
     println!("  bit is relative to byte {start_byte}; a real field repeats at a regular");
     println!("  spacing for its three axes, so look for three strong rows evenly spaced.");
+
+    rate_scan(phases, accel_base, start_byte, region_bits);
 }
 
 /// Compare the halves. They are bolted together and cannot rotate at different
