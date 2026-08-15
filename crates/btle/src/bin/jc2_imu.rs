@@ -462,4 +462,47 @@ fn init(dongle: &Dongle, conn: u16, want_mag: bool) {
         &acl::write_request(jc::HANDLE_INPUT_REPORT_RATE, &jc::REPORT_RATE_PAYLOAD),
     );
     std::thread::sleep(Duration::from_millis(150));
+
+    // Ask the controller what it ACTUALLY enabled.
+    //
+    // `0x0C/0x01` retrieves the feature configuration, so this is the
+    // controller's own answer rather than our assumption. Until now the probe
+    // subscribed to the command-response channel and then ignored it entirely,
+    // which meant a rejected feature mask looked exactly like an accepted one.
+    // That matters most for the magnetometer bit: the input report is a FIXED
+    // 63 bytes, so magnetometer data would land in existing padding rather
+    // than lengthening the report — an unchanged length proves nothing either
+    // way, and the readback is the only direct evidence available.
+    let _ = dongle.send_att(conn, &acl::write_command(jc::HANDLE_CMD_WRITE, &cmd_frame(0x0C, 0x01, &[])));
+    drain_responses(dongle, conn, Duration::from_millis(600));
+}
+
+/// Print whatever the controller sends back on the command-response channel.
+///
+/// Responses on this characteristic carry their 8-byte header at offset 0x0F
+/// (the leading bytes are the rumble region echoed back), so the header is
+/// decoded from there: `[cmd][dir 0x01][transport][subcmd][..][len]`.
+fn drain_responses(dongle: &Dongle, conn: u16, dur: Duration) {
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        let Ok(Some(pkt)) = dongle.read_acl(Duration::from_millis(20)) else { continue };
+        if pkt.cid != acl::CID_ATT || pkt.conn_handle != conn {
+            continue;
+        }
+        let Some(n) = acl::parse_notification(&pkt.payload) else { continue };
+        if n.handle != jc::HANDLE_CMD_RESPONSE {
+            continue;
+        }
+        const HDR: usize = 0x0F;
+        if n.value.len() >= HDR + 8 {
+            let h = &n.value[HDR..HDR + 8];
+            let data = &n.value[HDR + 8..(HDR + 8 + h[5] as usize).min(n.value.len())];
+            println!(
+                "    <- reply cmd={:#04x} sub={:#04x} len={} data={:02x?}",
+                h[0], h[3], h[5], data
+            );
+        } else {
+            println!("    <- reply (short) {:02x?}", n.value);
+        }
+    }
 }
