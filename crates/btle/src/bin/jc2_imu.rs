@@ -323,6 +323,103 @@ fn analyse(link: &Link, rec: &[HashMap<u16, Frames>]) {
     println!("
   A gyro axis has min and max of OPPOSITE sign (the sweep went both ways).");
     println!("  Real fields sit 4 bytes apart; anything in between is a misaligned read.");
+
+    if let Some((ab, _, _)) = accel.first().filter(|(_, _, e)| *e < 0.15) {
+        bit_scan(&rec_phases(rec, link.conn), *ab);
+    }
+}
+
+/// Frames for one link, grouped by phase.
+fn rec_phases(rec: &[HashMap<u16, Frames>], conn: u16) -> Vec<Frames> {
+    rec.iter()
+        .map(|m| m.get(&conn).cloned().unwrap_or_default())
+        .collect()
+}
+
+/// Extract a signed field of `width` bits starting at `bit_off`, LSB-first.
+fn bit_field(frame: &[u8], bit_off: usize, width: usize) -> Option<i64> {
+    if (bit_off + width + 7) / 8 > frame.len() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for i in 0..width {
+        let b = bit_off + i;
+        let bit = (frame[b / 8] >> (b % 8)) & 1;
+        v |= (bit as u64) << i;
+    }
+    // Sign-extend from `width` bits.
+    let sign = 1u64 << (width - 1);
+    Some(if v & sign != 0 {
+        (v as i64) - (1i64 << width)
+    } else {
+        v as i64
+    })
+}
+
+/// Search the packed region between the timestamp and the accelerometer for
+/// bit-aligned signed fields that behave like gyro axes.
+///
+/// Byte-aligned scans found nothing there but saturating garbage, while the
+/// same bytes read as u32 sit within a fraction of a percent of 2^24 and 2^23.
+/// Values centred on power-of-two biases mean a PACKED encoding — fields that
+/// do not start on byte boundaries — so the search has to move a bit at a time.
+///
+/// Six sensor axes (3 gyro + 3 magnetometer) in this region would be about
+/// 10-11 bits each, which also matches the persistent ~1023-range field the
+/// byte-aligned scan kept flagging.
+fn bit_scan(phases: &[Frames], accel_base: usize) {
+    // The region runs from just past the timestamp to the accel block.
+    let start_byte = accel_base.saturating_sub(9);
+    let region_bits = (accel_base - start_byte) * 8;
+
+    println!("
+-- PACKED BIT-FIELD SCAN (bytes {start_byte}..{accel_base}) --");
+    println!("{:>6} {:>6} {:>10} {:>10} {:>10} {:>7}", "bit", "width", "roll", "pitch", "yaw", "sel");
+
+    let sub = |frames: &Frames, bit: usize, w: usize| -> (i64, i64) {
+        let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+        for f in frames {
+            if let Some(v) = bit_field(&f[start_byte..], bit, w) {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        if lo > hi { (0, 0) } else { (lo, hi) }
+    };
+
+    let mut rows: Vec<(usize, usize, [i64; 3], f64)> = Vec::new();
+    for width in [10usize, 11, 12, 14, 16, 20, 21] {
+        for bit in 0..region_bits.saturating_sub(width) {
+            let rest = { let (l, h) = sub(&phases[0], bit, width); h - l };
+            let r = [
+                { let (l, h) = sub(&phases[1], bit, width); h - l },
+                { let (l, h) = sub(&phases[2], bit, width); h - l },
+                { let (l, h) = sub(&phases[3], bit, width); h - l },
+            ];
+            let best = r.iter().copied().max().unwrap_or(0);
+            // Must move a lot more during one sweep than at rest, and must not
+            // saturate its own width — a saturating field is a bad decoding.
+            let full = 1i64 << width;
+            if best < full / 8 || best > full * 9 / 10 || best < rest * 4 {
+                continue;
+            }
+            let others = r.iter().copied().sum::<i64>() - best;
+            rows.push((bit, width, r, best as f64 / others.max(1) as f64));
+        }
+    }
+    rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+    if rows.is_empty() {
+        println!("  nothing in this region behaved like a rotation-selective field");
+        return;
+    }
+    for (bit, width, r, sel) in rows.iter().take(12) {
+        let axis = (0..3).max_by_key(|i| r[*i]).unwrap();
+        let (lo, hi) = sub(&phases[axis + 1], *bit, *width);
+        let tag = if *sel > 2.0 { format!("  <== {} ({lo}..{hi})", AXES[axis]) } else { String::new() };
+        println!("{bit:>6} {width:>6} {:>10} {:>10} {:>10} {sel:>7.1}{tag}", r[0], r[1], r[2]);
+    }
+    println!("  bit is relative to byte {start_byte}; a real field repeats at a regular");
+    println!("  spacing for its three axes, so look for three strong rows evenly spaced.");
 }
 
 /// Compare the halves. They are bolted together and cannot rotate at different
