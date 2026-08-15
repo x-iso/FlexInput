@@ -254,10 +254,14 @@ fn hold(dongle: &Dongle, conn: u16) {
                             }
                             Some(base) => {
                                 for (i, b) in n.value.iter().enumerate() {
-                                    // Offsets 0..4 are the report counter and a
-                                    // timestamp; they always change and would
-                                    // drown out the fields we care about.
-                                    if i >= 4 && i < changed.len() && base.get(i) != Some(b) {
+                                    // Only offsets 0..2 are excluded (the report
+                                    // counter, which increments every frame and
+                                    // would mark itself live forever). An
+                                    // earlier version excluded 0..4 and thereby
+                                    // hid the BUTTON byte at offset 2 — visibly
+                                    // cycling 04/08/10/02 in the dumps while the
+                                    // summary claimed it never changed.
+                                    if i >= 2 && i < changed.len() && base.get(i) != Some(b) {
                                         changed[i] = true;
                                     }
                                 }

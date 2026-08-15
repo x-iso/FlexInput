@@ -1993,6 +1993,7 @@ version = "0.13.3"
 dependencies = [
  "aes",
  "btleplug",
+ "flexinput-btle",
  "futures",
  "hidapi",
  "log",

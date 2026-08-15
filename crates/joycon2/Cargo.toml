@@ -24,6 +24,10 @@ edition.workspace = true
 # lookup below reuses that major rather than adding a parallel COM runtime (see
 # the long note in devices/Cargo.toml for why that matters here).
 btleplug = "0.12"
+# FlexInput's own BLE host stack over a dedicated USB dongle. The preferred
+# transport: Windows reclaims unpaired BLE links on a ~30 s timer that no GATT
+# client can prevent, while this holds 90 s+ at 64 Hz on the same hardware.
+flexinput-btle = { path = "../btle" }
 # Current-thread runtime driving the BLE state machine on ONE dedicated thread.
 # No `rt-multi-thread`: a single controller link is not CPU work, and keeping it
 # single-threaded means the whole hub is one OS thread the I/O loop never joins.

@@ -6,7 +6,7 @@
 //! only ever touch an in-memory snapshot and never block on Bluetooth.
 
 use flexinput_core::Signal;
-use flexinput_joycon2::{Joycon2Hub, Joycon2UsbHub, PadKey, PadState, Side};
+use flexinput_joycon2::{Joycon2DongleHub, Joycon2Hub, Joycon2UsbHub, PadKey, PadState, Side};
 
 use crate::gyro::{ACCEL_REF_G, GYRO_REF_DPS};
 use crate::{layouts, ControllerKind, DeviceBackend, PhysicalDevice};
@@ -27,10 +27,11 @@ const JC2_GYRO_DPS_PER_LSB: f32 = 2000.0 / 32767.0;
 pub struct Joycon2Backend {
     hub: Joycon2Hub,
     usb: Joycon2UsbHub,
+    dongle: Joycon2DongleHub,
 }
 
 impl Joycon2Backend {
-    /// Pads from both transports, wired first.
+    /// Pads from every transport, best first.
     ///
     /// A controller reachable over both would appear twice, but the two get
     /// different `PadKey` addresses (USB synthesises one, tagged `0xFE`/`0xFF`
@@ -38,7 +39,11 @@ impl Joycon2Backend {
     /// device ids, so nothing is silently overwritten — the user just sees two
     /// entries and can wire the one they want.
     fn all_pads(&self) -> Vec<PadState> {
-        let mut pads = self.usb.pads();
+        // Dongle first: it is the only transport that holds a link
+        // indefinitely, so when a controller is reachable both ways its dongle
+        // entry is the one a user should reach for.
+        let mut pads = self.dongle.pads();
+        pads.extend(self.usb.pads());
         pads.extend(self.hub.pads());
         pads
     }
@@ -55,6 +60,9 @@ impl Joycon2Backend {
             // Bluetooth one here — Windows reclaims unpaired BLE links every
             // ~30 s and nothing we can do from a GATT client prevents it.
             usb: Joycon2UsbHub::new(),
+            // Costs one thread that exits immediately when no WinUSB-bound
+            // dongle is present, which is the common case.
+            dongle: Joycon2DongleHub::new(),
         }
     }
 
@@ -239,7 +247,8 @@ impl DeviceBackend for Joycon2Backend {
 
     fn take_event_counts(&mut self) -> Vec<(String, u32)> {
         // Both transports, or a wired pad would always display 0 Hz.
-        let mut counts = self.usb.take_event_counts();
+        let mut counts = self.dongle.take_event_counts();
+        counts.extend(self.usb.take_event_counts());
         counts.extend(self.hub.take_event_counts());
         counts
             .into_iter()

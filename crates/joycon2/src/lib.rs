@@ -26,6 +26,7 @@
 //!
 //! Protocol reference: <https://github.com/ndeadly/switch2_controller_research>
 
+pub mod dongle;
 pub mod host_addr;
 pub mod hub;
 pub mod pairing;
@@ -36,6 +37,7 @@ pub mod usb;
 pub mod win_pair;
 
 pub use hub::{Joycon2Hub, PadKey, PadState};
+pub use dongle::Joycon2DongleHub;
 pub use usb::Joycon2UsbHub;
 pub use protocol::{Side, NINTENDO_VID, PID_JOYCON2_L, PID_JOYCON2_R};
 pub use reports::{Buttons, Motion, Mouse, PadSnapshot, Power, StickCalib};
