@@ -20,8 +20,11 @@
 
 use std::time::Duration;
 
+pub mod acl;
 pub mod hci;
+pub mod joycon;
 
+pub use acl::{AclPacket, Notification};
 pub use hci::{CommandComplete, Event, Opcode};
 
 /// Errors from the dongle transport.
@@ -66,6 +69,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Dongle {
     handle: rusb::DeviceHandle<rusb::GlobalContext>,
     event_ep: u8,
+    acl_in_ep: u8,
+    acl_out_ep: u8,
     interface: u8,
     timeout: Duration,
 }
@@ -91,11 +96,13 @@ impl Dongle {
         let interface = 0u8;
         handle.claim_interface(interface)?;
 
-        let event_ep = find_interrupt_in_endpoint(handle.device(), interface)?;
+        let eps = find_endpoints(handle.device(), interface)?;
 
         Ok(Self {
             handle,
-            event_ep,
+            event_ep: eps.event,
+            acl_in_ep: eps.acl_in,
+            acl_out_ep: eps.acl_out,
             interface,
             timeout: Duration::from_secs(2),
         })
@@ -132,8 +139,17 @@ impl Dongle {
     /// waiting for a specific event need to distinguish "nothing yet" from
     /// "broken".
     pub fn read_event(&self) -> Result<Option<Event>> {
+        self.read_event_timeout(self.timeout)
+    }
+
+    /// [`Dongle::read_event`] with an explicit timeout.
+    ///
+    /// A streaming loop has to poll the event endpoint *and* the ACL endpoint,
+    /// and blocking two seconds on either would stall the other. Short
+    /// alternating reads keep both responsive without threads.
+    pub fn read_event_timeout(&self, timeout: Duration) -> Result<Option<Event>> {
         let mut buf = [0u8; 260];
-        match self.handle.read_interrupt(self.event_ep, &mut buf, self.timeout) {
+        match self.handle.read_interrupt(self.event_ep, &mut buf, timeout) {
             Ok(n) => hci::parse_event(&buf[..n]).map(Some),
             Err(rusb::Error::Timeout) => Ok(None),
             Err(e) => Err(Error::Usb(e)),
@@ -242,6 +258,125 @@ impl Dongle {
         self.command_sync(hci::Opcode::LE_SET_SCAN_ENABLE, &[0x00, 0x00])?;
         Ok(())
     }
+
+    /// Connect to a peripheral, returning the connection handle.
+    ///
+    /// `address` is in natural (display) order; the wire wants it reversed.
+    ///
+    /// Note this command answers with `Command Status`, not `Command Complete`
+    /// — the outcome arrives later as an `LE Connection Complete` sub-event, so
+    /// `command_sync` is deliberately not used here.
+    ///
+    /// The requested interval is 7.5–15 ms. The console drives these
+    /// controllers at 5 ms, which is below the 7.5 ms spec minimum and reachable
+    /// only through a vendor command; 7.5 ms is the fastest standard value and
+    /// already better than the 15 ms Windows negotiated.
+    pub fn le_connect(&self, address: [u8; 6], address_type: u8) -> Result<u16> {
+        let mut wire_addr = address;
+        wire_addr.reverse();
+
+        let mut p = Vec::with_capacity(25);
+        p.extend_from_slice(&0x0060u16.to_le_bytes()); // scan interval
+        p.extend_from_slice(&0x0030u16.to_le_bytes()); // scan window
+        p.push(0x00); // initiator filter policy: use the address below
+        p.push(address_type);
+        p.extend_from_slice(&wire_addr);
+        p.push(0x00); // own address type: public
+        p.extend_from_slice(&0x0006u16.to_le_bytes()); // min interval: 7.5 ms
+        p.extend_from_slice(&0x000Cu16.to_le_bytes()); // max interval: 15 ms
+        p.extend_from_slice(&0x0000u16.to_le_bytes()); // peripheral latency
+        p.extend_from_slice(&0x01F4u16.to_le_bytes()); // supervision timeout: 5 s
+        p.extend_from_slice(&0x0000u16.to_le_bytes()); // min CE length
+        p.extend_from_slice(&0x0000u16.to_le_bytes()); // max CE length
+
+        self.send_command(hci::Opcode::LE_CREATE_CONNECTION, &p)?;
+
+        // Give the controller several event reads: connection setup takes as
+        // long as it takes the peripheral to advertise again.
+        for _ in 0..40 {
+            match self.read_event()? {
+                Some(Event::LeConnectionComplete {
+                    status,
+                    conn_handle,
+                    interval,
+                    supervision_timeout,
+                }) => {
+                    if status != 0 {
+                        return Err(Error::Protocol(format!(
+                            "LE Connection Complete status {status:#04x}"
+                        )));
+                    }
+                    log::info!(
+                        "btle: connected handle {conn_handle:#06x} interval {:.2}ms timeout {}ms",
+                        interval as f32 * 1.25,
+                        supervision_timeout as u32 * 10,
+                    );
+                    return Ok(conn_handle);
+                }
+                Some(_) => continue,
+                None => continue,
+            }
+        }
+        // Leave no dangling initiator: without this the controller keeps trying
+        // to connect and refuses the next `LE_Create_Connection` with
+        // "Command Disallowed".
+        let _ = self.command_sync(hci::Opcode::LE_CREATE_CONNECTION_CANCEL, &[]);
+        Err(Error::Protocol("no LE Connection Complete".into()))
+    }
+
+    /// Tear down a connection.
+    pub fn disconnect(&self, conn_handle: u16) -> Result<()> {
+        let mut p = conn_handle.to_le_bytes().to_vec();
+        p.push(0x13); // reason: remote user terminated connection
+        self.send_command(hci::Opcode::DISCONNECT, &p)?;
+        Ok(())
+    }
+
+    /// Send an ATT PDU over the connection's ACL channel.
+    pub fn send_att(&self, conn_handle: u16, att_pdu: &[u8]) -> Result<()> {
+        let packet = acl::encode_acl(conn_handle, acl::CID_ATT, att_pdu);
+        self.handle
+            .write_bulk(self.acl_out_ep, &packet, self.timeout)?;
+        Ok(())
+    }
+
+    /// Read one inbound ACL packet, or `Ok(None)` on timeout.
+    pub fn read_acl(&self, timeout: Duration) -> Result<Option<AclPacket>> {
+        let mut buf = [0u8; 1024];
+        match self.handle.read_bulk(self.acl_in_ep, &mut buf, timeout) {
+            Ok(n) => Ok(acl::parse_acl(&buf[..n])),
+            Err(rusb::Error::Timeout) => Ok(None),
+            Err(e) => Err(Error::Usb(e)),
+        }
+    }
+
+    /// Start link encryption from an out-of-band LTK, bypassing SMP entirely.
+    ///
+    /// This is the capability the whole crate exists for. Windows will only
+    /// encrypt as the outcome of its own SMP pairing, which a Joy-Con 2 fails
+    /// with `Confirm Value Failed`; here the key from the controller's
+    /// pseudo-OOB GATT exchange is handed straight to the controller.
+    ///
+    /// `rand` and `ediv` are zero for a key that did not come from legacy SMP.
+    pub fn le_enable_encryption(
+        &self,
+        conn_handle: u16,
+        rand: u64,
+        ediv: u16,
+        ltk: &[u8; 16],
+    ) -> Result<()> {
+        let mut p = Vec::with_capacity(28);
+        p.extend_from_slice(&conn_handle.to_le_bytes());
+        p.extend_from_slice(&rand.to_le_bytes());
+        p.extend_from_slice(&ediv.to_le_bytes());
+        // The LTK goes out least-significant byte first, like every other
+        // multi-byte HCI field.
+        let mut key = *ltk;
+        key.reverse();
+        p.extend_from_slice(&key);
+        self.send_command(hci::Opcode::LE_ENABLE_ENCRYPTION, &p)?;
+        Ok(())
+    }
 }
 
 impl Drop for Dongle {
@@ -250,29 +385,44 @@ impl Drop for Dongle {
     }
 }
 
-/// Locate the interrupt IN endpoint that carries HCI events.
+struct Endpoints {
+    event: u8,
+    acl_in: u8,
+    acl_out: u8,
+}
+
+/// Locate the endpoints the Bluetooth USB transport defines.
 ///
-/// Read from the descriptors rather than assuming the conventional `0x81`,
-/// because dongles do vary and a wrong address fails as a silent timeout —
-/// indistinguishable from a dongle that simply is not answering.
-fn find_interrupt_in_endpoint(
-    device: rusb::Device<rusb::GlobalContext>,
-    interface: u8,
-) -> Result<u8> {
+/// Read from the descriptors rather than assuming the conventional `0x81` /
+/// `0x82` / `0x02`, because dongles do vary and a wrong address fails as a
+/// silent timeout — indistinguishable from a dongle that is not answering.
+fn find_endpoints(device: rusb::Device<rusb::GlobalContext>, interface: u8) -> Result<Endpoints> {
     let config = device.active_config_descriptor()?;
+    let (mut event, mut acl_in, mut acl_out) = (None, None, None);
     for iface in config.interfaces() {
         if iface.number() != interface {
             continue;
         }
         for desc in iface.descriptors() {
             for ep in desc.endpoint_descriptors() {
-                if ep.transfer_type() == rusb::TransferType::Interrupt
-                    && ep.direction() == rusb::Direction::In
-                {
-                    return Ok(ep.address());
+                match (ep.transfer_type(), ep.direction()) {
+                    (rusb::TransferType::Interrupt, rusb::Direction::In) => {
+                        event.get_or_insert(ep.address());
+                    }
+                    (rusb::TransferType::Bulk, rusb::Direction::In) => {
+                        acl_in.get_or_insert(ep.address());
+                    }
+                    (rusb::TransferType::Bulk, rusb::Direction::Out) => {
+                        acl_out.get_or_insert(ep.address());
+                    }
+                    _ => {}
                 }
             }
         }
     }
-    Err(Error::NoEndpoint("interrupt IN"))
+    Ok(Endpoints {
+        event: event.ok_or(Error::NoEndpoint("interrupt IN"))?,
+        acl_in: acl_in.ok_or(Error::NoEndpoint("bulk IN"))?,
+        acl_out: acl_out.ok_or(Error::NoEndpoint("bulk OUT"))?,
+    })
 }

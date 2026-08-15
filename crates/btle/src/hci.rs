@@ -36,6 +36,22 @@ impl Opcode {
     pub const LE_SET_SCAN_PARAMETERS: Opcode = Opcode::new(0x08, 0x000B);
     /// `HCI_LE_Set_Scan_Enable` — OGF 0x08, OCF 0x000C.
     pub const LE_SET_SCAN_ENABLE: Opcode = Opcode::new(0x08, 0x000C);
+    /// `HCI_LE_Create_Connection` — OGF 0x08, OCF 0x000D.
+    ///
+    /// Answers with `Command Status`, not `Command Complete`: the result
+    /// arrives later as an `LE Connection Complete` sub-event.
+    pub const LE_CREATE_CONNECTION: Opcode = Opcode::new(0x08, 0x000D);
+    /// `HCI_LE_Create_Connection_Cancel` — OGF 0x08, OCF 0x000E.
+    pub const LE_CREATE_CONNECTION_CANCEL: Opcode = Opcode::new(0x08, 0x000E);
+    /// `HCI_Disconnect` — OGF 0x01 (Link Control), OCF 0x0006.
+    pub const DISCONNECT: Opcode = Opcode::new(0x01, 0x0006);
+    /// `HCI_LE_Enable_Encryption` — OGF 0x08, OCF 0x0019.
+    ///
+    /// The reason this whole crate exists: it starts link encryption from an
+    /// out-of-band LTK with no SMP involved, which is exactly what the console
+    /// does after the Joy-Con's pseudo-OOB GATT exchange, and exactly what
+    /// WinRT offers no way to do.
+    pub const LE_ENABLE_ENCRYPTION: Opcode = Opcode::new(0x08, 0x0019);
 }
 
 /// Encode an HCI command packet: opcode (little-endian), length, parameters.
@@ -83,6 +99,20 @@ pub enum Event {
     CommandStatus { status: u8, opcode: Opcode },
     /// One device seen during an LE scan.
     LeAdvertisingReport(AdvReport),
+    /// The result of `LE Create Connection`.
+    LeConnectionComplete {
+        status: u8,
+        conn_handle: u16,
+        /// Connection interval in 1.25 ms units.
+        interval: u16,
+        /// Supervision timeout in 10 ms units.
+        supervision_timeout: u16,
+    },
+    /// The link went away. `reason` uses the standard HCI error codes — `0x13`
+    /// remote terminated, `0x16` local host, `0x08` supervision timeout.
+    DisconnectionComplete { conn_handle: u16, reason: u8 },
+    /// Link encryption turned on or off.
+    EncryptionChange { status: u8, conn_handle: u16, enabled: u8 },
     /// Anything not decoded yet, kept whole so nothing is silently discarded.
     Other { code: u8, params: Vec<u8> },
 }
@@ -128,7 +158,10 @@ impl AdvReport {
 
 pub const EVT_COMMAND_COMPLETE: u8 = 0x0E;
 pub const EVT_COMMAND_STATUS: u8 = 0x0F;
+pub const EVT_DISCONNECTION_COMPLETE: u8 = 0x05;
+pub const EVT_ENCRYPTION_CHANGE: u8 = 0x08;
 pub const EVT_LE_META: u8 = 0x3E;
+pub const SUBEVT_LE_CONNECTION_COMPLETE: u8 = 0x01;
 pub const SUBEVT_LE_ADVERTISING_REPORT: u8 = 0x02;
 
 /// Decode one HCI event packet: `[code][param_len][params…]`.
@@ -161,6 +194,25 @@ pub fn parse_event(buf: &[u8]) -> crate::Result<Event> {
             status: params[0],
             opcode: Opcode(u16::from_le_bytes([params[2], params[3]])),
         }),
+        EVT_DISCONNECTION_COMPLETE if params.len() >= 4 => Ok(Event::DisconnectionComplete {
+            conn_handle: u16::from_le_bytes([params[1], params[2]]) & 0x0FFF,
+            reason: params[3],
+        }),
+        EVT_ENCRYPTION_CHANGE if params.len() >= 4 => Ok(Event::EncryptionChange {
+            status: params[0],
+            conn_handle: u16::from_le_bytes([params[1], params[2]]) & 0x0FFF,
+            enabled: params[3],
+        }),
+        EVT_LE_META
+            if params.first() == Some(&SUBEVT_LE_CONNECTION_COMPLETE) && params.len() >= 19 =>
+        {
+            Ok(Event::LeConnectionComplete {
+                status: params[1],
+                conn_handle: u16::from_le_bytes([params[2], params[3]]) & 0x0FFF,
+                interval: u16::from_le_bytes([params[12], params[13]]),
+                supervision_timeout: u16::from_le_bytes([params[16], params[17]]),
+            })
+        }
         EVT_LE_META if params.first() == Some(&SUBEVT_LE_ADVERTISING_REPORT) => {
             match parse_adv_report(&params[1..]) {
                 Some(r) => Ok(Event::LeAdvertisingReport(r)),
