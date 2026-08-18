@@ -516,10 +516,29 @@ pub fn model_for_device(dev_id: &str) -> String {
 
 /// Marks which model the cached GPU buffers belong to, so buffers are rebuilt
 /// when the node switches models.
-struct BuffersKey(String);
+/// Per-viewer GPU buffers, keyed by [`MeshRenderState::instance`].
+///
+/// ⭐ **`CallbackResources` is a type-map shared by EVERY callback in a frame**,
+/// so a single `Vec<PartBuffers>` slot is one set of buffers for the whole
+/// application. Two 3D viewers on screen together each wrote their orientation
+/// into those same per-part uniforms during `prepare`, and both then painted
+/// from whichever prepared last — so both showed one viewer's pose, and panning
+/// one off-screen "fixed" the other.
+///
+/// The model name is kept per instance too: two viewers showing DIFFERENT
+/// models previously thrashed the shared slot, rebuilding every frame.
+#[derive(Default)]
+struct ModelBuffers(HashMap<u64, InstanceBuffers>);
+
+struct InstanceBuffers {
+    model: String,
+    parts: Vec<PartBuffers>,
+}
 
 /// A complete 3D mesh render callback built from a loaded model + orientation.
 pub struct MeshRenderState {
+    /// Stable per-viewer id — see [`ModelBuffers`].
+    pub instance: u64,
     pub model: Arc<LoadedModel>,
     /// Whole-assembly orientation (from gyro quaternion integration).
     pub orientation: Quat,
@@ -861,10 +880,14 @@ impl CallbackTrait for MeshRenderState {
             }
         };
 
-        // ── Per-part GPU buffers (rebuilt when the model changes) ──────────
+        // ── Per-part GPU buffers, PER VIEWER (rebuilt when its model changes) ──
+        if callback_resources.get::<ModelBuffers>().is_none() {
+            callback_resources.insert(ModelBuffers::default());
+        }
         let need_rebuild = callback_resources
-            .get::<BuffersKey>()
-            .map(|k| k.0 != self.model.name)
+            .get::<ModelBuffers>()
+            .and_then(|m| m.0.get(&self.instance))
+            .map(|b| b.model != self.model.name)
             .unwrap_or(true);
         if need_rebuild {
             let defaults = Uniforms::default_uniform();
@@ -874,12 +897,19 @@ impl CallbackTrait for MeshRenderState {
                 .iter()
                 .map(|pd| PartBuffers::new(device, &pipeline, &pd.vertices, &defaults))
                 .collect();
-            callback_resources.insert(parts);
-            callback_resources.insert(BuffersKey(self.model.name.clone()));
+            if let Some(m) = callback_resources.get_mut::<ModelBuffers>() {
+                m.0.insert(
+                    self.instance,
+                    InstanceBuffers { model: self.model.name.clone(), parts },
+                );
+            }
         }
 
-        let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
-            Some(parts) => parts.as_slice(),
+        let gpu_parts = match callback_resources
+            .get::<ModelBuffers>()
+            .and_then(|m| m.0.get(&self.instance))
+        {
+            Some(b) => b.parts.as_slice(),
             None => return Vec::new(),
         };
         if gpu_parts.is_empty() {
@@ -1203,8 +1233,11 @@ impl CallbackTrait for MeshRenderState {
                 });
             }
             // Immutable phase: re-borrow the parts + target and record the pass.
-            let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
-                Some(parts) => parts.as_slice(),
+            let gpu_parts = match callback_resources
+                .get::<ModelBuffers>()
+                .and_then(|m| m.0.get(&self.instance))
+            {
+                Some(b) => b.parts.as_slice(),
                 None => return Vec::new(),
             };
             if let Some(mt) = callback_resources.get::<MatteTarget>() {
@@ -1323,8 +1356,11 @@ impl CallbackTrait for MeshRenderState {
         }
         if n_parts > 0 {
             // Immutable phase: advance the readback state machine / record.
-            let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
-                Some(parts) => parts.as_slice(),
+            let gpu_parts = match callback_resources
+                .get::<ModelBuffers>()
+                .and_then(|m| m.0.get(&self.instance))
+            {
+                Some(b) => b.parts.as_slice(),
                 None => return Vec::new(),
             };
             if let Some(vm) = callback_resources.get::<VisMeasure>() {
@@ -1475,8 +1511,11 @@ impl CallbackTrait for MeshRenderState {
             Some(p) => p.clone(),
             None => return,
         };
-        let gpu_parts = match callback_resources.get::<Vec<PartBuffers>>() {
-            Some(parts) => parts.as_slice(),
+        let gpu_parts = match callback_resources
+            .get::<ModelBuffers>()
+            .and_then(|m| m.0.get(&self.instance))
+        {
+            Some(b) => b.parts.as_slice(),
             None => return,
         };
 
@@ -1569,6 +1608,7 @@ impl CallbackTrait for MeshRenderState {
 /// are cached across frames in the callback resources.
 pub fn paint_controller_model(
     ui: &egui::Ui,
+    instance: u64,
     vis_rect: egui::Rect,
     full_rect: egui::Rect,
     model: Arc<LoadedModel>,
@@ -1580,6 +1620,7 @@ pub fn paint_controller_model(
     composite: f32,
 ) {
     let state = MeshRenderState {
+        instance,
         model,
         orientation,
         full_rect,

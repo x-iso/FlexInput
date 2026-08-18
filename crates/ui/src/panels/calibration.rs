@@ -53,11 +53,53 @@ const ATRIG_SVG: &[u8] = include_bytes!("../../../../app/assets/Atrig.svg");
 pub struct CalCaps {
     pub gyro: bool,
     pub sticks: bool,
+    /// Which sticks the device actually has. A Joy-Con half reports ONE, and
+    /// drawing both left an empty scope the user could never fill — it looked
+    /// like a broken stick rather than a stick that does not exist.
+    pub left_stick: bool,
+    pub right_stick: bool,
     pub triggers: bool,
+    /// Device reports absolute orientation (`orientation` pin) and so can have
+    /// a baseline pose captured.
+    pub orientation: bool,
 }
 
 impl CalCaps {
     pub fn any(self) -> bool { self.gyro || self.sticks || self.triggers }
+}
+
+/// Capabilities for a device, refined by the pins it actually declares.
+///
+/// The slug table below can only know about hardware someone has already added
+/// to it, and every new controller silently lands on the conservative
+/// sticks-only fallback — which is exactly how the Joy-Con 2 ended up with no
+/// gyro section despite having the best IMU of any pad here. Where a pin
+/// answers the question directly, the pin wins.
+///
+/// Triggers stay slug-driven: layouts declare `left_trigger`/`right_trigger`
+/// for digital shoulders too, so their presence does NOT mean the trigger is
+/// analog and there is nothing to calibrate.
+pub fn caps_for_pins(dev_id: &str, pins: &[String]) -> CalCaps {
+    let mut caps = caps_for(dev_id);
+    if pins.is_empty() {
+        return caps;
+    }
+    let has = |id: &str| pins.iter().any(|p| p == id);
+    caps.gyro = has("gyro_x") || has("gyro_y") || has("gyro_z");
+    caps.left_stick = has("left_stick") || has("left_stick_x");
+    caps.right_stick = has("right_stick") || has("right_stick_x");
+    caps.sticks = caps.left_stick || caps.right_stick;
+    caps.orientation = has("orientation");
+    caps
+}
+
+/// Output pin ids a `device.source` node declares, used to refine capabilities.
+fn node_pin_ids(n: &crate::canvas::NodeData) -> Vec<String> {
+    n.params
+        .get("output_pin_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 pub fn caps_for(dev_id: &str) -> CalCaps {
@@ -69,17 +111,21 @@ pub fn caps_for(dev_id: &str) -> CalCaps {
     if let Some(slug) = crate::canvas::remapper_icons::phys_pad_slug(dev_id) {
         return match slug {
             // XInput: analog sticks + analog triggers, no IMU.
-            "xinput"     => CalCaps { gyro: false, sticks: true,  triggers: true  },
+            "xinput"     => CalCaps { gyro: false, sticks: true,  left_stick: true, right_stick: true, triggers: true,  orientation: false },
             // DS4 / DualSense: sticks + IMU + analog triggers.
-            "ds4"        => CalCaps { gyro: true,  sticks: true,  triggers: true  },
-            "dualsense"  => CalCaps { gyro: true,  sticks: true,  triggers: true  },
+            "ds4"        => CalCaps { gyro: true,  sticks: true,  left_stick: true, right_stick: true, triggers: true,  orientation: false },
+            "dualsense"  => CalCaps { gyro: true,  sticks: true,  left_stick: true, right_stick: true, triggers: true,  orientation: false },
             // Switch Pro: sticks + IMU, but triggers (ZL/ZR) are pure digital.
-            "switch_pro" => CalCaps { gyro: true,  sticks: true,  triggers: false },
+            "switch_pro" => CalCaps { gyro: true,  sticks: true,  left_stick: true, right_stick: true, triggers: false, orientation: false },
+            // Joy-Con 2: one stick per half, full IMU, digital shoulders. The
+            // firmware fuses orientation itself, so it also gets a baseline.
+            "joycon2_l"  => CalCaps { gyro: true,  sticks: true,  left_stick: true, right_stick: false, triggers: false, orientation: true },
+            "joycon2_r"  => CalCaps { gyro: true,  sticks: true,  left_stick: false, right_stick: true, triggers: false, orientation: true },
             // Anything else: conservative sticks-only.
-            _            => CalCaps { gyro: false, sticks: true,  triggers: false },
+            _            => CalCaps { gyro: false, sticks: true,  left_stick: true, right_stick: true, triggers: false, orientation: false },
         };
     }
-    CalCaps { gyro: false, sticks: false, triggers: false }
+    CalCaps { gyro: false, sticks: false, left_stick: false, right_stick: false, triggers: false, orientation: false }
 }
 
 /// Layout metrics derived from the current `ui.available_width()`. Used to
@@ -338,18 +384,18 @@ pub fn show_windows(
     scope_taps: &flexinput_engine::ScopeTaps,
     spike_settings: &SpikeSettings,
 ) {
-    let entries: Vec<(NodeId, String, String)> = open.iter()
+    let entries: Vec<(NodeId, String, String, Vec<String>)> = open.iter()
         .filter_map(|&nid| {
             let n = canvas.snarl.get_node(nid)?;
             if n.module_id != "device.source" { return None; }
             let dev_id = n.params.get("device_id").and_then(|v| v.as_str())?.to_string();
-            Some((nid, n.display_name.clone(), dev_id))
+            Some((nid, n.display_name.clone(), dev_id, node_pin_ids(n)))
         })
         .collect();
 
     let mut to_close: Vec<NodeId> = Vec::new();
-    for (node_id, display_name, dev_id) in entries {
-        let caps = caps_for(&dev_id);
+    for (node_id, display_name, dev_id, pin_ids) in entries {
+        let caps = caps_for_pins(&dev_id, &pin_ids);
         if !caps.any() {
             to_close.push(node_id);
             continue;
@@ -460,19 +506,19 @@ pub fn calibrate_button_activity(ui: &egui::Ui, node: NodeId, rect: egui::Rect) 
 }
 
 pub fn auto_cal_tick(ctx: &egui::Context, canvas: &mut Canvas, live: &LiveSignals) {
-    let candidates: Vec<(NodeId, String, bool)> = canvas.snarl.node_ids()
+    let candidates: Vec<(NodeId, String, bool, Vec<String>)> = canvas.snarl.node_ids()
         .filter(|(_, n)| n.module_id == "device.source"
             && n.params.get("gyro_auto_cal").and_then(|v| v.as_bool()).unwrap_or(false))
         .filter_map(|(id, n)| {
             let dev = n.params.get("device_id").and_then(|v| v.as_str())?.to_string();
             let skip_accel = n.params.get("skip_accel_cal")
                 .and_then(|v| v.as_bool()).unwrap_or(false);
-            Some((id, dev, skip_accel))
+            Some((id, dev, skip_accel, node_pin_ids(n)))
         })
         .collect();
 
-    for (node_id, dev_id, skip_accel) in candidates {
-        if !caps_for(&dev_id).gyro { continue; }
+    for (node_id, dev_id, skip_accel, pin_ids) in candidates {
+        if !caps_for_pins(&dev_id, &pin_ids).gyro { continue; }
         // Device disconnected → its pins vanish; read_float would return
         // steady zeros, which look perfectly "still". Require a live stream.
         if !live.contains_key(&(dev_id.clone(), "gyro_x".to_string())) { continue; }
@@ -592,14 +638,131 @@ fn draw_window_body(
         gyro_section(ui, canvas, node_id, dev_id, live, lo, scope_taps, spike_settings);
         ui.separator();
     }
+    if caps.orientation {
+        orientation_section(ui, canvas, node_id, dev_id, live);
+        ui.separator();
+    }
     if caps.sticks {
-        sticks_section(ui, canvas, node_id, dev_id, live, lo);
+        sticks_section(ui, canvas, node_id, dev_id, live, lo, caps);
         ui.separator();
     }
     if caps.triggers {
         triggers_section(ui, canvas, node_id, dev_id, live, lo);
     }
     ui.ctx().request_repaint();
+}
+
+/// Frames averaged for the orientation baseline. ~1 s of a resting device at
+/// the Joy-Con 2's ~67 Hz — long enough to average out jitter, short enough
+/// that the user is not asked to hold still for an age.
+const ORIENT_BASELINE_FRAMES: u32 = 64;
+
+/// Baseline-pose capture for devices that report absolute orientation.
+///
+/// The published pose is world-referenced — on a Joy-Con 2 its yaw is magnetic
+/// north — which is almost never what a patch wants. Capturing a reference
+/// while the device sits in a known pose lets the engine report rotation
+/// RELATIVE to that, so "as I set it down" reads as identity.
+fn orientation_section(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    node_id: NodeId,
+    dev_id: &str,
+    live: &LiveSignals,
+) {
+    let done = canvas.snarl.get_node(node_id)
+        .and_then(|n| n.params.get("orientation_baseline"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| a.len() == 4);
+    section_header(ui, "Orientation Baseline", done);
+
+    instruct_line(ui, &[
+        (false, "Clip BOTH halves into the grip / charger, lay it "),
+        (true,  "FLAT"),
+        (false, " on the table, then capture. Do not touch it while it samples."),
+    ]);
+
+    let live_q = read_vec4(live, dev_id, "orientation");
+
+    let (sampling, n, sum) = ui.ctx().data_mut(|d| {
+        let st = d.get_temp_mut_or_insert_with::<OrientBaseline>(
+            orient_baseline_id(node_id), OrientBaseline::default);
+        if st.sampling {
+            if let Some(q) = live_q {
+                // Align each sample's sign to the first before averaging: q and
+                // -q are the SAME rotation, and a device that flips
+                // representation mid-capture would otherwise average toward
+                // zero and produce a garbage baseline.
+                let s = if st.n == 0 {
+                    1.0
+                } else {
+                    let dot = st.sum[0] * q[0] + st.sum[1] * q[1] + st.sum[2] * q[2] + st.sum[3] * q[3];
+                    if dot < 0.0 { -1.0 } else { 1.0 }
+                };
+                for i in 0..4 { st.sum[i] += q[i] * s; }
+                st.n += 1;
+            }
+            if st.n >= ORIENT_BASELINE_FRAMES {
+                st.sampling = false;
+            }
+        }
+        (st.sampling, st.n, st.sum)
+    });
+
+    if !sampling && n >= ORIENT_BASELINE_FRAMES {
+        let len = (sum[0].powi(2) + sum[1].powi(2) + sum[2].powi(2) + sum[3].powi(2)).sqrt();
+        if len > f32::EPSILON {
+            let q: Vec<f64> = sum.iter().map(|v| (v / len) as f64).collect();
+            if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
+                nd.params.insert("orientation_baseline".into(), serde_json::json!(q));
+            }
+        }
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(orient_baseline_id(node_id), OrientBaseline::default());
+        });
+    }
+
+    ui.horizontal(|ui| {
+        let progress = if sampling { n as f32 / ORIENT_BASELINE_FRAMES as f32 } else { 0.0 };
+        let label = if sampling { "Sampling…" } else { "Capture Baseline" };
+        let enabled = live_q.is_some();
+        let resp = ui.add_enabled_ui(enabled, |ui| {
+            cal_button_with_progress(ui, label, progress)
+        }).inner;
+        if resp.clicked() && !sampling {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(orient_baseline_id(node_id), OrientBaseline {
+                    sampling: true, n: 0, sum: [0.0; 4],
+                });
+            });
+        }
+        if !enabled {
+            ui.label(egui::RichText::new("no orientation signal from this device")
+                .size(INSTRUCT_SIZE).color(ORANGE));
+        }
+        if done && ui.button("Clear").clicked() {
+            if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
+                nd.params.remove("orientation_baseline");
+            }
+        }
+    });
+}
+
+#[derive(Clone, Copy, Default)]
+struct OrientBaseline {
+    sampling: bool,
+    n: u32,
+    sum: [f32; 4],
+}
+
+fn orient_baseline_id(node: NodeId) -> egui::Id { egui::Id::new(("orient_baseline", node)) }
+
+/// Read a Vec4 pin, or `None` when the device is not publishing it.
+fn read_vec4(live: &LiveSignals, dev: &str, pin: &str) -> Option<[f32; 4]> {
+    match live.get(&(dev.to_string(), pin.to_string())) {
+        Some(flexinput_core::Signal::Vec4(v)) => Some([v.x, v.y, v.z, v.w]),
+        _ => None,
+    }
 }
 
 fn section_header(ui: &mut egui::Ui, title: &str, done: bool) {
@@ -1663,6 +1826,7 @@ fn sticks_section(
     dev_id: &str,
     live: &LiveSignals,
     lo: Layout,
+    caps: CalCaps,
 ) {
     let done = canvas.snarl.get_node(node_id)
         .and_then(|n| n.params.get("sticks_calibrated").and_then(|v| v.as_bool()))
@@ -1720,11 +1884,15 @@ fn sticks_section(
         }
         let l_filled = filled_buckets(&st.stick.l_edge);
         let r_filled = filled_buckets(&st.stick.r_edge);
-        let commit = st.stick.sampling
-            && l_filled >= STICK_MIN_BUCKETS
-            && r_filled >= STICK_MIN_BUCKETS
-            && st.stick.l_center_n >= STICK_CENTER_TARGET_N
-            && st.stick.r_center_n >= STICK_CENTER_TARGET_N;
+        // Absent sticks must not hold the commit hostage. On a one-stick pad
+        // the missing side never fills a bucket and never accumulates a rest
+        // sample, so requiring both meant calibration could NEVER complete —
+        // the button just spun forever with no indication why.
+        let l_ok = !caps.left_stick
+            || (l_filled >= STICK_MIN_BUCKETS && st.stick.l_center_n >= STICK_CENTER_TARGET_N);
+        let r_ok = !caps.right_stick
+            || (r_filled >= STICK_MIN_BUCKETS && st.stick.r_center_n >= STICK_CENTER_TARGET_N);
+        let commit = st.stick.sampling && l_ok && r_ok;
         (st.stick.sampling, l_filled, r_filled, st.stick.l_center_n, st.stick.r_center_n, commit)
     });
 
@@ -1822,8 +1990,16 @@ fn sticks_section(
                     .map(|s| s.l_trail.clone()).unwrap_or_default());
                 let r_trail = ui.ctx().data(|d| d.get_temp::<WindowState>(state_id(node_id))
                     .map(|s| s.r_trail.clone()).unwrap_or_default());
-                stick_scope(ui, lx, ly, &l_trail, &l_edge_snap, lc, ls, lo);
-                stick_scope(ui, rx, ry, &r_trail, &r_edge_snap, rc, rs, lo);
+                // Only draw scopes for sticks the device actually has. A
+                // Joy-Con half has one, and the missing scope sat permanently
+                // centred — indistinguishable from a dead stick, and the
+                // "rotate the stick fully" step could never complete for it.
+                if caps.left_stick {
+                    stick_scope(ui, lx, ly, &l_trail, &l_edge_snap, lc, ls, lo);
+                }
+                if caps.right_stick {
+                    stick_scope(ui, rx, ry, &r_trail, &r_edge_snap, rc, rs, lo);
+                }
             });
             // Deadzone slider — directly linked to the device.source's
             // `deadzone` param (same one the header slider edits). Lets

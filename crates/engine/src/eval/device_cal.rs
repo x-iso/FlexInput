@@ -54,6 +54,16 @@ pub(crate) struct DeviceCal {
     orient_matrix: [f32; 9],
     /// True if `orient_matrix` is non-identity and should be applied.
     orient_active: bool,
+    /// Baseline pose for devices that report ABSOLUTE orientation, as a
+    /// quaternion (x,y,z,w). The published pin is measured against the world —
+    /// yaw is magnetic north on a Joy-Con 2 — which is not what a patch wants:
+    /// it wants rotation relative to however the user was holding the device
+    /// when they set it down. Captured flat during calibration, then removed
+    /// with `baseline⁻¹ · current`.
+    ///
+    /// Identity when uncalibrated, so the raw world pose passes through.
+    orient_baseline: [f32; 4],
+    orient_baseline_active: bool,
     /// Noise-floor deadzone on the gyro TRIPLE's magnitude (post offset /
     /// matrix / sign): |g| below this zeroes all three axes at once, so slow
     /// diagonal rotations don't get per-axis steps. 0.0 = disabled. Effective
@@ -135,6 +145,10 @@ impl Default for DeviceCal {
             accel_sign:    [1.0; 3],
             orient_matrix: IDENTITY_M3,
             orient_active: false,
+            // Identity quaternion, inactive: an uncalibrated device passes its
+            // world-referenced pose straight through.
+            orient_baseline: [0.0, 0.0, 0.0, 1.0],
+            orient_baseline_active: false,
             gyro_dz:  0.0,
             accel_dz: 0.0,
             lstick_center: [0.0; 2],
@@ -225,6 +239,24 @@ pub(crate) fn mat3_apply(m: &[f32; 9], v: [f32; 3]) -> [f32; 3] {
 
 pub(crate) fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
     let (orient_matrix, orient_active) = read_orient_matrix(params, "gyro_orient_matrix");
+    // Absent or degenerate (zero-length) baselines are treated as "not
+    // calibrated" rather than normalised into something arbitrary — a
+    // zero quaternion would otherwise rotate every pose to garbage.
+    let baseline = params
+        .get("orientation_baseline")
+        .and_then(|v| v.as_array())
+        .filter(|a| a.len() == 4)
+        .map(|a| {
+            let mut q = [0.0f32; 4];
+            for (i, v) in a.iter().enumerate() {
+                q[i] = v.as_f64().unwrap_or(0.0) as f32;
+            }
+            q
+        })
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let baseline_active =
+        (baseline[0].powi(2) + baseline[1].powi(2) + baseline[2].powi(2) + baseline[3].powi(2))
+            .sqrt() > 0.5;
     let dz_on = params.get("gyro_dz_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
     let dz_w  = params.get("gyro_dz_width").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32;
     let floor = |key: &str| -> f32 {
@@ -238,6 +270,8 @@ pub(crate) fn load_device_cal(params: &HashMap<String, Value>) -> DeviceCal {
         accel_sign:    read_sign3(params, "accel_invert"),
         orient_matrix,
         orient_active,
+        orient_baseline: baseline,
+        orient_baseline_active: baseline_active,
         gyro_dz:  floor("gyro_noise_floor"),
         accel_dz: floor("accel_noise_floor"),
         lstick_center: read_arr2(params, "lstick_center"),
@@ -302,6 +336,22 @@ pub(crate) fn post_process_device_pin(
         ("accel_x", Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.accel_offset[0]) * cal.accel_sign[0]),
         ("accel_y", Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.accel_offset[1]) * cal.accel_sign[1]),
         ("accel_z", Signal::Float(v)) if !imu_pre_applied => Signal::Float((v - cal.accel_offset[2]) * cal.accel_sign[2]),
+        // Absolute orientation, re-referenced to the captured baseline.
+        ("orientation", Signal::Vec4(v)) if cal.orient_baseline_active => {
+            let b = glam::Quat::from_xyzw(
+                cal.orient_baseline[0],
+                cal.orient_baseline[1],
+                cal.orient_baseline[2],
+                cal.orient_baseline[3],
+            )
+            .normalize();
+            let cur = glam::Quat::from_xyzw(v.x, v.y, v.z, v.w).normalize();
+            // `inverse * current`, so the result is the rotation FROM the
+            // baseline pose, and holding the device as it was when calibrated
+            // reads as identity.
+            let rel = (b.inverse() * cur).normalize();
+            Signal::Vec4(glam::Vec4::new(rel.x, rel.y, rel.z, rel.w))
+        }
         ("left_stick_x", Signal::Float(v))  => Signal::Float(v - cal.lstick_center[0]),
         ("left_stick_y", Signal::Float(v))  => Signal::Float(v - cal.lstick_center[1]),
         ("right_stick_x", Signal::Float(v)) => Signal::Float(v - cal.rstick_center[0]),
@@ -536,5 +586,84 @@ pub(crate) fn apply_deadzone(sig: Signal, dz: f32) -> Signal {
             else { Signal::Vec2(v / len * (len - dz) / (1.0 - dz).max(f32::EPSILON)) }
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod orientation_baseline_tests {
+    use super::*;
+    use glam::{Quat, Vec4};
+
+    fn cal_with(baseline: Option<[f32; 4]>) -> DeviceCal {
+        let mut params: HashMap<String, Value> = HashMap::new();
+        if let Some(b) = baseline {
+            params.insert(
+                "orientation_baseline".into(),
+                serde_json::json!(b.iter().map(|v| *v as f64).collect::<Vec<_>>()),
+            );
+        }
+        load_device_cal(&params)
+    }
+
+    fn orient(cal: &DeviceCal, q: Quat) -> Quat {
+        match post_process_device_pin(
+            "orientation",
+            Signal::Vec4(Vec4::new(q.x, q.y, q.z, q.w)),
+            0.0,
+            1.0,
+            cal,
+            false,
+        ) {
+            Signal::Vec4(v) => Quat::from_xyzw(v.x, v.y, v.z, v.w),
+            other => panic!("expected Vec4, got {other:?}"),
+        }
+    }
+
+    /// An uncalibrated device must publish its world pose untouched. Silently
+    /// re-referencing it to identity would make a patch that never calibrated
+    /// look like it worked, then behave differently after calibration.
+    #[test]
+    fn without_a_baseline_the_pose_passes_through() {
+        let cal = cal_with(None);
+        let q = Quat::from_rotation_y(0.7);
+        let out = orient(&cal, q);
+        assert!((out.dot(q).abs() - 1.0).abs() < 1e-5, "{out:?} != {q:?}");
+    }
+
+    /// The headline behaviour: holding the device exactly as it was when
+    /// calibrated must read as identity — that is what "baseline" means.
+    #[test]
+    fn the_captured_pose_reads_as_identity() {
+        let q = Quat::from_rotation_z(1.2);
+        let cal = cal_with(Some([q.x, q.y, q.z, q.w]));
+        let out = orient(&cal, q);
+        assert!(
+            (out.dot(Quat::IDENTITY).abs() - 1.0).abs() < 1e-5,
+            "baseline pose should cancel to identity, got {out:?}"
+        );
+    }
+
+    /// Rotation FROM the baseline, not the baseline applied on top: capture
+    /// flat, turn 90°, and the output must be that 90° — not 90° plus whatever
+    /// the world offset happened to be.
+    #[test]
+    fn output_is_the_rotation_relative_to_the_baseline() {
+        let base = Quat::from_rotation_z(0.5);
+        let cal = cal_with(Some([base.x, base.y, base.z, base.w]));
+        let turn = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let out = orient(&cal, base * turn);
+        assert!((out.dot(turn).abs() - 1.0).abs() < 1e-5, "{out:?} != {turn:?}");
+    }
+
+    /// A zero-length baseline is not a rotation. Normalising it would produce
+    /// NaNs and send every downstream pose to garbage, so it must be treated as
+    /// "not calibrated" instead.
+    #[test]
+    fn a_degenerate_baseline_is_ignored_rather_than_normalised() {
+        let cal = cal_with(Some([0.0; 4]));
+        let q = Quat::from_rotation_x(0.3);
+        let out = orient(&cal, q);
+        assert!(out.is_finite(), "degenerate baseline produced {out:?}");
+        assert!((out.dot(q).abs() - 1.0).abs() < 1e-5);
     }
 }

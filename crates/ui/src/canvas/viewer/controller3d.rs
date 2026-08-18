@@ -72,6 +72,10 @@ pub(crate) fn controller3d_physical_device(
 /// Does NOT allocate — the caller reserves `full_rect` first.
 pub(crate) fn render_controller3d_core(
     ui: &mut egui::Ui,
+    // Stable per-viewer id. ❗ GPU callback resources are a type-map SHARED by
+    // every callback in a frame, so two viewers without distinct ids overwrite
+    // each other's buffers and both render the last one prepared.
+    instance: u64,
     full_rect: egui::Rect,
     resolved: &str,
     orientation: glam::Quat,
@@ -95,7 +99,7 @@ pub(crate) fn render_controller3d_core(
             let vis_rect = full_rect.intersect(ui.clip_rect());
             if vis_rect.width() > 1.0 && vis_rect.height() > 1.0 {
                 model::paint_controller_model(
-                    ui, vis_rect, full_rect, m, orientation, scheme, global_alpha, cam_pitch,
+                    ui, instance, vis_rect, full_rect, m, orientation, scheme, global_alpha, cam_pitch,
                     live, composite,
                 );
             }
@@ -752,8 +756,8 @@ pub(crate) fn show_controller3d_body(
             live_signals, dev_id.as_deref(), &ctx, node_id.0, tailoff, accent, deadzone,
         );
         render_controller3d_core(
-            ui, rect, &resolved, orientation, bg, outline, outline_w, scheme, alpha, cam_pitch,
-            live, 1.0,
+            ui, node_id.0 as u64, rect, &resolved, orientation, bg, outline, outline_w, scheme,
+            alpha, cam_pitch, live, 1.0,
         );
         // Expose the viewport so it can be pinned to a sub-patch layout / overlay.
         register_exposable_element(ui, node_id, "viewer", rect);

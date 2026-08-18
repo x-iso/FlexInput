@@ -215,6 +215,16 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "accel_x",       display_name: "Accel X",              signal_type: SignalType::Float },
     AutoMapPin { id: "accel_y",       display_name: "Accel Y",              signal_type: SignalType::Float },
     AutoMapPin { id: "accel_z",       display_name: "Accel Z",              signal_type: SignalType::Float },
+    // Absolute device orientation as a quaternion (x,y,z,w).
+    //
+    // Only devices whose firmware fuses the IMU itself can supply this — the
+    // Joy-Con 2 reports absolute angles rather than a rate, with yaw held by a
+    // magnetometer. Everything else leaves it unset, and consumers fall back to
+    // the Gyro 3DOF module's own integrated estimate.
+    //
+    // It has to live in ALL_PINS or the bus cannot carry it and it could never
+    // be picked in a Remapper or Splitter, however the device declares it.
+    AutoMapPin { id: "orientation",    display_name: "Orientation (absolute)", signal_type: SignalType::Vec4 },
     AutoMapPin { id: "btn_south",     display_name: "South",                signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_east",      display_name: "East",                 signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_west",      display_name: "West",                 signal_type: SignalType::Bool },

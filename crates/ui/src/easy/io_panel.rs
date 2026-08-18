@@ -260,10 +260,11 @@ fn show_input_section(
     let gamepads: Vec<&PhysicalDevice> = devices.iter()
         .filter(|d| !matches!(d.kind, ControllerKind::MidiIn | ControllerKind::MidiOut))
         .collect();
-    let active_dev_id: Option<String> = canvas.snarl.nodes_ids_data()
-        .find(|(_, n)| n.value.module_id == "device.source")
-        .and_then(|(_, n)| n.value.params.get("device_id")
-            .and_then(|v| v.as_str()).map(|s| s.to_string()));
+    // Every selected device, not just the first: a preset with several AutoMap
+    // inlets accepts one input device per inlet.
+    let active_dev_ids: Vec<String> =
+        active_sources(canvas).into_iter().map(|(_, d, _)| d).collect();
+    let capacity = input_capacity(canvas);
 
     // Snapshot the actual viewport rect from INSIDE the ScrollArea's
     // closure (= the same clip rect the input_card painter calls see).
@@ -288,7 +289,7 @@ fn show_input_section(
                 return;
             }
             for d in &gamepads {
-                let is_active = active_dev_id.as_deref() == Some(d.id.as_str());
+                let is_active = active_dev_ids.iter().any(|a| a == &d.id);
                 // FlexInput's own loopback virtual: nav is disabled (and forced
                 // off) so it can't drive the UI from our own output.
                 let nav_disabled = nav_excluded.contains(&d.id);
@@ -301,8 +302,8 @@ fn show_input_section(
                 if input_card(
                     ui, d, is_active, canvas, calibrate_request, device_rates_hz, defaults,
                     ping_requests, nav_on, nav_disabled, &mut nav_toggle, nav_targets,
-                ) && !is_active {
-                    replace_active_source(canvas, d, default_collapsed, defaults);
+                ) && (capacity > 1 || !is_active) {
+                    toggle_source(canvas, d, default_collapsed, defaults);
                     super::wiring::rewire(canvas);
                 }
                 if let Some(v) = nav_toggle {
@@ -807,6 +808,83 @@ fn find_source_node_for(canvas: &Canvas, device_id: &str) -> Option<NodeId> {
         .map(|(id, _)| id)
 }
 
+/// How many input devices this preset accepts — one per AutoMap inlet the
+/// subpatch declares.
+///
+/// Read from the preset rather than fixed, so a single-inlet preset keeps
+/// behaving exactly as it always has and a multi-inlet one just works.
+fn input_capacity(canvas: &Canvas) -> usize {
+    let sp = canvas.snarl.nodes_ids_data()
+        .find(|(_, n)| n.value.module_id == "subpatch");
+    match sp {
+        Some((id, _)) => {
+            super::wiring::automap_input_indices(canvas.snarl.get_node(id)).len().max(1)
+        }
+        None => 1,
+    }
+}
+
+/// Active sources with their AutoMap port, lowest port first.
+fn active_sources(canvas: &Canvas) -> Vec<(NodeId, String, usize)> {
+    let mut v: Vec<(NodeId, String, usize)> = canvas.snarl.nodes_ids_data()
+        .filter(|(_, n)| n.value.module_id == "device.source")
+        .filter_map(|(id, n)| {
+            let dev = n.value.params.get("device_id")?.as_str()?.to_string();
+            let port = n.value.params.get("automap_port")
+                .and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+            Some((id, dev, port))
+        })
+        .collect();
+    v.sort_by_key(|(_, _, port)| *port);
+    v
+}
+
+/// Add, remove or replace a source in response to a card click.
+///
+/// Rules, chosen so a single-inlet preset behaves EXACTLY as before:
+/// * already active, capacity 1 → nothing (clicking the active card was always
+///   a no-op, and turning it into a deselect would let a user end up with no
+///   input device and no obvious way back)
+/// * already active, capacity > 1 → deselect it
+/// * not active, room left → add on the lowest free port
+/// * not active, full → replace the highest port, which for capacity 1 is the
+///   old "clicking another device swaps to it" behaviour
+fn toggle_source(
+    canvas: &mut Canvas,
+    device: &PhysicalDevice,
+    default_collapsed: bool,
+    defaults: DeviceParamDefaults,
+) {
+    let capacity = input_capacity(canvas);
+    let active = active_sources(canvas);
+
+    if let Some((id, _, _)) = active.iter().find(|(_, d, _)| d == &device.id) {
+        if capacity > 1 {
+            canvas.snarl.remove_node(*id);
+            super::layout::reposition_io_nodes(canvas);
+        }
+        return;
+    }
+
+    let port = if active.len() < capacity {
+        // Lowest free port, so removing a middle device and adding another
+        // reuses the gap instead of pushing past the inlet count.
+        (0..capacity).find(|p| !active.iter().any(|(_, _, q)| q == p)).unwrap_or(0)
+    } else {
+        let (id, _, port) = active.last().map(|(a, _, c)| (*a, (), *c)).unwrap();
+        canvas.snarl.remove_node(id);
+        port
+    };
+
+    canvas.add_device_source(device, default_collapsed, defaults);
+    if let Some(node_id) = find_source_node_for(canvas, &device.id) {
+        if let Some(n) = canvas.snarl.get_node_mut(node_id) {
+            n.params.insert("automap_port".into(), serde_json::Value::from(port as u64));
+        }
+    }
+    super::layout::reposition_io_nodes(canvas);
+}
+
 fn active_source(canvas: &Canvas) -> Option<(NodeId, String)> {
     canvas.snarl.nodes_ids_data()
         .find(|(_, n)| n.value.module_id == "device.source")
@@ -817,20 +895,6 @@ fn active_source(canvas: &Canvas) -> Option<(NodeId, String)> {
         })
 }
 
-fn replace_active_source(
-    canvas: &mut Canvas,
-    device: &PhysicalDevice,
-    default_collapsed: bool,
-    defaults: DeviceParamDefaults,
-) {
-    let to_remove: Vec<NodeId> = canvas.snarl.nodes_ids_data()
-        .filter(|(_, n)| n.value.module_id == "device.source")
-        .map(|(id, _)| id)
-        .collect();
-    for id in to_remove { canvas.snarl.remove_node(id); }
-    canvas.add_device_source(device, default_collapsed, defaults);
-    super::layout::reposition_io_nodes(canvas);
-}
 
 // ── Output ──────────────────────────────────────────────────────────
 
