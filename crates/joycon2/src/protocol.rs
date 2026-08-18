@@ -215,12 +215,38 @@ pub mod feature {
     pub const BUTTONS: u8 = 0x01;
     pub const STICKS: u8 = 0x02;
     pub const IMU: u8 = 0x04;
+    /// ⭐ **The bit that actually turns the gyro on.**
+    ///
+    /// Unnamed here for a long time and never set, which is why the standard
+    /// accelerometer/gyroscope block at `0x30..0x3C` arrived as twelve zero
+    /// bytes in every report this project has ever captured. `IMU` (0x04) alone
+    /// yields a different, non-standard block that carries no angular rate.
+    ///
+    /// Taken from a working reference implementation, which enables motion with
+    /// `0c 91 01 02 00 04 00 00 2f 00 00 00` (and the same on subcommand 0x04).
+    /// That mask is `0x2f`, and it differs from the `0x37` used here only in
+    /// carrying this bit instead of [`MOUSE`].
+    pub const IMU_RAW: u8 = 0x08;
     pub const MOUSE: u8 = 0x10;
     pub const RUMBLE: u8 = 0x20;
     pub const MAGNETOMETER: u8 = 0x80;
 
-    /// What official software sends to a Joy-Con 2.
-    pub const JOYCON2_DEFAULT: u8 = BUTTONS | STICKS | IMU | MOUSE | RUMBLE; // 0x37
+    /// ⭐ What a working implementation sends to get raw motion: **0x2f**.
+    ///
+    /// ❗ This was `0x37` (with [`MOUSE`] in place of [`IMU_RAW`]) and that is
+    /// the single reason the gyro was never found. With `0x37` the controller
+    /// streams a twelve-byte block of integrated, drift-prone angles that do not
+    /// compose into any orientation — Euler in all six orders, rotation vector
+    /// and quaternion vector part were each tested against measured gravity and
+    /// none beat applying no rotation at all. Meanwhile the bytes where the
+    /// standard accel and gyro live stayed zero, because they were switched off.
+    ///
+    /// ⚠️ [`MOUSE`] is dropped here to match the reference exactly rather than
+    /// to save the bit. If the optical sensor goes quiet, `0x3f` is the obvious
+    /// next thing to try — but the reference is the only configuration known to
+    /// produce working motion on this hardware, so it is what ships until the
+    /// gyro is confirmed.
+    pub const JOYCON2_DEFAULT: u8 = BUTTONS | STICKS | IMU | IMU_RAW | RUMBLE; // 0x2f
 
     /// `JOYCON2_DEFAULT` plus the magnetometer (0xB7).
     ///
@@ -497,9 +523,30 @@ mod tests {
         );
     }
 
+    /// ⭐ The mask must be 0x2f, and must carry `IMU_RAW`.
+    ///
+    /// It was 0x37 for the whole life of this backend, and that single wrong
+    /// bit is why the gyro was never found: without `IMU_RAW` the controller
+    /// leaves the standard accel/gyro block at 0x30..0x3C entirely zero and
+    /// streams a set of integrated angles instead, which carry no recoverable
+    /// angular rate. Months of decoding went into that block.
+    ///
+    /// Spelled out bit by bit rather than as one literal, so that a future
+    /// change has to disagree with the reference's actual payload byte.
     #[test]
-    fn joycon2_default_features_are_0x37() {
-        assert_eq!(feature::JOYCON2_DEFAULT, 0x37);
+    fn joycon2_default_features_enable_the_raw_imu() {
+        assert_eq!(feature::JOYCON2_DEFAULT, 0x2f);
+        assert_ne!(
+            feature::JOYCON2_DEFAULT & feature::IMU_RAW,
+            0,
+            "without IMU_RAW the standard gyro block is never sent",
+        );
+        // Exactly the payload byte the working reference writes in
+        // `0c 91 01 02 00 04 00 00 2f 00 00 00`.
+        assert_eq!(
+            command(CMD_FEATURE_SELECT, SUB_FEATURE_INIT, &[feature::JOYCON2_DEFAULT, 0, 0, 0]),
+            vec![0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00],
+        );
     }
 
     #[test]

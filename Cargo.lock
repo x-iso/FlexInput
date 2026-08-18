@@ -1930,6 +1930,7 @@ dependencies = [
 name = "flexinput-btle"
 version = "0.13.3"
 dependencies = [
+ "glam",
  "log",
  "rusb",
 ]

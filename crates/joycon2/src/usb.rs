@@ -39,7 +39,7 @@ use hidapi::{HidApi, HidDevice};
 
 use crate::hub::{PadKey, PadState};
 use crate::protocol::{self, Side};
-use crate::reports::{self, GyroBias, PadSnapshot, StickCalib};
+use crate::reports::{self, OrientationTracker, PadSnapshot, StickCalib};
 
 /// How often to look for newly plugged controllers.
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
@@ -238,13 +238,15 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                 snapshot: PadSnapshot::default(),
                 stick: (0.0, 0.0),
                 gyro: [0.0; 3],
+                orientation: [0.0; 3],
+                field_rate: [0.0; 3],
                 events: 0,
             },
         );
     }
 
     let mut calib = StickCalib::default();
-    let mut gyro_bias = GyroBias::default();
+    let mut orientation = OrientationTracker::default();
     let mut buf = [0u8; protocol::USB_REPORT_LEN + 1];
     let mut errors = 0u32;
     let mut reports = 0u64;
@@ -309,13 +311,14 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                     continue;
                 };
                 let stick = calib.normalize(snap.stick_raw);
-                let gyro = gyro_bias.correct(snap.motion.gyro);
+                let o = orientation.update(&snap.motion);
                 reports += 1;
                 if let Some(pad) = shared.pads.lock().unwrap().get_mut(&key) {
                     pad.streaming = true;
                     pad.snapshot = snap;
                     pad.stick = stick;
-                    pad.gyro = gyro;
+                    pad.gyro = o.rate_dps;
+                    pad.orientation = o.euler_rad;
                     pad.events = pad.events.saturating_add(1);
                 }
             }

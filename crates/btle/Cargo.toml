@@ -30,3 +30,5 @@ edition.workspace = true
 # thread, so async buys nothing here and costs a runtime.
 rusb = "0.9"
 log  = "0.4"
+# Quaternion maths for the IMU decode probes (bin/jc2_imu only).
+glam = { workspace = true }

@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::pairing;
 use crate::protocol::{self, feature, Side};
-use crate::reports::{self, GyroBias, PadSnapshot, StickCalib};
+use crate::reports::{self, OrientationTracker, PadSnapshot, StickCalib};
 
 /// How long a pairing step waits for its response. Only the `0x15` exchange
 /// blocks on replies — it genuinely cannot proceed without the controller's key
@@ -138,6 +138,25 @@ pub struct PadState {
     /// rather than `snapshot.motion.gyro`, which is uncorrected and will drift
     /// an aim mapping across the screen on its own.
     pub gyro: [f32; 3],
+    /// Absolute orientation as canonical Euler angles `(roll, pitch, yaw)` in
+    /// radians, from [`crate::reports::OrientationTracker`].
+    ///
+    /// ⭐ Carried here rather than recomputed by the consumer because **yaw
+    /// requires unwrapping, which is stateful**. The heading field covers half
+    /// a turn and wraps twice per revolution; a consumer recomputing it from
+    /// `snapshot.motion.angle` has no wrap history and gets a 180 degree flip
+    /// at every seam. Recomputing it is exactly the bug this field prevents.
+    pub orientation: [f32; 3],
+    /// Angular rate differenced from the raw angle fields, deg/s, **in field
+    /// order** — see [`crate::reports::Orientation::field_rate_dps`].
+    ///
+    /// Separate from `gyro` above because the two come from different sensors.
+    /// `gyro` differentiates accel-derived tilt, which is unreliable during
+    /// exactly the fast motion an aim mapping cares about; this differentiates
+    /// the controller's own integrated gyro. Carried alongside rather than
+    /// replacing it so both can be wired at once and compared on hardware,
+    /// which is also how the field-to-axis mapping gets settled.
+    pub field_rate: [f32; 3],
     /// Reports received since the last [`Joycon2Hub::take_event_counts`].
     pub events: u32,
 }
@@ -158,7 +177,19 @@ struct Shared {
     /// Whether the LTK pairing handshake may run. Off means we still stream
     /// input, we just never write to controller flash.
     pairing_enabled: AtomicBool,
+    /// Dongle transport state; the hub defers to it. See
+    /// [`Joycon2Hub::set_stand_down`].
+    stand_down: Mutex<Option<Arc<std::sync::atomic::AtomicU8>>>,
     shutdown: AtomicBool,
+    /// ⭐ Set when the dongle takes over mid-session: every live `drive_pad`
+    /// must let go so the dongle can claim the controller.
+    ///
+    /// Standing down only stopped this hub from starting NEW connections. Pads
+    /// it already held were kept forever, and since a BLE peripheral accepts
+    /// exactly one connection, the dongle could never get in — the user's only
+    /// recourse was restarting the app, and even that failed if this hub won
+    /// the race again. Releasing is what makes the hand-over automatic.
+    release_pads: AtomicBool,
     /// Cuts the scan gap short when a pad drops, so a controller that powers
     /// off and is woken with a button press is picked up straight away instead
     /// of waiting out `SCAN_GAP_BUSY`.
@@ -191,9 +222,45 @@ pub struct Joycon2Hub {
 
 impl Joycon2Hub {
     /// Spawn the hub. Returns immediately; discovery happens in the background.
-    pub fn start(pairing_enabled: bool) -> Self {
+    ///
+    /// `stand_down` is the dongle's readiness flag. While it reads anything but
+    /// `DONGLE_ABSENT` the hub will not scan or connect. The two transports are
+    /// RIVALS, not complements: a BLE peripheral accepts one connection, so
+    /// whichever gets there first locks the other out — and the loser cannot
+    /// even see the controller afterwards, because a connected peripheral stops
+    /// advertising.
+    ///
+    /// The dongle must win. Windows reclaims unpaired BLE links after ~31 s and
+    /// nothing a GATT client does prevents it, whereas the dongle holds a link
+    /// indefinitely. Letting this hub connect first is how a working dongle
+    /// setup silently regresses to 31-second dropouts.
+    ///
+    /// ⭐ **Taken as a parameter, NOT set afterwards, and that is the whole
+    /// point.** It used to be a separate `set_stand_down` call:
+    ///
+    /// ```text
+    ///     let hub = Joycon2Hub::start(pairing_enabled);   // loop starts HERE
+    ///     hub.set_stand_down(dongle.state_flag());        // flag lands later
+    /// ```
+    ///
+    /// The worker thread begins scanning the moment `start` returns, and until
+    /// the second line ran its flag was `None` — which
+    /// [`dongle_owns_controllers`] deliberately treats as "no dongle, go
+    /// ahead". So every launch had a window in which this hub scanned freely,
+    /// and one `start_scan` is enough for Windows to spot a remembered
+    /// controller and connect it. Once that happens the dongle cannot see the
+    /// pad at all, and restarting does not help because the pad is now bonded
+    /// to Windows and gets auto-connected on sight.
+    ///
+    /// Passing it at construction closes the window by construction rather than
+    /// by ordering discipline, and there is no longer a setter to forget.
+    pub fn start(
+        pairing_enabled: bool,
+        stand_down: Option<Arc<std::sync::atomic::AtomicU8>>,
+    ) -> Self {
         let shared = Arc::new(Shared::default());
         shared.pairing_enabled.store(pairing_enabled, Ordering::Relaxed);
+        *shared.stand_down.lock().unwrap() = stand_down;
 
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -343,6 +410,31 @@ async fn run(shared: Arc<Shared>) {
         Arc::default();
 
     while !shared.shutdown.load(Ordering::Relaxed) {
+        // Stand aside entirely while the dongle is driving.
+        //
+        // Checked before scanning, not just before connecting: `start_scan` on
+        // the Windows stack is enough for Windows to notice a REMEMBERED
+        // controller and auto-connect it behind our back, which is exactly the
+        // regression this guards — the pads end up on the Windows adapter with
+        // FlexInput never having called `connect()`.
+        let dongle_owns = dongle_owns_controllers(&shared.stand_down.lock().unwrap());
+        if dongle_owns {
+            // Release anything already held, once, and say so — from the
+            // outside a controller changing transport looks like a dropout.
+            if !managed.lock().unwrap().is_empty()
+                && !shared.release_pads.swap(true, Ordering::Relaxed)
+            {
+                eprintln!(
+                    "[jc2] dongle is ready — releasing {} controller(s) to it",
+                    managed.lock().unwrap().len(),
+                );
+            }
+            tokio::time::sleep(SCAN_GAP_BUSY).await;
+            continue;
+        }
+        // The dongle is gone; this hub may hold controllers again.
+        shared.release_pads.store(false, Ordering::Relaxed);
+
         let connected = managed.lock().unwrap().len();
         let forced = shared.force_scan.swap(false, Ordering::Relaxed);
 
@@ -850,6 +942,8 @@ async fn run_session(
                 snapshot: PadSnapshot::default(),
                 stick: (0.0, 0.0),
                 gyro: [0.0; 3],
+                orientation: [0.0; 3],
+                field_rate: [0.0; 3],
                 events: 0,
             },
         );
@@ -1039,7 +1133,7 @@ async fn run_session(
 
     let rumble_char = find(side.rumble_char());
     let mut calib = StickCalib::default();
-    let mut gyro_bias = GyroBias::default();
+    let mut orientation = OrientationTracker::default();
     let input_uuid = side.input_char();
 
     // Raw report dump. The motion block's packing is documented as "unknown"
@@ -1098,6 +1192,11 @@ async fn run_session(
     );
 
     while !shared.shutdown.load(Ordering::Relaxed) {
+        // Hand the controller over the moment the dongle is ready for it.
+        if shared.release_pads.load(Ordering::Relaxed) {
+            reason = "released to the dongle";
+            break;
+        }
         tokio::select! {
             notif = stream.next() => {
                 let Some(n) = notif else {
@@ -1111,7 +1210,7 @@ async fn run_session(
                 reports += 1;
                 let Some(snap) = reports::parse_input(side, &n.value) else { continue };
                 let stick = calib.normalize(snap.stick_raw);
-                let gyro = gyro_bias.correct(snap.motion.gyro);
+                let o = orientation.update(&snap.motion);
 
                 // The first few reports are dumped unconditionally, THEN rate
                 // limited. A connection that only survives a couple of seconds
@@ -1148,7 +1247,9 @@ async fn run_session(
                 if let Some(pad) = shared.pads.lock().unwrap().get_mut(&key) {
                     pad.snapshot = snap;
                     pad.stick = stick;
-                    pad.gyro = gyro;
+                    pad.gyro = o.rate_dps;
+                    pad.field_rate = o.field_rate_dps;
+                    pad.orientation = o.euler_rad;
                     pad.events = pad.events.saturating_add(1);
                 }
             }
@@ -1557,4 +1658,110 @@ async fn run_pairing(
     // `0x03/0x09` is the flash write. Reconnects re-send `0x03/0x07` alone.
     register_link_key(p, cmd_char, stream, side, host, &ltk, true).await;
     Some(ltk)
+}
+
+/// Should this hub keep its hands off the controllers?
+///
+/// Deliberately conservative in BOTH directions, because the two ways of being
+/// wrong have very different costs:
+///
+/// * `PROBING` counts as owned. The dongle takes a moment to open, and a hub
+///   that scans in that window can hand a remembered controller to Windows
+///   before the dongle ever sees it. Waiting costs a fraction of a second.
+/// * No flag at all means NOT owned. A caller that never wired one up must
+///   still get working controllers, rather than silently having them disabled.
+fn dongle_owns_controllers(flag: &Option<Arc<std::sync::atomic::AtomicU8>>) -> bool {
+    match flag {
+        Some(f) => f.load(Ordering::Relaxed) != crate::dongle::DONGLE_ABSENT,
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod stand_down_tests {
+    use super::*;
+    use crate::dongle::{DONGLE_ABSENT, DONGLE_ACTIVE, DONGLE_PROBING};
+    use std::sync::atomic::AtomicU8;
+
+    /// A machine with no dongle must still get working Joy-Cons over the
+    /// Windows stack. Standing down unconditionally would disable them.
+    #[test]
+    fn without_a_flag_the_hub_runs_normally() {
+        assert!(!dongle_owns_controllers(&None));
+    }
+
+    /// ⭐ The flag must be in place BEFORE the worker can scan.
+    ///
+    /// This is the actual startup bug, and it hid behind a correct-looking
+    /// guard: the hub was constructed, its thread started scanning, and only
+    /// then was the flag attached. Until it landed the flag was `None`, which
+    /// the guard above deliberately reads as "no dongle, carry on" — so every
+    /// launch had a window where this hub scanned freely. One scan is enough
+    /// for Windows to auto-connect a remembered controller, after which the
+    /// dongle cannot even see the pad, and restarting does not help because the
+    /// pad is bonded to Windows by then.
+    ///
+    /// Asserting on `Shared` rather than on a live hub because spawning one
+    /// starts real Bluetooth work. What matters is that the state the worker
+    /// reads is already populated at the moment it could first run, and that
+    /// there is no setter left to call too late.
+    #[test]
+    fn the_stand_down_flag_is_installed_before_the_worker_can_scan() {
+        let shared = Arc::new(Shared::default());
+        // Exactly what `start` does, in the order it does it.
+        let flag = Arc::new(AtomicU8::new(DONGLE_PROBING));
+        *shared.stand_down.lock().unwrap() = Some(Arc::clone(&flag));
+
+        assert!(
+            dongle_owns_controllers(&shared.stand_down.lock().unwrap()),
+            "the worker's first scan check must already see the dongle",
+        );
+    }
+
+    /// Standing down must also RELEASE controllers already held.
+    ///
+    /// A peripheral accepts one connection, so a pad this hub is holding is a
+    /// pad the dongle can never have. Without the release the only way out was
+    /// restarting the app — and that could lose the race again.
+    #[test]
+    fn taking_over_mid_session_releases_held_pads() {
+        let shared = Arc::new(Shared::default());
+        assert!(
+            !shared.release_pads.load(Ordering::Relaxed),
+            "nothing is released until the dongle actually claims ownership",
+        );
+        // What the scan loop does when it finds the dongle ready with pads held.
+        assert!(!shared.release_pads.swap(true, Ordering::Relaxed), "raised once");
+        assert!(shared.release_pads.swap(true, Ordering::Relaxed), "and only once");
+
+        // And when the dongle goes away, this hub may hold controllers again —
+        // otherwise unplugging it would leave the pads unusable by anything.
+        shared.release_pads.store(false, Ordering::Relaxed);
+        assert!(!shared.release_pads.load(Ordering::Relaxed));
+    }
+
+    /// The startup race this exists to close: the dongle thread has not opened
+    /// the device yet, and a hub that scans now can lose the controllers to
+    /// Windows auto-connect before the dongle ever sees them.
+    #[test]
+    fn the_hub_waits_while_the_dongle_is_still_probing() {
+        let f = Arc::new(AtomicU8::new(DONGLE_PROBING));
+        assert!(dongle_owns_controllers(&Some(f)));
+    }
+
+    #[test]
+    fn an_active_dongle_owns_the_controllers() {
+        let f = Arc::new(AtomicU8::new(DONGLE_ACTIVE));
+        assert!(dongle_owns_controllers(&Some(f)));
+    }
+
+    /// Unplugging the dongle mid-session must hand the controllers back rather
+    /// than stranding them with no transport at all.
+    #[test]
+    fn a_departed_dongle_releases_the_hub() {
+        let f = Arc::new(AtomicU8::new(DONGLE_ACTIVE));
+        assert!(dongle_owns_controllers(&Some(Arc::clone(&f))));
+        f.store(DONGLE_ABSENT, Ordering::Relaxed);
+        assert!(!dongle_owns_controllers(&Some(f)));
+    }
 }

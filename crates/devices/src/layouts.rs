@@ -189,6 +189,10 @@ fn switch_pro_outputs() -> Vec<DevicePin> {
 fn joycon2_shared_outputs() -> Vec<DevicePin> {
     let mut pins = imu_pins();
     pins.extend(vec![
+        // Absolute orientation, which this controller can supply and a
+        // rate-only pad cannot: the firmware fuses gyro, accel and
+        // magnetometer, so yaw is drift-free rather than integrated.
+        f2("orientation", "Orientation (absolute)", SignalType::Vec4),
         // Relative optical-mouse deltas, in report units per frame. Unlike
         // every other Float pin here these are NOT normalised to −1..1: mouse
         // travel has no natural full-scale, and clamping it would cap pointer
@@ -202,7 +206,60 @@ fn joycon2_shared_outputs() -> Vec<DevicePin> {
         fl("battery", "Battery (0–1)"),
         bo("charging", "Charging"),
     ]);
+    pins.extend(joycon2_probe_outputs());
     pins
+}
+
+/// Raw, undecoded IMU bytes, exposed so they can be judged by hand.
+///
+/// The motion block has twelve bytes nobody has pinned down. Every attempt to
+/// decode them has been a script scoring a guessed layout against a saved
+/// capture, and each one only ever tested the layouts someone thought to write.
+/// These pins take the other route: put the numbers where a person can watch
+/// them while turning the controller. A rate field is unmistakable that way —
+/// near zero at rest, swinging with the turn, back to zero — and so is the
+/// absence of one.
+///
+/// Both readings of the same twelve bytes are here, because which is right is
+/// the open question:
+///
+/// * `probe_i16_*` — six i16 in byte order, the layout a raw gyro + raw
+///   magnetometer pair would use.
+/// * `probe_i24_*` — three tagged 24-bit values, what the parser currently
+///   believes. `probe_i24_2` is the heading, the one field that demonstrably
+///   tracks rotation, and it is here as a CONTROL: it shows what a field that
+///   really does follow the controller looks like on the same axes, in the same
+///   units, at the same instant. Without it "this pin does nothing" is
+///   ambiguous between a dead field and a dead wire.
+///
+/// Every pin is normalised by its own full scale, so ±1 is the widest value the
+/// field can hold. Nothing else is applied — no bias removal, no permutation,
+/// no sign flip — because the whole point is to see what the hardware sends,
+/// and anything applied here could only hide it.
+fn joycon2_probe_outputs() -> Vec<DevicePin> {
+    vec![
+        fl("probe_i16_0", "Probe i16 #0 — block bytes 0–1"),
+        fl("probe_i16_1", "Probe i16 #1 — block bytes 2–3"),
+        fl("probe_i16_2", "Probe i16 #2 — block bytes 4–5"),
+        fl("probe_i16_3", "Probe i16 #3 — block bytes 6–7"),
+        fl("probe_i16_4", "Probe i16 #4 — block bytes 8–9"),
+        fl("probe_i16_5", "Probe i16 #5 — block bytes 10–11"),
+        fl("probe_i24_0", "Probe i24 #0 — block bytes 1–3"),
+        fl("probe_i24_1", "Probe i24 #1 — block bytes 5–7"),
+        fl("probe_i24_2", "Probe i24 #2 — heading (known good, use as control)"),
+        // ⭐ The controller's real gyro, recovered by differencing the fields
+        // above. Normalised like every other gyro pin, so these are wireable
+        // straight into an aim mapping and directly comparable in feel against
+        // `gyro_x/y/z` — which derive roll and pitch from the accelerometer and
+        // are therefore at their worst during a hard flick.
+        //
+        // Field order, not axis order: which one is roll, pitch or yaw is the
+        // open question, and these pins exist to answer it by hand rather than
+        // ship a guessed permutation.
+        fl("probe_rate_0", "Probe rate: Roll (decoupled body rate)"),
+        fl("probe_rate_1", "Probe rate: Pitch (decoupled body rate)"),
+        fl("probe_rate_2", "Probe rate: Yaw (decoupled body rate)"),
+    ]
 }
 
 fn joycon2_left_outputs() -> Vec<DevicePin> {

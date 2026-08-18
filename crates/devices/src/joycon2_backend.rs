@@ -20,9 +20,6 @@ use crate::{layouts, ControllerKind, DeviceBackend, PhysicalDevice};
 /// field OFFSET was. Expressed via the measured constant so it stays anchored
 /// to evidence instead of a coincidence.
 const JC2_ACCEL_G_PER_LSB: f32 = 1.0 / flexinput_joycon2::reports::ACCEL_LSB_PER_G;
-/// Gyro scale. Still a guess — the gyro field has not been located in the
-/// report yet, so `pad.gyro` is always zero and this constant is unexercised.
-const JC2_GYRO_DPS_PER_LSB: f32 = 2000.0 / 32767.0;
 
 pub struct Joycon2Backend {
     hub: Joycon2Hub,
@@ -53,16 +50,24 @@ impl Joycon2Backend {
     /// Start the BLE hub. `pairing_enabled` gates the LTK handshake, which
     /// writes to controller flash — see `flexinput_joycon2::pairing`.
     pub fn new(pairing_enabled: bool) -> Self {
+        // Dongle FIRST, so its readiness flag exists before the hub can scan.
+        // Constructing the hub first leaves a window in which the Windows stack
+        // scans, spots a remembered controller and auto-connects it — after
+        // which the dongle cannot see the pad at all.
+        let dongle = Joycon2DongleHub::new();
+        // ❗ The flag goes in at construction. Handing it over afterwards left
+        // a window in which this hub scanned with no flag set, which Windows
+        // used to claim a remembered controller before the dongle was ready —
+        // see `Joycon2Hub::start`.
+        let hub = Joycon2Hub::start(pairing_enabled, Some(dongle.state_flag()));
         Self {
-            hub: Joycon2Hub::start(pairing_enabled),
+            hub,
             // Started unconditionally: it costs one idle thread polling hidapi
             // every 2 s, and a wired controller is strictly better than a
             // Bluetooth one here — Windows reclaims unpaired BLE links every
             // ~30 s and nothing we can do from a GATT client prevents it.
             usb: Joycon2UsbHub::new(),
-            // Costs one thread that exits immediately when no WinUSB-bound
-            // dongle is present, which is the common case.
-            dongle: Joycon2DongleHub::new(),
+            dongle,
         }
     }
 
@@ -98,25 +103,71 @@ fn kind_for(side: Side) -> ControllerKind {
 /// certainly need a per-orientation rotation on top. Left deliberately
 /// un-rotated until it can be checked against real hardware rather than
 /// guessed — a wrong rotation here is much harder to spot than none.
-/// `gyro` arrives already zero-rate corrected (see `flexinput_joycon2::GyroBias`)
-/// and so is `f32` LSB rather than raw counts. Passing the uncorrected
-/// `snapshot.motion.gyro` here instead is what makes an aim mapping slide
-/// across the screen with the controller sitting still.
-fn canonical_imu(accel: [i32; 3], gyro: [f32; 3]) -> ([f32; 3], [f32; 3]) {
-    let gs = JC2_GYRO_DPS_PER_LSB / GYRO_REF_DPS;
+///
+/// ❗ `gyro` now arrives already in **degrees per second**, from
+/// [`flexinput_joycon2::reports::OrientationTracker`], so the only conversion
+/// left is into the shared normalised unit. It used to arrive as angle counts
+/// per report from differencing three fields, two of which are not angles.
+///
+/// The Y/Z negation is unchanged and still unverified — it is a convention
+/// question, and a per-device baseline in calibration cancels a fixed frame
+/// offset either way.
+fn canonical_imu(accel: [i32; 3], gyro_dps: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let gs = 1.0 / GYRO_REF_DPS;
     let as_ = JC2_ACCEL_G_PER_LSB / ACCEL_REF_G;
+    let a = flexinput_joycon2::reports::to_canonical_accel(accel);
     (
-        [
-            gyro[0] * gs,
-            -gyro[1] * gs,
-            -gyro[2] * gs,
-        ],
-        [
-            accel[0] as f32 * as_,
-            accel[1] as f32 * as_,
-            accel[2] as f32 * as_,
-        ],
+        // ❗ NO per-axis negation here any more. It was inherited from the
+        // Switch Pro parser, which signs RAW SENSOR axes; these rates are not
+        // raw sensor output — they are differences of angles already computed
+        // in the canonical frame, so negating them again mirrors two axes.
+        [gyro_dps[0] * gs, gyro_dps[1] * gs, gyro_dps[2] * gs],
+        [a[0] as f32 * as_, a[1] as f32 * as_, a[2] as f32 * as_],
     )
+}
+
+/// Build an absolute orientation quaternion: gravity for roll and pitch, the
+/// heading field for yaw.
+///
+/// ⭐ **This used to compose three `Motion::angle` fields as Euler angles, and
+/// that is why the 3D model tumbled** — spinning through several revolutions on
+/// a small turn, with the calibration baseline unable to help. Only one of those
+/// three fields is an angle. The other two were exhaustively disproven (see
+/// [`flexinput_joycon2::reports::Motion::angle`]), so no composition order,
+/// handedness or per-axis scale could ever have made them work: the inputs were
+/// wrong, not the arithmetic.
+///
+/// What replaces them needs no reverse engineering at all:
+///
+/// * **roll and pitch from gravity.** The accelerometer is the best-established
+///   thing on this controller — 4096 LSB/g, confirmed by measurement and then
+///   independently by the device's own scale block.
+/// * **yaw from the heading field**, which is absolute and magnetometer-
+///   corrected: ≤4.5° drift across a full 360° turn.
+///
+/// So the composition is no longer a guess either. Roll and pitch are defined
+/// as rotations that bring the measured gravity vector back to vertical, and
+/// yaw is applied about that vertical — which is exactly `Rz · Ry · Rx`.
+///
+/// A per-device baseline captured during calibration still cancels any fixed
+/// mounting offset on top of this.
+fn canonical_orientation(euler: [f32; 3]) -> glam::Quat {
+    let [roll, pitch, yaw] = euler;
+    // ❗ Takes the euler the TRANSPORT already computed, rather than
+    // recomputing from the raw report. Yaw needs unwrapping and unwrapping is
+    // stateful: the heading field spans half a turn and wraps twice per
+    // revolution, so anything recomputing it without wrap history flips 180
+    // degrees at every seam. That showed up as instant full-scale jumps on an
+    // otherwise noisy yaw trace.
+    //
+    // The rotations are INVERTED relative to the angles because this quaternion
+    // must take the body frame to the world frame: pitch and yaw are stored
+    // with the canonical sign convention (pitch + nose-up, yaw + clockwise),
+    // and undoing a nose-up tilt is a nose-DOWN rotation. Pinned by the test
+    // that rotates measured gravity onto world up.
+    glam::Quat::from_rotation_z(yaw)
+        * glam::Quat::from_rotation_y(-pitch)
+        * glam::Quat::from_rotation_x(roll)
 }
 
 fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState) {
@@ -129,7 +180,25 @@ fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadStat
     f("mouse_liftoff", pad.snapshot.mouse.liftoff as f32);
     f("battery", pad.snapshot.power.fraction());
 
-    let (gyro, accel) = canonical_imu(pad.snapshot.motion.accel, pad.gyro);
+    // ⭐ The gyro pins now carry the FIELD-derived rate, not the accel-derived
+    // one.
+    //
+    // `pad.gyro` differentiates tilt read from the accelerometer, which is the
+    // worst available rate source at exactly the moment it matters: during a
+    // flick the accel measures centripetal load on top of gravity, so the tilt
+    // it implies is wrong precisely when the rate is largest. Captured sweep
+    // frames read 2627/649/3088 against a 4096 magnitude — the "gravity"
+    // direction there is fiction.
+    //
+    // The field-derived rate has none of that. It is the controller's own
+    // integrated motion, differenced back into a rate, and on hardware it is
+    // the difference between motion controls that are unusable and ones that
+    // are not. Putting it on `gyro_x/y/z` means the existing curve, filter and
+    // 3DOF tooling applies to it without anyone having to wire a probe pin.
+    let (gyro, accel) = canonical_imu(
+        pad.snapshot.motion.accel,
+        flexinput_joycon2::reports::canonical_field_rate(pad.field_rate),
+    );
     f("gyro_x", gyro[0]);
     f("gyro_y", gyro[1]);
     f("gyro_z", gyro[2]);
@@ -137,10 +206,60 @@ fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadStat
     f("accel_y", accel[1]);
     f("accel_z", accel[2]);
 
+    // Absolute orientation. Pushed here rather than beside the accel pins
+    // because `f` above holds a unique borrow of `out` for its whole scope.
+    let q = canonical_orientation(pad.orientation);
+    out.push((
+        dev.into(),
+        "orientation".into(),
+        Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w)),
+    ));
+
+    push_probe(out, dev, &pad.snapshot.motion);
+    // Normalised by the same reference as `gyro_x/y/z`, so the two are
+    // interchangeable in a patch and a difference in feel is a difference in
+    // SENSOR, not in scaling.
+    for (i, v) in pad.field_rate.iter().enumerate() {
+        out.push((
+            dev.into(),
+            format!("probe_rate_{i}"),
+            Signal::Float(v / GYRO_REF_DPS),
+        ));
+    }
+
     let mut bo = |pin: &str, v: bool| out.push((dev.into(), pin.into(), Signal::Bool(v)));
     bo("charging", pad.snapshot.power.charging);
     bo("btn_sl", b.sl);
     bo("btn_sr", b.sr);
+}
+
+/// Full scale of each probe reading, used only to bring the pins into the
+/// ±1 range every other Float pin lives in.
+const PROBE_I16_FULL_SCALE: f32 = 32768.0;
+const PROBE_I24_FULL_SCALE: f32 = (1u32 << 23) as f32;
+
+/// Push the undecoded motion bytes out as pins — see `joycon2_probe_outputs`.
+///
+/// Scaled, never re-interpreted. Dividing by full scale changes no shape and
+/// loses no information; it just puts the value where FlexInput's displays,
+/// curves and AutoMap already work. Anything more (bias removal, differencing,
+/// axis permutation) would be another decode, and a decode is exactly what
+/// these pins exist to avoid — the reader is the judge here, not the code.
+fn push_probe(out: &mut Vec<(String, String, Signal)>, dev: &str, m: &flexinput_joycon2::reports::Motion) {
+    for (i, v) in m.probe.iter().enumerate() {
+        out.push((
+            dev.into(),
+            format!("probe_i16_{i}"),
+            Signal::Float(*v as f32 / PROBE_I16_FULL_SCALE),
+        ));
+    }
+    for (i, v) in m.angle.iter().enumerate() {
+        out.push((
+            dev.into(),
+            format!("probe_i24_{i}"),
+            Signal::Float(*v as f32 / PROBE_I24_FULL_SCALE),
+        ));
+    }
 }
 
 fn push_left(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState) {
@@ -159,6 +278,15 @@ fn push_left(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState)
     out.push((dev.into(), "dpad".into(), Signal::Vec2(glam::Vec2::new(dx, dy))));
     out.push((dev.into(), "dpad_x".into(), Signal::Float(dx)));
     out.push((dev.into(), "dpad_y".into(), Signal::Float(dy)));
+
+    // Absolute orientation. Pushed here rather than beside the accel pins
+    // because `f` above holds a unique borrow of `out` for its whole scope.
+    let q = canonical_orientation(pad.orientation);
+    out.push((
+        dev.into(),
+        "orientation".into(),
+        Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w)),
+    ));
 
     let mut bo = |pin: &str, v: bool| out.push((dev.into(), pin.into(), Signal::Bool(v)));
     bo("btn_lb", b.shoulder);
@@ -179,6 +307,15 @@ fn push_right(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState
     out.push((dev.into(), "right_stick".into(), Signal::Vec2(glam::Vec2::new(x, y))));
     out.push((dev.into(), "right_stick_x".into(), Signal::Float(x)));
     out.push((dev.into(), "right_stick_y".into(), Signal::Float(y)));
+
+    // Absolute orientation. Pushed here rather than beside the accel pins
+    // because `f` above holds a unique borrow of `out` for its whole scope.
+    let q = canonical_orientation(pad.orientation);
+    out.push((
+        dev.into(),
+        "orientation".into(),
+        Signal::Vec4(glam::Vec4::new(q.x, q.y, q.z, q.w)),
+    ));
 
     let mut bo = |pin: &str, v: bool| out.push((dev.into(), pin.into(), Signal::Bool(v)));
     // Positional ids, Nintendo labels: A is East, B is South, X is North, Y is West.
@@ -295,6 +432,8 @@ fn emitted_pins(side: Side) -> Vec<(String, String, Signal)> {
         snapshot: Default::default(),
         stick: (0.0, 0.0),
         gyro: [0.0; 3],
+        field_rate: [0.0; 3],
+        orientation: [0.0; 3],
         events: 0,
     };
     let mut out = Vec::new();
@@ -377,15 +516,97 @@ mod tests {
         assert_eq!(accel, [0.0, 0.0, 0.0]);
     }
 
-    /// Full-scale counts land at ±1.0, matching every other pad's normalisation
-    /// so gyro-aim sensitivity carries across controllers.
+    /// A full-scale ROTATION RATE lands at ±1.0, matching every other pad's
+    /// normalisation so gyro-aim sensitivity carries across controllers.
+    ///
+    /// ❗ This has now been rewritten twice, each time because the UNIT of the
+    /// gyro input changed under it. First it fed `i16::MAX` raw counts; then
+    /// angle counts per report; now degrees per second, which is what
+    /// `OrientationTracker` produces. Each rewrite is a reminder that a test
+    /// asserting a number without asserting its unit is barely a test — so the
+    /// input here is spelled as a physical rate and nothing else.
     #[test]
-    fn full_scale_imu_counts_normalise_to_one() {
-        let (gyro, _) = canonical_imu([0; 3], [i16::MAX as f32; 3]);
-        assert!((gyro[0] - 1.0).abs() < 1e-4, "gyro roll {}", gyro[0]);
-        // Y/Z are negated relative to raw, matching the Switch Pro reference.
-        assert!((gyro[1] + 1.0).abs() < 1e-4);
-        assert!((gyro[2] + 1.0).abs() < 1e-4);
+    fn full_scale_rotation_rate_normalises_to_one() {
+        let (gyro, _) = canonical_imu([0; 3], [GYRO_REF_DPS; 3]);
+        // ❗ All three POSITIVE. The old version expected Y and Z negated,
+        // inherited from the Switch Pro parser — but that parser signs RAW
+        // SENSOR axes, and these rates are differences of angles already in the
+        // canonical frame. Negating them again mirrored two axes, which is
+        // exactly the "tumbling in all sorts of wrong ways" symptom.
+        for (i, g) in gyro.iter().enumerate() {
+            assert!((g - 1.0).abs() < 1e-4, "gyro axis {i} = {g}, expected 1.0");
+        }
+    }
+
+    /// A realistic hand rotation must produce a usable, non-tiny signal.
+    ///
+    /// Catches "the gyro technically works but the cursor barely moves", which
+    /// is how a scale error shows up on hardware rather than as an obvious
+    /// failure.
+    #[test]
+    fn a_brisk_hand_rotation_produces_a_usable_signal() {
+        let (gyro, _) = canonical_imu([0; 3], [180.0, 0.0, 0.0]);
+        let expect = 180.0 / GYRO_REF_DPS;
+        assert!(
+            (gyro[0] - expect).abs() < 1e-3,
+            "180 deg/s gave {}, expected {expect}",
+            gyro[0]
+        );
+        assert!(gyro[0] > 0.05, "signal too small to aim with: {}", gyro[0]);
+    }
+
+    /// The orientation must actually undo the measured tilt.
+    ///
+    /// This is the property the old three-Euler-angle version could not hold,
+    /// and the reason the 3D model tumbled: rotating the measured gravity
+    /// vector by the orientation has to land on world up, in every pose. It is
+    /// the same geometric check that `gravity_solve` used to reject the old
+    /// decode, applied here as a regression test.
+    ///
+    /// It also pins the SIGN of pitch, which has been wrong in both directions
+    /// now — once making the model tumble, once making `gyro_y` read backwards
+    /// against every other pad.
+    #[test]
+    fn the_orientation_brings_measured_gravity_back_to_vertical() {
+        use flexinput_joycon2::reports::{
+            tilt_from_accel, to_canonical_accel, ACCEL_LSB_PER_G,
+        };
+        let g = ACCEL_LSB_PER_G as i32;
+        let h = (g as f32 / 2f32.sqrt()) as i32;
+        for raw in [[0, 0, g], [0, g, 0], [g, 0, 0], [0, h, h], [h, 0, h], [-h, h, 0]] {
+            let c = to_canonical_accel(raw);
+            let (roll, pitch) = tilt_from_accel(c);
+            // Yaw rotates ABOUT gravity, so it cannot affect this — varied
+            // deliberately to prove it does not.
+            for yaw in [0.0f32, 1.3, -2.6] {
+                let q = canonical_orientation([roll, pitch, yaw]);
+                let a = glam::Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32).normalize();
+                let up = (q * a).normalize();
+                assert!(
+                    up.z > 0.999,
+                    "raw {raw:?} yaw {yaw} left gravity at {up:?}"
+                );
+            }
+        }
+    }
+
+    /// Pitch must be POSITIVE NOSE-UP, matching the canonical contract.
+    ///
+    /// The contract says `accel_x > 0` when the nose tilts up and `gyro_y` is
+    /// pitch positive nose-up, so the angle has to rise with canonical x.
+    /// Getting this backwards inverts `gyro_y` against every other pad while
+    /// still producing a perfectly self-consistent orientation — which is why
+    /// it needs its own test rather than being implied by the gravity check.
+    #[test]
+    fn pitch_is_positive_nose_up_and_roll_positive_right_grip_down() {
+        use flexinput_joycon2::reports::{tilt_from_accel, ACCEL_LSB_PER_G};
+        let g = ACCEL_LSB_PER_G as i32;
+        // Canonical accel: nose up puts gravity on +x.
+        let (_, pitch) = tilt_from_accel([g, 0, 0]);
+        assert!(pitch > 1.0, "nose-up pitch should be strongly positive, got {pitch}");
+        // Right grip down puts gravity on +y.
+        let (roll, _) = tilt_from_accel([0, g, 0]);
+        assert!(roll > 1.0, "right-grip-down roll should be positive, got {roll}");
     }
 
     /// One g of gravity must read as 1/8 of full scale, since the graph's
@@ -394,12 +615,103 @@ mod tests {
     #[test]
     fn one_g_reads_as_an_eighth_of_full_scale() {
         let lsb = flexinput_joycon2::reports::ACCEL_LSB_PER_G as i32;
-        let (_, accel) = canonical_imu([lsb, 0, 0], [0.0; 3]);
+        // Raw axis 1 is the canonical FORWARD axis — see `to_canonical_accel`.
+        let (_, accel) = canonical_imu([0, lsb, 0], [0.0; 3]);
         assert!((accel[0] - 0.125).abs() < 1e-4, "1 g read as {}", accel[0]);
 
-        // And a full-scale ±8 g excursion saturates at ±1.0.
-        let (_, accel) = canonical_imu([lsb * 8, 0, 0], [0.0; 3]);
+        // And a full-scale +/-8 g excursion saturates at +/-1.0.
+        let (_, accel) = canonical_imu([0, lsb * 8, 0], [0.0; 3]);
         assert!((accel[0] - 1.0).abs() < 1e-3, "8 g read as {}", accel[0]);
+    }
+
+    /// The canonical permutation itself, stated as the contract rather than as
+    /// three index swaps — so a future change has to disagree with the CONTRACT
+    /// to break it, not merely with the previous implementation.
+    #[test]
+    fn accel_lands_in_the_canonical_forward_side_vertical_frame() {
+        use flexinput_joycon2::reports::ACCEL_LSB_PER_G;
+        let lsb = ACCEL_LSB_PER_G as i32;
+        let axis_of = |raw: [i32; 3]| {
+            let (_, a) = canonical_imu(raw, [0.0; 3]);
+            a
+        };
+        // Grip flat, face up: gravity on canonical +z and nothing else.
+        let flat = axis_of([0, 0, lsb]);
+        assert!(flat[2] > 0.12 && flat[0].abs() < 1e-3 && flat[1].abs() < 1e-3, "flat {flat:?}");
+        // Raw 1 is forward; raw 0 is side, INVERTED. Both were passed straight
+        // through before, which put this pad's accel in a different order and
+        // sign from the DualSense and Switch Pro on the same motion.
+        assert!(axis_of([0, lsb, 0])[0] > 0.12, "raw axis 1 must be canonical +x");
+        assert!(axis_of([lsb, 0, 0])[1] < -0.12, "raw axis 0 must be canonical -y");
+    }
+
+    /// The probe pins must be a pure rescale of the report bytes.
+    ///
+    /// This is the one property that makes them worth having: the moment
+    /// anything here filters, biases or permutes, the pins stop answering "what
+    /// does the hardware send" and start answering "what does this code think
+    /// the hardware sends" — which is the question that has already been
+    /// answered wrongly several times.
+    #[test]
+    fn probe_pins_are_a_pure_rescale_of_the_raw_bytes() {
+        use flexinput_joycon2::reports::Motion;
+        let m = Motion {
+            probe: [i16::MIN, -1, 0, 1, 16384, i16::MAX],
+            angle: [-(1 << 23), 0, (1 << 23) - 1],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        push_probe(&mut out, "dev", &m);
+
+        let get = |pin: &str| {
+            out.iter()
+                .find(|(_, p, _)| p == pin)
+                .map(|(_, _, s)| match s {
+                    Signal::Float(v) => *v,
+                    other => panic!("{pin} is {other:?}, not a Float"),
+                })
+                .unwrap_or_else(|| panic!("{pin} was never pushed"))
+        };
+
+        // Full scale lands at -1, and no value can exceed it.
+        assert_eq!(get("probe_i16_0"), -1.0);
+        assert_eq!(get("probe_i16_2"), 0.0);
+        assert_eq!(get("probe_i16_4"), 0.5);
+        assert!((get("probe_i16_5") - 1.0).abs() < 1e-4);
+        assert_eq!(get("probe_i24_0"), -1.0);
+        assert_eq!(get("probe_i24_1"), 0.0);
+        assert!((get("probe_i24_2") - 1.0).abs() < 1e-6);
+
+        // Sign and ORDER survive: #1 and #3 differ only in sign, and neither is
+        // silently zeroed the way a "clean up the noise" filter would.
+        assert!(get("probe_i16_1") < 0.0 && get("probe_i16_3") > 0.0);
+        assert_eq!(get("probe_i16_1"), -get("probe_i16_3"));
+    }
+
+    /// A resting controller must NOT read zero on the probe pins.
+    ///
+    /// Sounds backwards, but it is the point: these pins exist to show what is
+    /// actually in the bytes, and the real at-rest capture has two fields near
+    /// full scale. If a future change makes them quietly read zero at rest —
+    /// the shape someone would "fix" them into, expecting a gyro — the pins
+    /// have stopped reporting and started asserting.
+    #[test]
+    fn the_probe_pins_report_the_resting_values_hardware_actually_sends() {
+        use flexinput_joycon2::reports::Motion;
+        let m = Motion {
+            // From the pinned at-rest capture in `reports.rs`.
+            probe: [30720, -153, -767, -24, -1536, 32752],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        push_probe(&mut out, "dev", &m);
+        let v = |pin: &str| match out.iter().find(|(_, p, _)| p == pin).unwrap().2 {
+            Signal::Float(v) => v,
+            _ => unreachable!(),
+        };
+        assert!(v("probe_i16_0") > 0.9, "resting #0 should be near full scale");
+        assert!(v("probe_i16_5") > 0.9, "resting #5 should be near full scale");
+        assert!(v("probe_i16_1").abs() < 0.01);
     }
 
     #[test]

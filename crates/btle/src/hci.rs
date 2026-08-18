@@ -45,6 +45,13 @@ impl Opcode {
     pub const LE_CREATE_CONNECTION_CANCEL: Opcode = Opcode::new(0x08, 0x000E);
     /// `HCI_Disconnect` — OGF 0x01 (Link Control), OCF 0x0006.
     pub const DISCONNECT: Opcode = Opcode::new(0x01, 0x0006);
+    /// `HCI_Read_BD_ADDR` — OGF 0x04 (Informational Parameters), OCF 0x0009.
+    ///
+    /// The dongle's own address. Needed because the Joy-Con 2 pairing handshake
+    /// tells the controller which host to bond to, and over a dedicated dongle
+    /// that is the DONGLE's address, not the machine's onboard radio — reading
+    /// the wrong one bonds the controller to a radio that will never talk to it.
+    pub const READ_BD_ADDR: Opcode = Opcode::new(0x04, 0x0009);
     /// `HCI_LE_Enable_Encryption` — OGF 0x08, OCF 0x0019.
     ///
     /// The reason this whole crate exists: it starts link encryption from an
@@ -176,11 +183,41 @@ pub fn parse_event(buf: &[u8]) -> crate::Result<Event> {
     let len = buf[1] as usize;
     // Trust the length field over the transfer size: a short read means a
     // truncated packet, and decoding it would invent values.
+    //
+    // ❗ But only for events we actually DECODE. This used to reject every
+    // truncated packet, and the error propagated all the way out of
+    // initialisation:
+    //
+    //     controller init failed: protocol error: event 0xfc claims 19 params, got 9
+    //
+    // `0xFC` is a VENDOR-SPECIFIC event — Realtek dongles emit them freely, and
+    // this stack does not decode a single one. Refusing to connect because a
+    // chip-specific status message arrived short is the transport failing over
+    // something it was always going to throw away, and it made the dongle look
+    // unreliable when the link itself was fine.
+    //
+    // Truncation still fails loudly for the five codes below, where inventing
+    // a connection handle or a disconnect reason from missing bytes would be
+    // far worse than an error.
+    const DECODED: [u8; 5] = [
+        EVT_COMMAND_COMPLETE,
+        EVT_COMMAND_STATUS,
+        EVT_DISCONNECTION_COMPLETE,
+        EVT_ENCRYPTION_CHANGE,
+        EVT_LE_META,
+    ];
     if buf.len() < 2 + len {
-        return Err(crate::Error::Protocol(format!(
-            "event {code:#04x} claims {len} params, got {}",
-            buf.len() - 2
-        )));
+        if DECODED.contains(&code) {
+            return Err(crate::Error::Protocol(format!(
+                "event {code:#04x} claims {len} params, got {}",
+                buf.len() - 2
+            )));
+        }
+        // Undecoded and short: hand back what arrived rather than failing.
+        return Ok(Event::Other {
+            code,
+            params: buf[2..].to_vec(),
+        });
     }
     let params = &buf[2..2 + len];
 
@@ -262,6 +299,48 @@ fn parse_adv_report(body: &[u8]) -> Option<AdvReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ A short VENDOR event must not fail the connection.
+    ///
+    /// This is the reported `event 0xfc claims 19 params, got 9`, which aborted
+    /// controller init outright. Realtek dongles emit vendor events constantly
+    /// and this stack decodes none of them, so refusing to connect over one
+    /// arriving short is failing on data that was going to be discarded either
+    /// way — and it made the dongle look flaky when the link was fine.
+    #[test]
+    fn a_truncated_vendor_event_is_kept_not_rejected() {
+        // Claims 19 params, carries 9 — exactly the observed packet shape.
+        let mut buf = vec![0xFC, 19];
+        buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        match parse_event(&buf) {
+            Ok(Event::Other { code, params }) => {
+                assert_eq!(code, 0xFC);
+                assert_eq!(params.len(), 9, "the bytes that DID arrive are kept");
+            }
+            other => panic!("expected Event::Other, got {other:?}"),
+        }
+    }
+
+    /// ⛔ But truncation still fails for events we decode.
+    ///
+    /// Reading a connection handle or a disconnect reason out of bytes that
+    /// never arrived would invent link state, which is far worse than an error.
+    #[test]
+    fn a_truncated_decoded_event_is_still_an_error() {
+        for code in [
+            EVT_COMMAND_COMPLETE,
+            EVT_COMMAND_STATUS,
+            EVT_DISCONNECTION_COMPLETE,
+            EVT_ENCRYPTION_CHANGE,
+            EVT_LE_META,
+        ] {
+            let buf = vec![code, 19, 1, 2, 3];
+            assert!(
+                parse_event(&buf).is_err(),
+                "{code:#04x} truncated must not decode",
+            );
+        }
+    }
 
     #[test]
     fn reset_opcode_is_0x0c03() {

@@ -65,6 +65,25 @@ impl From<rusb::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// What a link actually negotiated, as opposed to what was asked for.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkParams {
+    pub conn_handle: u16,
+    /// Connection interval in 1.25 ms units.
+    pub interval: u16,
+    /// Supervision timeout in 10 ms units.
+    pub supervision_timeout: u16,
+}
+
+impl LinkParams {
+    pub fn interval_ms(&self) -> f32 {
+        self.interval as f32 * 1.25
+    }
+    pub fn timeout_ms(&self) -> u32 {
+        self.supervision_timeout as u32 * 10
+    }
+}
+
 /// An open Bluetooth dongle, ready to exchange HCI traffic.
 pub struct Dongle {
     handle: rusb::DeviceHandle<rusb::GlobalContext>,
@@ -163,15 +182,28 @@ impl Dongle {
     /// misled by validators that locked onto the first thing they saw.
     pub fn command_sync(&self, opcode: Opcode, params: &[u8]) -> Result<CommandComplete> {
         self.send_command(opcode, params)?;
-        for _ in 0..16 {
-            match self.read_event()? {
+        // ❗ Bounded by TIME, not by a count of events.
+        //
+        // This used to give up after 16 events. That is fine on an idle dongle
+        // and wrong the moment links are streaming: a controller emits
+        // `Number Of Completed Packets` continuously for ACL flow control, and
+        // with two halves at ~67 Hz that backlog exhausts a 16-event budget
+        // before the Command Complete is ever reached. The command had usually
+        // succeeded; we simply stopped listening too early and reported
+        // "no Command Complete within timeout".
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match self.read_event_timeout(Duration::from_millis(100))? {
                 Some(Event::CommandComplete(cc)) if cc.opcode == opcode => return Ok(cc),
-                Some(_) => continue,
-                None => break,
+                // Unrelated events are skipped rather than treated as failures —
+                // a dongle emits plenty unprompted, and the earlier Joy-Con work
+                // was repeatedly misled by validators that locked onto the first
+                // thing they saw.
+                _ => continue,
             }
         }
         Err(Error::Protocol(format!(
-            "no Command Complete for {opcode:?} within timeout"
+            "no Command Complete for {opcode:?} within 2 s"
         )))
     }
 }
@@ -306,6 +338,23 @@ impl Dongle {
         interval_min: u16,
         interval_max: u16,
     ) -> Result<u16> {
+        self.le_connect_params(address, address_type, interval_min, interval_max)
+            .map(|p| p.conn_handle)
+    }
+
+    /// [`Dongle::le_connect_interval`], returning what was actually negotiated.
+    ///
+    /// The granted interval is not necessarily the one requested, and it was
+    /// only ever written to `log::info!` — invisible to any tool that does not
+    /// install a logger. A link that silently came up at the wrong interval
+    /// looked identical to one that came up correctly and then misbehaved.
+    pub fn le_connect_params(
+        &self,
+        address: [u8; 6],
+        address_type: u8,
+        interval_min: u16,
+        interval_max: u16,
+    ) -> Result<LinkParams> {
         let mut wire_addr = address;
         wire_addr.reverse();
 
@@ -365,7 +414,7 @@ impl Dongle {
                         interval as f32 * 1.25,
                         supervision_timeout as u32 * 10,
                     );
-                    return Ok(conn_handle);
+                    return Ok(LinkParams { conn_handle, interval, supervision_timeout });
                 }
                 Some(_) => continue,
                 None => continue,
@@ -421,6 +470,283 @@ impl Dongle {
             Ok(n) => Ok(acl::parse_acl(&buf[..n])),
             Err(rusb::Error::Timeout) => Ok(None),
             Err(e) => Err(Error::Usb(e)),
+        }
+    }
+
+    /// Send an ATT request and wait for the matching response on this link.
+    ///
+    /// Input-report notifications arrive continuously at the connection
+    /// interval, so a naive "read one packet" would almost always return a
+    /// report rather than the response. Everything that is not the awaited
+    /// opcode — or an error response for it — is therefore skipped.
+    fn att_request(
+        &self,
+        conn_handle: u16,
+        request: &[u8],
+        response_opcode: u8,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>> {
+        self.send_att(conn_handle, request)?;
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let Some(pkt) = self.read_acl(Duration::from_millis(20))? else {
+                continue;
+            };
+            if pkt.conn_handle != conn_handle || pkt.cid != acl::CID_ATT {
+                continue;
+            }
+            match pkt.payload.first() {
+                Some(&op) if op == response_opcode => return Ok(Some(pkt.payload)),
+                // An error response ends the exchange. Returning it rather than
+                // swallowing it lets the caller tell "walk finished" apart from
+                // "the controller refused", which look identical from a timeout.
+                Some(&acl::ATT_ERROR_RESPONSE) if pkt.payload.get(1) == request.first() => {
+                    return Ok(Some(pkt.payload))
+                }
+                _ => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Walk the peer's whole attribute table: every handle and its type.
+    ///
+    /// Worth doing despite the captured handles in [`crate::joycon`]: a capture
+    /// only shows the handles the capturing stack chose to touch. A
+    /// characteristic Windows never subscribed to leaves no trace in one, so
+    /// "not in the capture" and "not on the device" are indistinguishable
+    /// without an actual walk.
+    pub fn discover_attributes(&self, conn_handle: u16) -> Result<Vec<acl::AttrInfo>> {
+        let mut out: Vec<acl::AttrInfo> = Vec::new();
+        let mut start: u16 = 0x0001;
+        // Bounded so a peer that keeps answering cannot spin forever; an
+        // attribute table this stack cares about is a few dozen entries.
+        for _ in 0..64 {
+            let req = acl::find_information_request(start, 0xFFFF);
+            let rsp = match self.att_request(
+                conn_handle,
+                &req,
+                acl::ATT_FIND_INFORMATION_RESPONSE,
+                Duration::from_secs(2),
+            )? {
+                Some(r) => r,
+                // A timeout on the FIRST request is a failure worth naming; a
+                // timeout later just ends a walk that already produced results.
+                None if out.is_empty() => {
+                    return Err(Error::Protocol(
+                        "no reply to Find Information Request within 2 s".into(),
+                    ))
+                }
+                None => break,
+            };
+            if acl::is_attribute_not_found(&rsp) {
+                break;
+            }
+            if let Some(code) = acl::att_error_code(&rsp) {
+                return Err(Error::Protocol(format!(
+                    "Find Information refused: {code:#04x} {}",
+                    acl::att_error_name(code)
+                )));
+            }
+            let Some(entries) = acl::parse_find_information_response(&rsp) else {
+                return Err(Error::Protocol(format!(
+                    "undecodable Find Information Response: {:02x?}",
+                    &rsp[..rsp.len().min(16)]
+                )));
+            };
+            if entries.is_empty() {
+                break;
+            }
+            let last = entries[entries.len() - 1].handle;
+            out.extend(entries);
+            if last == 0xFFFF {
+                break;
+            }
+            start = last + 1;
+        }
+        Ok(out)
+    }
+
+    /// Walk every characteristic declaration, recovering properties and value
+    /// handles — which is what says whether a characteristic can notify at all.
+    pub fn discover_characteristics(&self, conn_handle: u16) -> Result<Vec<acl::CharDecl>> {
+        let mut out: Vec<acl::CharDecl> = Vec::new();
+        let mut start: u16 = 0x0001;
+        for _ in 0..64 {
+            let req = acl::read_by_type_request(start, 0xFFFF, acl::GATT_CHARACTERISTIC);
+            let rsp = match self.att_request(
+                conn_handle,
+                &req,
+                acl::ATT_READ_BY_TYPE_RESPONSE,
+                Duration::from_secs(2),
+            )? {
+                Some(r) => r,
+                None if out.is_empty() => {
+                    return Err(Error::Protocol(
+                        "no reply to Read By Type Request within 2 s".into(),
+                    ))
+                }
+                None => break,
+            };
+            if acl::is_attribute_not_found(&rsp) {
+                break;
+            }
+            if let Some(code) = acl::att_error_code(&rsp) {
+                return Err(Error::Protocol(format!(
+                    "Read By Type refused: {code:#04x} {}",
+                    acl::att_error_name(code)
+                )));
+            }
+            let Some(pairs) = acl::parse_read_by_type_response(&rsp) else {
+                return Err(Error::Protocol(format!(
+                    "undecodable Read By Type Response: {:02x?}",
+                    &rsp[..rsp.len().min(16)]
+                )));
+            };
+            if pairs.is_empty() {
+                break;
+            }
+            let last = pairs[pairs.len() - 1].0;
+            for (h, v) in pairs {
+                if let Some(c) = acl::parse_characteristic(h, &v) {
+                    out.push(c);
+                }
+            }
+            if last == 0xFFFF {
+                break;
+            }
+            start = last + 1;
+        }
+        Ok(out)
+    }
+
+    /// The dongle's own BD_ADDR, in natural (display) order.
+    ///
+    /// The wire carries it least-significant byte first, like every multi-byte
+    /// HCI field, so it is reversed here to match how addresses are written
+    /// down and how [`Dongle::le_connect`] takes them.
+    pub fn read_bd_addr(&self) -> Result<[u8; 6]> {
+        let cc = self.command_sync(hci::Opcode::READ_BD_ADDR, &[])?;
+        // params = [status][BD_ADDR 6, little-endian]
+        if cc.params.len() < 7 || cc.params[0] != 0 {
+            return Err(Error::Protocol(format!(
+                "HCI_Read_BD_ADDR failed: {:02x?}",
+                cc.params
+            )));
+        }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&cc.params[1..7]);
+        addr.reverse();
+        Ok(addr)
+    }
+
+    /// Read one attribute's value.
+    pub fn read_attribute(&self, conn_handle: u16, handle: u16) -> Result<Option<Vec<u8>>> {
+        Ok(self.read_attribute_detail(conn_handle, handle)?.ok().flatten())
+    }
+
+    /// [`Dongle::read_attribute`], keeping the ATT error code when refused.
+    ///
+    /// ❗ **"Refused" and "silent" are completely different facts and were being
+    /// collapsed into one.** `att_request` returns an Error Response as a
+    /// payload; `parse_read_response` then sees a non-`0x0B` opcode, returns
+    /// `None`, and the caller printed "no reply".
+    ///
+    /// That mattered: a read of `0x000e` — a characteristic streaming
+    /// notifications at 67 Hz, unambiguously alive — reported "no reply", and
+    /// was nearly recorded as evidence that the neighbouring `0x000a` was a
+    /// dead buffer. The error code is the whole content of the answer.
+    ///
+    /// `Ok(Err(code))` = refused with that ATT error. `Ok(Ok(None))` = genuine
+    /// silence, no response at all.
+    pub fn read_attribute_detail(
+        &self,
+        conn_handle: u16,
+        handle: u16,
+    ) -> Result<std::result::Result<Option<Vec<u8>>, u8>> {
+        let rsp = self.att_request(
+            conn_handle,
+            &acl::read_request(handle),
+            acl::ATT_READ_RESPONSE,
+            Duration::from_millis(800),
+        )?;
+        let Some(payload) = rsp else { return Ok(Ok(None)) };
+        if let Some(code) = acl::att_error_code(&payload) {
+            return Ok(Err(code));
+        }
+        Ok(Ok(acl::parse_read_response(&payload)))
+    }
+
+    /// Recover characteristic properties by reading each declaration directly.
+    ///
+    /// The fallback for a peer that answers [`Dongle::discover_attributes`] but
+    /// never answers `Read By Type` — which is exactly what the Joy-Con 2 does,
+    /// and it is not a transient failure: both halves, every run, no reply
+    /// within two seconds while Find Information returns 48 entries happily.
+    ///
+    /// Without this, properties are simply unknown, and "unknown" has meant
+    /// guessing which write opcode a characteristic accepts. That guess has now
+    /// been wrong in both directions.
+    ///
+    /// `attrs` is the table from [`Dongle::discover_attributes`]; every handle
+    /// in it typed `0x2803` is a characteristic declaration whose *value* is
+    /// the properties, value handle and UUID.
+    pub fn read_characteristics(
+        &self,
+        conn_handle: u16,
+        attrs: &[acl::AttrInfo],
+    ) -> Vec<acl::CharDecl> {
+        let mut out = Vec::new();
+        for a in attrs
+            .iter()
+            .filter(|a| a.uuid == acl::AttUuid::Short(acl::GATT_CHARACTERISTIC))
+        {
+            // A single unreadable declaration is skipped rather than aborting
+            // the walk: the rest of the table is still worth having, and a
+            // partial map beats none.
+            if let Ok(Some(v)) = self.read_attribute(conn_handle, a.handle) {
+                if let Some(c) = acl::parse_characteristic(a.handle, &v) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Write to an attribute using whichever opcode it actually accepts.
+    ///
+    /// `opcode` comes from [`acl::CharDecl::write_opcode`]. For an acknowledged
+    /// write this waits for the Write Response and reports an ATT error by
+    /// name; for an unacknowledged one there is nothing to wait for, so it
+    /// returns as soon as the packet is out.
+    pub fn write_attribute(
+        &self,
+        conn_handle: u16,
+        handle: u16,
+        value: &[u8],
+        opcode: u8,
+    ) -> Result<()> {
+        if opcode == acl::ATT_WRITE_COMMAND {
+            return self.send_att(conn_handle, &acl::write_command(handle, value));
+        }
+        let rsp = self.att_request(
+            conn_handle,
+            &acl::write_request(handle, value),
+            acl::ATT_WRITE_RESPONSE,
+            Duration::from_millis(800),
+        )?;
+        match rsp {
+            Some(r) if r.first() == Some(&acl::ATT_WRITE_RESPONSE) => Ok(()),
+            Some(r) => {
+                let code = acl::att_error_code(&r).unwrap_or(0);
+                Err(Error::Protocol(format!(
+                    "write to {handle:#06x} refused: {code:#04x} {}",
+                    acl::att_error_name(code)
+                )))
+            }
+            None => Err(Error::Protocol(format!(
+                "no Write Response from {handle:#06x} within 800 ms"
+            ))),
         }
     }
 

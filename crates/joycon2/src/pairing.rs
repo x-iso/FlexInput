@@ -345,3 +345,44 @@ mod tests {
         assert_eq!(parse_controller_address(&[0x01; 4]), None);
     }
 }
+
+#[cfg(test)]
+mod hardware_capture_tests {
+    use super::*;
+
+    /// Real values captured from a Mobapad M12-S RIGHT half over the dongle.
+    ///
+    /// ⭐ This is the check that decides whether the LTK derivation is right,
+    /// and it needs no hardware to run again. The controller answers `0x15/0x02`
+    /// with `AES128-ECB(LTK, A2)` — a proof that it derived the same key. If our
+    /// derived LTK reproduces that value, the derivation is correct and any
+    /// encryption failure lies elsewhere; if it does not, the derivation is
+    /// wrong and every encryption attempt was doomed.
+    const HOST_KEY_A1: [u8; 16] = [
+        0xea, 0xbd, 0x47, 0x13, 0x89, 0x35, 0x42, 0xc6,
+        0x79, 0xee, 0x07, 0xf2, 0x53, 0x2c, 0x6c, 0x31,
+    ];
+    const DEVICE_KEY_B1: [u8; 16] = [
+        0x5c, 0xf6, 0xee, 0x79, 0x2c, 0xdf, 0x05, 0xe1,
+        0xba, 0x2b, 0x63, 0x25, 0xc4, 0x1a, 0x5f, 0x10,
+    ];
+    const HOST_CHALLENGE_A2: [u8; 16] = [
+        0x40, 0xb0, 0x8a, 0x5f, 0xcd, 0x1f, 0x9b, 0x41,
+        0x12, 0x5c, 0xac, 0xc6, 0x3f, 0x38, 0xa0, 0x73,
+    ];
+    const DEVICE_CONFIRM_B2: [u8; 16] = [
+        0xd8, 0xf0, 0x12, 0x8b, 0x49, 0x29, 0xac, 0x18,
+        0x92, 0x95, 0xa4, 0x65, 0xda, 0x08, 0x1c, 0x14,
+    ];
+
+    #[test]
+    fn the_controller_confirms_the_ltk_we_derived() {
+        let ltk = derive_ltk(&HOST_KEY_A1, &DEVICE_KEY_B1);
+        let ours = expected_confirmation(&ltk, &HOST_CHALLENGE_A2);
+        assert_eq!(
+            ours, DEVICE_CONFIRM_B2,
+            "\n  derived LTK : {ltk:02x?}\n  we expect   : {ours:02x?}\n  device sent : {DEVICE_CONFIRM_B2:02x?}\n\
+             \n  Mismatch means the XOR derivation is NOT how this controller builds the key."
+        );
+    }
+}
