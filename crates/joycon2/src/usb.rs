@@ -239,7 +239,10 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                 stick: (0.0, 0.0),
                 gyro: [0.0; 3],
                 orientation: [0.0; 3],
+                orientation_quat: [0.0, 0.0, 0.0, 1.0],
                 field_rate: [0.0; 3],
+            yaw_rate: 0.0,
+            pin_rate: [0.0; 3],
                 events: 0,
             },
         );
@@ -311,14 +314,26 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                     continue;
                 };
                 let stick = calib.normalize(snap.stick_raw);
-                let o = orientation.update(&snap.motion);
+                // Pick up a calibration measured on THIS controller, if the user has
+                // captured one. Pushed every report rather than at connect: a capture
+                // that finishes while the pad is streaming must take effect at once,
+                // and an unchanged value costs one read lock.
+                orientation.set_resting_drift(crate::cal::field_drift(&key));
+                let o = orientation.update(&snap.motion, side);
                 reports += 1;
                 if let Some(pad) = shared.pads.lock().unwrap().get_mut(&key) {
                     pad.streaming = true;
                     pad.snapshot = snap;
                     pad.stick = stick;
                     pad.gyro = o.rate_dps;
+                    // Was missing: a wired pad published zeros on every
+                    // field-derived pin, so `probe_rate_*` read flat and the
+                    // drift calibration had nothing to measure over USB.
+                    pad.field_rate = o.field_rate_dps;
+                    pad.yaw_rate = o.yaw_rate_dps;
+                    pad.pin_rate = o.pin_rate_dps;
                     pad.orientation = o.euler_rad;
+                    pad.orientation_quat = o.quat_xyzw;
                     pad.events = pad.events.saturating_add(1);
                 }
             }

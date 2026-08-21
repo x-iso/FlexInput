@@ -44,11 +44,6 @@ const DEFAULT_PID: u16 = 0xA728;
 /// Most halves to hold at once. Two is a full pair.
 const MAX_LINKS: usize = 2;
 
-/// How long each discovery window runs while looking for more controllers.
-const SCAN_WINDOW: Duration = Duration::from_secs(2);
-/// Rest between discovery windows. Scanning shares the radio with live links,
-/// so this stays generous once anything is connected.
-const SCAN_GAP: Duration = Duration::from_secs(3);
 
 /// Spacing between the fire-and-forget init writes.
 ///
@@ -67,6 +62,32 @@ struct Shared {
     /// Transport state, published so the WinRT hub can stand down — see
     /// [`Joycon2DongleHub::state_flag`] and [`DONGLE_PROBING`].
     state: Arc<AtomicU8>,
+    /// Set by the worker as its last act, so shutdown can tell "finished
+    /// tearing the links down" from "stuck".
+    finished: AtomicBool,
+    /// Addresses already identified as Joy-Cons, and which half each is.
+    ///
+    /// ⭐ Once a controller has been recognised, it never needs recognising
+    /// again. Identification depends on manufacturer data that only rides in
+    /// the SCAN RESPONSE, so every reconnect otherwise waits for another one —
+    /// and a Joy-Con sleeps and wakes constantly, so that wait is paid over and
+    /// over. Remembering the address turns a wake into an immediate connect.
+    ///
+    /// Only ever populated from a report that DID carry the data, so this
+    /// caches a fact the controller told us rather than a guess.
+    known: Mutex<HashMap<[u8; 6], Side>>,
+    /// Controllers already paired during this run.
+    ///
+    /// ❗ **Pairing WRITES CONTROLLER FLASH**, twice — the finalise step and the
+    /// link-key commit. Without this the dongle re-ran the whole handshake on
+    /// every connect, and since a Joy-Con sleeps and reconnects on a button
+    /// press that meant a fresh pair of flash writes every time the user woke
+    /// it. The Bluetooth hub already caches for exactly this reason and the
+    /// research notes say the `0x15` commands are omitted on reconnection.
+    ///
+    /// In memory only, so it survives a reconnect but not an app restart —
+    /// which still removes the great majority of writes.
+    paired: Mutex<HashMap<[u8; 6], [u8; 16]>>,
 }
 
 /// A live connection to one half.
@@ -94,6 +115,15 @@ struct Link {
 /// Joy-Con 2 transport over a dedicated BLE dongle.
 pub struct Joycon2DongleHub {
     shared: Arc<Shared>,
+    /// Kept so shutdown can WAIT for the thread to tear the links down.
+    ///
+    /// ❗ Without this the handle was dropped on spawn, so closing the app set
+    /// the shutdown flag and exited immediately — the thread was killed before
+    /// it could send a single HCI Disconnect. The controller then held a link
+    /// to a process that no longer existed until its supervision timeout, and
+    /// the next run found a controller that was connected to nobody and would
+    /// not advertise. That is a large part of "it takes several attempts".
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Default for Joycon2DongleHub {
@@ -108,11 +138,14 @@ impl Joycon2DongleHub {
     pub fn new() -> Self {
         let shared: Arc<Shared> = Arc::default();
         let t = Arc::clone(&shared);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("jc2-dongle".into())
             .spawn(move || run(t))
             .expect("spawn jc2-dongle thread");
-        Self { shared }
+        Self {
+            shared,
+            thread: Mutex::new(Some(thread)),
+        }
     }
 
     pub fn pads(&self) -> Vec<PadState> {
@@ -149,6 +182,30 @@ impl Joycon2DongleHub {
 impl Drop for Joycon2DongleHub {
     fn drop(&mut self) {
         self.shutdown();
+        // Wait for the teardown. The loop tests the shutdown flag every
+        // iteration and its longest sleep is 50 ms, so this costs a fraction of
+        // a second on exit and buys a controller that is actually disconnected
+        // rather than one still holding a link to a dead process.
+        // ❗ BOUNDED. A plain `join()` here hangs the whole application when the
+        // worker is stuck — which is exactly the state worth exiting from, and
+        // the state the user hit: a controller mid-init, the thread blocked,
+        // and closing FlexInput simply never completing.
+        //
+        // Waiting on a flag rather than the thread means a healthy shutdown
+        // still tears the links down properly, and an unhealthy one costs a
+        // second and then lets go. Leaking a detached thread at process exit is
+        // free; hanging is not.
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        while !self.shared.finished.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.shared.finished.load(Ordering::Relaxed) {
+            if let Some(t) = self.thread.lock().unwrap().take() {
+                let _ = t.join();
+            }
+        } else {
+            eprintln!("[jc2-dongle] worker did not finish in time — leaving it detached");
+        }
     }
 }
 
@@ -345,6 +402,193 @@ fn scan_gatt(dongle: &Dongle, conn: u16) {
     );
 }
 
+/// Send one command on the working per-side handle and wait for its reply.
+///
+/// The rest of init is deliberately fire-and-forget — waiting on each reply
+/// once turned a millisecond handshake into ~40 s in the Bluetooth backend, and
+/// the controller powered itself off before it finished. Pairing is the one
+/// sequence that CANNOT work that way: each step consumes the previous step's
+/// response, so there is nothing to do but wait.
+///
+/// Replies arrive on [`jc::HANDLE_CMD_RESPONSE`] (`0x001a`), which is already
+/// subscribed. Matching is on the command id, not merely on "something
+/// arrived": input notifications and vendor events share this drain.
+fn cmd_and_wait(
+    dongle: &Dongle,
+    conn: u16,
+    cmd: u8,
+    sub: u8,
+    data: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let frame = protocol::rumble_cmd_frame(cmd, sub, data);
+    dongle
+        .send_att(conn, &acl::write_command(jc::HANDLE_CMD_WRITE, &frame))
+        .ok()?;
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for pkt in dongle.drain_acl(64) {
+            if pkt.cid != acl::CID_ATT {
+                continue;
+            }
+            let Some(n) = acl::parse_notification(&pkt.payload) else { continue };
+            if n.handle != jc::HANDLE_CMD_RESPONSE {
+                continue;
+            }
+            if let Some((hdr, body)) =
+                protocol::parse_response(&n.value, protocol::CMD_RESP_HEADER_OFFSET, cmd)
+            {
+                if hdr.subcmd == sub {
+                    return Some(body.to_vec());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Run the LTK pairing handshake over the dongle.
+///
+/// ⭐ **The dongle path has never done this, and the Windows path always has.**
+/// That asymmetry is worth closing on its own — a controller paired over one
+/// transport and not the other behaves differently for reasons nothing in the
+/// code explains — but the specific reason to try it now is that two
+/// characteristics declare `[READ|NOTIFY]` and refuse both:
+///
+/// ```text
+///   0x000a  ab7de9be-…-7fd2   Read Not Permitted, never notifies
+///   0x0026  ab7de9be-…-7fde   Read Not Permitted, never notifies
+/// ```
+///
+/// A peripheral gating attributes behind an authenticated relationship is
+/// exactly what that looks like, and the transport that HAS such a relationship
+/// is the one we never gave those attributes to. This is the cheapest way to
+/// find out, and it costs one handshake.
+///
+/// ❗ **The finalise step writes controller flash**, which is why this is opt-out
+/// rather than unconditional: `FLEXINPUT_JC2_DONGLE_PAIR=off` skips it. A real
+/// Joy-Con buzzes when it lands, which is a better success signal than any log
+/// line — the Windows path produces that buzz and this one never has.
+///
+/// Failure is non-fatal at every step. Pairing is an enhancement to a link that
+/// already streams input, and a controller that refuses it must still work.
+fn run_pairing(dongle: &Dongle, conn: u16, side: Side) -> Option<[u8; 16]> {
+    use protocol::{CMD_PAIRING, SUB_PAIR_CONFIRM_LTK, SUB_PAIR_EXCHANGE_ADDRS,
+                   SUB_PAIR_EXCHANGE_KEYS, SUB_PAIR_FINALISE};
+    use crate::pairing;
+
+    if std::env::var("FLEXINPUT_JC2_DONGLE_PAIR")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("off") || v == "0")
+    {
+        eprintln!("[jc2-dongle] pairing SKIPPED (FLEXINPUT_JC2_DONGLE_PAIR=off)");
+        return None;
+    }
+
+    let name = side.display_name();
+    // ❗ A synthetic host rather than giving up. `read_bd_addr` has failed on
+    // this dongle before, and skipping the whole handshake over it would answer
+    // nothing — the question is whether pairing changes what the controller
+    // exposes, and the controller only stores whatever host address it is
+    // handed. A made-up one still exercises every step; it only matters for
+    // reconnect, where the pad advertises the host it is bonded to.
+    let host = match dongle.read_bd_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "[jc2-dongle] {name} pairing: cannot read local BD_ADDR ({e}) —                  using a synthetic host, reconnect binding will be wrong"
+            );
+            [0x02, 0x00, 0x00, 0xFE, 0xED, 0x01]
+        }
+    };
+    eprintln!("[jc2-dongle] {name} pairing: host {host:02x?}");
+    let wait = Duration::from_millis(800);
+
+    // 1. Addresses.
+    //
+    // ❗ Every step reports its own failure. These used to be bare `?`, which
+    // returned with nothing logged — so a handshake that died at step one was
+    // indistinguishable from one that never ran, and "no authentication
+    // happening" could not be told from "authentication refused".
+    let Some(resp) = cmd_and_wait(
+        dongle, conn, CMD_PAIRING, SUB_PAIR_EXCHANGE_ADDRS,
+        &pairing::exchange_addresses_data(&[host]), wait,
+    ) else {
+        eprintln!("[jc2-dongle] {name} PAIRING FAILED: no reply to address exchange");
+        return None;
+    };
+    if let Some(addr) = pairing::parse_controller_address(&resp) {
+        eprintln!("[jc2-dongle] {name} pairing: controller address {addr:02x?}");
+    }
+
+    // 2. Keys. A1 is arbitrary; `uuid` v4 is already a dependency and is backed
+    //    by a proper CSPRNG, so it doubles as the random source.
+    let a1: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+    let Some(resp) = cmd_and_wait(
+        dongle, conn, CMD_PAIRING, SUB_PAIR_EXCHANGE_KEYS,
+        &pairing::exchange_keys_data(&a1), wait,
+    ) else {
+        eprintln!("[jc2-dongle] {name} PAIRING FAILED: no reply to key exchange");
+        return None;
+    };
+    let Some(b1) = pairing::parse_key_response(&resp) else {
+        eprintln!("[jc2-dongle] {name} PAIRING FAILED: malformed key response {resp:02x?}");
+        return None;
+    };
+    let ltk = pairing::derive_ltk(&a1, &b1);
+
+    // 3. Challenge / confirmation.
+    let a2: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+    let Some(resp) = cmd_and_wait(
+        dongle, conn, CMD_PAIRING, SUB_PAIR_CONFIRM_LTK,
+        &pairing::confirm_ltk_data(&a2), wait,
+    ) else {
+        eprintln!("[jc2-dongle] {name} PAIRING FAILED: no reply to LTK challenge");
+        return None;
+    };
+    match pairing::parse_key_response(&resp) {
+        Some(b2) => match pairing::check_confirmation(
+            &pairing::expected_confirmation(&ltk, &a2),
+            &b2,
+        ) {
+            pairing::Confirmation::Match => {
+                eprintln!("[jc2-dongle] {name} pairing: LTK confirmed")
+            }
+            pairing::Confirmation::MatchReversed => {
+                eprintln!("[jc2-dongle] {name} pairing: LTK confirmed (byte-reversed)")
+            }
+            // Advisory, not fatal: the controller decides whether pairing is
+            // accepted, and a mismatch most likely means our byte-order reading
+            // of the exchange is off rather than that the LTK is wrong.
+            pairing::Confirmation::Mismatch => {
+                eprintln!("[jc2-dongle] {name} pairing: LTK confirmation MISMATCH, continuing")
+            }
+        },
+        None => eprintln!("[jc2-dongle] {name} pairing: malformed challenge response"),
+    }
+
+    // 4. Finalise — THIS writes controller flash.
+    let _ = cmd_and_wait(
+        dongle, conn, CMD_PAIRING, SUB_PAIR_FINALISE, &pairing::finalise_data(), wait,
+    );
+    // 5. Register the link key, then commit it. `0x09` is the second flash
+    //    write; reconnects re-send `0x07` alone.
+    let registered = cmd_and_wait(
+        dongle, conn, protocol::CMD_PAIRING_EXTRA, pairing::SUB_REGISTER_LINK_KEY,
+        &pairing::register_link_key_data(&host, &ltk), wait,
+    );
+    let committed = cmd_and_wait(
+        dongle, conn, protocol::CMD_PAIRING_EXTRA, pairing::SUB_LINK_KEY_COMMIT, &[], wait,
+    );
+    eprintln!(
+        "[jc2-dongle] {name} PAIRED — LTK {ltk:02x?} registered={} committed={} \
+         (controller flash written)",
+        registered.is_some(),
+        committed.is_some(),
+    );
+    Some(ltk)
+}
+
 /// Read the readable vendor characteristics and dump them.
 ///
 /// ⭐ **`0x0026` does not have to notify for us to see what is in it.** The
@@ -438,6 +682,15 @@ pub const DONGLE_ACTIVE: u8 = 1;
 pub const DONGLE_ABSENT: u8 = 2;
 
 fn run(shared: Arc<Shared>) {
+    // Open the log FIRST, before anything can fail.
+    //
+    // It used to be created lazily on the first `dlog!`, which meant that every
+    // way this thread can give up early — no dongle, open failure, a claim
+    // refused — produced no file at all. Those are exactly the runs worth
+    // reading, and "the log is nowhere to be found" is an unhelpful thing for
+    // a diagnostic to say about itself.
+    dlog!("dongle thread start");
+
     // Whatever happens below, the hub must eventually be released; without this
     // an early return would leave it standing down forever and Joy-Cons would
     // stop working entirely on machines with no dongle.
@@ -460,32 +713,26 @@ fn run(shared: Arc<Shared>) {
     let _release = ReleaseUnlessActive(Arc::clone(&shared.state));
 
     let (vid, pid) = configured_dongle();
-    let dongle = match Dongle::open(vid, pid) {
-        Ok(d) => d,
-        Err(e) => {
-            // ❗ This was `log::info!` — the quietest line in the file, for the
-            // event with the largest visible consequence. A machine with no
-            // dongle is the ordinary case and says so once; but "another
-            // process already has it" is a mistake worth naming, because the
-            // user sees only that Windows stole their controllers again.
-            //
-            // The usual cause is a second FlexInput instance or a leftover
-            // `jc2_imu`: a WinUSB device admits ONE owner, so whichever
-            // process opened it first keeps it and every other one lands here.
-            eprintln!(
-                "[jc2-dongle] cannot open dongle {vid:04x}:{pid:04x} ({e})\n\
-                 [jc2-dongle] if a dongle IS plugged in, another process holds it — \
-                 close any other FlexInput instance or jc2_* probe and restart.\n\
-                 [jc2-dongle] Joy-Cons will fall back to the Windows stack until then."
-            );
-            return;
-        }
-    };
-    if let Err(e) = dongle.reset_and_init() {
-        eprintln!("[jc2-dongle] controller init failed: {e}");
+    // ⭐ SHARED, not owned. This hub and the Bluetooth Classic transport run on
+    // the same adapter at the same time, which is what a dual-mode radio is
+    // for — see `flexinput_btle::radio`. Whichever asks first opens and
+    // initialises it; the other joins. Ownership used to be a startup race
+    // whose loser reported "another process holds it" about its own process.
+    //
+    // ❗ Reads come from `sub`; anything that sends and waits for a reply goes
+    // through `radio.with_dongle`, which holds the router off for the length of
+    // the conversation.
+    let Some(radio) = flexinput_btle::radio::shared(vid, pid) else {
+        eprintln!(
+            "[jc2-dongle] no usable dongle {vid:04x}:{pid:04x} — is it bound to \
+             WinUSB via Zadig?\n\
+             [jc2-dongle] Joy-Cons will fall back to the Windows stack."
+        );
+        dlog!("no usable dongle {vid:04x}:{pid:04x}");
         return;
-    }
-    eprintln!("[jc2-dongle] dongle {vid:04x}:{pid:04x} ready");
+    };
+    let sub = flexinput_btle::radio::subscribe(&radio);
+    eprintln!("[jc2-dongle] dongle {vid:04x}:{pid:04x} ready (shared)");
     // From here on the WinRT hub must leave Joy-Cons alone; cleared on the way
     // out so unplugging the dongle hands them back rather than stranding them.
     shared.state.store(DONGLE_ACTIVE, Ordering::Relaxed);
@@ -499,45 +746,59 @@ fn run(shared: Arc<Shared>) {
     // seconds, and only settling once the second half connected and scanning
     // stopped. ACL now drains continuously while the scan runs.
     let mut scanning = false;
-    let mut scan_deadline = Instant::now();
-    let mut last_scan_end = Instant::now() - SCAN_GAP;
+    let mut scan_retry_at = Instant::now();
 
     while !shared.shutdown.load(Ordering::Relaxed) {
-        // ❗ The rest between scan windows exists to share the radio with LIVE
-        // LINKS. Applying it with nothing connected left the dongle deaf for
-        // 3 s out of every 5 — and a Joy-Con advertises only in a short burst
-        // after a button wake, so waking it during the deaf window missed the
-        // whole burst. That is the "took ten attempts to find them" symptom;
-        // `jc2_imu` scans back-to-back and connects on the first try.
+        // ⭐ SCAN CONTINUOUSLY until every half is connected. No windowing.
         //
-        // With nothing connected there is no traffic to protect, so scan
-        // continuously.
-        let gap = if links.is_empty() { Duration::ZERO } else { SCAN_GAP };
-        if links.len() < MAX_LINKS && !scanning && last_scan_end.elapsed() >= gap {
-            match dongle.start_le_scan() {
+        // This used to scan for 2 s, stop, and rest 3 s — and with a link held
+        // the radio itself only listened half of each window on top of that.
+        // Roughly 20% of the time actually spent listening, against a Joy-Con
+        // that advertises in a short burst after a button wake. Missing four
+        // bursts out of five is the whole "it takes several attempts, and it is
+        // far worse when one Joy-Con is already connected" complaint.
+        //
+        // The rest existed to protect live links, on the theory that scanning
+        // was what dropped them. That theory was tested and disproved: links
+        // still dropped at ~29 s with scanning fully disabled, so the airtime
+        // was being given up for nothing. A controller can scan and hold a
+        // connection at once; the cost is a little link jitter, which is
+        // enormously preferable to not connecting at all.
+        //
+        // Stopping is now driven by state, not by a timer: scan while a half is
+        // missing, stop when the pair is complete.
+        let want_scan = links.len() < MAX_LINKS;
+        if want_scan && !scanning && Instant::now() >= scan_retry_at {
+            match radio.with_dongle(|d| d.start_le_scan_duty(true)) {
                 Ok(()) => {
                     scanning = true;
-                    scan_deadline = Instant::now() + SCAN_WINDOW;
+                    dlog!("scan START ({} link(s) held)", links.len());
                 }
                 Err(e) => {
                     eprintln!("[jc2-dongle] scan enable failed: {e}");
-                    last_scan_end = Instant::now();
+                    dlog!("scan ENABLE FAILED: {e}");
+                    // Back off briefly rather than spinning on a controller
+                    // that is busy — usually a half-finished initiator, which
+                    // `start_le_scan` cancels on the next attempt.
+                    scan_retry_at = Instant::now() + Duration::from_millis(200);
                 }
             }
-        }
-        if scanning && Instant::now() >= scan_deadline {
-            let _ = dongle.stop_le_scan();
+        } else if !want_scan && scanning {
+            let _ = radio.with_dongle(|d| d.stop_le_scan());
             scanning = false;
-            last_scan_end = Instant::now();
+            dlog!("scan STOP — both halves connected");
         }
 
-        let found = pump(&dongle, &shared, &mut links, scanning);
+        let found = pump(&sub, &shared, &mut links, scanning);
 
         if let Some((addr, addr_type, side)) = found {
-            let _ = dongle.stop_le_scan();
+            // Scanning must stop while connecting: a controller cannot scan and
+            // initiate at the same time.
+            let _ = radio.with_dongle(|d| d.stop_le_scan());
             scanning = false;
-            last_scan_end = Instant::now();
-            match connect_and_init(&dongle, addr, addr_type, side) {
+            dlog!("connect ATTEMPT {addr:02x?} {} type {addr_type}", side.display_name());
+            let t0 = Instant::now();
+            match radio.with_dongle(|d| connect_and_init(&shared, d, addr, addr_type, side)) {
                 // Reject a handle already in use: it means a stale Connection
                 // Complete was returned rather than a new link, and both pads
                 // would then mirror one controller.
@@ -547,14 +808,49 @@ fn run(shared: Arc<Shared>) {
                         side.display_name(),
                         link.conn,
                     );
-                    dongle.cancel_pending_connect();
+                    dlog!(
+                        "connect REJECTED after {} ms — handle {:#06x} already in use",
+                        t0.elapsed().as_millis(), link.conn,
+                    );
+                    radio.with_dongle(|d| d.cancel_pending_connect());
+                    let now = Instant::now();
+                    for l in links.iter_mut() {
+                        l.last_input = now;
+                    }
                 }
                 Ok(link) => {
                     eprintln!("[jc2-dongle] {} handle {:#06x}", side.display_name(), link.conn);
+                    // ❗ The link(s) already held have been unserviced for the
+                    // whole of that init. Their `last_input` is stale through no
+                    // fault of the controller, and INPUT_TIMEOUT is shorter than
+                    // an init takes — so without this the first Joy-Con is
+                    // written off within moments of the second connecting.
+                    let now = Instant::now();
+                    for l in links.iter_mut() {
+                        l.last_input = now;
+                    }
+                    dlog!(
+                        "connect OK after {} ms — handle {:#06x}",
+                        t0.elapsed().as_millis(), link.conn,
+                    );
                     register(&shared, &link);
                     links.push(link);
                 }
-                Err(e) => eprintln!("[jc2-dongle] {} connect failed: {e}", side.display_name()),
+                Err(e) => {
+                    eprintln!("[jc2-dongle] {} connect failed: {e}", side.display_name());
+                    dlog!("connect FAILED after {} ms: {e}", t0.elapsed().as_millis());
+                    // ❗ A failed `LE_Create_Connection` leaves the controller
+                    // INITIATING, and while it initiates it refuses to scan
+                    // with "Command Disallowed". Without this the next scan
+                    // enable fails, and the one after that, until something
+                    // else happens to clear it — which reads as "it just stops
+                    // finding anything".
+                    radio.with_dongle(|d| d.cancel_pending_connect());
+                    let now = Instant::now();
+                    for l in links.iter_mut() {
+                        l.last_input = now;
+                    }
+                }
             }
         }
 
@@ -564,33 +860,118 @@ fn run(shared: Arc<Shared>) {
         }
     }
 
-    for link in &links {
-        let _ = dongle.disconnect(link.conn);
+    // Tear every link down, and WAIT for the controller to acknowledge.
+    //
+    // Sending Disconnect and closing the USB handle in the same breath loses
+    // the command: the dongle never gets to transmit it, and the controller is
+    // left believing the link is live until supervision timeout. Draining until
+    // each handle reports Disconnection Complete is what makes the next run
+    // find an advertising controller instead of a silent one.
+    if !links.is_empty() {
+        eprintln!("[jc2-dongle] disconnecting {} link(s)", links.len());
+        // ⭐ ONE lease for the whole teardown. Disconnecting and then waiting
+        // for each confirmation is a conversation, and the router must not eat
+        // the Disconnection Completes we are waiting on.
+        let lease = radio.exclusive();
+        let dongle = lease.dongle();
+        for link in &links {
+            let _ = dongle.disconnect(link.conn);
+        }
+        let deadline = Instant::now() + Duration::from_millis(600);
+        let mut open: Vec<u16> = links.iter().map(|l| l.conn).collect();
+        while !open.is_empty() && Instant::now() < deadline {
+            match dongle.read_event_timeout(Duration::from_millis(50)) {
+                Ok(Some(Event::DisconnectionComplete { conn_handle, .. })) => {
+                    open.retain(|h| *h != conn_handle);
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        if open.is_empty() {
+            eprintln!("[jc2-dongle] all links closed cleanly");
+        } else {
+            eprintln!("[jc2-dongle] {} link(s) did not confirm disconnect", open.len());
+        }
     }
+    dlog!("dongle thread exit");
+    shared.finished.store(true, Ordering::Relaxed);
 }
 
+
 /// Decide whether an advertising report is a Joy-Con 2 worth connecting to.
-fn advert_match(r: &flexinput_btle::hci::AdvReport, links: &[Link]) -> Option<([u8; 6], u8, Side)> {
-    let md = r.manufacturer_data()?;
+fn advert_match(
+    shared: &Arc<Shared>,
+    r: &flexinput_btle::hci::AdvReport,
+    links: &[Link],
+) -> Option<([u8; 6], u8, Side)> {
+    // A controller we have already identified needs no manufacturer data.
+    // Copied out to a local before branching — the guard would otherwise live
+    // for the whole block, and this function locks `known` again further down.
+    // See the deadlock note in `connect_and_init`.
+    let known_side = shared.known.lock().unwrap().get(&r.address).copied();
+    if let Some(side) = known_side {
+        if links.iter().any(|l| l.key.address == r.address) {
+            return None;
+        }
+        dlog!("adv {:02x?} {} KNOWN — matching without scan response",
+              r.address, side.display_name());
+        return Some((r.address, r.address_type, side));
+    }
+    // Every rejection below is logged with its reason. They were all bare
+    // `return None`, so a controller that advertised and was turned away looked
+    // exactly like one that never advertised at all.
+    let Some(md) = r.manufacturer_data() else {
+        // `event_type` 0x00 is ADV_IND, 0x04 is SCAN_RSP. Logged because which
+        // one carries the identifying payload is the whole question here.
+        dlog!(
+            "adv {:02x?} rssi {} type {} — no manufacturer data, {} data bytes",
+            r.address, r.rssi, r.event_type, r.data.len(),
+        );
+        return None;
+    };
     // The company id is INCLUDED in this stack's manufacturer data (unlike
     // btleplug, which strips it into a map key), so VID sits at 5 and PID at 7
     // rather than 3 and 5.
-    if md.len() < 9 || u16::from_le_bytes([md[0], md[1]]) != protocol::NINTENDO_MANUFACTURER_ID {
+    if md.len() < 9 {
+        dlog!("adv {:02x?} — manufacturer data only {} bytes: {md:02x?}", r.address, md.len());
         return None;
     }
-    if u16::from_le_bytes([md[5], md[6]]) != protocol::NINTENDO_VID {
+    let company = u16::from_le_bytes([md[0], md[1]]);
+    if company != protocol::NINTENDO_MANUFACTURER_ID {
+        dlog!("adv {:02x?} — company {company:#06x}, not Nintendo", r.address);
+        return None;
+    }
+    let vid = u16::from_le_bytes([md[5], md[6]]);
+    if vid != protocol::NINTENDO_VID {
+        dlog!("adv {:02x?} — VID {vid:#06x}, not Nintendo", r.address);
         return None;
     }
     let pid = u16::from_le_bytes([md[7], md[8]]);
-    let side = Side::from_pid(pid)?;
-    if Side::is_safe_mode(pid) || links.iter().any(|l| l.key.address == r.address) {
+    let Some(side) = Side::from_pid(pid) else {
+        dlog!("adv {:02x?} — PID {pid:#06x} is not a known half", r.address);
+        return None;
+    };
+    if Side::is_safe_mode(pid) {
+        dlog!("adv {:02x?} {} — SAFE MODE (PID {pid:#06x}), refusing",
+              r.address, side.display_name());
         return None;
     }
+    if links.iter().any(|l| l.key.address == r.address) {
+        dlog!("adv {:02x?} {} — already connected", r.address, side.display_name());
+        return None;
+    }
+    dlog!(
+        "adv {:02x?} {} MATCH — pid {pid:#06x} rssi {} addr_type {} data {md:02x?}",
+        r.address, side.display_name(), r.rssi, r.address_type,
+    );
+    shared.known.lock().unwrap().insert(r.address, side);
     Some((r.address, r.address_type, side))
 }
 
 /// Connect, subscribe and initialise one controller.
 fn connect_and_init(
+    shared: &Arc<Shared>,
     dongle: &Dongle,
     address: [u8; 6],
     address_type: u8,
@@ -701,7 +1082,23 @@ fn connect_and_init(
     let cmd = |c: u8, s: u8, data: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
         let frame = protocol::rumble_cmd_frame(c, s, data);
         dongle.send_att(conn, &acl::write_command(jc::HANDLE_CMD_WRITE, &frame))?;
-        std::thread::sleep(INIT_GAP);
+        // ⭐ Keep draining while we wait, rather than sleeping blind.
+        //
+        // Initialising the SECOND controller takes about three seconds, and for
+        // all of it the first one was going unserviced — its notifications
+        // piling up in the dongle's ACL buffer with nobody reading them. A
+        // controller whose buffers fill stops being able to send, which looks
+        // from the outside like the first Joy-Con dying the moment the second
+        // one connects.
+        //
+        // The data drained here belongs to a link this function knows nothing
+        // about, so it is discarded; a few dropped reports during init is
+        // nothing next to stalling the transport.
+        let until = Instant::now() + INIT_GAP;
+        while Instant::now() < until {
+            let _ = dongle.drain_acl(64);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         Ok(())
     };
 
@@ -713,6 +1110,46 @@ fn connect_and_init(
     // Controller-memory reads. These carry factory calibration; other
     // implementations report that skipping them leaves the controller emitting
     // stub reports indefinitely.
+    // ⭐ Pair BEFORE the rest of init, not after.
+    //
+    // It used to run last, after the report-rate descriptor had already started
+    // the input stream — so two controller-flash writes landed in the middle of
+    // a live stream. The controller then showed its player LED (connected) while
+    // FlexInput listed nothing at all: reports had stopped and never resumed,
+    // and the log simply ended.
+    //
+    // The Bluetooth hub has always paired before finishing init, and its logs
+    // read `paired …` then `init complete` then `steady state`. Matching that
+    // order keeps the stream-start as the last thing that happens, which is
+    // also what makes it recoverable — nothing after it can disturb it.
+    // ❗ The lookup is a STATEMENT, not an `if let` scrutinee, and that is not
+    // style. A `MutexGuard` created in an `if let` condition lives until the end
+    // of the whole if/else-if chain, so
+    //
+    //     if let Some(prev) = shared.paired.lock().unwrap().get(..).copied() {
+    //     } else if let Some(ltk) = run_pairing(..) {
+    //         shared.paired.lock().unwrap().insert(..);   // deadlock
+    //     }
+    //
+    // takes the same non-reentrant lock twice and blocks the thread forever.
+    // It hung exactly here: the console printed `PAIRED`, the very next log
+    // line never arrived, the controller kept its link, and closing the app
+    // stranded it because the teardown is at the end of a thread that could no
+    // longer reach it.
+    let already_paired = shared.paired.lock().unwrap().get(&address).copied();
+    match already_paired {
+        Some(prev) => eprintln!(
+            "[jc2-dongle] {} already paired this run, skipping the flash writes (LTK {prev:02x?})",
+            side.display_name(),
+        ),
+        None => {
+            if let Some(ltk) = run_pairing(dongle, conn, side) {
+                shared.paired.lock().unwrap().insert(address, ltk);
+            }
+        }
+    }
+
+    dlog!("init: pairing done, starting memory reads");
     for (size, addr) in protocol::JC2_INIT_MEMORY_READS {
         cmd(
             protocol::CMD_READ_MEMORY,
@@ -721,7 +1158,26 @@ fn connect_and_init(
         )?;
     }
 
+    dlog!("init: memory reads done");
+
+    // ⭐ CONNECTION FEEDBACK — this is the buzz, and it is a COMMAND.
+    //
+    // The Bluetooth hub sends `0x0a/0x02` (play a canned vibration preset) as
+    // the first step after the memory reads, and the dongle path never has. A
+    // Joy-Con paired over the Windows stack buzzes; over the dongle it does
+    // not — and that difference was reasonably, but wrongly, read as evidence
+    // that dongle pairing was being refused.
+    //
+    // It is not evidence of anything about pairing. Pairing reports a genuine
+    // cryptographic agreement at every step: the controller returns its device
+    // key, and the AES confirmation it sends back matches the one derived from
+    // the LTK. That cannot be faked by a controller that ignored the exchange.
+    // The buzz was simply a command nobody was sending.
+    cmd(protocol::CMD_VIBRATION, 0x02, &[0x03, 0, 0, 0])?;
+    dlog!("init: connection feedback (buzz) sent");
+
     cmd(protocol::CMD_PLAYER_LEDS, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0])?;
+    dlog!("init: player LED set");
 
     // ⭐ The feature-select command is now OPTIONAL, and off by default.
     //
@@ -751,8 +1207,29 @@ fn connect_and_init(
     match feature_override() {
         Some(mask) => {
             eprintln!("[jc2-dongle] feature-select ENABLED, mask {mask:#04x} (mouse needs 0x10)");
-            cmd(protocol::CMD_FEATURE_SELECT, 0x02, &[mask, 0, 0, 0])?;
-            cmd(protocol::CMD_FEATURE_SELECT, 0x04, &[mask, 0, 0, 0])?;
+            // ❗ The full captured sequence, in order, not just the two
+            // feature-select frames.
+            //
+            // The hub sends INIT, then `0x11/0x03`, then the 20-byte vibration
+            // payload `0x0a/0x08`, then `0x11/0x01`, and only THEN the confirm.
+            // Its own comment records that official software always sends the
+            // vibration data before the final confirm, and that omitting it was
+            // a real regression once already. The dongle path was sending the
+            // two feature frames back to back with all four intervening steps
+            // missing — a shorter sequence than the one this controller was
+            // captured responding to.
+            cmd(protocol::CMD_FEATURE_SELECT, protocol::SUB_FEATURE_INIT, &[mask, 0, 0, 0])?;
+            cmd(protocol::CMD_UNKNOWN_11, 0x03, &[])?;
+            cmd(
+                protocol::CMD_VIBRATION,
+                0x08,
+                &[
+                    0x01, 0x59, 0x09, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x35,
+                    0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ],
+            )?;
+            cmd(protocol::CMD_UNKNOWN_11, 0x01, &[])?;
+            cmd(protocol::CMD_FEATURE_SELECT, protocol::SUB_FEATURE_CONFIRM, &[mask, 0, 0, 0])?;
 
             // ⭐ Mirror it onto the COMMON command characteristic, bare.
             //
@@ -780,6 +1257,7 @@ fn connect_and_init(
         ),
     }
 
+    dlog!("init: feature-select done, writing report-rate descriptor");
     // The vendor report-rate descriptor. WITHOUT THIS the controller streams
     // stub reports forever — counter incrementing, every field zero — which is
     // indistinguishable from a parser bug. It is the single most expensive
@@ -789,8 +1267,9 @@ fn connect_and_init(
         &acl::write_request(jc::HANDLE_INPUT_REPORT_RATE, &protocol::REPORT_RATE_PAYLOAD),
     )?;
 
-    // With init done, read what the silent streams actually hold.
+    dlog!("init: report-rate written, stream should start now");
     probe_readable(dongle, conn);
+    dlog!("init: COMPLETE");
 
     Ok(Link {
         key: PadKey { side, address },
@@ -818,7 +1297,10 @@ fn register(shared: &Arc<Shared>, link: &Link) {
             stick: (0.0, 0.0),
             gyro: [0.0; 3],
                 orientation: [0.0; 3],
+                orientation_quat: [0.0, 0.0, 0.0, 1.0],
             field_rate: [0.0; 3],
+            yaw_rate: 0.0,
+            pin_rate: [0.0; 3],
             events: 0,
         },
     );
@@ -827,16 +1309,21 @@ fn register(shared: &Arc<Shared>, link: &Link) {
 /// Service every live link: drain ACL, demultiplex by connection handle, and
 /// drop links that go quiet or disconnect.
 fn pump(
-    dongle: &Dongle,
+    sub: &flexinput_btle::radio::Subscriber,
     shared: &Arc<Shared>,
     links: &mut Vec<Link>,
     scanning: bool,
 ) -> Option<([u8; 6], u8, Side)> {
     let mut found = None;
+    // ⭐ From the shared radio's fan-out, not from the dongle directly. One
+    // reader feeds every transport; reading the transport here would consume
+    // the other one's traffic as well as ours.
+    //
     // Events first — a disconnect must be noticed before its handle is reused.
-    while let Ok(Some(evt)) = dongle.read_event_timeout(Duration::from_millis(1)) {
+    while let Some(evt) = sub.recv_event(Duration::from_millis(1)) {
         match evt {
             Event::DisconnectionComplete { conn_handle, reason } => {
+                dlog!("DISCONNECT handle {conn_handle:#06x} reason {reason:#04x}");
                 if let Some(pos) = links.iter().position(|l| l.conn == conn_handle) {
                     let link = links.remove(pos);
                     eprintln!(
@@ -847,9 +1334,22 @@ fn pump(
                 }
             }
             Event::LeAdvertisingReport(r) if scanning && found.is_none() => {
-                found = advert_match(&r, links);
+                found = advert_match(shared, &r, links);
             }
-            _ => {}
+            // ⭐ Reports that arrive when we are NOT looking, logged too.
+            //
+            // `found.is_none()` means only the first match per pass is taken,
+            // and `scanning` gates the rest — so a controller whose whole
+            // advertising burst lands in a window where either was false is
+            // discarded without a trace. That is precisely the "woke it and
+            // nothing happened" case, and it is invisible from the console.
+            Event::LeAdvertisingReport(r) => {
+                dlog!(
+                    "adv {:02x?} rssi {} IGNORED — scanning={scanning} already_found={}",
+                    r.address, r.rssi, found.is_some(),
+                );
+            }
+            other => dlog!("event {other:?}"),
         }
     }
 
@@ -860,7 +1360,14 @@ fn pump(
     // and whichever half was serviced first took nearly all of it — the right
     // half was observed at 6 Hz against the left's 60 Hz. Two halves at a 5 ms
     // connection interval need 400 packets a second, so this has to be greedy.
-    for pkt in dongle.drain_acl(256) {
+    // Same fan-out. Bounded so one very chatty link cannot keep this loop from
+    // returning to its callers' scan and connect handling.
+    let mut drained = 0;
+    while let Some(pkt) = sub.recv_acl(Duration::from_millis(1)) {
+        drained += 1;
+        if drained > 256 {
+            break;
+        }
         if pkt.cid != acl::CID_ATT {
             continue;
         }
@@ -958,7 +1465,12 @@ fn pump(
         // Orientation from gravity (roll, pitch) and the heading field (yaw),
         // differenced into a rate. No zero-rate correction step any more:
         // both sources are absolute, so there is no bias to accumulate.
-        let o = link.orientation.update(&snap.motion);
+        // Pick up a calibration measured on THIS controller, if the user has
+        // captured one. Pushed every report rather than at connect: a capture
+        // that finishes while the pad is streaming must take effect at once,
+        // and an unchanged value costs one read lock.
+        link.orientation.set_resting_drift(crate::cal::field_drift(&link.key));
+        let o = link.orientation.update(&snap.motion, link.key.side);
         let gyro = o.rate_dps;
 
         // ⭐ MOTION DIAGNOSTIC. The dongle path had no report dump at all,
@@ -1005,7 +1517,10 @@ fn pump(
             pad.stick = stick;
             pad.gyro = gyro;
             pad.field_rate = o.field_rate_dps;
+            pad.yaw_rate = o.yaw_rate_dps;
+            pad.pin_rate = o.pin_rate_dps;
             pad.orientation = o.euler_rad;
+            pad.orientation_quat = o.quat_xyzw;
             pad.events = pad.events.saturating_add(1);
         }
     }
@@ -1020,7 +1535,9 @@ fn pump(
                 "[jc2-dongle] {} went quiet — dropping",
                 link.key.side.display_name()
             );
-            let _ = dongle.disconnect(link.conn);
+            // Dropping a quiet link is a write; the confirmation arrives on the
+            // fan-out like any other event.
+            let _ = sub.radio().with_dongle(|d| d.disconnect(link.conn));
             shared.pads.lock().unwrap().remove(&link.key);
         } else {
             i += 1;

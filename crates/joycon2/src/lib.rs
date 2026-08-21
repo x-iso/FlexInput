@@ -26,6 +26,9 @@
 //!
 //! Protocol reference: <https://github.com/ndeadly/switch2_controller_research>
 
+#[macro_use]
+pub(crate) mod dlog;
+pub mod cal;
 pub mod dongle;
 pub mod host_addr;
 pub mod hub;

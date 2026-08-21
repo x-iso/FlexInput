@@ -1449,6 +1449,76 @@ fn parse_dualsense_touch(buf: &[u8], off: usize) -> TouchPoint {
     }
 }
 
+/// Parse a Switch Pro `0x30` input report with no SPI calibration.
+///
+/// ⭐ For transports that never get to read the controller's flash — a
+/// Bluetooth link opened by our own dongle has no HID feature-report path set
+/// up — so the stick calibration falls back to the firmware defaults. That is
+/// good enough to be usable and FlexInput's own stick calibration corrects the
+/// rest; the alternative is no sticks at all.
+pub(crate) fn parse_switch_pro_report(buf: &[u8]) -> Option<HidReading> {
+    parse_switch_pro(buf, None)
+}
+
+/// Publish a Switch Pro's buttons and sticks as pins.
+///
+/// ⭐ Shared by every transport that produces a `0x30` report, so the mapping
+/// from Nintendo's button bits to FlexInput's positional pin names exists once.
+/// It is genuinely fiddly — A is EAST and B is SOUTH, the D-pad has no axis
+/// events at all over Bluetooth and has to be rebuilt from its button bits —
+/// and two copies of it would drift.
+pub(crate) fn push_switch_pro_buttons(
+    out: &mut Vec<(String, String, flexinput_core::Signal)>,
+    dev: &str,
+    sb: &SwitchProButtons,
+) {
+    use flexinput_core::Signal;
+    use glam::Vec2;
+    let mut f = |pin: &str, v: f32| out.push((dev.into(), pin.into(), Signal::Float(v)));
+    f("left_stick_x", sb.lstick_x);
+    f("left_stick_y", sb.lstick_y);
+    f("right_stick_x", sb.rstick_x);
+    f("right_stick_y", sb.rstick_y);
+    out.push((dev.into(), "left_stick".into(), Signal::Vec2(Vec2::new(sb.lstick_x, sb.lstick_y))));
+    out.push((dev.into(), "right_stick".into(), Signal::Vec2(Vec2::new(sb.rstick_x, sb.rstick_y))));
+
+    let mut b = |pin: &str, v: bool| out.push((dev.into(), pin.into(), Signal::Bool(v)));
+    // Face buttons by physical POSITION — Nintendo's labels are transposed
+    // against every other pad, and the positional names are the contract.
+    b("btn_south", sb.btn_b);
+    b("btn_east", sb.btn_a);
+    b("btn_west", sb.btn_y);
+    b("btn_north", sb.btn_x);
+    b("btn_lb", sb.btn_l);
+    b("btn_rb", sb.btn_r);
+    b("btn_lt_dig", sb.btn_zl);
+    b("btn_rt_dig", sb.btn_zr);
+    b("btn_ls", sb.btn_lstick);
+    b("btn_rs", sb.btn_rstick);
+    b("btn_start", sb.btn_plus);
+    b("btn_back", sb.btn_minus);
+    b("btn_guide", sb.btn_home);
+    b("btn_capture", sb.btn_capture);
+    b("dpad_up", sb.dpad_up);
+    b("dpad_down", sb.dpad_down);
+    b("dpad_left", sb.dpad_left);
+    b("dpad_right", sb.dpad_right);
+
+    // ❗ Rebuilt from the button bits: the Bluetooth report carries no D-pad
+    // AXIS at all. Diagonals get the unit-circle magnitude so a diagonal is not
+    // 1.41x a cardinal.
+    let bx = if sb.dpad_right { 1.0f32 } else if sb.dpad_left { -1.0 } else { 0.0 };
+    let by = if sb.dpad_up { 1.0f32 } else if sb.dpad_down { -1.0 } else { 0.0 };
+    let (nx, ny) = if bx != 0.0 && by != 0.0 {
+        (bx * std::f32::consts::FRAC_1_SQRT_2, by * std::f32::consts::FRAC_1_SQRT_2)
+    } else {
+        (bx, by)
+    };
+    out.push((dev.into(), "dpad_x".into(), Signal::Float(nx)));
+    out.push((dev.into(), "dpad_y".into(), Signal::Float(ny)));
+    out.push((dev.into(), "dpad".into(), Signal::Vec2(Vec2::new(nx, ny))));
+}
+
 fn parse_switch_pro(buf: &[u8], calib: Option<&SwitchProCalib>) -> Option<HidReading> {
     // Report 0x30: standard input report with full button state and 3 IMU samples.
     // Layout (per dekuNukem/Nintendo_Switch_Reverse_Engineering bluetooth_hid_notes.md):

@@ -63,16 +63,23 @@ const OFF_STD_GYRO: usize = 0x36;
 
 /// Per-axis gain on the recovered field rates, applied last.
 ///
-/// ⭐ **The yaw field reads about a quarter of what the other two do**, and this
-/// is a CALIBRATION for that, not a decode of it. Two independent measurements
-/// agree:
+/// ⭐ **Yaw needs a factor of 2**, measured against a real rotation.
 ///
-/// * On hardware, the yaw rate feels roughly four times weaker than roll or
-///   pitch during equivalent motion.
-/// * On saved captures, field #2's total path length is 0.23–0.24 of the
-///   dominant field's — 4.15, 4.29 and 4.14 across three phases, on two
-///   captures and both halves. Those phases rotate about DIFFERENT axes, so a
-///   ratio that stays put is not geometry.
+/// ❗ It was 4, and that was wrong. The 4 came from two soft sources: a
+/// path-length ratio across captures, and "yaw feels about four times weaker"
+/// on hardware — but that feel was reported through a probe chain that had yaw
+/// inverted downstream AND through a 3D view whose basis mismatch was rendering
+/// yaw as roll. Neither was a clean look at yaw.
+///
+/// The replacement is a direct comparison, in the corrected basis, against the
+/// user's own hand: turning the controller 90° rotated the model 180°. Exactly
+/// double, and it explained a second symptom at the same time — doubled yaw
+/// reaches the ±180° wrap at 90° of real rotation, so the model flipped and
+/// appeared to clamp just past a quarter turn.
+///
+/// A lesson worth keeping: a quantity confirmed only through a chain that
+/// contains other unverified transforms is not confirmed. Two of the three
+/// links in that chain later turned out to be wrong.
 ///
 /// Why it is a calibration and not a fix: three axes of one gyro share a
 /// full-scale setting, so they cannot genuinely differ in counts per degree.
@@ -90,7 +97,40 @@ const OFF_STD_GYRO: usize = 0x36;
 /// added to remove.
 ///
 /// Retune with `FLEXINPUT_JC2_FIELD_GAIN="1,1,4"` — see [`field_gain`].
+///
+/// ⭐ **This scales the GYRO OUTPUT PINS ONLY.** The orientation estimate has
+/// its own factor, [`ORIENTATION_GAIN`], and conflating the two was a real
+/// mistake: a report that the 3D model over-rotated in yaw was answered by
+/// halving this constant, which silently halved the yaw gyro pin as well and
+/// left yaw visibly weaker than roll and pitch to aim with.
+///
+/// ❗ They are judged against DIFFERENT quantities and there is no reason for
+/// them to agree. [`ORIENTATION_GAIN`] is judged against absolute angle — turn
+/// 90°, the model should show 90° — and the measured counts-per-turn settles it
+/// at 1.0 with no freedom left. This one is judged against the OTHER TWO AXES
+/// at the speeds a person actually aims: yaw comes from the fused, magnetometer-
+/// corrected heading field, which is accurate over a slow full turn but
+/// attenuated and smoothed on quick motion, so its differentiated rate reads
+/// low exactly where aiming lives. A scalar cannot really fix a frequency
+/// response, but it is what there is, and 4 is the value that felt matched on
+/// hardware.
 pub const FIELD_GAIN: [f32; 3] = [1.0, 1.0, 4.0];
+
+/// Per-axis gain for the ORIENTATION estimate, in field order.
+///
+/// ⭐ **1.0, and not arrived at by feel.** [`ANGLE_COUNTS_PER_TURN`] was
+/// measured from known 360° turns on hardware — the yaw field at 33 752 971
+/// (left) and 33 674 419 (right), both inside 0.6% of 2^25, and the roll field
+/// at 32 458 485 with r = 0.993. The conversion to degrees is therefore already
+/// correct, and any factor other than 1.0 here makes the model disagree with
+/// the world by exactly that factor.
+///
+/// So this constant exists to be 1.0 and to say why, rather than to be tuned:
+/// it is the thing that keeps a gyro-pin adjustment from quietly re-breaking
+/// "90° real reads 90° on screen". Override with
+/// `FLEXINPUT_JC2_ORIENTATION_GAIN="1,1,1"` if that measurement is ever shown
+/// to be wrong.
+pub const ORIENTATION_GAIN: [f32; 3] = [1.0, 1.0, 1.0];
 
 /// Which field drives which canonical gyro axis, and with what sign.
 ///
@@ -109,18 +149,18 @@ pub const FIELD_GAIN: [f32; 3] = [1.0, 1.0, 4.0];
 /// controller is held, and the person holding it can settle in ten seconds what
 /// a capture cannot settle at all.
 ///
-/// ❗ **Yaw is NEGATED.** Reported from hardware: with the sign positive the
-/// cursor moved the wrong way, and it had to be inverted downstream in the
-/// 3DOF-to-2D module to be usable. Fixing it there hides it from every other
-/// consumer — the `orientation` pin, any other aim module, a future patch — so
-/// it belongs in the one place that defines the canonical frame. The canonical
-/// contract is yaw POSITIVE CLOCKWISE seen from above, and this field counts
-/// the other way, which is the same handedness quirk `heading_rad` already
-/// corrects for the absolute angle.
+/// ❗ Yaw is POSITIVE. It was briefly negated here on a hardware report that the
+/// cursor moved the wrong way — but that report came from a patch still feeding
+/// the `probe_rate_*` pins, where the yaw had already been inverted once
+/// downstream. Two inversions in series, one of them invisible from where the
+/// symptom was observed.
 ///
-/// `FLEXINPUT_JC2_GYRO_MAP="+1,+0,-2"` — three signed field indices, in
+/// Worth remembering as a class of mistake: a sign confirmed through a chain
+/// that contains another sign is not confirmed at all.
+///
+/// `FLEXINPUT_JC2_GYRO_MAP="+1,+0,+2"` — three signed field indices, in
 /// canonical order.
-pub const GYRO_MAP: [(usize, f32); 3] = [(1, 1.0), (0, 1.0), (2, -1.0)];
+pub const GYRO_MAP: [(usize, f32); 3] = [(1, 1.0), (0, 1.0), (2, 1.0)];
 
 /// [`GYRO_MAP`], overridable at runtime by `FLEXINPUT_JC2_GYRO_MAP`.
 ///
@@ -165,15 +205,94 @@ pub fn gyro_map() -> [(usize, f32); 3] {
     })
 }
 
+/// Cross-axis correction, applied after the permutation and gain.
+///
+/// ⭐ **Identity by default, because the coefficients are not known** — and a
+/// guessed correction is worse than none, as the removed ZYX Euler transform
+/// demonstrated at length.
+///
+/// The problem it exists for is real and reported from hardware: rolling the
+/// controller bleeds into yaw. The fields are a firmware fusion of a
+/// nine-axis IMU, not three independent gyro axes, so nothing guarantees they
+/// separate cleanly — and every attempt to derive the mixing analytically has
+/// failed, because the saved captures rotate about the CONTROLLER's axes while
+/// the coupling that matters is in the user's grip.
+///
+/// So this is a knob rather than a derivation. Row-major, canonical order
+/// `(roll, pitch, yaw)`; row *i* says how canonical axis *i* is built from the
+/// three mapped rates. To cancel roll bleeding into yaw, make the yaw row's
+/// roll term negative:
+///
+/// ```text
+///   FLEXINPUT_JC2_GYRO_MIX="1,0,0, 0,1,0, -0.2,0,1"
+/// ```
+///
+/// The same approach settled the yaw gain: a factor found by feel, then
+/// confirmed against captures at 4.15 / 4.29 / 4.14. If a coefficient here
+/// turns out to work, it becomes the new default with that evidence recorded.
+pub const GYRO_MIX: [[f32; 3]; 3] = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+];
+
+/// [`GYRO_MIX`], overridable by `FLEXINPUT_JC2_GYRO_MIX` (nine numbers).
+pub fn gyro_mix() -> [[f32; 3]; 3] {
+    static MIX: std::sync::OnceLock<[[f32; 3]; 3]> = std::sync::OnceLock::new();
+    *MIX.get_or_init(|| {
+        let Ok(raw) = std::env::var("FLEXINPUT_JC2_GYRO_MIX") else {
+            return GYRO_MIX;
+        };
+        let v: Vec<f32> = raw.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        if v.len() == 9 && v.iter().all(|x| x.is_finite()) {
+            let m = [[v[0], v[1], v[2]], [v[3], v[4], v[5]], [v[6], v[7], v[8]]];
+            eprintln!("[jc2] gyro mix overridden: {m:?}");
+            m
+        } else {
+            eprintln!("[jc2] FLEXINPUT_JC2_GYRO_MIX={raw:?} is not nine numbers — ignoring");
+            GYRO_MIX
+        }
+    })
+}
+
 /// Apply [`gyro_map`] to a field-order rate triple, yielding canonical
 /// `(roll, pitch, yaw)`.
 pub fn canonical_field_rate(field_rate: [f32; 3]) -> [f32; 3] {
     let m = gyro_map();
-    [
+    let mapped = [
         field_rate[m[0].0] * m[0].1,
         field_rate[m[1].0] * m[1].1,
         field_rate[m[2].0] * m[2].1,
+    ];
+    // Cross-axis correction last, so the mix is expressed in canonical axes —
+    // the ones a person can reason about — rather than in field order.
+    let x = gyro_mix();
+    [
+        x[0][0] * mapped[0] + x[0][1] * mapped[1] + x[0][2] * mapped[2],
+        x[1][0] * mapped[0] + x[1][1] * mapped[1] + x[1][2] * mapped[2],
+        x[2][0] * mapped[0] + x[2][1] * mapped[1] + x[2][2] * mapped[2],
     ]
+}
+
+/// [`ORIENTATION_GAIN`], overridable by `FLEXINPUT_JC2_ORIENTATION_GAIN`.
+///
+/// Read once and cached; called per report.
+pub fn orientation_gain() -> [f32; 3] {
+    static GAIN: std::sync::OnceLock<[f32; 3]> = std::sync::OnceLock::new();
+    *GAIN.get_or_init(|| {
+        let Ok(raw) = std::env::var("FLEXINPUT_JC2_ORIENTATION_GAIN") else {
+            return ORIENTATION_GAIN;
+        };
+        let v: Vec<f32> = raw.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        if v.len() == 3 && v.iter().all(|x| x.is_finite() && *x != 0.0) {
+            let g = [v[0], v[1], v[2]];
+            eprintln!("[jc2] orientation gain overridden: {g:?}");
+            g
+        } else {
+            eprintln!("[jc2] FLEXINPUT_JC2_ORIENTATION_GAIN={raw:?} is not three non-zero numbers — ignoring");
+            ORIENTATION_GAIN
+        }
+    })
 }
 
 /// [`FIELD_GAIN`], overridable at runtime by `FLEXINPUT_JC2_FIELD_GAIN`.
@@ -222,6 +341,10 @@ const OFF_MOTION_PROBE: usize = OFF_MOTION_TIMESTAMP + 4;
 
 /// Length of that block. Exactly `3 x i16 + 3 x i16`, which is what a raw
 /// gyro-plus-magnetometer pair would occupy.
+// Referenced only from tests now that the probe reads six fixed i16, but it is
+// the documented width of the block and the offset assertions are written
+// against it.
+#[cfg_attr(not(test), allow(dead_code))]
 const MOTION_PROBE_LEN: usize = 12;
 
 /// The left half's report is offset one byte earlier than the right's.
@@ -411,7 +534,20 @@ pub struct AngleGyro {
     prev: Option<[i32; 3]>,
     /// Last rate emitted, held across a rejected sample — see [`MAX_STEP`].
     last: [f32; 3],
+    /// Reports each field has gone without changing, so a delta can be divided
+    /// by the time it actually accumulated over — see [`AngleGyro::rate`].
+    held: [u32; 3],
 }
+
+/// Reports a field may sit unchanged before its rate is called zero.
+///
+/// A field that has genuinely stopped must not hold its last rate forever, or a
+/// controller set down mid-turn keeps reporting that turn. The bound only has
+/// to sit above the slowest legitimate update: at 2^25 counts per revolution a
+/// field advances ~93 000 counts per degree, so even a 0.1 °/s crawl moves it
+/// every single report. Anything quiet for sixteen — an eighth of a second —
+/// has stopped, not slowed.
+const MAX_HOLD: u32 = 16;
 
 /// Largest believable change in one report, in angle counts.
 ///
@@ -454,31 +590,47 @@ impl AngleGyro {
             Some(p) => p,
             None => return [0.0; 3],
         };
-        // ⭐ A REPEATED sample is not a moment of stillness.
+        // ⭐ A REPEATED field is not a moment of stillness, and the three
+        // fields do NOT update together.
         //
-        // All three fields identical to the previous report means the
-        // controller sent the same motion sample twice, not that it stopped
-        // dead for one frame and resumed. Differentiating a duplicate gives
-        // zero, then a double step on the next real one — a staircase, which is
-        // exactly what a rate looks like when it is jagged despite the motion
-        // being smooth.
+        // ❗ This used to require all three to repeat before it did anything,
+        // which meant it almost never fired. The fields refresh at DIFFERENT
+        // internal rates, so the usual case is one field holding still while
+        // the others move — and that field then reported zero, zero, then one
+        // delta covering three reports' worth of motion divided by one
+        // report's worth of time. A comb: flat, flat, spike, flat, flat, spike,
+        // three times too tall, on a perfectly smooth motion.
         //
-        // Reported on hardware: the jaggedness appears while the back button is
-        // HELD. That button is a Mobapad addition with no Joy-Con 2 equivalent,
-        // remapped in their app to a stick click, so the firmware is
-        // synthesising an input it does not natively have — and repeating the
-        // last IMU sample while it does so is a very ordinary way for that to
-        // show up. It is not the user pressing hard enough to shake the sensor.
+        // On an oscilloscope that is unmistakable, and it is exactly what was
+        // seen — one channel smooth (the fastest field) while the other two
+        // pulsed. It was also visible as the fields "not responding": a rate
+        // that is zero two reports in three reads as a weak axis.
         //
-        // Holding the previous rate is right on the physics too: the controller
-        // was turning an instant ago and one duplicated report does not stop it.
-        // Genuine stillness still reads as zero, because a resting IMU's low
-        // bits dither and never repeat exactly.
-        if angle == prev {
-            return self.last;
-        }
-        let mut out = [0.0f32; 3];
+        // So: track each field separately, and divide a delta by the number of
+        // reports it actually accumulated over. That is the rate the field
+        // genuinely represents, it removes the comb without filtering anything,
+        // and it costs no lag — the same total motion, spread over the interval
+        // it happened in rather than dumped into one sample.
+        //
+        // Holding between updates is right on the physics too: the controller
+        // was turning an instant ago and a report that carries no fresh sample
+        // does not mean it stopped. Genuine stillness still reads zero, via
+        // MAX_HOLD.
+        //
+        // (Reported on hardware as jaggedness while the back button is HELD.
+        // That button is a Mobapad addition with no Joy-Con 2 equivalent, so
+        // the firmware is synthesising an input it does not natively have;
+        // stalling an IMU field while it does so is an ordinary way for that to
+        // show up, and it would widen the gaps this now handles.)
+        let mut out = self.last;
         for i in 0..3 {
+            if angle[i] == prev[i] {
+                self.held[i] = self.held[i].saturating_add(1);
+                if self.held[i] >= MAX_HOLD {
+                    out[i] = 0.0;
+                }
+                continue;
+            }
             // Wrapping is a property of the FIELD, so it uses the field
             // modulus — not the counts-per-turn scale. Using the scale here is
             // what made fast rotations decode as garbage: the threshold sat at
@@ -494,11 +646,11 @@ impl AngleGyro {
             // was turning an instant ago and one dropped report does not stop
             // it, so holding keeps a fast pan smooth where a zero would punch a
             // one-frame notch into it.
-            out[i] = if d.abs() > MAX_STEP {
-                self.last[i]
-            } else {
-                d as f32
-            };
+            if d.abs() <= MAX_STEP {
+                // Spread over the reports it accumulated across.
+                out[i] = d as f32 / (self.held[i] + 1) as f32;
+            }
+            self.held[i] = 0;
         }
         self.last = out;
         out
@@ -625,6 +777,290 @@ pub fn tilt_from_accel(accel: [i32; 3]) -> (f32, f32) {
     (y.atan2(z), x.atan2((y * y + z * z).sqrt()))
 }
 
+
+
+/// Measures resting drift over long stationary periods, straight from a running
+/// session.
+///
+/// ⭐ **Answers "is the drift a trend that can simply be cancelled?" with data
+/// instead of argument.** Saved captures only hold a few seconds of stillness at
+/// each end, which is enough to see that drift exists and not enough to say
+/// whether it is steady. Minutes are needed, and asking for them through a
+/// separate probe tool means fighting the dongle again.
+///
+/// Two design points, both from the proposal that prompted it:
+///
+/// * **The accelerometer decides what counts as still.** Not the gyro, which is
+///   the thing being measured — using it to gate its own measurement would hide
+///   exactly the drift being looked for.
+/// * **Deltas, not absolute field values.** The fields wrap, and a wrap looks
+///   like an enormous sign-flipped jump; accumulating the already-modulo-
+///   corrected steps is immune to that. This is the "make sure the axes do not
+///   flip sign like the absolute ones do" requirement, satisfied by
+///   construction rather than by a threshold.
+///
+/// Any movement resets the run, so a reported figure is always drift measured
+/// over one uninterrupted stationary stretch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DriftProbe {
+    /// Accumulated field rotation over the current stationary run, in degrees.
+    sum: [f64; 3],
+    secs: f64,
+    /// Seconds of stillness already reported, so each line covers new ground.
+    reported: f64,
+}
+
+/// How much continuous stillness to gather before reporting, and how often after
+/// that. Half a minute is long enough for a sub-degree-per-second trend to rise
+/// clear of noise, and short enough to see several points in a four-minute run.
+const DRIFT_REPORT_SECS: f64 = 30.0;
+
+impl DriftProbe {
+    /// Feed one sample. `rate_dps` is the raw per-field rate BEFORE any
+    /// correction — the point is to measure what the hardware does, not what is
+    /// left after the estimator has had a go at it.
+    pub fn update(&mut self, rate_dps: [f32; 3], dt: f32, still: bool, side: crate::protocol::Side) {
+        if !still || !(1e-6..0.5).contains(&dt) {
+            // Movement, or an implausible gap. Either way this run is over.
+            if self.secs >= DRIFT_REPORT_SECS {
+                crate::dlog::drift(format_args!(
+                    "drift {} run ENDED after {:.0} s",
+                    side.display_name(),
+                    self.secs,
+                ));
+            }
+            *self = Self::default();
+            return;
+        }
+        for i in 0..3 {
+            self.sum[i] += rate_dps[i] as f64 * dt as f64;
+        }
+        self.secs += dt as f64;
+        if self.secs - self.reported >= DRIFT_REPORT_SECS {
+            self.reported = self.secs;
+            let r = |i: usize| self.sum[i] / self.secs;
+            crate::dlog::drift(format_args!(
+                "drift {} still {:>5.0} s  field#0 {:+8.4}  field#1 {:+8.4}  field#2 {:+8.4} deg/s",
+                side.display_name(),
+                self.secs,
+                r(0),
+                r(1),
+                r(2),
+            ));
+        }
+    }
+}
+
+/// Resting drift subtracted before the bias estimator runs, in deg/s, field
+/// order, per half.
+///
+/// ⭐ **A head start, not a replacement.** Measured on hardware across six
+/// sessions of four to eleven minutes with both halves stationary throughout,
+/// by [`DriftProbe`] — then corrected for the clock error described in
+/// [`TickClock::dt_at`], which had been scaling every rate down by a factor
+/// that differed per half AND per session, and which is why the previous
+/// numbers here were roughly three times too large:
+///
+/// ```text
+///          field#0                 field#1                 field#2
+///   LEFT   -0.410  sd 0.026   6%   +0.046  sd 0.004   8%   -0.034  sd 0.006  17%
+///   RIGHT  -0.335  sd 0.013   4%   -0.008  sd 0.020 262%   +0.021  sd 0.013  61%
+/// ```
+///
+/// The big terms are the reproducible ones. Both halves' field #0 repeats to
+/// within a few per cent across all six sessions, and a third of a degree per
+/// second is twenty degrees of yaw a minute being integrated from the moment of
+/// connect. That is worth removing outright.
+///
+/// ❗ The small terms are not constants, and are not claimed as any. The right
+/// half's field #1 has a standard deviation twenty-five times its own mean and
+/// changes sign between sessions. It is set to the measured mean because that
+/// is the best fixed estimate there is, but it is within noise of zero and
+/// nothing should be built on its sign.
+///
+/// ⭐ **The drift is fixed in the BODY, not in the world.** Sessions 4-6 were
+/// captured with the grip yawed 90° from sessions 1-3 to test exactly that, and
+/// the shifts that appeared — up to 0.045 °/s — are far too large to be a
+/// heading effect: the earth turns at 0.0042 °/s in total, so no change of
+/// heading can move any projection of it by more than about 0.008 °/s. What
+/// moved instead was time. The trend within a single run is about -0.009 °/s
+/// per minute of stillness on the left half's field #0, and the six sessions
+/// ran back to back over half an hour. This is a MEMS zero-rate offset warming
+/// up, which no fixed table can follow.
+///
+/// So both, as before: this removes the reproducible bulk immediately, and
+/// [`GyroBias`] learns the session-specific remainder and the warm-up ramp —
+/// starting from a small error now, in the very window where the estimator has
+/// not converged and drift is otherwise unopposed.
+pub const RESTING_DRIFT_LEFT: [f32; 3] = [-0.410, 0.046, -0.034];
+pub const RESTING_DRIFT_RIGHT: [f32; 3] = [-0.335, -0.008, 0.021];
+
+/// The resting-drift correction for one half.
+pub fn resting_drift(side: crate::protocol::Side) -> [f32; 3] {
+    match side {
+        crate::protocol::Side::Left => RESTING_DRIFT_LEFT,
+        crate::protocol::Side::Right => RESTING_DRIFT_RIGHT,
+    }
+}
+
+/// Per-side mounting correction, applied after [`to_canonical_accel`].
+///
+/// ⭐ **The IMU is not mounted the way the canonical frame assumes, and it is
+/// mounted DIFFERENTLY in the two halves.** Both are documented traits of this
+/// hardware family — the research notes for the original Joy-Con say outright
+/// that "because of the placement of the IMU chip, the 2 Joy-Con have an axis
+/// reversed each" — and both showed up on hardware exactly as that predicts:
+///
+/// * pitching up rolled the model right, and rolling counter-clockwise pitched
+///   it down — a clean swap, which is a 90° rotation about the forward axis;
+/// * a small yaw flipped which half was edge-on, and the two halves flipped in
+///   OPPOSITE directions, which no shared correction can produce.
+///
+/// Expressed as a signed axis permutation rather than a matrix: `(source axis,
+/// sign)` per canonical axis, so it is readable, exactly invertible, and cannot
+/// introduce scale error the way a hand-written rotation matrix can.
+///
+/// ⚠️ Both default to identity, and on this hardware identity is CORRECT.
+/// Measured in the neutral grip pose, the accelerometer reads x≈0.000,
+/// y≈-0.002, z≈0.125 — a clean 1 g on canonical +z, exactly where the frame
+/// contract puts it. Nothing needs permuting.
+///
+/// This was added while chasing a "yaw rolls the model" symptom that turned out
+/// to be a Z-up/Y-up mismatch in the 3D renderer, not a sensor frame at all.
+/// Kept because the mirrored-IMU trait is real and a future half may need it —
+/// but do not reach for it before confirming the accelerometer is actually
+/// wrong, because here it never was.
+///
+/// `FLEXINPUT_JC2_MOUNT_L` / `_R`, three signed indices, e.g. `"+0,+2,-1"`.
+pub const MOUNT_LEFT: [(usize, f32); 3] = [(0, 1.0), (1, 1.0), (2, 1.0)];
+pub const MOUNT_RIGHT: [(usize, f32); 3] = [(0, 1.0), (1, 1.0), (2, 1.0)];
+
+/// The mounting correction for one half, with the environment override applied.
+pub fn mount_for(side: crate::protocol::Side) -> [(usize, f32); 3] {
+    use crate::protocol::Side;
+    static L: std::sync::OnceLock<[(usize, f32); 3]> = std::sync::OnceLock::new();
+    static R: std::sync::OnceLock<[(usize, f32); 3]> = std::sync::OnceLock::new();
+    let (cell, var, fallback) = match side {
+        Side::Left => (&L, "FLEXINPUT_JC2_MOUNT_L", MOUNT_LEFT),
+        Side::Right => (&R, "FLEXINPUT_JC2_MOUNT_R", MOUNT_RIGHT),
+    };
+    *cell.get_or_init(|| parse_mount(var).unwrap_or(fallback))
+}
+
+fn parse_mount(var: &str) -> Option<[(usize, f32); 3]> {
+    let raw = std::env::var(var).ok()?;
+    let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
+    if parts.len() != 3 {
+        eprintln!("[jc2] {var}={raw:?} is not three signed indices — ignoring");
+        return None;
+    }
+    let mut out = [(0usize, 1.0f32); 3];
+    let mut used = [false; 3];
+    for (i, p) in parts.iter().enumerate() {
+        let sign = if p.starts_with('-') { -1.0 } else { 1.0 };
+        match p.trim_start_matches(['+', '-']).parse::<usize>() {
+            // Every source axis exactly once, or the frame is not a rotation —
+            // it collapses one axis and doubles another, which reads as "one
+            // axis is dead" and is very hard to trace to a typo.
+            Ok(idx) if idx < 3 && !used[idx] => {
+                used[idx] = true;
+                out[i] = (idx, sign);
+            }
+            _ => {
+                eprintln!("[jc2] {var}={raw:?} is not a permutation — ignoring");
+                return None;
+            }
+        }
+    }
+    eprintln!("[jc2] {var} applied: {out:?}");
+    Some(out)
+}
+
+/// Apply a mounting permutation to a canonical-frame triple.
+pub fn apply_mount(v: [f32; 3], m: [(usize, f32); 3]) -> [f32; 3] {
+    [v[m[0].0] * m[0].1, v[m[1].0] * m[1].1, v[m[2].0] * m[2].1]
+}
+
+/// Rotation about gravity: the only component of a body rate that is yaw.
+///
+/// `up` is the measured up-vector in the body frame — an accelerometer at rest
+/// reports the upward reaction force, so the normalised accel already points
+/// up. Projecting onto it needs no axis assignment: whatever permutation the
+/// three rates arrive in, their component along up is the rotation about
+/// vertical.
+pub fn canonical_yaw_rate(body_dps: [f32; 3], up: [f32; 3]) -> f32 {
+    body_dps[0] * up[0] + body_dps[1] * up[1] + body_dps[2] * up[2]
+}
+
+/// Orientation as a quaternion `[x, y, z, w]`, body-to-world.
+///
+/// ⭐ **Body rates must be integrated as a rotation, not accumulated as Euler
+/// angles.** This is the fix for the single most damaging bug in this decode,
+/// and it was visible on hardware as:
+///
+///   > the left handle was on its side, the yaw was doing roll to it
+///
+/// The three field rates are BODY rates — measured about the controller's own
+/// axes, which move with it. The orientation was being composed as
+/// `Rz(yaw) · Ry(-pitch) · Rx(roll)`, where yaw is a rotation about the WORLD
+/// vertical. Those coincide only at neutral, which is exactly why the output
+/// was perfect immediately after connect and degraded as the pad's resting
+/// attitude wandered: tilt it and the "yaw" rate is applied about the wrong
+/// axis, so a body-axis rotation comes out as world roll, and every axis
+/// appears to bleed into every other.
+///
+/// No fixed mixing matrix can repair that, because the error depends on the
+/// current pose — which is why the measured cross-axis coupling wandered by
+/// 29-66° across a single capture and no constant 3x3 ever fitted it.
+///
+/// Integrating `q <- q * dq(omega * dt)` is pose-correct everywhere by
+/// construction, has no gimbal singularity, and needs no convention guessed.
+mod quat {
+    /// Hamilton product, `[x, y, z, w]` order.
+    pub fn mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+        let (ax, ay, az, aw) = (a[0], a[1], a[2], a[3]);
+        let (bx, by, bz, bw) = (b[0], b[1], b[2], b[3]);
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ]
+    }
+
+    pub fn normalise(q: [f32; 4]) -> [f32; 4] {
+        let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        if n < 1e-9 {
+            [0.0, 0.0, 0.0, 1.0]
+        } else {
+            [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
+        }
+    }
+
+    /// `(roll, pitch, yaw)` for consumers that still want Euler angles.
+    ///
+    /// ZYX, matching the convention the rest of this crate documents. Pitch is
+    /// clamped at the poles rather than allowed to produce NaN.
+    pub fn to_euler(q: [f32; 4]) -> [f32; 3] {
+        let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+        let sinp = 2.0 * (w * y - z * x);
+        // ❗ NEGATED, to match the convention the rest of this crate composes
+        // with: `Rz(yaw) * Ry(-pitch) * Rx(roll)`, where a positive pitch is
+        // nose-up. A textbook ZYX extraction returns the opposite sign, and
+        // taking it verbatim made a stationary controller report 15 deg/s of
+        // pitch — the estimate and the angles it was compared against
+        // disagreed about which way up was.
+        let pitch = -if sinp.abs() >= 1.0 {
+            std::f32::consts::FRAC_PI_2.copysign(sinp)
+        } else {
+            sinp.asin()
+        };
+        let roll = (2.0 * (w * x + y * z)).atan2(1.0 - 2.0 * (x * x + y * y));
+        let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+        [roll, pitch, yaw]
+    }
+}
+
 /// Orientation for one report, plus the angular rate implied by it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Orientation {
@@ -633,6 +1069,32 @@ pub struct Orientation {
     pub euler_rad: [f32; 3],
     /// `(roll, pitch, yaw)` rate in degrees per second.
     pub rate_dps: [f32; 3],
+    /// ⭐ **Yaw rate alone, in degrees per second: the component of the body
+    /// rotation about GRAVITY.**
+    ///
+    /// The one axis the raw fields cannot deliver, computed the one way that
+    /// does not cost anything to get it. `omega . g_hat` is a projection of the
+    /// FIELD rates — no differentiation of the accelerometer anywhere in it —
+    /// so it keeps the fields' low noise while being immune to how the
+    /// controller is held. Tilt the pad and the projection follows; the fields
+    /// alone cannot, which is what made yaw pick up roll.
+    ///
+    /// ❗ Noise from the gravity direction enters MULTIPLICATIVELY here, as a
+    /// weight on the rates, not additively as it does in
+    /// [`Orientation::rate_dps`]. A stationary controller has rates near zero,
+    /// so a jittering weight on them is still near zero. That is the whole
+    /// difference between this and differentiating tilt, which multiplies the
+    /// accelerometer's noise by the report rate and produces tens of degrees
+    /// per second of it while sitting still.
+    pub yaw_rate_dps: f32,
+    /// ⭐ Orientation as a quaternion `[x, y, z, w]`, body-to-world.
+    ///
+    /// The authoritative form. `euler_rad` is derived FROM this, not the other
+    /// way round, and exists for consumers that want angles. Rebuilding a
+    /// quaternion from those angles round-trips through a convention that has
+    /// already been got wrong twice — once here, once in the backend — so
+    /// anything wanting a rotation should take this directly.
+    pub quat_xyzw: [f32; 4],
     /// ⭐ **Angular rate from differencing the three [`Motion::angle`] fields**,
     /// in degrees per second, in FIELD ORDER — not yet mapped to canonical axes.
     ///
@@ -665,6 +1127,14 @@ pub struct Orientation {
     /// source. Rather than ship a guessed permutation, these go out on their own
     /// pins so the mapping can be read off hardware in one session.
     pub field_rate_dps: [f32; 3],
+    /// ⭐ **What the gyro PINS should carry**: `(roll, pitch, yaw)` in deg/s,
+    /// canonical order, with the fields' pose-dependent leak removed.
+    ///
+    /// See [`GhostCancel`]. Roll and pitch are the field rates with their
+    /// slow error corrected against gravity; yaw is the projection about
+    /// gravity, which needs no such help because it is built from a direction
+    /// rather than from an axis assignment.
+    pub pin_rate_dps: [f32; 3],
 }
 
 /// Tracks orientation across reports and differences it into an angular rate.
@@ -680,6 +1150,14 @@ pub struct Orientation {
 /// disappears rather than being reimplemented.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OrientationTracker {
+    /// Resting drift measured on THIS controller, replacing the compiled-in
+    /// default — see [`crate::cal`].
+    ///
+    /// `None` until something calibrates this half, at which point the constant
+    /// becomes only a fallback. It is applied at the SOURCE rather than to the
+    /// output pins because yaw is integrated further down: a correction applied
+    /// after that cannot remove drift the estimate has already absorbed.
+    resting_override: Option<[f32; 3]>,
     prev: Option<[f32; 3]>,
     /// Last raw heading field value, for wrap detection.
     prev_heading: Option<i32>,
@@ -701,7 +1179,246 @@ pub struct OrientationTracker {
     field_bias: GyroBias,
     /// Previous DEVICE timestamp, for a jitter-free `dt` — see [`TickClock`].
     clock: TickClock,
+    /// Last gravity direction, for the stillness test in
+    /// [`GyroBias::correct_gated`].
+    /// Is the controller holding still? See [`StillDetector`].
+    still: StillDetector,
+    /// Removes the fields' pose-dependent leak — see [`GhostCancel`].
+    ghost: GhostCancel,
+    /// Yaw, integrated from the corrected rate. Starts at zero on connect,
+    /// which is what makes the neutral pose correct.
+    yaw_rad: f32,
+    /// Long-run resting drift measurement — see [`DriftProbe`].
+    drift_probe: DriftProbe,
+    /// Last trustworthy gravity direction, body frame, unit length.
+    ///
+    /// ⭐ Held across samples where the accelerometer is NOT measuring gravity.
+    /// It feeds both the tilt angles and the yaw projection, so a corrupted
+    /// reading damages the orientation twice over — once directly, and once by
+    /// pointing the `omega . up` projection at the wrong axis, which is how a
+    /// sideways shove turned into yaw and how roll started leaking into yaw
+    /// over time.
+    gravity: Option<[f32; 3]>,
+    /// Orientation as a quaternion, body-to-world — see [`quat`].
+    ///
+    /// `None` until the first usable gravity reading, so the very first pose is
+    /// levelled from the accelerometer instead of starting at identity and
+    /// spending seconds converging.
+    q: Option<[f32; 4]>,
 }
+
+/// How far gravity may move between reports and still count as "not rotating",
+/// as a fraction of a unit vector.
+///
+/// 0.004 is about a quarter of a degree per report — well above accelerometer
+/// noise at rest, and far below any movement a person is making on purpose.
+/// ❗ Sized against the LAG of the average below, not against per-sample noise.
+/// A stationary controller sits within accelerometer noise of its own average
+/// (~0.004); a 5°/s rotation pulls away by ~0.03. 0.012 separates them with
+/// room on both sides.
+const STILL_GRAVITY_STEP: f32 = 0.012;
+/// Removes the fields' pose-dependent leak from the roll and pitch rates,
+/// using gravity as the reference for what actually moved.
+///
+/// ⭐ **The fields hand a physical axis between themselves depending on where
+/// the controller is, and this is measured, not suspected.** Integrating each
+/// field across a known 360° sweep — the true angle taken from gravity, which
+/// cannot lie about a rotation it can see — and reading the LOCAL gain
+/// `d(field)/d(truth)` in bins gives, for one half rotating about its x axis:
+///
+/// ```text
+///   truth    gain#0   gain#2
+///     -32     -2.68    -0.01     field #0 carries the rotation
+///     -95     -4.31    -0.00
+///    -111     -1.04     0.76     handover begins
+///    -127     -0.26     1.72     field #0 dead, field #2 carries it
+///    -281     -0.02     1.71
+///    -296     -6.76     0.05     field #0 returns
+/// ```
+///
+/// and rotating about y, field #1's gain runs −1.4…−2.8, flips to +0.9…+3.8
+/// through the middle of the sweep, and comes back — a sign reversal and
+/// return, which is a mirror bounce.
+///
+/// ❗ **No fixed axis map or 3×3 mix can express that**, because the mapping is
+/// a function of pose rather than a constant. That is why every attempt to
+/// tune `GYRO_MAP` or `GYRO_MIX` improved one orientation and broke another,
+/// and why the contamination always came back "over time" — time being however
+/// long it took the controller to be held somewhere else.
+///
+/// ⭐ **Gravity knows which motions are real.** It cannot see yaw, but roll and
+/// pitch move it directly, so a field claiming roll while gravity holds still
+/// is claiming a rotation that did not happen. Subtracting that disagreement
+/// cancels the ghost.
+///
+/// It is done as a COMPLEMENTARY correction rather than a gate:
+///
+/// ```text
+///   corrected = field_rate + lowpass(gravity_rate - field_rate)
+/// ```
+///
+/// * at high frequency the correction is flat, so a fast flick passes through
+///   the field path untouched — keeping its ~1 °/s noise and its responsiveness;
+/// * at low frequency the field is dragged onto gravity's truth, which is where
+///   the leak and the drift both live;
+/// * when the field is already right the two agree, the correction is zero, and
+///   nothing happens at all.
+///
+/// ⛔ It deliberately does NOT differentiate gravity into the output. Doing that
+/// directly was tried and was much worse: per-sample tilt differences carry
+/// 13–26 °/s of accelerometer noise against the fields' ~1. Here that noise is
+/// low-passed by [`GHOST_TAU_SECS`] before it can reach anything, which is what
+/// makes gravity usable as a reference without making it the signal.
+#[derive(Debug, Clone, Copy, Default)]
+struct GhostCancel {
+    /// Previous gravity-derived tilt, for its rate.
+    prev_tilt: Option<(f32, f32)>,
+    /// Low-passed (gravity rate − field rate), per axis, deg/s.
+    correction: [f32; 2],
+}
+
+/// Whether the ghost correction runs at all. **Off by default.**
+///
+/// ⛔ **The mechanism is sound and the trust gate underneath it is not, so it
+/// stays opt-in until that is fixed.** On hardware it made the controls worse,
+/// and the reason is visible in the gate rather than in the filter: gravity is
+/// accepted whenever `|accel|` is within 10% of 1 g, which a hand in motion
+/// satisfies almost continuously. Real play is not a sequence of clean
+/// stillness and clean flicks — it is constant small linear acceleration, all
+/// of it passing the magnitude test while corrupting the DIRECTION the
+/// correction treats as truth.
+///
+/// A filter that learns a persistent offset needs a reference that is right on
+/// average, not merely plausible in magnitude. The unit tests handed it a
+/// perfect trust signal, which is exactly why they passed while the controller
+/// got worse.
+///
+/// What would make it usable is a stricter gate — agreement between the two
+/// halves of a grip, which are rigidly coupled and cannot genuinely rotate
+/// differently, would be a far better arbiter than either half's own
+/// accelerometer. Until then: `FLEXINPUT_JC2_GHOST_CANCEL=on`.
+pub fn ghost_cancel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("FLEXINPUT_JC2_GHOST_CANCEL")
+            .map(|v| v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        if on {
+            eprintln!("[jc2] ghost cancellation enabled");
+        }
+        on
+    })
+}
+
+/// Time constant of the ghost correction, in SECONDS.
+///
+/// ❗ Seconds, not samples — a per-sample weight silently changes meaning with
+/// the polling rate, which is how the stillness detector broke when 200 Hz was
+/// unlocked.
+///
+/// Half a second is long enough that accelerometer noise averages away (20 °/s
+/// of it becomes about 2) and short enough to follow a handover, which happens
+/// as fast as the wrist can move between poses.
+const GHOST_TAU_SECS: f32 = 0.5;
+
+impl GhostCancel {
+    /// `field` is the canonical roll/pitch rate from the fields; `tilt` the
+    /// gravity-derived roll and pitch; `trusted` whether gravity is currently
+    /// measuring gravity alone. Returns the corrected roll/pitch rate.
+    fn correct(
+        &mut self,
+        field: [f32; 2],
+        tilt: (f32, f32),
+        dt: f32,
+        trusted: bool,
+    ) -> [f32; 2] {
+        let prev = self.prev_tilt.replace(tilt);
+        // ❗ The correction is only UPDATED while gravity is trustworthy; it is
+        // still APPLIED at all times. During a hard flick the accelerometer
+        // measures the flick, so learning from it would inject the flick as a
+        // correction — but the leak it is cancelling does not vanish for the
+        // duration, so holding the last value is right and zeroing is not.
+        if let (Some((pr, pp)), true) = (prev, trusted && dt > 1e-6) {
+            let g_rate = [
+                (tilt.0 - pr).to_degrees() / dt,
+                (tilt.1 - pp).to_degrees() / dt,
+            ];
+            let a = (dt / GHOST_TAU_SECS).min(1.0);
+            for i in 0..2 {
+                let want = g_rate[i] - field[i];
+                self.correction[i] += (want - self.correction[i]) * a;
+            }
+        }
+        [field[0] + self.correction[0], field[1] + self.correction[1]]
+    }
+}
+
+/// Decides whether the controller is holding still, from the direction of
+/// gravity alone.
+///
+/// ⭐ Its own type because the property that matters is not expressible about
+/// one sample: it is that a SUSTAINED slow rotation never reads as rest, at any
+/// report rate. That has now been got wrong twice inside
+/// [`OrientationTracker::update`], where it could only be tested at whatever
+/// rate the test harness happened to produce — which was 67 Hz, the one rate at
+/// which the broken version still worked.
+#[derive(Debug, Clone, Copy, Default)]
+struct StillDetector {
+    /// The direction stillness is measured AGAINST. Moves only to where the
+    /// device actually is, never toward where it is going.
+    anchor: Option<[f32; 3]>,
+    /// Seconds spent continuously within [`STILL_GRAVITY_STEP`] of it.
+    secs: f32,
+}
+
+impl StillDetector {
+    /// Feed one gravity direction and the time since the previous one.
+    fn observe(&mut self, dir: [f32; 3], dt: f32) -> bool {
+        let anchor = self.anchor.unwrap_or(dir);
+        let d = (0..3).map(|i| (dir[i] - anchor[i]).powi(2)).sum::<f32>().sqrt();
+        if d > STILL_GRAVITY_STEP {
+            // Left the neighbourhood: re-anchor here, and make stillness be
+            // earned again from scratch. A pan that keeps moving keeps failing.
+            self.anchor = Some(dir);
+            self.secs = 0.0;
+            return false;
+        }
+        self.anchor = Some(anchor);
+        self.secs += dt;
+        self.secs >= STILL_SETTLE_SECS
+    }
+
+    /// Give up on the current run — used when gravity cannot be measured at all.
+    fn interrupt(&mut self) {
+        self.secs = 0.0;
+    }
+}
+
+/// How long the device must stay inside [`STILL_GRAVITY_STEP`] of a FIXED
+/// anchor before it counts as still.
+///
+/// ⭐ This is what separates a slow deliberate aim from actual rest, and the
+/// pair of numbers is the whole detector: a rotation slower than
+/// `STILL_GRAVITY_STEP / STILL_SETTLE_SECS` — about 0.7 °/s — can still slip
+/// through, and anything faster cannot. Below that the motion is slower than
+/// the drift being corrected, so mistaking it for rest costs nothing.
+///
+/// ❗ In SECONDS, deliberately, not in samples. The previous test used a
+/// per-sample weight, which silently changed meaning with the polling rate:
+/// unlocking 200 Hz shortened its effective window threefold and made it three
+/// times worse at noticing slow motion, on exactly the axis a user aims with.
+const STILL_SETTLE_SECS: f32 = 1.0;
+/// How far |accel| may sit from 1 g and still be trusted as gravity alone.
+const STILL_GRAVITY_TOLERANCE: f32 = 0.06;
+/// How far |accel| may sit from 1 g before the sample is refused as a gravity
+/// REFERENCE.
+///
+/// Looser than the stillness test above, and deliberately so: that one decides
+/// whether to learn a bias, where being wrong is cheap and waiting costs
+/// nothing. This one decides whether to update the attitude at all, and holding
+/// a stale direction for too long is its own error. 10% passes ordinary
+/// handling and rejects the shoves that were showing up as phantom yaw.
+const GRAVITY_TRUST_TOLERANCE: f32 = 0.10;
 
 /// Converts the report's own timestamp into elapsed seconds.
 ///
@@ -738,12 +1455,21 @@ const TICK_MIN: u32 = 1;
 const TICK_MAX: u32 = 4096;
 /// Ticks to accumulate before the measured tick duration is trusted.
 const TICK_WARMUP: f64 = 2048.0;
+/// A host gap longer than this is a stall, not a report interval. Pairing that
+/// much wall clock with however many ticks happen to arrive after it says
+/// nothing about the device's clock, so it is left out of the ratio.
+const TICK_HOST_STALL: f64 = 1.0;
 
 impl TickClock {
     /// Seconds since the previous report, or `None` on the first sample or
     /// after a gap.
     fn dt(&mut self, stamp: u32, fallback_hz: f32) -> Option<f32> {
-        let now = std::time::Instant::now();
+        self.dt_at(stamp, fallback_hz, std::time::Instant::now())
+    }
+
+    /// [`TickClock::dt`] with the host clock supplied, so that bursty arrival —
+    /// the thing this used to get wrong — can be reproduced exactly in a test.
+    fn dt_at(&mut self, stamp: u32, fallback_hz: f32, now: std::time::Instant) -> Option<f32> {
         let host = self
             .prev_at
             .replace(now)
@@ -757,9 +1483,34 @@ impl TickClock {
         if !(TICK_MIN..=TICK_MAX).contains(&ticks) {
             return None;
         }
-        // Only well-behaved host samples calibrate the tick. A scheduling stall
-        // is not evidence about the device's clock.
-        if (0.001..0.2).contains(&host) {
+        // ⭐ EVERY plausible sample calibrates the tick, bursts included.
+        //
+        // This used to require `host` in 0.001..0.2 s, on the reasoning that a
+        // sub-millisecond gap could not be a real report interval. But it is
+        // one: BLE delivers several notifications in a single connection event,
+        // so reports arrive in bursts — one carrying the whole inter-event gap
+        // and the rest microseconds behind it.
+        //
+        // ❗ Excluding those dropped their TICKS from the ratio while dropping
+        // almost none of the TIME, and the ratio is seconds per tick. With
+        // bursts of N reports every P seconds, each advancing T ticks:
+        //
+        //     accepted:  T ticks per P seconds   ->  tick = P / T
+        //     truth:   N*T ticks per P seconds   ->  tick = P / (N*T)
+        //
+        // so the tick came out N times too long and every rate N times too
+        // small. That is not hypothetical — it is measured, in the saved drift
+        // logs, as device time running ahead of wall clock: the left half
+        // reported 420 s of stillness over 276 s of wall (x1.52), the right
+        // half 600 s over 267 s (x2.25). The two halves disagree because they
+        // negotiate different connection intervals, and a given half disagrees
+        // with itself between sessions for the same reason — which is why the
+        // gyro needed re-tuning by hand every time and never stayed tuned.
+        //
+        // Summing every sample is exact under the same model: N*T ticks against
+        // P seconds. A late-delivered burst is self-correcting too, since its
+        // host deltas still sum to the true elapsed time however they are split.
+        if host < TICK_HOST_STALL {
             self.ticks += ticks as f64;
             self.secs += host;
         }
@@ -772,40 +1523,105 @@ impl TickClock {
 }
 
 impl OrientationTracker {
+    /// Replace the compiled-in resting drift with one measured on this
+    /// controller; `None` restores the default.
+    ///
+    /// Degrees per second, field order, before any gain — the same space as
+    /// [`RESTING_DRIFT_LEFT`].
+    pub fn set_resting_drift(&mut self, drift: Option<[f32; 3]>) {
+        self.resting_override = drift;
+    }
+
     /// `motion` is one parsed report. The canonical accel permutation is applied
     /// here so every caller gets canonical-frame angles and rates without having
     /// to remember to do it — forgetting it is what put the axes in the wrong
     /// order in the first place.
-    pub fn update(&mut self, motion: &Motion) -> Orientation {
+    /// `side` selects the mounting correction — see [`mount_for`]. Passed
+    /// explicitly rather than stored, so a caller cannot forget to set it and
+    /// silently get the other half's frame.
+    pub fn update(&mut self, motion: &Motion, side: crate::protocol::Side) -> Orientation {
         let (accel, angle) = (motion.accel, motion.angle);
-        let (roll, pitch) = tilt_from_accel(to_canonical_accel(accel));
+        // Canonical permutation, then the per-half mounting correction. Both
+        // are frame changes; keeping them separate keeps the first anchored to
+        // the sensor's own axes and the second to how the part is fitted.
+        let mount = mount_for(side);
+        let ca = to_canonical_accel(accel);
+        let ca = apply_mount([ca[0] as f32, ca[1] as f32, ca[2] as f32], mount);
+
+        // ⭐ GATE THE GRAVITY READING. An accelerometer measures gravity plus
+        // whatever else is pushing the controller, and only the first is usable
+        // as a reference. Taking it ungated meant every shove tilted the
+        // estimate — reported as sideways acceleration producing yaw and
+        // forward-back producing pitch — and, worse, it corrupted the
+        // `omega . up` projection so linear motion leaked into the integrated
+        // yaw permanently rather than just wobbling it.
+        //
+        // Rotating the controller does NOT change the magnitude, so this rejects
+        // translation while passing rotation through untouched — which is what
+        // makes it safe to gate at all.
+        let raw_mag = (ca[0] * ca[0] + ca[1] * ca[1] + ca[2] * ca[2]).sqrt() / ACCEL_LSB_PER_G;
+        if (raw_mag - 1.0).abs() < GRAVITY_TRUST_TOLERANCE && raw_mag > 0.01 {
+            let n = raw_mag * ACCEL_LSB_PER_G;
+            self.gravity = Some([ca[0] / n, ca[1] / n, ca[2] / n]);
+        }
+        // Until a trustworthy sample arrives, fall back to the raw reading
+        // rather than reporting level — a controller picked up mid-motion
+        // should still show roughly where it is.
+        let gdir = self.gravity.or_else(|| {
+            (raw_mag > 0.01).then(|| {
+                let n = raw_mag * ACCEL_LSB_PER_G;
+                [ca[0] / n, ca[1] / n, ca[2] / n]
+            })
+        });
+        let gvec = gdir.unwrap_or([0.0, 0.0, 1.0]);
+        let (roll, pitch) = tilt_from_accel([
+            (gvec[0] * ACCEL_LSB_PER_G) as i32,
+            (gvec[1] * ACCEL_LSB_PER_G) as i32,
+            (gvec[2] * ACCEL_LSB_PER_G) as i32,
+        ]);
 
         // Unwrap BEFORE converting to radians. The field covers half a turn, so
         // untracked wraps land as 180 degree flips in the middle of otherwise
         // ordinary motion.
+        // Heading is still tracked, for the `probe_i24_2` pin and for anything
+        // that wants the controller's own absolute figure. It no longer feeds
+        // the orientation — see the yaw integration below.
         let h = angle[HEADING_AXIS];
         match self.prev_heading.replace(h) {
             Some(p) => unwrap_heading(p, h, &mut self.heading_acc),
-            // Seed from the first reading so the absolute heading is preserved
-            // rather than starting from zero at connect.
             None => self.heading_acc = h as i64,
         }
-        let yaw = heading_rad(self.heading_acc);
-        let euler_rad = [roll, pitch, yaw];
-
-        let prev = match self.prev.replace(euler_rad) {
-            Some(p) => p,
-            None => {
-                // Prime the field differencer too, or the SECOND sample
-                // produces the spike this branch exists to prevent.
-                self.field_gyro.rate(angle);
-                return Orientation {
-                    euler_rad,
-                    rate_dps: [0.0; 3],
-                    field_rate_dps: [0.0; 3],
-                };
-            }
-        };
+        // ❗ The euler triple is NOT built here. Yaw is integrated from the
+        // rate, which is not known until further down, and an earlier revision
+        // built the triple with a placeholder yaw of zero, stored THAT as the
+        // previous sample, and then differenced against it — so the yaw rate
+        // read zero forever. Everything that needs `prev` now happens after
+        // yaw exists.
+        let first_sample = self.prev.is_none();
+        if first_sample {
+            // Prime the differencer, or the SECOND sample produces the spike
+            // this branch exists to prevent.
+            self.field_gyro.rate(angle);
+            // Level from gravity immediately. Deferring this to the second
+            // sample left the first integration step with nothing to rotate,
+            // so the first reported rate was always zero.
+            let (sr, cr) = (roll * 0.5).sin_cos();
+            let (sp, cp) = (pitch * 0.5).sin_cos();
+            self.q = Some(quat::normalise(quat::mul(
+                [0.0, -sp, 0.0, cp],
+                [sr, 0.0, 0.0, cr],
+            )));
+            self.prev = Some([roll, pitch, 0.0]);
+            self.prev_at = Some(std::time::Instant::now());
+            return Orientation {
+                euler_rad: [roll, pitch, 0.0],
+                rate_dps: [0.0; 3],
+                field_rate_dps: [0.0; 3],
+                pin_rate_dps: [0.0; 3],
+                yaw_rate_dps: 0.0,
+                quat_xyzw: self.q.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+            };
+        }
 
         // Measured sample rate, not an assumed one. Implausible gaps (a stalled
         // link, a paused debugger, the very first sample) fall back to the
@@ -823,6 +1639,217 @@ impl OrientationTracker {
             None => REPORT_HZ,
         };
 
+
+        // The real gyro: difference the angle fields, drop the glitches, divide
+        // by the DEVICE's elapsed time, and only then remove the resting bias.
+        //
+        // ❗ Order matters. Converting to deg/s BEFORE the bias step is what
+        // makes the bias thresholds mean what they say: they are written in
+        // deg/s, and feeding them counts-per-report made them depend on the
+        // report rate.
+        let counts = self.field_gyro.rate(angle);
+        let dt = self.clock.dt(motion.timestamp, hz).unwrap_or(1.0 / hz);
+        let per_sec = if dt > 1e-6 { 1.0 / dt } else { hz };
+        // Is the controller actually stationary? Gravity is fixed in the world,
+        // so a body-frame gravity direction that is not moving means the device
+        // is not rotating. Both the magnitude check and the direction check
+        // matter: the first rejects samples carrying linear acceleration, the
+        // second is the rotation test itself.
+        let gmag = raw_mag;
+        // ⭐ Compare against a SLOWLY LAGGING average, not against the previous
+        // sample.
+        //
+        // Consecutive-sample comparison cannot work here and never did: at
+        // ±10 counts of accelerometer noise on 4096, the direction moves about
+        // 0.0035 between reports all by itself, which is the same order as the
+        // threshold. So a perfectly stationary controller failed the test
+        // constantly, the drift run reset almost every report, and no
+        // measurement ever reached thirty seconds — which is why the log stayed
+        // empty.
+        //
+        // It also could not have detected slow motion even in principle: a 5°/s
+        // pan moves the direction 0.0013 per report, FAR below the same
+        // threshold. Per-sample differences simply do not separate the two.
+        //
+        // ⛔ And a LAGGING AVERAGE does not work either, which is the mistake
+        // that replaced it and had to be undone.
+        //
+        // An EMA is a low-pass, and against a sustained rotation it settles at
+        // a CONSTANT lag of rate × time-constant — it does not keep pulling
+        // away, it catches up and then tracks. So a slow steady aim reads as
+        // still after the first fraction of a second, the bias estimator learns
+        // the aim as drift, and the cursor is dragged back while it is being
+        // moved. That is the "gyro fights small movements" report, and it is a
+        // property of the filter, not a tuning error.
+        //
+        // ⭐ A FIXED anchor does work. Deviation from a point that is not
+        // moving keeps growing for as long as the rotation continues, so
+        // stillness has to be earned by staying put for `STILL_SETTLE_SECS`
+        // and is lost the moment the pad leaves the neighbourhood of the
+        // anchor. The anchor only ever moves to where the device actually is,
+        // never toward where it is heading.
+        let device_still = match gdir {
+            Some(now) if (gmag - 1.0).abs() < STILL_GRAVITY_TOLERANCE => {
+                self.still.observe(now, dt)
+            }
+            // Not measuring gravity, so nothing can be concluded about
+            // stillness — and "moving" is the safe answer: it only ever stops
+            // the estimator learning, which is recoverable.
+            _ => {
+                self.still.interrupt();
+                false
+            }
+        };
+
+        // Measure the raw drift before anything is subtracted from it.
+        let raw_dps = [
+            counts[0] * per_sec / ANGLE_COUNTS_PER_DEG,
+            counts[1] * per_sec / ANGLE_COUNTS_PER_DEG,
+            counts[2] * per_sec / ANGLE_COUNTS_PER_DEG,
+        ];
+        self.drift_probe.update(raw_dps, dt, device_still, side);
+
+        // Subtract the reproducible resting drift FIRST, so the estimator only
+        // has the session-specific remainder to find — see `RESTING_DRIFT_*`.
+        let fixed = self.resting_override.unwrap_or_else(|| resting_drift(side));
+        let euler_dps = self.field_bias.correct_gated([
+            counts[0] * per_sec / ANGLE_COUNTS_PER_DEG - fixed[0],
+            counts[1] * per_sec / ANGLE_COUNTS_PER_DEG - fixed[1],
+            counts[2] * per_sec / ANGLE_COUNTS_PER_DEG - fixed[2],
+        ], device_still);
+
+        // ⭐ If the controller is sending its REAL gyro, use it and throw all of
+        // the above away — no wrap seam, no per-axis gain, no drift beyond the
+        // sensor's own offset. The recovered path stays as a fallback so a
+        // controller that withholds it still produces something.
+        //
+        // ⭐ TWO rates, deliberately, because they are judged against different
+        // things — see [`FIELD_GAIN`] and [`ORIENTATION_GAIN`]. `field_rate_dps`
+        // goes out to the gyro pins; `orient_dps` drives the yaw integration.
+        // A real gyro block needs neither, so both collapse to it when present.
+        let (field_rate_dps, orient_dps) = match motion.gyro {
+            Some(g) => {
+                let s = 1.0 / GYRO_LSB_PER_DPS;
+                let r = [g[0] as f32 * s, g[1] as f32 * s, g[2] as f32 * s];
+                (r, r)
+            }
+            None => {
+                let g = field_gain();
+                let o = orientation_gain();
+                (
+                    [euler_dps[0] * g[0], euler_dps[1] * g[1], euler_dps[2] * g[2]],
+                    [euler_dps[0] * o[0], euler_dps[1] * o[1], euler_dps[2] * o[2]],
+                )
+            }
+        };
+
+        // ⭐ ORIENTATION: tilt comes STRAIGHT FROM GRAVITY. Only yaw is integrated.
+        //
+        // Free-integrating all three body rates and correcting afterwards was
+        // tried and failed on hardware the same way the Euler composition did:
+        // the model tumbled, roll appeared in yaw, and every movement ended
+        // with the estimate being dragged back. That is what an integrator with
+        // a WRONG AXIS MAP looks like once a correction term is fighting it —
+        // and the map is exactly the thing this decode has never been able to
+        // verify, because the fields are a firmware fusion rather than three
+        // gyro axes.
+        //
+        // So do not integrate what does not need integrating. The
+        // accelerometer measures the direction of gravity directly, which fixes
+        // roll and pitch EXACTLY, with no accumulation, no axis map, and no
+        // convention to guess. They cannot tumble because nothing is being
+        // integrated into them.
+        //
+        // Yaw is the only degree of freedom gravity cannot see, so it is the
+        // only one integrated — and the rate used is the component of the body
+        // rotation ABOUT GRAVITY:
+        //
+        //     yaw_rate = omega . g_hat
+        //
+        // A dot product with the measured down-vector, which needs no axis
+        // assignment either: whatever permutation the three rates arrive in,
+        // their projection onto gravity is the rotation about vertical. That is
+        // the piece that was wrong before — a body-axis rate was being applied
+        // as a world-vertical rotation, so tilting the controller turned yaw
+        // into roll.
+        // Same correction on the rates: gravity and the gyro must agree about
+        // which way the controller is fitted, or the yaw projection below is
+        // taken against the wrong up-vector.
+        let body = apply_mount(canonical_field_rate(orient_dps), mount);
+        // ⭐ The PIN's yaw is projected from the pin-scaled rate, the
+        // orientation's from its own.
+        //
+        // ❗ Both were taken from `body` at first, which quietly put the yaw pin
+        // on `ORIENTATION_GAIN` and left `FIELD_GAIN`'s yaw term driving
+        // nothing at all. Turning the documented knob for "yaw is weak to aim
+        // with" then did nothing, which is the worst way for a constant to be
+        // wrong. Roll and pitch pins already scale with `FIELD_GAIN`; this is
+        // what makes the third entry mean the same thing for yaw.
+        let body_pin = apply_mount(canonical_field_rate(field_rate_dps), mount);
+        // ⭐ NEGATED, and this is a convention mismatch rather than a guess.
+        //
+        // `canonical_yaw_rate` is `omega . g_hat`, and `g_hat` points UP. By the
+        // right-hand rule a positive rotation about UP turns the controller to
+        // the LEFT. But the canonical gyro contract is the opposite: `gyro_z` is
+        // positive turning RIGHT — see the Switch Pro parser in
+        // `flexinput_devices::gyro`, which negates its raw yaw for exactly this
+        // reason and is the reference every other pad is matched against.
+        //
+        // ❗ So the projection is correct physics and still the wrong sign for
+        // this pin. Left unflipped, a patch has to tick "invert yaw" to get
+        // ordinary behaviour, which pushes a decode bug out into every user's
+        // configuration and hides it there.
+        //
+        // The ORIENTATION integration below deliberately does NOT take this
+        // negation: it feeds `yaw_rad` in the crate's own Euler convention,
+        // where positive yaw is about the up-vector. Two consumers, two
+        // conventions, and conflating them is what made the sign wander.
+        let yaw_rate_pin = -match gdir {
+            Some(g) => canonical_yaw_rate(body_pin, g),
+            None => body_pin[2],
+        };
+        // Roll and pitch for the PINS. Straight from the fields unless the
+        // ghost correction is switched on — see [`ghost_cancel`].
+        let pin_rp = if ghost_cancel() {
+            self.ghost.correct(
+                [body_pin[0], body_pin[1]],
+                (roll, pitch),
+                dt,
+                gdir.is_some(),
+            )
+        } else {
+            [body_pin[0], body_pin[1]]
+        };
+        let yaw_rate = match gdir {
+            // ❗ NOT negated. An accelerometer at rest measures the upward
+            // REACTION force, not gravity — a controller lying flat face-up
+            // reads +1 g on its vertical axis. So `gdir` already points UP,
+            // which is the axis yaw is positive about.
+            Some(g) => canonical_yaw_rate(body, g),
+            None => body[2],
+        };
+        self.yaw_rad += yaw_rate.to_radians() * dt;
+        if self.yaw_rad > std::f32::consts::PI {
+            self.yaw_rad -= std::f32::consts::TAU;
+        } else if self.yaw_rad < -std::f32::consts::PI {
+            self.yaw_rad += std::f32::consts::TAU;
+        }
+
+        // Compose in the crate's documented convention. Roll and pitch are the
+        // gravity-derived angles for THIS sample, so the attitude is absolute
+        // and self-correcting by construction rather than by a feedback gain.
+        let (sy, cy) = (self.yaw_rad * 0.5).sin_cos();
+        let (sp, cp) = (pitch * 0.5).sin_cos();
+        let (sr, cr) = (roll * 0.5).sin_cos();
+        self.q = Some(quat::normalise(quat::mul(
+            quat::mul([0.0, 0.0, sy, cy], [0.0, -sp, 0.0, cp]),
+            [sr, 0.0, 0.0, cr],
+        )));
+
+        let euler_rad = quat::to_euler(self.q.unwrap_or([0.0, 0.0, 0.0, 1.0]));
+
+        // Now that the triple is real, difference it against the previous one.
+        let prev = self.prev.replace(euler_rad).unwrap_or(euler_rad);
         let mut rate_dps = [0.0f32; 3];
         for i in 0..3 {
             let mut d = euler_rad[i] - prev[i];
@@ -836,39 +1863,14 @@ impl OrientationTracker {
             rate_dps[i] = d.to_degrees() * hz;
         }
 
-        // The real gyro: difference the angle fields, drop the glitches, divide
-        // by the DEVICE's elapsed time, and only then remove the resting bias.
-        //
-        // ❗ Order matters. Converting to deg/s BEFORE the bias step is what
-        // makes the bias thresholds mean what they say: they are written in
-        // deg/s, and feeding them counts-per-report made them depend on the
-        // report rate.
-        let counts = self.field_gyro.rate(angle);
-        let dt = self.clock.dt(motion.timestamp, hz).unwrap_or(1.0 / hz);
-        let per_sec = if dt > 1e-6 { 1.0 / dt } else { hz };
-        let euler_dps = self.field_bias.correct([
-            counts[0] * per_sec / ANGLE_COUNTS_PER_DEG,
-            counts[1] * per_sec / ANGLE_COUNTS_PER_DEG,
-            counts[2] * per_sec / ANGLE_COUNTS_PER_DEG,
-        ]);
-
-        // ⭐ If the controller is sending its REAL gyro, use it and throw all of
-        // the above away — no wrap seam, no per-axis gain, no drift beyond the
-        // sensor's own offset. The recovered path stays as a fallback so a
-        // controller that withholds it still produces something.
-        let field_rate_dps = match motion.gyro {
-            Some(g) => {
-                let s = 1.0 / GYRO_LSB_PER_DPS;
-                [g[0] as f32 * s, g[1] as f32 * s, g[2] as f32 * s]
-            }
-            // Per-axis gain and nothing else — see `FIELD_GAIN`.
-            None => {
-                let g = field_gain();
-                [euler_dps[0] * g[0], euler_dps[1] * g[1], euler_dps[2] * g[2]]
-            }
-        };
-
-        Orientation { euler_rad, rate_dps, field_rate_dps }
+        Orientation {
+            euler_rad,
+            rate_dps,
+            field_rate_dps,
+            pin_rate_dps: [pin_rp[0], pin_rp[1], yaw_rate_pin],
+            yaw_rate_dps: yaw_rate_pin,
+            quat_xyzw: self.q.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        }
     }
 }
 
@@ -1229,16 +2231,53 @@ const STILL_DELTA_LSB: f32 = STILL_DELTA_DPS;
 /// Consecutive stable samples before the bias starts tracking. At ~60 Hz this is
 /// about a quarter second, long enough that a momentary pause mid-motion does
 /// not get mistaken for rest.
+///
+/// ⛔ **Do not speed this up to chase the fusion pull-back.** That was tried —
+/// 8 samples with a 0.10 EMA — and it made the controller fight the user:
+///
+///   > I try to move the cursor a little to the right and it fights it and
+///   > moves back until I give enough momentum.
+///
+/// Which is exactly right, and is what any bias tracker does when it converges
+/// faster than a person moves. A deliberate slow movement is indistinguishable
+/// from a zero-rate offset by magnitude and by stability, so the only thing
+/// separating them is TIME — and taking that away turns the estimator into a
+/// high-pass filter that cancels precisely the small, careful motions aiming
+/// depends on.
 const REST_SAMPLES: u32 = 16;
 /// EMA weight once converged. Deliberately slow: bias drifts with temperature
 /// over minutes, so it needs to follow that without chasing per-sample noise.
 const BIAS_EMA: f32 = 0.02;
-/// Refuse to treat anything beyond this as bias. Stability alone cannot tell a
-/// resting controller from one turning at a perfectly constant rate; this cap
-/// means a sustained fast pan can never be silently absorbed into the estimate
-/// and cancelled out. Roughly 36 dps — far above any real zero-rate offset,
-/// well below a deliberate flick.
-const MAX_BIAS_DPS: f32 = 36.0;
+/// Refuse to treat anything beyond this as bias.
+///
+/// Stability alone cannot tell a resting controller from one turning at a
+/// perfectly constant rate, so this cap is what stops a sustained pan being
+/// silently absorbed and cancelled out.
+///
+/// ⭐ **Was 36 dps, chosen as "far above any real zero-rate offset". It is far
+/// above it — by a factor of twenty-five.** The resting drift of these fields
+/// was later measured directly, on both halves across two captures, at 0.03 to
+/// 1.44 °/s. A 36 °/s ceiling therefore did nothing to protect real motion: a
+/// deliberate slow pan sits well inside it and was eligible to be learned as an
+/// offset and subtracted away.
+///
+/// ⭐ **10 °/s, raised from 4 once the estimator stopped guessing at stillness.**
+///
+/// 4 was chosen against a resting drift measured at 0.03-1.44 °/s over short
+/// captures. Over a long session the fields drift considerably faster than that
+/// — one of the three visibly outruns the others and all three loop right
+/// around given time — so a 4 °/s ceiling simply refused to learn the offset
+/// that mattered, and it passed straight through into the rate.
+///
+/// Raising it is only safe because learning is now gated on the ACCELEROMETER
+/// saying the controller is stationary, not on the gyro reading looking steady.
+/// A slow deliberate tilt moves gravity, so it can no longer be mistaken for an
+/// offset however small it is — which is what made the old cap load-bearing.
+///
+/// ⚠️ The gate is blind to rotation about gravity, so a very slow flat yaw can
+/// still be learned as bias. That is the same axis an accelerometer can never
+/// see, and it is the reason yaw needs a gyro in the first place.
+const MAX_BIAS_DPS: f32 = 10.0;
 const MAX_BIAS_LSB: f32 = MAX_BIAS_DPS;
 
 impl Default for GyroBias {
@@ -1256,6 +2295,28 @@ impl Default for GyroBias {
 impl GyroBias {
     /// Feed a raw gyro sample; returns it with the current bias removed.
     pub fn correct(&mut self, raw: [f32; 3]) -> [f32; 3] {
+        self.correct_gated(raw, true)
+    }
+
+    /// [`GyroBias::correct`], but only allowed to LEARN while `device_still`.
+    ///
+    /// ⭐ **Stability is not stillness, and conflating them is what made the
+    /// controller fight small movements.** This estimator judged rest by how
+    /// much the reading moved between samples — but a hand panning slowly and
+    /// steadily is just as stable as a controller lying on a desk. Given time
+    /// it learned that pan as an offset and cancelled it, so a careful little
+    /// nudge went nowhere while a flick worked fine.
+    ///
+    /// The accelerometer settles it independently: gravity is a fixed direction
+    /// in the world, so if its direction in the BODY frame is not moving, the
+    /// controller is not rotating — about roll or pitch at least. That is a
+    /// measurement of the thing we actually mean, rather than an inference from
+    /// the signal being corrected.
+    ///
+    /// ⚠️ Rotation about gravity itself is invisible to this, so a slow flat
+    /// yaw can still be learned as bias. Nothing an accelerometer can do about
+    /// that; it is the same blind axis that makes yaw need a gyro at all.
+    pub fn correct_gated(&mut self, raw: [f32; 3], device_still: bool) -> [f32; 3] {
         let s = [raw[0] as f32, raw[1] as f32, raw[2] as f32];
 
         let stable = self.have_last
@@ -1264,7 +2325,7 @@ impl GyroBias {
         self.last = s;
         self.have_last = true;
 
-        if stable && plausible {
+        if stable && plausible && device_still {
             self.still_count = self.still_count.saturating_add(1);
             if self.still_count >= REST_SAMPLES {
                 if self.seeded {
@@ -1508,26 +2569,118 @@ mod tests {
         let out = canonical_field_rate([10.0, 20.0, 30.0]);
         assert_eq!(out[0], 20.0, "canonical roll should come from field #1");
         assert_eq!(out[1], 10.0, "canonical pitch should come from field #0");
-        // ❗ Negated. Positive yaw sent the cursor the wrong way on hardware,
-        // and correcting it downstream would leave every other consumer of the
-        // canonical frame still wrong.
-        assert_eq!(out[2], -30.0, "canonical yaw comes from field #2, INVERTED");
+        assert_eq!(out[2], 30.0, "canonical yaw comes from field #2, upright");
     }
 
-    /// ⛔ The yaw gain must not be silently dropped.
+    /// ⛔ A slow, deliberate movement must NOT be learned as bias.
     ///
-    /// It is the difference between yaw reading a quarter of the other axes and
-    /// reading the same — measured both on hardware and as a 4.15/4.29/4.14
-    /// path-length ratio across captures. A default that drifts back to 1.0
-    /// would restore the original complaint with no visible cause.
+    /// This is the "it fights small movements" regression, pinned. A hand
+    /// panning slowly is perfectly stable sample to sample and sits well inside
+    /// the bias cap, so the estimator has no way to tell it from a zero-rate
+    /// offset — except that the accelerometer can see the device rotating.
+    /// With that gate shut, the reading must survive.
     #[test]
-    fn the_yaw_field_keeps_its_measured_gain() {
+    fn a_slow_deliberate_pan_is_not_absorbed_while_the_device_is_moving() {
+        let mut bias = GyroBias::default();
+        // Well below the cap, perfectly steady — indistinguishable from bias by
+        // every test except "is the controller actually still".
+        let pan = [3.0f32, 0.0, 0.0];
+        let mut out = [0.0; 3];
+        for _ in 0..(REST_SAMPLES * 8) {
+            out = bias.correct_gated(pan, false);
+        }
+        assert!(
+            (out[0] - pan[0]).abs() < 0.05,
+            "a 3 deg/s pan decayed to {} while the device was moving",
+            out[0],
+        );
+    }
+
+    /// And with the device genuinely still, it must still converge.
+    #[test]
+    fn a_resting_offset_is_still_learned_when_the_device_is_still() {
+        let mut bias = GyroBias::default();
+        let resting = [1.2f32, -0.4, 0.7];
+        let mut out = [0.0; 3];
+        for _ in 0..(REST_SAMPLES * 40) {
+            out = bias.correct_gated(resting, true);
+        }
+        assert!(
+            out.iter().all(|v| v.abs() < 0.1),
+            "resting offset was not cancelled: {out:?}",
+        );
+    }
+
+    /// The cross-axis mix defaults to the identity, and must.
+    ///
+    /// ⛔ A guessed correction is worse than none — the removed ZYX Euler
+    /// transform was exactly that, and it injected the coupling it was meant to
+    /// remove. Until a coefficient is measured rather than assumed, this stays
+    /// a no-op, and a future edit that quietly bakes one in has to fail here.
+    #[test]
+    fn the_cross_axis_mix_is_identity_until_something_is_measured() {
+        for r in 0..3 {
+            for c in 0..3 {
+                let want = if r == c { 1.0 } else { 0.0 };
+                assert_eq!(GYRO_MIX[r][c], want, "GYRO_MIX[{r}][{c}] is not identity");
+            }
+        }
+        // And it must be a genuine pass-through, not merely look like one.
+        let out = canonical_field_rate([3.0, 5.0, 7.0]);
+        let mapped = canonical_field_rate([3.0, 5.0, 7.0]);
+        assert_eq!(out, mapped);
+        assert!(out.iter().any(|v| *v != 0.0), "mapping produced nothing");
+    }
+
+    /// The bias cap must stay near the drift actually measured on hardware.
+    ///
+    /// It was 36 °/s against a real resting drift of 0.03–1.44 °/s — twenty-five
+    /// times too permissive, which meant a deliberate slow pan was eligible to
+    /// be learned as a zero-offset and subtracted away. A cap that large is
+    /// indistinguishable from having no cap for any motion a hand produces.
+    #[test]
+    fn the_bias_cap_is_scaled_to_measured_drift_not_guessed() {
+        assert!(
+            (1.44..=10.0).contains(&MAX_BIAS_DPS),
+            "MAX_BIAS_DPS is {MAX_BIAS_DPS} — it must exceed the 1.44 deg/s measured \
+             on hardware but stay well below any deliberate aiming motion",
+        );
+    }
+
+    /// ⛔ The two yaw gains must not be collapsed back into one.
+    ///
+    /// ⭐ The history is worth keeping, because it is a double-correction and
+    /// those are hard to see from either end. `ANGLE_COUNTS_PER_TURN` was once
+    /// the field MODULUS, 2^24, which made every axis rotate twice as far as it
+    /// should. That 2x was observed as "a 90° turn shows 180° on screen" — and
+    /// then FIXED TWICE, independently: the constant was corrected to 2^25, and
+    /// the yaw gain was separately halved from 4 to 2 to cancel the same error.
+    ///
+    /// The result is exactly what was reported from hardware afterwards. All
+    /// three axes lost the shared 2x from the constant, and yaw alone lost
+    /// another 2x from the gain — so yaw read half of roll and pitch on the
+    /// pins ("weaker than the rest"), while the orientation, having been
+    /// corrected only once, still turned 180° for 90°.
+    ///
+    /// Hence the split, and hence both values here: 1.0 for orientation, where
+    /// the measured counts-per-turn leaves no freedom, and 4.0 for the pins,
+    /// which is where it was before either correction landed.
+    #[test]
+    fn the_two_yaw_gains_stay_separate_and_keep_their_values() {
         assert_eq!(FIELD_GAIN[0], 1.0);
         assert_eq!(FIELD_GAIN[1], 1.0);
         assert!(
             (FIELD_GAIN[2] - 4.0).abs() < 1e-6,
-            "yaw gain is {} — hardware and captures both put it near 4",
+            "yaw PIN gain is {} — halving it is what made yaw weaker than roll              and pitch to aim with",
             FIELD_GAIN[2],
+        );
+        assert_eq!(
+            ORIENTATION_GAIN, [1.0, 1.0, 1.0],
+            "orientation gain is fixed by the measured counts-per-turn; a value              other than 1 makes the model disagree with the world by that factor",
+        );
+        assert_ne!(
+            FIELD_GAIN[2], ORIENTATION_GAIN[2],
+            "the pin gain and the orientation gain have been collapsed back into              one number — tuning either will now silently move the other",
         );
     }
 
@@ -1548,6 +2701,44 @@ mod tests {
         assert_eq!(c.dt(1012, 100.0), None, "zero ticks is not a duration");
         // A gap far beyond a dropped report or two: a counter wrap or a stall.
         assert_eq!(c.dt(1012 + TICK_MAX + 1, 100.0), None, "implausible gap");
+    }
+
+    /// ⛔ Bursty arrival must not stretch the tick.
+    ///
+    /// The radio hands over several notifications per connection event, so most
+    /// reports land microseconds after the one before. Calibrating only on the
+    /// gaps and ignoring those counted their ticks nowhere while counting their
+    /// time everywhere, and the tick came out one burst-length too long — which
+    /// scaled every gyro rate down by the same factor, differently on each half
+    /// and on each session. See the comment in [`TickClock::dt_at`].
+    #[test]
+    fn the_device_clock_is_not_fooled_by_bursts() {
+        use std::time::Duration;
+        // Three reports every 15 ms, twelve ticks each: 36 ticks per 15 ms, so
+        // a tick is 15/36 ms and one report is exactly 5 ms of device time.
+        const PERIOD: Duration = Duration::from_millis(15);
+        const PER_EVENT: u32 = 3;
+        const TICKS: u32 = 12;
+
+        let mut c = TickClock::default();
+        let base = std::time::Instant::now();
+        let mut stamp = 1000u32;
+        let mut dt = None;
+        for event in 0..400u32 {
+            for i in 0..PER_EVENT {
+                // First report of the event carries the whole gap; the rest
+                // arrive right behind it, as the radio actually delivers them.
+                let at = base + PERIOD * event + Duration::from_micros(i as u64 * 60);
+                stamp = stamp.wrapping_add(TICKS);
+                dt = c.dt_at(stamp, 100.0, at);
+            }
+        }
+        let dt = dt.expect("a calibrated clock must answer");
+        assert!(
+            (dt - 0.005).abs() < 0.0005,
+            "expected ~5 ms per report, got {dt} s — the clock is out by x{:.2}",
+            dt / 0.005,
+        );
     }
 
     /// Calibration must survive the timestamp counter wrapping at 2^32.
@@ -1592,22 +2783,76 @@ mod tests {
         assert_eq!(g.rate([120_000 + 8_176_435 + 5_000, 0, 0])[0], 5_000.0);
     }
 
-    /// A duplicated sample holds the rate instead of punching a zero into it.
-    ///
-    /// The controller repeats its last IMU sample under some conditions —
-    /// observed while the added back button is held — and a duplicate
-    /// differentiates to zero followed by a double step. That staircase is the
-    /// jaggedness seen on an otherwise smooth pan.
+    /// A stalled field holds its rate, then spreads its catch-up step over the
+    /// gap instead of spiking.
     #[test]
-    fn a_repeated_sample_holds_the_rate_rather_than_reading_as_a_stop() {
+    fn a_stalled_field_averages_over_the_gap_instead_of_spiking() {
         let mut g = AngleGyro::default();
         g.rate([0, 0, 0]);
         assert_eq!(g.rate([90_000, 0, 0])[0], 90_000.0);
-        // Same sample again: the pad did not stop, the report repeated.
-        assert_eq!(g.rate([90_000, 0, 0])[0], 90_000.0, "duplicate read as a stop");
-        // And the next genuine step is measured from the CURRENT value, so it
-        // is an ordinary step rather than a doubled one.
-        assert_eq!(g.rate([180_000, 0, 0])[0], 90_000.0);
+        // Same value again: the pad did not stop, the field carried no fresh
+        // sample.
+        assert_eq!(g.rate([90_000, 0, 0])[0], 90_000.0, "a stall read as a stop");
+        // ⭐ The catch-up step covers TWO reports, so it is HALF the rate — not
+        // the doubled spike it used to be. The field moved 90 000 counts in the
+        // time two reports took; that is what it did, and reporting it as one
+        // report's worth is what put a comb on a smooth pan.
+        assert_eq!(g.rate([180_000, 0, 0])[0], 45_000.0);
+    }
+
+    /// ⛔ Fields refreshing at DIFFERENT rates must still read as one steady
+    /// rate.
+    ///
+    /// This is the oscilloscope symptom, reproduced: one channel smooth and the
+    /// others pulsing, on a motion that was perfectly smooth. The old code only
+    /// held when all three fields repeated together, which is the one case that
+    /// almost never happens — the usual case is one field stalling while the
+    /// others move, and that field then read zero, zero, triple.
+    #[test]
+    fn fields_that_refresh_at_different_rates_read_as_one_steady_rate() {
+        let mut g = AngleGyro::default();
+        // Field 0 advances every report, field 2 every third — the same true
+        // angular rate, sampled at a third of the refresh.
+        let (mut a0, mut a2) = (0i32, 0i32);
+        g.rate([0, 0, 0]);
+        let mut fast = Vec::new();
+        let mut slow = Vec::new();
+        for step in 1..=12 {
+            a0 += 300;
+            if step % 3 == 0 {
+                a2 += 900;
+            }
+            let out = g.rate([a0, 0, a2]);
+            fast.push(out[0]);
+            slow.push(out[2]);
+        }
+        // Once the slow field has produced its first update, every sample from
+        // it must agree with the fast one. A comb would show up here as a third
+        // of the samples at zero and a third at 900.
+        for (i, (f, sl)) in fast.iter().zip(&slow).enumerate().skip(3) {
+            assert!(
+                (sl - 300.0).abs() < 1.0,
+                "sample {i}: slow field read {sl}, expected the true 300 (fast field reads {f})",
+            );
+        }
+    }
+
+    /// A field that genuinely stops must not hold its last rate forever.
+    ///
+    /// The counterpart to the hold above: a controller set down mid-turn has to
+    /// stop reporting that turn. `MAX_HOLD` bounds it at an eighth of a second,
+    /// which no real motion can hide inside — at 2^25 counts per revolution
+    /// even a 0.1 °/s crawl moves the field every report.
+    #[test]
+    fn a_field_that_stops_eventually_reads_zero() {
+        let mut g = AngleGyro::default();
+        g.rate([0, 0, 0]);
+        assert_eq!(g.rate([90_000, 0, 0])[0], 90_000.0);
+        let mut last = 90_000.0;
+        for _ in 0..MAX_HOLD {
+            last = g.rate([90_000, 0, 0])[0];
+        }
+        assert_eq!(last, 0.0, "a stopped field held its rate past MAX_HOLD");
     }
 
     /// ⛔ The rejection must not clip real motion.
@@ -1803,7 +3048,7 @@ mod tests {
     fn small_noise_around_rest_still_counts_as_still() {
         let mut bias = GyroBias::default();
         for i in 0..REST_SAMPLES + 10 {
-            let jitter = if i % 2 == 0 { (0.15) } else { (-0.15) };
+            let jitter = if i % 2 == 0 { 0.15 } else { -0.15 };
             bias.correct([(2.0) + jitter, (-1.2), (0.6)]);
         }
         assert!(bias.is_seeded());
@@ -1938,7 +3183,7 @@ mod orientation_tests {
             if h as i64 >= ANGLE_FIELD_MODULUS / 2 {
                 h -= ANGLE_FIELD_MODULUS as i32;
             }
-            let o = t.update(&sample([0, 0, g], [0, 0, h]));
+            let o = t.update(&sample([0, 0, g], [0, 0, h]), Side::Right);
             worst = worst.max(o.rate_dps[2].abs());
         }
         // Half a degree per report at REPORT_HZ is ~34 deg/s. A missed wrap
@@ -1949,10 +3194,16 @@ mod orientation_tests {
     #[test]
     fn the_first_sample_produces_no_rate_spike() {
         let mut t = OrientationTracker::default();
-        let o = t.update(&sample([0, 0, G], [0, 0, 12_345_678]));
+        let o = t.update(&sample([0, 0, G], [0, 0, 12_345_678]), Side::Right);
         assert_eq!(o.rate_dps, [0.0; 3]);
-        // ...but the orientation itself is available immediately.
-        assert!(o.euler_rad[2] != 0.0);
+        // ⭐ And yaw starts at EXACTLY zero, which is the point. It used to be
+        // seeded from the controller's raw heading, whose value at connect is
+        // arbitrary — so a pad lying flat and pointing at the screen produced
+        // whatever heading it happened to hold, and the 3D model faced a random
+        // direction. Yaw is integrated from the rate now, so neutral is neutral.
+        assert_eq!(o.euler_rad[2], 0.0, "yaw must start at neutral, not at the raw heading");
+        // Roll and pitch remain absolute and available immediately.
+        assert!(o.euler_rad[0].abs() < 1e-6 && o.euler_rad[1].abs() < 1e-6);
     }
 
     #[test]
@@ -1961,15 +3212,45 @@ mod orientation_tests {
         // REPORT_HZ deg/s, straight from the definition.
         let per_report = (ANGLE_COUNTS_PER_TURN / 360) as i32;
         let mut t = OrientationTracker::default();
-        t.update(&sample([0, 0, G], [0, 0, 0]));
-        let o = t.update(&sample([0, 0, G], [0, 0, per_report]));
-        // Negative: the field counts opposite to the canonical yaw convention,
-        // and `heading_rad` owns that negation.
+        t.update(&sample([0, 0, G], [0, 0, 0]), Side::Right);
+        let o = t.update(&sample([0, 0, G], [0, 0, per_report]), Side::Right);
+        // One degree of FIELD movement per report, through the same chain the
+        // orientation uses: field #2 -> canonical yaw, times the yaw gain.
+        // Spelled out rather than hardcoded so a change to either constant
+        // shows up here as a disagreement about the chain, not a magic number.
+        // ❗ ORIENTATION_GAIN, not FIELD_GAIN: `rate_dps` is differentiated from
+        // the orientation, so it follows the orientation's scale. Reading it
+        // against the PIN gain is precisely the conflation that broke both.
+        let expect = REPORT_HZ * ORIENTATION_GAIN[2] * GYRO_MAP[2].1;
         assert!(
-            (o.rate_dps[2] + REPORT_HZ).abs() < 1.0,
-            "yaw rate {} deg/s, expected {}",
+            (o.rate_dps[2] - expect).abs() < 2.0,
+            "yaw rate {} deg/s, expected {expect}",
             o.rate_dps[2],
-            -REPORT_HZ
+        );
+        // ⭐ And the PIN carries the pin gain from the same sample — the split
+        // pinned behaviourally, not just as two constants. If these two ever
+        // come out equal again, one knob is driving both jobs.
+        let pin = REPORT_HZ * FIELD_GAIN[2];
+        assert!(
+            (o.field_rate_dps[2] - pin).abs() < 2.0,
+            "yaw pin {} deg/s, expected {pin}",
+            o.field_rate_dps[2],
+        );
+        assert!(
+            (o.field_rate_dps[2] - o.rate_dps[2]).abs() > 1.0,
+            "the pin rate and the orientation rate came out identical — the two              gains have been collapsed back into one",
+        );
+        // ⭐ And the yaw PIN follows the pin gain, not the orientation's.
+        //
+        // Flat on the table, canonical up is +z, so the projection onto gravity
+        // reduces to the yaw component itself — which makes this a direct read
+        // of which gain reached the pin. It was the orientation's for a while,
+        // and the symptom was that `FLEXINPUT_JC2_FIELD_GAIN` did nothing to a
+        // yaw axis everyone agreed was too weak.
+        assert!(
+            (o.yaw_rate_dps.abs() - pin).abs() < 2.0,
+            "yaw pin projected {} deg/s, expected the pin-gained {pin}",
+            o.yaw_rate_dps,
         );
     }
 
@@ -1981,25 +3262,484 @@ mod orientation_tests {
         let one_deg = (ANGLE_COUNTS_PER_TURN / 360) as i32;
         let half = (ANGLE_COUNTS_PER_TURN / 2) as i32;
         let mut t = OrientationTracker::default();
-        t.update(&sample([0, 0, G], [0, 0, half - one_deg]));
-        let o = t.update(&sample([0, 0, G], [0, 0, half + one_deg]));
+        t.update(&sample([0, 0, G], [0, 0, half - one_deg]), Side::Right);
+        let o = t.update(&sample([0, 0, G], [0, 0, half + one_deg]), Side::Right);
+        // Generous, and scaled by the yaw gain: the point is that a wrap does
+        // not produce a FULL-CIRCLE flick, not that it is pixel-perfect.
         assert!(
-            o.rate_dps[2].abs() < 3.0 * REPORT_HZ,
+            o.rate_dps[2].abs() < 6.0 * REPORT_HZ * FIELD_GAIN[2],
             "wrap produced a {} deg/s spike",
             o.rate_dps[2]
         );
     }
 
+    /// ⭐ Tilt must come from GRAVITY, not from integration.
+    ///
+    /// The failure this pins is the one that survived three attempts: a
+    /// body-axis rate applied as a world-vertical rotation, so tilting the
+    /// controller turned yaw into roll and the model tumbled. Roll and pitch
+    /// are read from the accelerometer for every sample now, so a controller
+    /// held at a fixed tilt reports that tilt exactly, no matter what the gyro
+    /// fields are doing or how long it has been running.
+    #[test]
+    fn a_fixed_tilt_reads_exactly_that_tilt_however_the_gyro_behaves() {
+        let mut t = OrientationTracker::default();
+        // Right grip down: gravity on canonical +y, which is raw axis 0 negated.
+        let held = [-G, 0, 0];
+        // Feed a large, steadily changing angle field the whole time — the gyro
+        // is "spinning" as hard as the glitch filter allows.
+        let mut angle = 0i32;
+        let mut last = [0.0f32; 3];
+        for _ in 0..2000 {
+            angle = angle.wrapping_add(200_000);
+            last = t.update(&sample(held, [angle, angle, angle]), Side::Right).euler_rad;
+        }
+        // Roll pinned at +90 by gravity, pitch at zero. Neither may wander.
+        assert!(
+            (last[0] - std::f32::consts::FRAC_PI_2).abs() < 0.02,
+            "roll drifted to {} rad after 2000 reports of hard rotation",
+            last[0],
+        );
+        assert!(last[1].abs() < 0.02, "pitch drifted to {} rad", last[1]);
+    }
+
+    /// The drift probe must measure a steady offset, and must reset on motion.
+    ///
+    /// Both halves matter. Averaging a known offset over a long run is the
+    /// whole point; resetting when the controller moves is what makes the
+    /// figure mean "drift" rather than "whatever happened recently".
+    #[test]
+    fn the_drift_probe_averages_a_steady_offset_and_resets_on_motion() {
+        let mut p = DriftProbe::default();
+        // 90 s of stillness at a steady -1.2 deg/s, in 10 ms steps.
+        for _ in 0..9000 {
+            p.update([-1.2, 0.1, 0.0], 0.01, true, Side::Left);
+        }
+        assert!(p.secs > 89.0, "accumulated only {:.1} s", p.secs);
+        let mean0 = p.sum[0] / p.secs;
+        assert!((mean0 + 1.2).abs() < 1e-3, "measured {mean0} deg/s, expected -1.2");
+
+        // Movement ends the run outright — a drift figure spanning a movement
+        // is not a drift figure.
+        p.update([-1.2, 0.1, 0.0], 0.01, false, Side::Left);
+        assert_eq!(p.secs, 0.0, "motion did not reset the run");
+        assert_eq!(p.sum, [0.0; 3]);
+    }
+
+    /// The resting-drift constants must stay within measured bounds.
+    ///
+    /// They come from six stationary sessions of four to eleven minutes, and
+    /// their job is to remove the reproducible part of the offset before the
+    /// estimator converges. A value outside the observed range would be adding
+    /// drift rather than removing it, in the exact window where nothing else is
+    /// opposing it.
+    #[test]
+    fn the_resting_drift_constants_match_what_was_measured() {
+        // field#0 is the reproducible term on both halves: -0.37..-0.44 on the
+        // left and -0.31..-0.36 on the right, once the clock error is out. The
+        // rest are near zero. Bounds are deliberately loose — this pins the
+        // sign and order of magnitude, which is what a wrong edit would get
+        // wrong.
+        let l = RESTING_DRIFT_LEFT;
+        assert!((-0.50..=-0.30).contains(&l[0]), "left field#0 drift {} deg/s", l[0]);
+        assert!(l[1].abs() < 0.15 && l[2].abs() < 0.15, "left {l:?}");
+        let r = RESTING_DRIFT_RIGHT;
+        assert!((-0.45..=-0.25).contains(&r[0]), "right field#0 drift {} deg/s", r[0]);
+        assert!(r[1].abs() < 0.15 && r[2].abs() < 0.15, "right {r:?}");
+        // And the two halves must differ — they are separate sensors, and
+        // sharing one table would silently apply the wrong correction to one.
+        assert_ne!(l, r, "both halves cannot share a drift correction");
+    }
+
+    /// ⛔ A shove must not tilt the estimate.
+    ///
+    /// The accelerometer measures gravity plus every other force, and only the
+    /// first is a reference. Ungated, a sideways push showed up as yaw and a
+    /// forward-back push as pitch — and because yaw is the projection of the
+    /// body rate onto the up-vector, a corrupted up-vector leaked linear motion
+    /// into the INTEGRATED yaw, where it stayed.
+    #[test]
+    fn linear_acceleration_does_not_move_the_attitude_estimate() {
+        let mut t = OrientationTracker::default();
+        // Settle flat.
+        for _ in 0..50 {
+            t.update(&sample([0, 0, G], [0, 0, 0]), Side::Right);
+        }
+        let level = t.update(&sample([0, 0, G], [0, 0, 0]), Side::Right).euler_rad;
+
+        // A hard sideways shove: magnitude far from 1 g, so not gravity.
+        for _ in 0..50 {
+            t.update(&sample([0, G, G], [0, 0, 0]), Side::Right);
+        }
+        let shoved = t.update(&sample([0, G, G], [0, 0, 0]), Side::Right).euler_rad;
+        assert!(
+            (shoved[0] - level[0]).abs() < 0.02 && (shoved[1] - level[1]).abs() < 0.02,
+            "a shove moved the attitude from {level:?} to {shoved:?}",
+        );
+    }
+
+    /// But a genuine ROTATION must still be tracked immediately.
+    ///
+    /// The gate keys on magnitude, which rotation does not change — that is
+    /// what makes it safe. If it ever started rejecting rotations too, the
+    /// attitude would freeze and the fix would look like the bug.
+    #[test]
+    fn rotating_the_controller_still_updates_the_attitude() {
+        let mut t = OrientationTracker::default();
+        for _ in 0..50 {
+            t.update(&sample([0, 0, G], [0, 0, 0]), Side::Right);
+        }
+        // Tipped onto its side: still exactly 1 g, just pointing elsewhere.
+        // Raw axis 0 maps to canonical -y, so right-grip-down is NEGATIVE here.
+        let tipped = t.update(&sample([-G, 0, 0], [0, 0, 0]), Side::Right).euler_rad;
+        assert!(
+            (tipped[0] - std::f32::consts::FRAC_PI_2).abs() < 0.05,
+            "rotation was rejected as well: roll {} rad",
+            tipped[0],
+        );
+    }
+
+    /// A mounting correction must be a PERMUTATION, both halves.
+    ///
+    /// Reusing a source axis collapses one output and doubles another, which on
+    /// hardware reads as "one axis is dead" with nothing pointing at a frame
+    /// table as the cause.
+    #[test]
+    fn the_mounting_corrections_are_permutations() {
+        for (name, m) in [("left", MOUNT_LEFT), ("right", MOUNT_RIGHT)] {
+            let mut used = [false; 3];
+            for (idx, sign) in m {
+                assert!(idx < 3, "{name}: source axis {idx} out of range");
+                assert!(!used[idx], "{name}: source axis {idx} used twice");
+                assert!(sign == 1.0 || sign == -1.0, "{name}: sign {sign} is not ±1");
+                used[idx] = true;
+            }
+            assert!(used.iter().all(|v| *v), "{name}: an axis is unused");
+        }
+    }
+
+    /// A mounting permutation must move values, and preserve magnitude.
+    ///
+    /// It is a change of frame, so it can reorder and negate but must never
+    /// scale — a hand-written rotation matrix can quietly do the latter, which
+    /// is why this is expressed as a signed permutation instead.
+    #[test]
+    fn a_mounting_permutation_preserves_magnitude() {
+        let m: [(usize, f32); 3] = [(2, 1.0), (0, -1.0), (1, 1.0)];
+        let v = [3.0f32, 4.0, 12.0];
+        let out = apply_mount(v, m);
+        assert_eq!(out, [12.0, -3.0, 4.0]);
+        let mag = |a: [f32; 3]| (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+        assert!((mag(out) - mag(v)).abs() < 1e-5);
+    }
+
+    /// Yaw must be the rotation ABOUT GRAVITY, not about a body axis.
+    ///
+    /// With the controller on its side, a rotation about its own vertical axis
+    /// is physically ROLL, not yaw — and reporting it as yaw is what produced
+    /// "the yaw was doing roll to it". Projecting the body rate onto the
+    /// measured up-vector is what makes that impossible.
+    #[test]
+    fn yaw_is_measured_about_gravity_not_about_a_body_axis() {
+        // Flat: canonical up is +z, so a rate on canonical z is real yaw.
+        let flat = canonical_yaw_rate([0.0, 0.0, 50.0], [0.0, 0.0, 1.0]);
+        assert!((flat - 50.0).abs() < 1e-4, "flat yaw rate {flat}");
+        // On its side: canonical up is now +y, so that same z rate is no longer
+        // yaw at all and must contribute nothing.
+        let sideways = canonical_yaw_rate([0.0, 0.0, 50.0], [0.0, 1.0, 0.0]);
+        assert!(sideways.abs() < 1e-4, "a body-axis rate leaked into yaw: {sideways}");
+    }
+
+    /// ⛔ A field claiming a rotation gravity cannot see must be cancelled.
+    ///
+    /// This is the ghost: the fields hand a physical axis between themselves
+    /// depending on pose, so one starts reporting roll while the controller is
+    /// not rolling. Gravity is the arbiter — it moves when roll moves, and here
+    /// it does not.
+    #[test]
+    fn a_ghost_rotation_the_accelerometer_cannot_see_is_cancelled() {
+        for hz in [67.0f32, 200.0] {
+            let dt = 1.0 / hz;
+            let mut g = GhostCancel::default();
+            let mut out = [0.0; 2];
+            // Two seconds of the field insisting on 20 deg/s of roll while the
+            // tilt does not move at all.
+            for _ in 0..(hz * 2.0) as usize {
+                out = g.correct([20.0, 0.0], (0.0, 0.0), dt, true);
+            }
+            assert!(
+                out[0].abs() < 2.0,
+                "at {hz} Hz a ghost roll of 20 deg/s was left at {} deg/s",
+                out[0],
+            );
+        }
+    }
+
+    /// ⛔ …and a REAL rotation must pass through untouched.
+    ///
+    /// The other half of the bargain, and the one a naive gate gets wrong: when
+    /// the field and gravity agree, the correction has nothing to correct and
+    /// must converge to zero rather than to some fraction of the signal.
+    #[test]
+    fn a_real_rotation_both_sources_agree_on_is_not_attenuated() {
+        for hz in [67.0f32, 200.0] {
+            let dt = 1.0 / hz;
+            let mut g = GhostCancel::default();
+            let rate = 20.0f32;
+            let mut tilt = 0.0f32;
+            let mut out = [0.0; 2];
+            for _ in 0..(hz * 2.0) as usize {
+                tilt += rate.to_radians() * dt;
+                out = g.correct([rate, 0.0], (tilt, 0.0), dt, true);
+            }
+            assert!(
+                (out[0] - rate).abs() < 1.0,
+                "at {hz} Hz a real {rate} deg/s roll came out as {} deg/s",
+                out[0],
+            );
+        }
+    }
+
+    /// ⛔ A fast flick must not be learned as a correction.
+    ///
+    /// The accelerometer measures the flick as well as gravity, so its implied
+    /// tilt is wrong exactly when the rate is highest. The correction is HELD
+    /// through that rather than updated — and held, not zeroed, because the
+    /// leak it cancels does not go away for the duration of a flick.
+    #[test]
+    fn an_untrusted_accelerometer_holds_the_correction_rather_than_learning() {
+        let dt = 1.0 / 200.0;
+        let mut g = GhostCancel::default();
+        // Learn a ghost while gravity is trustworthy.
+        for _ in 0..400 {
+            g.correct([20.0, 0.0], (0.0, 0.0), dt, true);
+        }
+        let learned = g.correction[0];
+        assert!(learned < -15.0, "correction never converged: {learned}");
+        // Now a flick: the accelerometer implies a wild tilt, and is not trusted.
+        let mut tilt = 0.0f32;
+        for _ in 0..200 {
+            tilt += 500.0f32.to_radians() * dt;
+            g.correct([20.0, 0.0], (tilt, 0.0), dt, false);
+        }
+        assert!(
+            (g.correction[0] - learned).abs() < 1e-3,
+            "an untrusted accelerometer moved the correction from {learned} to {}",
+            g.correction[0],
+        );
+    }
+
+    /// ⛔ A sustained slow pan must read as MOVING — at every report rate.
+    ///
+    /// ⭐ The rate sweep is the point. The detector this replaced compared
+    /// gravity against a LAGGING AVERAGE with a per-sample weight, and a
+    /// low-pass settles at a constant lag against a steady input — it catches
+    /// up and then tracks. Worse, "per-sample" made its window depend on the
+    /// polling rate: at 67 Hz the lag was 0.75 s and a 2 °/s pan stayed
+    /// detectable, so every test passed. Unlocking 200 Hz cut the window to
+    /// 0.25 s, the lag fell under the threshold, and a deliberate aim started
+    /// reading as rest — which the bias estimator then cancelled, dragging the
+    /// cursor back while the user was moving it.
+    ///
+    /// So this asserts across rates. A version that only works at one is the
+    /// exact bug.
+    #[test]
+    fn a_sustained_slow_pan_never_reads_as_still_at_any_rate() {
+        for hz in [67.0f32, 125.0, 200.0, 250.0] {
+            for rate_dps in [1.5f32, 2.0, 5.0, 20.0] {
+                let dt = 1.0 / hz;
+                let mut d = StillDetector::default();
+                let mut still_count = 0;
+                // Five seconds of continuous, perfectly steady rotation.
+                for i in 0..(hz * 5.0) as usize {
+                    let th = (rate_dps * dt * i as f32).to_radians();
+                    if d.observe([th.sin(), 0.0, th.cos()], dt) {
+                        still_count += 1;
+                    }
+                }
+                assert_eq!(
+                    still_count, 0,
+                    "{rate_dps} deg/s at {hz} Hz read as still on {still_count} \
+                     samples — a deliberate aim will be cancelled as drift",
+                );
+            }
+        }
+    }
+
+    /// …and a pad that IS still must be recognised, promptly, at every rate.
+    ///
+    /// The other half of the bargain: a gate that never opens is as broken as
+    /// one that never shuts, and it removes no drift at all. Accelerometer
+    /// noise moves the measured direction about 0.0035 per sample, so this
+    /// feeds that too — a detector that only works on noiseless input is not
+    /// one.
+    #[test]
+    fn a_still_pad_is_recognised_promptly_at_any_rate() {
+        for hz in [67.0f32, 200.0] {
+            let dt = 1.0 / hz;
+            let mut d = StillDetector::default();
+            let mut first_still = None;
+            for i in 0..(hz * 4.0) as usize {
+                // Deterministic dither of the same size as the real noise.
+                let n = ((i * 2654435761usize) % 1000) as f32 / 1000.0 - 0.5;
+                let j = n * 0.007;
+                if d.observe([j, j * 0.5, 1.0 + j * 0.25], dt) && first_still.is_none() {
+                    first_still = Some(i as f32 * dt);
+                }
+            }
+            let t = first_still
+                .unwrap_or_else(|| panic!("never settled at {hz} Hz — no drift \
+                                           would ever be learned"));
+            assert!(
+                t < STILL_SETTLE_SECS * 2.0,
+                "took {t} s to settle at {hz} Hz, expected about {STILL_SETTLE_SECS}",
+            );
+        }
+    }
+
+    /// ⛔ The yaw PIN and the yaw ORIENTATION use OPPOSITE sign conventions,
+    /// on purpose.
+    ///
+    /// ⭐ Both are correct, for different contracts, and that is exactly why
+    /// this keeps getting "fixed" in the wrong direction. The orientation
+    /// integrates in the crate's own Euler convention, where positive yaw is a
+    /// rotation about the up-vector. The PIN answers to
+    /// `flexinput_devices::gyro`, whose contract is `gyro_z` POSITIVE TURNING
+    /// RIGHT — which by the right-hand rule is negative about up.
+    ///
+    /// Without the flip a patch has to enable "invert yaw" to behave normally,
+    /// which is a decode bug relocated into every user's configuration. With
+    /// the flip applied to BOTH, the 3D model turns the wrong way instead. The
+    /// invariant worth pinning is therefore not either sign on its own but that
+    /// the two DISAGREE.
+    #[test]
+    fn the_yaw_pin_is_signed_against_the_gyro_contract_not_the_euler_one() {
+        let per_report = (ANGLE_COUNTS_PER_TURN / 360) as i32;
+        let mut t = OrientationTracker::default();
+        // Flat on the table, so gravity is unambiguous and the projection
+        // reduces to the yaw component alone.
+        t.update(&sample([0, 0, G], [0, 0, 0]), Side::Right);
+        let o = t.update(&sample([0, 0, G], [0, 0, per_report]), Side::Right);
+
+        assert!(o.yaw_rate_dps.abs() > 1.0, "no yaw rate to check the sign of");
+        assert!(o.rate_dps[2].abs() > 1.0, "no orientation yaw to compare against");
+        assert!(
+            o.yaw_rate_dps.signum() != o.rate_dps[2].signum(),
+            "the yaw pin ({}) and the orientation yaw ({}) agree in sign — one \
+             of the two conventions has been applied to both",
+            o.yaw_rate_dps,
+            o.rate_dps[2],
+        );
+    }
+
+    /// ⛔ A slow deliberate aim must NOT be learned as drift.
+    ///
+    /// ⭐ This is the regression that has landed twice, and both times it was a
+    /// stillness detector that TRACKED the motion instead of measuring it
+    /// against something fixed. The symptom on hardware is unmistakable and
+    /// horrible: nudge the aim a little and it slides back under you, because
+    /// the estimator decided the nudge was bias and started cancelling it.
+    ///
+    /// 2 °/s is the case that matters — well above any drift worth correcting,
+    /// well below anything a detector tuned for "is it being waved about" would
+    /// catch.
+    #[test]
+    fn a_slow_steady_pan_is_not_learned_as_drift() {
+        const RATE_DPS: f32 = 2.0;
+        let per_report_deg = RATE_DPS / REPORT_HZ;
+        let counts = (per_report_deg * ANGLE_COUNTS_PER_DEG) as i32;
+
+        let mut t = OrientationTracker::default();
+        let mut angle = 0i32;
+        let mut out = 0.0;
+        // Twenty seconds — many times the estimator's convergence, so if it
+        // were going to swallow the pan it has had every chance.
+        for i in 0..(REPORT_HZ * 20.0) as usize {
+            // Gravity genuinely moves, because the controller genuinely turns.
+            let th = (per_report_deg * i as f32).to_radians();
+            let accel = [
+                (G as f32 * th.sin()) as i32,
+                0,
+                (G as f32 * th.cos()) as i32,
+            ];
+            angle += counts;
+            out = t.update(&sample(accel, [0, 0, angle]), Side::Right).field_rate_dps[2];
+        }
+        let expect = RATE_DPS * FIELD_GAIN[2];
+        assert!(
+            out > expect * 0.8,
+            "a {RATE_DPS} deg/s pan decayed to {out} deg/s (expected about \
+             {expect}) — the estimator is cancelling deliberate movement",
+        );
+    }
+
+    /// …and the other half of the same bargain: a pad that is genuinely still
+    /// must still have its drift removed.
+    ///
+    /// Held together these two pin the detector from both sides. Either alone
+    /// is trivially satisfiable by a gate that is always open or always shut,
+    /// and both of those have shipped.
+    ///
+    /// Gravity fixed while the field advances is not a contradiction — it is
+    /// exactly what yaw drift looks like, the one rotation gravity cannot see.
+    #[test]
+    fn a_resting_pad_still_gets_its_drift_removed() {
+        const DRIFT_DPS: f32 = 2.0;
+        let counts = (DRIFT_DPS / REPORT_HZ * ANGLE_COUNTS_PER_DEG) as i32;
+
+        let mut t = OrientationTracker::default();
+        let mut angle = 0i32;
+        let mut out = 0.0;
+        for _ in 0..(REPORT_HZ * 20.0) as usize {
+            angle += counts;
+            out = t.update(&sample([12, -8, G], [0, 0, angle]), Side::Right)
+                .field_rate_dps[2];
+        }
+        assert!(
+            out.abs() < DRIFT_DPS * FIELD_GAIN[2] * 0.2,
+            "a resting pad kept reporting {out} deg/s — the drift was never learned",
+        );
+    }
+
+    /// A controller left alone must stop accumulating yaw.
+    ///
+    /// ❗ A CONSTANT angle field is not a stationary controller, and the test
+    /// used to read as though it were. Real hardware at rest reports a steady
+    /// non-zero field rate — that is precisely what `RESTING_DRIFT_*` measures
+    /// — and the decoder subtracts it. A field that never moves is therefore a
+    /// controller whose drift has ALREADY been removed, so the subtraction puts
+    /// the constant back in with the opposite sign, and report 1 carries it in
+    /// full by construction. Asserting zero there tests nothing but the size of
+    /// the constant.
+    ///
+    /// What is worth pinning is what happens next: [`GyroBias`] has to notice a
+    /// standing offset on a device it can see is still, and drive it out before
+    /// it becomes degrees. So the assertions are on the settled tail and on the
+    /// TOTAL yaw accumulated on the way there — the quantity the user actually
+    /// sees, and the one that made the model wander off while sitting on a
+    /// desk.
+    ///
+    /// (This test spent a while silently not running: a stray `#[test]` above
+    /// it was adopted by a newly inserted neighbour, leaving this one with
+    /// none. It is here, in a drift test, that that mattered most.)
     #[test]
     fn holding_still_produces_no_drift() {
-        // The point of sourcing both angles from absolute references: there is
-        // no bias to accumulate, so a stationary controller reports exactly
-        // zero rate forever rather than needing a GyroBias estimator.
         let mut t = OrientationTracker::default();
-        for _ in 0..500 {
-            let o = t.update(&sample([12, -8, G], [0, 0, 5_000_000]));
-            assert_eq!(o.rate_dps, [0.0; 3]);
+        let mut settled = 0.0f32;
+        for i in 0..2000 {
+            let o = t.update(&sample([12, -8, G], [0, 0, 5_000_000]), Side::Right);
+            // By 300 reports — under three seconds of link time — the estimator
+            // has had ample opportunity; anything left is a leak, not lag.
+            if i >= 300 {
+                settled = settled.max(o.rate_dps.iter().fold(0.0, |a: f32, v| a.max(v.abs())));
+            }
         }
+        assert!(settled < 1e-3, "still drifting at {settled} deg/s after settling");
+        // Everything the injected offset managed to integrate before the
+        // estimator caught it. Measured at 0.010°; a tenth of a degree is a
+        // generous ceiling and still far below anything visible.
+        let wandered = t.yaw_rad.to_degrees().abs();
+        assert!(wandered < 0.1, "yaw wandered {wandered} deg while sitting still");
     }
 }
 

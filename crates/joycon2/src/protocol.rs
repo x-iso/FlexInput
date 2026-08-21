@@ -58,8 +58,10 @@ impl Side {
 
     pub fn display_name(self) -> &'static str {
         match self {
-            Self::Left => "Joy-Con 2 (L)",
-            Self::Right => "Joy-Con 2 (R)",
+            // See `ControllerKind::display_name` for why this is not
+            // "Joy-Con 2": the identity is shared with third-party clones.
+            Self::Left => "Switch 2 Controller (L)",
+            Self::Right => "Switch 2 Controller (R)",
         }
     }
 }

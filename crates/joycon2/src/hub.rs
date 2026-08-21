@@ -147,6 +147,13 @@ pub struct PadState {
     /// `snapshot.motion.angle` has no wrap history and gets a 180 degree flip
     /// at every seam. Recomputing it is exactly the bug this field prevents.
     pub orientation: [f32; 3],
+    /// ⭐ The same orientation as a quaternion `[x, y, z, w]`, body-to-world.
+    ///
+    /// Authoritative. `orientation` above is derived from it for consumers that
+    /// want angles; anything that needs a rotation should take this, because
+    /// rebuilding one from Euler means re-deciding a composition convention
+    /// that has already been got wrong twice.
+    pub orientation_quat: [f32; 4],
     /// Angular rate differenced from the raw angle fields, deg/s, **in field
     /// order** — see [`crate::reports::Orientation::field_rate_dps`].
     ///
@@ -157,6 +164,13 @@ pub struct PadState {
     /// replacing it so both can be wired at once and compared on hardware,
     /// which is also how the field-to-axis mapping gets settled.
     pub field_rate: [f32; 3],
+    /// Yaw rate about gravity, deg/s — see
+    /// [`crate::reports::Orientation::yaw_rate_dps`].
+    pub yaw_rate: f32,
+    /// ⭐ What the gyro pins should carry: `(roll, pitch, yaw)` deg/s in
+    /// canonical order, with the fields' pose-dependent leak cancelled — see
+    /// [`crate::reports::Orientation::pin_rate_dps`].
+    pub pin_rate: [f32; 3],
     /// Reports received since the last [`Joycon2Hub::take_event_counts`].
     pub events: u32,
 }
@@ -930,6 +944,65 @@ async fn run_session(
         chars.iter().find(|c| c.uuid == uuid).cloned()
     };
 
+    // ⭐ The same GATT probe the dongle runs, on the Windows stack.
+    //
+    // The two transports reach the same controller and get different results:
+    // over the dongle, `ab7de9be-…-7fd2` and `…-7fde` declare READ|NOTIFY and
+    // refuse both — Read Not Permitted, never a notification — and no
+    // confirmation buzz ever arrives even though every pairing step reports
+    // success and the AES confirmation matches.
+    //
+    // Windows reaches the controller through a relationship this project cannot
+    // reproduce, so if those attributes are gated on something about the LINK
+    // rather than on the commands sent over it, this is where the difference
+    // shows. Reading the same characteristics from here answers it directly,
+    // and Windows holds the pad long enough (~31 s) to find out.
+    //
+    // Same log file as the dongle, deliberately: one timeline, one clock, so
+    // the two paths can be compared line for line.
+    if std::env::var("FLEXINPUT_JC2_GATT_SCAN").is_ok() {
+        dlog!("=== WinRT path: GATT probe for {} ===", side.display_name());
+        for c in &chars {
+            dlog!(
+                "winrt char {} props {:?} service {}",
+                c.uuid, c.properties, c.service_uuid,
+            );
+        }
+        // The two that refuse everything over the dongle.
+        for uuid_str in [
+            "ab7de9be-89fe-49ad-828f-118f09df7fd2",
+            "ab7de9be-89fe-49ad-828f-118f09df7fde",
+            "ab7de9be-89fe-49ad-828f-118f09df7fdf",
+        ] {
+            let Ok(uuid) = Uuid::parse_str(uuid_str) else { continue };
+            match find(uuid) {
+                None => dlog!("winrt read {uuid_str}: characteristic ABSENT"),
+                Some(c) => match p.read(&c).await {
+                    Ok(v) => dlog!(
+                        "winrt read {uuid_str}: ⭐ OK {} bytes {:02x?}",
+                        v.len(),
+                        &v[..v.len().min(48)],
+                    ),
+                    Err(e) => dlog!("winrt read {uuid_str}: FAILED {e}"),
+                },
+            }
+        }
+        // And whether the silent streams notify here.
+        for uuid_str in [
+            "ab7de9be-89fe-49ad-828f-118f09df7fd2",
+            "ab7de9be-89fe-49ad-828f-118f09df7fde",
+        ] {
+            let Ok(uuid) = Uuid::parse_str(uuid_str) else { continue };
+            if let Some(c) = find(uuid) {
+                match p.subscribe(&c).await {
+                    Ok(()) => dlog!("winrt subscribe {uuid_str}: ⭐ accepted"),
+                    Err(e) => dlog!("winrt subscribe {uuid_str}: refused {e}"),
+                }
+            }
+        }
+        dlog!("=== WinRT GATT probe done ===");
+    }
+
     {
         let mut pads = shared.pads.lock().unwrap();
         pads.insert(
@@ -943,7 +1016,10 @@ async fn run_session(
                 stick: (0.0, 0.0),
                 gyro: [0.0; 3],
                 orientation: [0.0; 3],
+                orientation_quat: [0.0, 0.0, 0.0, 1.0],
                 field_rate: [0.0; 3],
+                yaw_rate: 0.0,
+                pin_rate: [0.0; 3],
                 events: 0,
             },
         );
@@ -1210,7 +1286,12 @@ async fn run_session(
                 reports += 1;
                 let Some(snap) = reports::parse_input(side, &n.value) else { continue };
                 let stick = calib.normalize(snap.stick_raw);
-                let o = orientation.update(&snap.motion);
+                // Pick up a calibration measured on THIS controller, if the user has
+                // captured one. Pushed every report rather than at connect: a capture
+                // that finishes while the pad is streaming must take effect at once,
+                // and an unchanged value costs one read lock.
+                orientation.set_resting_drift(crate::cal::field_drift(&key));
+                let o = orientation.update(&snap.motion, side);
 
                 // The first few reports are dumped unconditionally, THEN rate
                 // limited. A connection that only survives a couple of seconds
@@ -1249,7 +1330,10 @@ async fn run_session(
                     pad.stick = stick;
                     pad.gyro = o.rate_dps;
                     pad.field_rate = o.field_rate_dps;
+                    pad.yaw_rate = o.yaw_rate_dps;
+                    pad.pin_rate = o.pin_rate_dps;
                     pad.orientation = o.euler_rad;
+                    pad.orientation_quat = o.quat_xyzw;
                     pad.events = pad.events.saturating_add(1);
                 }
             }
