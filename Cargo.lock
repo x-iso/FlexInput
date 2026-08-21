@@ -1950,6 +1950,7 @@ dependencies = [
 name = "flexinput-devices"
 version = "0.13.3"
 dependencies = [
+ "flexinput-btle",
  "flexinput-core",
  "flexinput-joycon2",
  "gilrs",
@@ -2039,6 +2040,7 @@ dependencies = [
  "egui-snarl",
  "egui-wgpu",
  "egui_extras",
+ "flexinput-btle",
  "flexinput-core",
  "flexinput-devices",
  "flexinput-engine",

@@ -39,6 +39,22 @@ pub const CID_ATT: u16 = 0x0004;
 /// ATT error, nothing — followed by the peripheral giving up and terminating
 /// the link itself.
 const PB_FIRST: u16 = 0b00;
+/// Packet-boundary flag for a CONTINUATION of an L2CAP PDU already begun.
+///
+/// ❗ A continuing fragment carries NO L2CAP header — it is raw payload picked
+/// up mid-PDU. Decoding one as though it started a fresh packet reads two
+/// arbitrary payload bytes as a length and two more as a channel id, and if
+/// those happen to pass the sanity checks the result is a well-formed-looking
+/// ATT PDU assembled from the middle of an IMU sample. Roughly one continuation
+/// in 256 would then be accepted as a notification, with a garbage attribute
+/// handle and a garbage value.
+///
+/// That is the worst possible failure for this decode: a motion report parsed
+/// from misaligned bytes yields an accelerometer vector of about the right
+/// magnitude pointing the wrong way, and the orientation tracker LATCHES the
+/// last plausible gravity it saw. One accepted fragment can therefore leave
+/// pitch inverted and stuck that way.
+const PB_CONTINUING: u16 = 0b01;
 
 // ATT opcodes. Only what is actually sent or received here.
 pub const ATT_WRITE_REQUEST: u8 = 0x12;
@@ -91,7 +107,24 @@ pub const CCCD_NOTIFY: [u8; 2] = [0x01, 0x00];
 /// No fragmentation: every packet this stack sends is far below the ACL
 /// payload size a controller must accept, and a Joy-Con command is 49 bytes.
 pub fn encode_acl(conn_handle: u16, cid: u16, payload: &[u8]) -> Vec<u8> {
-    let header = (conn_handle & 0x0FFF) | (PB_FIRST << 12);
+    encode_acl_pb(conn_handle, cid, payload, PB_FIRST)
+}
+
+/// First packet of an L2CAP PDU on a BR/EDR link.
+///
+/// ⭐ **A different flag from the LE one, and the difference is not cosmetic.**
+/// On LE, `0b00` means "first, non-automatically-flushable" and is what every
+/// packet uses. On BR/EDR the same value means the packet is NOT flushable,
+/// which is wrong for HID: an interrupt report that cannot be flushed will be
+/// retransmitted indefinitely when the air is busy, stalling the channel behind
+/// it rather than being dropped in favour of the next, fresher report.
+///
+/// `0b10` — first, automatically flushable — is the classic form.
+pub const PB_FIRST_FLUSHABLE: u16 = 0b10;
+
+/// [`encode_acl`] with the packet-boundary flag chosen explicitly.
+pub fn encode_acl_pb(conn_handle: u16, cid: u16, payload: &[u8], pb: u16) -> Vec<u8> {
+    let header = (conn_handle & 0x0FFF) | (pb << 12);
     let l2cap_len = payload.len() as u16;
     let total_len = (payload.len() + 4) as u16;
 
@@ -123,6 +156,14 @@ pub fn parse_acl(buf: &[u8]) -> Option<AclPacket> {
     }
     let header = u16::from_le_bytes([buf[0], buf[1]]);
     let conn_handle = header & 0x0FFF;
+    // ⭐ The boundary flag is READ, not masked away and forgotten.
+    //
+    // Reassembling fragments properly would be better still, but dropping them
+    // is both correct and safe: the report is lost either way, and a lost
+    // report is invisible next to one decoded from the wrong bytes.
+    if (header >> 12) & 0b11 == PB_CONTINUING {
+        return None;
+    }
     let total_len = u16::from_le_bytes([buf[2], buf[3]]) as usize;
     if buf.len() < 4 + total_len || total_len < 4 {
         return None;
@@ -138,6 +179,31 @@ pub fn parse_acl(buf: &[u8]) -> Option<AclPacket> {
         cid,
         payload: body[..l2cap_len].to_vec(),
     })
+}
+
+/// Split one USB bulk transfer into every complete ACL packet it holds.
+///
+/// ⭐ Separated from the read so it can be tested without a dongle. The bug it
+/// exists to prevent — keeping only the first packet of a transfer — is silent,
+/// produces no error, and only shows up under load, which is the hardest
+/// possible combination to catch by running the thing.
+///
+/// A truncated tail is dropped rather than held for the next read. See
+/// `Dongle::read_event_timeout` for why carrying it forward is worse.
+pub fn split_acl(buf: &[u8]) -> Vec<AclPacket> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let want = 4 + u16::from_le_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        if i + want > buf.len() {
+            break;
+        }
+        if let Some(p) = parse_acl(&buf[i..i + want]) {
+            out.push(p);
+        }
+        i += want;
+    }
+    out
 }
 
 /// An ATT notification: a characteristic value pushed by the controller.
@@ -598,5 +664,75 @@ mod tests {
             );
         }
         assert!(parse_acl(&acl).is_some());
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    /// One ACL packet, as the controller sends a motion report.
+    fn packet(handle: u16, pb: u16, att: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&((handle & 0x0FFF) | (pb << 12)).to_le_bytes());
+        v.extend_from_slice(&((att.len() + 4) as u16).to_le_bytes());
+        v.extend_from_slice(&(att.len() as u16).to_le_bytes());
+        v.extend_from_slice(&CID_ATT.to_le_bytes());
+        v.extend_from_slice(att);
+        v
+    }
+
+    /// ⛔ A transfer carrying several packets must yield all of them.
+    ///
+    /// USB bulk does not guarantee one packet per transfer, and the dongle
+    /// coalesces whenever the host is slow to poll — which is precisely when a
+    /// game is running. Keeping only the first silently dropped a share of
+    /// every controller's reports, with no error and no counter, and got worse
+    /// exactly when it mattered most.
+    #[test]
+    fn every_packet_in_a_transfer_is_recovered() {
+        let mut buf = Vec::new();
+        buf.extend(packet(0x0040, 0b00, &[0x1b, 0x0e, 0x00, 1, 2, 3]));
+        buf.extend(packet(0x0041, 0b00, &[0x1b, 0x0e, 0x00, 4, 5, 6]));
+        buf.extend(packet(0x0040, 0b00, &[0x1b, 0x0e, 0x00, 7, 8, 9]));
+
+        let got = split_acl(&buf);
+        assert_eq!(got.len(), 3, "only {} of 3 packets recovered", got.len());
+        assert_eq!(got[0].conn_handle, 0x0040);
+        assert_eq!(got[1].conn_handle, 0x0041, "the second link's report was lost");
+        assert_eq!(got[2].payload, vec![0x1b, 0x0e, 0x00, 7, 8, 9]);
+    }
+
+    /// A truncated tail is dropped, and must not take the good packets with it.
+    #[test]
+    fn a_truncated_tail_costs_only_itself() {
+        let mut buf = packet(0x0040, 0b00, &[0x1b, 0x0e, 0x00, 1, 2, 3]);
+        let partial = packet(0x0040, 0b00, &[0x1b, 0x0e, 0x00, 4, 5, 6]);
+        buf.extend_from_slice(&partial[..partial.len() - 3]);
+        let got = split_acl(&buf);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload, vec![0x1b, 0x0e, 0x00, 1, 2, 3]);
+    }
+
+    /// ⛔ A CONTINUATION fragment must be refused, not decoded as a new PDU.
+    ///
+    /// It carries no L2CAP header, so decoding it reads two payload bytes as a
+    /// length and two more as a channel id. When those happen to pass the
+    /// sanity checks — and payload bytes eventually will — the result is an ATT
+    /// PDU assembled from the middle of an IMU sample: an accelerometer vector
+    /// of roughly the right magnitude pointing the wrong way, which the
+    /// orientation tracker then LATCHES as its gravity reference.
+    #[test]
+    fn a_continuation_fragment_is_refused() {
+        // Bytes chosen so the fragment WOULD parse if the flag were ignored.
+        let frag = packet(0x0040, 0b01, &[0x1b, 0x0e, 0x00, 1, 2, 3]);
+        assert!(
+            parse_acl(&frag).is_none(),
+            "a continuation fragment was decoded as a fresh L2CAP packet",
+        );
+        // The identical bytes with a FIRST flag are still accepted, so the
+        // check is on the flag and not on something incidental.
+        let first = packet(0x0040, 0b00, &[0x1b, 0x0e, 0x00, 1, 2, 3]);
+        assert!(parse_acl(&first).is_some());
     }
 }
