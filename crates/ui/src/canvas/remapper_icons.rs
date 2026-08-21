@@ -66,6 +66,8 @@ pub fn phys_pad_slug(dev_id: &str) -> Option<&str> {
         // field is an address rather than an index, but only the slug is read
         // here so the shape matches.
         .or_else(|| dev_id.strip_prefix("jc2:"))
+        // Bluetooth Classic pads: `btc:<slug>:<bt-address>`, same shape.
+        .or_else(|| dev_id.strip_prefix("btc:"))
         .and_then(|rest| rest.split(':').next())
 }
 
@@ -794,3 +796,61 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    /// Every device-id prefix a backend produces, with a real example.
+    ///
+    /// ⭐ **Add a backend, add a line here.** This list is the thing that was
+    /// missing both times this broke.
+    const IDS: &[(&str, &str)] = &[
+        ("gilrs:xinput:0", "xinput"),
+        ("gilrs:switch_pro:1", "switch_pro"),
+        ("sdl:generic:2", "generic"),
+        ("jc2:joycon2_l:da2d160f0169", "joycon2_l"),
+        ("btc:switch_pro:da2d160f0169", "switch_pro"),
+    ];
+
+    /// ⛔ A device id whose prefix nothing recognises loses its CAPABILITIES,
+    /// not just its icon.
+    ///
+    /// ⭐ This has now gone wrong twice, with the same shape both times: a
+    /// backend was added, its prefix was not, and `phys_pad_slug` returned
+    /// `None`. Downstream that means the conservative fallback — no gyro, no
+    /// orientation, no calibration — so the pad appears, produces input, and
+    /// simply has no settings, which reads as a half-finished feature rather
+    /// than a missing string. First `sdl:`, then `btc:`.
+    #[test]
+    fn every_backend_prefix_resolves_to_its_slug() {
+        for (id, want) in IDS {
+            assert_eq!(
+                phys_pad_slug(id),
+                Some(*want),
+                "{id} did not resolve — a pad on this backend gets no gyro, no                  orientation and no calibration, silently",
+            );
+        }
+    }
+
+    /// …and the same ids must count as physical pads.
+    ///
+    /// The two lists are maintained separately and drifted apart before, which
+    /// is why they are checked against one set of examples.
+    #[test]
+    fn every_backend_prefix_counts_as_a_physical_pad() {
+        for (id, _) in IDS {
+            assert!(
+                crate::app::graph::is_physical_pad_id(id),
+                "{id} is not treated as a physical pad — it cannot be masked,                  rumbled, or routed like one",
+            );
+        }
+    }
+
+    /// A virtual pad must NOT be mistaken for a physical one.
+    #[test]
+    fn virtual_and_unknown_ids_are_not_physical_pads() {
+        for id in ["vgamepad:xbox360:v0", "midi_in:0", "nonsense"] {
+            assert_eq!(phys_pad_slug(id), None, "{id} resolved to a pad slug");
+        }
+    }
+}

@@ -136,6 +136,17 @@ pub struct AppSettings {
     /// model. `None`/empty = bundled models only.
     #[serde(default)]
     pub user_models_dir: Option<String>,
+    /// Where Bluetooth Classic link keys are stored.
+    ///
+    /// ⭐ Worth pointing at a cloud-synced folder. A link key is the bond
+    /// between a controller and the DONGLE — carrying the dongle to another PC
+    /// carries the pairing with it, except that both ends must hold the key and
+    /// the host's copy is this file. Synced, it follows the dongle everywhere
+    /// and there is nothing to copy by hand.
+    ///
+    /// `None`/empty = beside the executable's working directory.
+    #[serde(default)]
+    pub bt_key_dir: Option<String>,
     #[serde(default = "default_polling_hz")]
     pub polling_hz: u32,
     #[serde(default = "default_sample_rate_hz")]
@@ -600,6 +611,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             user_models_dir: None,
+            bt_key_dir: None,
             polling_hz: POLLING_HZ_DEFAULT,
             sample_rate_hz: SAMPLE_RATE_HZ_DEFAULT,
             keep_workspace: true,

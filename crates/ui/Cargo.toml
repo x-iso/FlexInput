@@ -17,6 +17,7 @@ joycon2 = ["flexinput-devices/joycon2"]
 flexinput-core    = { workspace = true }
 flexinput-engine  = { workspace = true }
 flexinput-devices = { workspace = true }
+flexinput-btle    = { path = "../btle" }
 glam              = { workspace = true }
 flexinput-virtual = { workspace = true }
 flexinput-modules = { workspace = true }

@@ -99,13 +99,39 @@ struct TargetWatch {
 
 type SignalMap = HashMap<(String, String), Signal>;
 
-/// True when some single non-virtual device holds every button in `combo`.
+/// Which physical controller a device id belongs to, for chord purposes.
+///
+/// ⭐ **A split controller is two devices and one pad.** Joy-Con 2 halves
+/// enumerate separately — they connect separately, and either can be used
+/// alone — so the left half publishes Minus, L and the D-pad while the right
+/// publishes Home, Plus and the face buttons. Nothing links them.
+///
+/// ❗ That made every cross-half chord impossible. `combo_held` requires ONE
+/// device to hold the whole combo, which is right for keeping two PLAYERS' pads
+/// from jointly firing a shortcut — but a grip is one player, and Home lives on
+/// the right half while most of what anyone would pair it with lives on the
+/// left. The shortcut simply never fired, with nothing to see anywhere.
+///
+/// Grouping the halves restores the intent: one player, one pad. Two grips in
+/// the room would share a group, since the halves carry no pairing information
+/// to tell one grip from another — worth knowing, and still strictly better
+/// than a chord that cannot fire at all.
+fn chord_group(dev: &str) -> &str {
+    // Only SPLIT controllers group. A classic pad is one device and one
+    // controller, so it must not share a group with anything.
+    if dev.starts_with("jc2:") { "jc2" } else { dev }
+}
+
+/// True when one physical controller holds every button in `combo`.
 /// When `device_filter` is `Some`, only devices in that set are considered (used
 /// to restrict the four window shortcuts to the nav-selected pads).
 fn combo_held(snap: &SignalMap, combo: &[String], device_filter: Option<&HashSet<String>>) -> bool {
     if combo.is_empty() { return false; }
-    // Tally, per device, how many of the combo's buttons are currently true.
-    let mut per_dev: HashMap<&str, usize> = HashMap::new();
+    // Tally, per controller, which of the combo's buttons are currently held.
+    // ❗ The set of BUTTON IDS, not a count: the two halves of a grip both
+    // publish `btn_sl`, so counting hits would let one button pressed on both
+    // halves satisfy a two-button chord.
+    let mut per_dev: HashMap<&str, HashSet<&str>> = HashMap::new();
     for ((dev, sig), val) in snap.iter() {
         if crate::app::is_own_virtual_gilrs_id(dev) { continue; }
         if let Some(filter) = device_filter {
@@ -113,10 +139,10 @@ fn combo_held(snap: &SignalMap, combo: &[String], device_filter: Option<&HashSet
         }
         if !matches!(val, Signal::Bool(true)) { continue; }
         if combo.iter().any(|p| p == sig) {
-            *per_dev.entry(dev.as_str()).or_insert(0) += 1;
+            per_dev.entry(chord_group(dev)).or_default().insert(sig.as_str());
         }
     }
-    per_dev.values().any(|&n| n >= combo.len())
+    per_dev.values().any(|held| held.len() >= combo.len())
 }
 
 /// Evaluate one target: if its chord fires (past grace + refractory), raise the
@@ -193,4 +219,80 @@ pub fn spawn_chord_watcher(
             }
         })
         .expect("failed to spawn gamepad-shortcut-watcher thread");
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::*;
+
+    fn snap(entries: &[(&str, &str, bool)]) -> SignalMap {
+        entries
+            .iter()
+            .map(|(d, p, v)| ((d.to_string(), p.to_string()), Signal::Bool(*v)))
+            .collect()
+    }
+
+    fn combo(pins: &[&str]) -> Vec<String> {
+        pins.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// ⛔ A chord spanning the two halves of one grip must fire.
+    ///
+    /// Home is on the right half; almost anything worth pairing it with is on
+    /// the left. Requiring a single device meant these chords could never fire,
+    /// and produced no diagnostic of any kind — the shortcut was simply inert.
+    #[test]
+    fn a_chord_across_the_halves_of_one_grip_fires() {
+        let s = snap(&[
+            ("jc2:joycon2_r:aabb", "btn_guide", true),
+            ("jc2:joycon2_l:ccdd", "btn_back", true),
+        ]);
+        assert!(combo_held(&s, &combo(&["btn_guide", "btn_back"]), None));
+    }
+
+    /// …and it still must not fire from one half alone.
+    #[test]
+    fn one_half_alone_does_not_satisfy_a_two_button_chord() {
+        let s = snap(&[("jc2:joycon2_r:aabb", "btn_guide", true)]);
+        assert!(!combo_held(&s, &combo(&["btn_guide", "btn_back"]), None));
+    }
+
+    /// ⛔ The SAME button id held on two grouped devices is one button, not
+    /// two.
+    ///
+    /// Grouping means a tally of HITS would let one button pressed on both
+    /// halves satisfy a two-button chord. Counting distinct ids is what stops
+    /// that. The Joy-Con halves happen to share no button id today — the rail
+    /// buttons take per-side paddle ids — but the grouping is what makes this
+    /// reachable at all, so the rule belongs with it rather than with whichever
+    /// pin list happens to overlap.
+    #[test]
+    fn the_same_button_on_two_grouped_devices_is_not_two_buttons() {
+        let s = snap(&[
+            ("jc2:joycon2_l:ccdd", "btn_guide", true),
+            ("jc2:joycon2_r:aabb", "btn_guide", true),
+        ]);
+        assert!(!combo_held(&s, &combo(&["btn_guide", "btn_back"]), None));
+    }
+
+    /// ⛔ Two separate pads must still not jointly fire a chord — that is the
+    /// rule the grouping had to be careful not to dissolve.
+    #[test]
+    fn two_different_controllers_still_cannot_share_a_chord() {
+        let s = snap(&[
+            ("gilrs:xinput:0", "btn_guide", true),
+            ("gilrs:xinput:1", "btn_back", true),
+        ]);
+        assert!(!combo_held(&s, &combo(&["btn_guide", "btn_back"]), None));
+    }
+
+    /// A single ordinary pad holding both buttons fires, as it always did.
+    #[test]
+    fn one_ordinary_pad_holding_both_still_fires() {
+        let s = snap(&[
+            ("gilrs:xinput:0", "btn_guide", true),
+            ("gilrs:xinput:0", "btn_back", true),
+        ]);
+        assert!(combo_held(&s, &combo(&["btn_guide", "btn_back"]), None));
+    }
 }

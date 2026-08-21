@@ -27,6 +27,11 @@ pub(crate) fn spawn_io_thread(
     device_rates: flexinput_engine::DeviceRates,
     scope_taps: flexinput_engine::ScopeTaps,
     spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
+    // Per-device measured resting gyro drift, deg/s on the device's rate
+    // axes. Pushed to backends every iteration, not once, so a controller
+    // that reconnects gets its calibration back without the user reopening
+    // the window. See `DeviceBackend::set_gyro_drift`.
+    gyro_drift_settings: Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>,
     // Global "route every pad through SDL" switch — pushed to every backend
     // each iteration so a live toggle re-arbitrates without a restart.
     sdl_all_pads: Arc<AtomicBool>,
@@ -187,6 +192,20 @@ pub(crate) fn spawn_io_thread(
                     }
                 }
                 mark!("spike_filter");
+
+                // Push measured resting gyro drift the same way and for the same
+                // reason: it must be in place before this iteration's samples are
+                // decoded, and the backend early-returns when it has not changed.
+                {
+                    puffin::profile_scope!("push_gyro_drift");
+                    let settings = gyro_drift_settings.read().unwrap();
+                    for (dev_id, drift) in settings.iter() {
+                        for backend in &mut backends {
+                            backend.set_gyro_drift(dev_id, *drift);
+                        }
+                    }
+                }
+                mark!("gyro_drift");
 
                 // Push the global-SDL switch before enumerate/poll so a live
                 // toggle takes effect this iteration.

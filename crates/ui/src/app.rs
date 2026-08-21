@@ -30,10 +30,11 @@ use crate::{
 // Children carry `use super::*;`, so they see these imports and the app's own
 // private items exactly as they did when they lived here.
 mod bind_window;
+mod bluetooth_window;
 mod chrome;
 mod config_route;
 mod devices_pool;
-mod graph;
+pub(crate) mod graph;
 mod hidhide_ui;
 mod nav;
 mod persistence;
@@ -459,6 +460,12 @@ pub struct FlexInputApp {
     settings: AppSettings,
     /// True while the Settings window is shown.
     settings_open: bool,
+    /// Bluetooth dongle panel — adapters, pairings, key file.
+    bluetooth: bluetooth_window::BluetoothState,
+    /// Cached "is any adapter visible", refreshed on the panel's own
+    /// timer. Read every frame by the title bar, so it must not enumerate
+    /// USB on the UI thread per frame.
+    bluetooth_present: bool,
     /// Set when settings have changed and need to be written out at end of frame.
     settings_dirty: bool,
     /// Gamepad UI-navigation runtime state (per-device toggle, selection/edit
@@ -486,6 +493,9 @@ pub struct FlexInputApp {
     /// Written by the UI (calibration window) when the user toggles or drags
     /// the slider; read by the I/O thread each tick and pushed to backends.
     pub spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>>,
+    /// Per-device measured resting gyro drift, deg/s on the device's rate
+    /// axes — see `DeviceBackend::set_gyro_drift`.
+    pub gyro_drift_settings: Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>,
     /// Pending rumble-ping requests, pushed by the UI when the user clicks a
     /// device-card icon. The I/O thread drains this each tick, starts a 200 ms
     /// rumble pulse on the named physical device, and stops it when it expires.
@@ -735,6 +745,17 @@ impl FlexInputApp {
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from),
         );
+        // ⭐ Before any controller can try to reconnect. A pairing that lands
+        // while this is still unset would write its link key to the working
+        // directory, and the user would find the bond missing on the next
+        // machine with nothing to explain it.
+        flexinput_btle::keystore::set_dir(
+            app_settings
+                .bt_key_dir
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from),
+        );
 
         let proc_graph          = flexinput_engine::new_arc_graph();
         let proc_device_signals = flexinput_engine::new_arc_signals();
@@ -875,6 +896,38 @@ impl FlexInputApp {
         let scope_taps   = flexinput_engine::new_scope_taps();
         let spike_filter_settings: Arc<RwLock<HashMap<String, (bool, f32)>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        // ⭐ Seeded from the SAVED graph, not left empty for the calibration
+        // window to fill.
+        //
+        // A drift measurement costs the user a minute of sitting still, so it
+        // has to survive a restart without them going and looking at it again.
+        // The value lives on the device node as `gyro_field_drift`; this walks
+        // every tab's graph once at startup and republishes what is already
+        // there, so a controller that connects five minutes later still gets
+        // its calibration.
+        let gyro_drift_settings: Arc<RwLock<HashMap<String, Option<[f32; 3]>>>> = {
+            let mut seed: HashMap<String, Option<[f32; 3]>> = HashMap::new();
+            for tab in &tabs {
+                for (_, node) in tab.canvas.snarl.node_ids() {
+                    if node.module_id != "device.source" {
+                        continue;
+                    }
+                    let Some(dev) = node.params.get("device_id").and_then(|v| v.as_str())
+                    else { continue };
+                    let Some(arr) = node.params.get("gyro_field_drift")
+                        .and_then(|v| v.as_array()) else { continue };
+                    if arr.len() != 3 {
+                        continue;
+                    }
+                    let mut d = [0.0f32; 3];
+                    for (i, v) in arr.iter().enumerate() {
+                        d[i] = v.as_f64().unwrap_or(0.0) as f32;
+                    }
+                    seed.insert(dev.to_string(), Some(d));
+                }
+            }
+            Arc::new(RwLock::new(seed))
+        };
         let ping_requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         spawn_io_thread(
             backends,
@@ -891,6 +944,7 @@ impl FlexInputApp {
             Arc::clone(&device_rates),
             Arc::clone(&scope_taps),
             Arc::clone(&spike_filter_settings),
+            Arc::clone(&gyro_drift_settings),
             Arc::clone(&sdl_all_pads),
             Arc::clone(&joycon2_pairing),
             Arc::clone(&ping_requests),
@@ -1073,6 +1127,8 @@ impl FlexInputApp {
             panic_shortcut_shared,
             settings: app_settings,
             settings_open: false,
+            bluetooth: Default::default(),
+            bluetooth_present: false,
             settings_dirty: false,
             gamepad_nav: crate::gamepad_nav::GamepadNav::default(),
             sample_rate_hz,
@@ -1082,6 +1138,7 @@ impl FlexInputApp {
             device_rates,
             scope_taps,
             spike_filter_settings,
+            gyro_drift_settings,
             ping_requests,
             pin_toggle_requested,
             pin_shortcut_shared,
@@ -1848,6 +1905,7 @@ impl eframe::App for FlexInputApp {
         let mut do_undo = false;
         let mut do_redo = false;
         let mut toggle_settings = false;
+        let mut toggle_bluetooth = false;
         let mut do_pin_toggle = false;
         let mut do_set_mode: Option<settings::UiMode> = None;
         let pin_active_now = self.settings.pin_active;
@@ -1875,6 +1933,8 @@ impl eframe::App for FlexInputApp {
                     &mut self.panic_learning,
                     &self.panic_shortcut_shared,
                     &mut toggle_settings,
+                    &mut toggle_bluetooth,
+                    self.bluetooth_present,
                     pin_active_now,
                     &mut do_pin_toggle,
                     ui_mode_now,
@@ -1883,6 +1943,9 @@ impl eframe::App for FlexInputApp {
             });
         if toggle_settings {
             self.settings_open = !self.settings_open;
+        }
+        if toggle_bluetooth {
+            self.bluetooth.open = !self.bluetooth.open;
         }
         if do_pin_toggle {
             self.toggle_pin(ctx);
@@ -1972,6 +2035,11 @@ impl eframe::App for FlexInputApp {
 
         // ── Settings window ───────────────────────────────────────────────────
         self.draw_settings_window(ctx);
+        // Refreshed here rather than in the title bar: `present` rescans on
+        // its own timer, and the title bar runs before this in the frame.
+        self.bluetooth_present = self.bluetooth.present();
+        let key_dir = self.settings.bt_key_dir.clone();
+        bluetooth_window::show(ctx, &mut self.bluetooth, key_dir.as_deref());
         self.draw_gp_settings_panel(ctx);
         // Auto-close the picker when a Touch Zones assignment finishes: the card
         // renderer commits the mapping (or Cancel fires) by resetting the node's
@@ -2818,7 +2886,7 @@ impl eframe::App for FlexInputApp {
             // Hands-free gyro auto-calibration watcher — runs whether or not
             // a calibration window is open.
             crate::panels::calibration::auto_cal_tick(ctx, canvas, &self.last_signals);
-            crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps, &self.spike_filter_settings);
+            crate::panels::calibration::show_windows(ctx, canvas, &mut self.calibration_open, &self.last_signals, &self.scope_taps, &self.spike_filter_settings, &self.gyro_drift_settings);
         }
 
         // Only update app_clipboard from outer canvas when the user actually copied

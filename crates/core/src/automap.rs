@@ -258,6 +258,12 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     // the display names are the generic on-icon labels (PL1/PR1/PL2/PR2, M1…M6),
     // since SDL exposes no vendor-specific paddle names. Keep in sync with
     // generic_outputs() — guarded by `all_pins_covers_generic_extra_buttons`.
+    // ⭐ Switch 2's GameChat button. No positional equivalent on any other
+    // pad, so it keeps its own id rather than being aliased onto one — but it
+    // MUST be in this list, because a pin absent from here never reaches the
+    // bus at all. It was declared by the layout, published by the backend, and
+    // silently dropped in between.
+    AutoMapPin { id: "btn_c",         display_name: "C (GameChat)",         signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_paddle_l1", display_name: "Paddle L1",            signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_paddle_r1", display_name: "Paddle R1",            signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_paddle_l2", display_name: "Paddle L2",            signal_type: SignalType::Bool },

@@ -10,6 +10,50 @@ use super::*;
 /// bus through every module to the real `device.source`, so auto-detect works
 /// when the Device input is wired through a Remapper, Gyro 3DOF, Fork, etc., or
 /// across sub-patch boundaries. Returns `None` if no device is reachable.
+/// Re-express a device orientation from the canonical IMU basis into the
+/// renderer's basis.
+///
+/// ⭐ **The two disagree about which way is up, and that renders as a completely
+/// wrong rotation.** FlexInput's canonical IMU frame is Z-UP — the contract on
+/// `flexinput_devices::gyro::HidReading` defines `z` as vertical, positive with
+/// the controller lying flat and face up. This renderer's camera is built with
+/// `Mat4::look_at_rh(.., Vec3::Y)`, so its world is Y-UP.
+///
+/// Applied without conversion, a yaw — a rotation about canonical Z — becomes a
+/// rotation about the VIEWER's Z, which points at the camera. That is roll. It
+/// was reported from hardware as
+///
+///   > when I do yaw rotation, it rolls both handles
+///
+/// and "both" is the tell: an IMU fault would differ between the halves, whose
+/// sensors are mounted mirrored. A basis mismatch cannot.
+///
+/// The conversion is a change of basis, `q' = R q R⁻¹`, where `R` maps canonical
+/// axes onto viewer axes:
+///
+/// ```text
+///   canonical +z (up)      -> viewer +y (up)
+///   canonical +x (forward) -> viewer -z (into the screen)
+///   canonical +y (side)    -> viewer -x
+/// ```
+///
+/// Signs chosen so `R` is a proper rotation (determinant +1) rather than a
+/// reflection — a mirrored basis looks plausible while inverting every rotation
+/// direction, which is a much harder fault to spot than an obvious one.
+///
+/// ❗ Belongs HERE, not in the device layer. The orientation pin feeds aim
+/// modules too and they work in the canonical frame; rotating it at source to
+/// suit one renderer would silently break everything else.
+fn to_view_basis(q: glam::Quat) -> glam::Quat {
+    // Columns are the images of the canonical basis vectors.
+    let r = glam::Quat::from_mat3(&glam::Mat3::from_cols(
+        glam::Vec3::new(0.0, 0.0, -1.0), // canonical x -> viewer -z
+        glam::Vec3::new(-1.0, 0.0, 0.0), // canonical y -> viewer -x
+        glam::Vec3::new(0.0, 1.0, 0.0),  // canonical z -> viewer +y
+    ));
+    r * q * r.conjugate()
+}
+
 pub(crate) fn controller3d_physical_device(
     snarl: &Snarl<NodeData>,
     src: OutPinId,
@@ -527,7 +571,7 @@ pub(crate) fn show_controller3d_body(
             _ => None,
         })
         .filter(|q| q.length_squared() > 1e-6)
-        .map(|q| q.normalize())
+        .map(|q| to_view_basis(q.normalize()))
         .unwrap_or(glam::Quat::IDENTITY);
 
     ui.vertical(|ui| {

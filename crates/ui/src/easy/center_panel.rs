@@ -1174,7 +1174,23 @@ fn check_compat(canvas: &Canvas) -> Compat {
     for k in counts.keys() {
         if !allowed.iter().any(|a| a == k) { return Compat::Incompatible; }
     }
-    if counts.get("device.source").copied().unwrap_or(0) > 1 { return Compat::Incompatible; }
+    // ⭐ As many input devices as the sub-patch has AutoMap inlets.
+    //
+    // ❗ This was pinned at one, which made multi-device Easy mode
+    // unreachable from the UI that offers it: the picker lets you choose up to
+    // `input_capacity` gamepads — the wiring layer has always given each its own
+    // port — and then the patch was declared incompatible the moment a second
+    // one was chosen. A Joy-Con 2 grip is the obvious casualty, being two
+    // devices for one pair of hands.
+    //
+    // The SAME helper the picker caps itself with, so the two cannot drift
+    // apart again: a preset with one inlet still admits exactly one source, and
+    // no preset can be configured into a state the check then rejects.
+    if counts.get("device.source").copied().unwrap_or(0)
+        > super::io_panel::input_capacity(canvas)
+    {
+        return Compat::Incompatible;
+    }
     if counts.get("subpatch").copied().unwrap_or(0) > 1     { return Compat::Incompatible; }
 
     let mut by_kind: HashMap<String, usize> = HashMap::new();
@@ -1187,6 +1203,70 @@ fn check_compat(canvas: &Canvas) -> Compat {
     }
     if by_kind.values().any(|v| *v > 1) { return Compat::Incompatible; }
     Compat::Ok
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+    use crate::canvas::NodeData;
+    use flexinput_core::{PinDescriptor, SignalType};
+
+    fn node(module_id: &str, automap_inlets: usize) -> NodeData {
+        NodeData {
+            module_id: module_id.into(),
+            display_name: String::new(),
+            category: String::new(),
+            inputs: (0..automap_inlets)
+                .map(|_| PinDescriptor::new("in", SignalType::AutoMap))
+                .collect(),
+            outputs: Vec::new(),
+            params: Default::default(),
+            subpatch: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn canvas_with(inlets: usize, sources: usize) -> Canvas {
+        let mut c = Canvas::default();
+        c.snarl.insert_node(egui::pos2(0.0, 0.0), node("subpatch", inlets));
+        for i in 0..sources {
+            c.snarl
+                .insert_node(egui::pos2(0.0, 40.0 * (i + 1) as f32), node("device.source", 0));
+        }
+        c
+    }
+
+    /// ⛔ A preset with N AutoMap inlets must accept N input devices.
+    ///
+    /// The picker offers exactly that many, so anything stricter here declares
+    /// the patch broken for a configuration the UI just invited. A Joy-Con 2
+    /// grip is two devices for one pair of hands, and this is what stopped it
+    /// working in Easy mode.
+    #[test]
+    fn a_multi_inlet_preset_accepts_one_device_per_inlet() {
+        for n in 1..=4 {
+            assert!(
+                matches!(check_compat(&canvas_with(n, n)), Compat::Ok),
+                "{n} inlets with {n} sources was rejected",
+            );
+        }
+    }
+
+    /// …and one more than it has inlets is genuinely incompatible: there is no
+    /// port left to wire it to.
+    #[test]
+    fn more_devices_than_inlets_is_still_incompatible() {
+        assert!(matches!(check_compat(&canvas_with(2, 3)), Compat::Incompatible));
+        assert!(matches!(check_compat(&canvas_with(1, 2)), Compat::Incompatible));
+    }
+
+    /// The single-inlet case must behave exactly as it always did — that is the
+    /// whole existing preset library.
+    #[test]
+    fn a_single_inlet_preset_is_unchanged() {
+        assert!(matches!(check_compat(&canvas_with(1, 1)), Compat::Ok));
+        assert!(matches!(check_compat(&canvas_with(1, 0)), Compat::Ok));
+    }
 }
 
 fn find_subpatch(canvas: &Canvas) -> Option<NodeId> {

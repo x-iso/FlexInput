@@ -476,9 +476,10 @@ fn input_card(
     top_right.add_space(1.0);
     top_right.horizontal(|ui| {
         if is_active {
-            if let Some((node_id, dev_id)) = active_source(canvas) {
+            // This card's own node — see `source_node_for`.
+            if let Some(node_id) = source_node_for(canvas, &d.id) {
                 header_controls::render_calibrate_row(
-                    ui, node_id, &dev_id,
+                    ui, node_id, &d.id,
                     device_rates_hz, calibrate_request,
                 );
             }
@@ -813,7 +814,7 @@ fn find_source_node_for(canvas: &Canvas, device_id: &str) -> Option<NodeId> {
 ///
 /// Read from the preset rather than fixed, so a single-inlet preset keeps
 /// behaving exactly as it always has and a multi-inlet one just works.
-fn input_capacity(canvas: &Canvas) -> usize {
+pub(super) fn input_capacity(canvas: &Canvas) -> usize {
     let sp = canvas.snarl.nodes_ids_data()
         .find(|(_, n)| n.value.module_id == "subpatch");
     match sp {
@@ -885,15 +886,25 @@ fn toggle_source(
     super::layout::reposition_io_nodes(canvas);
 }
 
-fn active_source(canvas: &Canvas) -> Option<(NodeId, String)> {
+/// The `device.source` node driving a SPECIFIC device.
+///
+/// ⛔ Not the same as [`active_source`], and using that here was a bug. It
+/// returns the FIRST source node on the canvas, which was fine when Easy mode
+/// held exactly one — but multi-device support made every card's Calibrate
+/// button open whichever node happened to be first. With a stale Joy-Con node
+/// still on the canvas, clicking Calibrate on a Pro Controller opened a
+/// "Joy-Con 2 (L) Calibration" window for a device that was not even connected.
+///
+/// A per-card control has to resolve the card's OWN device.
+fn source_node_for(canvas: &Canvas, dev_id: &str) -> Option<NodeId> {
     canvas.snarl.nodes_ids_data()
-        .find(|(_, n)| n.value.module_id == "device.source")
-        .and_then(|(id, n)| {
-            n.value.params.get("device_id")
-                .and_then(|v| v.as_str())
-                .map(|s| (id, s.to_string()))
+        .find(|(_, n)| {
+            n.value.module_id == "device.source"
+                && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(dev_id)
         })
+        .map(|(id, _)| id)
 }
+
 
 
 // ── Output ──────────────────────────────────────────────────────────

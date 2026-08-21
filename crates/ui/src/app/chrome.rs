@@ -578,6 +578,8 @@ pub(crate) fn show_title_bar(
     panic_learning: &mut bool,
     panic_shortcut_shared: &Arc<RwLock<PanicShortcut>>,
     toggle_settings: &mut bool,
+    toggle_bluetooth: &mut bool,
+    bluetooth_present: bool,
     pin_active: bool,
     do_pin_toggle: &mut bool,
     ui_mode: settings::UiMode,
@@ -930,6 +932,68 @@ pub(crate) fn show_title_bar(
         painter.image(tex.id(), logo_rect, uv, egui::Color32::WHITE);
     }
     painter.galley(egui::pos2(text_left, mid.y - text_size.y / 2.0), galley, base_color);
+
+    // ── Bluetooth dongle button ──────────────────────────────────────────
+    //
+    // ⭐ Shown only when a Bluetooth adapter is actually visible to our USB
+    // stack. It is a control for hardware that most machines do not have and
+    // most users will never plug in, so a permanent button would be a
+    // permanent question ("what is this for?") for everyone it does not serve.
+    // Present hardware, present button.
+    if bluetooth_present {
+        let side = pill_rect.height() * 0.82;
+        let bt_rect = egui::Rect::from_center_size(
+            egui::pos2(pill_rect.right() + 6.0 + side / 2.0, mid.y),
+            egui::vec2(side, side),
+        );
+        let bt = ui.interact(bt_rect, ui.id().with("bt_dongle"), egui::Sense::click());
+        if bt.clicked() {
+            *toggle_bluetooth = true;
+        }
+        if bt.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let p = ui.painter();
+        p.rect(
+            bt_rect,
+            egui::CornerRadius::same(6),
+            if bt.hovered() {
+                egui::Color32::from_rgb(38, 38, 38)
+            } else {
+                egui::Color32::from_rgb(27, 27, 27)
+            },
+            if bt.hovered() {
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110))
+            } else {
+                egui::Stroke::NONE
+            },
+            egui::StrokeKind::Inside,
+        );
+        // The Bluetooth rune, drawn rather than glyphed: the character is not
+        // in most bundled fonts and renders as a replacement box.
+        let c = bt_rect.center();
+        let hh = side * 0.30; // half-height of the rune
+        let w = side * 0.17;
+        let col = if bt.hovered() {
+            egui::Color32::from_gray(235)
+        } else {
+            egui::Color32::from_gray(170)
+        };
+        let stroke = egui::Stroke::new((side * 0.075).max(1.0), col);
+        let (top, bot) = (egui::pos2(c.x, c.y - hh), egui::pos2(c.x, c.y + hh));
+        let (ur, lr) = (egui::pos2(c.x + w, c.y - hh / 2.0), egui::pos2(c.x + w, c.y + hh / 2.0));
+        let (ul, ll) = (egui::pos2(c.x - w, c.y - hh / 2.0), egui::pos2(c.x - w, c.y + hh / 2.0));
+        for seg in [
+            [top, bot],   // the spine
+            [top, ur],    // upper right diagonal
+            [ur, ll],     // down through the centre to lower left
+            [bot, lr],    // lower right diagonal
+            [lr, ul],     // up through the centre to upper left
+        ] {
+            p.line_segment(seg, stroke);
+        }
+        bt.on_hover_text("Bluetooth dongle — paired controllers, keys and transport");
+    }
 
     // Fire StartDrag on mouse-press (not drag_started) to avoid the
     // egui ~6 px threshold lag before the OS drag-move loop takes

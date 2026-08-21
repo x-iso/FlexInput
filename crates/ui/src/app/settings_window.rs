@@ -732,6 +732,70 @@ impl FlexInputApp {
                     }
                 });
 
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Bluetooth link keys");
+                    let cur = self.settings.bt_key_dir.clone().unwrap_or_default();
+                    ui.label(
+                        egui::RichText::new(if cur.is_empty() { "(working directory)" } else { &cur })
+                            .small()
+                            .color(egui::Color32::from_gray(160)),
+                    )
+                    .on_hover_text(
+                        "Where link keys for controllers paired to FlexInput's own \
+                         Bluetooth dongle are kept.\n\n\
+                         A pairing is between the controller and the DONGLE, not this PC \
+                         — so the same dongle works on another machine. Both ends have to \
+                         hold the key, though, and this file is the host's copy. Point \
+                         this at a cloud-synced folder and the key follows the dongle \
+                         everywhere with nothing to copy by hand.",
+                    );
+                    if ui.small_button("Browse…").clicked() {
+                        if let Some(p) = crate::overlay::with_overlay_not_topmost(
+                            || rfd::FileDialog::new().pick_folder(),
+                        ) {
+                            // ⭐ Checked NOW, not at pairing time. A cloud folder can be
+                            // offline, read-only mid-sync, or not yet created — and
+                            // finding that out during a pairing means losing the key for
+                            // a bond that has already replaced the controller's previous
+                            // host. That is the worst possible moment to discover it.
+                            match flexinput_btle::keystore::check_writable(&p) {
+                                Ok(()) => {
+                                    self.settings.bt_key_dir =
+                                        Some(p.to_string_lossy().to_string());
+                                    flexinput_btle::keystore::set_dir(Some(p));
+                                    dirty = true;
+                                }
+                                Err(e) => {
+                                    // Kept on screen rather than flashed: the
+                                    // whole point is that the user learns the
+                                    // folder is unusable BEFORE relying on it.
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(
+                                            egui::Id::new("bt_key_dir_error"),
+                                            format!("Cannot use that folder — {e}"),
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if !cur.is_empty() && ui.small_button("Clear").clicked() {
+                        self.settings.bt_key_dir = None;
+                        flexinput_btle::keystore::set_dir(None);
+                        ui.ctx().data_mut(|d| {
+                            d.remove::<String>(egui::Id::new("bt_key_dir_error"))
+                        });
+                        dirty = true;
+                    }
+                });
+                if let Some(err) = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<String>(egui::Id::new("bt_key_dir_error")))
+                {
+                    ui.label(egui::RichText::new(err).small().color(egui::Color32::from_rgb(230, 140, 60)));
+                }
+
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);

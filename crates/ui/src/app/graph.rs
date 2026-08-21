@@ -164,7 +164,13 @@ pub(crate) fn sync_display_state_into(dst: &mut Snarl<NodeData>, src: &Snarl<Nod
 /// deliberately cover only SOME backends spell that out inline instead of
 /// calling this.
 pub(crate) fn is_physical_pad_id(id: &str) -> bool {
-    id.starts_with("gilrs:") || id.starts_with("sdl:") || id.starts_with("jc2:")
+    id.starts_with("gilrs:")
+        || id.starts_with("sdl:")
+        || id.starts_with("jc2:")
+        // Bluetooth Classic pads on our own dongle. Windows binds no driver
+        // to these either, so like `jc2:` they can never collide with a
+        // gilrs/SDL entry for the same hardware.
+        || id.starts_with("btc:")
 }
 
 pub(crate) fn is_real_device_id(id: &str) -> bool {

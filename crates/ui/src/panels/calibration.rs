@@ -177,6 +177,17 @@ fn read_float(live: &LiveSignals, dev: &str, pin: &str) -> f32 {
     }
 }
 
+/// Whether a device publishes a pin at all.
+///
+/// ❗ Not the same question as "is it zero". [`read_float`] answers a missing
+/// pin with 0.0, which is indistinguishable from a real reading of zero — and
+/// for a drift measurement those two mean opposite things: one says "this
+/// device integrates nothing internally, correct the pins instead", the other
+/// says "this device is perfectly calibrated already".
+fn has_signal(live: &LiveSignals, dev: &str, pin: &str) -> bool {
+    live.contains_key(&(dev.into(), pin.into()))
+}
+
 fn read_vec2(live: &LiveSignals, dev: &str, x_pin: &str, y_pin: &str) -> (f32, f32) {
     (read_float(live, dev, x_pin), read_float(live, dev, y_pin))
 }
@@ -375,6 +386,16 @@ fn state_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_state", node)) }
 // ── Public entry: render all open windows ────────────────────────────────────
 
 pub type SpikeSettings = Arc<RwLock<HashMap<String, (bool, f32)>>>;
+/// Per-device measured resting gyro drift, deg/s on the device's own rate
+/// axes. Shared with the device thread, which pushes it to the backend every
+/// tick — see `DeviceBackend::set_gyro_drift`.
+///
+/// `None` means "revert to whatever the backend compiled in" — an entry
+/// that has been cleared, which still has to be PUSHED to undo a
+/// calibration already sitting in the decoder. Removing the key instead
+/// would only stop repeating it, leaving the old value in place until the
+/// app restarted.
+pub type GyroDriftSettings = Arc<RwLock<HashMap<String, Option<[f32; 3]>>>>;
 
 pub fn show_windows(
     ctx: &egui::Context,
@@ -383,6 +404,7 @@ pub fn show_windows(
     live: &LiveSignals,
     scope_taps: &flexinput_engine::ScopeTaps,
     spike_settings: &SpikeSettings,
+    gyro_drift: &GyroDriftSettings,
 ) {
     let entries: Vec<(NodeId, String, String, Vec<String>)> = open.iter()
         .filter_map(|&nid| {
@@ -426,7 +448,8 @@ pub fn show_windows(
             .min_width(min_w)
             .min_height(min_h)
             .show(ctx, |ui| {
-                draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps, spike_settings);
+                draw_window_body(ui, canvas, node_id, &dev_id, caps, live, scope_taps,
+                spike_settings, gyro_drift);
             });
         if !is_open {
             to_close.push(node_id);
@@ -632,6 +655,7 @@ fn draw_window_body(
     live: &LiveSignals,
     scope_taps: &flexinput_engine::ScopeTaps,
     spike_settings: &SpikeSettings,
+    gyro_drift: &GyroDriftSettings,
 ) {
     let lo = Layout::compute(ui);
     if caps.gyro {
@@ -639,7 +663,7 @@ fn draw_window_body(
         ui.separator();
     }
     if caps.orientation {
-        orientation_section(ui, canvas, node_id, dev_id, live);
+        orientation_section(ui, canvas, node_id, dev_id, live, gyro_drift);
         ui.separator();
     }
     if caps.sticks {
@@ -652,23 +676,71 @@ fn draw_window_body(
     ui.ctx().request_repaint();
 }
 
-/// Frames averaged for the orientation baseline. ~1 s of a resting device at
-/// the Joy-Con 2's ~67 Hz — long enough to average out jitter, short enough
-/// that the user is not asked to hold still for an age.
-const ORIENT_BASELINE_FRAMES: u32 = 64;
-
-/// Baseline-pose capture for devices that report absolute orientation.
+/// How long the resting baseline samples for, in seconds.
 ///
-/// The published pose is world-referenced — on a Joy-Con 2 its yaw is magnetic
-/// north — which is almost never what a patch wants. Capturing a reference
-/// while the device sits in a known pose lets the engine report rotation
-/// RELATIVE to that, so "as I set it down" reads as identity.
+/// ⭐ **Sixty seconds, and the number is measured rather than chosen for what
+/// feels tolerable.** A Joy-Con 2's resting gyro drift is a few tenths of a
+/// degree per second — small enough to be buried in per-sample noise and to
+/// appear only in the average — so the question is how long an average has to
+/// run before it is worth trusting. Six stationary sessions of four to eleven
+/// minutes answer it:
+///
+/// * a 30-second window pins the dominant axis to about 6%;
+/// * 60 seconds roughly halves the noise, to about 4%;
+/// * beyond that the sensor's own warm-up takes over — the offset moves about
+///   0.009 °/s per minute as the device heats — so a longer capture is no
+///   longer averaging away noise, it is averaging together a moving target.
+///
+/// Sixty seconds is where those two cross. Sampling longer would report a more
+/// precise answer to a less useful question.
+const BASELINE_SECS: f32 = 60.0;
+
+/// Peak-to-peak ACCELEROMETER span, per axis, that ends a capture as "the
+/// device moved".
+///
+/// ⭐ Watched on the accelerometer rather than the gyro because it is the more
+/// direct question. What invalidates a resting measurement is the device having
+/// ROTATED, and a changed gravity direction IS that — no scale factor, no axis
+/// map, and nothing that depends on which source the gyro pins happen to be
+/// wired to this week.
+///
+/// It also stays valid across that choice. A gyro-based check has to be sized
+/// against whichever rate source is in use, and those differ by more than an
+/// order of magnitude in noise; gravity at rest moves under 0.001 of the accel
+/// range either way, leaving more than a decade of headroom under this
+/// threshold, while picking the device up moves it by a large fraction of 1 g.
+const BASELINE_MOVE_P2P: f32 = AUTOCAL_ACCEL_P2P;
+
+/// Below this, a measured offset is written as exactly zero.
+///
+/// Finer than the quick capture's snap (1/16384 ≈ 0.12 °/s), because a
+/// sixty-second average genuinely resolves more than a four-second one — around
+/// 0.03 °/s. Keeping the coarser value here would discard the two smaller axes
+/// outright, and they are small but real.
+const BASELINE_SNAP_EPS: f32 = 1.5e-5;
+
+/// Baseline-pose and resting-drift capture, for devices reporting absolute
+/// orientation.
+///
+/// Two measurements from one sitting, because they want identical conditions —
+/// the device flat, still, and untouched:
+///
+/// * **Pose.** The published orientation is world-referenced (on a Joy-Con 2
+///   its yaw is magnetic north), which is almost never what a patch wants. A
+///   captured reference lets the engine report rotation RELATIVE to it, so "as
+///   I set it down" reads as identity.
+/// * **Resting drift.** Every gyro reports some rotation while perfectly still,
+///   and here it is large enough to matter: a few tenths of a degree per second
+///   is tens of degrees of yaw a minute. It is also PER-DEVICE — the two halves
+///   of one grip measure meaningfully different offsets, being separate sensors
+///   — which is why it is captured here, per device, rather than compiled in.
 fn orientation_section(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
     node_id: NodeId,
     dev_id: &str,
     live: &LiveSignals,
+    gyro_drift: &GyroDriftSettings,
 ) {
     let done = canvas.snarl.get_node(node_id)
         .and_then(|n| n.params.get("orientation_baseline"))
@@ -677,14 +749,45 @@ fn orientation_section(
     section_header(ui, "Orientation Baseline", done);
 
     instruct_line(ui, &[
-        (false, "Clip BOTH halves into the grip / charger, lay it "),
+        (false, "Clip BOTH halves into the grip, lay it "),
         (true,  "FLAT"),
-        (false, " on the table, then capture. Do not touch it while it samples."),
+        (false, " on the table, and "),
+        (true,  "DO NOT TOUCH IT"),
+        (false, " until it finishes. It runs for 60 s because it is measuring a \
+drift of a fraction of a degree per second, which only shows up in a long \
+average. This also sets the gyro zero for this device."),
     ]);
 
     let live_q = read_vec4(live, dev_id, "orientation");
+    let g = [
+        read_float(live, dev_id, "gyro_x"),
+        read_float(live, dev_id, "gyro_y"),
+        read_float(live, dev_id, "gyro_z"),
+    ];
+    // Movement is judged on gravity — see `BASELINE_MOVE_P2P`.
+    let a = [
+        read_float(live, dev_id, "accel_x"),
+        read_float(live, dev_id, "accel_y"),
+        read_float(live, dev_id, "accel_z"),
+    ];
+    // ⭐ The device's OWN rate axes, not the canonical gyro pins.
+    //
+    // The drift has to be handed back to the decoder in the space it applies it
+    // in, and `gyro_x/y/z` are several transforms downstream of that: an axis
+    // permutation, a sign convention, and a per-axis gain. Inverting all of
+    // that to recover the original would be three chances to get a sign wrong,
+    // silently, in a correction whose whole job is to be subtracted. These pins
+    // are the rate as the device reports it, in device order, so the only
+    // conversion left is the gain — and the backend, which owns that constant,
+    // does it.
+    let f = [
+        read_float(live, dev_id, "probe_rate_0"),
+        read_float(live, dev_id, "probe_rate_1"),
+        read_float(live, dev_id, "probe_rate_2"),
+    ];
+    let has_field = (0..3).any(|i| has_signal(live, dev_id, &format!("probe_rate_{i}")));
 
-    let (sampling, n, sum) = ui.ctx().data_mut(|d| {
+    let st = ui.ctx().data_mut(|d| {
         let st = d.get_temp_mut_or_insert_with::<OrientBaseline>(
             orient_baseline_id(node_id), OrientBaseline::default);
         if st.sampling {
@@ -693,69 +796,233 @@ fn orientation_section(
                 // -q are the SAME rotation, and a device that flips
                 // representation mid-capture would otherwise average toward
                 // zero and produce a garbage baseline.
-                let s = if st.n == 0 {
+                let sgn = if st.n == 0 {
                     1.0
                 } else {
-                    let dot = st.sum[0] * q[0] + st.sum[1] * q[1] + st.sum[2] * q[2] + st.sum[3] * q[3];
+                    let dot = st.sum[0] * q[0] + st.sum[1] * q[1]
+                        + st.sum[2] * q[2] + st.sum[3] * q[3];
                     if dot < 0.0 { -1.0 } else { 1.0 }
                 };
-                for i in 0..4 { st.sum[i] += q[i] * s; }
+                for i in 0..4 { st.sum[i] += q[i] * sgn; }
                 st.n += 1;
             }
-            if st.n >= ORIENT_BASELINE_FRAMES {
+            for i in 0..3 {
+                st.gyro_sum[i] += g[i] as f64;
+                st.gyro_sq[i] += (g[i] as f64) * (g[i] as f64);
+                st.amin[i] = st.amin[i].min(a[i]);
+                st.amax[i] = st.amax[i].max(a[i]);
+                st.field_sum[i] += f[i] as f64;
+            }
+            st.gyro_n += 1;
+            // Checked only once a span can mean anything: on the first frame
+            // min == max on every axis.
+            let moved = st.gyro_n > 8
+                && (0..3).any(|i| st.amax[i] - st.amin[i] > BASELINE_MOVE_P2P);
+            if moved {
                 st.sampling = false;
+                st.moved = true;
+            } else if st.elapsed() >= BASELINE_SECS {
+                st.sampling = false;
+                st.finished = true;
             }
         }
-        (st.sampling, st.n, st.sum)
+        *st
     });
 
-    if !sampling && n >= ORIENT_BASELINE_FRAMES {
-        let len = (sum[0].powi(2) + sum[1].powi(2) + sum[2].powi(2) + sum[3].powi(2)).sqrt();
-        if len > f32::EPSILON {
-            let q: Vec<f64> = sum.iter().map(|v| (v / len) as f64).collect();
-            if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
+    if st.finished {
+        let len = (st.sum[0].powi(2) + st.sum[1].powi(2)
+            + st.sum[2].powi(2) + st.sum[3].powi(2)).sqrt();
+        let n = st.gyro_n.max(1) as f64;
+        let snap = |v: f64| -> f32 {
+            let f = v as f32;
+            if f.abs() < BASELINE_SNAP_EPS { 0.0 } else { f }
+        };
+        let mean: Vec<f32> = (0..3).map(|i| snap(st.gyro_sum[i] / n)).collect();
+        let floor = (0..3)
+            .map(|i| st.gyro_sq[i] / n - (st.gyro_sum[i] / n).powi(2))
+            .sum::<f64>()
+            .max(0.0)
+            .sqrt() as f32;
+        // ⭐ An ABSOLUTE measurement, because the capture ran with the
+        // decoder's correction switched off — see the button handler.
+        //
+        // ❗ The alternative, folding each capture into the last, was worse in
+        // the way that matters: it is not idempotent. A capture taken while the
+        // desk was knocked would be added permanently, and every later capture
+        // would inherit it, with no way to tell a good calibration from an
+        // accumulated pile of bad ones. Zeroing first means a recalibration is
+        // exactly what it sounds like — the second capture of a pad gives the
+        // same answer as the first, and a bad one is undone by repeating it.
+        let field: Vec<f32> = (0..3)
+            .map(|i| (st.field_sum[i] / n) as f32 * flexinput_devices::gyro::GYRO_REF_DPS)
+            .collect();
+        if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
+            if len > f32::EPSILON && st.n > 0 {
+                let q: Vec<f64> = st.sum.iter().map(|v| (v / len) as f64).collect();
                 nd.params.insert("orientation_baseline".into(), serde_json::json!(q));
+            }
+            nd.params.insert("gyro_calibrated".into(), Value::Bool(true));
+            nd.params.insert("gyro_noise_floor".into(), serde_json::json!(floor));
+            if has_field {
+                // ❗ The pin offset is deliberately CLEARED when the decoder is
+                // taking the correction instead.
+                //
+                // Both would otherwise be subtracted from the same signal: the
+                // decoder removes the drift at the source, and the pins are
+                // derived from that same corrected rate, so an engine-side
+                // `gyro_offset` measured in the same sitting would remove it a
+                // second time and leave the pads drifting the other way by
+                // exactly the amount just calibrated.
+                nd.params.insert("gyro_field_drift".into(), serde_json::json!(field));
+                nd.params.insert("gyro_offset".into(), serde_json::json!([0.0_f32, 0.0, 0.0]));
+            } else {
+                // No device-frame rate published — this device integrates
+                // nothing internally, so the pin offset is the whole job.
+                nd.params.insert("gyro_offset".into(), serde_json::json!(mean));
+            }
+        }
+        if has_field {
+            if let Ok(mut map) = gyro_drift.write() {
+                map.insert(dev_id.to_string(), Some([field[0], field[1], field[2]]));
             }
         }
         ui.ctx().data_mut(|d| {
             d.insert_temp(orient_baseline_id(node_id), OrientBaseline::default());
+            d.insert_temp(cal_glow_id(node_id), Instant::now());
         });
     }
 
     ui.horizontal(|ui| {
-        let progress = if sampling { n as f32 / ORIENT_BASELINE_FRAMES as f32 } else { 0.0 };
-        let label = if sampling { "Sampling…" } else { "Capture Baseline" };
+        let left = (BASELINE_SECS - st.elapsed()).max(0.0);
+        let progress = if st.sampling { st.elapsed() / BASELINE_SECS } else { 0.0 };
+        let label = if st.sampling {
+            format!("Sampling… {left:.0} s")
+        } else {
+            "Capture Baseline".to_string()
+        };
         let enabled = live_q.is_some();
         let resp = ui.add_enabled_ui(enabled, |ui| {
-            cal_button_with_progress(ui, label, progress)
+            cal_button_with_progress(ui, &label, progress)
         }).inner;
-        if resp.clicked() && !sampling {
-            ui.ctx().data_mut(|d| {
-                d.insert_temp(orient_baseline_id(node_id), OrientBaseline {
-                    sampling: true, n: 0, sum: [0.0; 4],
-                });
-            });
+        if resp.clicked() {
+            let starting = !st.sampling;
+            let next = if starting {
+                OrientBaseline {
+                    sampling: true,
+                    started: Some(Instant::now()),
+                    ..Default::default()
+                }
+            } else {
+                // Clicking again cancels rather than restarting: a capture this
+                // long is one someone will want to call off.
+                OrientBaseline::default()
+            };
+            ui.ctx().data_mut(|d| d.insert_temp(orient_baseline_id(node_id), next));
+            if let Ok(mut map) = gyro_drift.write() {
+                // ⭐ Measure the drift the device ACTUALLY has, not what is left
+                // after the last calibration.
+                //
+                // An explicit zero, not a removal: removing the entry would fall
+                // back to the compiled-in constant, and the pins would then show
+                // the residual against THAT — an absolute measurement taken
+                // relative to a number this controller was never measured for.
+                // Zero means "subtract nothing", which is the only baseline that
+                // makes the result mean what it says.
+                //
+                // On cancel the same write leaves the correction off until the
+                // capture is redone. That is deliberate: a half-finished
+                // calibration should not silently restore the old one and leave
+                // the user unsure which is in effect.
+                map.insert(dev_id.to_string(), Some([0.0; 3]));
+            }
+            if starting {
+                if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
+                    nd.params.insert("gyro_field_drift".into(),
+                        serde_json::json!([0.0_f32, 0.0, 0.0]));
+                }
+            }
         }
         if !enabled {
             ui.label(egui::RichText::new("no orientation signal from this device")
                 .size(INSTRUCT_SIZE).color(ORANGE));
         }
-        if done && ui.button("Clear").clicked() {
+        if done && !st.sampling && ui.button("Clear").clicked() {
             if let Some(nd) = canvas.snarl.get_node_mut(node_id) {
                 nd.params.remove("orientation_baseline");
+                // The drift measurement goes with it. One button captured both,
+                // so one button has to be able to undo both — otherwise a bad
+                // capture (knocked table, controller picked up early) is stuck
+                // in the decoder with no way back short of editing the saved
+                // graph by hand.
+                nd.params.remove("gyro_field_drift");
+            }
+            if let Ok(mut map) = gyro_drift.write() {
+                map.insert(dev_id.to_string(), None);
             }
         }
     });
+
+    if st.moved {
+        ui.label(egui::RichText::new(
+            "The device moved — nothing was written. Set it down flat and start again.")
+            .size(INSTRUCT_SIZE).color(ORANGE));
+    }
+
+    // A minute-long capture needs frames to keep arriving even when nothing
+    // else on screen is changing.
+    if st.sampling {
+        ui.ctx().request_repaint();
+    }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct OrientBaseline {
     sampling: bool,
+    started: Option<Instant>,
+    finished: bool,
+    moved: bool,
+    /// Quaternion samples: count, and the sign-aligned sum.
     n: u32,
     sum: [f32; 4],
+    /// Gyro samples: count, sum, and sum of squares (for the noise floor).
+    gyro_n: u32,
+    gyro_sum: [f64; 3],
+    gyro_sq: [f64; 3],
+    /// Same window, but on the device's own rate axes — see `probe_rate_*`.
+    field_sum: [f64; 3],
+    /// Accelerometer extremes over the window — the movement check watches
+    /// gravity, not the gyro. See `BASELINE_MOVE_P2P`.
+    amin: [f32; 3],
+    amax: [f32; 3],
+}
+
+impl Default for OrientBaseline {
+    fn default() -> Self {
+        Self {
+            sampling: false,
+            started: None,
+            finished: false,
+            moved: false,
+            n: 0,
+            sum: [0.0; 4],
+            gyro_n: 0,
+            gyro_sum: [0.0; 3],
+            gyro_sq: [0.0; 3],
+            field_sum: [0.0; 3],
+            amin: [f32::INFINITY; 3],
+            amax: [f32::NEG_INFINITY; 3],
+        }
+    }
+}
+
+impl OrientBaseline {
+    fn elapsed(&self) -> f32 {
+        self.started.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0)
+    }
 }
 
 fn orient_baseline_id(node: NodeId) -> egui::Id { egui::Id::new(("orient_baseline", node)) }
+
 
 /// Read a Vec4 pin, or `None` when the device is not publishing it.
 fn read_vec4(live: &LiveSignals, dev: &str, pin: &str) -> Option<[f32; 4]> {
