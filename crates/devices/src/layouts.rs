@@ -275,10 +275,27 @@ fn joycon2_left_outputs() -> Vec<DevicePin> {
         bo("btn_ls", "Stick Click"),
         bo("btn_back", "Minus"),
         bo("btn_capture", "Capture"),
-        // The rail buttons, only reachable when the Joy-Con is detached. No
-        // positional equivalent on a standard pad, so they keep their own ids.
-        bo("btn_sl", "SL"),
-        bo("btn_sr", "SR"),
+        // ⭐ The rail buttons, published under the STANDARD paddle ids.
+        //
+        // They kept device-native ids (`btn_sl`/`btn_sr`) on the reasoning that
+        // they have no positional equivalent on a normal pad. True, but the
+        // consequence was that they reached nothing: AutoMap carries a fixed
+        // vocabulary, and a pin outside it is dropped between the backend and
+        // the bus. A button that exists, is decoded, is displayed, and can
+        // never be mapped is worse than one that is simply absent.
+        //
+        // Rear paddles are the closest standard analogue — extra buttons under
+        // the fingers, no fixed function — and this half's two become L1/L2.
+        // The DISPLAY names stay SL and SR, because that is what is printed on
+        // the hardware.
+        //
+        // ❗ ONE id per switch, not two. Keeping `btn_sl`/`btn_sr` alongside as
+        // aliases was tried and is worse: two bindable pins for one physical
+        // button means a preset can drive an action twice, and the second name
+        // is not in the vocabulary either, so it would still reach nothing.
+        // A test asserts no declared button is left outside AutoMap.
+        bo("btn_paddle_l1", "SL"),
+        bo("btn_paddle_l2", "SR"),
         bo("dpad_up", "D-Pad Up"),
         bo("dpad_down", "D-Pad Down"),
         bo("dpad_left", "D-Pad Left"),
@@ -304,8 +321,10 @@ fn joycon2_right_outputs() -> Vec<DevicePin> {
         bo("btn_guide", "Home"),
         // New on Switch 2: the GameChat button.
         bo("btn_c", "C (GameChat)"),
-        bo("btn_sl", "SL"),
-        bo("btn_sr", "SR"),
+        // The rail buttons — see the left half for why these carry paddle ids.
+        // This half's two become R1/R2.
+        bo("btn_paddle_r1", "SL"),
+        bo("btn_paddle_r2", "SR"),
     ];
     pins.extend(joycon2_shared_outputs());
     pins
@@ -485,4 +504,54 @@ fn bo(id: &str, name: &str) -> DevicePin {
 }
 fn am(id: &str, name: &str) -> DevicePin {
     f2(id, name, SignalType::AutoMap)
+}
+
+#[cfg(test)]
+mod automap_vocabulary_tests {
+    use super::*;
+    use crate::ControllerKind;
+
+    /// ⛔ Every BUTTON a layout declares must exist in the AutoMap vocabulary.
+    ///
+    /// ⭐ A pin outside `flexinput_core::automap::ALL_PINS` is dropped between
+    /// the backend and the bus — silently, with nothing logged and nothing
+    /// missing from the UI. `btn_sl`, `btn_sr` and `btn_c` were declared here,
+    /// decoded correctly, published every report, shown in the device node, and
+    /// reached nothing at all. The only way to notice was to press one and
+    /// wonder why nothing happened.
+    ///
+    /// Buttons only. Analogue and diagnostic pins are deliberately outside the
+    /// vocabulary — raw probe values and mouse deltas have no standard
+    /// meaning to map onto — but a button is exactly the thing a person expects
+    /// to be able to bind.
+    #[test]
+    fn every_declared_button_is_carried_by_automap() {
+        let vocab: std::collections::HashSet<&str> =
+            flexinput_core::automap::ALL_PINS.iter().map(|p| p.id).collect();
+        let kinds = [
+            ControllerKind::JoyCon2L,
+            ControllerKind::JoyCon2R,
+            ControllerKind::SwitchPro,
+            ControllerKind::DualSense,
+            ControllerKind::DualShock4,
+            ControllerKind::XInput,
+            ControllerKind::Generic,
+        ];
+        let mut orphans: Vec<String> = Vec::new();
+        for kind in kinds {
+            for pin in outputs_for(kind) {
+                if !pin.id.starts_with("btn_") {
+                    continue;
+                }
+                if !vocab.contains(pin.id.as_str()) {
+                    orphans.push(format!("{kind:?}/{}", pin.id));
+                }
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "these buttons can never be mapped — they are published but absent \
+             from ALL_PINS: {orphans:?}",
+        );
+    }
 }

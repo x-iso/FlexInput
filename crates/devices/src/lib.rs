@@ -1,5 +1,6 @@
 pub mod gamepad;
 pub mod gilrs_backend;
+pub mod classic_bt;
 pub mod gyro;
 pub mod haptic_pcm;
 pub mod hidhide;
@@ -88,6 +89,17 @@ pub trait DeviceBackend: Send {
     /// wake-and-reconnect on a button press, so the Sync button is needed each
     /// session.
     fn set_joycon2_pairing(&mut self, _on: bool) {}
+    /// Hand a device its measured resting gyro drift, in **degrees per second
+    /// on the device's own rate axes**, or `None` to fall back to whatever the
+    /// backend compiled in.
+    ///
+    /// ⭐ Separate from the `gyro_offset` calibration the engine applies to the
+    /// pins, and NOT a duplicate of it. Some devices integrate an orientation
+    /// internally from the same rate; for those, a correction applied to the
+    /// output pins arrives too late to stop the integrated estimate drifting,
+    /// and only the device layer can subtract it early enough to fix both.
+    /// Backends without an internal integrator can ignore this.
+    fn set_gyro_drift(&mut self, _device_id: &str, _drift: Option<[f32; 3]>) {}
 }
 
 pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {
@@ -111,5 +123,11 @@ pub fn init_backends() -> Vec<Box<dyn DeviceBackend>> {
     // entry. The UI turns it on explicitly via `set_pairing_enabled`.
     #[cfg(feature = "joycon2")]
     backends.push(Box::new(joycon2_backend::Joycon2Backend::new(false)));
+    // Bluetooth Classic gamepads on our own dongle. Enumerates nothing until a
+    // controller with a STORED LINK KEY connects, so on a machine that has
+    // never run the pairing tool it costs one idle thread and touches no radio
+    // at all — see `classic_bt`, which also explains why it yields the dongle
+    // to the Joy-Con 2 hub rather than competing for it.
+    backends.push(Box::new(classic_bt::ClassicBtBackend::new()));
     backends
 }

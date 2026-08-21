@@ -76,6 +76,82 @@ impl Joycon2Backend {
     }
 }
 
+/// Where the gyro pins get their angular rate.
+///
+/// ⭐ **Roll and pitch come from the fields; only yaw does not.** That split is
+/// the whole point, and it was arrived at the hard way — by replacing all three
+/// at once and making two working axes worse.
+///
+/// The fields are the controller's own integrated motion, differenced back into
+/// a rate. Being integrated rather than differentiated, they are QUIET: about
+/// 1 °/s of noise at rest. Roll and pitch worked well on hardware from that
+/// source and there was never a reason to touch them.
+///
+/// ❗ Yaw was the broken one, and for a reason no gain or axis map can reach:
+/// the field that carries it responds to more than yaw, so a tilted controller
+/// bled roll into it. What fixes that is not a different field but a
+/// PROJECTION — the component of the body rate about gravity, `omega . g_hat`,
+/// which is yaw by definition however the pad is held.
+///
+/// ⛔ And explicitly NOT by differentiating the accelerometer. The orientation
+/// estimate's roll and pitch rates do exactly that, and it multiplies the
+/// accelerometer's noise by the report rate: 13–26 °/s of jitter while sitting
+/// perfectly still, against the fields' ~1. Smoothing it enough to matter costs
+/// more lag than aiming can afford. [`GyroSource::Orientation`] keeps that path
+/// available for comparison; it should not be the default and was a mistake as
+/// one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GyroSource {
+    /// Roll and pitch from the fields, yaw about gravity. The default.
+    Hybrid,
+    /// All three straight from the fields — yaw included, contamination and
+    /// all. `FLEXINPUT_JC2_GYRO_SOURCE=field`.
+    Field,
+    /// All three from the orientation estimate: axis-isolated, and noisy with
+    /// it. `FLEXINPUT_JC2_GYRO_SOURCE=orientation`.
+    Orientation,
+}
+
+fn gyro_source() -> GyroSource {
+    static SRC: std::sync::OnceLock<GyroSource> = std::sync::OnceLock::new();
+    *SRC.get_or_init(|| {
+        let Ok(raw) = std::env::var("FLEXINPUT_JC2_GYRO_SOURCE") else {
+            return GyroSource::Hybrid;
+        };
+        let src = match raw.trim().to_ascii_lowercase().as_str() {
+            "field" => GyroSource::Field,
+            "orientation" => GyroSource::Orientation,
+            "hybrid" => GyroSource::Hybrid,
+            other => {
+                eprintln!(
+                    "[jc2] FLEXINPUT_JC2_GYRO_SOURCE={other:?} is not \
+                     hybrid/field/orientation — ignoring"
+                );
+                GyroSource::Hybrid
+            }
+        };
+        if src != GyroSource::Hybrid {
+            eprintln!("[jc2] gyro pin source overridden: {raw}");
+        }
+        src
+    })
+}
+
+/// Undo the pin gain, taking a drift measured on `probe_rate_*` back into the
+/// space the decoder subtracts it in.
+///
+/// Trivial arithmetic with an untrivial failure mode: get it backwards and the
+/// correction is applied at `gain²`, which on the yaw field is sixteen times
+/// the measured value, pointed the wrong way. It reads as "calibration made the
+/// drift much worse", which is not an obvious symptom of a division.
+fn pre_gain_drift(post_gain: [f32; 3], gain: [f32; 3]) -> [f32; 3] {
+    [
+        post_gain[0] / gain[0],
+        post_gain[1] / gain[1],
+        post_gain[2] / gain[2],
+    ]
+}
+
 /// Device id for one half.
 ///
 /// The BLE address is folded in because two same-side halves can be connected
@@ -151,6 +227,14 @@ fn canonical_imu(accel: [i32; 3], gyro_dps: [f32; 3]) -> ([f32; 3], [f32; 3]) {
 ///
 /// A per-device baseline captured during calibration still cancels any fixed
 /// mounting offset on top of this.
+/// ⭐ **Superseded by `Joycon2Hub`'s quaternion.** Kept only for the tests that
+/// pin the gravity/pitch conventions; live code takes `pad.orientation_quat`.
+///
+/// Rebuilding a rotation from Euler angles means re-deciding a composition
+/// convention, and that has now been got wrong twice — once here and once in
+/// the extraction on the other side. The transport integrates body rates into a
+/// quaternion directly, so there is nothing left to reconstruct.
+#[cfg_attr(not(test), allow(dead_code))]
 fn canonical_orientation(euler: [f32; 3]) -> glam::Quat {
     let [roll, pitch, yaw] = euler;
     // ❗ Takes the euler the TRANSPORT already computed, rather than
@@ -171,7 +255,6 @@ fn canonical_orientation(euler: [f32; 3]) -> glam::Quat {
 }
 
 fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState) {
-    let b = pad.snapshot.buttons;
     let mut f = |pin: &str, v: f32| out.push((dev.into(), pin.into(), Signal::Float(v)));
 
     // Mouse deltas are relative and intentionally unnormalised (see layouts.rs).
@@ -195,10 +278,16 @@ fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadStat
     // the difference between motion controls that are unusable and ones that
     // are not. Putting it on `gyro_x/y/z` means the existing curve, filter and
     // 3DOF tooling applies to it without anyone having to wire a probe pin.
-    let (gyro, accel) = canonical_imu(
-        pad.snapshot.motion.accel,
-        flexinput_joycon2::reports::canonical_field_rate(pad.field_rate),
-    );
+    let rate = match gyro_source() {
+        GyroSource::Orientation => pad.gyro,
+        GyroSource::Field => flexinput_joycon2::reports::canonical_field_rate(pad.field_rate),
+        // Roll and pitch from the fields with their pose-dependent leak
+        // cancelled against gravity, yaw projected about gravity — all three
+        // computed in the decoder, which is the only place that has the tilt,
+        // the field rates and the trust gate in one hand. See `GyroSource`.
+        GyroSource::Hybrid => pad.pin_rate,
+    };
+    let (gyro, accel) = canonical_imu(pad.snapshot.motion.accel, rate);
     f("gyro_x", gyro[0]);
     f("gyro_y", gyro[1]);
     f("gyro_z", gyro[2]);
@@ -208,7 +297,9 @@ fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadStat
 
     // Absolute orientation. Pushed here rather than beside the accel pins
     // because `f` above holds a unique borrow of `out` for its whole scope.
-    let q = canonical_orientation(pad.orientation);
+    // Straight from the transport — see `canonical_orientation`.
+    let qv = pad.orientation_quat;
+    let q = glam::Quat::from_xyzw(qv[0], qv[1], qv[2], qv[3]).normalize();
     out.push((
         dev.into(),
         "orientation".into(),
@@ -229,8 +320,8 @@ fn push_common(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadStat
 
     let mut bo = |pin: &str, v: bool| out.push((dev.into(), pin.into(), Signal::Bool(v)));
     bo("charging", pad.snapshot.power.charging);
-    bo("btn_sl", b.sl);
-    bo("btn_sr", b.sr);
+    // The rail buttons are pushed per side — see `push_left` / `push_right` —
+    // because which paddle slot they occupy depends on which half they are on.
 }
 
 /// Full scale of each probe reading, used only to bring the pins into the
@@ -281,7 +372,9 @@ fn push_left(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState)
 
     // Absolute orientation. Pushed here rather than beside the accel pins
     // because `f` above holds a unique borrow of `out` for its whole scope.
-    let q = canonical_orientation(pad.orientation);
+    // Straight from the transport — see `canonical_orientation`.
+    let qv = pad.orientation_quat;
+    let q = glam::Quat::from_xyzw(qv[0], qv[1], qv[2], qv[3]).normalize();
     out.push((
         dev.into(),
         "orientation".into(),
@@ -298,6 +391,9 @@ fn push_left(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState)
     bo("dpad_down", b.dpad_down);
     bo("dpad_left", b.dpad_left);
     bo("dpad_right", b.dpad_right);
+    // This half's rail buttons, under the standard paddle vocabulary.
+    bo("btn_paddle_l1", b.sl);
+    bo("btn_paddle_l2", b.sr);
 }
 
 fn push_right(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState) {
@@ -310,7 +406,9 @@ fn push_right(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState
 
     // Absolute orientation. Pushed here rather than beside the accel pins
     // because `f` above holds a unique borrow of `out` for its whole scope.
-    let q = canonical_orientation(pad.orientation);
+    // Straight from the transport — see `canonical_orientation`.
+    let qv = pad.orientation_quat;
+    let q = glam::Quat::from_xyzw(qv[0], qv[1], qv[2], qv[3]).normalize();
     out.push((
         dev.into(),
         "orientation".into(),
@@ -329,6 +427,8 @@ fn push_right(out: &mut Vec<(String, String, Signal)>, dev: &str, pad: &PadState
     bo("btn_start", b.plus);
     bo("btn_guide", b.home);
     bo("btn_c", b.c);
+    bo("btn_paddle_r1", b.sl);
+    bo("btn_paddle_r2", b.sr);
 }
 
 impl DeviceBackend for Joycon2Backend {
@@ -373,6 +473,36 @@ impl DeviceBackend for Joycon2Backend {
             }
         }
         out
+    }
+
+    /// Route a measured resting drift down to the decoder.
+    ///
+    /// ❗ Two conversions, and both matter.
+    ///
+    /// The value arrives in the units the calibration could actually observe:
+    /// degrees per second on the `probe_rate_*` pins, which carry the field
+    /// rate AFTER [`flexinput_joycon2::reports::field_gain`]. The decoder
+    /// subtracts its drift BEFORE that gain — the same place
+    /// `RESTING_DRIFT_*` is applied — so the gain has to come back out here, or
+    /// the correction lands four times too large on the yaw field and
+    /// introduces exactly the drift it was measured to remove.
+    ///
+    /// The pad also has to be resolved from its device id, which only connected
+    /// pads can answer. That is why this is pushed every tick rather than once:
+    /// a controller that drops and comes back picks its calibration up again
+    /// on the next tick, with no involvement from the UI.
+    fn set_gyro_drift(&mut self, device_id_in: &str, drift: Option<[f32; 3]>) {
+        let Some(pad) = self
+            .all_pads()
+            .into_iter()
+            .find(|p| device_id(&p.key) == device_id_in)
+        else {
+            return;
+        };
+        let pre_gain = drift.map(|d| {
+            pre_gain_drift(d, flexinput_joycon2::reports::field_gain())
+        });
+        flexinput_joycon2::cal::set_field_drift(pad.key, pre_gain);
     }
 
     fn set_joycon2_pairing(&mut self, on: bool) {
@@ -433,7 +563,10 @@ fn emitted_pins(side: Side) -> Vec<(String, String, Signal)> {
         stick: (0.0, 0.0),
         gyro: [0.0; 3],
         field_rate: [0.0; 3],
+        yaw_rate: 0.0,
+        pin_rate: [0.0; 3],
         orientation: [0.0; 3],
+                orientation_quat: [0.0, 0.0, 0.0, 1.0],
         events: 0,
     };
     let mut out = Vec::new();
@@ -508,6 +641,36 @@ mod tests {
 
     /// A resting IMU must read zero on every axis, whatever the axis mapping
     /// ends up being — this catches a sign or index slip that leaves a constant
+    /// A drift measured on the pins must come back as the rate that produced it.
+    ///
+    /// The calibration can only observe what the pins publish, which is the
+    /// decoder's rate AFTER `FIELD_GAIN`; the decoder subtracts drift BEFORE
+    /// it. This is the only step joining the two, and the yaw gain is 4, so an
+    /// inverted or forgotten division lands four to sixteen times out — large
+    /// enough that the calibration would add far more drift than it removed.
+    #[test]
+    fn a_drift_measured_on_the_pins_converts_back_to_the_decoder_s_rate() {
+        let gain = flexinput_joycon2::reports::field_gain();
+        // What the decoder is actually drifting at, in its own pre-gain space.
+        let truth = [-0.410_f32, 0.046, -0.034];
+        // What the pins therefore show, which is all the calibration can see.
+        let on_pins = [truth[0] * gain[0], truth[1] * gain[1], truth[2] * gain[2]];
+        let recovered = pre_gain_drift(on_pins, gain);
+        for i in 0..3 {
+            assert!(
+                (recovered[i] - truth[i]).abs() < 1e-6,
+                "axis {i}: recovered {} from {}, expected {}",
+                recovered[i], on_pins[i], truth[i],
+            );
+        }
+        // And the conversion must actually DO something on yaw — a silent
+        // pass-through would look correct on the two unity axes.
+        assert!(
+            (on_pins[2] - truth[2]).abs() > 1e-6,
+            "the yaw gain is 1, so this test can no longer catch a missing conversion",
+        );
+    }
+
     /// bias on the gyro, which would make a gyro-aim patch drift forever.
     #[test]
     fn zero_imu_counts_produce_zero_signal() {

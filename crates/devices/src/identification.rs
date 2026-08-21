@@ -94,8 +94,14 @@ impl ControllerKind {
             Self::DualShock4 => "DualShock 4",
             Self::DualSense  => "DualSense",
             Self::SwitchPro  => "Switch Pro Controller",
-            Self::JoyCon2L   => "Joy-Con 2 (L)",
-            Self::JoyCon2R   => "Joy-Con 2 (R)",
+            // ❗ "Switch 2", not "Joy-Con 2". The Mobapad M12-S clones
+            // Nintendo's VID and the genuine Joy-Con 2 product ids
+            // (0x057E / 0x2066-7), so nothing in the identity distinguishes
+            // them and naming either one specifically mislabels the other.
+            // What IS common to both is the Switch 2 protocol this backend
+            // speaks, so the name says that and no more.
+            Self::JoyCon2L   => "Switch 2 Controller (L)",
+            Self::JoyCon2R   => "Switch 2 Controller (R)",
             Self::Generic    => "Generic Gamepad",
             Self::MidiIn     => "MIDI Input Port",
             Self::MidiOut    => "MIDI Output Port",

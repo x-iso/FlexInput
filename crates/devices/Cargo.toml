@@ -16,6 +16,8 @@ flexinput-core = { workspace = true }
 # protocol with no HID-over-GATT service, so gilrs/SDL/hidapi can never see
 # them and they need a backend of their own.
 flexinput-joycon2 = { workspace = true, optional = true }
+# Our own HCI stack, for Bluetooth Classic gamepads on a dedicated dongle.
+flexinput-btle    = { path = "../btle" }
 glam           = { workspace = true }
 gilrs          = "0.10"
 hidapi         = "2"

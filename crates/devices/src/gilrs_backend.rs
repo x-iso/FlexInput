@@ -850,45 +850,11 @@ impl DeviceBackend for GilrsBackend {
                     // by Nintendo label vs physical position, and mis-routes Plus/Minus/Home/Capture.
                     // Pushing last makes these the authoritative values in the IO-thread HashMap.
                     if let Some(sb) = g.switch_buttons {
-                        // Sticks: raw-HID values calibrated from SPI flash are authoritative.
-                        // gilrs's WGI stick mapping can land on the wrong axes when the HID
-                        // device tree shifts (e.g. another driver install changes enumeration),
-                        // so we override unconditionally for Switch Pro.
-                        out.push((dev.clone(), "left_stick_x".into(),  Signal::Float(sb.lstick_x)));
-                        out.push((dev.clone(), "left_stick_y".into(),  Signal::Float(sb.lstick_y)));
-                        out.push((dev.clone(), "right_stick_x".into(), Signal::Float(sb.rstick_x)));
-                        out.push((dev.clone(), "right_stick_y".into(), Signal::Float(sb.rstick_y)));
-                        out.push((dev.clone(), "left_stick".into(),    Signal::Vec2(Vec2::new(sb.lstick_x, sb.lstick_y))));
-                        out.push((dev.clone(), "right_stick".into(),   Signal::Vec2(Vec2::new(sb.rstick_x, sb.rstick_y))));
-                        // Face buttons by physical position (Nintendo's labels are weird):
-                        out.push((dev.clone(), "btn_south".into(), Signal::Bool(sb.btn_b))); // B = south
-                        out.push((dev.clone(), "btn_east".into(),  Signal::Bool(sb.btn_a))); // A = east
-                        out.push((dev.clone(), "btn_west".into(),  Signal::Bool(sb.btn_y))); // Y = west
-                        out.push((dev.clone(), "btn_north".into(), Signal::Bool(sb.btn_x))); // X = north
-                        out.push((dev.clone(), "btn_lb".into(),    Signal::Bool(sb.btn_l)));
-                        out.push((dev.clone(), "btn_rb".into(),    Signal::Bool(sb.btn_r)));
-                        out.push((dev.clone(), "btn_lt_dig".into(),Signal::Bool(sb.btn_zl)));
-                        out.push((dev.clone(), "btn_rt_dig".into(),Signal::Bool(sb.btn_zr)));
-                        out.push((dev.clone(), "btn_ls".into(),    Signal::Bool(sb.btn_lstick)));
-                        out.push((dev.clone(), "btn_rs".into(),    Signal::Bool(sb.btn_rstick)));
-                        out.push((dev.clone(), "btn_start".into(), Signal::Bool(sb.btn_plus)));
-                        out.push((dev.clone(), "btn_back".into(),  Signal::Bool(sb.btn_minus)));
-                        out.push((dev.clone(), "btn_guide".into(), Signal::Bool(sb.btn_home)));
-                        out.push((dev.clone(), "btn_capture".into(),Signal::Bool(sb.btn_capture)));
-                        out.push((dev.clone(), "dpad_up".into(),   Signal::Bool(sb.dpad_up)));
-                        out.push((dev.clone(), "dpad_down".into(), Signal::Bool(sb.dpad_down)));
-                        out.push((dev.clone(), "dpad_left".into(), Signal::Bool(sb.dpad_left)));
-                        out.push((dev.clone(), "dpad_right".into(),Signal::Bool(sb.dpad_right)));
-                        // Reconstruct DPad axis/Vec2 from authoritative button bits (BT path
-                        // sends no axis events at all; diagonals get √2/2 magnitude).
-                        let bx = if sb.dpad_right { 1.0f32 } else if sb.dpad_left { -1.0 } else { 0.0 };
-                        let by = if sb.dpad_up    { 1.0f32 } else if sb.dpad_down { -1.0 } else { 0.0 };
-                        let (nx, ny) = if bx != 0.0 && by != 0.0 {
-                            (bx * std::f32::consts::FRAC_1_SQRT_2, by * std::f32::consts::FRAC_1_SQRT_2)
-                        } else { (bx, by) };
-                        out.push((dev.clone(), "dpad_x".into(), Signal::Float(nx)));
-                        out.push((dev.clone(), "dpad_y".into(), Signal::Float(ny)));
-                        out.push((dev.clone(), "dpad".into(),   Signal::Vec2(Vec2::new(nx, ny))));
+                        // Shared with the dongle transport — see
+                        // `gyro::push_switch_pro_buttons`. Raw-HID sticks are
+                        // authoritative: gilrs's WGI mapping can land on the
+                        // wrong axes when the HID device tree shifts.
+                        crate::gyro::push_switch_pro_buttons(&mut out, &dev, &sb);
                     }
                 }
             }
