@@ -1,5 +1,6 @@
 /target/
 /out/
+/debug_and_testing/
 *.fxp
 *.fxm
 .lla-embeddings.json
@@ -17,3 +18,13 @@
 .notes
 .mcp.json
 .spacedrive
+
+# Diagnostic artefacts written beside whatever ran — logs rotate to .prev, and
+# IMU captures are megabytes of one session's hardware. Neither belongs in the
+# repo; move anything worth keeping into /debug_and_testing/.
+*.log
+*.log.prev
+/*.bin
+# Bluetooth link keys are per-machine shared secrets.
+bt-classic-keys.txt
+bt-classic-keys.json
