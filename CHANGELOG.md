@@ -5,7 +5,25 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
-## [0.13.3] - 2026-08-11
+## [0.13.5] - 2026-08-23
+
+### Fixed
+
+- **Config Overlay: live widgets on a gyro path stayed frozen while editing.** The
+  overlay's selective input-suppression passes through only the physical pins the
+  tweaked control depends on, tracing the control's node upstream to its source.
+  Two gaps left the gyro blocked — so the RWS Aim calibration ruler/room (and any
+  Response Curve on the same path) wouldn't animate:
+  - The upstream tracer followed each node's *first* input, but a **Selector**'s
+    input 0 is its *select* control, not the data — so the walk chased the
+    dropdown/switch instead of the routed source. It now follows the **active data
+    branch** through `module.selector` (the currently-selected input) and
+    `module.split` (the data input), reaching whichever physical source is live.
+  - **RWS Aim** is driven by its Rotation input, but `scale` only affects the Mouse
+    output — so with only the Stick output wired, the fallback (downstream) resolver
+    found nothing and blocked the whole device. RWS now always passes its Rotation
+    (IMU) input through so the calibration widget animates regardless of which
+    output is used.
 
 Three fixes for the same underlying trap: egui's `ctx.data()` and its layer→transform
 map are shared by *every* window, while all of FlexInput's hosts (main canvas,

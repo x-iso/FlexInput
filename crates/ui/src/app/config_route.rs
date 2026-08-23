@@ -281,7 +281,7 @@ fn split_active_outs(snarl: &Snarl<NodeData>, node_id: NodeId) -> Vec<usize> {
 
 /// Active source index(es) of a `module.selector` mux, as 0-based offsets into
 /// the source inputs (actual input pin = offset + 1).
-fn selector_active_ins(snarl: &Snarl<NodeData>, node_id: NodeId) -> Vec<usize> {
+pub(crate) fn selector_active_ins(snarl: &Snarl<NodeData>, node_id: NodeId) -> Vec<usize> {
     let Some(node) = snarl.get_node(node_id) else { return vec![] };
     let n = node.inputs.len().saturating_sub(1); // minus the select input
     if n == 0 {

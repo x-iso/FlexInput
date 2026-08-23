@@ -437,6 +437,16 @@ pub(crate) fn config_passthrough_pins(
         return Some((device, pins));
     }
 
+    // RWS Aim: its calibration ruler/room is driven by the ROTATION input (the
+    // gyro), so that input must pass through while you tweak `scale` — otherwise
+    // the widget freezes. `scale` only affects the MOUSE output, so the source-
+    // like (downstream) resolver below finds nothing when only the STICK output
+    // is wired and would block the whole device. Pass the IMU pins so the widget
+    // always animates (and you feel the calibration), regardless of the output.
+    if pin_module_id(tab_snarl, source_path, inner_node_id).as_deref() == Some("processing.rws") {
+        return Some((device, GYRO_IMU_PINS.iter().map(|s| s.to_string()).collect()));
+    }
+
     // Source-like tweak params (a Knob/Constant with no physical UPSTREAM) can't
     // be traced up to a device — their effect is decided DOWNSTREAM by the patch
     // (which virtual stick a gyro↔stick mix currently drives, chosen live by
@@ -586,10 +596,24 @@ fn config_consumed_pins(
         let mut cur = NodeId(inner_node_id);
         for _ in 0..32 {
             let node = snarl.get_node(cur)?;
-            // First connected input's upstream output.
-            let remote = (0..node.inputs.len()).find_map(|i| {
-                snarl.in_pin(InPinId { node: cur, input: i }).remotes.first().copied()
-            })?;
+            // Which input to follow upstream. For signal-path GATES we must follow
+            // the ACTIVE DATA branch, not the first input (a Selector's input 0 is
+            // the select control, a Split's input 0 is the select and input 1 the
+            // data) — otherwise the walk chases the select's dropdown/switch and
+            // never reaches the physical source that's currently routed through.
+            let remote = match node.module_id.as_str() {
+                "module.selector" => {
+                    let act = super::config_route::selector_active_ins(snarl, cur);
+                    let idx = act.first().copied().unwrap_or(0) + 1; // skip the select input
+                    snarl.in_pin(InPinId { node: cur, input: idx }).remotes.first().copied()
+                }
+                "module.split" => {
+                    snarl.in_pin(InPinId { node: cur, input: 1 }).remotes.first().copied()
+                }
+                _ => (0..node.inputs.len()).find_map(|i| {
+                    snarl.in_pin(InPinId { node: cur, input: i }).remotes.first().copied()
+                }),
+            }?;
             let up = snarl.get_node(remote.node)?;
             match up.module_id.as_str() {
                 // A gyro processor terminates the walk: it consumes exactly the
