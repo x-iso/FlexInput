@@ -61,8 +61,6 @@ use std::time::{Duration, Instant};
 
 use flexinput_btle::{acl, joycon as jc, Dongle, Event};
 
-const DONGLE_VID: u16 = 0x0BDA;
-const DONGLE_PID: u16 = 0xA728;
 const NINTENDO_COMPANY_ID: u16 = 0x0553;
 
 /// Byte range searched, as overlapping little-endian `i16`s. The real alignment
@@ -310,7 +308,7 @@ fn main() {
     // questions directly — how many counts per degree, and where the value
     // actually wraps — with no model in the way.
     if args.iter().any(|a| a == "--watch") {
-        let dongle = match Dongle::open(DONGLE_VID, DONGLE_PID) {
+        let dongle = match flexinput_btle::open_preferred() {
             Ok(d) => d,
             Err(e) => { eprintln!("[imu] cannot open dongle: {e}"); std::process::exit(1); }
         };
@@ -412,7 +410,7 @@ fn main() {
     );
     println!("[imu] ───────────────────────────────────────────────────");
 
-    let dongle = match Dongle::open(DONGLE_VID, DONGLE_PID) {
+    let dongle = match flexinput_btle::open_preferred() {
         Ok(d) => d,
         Err(e) => { eprintln!("[imu] cannot open dongle: {e}"); std::process::exit(1); }
     };

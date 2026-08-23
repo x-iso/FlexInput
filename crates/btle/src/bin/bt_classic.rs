@@ -64,8 +64,6 @@ use std::time::Duration;
 
 use flexinput_btle::{keystore, l2cap, Dongle, Event, Opcode};
 
-const DONGLE_VID: u16 = 0x0BDA;
-const DONGLE_PID: u16 = 0xA728;
 
 /// Human-readable major device class, from the Class of Device bits.
 fn major_class_name(major: u8) -> &'static str {
@@ -450,7 +448,7 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| keystore::parse_addr(v));
 
-    let dongle = match Dongle::open(DONGLE_VID, DONGLE_PID) {
+    let dongle = match flexinput_btle::open_preferred() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[bt] cannot open dongle: {e}");

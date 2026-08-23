@@ -36,11 +36,6 @@ use crate::hub::{PadKey, PadState};
 use crate::protocol::{self, Side};
 use crate::reports::{self, OrientationTracker, PadSnapshot, StickCalib};
 
-/// Realtek RTL8761/8852-class dongle, the one this was developed against.
-/// Override with `FLEXINPUT_JC2_DONGLE=vid:pid` (hex).
-const DEFAULT_VID: u16 = 0x0BDA;
-const DEFAULT_PID: u16 = 0xA728;
-
 /// Most halves to hold at once. Two is a full pair.
 const MAX_LINKS: usize = 2;
 
@@ -657,8 +652,15 @@ fn probe_readable(dongle: &Dongle, conn: u16) {
     }
 }
 
-/// Parse `FLEXINPUT_JC2_DONGLE=vid:pid`, falling back to the known Realtek.
-fn configured_dongle() -> (u16, u16) {
+/// `FLEXINPUT_JC2_DONGLE=vid:pid` if set, otherwise whatever is actually here.
+///
+/// ⛔ **This used to fall back to a literal `0bda:a728` without ever asking
+/// what was plugged in.** Any adapter bound to WinUSB speaks the same HCI —
+/// nothing in this stack is Realtek-specific — so hardcoding one vendor's id
+/// meant the transport looked for a device most users do not own, failed to
+/// open it, and announced that no dongle was available while one sat beside it
+/// unopened. See `flexinput_btle::preferred_dongle`.
+fn configured_dongle() -> Option<(u16, u16)> {
     let parse = || -> Option<(u16, u16)> {
         let raw = std::env::var("FLEXINPUT_JC2_DONGLE").ok()?;
         let (v, p) = raw.split_once(':')?;
@@ -667,7 +669,7 @@ fn configured_dongle() -> (u16, u16) {
             u16::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok()?,
         ))
     };
-    parse().unwrap_or((DEFAULT_VID, DEFAULT_PID))
+    parse().or_else(flexinput_btle::preferred_dongle)
 }
 
 /// Dongle transport state, shared with the WinRT hub.
@@ -712,7 +714,14 @@ fn run(shared: Arc<Shared>) {
     }
     let _release = ReleaseUnlessActive(Arc::clone(&shared.state));
 
-    let (vid, pid) = configured_dongle();
+    let Some((vid, pid)) = configured_dongle() else {
+        eprintln!(
+            "[jc2-dongle] no WinUSB-bound Bluetooth adapter found — bind one              with Zadig, or set FLEXINPUT_JC2_DONGLE=vid:pid.
+             [jc2-dongle] Joy-Cons will fall back to the Windows stack."
+        );
+        dlog!("no WinUSB-bound adapter present");
+        return;
+    };
     // ⭐ SHARED, not owned. This hub and the Bluetooth Classic transport run on
     // the same adapter at the same time, which is what a dual-mode radio is
     // for — see `flexinput_btle::radio`. Whichever asks first opens and
@@ -1552,10 +1561,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dongle_id_defaults_to_the_realtek_and_parses_an_override() {
-        // The env var is process-global, so this asserts the parser through a
-        // direct call rather than mutating it and racing other tests.
-        assert_eq!(configured_dongle(), (DEFAULT_VID, DEFAULT_PID));
+    /// ⛔ No vendor id is hardcoded as the answer.
+    ///
+    /// With no override set this must report whatever discovery finds — which
+    /// on a machine with no WinUSB-bound adapter is nothing at all. Asserting a
+    /// particular Realtek here is what let the hardcoded fallback survive: the
+    /// test passed on the one machine where the wrong answer was right.
+    fn the_dongle_is_discovered_rather_than_assumed() {
+        std::env::remove_var("FLEXINPUT_JC2_DONGLE");
+        assert_eq!(configured_dongle(), flexinput_btle::preferred_dongle());
+
+        std::env::set_var("FLEXINPUT_JC2_DONGLE", "0x1234:0x5678");
+        assert_eq!(configured_dongle(), Some((0x1234, 0x5678)));
+        std::env::remove_var("FLEXINPUT_JC2_DONGLE");
     }
 
     #[test]

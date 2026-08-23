@@ -36,6 +36,13 @@ pub use hci::{CommandComplete, Event, Opcode};
 pub enum Error {
     /// No USB device with the requested VID/PID, or it is not WinUSB-bound.
     NotFound { vid: u16, pid: u16 },
+    /// No WinUSB-bound Bluetooth adapter at all, as opposed to a named one
+    /// being absent.
+    ///
+    /// ❗ Distinct because the advice differs: a missing vid:pid means "that
+    /// dongle is not plugged in", while this means "nothing here speaks HCI to
+    /// us yet" — and reporting the latter as `0000:0000` reads as a bug.
+    NoAdapter,
     /// The device IS present and WinUSB-bound, but could not be opened —
     /// something else holds it.
     ///
@@ -59,6 +66,10 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::NoAdapter => write!(
+                f,
+                "no WinUSB-bound Bluetooth adapter found — bind one with Zadig"
+            ),
             Error::NotFound { vid, pid } => write!(
                 f,
                 "no USB device {vid:04x}:{pid:04x} (is it bound to WinUSB via Zadig?)"
@@ -188,6 +199,43 @@ pub fn is_ours(vid: u16, pid: u16) -> bool {
         .lock()
         .map(|v| v.contains(&(vid, pid)))
         .unwrap_or(false)
+}
+
+/// The adapter both transports should use, or `None` when there is none.
+///
+/// ⛔ **No hardcoded fallback, deliberately.** Both transports used to end up
+/// at a literal `0bda:a728` — the Realtek this stack was written against — the
+/// Joy-Con side without consulting discovery at all. On the author's machine
+/// that is invisible, because it IS that dongle; on anyone else's it means the
+/// app opens a device that is not there, reports "no usable dongle", and never
+/// touches the perfectly good adapter sitting next to it.
+///
+/// A guess cannot be right here and cannot fail usefully either: `None` says
+/// "no WinUSB-bound Bluetooth adapter", which is true and actionable, whereas
+/// a wrong vid:pid says "your dongle is missing" about somebody else's dongle.
+///
+/// ❗ One this process already opened WINS. Both transports share a single
+/// radio, and with two adapters plugged in, picking by "first available" twice
+/// can hand them different ones — at which point the sharing that makes classic
+/// and LE coexist quietly stops happening.
+pub fn preferred_dongle() -> Option<(u16, u16)> {
+    let all = discover();
+    all.iter()
+        .find(|d| d.ours)
+        .or_else(|| all.iter().find(|d| d.available))
+        .map(|d| (d.vid, d.pid))
+}
+
+/// Open whichever adapter is present, for the probe binaries.
+///
+/// ❗ The probes are how this stack gets diagnosed, so pinning them to one
+/// vendor id makes them useless on exactly the machines where something needs
+/// diagnosing. Falls back to nothing rather than to a guess.
+pub fn open_preferred() -> Result<Dongle> {
+    match preferred_dongle() {
+        Some((vid, pid)) => Dongle::open(vid, pid),
+        None => Err(Error::NoAdapter),
+    }
 }
 
 /// USB device class for a wireless controller.

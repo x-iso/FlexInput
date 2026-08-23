@@ -16,8 +16,6 @@ use std::time::{Duration, Instant};
 
 use flexinput_btle::{acl, joycon, Dongle, Event};
 
-const DONGLE_VID: u16 = 0x0BDA;
-const DONGLE_PID: u16 = 0xA728;
 const NINTENDO_COMPANY_ID: u16 = 0x0553;
 
 /// How long to hold the link before declaring success and disconnecting.
@@ -30,7 +28,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let wanted: Option<[u8; 6]> = args.first().map(|s| parse_addr(s));
 
-    let dongle = match Dongle::open(DONGLE_VID, DONGLE_PID) {
+    let dongle = match flexinput_btle::open_preferred() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[link] cannot open dongle: {e}");

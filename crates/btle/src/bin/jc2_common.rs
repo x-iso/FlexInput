@@ -29,8 +29,6 @@ use std::time::{Duration, Instant};
 
 use flexinput_btle::{acl, joycon as jc, Dongle, Event};
 
-const DONGLE_VID: u16 = 0x0BDA;
-const DONGLE_PID: u16 = 0xA728;
 const NINTENDO_COMPANY_ID: u16 = 0x0553;
 
 /// motion | mouse | magnetometer — the whole IMU behind one gate.
@@ -57,7 +55,7 @@ const INIT: &[(u8, u8, &[u8])] = &[
 ];
 
 fn main() {
-    let dongle = match Dongle::open(DONGLE_VID, DONGLE_PID) {
+    let dongle = match flexinput_btle::open_preferred() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("cannot open dongle: {e}");

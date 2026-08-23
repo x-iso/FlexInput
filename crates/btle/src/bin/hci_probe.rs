@@ -15,14 +15,19 @@
 
 use flexinput_btle::{hci::Opcode, Dongle};
 
-/// Realtek RTL8761/8852-class BT 5.4 dongle.
-const DEFAULT_VID: u16 = 0x0BDA;
-const DEFAULT_PID: u16 = 0xA728;
-
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (vid, pid) = match args.len() {
-        0 => (DEFAULT_VID, DEFAULT_PID),
+        // Whatever is plugged in, not whatever the author owns.
+        0 => match flexinput_btle::preferred_dongle() {
+            Some(ids) => ids,
+            None => {
+                eprintln!(
+                    "no WinUSB-bound Bluetooth adapter found — bind one with                      Zadig, or pass <vid hex> <pid hex>"
+                );
+                std::process::exit(1);
+            }
+        },
         2 => (
             u16::from_str_radix(args[0].trim_start_matches("0x"), 16).expect("vid must be hex"),
             u16::from_str_radix(args[1].trim_start_matches("0x"), 16).expect("pid must be hex"),

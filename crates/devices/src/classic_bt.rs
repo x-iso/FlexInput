@@ -39,10 +39,6 @@ use flexinput_core::Signal;
 use crate::gyro::{parse_switch_pro_report, push_switch_pro_buttons, HidReading};
 use crate::{layouts, ControllerKind, DeviceBackend, DevicePin, PhysicalDevice};
 
-/// Default dongle, the same Realtek the LE work uses.
-const DEFAULT_VID: u16 = 0x0BDA;
-const DEFAULT_PID: u16 = 0xA728;
-
 /// How long a link may go silent before it is treated as gone.
 const STALE: Duration = Duration::from_secs(3);
 
@@ -210,23 +206,24 @@ impl Drop for ClassicBtBackend {
 ///
 /// The environment variable still wins, and is what you use to pin a SECOND
 /// adapter to this transport while the Joy-Con hub keeps the first.
-fn dongle_ids() -> (u16, u16) {
+fn dongle_ids() -> Option<(u16, u16)> {
     let Ok(raw) = std::env::var("FLEXINPUT_BT_CLASSIC_DONGLE") else {
-        return flexinput_btle::discover()
-            .into_iter()
-            .find(|d| d.available)
-            .map(|d| (d.vid, d.pid))
-            .unwrap_or((DEFAULT_VID, DEFAULT_PID));
+        // ⛔ No hardcoded fallback. Guessing a vendor id reports "your dongle
+        // is missing" about somebody else's dongle — see
+        // `flexinput_btle::preferred_dongle`.
+        return flexinput_btle::preferred_dongle();
     };
     let mut it = raw.split(':');
     match (
         it.next().and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
         it.next().and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
     ) {
-        (Some(v), Some(p)) => (v, p),
+        (Some(v), Some(p)) => Some((v, p)),
         _ => {
-            eprintln!("[bt-classic] FLEXINPUT_BT_CLASSIC_DONGLE={raw:?} is not vid:pid");
-            (DEFAULT_VID, DEFAULT_PID)
+            eprintln!(
+                "[bt-classic] FLEXINPUT_BT_CLASSIC_DONGLE={raw:?} is not vid:pid                  — ignoring it and using whichever adapter is present"
+            );
+            flexinput_btle::preferred_dongle()
         }
     }
 }
@@ -455,8 +452,7 @@ fn run_inner(shared: &Arc<Shared>) {
         }
         shared.said_empty.store(false, Ordering::Relaxed);
         if radio.is_none() {
-            let (vid, pid) = dongle_ids();
-            match flexinput_btle::radio::shared(vid, pid) {
+            match dongle_ids().and_then(|(v, p)| flexinput_btle::radio::shared(v, p)) {
                 Some(r) => {
                     if trace() {
                         eprintln!("[bt-classic] radio obtained; enabling page scan");
@@ -1221,10 +1217,13 @@ mod tests {
     #[test]
     fn the_dongle_selector_parses_vid_pid() {
         std::env::set_var("FLEXINPUT_BT_CLASSIC_DONGLE", "0bda:a728");
-        assert_eq!(dongle_ids(), (0x0BDA, 0xA728));
+        assert_eq!(dongle_ids(), Some((0x0BDA, 0xA728)));
         std::env::set_var("FLEXINPUT_BT_CLASSIC_DONGLE", "0x1234:0x5678");
-        assert_eq!(dongle_ids(), (0x1234, 0x5678));
+        assert_eq!(dongle_ids(), Some((0x1234, 0x5678)));
+        // ⛔ With no override it is DISCOVERED, never assumed. Asserting a
+        // particular Realtek here is what let the hardcoded fallback survive —
+        // the test passed on the one machine where the wrong answer was right.
         std::env::remove_var("FLEXINPUT_BT_CLASSIC_DONGLE");
-        assert_eq!(dongle_ids(), (DEFAULT_VID, DEFAULT_PID));
+        assert_eq!(dongle_ids(), flexinput_btle::preferred_dongle());
     }
 }
