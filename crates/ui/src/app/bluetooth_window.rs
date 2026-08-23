@@ -204,7 +204,15 @@ fn body(ui: &mut egui::Ui, st: &mut BluetoothState, key_dir: Option<&str>) {
             // and giving no hint whether "in use" meant this app, a leftover
             // process or a helper, made the panel unreadable exactly when it
             // was being consulted.
-            let (mark, colour, what) = if a.ours {
+            //
+            // ⛔ A recorded failure OUTRANKS every other state. An adapter that
+            // is WinUSB-bound, openable and mute reads as a perfectly healthy
+            // "idle" row, which is the most misleading thing this panel could
+            // possibly say — the user goes looking for a configuration mistake
+            // that does not exist.
+            let (mark, colour, what) = if let Some(why) = &a.problem {
+                ("⛔", egui::Color32::from_rgb(225, 90, 90), why.as_str())
+            } else if a.ours {
                 (
                     "●",
                     egui::Color32::from_rgb(120, 200, 120),

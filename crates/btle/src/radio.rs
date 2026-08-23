@@ -405,11 +405,20 @@ pub fn shared(vid: u16, pid: u16) -> Option<Arc<Radio>> {
     // contradictory truths from one stale cache.
     match open_and_start(vid, pid) {
         Ok(r) => {
+            crate::note_open_failure(vid, pid, None);
             *slot = Some(Arc::clone(&r));
             Some(r)
         }
         Err(e) => {
-            // Not cached, so the next caller tries again.
+            // Not cached, so the next caller tries again — but REMEMBERED, so
+            // the Bluetooth panel can say why instead of listing a dongle that
+            // looks fine and does nothing.
+            //
+            // ❗ "Busy" is not recorded: another transport holding the radio is
+            // the normal working state, and the listing already shows it.
+            if !matches!(e, crate::Error::Busy { .. }) {
+                crate::note_open_failure(vid, pid, Some(e.to_string()));
+            }
             log::debug!("[radio] cannot open dongle {vid:04x}:{pid:04x}: {e}");
             None
         }

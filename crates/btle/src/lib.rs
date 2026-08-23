@@ -36,6 +36,20 @@ pub use hci::{CommandComplete, Event, Opcode};
 pub enum Error {
     /// No USB device with the requested VID/PID, or it is not WinUSB-bound.
     NotFound { vid: u16, pid: u16 },
+    /// The adapter is open, and does not answer HCI at all.
+    ///
+    /// ⛔ **Almost always missing vendor firmware.** Binding a dongle to
+    /// WinUSB is what lets this stack talk to it, and it is also what stops
+    /// the vendor driver loading — including the firmware upload that driver
+    /// would normally do first. Chips with usable HCI in ROM (Realtek
+    /// RTL8761-class, CSR8510) come up fine; Broadcom/Cypress `.hcd` patchram
+    /// parts and Intel `ibt-*.sfi` parts do not answer a single command until
+    /// their blob has been pushed, which nothing here can do.
+    ///
+    /// ❗ Worth its own variant because the generic timeout reads as a bug in
+    /// FlexInput. It is a property of the hardware, the user can act on it by
+    /// using a different dongle, and no amount of retrying will change it.
+    NoHciResponse,
     /// No WinUSB-bound Bluetooth adapter at all, as opposed to a named one
     /// being absent.
     ///
@@ -66,6 +80,12 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::NoHciResponse => write!(
+                f,
+                "the adapter never answered HCI — it most likely needs vendor \
+                 firmware, which the WinUSB path cannot load (Broadcom and Intel \
+                 dongles usually do; Realtek and CSR usually do not)"
+            ),
             Error::NoAdapter => write!(
                 f,
                 "no WinUSB-bound Bluetooth adapter found — bind one with Zadig"
@@ -193,6 +213,41 @@ fn open_dongles() -> &'static std::sync::Mutex<Vec<(u16, u16)>> {
     OPEN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Why opening an adapter last failed, remembered per `vid:pid`.
+///
+/// ⭐ **Recorded at the moment of failure, not probed for.** Whether a dongle
+/// answers HCI can only be discovered by resetting it, and doing that from
+/// `discover` — which the panel calls every two seconds — would reset a radio
+/// that is mid-conversation. So the transports report what they found when
+/// they genuinely tried, and the panel reads it back.
+fn open_failures() -> &'static std::sync::Mutex<Vec<(u16, u16, String)>> {
+    static FAILED: std::sync::OnceLock<std::sync::Mutex<Vec<(u16, u16, String)>>> =
+        std::sync::OnceLock::new();
+    FAILED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Record why `vid:pid` could not be brought up. `None` clears it.
+///
+/// ❗ Cleared on success, or a dongle that failed once is condemned for the
+/// life of the process — the same mistake as caching a failed open.
+pub fn note_open_failure(vid: u16, pid: u16, why: Option<String>) {
+    let Ok(mut all) = open_failures().lock() else { return };
+    all.retain(|(v, p, _)| (*v, *p) != (vid, pid));
+    if let Some(why) = why {
+        all.push((vid, pid, why));
+    }
+}
+
+/// The last recorded failure for `vid:pid`.
+pub fn last_open_failure(vid: u16, pid: u16) -> Option<String> {
+    open_failures()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(v, p, _)| (*v, *p) == (vid, pid))
+        .map(|(_, _, why)| why.clone())
+}
+
 /// Whether this process holds `vid:pid` open right now.
 pub fn is_ours(vid: u16, pid: u16) -> bool {
     open_dongles()
@@ -274,6 +329,13 @@ pub struct DongleInfo {
     pub manufacturer: Option<String>,
     /// USB product string, same caveat.
     pub product: Option<String>,
+    /// Why the last attempt to bring this adapter up failed, if one did.
+    ///
+    /// ⭐ The case this exists for is an adapter that looks perfect and is
+    /// useless: WinUSB-bound, openable, listed as idle, and mute because its
+    /// firmware was never loaded. Without this the panel showed a healthy row
+    /// and the reason sat in a log nobody was told to read.
+    pub problem: Option<String>,
 }
 
 /// USB vendor ids seen on Bluetooth adapters, for when the descriptor strings
@@ -406,6 +468,7 @@ pub fn discover() -> Vec<DongleInfo> {
             ours: is_ours(vid, pid),
             manufacturer: manufacturer.filter(|s| !s.is_empty()),
             product: product.filter(|s| !s.is_empty()),
+            problem: last_open_failure(vid, pid),
         });
     }
     out
@@ -719,7 +782,11 @@ impl Dongle {
             std::thread::sleep(Duration::from_millis(250));
         }
         if let Some(e) = last {
-            return Err(e);
+            // ⛔ A dongle that answered nothing at all is a different problem
+            // from one that answered badly, and only the first is the user's
+            // to solve — see `Error::NoHciResponse`.
+            let silent = matches!(&e, Error::Protocol(m) if m.contains("no Command Complete"));
+            return Err(if silent { Error::NoHciResponse } else { e });
         }
 
         // 0x3FFFFFFFFFFFFFFF — everything the spec defines, LE Meta included,
@@ -2478,4 +2545,54 @@ fn find_endpoints(device: rusb::Device<rusb::GlobalContext>, interface: u8) -> R
         acl_in: acl_in.ok_or(Error::NoEndpoint("bulk IN"))?,
         acl_out: acl_out.ok_or(Error::NoEndpoint("bulk OUT"))?,
     })
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    /// ⛔ A failure is remembered so the panel can explain it, and CLEARED on
+    /// success so one bad moment does not condemn a dongle for the session.
+    ///
+    /// ❗ Uses ids no real adapter has. The record is process-global, and a
+    /// test that scribbled on a live vid:pid would show a false fault in the
+    /// Bluetooth window of anyone running the suite with a dongle plugged in.
+    #[test]
+    fn an_open_failure_is_remembered_and_then_cleared() {
+        let (vid, pid) = (0xFFFE, 0xFFFD);
+        assert_eq!(last_open_failure(vid, pid), None, "started dirty");
+
+        note_open_failure(vid, pid, Some("never answered HCI".into()));
+        assert_eq!(last_open_failure(vid, pid).as_deref(), Some("never answered HCI"));
+
+        // Recording again replaces rather than accumulating.
+        note_open_failure(vid, pid, Some("second reason".into()));
+        assert_eq!(last_open_failure(vid, pid).as_deref(), Some("second reason"));
+
+        note_open_failure(vid, pid, None);
+        assert_eq!(last_open_failure(vid, pid), None, "success must clear it");
+    }
+
+    /// A silent adapter must not be reported as a generic timeout — that reads
+    /// as a bug in FlexInput rather than a property of the hardware.
+    #[test]
+    fn the_silent_adapter_error_names_firmware() {
+        let text = Error::NoHciResponse.to_string();
+        assert!(text.contains("firmware"), "unhelpful: {text}");
+        assert!(text.contains("WinUSB"), "does not say why it cannot load: {text}");
+    }
+
+    /// No vendor id is baked in as the answer: with nothing plugged in there
+    /// is no adapter, rather than a Realtek that was never there.
+    #[test]
+    fn no_adapter_is_a_real_answer() {
+        match preferred_dongle() {
+            // Whatever is present must actually be present.
+            Some((vid, pid)) => assert!(
+                discover().iter().any(|d| (d.vid, d.pid) == (vid, pid)),
+                "picked {vid:04x}:{pid:04x}, which discovery does not list"
+            ),
+            None => assert!(discover().iter().all(|d| !d.available && !d.ours)),
+        }
+    }
 }
