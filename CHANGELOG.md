@@ -7,6 +7,104 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [0.13.5] - 2026-08-23
 
+**Joy-Con 2 support — by way of an entire Bluetooth host stack of FlexInput's
+own.** Switch 2 controllers are BLE devices that implement no standard profiles:
+no HID-over-GATT, so Windows binds no driver and gilrs, SDL and hidapi never see
+them at all. Everything is a vendor GATT service plus a command protocol. Worse,
+Windows reclaims unpaired BLE links on a ~30 second timer that nothing available
+to a GATT client prevents, and it cannot bond with these controllers either
+(their legacy pairing uses a non-zero TK that WinRT has no way to supply). So
+FlexInput now ships `crates/btle`: an independent Bluetooth host stack — LE
+**and** Classic — driving a dedicated USB dongle over WinUSB, bypassing the OS
+stack entirely. On that path a Joy-Con 2 holds a link indefinitely, and a Switch
+Pro can be paired over Bluetooth Classic on the same radio at the same time.
+
+### Added
+
+- **Joy-Con 2 controllers** (`jc2:` devices), left and right halves, each a full
+  FlexInput device with its own layout, calibration and 3D model. Three
+  transports, all surfaced identically so only the connection differs:
+  - **Dongle (preferred)** — FlexInput's own BLE stack over a WinUSB-bound USB
+    dongle. Holds a link indefinitely at up to 200 Hz, connects **both** halves,
+    and reaches the left half, which never enumerates over the USB charging grip
+    at all. One thread owns the dongle and demultiplexes every link on it by
+    connection handle. Override the device with `FLEXINPUT_JC2_DONGLE=vid:pid`.
+  - **USB** — over the charging grip.
+  - **Windows Bluetooth** — works, but subject to the ~30 s reclaim above.
+- **FlexInput's own Bluetooth stack** (`crates/btle`) — HCI over WinUSB:
+  - **LE**: scanning, `LE_Create_Connection`, ACL / L2CAP / ATT framing, MTU
+    negotiation, and `HCI_LE_Enable_Encryption` from an out-of-band LTK with no
+    SMP at all — the capability the crate exists for, and the one WinRT exposes
+    no API for.
+  - **BR/EDR (Bluetooth Classic)**: inquiry, paging, Secure Simple Pairing,
+    L2CAP connection-oriented channels, and a keystore for the bonds.
+  - **One radio, both transports.** A dual-mode adapter carries Classic and LE
+    over a single HCI transport, but WinUSB grants an interface to one claimant —
+    so there is now one reader, a router thread that broadcasts, and a lease that
+    transports take for request/response conversations.
+- **Bluetooth Classic gamepads on the dongle.** A Switch Pro paired to the dongle
+  appears as an ordinary FlexInput device while Joy-Con 2 controllers stay
+  connected on the same radio.
+- **Bluetooth panel** — a Bluetooth button appears next to the logo *only* when a
+  WinUSB-bound dongle is actually present. The panel lists adapters and paired
+  controllers by manufacturer and model rather than by address, with a button to
+  pair a new one. Adapters without the WinUSB driver are not listed at all, since
+  there is nothing the app can do with them.
+  - Adapter status says what it means: **active** when FlexInput is using it,
+    **idle** when it is free, **held** when another program has it.
+  - **Pairing no longer skips controllers it already knows** — the pad most in
+    need of re-pairing is the one whose stored key has gone stale. Unpaired pads
+    simply outrank paired ones.
+  - The **key store location is a setting**, so pointing it at a cloud-synced
+    folder carries the bond to every machine the dongle travels to.
+- **Joy-Con 2 motion.** The accelerometer was located from hardware captures
+  (i16 followed by two padding bytes on a 4-byte stride, 4096 LSB = 1 g) and is
+  pinned by regression tests — the published layout for reports 0x07/0x08 is
+  simply wrong over BLE, and the left half's report sits one byte earlier than the
+  right's. Rotation comes from the controller's **own integrated motion**,
+  differenced back into a rate; on hardware that is the difference between motion
+  controls that are unusable and ones that can drive a cursor in fast circles.
+  - Timing runs off the **device's own clock** carried in the report, not
+    `Instant::now()` — BLE batches notifications, so host-side timing jitter was
+    multiplicative: the harder the controller was swung, the more the rate
+    zig-zagged.
+  - Wrap discontinuities are rejected above 45° in a single report, while a
+    full-scale 2000 °/s flick survives untouched.
+  - Resting-drift compensation is anchored rather than averaged (a lagging EMA
+    settles at a constant offset against sustained rotation, so it fought slow
+    pans and then pulled them back), and its settle time is in seconds rather than
+    samples, so it means the same thing at every polling rate.
+  - Separate field and orientation gains, because yaw needs correcting for
+    orientation tracking and not on the pin — one constant could only fix either
+    by breaking the other.
+- **Multi-device Easy mode.** A preset now accepts **one input device per AutoMap
+  inlet** its sub-patch declares — so a multi-inlet preset takes several
+  controllers, each keeping its own port, and a Remapper reading inlet 2 simply
+  knows it is player 2. Devices are never merged onto one port, which would leak
+  "which device did this come from" into every downstream curve and gate. The port
+  is stored on the source node, so it survives save/reload and node reordering.
+  Single-inlet presets behave exactly as before.
+- **Orientation baseline calibration** for devices that report absolute
+  orientation. A Joy-Con 2's published pose is measured against the world — yaw is
+  magnetic north — which is not what a patch wants. Calibration captures the pose
+  flat and removes it, so holding the device as it was when calibrated reads as
+  identity. Uncalibrated devices pass their world pose through untouched.
+
+### Changed
+
+- **A pad on the dongle is now an ordinary device.** The backend prefix gate had
+  grown a third backend and been updated for two, so Classic pads reached the
+  canvas with no settings and no calibration — the same class of bug as the `sdl:`
+  prefix before it, now covered by a test with one line per backend.
+- Joy-Con 2 **pairing writes controller flash exactly once**, at first pairing.
+  `0x03/0x09` is "Store Pairing Info" — a flash write into the same two-slot table
+  that holds the console's entry — and it had been going out on every connect,
+  including every button-press wake. Reconnects now re-send only `0x03/0x07`.
+- The Joy-Con 2 link is requested at the **5 ms interval the console itself uses**,
+  falling back to the 7.5 ms spec minimum if the dongle refuses. One input report
+  arrives per connection event, so the interval *is* the report rate: 200 Hz
+  instead of 66 Hz.
+
 ### Fixed
 
 - **Config Overlay: live widgets on a gyro path stayed frozen while editing.** The
@@ -24,12 +122,127 @@ All notable changes to FlexInput are documented here. This project adheres to
     found nothing and blocked the whole device. RWS now always passes its Rotation
     (IMU) input through so the calibration widget animates regardless of which
     output is used.
+- **HidHide masked the wired Joy-Con from FlexInput itself.** Over USB the pad
+  *does* get a HID node and arrives as an `sdl:` device, so it sailed past the
+  `jc2:` prefix gate, got cloaked, and then opened and streamed nothing. It is
+  excluded by controller kind now, since a prefix cannot express "this pad,
+  whichever backend surfaced it".
+- **Two 3D viewers of the same model drew the same pose.** The instance buffers
+  were shared per model rather than per viewer, so both showed whichever pose was
+  uploaded last and the second viewer looked broken rather than duplicated.
+- **Easy mode's Calibrate opened whichever source node happened to be first**
+  rather than the card it was pressed on.
+- **Scanning starved an already-connected Joy-Con.** With one half connected, its
+  poll rate cycled between ~67 Hz and zero every few seconds, settling only once
+  the second half joined — `discover()` was a blocking 2 s scan window on the same
+  thread that pumps ACL. Scanning is a state now: the loop keeps draining ACL and
+  events throughout and stops the scan as soon as a controller is matched.
+- **Both Joy-Con halves reported byte-identical frames.** A stale LE Connection
+  Complete from the first controller was still queued when the second connect ran,
+  so the second link was handed a handle that already belonged to the first — two
+  links onto one stream, which looks entirely healthy until you notice the dumps
+  match byte for byte. Pending events are drained before connecting, and a handle
+  already in use is rejected and retried.
+- **A failed connect left the dongle unable to scan.** A rejected
+  `LE_Create_Connection` leaves the controller initiating, and while initiating it
+  refuses `LE_Set_Scan_Enable` — so one refused parameter set poisoned every later
+  scan. Scanning now cancels any pending initiator first, errors are reported
+  instead of swallowed, and a refused connect bails on the Command Status rather
+  than spending eighty seconds failing.
+- **Bluetooth Classic: six separate faults, each enough on its own to stop a
+  bonded controller ever reconnecting**, none of which reported anything useful.
+  The accept asked to become master — a role switch this controller never
+  completes, killing the link on LMP Response Timeout about ten seconds later,
+  *after* authentication and encryption had both succeeded, which made it look
+  like a device refusing to open its HID channels. Paging held the radio while the
+  pad was calling in, and eager retries had it paging essentially 100% of the time.
+  Abandoning a page host-side did not stop the radio paging. Either end may open
+  the L2CAP HID channels and the same pad was observed doing it both ways minutes
+  apart. `set_scan_enable` never checked its status byte, so a refusal read as
+  success. And an event subscriber discarded every ACL packet it stepped over,
+  eating the input reports of a controller that had connected perfectly.
+- **A link key issued during connect was thrown away.** Re-pairing happens whenever
+  the remote asks — which a controller in Sync mode always does — but only the
+  pairing button stored the result, so a pad would pair perfectly and then never
+  reconnect, its flash and our key file disagreeing. Keys also record the adapter
+  that made them, since a key is worthless to any other dongle and the failure is
+  otherwise completely silent.
+- **The Classic transport deadlocked against itself on the first input report** —
+  a non-reentrant mutex locked again inside the insert expression while the first
+  guard was still alive — which then blocked `enumerate()` from the UI thread, so
+  no device ever appeared either.
+- **A truncated vendor HCI event aborted controller init outright.** Realtek
+  dongles emit those constantly and this stack decodes none of them, so the dongle
+  looked flaky while the link was fine. Truncation still fails for the five codes
+  that *are* decoded, where inventing a handle would be worse.
+- The WinRT hub's stand-down flag was attached after its worker started, leaving a
+  window at each launch where it scanned with no flag — enough for Windows to claim
+  a remembered controller. Standing down now also releases pads already held.
+- **ACL packets were never put on air.** The packet-boundary flag was `0b10`
+  ("first automatically-flushable"), which exists for BR/EDR; an LE-U link has no
+  automatic flush and the host must send `0b00`. The dongle accepted the USB write
+  and returned success either way, so the failure was silent in the worst possible
+  way.
+- **Input stayed in stub mode** — report counter incrementing at byte 0, every
+  field past the header zero — until the vendor report-rate descriptor is written
+  on the input characteristic, the step official software sends second-to-last
+  during init.
+- **A starved ACL read loop** consumed one packet per iteration while blocking up
+  to 10 ms on it, capping the whole process near 90 packets a second shared between
+  both links — measured as 60 Hz on one half against 6 Hz on the other. Draining is
+  greedy now; two halves at a 5 ms interval need 400 packets a second.
+
+### Internal
+
+- `crates/btle` ships hardware bring-up and diagnostic binaries: `jc2_link`
+  (connect, subscribe, init, then report throughput plus which byte offsets have
+  ever changed), `jc2_imu` (a guided motion-sweep probe that identifies the
+  accelerometer by physics — the one field triple whose vector magnitude holds at
+  1 g through every orientation — then searches for gyro axes, with `--save` /
+  `--load` so a decoding idea costs seconds against identical captured data
+  instead of a fresh 45-second two-controller sweep), plus `bt_classic`,
+  `hci_probe` and `jc2_crypt`.
+- The gyro search is recorded as a **validated null result**: nothing in the report
+  correlates with rotation rate — bytes 8–48, widths 10–21 bits, every bit offset,
+  both halves, scored against the angular rate implied by the accelerometer, with
+  the reference itself validated before any conclusion was drawn. The Joy-Con 2
+  gyro is not a plain packed signed field, which is why the shipped implementation
+  differentiates the controller's own integrated orientation instead. A ZYX
+  Euler-rate-to-body-rate transform was also removed: 288 hypotheses (Euler in all
+  six orders, the rotation vector, the vector part of a quaternion) were scored
+  against measured gravity, and the best managed 40.0° against 49.2° for applying
+  no rotation at all.
+- The Joy-Con 2 attribute table is fully mapped (48 handles, properties read from
+  the device), and the standard 0x30 accel/gyro block is parsed for controllers
+  that populate it.
+- btleplug 0.12 is vendored with a `GattSession.MaintainConnection` patch. It does
+  not fix the ~30 s reclaim — nothing does — but it is correct, cheap, and it does
+  make Windows re-establish a link it reclaimed.
+- Diagnostic logs and IMU captures are gitignored, as is the Bluetooth link-key
+  file: a link key is a shared secret between one controller and one dongle, so
+  committing it would publish a credential that is useless to anyone else anyway.
+
+## [0.13.3] - 2026-08-11
 
 Three fixes for the same underlying trap: egui's `ctx.data()` and its layer→transform
 map are shared by *every* window, while all of FlexInput's hosts (main canvas,
 sub-patch editor, and the three overlays) report the same background layer id. Any
 state keyed only by node id therefore collided as soon as one node was visible in two
-places at once — and the host that painted last won. Plus a D-pad output fix.
+places at once — and the host that painted last won. Plus a D-pad output fix, an
+idle-virtual-mouse fix, and an optional sticky HidHide mask.
+
+### Added
+
+- **"Keep hiding through disconnects"** (`hidhide_sticky`, off by default) — the
+  HidHide blacklist is rebuilt from the devices enumerated right now, so whenever
+  a remapped pad blipped out of enumeration (a Bluetooth gap, or a reconnect that
+  arrived already blacklisted and never reached our device list) the target set
+  went empty and the pad was **unhidden system-wide** until it came back — windows
+  of 3 to 94 seconds in the logs, during which a running game is handed the
+  physical pad alongside the virtual one. With the setting on, the mask is kept
+  for any pad the patch still wires up, and applied *at* arrival rather than ~2 s
+  later. Unmapping the device, turning off "hide originals", or exiting all unhide
+  as before.
 
 ### Fixed
 
@@ -59,6 +272,14 @@ places at once — and the host that painted last won. Plus a D-pad output fix.
   idle). The Remapper now synthesizes the axis and Vec2 forms from the direction
   Bools whenever it drives any of them; directions it doesn't own keep passing
   through, and opposite directions cancel.
+- **An idle virtual mouse wrote a zero-delta HID report every tick**, at up to
+  1 kHz, for as long as the app was open — the I/O thread calls `reset_outputs()`
+  on a bypassed device every tick, and that armed the dirty flag unconditionally.
+  Games that pick their glyph set from "which device reported last" then flickered
+  between controller and keyboard prompts while the sticks moved, and every flip
+  re-ran the game's cursor lock, warping the pointer to screen centre in menus. The
+  flag is a true one-shot now: set once at creation so a reclaimed node still gets
+  exactly one neutral frame, and never re-armed.
 
 ## [0.13.2] - 2026-07-31
 
