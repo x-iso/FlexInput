@@ -860,6 +860,8 @@ impl ImuDiag {
         still: bool,
         side: crate::protocol::Side,
         calibrated: Option<[f32; 3]>,
+        accel: [f32; 3],
+        gmag: f32,
     ) {
         if !(1e-6..0.5).contains(&dt) {
             return;
@@ -880,6 +882,26 @@ impl ImuDiag {
                 field_gain(),
                 ORIENTATION_GAIN,
             ));
+            // ⛔ **The gate everything else hangs off.** Stillness is decided
+            // purely from |accel|, and it must sit within
+            // STILL_GRAVITY_TOLERANCE of 1 g or the device is never still, the
+            // bias estimator never learns, calibration can never run, and the
+            // drift nothing corrects is the symptom. ACCEL_LSB_PER_G was
+            // established on one third-party grip; a different full-scale on
+            // retail hardware makes this permanently false with no error
+            // anywhere. Stated at connect so it is the first thing read.
+            crate::dlog::imu(format_args!(
+                "{} accel scale check — ACCEL_LSB_PER_G {} · |accel| {:.3} g ·                  tolerance {:.2} g · gravity {}",
+                side.display_name(),
+                ACCEL_LSB_PER_G,
+                gmag,
+                STILL_GRAVITY_TOLERANCE,
+                if (gmag - 1.0).abs() < STILL_GRAVITY_TOLERANCE {
+                    "TRUSTED"
+                } else {
+                    "REFUSED — stillness can never be detected on this hardware"
+                },
+            ));
         }
         for i in 0..3 {
             self.total_deg[i] += raw_dps[i] as f64 * dt as f64;
@@ -897,10 +919,14 @@ impl ImuDiag {
         }
         self.reported = elapsed;
         crate::dlog::imu(format_args!(
-            "{} still {:>6.1}s move {:>6.1}s | total deg {:+9.2} {:+9.2} {:+9.2} |              now dps {:+7.2} {:+7.2} {:+7.2} | raw angle {:#09x} {:#09x} {:#09x} |              counts {:+8.1} {:+8.1} {:+8.1}",
+            "{} still {:>6.1}s move {:>6.1}s | |accel| {:>5.3} g accel {:+7.0} {:+7.0}              {:+7.0} | total deg {:+9.2} {:+9.2} {:+9.2} |              now dps {:+7.2} {:+7.2} {:+7.2} | raw angle {:#09x} {:#09x} {:#09x} |              counts {:+8.1} {:+8.1} {:+8.1}",
             side.display_name(),
             self.still_secs,
             self.moving_secs,
+            gmag,
+            accel[0],
+            accel[1],
+            accel[2],
             self.total_deg[0],
             self.total_deg[1],
             self.total_deg[2],
@@ -1833,7 +1859,7 @@ impl OrientationTracker {
         ];
         self.drift_probe.update(raw_dps, dt, device_still, side);
         self.imu_diag.update(raw_dps, counts, angle, dt, device_still, side,
-                             self.resting_override);
+                             self.resting_override, ca, gmag);
 
         // Subtract the reproducible resting drift FIRST, so the estimator only
         // has the session-specific remainder to find — see `RESTING_DRIFT_*`.
