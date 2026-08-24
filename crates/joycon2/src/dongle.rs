@@ -1734,6 +1734,67 @@ fn connect_and_init(
         ));
     }
 
+    // ⛔ **READ it, rather than waiting to be told.**
+    //
+    // Five hypotheses have died against this characteristic: exclusivity, the
+    // feature mask, the CCCD, the command channel, and the subscribe ordering.
+    // Every one was a guess at why it will not NOTIFY. Its declaration says
+    // properties 0x12 — and 0x02 is READ, which has never once been used.
+    //
+    // ⭐ A read separates two very different worlds. If 0x000a returns a report
+    // with accel and gyro at 0x30/0x36, the data exists and only the
+    // notification path is broken — and polling a readable characteristic is an
+    // ugly but entirely workable fallback that would deliver a real angular
+    // rate today. If it returns zeros or refuses, the stream genuinely is not
+    // there to be had on this firmware, and no amount of subscribing was ever
+    // going to produce it.
+    //
+    // ❗ Cheap, and it needs nothing from the user beyond one run. It should
+    // have been the second thing tried, not the seventh.
+    if let Some(common) = handles.common {
+        let _ = dongle.drain_acl(64);
+        if dongle.send_att(conn, &acl::read_request(common)).is_ok() {
+            let deadline = Instant::now() + Duration::from_millis(400);
+            let mut got = false;
+            while Instant::now() < deadline && !got {
+                for pkt in dongle.drain_acl(32) {
+                    if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
+                        continue;
+                    }
+                    if pkt.payload[0] == acl::ATT_ERROR_RESPONSE {
+                        crate::dlog::imu(format_args!(
+                            "{} READ of common input {common:#06x} REFUSED: {:02x?}",
+                            side.display_name(),
+                            pkt.payload,
+                        ));
+                        got = true;
+                        break;
+                    }
+                    let Some(v) = acl::parse_read_response(&pkt.payload) else { continue };
+                    let block = v
+                        .get(0x30..0x3c)
+                        .map(|b| b.iter().any(|x| *x != 0))
+                        .unwrap_or(false);
+                    crate::dlog::imu(format_args!(
+                        "{} READ of common input {common:#06x}: {} bytes, standard block                          0x30..0x3c {} - {:02x?}",
+                        side.display_name(),
+                        v.len(),
+                        if block { "POPULATED" } else { "zero/absent" },
+                        &v[..],
+                    ));
+                    got = true;
+                    break;
+                }
+            }
+            if !got {
+                crate::dlog::imu(format_args!(
+                    "{} READ of common input {common:#06x}: no reply in 400 ms",
+                    side.display_name()
+                ));
+            }
+        }
+    }
+
     dlog!("init: COMPLETE");
 
     Ok(Link {
