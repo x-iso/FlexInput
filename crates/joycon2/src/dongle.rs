@@ -1287,6 +1287,32 @@ fn connect_and_init(
         conn,
         &acl::write_request(jc::HANDLE_CMD_RESPONSE_PERSIDE_CCCD, &acl::CCCD_NOTIFY),
     )?;
+    dlog!("init: feature-select done, writing report-rate descriptor");
+    // The vendor report-rate descriptor. WITHOUT THIS the controller streams
+    // stub reports forever — counter incrementing, every field zero — which is
+    // indistinguishable from a parser bug. It is the single most expensive
+    // omission in this sequence.
+    dongle.send_att(
+        conn,
+        &acl::write_request(jc::HANDLE_INPUT_REPORT_RATE, &protocol::REPORT_RATE_PAYLOAD),
+    )?;
+
+    dlog!("init: report-rate written, stream should start now");
+    probe_readable(dongle, conn);
+    // ⛔ **Moved to the END of init, which is where the reference puts it.**
+    //
+    // This ran FIRST — before pairing, the memory reads, the LED, and before
+    // the report-rate descriptor that actually starts a stream. Acknowledged
+    // every time, and the common characteristic never sent a byte. The
+    // reference sends its enable after the info and calibration reads and
+    // subscribes its input LAST, and that ordering was described plainly in the
+    // source I took the command from; I implemented the command and ignored
+    // where it sat.
+    //
+    // ❗ Not proof that order is the missing piece — subscribing only the
+    // common stream did not start it either, so exclusivity is already ruled
+    // out. But sending a setup command before setup has happened is not a test
+    // of anything, and this is the cheap half of the remaining difference.
     // ⭐ **Turn the common stream ON before subscribing to it.**
     //
     // ⛔ This is the step that was missing, and the reason `0x000a` was
@@ -1304,6 +1330,13 @@ fn connect_and_init(
     // second. Both writes are acknowledged so a refusal is visible rather than
     // inferred from silence, and neither is fatal — a controller that refuses
     // still streams the per-side report exactly as before.
+    // ❗ Written to the DISCOVERY log as well, so its position in the real
+    // sequence is observable rather than inferred. Two attempts to place this
+    // step by reading timestamps were wrong: the diagnostic log and the
+    // discovery log have different clock origins, and the `dlog!` calls around
+    // it live in different functions, so neither file nor the source order
+    // answers "when does this actually run".
+    dlog!("init: motion enable (0x03) about to be sent");
     for (what, sub_id) in [
         ("init", protocol::SUB_ENABLE_INIT),
         ("start", protocol::SUB_ENABLE_START),
@@ -1335,6 +1368,7 @@ fn connect_and_init(
         }
     }
 
+    dlog!("init: motion enable sent, subscribing the common input");
     // ⭐ The common input, subscribed at its RESOLVED handle and with the reply
     // actually read.
     //
@@ -1583,18 +1617,6 @@ fn connect_and_init(
         ),
     }
 
-    dlog!("init: feature-select done, writing report-rate descriptor");
-    // The vendor report-rate descriptor. WITHOUT THIS the controller streams
-    // stub reports forever — counter incrementing, every field zero — which is
-    // indistinguishable from a parser bug. It is the single most expensive
-    // omission in this sequence.
-    dongle.send_att(
-        conn,
-        &acl::write_request(jc::HANDLE_INPUT_REPORT_RATE, &protocol::REPORT_RATE_PAYLOAD),
-    )?;
-
-    dlog!("init: report-rate written, stream should start now");
-    probe_readable(dongle, conn);
     dlog!("init: COMPLETE");
 
     Ok(Link {
