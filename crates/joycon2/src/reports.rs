@@ -815,6 +815,108 @@ pub struct DriftProbe {
 /// clear of noise, and short enough to see several points in a four-minute run.
 const DRIFT_REPORT_SECS: f64 = 30.0;
 
+/// ⏳ **TEMPORARY.** Records the MOVING half of the picture — see
+/// [`crate::dlog::imu`].
+///
+/// ⛔ The question it exists to settle: does integrated rotation come back to
+/// where it started? [`DriftProbe`] cannot say, because it abandons its run the
+/// instant anything moves, so a scale error — the wrong
+/// [`ANGLE_COUNTS_PER_TURN`] for retail hardware — is invisible to it no matter
+/// how long anyone watches. That error accumulates only with motion, which is
+/// exactly why per-controller calibration does not help: calibration measures
+/// an offset at REST, and there is nothing wrong with the offset.
+///
+/// So this integrates every field continuously and reports the running total.
+/// Turn the controller through a known angle and back, and the totals say
+/// whether the counts-per-turn is right: return to the starting pose with
+/// field #2 reading 360 after one full turn out and back means the scale is
+/// out by that much, and by how much.
+#[derive(Debug, Clone, Copy, Default)]
+struct ImuDiag {
+    /// Integrated degrees per field since connect, uncorrected.
+    total_deg: [f64; 3],
+    /// Seconds of motion, and of stillness, kept apart — a drift that only
+    /// grows in one of them names its own cause.
+    moving_secs: f64,
+    still_secs: f64,
+    reported: f64,
+    samples: u64,
+    announced: bool,
+}
+
+/// How often the running totals are written. Frequent enough to follow a
+/// deliberate test motion, rare enough that an evening of play stays inside the
+/// log's size cap.
+const IMU_DIAG_SECS: f64 = 2.0;
+
+impl ImuDiag {
+    #[allow(clippy::too_many_arguments)]
+    fn update(
+        &mut self,
+        raw_dps: [f32; 3],
+        counts: [f32; 3],
+        angle: [i32; 3],
+        dt: f32,
+        still: bool,
+        side: crate::protocol::Side,
+        calibrated: Option<[f32; 3]>,
+    ) {
+        if !(1e-6..0.5).contains(&dt) {
+            return;
+        }
+        if !self.announced {
+            self.announced = true;
+            // ⭐ The header answers "was calibration even in force?" without
+            // anyone having to ask the tester a second time. That question cost
+            // a round trip once already.
+            crate::dlog::imu(format_args!(
+                "{} CONNECTED — calibration {} · counts/turn {} · field gain {:?} ·                  orientation gain {:?}",
+                side.display_name(),
+                match calibrated {
+                    Some(d) => format!("IN FORCE {d:?}"),
+                    None => "NOT SET (uncalibrated)".to_string(),
+                },
+                ANGLE_COUNTS_PER_TURN,
+                field_gain(),
+                ORIENTATION_GAIN,
+            ));
+        }
+        for i in 0..3 {
+            self.total_deg[i] += raw_dps[i] as f64 * dt as f64;
+        }
+        if still {
+            self.still_secs += dt as f64;
+        } else {
+            self.moving_secs += dt as f64;
+        }
+        self.samples += 1;
+
+        let elapsed = self.still_secs + self.moving_secs;
+        if elapsed - self.reported < IMU_DIAG_SECS {
+            return;
+        }
+        self.reported = elapsed;
+        crate::dlog::imu(format_args!(
+            "{} still {:>6.1}s move {:>6.1}s | total deg {:+9.2} {:+9.2} {:+9.2} |              now dps {:+7.2} {:+7.2} {:+7.2} | raw angle {:#09x} {:#09x} {:#09x} |              counts {:+8.1} {:+8.1} {:+8.1}",
+            side.display_name(),
+            self.still_secs,
+            self.moving_secs,
+            self.total_deg[0],
+            self.total_deg[1],
+            self.total_deg[2],
+            raw_dps[0],
+            raw_dps[1],
+            raw_dps[2],
+            angle[0],
+            angle[1],
+            angle[2],
+            counts[0],
+            counts[1],
+            counts[2],
+        ));
+    }
+}
+
 impl DriftProbe {
     /// Feed one sample. `rate_dps` is the raw per-field rate BEFORE any
     /// correction — the point is to measure what the hardware does, not what is
@@ -895,8 +997,28 @@ impl DriftProbe {
 pub const RESTING_DRIFT_LEFT: [f32; 3] = [-0.410, 0.046, -0.034];
 pub const RESTING_DRIFT_RIGHT: [f32; 3] = [-0.335, -0.008, 0.021];
 
-/// The resting-drift correction for one half.
-pub fn resting_drift(side: crate::protocol::Side) -> [f32; 3] {
+/// The default resting-drift correction for an UNCALIBRATED half: none.
+///
+/// ⛔ **A zero-rate offset belongs to one piece of silicon, not to a model.**
+/// This used to return the constants above for every Joy-Con 2 in the world.
+/// They were measured across six sessions on ONE grip — a third-party M12-S —
+/// and on any other controller they are not a correction at all, they are up to
+/// 0.41 °/s of bias being INJECTED. Reported from the field as a genuine
+/// Joy-Con 2 that drifts, which is exactly what applying somebody else's offset
+/// produces.
+///
+/// The measured values are kept, because they are real data and the M12-S is
+/// the reference this stack was built against — but they are reference now, not
+/// a default. [`crate::cal`] holds per-controller measurements from the
+/// calibration flow, and [`GyroBias`] learns the remainder for anything
+/// uncalibrated. Both start from the honest position that we do not know this
+/// controller's offset until it has been measured.
+pub fn resting_drift(_side: crate::protocol::Side) -> [f32; 3] {
+    [0.0; 3]
+}
+
+/// What the M12-S reference grip measured, for comparison and for tests.
+pub fn reference_drift(side: crate::protocol::Side) -> [f32; 3] {
     match side {
         crate::protocol::Side::Left => RESTING_DRIFT_LEFT,
         crate::protocol::Side::Right => RESTING_DRIFT_RIGHT,
@@ -1190,6 +1312,8 @@ pub struct OrientationTracker {
     yaw_rad: f32,
     /// Long-run resting drift measurement — see [`DriftProbe`].
     drift_probe: DriftProbe,
+    /// ⏳ TEMPORARY — see [`ImuDiag`]. Remove with it.
+    imu_diag: ImuDiag,
     /// Last trustworthy gravity direction, body frame, unit length.
     ///
     /// ⭐ Held across samples where the accelerometer is NOT measuring gravity.
@@ -1708,6 +1832,8 @@ impl OrientationTracker {
             counts[2] * per_sec / ANGLE_COUNTS_PER_DEG,
         ];
         self.drift_probe.update(raw_dps, dt, device_still, side);
+        self.imu_diag.update(raw_dps, counts, angle, dt, device_still, side,
+                             self.resting_override);
 
         // Subtract the reproducible resting drift FIRST, so the estimator only
         // has the session-specific remainder to find — see `RESTING_DRIFT_*`.
@@ -3307,6 +3433,32 @@ mod orientation_tests {
     ///
     /// Both halves matter. Averaging a known offset over a long run is the
     /// whole point; resetting when the controller moves is what makes the
+
+    /// ⛔ An uncalibrated controller gets NO drift correction, not somebody
+    /// else's.
+    ///
+    /// The constants were measured on one third-party M12-S grip. Applied to
+    /// any other controller they do not correct a zero-rate offset, they add
+    /// one — up to 0.41 deg/s — and a MEMS offset belongs to one piece of
+    /// silicon, not to a model. Reported from the field as a retail Joy-Con 2
+    /// that drifts. The measurements survive as `reference_drift` because they
+    /// are real data about the reference grip; they are simply not a default.
+    #[test]
+    fn an_uncalibrated_half_gets_no_borrowed_offset() {
+        use crate::protocol::Side;
+        for side in [Side::Left, Side::Right] {
+            assert_eq!(
+                resting_drift(side),
+                [0.0; 3],
+                "{side:?} still starts from another controller's offset",
+            );
+        }
+        // The reference values are kept, and the two halves stay distinct.
+        assert_eq!(reference_drift(Side::Left), RESTING_DRIFT_LEFT);
+        assert_eq!(reference_drift(Side::Right), RESTING_DRIFT_RIGHT);
+        assert_ne!(RESTING_DRIFT_LEFT, RESTING_DRIFT_RIGHT);
+    }
+
     /// figure mean "drift" rather than "whatever happened recently".
     #[test]
     fn the_drift_probe_averages_a_steady_offset_and_resets_on_motion() {

@@ -45,17 +45,46 @@ fn diag_log(line: &str) {
     eprintln!("{line}");
     if let Some(path) = log_file_path() {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        rotate_if_large(&path);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = writeln!(f, "[{}] {line}", now_stamp());
         }
     }
 }
 
-/// `flexinput-hidmaestro.log` next to the current exe (the elevated helper).
+/// `flexinput-hidmaestro.log` under `%APPDATA%\FlexInput\logs`.
+///
+/// ⛔ **Not beside the exe.** The helper lives wherever the app was installed,
+/// which for a real install is not writable — so the log either failed to open
+/// or scattered files next to the binary, where nobody looks and no uninstall
+/// cleans up. AppData is writable, per-user, and where the settings and crash
+/// log already are.
+///
+/// ❗ The helper runs ELEVATED, but elevation keeps the same user profile, so
+/// `%APPDATA%` resolves to the same directory the app itself writes to. That
+/// would NOT hold if this ever became a service running as SYSTEM.
 fn log_file_path() -> Option<std::path::PathBuf> {
-    let mut p = std::env::current_exe().ok()?;
-    p.set_file_name("flexinput-hidmaestro.log");
-    Some(p)
+    let appdata = std::env::var_os("APPDATA")?;
+    let dir = std::path::PathBuf::from(appdata).join("FlexInput").join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("flexinput-hidmaestro.log"))
+}
+
+/// Largest the helper log may grow before one generation is rotated away.
+///
+/// ❗ It appends for the life of the helper and nothing else ever truncates it.
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Rotate the log aside once it passes [`MAX_LOG_BYTES`], keeping one
+/// generation as `.prev`.
+fn rotate_if_large(path: &std::path::Path) {
+    let too_big = path.metadata().map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false);
+    if !too_big {
+        return;
+    }
+    let mut prev = path.as_os_str().to_owned();
+    prev.push(".prev");
+    let _ = std::fs::rename(path, std::path::PathBuf::from(prev));
 }
 
 /// Coarse local timestamp (seconds since process start) for log correlation —
