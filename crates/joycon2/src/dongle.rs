@@ -1534,6 +1534,27 @@ fn connect_and_init(
     match feature_override() {
         Some(mask) => {
             eprintln!("[jc2-dongle] feature-select ENABLED, mask {mask:#04x} (mouse needs 0x10)");
+            // ⛔ **Into the diagnostic log, not just stderr.**
+            //
+            // The mask is the variable under test and it was only ever printed
+            // to a console nobody keeps, so a run could not say which
+            // experiment it was. A log that records the result but not the
+            // condition answers nothing.
+            crate::dlog::imu(format_args!(
+                "{} feature-select mask {mask:#04x} \
+                 (buttons {} sticks {} imu {} imu_raw {} mouse {} rumble {} mag {}) \
+                 -> per-side {:#06x}, bare -> common {:#06x}",
+                side.display_name(),
+                mask & protocol::feature::BUTTONS != 0,
+                mask & protocol::feature::STICKS != 0,
+                mask & protocol::feature::IMU != 0,
+                mask & protocol::feature::IMU_RAW != 0,
+                mask & protocol::feature::MOUSE != 0,
+                mask & protocol::feature::RUMBLE != 0,
+                mask & protocol::feature::MAGNETOMETER != 0,
+                jc::HANDLE_CMD_WRITE,
+                jc::HANDLE_CMD_WRITE_COMMON,
+            ));
             // ❗ The full captured sequence, in order, not just the two
             // feature-select frames.
             //
@@ -1844,10 +1865,19 @@ fn pump(
         // costs a few hundred bytes and no judgement about what matters.
         if link.frame_dump.elapsed() >= Duration::from_secs(10) {
             link.frame_dump = Instant::now();
+            // ⭐ The verdict alongside the bytes. Whether 0x30..0x3c is zero
+            // is the entire question, and counting zeros by eye across
+            // sixty-three bytes of hex is how a run gets misread.
+            let block_empty = n
+                .value
+                .get(0x30..0x3c)
+                .map(|b| b.iter().all(|v| *v == 0))
+                .unwrap_or(true);
             crate::dlog::imu(format_args!(
-                "{} FRAME len {} {:02x?}",
+                "{} FRAME len {} - standard block 0x30..0x3c {} - {:02x?}",
                 link.key.side.display_name(),
                 n.value.len(),
+                if block_empty { "STILL ZERO" } else { "POPULATED" },
                 &n.value[..],
             ));
         }
