@@ -2258,7 +2258,7 @@ impl Dongle {
                 // timeout later just ends a walk that already produced results.
                 None if out.is_empty() => {
                     return Err(Error::Protocol(
-                        "no reply to Find Information Request within 2 s".into(),
+                        format!("no reply to Find Information Request within {budget:?}"),
                     ))
                 }
                 None => break,
@@ -2329,7 +2329,7 @@ impl Dongle {
                 Some(r) => r,
                 None if out.is_empty() => {
                     return Err(Error::Protocol(
-                        "no reply to Read By Type Request within 2 s".into(),
+                        format!("no reply to Read By Type Request within {budget:?}"),
                     ))
                 }
                 None => break,

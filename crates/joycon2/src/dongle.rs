@@ -47,6 +47,22 @@ const MAX_LINKS: usize = 2;
 /// having never seen a completed init.
 const INIT_GAP: Duration = Duration::from_millis(30);
 
+/// How long to wait for a Write Response during init.
+///
+/// ⛔ **Init is a race against [`INPUT_TIMEOUT`], and I lost it.**
+///
+/// Acknowledged writes were introduced so a refused command would say so
+/// instead of vanishing, which was right — but at 400-600 ms each, four of
+/// them plus a 600 ms discovery walk put more than two seconds of blocking
+/// waits in front of a three-second watchdog. Observed as controllers
+/// reconnecting in a loop, and on one attempt as every single write returning
+/// NO REPLY: a link too busy being set up to answer anything.
+///
+/// A controller that is going to acknowledge does it in milliseconds. Waiting
+/// longer does not make a refusal more likely to arrive; it only makes the
+/// link less likely to survive long enough to hear it.
+const ATT_ACK_WAIT: Duration = Duration::from_millis(120);
+
 /// Longest gap between input notifications before a link is written off.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -719,13 +735,20 @@ fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
     // ⭐ An escape hatch that needs no rebuild. Discovery runs during setup,
     // before the input subscription, so if it ever costs a link again this is
     // how to prove it in one run rather than one round trip.
-    if std::env::var("FLEXINPUT_JC2_DISCOVER")
-        .is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+    // ⛔ **Opt-IN, because it costs connect time and has never once
+    // disagreed with the constants.**
+    //
+    // Across every log so far it has resolved input, cmd and common to exactly
+    // the assumed handles, on two different controllers — while spending its
+    // whole budget doing so. Connect time is not free: it is measured against a
+    // three-second input watchdog, and everything spent here is spent before
+    // the stream starts. The question it was added to answer has been answered.
+    //
+    // `FLEXINPUT_JC2_DISCOVER=on` brings it back for the next controller that
+    // might genuinely differ.
+    if !std::env::var("FLEXINPUT_JC2_DISCOVER")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("on"))
     {
-        crate::dlog::imu(format_args!(
-            "{} handle discovery DISABLED by FLEXINPUT_JC2_DISCOVER=off",
-            side.display_name()
-        ));
         return h;
     }
     // ❗ Budgeted, and TIMED. This happens before the input subscription, so
@@ -1294,10 +1317,10 @@ fn connect_and_init(
             conn,
             &acl::write_request(jc::HANDLE_CMD_WRITE_COMMON, &frame),
             acl::ATT_WRITE_RESPONSE,
-            Duration::from_millis(400),
+            ATT_ACK_WAIT,
         ) {
             Ok(Some(_)) => crate::dlog::imu(format_args!(
-                "{} motion enable {what} (0x03/{sub_id:#04x} flags {:#04x}) ACCEPTED",
+                "{} motion enable {what} (0x03/{sub_id:#04x} flags {:#04x})                  acknowledged at the ATT layer",
                 side.display_name(),
                 protocol::ENABLE_FLAGS,
             )),
@@ -1335,10 +1358,10 @@ fn connect_and_init(
                 conn,
                 &acl::write_request(handle, payload),
                 acl::ATT_WRITE_RESPONSE,
-                Duration::from_millis(600),
+                ATT_ACK_WAIT,
             ) {
                 Ok(Some(_)) => crate::dlog::imu(format_args!(
-                    "{} common input {what} write {handle:#06x} ACCEPTED",
+                    "{} common input {what} write {handle:#06x} acknowledged",
                     side.display_name()
                 )),
                 Ok(None) => crate::dlog::imu(format_args!(
