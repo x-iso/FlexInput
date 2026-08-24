@@ -657,6 +657,118 @@ impl AngleGyro {
     }
 }
 
+/// How long a baseline the field rate is measured over.
+///
+/// ⛔ **Differentiating a QUANTISED angle multiplies its step by the sample
+/// rate, so a faster link makes the gyro noisier.**
+///
+/// The heading field carries about 93 206 counts per degree, and at rest it
+/// wobbles by a couple of thousand counts — roughly 0.02°. Differenced against
+/// the previous report that is 0.02° × the report rate: about 1.4 °/s at 67 Hz,
+/// and about 3.9 °/s at 183 Hz. Measured on hardware at ±3.10 °/s with the
+/// controller sitting still on a table, which is that arithmetic exactly.
+///
+/// Pinning the connection interval made the link three times faster and the
+/// derived gyro three times noisier, which is not a trade anyone chose.
+///
+/// ❗ In SECONDS, not in reports, and that is the whole point: a window fixed
+/// in samples would keep changing meaning with the link rate, which is the
+/// mistake being corrected. 25 ms spans about four reports at 183 Hz and under
+/// two at 67 Hz, so it removes the excess noise the fast link introduced
+/// without touching what the slow one always did.
+///
+/// The cost is group delay of half the window — about 12 ms, under one frame
+/// at 60 Hz. A real rate sensor would need none of this; see the standard
+/// motion block on [`Motion::gyro`], which is the proper fix if the hardware
+/// ever turns out to populate it.
+const RATE_WINDOW_SECS: f32 = 0.025;
+
+/// A moving-average derivative over [`RATE_WINDOW_SECS`] of wall time.
+///
+/// ⭐ Averages the ANGLE covered and the TIME it took, then divides — rather
+/// than averaging rates. Those differ whenever samples are unevenly spaced,
+/// which they are: the fields refresh at different rates and a report can be
+/// dropped. Summing counts and seconds keeps the answer exact under both.
+///
+/// ❗ A fixed ring rather than a `VecDeque`: `OrientationTracker` is `Copy`, and
+/// 16 slots covers the window at any rate this link can reach (25 ms at 200 Hz
+/// is five samples).
+#[derive(Debug, Clone, Copy)]
+struct RateWindow {
+    samples: [([f32; 3], f32); RATE_WINDOW_SLOTS],
+    head: usize,
+    len: usize,
+    counts: [f32; 3],
+    secs: f32,
+}
+
+const RATE_WINDOW_SLOTS: usize = 16;
+
+impl Default for RateWindow {
+    fn default() -> Self {
+        Self {
+            samples: [([0.0; 3], 0.0); RATE_WINDOW_SLOTS],
+            head: 0,
+            len: 0,
+            counts: [0.0; 3],
+            secs: 0.0,
+        }
+    }
+}
+
+impl RateWindow {
+    /// Feed one sample and return the smoothed rate, in the SAME units as the
+    /// input: counts per report.
+    fn push(&mut self, per_report: [f32; 3], dt: f32) -> [f32; 3] {
+        if !(dt.is_finite() && dt > 0.0) {
+            return per_report;
+        }
+        // ❗ The per-report delta IS the counts moved in this report; it does
+        // not get multiplied by dt. Doing that divided every rate by the report
+        // rate — a steady 67 deg/s turn came out at 1 deg/s — which two
+        // existing orientation tests caught immediately.
+        let contributed = per_report;
+        for i in 0..3 {
+            self.counts[i] += contributed[i];
+        }
+        self.secs += dt;
+        if self.len == RATE_WINDOW_SLOTS {
+            // Full: the oldest leaves to make room, so a stalled link cannot
+            // grow the window without bound.
+            let (c, t) = self.samples[self.head];
+            for i in 0..3 {
+                self.counts[i] -= c[i];
+            }
+            self.secs -= t;
+            self.samples[self.head] = (contributed, dt);
+            self.head = (self.head + 1) % RATE_WINDOW_SLOTS;
+        } else {
+            self.samples[(self.head + self.len) % RATE_WINDOW_SLOTS] = (contributed, dt);
+            self.len += 1;
+        }
+        // ❗ Always leave the window at least one sample wide, or a link slower
+        // than the window would empty it and divide by zero.
+        while self.secs > RATE_WINDOW_SECS && self.len > 1 {
+            let (c, t) = self.samples[self.head];
+            for i in 0..3 {
+                self.counts[i] -= c[i];
+            }
+            self.secs -= t;
+            self.head = (self.head + 1) % RATE_WINDOW_SLOTS;
+            self.len -= 1;
+        }
+        if self.secs <= 0.0 {
+            return per_report;
+        }
+        // Back to counts-per-report so every caller downstream is unchanged.
+        [
+            self.counts[0] / self.secs * dt,
+            self.counts[1] / self.secs * dt,
+            self.counts[2] / self.secs * dt,
+        ]
+    }
+}
+
 /// Accelerometer counts per g, measured from hardware (see [`Motion::accel`]).
 ///
 /// ✅ Confirmed TWICE, independently: measured from the constant magnitude of
@@ -1361,6 +1473,8 @@ pub struct OrientationTracker {
     yaw_rad: f32,
     /// Long-run resting drift measurement — see [`DriftProbe`].
     drift_probe: DriftProbe,
+    /// Time-windowed derivative of the angle fields — see `RATE_WINDOW_SECS`.
+    rate_window: RateWindow,
     /// ⏳ TEMPORARY — see [`ImuDiag`]. Remove with it.
     imu_diag: ImuDiag,
     /// Last trustworthy gravity direction, body frame, unit length.
@@ -1820,8 +1934,11 @@ impl OrientationTracker {
         // makes the bias thresholds mean what they say: they are written in
         // deg/s, and feeding them counts-per-report made them depend on the
         // report rate.
-        let counts = self.field_gyro.rate(angle);
+        // ⛔ Smoothed over a TIME window before anything uses it — see
+        // `RATE_WINDOW_SECS`. Report-to-report differencing of a quantised
+        // angle put ±3 °/s of spikes on a stationary controller.
         let dt = self.clock.dt(motion.timestamp, hz).unwrap_or(1.0 / hz);
+        let counts = self.rate_window.push(self.field_gyro.rate(angle), dt);
         let per_sec = if dt > 1e-6 { 1.0 / dt } else { hz };
         // Is the controller actually stationary? Gravity is fixed in the world,
         // so a body-frame gravity direction that is not moving means the device
@@ -3482,6 +3599,68 @@ mod orientation_tests {
     ///
     /// Both halves matter. Averaging a known offset over a long run is the
     /// whole point; resetting when the controller moves is what makes the
+
+    /// ⛔ The window must kill the quantisation spikes and leave a real
+    /// rotation ALONE.
+    ///
+    /// A smoother that also flattens genuine motion trades visible jitter for
+    /// an aim that feels dead — the worse of the two, and much harder to spot
+    /// in a diff. So both properties are asserted, and the noise case uses the
+    /// measured numbers: 2000 counts of field wobble at 183 Hz is the 3 deg/s
+    /// seen on hardware with the controller sitting on a table.
+    #[test]
+    fn the_rate_window_removes_jitter_without_eating_real_motion() {
+        let dt = 1.0 / 183.0;
+        let per_deg = ANGLE_COUNTS_PER_DEG;
+        let dps = |counts: f32, dt: f32| counts / dt / per_deg;
+
+        let mut w = RateWindow::default();
+        let (mut worst_in, mut worst_out) = (0.0f32, 0.0f32);
+        for i in 0..200 {
+            let wobble = if i % 2 == 0 { 2000.0 } else { -2000.0 };
+            let out = w.push([wobble, 0.0, 0.0], dt)[0];
+            if i > 20 {
+                worst_in = worst_in.max(dps(wobble, dt).abs());
+                worst_out = worst_out.max(dps(out, dt).abs());
+            }
+        }
+        assert!(worst_in > 3.0, "input is not the measured noise: {worst_in:.2}");
+        assert!(
+            worst_out < worst_in / 2.0,
+            "jitter barely reduced: {worst_in:.2} -> {worst_out:.2} deg/s"
+        );
+
+        // A steady 100 deg/s turn must still read 100 deg/s.
+        let mut w = RateWindow::default();
+        let steady = 100.0 * per_deg * dt;
+        let mut last = 0.0;
+        for _ in 0..200 {
+            last = w.push([steady, 0.0, 0.0], dt)[0];
+        }
+        assert!(
+            (dps(last, dt) - 100.0).abs() < 0.5,
+            "a sustained turn was attenuated to {:.2} deg/s",
+            dps(last, dt)
+        );
+
+        // ⭐ Rate-INDEPENDENT: the fast link must not end up noisier than the
+        // slow one, which is the entire complaint being fixed.
+        let slow_dt = 1.0 / 67.0;
+        let mut slow = RateWindow::default();
+        let mut worst_slow = 0.0f32;
+        for i in 0..200 {
+            let wobble = if i % 2 == 0 { 2000.0 } else { -2000.0 };
+            let out = slow.push([wobble, 0.0, 0.0], slow_dt)[0];
+            if i > 20 {
+                worst_slow = worst_slow.max(dps(out, slow_dt).abs());
+            }
+        }
+        assert!(
+            worst_out <= worst_slow * 1.35,
+            "the fast link is still noisier: {worst_out:.2} vs {worst_slow:.2} deg/s"
+        );
+    }
+
 
     /// ⛔ An uncalibrated controller gets NO drift correction, not somebody
     /// else's.
