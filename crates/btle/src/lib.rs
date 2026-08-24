@@ -2180,7 +2180,10 @@ impl Dongle {
     /// interval, so a naive "read one packet" would almost always return a
     /// report rather than the response. Everything that is not the awaited
     /// opcode — or an error response for it — is therefore skipped.
-    fn att_request(
+    /// ❗ Public because a write whose reply nobody reads is indistinguishable
+    /// from one that was refused — see the common-input subscription in the
+    /// Joy-Con 2 dongle init.
+    pub fn att_request(
         &self,
         conn_handle: u16,
         request: &[u8],

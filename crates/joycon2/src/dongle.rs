@@ -89,6 +89,10 @@ struct Shared {
 struct Link {
     key: PadKey,
     conn: u16,
+    /// Resolved from THIS controller's table — see `resolve_handles`. Matching
+    /// notifications against the captured constants instead would drop a
+    /// stream that discovery had just found at a different number.
+    handles: Handles,
     calib: StickCalib,
     orientation: OrientationTracker,
     /// ⏳ TEMPORARY — slow timer for the 0x000a presence line.
@@ -654,6 +658,141 @@ fn probe_readable(dongle: &Dongle, conn: u16) {
     }
 }
 
+/// The handles this controller actually uses, resolved from its own table.
+///
+/// ⛔ **Handle numbers are not part of a protocol. They are one device's
+/// GATT layout, and we had them hardcoded.**
+///
+/// `0x000a`, `0x000e`, `0x0016` and the rest were captured by walking the
+/// attribute table of ONE controller — a third-party M12-S grip — and then
+/// written into `joycon.rs` as constants. A GATT server is free to lay its
+/// table out however it likes; the numbers are assigned in the order attributes
+/// are declared, and nothing requires two devices to agree. Subscribing by
+/// number on a device with a different layout writes `CCCD_NOTIFY` to whatever
+/// attribute happens to occupy that slot.
+///
+/// That failure is completely silent. Every write here is fire-and-forget, so
+/// an `Attribute Not Found` or `Write Not Permitted` in reply goes unread, and
+/// the symptom is a characteristic that was "subscribed and never notified" —
+/// which is exactly what was recorded against `0x000a` on both the reference
+/// grip and, in a field log, on retail Joy-Con 2s. Reported working in another
+/// project on the same hardware, which is what makes it ours rather than the
+/// controller's.
+///
+/// So the table is walked and the characteristics are found by UUID, which IS
+/// part of the protocol. The constants remain as a fallback for a controller
+/// that will not answer discovery at all.
+#[derive(Debug, Clone, Copy)]
+struct Handles {
+    /// Per-side input, report 0x07/0x08 — the stream we already decode.
+    input: u16,
+    /// Common input, report 0x05 — where a real gyro would be.
+    common: Option<u16>,
+    /// Whether the common input declares NOTIFY at all.
+    common_notifiable: bool,
+    /// Command channel, shared with rumble.
+    cmd: u16,
+}
+
+impl Default for Handles {
+    fn default() -> Self {
+        Self {
+            input: jc::HANDLE_INPUT_VALUE,
+            common: Some(jc::HANDLE_INPUT_COMMON),
+            common_notifiable: true,
+            cmd: jc::HANDLE_CMD_WRITE,
+        }
+    }
+}
+
+/// Find the characteristics by UUID, falling back to the captured numbers.
+///
+/// ❗ Failure is not fatal. A controller that refuses discovery still works on
+/// the old constants — they were right for at least one device — so this
+/// upgrades where it can and never blocks a connection.
+fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
+    let mut h = Handles::default();
+    let chars = match dongle.discover_characteristics(conn) {
+        Ok(c) if !c.is_empty() => c,
+        other => {
+            let why = match other {
+                Ok(_) => "the table was empty".to_string(),
+                Err(e) => e.to_string(),
+            };
+            eprintln!("[jc2-dongle] {} handle discovery failed ({why}) — using captured numbers",
+                side.display_name());
+            crate::dlog::imu(format_args!(
+                "{} handle discovery FAILED ({why}) — falling back to hardcoded \
+                 handles, which may belong to a different controller's layout",
+                side.display_name(),
+            ));
+            return h;
+        }
+    };
+
+    let find = |want: uuid::Uuid| -> Option<&acl::CharDecl> {
+        chars.iter().find(|c| match c.uuid {
+            // ATT carries 128-bit UUIDs little-endian; `uuid::Uuid` bytes are
+            // big-endian, so one side has to be reversed to compare them.
+            acl::AttUuid::Long(raw) => {
+                let mut be = raw;
+                be.reverse();
+                uuid::Uuid::from_bytes(be) == want
+            }
+            acl::AttUuid::Short(_) => false,
+        })
+    };
+
+    let per_side = match side {
+        Side::Left => protocol::CHR_INPUT_L,
+        Side::Right => protocol::CHR_INPUT_R,
+    };
+    if let Some(c) = find(per_side) {
+        h.input = c.value_handle;
+    }
+    let cmd = match side {
+        Side::Left => protocol::CHR_RUMBLE_CMD_L,
+        Side::Right => protocol::CHR_RUMBLE_CMD_R,
+    };
+    if let Some(c) = find(cmd) {
+        h.cmd = c.value_handle;
+    }
+    match find(protocol::CHR_INPUT_COMMON) {
+        Some(c) => {
+            h.common = Some(c.value_handle);
+            h.common_notifiable = c.notifiable();
+        }
+        None => {
+            // ⭐ Absent from the table is a different fact from present and
+            // silent, and only one of them is our bug.
+            h.common = None;
+        }
+    }
+
+    // ⭐ Logged with the ASSUMED values beside them. A mismatch here is the
+    // whole hypothesis, and it is invisible unless both numbers are shown.
+    crate::dlog::imu(format_args!(
+        "{} handles resolved — input {:#06x} (assumed {:#06x}) · cmd {:#06x} \
+         (assumed {:#06x}) · common {} (assumed {:#06x}){}",
+        side.display_name(),
+        h.input,
+        jc::HANDLE_INPUT_VALUE,
+        h.cmd,
+        jc::HANDLE_CMD_WRITE,
+        match h.common {
+            Some(v) => format!("{v:#06x}"),
+            None => "ABSENT FROM THIS CONTROLLER'S TABLE".to_string(),
+        },
+        jc::HANDLE_INPUT_COMMON,
+        if h.common.is_some() && !h.common_notifiable {
+            " — common input declares NO NOTIFY property"
+        } else {
+            ""
+        },
+    ));
+    h
+}
+
 /// `FLEXINPUT_JC2_DONGLE=vid:pid` if set, otherwise whatever is actually here.
 ///
 /// ⛔ **This used to fall back to a literal `0bda:a728` without ever asking
@@ -1019,9 +1158,15 @@ fn connect_and_init(
     // Before any of the Nintendo init, ask what this controller actually
     // exposes — see `scan_gatt`. No-op unless FLEXINPUT_JC2_GATT_SCAN is set.
     scan_gatt(dongle, conn);
+
+    // ⛔ Resolve the handles from THIS controller's table before writing to any
+    // of them — see `resolve_handles`. Subscribing by a number captured from a
+    // different device configures whatever attribute happens to sit there.
+    let handles = resolve_handles(dongle, conn, side);
+
     dongle.send_att(
         conn,
-        &acl::write_request(jc::HANDLE_INPUT_CCCD, &acl::CCCD_NOTIFY),
+        &acl::write_request(handles.input + 1, &acl::CCCD_NOTIFY),
     )?;
     dongle.send_att(
         conn,
@@ -1057,14 +1202,51 @@ fn connect_and_init(
         conn,
         &acl::write_request(jc::HANDLE_CMD_RESPONSE_PERSIDE_CCCD, &acl::CCCD_NOTIFY),
     )?;
-    dongle.send_att(
-        conn,
-        &acl::write_request(jc::HANDLE_INPUT_COMMON_CCCD, &acl::CCCD_NOTIFY),
-    )?;
-    dongle.send_att(
-        conn,
-        &acl::write_request(jc::HANDLE_INPUT_COMMON_RATE, &protocol::REPORT_RATE_PAYLOAD),
-    )?;
+    // ⭐ The common input, subscribed at its RESOLVED handle and with the reply
+    // actually read.
+    //
+    // ⛔ Both of these were fire-and-forget at a hardcoded number. If the
+    // number was wrong the write landed on an unrelated attribute; if it was
+    // refused the error response was never read. Either way the outcome was a
+    // characteristic recorded as "subscribed and silent" — the exact note that
+    // sat against `0x000a` for the whole gyro search, on two different
+    // controllers, while another project read motion from it on the same
+    // hardware.
+    //
+    // A CCCD sits immediately after the value handle it configures, and the
+    // vendor rate descriptor after that; those offsets are GATT convention and
+    // hold wherever the base handle lands.
+    if let Some(common) = handles.common {
+        for (what, handle, payload) in [
+            ("CCCD", common + 1, &acl::CCCD_NOTIFY[..]),
+            ("rate", common + 2, &protocol::REPORT_RATE_PAYLOAD[..]),
+        ] {
+            match dongle.att_request(
+                conn,
+                &acl::write_request(handle, payload),
+                acl::ATT_WRITE_RESPONSE,
+                Duration::from_millis(600),
+            ) {
+                Ok(Some(_)) => crate::dlog::imu(format_args!(
+                    "{} common input {what} write {handle:#06x} ACCEPTED",
+                    side.display_name()
+                )),
+                Ok(None) => crate::dlog::imu(format_args!(
+                    "{} common input {what} write {handle:#06x} — NO REPLY                      (the attribute may not exist here)",
+                    side.display_name()
+                )),
+                Err(e) => crate::dlog::imu(format_args!(
+                    "{} common input {what} write {handle:#06x} REFUSED: {e}",
+                    side.display_name()
+                )),
+            }
+        }
+    } else {
+        crate::dlog::imu(format_args!(
+            "{} common input NOT PRESENT in this controller's table — nothing              to subscribe to, so report 0x05 cannot be a gyro source here",
+            side.display_name()
+        ));
+    }
 
     // ⭐ The third input stream and the spare notify characteristic, both found
     // by walking the attribute table — see `jc::HANDLE_INPUT_EXTRA`. Same
@@ -1285,6 +1467,7 @@ fn connect_and_init(
     Ok(Link {
         key: PadKey { side, address },
         conn,
+        handles,
         calib: StickCalib::default(),
         orientation: OrientationTracker::default(),
         common_probe: Instant::now(),
@@ -1411,7 +1594,10 @@ fn pump(
             }
             continue;
         }
-        if n.handle == jc::HANDLE_INPUT_COMMON {
+        if links
+            .iter()
+            .any(|l| l.conn == pkt.conn_handle && l.handles.common == Some(n.handle))
+        {
             if let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) {
                 link.common_reports = link.common_reports.saturating_add(1);
                 if link.common_reports.is_power_of_two() {

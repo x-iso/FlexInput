@@ -862,6 +862,7 @@ impl ImuDiag {
         calibrated: Option<[f32; 3]>,
         accel: [f32; 3],
         gmag: f32,
+        std_gyro: Option<[i16; 3]>,
     ) {
         if !(1e-6..0.5).contains(&dt) {
             return;
@@ -890,6 +891,28 @@ impl ImuDiag {
             // established on one third-party grip; a different full-scale on
             // retail hardware makes this permanently false with no error
             // anywhere. Stated at connect so it is the first thing read.
+            // ⭐ **The question the whole gyro search turns on.** This decoder
+            // already prefers a real angular rate when the report carries one —
+            // the standard block at OFF_STD_ACCEL / OFF_STD_GYRO — and falls
+            // back to differentiating the fused heading only when it does not.
+            // On the reference grip that block reads zeros, so the fallback is
+            // all anyone has ever seen. Nobody has checked retail hardware.
+            crate::dlog::imu(format_args!(
+                "{} standard motion block at {:#04x}/{:#04x}: {}",
+                side.display_name(),
+                OFF_STD_ACCEL,
+                OFF_STD_GYRO,
+                match std_gyro {
+                    Some(g) => format!(
+                        "PRESENT - raw gyro {:+6} {:+6} {:+6} counts ({:+7.1} {:+7.1} {:+7.1} dps). The constructed axes are not needed here.",
+                        g[0], g[1], g[2],
+                        g[0] as f32 / GYRO_LSB_PER_DPS,
+                        g[1] as f32 / GYRO_LSB_PER_DPS,
+                        g[2] as f32 / GYRO_LSB_PER_DPS,
+                    ),
+                    None => "ABSENT (zeros) - rates come from differentiating the fused heading, with all the drift that implies".to_string(),
+                },
+            ));
             crate::dlog::imu(format_args!(
                 "{} accel scale check — ACCEL_LSB_PER_G {} · |accel| {:.3} g ·                  tolerance {:.2} g · gravity {}",
                 side.display_name(),
@@ -1859,7 +1882,7 @@ impl OrientationTracker {
         ];
         self.drift_probe.update(raw_dps, dt, device_still, side);
         self.imu_diag.update(raw_dps, counts, angle, dt, device_still, side,
-                             self.resting_override, ca, gmag);
+                             self.resting_override, ca, gmag, motion.gyro);
 
         // Subtract the reproducible resting drift FIRST, so the estimator only
         // has the session-specific remainder to find — see `RESTING_DRIFT_*`.
