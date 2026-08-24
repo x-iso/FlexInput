@@ -1408,51 +1408,6 @@ fn connect_and_init(
     // discovery log have different clock origins, and the `dlog!` calls around
     // it live in different functions, so neither file nor the source order
     // answers "when does this actually run".
-    // ⭐ The common input, subscribed at its RESOLVED handle and with the reply
-    // actually read.
-    //
-    // ⛔ Both of these were fire-and-forget at a hardcoded number. If the
-    // number was wrong the write landed on an unrelated attribute; if it was
-    // refused the error response was never read. Either way the outcome was a
-    // characteristic recorded as "subscribed and silent" — the exact note that
-    // sat against `0x000a` for the whole gyro search, on two different
-    // controllers, while another project read motion from it on the same
-    // hardware.
-    //
-    // A CCCD sits immediately after the value handle it configures, and the
-    // vendor rate descriptor after that; those offsets are GATT convention and
-    // hold wherever the base handle lands.
-    if let Some(common) = handles.common {
-        for (what, handle, payload) in [
-            ("CCCD", common + 1, &acl::CCCD_NOTIFY[..]),
-            ("rate", common + 2, &protocol::REPORT_RATE_PAYLOAD[..]),
-        ] {
-            match dongle.att_request(
-                conn,
-                &acl::write_request(handle, payload),
-                acl::ATT_WRITE_RESPONSE,
-                ATT_ACK_WAIT,
-            ) {
-                Ok(Some(_)) => crate::dlog::imu(format_args!(
-                    "{} common input {what} write {handle:#06x} acknowledged",
-                    side.display_name()
-                )),
-                Ok(None) => crate::dlog::imu(format_args!(
-                    "{} common input {what} write {handle:#06x} — NO REPLY                      (the attribute may not exist here)",
-                    side.display_name()
-                )),
-                Err(e) => crate::dlog::imu(format_args!(
-                    "{} common input {what} write {handle:#06x} REFUSED: {e}",
-                    side.display_name()
-                )),
-            }
-        }
-    } else {
-        crate::dlog::imu(format_args!(
-            "{} common input NOT PRESENT in this controller's table — nothing              to subscribe to, so report 0x05 cannot be a gyro source here",
-            side.display_name()
-        ));
-    }
 
     // ⭐ The third input stream and the spare notify characteristic, both found
     // by walking the attribute table — see `jc::HANDLE_INPUT_EXTRA`. Same
@@ -1713,6 +1668,70 @@ fn connect_and_init(
                 side.display_name()
             ));
         }
+    }
+
+    // ⛔ **Subscribed LAST, after the features are on — and with NO rate
+    // descriptor.**
+    //
+    // From the reference's initialise(), verbatim, which ends:
+    //
+    //     self._retry("enable features", lambda: self.enable_features(...))
+    //     self._retry("input notifications",
+    //                 lambda: self.att.subscribe(self.h_input_cccd, True))
+    //
+    // Two differences, both mine. The common input was subscribed near the
+    // START of init, before the feature-select that enables motion had been
+    // sent — asking a controller to stream something it had not yet been told
+    // to produce. And a vendor rate descriptor was written to 0x000c because
+    // the per-side input needs one at 0x0010; the reference writes no such
+    // thing here, and an unasked-for write to a vendor descriptor is as likely
+    // to suppress a stream as to start one.
+    //
+    // ❗ The per-side input keeps its rate descriptor. That path works, and
+    // this is not the place to find out whether it needs it.
+    // ⭐ The common input, subscribed at its RESOLVED handle and with the reply
+    // actually read.
+    //
+    // ⛔ Both of these were fire-and-forget at a hardcoded number. If the
+    // number was wrong the write landed on an unrelated attribute; if it was
+    // refused the error response was never read. Either way the outcome was a
+    // characteristic recorded as "subscribed and silent" — the exact note that
+    // sat against `0x000a` for the whole gyro search, on two different
+    // controllers, while another project read motion from it on the same
+    // hardware.
+    //
+    // A CCCD sits immediately after the value handle it configures, and the
+    // vendor rate descriptor after that; those offsets are GATT convention and
+    // hold wherever the base handle lands.
+    if let Some(common) = handles.common {
+        for (what, handle, payload) in [
+            ("CCCD", common + 1, &acl::CCCD_NOTIFY[..]),
+        ] {
+            match dongle.att_request(
+                conn,
+                &acl::write_request(handle, payload),
+                acl::ATT_WRITE_RESPONSE,
+                ATT_ACK_WAIT,
+            ) {
+                Ok(Some(_)) => crate::dlog::imu(format_args!(
+                    "{} common input {what} write {handle:#06x} acknowledged",
+                    side.display_name()
+                )),
+                Ok(None) => crate::dlog::imu(format_args!(
+                    "{} common input {what} write {handle:#06x} — NO REPLY                      (the attribute may not exist here)",
+                    side.display_name()
+                )),
+                Err(e) => crate::dlog::imu(format_args!(
+                    "{} common input {what} write {handle:#06x} REFUSED: {e}",
+                    side.display_name()
+                )),
+            }
+        }
+    } else {
+        crate::dlog::imu(format_args!(
+            "{} common input NOT PRESENT in this controller's table — nothing              to subscribe to, so report 0x05 cannot be a gyro source here",
+            side.display_name()
+        ));
     }
 
     dlog!("init: COMPLETE");
