@@ -6,7 +6,6 @@
 //! files with independent clocks would hide exactly the difference being
 //! looked for.
 
-use std::sync::Mutex;
 use std::time::Instant;
 
 /// Where long-lived logs belong: `%APPDATA%\FlexInput\logs`.
@@ -41,9 +40,18 @@ pub(crate) const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 /// Checking only at startup caps nothing at all.
 pub(crate) struct Sink {
     path: std::path::PathBuf,
-    /// The handle and how many bytes have gone through it.
-    state: Mutex<Option<(std::fs::File, u64)>>,
+    /// Lines queued for the writer thread.
+    ///
+    /// ⛔ **Bounded, and dropped when full — never blocking.** The sender is a
+    /// transport thread servicing a controller at up to 200 Hz.
+    tx: std::sync::mpsc::SyncSender<String>,
 }
+
+/// How many lines may queue before new ones are dropped.
+///
+/// Generous, because the writer only has to keep up on average, and small
+/// enough that a wedged disk cannot consume real memory.
+const QUEUE: usize = 4096;
 
 impl Sink {
     /// Open `name`, honouring `env` (`off` disables), under `dir` with the
@@ -76,9 +84,53 @@ impl Sink {
         };
         for path in candidates {
             rotate(&path);
-            if let Ok(f) = std::fs::File::create(&path) {
-                return Some(Sink { path, state: Mutex::new(Some((f, 0))) });
-            }
+            let Ok(file) = std::fs::File::create(&path) else { continue };
+            let (tx, rx) = std::sync::mpsc::sync_channel::<String>(QUEUE);
+            let thread_path = path.clone();
+            // ⛔ **The file is owned by a thread of its own, and this is not
+            // tidiness.** Writing happened inline on the transport thread, with
+            // a `flush` per line — and the temporary diagnostic is written
+            // BESIDE THE EXE, which on a development build sits inside a
+            // OneDrive-synced tree. Every line was therefore a synchronous
+            // fsync into a directory a sync client can lock for seconds, on the
+            // thread servicing the controller. Reported from hardware as input
+            // freezing for a few seconds at a time.
+            //
+            // A diagnostic that stalls the thing it is diagnosing does not just
+            // cost performance, it manufactures the symptom being investigated.
+            std::thread::Builder::new()
+                .name("jc2-log".into())
+                .spawn(move || {
+                    let mut file = file;
+                    let mut written: u64 = 0;
+                    while let Ok(line) = rx.recv() {
+                        use std::io::Write;
+                        if written > MAX_LOG_BYTES {
+                            let _ = file.flush();
+                            rotate(&thread_path);
+                            match std::fs::File::create(&thread_path) {
+                                Ok(f) => {
+                                    file = f;
+                                    written = 0;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if writeln!(file, "{line}").is_ok() {
+                            written += line.len() as u64 + 1;
+                        }
+                        // ❗ Flushed when the queue goes quiet rather than per
+                        // line: the data still reaches disk promptly, without
+                        // an fsync for every entry.
+                        if rx.try_recv().is_err() {
+                            let _ = file.flush();
+                        }
+                    }
+                    use std::io::Write;
+                    let _ = file.flush();
+                })
+                .ok()?;
+            return Some(Sink { path, tx });
         }
         None
     }
@@ -87,27 +139,10 @@ impl Sink {
         &self.path
     }
 
+    /// Queue a line. Never blocks, and never fails visibly: a dropped
+    /// diagnostic line is preferable to a stalled controller.
     fn write(&self, line: &str) {
-        use std::io::Write;
-        let Ok(mut g) = self.state.lock() else { return };
-        let Some((f, written)) = g.as_mut() else { return };
-        if *written > MAX_LOG_BYTES {
-            // One generation kept, as everywhere else here.
-            let _ = f.flush();
-            *g = None;
-            rotate(&self.path);
-            match std::fs::File::create(&self.path) {
-                Ok(nf) => *g = Some((nf, 0)),
-                // Nothing useful to say from inside a logger; going quiet is
-                // better than a panic or an unbounded file.
-                Err(_) => return,
-            }
-        }
-        let Some((f, written)) = g.as_mut() else { return };
-        if writeln!(f, "{line}").is_ok() {
-            *written += line.len() as u64 + 1;
-            let _ = f.flush();
-        }
+        let _ = self.tx.try_send(line.to_string());
     }
 }
 
