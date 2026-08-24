@@ -777,6 +777,28 @@ fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
         }
     };
 
+    // ⛔ **The whole table, into the log.**
+    //
+    // Subscribing the common input means writing CCCD_NOTIFY to
+    // `HANDLE_INPUT_COMMON + 1`, on the GATT convention that a CCCD follows the
+    // value it configures. That write is acknowledged every time — but a write
+    // to ANY writable attribute is acknowledged, so the acknowledgement has
+    // never been evidence that 0x000b is a CCCD at all. If a vendor descriptor
+    // sits there instead, we have been enabling notifications on nothing and
+    // being told it worked, which fits every observation so far.
+    //
+    // The walk already has the answer in hand; it was throwing it away and
+    // keeping three handles. Printing it costs nothing and settles what 0x000b
+    // and 0x000c actually are — 0x2902 is a CCCD, anything else is not.
+    for a in &attrs {
+        crate::dlog::imu(format_args!(
+            "{} attr {:#06x} = {}",
+            side.display_name(),
+            a.handle,
+            a.uuid,
+        ));
+    }
+
     // ⭐ The TYPE of a characteristic value attribute IS the characteristic's
     // UUID, so a Find Information walk resolves handles on its own.
     let find = |want: uuid::Uuid| -> Option<u16> {
