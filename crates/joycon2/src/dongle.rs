@@ -786,6 +786,9 @@ fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
     if let Some(v) = find(cmd) {
         h.cmd = v;
     }
+    // ❗ The walk is capped at 600 ms and was spending all of it. Stopping as
+    // soon as the three characteristics are in hand takes a fixed cost off
+    // every connect, and connect time is what the link watchdog measures.
     match find(protocol::CHR_INPUT_COMMON) {
         Some(v) => {
             h.common = Some(v);
@@ -1196,10 +1199,37 @@ fn connect_and_init(
     // different device configures whatever attribute happens to sit there.
     let handles = resolve_handles(dongle, conn, side);
 
-    dongle.send_att(
-        conn,
-        &acl::write_request(handles.input + 1, &acl::CCCD_NOTIFY),
-    )?;
+    // ⭐ **Whether the per-side stream is subscribed at all is now a choice.**
+    //
+    // ⛔ The reference subscribes its input characteristic LAST, after the
+    // motion enable, and subscribes only ONE. FlexInput subscribes the per-side
+    // input FIRST and then asks for the common one too — and the common one has
+    // never sent a byte, on any controller, even with every write accepted.
+    //
+    // ❗ "Accepted" there means an ATT Write Response came back: the write
+    // reached the attribute. It says nothing about the controller acting on it.
+    // A plausible reading of the silence is that the controller emits ONE input
+    // stream and picks it from what is already subscribed when the enable
+    // lands — in which case subscribing the per-side report first settles the
+    // question before the enable is even sent.
+    //
+    // FLEXINPUT_JC2_COMMON=only tests exactly that: skip the per-side
+    // subscription entirely and take the common stream or nothing. Off by
+    // default, because the per-side path is the one that currently works and a
+    // hypothesis should not cost anyone their controllers.
+    let common_only = std::env::var("FLEXINPUT_JC2_COMMON")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("only"));
+    if common_only {
+        crate::dlog::imu(format_args!(
+            "{} FLEXINPUT_JC2_COMMON=only — per-side input NOT subscribed;              the common stream is the only source this run",
+            side.display_name()
+        ));
+    } else {
+        dongle.send_att(
+            conn,
+            &acl::write_request(handles.input + 1, &acl::CCCD_NOTIFY),
+        )?;
+    }
     dongle.send_att(
         conn,
         &acl::write_request(jc::HANDLE_CMD_RESPONSE_CCCD, &acl::CCCD_NOTIFY),
