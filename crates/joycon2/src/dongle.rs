@@ -97,9 +97,8 @@ struct Link {
     orientation: OrientationTracker,
     /// ⏳ TEMPORARY — slow timer for the 0x000a presence line.
     common_probe: Instant,
-    /// ⏳ TEMPORARY — last `(payload len, motion_len)`, to spot a second
-    /// report shape arriving on the same characteristic.
-    last_shape: (usize, u8),
+    /// ⏳ TEMPORARY — slow timer for the whole-frame dump.
+    frame_dump: Instant,
     /// Latest real gyro (and its accel) from the common input, if it streams.
     common_motion: Option<([i16; 3], Option<[i16; 3]>)>,
     last_input: Instant,
@@ -733,8 +732,12 @@ fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
     // whatever it spends is time the controller is connected and silent — and
     // the link watchdog is three seconds. See `discover_characteristics`.
     let began = Instant::now();
-    let chars = match dongle.discover_characteristics(conn, Duration::from_millis(600)) {
-        Ok(c) if !c.is_empty() => c,
+    // ⛔ Find Information, NOT Read By Type. A Joy-Con 2 grip does not answer
+    // Read By Type at all — "no reply within 2 s", every connect — which both
+    // wasted the budget and, before it was bounded, cost the link. The GATT
+    // scan has always walked the table this way and always worked.
+    let attrs = match dongle.discover_attributes(conn, Duration::from_millis(600)) {
+        Ok(a) if !a.is_empty() => a,
         other => {
             let why = match other {
                 Ok(_) => "the table was empty".to_string(),
@@ -751,37 +754,44 @@ fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
         }
     };
 
-    let find = |want: uuid::Uuid| -> Option<&acl::CharDecl> {
-        chars.iter().find(|c| match c.uuid {
-            // ATT carries 128-bit UUIDs little-endian; `uuid::Uuid` bytes are
-            // big-endian, so one side has to be reversed to compare them.
-            acl::AttUuid::Long(raw) => {
-                let mut be = raw;
-                be.reverse();
-                uuid::Uuid::from_bytes(be) == want
-            }
-            acl::AttUuid::Short(_) => false,
-        })
+    // ⭐ The TYPE of a characteristic value attribute IS the characteristic's
+    // UUID, so a Find Information walk resolves handles on its own.
+    let find = |want: uuid::Uuid| -> Option<u16> {
+        attrs
+            .iter()
+            .find(|a| match a.uuid {
+                // ATT carries 128-bit UUIDs little-endian; `uuid::Uuid` bytes
+                // are big-endian, so one side has to be reversed to compare.
+                acl::AttUuid::Long(raw) => {
+                    let mut be = raw;
+                    be.reverse();
+                    uuid::Uuid::from_bytes(be) == want
+                }
+                acl::AttUuid::Short(_) => false,
+            })
+            .map(|a| a.handle)
     };
 
     let per_side = match side {
         Side::Left => protocol::CHR_INPUT_L,
         Side::Right => protocol::CHR_INPUT_R,
     };
-    if let Some(c) = find(per_side) {
-        h.input = c.value_handle;
+    if let Some(v) = find(per_side) {
+        h.input = v;
     }
     let cmd = match side {
         Side::Left => protocol::CHR_RUMBLE_CMD_L,
         Side::Right => protocol::CHR_RUMBLE_CMD_R,
     };
-    if let Some(c) = find(cmd) {
-        h.cmd = c.value_handle;
+    if let Some(v) = find(cmd) {
+        h.cmd = v;
     }
     match find(protocol::CHR_INPUT_COMMON) {
-        Some(c) => {
-            h.common = Some(c.value_handle);
-            h.common_notifiable = c.notifiable();
+        Some(v) => {
+            h.common = Some(v);
+            // Find Information does not carry properties; the declaration walk
+            // did. Not knowing is not a reason to refuse to subscribe.
+            h.common_notifiable = true;
         }
         None => {
             // ⭐ Absent from the table is a different fact from present and
@@ -1541,7 +1551,7 @@ fn connect_and_init(
         calib: StickCalib::default(),
         orientation: OrientationTracker::default(),
         common_probe: Instant::now(),
-        last_shape: (0, 0),
+        frame_dump: Instant::now(),
         common_motion: None,
         last_input: Instant::now(),
         reports: 0,
@@ -1773,37 +1783,28 @@ fn pump(
         let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) else {
             continue;
         };
-        // ⏳ TEMPORARY. ⛔ **Two report shapes are arriving on this
-        // characteristic and we decode both with one layout.**
+        // ⏳ TEMPORARY. The WHOLE frame, periodically.
         //
-        // A field log from retail Joy-Con 2s shows roughly every OTHER frame
-        // decoding to an impossible accelerometer — 2.8 g, 5.8 g, 8.7 g with
-        // the controller flat on a table — and the bad values are almost all
-        // multiples of 256, which is the signature of a read landing one byte
-        // off. Every constant that could do that (`left_shift`, the motion
-        // offsets) was measured on a single third-party grip.
+        // ⛔ The previous version of this logged a "frame shape" from byte
+        // 0x0f and reported two alternating shapes. There is only one: byte
+        // 0x0f is the motion TIMESTAMP, which steps by four every report, and
+        // the motion-length byte for the left half sits one earlier at 0x0e
+        // where it reads a constant 30. A discriminator invented from a
+        // counter will always look like two formats.
         //
-        // The consequence is not cosmetic: stillness calls `interrupt()`
-        // whenever |accel| leaves 1 g, so one bad frame in two resets the
-        // settle counter forever and baseline capture cancels the instant it
-        // starts — reported from the field, twice.
-        //
-        // ❗ The discriminator is what is missing, and guessing it would risk
-        // breaking the grip that DOES work. So this logs the shape of a frame
-        // whenever it changes: payload length, the motion-length byte, and the
-        // head of the buffer. Two alternating shapes will name themselves in
-        // seconds. Remove with the rest of the diagnostic.
-        {
-            let len = n.value.len();
-            let mlen = n.value.get(0x0f).copied().unwrap_or(0);
-            if (len, mlen) != link.last_shape {
-                link.last_shape = (len, mlen);
-                crate::dlog::imu(format_args!(
-                    "{} FRAME SHAPE len {len} motion_len {mlen:#04x} head {:02x?}",
-                    link.key.side.display_name(),
-                    &n.value[..len.min(20)],
-                ));
-            }
+        // ❗ So this prints the entire 63 bytes instead of a summary of them.
+        // Every offset question so far — accel stride, the per-side one-byte
+        // shift, whether retail lays the block out the same way — is answerable
+        // from the raw frame and from nothing less. Once every ten seconds
+        // costs a few hundred bytes and no judgement about what matters.
+        if link.frame_dump.elapsed() >= Duration::from_secs(10) {
+            link.frame_dump = Instant::now();
+            crate::dlog::imu(format_args!(
+                "{} FRAME len {} {:02x?}",
+                link.key.side.display_name(),
+                n.value.len(),
+                &n.value[..],
+            ));
         }
         let Some(snap) = reports::parse_input(link.key.side, &n.value) else {
             link.unparsed = link.unparsed.saturating_add(1);

@@ -129,7 +129,7 @@ fn main() {
         std::thread::sleep(Duration::from_millis(300));
 
         // NOW subscribe the inputs.
-        let attrs = dongle.discover_attributes(conn).unwrap_or_default();
+        let attrs = dongle.discover_attributes(conn, std::time::Duration::from_secs(10)).unwrap_or_default();
         let mut watched = Vec::new();
         for a in attrs.iter().filter(|a| a.uuid == acl::AttUuid::Short(acl::GATT_CCCD)) {
             if a.handle == jc::HANDLE_CMD_RESPONSE_CCCD {

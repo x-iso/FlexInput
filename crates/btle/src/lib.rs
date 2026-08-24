@@ -2220,18 +2220,38 @@ impl Dongle {
     /// characteristic Windows never subscribed to leaves no trace in one, so
     /// "not in the capture" and "not on the device" are indistinguishable
     /// without an actual walk.
-    pub fn discover_attributes(&self, conn_handle: u16) -> Result<Vec<acl::AttrInfo>> {
+    /// ⭐ **Find Information, which these controllers actually answer.**
+    ///
+    /// Read By Type is the tidier request — it returns properties and value
+    /// handles in one pass — but a Joy-Con 2 grip does not reply to it at all:
+    /// "no reply to Read By Type Request within 2 s", every time. The GATT scan
+    /// has always walked the table with Find Information and always worked.
+    ///
+    /// For resolving a characteristic by UUID this is enough on its own: the
+    /// TYPE of a characteristic value attribute is the characteristic's own
+    /// UUID, so a handle and a 128-bit type is exactly the pair needed.
+    ///
+    /// `budget` is a hard wall-clock limit — see `discover_characteristics`.
+    pub fn discover_attributes(
+        &self,
+        conn_handle: u16,
+        budget: Duration,
+    ) -> Result<Vec<acl::AttrInfo>> {
         let mut out: Vec<acl::AttrInfo> = Vec::new();
         let mut start: u16 = 0x0001;
+        let deadline = std::time::Instant::now() + budget;
         // Bounded so a peer that keeps answering cannot spin forever; an
         // attribute table this stack cares about is a few dozen entries.
         for _ in 0..64 {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
             let req = acl::find_information_request(start, 0xFFFF);
             let rsp = match self.att_request(
                 conn_handle,
                 &req,
                 acl::ATT_FIND_INFORMATION_RESPONSE,
-                Duration::from_secs(2),
+                left.min(Duration::from_millis(400)),
             )? {
                 Some(r) => r,
                 // A timeout on the FIRST request is a failure worth naming; a

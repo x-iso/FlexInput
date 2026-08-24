@@ -4485,7 +4485,7 @@ fn subscribe_all(dongle: &Dongle, conn: u16, side: &str, opts: &Opts) -> Discove
             Vec::new()
         }
     };
-    let attrs = match dongle.discover_attributes(conn) {
+    let attrs = match dongle.discover_attributes(conn, std::time::Duration::from_secs(10)) {
         Ok(a) if !a.is_empty() => {
             println!("[imu] {side}: Find Information walk found {} attribute(s)", a.len());
             // The raw table, printed whenever it is available. This is the

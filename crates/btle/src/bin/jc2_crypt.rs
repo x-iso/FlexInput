@@ -357,7 +357,7 @@ fn main() {
     }
 
     // ── Now subscribe the inputs and see who talks ───────────────────────────
-    let attrs = match dongle.discover_attributes(conn) {
+    let attrs = match dongle.discover_attributes(conn, std::time::Duration::from_secs(10)) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("discovery failed after encryption: {e}");
