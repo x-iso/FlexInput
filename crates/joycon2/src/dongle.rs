@@ -91,6 +91,8 @@ struct Link {
     conn: u16,
     calib: StickCalib,
     orientation: OrientationTracker,
+    /// ⏳ TEMPORARY — slow timer for the 0x000a presence line.
+    common_probe: Instant,
     last_input: Instant,
     /// Reports parsed on this link, for the backoff in the motion diagnostic.
     reports: u32,
@@ -1285,6 +1287,7 @@ fn connect_and_init(
         conn,
         calib: StickCalib::default(),
         orientation: OrientationTracker::default(),
+        common_probe: Instant::now(),
         last_input: Instant::now(),
         reports: 0,
         extra_reports: 0,
@@ -1419,6 +1422,47 @@ fn pump(
                         n.value.len(),
                         &n.value[..n.value.len().min(64)],
                     );
+                    // ⏳ TEMPORARY, and the single most valuable line this log
+                    // can carry.
+                    //
+                    // ⭐ **This characteristic is where a real gyro would be.**
+                    // The per-side stream has been shown to contain no angular
+                    // rate at all, so every rate FlexInput reports is
+                    // differentiated from a fused heading — which is why yaw
+                    // needs a x4 fudge for its frequency response. Both working
+                    // PC implementations read motion from HERE instead, as six
+                    // contiguous i16 at 0x30 (accel) and 0x36 (gyro).
+                    //
+                    // ❗ It has never notified on the reference M12-S grip, so
+                    // nobody knows whether retail hardware gates it differently.
+                    // If these lines appear on a genuine Joy-Con 2, the whole
+                    // constructed-axis approach can be replaced by the real
+                    // thing. Decoded inline because "did it notify" and "is
+                    // there sensible motion in it" are one question in practice.
+                    let i16_at = |off: usize| -> Option<i16> {
+                        let b = n.value.get(off..off + 2)?;
+                        Some(i16::from_le_bytes([b[0], b[1]]))
+                    };
+                    let six = (0..6)
+                        .map(|i| i16_at(0x30 + i * 2))
+                        .collect::<Option<Vec<_>>>();
+                    match six {
+                        Some(v) => crate::dlog::imu(format_args!(
+                            "{} COMMON INPUT (0x000a) #{} len {} | accel {:>7} {:>7} {:>7}                              | gyro {:>7} {:>7} {:>7} | raw {:02x?}",
+                            link.key.side.display_name(),
+                            link.common_reports,
+                            n.value.len(),
+                            v[0], v[1], v[2], v[3], v[4], v[5],
+                            &n.value[..n.value.len().min(64)],
+                        )),
+                        None => crate::dlog::imu(format_args!(
+                            "{} COMMON INPUT (0x000a) #{} len {} — TOO SHORT for the                              0x30/0x36 motion block | raw {:02x?}",
+                            link.key.side.display_name(),
+                            link.common_reports,
+                            n.value.len(),
+                            &n.value[..n.value.len().min(64)],
+                        )),
+                    }
                 }
             }
             continue;
@@ -1478,6 +1522,22 @@ fn pump(
         // captured one. Pushed every report rather than at connect: a capture
         // that finishes while the pad is streaming must take effect at once,
         // and an unchanged value costs one read lock.
+        // ⏳ TEMPORARY. ⛔ Silence in a log is ambiguous — "0x000a never
+        // notified" and "this build does not log it" look identical, and the
+        // first is the finding. So absence is stated, on a slow timer.
+        if link.common_probe.elapsed() >= Duration::from_secs(30) {
+            link.common_probe = Instant::now();
+            crate::dlog::imu(format_args!(
+                "{} common input (0x000a): {} report(s) so far{}",
+                link.key.side.display_name(),
+                link.common_reports,
+                if link.common_reports == 0 {
+                    " — SUBSCRIBED AND SILENT, so rates stay differentiated from                      the fused heading"
+                } else {
+                    ""
+                },
+            ));
+        }
         link.orientation.set_resting_drift(crate::cal::field_drift(&link.key));
         let o = link.orientation.update(&snap.motion, link.key.side);
         let gyro = o.rate_dps;
