@@ -1478,9 +1478,44 @@ fn connect_and_init(
     // one of them was a stub: `motion_len = 0`, all fields zero. Downstream
     // that reads as a dead accelerometer, several layers from the cause.
     debug_assert!(jc::executes_commands(jc::HANDLE_CMD_WRITE));
+    // ⛔ **The last structural difference from the working reference.**
+    //
+    // Everything else about the common input now checks out and it is still
+    // silent: the handle is right, 0x000b is a real CCCD, the rate descriptor
+    // matches the per-side one, the write is acknowledged, and its declaration
+    // reads properties 0x12 — READ|NOTIFY, byte for byte identical to the
+    // per-side input that streams perfectly.
+    //
+    // So the characteristic can notify and nothing we send makes it. The one
+    // thing left that differs: the reference drives its WHOLE session through
+    // `649d4ac9-…` (0x0014) with bare frames, while this drives
+    // `65a724b3-…` (0x0016) with a 17-byte rumble prefix and only mirrors the
+    // feature-select onto 0x0014.
+    //
+    // ❗ 0x0014 was once written off as inert — commands there "moved nothing"
+    // while the same command on 0x0016 visibly worked. But that was judged on
+    // LEDs and buzzes, which are per-side effects, and a stream-selection bit
+    // need not have any visible effect at all. Inert for rumble does not mean
+    // inert for everything.
+    //
+    // FLEXINPUT_JC2_CMD=common routes the entire init there, unprefixed, the
+    // way the reference does. If the LEDs stop responding it is inert and this
+    // is settled; if the common input starts streaming, it never was.
+    let cmd_common = std::env::var("FLEXINPUT_JC2_CMD")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("common"));
+    crate::dlog::imu(format_args!(
+        "{} command channel: {} ({})",
+        side.display_name(),
+        if cmd_common { "0x0014 BARE (reference)" } else { "0x0016 prefixed (default)" },
+        if cmd_common { "FLEXINPUT_JC2_CMD=common" } else { "set FLEXINPUT_JC2_CMD=common to try the reference path" },
+    ));
     let cmd = |c: u8, s: u8, data: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
-        let frame = protocol::rumble_cmd_frame(c, s, data);
-        dongle.send_att(conn, &acl::write_command(jc::HANDLE_CMD_WRITE, &frame))?;
+        let (handle, frame) = if cmd_common {
+            (jc::HANDLE_CMD_WRITE_COMMON, protocol::command(c, s, data))
+        } else {
+            (jc::HANDLE_CMD_WRITE, protocol::rumble_cmd_frame(c, s, data))
+        };
+        dongle.send_att(conn, &acl::write_command(handle, &frame))?;
         // ⭐ Keep draining while we wait, rather than sleeping blind.
         //
         // Initialising the SECOND controller takes about three seconds, and for
