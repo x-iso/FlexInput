@@ -46,7 +46,7 @@
 //! the radio at all.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -131,6 +131,9 @@ pub struct Radio {
     bus: Bus,
     /// Held while a transport is running a request/response conversation.
     exclusive: Mutex<()>,
+    /// When ACL last arrived, as millis since `started` — see `quiet_for`.
+    last_acl_ms: AtomicU64,
+    started: Instant,
     /// Set when the router should stop reading, so a lease is not kept waiting
     /// behind a read that is already in flight.
     paused: AtomicBool,
@@ -180,6 +183,26 @@ impl Drop for Lease<'_> {
 
 impl Radio {
     /// Take an exclusive lease for a setup conversation.
+    /// How long since ANY transport last received an ACL packet.
+    ///
+    /// ⛔ **The radio is shared, and an exclusive lease is a blackout.** While
+    /// one transport holds a lease the router stops reading, so every other
+    /// transport's link goes unserviced for the whole operation — and a
+    /// speculative page at a controller that is switched off costs seconds.
+    ///
+    /// Traced from a user report of Joy-Cons freezing for a few seconds at a
+    /// regular interval: the classic transport was paging a powered-off pad
+    /// every 20 s, holding the lease for 2 s each time, and the LE links simply
+    /// stopped being read for that whole window. Nothing was wrong with either
+    /// link; one transport was starving the other by design.
+    ///
+    /// So a transport about to do something long can ask whether anyone else is
+    /// mid-conversation, and stay out of the way if so.
+    pub fn quiet_for(&self) -> Duration {
+        let ms = self.last_acl_ms.load(Ordering::Relaxed);
+        Duration::from_millis(self.started.elapsed().as_millis().saturating_sub(ms as u128) as u64)
+    }
+
     pub fn exclusive(&self) -> Lease<'_> {
         // Asked for BEFORE the lock so the router notices and stops reading
         // rather than being discovered mid-transfer.
@@ -433,6 +456,8 @@ fn open_and_start(vid: u16, pid: u16) -> Result<Arc<Radio>> {
         dongle,
         bus: Bus::default(),
         exclusive: Mutex::new(()),
+        last_acl_ms: AtomicU64::new(0),
+        started: Instant::now(),
         paused: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
     });
@@ -505,6 +530,9 @@ fn route(radio: Arc<Radio>) {
             idle = false;
         }
         if let Ok(Some(p)) = radio.dongle.read_acl(Duration::from_millis(2)) {
+            radio
+                .last_acl_ms
+                .store(radio.started.elapsed().as_millis() as u64, Ordering::Relaxed);
             radio.broadcast(Inbound::Acl(p));
             idle = false;
         }

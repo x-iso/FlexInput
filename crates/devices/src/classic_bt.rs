@@ -116,6 +116,9 @@ struct Shared {
     yielded: AtomicBool,
     /// Same, for "enabled but nothing is paired".
     said_empty: AtomicBool,
+    /// Said once when this transport stands aside for another — see the page
+    /// gate. Repeating it every pass would be a firehose.
+    yielded_radio: AtomicBool,
     /// Set by the worker once it has disconnected everything and returned.
     stopped: AtomicBool,
 }
@@ -520,7 +523,33 @@ fn run_inner(shared: &Arc<Shared>) {
         // attempt costs `CONNECT_PATIENCE` of this thread, and trying four
         // switched-off controllers back to back would stall the ones that are
         // on for twelve seconds.
-        if Instant::now() >= next_try && links.len() < MAX_LINKS {
+        // ⛔ **Never black out a radio somebody else is using.**
+        //
+        // A page holds an exclusive lease, and an exclusive lease stops the
+        // router — so every OTHER transport's link goes unserviced for its
+        // whole duration. Paging a switched-off controller every 20 s for 2 s
+        // at a time froze connected Joy-Cons for two seconds in every twenty,
+        // reported as random dropouts and chased as radio instability. Neither
+        // link was faulty; this transport was starving the other one on a
+        // timer.
+        //
+        // ❗ Deliberately generous. Half a second of silence means the other
+        // transport really has stopped, not that we caught it between packets:
+        // a streaming controller sends every few milliseconds, so this cannot
+        // be tripped by ordinary jitter, and being wrong costs only a delayed
+        // reconnection of a pad that is switched off anyway.
+        let someone_streaming = r.quiet_for() < Duration::from_millis(500);
+        if someone_streaming && links.is_empty() {
+            if !shared.yielded_radio.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[bt-classic] another transport is streaming — not paging                      while it is, so its link is not interrupted."
+                );
+            }
+            next_try = Instant::now() + Duration::from_secs(2);
+        } else {
+            shared.yielded_radio.store(false, Ordering::Relaxed);
+        }
+        if !someone_streaming && Instant::now() >= next_try && links.len() < MAX_LINKS {
             // With a link up the lease belongs to the controller that is
             // actually playing; with none, to listening for one.
             let gap = if links.is_empty() { PAGE_EAGER } else { PAGE_FALLBACK };
