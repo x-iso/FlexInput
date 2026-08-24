@@ -1578,10 +1578,13 @@ fn connect_and_init(
                 std::thread::sleep(INIT_GAP);
             }
         }
-        None => eprintln!(
-            "[jc2-dongle] feature-select SKIPPED (reference behaviour) — \
-             set FLEXINPUT_JC2_FEATURES=2f to send it"
-        ),
+        None => {
+            eprintln!("[jc2-dongle] feature-select SKIPPED by FLEXINPUT_JC2_FEATURES=off");
+            crate::dlog::imu(format_args!(
+                "{} feature-select SKIPPED (FLEXINPUT_JC2_FEATURES=off)",
+                side.display_name()
+            ));
+        }
     }
 
     dlog!("init: COMPLETE");
