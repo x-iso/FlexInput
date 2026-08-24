@@ -799,6 +799,56 @@ fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
         ));
     }
 
+    // ⛔ **Can 0x000a notify AT ALL?**
+    //
+    // Everything checks out and nothing arrives: the handle is right, 0x000b
+    // really is a `0x2902` CCCD, the write is acknowledged, the layout matches
+    // the per-side pair that works. The one property never measured is whether
+    // the characteristic declares NOTIFY in the first place — and this
+    // project's own notes contradict each other on it, one calling 0x000a
+    // `READ|NOTIFY` and another `Read Not Permitted`.
+    //
+    // A characteristic declaration (`0x2803`) sits immediately before its
+    // value and holds `properties | value_handle | uuid`. Reading the two
+    // declarations and comparing them answers it outright: if the common input
+    // lacks bit 0x10 while the per-side one has it, it cannot notify however it
+    // is configured, and every attempt to make it has been addressed to a
+    // characteristic that was never going to.
+    let read_decl = |value_handle: u16, what: &str| {
+        let decl = value_handle.saturating_sub(1);
+        if dongle.send_att(conn, &acl::read_request(decl)).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            for pkt in dongle.drain_acl(32) {
+                if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
+                    continue;
+                }
+                let Some(v) = acl::parse_read_response(&pkt.payload) else { continue };
+                let props = v.first().copied().unwrap_or(0);
+                crate::dlog::imu(format_args!(
+                    "{} {what} declaration {decl:#06x}: properties {props:#04x}                      (read {} write-no-rsp {} write {} NOTIFY {} indicate {}) raw {:02x?}",
+                    side.display_name(),
+                    props & 0x02 != 0,
+                    props & 0x04 != 0,
+                    props & 0x08 != 0,
+                    props & 0x10 != 0,
+                    props & 0x20 != 0,
+                    &v[..v.len().min(24)],
+                ));
+                return;
+            }
+        }
+        crate::dlog::imu(format_args!(
+            "{} {what} declaration {decl:#06x}: NO REPLY to the read",
+            side.display_name()
+        ));
+    };
+    let _ = dongle.drain_acl(64);
+    read_decl(jc::HANDLE_INPUT_COMMON, "common input");
+    read_decl(jc::HANDLE_INPUT_VALUE, "per-side input (known good)");
+
     // ⭐ The TYPE of a characteristic value attribute IS the characteristic's
     // UUID, so a Find Information walk resolves handles on its own.
     let find = |want: uuid::Uuid| -> Option<u16> {
