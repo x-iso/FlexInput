@@ -100,6 +100,8 @@ struct Link {
     /// ⏳ TEMPORARY — last `(payload len, motion_len)`, to spot a second
     /// report shape arriving on the same characteristic.
     last_shape: (usize, u8),
+    /// Latest real gyro (and its accel) from the common input, if it streams.
+    common_motion: Option<([i16; 3], Option<[i16; 3]>)>,
     last_input: Instant,
     /// Reports parsed on this link, for the backoff in the motion diagnostic.
     reports: u32,
@@ -1222,6 +1224,54 @@ fn connect_and_init(
         conn,
         &acl::write_request(jc::HANDLE_CMD_RESPONSE_PERSIDE_CCCD, &acl::CCCD_NOTIFY),
     )?;
+    // ⭐ **Turn the common stream ON before subscribing to it.**
+    //
+    // ⛔ This is the step that was missing, and the reason `0x000a` was
+    // recorded as "subscribed and silent" for the whole gyro search. FlexInput
+    // enables features with `0x0C` on the per-side rumble+command channel,
+    // which visibly works — it starts the per-side report. It simply enables a
+    // DIFFERENT stream. Every working PC implementation sends `0x03` on the
+    // BASIC command channel instead, twice: subcommand `0x00` to initialise
+    // and `0x01` to enable, each carrying the feature flags.
+    //
+    // The report that follows carries a real angular rate at 0x30/0x36, which
+    // is what every workaround downstream exists to substitute for.
+    //
+    // ❗ Order matters and is taken from the reference: enable FIRST, subscribe
+    // second. Both writes are acknowledged so a refusal is visible rather than
+    // inferred from silence, and neither is fatal — a controller that refuses
+    // still streams the per-side report exactly as before.
+    for (what, sub_id) in [
+        ("init", protocol::SUB_ENABLE_INIT),
+        ("start", protocol::SUB_ENABLE_START),
+    ] {
+        let frame = protocol::command(
+            protocol::CMD_ENABLE,
+            sub_id,
+            &protocol::enable_payload(protocol::ENABLE_FLAGS),
+        );
+        match dongle.att_request(
+            conn,
+            &acl::write_request(jc::HANDLE_CMD_WRITE_COMMON, &frame),
+            acl::ATT_WRITE_RESPONSE,
+            Duration::from_millis(400),
+        ) {
+            Ok(Some(_)) => crate::dlog::imu(format_args!(
+                "{} motion enable {what} (0x03/{sub_id:#04x} flags {:#04x}) ACCEPTED",
+                side.display_name(),
+                protocol::ENABLE_FLAGS,
+            )),
+            Ok(None) => crate::dlog::imu(format_args!(
+                "{} motion enable {what} — NO REPLY",
+                side.display_name()
+            )),
+            Err(e) => crate::dlog::imu(format_args!(
+                "{} motion enable {what} REFUSED: {e}",
+                side.display_name()
+            )),
+        }
+    }
+
     // ⭐ The common input, subscribed at its RESOLVED handle and with the reply
     // actually read.
     //
@@ -1492,6 +1542,7 @@ fn connect_and_init(
         orientation: OrientationTracker::default(),
         common_probe: Instant::now(),
         last_shape: (0, 0),
+        common_motion: None,
         last_input: Instant::now(),
         reports: 0,
         extra_reports: 0,
@@ -1621,6 +1672,20 @@ fn pump(
         {
             if let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) {
                 link.common_reports = link.common_reports.saturating_add(1);
+                // ⭐ **The real angular rate, kept for the next per-side
+                // report.**
+                //
+                // Merged rather than used wholesale: the per-side report is
+                // what buttons, sticks, mouse and battery already come from and
+                // it works, so this changes only the one field that was
+                // missing. `OrientationTracker::update` ALREADY prefers
+                // `motion.gyro` over the constructed axes when it is present —
+                // so supplying it here retires the differentiated heading, the
+                // x4 yaw gain and the smoothing window in one step, with no
+                // change to the pipeline below.
+                if let Some(common) = reports::parse_common_input(link.key.side, &n.value) {
+                    link.common_motion = common.motion.gyro.map(|g| (g, common.motion.std_accel));
+                }
                 if link.common_reports.is_power_of_two() {
                     eprintln!(
                         "[jc2-dongle] {} ⭐ COMMON INPUT #{} ({} bytes): {:02x?}",
@@ -1753,6 +1818,19 @@ fn pump(
             }
             continue;
         };
+        // ⭐ Inject the real rate, if the common stream is running.
+        //
+        // ❗ `mut` from here on purely for this. Everything downstream is
+        // unchanged: the tracker already prefers `motion.gyro` when it exists,
+        // so this is the single line that switches the whole orientation path
+        // from a differentiated heading to a rate sensor.
+        let mut snap = snap;
+        if let Some((gyro, accel)) = link.common_motion {
+            snap.motion.gyro = Some(gyro);
+            if let Some(a) = accel {
+                snap.motion.std_accel = Some(a);
+            }
+        }
         let stick = link.calib.normalize(snap.stick_raw);
         // Orientation from gravity (roll, pitch) and the heading field (yaw),
         // differenced into a rate. No zero-rate correction step any more:

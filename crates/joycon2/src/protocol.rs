@@ -194,6 +194,41 @@ pub const CMD_PAIRING_EXTRA: u8 = 0x03;
 pub const CMD_UNKNOWN_07: u8 = 0x07;
 pub const CMD_PLAYER_LEDS: u8 = 0x09;
 pub const CMD_VIBRATION: u8 = 0x0A;
+/// ⭐ **The command that turns on the COMMON input stream, and the whole
+/// reason `0x000a` never notified.**
+///
+/// FlexInput enables features with [`CMD_FEATURE_SELECT`] (`0x0C`) on the
+/// per-side rumble+command channel, and that visibly works — the per-side
+/// report starts, buttons and sticks arrive. It simply enables a different
+/// stream. Every working PC implementation instead sends `0x03` on the BASIC
+/// command channel (`0x0014`), twice: subcommand `0x00` to initialise and
+/// `0x01` to enable, each carrying the feature flags padded to four bytes.
+///
+/// ❗ The report that follows is the one with a REAL GYRO in it — six
+/// contiguous `i16` at `0x30`/`0x36` — rather than the fused heading fields
+/// this project has been differentiating. Every downstream workaround exists
+/// because of that: the constructed axes, the x4 yaw gain, the smoothing
+/// window and its group delay.
+///
+/// Source: `trevlars/switch2-controllers-linux`, `ngc/device.py`.
+pub const CMD_ENABLE: u8 = 0x03;
+/// `0x03` subcommands: initialise, then enable. Both are sent, in this order.
+pub const SUB_ENABLE_INIT: u8 = 0x00;
+pub const SUB_ENABLE_START: u8 = 0x01;
+
+/// Feature bits for [`CMD_ENABLE`]. NOT the same numbering as `0x0C`'s.
+pub const ENABLE_FEATURE_MOTION: u8 = 0x04;
+pub const ENABLE_FEATURE_MOUSE: u8 = 0x10;
+pub const ENABLE_FEATURE_MAGNETOMETER: u8 = 0x80;
+
+/// What the reference sends: the base bits plus motion.
+pub const ENABLE_FLAGS: u8 = 0x03 | ENABLE_FEATURE_MOTION;
+
+/// The four-byte flags payload [`CMD_ENABLE`] carries.
+pub fn enable_payload(flags: u8) -> [u8; 4] {
+    [flags, 0, 0, 0]
+}
+
 pub const CMD_FEATURE_SELECT: u8 = 0x0C;
 pub const CMD_UNKNOWN_10: u8 = 0x10;
 pub const CMD_UNKNOWN_11: u8 = 0x11;
@@ -549,6 +584,27 @@ mod tests {
             command(CMD_FEATURE_SELECT, SUB_FEATURE_INIT, &[feature::JOYCON2_DEFAULT, 0, 0, 0]),
             vec![0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00],
         );
+    }
+
+    /// ⛔ The enable command must match the reference byte for byte.
+    ///
+    /// This is what starts the common input stream, and it goes UNPREFIXED to
+    /// the basic command channel — the 17 zero bytes belong to the per-side
+    /// rumble+command handle. Getting either wrong reproduces the silence this
+    /// was written to end.
+    #[test]
+    fn the_motion_enable_matches_the_reference_frame() {
+        assert_eq!(ENABLE_FLAGS, 0x07, "base bits plus motion");
+        assert_eq!(enable_payload(ENABLE_FLAGS), [0x07, 0, 0, 0], "flags pad to four");
+
+        let init = command(CMD_ENABLE, SUB_ENABLE_INIT, &enable_payload(ENABLE_FLAGS));
+        assert_eq!(
+            init,
+            vec![0x03, 0x91, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00]
+        );
+        let start = command(CMD_ENABLE, SUB_ENABLE_START, &enable_payload(ENABLE_FLAGS));
+        assert_eq!(start[3], SUB_ENABLE_START, "second command is the enable");
+        assert_eq!(&start[..3], &[0x03, 0x91, 0x01]);
     }
 
     #[test]

@@ -2337,6 +2337,71 @@ fn parse_buttons(side: Side, b0: u8, b1: u8) -> Buttons {
 
 /// Parse an input notification. Returns `None` if the payload is too short to
 /// contain even buttons and a stick.
+/// Decode the COMMON input report — the one carrying a real angular rate.
+///
+/// ⭐ **A different report with a different layout, from a different
+/// characteristic.** `parse_input` reads the per-side report on `0x000e`,
+/// whose motion block holds fused absolute angles and no rate at all. This
+/// reads the report on `0x000a`, which every working PC implementation uses:
+///
+/// ```text
+///   timestamp 0x00..0x04   buttons  0x04..0x08
+///   left stick 0x0a..0x0d  right    0x0d..0x10
+///   battery mV 0x1f..0x21
+///   accel     0x30..0x36   gyro     0x36..0x3c   triggers 0x3c, 0x3d
+/// ```
+///
+/// ❗ Six contiguous `i16` for accel and gyro — no 4-byte stride, no padding
+/// bytes, no per-side one-byte shift. All of those belong to the other report
+/// and applying them here would produce exactly the kind of plausible nonsense
+/// that cost this project a great deal of time.
+///
+/// Source: `trevlars/switch2-controllers-linux`, `ngc/protocol.py`.
+pub fn parse_common_input(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
+    // The gyro block is the last thing needed; without it this report offers
+    // nothing the per-side one does not already give us.
+    if payload.len() < OFF_STD_GYRO + 6 {
+        return None;
+    }
+    let mut snap = PadSnapshot {
+        buttons: parse_buttons(side, payload[COMMON_OFF_BUTTONS], payload[COMMON_OFF_BUTTONS + 1]),
+        ..Default::default()
+    };
+    let stick = match side {
+        Side::Left => COMMON_OFF_STICK_L,
+        Side::Right => COMMON_OFF_STICK_R,
+    };
+    if payload.len() >= stick + 3 {
+        snap.stick_raw = unpack_stick(&payload[stick..stick + 3]);
+    }
+    let read3 = |off: usize| {
+        [
+            i16le(payload, off),
+            i16le(payload, off + 2),
+            i16le(payload, off + 4),
+        ]
+    };
+    let accel = read3(OFF_STD_ACCEL);
+    let gyro = read3(OFF_STD_GYRO);
+    snap.motion = Motion {
+        timestamp: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+        // ⭐ Widened into the SAME field the rest of the pipeline already
+        // reads, so orientation, calibration and the pins need no changes.
+        accel: [accel[0] as i32, accel[1] as i32, accel[2] as i32],
+        std_accel: Some(accel),
+        gyro: Some(gyro),
+        ..Default::default()
+    };
+    snap.motion_len = 30;
+    Some(snap)
+}
+
+/// Buttons in the common report sit at 4, not 2.
+const COMMON_OFF_BUTTONS: usize = 0x04;
+/// Sticks are three packed bytes each, left then right.
+const COMMON_OFF_STICK_L: usize = 0x0A;
+const COMMON_OFF_STICK_R: usize = 0x0D;
+
 pub fn parse_input(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
     if payload.len() < OFF_STICK + 3 {
         return None;
@@ -3630,6 +3695,39 @@ mod orientation_tests {
     ///
     /// Both halves matter. Averaging a known offset over a long run is the
     /// whole point; resetting when the controller moves is what makes the
+
+    /// ⛔ The common report decodes to a REAL rate at the reference offsets.
+    ///
+    /// The per-side report's motion block uses a 4-byte stride with padding and
+    /// a per-side one-byte shift; the common report uses six contiguous i16 at
+    /// 0x30 and 0x36 with neither. Applying the wrong one produces plausible
+    /// nonsense — values that are multiples of 256, which is exactly what a
+    /// retail field log showed — so the two layouts are pinned apart here.
+    #[test]
+    fn the_common_report_reads_six_contiguous_i16() {
+        let mut p = vec![0u8; 0x40];
+        // timestamp
+        p[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        // accel 0x30: 1000, -2000, 4096
+        for (i, v) in [1000i16, -2000, 4096].iter().enumerate() {
+            p[OFF_STD_ACCEL + i * 2..OFF_STD_ACCEL + i * 2 + 2]
+                .copy_from_slice(&v.to_le_bytes());
+        }
+        // gyro 0x36: -300, 150, 12000
+        for (i, v) in [-300i16, 150, 12000].iter().enumerate() {
+            p[OFF_STD_GYRO + i * 2..OFF_STD_GYRO + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
+
+        let snap = parse_common_input(crate::protocol::Side::Left, &p).expect("should decode");
+        assert_eq!(snap.motion.timestamp, 0x1234_5678);
+        assert_eq!(snap.motion.gyro, Some([-300, 150, 12000]), "gyro offsets wrong");
+        assert_eq!(snap.motion.std_accel, Some([1000, -2000, 4096]), "accel offsets wrong");
+        // ⭐ Contiguous, not strided: a 4-byte stride would read the NEXT axis
+        // as zero, which is how the other block is laid out.
+        assert_ne!(snap.motion.gyro, Some([-300, 0, 150]));
+        // Too short to hold the gyro block is refused, not half-decoded.
+        assert!(parse_common_input(crate::protocol::Side::Left, &p[..OFF_STD_GYRO + 4]).is_none());
+    }
 
     /// ⛔ An unreadable frame must not reset the settle timer.
     ///
