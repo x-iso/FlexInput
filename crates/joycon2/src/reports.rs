@@ -2435,7 +2435,26 @@ pub fn parse_input(side: Side, payload: &[u8]) -> Option<PadSnapshot> {
         // and no sensor data. Require enough length for the accel field rather
         // than for the (wrong) 18-byte layout the spec describes.
         let need = OFF_MOTION_ACCEL + 12 - OFF_MOTION;
-        if snap.motion_len as usize >= need && payload.len() >= OFF_MOTION_ACCEL + 12 {
+        // ⛔ **A length this decoder does not know is NOT motion.**
+        //
+        // Retail Joy-Con 2 interleaves two report variants: `motion_len` 0x1e
+        // (30), which is the block this layout describes, and 0x28 (40), which
+        // is not motion at all — its bytes are high entropy and contain no
+        // accelerometer at any offset or stride, while the 0x1e frames put
+        // gravity exactly where expected. The old guard was `>= 30`, so the
+        // 40-byte frames sailed through and were decoded as motion.
+        //
+        // What that produced was an accelerometer alternating between 1 g and
+        // 6-11 g on a controller lying flat on a table, which fails the gravity
+        // check, resets the stillness timer every other sample, and makes
+        // calibration and baseline capture impossible on retail hardware. Two
+        // field reports of exactly that.
+        //
+        // ❗ Equality, not a floor. "At least as long as I need" is the wrong
+        // question about a tagged block: a longer one is a different thing, not
+        // a superset, and treating it as one is how nonsense gets decoded with
+        // total confidence.
+        if snap.motion_len as usize == need && payload.len() >= OFF_MOTION_ACCEL + 12 {
             let t = OFF_MOTION_TIMESTAMP - sh;
             let a = OFF_MOTION_ACCEL - sh;
             let g = OFF_MOTION_ANGLE - sh;
@@ -3727,6 +3746,47 @@ mod orientation_tests {
         assert_ne!(snap.motion.gyro, Some([-300, 0, 150]));
         // Too short to hold the gyro block is refused, not half-decoded.
         assert!(parse_common_input(crate::protocol::Side::Left, &p[..OFF_STD_GYRO + 4]).is_none());
+    }
+
+    /// ⛔ A motion block of an unexpected LENGTH is refused, not decoded.
+    ///
+    /// Retail Joy-Con 2 interleaves `motion_len` 0x1e with 0x28, and only the
+    /// first is this layout. The old guard accepted anything `>= 30`, so the
+    /// 40-byte frames were decoded as motion and produced an accelerometer
+    /// reading 6-11 g on a controller lying still — which resets the stillness
+    /// timer every other sample and makes calibration impossible.
+    ///
+    /// "At least as long as I need" is the wrong question about a tagged block:
+    /// a longer one is a different thing, not a superset.
+    #[test]
+    fn a_motion_block_of_the_wrong_length_is_not_decoded() {
+        use crate::protocol::Side;
+        let need = (OFF_MOTION_ACCEL + 12 - OFF_MOTION) as u8;
+        assert_eq!(need, 30, "the known-good block is 30 bytes");
+
+        let build = |len: u8| {
+            let mut p = vec![0u8; 64];
+            p[OFF_MOTION_LEN - 1] = len; // left half: shifted one earlier
+            // Gravity where the 30-byte layout puts it, 4-byte stride.
+            let a = OFF_MOTION_ACCEL - 1;
+            for (i, v) in [100i16, 200, 4000].iter().enumerate() {
+                p[a + i * 4..a + i * 4 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            p
+        };
+
+        let good = parse_input(Side::Left, &build(30)).expect("30-byte block");
+        assert_eq!(good.motion.accel, [100, 200, 4000], "the known block must decode");
+
+        // ⭐ The 40-byte variant carries no accelerometer at these offsets, so
+        // decoding it here is how nonsense reaches the estimator.
+        let odd = parse_input(Side::Left, &build(40)).expect("report still parses");
+        assert_eq!(
+            odd.motion.accel,
+            [0, 0, 0],
+            "a 40-byte block was decoded with the 30-byte layout"
+        );
+        assert_eq!(odd.motion_len, 40, "the length is still reported for diagnosis");
     }
 
     /// ⛔ An unreadable frame must not reset the settle timer.
