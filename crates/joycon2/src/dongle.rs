@@ -97,6 +97,9 @@ struct Link {
     orientation: OrientationTracker,
     /// ⏳ TEMPORARY — slow timer for the 0x000a presence line.
     common_probe: Instant,
+    /// ⏳ TEMPORARY — last `(payload len, motion_len)`, to spot a second
+    /// report shape arriving on the same characteristic.
+    last_shape: (usize, u8),
     last_input: Instant,
     /// Reports parsed on this link, for the backoff in the motion diagnostic.
     reports: u32,
@@ -712,7 +715,23 @@ impl Default for Handles {
 /// upgrades where it can and never blocks a connection.
 fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
     let mut h = Handles::default();
-    let chars = match dongle.discover_characteristics(conn) {
+    // ⭐ An escape hatch that needs no rebuild. Discovery runs during setup,
+    // before the input subscription, so if it ever costs a link again this is
+    // how to prove it in one run rather than one round trip.
+    if std::env::var("FLEXINPUT_JC2_DISCOVER")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+    {
+        crate::dlog::imu(format_args!(
+            "{} handle discovery DISABLED by FLEXINPUT_JC2_DISCOVER=off",
+            side.display_name()
+        ));
+        return h;
+    }
+    // ❗ Budgeted, and TIMED. This happens before the input subscription, so
+    // whatever it spends is time the controller is connected and silent — and
+    // the link watchdog is three seconds. See `discover_characteristics`.
+    let began = Instant::now();
+    let chars = match dongle.discover_characteristics(conn, Duration::from_millis(600)) {
         Ok(c) if !c.is_empty() => c,
         other => {
             let why = match other {
@@ -772,9 +791,10 @@ fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
     // ⭐ Logged with the ASSUMED values beside them. A mismatch here is the
     // whole hypothesis, and it is invisible unless both numbers are shown.
     crate::dlog::imu(format_args!(
-        "{} handles resolved — input {:#06x} (assumed {:#06x}) · cmd {:#06x} \
+        "{} handles resolved in {} ms — input {:#06x} (assumed {:#06x}) · cmd {:#06x} \
          (assumed {:#06x}) · common {} (assumed {:#06x}){}",
         side.display_name(),
+        began.elapsed().as_millis(),
         h.input,
         jc::HANDLE_INPUT_VALUE,
         h.cmd,
@@ -1471,6 +1491,7 @@ fn connect_and_init(
         calib: StickCalib::default(),
         orientation: OrientationTracker::default(),
         common_probe: Instant::now(),
+        last_shape: (0, 0),
         last_input: Instant::now(),
         reports: 0,
         extra_reports: 0,
@@ -1687,6 +1708,38 @@ fn pump(
         let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) else {
             continue;
         };
+        // ⏳ TEMPORARY. ⛔ **Two report shapes are arriving on this
+        // characteristic and we decode both with one layout.**
+        //
+        // A field log from retail Joy-Con 2s shows roughly every OTHER frame
+        // decoding to an impossible accelerometer — 2.8 g, 5.8 g, 8.7 g with
+        // the controller flat on a table — and the bad values are almost all
+        // multiples of 256, which is the signature of a read landing one byte
+        // off. Every constant that could do that (`left_shift`, the motion
+        // offsets) was measured on a single third-party grip.
+        //
+        // The consequence is not cosmetic: stillness calls `interrupt()`
+        // whenever |accel| leaves 1 g, so one bad frame in two resets the
+        // settle counter forever and baseline capture cancels the instant it
+        // starts — reported from the field, twice.
+        //
+        // ❗ The discriminator is what is missing, and guessing it would risk
+        // breaking the grip that DOES work. So this logs the shape of a frame
+        // whenever it changes: payload length, the motion-length byte, and the
+        // head of the buffer. Two alternating shapes will name themselves in
+        // seconds. Remove with the rest of the diagnostic.
+        {
+            let len = n.value.len();
+            let mlen = n.value.get(0x0f).copied().unwrap_or(0);
+            if (len, mlen) != link.last_shape {
+                link.last_shape = (len, mlen);
+                crate::dlog::imu(format_args!(
+                    "{} FRAME SHAPE len {len} motion_len {mlen:#04x} head {:02x?}",
+                    link.key.side.display_name(),
+                    &n.value[..len.min(20)],
+                ));
+            }
+        }
         let Some(snap) = reports::parse_input(link.key.side, &n.value) else {
             link.unparsed = link.unparsed.saturating_add(1);
             if link.unparsed.is_power_of_two() {

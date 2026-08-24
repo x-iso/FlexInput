@@ -4471,7 +4471,7 @@ fn subscribe_all(dongle: &Dongle, conn: u16, side: &str, opts: &Opts) -> Discove
     // where the other is refused, and the reasons they fail are not the same
     // reason. Collapsing that into one "discovery returned nothing" line is how
     // a diagnosable refusal becomes a dead end.
-    let mut chars = match dongle.discover_characteristics(conn) {
+    let mut chars = match dongle.discover_characteristics(conn, std::time::Duration::from_secs(10)) {
         Ok(c) if !c.is_empty() => {
             println!("[imu] {side}: Read By Type walk found {} characteristic(s)", c.len());
             c

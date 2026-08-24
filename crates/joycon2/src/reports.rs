@@ -1675,6 +1675,14 @@ impl StillDetector {
         self.secs >= STILL_SETTLE_SECS
     }
 
+    /// Whether it is currently settled, without feeding it a sample.
+    ///
+    /// For frames that carry no usable gravity reading: they must not advance
+    /// the settle timer and must not reset it either.
+    fn settled(&self) -> bool {
+        self.secs >= STILL_SETTLE_SECS
+    }
+
     /// Give up on the current run — used when gravity cannot be measured at all.
     fn interrupt(&mut self) {
         self.secs = 0.0;
@@ -1697,6 +1705,25 @@ impl StillDetector {
 const STILL_SETTLE_SECS: f32 = 1.0;
 /// How far |accel| may sit from 1 g and still be trusted as gravity alone.
 const STILL_GRAVITY_TOLERANCE: f32 = 0.06;
+
+/// Beyond this, the sample is not a reading at all.
+///
+/// ⛔ **Garbage must not be mistaken for movement.** Stillness interrupts
+/// whenever |accel| leaves 1 g, which is right for a controller being moved —
+/// but a retail field log shows every other frame decoding to 2.8 g, 5.8 g,
+/// even 10.9 g with the pad flat on a table, because two report shapes arrive
+/// on one characteristic and both are decoded with one layout. One unreadable
+/// frame in two resets the settle counter forever, so stillness never lands and
+/// baseline capture cancels the instant it is started.
+///
+/// A hand cannot hold 6 g. Past that the frame is unreadable, and an unreadable
+/// frame is evidence of nothing: it neither confirms stillness nor denies it,
+/// so the detector is left exactly as it was rather than being told the
+/// controller moved.
+///
+/// ❗ A GUARD, not the fix. The frames should not be decoding to this in the
+/// first place; see the frame-shape logging in the dongle transport.
+const IMPLAUSIBLE_G: f32 = 6.0;
 /// How far |accel| may sit from 1 g before the sample is refused as a gravity
 /// REFERENCE.
 ///
@@ -1982,9 +2009,13 @@ impl OrientationTracker {
             Some(now) if (gmag - 1.0).abs() < STILL_GRAVITY_TOLERANCE => {
                 self.still.observe(now, dt)
             }
-            // Not measuring gravity, so nothing can be concluded about
-            // stillness — and "moving" is the safe answer: it only ever stops
-            // the estimator learning, which is recoverable.
+            // ⛔ Unreadable, not moving — see `IMPLAUSIBLE_G`. Left untouched
+            // rather than interrupted, so a stream with a bad frame in it can
+            // still settle on the good ones.
+            _ if gmag > IMPLAUSIBLE_G => self.still.settled(),
+            // Genuinely off gravity: the controller is being moved. "Moving" is
+            // the safe answer here — it only stops the estimator learning,
+            // which is recoverable.
             _ => {
                 self.still.interrupt();
                 false
@@ -3599,6 +3630,36 @@ mod orientation_tests {
     ///
     /// Both halves matter. Averaging a known offset over a long run is the
     /// whole point; resetting when the controller moves is what makes the
+
+    /// ⛔ An unreadable frame must not reset the settle timer.
+    ///
+    /// Retail hardware interleaves a second report shape that decodes to 6-11 g
+    /// with the pad flat on a table. Treating those as movement reset stillness
+    /// every other sample, so it never settled and baseline capture cancelled
+    /// the moment it started — reported from the field twice before the cause
+    /// was found. Real movement must still interrupt, or the guard would hide
+    /// deliberate motion instead.
+    #[test]
+    fn an_unreadable_frame_neither_settles_nor_interrupts() {
+        let level = [0.0, 0.0, 1.0];
+        let mut d = StillDetector::default();
+        // Settle first.
+        for _ in 0..200 {
+            d.observe(level, 0.01);
+        }
+        assert!(d.settled(), "never settled on clean samples");
+
+        // A garbage frame arrives: the detector must be untouched.
+        assert!(d.settled(), "an unreadable frame cleared the settle");
+        for _ in 0..5 {
+            assert!(d.settled());
+        }
+
+        // ⭐ And genuine motion still breaks it, or this would mask real
+        // movement rather than a decode fault.
+        d.interrupt();
+        assert!(!d.settled(), "real motion no longer interrupts stillness");
+    }
 
     /// ⛔ The window must kill the quantisation spikes and leave a real
     /// rotation ALONE.

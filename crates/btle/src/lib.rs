@@ -2273,16 +2273,38 @@ impl Dongle {
 
     /// Walk every characteristic declaration, recovering properties and value
     /// handles — which is what says whether a characteristic can notify at all.
-    pub fn discover_characteristics(&self, conn_handle: u16) -> Result<Vec<acl::CharDecl>> {
+    /// ⛔ `budget` is a HARD wall-clock limit on the whole walk, and it is not
+    /// optional politeness.
+    ///
+    /// This runs during connection setup, holding the radio, before the input
+    /// subscription is written — so every second it spends is a second the
+    /// controller is connected and sending nothing. At 2 s per round trip and
+    /// up to 64 of them, a device that answers slowly stalls init past the
+    /// three-second input timeout and the link is written off as soon as it is
+    /// made. Reported from hardware as Joy-Cons disconnecting almost
+    /// immediately after connecting, the moment discovery was introduced.
+    ///
+    /// Running out of budget returns what was found so far; the caller falls
+    /// back to its captured handles, which is strictly better than a link that
+    /// does not survive setup.
+    pub fn discover_characteristics(
+        &self,
+        conn_handle: u16,
+        budget: Duration,
+    ) -> Result<Vec<acl::CharDecl>> {
         let mut out: Vec<acl::CharDecl> = Vec::new();
         let mut start: u16 = 0x0001;
+        let deadline = std::time::Instant::now() + budget;
         for _ in 0..64 {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
             let req = acl::read_by_type_request(start, 0xFFFF, acl::GATT_CHARACTERISTIC);
             let rsp = match self.att_request(
                 conn_handle,
                 &req,
                 acl::ATT_READ_BY_TYPE_RESPONSE,
-                Duration::from_secs(2),
+                left.min(Duration::from_millis(400)),
             )? {
                 Some(r) => r,
                 None if out.is_empty() => {
