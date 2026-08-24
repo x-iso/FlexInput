@@ -1617,7 +1617,11 @@ fn connect_and_init(
         calib: StickCalib::default(),
         orientation: OrientationTracker::default(),
         common_probe: Instant::now(),
-        frame_dump: Instant::now(),
+        // ❗ Dated in the PAST so the first frame dumps immediately. Set to
+        // "now", the first dump was ten seconds away and two short test runs
+        // produced no frame at all — a diagnostic that cannot answer a
+        // five-second run is not a diagnostic.
+        frame_dump: Instant::now() - Duration::from_secs(10),
         common_motion: None,
         last_input: Instant::now(),
         reports: 0,

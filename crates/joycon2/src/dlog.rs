@@ -119,12 +119,25 @@ impl Sink {
                         if writeln!(file, "{line}").is_ok() {
                             written += line.len() as u64 + 1;
                         }
-                        // ❗ Flushed when the queue goes quiet rather than per
-                        // line: the data still reaches disk promptly, without
-                        // an fsync for every entry.
-                        if rx.try_recv().is_err() {
-                            let _ = file.flush();
-                        }
+                        // ⛔ **Flushed every line, because the clever version
+                        // ATE them.**
+                        //
+                        // This used to flush only when the queue looked empty,
+                        // tested with `rx.try_recv().is_err()` — and
+                        // `try_recv` CONSUMES a message when one is there. Every
+                        // burst therefore lost every other line, silently and
+                        // for good. At connect that meant three queued lines
+                        // became two, and the one destroyed happened to be the
+                        // verdict the whole investigation was waiting on; two
+                        // more of the user's test runs were spent before the
+                        // pattern was recognised.
+                        //
+                        // ❗ There is nothing to optimise here. This is a
+                        // diagnostic writing a few lines a second from a thread
+                        // whose only job is writing them. The fsync that had to
+                        // be avoided was the one on the TRANSPORT thread, and it
+                        // is not on the transport thread any more.
+                        let _ = file.flush();
                     }
                     use std::io::Write;
                     let _ = file.flush();
