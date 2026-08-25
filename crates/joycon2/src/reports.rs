@@ -323,12 +323,32 @@ pub fn field_gain() -> [f32; 3] {
     })
 }
 
-/// Gyro counts per degree per second: 48000 counts = 360 °/s.
+/// Gyro counts per degree per second, **as stated by the controller itself**.
 ///
-/// Works out to a full scale of ±245 °/s over `i16`, which is a standard
-/// LSM6DS-family range rather than an arbitrary figure — a good sign the
-/// documented scale is the real one.
-pub const GYRO_LSB_PER_DPS: f32 = 48000.0 / 360.0;
+/// ⭐ This is not documentation or inference. Command `0x11` returns the IMU
+/// configuration, and both halves of a real Joy-Con 2 answered identically:
+///
+/// ```text
+///   accel 0.002393  m/s2 per LSB -> 4098.4 LSB/g   (range +/-8 g)
+///   gyro  0.0012217 rad/s per LSB -> 14.286 LSB per deg/s  (range +/-2000 deg/s)
+/// ```
+///
+/// The accelerometer figure confirms [`ACCEL_LSB_PER_G`] — 4098.4 against the
+/// 4096 measured from gravity, well inside the noise.
+///
+/// ⛔ The gyro figure does NOT confirm what was here. This read
+/// `48000.0 / 360.0` = 133.33 LSB per deg/s, reasoned from "a full scale of
+/// +/-245 deg/s over an i16, a standard LSM6DS-family range — a good sign the
+/// documented scale is the real one". It is a plausible range for that sensor
+/// family and it is off by a factor of nine: the part is configured for
+/// +/-2000 deg/s, not +/-245, and every rate decoded through the old constant
+/// would have read nine times too slow.
+///
+/// ❗ Nothing has used this yet, because the raw gyro block has never arrived —
+/// so the error has never shown. It would have shown the moment it did, as a
+/// gyro that barely responded, and it would have been blamed on the new data
+/// rather than on a constant that predated it.
+pub const GYRO_LSB_PER_DPS: f32 = 1.0 / 0.07; // 14.286, from command 0x11
 
 /// Start of the 12 bytes whose meaning is still open — see [`Motion::probe`].
 ///
@@ -3746,6 +3766,46 @@ mod orientation_tests {
         assert_ne!(snap.motion.gyro, Some([-300, 0, 150]));
         // Too short to hold the gyro block is refused, not half-decoded.
         assert!(parse_common_input(crate::protocol::Side::Left, &p[..OFF_STD_GYRO + 4]).is_none());
+    }
+
+    /// ⛔ The IMU scales are the ones the CONTROLLER states, not ones inferred
+    /// from a plausible sensor range.
+    ///
+    /// Command 0x11 returns the configuration and both halves of a real
+    /// Joy-Con 2 answered identically: 0.002393 m/s2 per LSB and 0.0012217
+    /// rad/s per LSB, for ranges of +/-8 g and +/-2000 deg/s. The gyro constant
+    /// here had been reasoned from "+/-245 deg/s, a standard LSM6DS-family
+    /// range" and was nine times out — invisible only because the raw block has
+    /// never arrived to be scaled by it.
+    #[test]
+    fn the_imu_scales_match_what_the_controller_reports() {
+        // 0.0700 deg/s per LSB -> 14.286 LSB per deg/s.
+        assert!(
+            (GYRO_LSB_PER_DPS - 14.2857).abs() < 0.01,
+            "gyro scale is {GYRO_LSB_PER_DPS}, controller says 14.286"
+        );
+        // ⭐ The stated +/-2000 deg/s range must FIT in an i16 at this scale,
+        // with headroom rather than exactly filling it.
+        //
+        // ❗ Not "full scale equals the range". That was asserted first and is
+        // wrong: 32767 counts works out to 2294 deg/s, and a sensor's
+        // configured range sitting inside its representable range is ordinary.
+        // Demanding they match is the same kind of tidy inference that produced
+        // the constant this test exists to correct.
+        let at_full_range = 2000.0 * GYRO_LSB_PER_DPS;
+        assert!(
+            at_full_range < 32767.0,
+            "+/-2000 deg/s needs {at_full_range:.0} counts, which an i16 cannot hold"
+        );
+        assert!(
+            at_full_range > 20_000.0,
+            "the range uses only {at_full_range:.0} of 32767 counts — scale looks wrong"
+        );
+        // The accelerometer figure the controller gives confirms ours.
+        assert!(
+            (ACCEL_LSB_PER_G - 4098.4).abs() < 10.0,
+            "accel scale is {ACCEL_LSB_PER_G}, controller says 4098.4"
+        );
     }
 
     /// ⛔ A motion block of an unexpected LENGTH is refused, not decoded.
