@@ -1505,6 +1505,58 @@ fn connect_and_init(
         // The data drained here belongs to a link this function knows nothing
         // about, so it is discarded; a few dropped reports during init is
         // nothing next to stalling the transport.
+        // ⛔ **In reference mode, WAIT for the controller's reply.**
+        //
+        // The reference's write_command blocks on the response and validates it
+        // — `resp[0] == command_id` and `resp[1] == 0x01` — with a two-second
+        // timeout, before sending the next command. This has always fired and
+        // forgotten with a fixed 30 ms sleep, on the reasoning that waiting
+        // once turned a millisecond handshake into forty seconds.
+        //
+        // ❗ That reasoning is about TIMING and says nothing about ordering. If
+        // the controller processes commands strictly in sequence and drops
+        // whatever arrives while it is busy, a fire-and-forget init is applied
+        // in part, and which parts survive depends on how fast the link is that
+        // day. Feature-select landing often enough for the per-side stream
+        // while never landing for the common one is exactly what a partially
+        // applied init looks like.
+        //
+        // Reference mode only: the default path keeps its 30 ms and its
+        // measured behaviour.
+        if cmd_common {
+            let deadline = Instant::now() + Duration::from_millis(400);
+            let mut answered = false;
+            while Instant::now() < deadline && !answered {
+                for pkt in dongle.drain_acl(64) {
+                    if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
+                        continue;
+                    }
+                    let Some(note) = acl::parse_notification(&pkt.payload) else { continue };
+                    if note.handle != jc::HANDLE_CMD_RESPONSE {
+                        continue;
+                    }
+                    // Byte 0 echoes the command; byte 1 is 0x01 for accepted.
+                    if note.value.first() == Some(&c) {
+                        if note.value.get(1) != Some(&0x01) {
+                            crate::dlog::imu(format_args!(
+                                "{} command {c:#04x}/{s:#04x} REJECTED: {:02x?}",
+                                side.display_name(),
+                                &note.value[..note.value.len().min(12)],
+                            ));
+                        }
+                        answered = true;
+                        break;
+                    }
+                }
+            }
+            if !answered {
+                crate::dlog::imu(format_args!(
+                    "{} command {c:#04x}/{s:#04x} — no reply in 400 ms",
+                    side.display_name()
+                ));
+            }
+            return Ok(());
+        }
         let until = Instant::now() + INIT_GAP;
         while Instant::now() < until {
             let _ = dongle.drain_acl(64);
