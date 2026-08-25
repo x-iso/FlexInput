@@ -117,6 +117,9 @@ struct Link {
     frame_dump: Instant,
     /// Latest real gyro (and its accel) from the common input, if it streams.
     common_motion: Option<([i16; 3], Option<[i16; 3]>)>,
+    /// True when the per-side stream was never subscribed, so the common
+    /// characteristic is the only source of input for this link.
+    common_only: bool,
     last_input: Instant,
     /// Reports parsed on this link, for the backoff in the motion diagnostic.
     reports: u32,
@@ -1312,8 +1315,26 @@ fn connect_and_init(
     // subscription entirely and take the common stream or nothing. Off by
     // default, because the per-side path is the one that currently works and a
     // hypothesis should not cost anyone their controllers.
-    let common_only = std::env::var("FLEXINPUT_JC2_COMMON")
-        .is_ok_and(|v| v.eq_ignore_ascii_case("only"));
+    // ⛔ **The two settings are a MATCHED PAIR and were only ever tested
+    // apart.**
+    //
+    // Reading the reference in full rather than in fragments: it writes
+    // commands to `649d4ac9-…` (0x0014) and reads input from
+    // `ab7de9be-…-7fd2` (0x000a), and it never touches the per-side
+    // characteristics at all — `cc1bbbb5`/`d5a9e01e` appear nowhere in it.
+    //
+    // Routing commands to 0x0014 ALONE was tried, and the per-side stream's
+    // motion_len dropped from 0x1e to 0x00. That was read as "0x0014 is inert".
+    // It is the opposite: the controller switched to serving the OTHER stream,
+    // and we were still listening to the one it had stopped filling.
+    //
+    // FLEXINPUT_JC2_MODE=reference sets both at once, because setting one
+    // without the other is what made a working change look like a broken one.
+    let reference_mode = std::env::var("FLEXINPUT_JC2_MODE")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("reference"));
+    let common_only = reference_mode
+        || std::env::var("FLEXINPUT_JC2_COMMON")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("only"));
     if common_only {
         crate::dlog::imu(format_args!(
             "{} FLEXINPUT_JC2_COMMON=only — per-side input NOT subscribed;              the common stream is the only source this run",
@@ -1456,8 +1477,9 @@ fn connect_and_init(
     // FLEXINPUT_JC2_CMD=common routes the entire init there, unprefixed, the
     // way the reference does. If the LEDs stop responding it is inert and this
     // is settled; if the common input starts streaming, it never was.
-    let cmd_common = std::env::var("FLEXINPUT_JC2_CMD")
-        .is_ok_and(|v| v.eq_ignore_ascii_case("common"));
+    let cmd_common = reference_mode
+        || std::env::var("FLEXINPUT_JC2_CMD")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("common"));
     crate::dlog::imu(format_args!(
         "{} command channel: {} ({})",
         side.display_name(),
@@ -1841,6 +1863,7 @@ fn connect_and_init(
         // five-second run is not a diagnostic.
         frame_dump: Instant::now() - Duration::from_secs(10),
         common_motion: None,
+        common_only,
         last_input: Instant::now(),
         reports: 0,
         extra_reports: 0,
@@ -2035,7 +2058,25 @@ fn pump(
                     }
                 }
             }
-            continue;
+            // ⛔ **When the common stream is the only source it must drive
+            // EVERYTHING, not just donate a gyro.**
+            //
+            // In reference mode the per-side characteristic is never
+            // subscribed, so continuing here would leave no buttons, no sticks
+            // and no device at all — and the run would prove nothing about
+            // whether 0x000a works, which is the only reason for the mode.
+            // Falling through sends this report down the same path the
+            // per-side one takes; the decoder is chosen by handle below.
+            // ❗ Looked up again rather than reusing the borrow above: this
+            // sits outside that `if let`, and the mutable borrow has ended.
+            let only = links
+                .iter()
+                .find(|l| l.conn == pkt.conn_handle)
+                .map(|l| l.common_only)
+                .unwrap_or(false);
+            if !only {
+                continue;
+            }
         }
         // ⭐ Print the controller's command REPLIES. We have never read them.
         //
@@ -2103,7 +2144,16 @@ fn pump(
                 &n.value[..],
             ));
         }
-        let Some(snap) = reports::parse_input(link.key.side, &n.value) else {
+        // ⭐ The decoder follows the CHARACTERISTIC, not an assumption. The
+        // two reports share nothing but their length: the per-side block is
+        // strided with padding and a one-byte side shift, the common one is
+        // contiguous with neither.
+        let parsed = if link.common_only && Some(n.handle) == link.handles.common {
+            reports::parse_common_input(link.key.side, &n.value)
+        } else {
+            reports::parse_input(link.key.side, &n.value)
+        };
+        let Some(snap) = parsed else {
             link.unparsed = link.unparsed.saturating_add(1);
             if link.unparsed.is_power_of_two() {
                 eprintln!(
