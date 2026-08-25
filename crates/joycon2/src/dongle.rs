@@ -1525,6 +1525,36 @@ fn connect_and_init(
     // line never arrived, the controller kept its link, and closing the app
     // stranded it because the teardown is at the end of a thread that could no
     // longer reach it.
+    // ⛔ **The reference NEVER PAIRS, and that is now the only thing we do
+    // that it does not.**
+    //
+    // `trevlars/switch2-controllers-linux` connects L2CAP with
+    // `BT_SECURITY_LOW`, and its own comment says why: "which is required by
+    // Switch 2 controllers (they drop any link that attempts SMP pairing)". It
+    // sends no 0x15 at all. It then reads the common input on a plaintext,
+    // unbonded link — the exact thing FlexInput cannot get.
+    //
+    // This runs a full Nintendo pairing on every first connect: exchange
+    // addresses, exchange keys, confirm the LTK, FINALISE — which writes the
+    // controller's flash and replaces its bond with a Switch — and register the
+    // link key. None of that is in the reference's path.
+    //
+    // ❗ Two reasons to be able to turn it off, and only one is the gyro. The
+    // other is that if a plaintext link works without it, then writing a user's
+    // controller flash to talk to it was never necessary, and doing something
+    // irreversible that the working reference does not do needs better
+    // justification than "it is what we have always done".
+    //
+    // FLEXINPUT_JC2_PAIR=off skips it. Off by default until it is shown safe:
+    // the per-side stream may or may not depend on it, and finding out is what
+    // the switch is for.
+    if std::env::var("FLEXINPUT_JC2_PAIR").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        eprintln!("[jc2-dongle] {} pairing SKIPPED (FLEXINPUT_JC2_PAIR=off)", side.display_name());
+        crate::dlog::imu(format_args!(
+            "{} pairing SKIPPED — no 0x15 sent, no flash written, as the reference does",
+            side.display_name()
+        ));
+    } else {
     let already_paired = shared.paired.lock().unwrap().get(&address).copied();
     match already_paired {
         Some(prev) => eprintln!(
@@ -1536,6 +1566,7 @@ fn connect_and_init(
                 shared.paired.lock().unwrap().insert(address, ltk);
             }
         }
+    }
     }
 
     dlog!("init: pairing done, starting memory reads");
