@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 pub mod acl;
+pub mod cadence;
 pub mod keystore;
 pub mod l2cap;
 pub mod radio;
@@ -1009,7 +1010,20 @@ impl Dongle {
         p.extend_from_slice(&0x0000u16.to_le_bytes()); // peripheral latency
         p.extend_from_slice(&0x01F4u16.to_le_bytes()); // supervision timeout: 5 s
         p.extend_from_slice(&0x0000u16.to_le_bytes()); // min CE length
-        p.extend_from_slice(&0x0000u16.to_le_bytes()); // max CE length
+        // ⛔ **Not zero.** Connection event length is in 0.625 ms units and
+        // bounds how long the radio may keep transmitting within one event —
+        // which is to say, how many notifications it may deliver before the
+        // next one. Asking for a maximum of zero asks for the shortest possible
+        // event, and with two controllers sharing one adapter that is measured:
+        // a single link holds a steady 200 Hz, while adding the second drops
+        // one of them to ~156 Hz. Those are dropped reports, and since this
+        // controller's rate is a difference over a QUANTISED heading, dropping
+        // them irregularly is what turns the gyro jagged.
+        //
+        // Six units is 3.75 ms — half of the 7.5 ms interval, leaving the rest
+        // for the other link. It is a suggestion the controller may ignore, but
+        // a suggestion of "as little as possible" it will happily honour.
+        p.extend_from_slice(&0x0006u16.to_le_bytes()); // max CE length: 3.75 ms
 
         // Drain stale events BEFORE issuing the command. A Connection Complete
         // left over from a previous link would otherwise be returned as this
@@ -1088,6 +1102,38 @@ impl Dongle {
     }
 
     /// Send an ATT PDU over the connection's ACL channel.
+    /// Ask this link to move to the LE 2M PHY, doubling on-air throughput.
+    ///
+    /// ⭐ Reported as a best-effort: the command is status-only and the real
+    /// outcome lands later in an LE PHY Update Complete meta event, so a
+    /// success here means "the adapter accepted the request", not "the link is
+    /// now 2M". Claiming otherwise would be the same mistake as reading a Write
+    /// Response that belonged to somebody else's request.
+    ///
+    /// ❗ Non-fatal by design. An adapter or peripheral without 2M support
+    /// simply stays where it is, and a link that streams at 1M is far better
+    /// than one refused for want of an optional feature.
+    pub fn request_2m_phy(&self, conn_handle: u16) -> Result<()> {
+        let mut p = Vec::with_capacity(7);
+        p.extend_from_slice(&conn_handle.to_le_bytes());
+        p.push(0x00); // all_phys: honour both preferences below
+        p.push(0x02); // tx_phys: LE 2M
+        p.push(0x02); // rx_phys: LE 2M
+        p.extend_from_slice(&0x0000u16.to_le_bytes()); // phy_options
+        self.send_command(hci::Opcode::LE_SET_PHY, &p)
+    }
+
+    /// Whether this adapter advertises LE 2M PHY support (feature bit 8).
+    pub fn supports_2m_phy(&self) -> bool {
+        match self.command_sync(hci::Opcode::LE_READ_LOCAL_FEATURES, &[]) {
+            // Return parameters are [status][8 bytes of feature bits].
+            // Status byte, then eight feature bytes; the 2M bit is number 8,
+            // which is bit 0 of the second feature byte.
+            Ok(cc) if cc.succeeded() && cc.params.len() >= 9 => cc.params[2] & 0x01 != 0,
+            _ => false,
+        }
+    }
+
     pub fn send_att(&self, conn_handle: u16, att_pdu: &[u8]) -> Result<()> {
         let packet = acl::encode_acl(conn_handle, acl::CID_ATT, att_pdu);
         self.handle

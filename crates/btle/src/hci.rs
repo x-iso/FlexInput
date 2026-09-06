@@ -40,6 +40,24 @@ impl Opcode {
     ///
     /// Answers with `Command Status`, not `Command Complete`: the result
     /// arrives later as an `LE Connection Complete` sub-event.
+    /// Ask for the LE 2M PHY on an existing link.
+    ///
+    /// ⭐ **The only way past this transport's data ceiling.** A BLE connection
+    /// interval cannot go below 7.5 ms — six units of 1.25 ms is the spec floor
+    /// and the controller rejects less — so the report rate is set entirely by
+    /// how much fits in one connection event. On the 1M PHY that is roughly
+    /// half of what the same event carries at 2 Mbit, which is exactly the
+    /// headroom a second controller is currently competing for.
+    ///
+    /// ❗ Status-only: the controller answers Command Status and reports the
+    /// outcome later in an LE PHY Update Complete meta event. Waiting for a
+    /// Command Complete that never arrives is how this kind of command times
+    /// out and gets wrongly written off as unsupported.
+    pub const LE_SET_PHY: Opcode = Opcode::new(0x08, 0x0032);
+
+    /// Which LE features this adapter has — bit 8 is the 2M PHY.
+    pub const LE_READ_LOCAL_FEATURES: Opcode = Opcode::new(0x08, 0x0003);
+
     pub const LE_CREATE_CONNECTION: Opcode = Opcode::new(0x08, 0x000D);
     /// `HCI_LE_Create_Connection_Cancel` — OGF 0x08, OCF 0x000E.
     pub const LE_CREATE_CONNECTION_CANCEL: Opcode = Opcode::new(0x08, 0x000E);
