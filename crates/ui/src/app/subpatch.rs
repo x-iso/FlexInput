@@ -618,6 +618,8 @@ pub(crate) fn show_subpatch_editors(
                             source_path: vec![],
                             iv_style_override: None,
                             menu_style_override: None,
+                            keep_aspect: false,
+                            anchor: Default::default(),
                         });
                     }
                 }

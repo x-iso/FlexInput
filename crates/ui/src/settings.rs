@@ -843,7 +843,72 @@ pub fn save_workspace(ws: &PersistedWorkspace) {
 pub fn load_workspace() -> Option<PersistedWorkspace> {
     let p = workspace_path()?;
     let bytes = std::fs::read(&p).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    parse_workspace_resilient(&bytes, Some(&p))
+}
+
+/// Parse a workspace, isolating per-tab failures. A tab whose schema no longer
+/// deserializes (e.g. a field removed across versions) is BLANKED — its content
+/// is dropped but its slot, title, and bindings are kept — so one incompatible
+/// patch never discards the whole workspace. Before returning any such degraded
+/// result the ORIGINAL bytes are copied to a `.corrupt-<ts>.bak` sibling so
+/// nothing is lost to the subsequent autosave. Returns `None` only when the
+/// bytes are not valid JSON at all (still backed up first).
+fn parse_workspace_resilient(bytes: &[u8], origin: Option<&std::path::Path>) -> Option<PersistedWorkspace> {
+    // Fast path: whole workspace still deserializes cleanly.
+    if let Ok(ws) = serde_json::from_slice::<PersistedWorkspace>(bytes) {
+        return Some(ws);
+    }
+    // Degraded path: something no longer fits the schema. Preserve the original
+    // before we hand back anything the app might autosave over.
+    if let Some(p) = origin {
+        backup_corrupt_workspace(p, bytes);
+    }
+    let val: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let version = val.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+    let active_tab = val.get("active_tab").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let mut tabs = Vec::new();
+    if let Some(arr) = val.get("tabs").and_then(|t| t.as_array()) {
+        for tv in arr {
+            match serde_json::from_value::<PersistedTab>(tv.clone()) {
+                Ok(t) => tabs.push(t),
+                Err(_) => tabs.push(blank_tab_from_value(tv)),
+            }
+        }
+    }
+    Some(PersistedWorkspace { version, active_tab, tabs })
+}
+
+/// Best-effort blanked tab from a tab value that failed to deserialize: keep the
+/// identifying metadata (title, file/exe bindings) but drop the unparseable
+/// snarl and overlays. The title is marked so the user sees which patch was
+/// reset (and that a `.bak` holds the original).
+fn blank_tab_from_value(v: &serde_json::Value) -> PersistedTab {
+    let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("Untitled");
+    PersistedTab {
+        title: format!("{title} (recovered)"),
+        file_path: v.get("file_path").cloned().and_then(|x| serde_json::from_value(x).ok()).unwrap_or(None),
+        bound_exes: v.get("bound_exes").cloned().and_then(|x| serde_json::from_value(x).ok()).unwrap_or_default(),
+        auto_bypass: v.get("auto_bypass").and_then(|x| x.as_bool()).unwrap_or(false),
+        snarl: Snarl::new(),
+        easy_preset_path: None,
+        view_salt: 0,
+        overlay: crate::canvas::OverlayLayout::default(),
+        config: crate::canvas::OverlayLayout::default(),
+    }
+}
+
+/// Copy the original (unparseable / partly-incompatible) workspace bytes to a
+/// timestamped `.corrupt-<epoch>.bak` sibling so the user can recover the exact
+/// pre-degradation state even after the app autosaves the blanked version.
+fn backup_corrupt_workspace(origin: &std::path::Path, bytes: &[u8]) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = origin.file_name().and_then(|f| f.to_str()).unwrap_or("workspace.json");
+    let mut bak = origin.to_path_buf();
+    bak.set_file_name(format!("{name}.corrupt-{ts}.bak"));
+    let _ = std::fs::write(&bak, bytes);
 }
 
 pub fn delete_workspace() {
@@ -866,7 +931,7 @@ pub fn save_workspace_to(ws: &PersistedWorkspace, path: &std::path::Path) -> std
 /// file is missing or unparseable.
 pub fn load_workspace_from(path: &std::path::Path) -> Option<PersistedWorkspace> {
     let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    parse_workspace_resilient(&bytes, Some(path))
 }
 
 // ── Crash-recovery snapshot (always-on, separate from opt-in workspace) ───────
@@ -910,7 +975,7 @@ pub fn save_recovery(ws: &PersistedWorkspace) {
 pub fn load_recovery() -> Option<PersistedWorkspace> {
     let p = recovery_path()?;
     let bytes = std::fs::read(&p).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    parse_workspace_resilient(&bytes, Some(&p))
 }
 
 /// Delete the crash-recovery snapshot. Called on clean exit and immediately
@@ -950,5 +1015,49 @@ mod polling_step_tests {
     #[test]
     fn from_index_clamps_out_of_bounds() {
         assert_eq!(polling_hz_from_index(99), 125); // last step
+    }
+}
+
+#[cfg(test)]
+mod workspace_resilience_tests {
+    use super::*;
+
+    fn tab(title: &str) -> PersistedTab {
+        PersistedTab {
+            title: title.into(),
+            file_path: None,
+            bound_exes: vec![],
+            auto_bypass: false,
+            snarl: Snarl::new(),
+            easy_preset_path: None,
+            view_salt: 7,
+            overlay: crate::canvas::OverlayLayout::default(),
+            config: crate::canvas::OverlayLayout::default(),
+        }
+    }
+
+    #[test]
+    fn one_incompatible_tab_is_blanked_not_the_whole_workspace() {
+        let ws = PersistedWorkspace { version: 1, active_tab: 0, tabs: vec![tab("Good"), tab("Bad")] };
+        let mut val: serde_json::Value = serde_json::to_value(&ws).unwrap();
+        // Make tab[1] undeserializable (as a removed enum variant / schema drift would).
+        val["tabs"][1]["snarl"] = serde_json::Value::String("not a snarl".into());
+        let bytes = serde_json::to_vec(&val).unwrap();
+
+        // origin = None → no backup file written during the test.
+        let out = parse_workspace_resilient(&bytes, None).expect("must salvage, not lose all");
+        assert_eq!(out.tabs.len(), 2, "both slots kept");
+        assert_eq!(out.tabs[0].title, "Good");
+        assert_eq!(out.tabs[0].view_salt, 7, "the good tab is untouched");
+        assert_eq!(out.tabs[1].title, "Bad (recovered)", "the bad tab is blanked + marked");
+    }
+
+    #[test]
+    fn clean_workspace_takes_the_fast_path() {
+        let ws = PersistedWorkspace { version: 1, active_tab: 1, tabs: vec![tab("A"), tab("B")] };
+        let bytes = serde_json::to_vec(&ws).unwrap();
+        let out = parse_workspace_resilient(&bytes, None).unwrap();
+        assert_eq!(out.active_tab, 1);
+        assert_eq!(out.tabs.iter().map(|t| t.title.clone()).collect::<Vec<_>>(), ["A", "B"]);
     }
 }

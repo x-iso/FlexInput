@@ -215,6 +215,8 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     source_path,
                     iv_style_override: None,
                     menu_style_override: None,
+                    keep_aspect: false,
+                    anchor: Default::default(),
                 }));
                 let idx = config_layout.items.len() - 1;
                 config_layout.selected_item = Some(idx);
@@ -268,12 +270,31 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 
         const HIT_MARGIN: f32 = 14.0;
         let live = !edit && !pick;
-        let item_rect = |it: &LayoutItem| {
-            let (p, s) = it.bbox();
-            egui::Rect::from_min_size(
-                egui::pos2(p[0], p[1]),
-                egui::vec2(s[0].max(8.0), s[1].max(8.0)),
-            )
+        // Screen-anchor resolution for hit-test / passthrough / nav targets, so
+        // these match the displayed (re-anchored) rects `show_overlay_body`
+        // paints. Current overlay size = the monitor it fills.
+        let cur_size: [f32; 2] = child_monitor
+            .or_else(|| inner_rect.map(|r| r.size()))
+            .map(|s| [s.x.max(1.0), s.y.max(1.0)])
+            .unwrap_or([1920.0, 1080.0]);
+        let authored = config_layout.authored_size.unwrap_or(cur_size);
+        // Resolve every pin's rect up front (screen-anchored or following a
+        // linked target), so hit-test / passthrough / nav targets match what
+        // `show_overlay_body` paints. Precomputed into an owned Vec so the
+        // closure doesn't borrow `config_layout` (which is mutated below).
+        let resolved_rects: Vec<egui::Rect> = (0..config_layout.items.len())
+            .map(|i| {
+                let (p, s) = crate::canvas::node::resolve_layout_rect(
+                    &config_layout.items, i, authored, cur_size,
+                );
+                egui::Rect::from_min_size(
+                    egui::pos2(p[0], p[1]),
+                    egui::vec2(s[0].max(8.0), s[1].max(8.0)),
+                )
+            })
+            .collect();
+        let item_rect = |i: usize| -> egui::Rect {
+            resolved_rects.get(i).copied().unwrap_or(egui::Rect::NOTHING)
         };
         // OS cursor in overlay-local points (the overlay fills the monitor at
         // origin, so screen points == item coords). None during a pick.
@@ -301,7 +322,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     )
                     .map(|n| FlexInputApp::elem_is_nav_target(&n.module_id, &m.element_id))
                     .unwrap_or(false);
-                    editable.then(|| (i, item_rect(it)))
+                    editable.then(|| (i, item_rect(i)))
                 })
                 .collect();
             let pass = vctx.cumulative_pass_nr();
@@ -316,7 +337,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         let hovered_module_idx = cursor.and_then(|c| {
             config_layout.items.iter().enumerate().rev().find_map(|(i, it)| {
                 matches!(it, LayoutItem::Module(_))
-                    .then(|| item_rect(it).expand(HIT_MARGIN).contains(c))
+                    .then(|| item_rect(i).expand(HIT_MARGIN).contains(c))
                     .filter(|&hit| hit)
                     .map(|_| i)
             })
@@ -378,7 +399,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 })
                 .unwrap_or(false);
             let over_item = cursor
-                .map(|c| config_layout.items.iter().any(|it| item_rect(it).expand(HIT_MARGIN).contains(c)))
+                .map(|c| (0..config_layout.items.len()).any(|i| item_rect(i).expand(HIT_MARGIN).contains(c)))
                 .unwrap_or(false);
             egui::Popup::is_any_open(vctx) || dragging || over_toolbar || over_item || cursor.is_none()
         };
@@ -453,12 +474,11 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 // brighter + larger while it's being edited, like Easy mode.
                 // Drawn after the body so it sits on top; the &mut borrow above
                 // has ended, so reading the item back is safe.
-                if let Some(it) = active_idx.and_then(|i| config_layout.items.get(i)) {
-                    let (p, s) = it.bbox();
-                    let r = egui::Rect::from_min_size(
-                        egui::pos2(p[0], p[1]),
-                        egui::vec2(s[0].max(8.0), s[1].max(8.0)),
-                    );
+                if let Some(i) = active_idx.filter(|&i| i < config_layout.items.len()) {
+                    // Resolve to the re-anchored rect (not the raw authored bbox)
+                    // so the ring tracks the pin after a cross-resolution shift —
+                    // matching what `show_overlay_body` paints.
+                    let r = item_rect(i);
                     paint_focus_ring(ui, r, gp_editing);
                 }
 

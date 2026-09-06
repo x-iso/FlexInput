@@ -15,7 +15,36 @@ All notable changes to FlexInput are documented here. This project adheres to
   `licenses/` and from the licence files the vendored dependencies already ship,
   so a missing one is a build error rather than a silently dropped notice.
 
+- **Resolution- and aspect-independent overlays.** Info- and config-overlay
+  elements now re-anchor to the screen instead of living at fixed pixels, so a
+  layout authored at one resolution holds up on another display or aspect ratio.
+  Each element — module pins and decorations alike — carries a per-axis anchor
+  picked from a 3×3 zone grid (corner / edge / centre) plus **independent
+  Stretch X/Y** toggles that scale that dimension proportionally to keep the same
+  relative width/height; `Auto` derives both point and stretch from where the
+  element sits. An element can also be **anchored to another element**, so a box,
+  its label and its icons travel and stretch together as a group (with a visible
+  link guide, a selecting-target mode, and a pivot marker on the anchor point in
+  edit mode). The overlay snap grid is now a zone-aligned percentage of the
+  viewport rather than pixels.
+
 ### Fixed
+
+- **An incompatible tab no longer wipes the whole workspace.** `workspace.json`
+  (and the Save/Load Workspace files and the crash-recovery snapshot) used to be
+  deserialized in one shot, so a single tab carrying a field from a different
+  schema version failed the *entire* load — the app started empty and the autosave
+  then overwrote everything with no backup. Loading is now per-tab resilient: a
+  tab that no longer fits the schema is **blanked** (its slot, title and bindings
+  kept, title marked "(recovered)") while every other tab loads normally, and the
+  original bytes are copied to a timestamped `.corrupt-*.bak` sibling before
+  anything can overwrite them.
+
+- **Config-overlay selection glow tracks re-anchored pins.** The active-pin focus
+  ring was drawn from the raw authored rect while the widget painted at its
+  re-anchored position, so on a different resolution the glow sat away from the
+  pin until an edit-mode round-trip realigned them; hit-testing, passthrough, nav
+  targets and the ring now all use the resolved rect.
 
 - **HIDMaestro's MIT licence now accompanies its binaries.** The signed driver
   package under `crates/hidmaestro/driver` was vendored and redistributed without

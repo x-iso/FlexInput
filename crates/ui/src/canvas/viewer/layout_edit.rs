@@ -31,6 +31,14 @@ pub(crate) struct LayoutStateMut<'a> {
     pub snap_grid_px: &'a mut u32,
     pub selected_item: &'a mut Option<usize>,
     pub selected_items: &'a mut Vec<usize>,
+    /// True for screen-anchored overlay layouts (info / config / menu overlays):
+    /// the snap grid is a % of the viewport and elements can keep their aspect
+    /// when stretched. False for px-based sub-patch body layouts.
+    pub is_overlay: bool,
+    /// Overlay layouts: the viewport size elements are stored at (used by the
+    /// anchor picker to show what an `Auto` axis resolves to). `None` for
+    /// sub-patch layouts and un-baked overlays.
+    pub authored_size: Option<[f32; 2]>,
 }
 
 impl<'a> LayoutStateMut<'a> {
@@ -41,15 +49,20 @@ impl<'a> LayoutStateMut<'a> {
             snap_grid_px: &mut sp.snap_grid_px,
             selected_item: &mut sp.selected_item,
             selected_items: &mut sp.selected_items,
+            is_overlay: false,
+            authored_size: None,
         }
     }
     pub fn of_overlay(ov: &'a mut crate::canvas::node::OverlayLayout) -> Self {
+        let authored_size = ov.authored_size;
         Self {
             items: &mut ov.items,
             snap_enabled: &mut ov.snap_enabled,
             snap_grid_px: &mut ov.snap_grid_px,
             selected_item: &mut ov.selected_item,
             selected_items: &mut ov.selected_items,
+            is_overlay: true,
+            authored_size,
         }
     }
 }
@@ -88,19 +101,86 @@ pub(crate) fn layout_toolbar_controls_core(
     let mut add_kind: Option<&'static str> = None;
     ui.checkbox(state.snap_enabled, egui::RichText::new("Snap").small())
         .on_hover_text("Snap pinned-element positions and sizes to a grid in Layout mode");
+    let overlay = state.is_overlay;
     ui.add_enabled_ui(*state.snap_enabled, |ui| {
         ui.label(egui::RichText::new("grid").small().weak());
-        let mut g = *state.snap_grid_px as i32;
-        if ui.add(egui::DragValue::new(&mut g)
-            .speed(0.5)
-            .range(2i32..=64)
-            .suffix("px"))
-            .on_hover_text("Grid step in pixels (rounded to multiples of 2)")
-            .changed()
-        {
-            *state.snap_grid_px = ((g.max(2)) / 2 * 2) as u32;
+        if overlay {
+            // Overlays snap on a % division of the viewport. The control edits
+            // the per-cell % directly (so dragging right = bigger % = COARSER,
+            // dragging left = smaller % = FINER), quantized to zone-aligned cell
+            // counts (multiples of 3, so the grid nests in the 3×3 anchor zones).
+            let cells = (((*state.snap_grid_px).max(9) / 3) * 3).clamp(9, 99);
+            let mut pct = 100.0 / cells as f64;
+            // px → cells: nearest multiple of 3 in [9, 99].
+            let to_cells = |p: f64| (((100.0 / p) / 3.0).round() * 3.0).clamp(9.0, 99.0) as u32;
+            if ui.add(
+                egui::DragValue::new(&mut pct)
+                    .speed(0.05)
+                    .range(100.0 / 99.0..=100.0 / 9.0)
+                    .suffix("%")
+                    .max_decimals(2),
+            )
+                .on_hover_text("Grid cell size as % of the viewport per axis (lower = finer). Quantized so the grid lines up with the 3×3 anchor zones.")
+                .changed()
+            {
+                *state.snap_grid_px = to_cells(pct.max(0.01));
+            }
+        } else {
+            // Sub-patch bodies snap on a px grid (rounded to multiples of 2).
+            let mut g = *state.snap_grid_px as i32;
+            if ui.add(egui::DragValue::new(&mut g).speed(0.5).range(2i32..=64).suffix("px"))
+                .on_hover_text("Grid step in pixels (rounded to multiples of 2)")
+                .changed()
+            {
+                *state.snap_grid_px = ((g.max(2)) / 2 * 2) as u32;
+            }
         }
     });
+
+    // Overlay-only: explicit anchoring + keep-aspect for the selected
+    // element(s).
+    if overlay {
+        let sel: Vec<usize> = if state.selected_items.is_empty() {
+            state.selected_item.iter().copied().collect()
+        } else {
+            state.selected_items.clone()
+        };
+        // While a target pick is armed, replace the picker with a clear
+        // "selecting…" indicator + Cancel, so the mode is obvious.
+        if let Some(followers) = crate::canvas::overlay_body::anchor_pick_armed(ui.ctx()) {
+            ui.label(
+                egui::RichText::new(format!("⚓ Click a target for {} element(s)…", followers.len()))
+                    .small()
+                    .color(egui::Color32::from_rgb(150, 200, 255)),
+            );
+            if ui.small_button("Cancel").clicked() {
+                crate::canvas::overlay_body::clear_anchor_pick(ui.ctx());
+            }
+        } else if !sel.is_empty() {
+            anchor_picker(ui, state, &sel);
+        }
+        // Keep-aspect (module pins only): when the element stretches across
+        // anchor zones it scales uniformly instead of distorting.
+        let modules: Vec<usize> = sel.iter().copied()
+            .filter(|&i| matches!(state.items.get(i), Some(LayoutItem::Module(_))))
+            .collect();
+        if !modules.is_empty() {
+            // Checkbox reflects the primary/first selected module; toggling
+            // applies to all selected modules.
+            let mut ka = modules.iter().any(|&i| matches!(
+                state.items.get(i), Some(LayoutItem::Module(m)) if m.keep_aspect));
+            if ui.checkbox(&mut ka, egui::RichText::new("Keep aspect").small())
+                .on_hover_text("When this element stretches across screen zones, scale it uniformly (no distortion)")
+                .changed()
+            {
+                for &i in &modules {
+                    if let Some(LayoutItem::Module(m)) = state.items.get_mut(i) {
+                        m.keep_aspect = ka;
+                    }
+                }
+            }
+        }
+    }
     ui.separator();
     ui.label(egui::RichText::new("Add:").small().weak());
     if ui.small_button("T").on_hover_text("Add Text label").clicked() {
@@ -125,6 +205,157 @@ pub(crate) fn layout_toolbar_controls_core(
         *state.selected_item = Some(idx);
         *state.selected_items = vec![idx];
     }
+}
+
+/// A compact glyph for the toolbar's Anchor button showing the effective anchor
+/// point (`Auto` axes shown as their resolved zone). Stretched axes get a ↔/↕.
+fn anchor_label(
+    a: crate::canvas::node::Anchor,
+    px: crate::canvas::node::AnchorAxis,
+    sx_auto: bool,
+    py: crate::canvas::node::AnchorAxis,
+    sy_auto: bool,
+) -> String {
+    use crate::canvas::node::AnchorAxis::*;
+    let link = if a.to.is_some() { "🔗" } else { "" };
+    if a.is_auto() {
+        return format!("{link}Auto");
+    }
+    let col = |ax| match ax { Center => 1usize, End => 2, _ => 0 };
+    let ex = if a.x == Auto { px } else { a.x };
+    let ey = if a.y == Auto { py } else { a.y };
+    let sx = if a.x == Auto { sx_auto } else { a.stretch_x };
+    let sy = if a.y == Auto { sy_auto } else { a.stretch_y };
+    let base = [["↖", "↑", "↗"], ["←", "•", "→"], ["↙", "↓", "↘"]][col(ey)][col(ex)];
+    let stretch = match (sx, sy) {
+        (true, true) => "⤢",
+        (true, false) => "↔",
+        (false, true) => "↕",
+        (false, false) => "",
+    };
+    format!("{link}{base}{stretch}")
+}
+
+/// Overlay-only anchor picker: a 3×3 grid that picks the anchor POINT (a specific
+/// zone / corner / edge / centre) and two INDEPENDENT Stretch toggles. The point
+/// fixes which edge/centre stays put; Stretch X/Y scale the size proportionally
+/// so an element spanning zones keeps the same relative width/height across
+/// aspect ratios. They combine freely (e.g. bottom-centre + Stretch X). `Auto`
+/// derives both from placement; its resolved cell + stretch are shown.
+/// Changes propagate to every selected element (modules AND decorations).
+fn anchor_picker(ui: &mut egui::Ui, state: &mut LayoutStateMut<'_>, sel: &[usize]) {
+    use crate::canvas::node::{Anchor, AnchorAxis};
+    let primary = state.selected_item.filter(|i| sel.contains(i)).or_else(|| sel.first().copied());
+    let (cur, bbox) = primary
+        .and_then(|i| state.items.get(i))
+        .map(|it| (it.anchor(), it.bbox()))
+        .unwrap_or((Anchor::default(), ([0.0, 0.0], [0.0, 0.0])));
+    // What each Auto axis resolves to right now (needs the authored viewport).
+    let authored = state.authored_size.unwrap_or([1920.0, 1080.0]);
+    let (dpx, dsx) = crate::canvas::node::zone_axis(bbox.0[0], bbox.1[0], authored[0]);
+    let (dpy, dsy) = crate::canvas::node::zone_axis(bbox.0[1], bbox.1[1], authored[1]);
+    // Effective point/stretch (Auto → derived), used to seed the controls.
+    let ex = if cur.x == AnchorAxis::Auto { dpx } else { cur.x };
+    let ey = if cur.y == AnchorAxis::Auto { dpy } else { cur.y };
+
+    ui.menu_button(format!("⚓ {}", anchor_label(cur, dpx, dsx, dpy, dsy)), |ui| {
+        ui.label(egui::RichText::new("Anchor to screen").small().weak());
+
+        let mut sx = if cur.x == AnchorAxis::Auto { dsx } else { cur.stretch_x };
+        let mut sy = if cur.y == AnchorAxis::Auto { dsy } else { cur.stretch_y };
+        let col = |ax| match ax { AnchorAxis::Center => 1usize, AnchorAxis::End => 2, _ => 0 };
+        let mut gx = col(ex);
+        let mut gy = col(ey);
+        let is_auto = cur.x == AnchorAxis::Auto && cur.y == AnchorAxis::Auto;
+        let mut changed = false;
+        let mut set_auto = false;
+
+        // 3×3 point grid — a single cell (the anchor point) is highlighted.
+        let glyphs = [["↖", "↑", "↗"], ["←", "•", "→"], ["↙", "↓", "↘"]];
+        egui::Grid::new("overlay_anchor_grid").spacing([3.0, 3.0]).show(ui, |ui| {
+            for row in 0..3usize {
+                for c in 0..3usize {
+                    let lit = c == gx && row == gy;
+                    if ui.selectable_label(lit, egui::RichText::new(glyphs[row][c]).monospace()).clicked() {
+                        gx = c;
+                        gy = row;
+                        changed = true;
+                    }
+                }
+                ui.end_row();
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut sx, egui::RichText::new("Stretch X").small())
+                .on_hover_text("Scale width with the viewport (keep the same relative width)")
+                .changed() { changed = true; }
+            if ui.checkbox(&mut sy, egui::RichText::new("Stretch Y").small())
+                .on_hover_text("Scale height with the viewport (keep the same relative height)")
+                .changed() { changed = true; }
+        });
+        ui.separator();
+        if ui.selectable_label(is_auto, egui::RichText::new("Auto (from placement)").small())
+            .on_hover_text("Derive point + stretch from which 3×3 zone the element sits in")
+            .clicked()
+        {
+            set_auto = true;
+            changed = true;
+        }
+
+        // Apply edits before the object-link section (which mutates the same
+        // items) so both can happen in one menu pass. Preserve id/to.
+        if changed {
+            let points = [AnchorAxis::Start, AnchorAxis::Center, AnchorAxis::End];
+            for &i in sel {
+                if let Some(it) = state.items.get_mut(i) {
+                    let mut a = it.anchor();
+                    if set_auto {
+                        a.x = AnchorAxis::Auto;
+                        a.y = AnchorAxis::Auto;
+                        a.stretch_x = false;
+                        a.stretch_y = false;
+                    } else {
+                        a.x = points[gx];
+                        a.y = points[gy];
+                        a.stretch_x = sx;
+                        a.stretch_y = sy;
+                    }
+                    it.set_anchor(a);
+                }
+            }
+        }
+
+        ui.separator();
+        // ── Anchor to another OBJECT ────────────────────────────────────────
+        // A linked element follows the target's resolved rect (the X/Y anchors
+        // above then act WITHIN that target frame), so framed groups move and
+        // stretch together.
+        let linked = cur.to.is_some();
+        if linked {
+            ui.label(egui::RichText::new("Following another element").small().weak());
+            if ui.button(egui::RichText::new("Unlink from object").small())
+                .on_hover_text("Anchor to the screen again instead of to another element")
+                .clicked()
+            {
+                for &i in sel {
+                    if let Some(it) = state.items.get_mut(i) {
+                        let mut a = it.anchor();
+                        a.to = None;
+                        it.set_anchor(a);
+                    }
+                }
+                ui.close();
+            }
+        } else if ui.button(egui::RichText::new("⚓ Anchor to object…").small())
+            .on_hover_text("Then click the element to anchor the selection to")
+            .clicked()
+        {
+            crate::canvas::overlay_body::arm_anchor_pick(ui.ctx(), sel.to_vec());
+            ui.close();
+        }
+    })
+    .response
+    .on_hover_text("Anchor the selected element(s) to a screen region or another element");
 }
 
 /// Resolve `SelectedModuleInfo` for a sub-patch layout's current selection:
@@ -365,6 +596,7 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             outline_px: 0.0,
             align: TextAlign::Left,
             valign: crate::canvas::node::TextVAlign::Top,
+            anchor: Default::default(),
         },
         "rect" => LayoutDecoration::Rect {
             pos: [16.0, 16.0],
@@ -373,6 +605,7 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             stroke: DECO_DEFAULT_STROKE,
             stroke_px: 1.0,
             corner_radius: 4.0,
+            anchor: Default::default(),
         },
         "ellipse" => LayoutDecoration::Ellipse {
             pos: [16.0, 16.0],
@@ -380,12 +613,14 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             fill: [60, 60, 60, 180],
             stroke: DECO_DEFAULT_STROKE,
             stroke_px: 1.0,
+            anchor: Default::default(),
         },
         "line" => LayoutDecoration::Line {
             a: [16.0, 16.0],
             b: [136.0, 16.0],
             stroke: DECO_DEFAULT_STROKE,
             stroke_px: 1.5,
+            anchor: Default::default(),
         },
         "svg" => LayoutDecoration::Svg {
             pos: [16.0, 16.0],
@@ -397,6 +632,7 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             stroke: [0, 0, 0, 0],
             stroke_px: 0.0,
             icon_key: String::new(),
+            anchor: Default::default(),
         },
         _ => LayoutDecoration::Rect {
             pos: [16.0, 16.0],
@@ -405,6 +641,7 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             stroke: DECO_DEFAULT_STROKE,
             stroke_px: 1.0,
             corner_radius: 4.0,
+            anchor: Default::default(),
         },
     }
 }
@@ -1083,7 +1320,7 @@ pub(crate) fn graph_pin_inspector_strip_item(
 /// `painter` and `offset` to add to local coords.
 pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco: &LayoutDecoration) {
     match deco {
-        LayoutDecoration::Rect { pos, size, fill, stroke, stroke_px, corner_radius } => {
+        LayoutDecoration::Rect { pos, size, fill, stroke, stroke_px, corner_radius, .. } => {
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
                 egui::vec2(size[0].max(1.0), size[1].max(1.0)),
@@ -1099,7 +1336,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                     egui::StrokeKind::Inside);
             }
         }
-        LayoutDecoration::Ellipse { pos, size, fill, stroke, stroke_px } => {
+        LayoutDecoration::Ellipse { pos, size, fill, stroke, stroke_px, .. } => {
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
                 egui::vec2(size[0].max(1.0), size[1].max(1.0)),
@@ -1122,13 +1359,13 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                 painter.add(egui::Shape::line(pts, egui::Stroke::new(*stroke_px, scol)));
             }
         }
-        LayoutDecoration::Line { a, b, stroke, stroke_px } => {
+        LayoutDecoration::Line { a, b, stroke, stroke_px, .. } => {
             let p1 = origin + egui::vec2(a[0], a[1]);
             let p2 = origin + egui::vec2(b[0], b[1]);
             painter.line_segment([p1, p2],
                 egui::Stroke::new(*stroke_px, rgba_to_color32(*stroke)));
         }
-        LayoutDecoration::Text { pos, size, text, font_size, fill, outline, outline_px, align, valign } => {
+        LayoutDecoration::Text { pos, size, text, font_size, fill, outline, outline_px, align, valign, .. } => {
             use crate::canvas::node::TextVAlign;
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
@@ -1170,7 +1407,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                 fcol,
             );
         }
-        LayoutDecoration::Svg { pos, size, svg_data, rev, tint, tint_mode, stroke, stroke_px, icon_key } => {
+        LayoutDecoration::Svg { pos, size, svg_data, rev, tint, tint_mode, stroke, stroke_px, icon_key, .. } => {
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
                 egui::vec2(size[0].max(8.0), size[1].max(8.0)),

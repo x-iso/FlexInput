@@ -270,6 +270,8 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     source_path,
                     iv_style_override: None,
                     menu_style_override: None,
+                    keep_aspect: false,
+                    anchor: Default::default(),
                 },
             ));
             let idx = overlay_layout.items.len() - 1;
