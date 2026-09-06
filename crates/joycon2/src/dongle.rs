@@ -102,6 +102,74 @@ struct Shared {
 }
 
 /// A live connection to one half.
+/// Watches the mouse delta fields for signs of being a gyroscope in disguise.
+///
+/// ⭐ **The question is where this controller's angular rate actually lives.**
+/// A retail Joy-Con 2 has a real optical sensor: slide it on a desk and it
+/// reports surface motion. A third-party unit that lacks that sensor but must
+/// still satisfy a Switch 2 has an obvious shortcut — synthesise the deltas
+/// from the gyro. Projecting 3DOF onto two axes would pass unnoticed in
+/// ordinary use, and it would mean the rate we have been reconstructing by
+/// differentiating a quantised heading has been sitting in the report all
+/// along, already differentiated by the firmware.
+///
+/// ❗ The discriminator is motion IN THE AIR. An optical sensor with nothing in
+/// front of it produces nothing; a gyro-derived one tracks rotation regardless.
+/// So the numbers here are only meaningful against a stated gesture, which is
+/// why the log line says what it is measuring rather than just printing deltas.
+#[derive(Debug, Default)]
+struct MouseProbe {
+    window_began: Option<Instant>,
+    reports: u32,
+    moved: u32,
+    sum_abs: [u64; 2],
+    peak: [i16; 2],
+    /// Every distinct liftoff byte seen, OR-ed. A sensor that never leaves a
+    /// surface it does not have should hold this constant.
+    liftoff_bits: u8,
+}
+
+impl MouseProbe {
+    /// Fold in one report; returns a summary every `window`.
+    fn tick(&mut self, m: &reports::Mouse, now: Instant, window: Duration) -> Option<String> {
+        let began = *self.window_began.get_or_insert(now);
+        self.reports += 1;
+        if m.delta_x != 0 || m.delta_y != 0 {
+            self.moved += 1;
+        }
+        self.sum_abs[0] += m.delta_x.unsigned_abs() as u64;
+        self.sum_abs[1] += m.delta_y.unsigned_abs() as u64;
+        if m.delta_x.abs() > self.peak[0].abs() {
+            self.peak[0] = m.delta_x;
+        }
+        if m.delta_y.abs() > self.peak[1].abs() {
+            self.peak[1] = m.delta_y;
+        }
+        self.liftoff_bits |= m.liftoff;
+        if now.duration_since(began) < window || self.reports == 0 {
+            return None;
+        }
+        let out = format!(
+            "mouse over {} reports: {} moved, sum |dx| {} |dy| {}, peak {:+} {:+}, \
+             liftoff bits {:#04x} — {}",
+            self.reports,
+            self.moved,
+            self.sum_abs[0],
+            self.sum_abs[1],
+            self.peak[0],
+            self.peak[1],
+            self.liftoff_bits,
+            if self.moved == 0 {
+                "DEAD (no optical sensor, or the feature bit did not take)"
+            } else {
+                "LIVE - compare against whether it was on a surface"
+            },
+        );
+        *self = MouseProbe { window_began: Some(now), ..Default::default() };
+        Some(out)
+    }
+}
+
 struct Link {
     key: PadKey,
     conn: u16,
@@ -121,6 +189,10 @@ struct Link {
     /// characteristic is the only source of input for this link.
     common_only: bool,
     last_input: Instant,
+    /// Inter-report timing, for the gyro-jitter diagnostic.
+    cadence: flexinput_btle::cadence::Cadence,
+    /// Mouse-delta watch, live only when the feature bit is set.
+    mouse_probe: MouseProbe,
     /// Reports parsed on this link, for the backoff in the motion diagnostic.
     reports: u32,
     /// Notifications on the previously unsubscribed streams — see
@@ -241,6 +313,31 @@ impl Drop for Joycon2DongleHub {
 ///
 /// `FLEXINPUT_JC2_FEATURES` takes a hex byte (`2f`, `37`, `10`, `04`, …) to try
 /// a different mask, or `off` to skip the command, without a rebuild.
+/// Parse `FLEXINPUT_JC2_FEATURES` into the masks to sweep.
+///
+/// Split out from [`feature_override`] purely so it can be tested: the rest of
+/// that function reads the environment and advances a global counter, and a
+/// parse slip there costs a hardware run on someone else's hands rather than a
+/// red test.
+fn parse_feature_masks(raw: &str) -> Vec<u8> {
+    raw.split(',')
+        .filter_map(|t| {
+            let t = t.trim();
+            let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            u8::from_str_radix(t, 16).ok()
+        })
+        .collect()
+}
+
+/// Whether this run asked for the mouse feature.
+///
+/// Separate from the mask so the probe can be turned on without hand-building a
+/// mask byte and getting the bit wrong — the sweep already showed how easily a
+/// run gets spent testing a condition nobody meant to set.
+fn mouse_enabled() -> bool {
+    std::env::var("FLEXINPUT_JC2_MOUSE").is_ok_and(|v| v.eq_ignore_ascii_case("on"))
+}
+
 fn feature_override() -> Option<u8> {
     let Ok(raw) = std::env::var("FLEXINPUT_JC2_FEATURES") else {
         // ⭐ Default is to SEND it. Skipping was tried and the controller then
@@ -248,19 +345,51 @@ fn feature_override() -> Option<u8> {
         // with the counter climbing, but the motion block is absent entirely.
         // So on this hardware the feature command is what enables motion at
         // all — it is not merely selecting a format.
-        return Some(protocol::feature::JOYCON2_DEFAULT);
+        // ❗ The mouse switch has to survive this early return too, or
+        // `FLEXINPUT_JC2_MOUSE=on` alone silently probes a feature that was
+        // never enabled — a dead reading that looks like an answer.
+        return Some(if mouse_enabled() {
+            protocol::feature::JOYCON2_DEFAULT | protocol::feature::MOUSE
+        } else {
+            protocol::feature::JOYCON2_DEFAULT
+        });
     };
-    let raw = raw.trim().trim_start_matches("0x");
+    let raw = raw.trim();
     if raw.eq_ignore_ascii_case("off") || raw.is_empty() {
         return None;
     }
-    match u8::from_str_radix(raw, 16) {
-        Ok(v) => Some(v),
-        Err(_) => {
-            eprintln!("[jc2-dongle] FLEXINPUT_JC2_FEATURES={raw:?} is not a hex byte — skipping");
-            None
-        }
+    // ⭐ **A comma-separated list sweeps one mask per connection.**
+    //
+    // A mask is only testable across a whole connect-init-observe cycle, so a
+    // single value per run meant one data point per launch, and the masks worth
+    // trying are more numerous than anyone wants to relaunch for. These
+    // controllers already reconnect every few seconds while the stream under
+    // test is silent, which turns the reconnect loop from a nuisance into the
+    // sweep mechanism: `FLEXINPUT_JC2_FEATURES=07,0f,2f,3f,ff` walks the list,
+    // one entry per initialisation, and the log records which was in force for
+    // each. A bare single value behaves exactly as before.
+    let masks = parse_feature_masks(raw);
+    if masks.is_empty() {
+        eprintln!("[jc2-dongle] FLEXINPUT_JC2_FEATURES={raw:?} has no hex bytes — skipping");
+        return None;
     }
+    // ❗ Advances per CALL, which is per controller initialisation. Both halves
+    // reconnecting therefore see different masks, and the log line naming the
+    // mask is what ties a result to its condition — never assume the nth
+    // connection used the nth entry.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let i = NEXT.fetch_add(1, Ordering::Relaxed) % masks.len();
+    if masks.len() > 1 {
+        eprintln!(
+            "[jc2-dongle] feature mask sweep: entry {}/{} = {:#04x}",
+            i + 1,
+            masks.len(),
+            masks[i]
+        );
+    }
+    // ⭐ The switch ORs its bit in rather than replacing the mask, so it
+    // composes with a sweep instead of overriding one.
+    Some(if mouse_enabled() { masks[i] | protocol::feature::MOUSE } else { masks[i] })
 }
 
 /// Walk the controller's whole attribute table and print it.
@@ -957,6 +1086,29 @@ pub const DONGLE_PROBING: u8 = 0;
 pub const DONGLE_ACTIVE: u8 = 1;
 pub const DONGLE_ABSENT: u8 = 2;
 
+/// The diagnostic switches that ONLY this transport implements.
+///
+/// ⛔ **A run with one of these set must never fall back to the Windows
+/// stack.** The WinRT hub knows nothing about them: it connects, subscribes
+/// the per-side characteristic and streams, and writes a log that reads
+/// exactly like a healthy ordinary session. So a test whose transport
+/// silently changed underneath it does not look like "the experiment did not
+/// run" — it looks like "the experiment ran and changed nothing", which is
+/// the most expensive wrong answer available, and it has already cost
+/// hardware runs on someone else's hands.
+fn experiment_switches() -> Vec<String> {
+    [
+        "FLEXINPUT_JC2_MODE",
+        "FLEXINPUT_JC2_COMMON",
+        "FLEXINPUT_JC2_CMD",
+        "FLEXINPUT_JC2_PAIR",
+        "FLEXINPUT_JC2_DISCOVER",
+    ]
+    .into_iter()
+    .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+    .collect()
+}
+
 fn run(shared: Arc<Shared>) {
     // Open the log FIRST, before anything can fail.
     //
@@ -970,15 +1122,30 @@ fn run(shared: Arc<Shared>) {
     // Whatever happens below, the hub must eventually be released; without this
     // an early return would leave it standing down forever and Joy-Cons would
     // stop working entirely on machines with no dongle.
-    struct ReleaseUnlessActive(Arc<AtomicU8>);
+    let experiments = experiment_switches();
+    struct ReleaseUnlessActive {
+        state: Arc<AtomicU8>,
+        /// A diagnostic switch is set, so the hub must NOT take over.
+        pinned: bool,
+    }
     impl Drop for ReleaseUnlessActive {
         fn drop(&mut self) {
+            if self.pinned {
+                // Left at DONGLE_PROBING, the value the hub stands down on.
+                // No input at all is the correct outcome: a run that produces
+                // nothing says so, while a run on the other transport says
+                // nothing true about the thing under test.
+                eprintln!(
+                    "[jc2-dongle] a diagnostic switch is set and this transport is                      unavailable — NOT handing the Joy-Cons to the Windows stack,                      because that would quietly run a different experiment."
+                );
+                return;
+            }
             // ❗ Publishing ABSENT is not housekeeping — it is the signal that
             // lets the WinRT hub start scanning, after which Windows
             // auto-connects any remembered controller and the dongle can no
             // longer even SEE it. Announce it, because from the outside it
             // looks like "the dongle stopped working for no reason".
-            if self.0.swap(DONGLE_ABSENT, Ordering::Relaxed) == DONGLE_ACTIVE {
+            if self.state.swap(DONGLE_ABSENT, Ordering::Relaxed) == DONGLE_ACTIVE {
                 eprintln!(
                     "[jc2-dongle] dongle thread exiting — Joy-Cons handed back to the \
                      Windows stack, which will grab them within seconds"
@@ -986,7 +1153,10 @@ fn run(shared: Arc<Shared>) {
             }
         }
     }
-    let _release = ReleaseUnlessActive(Arc::clone(&shared.state));
+    let _release = ReleaseUnlessActive {
+        state: Arc::clone(&shared.state),
+        pinned: !experiments.is_empty(),
+    };
 
     let Some((vid, pid)) = configured_dongle() else {
         eprintln!(
@@ -994,6 +1164,15 @@ fn run(shared: Arc<Shared>) {
              [jc2-dongle] Joy-Cons will fall back to the Windows stack."
         );
         dlog!("no WinUSB-bound adapter present");
+        // ⭐ Into the IMU log too, because that is the file these experiments
+        // are read from, and its silence there is otherwise indistinguishable
+        // from a result.
+        if !experiments.is_empty() {
+            crate::dlog::imu(format_args!(
+                "NO RUN — {} set, but no WinUSB-bound Bluetooth adapter is present.                  Only the dongle transport implements these switches, so NOTHING was                  tested. Bind an adapter with Zadig (or set FLEXINPUT_JC2_DONGLE=vid:pid)                  and run again.",
+                experiments.join(" ")
+            ));
+        }
         return;
     };
     // ⭐ SHARED, not owned. This hub and the Bluetooth Classic transport run on
@@ -1283,6 +1462,31 @@ fn connect_and_init(
         "[jc2-dongle] {} connected, handle {conn:#06x}",
         side.display_name()
     );
+    // ⭐ **Ask for the 2M PHY, because the interval cannot go any lower.**
+    //
+    // 7.5 ms is the spec floor for a connection interval, so the only remaining
+    // way to move more reports per second is to move them faster on the air.
+    // Doubling the symbol rate roughly doubles what one connection event can
+    // carry, and events are exactly what the two halves are competing for: a
+    // lone controller holds 200 Hz, and the second one arriving costs the loser
+    // a fifth of its reports.
+    //
+    // ❗ Best-effort and deliberately unchecked here. The command is
+    // status-only and the outcome arrives later as an LE PHY Update Complete,
+    // so this logs the REQUEST. Reading it as confirmation would repeat the
+    // write-response mistake — claiming a result from an answer that has not
+    // come back yet.
+    match dongle.request_2m_phy(conn) {
+        Ok(()) => crate::dlog::imu(format_args!(
+            "{} requested LE 2M PHY (adapter advertises 2M: {})",
+            side.display_name(),
+            dongle.supports_2m_phy(),
+        )),
+        Err(e) => crate::dlog::imu(format_args!(
+            "{} LE 2M PHY request refused: {e} — staying on 1M, which streams fine",
+            side.display_name(),
+        )),
+    }
 
     // Raise the ATT MTU before anything else. At the 23-byte default a 63-byte
     // input report arrives fragmented and every parser offset is wrong.
@@ -1480,6 +1684,28 @@ fn connect_and_init(
     let cmd_common = reference_mode
         || std::env::var("FLEXINPUT_JC2_CMD")
             .is_ok_and(|v| v.eq_ignore_ascii_case("common"));
+    // ⭐ **The control this investigation has never had.**
+    //
+    // Reference mode reports that no command on `0x0014` is ever answered. That
+    // is only meaningful against a channel known to answer — and nothing has
+    // ever waited for a reply on the WORKING `0x0016` path, so "the controller
+    // does not answer commands on 0x0014" and "this controller does not answer
+    // commands at all" have never been told apart. One is a wrong channel; the
+    // other means the reference protocol does not exist on this hardware and
+    // the search should stop.
+    //
+    // `FLEXINPUT_JC2_REPLIES=on` waits on the default path too. Off by default
+    // because it adds up to 400 ms per command to an init measured against a
+    // three-second watchdog — a diagnostic, not a mode to ship.
+    let reply_probe = std::env::var("FLEXINPUT_JC2_REPLIES")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("on"));
+    if reply_probe {
+        crate::dlog::imu(format_args!(
+            "{} FLEXINPUT_JC2_REPLIES=on — waiting for a reply to every command, \
+             on whichever channel this run uses",
+            side.display_name()
+        ));
+    }
     crate::dlog::imu(format_args!(
         "{} command channel: {} ({})",
         side.display_name(),
@@ -1523,27 +1749,70 @@ fn connect_and_init(
         //
         // Reference mode only: the default path keeps its 30 ms and its
         // measured behaviour.
-        if cmd_common {
-            let deadline = Instant::now() + Duration::from_millis(400);
+        if cmd_common || reply_probe {
+            // ⛔ **Record every ATT PDU seen while waiting, not only the one
+            // that matched.**
+            //
+            // The previous version dropped non-matching packets on the floor and
+            // could therefore only ever report absence. A whole run came back
+            // reading "no reply in 400 ms" nineteen times, which is equally
+            // consistent with a silent controller, a reply on a handle nothing
+            // here watches, and a matcher that is simply wrong — three
+            // different problems, and a log that says nothing cannot tell them
+            // apart. Absence is evidence only when you can also show what would
+            // have been accepted.
+            // ❗ **The budget is the input watchdog, not patience.**
+            //
+            // Nineteen commands at 400 ms each is 7.6 s of init when nothing
+            // answers, against a 3 s watchdog — the diagnostic would kill the
+            // link it is measuring and report the wrong cause. Reference mode
+            // can afford the long wait because its stream never starts anyway;
+            // the working path cannot, so it gets 120 ms, which is far longer
+            // than a reply that is coming at all will take.
+            let budget = if cmd_common { 400 } else { 120 };
+            let deadline = Instant::now() + Duration::from_millis(budget);
             let mut answered = false;
+            let mut seen: Vec<String> = Vec::new();
             while Instant::now() < deadline && !answered {
                 for pkt in dongle.drain_acl(64) {
                     if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
                         continue;
                     }
+                    if seen.len() < 8 {
+                        seen.push(format!(
+                            "op {:#04x} {:02x?}",
+                            pkt.payload[0],
+                            &pkt.payload[..pkt.payload.len().min(10)],
+                        ));
+                    }
                     let Some(note) = acl::parse_notification(&pkt.payload) else { continue };
-                    if note.handle != jc::HANDLE_CMD_RESPONSE {
+                    // ⛔ **Both response channels, and the project's own parser.**
+                    //
+                    // The hand-rolled `value[0] == cmd` test used here before
+                    // only ever matched a bare header at offset 0. Replies on
+                    // `0x001e` carry fifteen bytes of prefix, so a reply
+                    // arriving there was read as no reply at all — the failure
+                    // mode this whole block exists to rule out. `parse_response`
+                    // validates at the expected offset and falls back to
+                    // scanning, and it is what the working pairing path uses.
+                    let offset = if note.handle == jc::HANDLE_CMD_RESPONSE_PERSIDE {
+                        protocol::CMD_RESP_HEADER_OFFSET
+                    } else {
+                        0
+                    };
+                    if note.handle != jc::HANDLE_CMD_RESPONSE
+                        && note.handle != jc::HANDLE_CMD_RESPONSE_PERSIDE
+                    {
                         continue;
                     }
-                    // Byte 0 echoes the command; byte 1 is 0x01 for accepted.
-                    if note.value.first() == Some(&c) {
-                        if note.value.get(1) != Some(&0x01) {
-                            crate::dlog::imu(format_args!(
-                                "{} command {c:#04x}/{s:#04x} REJECTED: {:02x?}",
-                                side.display_name(),
-                                &note.value[..note.value.len().min(12)],
-                            ));
-                        }
+                    if let Some((hdr, _)) = protocol::parse_response(&note.value, offset, c) {
+                        crate::dlog::imu(format_args!(
+                            "{} command {c:#04x}/{s:#04x} REPLY on {:#06x}: sub {:#04x} ack {:#04x}",
+                            side.display_name(),
+                            note.handle,
+                            hdr.subcmd,
+                            hdr.ack,
+                        ));
                         answered = true;
                         break;
                     }
@@ -1551,8 +1820,10 @@ fn connect_and_init(
             }
             if !answered {
                 crate::dlog::imu(format_args!(
-                    "{} command {c:#04x}/{s:#04x} — no reply in 400 ms",
-                    side.display_name()
+                    "{} command {c:#04x}/{s:#04x} — NO REPLY on 0x001a or 0x001e \
+                     within {budget} ms; ATT traffic meanwhile: {}",
+                    side.display_name(),
+                    if seen.is_empty() { "NOTHING AT ALL".to_string() } else { seen.join(" | ") },
                 ));
             }
             return Ok(());
@@ -1565,10 +1836,84 @@ fn connect_and_init(
         Ok(())
     };
 
+    // ⭐ **Probe the command handle with a write that MUST be answered.**
+    //
+    // Every command below is an ATT Write Command (`0x52`), unacknowledged by
+    // definition — the reference uses the same opcode. So a write to a handle
+    // that refuses writes, does not exist, or is gated behind authentication is
+    // indistinguishable from one that was accepted and acted upon. That
+    // ambiguity has sat underneath this entire investigation.
+    //
+    // An ATT Write Request (`0x12`) to the same handle cannot be ignored: the
+    // peer owes either a Write Response or an Error Response. It settles
+    // whether `0x0014` is reachable at all, which no fire-and-forget sequence
+    // can. One extra PDU per connection, in reference mode only.
+    if cmd_common || reply_probe {
+        // ⛔ **Drain first.** An ATT Write Response carries no handle, so the
+        // bare `0x13` this loop matches could belong to any earlier write — and
+        // on the first run it did: three CCCD writes were still in flight, the
+        // probe credited one of their responses to itself and reported "the
+        // handle accepts writes", while the genuine answer for `0x0014` —
+        // `01 12 14 00 03`, Write Not Permitted — arrived in the NEXT drain and
+        // was read as unrelated traffic. A correlation-free matcher on a
+        // shared queue will always find the answer it hoped for.
+        let flushed = dongle.drain_acl(64).len();
+        let probe = protocol::command(protocol::CMD_UNKNOWN_07, 0x01, &[]);
+        let target = if cmd_common { jc::HANDLE_CMD_WRITE_COMMON } else { jc::HANDLE_CMD_WRITE };
+        let _ = dongle.send_att(conn, &acl::write_request(target, &probe));
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let mut answer: Option<String> = None;
+        while Instant::now() < deadline && answer.is_none() {
+            for pkt in dongle.drain_acl(64) {
+                if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
+                    continue;
+                }
+                match pkt.payload[0] {
+                    0x13 => {
+                        answer = Some("WRITE RESPONSE - the handle accepts writes".to_string());
+                    }
+                    // Error responses DO name the handle, so this one is
+                    // attributable: only claim it if it is ours.
+                    0x01 if pkt.payload.len() >= 5
+                        && u16::from_le_bytes([pkt.payload[2], pkt.payload[3]]) == target =>
+                    {
+                        answer = Some(format!(
+                            "ERROR RESPONSE {:02x?} - the handle REFUSED the write \
+                             (0x03 = Write Not Permitted, which is NORMAL for a \
+                             write-without-response-only characteristic)",
+                            &pkt.payload[..pkt.payload.len().min(6)],
+                        ));
+                    }
+                    _ => continue,
+                }
+                break;
+            }
+        }
+        let _ = flushed;
+        crate::dlog::imu(format_args!(
+            "{} write-request probe of command handle {:#06x} (flushed {flushed} stale PDUs): {}",
+            side.display_name(),
+            target,
+            answer.unwrap_or_else(|| {
+                "NO ANSWER in 400 ms - an ATT violation, so the PDU never reached the peer"
+                    .to_string()
+            }),
+        ));
+    }
+
     // Undocumented handshake steps official software always sends first.
-    cmd(protocol::CMD_UNKNOWN_07, 0x01, &[])?;
-    cmd(protocol::CMD_UNKNOWN_10, 0x01, &[])?;
-    cmd(protocol::CMD_UNKNOWN_16, 0x01, &[])?;
+    //
+    // ⛔ Not in reference mode. The reference's initialize() sends NONE of
+    // these — it goes straight from subscribing the response channel to
+    // reading controller info. Three unknown commands ahead of everything else,
+    // taken from a different research source, could put the controller into a
+    // mode the reference never sees. "We send a superset of what works" is safe
+    // only if every extra is inert, and that was never established for these.
+    if !reference_mode {
+        cmd(protocol::CMD_UNKNOWN_07, 0x01, &[])?;
+        cmd(protocol::CMD_UNKNOWN_10, 0x01, &[])?;
+        cmd(protocol::CMD_UNKNOWN_16, 0x01, &[])?;
+    }
 
     // Controller-memory reads. These carry factory calibration; other
     // implementations report that skipping them leaves the controller emitting
@@ -1622,7 +1967,9 @@ fn connect_and_init(
     // FLEXINPUT_JC2_PAIR=off skips it. Off by default until it is shown safe:
     // the per-side stream may or may not depend on it, and finding out is what
     // the switch is for.
-    if std::env::var("FLEXINPUT_JC2_PAIR").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+    if reference_mode
+        || std::env::var("FLEXINPUT_JC2_PAIR").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+    {
         eprintln!("[jc2-dongle] {} pairing SKIPPED (FLEXINPUT_JC2_PAIR=off)", side.display_name());
         crate::dlog::imu(format_args!(
             "{} pairing SKIPPED — no 0x15 sent, no flash written, as the reference does",
@@ -1667,11 +2014,17 @@ fn connect_and_init(
     // key, and the AES confirmation it sends back matches the one derived from
     // the LTK. That cannot be faked by a controller that ignored the exchange.
     // The buzz was simply a command nobody was sending.
-    cmd(protocol::CMD_VIBRATION, 0x02, &[0x03, 0, 0, 0])?;
-    dlog!("init: connection feedback (buzz) sent");
-
-    cmd(protocol::CMD_PLAYER_LEDS, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0])?;
-    dlog!("init: player LED set");
+    // Reference order is player LEDs, then the vibration preset. This path had
+    // them the other way round for no recorded reason, so reference mode uses
+    // theirs.
+    if reference_mode {
+        cmd(protocol::CMD_PLAYER_LEDS, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0])?;
+        cmd(protocol::CMD_VIBRATION, 0x02, &[0x03, 0, 0, 0])?;
+    } else {
+        cmd(protocol::CMD_VIBRATION, 0x02, &[0x03, 0, 0, 0])?;
+        cmd(protocol::CMD_PLAYER_LEDS, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0])?;
+    }
+    dlog!("init: player LED and connection feedback sent");
 
     // ⭐ The feature-select command is now OPTIONAL, and off by default.
     //
@@ -1698,7 +2051,20 @@ fn connect_and_init(
     //
     // `FLEXINPUT_JC2_FEATURES=2f` (any hex byte) restores the old behaviour with
     // that mask, so both paths are one restart apart rather than a rebuild.
-    match feature_override() {
+    // ⭐ Reference mode defaults to the mask the reference actually sends.
+    //
+    // `enable_features(0x03 | FEATURE_MOTION)` — buttons, sticks, motion, and
+    // nothing else. This path's default is `0x2f`, which adds IMU_RAW and
+    // RUMBLE. Running "the reference sequence" with a mask the reference never
+    // sends is not running the reference sequence, and the mask is the one
+    // parameter this command exists to carry. An explicit
+    // FLEXINPUT_JC2_FEATURES still wins, so the sweep stays available.
+    let selected = if reference_mode && std::env::var_os("FLEXINPUT_JC2_FEATURES").is_none() {
+        Some(protocol::feature::BUTTONS | protocol::feature::STICKS | protocol::feature::IMU)
+    } else {
+        feature_override()
+    };
+    match selected {
         Some(mask) => {
             eprintln!("[jc2-dongle] feature-select ENABLED, mask {mask:#04x} (mouse needs 0x10)");
             // ⛔ **Into the diagnostic log, not just stderr.**
@@ -1733,7 +2099,27 @@ fn connect_and_init(
             // two feature frames back to back with all four intervening steps
             // missing — a shorter sequence than the one this controller was
             // captured responding to.
+            // ⛔ **In reference mode the two feature frames go back to back.**
+            //
+            // enable_features() in the reference is exactly two writes:
+            //
+            //     self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_INIT, payload)
+            //     self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, payload)
+            //
+            // with nothing at all between them. This path injects three
+            // unrelated commands into that gap. If the pair is one transaction
+            // — which is what an INIT/ENABLE pair usually is — interleaving
+            // voids it, and it would fail in exactly the way seen here: the
+            // per-side stream, already running, unaffected; the stream the
+            // ENABLE was meant to select never arriving.
             cmd(protocol::CMD_FEATURE_SELECT, protocol::SUB_FEATURE_INIT, &[mask, 0, 0, 0])?;
+            if reference_mode {
+                cmd(
+                    protocol::CMD_FEATURE_SELECT,
+                    protocol::SUB_FEATURE_CONFIRM,
+                    &[mask, 0, 0, 0],
+                )?;
+            } else {
             cmd(protocol::CMD_UNKNOWN_11, 0x03, &[])?;
             cmd(
                 protocol::CMD_VIBRATION,
@@ -1745,6 +2131,7 @@ fn connect_and_init(
             )?;
             cmd(protocol::CMD_UNKNOWN_11, 0x01, &[])?;
             cmd(protocol::CMD_FEATURE_SELECT, protocol::SUB_FEATURE_CONFIRM, &[mask, 0, 0, 0])?;
+            }
 
             // ⭐ Mirror it onto the COMMON command characteristic, bare.
             //
@@ -1917,6 +2304,8 @@ fn connect_and_init(
         common_motion: None,
         common_only,
         last_input: Instant::now(),
+        cadence: flexinput_btle::cadence::Cadence::new(),
+        mouse_probe: MouseProbe::default(),
         reports: 0,
         extra_reports: 0,
         replies: 0,
@@ -1955,6 +2344,10 @@ fn pump(
     scanning: bool,
 ) -> Option<([u8; 6], u8, Side)> {
     let mut found = None;
+    // ❗ Taken before the per-report loop borrows `links` mutably. It is the
+    // condition the cadence measurement is being compared ACROSS, so a
+    // measurement that could not name it would answer nothing.
+    let streaming_links = links.len();
     // ⭐ From the shared radio's fan-out, not from the dongle directly. One
     // reader feeds every transport; reading the transport here would consume
     // the other one's traffic as well as ours.
@@ -2296,7 +2689,53 @@ fn pump(
                 gyro,
             );
         }
-        link.last_input = Instant::now();
+        let arrived = Instant::now();
+        // ⭐ The raw fields, before anything interprets them.
+        if crate::dlog::capturing() {
+            let m = &snap.motion;
+            crate::dlog::capture(format_args!(
+                "{},{},{},{},{},{},{},{},{}",
+                match link.key.side {
+                    protocol::Side::Left => "L",
+                    protocol::Side::Right => "R",
+                },
+                m.timestamp,
+                m.angle[0],
+                m.angle[1],
+                m.angle[2],
+                m.accel[0],
+                m.accel[1],
+                m.accel[2],
+                snap.motion_len,
+            ));
+        }
+        if let Some(c) = link.cadence.tick(arrived, Duration::from_secs(2)) {
+            crate::dlog::imu(format_args!(
+                "{} cadence over {} reports: {:.1} Hz, mean {:.2} ms \
+                 (min {:.2}, max {:.2}), jitter {:.2} ms/step — {} link(s) streaming",
+                link.key.side.display_name(),
+                c.samples,
+                c.hz,
+                c.mean_ms,
+                c.min_ms,
+                c.max_ms,
+                c.jitter_ms,
+                streaming_links,
+            ));
+        }
+        if mouse_enabled() {
+            if let Some(line) = link.mouse_probe.tick(
+                &snap.mouse,
+                arrived,
+                Duration::from_secs(2),
+            ) {
+                crate::dlog::imu(format_args!(
+                    "{} {line}",
+                    link.key.side.display_name()
+                ));
+            }
+        }
+        link.last_input = arrived;
         if let Some(pad) = shared.pads.lock().unwrap().get_mut(&link.key) {
             pad.streaming = true;
             pad.snapshot = snap;
@@ -2358,3 +2797,34 @@ mod tests {
         assert_eq!(MAX_LINKS, 2, "two halves make one controller");
     }
 }
+
+#[cfg(test)]
+mod feature_mask_tests {
+    use super::parse_feature_masks;
+
+    #[test]
+    fn a_single_value_is_a_one_entry_sweep() {
+        assert_eq!(parse_feature_masks("2f"), vec![0x2f]);
+        assert_eq!(parse_feature_masks("0x2F"), vec![0x2f]);
+    }
+
+    #[test]
+    fn a_list_keeps_its_order_and_tolerates_spacing() {
+        assert_eq!(parse_feature_masks("07, 0f ,0x2f"), vec![0x07, 0x0f, 0x2f]);
+    }
+
+    #[test]
+    fn unparsable_entries_are_dropped_rather_than_shifting_the_sweep() {
+        // ❗ A silently mis-parsed entry would attribute one mask's result to
+        // another, which is worse than testing one fewer mask.
+        assert_eq!(parse_feature_masks("07,zz,2f"), vec![0x07, 0x2f]);
+        assert!(parse_feature_masks("zz").is_empty());
+        assert!(parse_feature_masks("").is_empty());
+    }
+
+    #[test]
+    fn a_value_wider_than_a_byte_is_refused_not_truncated() {
+        assert!(parse_feature_masks("1ff").is_empty());
+    }
+}
+

@@ -54,11 +54,34 @@ pub(crate) struct Sink {
 const QUEUE: usize = 4096;
 
 impl Sink {
-    /// Open `name`, honouring `env` (`off` disables), under `dir` with the
-    /// temp directory as a fallback.
+    /// Open `name`, honouring `env`, under `dir` with the temp directory as a
+    /// fallback.
+    ///
+    /// `env` takes a path, or `off` to disable, or `on` to enable at the
+    /// default location.
+    ///
+    /// ⛔ **In a RELEASE build these are opt-in, and that is the whole point of
+    /// this function being the only way to open one.** Every log here exists to
+    /// answer a question someone is actively investigating; none of them is
+    /// something a shipped build should be writing to a user's disk unasked.
+    /// Gating at each call site instead would mean gating four of them
+    /// correctly and then adding a fifth that nobody remembers to gate.
+    ///
+    /// ❗ A tester still gets them with one variable — `…=on` for the default
+    /// location, or a path — so "send me the log" costs a restart, not a
+    /// special build.
     fn open(name: &str, env: &str, beside_exe: bool) -> Option<Self> {
         let configured = std::env::var(env).ok();
         if configured.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("off")) {
+            return None;
+        }
+        // `on` means "yes, at the usual place" rather than a file called `on`.
+        let configured = match configured {
+            Some(v) if v.eq_ignore_ascii_case("on") => None,
+            other => other,
+        };
+        let asked_for = std::env::var_os(env).is_some();
+        if !cfg!(debug_assertions) && !asked_for {
             return None;
         }
         let candidates: Vec<std::path::PathBuf> = match configured {
@@ -274,6 +297,46 @@ pub(crate) fn drift(args: std::fmt::Arguments) {
 /// be found, read and mailed by someone who is not going to be walked through
 /// AppData. Delete this function and its call site when the question is
 /// answered. `FLEXINPUT_JC2_IMU_LOG` overrides the path, `off` disables it.
+/// Whether the raw per-report capture is switched on.
+pub(crate) fn capturing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FLEXINPUT_JC2_CAPTURE").is_ok_and(|v| v.eq_ignore_ascii_case("on"))
+    })
+}
+
+/// One CSV row of RAW report data, at full report rate.
+///
+/// ⭐ **Every attempt to fix this gyro has worked on the derived signal.** The
+/// angle fields have been modelled as wrapping twice per turn, spike-limited,
+/// smoothed and drift-corrected — and the reported symptoms are still mirrored
+/// bounces and teleports, which are signatures of the ENCODING, not of noise.
+///
+/// ❗ Two-second diagnostic samples cannot settle it. A wrap and a fold produce
+/// the identical value RANGE and are told apart only by what happens across the
+/// boundary: a wrap is a discontinuity in the value with a continuous
+/// derivative, a fold is a continuous value whose derivative flips sign. Seeing
+/// that needs consecutive reports, so it needs this.
+///
+/// Written raw and unprocessed on purpose — no permutation, no mount
+/// correction, no scaling. Every one of those is a hypothesis, and a capture
+/// that bakes in the hypotheses cannot test them.
+pub(crate) fn capture(args: std::fmt::Arguments) {
+    static SINK: std::sync::OnceLock<Option<Sink>> = std::sync::OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        let s = Sink::open("jc2-raw-capture.csv", "FLEXINPUT_JC2_CAPTURE_FILE", true);
+        if let Some(s) = &s {
+            eprintln!("[jc2] raw capture: {}", s.path().display());
+            s.write("host_us,side,dev_ticks,f0,f1,f2,ax,ay,az,motion_len");
+        }
+        s
+    });
+    let Some(sink) = sink else { return };
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let t = START.get_or_init(Instant::now).elapsed().as_micros();
+    sink.write(&format!("{t},{args}"));
+}
+
 pub(crate) fn imu(args: std::fmt::Arguments) {
     static SINK: std::sync::OnceLock<Option<Sink>> = std::sync::OnceLock::new();
     let sink = SINK.get_or_init(|| {
@@ -288,4 +351,46 @@ pub(crate) fn imu(args: std::fmt::Arguments) {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let t = START.get_or_init(Instant::now).elapsed().as_secs();
     sink.write(&format!("{t} {args}"));
+}
+
+#[cfg(test)]
+mod release_gating_tests {
+    use super::Sink;
+
+    /// ⛔ The property that matters: a shipped build writes nothing unless
+    /// asked. Asserted through `Sink::open` itself rather than by reading the
+    /// cfg, because the gate is only worth anything if it lives at the one
+    /// place every log is opened.
+    #[test]
+    fn a_log_is_opt_in_for_release_and_on_by_default_for_debug() {
+        let var = "FLEXINPUT_TEST_GATE_UNSET";
+        std::env::remove_var(var);
+        let opened = Sink::open("flexinput-gate-test.log", var, false).is_some();
+        assert_eq!(
+            opened,
+            cfg!(debug_assertions),
+            "unasked-for logging must follow the build profile"
+        );
+    }
+
+    #[test]
+    fn off_disables_it_in_every_build() {
+        let var = "FLEXINPUT_TEST_GATE_OFF";
+        std::env::set_var(var, "off");
+        assert!(Sink::open("flexinput-gate-off.log", var, false).is_none());
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn on_enables_it_without_naming_a_file_called_on() {
+        // ❗ The variable is a PATH everywhere else, so `on` had to be given a
+        // meaning — otherwise the way to switch a log on in release would be to
+        // create a file literally named `on` in the working directory.
+        let var = "FLEXINPUT_TEST_GATE_ON";
+        std::env::set_var(var, "on");
+        let sink = Sink::open("flexinput-gate-on.log", var, false).expect("opens");
+        assert_ne!(sink.path().file_name().unwrap(), "on");
+        assert_eq!(sink.path().file_name().unwrap(), "flexinput-gate-on.log");
+        std::env::remove_var(var);
+    }
 }
