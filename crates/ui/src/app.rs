@@ -460,6 +460,12 @@ pub struct FlexInputApp {
     settings: AppSettings,
     /// True while the Settings window is shown.
     settings_open: bool,
+    /// True while the third-party licence viewer is shown. Independent of
+    /// `settings_open` — it's opened from Credits but outlives the Settings
+    /// window, so closing Settings doesn't yank the licence text away.
+    licenses_open: bool,
+    /// Index into `licenses::LICENSES` of the entry the viewer is showing.
+    licenses_selected: usize,
     /// Bluetooth dongle panel — adapters, pairings, key file.
     bluetooth: bluetooth_window::BluetoothState,
     /// Cached "is any adapter visible", refreshed on the panel's own
@@ -1127,6 +1133,8 @@ impl FlexInputApp {
             panic_shortcut_shared,
             settings: app_settings,
             settings_open: false,
+            licenses_open: false,
+            licenses_selected: 0,
             bluetooth: Default::default(),
             bluetooth_present: false,
             settings_dirty: false,
@@ -2035,6 +2043,7 @@ impl eframe::App for FlexInputApp {
 
         // ── Settings window ───────────────────────────────────────────────────
         self.draw_settings_window(ctx);
+        self.draw_licenses_window(ctx);
         // Refreshed here rather than in the title bar: `present` rescans on
         // its own timer, and the title bar runs before this in the frame.
         self.bluetooth_present = self.bluetooth.present();

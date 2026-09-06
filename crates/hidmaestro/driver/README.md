@@ -19,6 +19,10 @@ release **v1.3.17**, **MIT License**. Extracted from the Windows DriverStore cop
 installed from that release. The protocol port in this crate is pinned to the same
 version (`shm.rs` constants match v1.3.17 `SharedMemoryIO.cs` / `driver/driver.h`).
 
+HIDMaestro's MIT licence — required to accompany these binaries and the port
+derived from them — is reproduced verbatim in [`LICENSE`](LICENSE), copied from
+the `v1.3.17` tag. Keep it alongside these files in any redistribution.
+
 ## Distribution caveat
 
 The catalogs are signed with `CN=HIDMaestroTestCert` (HIDMaestro's own test cert).

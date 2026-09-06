@@ -5,6 +5,23 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Third-party licences, in the app.** Settings → Credits gains a
+  **Third-party licenses** button opening a viewer with the full licence text of
+  everything FlexInput redistributes — linked-in crates (including SDL3, which is
+  built from source and linked statically), the vendored HIDMaestro driver
+  package, and the bundled models and icon sets. Texts are embedded verbatim from
+  `licenses/` and from the licence files the vendored dependencies already ship,
+  so a missing one is a build error rather than a silently dropped notice.
+
+### Fixed
+
+- **HIDMaestro's MIT licence now accompanies its binaries.** The signed driver
+  package under `crates/hidmaestro/driver` was vendored and redistributed without
+  the licence text MIT requires travel with it; the notice is now reproduced at
+  `crates/hidmaestro/driver/LICENSE` and shown in the in-app viewer.
+
 ## [0.13.5] - 2026-08-23
 
 **Joy-Con 2 support — by way of an entire Bluetooth host stack of FlexInput's

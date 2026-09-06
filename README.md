@@ -125,6 +125,11 @@ State is shared via `Arc<RwLock<T>>` and `Arc<Mutex<T>>` with careful lock hiera
 
 ## Credits
 
+- The vendored virtual-controller driver in `crates/hidmaestro/driver` (and the
+  protocol port that drives it) comes from
+  [hifihedgehog/HIDMaestro](https://github.com/hifihedgehog/HIDMaestro) v1.3.17
+  (MIT). Its licence is reproduced at
+  [`crates/hidmaestro/driver/LICENSE`](crates/hidmaestro/driver/LICENSE).
 - 3D controller models in `app/assets/models` are adapted from
   [larfingshnew/3d-controller-overlay](https://github.com/larfingshnew/3d-controller-overlay)
   (MIT). That repo is also the reference for the model format when adding
@@ -138,6 +143,10 @@ State is shared via `Arc<RwLock<T>>` and `Arc<Mutex<T>>` with careful lock hiera
   for the per-author list.
 - Input-prompt SVG icons are by [Kenney](https://kenney.nl/assets/input-prompts)
   (CC0).
+
+The full licence text for everything FlexInput redistributes is bundled in the
+app under **Settings → Credits → Third-party licenses**, and on disk in
+[`licenses/`](licenses/).
 
 ## License
 

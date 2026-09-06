@@ -1627,11 +1627,117 @@ impl FlexInputApp {
                     );
                     ui.label(egui::RichText::new("by larfingshnew (MIT).").small());
                 });
+                ui.add_space(8.0);
+                if ui.button("Third-party licenses…")
+                    .on_hover_text("Full licence text for everything FlexInput redistributes")
+                    .clicked()
+                {
+                    self.licenses_open = true;
+                }
                 }); // ScrollArea
             });
 
         if dirty { self.settings_dirty = true; }
         if save_workspace { self.save_workspace_now(); }
         if !open { self.settings_open = false; }
+    }
+
+    /// The third-party licence viewer, opened from Settings → Credits.
+    ///
+    /// Entry list on the left, that entry's licence on the right. The texts are
+    /// embedded verbatim (see `crate::licenses`) and rendered monospace without
+    /// truncation — a licence notice that's been reflowed or cut short is no
+    /// longer the notice the licence asks us to reproduce.
+    ///
+    /// Drawn from `update` rather than from inside the Settings window so it
+    /// stands on its own: closing Settings leaves it up.
+    pub(crate) fn draw_licenses_window(&mut self, ctx: &egui::Context) {
+        if !self.licenses_open { return; }
+        let mut open = true;
+        let entries = crate::licenses::LICENSES;
+        // The index outlives any single frame, so don't trust it blindly.
+        if self.licenses_selected >= entries.len() { self.licenses_selected = 0; }
+
+        egui::Window::new("Third-party licenses")
+            .id(egui::Id::new("licenses_window"))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([760.0, 560.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    "FlexInput redistributes the software and assets below — linked \
+                     into flexinput.exe, or bundled alongside it. Tools you install \
+                     separately (HidHide, ViGEmBus) aren't redistributed and so \
+                     aren't listed here."
+                ).small().weak());
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Width of the entry list. Points, so it tracks UI scale.
+                const LIST_W: f32 = 210.0;
+                let avail_h = ui.available_height();
+                ui.horizontal_top(|ui| {
+                    // Both columns ask for `top_down` EXPLICITLY: a child ui built
+                    // inside a horizontal layout inherits that direction, which lays
+                    // the entry list out sideways across the window and leaves the
+                    // text column a few pixels wide.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(LIST_W, avail_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("licenses_list")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (i, entry) in entries.iter().enumerate() {
+                                        if ui.selectable_label(
+                                            self.licenses_selected == i, entry.name).clicked()
+                                        {
+                                            self.licenses_selected = i;
+                                        }
+                                    }
+                                });
+                        },
+                    );
+                    ui.separator();
+
+                    let entry = &entries[self.licenses_selected];
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), avail_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(entry.name).strong());
+                                ui.label(egui::RichText::new(entry.spdx).small().weak());
+                                ui.hyperlink_to(egui::RichText::new("source").small(), entry.url);
+                                if ui.small_button("Copy")
+                                    .on_hover_text("Copy this licence text to the clipboard")
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(entry.text.to_owned());
+                                }
+                            });
+                            ui.label(egui::RichText::new(entry.what).small());
+                            if let Some(note) = entry.note {
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(note).small().weak());
+                            }
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("licenses_text")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(
+                                        egui::RichText::new(entry.text).monospace().size(11.0)
+                                    ).wrap());
+                                });
+                        },
+                    );
+                });
+            });
+
+        if !open { self.licenses_open = false; }
     }
 }

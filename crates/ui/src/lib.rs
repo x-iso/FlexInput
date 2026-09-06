@@ -4,6 +4,7 @@ mod device_ops;
 mod easy;
 mod gamepad_nav;
 mod kbm_picker;
+mod licenses;
 mod guide_watcher;
 mod macro_icons;
 mod module_ui_info;
