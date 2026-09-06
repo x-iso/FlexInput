@@ -403,6 +403,22 @@ FLEXINPUT_NET_DEBUG=1 cargo run
 RUST_LOG=debug cargo run
 ```
 
+**Bluetooth transport logs are opt-in for release builds.** They are gated where
+they are opened, so a shipped build writes nothing to a user's disk unasked. Each
+variable takes a path, `on` for the default location, or `off`:
+
+```powershell
+$env:FLEXINPUT_JC2_LOG = "on"        # discovery and connection lifecycle
+$env:FLEXINPUT_JC2_IMU_LOG = "on"    # IMU / orientation diagnostics
+$env:FLEXINPUT_JC2_CAPTURE = "on"    # raw per-report CSV capture
+$env:FLEXINPUT_BTC_CADENCE = "on"    # Bluetooth Classic report cadence
+```
+
+Debug builds keep them on by default. Adding a new diagnostic log means calling
+`dlog::Sink::open` rather than opening a file directly — that is the only place
+the release gate lives, and a fifth log opened by hand would bypass it. See
+[BLUETOOTH_TRANSPORTS.md](./BLUETOOTH_TRANSPORTS.md).
+
 ### Puffin Profiler
 
 **Setup:**

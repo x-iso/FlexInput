@@ -34,7 +34,8 @@ This directory contains comprehensive reference documentation for the FlexInput 
 
 | Document | Description | Key Topics |
 |----------|-------------|------------|
-| [DEVICES_REFERENCE.md](./DEVICES_REFERENCE.md) | Physical + virtual devices | Backends (gilrs, SDL3, MIDI), HIDMaestro, calibration, polling thread |
+| [DEVICES_REFERENCE.md](./DEVICES_REFERENCE.md) | Physical + virtual devices | Backends (gilrs, SDL3, MIDI, Joy-Con 2, BT Classic), HIDMaestro, calibration, polling thread |
+| [BLUETOOTH_TRANSPORTS.md](./BLUETOOTH_TRANSPORTS.md) | FlexInput's own Bluetooth stack | Shared radio, Joy-Con 2 over BLE, BT Classic HID, diagnostics and release gating |
 
 ### Network Subsystem
 

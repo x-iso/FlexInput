@@ -24,7 +24,9 @@ FlexInput/
 ├── crates/
 │   ├── core/                     # Core types: Signal, Module, Patch
 │   ├── engine/                   # Processing thread, graph evaluation
-│   ├── devices/                  # Physical device backends (gilrs, SDL3, MIDI)
+│   ├── devices/                  # Physical device backends (gilrs, SDL3, MIDI, BT)
+│   ├── btle/                     # Bluetooth host stack over a WinUSB dongle
+│   ├── joycon2/                  # Switch 2 controller protocol
 │   ├── virtual/                  # Virtual output device abstractions
 │   ├── hidmaestro/               # HIDMaestro driver integration
 │   ├── net/                      # Network transport layer
@@ -289,6 +291,12 @@ pub trait DeviceBackend: Send {
 - **gilrs** - XInput, DualShock 4, DualSense, Switch Pro (primary)
 - **SDL3** - Third-party controllers with special features (gyro, extra buttons)
 - **MIDI** - Per-CC output pins with CC Learn
+- **Joy-Con 2** - Switch 2 controllers over FlexInput's own BLE stack (`jc2:`)
+- **BT Classic** - BR/EDR gamepads on a WinUSB-bound dongle (`btc:`)
+
+The last two drive `crates/btle`, a Bluetooth host stack FlexInput implements
+itself, sharing one radio between them — see
+[BLUETOOTH_TRANSPORTS.md](./BLUETOOTH_TRANSPORTS.md).
 
 **Device identification:**
 - Format: `{backend}:{family}:{instance}` (e.g., `gilrs:dualsense:0`)

@@ -99,6 +99,36 @@ pub struct MidiInputPort {
 - Press any MIDI knob/fader → records CC number to node params
 - Output pin named `cc_{number}` appears in the snarl
 
+#### 4. Joy-Con 2 Backend (`joycon2_backend.rs`)
+
+**Switch 2 controllers over FlexInput's own BLE stack.** Device IDs are
+`jc2:{kind}:{instance}`.
+
+Behind the `joycon2` cargo feature (default on), pushed after SDL. No dedup is
+needed against gilrs or SDL: these controllers expose no HID-over-GATT service,
+so Windows binds no driver and neither of those backends can ever see them.
+
+Pairing defaults **off**. The LTK handshake writes the host address into
+controller flash, which has only two slots and can evict a console's entry; the
+UI turns it on explicitly via `set_pairing_enabled`.
+
+⚠️ The published gyro is derived from a fused angle field, not a measured rate —
+see [BLUETOOTH_TRANSPORTS.md](./BLUETOOTH_TRANSPORTS.md) for what is and is not
+reachable on this hardware.
+
+#### 5. Bluetooth Classic Backend (`classic_bt.rs`)
+
+**BR/EDR gamepads (Switch Pro) on a WinUSB-bound dongle.** Device IDs are
+`btc:switch_pro:{address}`.
+
+Not feature-gated. Enumerates nothing until a controller **with a stored link
+key** connects, so on a machine that has never run the `bt_classic` pairing tool
+it costs one idle thread and touches no radio at all. Shares the dongle with the
+Joy-Con 2 backend rather than competing for it.
+
+Reads the controller's own stick calibration out of SPI flash; without it the
+sticks trace a square rather than a circle.
+
 ---
 
 ## Device Layouts (`layouts.rs`)
@@ -507,6 +537,12 @@ Applied in I/O thread after polling, before signals reach processing thread.
 | `crates/devices/src/midi.rs` | MIDI input/output handling | ~250 |
 | `crates/devices/src/layouts.rs` | Pin definitions per controller kind | ~500 |
 | `crates/devices/src/hidhide.rs` | HidHide client wrapper | ~150 |
+| `crates/devices/src/joycon2_backend.rs` | Joy-Con 2 backend surface | ~660 |
+| `crates/devices/src/classic_bt.rs` | BT Classic transport and pad state | ~1500 |
+| `crates/btle/src/lib.rs` | HCI host stack over a WinUSB dongle | ~2700 |
+| `crates/btle/src/radio.rs` | Shared-radio arbitration for both transports | ~660 |
+| `crates/joycon2/src/reports.rs` | Switch 2 report parsing and orientation | ~4500 |
+| `crates/joycon2/src/dongle.rs` | Switch 2 BLE transport | ~2830 |
 | `crates/virtual/src/lib.rs` | VirtualDevice trait | ~50 |
 | `crates/virtual/src/hidmaestro_device.rs` | XInput/DS4/DualSense impls | ~600 |
 | `crates/virtual/src/keymouse_hm.rs` | Keyboard/mouse emulation | ~300 |

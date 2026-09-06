@@ -10,6 +10,8 @@ A node-based HID/MIDI input routing and mapping application for Windows. Connect
 - **Gamepads** — XInput, DualShock 4, DualSense, Switch Pro via gilrs (tuned paths)
 - **SDL3 support** — Third-party controllers with special features (gyro, extra buttons) - filtered to avoid duplicates with gilrs
 - **MIDI IN/OUT** — Per-CC output pins with CC Learn for easy mapping
+- **Joy-Con 2 / Switch 2 pads** — Over FlexInput's own Bluetooth LE stack on a WinUSB-bound dongle; Windows binds no driver to these controllers, so no ordinary HID backend can see them
+- **Bluetooth Classic gamepads** — Switch Pro on the same dongle, using its stored link key; a dedicated radio rather than sharing the Windows one
 
 #### Virtual Outputs
 - **HIDMaestro XInput** — Virtual Xbox 360/XInput controller (pure-Rust UMDF2 client)
