@@ -162,15 +162,19 @@ enum Connection { Usb, Bt }
 /// per controller and per side). Values normalize raw → [-1, 1] as:
 ///   raw < center: (raw - center) / (center - min)
 ///   raw > center: (raw - center) / (max - center)
-#[derive(Clone, Copy, Default, Debug)]
-struct AxisCalib { min: u16, center: u16, max: u16 }
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct AxisCalib {
+    pub(crate) min: u16,
+    pub(crate) center: u16,
+    pub(crate) max: u16,
+}
 
 #[derive(Clone, Copy, Default, Debug)]
-struct SwitchProCalib {
-    l_x: AxisCalib,
-    l_y: AxisCalib,
-    r_x: AxisCalib,
-    r_y: AxisCalib,
+pub(crate) struct SwitchProCalib {
+    pub(crate) l_x: AxisCalib,
+    pub(crate) l_y: AxisCalib,
+    pub(crate) r_x: AxisCalib,
+    pub(crate) r_y: AxisCalib,
 }
 
 enum DeviceKind {
@@ -898,6 +902,71 @@ fn hid_write(device: &HidDevice, data: &[u8]) {
 
 // ── Switch Pro initialisation ─────────────────────────────────────────────────
 
+/// Build stick calibration from the four raw SPI blobs.
+///
+/// ⭐ **Transport-free on purpose.** Reading these blobs is HID-specific, but
+/// DECODING them is not, and keeping the two welded together is why the
+/// Bluetooth Classic path has been running on the fallback numbers: it reaches
+/// the same controller by a different route, so it could not call any of this
+/// and silently got a guess instead. See [`switch_pro_fallback_calib`].
+///
+/// Addresses and layout, per dekuNukem's `spi_flash_notes.md`:
+/// `0x603D` factory L (max, centre, min) · `0x6046` factory R (centre, min, max)
+/// · `0x8010` / `0x801B` user calibration, valid when prefixed `B2 A1`.
+pub(crate) fn switch_pro_calib_from_spi(
+    factory_l: Option<&[u8]>,
+    factory_r: Option<&[u8]>,
+    user_l: Option<&[u8]>,
+    user_r: Option<&[u8]>,
+) -> Option<SwitchProCalib> {
+    // User calibration wins, but only when its magic marks it as written.
+    // A named fn rather than a closure: a closure infers one lifetime across
+    // both arguments and the return, which ties the factory blob's lifetime to
+    // the user blob's for no reason and will not compile.
+    fn pick<'a>(user: Option<&'a [u8]>, factory: Option<&'a [u8]>) -> Option<&'a [u8]> {
+        match user {
+            Some(d) if d.len() >= 11 && d[0] == 0xB2 && d[1] == 0xA1 => Some(&d[2..11]),
+            _ => factory,
+        }
+    }
+    let l = pick(user_l, factory_l)?;
+    let r = pick(user_r, factory_r)?;
+    if l.len() < 9 || r.len() < 9 {
+        return None;
+    }
+    let (l_x_max, l_y_max) = unpack_12bit_pair(l, 0);
+    let (l_x_ctr, l_y_ctr) = unpack_12bit_pair(l, 3);
+    let (l_x_min, l_y_min) = unpack_12bit_pair(l, 6);
+    let (r_x_ctr, r_y_ctr) = unpack_12bit_pair(r, 0);
+    let (r_x_min, r_y_min) = unpack_12bit_pair(r, 3);
+    let (r_x_max, r_y_max) = unpack_12bit_pair(r, 6);
+    // ❗ The blob stores OFFSETS from centre, not absolute positions. Treating
+    // them as absolute is the difference between a stick that reaches its
+    // corners and one that saturates early — the square response.
+    Some(SwitchProCalib {
+        l_x: AxisCalib { min: l_x_ctr.saturating_sub(l_x_min), center: l_x_ctr, max: l_x_ctr.saturating_add(l_x_max) },
+        l_y: AxisCalib { min: l_y_ctr.saturating_sub(l_y_min), center: l_y_ctr, max: l_y_ctr.saturating_add(l_y_max) },
+        r_x: AxisCalib { min: r_x_ctr.saturating_sub(r_x_min), center: r_x_ctr, max: r_x_ctr.saturating_add(r_x_max) },
+        r_y: AxisCalib { min: r_y_ctr.saturating_sub(r_y_min), center: r_y_ctr, max: r_y_ctr.saturating_add(r_y_max) },
+    })
+}
+
+/// The numbers used when the controller's own calibration could not be read.
+///
+/// ⛔ **A guess, and it shows.** Centre 2048 with a ±1500 half-range is a
+/// nominal 12-bit stick, not this one: a real unit's travel is both off-centre
+/// and asymmetric, so the normalised value reaches full scale on the axes well
+/// before the diagonals and the circularity plot comes out square. It is the
+/// right thing to fall back to and the wrong thing to ship as the only option.
+pub(crate) fn switch_pro_fallback_calib() -> SwitchProCalib {
+    SwitchProCalib {
+        l_x: AxisCalib { min: 548, center: 2048, max: 3548 },
+        l_y: AxisCalib { min: 548, center: 2048, max: 3548 },
+        r_x: AxisCalib { min: 548, center: 2048, max: 3548 },
+        r_y: AxisCalib { min: 548, center: 2048, max: 3548 },
+    }
+}
+
 fn init_switch_pro(device: &HidDevice, counter: &mut u8, calib: &mut Option<SwitchProCalib>) -> bool {
     let mut buf = [0u8; 64];
 
@@ -940,34 +1009,12 @@ fn init_switch_pro(device: &HidDevice, counter: &mut u8, calib: &mut Option<Swit
     let user_l    = spi_read(device, 0x8_010, 11, counter, &mut buf);
     let user_r    = spi_read(device, 0x8_01B, 11, counter, &mut buf);
 
-    // User cal overrides factory when its magic bytes are 0xB2 0xA1 (LE 0xA1B2).
-    let l_data = match &user_l {
-        Some(d) if d.len() >= 11 && d[0] == 0xB2 && d[1] == 0xA1 => Some(&d[2..11]),
-        _ => factory_l.as_deref(),
-    };
-    let r_data = match &user_r {
-        Some(d) if d.len() >= 11 && d[0] == 0xB2 && d[1] == 0xA1 => Some(&d[2..11]),
-        _ => factory_r.as_deref(),
-    };
-
-    if let (Some(l), Some(r)) = (l_data, r_data) {
-        if l.len() >= 9 && r.len() >= 9 {
-            let (l_x_max, l_y_max) = unpack_12bit_pair(l, 0);
-            let (l_x_ctr, l_y_ctr) = unpack_12bit_pair(l, 3);
-            let (l_x_min, l_y_min) = unpack_12bit_pair(l, 6);
-            let (r_x_ctr, r_y_ctr) = unpack_12bit_pair(r, 0);
-            let (r_x_min, r_y_min) = unpack_12bit_pair(r, 3);
-            let (r_x_max, r_y_max) = unpack_12bit_pair(r, 6);
-            // SPI factory blob stores offsets relative to center for L's max/min and
-            // R's min/max. Convert to absolute raw values for the simple normalize.
-            *calib = Some(SwitchProCalib {
-                l_x: AxisCalib { min: l_x_ctr.saturating_sub(l_x_min), center: l_x_ctr, max: l_x_ctr.saturating_add(l_x_max) },
-                l_y: AxisCalib { min: l_y_ctr.saturating_sub(l_y_min), center: l_y_ctr, max: l_y_ctr.saturating_add(l_y_max) },
-                r_x: AxisCalib { min: r_x_ctr.saturating_sub(r_x_min), center: r_x_ctr, max: r_x_ctr.saturating_add(r_x_max) },
-                r_y: AxisCalib { min: r_y_ctr.saturating_sub(r_y_min), center: r_y_ctr, max: r_y_ctr.saturating_add(r_y_max) },
-            });
-        }
-    }
+    *calib = switch_pro_calib_from_spi(
+        factory_l.as_deref(),
+        factory_r.as_deref(),
+        user_l.as_deref(),
+        user_r.as_deref(),
+    );
 
     // Subcommand 0x03 0x30 — full input report mode (sends 0x30 with IMU).
     if device.write(&subcommand(*counter, 0x03, &[0x30])).is_err() {
@@ -1026,25 +1073,61 @@ fn wait_for_ack(device: &HidDevice, expected_id: u8, buf: &mut [u8; 64]) -> bool
 /// Returns the payload bytes from the matching ack, or None on timeout / failure.
 /// The reply is a 0x21 ack whose subcommand byte (offset 14) is 0x10 and whose
 /// payload bytes 15..19 echo the address+length, followed by the data at byte 20.
-fn spi_read(device: &HidDevice, addr: u32, len: u8, counter: &mut u8, buf: &mut [u8; 64]) -> Option<Vec<u8>> {
-    let args = [
+/// The four SPI regions stick calibration lives in: `(address, length)`.
+///
+/// ⭐ Named once so both transports read the same four things. The HID path had
+/// these inline, which is part of why the Bluetooth Classic path never got
+/// them — there was nothing to call.
+pub(crate) const SWITCH_PRO_CALIB_READS: [(u32, u8); 4] =
+    [(0x6_03D, 9), (0x6_046, 9), (0x8_010, 11), (0x8_01B, 11)];
+
+/// Build the output report that asks for `len` bytes at `addr`.
+pub(crate) fn switch_pro_spi_request(addr: u32, len: u8, counter: u8) -> [u8; 64] {
+    subcommand(counter, 0x10, &spi_args(addr, len))
+}
+
+fn spi_args(addr: u32, len: u8) -> [u8; 8] {
+    [
         (addr & 0xFF) as u8,
         ((addr >> 8) & 0xFF) as u8,
         ((addr >> 16) & 0xFF) as u8,
         ((addr >> 24) & 0xFF) as u8,
-        len, 0, 0, 0,
-    ];
-    if device.write(&subcommand(*counter, 0x10, &args)).is_err() {
+        len,
+        0,
+        0,
+        0,
+    ]
+}
+
+/// Pull the payload out of a `0x21` reply, but only if it answers THIS read.
+///
+/// ❗ The address echo is the whole point. A `0x21` report is the acknowledgement
+/// for every subcommand, not just this one, and on a transport where replies
+/// arrive interleaved with a 200 Hz input stream, "the next 0x21" is routinely
+/// somebody else's. Matching on the echoed address is what makes the exchange
+/// safe to run without blocking the link.
+pub(crate) fn switch_pro_spi_reply<'a>(report: &'a [u8], addr: u32, len: u8) -> Option<&'a [u8]> {
+    let args = spi_args(addr, len);
+    if report.len() < 20 + len as usize || report[0] != 0x21 || report[14] != 0x10 {
+        return None;
+    }
+    if report[15..19] != args[..4] {
+        return None;
+    }
+    Some(&report[20..20 + len as usize])
+}
+
+fn spi_read(device: &HidDevice, addr: u32, len: u8, counter: &mut u8, buf: &mut [u8; 64]) -> Option<Vec<u8>> {
+    let args = spi_args(addr, len);
+    if device.write(&switch_pro_spi_request(addr, len, *counter)).is_err() {
         return None;
     }
     *counter = counter.wrapping_add(1);
+    let _ = args;
     for _ in 0..30 {
         if let Ok(n) = device.read_timeout(buf, 50) {
-            if n >= (20 + len as usize) && buf[0] == 0x21 && buf[14] == 0x10
-                && buf[15] == args[0] && buf[16] == args[1]
-                && buf[17] == args[2] && buf[18] == args[3]
-            {
-                return Some(buf[20..20 + len as usize].to_vec());
+            if let Some(data) = switch_pro_spi_reply(&buf[..n], addr, len) {
+                return Some(data.to_vec());
             }
         }
     }
@@ -1456,8 +1539,32 @@ fn parse_dualsense_touch(buf: &[u8], off: usize) -> TouchPoint {
 /// up — so the stick calibration falls back to the firmware defaults. That is
 /// good enough to be usable and FlexInput's own stick calibration corrects the
 /// rest; the alternative is no sticks at all.
+/// Decode a `0x30` report with NO stick calibration.
+///
+/// # Tests only
+///
+/// A transport that calls this gets the square response documented on
+/// [`switch_pro_fallback_calib`], which is the bug the Bluetooth Classic path
+/// shipped with for as long as this was the convenient entry point. Production
+/// callers use [`parse_switch_pro_report_calibrated`] and pass what they have,
+/// including `None` — the difference being that they then have somewhere to put
+/// the calibration once they read it.
+#[cfg(test)]
 pub(crate) fn parse_switch_pro_report(buf: &[u8]) -> Option<HidReading> {
     parse_switch_pro(buf, None)
+}
+
+/// [`parse_switch_pro_report`] for a transport that has read the controller's
+/// own stick calibration.
+///
+/// ⛔ The no-calibration entry point above is not a default to reach for. It
+/// exists for callers that genuinely have nothing, and every one of them gets
+/// the square response described on [`switch_pro_fallback_calib`].
+pub(crate) fn parse_switch_pro_report_calibrated(
+    buf: &[u8],
+    calib: Option<&SwitchProCalib>,
+) -> Option<HidReading> {
+    parse_switch_pro(buf, calib)
 }
 
 /// Publish a Switch Pro's buttons and sticks as pins.
@@ -1539,15 +1646,8 @@ fn parse_switch_pro(buf: &[u8], calib: Option<&SwitchProCalib>) -> Option<HidRea
     let (lx_raw, ly_raw) = unpack_12bit_pair(buf, 6);
     let (rx_raw, ry_raw) = unpack_12bit_pair(buf, 9);
 
-    // Fallback identity calibration if SPI read failed: centered at 2048, half-range ~1500.
-    // The center matches an uncalibrated 12-bit stick at rest; range is the firmware default.
-    static FALLBACK: SwitchProCalib = SwitchProCalib {
-        l_x: AxisCalib { min: 548, center: 2048, max: 3548 },
-        l_y: AxisCalib { min: 548, center: 2048, max: 3548 },
-        r_x: AxisCalib { min: 548, center: 2048, max: 3548 },
-        r_y: AxisCalib { min: 548, center: 2048, max: 3548 },
-    };
-    let c = calib.unwrap_or(&FALLBACK);
+    let fallback = switch_pro_fallback_calib();
+    let c = calib.unwrap_or(&fallback);
     let lx = normalize_axis(lx_raw, c.l_x);
     let ly = normalize_axis(ly_raw, c.l_y);
     let rx = normalize_axis(rx_raw, c.r_x);
@@ -2364,5 +2464,184 @@ mod tests {
     fn crc32_le_matches_ieee_check_vector() {
         let crc = !crc32_le_update(0xFFFFFFFF, b"123456789");
         assert_eq!(crc, 0xCBF43926);
+    }
+}
+
+#[cfg(test)]
+mod switch_pro_stick_calibration_tests {
+    use super::{switch_pro_calib_from_spi, switch_pro_fallback_calib, AxisCalib};
+
+    /// Pack two 12-bit values the way the SPI blob does.
+    fn pack(a: u16, b: u16) -> [u8; 3] {
+        [(a & 0xFF) as u8, (((a >> 8) & 0x0F) as u8) | (((b & 0x0F) as u8) << 4), (b >> 4) as u8]
+    }
+
+    /// A factory L blob: (max, centre, min) as OFFSETS from centre.
+    fn factory_l() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&pack(1400, 1300)); // max offsets
+        v.extend_from_slice(&pack(2100, 1950)); // centre, absolute
+        v.extend_from_slice(&pack(1500, 1350)); // min offsets
+        v
+    }
+
+    /// A factory R blob: (centre, min, max).
+    fn factory_r() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&pack(2000, 2050));
+        v.extend_from_slice(&pack(1450, 1250));
+        v.extend_from_slice(&pack(1380, 1420));
+        v
+    }
+
+    #[test]
+    fn offsets_become_absolute_endpoints() {
+        // ⭐ The bug behind the square response: the blob holds distances from
+        // centre, and reading them as absolute positions saturates the axes
+        // long before the corners.
+        let c = switch_pro_calib_from_spi(Some(&factory_l()), Some(&factory_r()), None, None)
+            .expect("factory blobs are enough");
+        assert_eq!(c.l_x, AxisCalib { min: 2100 - 1500, center: 2100, max: 2100 + 1400 });
+        assert_eq!(c.l_y, AxisCalib { min: 1950 - 1350, center: 1950, max: 1950 + 1300 });
+        assert_eq!(c.r_x, AxisCalib { min: 2000 - 1450, center: 2000, max: 2000 + 1380 });
+    }
+
+    #[test]
+    fn user_calibration_wins_when_its_magic_is_present() {
+        // ⭐ The user blob must DIFFER from the factory one, or the assertion
+        // passes whichever was used and proves nothing. The first version of
+        // this test copied the factory bytes and did exactly that, while the
+        // Bluetooth Classic path was building its calibration before the user
+        // blob had even arrived — one stick correct, the other reaching
+        // further one way than the other.
+        let mut user = Vec::from([0xB2u8, 0xA1]);
+        user.extend_from_slice(&pack(1200, 1100)); // max offsets
+        user.extend_from_slice(&pack(1900, 2000)); // centre, moved
+        user.extend_from_slice(&pack(1250, 1150)); // min offsets
+        let c = switch_pro_calib_from_spi(
+            Some(&factory_l()),
+            Some(&factory_r()),
+            Some(&user),
+            None,
+        )
+        .expect("user blob is valid");
+        assert_eq!(c.l_x, AxisCalib { min: 1900 - 1250, center: 1900, max: 1900 + 1200 });
+        assert_ne!(c.l_x.center, 2100, "the factory centre must not survive");
+        // The right stick had no user blob, so it keeps the factory numbers.
+        assert_eq!(c.r_x.center, 2000);
+    }
+
+    #[test]
+    fn user_calibration_without_the_magic_is_ignored() {
+        // ❗ Unwritten user calibration is 0xFF filler. Trusting it would centre
+        // the stick on garbage, which is worse than the factory numbers.
+        let mut blank = vec![0xFF; 11];
+        blank[0] = 0xFF;
+        blank[1] = 0xFF;
+        let from_factory =
+            switch_pro_calib_from_spi(Some(&factory_l()), Some(&factory_r()), None, None).unwrap();
+        let with_blank = switch_pro_calib_from_spi(
+            Some(&factory_l()),
+            Some(&factory_r()),
+            Some(&blank),
+            Some(&blank),
+        )
+        .unwrap();
+        assert_eq!(from_factory.l_x, with_blank.l_x);
+        assert_eq!(from_factory.r_y, with_blank.r_y);
+    }
+
+    #[test]
+    fn a_missing_blob_yields_no_calibration_rather_than_half_of_one() {
+        assert!(switch_pro_calib_from_spi(None, Some(&factory_r()), None, None).is_none());
+        assert!(switch_pro_calib_from_spi(Some(&factory_l()), None, None, None).is_none());
+        assert!(switch_pro_calib_from_spi(None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn a_truncated_blob_is_refused_not_read_past() {
+        let short = vec![0u8; 5];
+        assert!(switch_pro_calib_from_spi(Some(&short), Some(&factory_r()), None, None).is_none());
+    }
+
+    #[test]
+    fn the_fallback_is_symmetric_and_centred() {
+        // Documents what the Bluetooth Classic path has been running on, so a
+        // change to it is a deliberate act rather than a silent drift.
+        let f = switch_pro_fallback_calib();
+        assert_eq!(f.l_x, AxisCalib { min: 548, center: 2048, max: 3548 });
+        assert_eq!(f.l_x, f.r_y);
+    }
+}
+
+#[cfg(test)]
+mod switch_pro_spi_tests {
+    use super::{switch_pro_spi_reply, switch_pro_spi_request, SWITCH_PRO_CALIB_READS};
+
+    #[test]
+    fn a_request_carries_the_address_little_endian_and_the_length() {
+        let r = switch_pro_spi_request(0x6_03D, 9, 3);
+        assert_eq!(r[0], 0x01, "output report id");
+        assert_eq!(r[1], 3, "counter");
+        assert_eq!(r[10], 0x10, "SPI read subcommand");
+        assert_eq!(&r[11..15], &[0x3D, 0x60, 0x00, 0x00]);
+        assert_eq!(r[15], 9, "length");
+    }
+
+    #[test]
+    fn the_counter_is_masked_to_a_nibble() {
+        // The protocol has four bits for it; overflowing into the neighbouring
+        // field would corrupt the rumble bytes.
+        assert_eq!(switch_pro_spi_request(0x6_03D, 9, 0xFF)[1], 0x0F);
+    }
+
+    /// A `0x21` acknowledgement echoing `addr`, with `len` bytes of payload.
+    fn reply(addr: u32, len: u8, fill: u8) -> Vec<u8> {
+        let mut v = vec![0u8; 20 + len as usize];
+        v[0] = 0x21;
+        v[14] = 0x10;
+        v[15] = (addr & 0xFF) as u8;
+        v[16] = ((addr >> 8) & 0xFF) as u8;
+        v[17] = ((addr >> 16) & 0xFF) as u8;
+        v[18] = ((addr >> 24) & 0xFF) as u8;
+        for b in v[20..].iter_mut() {
+            *b = fill;
+        }
+        v
+    }
+
+    #[test]
+    fn a_matching_reply_yields_exactly_its_payload() {
+        let r = reply(0x6_046, 9, 0xAB);
+        assert_eq!(switch_pro_spi_reply(&r, 0x6_046, 9).expect("matches"), &[0xAB; 9]);
+    }
+
+    #[test]
+    fn a_reply_for_a_different_address_is_refused() {
+        // ⭐ The property the Classic path depends on. Replies arrive
+        // interleaved with a 200 Hz input stream, so "the next 0x21" is
+        // routinely the answer to a different request — and accepting it would
+        // write one region's bytes into another region's slot.
+        let r = reply(0x6_03D, 9, 0x11);
+        assert!(switch_pro_spi_reply(&r, 0x6_046, 9).is_none());
+        for (addr, len) in SWITCH_PRO_CALIB_READS {
+            if addr != 0x6_03D {
+                assert!(switch_pro_spi_reply(&r, addr, len).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn an_input_report_is_never_mistaken_for_a_reply() {
+        let mut input = vec![0u8; 49];
+        input[0] = 0x30;
+        assert!(switch_pro_spi_reply(&input, 0x6_03D, 9).is_none());
+    }
+
+    #[test]
+    fn a_truncated_reply_is_refused_rather_than_read_past_its_end() {
+        let mut r = reply(0x6_03D, 9, 0x22);
+        r.truncate(24);
+        assert!(switch_pro_spi_reply(&r, 0x6_03D, 9).is_none());
     }
 }

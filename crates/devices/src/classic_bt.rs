@@ -36,8 +36,25 @@ use std::time::{Duration, Instant};
 use flexinput_btle::{keystore, l2cap};
 use flexinput_core::Signal;
 
-use crate::gyro::{parse_switch_pro_report, push_switch_pro_buttons, HidReading};
+use crate::gyro::{
+    parse_switch_pro_report_calibrated, push_switch_pro_buttons, switch_pro_calib_from_spi,
+    switch_pro_spi_reply, switch_pro_spi_request, HidReading, SwitchProCalib,
+    SWITCH_PRO_CALIB_READS,
+};
 use crate::{layouts, ControllerKind, DeviceBackend, DevicePin, PhysicalDevice};
+
+/// Whether to print the per-link report-cadence line.
+///
+/// On in debug; in release it takes `FLEXINPUT_BTC_CADENCE=on`, so asking a user
+/// "is your controller's rate its own choice, or are we dropping reports?" costs
+/// them a restart rather than a special build.
+fn cadence_logging() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(debug_assertions)
+            || std::env::var("FLEXINPUT_BTC_CADENCE").is_ok_and(|v| v.eq_ignore_ascii_case("on"))
+    })
+}
 
 /// How long a link may go silent before it is treated as gone.
 const STALE: Duration = Duration::from_secs(3);
@@ -301,6 +318,32 @@ const PAGE_EAGER: Duration = Duration::from_secs(20);
 /// ❗ Said once, it reads as "gave up". Said every pass, it is a firehose.
 const NOTE_REPEAT: Duration = Duration::from_secs(120);
 
+/// Reading the controller's own stick calibration, without blocking the link.
+///
+/// ⭐ **Why this is not a blocking exchange in `bring_up`.** This transport
+/// took a long time to make reliable, and the controller is streaming ~200
+/// reports a second by the time anyone could ask it anything. Stopping to wait
+/// on a reply means either not draining that stream — which fills the radio
+/// queue and stalls the link — or writing a second, parallel drain that has to
+/// agree with the first. So the requests are fired into the normal flow and the
+/// answers are picked out of it as they pass.
+///
+/// ❗ Retried, because it is fire-and-forget over a lossy link and a dropped
+/// request is otherwise a controller that silently keeps the square response.
+#[derive(Default)]
+struct SpiProbe {
+    /// One slot per entry in `SWITCH_PRO_CALIB_READS`.
+    blobs: [Option<Vec<u8>>; 4],
+    attempts: u8,
+    next_try: Option<Instant>,
+    counter: u8,
+}
+
+/// How many times to ask before settling for the fallback numbers.
+const SPI_ATTEMPTS: u8 = 4;
+/// Gap between rounds of requests.
+const SPI_RETRY: Duration = Duration::from_millis(600);
+
 /// One live controller.
 struct Link {
     addr: [u8; 6],
@@ -311,6 +354,21 @@ struct Link {
     name: Option<String>,
     /// Whether any input report has arrived on this link yet.
     reported: bool,
+    /// Inter-report timing, so "170 Hz" can be told apart from "200 Hz with a
+    /// sixth of the reports lost".
+    ///
+    /// ⭐ The same measurement the LE transport uses, from the same type. The
+    /// question there was whether a rate was the device's choice or our loss,
+    /// and it is the same question here — asked with different numbers, the
+    /// answers could not be compared.
+    cadence: flexinput_btle::cadence::Cadence,
+    /// The controller's own stick calibration, once it has answered.
+    ///
+    /// ⛔ `None` means the sticks are being normalised against a NOMINAL
+    /// 12-bit range rather than this unit's real travel, which reads as a
+    /// square circularity plot — see `switch_pro_fallback_calib`.
+    calib: Option<SwitchProCalib>,
+    spi: SpiProbe,
 }
 
 /// Answer the remote's L2CAP signalling on a live link.
@@ -710,6 +768,38 @@ fn run_inner(shared: &Arc<Shared>) {
             }
         }
 
+        // ── Ask for stick calibration on any link still without it ───────
+        //
+        // ⭐ Fired into the stream rather than waited on; the replies are
+        // collected below as they pass. A link that answers nothing after
+        // `SPI_ATTEMPTS` rounds keeps the fallback numbers and streams
+        // perfectly well — it simply keeps the square response, which is what
+        // every Classic link did before this existed.
+        for link in links.iter_mut() {
+            if link.calib.is_some() || !link.reported || link.spi.attempts >= SPI_ATTEMPTS {
+                continue;
+            }
+            if link.spi.next_try.is_some_and(|t| Instant::now() < t) {
+                continue;
+            }
+            link.spi.attempts += 1;
+            link.spi.next_try = Some(Instant::now() + SPI_RETRY);
+            for (i, (addr, len)) in SWITCH_PRO_CALIB_READS.iter().enumerate() {
+                if link.spi.blobs[i].is_some() {
+                    continue;
+                }
+                // `0xa2` is the HID DATA header on the OUTPUT pipe, the
+                // counterpart of the `0xa1` every input report carries.
+                let mut frame = Vec::with_capacity(65);
+                frame.push(0xA2);
+                frame.extend_from_slice(&switch_pro_spi_request(*addr, *len, link.spi.counter));
+                link.spi.counter = link.spi.counter.wrapping_add(1);
+                let _ = r.with_dongle(|d| {
+                    d.send_att_raw(link.conn, link.interrupt.remote_cid, &frame)
+                });
+            }
+        }
+
         // ── Service every link from ONE read ─────────────────────────────
         //
         // The whole point of the restructure: reports for all connected
@@ -748,7 +838,73 @@ fn run_inner(shared: &Arc<Shared>) {
             if pkt.payload.len() < 2 || pkt.payload[0] != 0xA1 {
                 continue;
             }
-            let Some(reading) = parse_switch_pro_report(&pkt.payload[1..]) else {
+            // ⭐ A subcommand acknowledgement, not an input report. These carry
+            // the stick calibration and arrive interleaved with the input
+            // stream, which is why they are matched by echoed address rather
+            // than by being "the next reply".
+            if pkt.payload[1] == 0x21 && link.calib.is_none() {
+                let report = &pkt.payload[1..];
+                for (i, (addr, len)) in SWITCH_PRO_CALIB_READS.iter().enumerate() {
+                    if link.spi.blobs[i].is_some() {
+                        continue;
+                    }
+                    if let Some(data) = switch_pro_spi_reply(report, *addr, *len) {
+                        link.spi.blobs[i] = Some(data.to_vec());
+                    }
+                }
+                // ⛔ **Wait for all four, not just the factory pair.**
+                //
+                // Building the moment the two FACTORY blobs land throws away
+                // the USER calibration, which arrives in its own reply a moment
+                // later — and once `calib` is Some this whole block is skipped,
+                // so it is discarded permanently. A controller recalibrated on
+                // a Switch stores its corrected centre and travel there, so the
+                // symptom is one stick right and the other reaching further one
+                // way than the other: exactly the axis whose real centre is not
+                // where the factory said it was.
+                //
+                // Giving up is still allowed — but only once the retries are
+                // spent, and then it is a deliberate fallback rather than a
+                // race that the factory blobs happen to win every time.
+                let all = link.spi.blobs.iter().all(|b| b.is_some());
+                let out_of_tries = link.spi.attempts >= SPI_ATTEMPTS
+                    && link.spi.blobs[0].is_some()
+                    && link.spi.blobs[1].is_some();
+                if all || out_of_tries {
+                    link.calib = switch_pro_calib_from_spi(
+                        link.spi.blobs[0].as_deref(),
+                        link.spi.blobs[1].as_deref(),
+                        link.spi.blobs[2].as_deref(),
+                        link.spi.blobs[3].as_deref(),
+                    );
+                    if let Some(c) = &link.calib {
+                        // ⭐ The NUMBERS, not just "it worked". An unbalanced
+                        // stick is a wrong centre or a wrong endpoint, and
+                        // those are two different bugs that a success line
+                        // cannot tell apart.
+                        let user = |i: usize| {
+                            link.spi.blobs[i]
+                                .as_deref()
+                                .is_some_and(|d| d.len() >= 2 && d[0] == 0xB2 && d[1] == 0xA1)
+                        };
+                        eprintln!(
+                            "[bt-classic] {} stick calibration: L x {}..{}..{} y {}..{}..{} | \
+                             R x {}..{}..{} y {}..{}..{} (user cal L {} R {})",
+                            keystore::format_addr(link.addr),
+                            c.l_x.min, c.l_x.center, c.l_x.max,
+                            c.l_y.min, c.l_y.center, c.l_y.max,
+                            c.r_x.min, c.r_x.center, c.r_x.max,
+                            c.r_y.min, c.r_y.center, c.r_y.max,
+                            user(2), user(3),
+                        );
+                    }
+                }
+                continue;
+            }
+            let Some(reading) = parse_switch_pro_report_calibrated(
+                &pkt.payload[1..],
+                link.calib.as_ref(),
+            ) else {
                 continue;
             };
             if !link.reported {
@@ -784,6 +940,23 @@ fn run_inner(shared: &Arc<Shared>) {
                 slot.last = link.last;
                 slot.name = link.name.clone();
                 slot.events = slot.events.saturating_add(1);
+            }
+            // ⛔ Debug builds, or when explicitly asked for. A line every five
+            // seconds per pad is a diagnostic, not something a shipped build
+            // should print at a user forever.
+            if let Some(c) = link.cadence.tick(Instant::now(), Duration::from_secs(5)) {
+                if cadence_logging() {
+                    eprintln!(
+                        "[bt-classic] {} cadence: {:.1} Hz over {} reports, mean {:.2} ms                          (min {:.2}, max {:.2}), jitter {:.2} ms/step",
+                        keystore::format_addr(link.addr),
+                        c.hz,
+                        c.samples,
+                        c.mean_ms,
+                        c.min_ms,
+                        c.max_ms,
+                        c.jitter_ms,
+                    );
+                }
             }
         }
     }
@@ -1070,6 +1243,9 @@ fn bring_up(
         last: Instant::now(),
         name: None,
         reported: false,
+        cadence: flexinput_btle::cadence::Cadence::new(),
+        calib: None,
+        spi: SpiProbe::default(),
     })
 }
 
@@ -1147,6 +1323,10 @@ pub fn outputs() -> Vec<DevicePin> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These check the REPORT layout, which calibration does not touch, so the
+    // uncalibrated entry point is the right one here — and it now exists only
+    // for tests, so no transport can reach for it by accident again.
+    use crate::gyro::parse_switch_pro_report;
 
     /// One IMU frame from the real capture, repeated three times — the report
     /// carries three and the parser averages them, so identical frames give
