@@ -41,9 +41,12 @@ pub(crate) fn eval_rws_node(
     let flick_enabled = snap.params.get("flick_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
     let sup_mode = snap.params.get("suppress_source").and_then(|v| v.as_str()).unwrap_or("off").to_string();
     let deadzone = snap.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32;
+    let stick_aim = snap.params.get("stick_aim_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    // Stick-aim needs the stick suppressed even with suppress_source "off" (and
+    // even when flick is off), so it doesn't double-drive its default mapping.
     let can_suppress =
-        flick_enabled && sup_mode != "off" && !dev_id.is_empty() && !stick.is_empty();
+        (flick_enabled || stick_aim) && (sup_mode != "off" || stick_aim) && !dev_id.is_empty() && !stick.is_empty();
 
     // Recover the flick stick from the pre-block snapshot (we're the reason it's
     // blocked, so we must still read it); falls back to the resolved input when
@@ -88,8 +91,14 @@ pub(crate) fn eval_rws_node(
     // Publish the source-block for the flick stick (drained into `source_block`
     // at tick end, applied next tick — one tick stale, imperceptible at kHz).
     if can_suppress {
-        let past = live_flick.map(|v| v.length() >= deadzone.max(0.05)).unwrap_or(false);
-        let do_block = sup_mode == "full" || (sup_mode == "deadzone" && past);
+        let mag = live_flick.map(|v| v.length()).unwrap_or(0.0);
+        let past = mag >= deadzone.max(0.05);
+        let inside = mag > 0.05 && !past; // deflected but within the deadzone
+        // Stick-aim owns the whole stick while deflected (inside for aim, past for
+        // the flick); otherwise honour the plain suppression mode.
+        let do_block = sup_mode == "full"
+            || (sup_mode == "deadzone" && past)
+            || (stick_aim && (inside || past));
         if do_block {
             let bk = format!("{SRC_BLOCK_PREFIX}{dev_id}");
             for p in [
@@ -145,7 +154,7 @@ pub(crate) fn compute_rws(
     let pb = |k: &str, d: bool| params.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
     let scale = pf("scale", 100.0);
-    let rws = pf("rws", 1.0);
+    let mut rws = pf("rws", 1.0);
     let calibrating = pb("calibrating", false);
     let cal_speed = pf("cal_speed", 0.5);
     let input_mode = ps("input_mode", "gyro");
@@ -153,8 +162,20 @@ pub(crate) fn compute_rws(
     let flick_enabled = pb("flick_enabled", false);
     let flick_deadzone = pf("flick_deadzone", 0.85);
     let flick_smooth_ms = pf("flick_smooth_ms", 100.0);
+    // Vertical/horizontal sensitivity bias: horizontal (yaw) is the reference the
+    // `scale` is calibrated on, so the ratio scales VERTICAL (pitch) only —
+    // separately for the gyro source and stick sources. 1.0 = equal.
+    let gyro_vh_ratio = pf("gyro_vh_ratio", 1.0).max(0.0);
+    let stick_vh_ratio = pf("stick_vh_ratio", 1.0).max(0.0);
+    // User-driven MEASURE calibration ("pitch"|"yaw"|"off"): the user turns the
+    // camera a known amount (180° down→up, or 360°) while we drive the game at the
+    // BASE scale (rws = 1, no V/H bias, off-axis blocked, no flick/stick-aim); the
+    // UI integrates the physical rotation and back-solves `scale`. Distinct from
+    // the spin-`calibrating` reference method.
+    let cal_measure = ps("cal_measure", "off");
+    let measuring = cal_measure == "pitch" || cal_measure == "yaw";
 
-    // Rotation rate in deg/s (yaw = x, pitch = y). While calibrating we ignore
+    // Rotation rate in deg/s (yaw = x, pitch = y). While spin-calibrating we ignore
     // the inputs and spin at a KNOWN rate (cal_speed revolutions/second) so the
     // user can match the game to the on-screen reference; cal_speed 1.0 = 1 rev/s.
     let (yaw_dps, pitch_dps) = if calibrating {
@@ -167,32 +188,77 @@ pub(crate) fn compute_rws(
         };
         // Gyro axes are already ±1 == ±GYRO_REF_DPS deg/s; a stick is bounded
         // deflection, so treat it as a rate up to `max_rate_dps` at full tilt.
-        let k = if input_mode == "stick_rate" { max_rate } else { GYRO_REF_DPS };
-        (rot.x * k, rot.y * k)
+        let is_stick = input_mode == "stick_rate";
+        let k = if is_stick { max_rate } else { GYRO_REF_DPS };
+        if measuring {
+            // Drive only the axis being measured at the BASE scale (no V/H bias),
+            // so the UI's integral back-solves the ground-truth `scale`.
+            rws = 1.0;
+            match cal_measure.as_str() {
+                "pitch" => (0.0, rot.y * k),
+                _ => (rot.x * k, 0.0), // "yaw"
+            }
+        } else {
+            // Apply the V/H bias to the vertical (pitch) axis for this source.
+            let vh = if is_stick { stick_vh_ratio } else { gyro_vh_ratio };
+            (rot.x * k, rot.y * k * vh)
+        }
     };
 
     // Flick-stick yaw contribution (degrees). It is a REAL rotation, so it maps
     // 1:1 through `scale` only — `rws` (a feel multiplier) deliberately does NOT
     // apply, so a flick lands on the direction you point regardless of RWS.
-    let flick_deg = if flick_enabled && !calibrating {
+    let flick_deg = if flick_enabled && !calibrating && !measuring {
         compute_flick(inputs, state, flick_deadzone, flick_smooth_ms, dt)
     } else {
         reset_flick(state);
         0.0
     };
 
-    // Mouse output: per-tick displacement in mouse counts (scale = counts/degree).
-    let dx = yaw_dps * dt * scale * rws + flick_deg * scale;
-    let dy = pitch_dps * dt * scale * rws;
-
-    // Right-stick output: the desired turn RATE (rws applied) normalized by the
-    // game's full-deflection turn rate, clamped to the stick's unit range. Wire
-    // this to a virtual Right Stick for stick-aim games. (The flick and a future
-    // speed-cap "landing" that keeps deflecting until the intended angle is
-    // reached are mouse-only for now.)
     let stick_max = pf("stick_out_dps", 360.0).max(1.0);
-    let sx = (yaw_dps * rws / stick_max).clamp(-1.0, 1.0);
-    let sy = (pitch_dps * rws / stick_max).clamp(-1.0, 1.0);
+
+    // Mouse output: per-tick displacement in mouse counts (scale = counts/degree).
+    // Right-stick output: the desired turn RATE (rws applied) normalized by the
+    // game's full-deflection turn rate, clamped below to the unit range. Both
+    // accumulate the primary source first, then the optional stick-aim.
+    let mut dx = yaw_dps * dt * scale * rws + flick_deg * scale;
+    let mut dy = pitch_dps * dt * scale * rws;
+    let mut sx = yaw_dps * rws / stick_max;
+    let mut sy = pitch_dps * rws / stick_max;
+
+    // Stick-aim: the stick wired to the Flick input drives BOTH outputs as a rate
+    // aim with its own RWS. When flick is ALSO enabled it is active only INSIDE the
+    // flick deadzone (past → the flick takes over); with flick off it uses the full
+    // stick range. Its vertical axis honours the stick V/H bias, and eval_rws_node
+    // suppresses the stick from its default mapping so it doesn't double-drive.
+    if pb("stick_aim_enabled", false) && !calibrating && !measuring {
+        let v = match inputs.get(1).and_then(|s| *s) {
+            Some(Signal::Vec2(v)) => v,
+            _ => glam::Vec2::ZERO,
+        };
+        let m = v.length();
+        let (active, t) = if flick_enabled {
+            // Ramp 0→full across the deadzone; past it belongs to the flick.
+            let dz = flick_deadzone.clamp(0.05, 0.99);
+            (m > 1e-4 && m < dz, (m / dz).clamp(0.0, 1.0))
+        } else {
+            // No flick: the full stick deflection is the rate.
+            (m > 1e-4, m.clamp(0.0, 1.0))
+        };
+        if active {
+            let aim_rws = pf("stick_aim_rws", 1.0);
+            let dir = v / m;
+            let a_yaw = dir.x * t * max_rate;
+            let a_pitch = dir.y * t * max_rate * stick_vh_ratio;
+            dx += a_yaw * dt * scale * aim_rws;
+            dy += a_pitch * dt * scale * aim_rws;
+            sx += a_yaw * aim_rws / stick_max;
+            sy += a_pitch * aim_rws / stick_max;
+        }
+    }
+
+    let sx = sx.clamp(-1.0, 1.0);
+    let sy = sy.clamp(-1.0, 1.0);
 
     vec![
         Some(Signal::Vec2(glam::Vec2::new(dx, dy))),

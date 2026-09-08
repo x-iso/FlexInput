@@ -3154,6 +3154,89 @@ mod rws_tests {
         assert!(matches!(out2[1], Some(Signal::Vec2(v)) if (v.x - 1.0).abs() < 1e-6));
     }
 
+    // V/H bias scales the VERTICAL (pitch) axis only; horizontal is the reference.
+    #[test]
+    fn gyro_vh_ratio_biases_pitch_only() {
+        let mut st = NodeState::default();
+        let p = params(&[
+            ("scale", serde_json::json!(1.0)),
+            ("rws", serde_json::json!(1.0)),
+            ("gyro_vh_ratio", serde_json::json!(2.0)),
+        ]);
+        // Equal yaw & pitch input → pitch output should be 2× the yaw output.
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::new(0.5, 0.5)))];
+        let out = compute_rws(&inputs, &mut st, &p, 0.01);
+        match out[0] {
+            Some(Signal::Vec2(v)) => assert!((v.y - 2.0 * v.x).abs() < 1e-3, "y {} x {}", v.y, v.x),
+            _ => panic!("expected Vec2"),
+        }
+    }
+
+    // Stick-aim: the flick stick INSIDE the deadzone adds a rate to both outputs
+    // with its own RWS, even when the primary rotation input is zero.
+    #[test]
+    fn stick_aim_inside_deadzone_feeds_both_outputs() {
+        let mut st = NodeState::default();
+        let p = params(&[
+            ("scale", serde_json::json!(1.0)),
+            ("rws", serde_json::json!(1.0)),
+            ("stick_out_dps", serde_json::json!(360.0)),
+            ("max_rate_dps", serde_json::json!(360.0)),
+            ("flick_enabled", serde_json::json!(true)),
+            ("flick_deadzone", serde_json::json!(0.85)),
+            ("stick_aim_enabled", serde_json::json!(true)),
+            ("stick_aim_rws", serde_json::json!(1.0)),
+        ]);
+        // Primary rotation zero; flick stick at 0.4 right (inside the 0.85 dz).
+        let inputs = vec![
+            Some(Signal::Vec2(glam::Vec2::ZERO)),
+            Some(Signal::Vec2(glam::Vec2::new(0.4, 0.0))),
+        ];
+        let out = compute_rws(&inputs, &mut st, &p, 0.01);
+        let t = 0.4 / 0.85;
+        let a_yaw = t * 360.0; // dir.x=1
+        match out[0] {
+            Some(Signal::Vec2(v)) => {
+                assert!((v.x - a_yaw * 0.01).abs() < 1e-3, "mouse x {}", v.x);
+                assert!(v.y.abs() < 1e-4, "mouse y {}", v.y);
+            }
+            _ => panic!("expected Mouse Vec2"),
+        }
+        match out[1] {
+            Some(Signal::Vec2(v)) => assert!((v.x - a_yaw / 360.0).abs() < 1e-3, "stick x {}", v.x),
+            _ => panic!("expected Stick Vec2"),
+        }
+    }
+
+    // Past the deadzone the flick takes over — stick-aim does NOT also add its rate.
+    #[test]
+    fn stick_aim_inactive_past_deadzone() {
+        let mut st = NodeState::default();
+        let p = params(&[
+            ("scale", serde_json::json!(1.0)),
+            ("rws", serde_json::json!(1.0)),
+            ("max_rate_dps", serde_json::json!(360.0)),
+            ("flick_enabled", serde_json::json!(true)),
+            ("flick_deadzone", serde_json::json!(0.85)),
+            ("flick_smooth_ms", serde_json::json!(0.0)),
+            ("stick_aim_enabled", serde_json::json!(true)),
+        ]);
+        // Straight up, past the deadzone → a 0° flick engages (no yaw), and the
+        // stick-aim rate must NOT contribute (it is deadzone-only).
+        let inputs = vec![
+            Some(Signal::Vec2(glam::Vec2::ZERO)),
+            Some(Signal::Vec2(glam::Vec2::new(0.0, 1.0))),
+        ];
+        let out = compute_rws(&inputs, &mut st, &p, 0.01);
+        match out[0] {
+            Some(Signal::Vec2(v)) => {
+                assert!(v.x.abs() < 1e-4, "no yaw from a straight-up flick/aim, got {}", v.x);
+                assert!(v.y.abs() < 1e-4, "stick-aim must not add pitch past dz, got {}", v.y);
+            }
+            _ => panic!("expected Mouse Vec2"),
+        }
+    }
+
     // Stick-rate mode: a bounded deflection is treated as a rate up to max_rate_dps.
     #[test]
     fn stick_rate_mode_uses_max_rate() {

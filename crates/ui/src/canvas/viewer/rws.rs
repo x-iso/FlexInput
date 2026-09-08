@@ -80,11 +80,37 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     });
     register_exposable_element(ui, node_id, "rws", r_rws.response.rect);
 
+    // V/H bias — vertical sensitivity relative to horizontal (the calibrated
+    // reference), separately for the gyro source and stick sources. 1.0 = equal.
+    let (gyro_vh, stick_vh) = snarl.get_node(node_id).map(|n| (
+        n.params.get("gyro_vh_ratio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        n.params.get("stick_vh_ratio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+    )).unwrap_or((1.0, 1.0));
+    let r_vh = ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("V/H").small().weak())
+            .on_hover_text("Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated reference,\nset per source: gyro vs stick.");
+        ui.label(egui::RichText::new("gyro").small().weak());
+        let mut g = gyro_vh;
+        if ui.add(egui::DragValue::new(&mut g).speed(0.01).range(0.0..=8.0)).changed() {
+            if let Some(n) = Number::from_f64(g as f64) { set.push(("gyro_vh_ratio", Value::Number(n))); }
+        }
+        ui.label(egui::RichText::new("stick").small().weak());
+        let mut s = stick_vh;
+        if ui.add(egui::DragValue::new(&mut s).speed(0.01).range(0.0..=8.0)).changed() {
+            if let Some(n) = Number::from_f64(s as f64) { set.push(("stick_vh_ratio", Value::Number(n))); }
+        }
+    });
+    register_exposable_element(ui, node_id, "vh", r_vh.response.rect);
+
     // Calibration viewport (own row). Writes `scale` directly via its centre box,
     // so it must run before the `set` flush below (disjoint params — no conflict).
     let fw = ui.available_width().clamp(120.0, 260.0);
     let frect = render_rws_field(node_id, ui, snarl, egui::vec2(fw, 100.0), false);
     register_exposable_element(ui, node_id, "field", frect);
+
+    // Measure-based auto-calibration (turn a known 180°/360° → back-solve Scale).
+    let r_meas = ui.horizontal(|ui| rws_measure_controls(node_id, ui, snarl));
+    register_exposable_element(ui, node_id, "measure", r_meas.response.rect);
 
     // View + style row.
     let mode = snarl.get_node(node_id)
@@ -133,13 +159,15 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     register_exposable_element(ui, node_id, "style", r_style.response.rect);
 
     // Flick stick (input 2, optional): push to flick, hold + rotate to track.
-    let (flick_on, flick_dz, flick_sm) = snarl.get_node(node_id).map(|n| {
+    let (flick_on, flick_dz, flick_sm, aim_on, aim_rws) = snarl.get_node(node_id).map(|n| {
         (
             n.params.get("flick_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
             n.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32,
             n.params.get("flick_smooth_ms").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
+            n.params.get("stick_aim_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            n.params.get("stick_aim_rws").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
         )
-    }).unwrap_or((false, 0.85, 100.0));
+    }).unwrap_or((false, 0.85, 100.0, false, 1.0));
     let r_flick = ui.horizontal(|ui| {
         let mut fe = flick_on;
         if ui.checkbox(&mut fe, egui::RichText::new("Flick").small())
@@ -164,6 +192,24 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
                 .changed()
             {
                 if let Some(n) = Number::from_f64(sm as f64) { set.push(("flick_smooth_ms", Value::Number(n))); }
+            }
+        }
+        // Stick-aim — available whether or not Flick is on (with Flick it lives
+        // inside the deadzone; without, it uses the full stick range).
+        let mut ae = aim_on;
+        if ui.checkbox(&mut ae, egui::RichText::new("Stick aim").small())
+            .on_hover_text("Use the stick wired to the Flick input as a rate aim feeding BOTH\noutputs (its own RWS + the stick V/H bias). With Flick on it acts INSIDE\nthe deadzone (past → flick); with Flick off it uses the full stick range.\nThe stick is suppressed from its default mapping while aiming.")
+            .changed()
+        {
+            set.push(("stick_aim_enabled", Value::Bool(ae)));
+        }
+        if aim_on {
+            let mut ar = aim_rws;
+            if ui.add(egui::DragValue::new(&mut ar).speed(0.01).range(0.01..=50.0).prefix("×"))
+                .on_hover_text("Stick-aim RWS multiplier (independent of the main RWS).")
+                .changed()
+            {
+                if let Some(n) = Number::from_f64(ar as f64) { set.push(("stick_aim_rws", Value::Number(n))); }
             }
         }
     });
@@ -259,13 +305,15 @@ pub(crate) fn render_rws_flick(
     snarl: &mut Snarl<NodeData>,
     container: egui::Vec2,
 ) {
-    let (flick_on, flick_dz, flick_sm) = snarl.get_node(node_id).map(|n| {
+    let (flick_on, flick_dz, flick_sm, aim_on, aim_rws) = snarl.get_node(node_id).map(|n| {
         (
             n.params.get("flick_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
             n.params.get("flick_deadzone").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32,
             n.params.get("flick_smooth_ms").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
+            n.params.get("stick_aim_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            n.params.get("stick_aim_rws").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
         )
-    }).unwrap_or((false, 0.85, 100.0));
+    }).unwrap_or((false, 0.85, 100.0, false, 1.0));
     let mut set: Vec<(&str, Value)> = Vec::new();
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(190.0, 22.0));
@@ -284,6 +332,16 @@ pub(crate) fn render_rws_flick(
             let mut sm = flick_sm;
             if ui.add(egui::DragValue::new(&mut sm).speed(1.0).range(0.0..=500.0)).changed() {
                 if let Some(n) = Number::from_f64(sm as f64) { set.push(("flick_smooth_ms", Value::Number(n))); }
+            }
+        }
+        let mut ae = aim_on;
+        if ui.checkbox(&mut ae, egui::RichText::new("aim").small()).changed() {
+            set.push(("stick_aim_enabled", Value::Bool(ae)));
+        }
+        if aim_on {
+            let mut ar = aim_rws;
+            if ui.add(egui::DragValue::new(&mut ar).speed(0.01).range(0.01..=50.0).prefix("×")).changed() {
+                if let Some(n) = Number::from_f64(ar as f64) { set.push(("stick_aim_rws", Value::Number(n))); }
             }
         }
     });
@@ -374,6 +432,201 @@ pub(crate) fn render_rws_cal(
             for (k, v) in set { node.params.insert(k.to_string(), v); }
         }
     }
+}
+
+// ── Measure calibration (user turns a known amount; we back-solve `scale`) ────
+//
+// `cal_measure` param drives the engine to emit only the measured axis at the
+// BASE scale (rws 1, no V/H); meanwhile the UI integrates the physical rotation
+// entering the RWS node (the same rate readback the field preview uses) into a
+// running angle. On Finish: `scale_new = scale_old * |angle| / target` (target
+// 180° for pitch, 360° for yaw). Integrating a RATE by the UI dt is
+// cadence-independent, so a ~60 Hz UI still measures a smooth sweep accurately.
+
+fn rws_meas_theta_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_meas_theta", node_id.0)) }
+fn rws_meas_stamp_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_meas_stamp", node_id.0)) }
+fn rws_meas_prev_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_meas_prev", node_id.0)) }
+
+fn rws_meas_reset(ui: &egui::Ui, node_id: NodeId) {
+    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_theta_key(node_id), 0.0_f32));
+}
+
+/// Integrate the measured-axis rotation once per frame (guarded), returning the
+/// active axis ("off"/"pitch"/"yaw") and the accumulated degrees. The angle
+/// auto-resets whenever measuring (re)starts or switches axis, so starting via
+/// the gamepad (which just sets `cal_measure`) is equivalent to the buttons.
+fn rws_measure_state(node_id: NodeId, ui: &egui::Ui, snarl: &Snarl<NodeData>) -> (String, f32) {
+    let (cal_measure, input_mode, max_rate) = snarl.get_node(node_id).map(|n| (
+        n.params.get("cal_measure").and_then(|v| v.as_str()).unwrap_or("off").to_string(),
+        n.params.get("input_mode").and_then(|v| v.as_str()).unwrap_or("gyro").to_string(),
+        n.params.get("max_rate_dps").and_then(|v| v.as_f64()).unwrap_or(360.0) as f32,
+    )).unwrap_or(("off".into(), "gyro".into(), 360.0));
+
+    let theta = ui.ctx().data(|d| d.get_temp::<f32>(rws_meas_theta_key(node_id))).unwrap_or(0.0);
+    if cal_measure != "pitch" && cal_measure != "yaw" {
+        ui.ctx().data_mut(|d| d.insert_temp(rws_meas_prev_key(node_id), "off".to_string()));
+        return ("off".into(), theta);
+    }
+    // Once per pass: integrate the on-axis input RATE by the UI dt.
+    let frame = ui.ctx().cumulative_pass_nr();
+    let last = ui.ctx().data(|d| d.get_temp::<u64>(rws_meas_stamp_key(node_id))).unwrap_or(u64::MAX);
+    if last == frame {
+        return (cal_measure, theta);
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_stamp_key(node_id), frame));
+
+    // Reset the angle when (re)entering a measuring axis (start or axis switch).
+    let prev = ui.ctx().data(|d| d.get_temp::<String>(rws_meas_prev_key(node_id))).unwrap_or_default();
+    let mut theta = if prev != cal_measure { 0.0 } else { theta };
+    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_prev_key(node_id), cal_measure.clone()));
+
+    let src = snarl
+        .in_pin(InPinId { node: node_id, input: 0 })
+        .remotes
+        .first()
+        .copied()
+        .and_then(|src| snarl.get_node(src.node).and_then(|n| n.extra.last_out.get(src.output).copied().flatten()));
+    let is_pitch = cal_measure == "pitch";
+    let rate = src.map(|s| match s {
+        Signal::Vec2(v) => if is_pitch { v.y } else { v.x },
+        Signal::Float(f) => if is_pitch { 0.0 } else { f },
+        _ => 0.0,
+    }).unwrap_or(0.0);
+    let k = if input_mode == "stick_rate" { max_rate } else { GYRO_REF_DPS };
+    let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
+    theta += rate * k * dt;
+    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_theta_key(node_id), theta));
+    (cal_measure, theta)
+}
+
+fn rws_meas_msg_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_cal_msg", node_id.0)) }
+
+/// Complete the active measure: back-solve `scale = old * |angle| / target`,
+/// then clear the calibration state and stash a short result message the widget
+/// shows for a few seconds (so the user KNOWS whether it took). Shared by the
+/// mouse Finish button and the gamepad South finish.
+fn rws_finish_measure(node_id: NodeId, ui: &egui::Ui, snarl: &mut Snarl<NodeData>, axis: &str, theta: f32) {
+    let target = if axis == "yaw" { 360.0_f32 } else { 180.0 };
+    let mut msg = "⚠ No rotation measured — re-run".to_string();
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        let scale = node.params.get("scale").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32;
+        if theta.abs() >= 5.0 && scale > 0.0 {
+            let new = scale * theta.abs() / target;
+            if let Some(n) = Number::from_f64(new as f64) { node.params.insert("scale".into(), Value::Number(n)); }
+            msg = format!("✓ Scale set to {new:.1}");
+        }
+        node.params.insert("cal_measure".into(), Value::String("off".into()));
+        node.params.insert("cal_finish".into(), Value::Bool(false));
+    }
+    let now = ui.input(|i| i.time);
+    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_msg_key(node_id), (msg, now)));
+    rws_meas_reset(ui, node_id);
+}
+
+/// The measure-calibration controls. Gamepad flow (see `nav_drive_rws_measure`):
+/// enter the widget with South, then ◄► pick the method, Ⓐ start, Ⓐ finish, Ⓑ
+/// cancel/back, Ⓨ toggles the 360°-only snapshot reference. Mouse users click the
+/// method / Finish / Cancel buttons directly. A guide line under the row spells
+/// out where to point the camera; a short result message reports the outcome.
+/// Shared by the module body and the pinnable element.
+pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
+    let (axis, theta) = rws_measure_state(node_id, ui, snarl);
+    let (ref_on, pending, finish_flag) = snarl.get_node(node_id).map(|n| (
+        n.params.get("cal_ref_shot").and_then(|v| v.as_bool()).unwrap_or(false),
+        n.params.get("cal_pending").and_then(|v| v.as_str()).filter(|p| *p == "pitch" || *p == "yaw").unwrap_or("yaw").to_string(),
+        n.params.get("cal_finish").and_then(|v| v.as_bool()).unwrap_or(false),
+    )).unwrap_or((false, "yaw".into(), false));
+
+    let measuring = axis == "pitch" || axis == "yaw";
+    let mut set: Vec<(&str, Value)> = Vec::new();
+    let mut do_finish = false;
+    let mut cancel = false;
+    // The method row's rect → the config-overlay focus glow while entered.
+    let mut method_rect = egui::Rect::NOTHING;
+
+    if measuring {
+        let target = if axis == "yaw" { 360.0_f32 } else { 180.0 };
+        let r = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("Measuring {axis}: {:.0}° / {:.0}°", theta.abs(), target))
+                .strong().color(egui::Color32::from_rgb(255, 200, 80)));
+            if ui.button(egui::RichText::new("✓ Finish").small()).clicked() { do_finish = true; }
+            if ui.button(egui::RichText::new("✗ Cancel").small()).clicked() { cancel = true; }
+        });
+        method_rect = r.response.rect;
+        let guide = if axis == "pitch" {
+            "Turn the camera fully UP, then Finish  ·  A = Finish · B = Cancel"
+        } else {
+            "Turn one full 360°, then Finish  ·  A = Finish · B = Cancel"
+        };
+        ui.label(egui::RichText::new(guide).small().weak());
+    } else {
+        let r = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Auto-cal").small().weak());
+            // Method buttons; the gamepad-highlighted (pending) one is marked.
+            let r_p = ui.selectable_label(pending == "pitch", egui::RichText::new("↕180°").small())
+                .on_hover_text("Vertical: aim straight DOWN, then turn straight UP (horizontal blocked).");
+            let r_y = ui.selectable_label(pending == "yaw", egui::RichText::new("↔360°").small())
+                .on_hover_text("Horizontal: turn one full 360° (vertical blocked).");
+            if r_p.clicked() { set.push(("cal_measure", Value::String("pitch".into()))); }
+            if r_y.clicked() { set.push(("cal_measure", Value::String("yaw".into()))); }
+            method_rect = r_p.rect.union(r_y.rect);
+            // Snapshot comparison — only meaningful for the 360° horizontal method.
+            if pending == "yaw" {
+                let mut shot = ref_on;
+                if ui.checkbox(&mut shot, egui::RichText::new("snapshot comparison").small())
+                    .on_hover_text("Freeze the game frame behind the overlay at sweep start and show its\nleft half at 70% as an alignment reference for the full 360° turn.")
+                    .changed()
+                {
+                    set.push(("cal_ref_shot", Value::Bool(shot)));
+                }
+            }
+        });
+        if method_rect == egui::Rect::NOTHING { method_rect = r.response.rect; }
+        // Recent result message (a few seconds after a Finish).
+        let msg = ui.ctx().data(|d| d.get_temp::<(String, f64)>(rws_meas_msg_key(node_id)));
+        if let Some((m, t)) = msg {
+            if ui.input(|i| i.time) - t < 3.5 {
+                let col = if m.starts_with('✓') { egui::Color32::from_rgb(150, 220, 150) } else { egui::Color32::from_rgb(230, 180, 120) };
+                ui.label(egui::RichText::new(m).small().color(col));
+            }
+        }
+        let guide = if pending == "pitch" {
+            "Aim the camera straight DOWN first  ·  A = Start · ◄► method"
+        } else {
+            "Aim straight ahead first  ·  A = Start · ◄► method · Y = snapshot"
+        };
+        ui.label(egui::RichText::new(guide).small().weak());
+    }
+
+    publish_nav_field_rects(ui, node_id, &[method_rect]);
+
+    if finish_flag || do_finish {
+        if measuring {
+            rws_finish_measure(node_id, ui, snarl, &axis, theta);
+        } else if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("cal_finish".into(), Value::Bool(false));
+        }
+    } else if cancel {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            node.params.insert("cal_measure".into(), Value::String("off".into()));
+        }
+    } else if !set.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for (k, v) in set { node.params.insert(k.to_string(), v); }
+        }
+    }
+}
+
+/// Measure-calibration controls as a standalone pinnable element.
+pub(crate) fn render_rws_measure(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(210.0, 24.0));
+    rws_measure_controls(node_id, ui, snarl);
 }
 
 /// Ruler style row (BG opacity / tick spacing / labels), as a standalone

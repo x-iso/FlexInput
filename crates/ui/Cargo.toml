@@ -69,3 +69,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
 ] }
+# Screen capture for the RWS calibration reference frame (GDI BitBlt of the
+# desktop; a plain BitBlt excludes our layered overlay, capturing the game
+# behind). Same major version already used by flexinput-joycon2.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }

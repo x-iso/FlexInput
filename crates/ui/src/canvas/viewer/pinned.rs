@@ -333,6 +333,11 @@ pub(crate) fn render_pinned_element_impl(
             render_rws_cal(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        // Measure-based auto-calibration (turn 180°/360° → back-solve Scale).
+        ("processing.rws", "measure") => {
+            render_rws_measure(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Ruler style (BG opacity / tick spacing / labels).
         ("processing.rws", "style") => {
             render_rws_style(inner_id, ui, inner_snarl, container_size);

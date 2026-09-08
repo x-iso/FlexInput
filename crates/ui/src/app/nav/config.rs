@@ -86,9 +86,16 @@ impl FlexInputApp {
         // with identical UX. Its Widget-level branch is skipped here (edit_level
         // != Widget), so it never touches the sub-patch's own selection.
         if editing {
-            if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
+            if let Some((outer, inner, elem)) = self.gamepad_nav.config_nav_sel.clone() {
                 let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
                 let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
+                // RWS measure widget: bespoke South/East flow (not field-walking).
+                if elem == "measure"
+                    && self.nav_selected_module_id(outer).as_deref() == Some("processing.rws")
+                {
+                    self.nav_drive_rws_measure(ctx, outer, inner, nav, rt_rising);
+                    return;
+                }
                 let dnav = match control {
                     // LS already drives the editor's stick role.
                     ControlInput::LeftStick => nav.clone(),
@@ -313,6 +320,54 @@ impl FlexInputApp {
             Some((_, pins)) => crate::app::control_input_from_pins(&pins),
             None => ControlInput::LeftStick,
         }
+    }
+
+    /// Bespoke gamepad flow for the RWS "measure" auto-cal widget while entered.
+    /// OFF: ◄►/dpad pick the method (pitch/yaw), Y toggles snapshot comparison
+    /// (360° only), A starts the highlighted method, B backs out. MEASURING: A
+    /// finishes (back-solves Scale via the widget's `cal_finish` handler), B
+    /// cancels. Chosen over field-walking because South/East read far clearer.
+    pub(crate) fn nav_drive_rws_measure(
+        &mut self,
+        ctx: &egui::Context,
+        outer: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId,
+        nav: &crate::gamepad_nav::NavInput,
+        rt_rising: bool,
+    ) {
+        let south = nav.is_rising("btn_south") || rt_rising;
+        let east = nav.is_rising("btn_east");
+        let cur = self.get_subpatch_param_str(outer, inner, "cal_measure").unwrap_or_default();
+        let measuring = cur == "pitch" || cur == "yaw";
+        if measuring {
+            if south {
+                // The widget renderer sees this and back-solves Scale + stops.
+                self.set_subpatch_param_bool(outer, inner, "cal_finish", true);
+            } else if east {
+                self.set_subpatch_param_str(outer, inner, "cal_measure", "off");
+            }
+        } else {
+            if nav.is_rising("dpad_left") {
+                self.set_subpatch_param_str(outer, inner, "cal_pending", "pitch");
+            }
+            if nav.is_rising("dpad_right") {
+                self.set_subpatch_param_str(outer, inner, "cal_pending", "yaw");
+            }
+            // Y toggles the snapshot-comparison reference (only used by 360° yaw).
+            if nav.is_rising("btn_north") {
+                let s = self.get_subpatch_param_bool(outer, inner, "cal_ref_shot").unwrap_or(false);
+                self.set_subpatch_param_bool(outer, inner, "cal_ref_shot", !s);
+            }
+            if south {
+                let pending = self.get_subpatch_param_str(outer, inner, "cal_pending")
+                    .filter(|p| p == "pitch" || p == "yaw")
+                    .unwrap_or_else(|| "yaw".into());
+                self.set_subpatch_param_str(outer, inner, "cal_measure", &pending);
+            } else if east {
+                self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::Widget;
+            }
+        }
+        ctx.request_repaint();
     }
 
     /// The focused value-field the config overlay should draw a glow ring on:

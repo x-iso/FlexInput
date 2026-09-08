@@ -28,6 +28,21 @@ All notable changes to FlexInput are documented here. This project adheres to
   edit mode). The overlay snap grid is now a zone-aligned percentage of the
   viewport rather than pixels.
 
+- **RWS Aim: stick-aim, V/H bias, and measure-based calibration.** The stick
+  wired to the Flick input can now drive BOTH the Mouse and Stick outputs as a
+  rate aim with its own RWS multiplier (inside the flick deadzone when Flick is
+  on, full range when off). A per-source **V/H sensitivity bias** scales the
+  vertical axis relative to the calibrated horizontal, separately for the gyro
+  and stick sources. And a new **measure-based auto-calibration** sets Scale by
+  turning the camera a known amount instead of eyeballing the ruler: **↕180°**
+  (aim down → up, horizontal blocked) or **↔360°** (one full turn, vertical
+  blocked); it drives the game at the base scale and back-solves Scale from the
+  rotation it emitted (curve-immune). Fully gamepad-operable from the config
+  overlay (◄► method, A start/finish, B cancel), since the mouse is busy driving
+  the game — with an optional **snapshot comparison** that freezes the game frame
+  behind the overlay (captured so our own overlay is excluded) and shows its left
+  half at 70% as an alignment reference for the 360° turn.
+
 ### Fixed
 
 - **An incompatible tab no longer wipes the whole workspace.** `workspace.json`

@@ -433,6 +433,7 @@ impl FlexInputApp {
             | ("module.menu", "options")
             | ("processing.rws", "scale") | ("processing.rws", "rws")
             | ("processing.rws", "input") | ("processing.rws", "cal")
+            | ("processing.rws", "measure")
             | ("processing.rws", "field") | ("processing.rws", "style")
             | ("processing.rws", "flick") | ("processing.rws", "suppress")
             | ("math.negate", "unipolar")
@@ -653,6 +654,14 @@ impl FlexInputApp {
             ("processing.rws", "cal") => vec![
                 f!("Calibrate", Toggle{key:"calibrating"}),
                 f!("Speed", v("cal_speed",0.05,10.0,0.5,Linear)),
+            ],
+            // Measure auto-cal. One nominal field so it classifies as MultiField
+            // (South at the pin ENTERS it); the actual in-widget controls are
+            // handled specially in `nav_drive_rws_measure` (◄► pick method, A
+            // start / A finish, B back / B cancel) because South/East are far
+            // clearer here than field-walking.
+            ("processing.rws", "measure") => vec![
+                f!("Auto-cal", Enum{key:"cal_measure",opts:&["off","pitch","yaw"]}),
             ],
             ("processing.rws", "field") => vec![
                 f!("Scale", v("scale",0.0,100_000.0,100.0,Fixed(1.0))),

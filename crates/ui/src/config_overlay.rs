@@ -131,6 +131,88 @@ pub fn set_config_overlay_edit(ctx: &egui::Context, on: bool) {
     ctx.data_mut(|d| d.insert_temp(edit_id(), on));
 }
 
+/// While an RWS pin is running a MEASURE calibration sweep (`cal_measure` =
+/// pitch/yaw), the user's gyro/stick must reach the RWS node so the camera moves
+/// — but the config overlay source-blocks every physical input by default. This
+/// finds such a pin and returns its upstream physical device to force through
+/// (whole device, so the sweep works even with selectors/curves before RWS),
+/// overriding the normal hover/tweak gate.
+fn rws_measure_passthrough(
+    tab_snarl: &Snarl<NodeData>,
+    config_layout: &OverlayLayout,
+) -> Option<(String, Vec<String>)> {
+    for it in &config_layout.items {
+        let LayoutItem::Module(m) = it else { continue };
+        let node = match m.source_path.as_slice() {
+            [] => tab_snarl.get_node(egui_snarl::NodeId(m.inner_node_id)),
+            [sp] => tab_snarl
+                .get_node(egui_snarl::NodeId(*sp))
+                .and_then(|n| n.subpatch.as_ref())
+                .and_then(|s| s.snarl.get_node(egui_snarl::NodeId(m.inner_node_id))),
+            _ => None,
+        };
+        let Some(node) = node else { continue };
+        if node.module_id != "processing.rws" {
+            continue;
+        }
+        let cm = node.params.get("cal_measure").and_then(|v| v.as_str()).unwrap_or("off");
+        if cm == "pitch" || cm == "yaw" {
+            if let Some(dev) = crate::app::config_passthrough_device(tab_snarl, &m.source_path, m.inner_node_id) {
+                return Some((dev, Vec::new())); // whole device
+            }
+        }
+    }
+    None
+}
+
+/// Manage the RWS calibration REFERENCE frame: when a measure sweep with the
+/// screenshot reference enabled starts, grab the game frame behind the overlay
+/// once and cache it as a texture; drop it when the sweep ends. Returns the
+/// texture to paint while a sweep is active. Keyed in ctx temp-data (only one
+/// sweep runs at a time), so it survives across frames without an app field.
+fn rws_reference_frame(
+    ctx: &egui::Context,
+    tab_snarl: &Snarl<NodeData>,
+    config_layout: &OverlayLayout,
+) -> Option<egui::TextureHandle> {
+    let active = config_layout.items.iter().any(|it| {
+        let LayoutItem::Module(m) = it else { return false };
+        let node = match m.source_path.as_slice() {
+            [] => tab_snarl.get_node(egui_snarl::NodeId(m.inner_node_id)),
+            [sp] => tab_snarl
+                .get_node(egui_snarl::NodeId(*sp))
+                .and_then(|n| n.subpatch.as_ref())
+                .and_then(|s| s.snarl.get_node(egui_snarl::NodeId(m.inner_node_id))),
+            _ => None,
+        };
+        let Some(node) = node else { return false };
+        node.module_id == "processing.rws"
+            && node.params.get("cal_ref_shot").and_then(|v| v.as_bool()).unwrap_or(false)
+            // Snapshot comparison is the 360° horizontal aid only.
+            && node.params.get("cal_measure").and_then(|v| v.as_str()) == Some("yaw")
+    });
+
+    let tex_key = egui::Id::new("fxi_rws_ref_tex");
+    let prev_key = egui::Id::new("fxi_rws_ref_active");
+    let prev = ctx.data(|d| d.get_temp::<bool>(prev_key)).unwrap_or(false);
+    if active && !prev {
+        // Sweep just started — capture the game frame (our layered overlay is
+        // excluded by the plain BitBlt), cache as a texture on this ctx.
+        let tex = crate::capture::capture_primary_monitor()
+            .map(|img| ctx.load_texture("fxi_rws_ref", img, egui::TextureOptions::LINEAR));
+        ctx.data_mut(|d| d.insert_temp(tex_key, tex));
+    }
+    if !active && prev {
+        ctx.data_mut(|d| d.insert_temp(tex_key, None::<egui::TextureHandle>));
+    }
+    ctx.data_mut(|d| d.insert_temp(prev_key, active));
+    if active {
+        ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(tex_key)).flatten()
+    } else {
+        None
+    }
+}
+
 /// Show the config overlay viewport (call once per frame from
 /// `FlexInputApp::update`, right after the menu overlay). No-op while hidden.
 pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
@@ -372,7 +454,16 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // game. The top-bar checkbox restores always-on passthrough for the
         // focused pin.
         let tweaking = gp_editing || dragging;
-        let passthrough = if passthrough_default || tweaking { raw_passthrough } else { None };
+        // An active RWS measure sweep forces its input device through regardless of
+        // hover/tweak, so the gyro/stick actually moves the camera during cal.
+        let cal_passthrough = rws_measure_passthrough(tab_snarl, config_layout);
+        let passthrough = if cal_passthrough.is_some() {
+            cal_passthrough
+        } else if passthrough_default || tweaking {
+            raw_passthrough
+        } else {
+            None
+        };
         if live && (active_idx.is_some() || !dragging) {
             // Overwrite the passthrough — but not on a stray cursor-off-pin frame
             // mid-drag, so a fast drag keeps the pin's input flowing.
@@ -453,6 +544,32 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 // `crate::widgets::nav_pass`, which returns the ROOT nav pass in any
                 // viewport, so the highlights match in this overlay viewport with no
                 // republishing. New highlight channels get this for free.
+
+                // RWS calibration reference: the frozen game frame's LEFT half at
+                // 70%, so the user turns until the live right half realigns (a full
+                // 360° / the pitch endpoint). Drawn under the pins/toolbar.
+                if !edit {
+                    if let Some(tex) = rws_reference_frame(vctx, tab_snarl, config_layout) {
+                        let painter = ui.painter();
+                        let left = egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.center().x, rect.max.y),
+                        );
+                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.5, 1.0));
+                        painter.image(tex.id(), left, uv, egui::Color32::from_white_alpha(179));
+                        painter.line_segment(
+                            [egui::pos2(rect.center().x, rect.min.y), egui::pos2(rect.center().x, rect.max.y)],
+                            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(130)),
+                        );
+                        painter.text(
+                            egui::pos2(left.center().x, rect.min.y + 40.0),
+                            egui::Align2::CENTER_CENTER,
+                            "Reference — turn until the live view realigns, then Finish",
+                            egui::FontId::proportional(15.0),
+                            egui::Color32::from_rgba_unmultiplied(255, 230, 180, 230),
+                        );
+                    }
+                }
 
                 crate::canvas::overlay_body::show_overlay_body(
                     ui, rect, tab_snarl, config_layout, edit,
