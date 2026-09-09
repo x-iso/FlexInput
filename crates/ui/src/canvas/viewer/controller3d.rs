@@ -44,14 +44,8 @@ use super::*;
 /// ❗ Belongs HERE, not in the device layer. The orientation pin feeds aim
 /// modules too and they work in the canonical frame; rotating it at source to
 /// suit one renderer would silently break everything else.
-fn to_view_basis(q: glam::Quat) -> glam::Quat {
-    // Columns are the images of the canonical basis vectors.
-    let r = glam::Quat::from_mat3(&glam::Mat3::from_cols(
-        glam::Vec3::new(0.0, 0.0, -1.0), // canonical x -> viewer -z
-        glam::Vec3::new(-1.0, 0.0, 0.0), // canonical y -> viewer -x
-        glam::Vec3::new(0.0, 1.0, 0.0),  // canonical z -> viewer +y
-    ));
-    r * q * r.conjugate()
+pub(crate) fn to_view_basis(q: glam::Quat) -> glam::Quat {
+    flexinput_core::frames::canonical_to_viewer_quat(q)
 }
 
 pub(crate) fn controller3d_physical_device(

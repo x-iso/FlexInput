@@ -211,7 +211,11 @@ pub(crate) fn render_pinned_element_impl(
                     _ => None,
                 })
                 .filter(|q| q.length_squared() > 1e-6)
-                .map(|q| q.normalize())
+                // ⛔ The same conversion the node-body renderer does. This one
+                // was normalising and drawing the canonical quaternion
+                // unchanged, so a pinned 3D view and the node it was pinned
+                // from disagreed about which way the controller was pointing.
+                .map(|q| to_view_basis(q.normalize()))
                 .unwrap_or(glam::Quat::IDENTITY);
             // Colours/model are the PIN's own style override (edited directly
             // by the inspector strip — no snarl writes, no temp channels; a

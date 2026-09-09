@@ -531,12 +531,34 @@ pub(crate) fn compute_gyro_3dof(
         state.aux_f32[16] = 0.0;
     }
 
-    // Emit orientation as Vec4 (x, y, z, w)
-    let orientation_signal = Some(Signal::Vec4(glam::Vec4::new(
+    // ⛔ **Published in the CANONICAL frame, not the one it was integrated in.**
+    //
+    // The integration above works in the model/renderer frame (X=pitch, Y=yaw,
+    // Z=roll, Y-up), and so does the accel drift correction beneath it. That is
+    // fine internally, but a `Vec4` orientation PIN is canonical by contract —
+    // see `flexinput_core::frames` — because a device that fuses its own
+    // absolute orientation publishes on the same kind of pin, and the Joy-Con 2
+    // publishes canonical.
+    //
+    // ❗ Emitting the model frame here made the renderer convert a quaternion
+    // that was already converted, which permutes the axes: yaw drew as pitch,
+    // pitch as roll, roll as yaw. It only showed on rate-only pads — DualSense,
+    // DS4, Switch Pro, XInput — because those are the ones whose orientation
+    // comes from this module rather than from the device.
+    //
+    // Converting HERE rather than changing the integration keeps the drift
+    // correction's captured gravity reference in the frame it was captured in.
+    let q_canonical = flexinput_core::frames::viewer_to_canonical_quat(glam::Quat::from_xyzw(
         state.aux_f32[7],
         state.aux_f32[8],
         state.aux_f32[9],
         state.aux_f32[10],
+    ));
+    let orientation_signal = Some(Signal::Vec4(glam::Vec4::new(
+        q_canonical.x,
+        q_canonical.y,
+        q_canonical.z,
+        q_canonical.w,
     )));
 
     vec![
@@ -556,3 +578,92 @@ pub(crate) fn compute_gyro_3dof(
 
 // ── Curve helpers ─────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+mod orientation_frame_tests {
+    use super::compute_gyro_3dof;
+    use crate::NodeState;
+    use flexinput_core::Signal;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    /// Spin the module for `secs` at a constant normalised gyro reading and
+    /// return the orientation it publishes.
+    fn run(gx: f32, gy: f32, gz: f32, secs: f32) -> glam::Quat {
+        let mut state = NodeState::default();
+        let mut params: HashMap<String, Value> = HashMap::new();
+        // Off, so the captured gravity reference cannot nudge the pose and
+        // blur what this is measuring.
+        params.insert("orient_drift".into(), json!(0.0));
+        let dev = HashMap::new();
+        let coll = HashMap::new();
+        let dt = 1.0 / 250.0;
+        let mut out = Vec::new();
+        let steps = (secs / dt) as usize;
+        for _ in 0..steps {
+            // Gyro X/Y/Z are direct pin overrides at inputs 2, 3 and 4.
+            let inputs = vec![
+                None,
+                None,
+                Some(Signal::Float(gx)),
+                Some(Signal::Float(gy)),
+                Some(Signal::Float(gz)),
+            ];
+            out = compute_gyro_3dof(&inputs, &mut state, &params, &dev, &coll, dt);
+        }
+        match out.get(5).and_then(|s| s.as_ref()) {
+            Some(Signal::Vec4(v)) => glam::Quat::from_xyzw(v.x, v.y, v.z, v.w),
+            other => panic!("expected an orientation quaternion, got {other:?}"),
+        }
+    }
+
+    /// The internal integration frame, recovered from what was published.
+    fn as_rendered(q: glam::Quat) -> glam::Quat {
+        flexinput_core::frames::canonical_to_viewer_quat(q)
+    }
+
+    #[test]
+    fn the_published_orientation_is_canonical_not_the_render_frame() {
+        // ⛔ The regression. This module integrates in the renderer's frame,
+        // and used to publish that frame straight onto the pin — so the
+        // renderer, which converts canonical to render frame, converted an
+        // already-converted quaternion. The axes came out permuted: yaw drew
+        // as pitch, pitch as roll, roll as yaw.
+        //
+        // A pure yaw must therefore arrive on the pin as a rotation about
+        // canonical +z (up), NOT about the renderer's +y.
+        let q = run(0.0, 0.0, 0.25, 0.5);
+        let (axis, angle) = q.to_axis_angle();
+        assert!(angle > 0.05, "the pad should have turned somewhere: {angle}");
+        let up = axis.dot(glam::Vec3::Z).abs();
+        assert!(up > 0.99, "a yaw must be about canonical up, got axis {axis:?}");
+    }
+
+    #[test]
+    fn a_roll_and_a_pitch_land_on_their_own_canonical_axes() {
+        // ❗ Guards the whole 3-cycle, not just one third of it: the bug moved
+        // every axis, so testing yaw alone would pass on a map that still had
+        // roll and pitch swapped.
+        let (roll_axis, _) = run(0.25, 0.0, 0.0, 0.5).to_axis_angle();
+        assert!(
+            roll_axis.dot(glam::Vec3::X).abs() > 0.99,
+            "a roll must be about canonical forward, got {roll_axis:?}"
+        );
+        let (pitch_axis, _) = run(0.0, 0.25, 0.0, 0.5).to_axis_angle();
+        assert!(
+            pitch_axis.dot(glam::Vec3::Y).abs() > 0.99,
+            "a pitch must be about canonical side, got {pitch_axis:?}"
+        );
+    }
+
+    #[test]
+    fn rendering_the_published_quaternion_reproduces_the_integration_frame() {
+        // The round trip the renderer performs: what it draws must be a
+        // rotation about the renderer's up axis for a yaw, which is the
+        // property that was broken in the other direction before.
+        let (axis, _) = as_rendered(run(0.0, 0.0, 0.25, 0.5)).to_axis_angle();
+        assert!(
+            axis.dot(glam::Vec3::Y).abs() > 0.99,
+            "a yaw must render about the viewer's up axis, got {axis:?}"
+        );
+    }
+}
