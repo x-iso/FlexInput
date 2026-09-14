@@ -2390,11 +2390,10 @@ pub(crate) fn render_touch_zone_cards(
     if phase == "captured"
         && getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false)
     {
-        // Suppress gamepad UI navigation this + next frame so the button the user
+        // Suppress gamepad UI navigation while armed so the button the user
         // presses reaches THIS capture instead of driving the cursor/menus. Read
-        // by `run_gamepad_nav` (goes inert while the flag is fresh).
-        let pass = ui.ctx().cumulative_pass_nr();
-        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("fxi_tz_gp_learn"), pass));
+        // by `run_gamepad_nav` (goes inert while the hold is fresh).
+        crate::widgets::hold_nav_for_capture(ui.ctx());
         ui.ctx().request_repaint();
         let pressed_now: Vec<String> = dev.as_deref()
             .map(|d| remapper_pressed_now(live_signals, d)).unwrap_or_default();

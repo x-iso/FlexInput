@@ -205,6 +205,29 @@ pub(crate) fn nav_pass_matches(ctx: &egui::Context, pass: u64) -> bool {
     nav_pass(ctx).saturating_sub(pass) <= 2
 }
 
+/// Ctx-data slot a mapping body stamps (with the root nav pass) every frame a
+/// Learn capture is live for the nav-driving pad. See `hold_nav_for_capture`.
+const NAV_CAPTURE_HOLD_KEY: &str = "gp_nav_capture_hold";
+
+/// Hold gamepad UI-nav inert this frame: a mapping body (Remapper / Map Action /
+/// 3DOF-to-2D Lean / Touch Zones) has a Learn capture armed, so the buttons the
+/// user demonstrates must reach that capture instead of navigating (LB/RB
+/// flipping tabs, Select Alt-Tabbing, …). Re-publish EVERY frame the capture is
+/// live — nav resumes on its own once the stamps stop, so an arm left behind by
+/// a body that stopped rendering can never lock navigation out. Stamped with the
+/// root nav pass so a body in the config-overlay viewport gates correctly.
+pub(crate) fn hold_nav_for_capture(ctx: &egui::Context) {
+    // Pass first: nesting the data lock inside `nav_pass`'s would deadlock.
+    let pass = nav_pass(ctx);
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(NAV_CAPTURE_HOLD_KEY), pass));
+}
+
+/// True while some body is holding nav for a live capture (`hold_nav_for_capture`).
+pub(crate) fn nav_held_for_capture(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<u64>(egui::Id::new(NAV_CAPTURE_HOLD_KEY)))
+        .map_or(false, |p| nav_pass_matches(ctx, p))
+}
+
 /// Centralized appearance of every gamepad-nav highlight. Built from the active
 /// egui visuals so it tracks the theme; the single seam a future custom theme
 /// would override to restyle all highlights at once.

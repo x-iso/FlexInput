@@ -48,6 +48,32 @@ pub(crate) fn remapper_upstream_device_id(
     crate::app::find_automap_device_id_for_viewer(snarl, src, automap_parent)
 }
 
+/// Hold gamepad UI-nav inert (`widgets::hold_nav_for_capture`) while `node_id`
+/// has its one-shot nav capture armed (`armed_key`) in one of `capture_phases`
+/// (`phase_key`) AND the pad it captures from is the one driving nav. Call AFTER
+/// the action row: it reads the node's FINAL state for the frame, so a Learn
+/// armed this frame holds nav from the very next nav pass, and a latch / Stop /
+/// Clear / Add that disarms releases it.
+pub(crate) fn remapper_hold_nav_while_capturing(
+    ctx: &egui::Context,
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    nav_active_for_device: bool,
+    armed_key: &str,
+    phase_key: &str,
+    capture_phases: &[&str],
+) {
+    if !nav_active_for_device {
+        return;
+    }
+    let Some(n) = snarl.get_node(node_id) else { return };
+    let armed = n.params.get(armed_key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let phase = n.params.get(phase_key).and_then(|v| v.as_str()).unwrap_or("idle");
+    if armed && capture_phases.contains(&phase) {
+        crate::widgets::hold_nav_for_capture(ctx);
+    }
+}
+
 /// Read which canonical AutoMap pins are currently asserted (Bool == true)
 /// for the given upstream device id.
 pub(crate) fn remapper_pressed_now(

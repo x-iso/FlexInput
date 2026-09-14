@@ -3472,22 +3472,6 @@ impl FlexInputApp {
         // the right button-glyph skin this frame.
         self.gamepad_nav.active_dev = Some(dev_id.clone());
 
-        // ── Touch Zones gamepad-learn: hold nav inert ───────────────────────
-        // While a 🎮 gamepad-learn is armed on a Touch Zones card (the user is
-        // demonstrating a gamepad button as the mapping OUTPUT), the raw button
-        // must reach that capture, not drive navigation. The cards renderer
-        // publishes a fresh pass number while armed; go inert but keep edge state
-        // current so nav resumes cleanly the moment the capture latches.
-        if let Some(pass) = ctx.data(|d| d.get_temp::<u64>(egui::Id::new("fxi_tz_gp_learn"))) {
-            if ctx.cumulative_pass_nr().saturating_sub(pass) <= 2 {
-                self.gamepad_nav.prev_pressed = nav.pressed.clone();
-                self.gamepad_nav.prev_lt = nav.lt > 0.5;
-                self.gamepad_nav.prev_rt = nav.rt > 0.5;
-                ctx.request_repaint();
-                return;
-            }
-        }
-
         let dt = ctx
             .input(|i| i.stable_dt)
             .clamp(0.001, 0.1);
@@ -3502,6 +3486,20 @@ impl FlexInputApp {
             self.drive_alt_tab(&dev_id, &nav);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
+            return;
+        }
+
+        // ── Live mapping capture (Learn armed): hold nav inert ──────────────
+        // While a mapping body is capturing a chord from this pad (Remapper / Map
+        // Action / 3DOF-to-2D Lean Learn, Touch Zones 🎮), the demonstrated
+        // buttons must reach the capture and NOTHING else — this sits above every
+        // global handler so LB/RB can't flip tabs, Select can't Alt-Tab, Start
+        // can't open the preset list, LS/RS can't undo/redo mid-capture. (The
+        // per-widget inert checks only covered the widget's own handlers, which
+        // run after all of those.) Checked after the Alt-Tab driver so a held
+        // Select still releases Alt.
+        if crate::widgets::nav_held_for_capture(ctx) {
+            self.nav_hold_for_capture(ctx, &nav, config_visible);
             return;
         }
 
@@ -3703,44 +3701,51 @@ impl FlexInputApp {
         }
 
         // ── Selection + edit on the active tab's sub-patch ───────────────────
-        let outer_id = {
-            let canvas = &self.tabs[self.active_tab].canvas;
-            canvas
-                .snarl
-                .nodes_ids_data()
-                .find(|(_, n)| n.value.module_id == "subpatch")
-                .map(|(id, _)| id)
-        };
+        let outer_id = self.nav_active_subpatch_id();
         if let Some(outer_id) = outer_id {
             self.nav_drive_subpatch(ctx, outer_id, &nav, dt, rt_rising, lt_rising);
-            // Publish glow state for the subpatch renderer: presence of the key
-            // means "draw the nav selection glow"; value = is-editing.
-            let editing = matches!(
-                self.gamepad_nav.edit_level,
-                crate::gamepad_nav::EditLevel::Editing
-                    | crate::gamepad_nav::EditLevel::CurveDots
-                    | crate::gamepad_nav::EditLevel::CurveDot
-                    | crate::gamepad_nav::EditLevel::RemapScroll
-                    | crate::gamepad_nav::EditLevel::TzCards
-            );
-            let pass = ctx.cumulative_pass_nr();
-            ctx.data_mut(|d| {
-                d.insert_temp(egui::Id::new(("gp_nav_glow", outer_id.0)), (pass, editing))
-            });
-            // Draw the mapping-card glow at top level (NOT inside the remapper
-            // body's child layer — that deadlocks epaint). Uses global rects the
-            // body published last frame.
-            if matches!(self.gamepad_nav.edit_level,
-                crate::gamepad_nav::EditLevel::RemapScroll
-                | crate::gamepad_nav::EditLevel::RemapCard
-                | crate::gamepad_nav::EditLevel::TzCards)
-            {
-                self.nav_draw_remap_card_glow(ctx, outer_id);
-            }
+            self.nav_publish_subpatch_glow(ctx, outer_id);
         }
 
         self.gamepad_nav.prev_pressed = nav.pressed.clone();
         ctx.request_repaint();
+    }
+
+    /// The active tab's top-level sub-patch node (the one Easy-mode nav drives).
+    pub(crate) fn nav_active_subpatch_id(&self) -> Option<egui_snarl::NodeId> {
+        self.tabs[self.active_tab].canvas.snarl
+            .nodes_ids_data()
+            .find(|(_, n)| n.value.module_id == "subpatch")
+            .map(|(id, _)| id)
+    }
+
+    /// Publish the sub-patch nav glow for `outer_id` (selection ring + the
+    /// mapping-card glow) from the current edit level.
+    pub(crate) fn nav_publish_subpatch_glow(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
+        // Presence of the key means "draw the nav selection glow"; value =
+        // is-editing.
+        let editing = matches!(
+            self.gamepad_nav.edit_level,
+            crate::gamepad_nav::EditLevel::Editing
+                | crate::gamepad_nav::EditLevel::CurveDots
+                | crate::gamepad_nav::EditLevel::CurveDot
+                | crate::gamepad_nav::EditLevel::RemapScroll
+                | crate::gamepad_nav::EditLevel::TzCards
+        );
+        let pass = ctx.cumulative_pass_nr();
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(("gp_nav_glow", outer_id.0)), (pass, editing))
+        });
+        // Draw the mapping-card glow at top level (NOT inside the remapper
+        // body's child layer — that deadlocks epaint). Uses global rects the
+        // body published last frame.
+        if matches!(self.gamepad_nav.edit_level,
+            crate::gamepad_nav::EditLevel::RemapScroll
+            | crate::gamepad_nav::EditLevel::RemapCard
+            | crate::gamepad_nav::EditLevel::TzCards)
+        {
+            self.nav_draw_remap_card_glow(ctx, outer_id);
+        }
     }
 
     /// Selection + value-edit handling within the sub-patch identified by

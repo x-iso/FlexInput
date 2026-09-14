@@ -638,6 +638,8 @@ pub(crate) fn show_gyro_lean_mapping_section(
     // scope.
     publish_nav_action_rects_scoped(ui, node_id, key,
         &[learn_rect, special_rect, clear_rect, add_rect]);
+    remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
+        armed_key, phase_key, &["learning"]);
 
     // Status / draft preview line. During "learning" with an empty draft, prompt
     // for the chord; otherwise (learning or "ready" with a draft) show the

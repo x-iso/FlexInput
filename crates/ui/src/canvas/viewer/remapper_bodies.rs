@@ -443,9 +443,12 @@ pub(crate) fn show_remapper_body(
             if learn_btn.clicked() || act_learn {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     if in_learning {
-                        // Stop → keep latched input, drop output draft.
+                        // Stop → keep latched input, drop output draft, disarm
+                        // (a Stop mid-capture would otherwise leave nav held).
                         node.params.insert("ui_phase".to_string(), Value::String("ready_to_learn".to_string()));
                         remapper_write_str_array(node, "draft_output", &[]);
+                        node.params.insert("_nav_capture_armed".to_string(), Value::from(false));
+                        node.params.insert("_nav_arm_idle".to_string(), Value::from(false));
                     } else if learn_enabled {
                         // Input latched → start output learning + arm capture.
                         // arm_idle=false so capture waits for the Learn press to
@@ -537,6 +540,8 @@ pub(crate) fn show_remapper_body(
         // focused one. Order MUST match `nav_remap_action_items` AND the visual
         // layout: Learn, Special, Clear, Add (entries NOTHING where absent).
         publish_nav_action_rects(ui, node_id, &[learn_rect, special_rect, clear_rect, add_rect]);
+        remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
+            "_nav_capture_armed", "ui_phase", &["capturing", "learning"]);
 
         // Mapping list.
         if !mappings.is_empty() {
@@ -1031,6 +1036,8 @@ pub(crate) fn show_map_action_body(
         });
         // Map Action action order: Learn, Clear, Add (no Special).
         publish_nav_action_rects(ui, node_id, &[learn_rect, clear_rect, add_rect]);
+        remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
+            "_nav_capture_armed", "ui_phase", &["capturing"]);
 
         // Mapping list: each mapping is Array<String> (input chord)
         if !mappings.is_empty() {

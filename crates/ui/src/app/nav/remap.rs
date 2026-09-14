@@ -417,6 +417,53 @@ impl FlexInputApp {
         }
     }
 
+    /// One nav frame held inert for a live mapping capture (see the hold in
+    /// `run_gamepad_nav`). Acts on nothing, but keeps edge state current so no
+    /// press made during the capture fires once nav resumes, and keeps the
+    /// focused widget's highlight alive so the user still sees what they're
+    /// learning into.
+    pub(crate) fn nav_hold_for_capture(
+        &mut self,
+        ctx: &egui::Context,
+        nav: &crate::gamepad_nav::NavInput,
+        config_visible: bool,
+    ) {
+        use crate::gamepad_nav::EditLevel;
+        let gn = &mut self.gamepad_nav;
+        gn.prev_pressed = nav.pressed.clone();
+        gn.prev_lt = nav.lt > 0.5;
+        gn.prev_rt = nav.rt > 0.5;
+        gn.start_down_at = None;
+        gn.repeat_dir = None;
+        gn.repeat_accum = 0.0;
+
+        let outer = if config_visible {
+            gn.config_nav_sel.as_ref().map(|(o, _, _)| *o)
+        } else {
+            self.nav_active_subpatch_id()
+        };
+        if let Some(outer_id) = outer {
+            if let Some(inner) = self.nav_selected_inner_node(outer_id) {
+                match self.gamepad_nav.edit_level {
+                    EditLevel::RemapScroll | EditLevel::RemapCard => {
+                        self.nav_publish_remap_selection(ctx, outer_id, inner);
+                    }
+                    EditLevel::TzCards => {
+                        let phase = self.picker_target_param_str(&[outer_id.0], inner, "_tz_phase")
+                            .unwrap_or_else(|| "idle".into());
+                        self.nav_tz_publish_selection(ctx, outer_id, inner, &phase);
+                    }
+                    _ => {}
+                }
+            }
+            // The config overlay draws its own glow from app state on its layer.
+            if !config_visible {
+                self.nav_publish_subpatch_glow(ctx, outer_id);
+            }
+        }
+        ctx.request_repaint();
+    }
+
     /// Drive a remapper-family widget the user has ENTERED (RemapScroll level):
     /// up/down moves the SELECTED CARD, North resets it (or arms Learn when the
     /// list is empty), West deletes it, South ENTERS it (`RemapCard`), LT/RT
@@ -452,6 +499,9 @@ impl FlexInputApp {
         // "stuck in Map Action" bug).
         // Lean sections arm via side-scoped `_lean_<side>_armed`; everything else
         // via `_nav_capture_armed`.
+        // (The body's `hold_nav_for_capture` stamp holds ALL of nav — tabs,
+        // Alt-Tab, undo… — from the frame after arming; this local check covers
+        // the arming frame itself, before the first stamp lands.)
         let armed_key = match self.nav_lean_side(outer_id) {
             Some("left") => "_lean_left_armed",
             Some("right") => "_lean_right_armed",
