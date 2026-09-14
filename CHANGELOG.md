@@ -42,8 +42,9 @@ All notable changes to FlexInput are documented here. This project adheres to
   measured in the engine with its sign, so turning back after an overshoot
   subtracts; the result shows old → new (or why nothing changed), and a Stick
   sweep that maxed out the stick is refused. Fully gamepad-operable from the
-  config overlay (◄► method, ▲▼ output, A start/finish, B cancel), since the
-  mouse is busy driving the game — with an optional **snapshot comparison** that
+  config overlay (◄► method, ▲▼ output, A start/finish, B cancel — A and B work
+  however the sweep was started and are withheld from the game while it runs),
+  since the mouse is busy driving the game — with an optional **snapshot comparison** that
   freezes the game frame behind the overlay (captured so our own overlay is
   excluded) and shows its left half at 70% as an alignment reference for the
   360° turn.
@@ -62,6 +63,15 @@ All notable changes to FlexInput are documented here. This project adheres to
   pinnable row, and the pinned V/H bias row is interactive.
 
 ### Fixed
+
+- **The config overlay no longer takes the game's focus.** Hovering a pin used
+  to activate the overlay window — including a game's hidden cursor parked over
+  a pin when the overlay was summoned, or a mouse output sweeping the cursor
+  across one — so a game that only reads input while focused went deaf until the
+  overlay was re-summoned. Hover no longer activates it; after a click it hands
+  foreground back to the game once the cursor leaves the pins; and while a
+  calibration sweep runs or a gamepad is editing a pin, the overlay ignores the
+  mouse entirely (fully click-through) so the game keeps it.
 
 - **An incompatible tab no longer wipes the whole workspace.** `workspace.json`
   (and the Save/Load Workspace files and the crash-recovery snapshot) used to be

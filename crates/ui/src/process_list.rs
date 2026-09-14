@@ -260,6 +260,25 @@ mod imp {
         }
     }
 
+    /// Hand foreground back to `hwnd` while FlexInput itself holds it (a click
+    /// on one of our overlays activated us). Being the foreground process is
+    /// what permits the call, so none of [`bring_hwnd_to_front`]'s workarounds
+    /// are needed — in particular no synthetic ALT reaching a game. Skips a
+    /// window that is gone, hidden or minimized.
+    pub fn return_foreground(hwnd_isize: isize) -> bool {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IsIconic, IsWindow, SetForegroundWindow,
+        };
+        unsafe {
+            let hwnd = hwnd_isize as HWND;
+            if hwnd.is_null() || IsWindow(hwnd) == 0 || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                return false;
+            }
+            SetForegroundWindow(hwnd) != 0
+        }
+    }
+
     /// Drop `hwnd` out of the topmost z-order band synchronously, without
     /// changing focus. We need this on pin-off because `eframe` defers
     /// the `WindowLevel::Normal` viewport command into winit's event
@@ -286,7 +305,7 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{
     enumerate_windows, enumerate_processes_full, foreground_exe,
-    foreground_hwnd, bring_hwnd_to_front,
+    foreground_hwnd, bring_hwnd_to_front, return_foreground,
     drop_topmost, yield_foreground_below,
 };
 
@@ -310,6 +329,9 @@ pub fn foreground_hwnd() -> Option<isize> { None }
 
 #[cfg(not(windows))]
 pub fn bring_hwnd_to_front(_hwnd: isize) -> bool { false }
+
+#[cfg(not(windows))]
+pub fn return_foreground(_hwnd: isize) -> bool { false }
 
 #[cfg(not(windows))]
 pub fn drop_topmost(_hwnd: isize) {}

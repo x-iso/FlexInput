@@ -65,6 +65,12 @@ fn reject_id() -> egui::Id {
 fn passthrough_dev_id() -> egui::Id {
     egui::Id::new(CONFIG_PASSTHROUGH_DEV_KEY)
 }
+/// The last non-FlexInput foreground window seen while the overlay is up —
+/// normally the game. Foreground is handed back to it whenever the overlay
+/// holds it without needing it (see the passthrough block).
+fn game_hwnd_id() -> egui::Id {
+    egui::Id::new("fxi_config_game_hwnd")
+}
 
 /// What the config overlay wants passed through to the game right now, as
 /// `(device, pins)` — the active tweak-pin's upstream device and the SPECIFIC
@@ -110,6 +116,7 @@ pub fn set_config_overlay_visible(ctx: &egui::Context, on: bool) {
         ctx.data_mut(|d| {
             d.remove_temp::<bool>(edit_id());
             d.remove_temp::<(String, Vec<String>)>(passthrough_dev_id());
+            d.remove_temp::<isize>(game_hwnd_id());
         });
     }
 }
@@ -131,15 +138,23 @@ pub fn set_config_overlay_edit(ctx: &egui::Context, on: bool) {
     ctx.data_mut(|d| d.insert_temp(edit_id(), on));
 }
 
+/// The pad buttons that drive a running measure sweep (A finishes, B cancels —
+/// see `nav_drive_config_overlay`). They stay blocked from the game while the
+/// rest of the device passes through.
+const RWS_SWEEP_CONTROL_PINS: &[&str] = &["btn_south", "btn_east"];
+
 /// While an RWS pin is running a MEASURE calibration sweep (`cal_measure` =
 /// pitch/yaw), the user's gyro/stick must reach the RWS node so the camera moves
 /// — but the config overlay source-blocks every physical input by default. This
-/// finds such a pin and returns its upstream physical device to force through
-/// (whole device, so the sweep works even with selectors/curves before RWS),
-/// overriding the normal hover/tweak gate.
-fn rws_measure_passthrough(
+/// finds such a pin and returns its upstream physical device to force through,
+/// overriding the normal hover/tweak gate. Every pin of the device passes (so
+/// the sweep works even with selectors/curves/aim buttons before RWS) EXCEPT the
+/// sweep's own controls; `live_signals` supplies the device's pins, since the
+/// passthrough is an allowlist (an empty list would mean the whole device).
+fn rws_measure_passthrough<V>(
     tab_snarl: &Snarl<NodeData>,
     config_layout: &OverlayLayout,
+    live_signals: &std::collections::HashMap<(String, String), V>,
 ) -> Option<(String, Vec<String>)> {
     for it in &config_layout.items {
         let LayoutItem::Module(m) = it else { continue };
@@ -158,7 +173,14 @@ fn rws_measure_passthrough(
         let cm = node.params.get("cal_measure").and_then(|v| v.as_str()).unwrap_or("off");
         if cm == "pitch" || cm == "yaw" {
             if let Some(dev) = crate::app::config_passthrough_device(tab_snarl, &m.source_path, m.inner_node_id) {
-                return Some((dev, Vec::new())); // whole device
+                let pins: Vec<String> = live_signals
+                    .keys()
+                    .filter(|(d, p)| *d == dev && !RWS_SWEEP_CONTROL_PINS.contains(&p.as_str()))
+                    .map(|(_, p)| p.clone())
+                    .collect();
+                // No pins seen for it (device gone): pass nothing rather than an
+                // empty list, which would unblock the whole device.
+                return (!pins.is_empty()).then_some((dev, pins));
             }
         }
     }
@@ -259,6 +281,14 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         .input(|i| i.viewport().monitor_size)
         .filter(|s| s.x > 1.0 && s.y > 1.0)
         .unwrap_or(egui::vec2(1920.0, 1080.0));
+
+    // Remember the game (whatever non-FlexInput window is foreground) so the
+    // overlay can hand foreground back after a click activated it. Cleared on
+    // close, so a window from before the overlay was summoned is never raised.
+    if let Some(hwnd) = crate::process_list::foreground_hwnd() {
+        ctx.data_mut(|d| d.insert_temp(game_hwnd_id(), hwnd));
+    }
+    let game_hwnd = ctx.data(|d| d.get_temp::<isize>(game_hwnd_id()));
 
     let (tab, live_signals, panic_shortcut) = app.overlay_parts();
     // Disjoint field borrows: the snarl renders the pins, the config layout is
@@ -411,12 +441,23 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             vctx.data_mut(|d| d.insert_temp(nav_targets_id(), (pass, targets)));
         }
 
+        // An active RWS measure sweep forces its input device through regardless of
+        // hover/tweak, so the gyro/stick actually moves the camera during cal.
+        let cal_passthrough = rws_measure_passthrough(tab_snarl, config_layout, live_signals);
+        // Hands-off: input is being driven INTO the game by something other than
+        // the user's own pointer — a running measure sweep, or a gamepad editing a
+        // pin — and either may be moving the OS cursor through a mouse output. The
+        // overlay then ignores the cursor entirely (fully click-through, no
+        // hover-picked pin) and keeps foreground with the game, so the cursor
+        // crossing a pin can't pull the game's mouse away.
+        let hands_off = live && (cal_passthrough.is_some() || gp_editing);
+
         // The ACTIVE tweak-pin: the topmost Module pin under the cursor (items
         // paint bottom→top, so the LAST match is on top), else the gamepad-focused
         // pin. Its upstream physical device passes through to the game (M3.4/M3.5)
         // — you feel/steer the parameter while adjusting and its live graph dot
         // keeps moving.
-        let hovered_module_idx = cursor.and_then(|c| {
+        let hovered_module_idx = cursor.filter(|_| !hands_off).and_then(|c| {
             config_layout.items.iter().enumerate().rev().find_map(|(i, it)| {
                 matches!(it, LayoutItem::Module(_))
                     .then(|| item_rect(i).expand(HIT_MARGIN).contains(c))
@@ -454,9 +495,6 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // game. The top-bar checkbox restores always-on passthrough for the
         // focused pin.
         let tweaking = gp_editing || dragging;
-        // An active RWS measure sweep forces its input device through regardless of
-        // hover/tweak, so the gyro/stick actually moves the camera during cal.
-        let cal_passthrough = rws_measure_passthrough(tab_snarl, config_layout);
         let passthrough = if cal_passthrough.is_some() {
             cal_passthrough
         } else if passthrough_default || tweaking {
@@ -479,8 +517,8 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // Passthrough (window click-through): interactive over the toolbar or any
         // pinned item, or during a drag/popup; click-through elsewhere so the game
         // stays reachable. During a pick the window is fully click-through so the
-        // pin click lands on FlexInput behind it.
-        let interactive = if pick {
+        // pin click lands on FlexInput behind it, and hands-off (above) is too.
+        let interactive = if pick || hands_off {
             false
         } else {
             let over_toolbar = cursor
@@ -498,11 +536,32 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         let want_passthrough = !interactive;
         let applied: Option<bool> = vctx.data(|d| d.get_temp(pt_id));
         if applied != Some(want_passthrough) {
+            // No `Focus` when turning interactive: that fired on mere hover —
+            // including a game's hidden cursor parked over a pin when the overlay
+            // is summoned — and took foreground from the game. A real click still
+            // activates the overlay on its own.
             vctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
-            if !want_passthrough {
-                vctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
             vctx.data_mut(|d| d.insert_temp(pt_id, want_passthrough));
+        }
+
+        // Hand foreground back to the game once the overlay no longer needs it:
+        // a click activated it, and now the cursor has left every pin (no drag,
+        // popup or text entry in progress) or input went hands-off. Otherwise a
+        // game that only reads input while focused stays deaf until the overlay
+        // is re-summoned. Throttled in case the OS refuses the switch.
+        let overlay_focused = vctx.input(|i| i.viewport().focused).unwrap_or(false);
+        if let Some(hwnd) = game_hwnd.filter(|_| {
+            overlay_focused
+                && live
+                && (hands_off || (want_passthrough && !vctx.wants_keyboard_input()))
+        }) {
+            let now = vctx.input(|i| i.time);
+            let retry_id = egui::Id::new("fxi_config_fg_return_at");
+            let last: f64 = vctx.data(|d| d.get_temp(retry_id)).unwrap_or(f64::NEG_INFINITY);
+            if now - last > 0.25 {
+                crate::process_list::return_foreground(hwnd);
+                vctx.data_mut(|d| d.insert_temp(retry_id, now));
+            }
         }
 
         // Esc: in a pick the main window handles cancel; otherwise Esc exits

@@ -56,6 +56,35 @@ impl FlexInputApp {
             }
         }
 
+        // A running RWS measure sweep owns the pad wherever it was started: A
+        // finishes, B cancels, and pin nav stays frozen until it ends. It must be
+        // reachable from here, not only from inside the widget, because a sweep
+        // started with the MOUSE turns the overlay click-through (hands-off in
+        // `show_config_overlay`), leaving the widget's own buttons unclickable.
+        // Only A/B: they're withheld from the game during the sweep, while the
+        // rest of the pad (an RT aim button, say) passes through, so RT is not a
+        // finish alias here.
+        if let Some((path, inner)) = self.config_active_rws_sweep() {
+            let finish = nav.is_rising("btn_south");
+            let cancel = nav.is_rising("btn_east");
+            if finish || cancel {
+                if let Some(node) = self.picker_tab_node_mut(&path, inner) {
+                    if finish {
+                        // The widget renderer sees this, back-solves the constant and stops.
+                        node.params.insert("cal_finish".into(), serde_json::Value::Bool(true));
+                    } else {
+                        node.params.insert("cal_measure".into(), serde_json::Value::String("off".into()));
+                    }
+                }
+                // Direct write into the tab's embedded copy: bump the generation so
+                // an open sub-patch editor re-pulls instead of writing back stale.
+                let canvas = &mut self.tabs[self.active_tab].canvas;
+                canvas.mutation_gen = canvas.mutation_gen.wrapping_add(1);
+            }
+            ctx.request_repaint();
+            return;
+        }
+
         // A physical stick that passes through (so the tweak's effect is FELT in
         // game) must NOT also drive the editor. Pick the control input from the
         // pin's passthrough set: right-stick felt → LEFT adjusts; left felt →
@@ -322,11 +351,24 @@ impl FlexInputApp {
         }
     }
 
-    /// Bespoke gamepad flow for the RWS "measure" auto-cal widget while entered.
-    /// OFF: ◄►/dpad pick the method (pitch/yaw), Y toggles snapshot comparison
-    /// (360° only), A starts the highlighted method, B backs out. MEASURING: A
-    /// finishes (back-solves Scale via the widget's `cal_finish` handler), B
-    /// cancels. Chosen over field-walking because South/East read far clearer.
+    /// The config pin whose RWS node is mid measure sweep (`cal_measure` =
+    /// pitch/yaw), as its `(source_path, inner)` address. Only one runs at a time.
+    fn config_active_rws_sweep(&self) -> Option<(Vec<usize>, egui_snarl::NodeId)> {
+        self.tabs[self.active_tab].config.items.iter().find_map(|it| {
+            let crate::canvas::node::LayoutItem::Module(m) = it else { return None };
+            let inner = egui_snarl::NodeId(m.inner_node_id);
+            let node = self.picker_node(&m.source_path, inner)?;
+            let cm = node.params.get("cal_measure").and_then(|v| v.as_str());
+            (node.module_id == "processing.rws" && matches!(cm, Some("pitch" | "yaw")))
+                .then(|| (m.source_path.clone(), inner))
+        })
+    }
+
+    /// Bespoke gamepad flow for the RWS "measure" auto-cal widget while entered
+    /// and idle: ◄► pick the method (pitch/yaw), ▲▼ the output, Y toggles snapshot
+    /// comparison (360° only), A starts the highlighted method, B backs out.
+    /// Chosen over field-walking because South/East read far clearer. Once a
+    /// sweep runs, `nav_drive_config_overlay` takes A (finish) / B (cancel).
     pub(crate) fn nav_drive_rws_measure(
         &mut self,
         ctx: &egui::Context,
@@ -337,49 +379,36 @@ impl FlexInputApp {
     ) {
         let south = nav.is_rising("btn_south") || rt_rising;
         let east = nav.is_rising("btn_east");
-        let cur = self.get_subpatch_param_str(outer, inner, "cal_measure").unwrap_or_default();
-        let measuring = cur == "pitch" || cur == "yaw";
         let mut wrote = false;
-        if measuring {
-            if south {
-                // The widget renderer sees this and back-solves the constant + stops.
-                self.set_subpatch_param_bool(outer, inner, "cal_finish", true);
-                wrote = true;
-            } else if east {
-                self.set_subpatch_param_str(outer, inner, "cal_measure", "off");
-                wrote = true;
-            }
-        } else {
-            if nav.is_rising("dpad_left") {
-                self.set_subpatch_param_str(outer, inner, "cal_pending", "pitch");
-                wrote = true;
-            }
-            if nav.is_rising("dpad_right") {
-                self.set_subpatch_param_str(outer, inner, "cal_pending", "yaw");
-                wrote = true;
-            }
-            // Up/Down flips which OUTPUT gets calibrated (Mouse ↔ Stick).
-            if nav.is_rising("dpad_up") || nav.is_rising("dpad_down") {
-                let cur = self.get_subpatch_param_str(outer, inner, "cal_output");
-                let next = if cur.as_deref() == Some("stick") { "mouse" } else { "stick" };
-                self.set_subpatch_param_str(outer, inner, "cal_output", next);
-                wrote = true;
-            }
-            // Y toggles the snapshot-comparison reference (only used by 360° yaw).
-            if nav.is_rising("btn_north") {
-                let s = self.get_subpatch_param_bool(outer, inner, "cal_ref_shot").unwrap_or(false);
-                self.set_subpatch_param_bool(outer, inner, "cal_ref_shot", !s);
-                wrote = true;
-            }
-            if south {
-                let pending = self.get_subpatch_param_str(outer, inner, "cal_pending")
-                    .filter(|p| p == "pitch" || p == "yaw")
-                    .unwrap_or_else(|| "yaw".into());
-                self.set_subpatch_param_str(outer, inner, "cal_measure", &pending);
-                wrote = true;
-            } else if east {
-                self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::Widget;
-            }
+        if nav.is_rising("dpad_left") {
+            self.set_subpatch_param_str(outer, inner, "cal_pending", "pitch");
+            wrote = true;
+        }
+        if nav.is_rising("dpad_right") {
+            self.set_subpatch_param_str(outer, inner, "cal_pending", "yaw");
+            wrote = true;
+        }
+        // Up/Down flips which OUTPUT gets calibrated (Mouse ↔ Stick).
+        if nav.is_rising("dpad_up") || nav.is_rising("dpad_down") {
+            let cur = self.get_subpatch_param_str(outer, inner, "cal_output");
+            let next = if cur.as_deref() == Some("stick") { "mouse" } else { "stick" };
+            self.set_subpatch_param_str(outer, inner, "cal_output", next);
+            wrote = true;
+        }
+        // Y toggles the snapshot-comparison reference (only used by 360° yaw).
+        if nav.is_rising("btn_north") {
+            let s = self.get_subpatch_param_bool(outer, inner, "cal_ref_shot").unwrap_or(false);
+            self.set_subpatch_param_bool(outer, inner, "cal_ref_shot", !s);
+            wrote = true;
+        }
+        if south {
+            let pending = self.get_subpatch_param_str(outer, inner, "cal_pending")
+                .filter(|p| p == "pitch" || p == "yaw")
+                .unwrap_or_else(|| "yaw".into());
+            self.set_subpatch_param_str(outer, inner, "cal_measure", &pending);
+            wrote = true;
+        } else if east {
+            self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::Widget;
         }
         // These are direct writes into the tab's embedded sub-patch copy. Bump the
         // canvas generation (no undo entry — calibration state is transient) so an
