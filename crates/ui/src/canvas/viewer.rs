@@ -9,7 +9,7 @@ use flexinput_engine::current_sample_rate;
 use serde_json::{Number, Value};
 
 use super::{
-    curve::{sample_curve, vec_reshape_apply, VEC_RESHAPE_BOUNDARY_DEFAULT, VEC_RESHAPE_GAIN_DEFAULT},
+    curve::{sample_curve, curve_insert_point, curve_remove_point, vec_reshape_apply, VEC_RESHAPE_BOUNDARY_DEFAULT, VEC_RESHAPE_GAIN_DEFAULT},
     node::{LayoutDecoration, LayoutItem, NodeData, TextAlign},
 };
 use crate::app::request_repaint_throttled;

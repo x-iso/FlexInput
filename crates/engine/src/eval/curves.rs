@@ -22,6 +22,54 @@ pub fn sample_curve(pts: &[[f32; 2]], x: f32, biases: &[f32]) -> f32 {
     }
 }
 
+/// Insert control point `p` at `idx`, keeping every bend on the segment it was
+/// drawn on (`biases` is one per segment; missing entries read as 0). Splitting
+/// a bent segment scales each half's bias by (half_len / seg_len)², which keeps
+/// the segment's curvature — a point dropped onto the curve leaves its shape
+/// unchanged. A point past either end adds a straight segment there.
+pub fn curve_insert_point(pts: &mut Vec<[f32; 2]>, biases: &mut Vec<f32>, idx: usize, p: [f32; 2]) {
+    let idx = idx.min(pts.len());
+    biases.resize(pts.len().saturating_sub(1), 0.0);
+    if !pts.is_empty() {
+        if idx == 0 {
+            biases.insert(0, 0.0);
+        } else if idx == pts.len() {
+            biases.push(0.0);
+        } else {
+            let (x0, x1) = (pts[idx - 1][0], pts[idx][0]);
+            let b = biases[idx - 1];
+            let (lb, rb) = if (x1 - x0).abs() > f32::EPSILON {
+                let l = ((p[0] - x0) / (x1 - x0)).clamp(0.0, 1.0);
+                (b * l * l, b * (1.0 - l) * (1.0 - l))
+            } else {
+                (0.0, 0.0)
+            };
+            biases[idx - 1] = lb;
+            biases.insert(idx, rb);
+        }
+    }
+    pts.insert(idx, p);
+}
+
+/// Remove control point `idx`, keeping every other bend on its own segment.
+/// Only the segments that ended at the removed point lose their bend; removing
+/// an interior point merges its two segments into one straight segment.
+pub fn curve_remove_point(pts: &mut Vec<[f32; 2]>, biases: &mut Vec<f32>, idx: usize) {
+    if idx >= pts.len() { return; }
+    biases.resize(pts.len() - 1, 0.0);
+    if !biases.is_empty() {
+        if idx == 0 {
+            biases.remove(0);
+        } else if idx == pts.len() - 1 {
+            biases.pop();
+        } else {
+            biases[idx - 1] = 0.0;
+            biases.remove(idx);
+        }
+    }
+    pts.remove(idx);
+}
+
 pub fn apply_curve(
     x: f32, pts: &[[f32; 2]], biases: &[f32],
     absolute: bool, in_min: f32, in_max: f32, out_min: f32, out_max: f32, scale_t: f32,

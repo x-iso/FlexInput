@@ -611,6 +611,9 @@ pub(crate) fn paint_response_curve_graph(
             (pass, screen_rect, x_lo, x_hi, y_lo, y_hi)));
     }
 
+    // Add/remove keep each segment's bias on its own segment (plain Vec
+    // insert/remove would slide every later bend onto its neighbour).
+    if let Some(idx) = remove_idx { curve_remove_point(&mut new_points, &mut new_biases, idx); }
     if bg_resp.double_clicked() {
         if let Some(pos) = bg_resp.interact_pointer_pos() {
             let [gx_raw, gy_raw] = s2c(pos);
@@ -618,11 +621,10 @@ pub(crate) fn paint_response_curve_graph(
             let gx = gx_sn.clamp(x_lo, x_hi);
             let gy = gy_sn.clamp(y_lo, y_hi);
             let idx = new_points.partition_point(|p| p[0] < gx);
-            new_points.insert(idx, [gx, gy]);
+            curve_insert_point(&mut new_points, &mut new_biases, idx, [gx, gy]);
             pts_changed = true;
         }
     }
-    if let Some(idx) = remove_idx { new_points.remove(idx); }
 
     // Live-position trails.
     let abs_max   = if is_vec { in_max.abs().max(f32::EPSILON) } else {

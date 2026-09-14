@@ -66,6 +66,14 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **Curve bends stay on their segment when dots are added or removed.** Each
+  segment's bend was stored by position and never re-indexed, so removing a dot
+  slid every later bend onto the segment to its left, and adding one slid them
+  right. Removing a dot now clears only the bends of the two segments that met at
+  it; adding a dot inside a bent segment splits the bend so the curve keeps its
+  shape. Covers the Response Curve, Vec and Two-way curves, Vec Reshape's gain
+  curve, the Envelope, and gamepad dot editing.
+
 - **The config overlay no longer takes the game's focus.** Hovering a pin used
   to activate the overlay window — including a game's hidden cursor parked over
   a pin when the overlay was summoned, or a mouse output sweeping the cursor

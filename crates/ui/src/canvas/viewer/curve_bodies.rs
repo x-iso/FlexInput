@@ -386,6 +386,7 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
                 }
 
+                if let Some(idx) = remove_idx { curve_remove_point(&mut new_points, &mut new_biases, idx); }
                 if bg_resp.double_clicked() {
                     if let Some(pos) = bg_resp.interact_pointer_pos() {
                         let [gx_raw, gy_raw] = s2c(pos);
@@ -393,11 +394,10 @@ pub(crate) fn show_response_curve_body(node_id: NodeId, inputs: &[InPin], output
                         let gx = gx_sn.clamp(x_lo, x_hi);
                         let gy = gy_sn.clamp(y_lo, y_hi);
                         let idx = new_points.partition_point(|p| p[0] < gx);
-                        new_points.insert(idx, [gx, gy]);
+                        curve_insert_point(&mut new_points, &mut new_biases, idx, [gx, gy]);
                         pts_changed = true;
                     }
                 }
-                if let Some(idx) = remove_idx { new_points.remove(idx); }
 
                 // Live-position trails — trail_ms history, y always recomputed
                 // from the live curve so dragging control points leaves no streaks.
@@ -909,6 +909,7 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
                 }
 
+                if let Some(idx) = remove_idx { curve_remove_point(&mut new_points, &mut new_biases, idx); }
                 if bg_resp.double_clicked() {
                     if let Some(pos) = bg_resp.interact_pointer_pos() {
                         let [gx_raw, gy_raw] = s2c(pos);
@@ -916,11 +917,10 @@ pub(crate) fn show_vec_response_curve_body(node_id: NodeId, inputs: &[InPin], ou
                         let gx = gx_sn.clamp(x_lo, x_hi);
                         let gy = gy_sn.clamp(y_lo, y_hi);
                         let idx = new_points.partition_point(|p| p[0] < gx);
-                        new_points.insert(idx, [gx, gy]);
+                        curve_insert_point(&mut new_points, &mut new_biases, idx, [gx, gy]);
                         pts_changed = true;
                     }
                 }
-                if let Some(idx) = remove_idx { new_points.remove(idx); }
 
                 // Live-position trails (magnitude of Vec2 input → position on curve)
                 let abs_max   = in_max.abs().max(f32::EPSILON);
@@ -1435,17 +1435,17 @@ pub(crate) fn show_twoway_response_curve_body(node_id: NodeId, inputs: &[InPin],
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
                 }
 
+                if let Some(idx) = remove_idx { curve_remove_point(new_edit_pts, new_edit_biases, idx); }
                 if bg_resp.double_clicked() {
                     if let Some(pos) = bg_resp.interact_pointer_pos() {
                         let [gx_raw, gy_raw] = s2c(pos);
                         let (gxs, gys) = do_snap(gx_raw, gy_raw);
                         let gx = gxs.clamp(x_lo, x_hi); let gy = gys.clamp(y_lo, y_hi);
                         let idx = new_edit_pts.partition_point(|p| p[0] < gx);
-                        new_edit_pts.insert(idx, [gx, gy]);
+                        curve_insert_point(new_edit_pts, new_edit_biases, idx, [gx, gy]);
                         *pts_changed_ref = true; undo_requested = true;
                     }
                 }
-                if let Some(idx) = remove_idx { new_edit_pts.remove(idx); }
 
                 // Live arrow marker — X from input, Y from actual engine output (last_signals)
                 let abs_max   = in_max.abs().max(in_min.abs()).max(f32::EPSILON);
@@ -1978,18 +1978,18 @@ pub(crate) fn paint_twoway_curve_graph(
         painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0, Color32::from_gray(80)));
     }
 
-    // Add point on double-click
+    // Remove (right-click) / add (double-click) — biases stay on their segments.
+    if let Some(idx) = remove_idx { curve_remove_point(&mut new_edit_pts, &mut new_edit_biases, idx); }
     if bg_resp.double_clicked() {
         if let Some(pos) = bg_resp.interact_pointer_pos() {
             let [gx_raw, gy_raw] = s2c(pos);
             let (gxs, gys) = do_snap(gx_raw, gy_raw);
             let gx = gxs.clamp(x_lo, x_hi); let gy = gys.clamp(y_lo, y_hi);
             let idx = new_edit_pts.partition_point(|p| p[0] < gx);
-            new_edit_pts.insert(idx, [gx, gy]);
+            curve_insert_point(&mut new_edit_pts, &mut new_edit_biases, idx, [gx, gy]);
             pts_changed = true;
         }
     }
-    if let Some(idx) = remove_idx { new_edit_pts.remove(idx); }
 
     // Write back
     if pts_changed || bias_changed {

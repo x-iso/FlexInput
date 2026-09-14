@@ -399,7 +399,8 @@ pub(crate) fn paint_envelope_curve_graph(
         }
     }
 
-    // Double-click adds a point
+    // Right-click removes / double-click adds a point; biases stay on their segments.
+    if let Some(idx) = remove_idx { curve_remove_point(&mut new_points, &mut new_biases, idx); }
     if bg_resp.double_clicked() {
         if let Some(pos) = bg_resp.interact_pointer_pos() {
             let [gx_raw, gy_raw] = s2c(pos);
@@ -407,11 +408,10 @@ pub(crate) fn paint_envelope_curve_graph(
             let gx = gx_sn.clamp(0.0, 1.0);
             let gy = gy_sn.clamp(0.0, 1.0);
             let idx = new_points.partition_point(|p| p[0] < gx);
-            new_points.insert(idx, [gx, gy]);
+            curve_insert_point(&mut new_points, &mut new_biases, idx, [gx, gy]);
             pts_changed = true;
         }
     }
-    if let Some(idx) = remove_idx { new_points.remove(idx); }
 
     // Publish geometry for gamepad-nav (same ids as response_curve so the driver works here too)
     {

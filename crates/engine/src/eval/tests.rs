@@ -3571,3 +3571,79 @@ mod rws_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod curve_edit_tests {
+    use super::*;
+
+    // The reported bug: 4 dots, bend on the 3rd→4th segment, remove the 2nd dot.
+    // The bend must stay on the 3rd→4th segment (now segment 1), not slide left.
+    #[test]
+    fn removing_a_dot_keeps_later_bends_on_their_segment() {
+        let mut pts = vec![[0.0, 0.0], [0.2, 0.1], [0.4, 0.3], [1.0, 1.0]];
+        let mut biases = vec![0.0, 0.0, 0.5];
+        curve_remove_point(&mut pts, &mut biases, 1);
+        assert_eq!(pts, vec![[0.0, 0.0], [0.4, 0.3], [1.0, 1.0]]);
+        assert_eq!(biases, vec![0.0, 0.5]);
+    }
+
+    // Only the segments touching the removed dot lose their bend.
+    #[test]
+    fn removing_a_dot_clears_only_its_own_segments() {
+        let pts0 = vec![[0.0, 0.0], [0.25, 0.2], [0.5, 0.5], [0.75, 0.7], [1.0, 1.0]];
+        let b0 = vec![0.1, 0.2, 0.3, 0.4];
+
+        let (mut pts, mut b) = (pts0.clone(), b0.clone());
+        curve_remove_point(&mut pts, &mut b, 2);
+        assert_eq!(b, vec![0.1, 0.0, 0.4]);
+
+        let (mut pts, mut b) = (pts0.clone(), b0.clone());
+        curve_remove_point(&mut pts, &mut b, 0);
+        assert_eq!(b, vec![0.2, 0.3, 0.4]);
+
+        let (mut pts, mut b) = (pts0.clone(), b0.clone());
+        curve_remove_point(&mut pts, &mut b, 4);
+        assert_eq!(b, vec![0.1, 0.2, 0.3]);
+        assert_eq!(pts.len(), 4);
+    }
+
+    // Short (never-edited) bias lists read as zeros and come back one-per-segment.
+    #[test]
+    fn short_bias_list_is_padded() {
+        let mut pts = vec![[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]];
+        let mut b = vec![];
+        curve_remove_point(&mut pts, &mut b, 1);
+        assert_eq!(b, vec![0.0]);
+        curve_insert_point(&mut pts, &mut b, 1, [0.5, 0.2]);
+        assert_eq!(b, vec![0.0, 0.0]);
+    }
+
+    // Adding a dot shifts later bends with their segments; a dot dropped onto a
+    // bent segment splits it without changing the curve's shape.
+    #[test]
+    fn inserting_a_dot_keeps_bends_and_shape() {
+        let mut pts = vec![[0.0, 0.0], [0.4, 0.2], [1.0, 1.0]];
+        let mut b = vec![0.3, -0.6];
+        let before: Vec<f32> = (0..=100).map(|i| sample_curve(&pts, i as f32 / 100.0, &b)).collect();
+
+        let x = 0.1;
+        let y = sample_curve(&pts, x, &b);
+        curve_insert_point(&mut pts, &mut b, 1, [x, y]);
+        assert_eq!(pts.len(), 4);
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[2], -0.6, "untouched later segment keeps its bend");
+        for (i, want) in before.iter().enumerate() {
+            let got = sample_curve(&pts, i as f32 / 100.0, &b);
+            assert!((got - want).abs() < 1e-5, "x={} got {} want {}", i as f32 / 100.0, got, want);
+        }
+    }
+
+    #[test]
+    fn inserting_past_the_ends_adds_straight_segments() {
+        let mut pts = vec![[0.2, 0.2], [0.8, 0.8]];
+        let mut b = vec![0.5];
+        curve_insert_point(&mut pts, &mut b, 0, [0.0, 0.0]);
+        curve_insert_point(&mut pts, &mut b, 3, [1.0, 1.0]);
+        assert_eq!(b, vec![0.0, 0.5, 0.0]);
+    }
+}

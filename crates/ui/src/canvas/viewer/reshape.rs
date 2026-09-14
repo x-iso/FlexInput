@@ -519,13 +519,15 @@ pub(crate) fn draw_reshape_curve_editor(
                 painter.circle_filled(screen, 4.0, col);
                 painter.circle_stroke(screen, 4.0, egui::Stroke::new(1.0, Color32::from_gray(70)));
             }
-            if let Some(idx) = remove_idx { pts.remove(idx); }
+            // Biases stay on their own segments (boundary has none; its all-zero
+            // list is never written back).
+            if let Some(idx) = remove_idx { curve_remove_point(&mut pts, &mut biases, idx); }
             if bg_resp.double_clicked() {
                 if let Some(pos) = bg_resp.interact_pointer_pos() {
                     let [gx, gy] = s2c(pos);
                     let (gx, gy) = do_snap(gx.clamp(0.02, 0.98), gy.clamp(0.0, 1.0));
                     let idx = pts.partition_point(|q| q[0] < gx);
-                    pts.insert(idx, [gx, gy]);
+                    curve_insert_point(&mut pts, &mut biases, idx, [gx, gy]);
                     pts_changed = true;
                 }
             }

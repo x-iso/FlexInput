@@ -305,7 +305,10 @@ impl FlexInputApp {
         let gx = g[0].clamp(x_lo, x_hi);
         let gy = g[1].clamp(y_lo, y_hi);
         let idx = pts.partition_point(|p| p[0] < gx);
-        pts.insert(idx, [gx, gy]);
+        let mut biases = self.nav_curve_biases(outer_id, inner).unwrap_or_default();
+        flexinput_engine::curve_insert_point(&mut pts, &mut biases, idx, [gx, gy]);
+        // Biases first: write_points then finds them already one-per-segment.
+        self.nav_curve_write_biases(outer_id, inner, &biases);
         self.nav_curve_write_points(inner, outer_id, &pts);
         Some(idx)
     }
@@ -316,9 +319,50 @@ impl FlexInputApp {
         if pts.len() <= 2 { return false; }
         // Keep the two endpoints; only interior dots are deletable.
         if idx == 0 || idx >= pts.len() - 1 { return false; }
-        pts.remove(idx);
+        let mut biases = self.nav_curve_biases(outer_id, inner).unwrap_or_default();
+        flexinput_engine::curve_remove_point(&mut pts, &mut biases, idx);
+        self.nav_curve_write_biases(outer_id, inner, &biases);
         self.nav_curve_write_points(inner, outer_id, &pts);
         true
+    }
+
+    /// Bias param key of the selected curve, if its biases live on the node:
+    /// None for per-card / Touch Zones curves (points only) and the ASTH EQ.
+    fn nav_curve_bias_key(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
+        -> Option<&'static str>
+    {
+        if matches!(self.gamepad_nav.curve_return_level, crate::gamepad_nav::EditLevel::RemapCard) {
+            return None;
+        }
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let node = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.snarl.get_node(inner)?;
+        if node.module_id == "module.touch_zones" { return None; }
+        self.nav_curve_keys(outer_id, inner).1
+    }
+
+    /// The selected curve's stored per-segment biases (see `nav_curve_bias_key`).
+    fn nav_curve_biases(&self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId)
+        -> Option<Vec<f32>>
+    {
+        let bias_key = self.nav_curve_bias_key(outer_id, inner)?;
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let node = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.snarl.get_node(inner)?;
+        Some(node.params.get(bias_key).and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|b| b.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default())
+    }
+
+    /// Store per-segment biases on the selected curve; no-op for bias-less curves.
+    fn nav_curve_write_biases(&mut self, outer_id: egui_snarl::NodeId, inner: egui_snarl::NodeId,
+        biases: &[f32])
+    {
+        let Some(bias_key) = self.nav_curve_bias_key(outer_id, inner) else { return; };
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        let Some(node) = canvas.snarl.get_node_mut(outer_id)
+            .and_then(|n| n.subpatch.as_mut())
+            .and_then(|sp| sp.snarl.get_node_mut(inner)) else { return; };
+        node.params.insert(bias_key.into(), serde_json::Value::Array(
+            biases.iter().map(|&b| serde_json::Value::from(b as f64)).collect()));
     }
 
     /// Move dot `i` by (dx, dy) in graph space. Endpoints keep their fixed X
