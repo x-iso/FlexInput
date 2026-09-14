@@ -5,6 +5,8 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.8] - 2026-09-14
+
 ### Added
 
 - **Third-party licences, in the app.** Settings → Credits gains a
