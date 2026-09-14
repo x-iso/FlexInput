@@ -6,34 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// App-wide desired polling rate (Hz), mirrored from the UI's `polling_hz`
-/// setting. HIDMaestro XInput devices read this at create time to set the XUSB
-/// companion's input-pump period (`PollIntervalMs = round(1000/hz)`), so the
-/// virtual Xbox pad delivers XInput at the configured rate instead of the
-/// driver's fixed 125Hz default. A global (not a `create_device` parameter)
-/// because the device-build path is deep and signature-stable. 0 = unset =>
-/// devices fall back to the driver default. See `requested_poll_interval_ms`.
-pub static REQUESTED_POLL_HZ: AtomicU32 = AtomicU32::new(0);
-
-/// Set the desired polling rate (Hz) read by HIDMaestro XInput device creation.
-/// Called by the UI at startup and whenever the polling-rate setting changes.
-pub fn set_requested_poll_hz(hz: u32) {
-    REQUESTED_POLL_HZ.store(hz, Ordering::Relaxed);
-}
-
-/// The XUSB companion input-pump period in ms derived from [`REQUESTED_POLL_HZ`],
-/// clamped to 1..=8 (1000..125 Hz). Returns 0 when unset, meaning "use the
-/// driver default" — the create IPC treats 0 as "don't write PollIntervalMs".
-pub fn requested_poll_interval_ms() -> u32 {
-    let hz = REQUESTED_POLL_HZ.load(Ordering::Relaxed);
-    if hz == 0 {
-        return 0;
-    }
-    // round(1000/hz), clamped to the supported whole-ms band.
-    let ms = ((1000.0 / hz as f32).round() as u32).clamp(1, 8);
-    ms
-}
-
 // ── Virtual-mouse physical-suppression config ───────────────────────────────
 //
 // The Virtual Keyboard & Mouse device blocks its synthetic mouse motion for a
@@ -43,8 +15,8 @@ pub fn requested_poll_interval_ms() -> u32 {
 // titles warp/recenter the cursor every frame, which the heuristic misreads as
 // physical input and uses to repeatedly stall the virtual mouse, producing the
 // "jerky in-game" feel. These process-global atomics let the UI tune it (the
-// mouse thread reads them every tick), following the `REQUESTED_POLL_HZ`
-// pattern — the device-build path is deep and signature-stable.
+// mouse thread reads them every tick) — a global rather than a parameter
+// because the device-build path is deep and signature-stable.
 
 /// User setting: master enable for physical-mouse suppression. Default on
 /// (desktop-friendly). When off, the virtual mouse always wins.

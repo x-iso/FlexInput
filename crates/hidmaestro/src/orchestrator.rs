@@ -1469,20 +1469,6 @@ pub fn write_instance_config(
     let _ = write_string(HKLM, &oem_path, "OEMName", display_name);
 }
 
-/// Write the XUSB companion's input-pump period (ms) to
-/// `HKLM\SOFTWARE\HIDMaestro\Controller{index}` `PollIntervalMs`. The companion
-/// driver reads this at `CompanionDeviceAdd` and re-reads it periodically, so it
-/// pumps XInput at the app's configured polling rate. `interval_ms` is clamped to
-/// 1..8 (1000..125 Hz); values outside make no sense (the WDF timer is whole-ms
-/// and >125Hz..1000Hz is the supported band). Requires elevation (called from the
-/// helper). Best-effort: a failed write just leaves the driver on its default.
-pub fn write_poll_interval(index: u32, interval_ms: u32) {
-    use registry::*;
-    let ms = interval_ms.clamp(1, 8);
-    let path = format!(r"SOFTWARE\HIDMaestro\Controller{index}");
-    let _ = write_dword(HKLM, &path, "PollIntervalMs", ms);
-}
-
 /// One HIDMaestro-owned device discovered in the registry.
 #[derive(Debug, Clone)]
 pub struct ExistingDevice {

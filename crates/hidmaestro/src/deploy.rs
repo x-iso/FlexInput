@@ -13,9 +13,12 @@
 //!
 //! Each machine trusts only a key it generated itself, and that key never leaves
 //! it. Earlier builds instead shipped catalogs pre-signed on one build machine
-//! and trusted those certs on every install. [`installed_signing`] recognises
-//! such an install, and the helper re-signs it once at startup via
-//! [`migrate_legacy_install`], after which the legacy certs are removed.
+//! and trusted those certs on every install.
+//!
+//! An installed driver is only ever replaced deliberately: at helper startup,
+//! [`reconcile_installed_driver`] reinstalls when [`installed_driver`] finds a
+//! different driver version than this build vendors, or catalogs signed by
+//! anything but this machine's cert, then removes the legacy certs.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -29,18 +32,19 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
-use crate::install::{driver_state, installed_inf_names, DriverState};
+use crate::install::{driver_state, inf_driver_version, installed_inf_names, published_packages, DriverState};
 use crate::orchestrator::registry;
 use crate::signing::{self, DriverPackage, Scope, SignError, Thumbprint};
 
-/// The vendored driver payload, embedded at compile time so the helper can stage
-/// it regardless of cwd. The binaries' own signatures are replaced and the
-/// catalogs are built on the target machine.
+/// The vendored driver payload (HIDMaestro v1.7.3, unmodified), embedded at
+/// compile time so the helper can stage it regardless of cwd. The binaries ship
+/// unsigned; they're signed and catalogued on the target machine. Each INF's
+/// `DriverVer` is what [`installed_driver`] compares an install against, so a
+/// driver update must change it.
 pub mod payload {
     pub const HIDMAESTRO_DLL: &[u8] = include_bytes!("../driver/HIDMaestro.dll");
     pub const HIDMAESTRO_INF: &[u8] = include_bytes!("../driver/hidmaestro.inf");
-    /// The XUSB companion, which FlexInput rebuilds from HIDMaestro's source to
-    /// make the input-pump period configurable via `PollIntervalMs`.
+    /// The XUSB companion.
     pub const HMXINPUT_DLL: &[u8] = include_bytes!("../driver/HMXInput.dll");
     pub const HIDMAESTRO_XUSB_INF: &[u8] = include_bytes!("../driver/hidmaestro_xusb.inf");
 }
@@ -82,13 +86,14 @@ const LEGACY_SIGNERS: [Thumbprint; 2] = [
 /// when it binds the driver to a device.
 const DRIVER_CATROOT: &str = r"System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}";
 
-/// Where the helper records automatic re-sign attempts: see [`migrate_legacy_install`].
-const MIGRATION_KEY: &str = r"SOFTWARE\FlexInput\Driver";
-const MIGRATION_ATTEMPTS: &str = "ResignAttempts";
-/// Automatic re-signing gives up after this many failed attempts, so a machine
-/// where it can't succeed doesn't lose its virtual devices on every launch.
+/// Where the helper records automatic reinstall attempts: see
+/// [`reconcile_installed_driver`].
+const RECONCILE_KEY: &str = r"SOFTWARE\FlexInput\Driver";
+const RECONCILE_ATTEMPTS: &str = "ReinstallAttempts";
+/// Automatic reinstalls give up after this many failed attempts, so a machine
+/// where one can't succeed doesn't lose its virtual devices on every launch.
 /// "Reinstall drivers" still works, and a success resets the count.
-const MAX_MIGRATION_ATTEMPTS: u32 = 3;
+const MAX_RECONCILE_ATTEMPTS: u32 = 3;
 
 #[derive(Debug)]
 pub enum DeployError {
@@ -150,9 +155,10 @@ impl From<SignError> for DeployError {
 /// otherwise sign, trust and install both packages. Returns `Ok(true)` if a
 /// fresh install happened, `Ok(false)` if already present. **Requires elevation.**
 ///
-/// Deliberately doesn't re-sign an install made by an earlier build: this runs on
-/// every device create, where tearing devices down isn't acceptable. The helper
-/// handles that once at startup instead ([`migrate_legacy_install`]).
+/// Deliberately never replaces an installed driver, even an outdated or
+/// foreign-signed one: this runs on every device create, where tearing devices
+/// down isn't acceptable. The helper does that once at startup instead
+/// ([`reconcile_installed_driver`]).
 pub fn ensure_driver_installed() -> Result<bool, DeployError> {
     match driver_state() {
         DriverState::Complete => return Ok(false),
@@ -172,7 +178,8 @@ pub fn ensure_driver_installed() -> Result<bool, DeployError> {
 /// from the DriverStore, then run a fresh install. Unlike
 /// [`ensure_driver_installed`] this does NOT short-circuit when the driver is
 /// present — it's the "Reinstall drivers" path for recovering from a corrupt or
-/// mismatched package, and how an install is re-signed. **Requires elevation.**
+/// mismatched package, and how an install is upgraded or re-signed. **Requires
+/// elevation.**
 /// Callers must tear down any live virtual device nodes first (a bound driver can
 /// refuse removal).
 ///
@@ -217,104 +224,137 @@ pub fn uninstall_driver() -> Result<(), DeployError> {
     }
 }
 
-/// Who signed the HIDMaestro packages Windows has installed.
+/// How the HIDMaestro packages Windows has installed compare with the ones this
+/// build ships.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstalledSigning {
+pub enum InstalledDriver {
     /// No HIDMaestro package is installed.
     NotInstalled,
-    /// Every installed package's catalog is signed by this machine's current cert.
-    ThisMachine,
-    /// A catalog is signed by something else — an earlier build's vendored cert,
-    /// or a machine cert that has since been replaced — so the install needs
-    /// re-signing.
-    Other,
-    /// Half-installed, or the installed catalogs couldn't be found. Left alone
-    /// rather than guessed at: "Reinstall drivers" resolves both.
+    /// Same driver version as this build's payload, and every catalog is signed by
+    /// this machine's current cert. Nothing to do.
+    Current,
+    /// A different driver version than this build ships — typically an older
+    /// one, after FlexInput updated its vendored HIDMaestro.
+    OtherVersion,
+    /// The right version, but a catalog is signed by something other than this
+    /// machine's current cert: an earlier build's vendored cert, or a machine cert
+    /// that has since been replaced.
+    ForeignSigner,
+    /// Half-installed, or the installed INFs or catalogs couldn't be read. Left
+    /// alone rather than guessed at: "Reinstall drivers" resolves it.
     Indeterminate,
 }
 
-/// Classify the installed packages by who signed the catalogs Windows validates
+impl InstalledDriver {
+    /// Whether the helper should replace the installed packages.
+    pub fn needs_reinstall(self) -> bool {
+        matches!(self, InstalledDriver::OtherVersion | InstalledDriver::ForeignSigner)
+    }
+}
+
+/// Classify the installed packages. Version is checked first, against each
+/// published INF's `DriverVer`; then the signer of the catalog Windows validates
 /// against (see [`DRIVER_CATROOT`]). Read-only; never creates a cert.
-pub fn installed_signing() -> InstalledSigning {
+pub fn installed_driver() -> InstalledDriver {
     match driver_state() {
-        DriverState::Missing => return InstalledSigning::NotInstalled,
-        DriverState::Partial { .. } => return InstalledSigning::Indeterminate,
+        DriverState::Missing => return InstalledDriver::NotInstalled,
+        DriverState::Partial { .. } => return InstalledDriver::Indeterminate,
         DriverState::Complete => {}
     }
-    let published = installed_inf_names();
+    let published = published_packages();
     if published.is_empty() {
-        return InstalledSigning::Indeterminate;
+        return InstalledDriver::Indeterminate;
+    }
+    for pkg in &published {
+        let payload = if pkg.is_xusb { payload::HIDMAESTRO_XUSB_INF } else { payload::HIDMAESTRO_INF };
+        // A version this parser can't read is left alone rather than treated as a
+        // mismatch: guessing wrong would reinstall on every launch.
+        let (Some(installed), Some(shipped)) = (&pkg.version, inf_driver_version(payload)) else {
+            return InstalledDriver::Indeterminate;
+        };
+        if *installed != shipped {
+            return InstalledDriver::OtherVersion;
+        }
     }
     let ours = signing::find_signing_cert(Scope::LocalMachine).and_then(|c| c.thumbprint().ok());
     let catroot = windows_dir().join(DRIVER_CATROOT);
-    for inf in published {
-        let catalog = catroot.join(Path::new(&inf).with_extension("cat"));
+    for pkg in &published {
+        let catalog = catroot.join(Path::new(&pkg.name).with_extension("cat"));
         if !catalog.exists() {
-            return InstalledSigning::Indeterminate;
+            return InstalledDriver::Indeterminate;
         }
         match signing::signer_thumbprint(&catalog) {
             Ok(Some(signer)) if Some(signer) == ours => {}
-            _ => return InstalledSigning::Other,
+            _ => return InstalledDriver::ForeignSigner,
         }
     }
-    InstalledSigning::ThisMachine
+    InstalledDriver::Current
 }
 
-/// What [`migrate_legacy_install`] did.
+/// What [`reconcile_installed_driver`] did.
 #[derive(Debug)]
-pub enum Migration {
-    /// Already signed by this machine, or nothing installed. Any leftover legacy
-    /// certs were removed; the count says how many store entries went.
+pub enum Reconcile {
+    /// Already current, or nothing installed. Any leftover legacy certs were
+    /// removed; the count says how many store entries went.
     NotNeeded { legacy_certs_removed: usize },
-    /// The install was signed by another cert and has been re-signed.
-    Migrated,
-    /// Re-signing was needed but automatic attempts are exhausted.
-    GaveUp,
+    /// The install was out of date or foreign-signed (`from`) and has been
+    /// replaced with this build's packages, signed by this machine.
+    Reinstalled { from: InstalledDriver },
+    /// A reinstall was needed but automatic attempts are exhausted.
+    GaveUp { from: InstalledDriver },
     /// Half-installed or unreadable; left for "Reinstall drivers".
     Skipped,
-    Failed(DeployError),
+    Failed { from: InstalledDriver, error: DeployError },
 }
 
-/// Move an install onto this machine's own signing cert, once. The helper calls
-/// this at startup, before it accepts any request, so no device of this session
-/// exists yet. **Requires elevation.**
+/// Bring the installed driver in line with this build: the vendored version,
+/// signed by this machine's own cert. The helper calls this at startup, before it
+/// accepts any request, so no device of this session exists yet. **Requires
+/// elevation.**
 ///
-/// When re-signing is needed, `remove_devices` runs first: installed packages
-/// can't be replaced while device nodes are bound to them, so virtual devices —
-/// including persisted ones — are recreated afterwards. That happens once per
-/// machine; later starts find the install already signed and only confirm that
-/// no legacy cert is still trusted.
+/// That covers both an update to the vendored HIDMaestro — without this an
+/// installed driver would never be replaced, because [`ensure_driver_installed`]
+/// only installs when nothing is present — and the move off earlier builds'
+/// shared signing certs.
+///
+/// When a reinstall is needed, `clear_devices` runs first and should block until
+/// no HIDMaestro device node remains: packages can't be replaced cleanly while
+/// nodes are bound to them, and a driver host still holding the old DLL can make
+/// the old package's removal fail. Virtual devices, persisted ones included, are
+/// recreated afterwards. That happens once per change; later starts find the
+/// install current and only confirm no legacy cert is still trusted.
 ///
 /// Failed attempts are counted in the registry, and after
-/// [`MAX_MIGRATION_ATTEMPTS`] the helper stops trying, so a machine where
-/// re-signing can't succeed doesn't lose its devices on every launch.
-pub fn migrate_legacy_install(remove_devices: impl FnOnce() -> usize) -> Migration {
-    match installed_signing() {
-        InstalledSigning::NotInstalled | InstalledSigning::ThisMachine => {
+/// [`MAX_RECONCILE_ATTEMPTS`] the helper stops trying, so a machine where the
+/// reinstall can't succeed doesn't lose its devices on every launch.
+pub fn reconcile_installed_driver(clear_devices: impl FnOnce()) -> Reconcile {
+    let from = installed_driver();
+    match from {
+        InstalledDriver::NotInstalled | InstalledDriver::Current => {
             // A manual reinstall may have succeeded after automatic attempts ran
-            // out; clear the count so a future re-sign (e.g. a replaced cert)
-            // starts fresh instead of giving up at once.
-            if registry::read_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS).unwrap_or(0) != 0 {
-                let _ = registry::write_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS, 0);
+            // out; clear the count so the next needed reinstall (a later driver
+            // update, a replaced cert) starts fresh instead of giving up at once.
+            if registry::read_dword(registry::HKLM, RECONCILE_KEY, RECONCILE_ATTEMPTS).unwrap_or(0) != 0 {
+                let _ = registry::write_dword(registry::HKLM, RECONCILE_KEY, RECONCILE_ATTEMPTS, 0);
             }
-            return Migration::NotNeeded { legacy_certs_removed: remove_legacy_trust() };
+            return Reconcile::NotNeeded { legacy_certs_removed: remove_legacy_trust() };
         }
-        InstalledSigning::Indeterminate => return Migration::Skipped,
-        InstalledSigning::Other => {}
+        InstalledDriver::Indeterminate => return Reconcile::Skipped,
+        InstalledDriver::OtherVersion | InstalledDriver::ForeignSigner => {}
     }
-    let attempts = registry::read_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS).unwrap_or(0);
-    if attempts >= MAX_MIGRATION_ATTEMPTS {
-        return Migration::GaveUp;
+    let attempts = registry::read_dword(registry::HKLM, RECONCILE_KEY, RECONCILE_ATTEMPTS).unwrap_or(0);
+    if attempts >= MAX_RECONCILE_ATTEMPTS {
+        return Reconcile::GaveUp { from };
     }
-    let _ = registry::write_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS, attempts + 1);
-    remove_devices();
+    let _ = registry::write_dword(registry::HKLM, RECONCILE_KEY, RECONCILE_ATTEMPTS, attempts + 1);
+    clear_devices();
     match reinstall_driver_force() {
-        Ok(()) if installed_signing() == InstalledSigning::ThisMachine => {
-            let _ = registry::write_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS, 0);
-            Migration::Migrated
+        Ok(()) if installed_driver() == InstalledDriver::Current => {
+            let _ = registry::write_dword(registry::HKLM, RECONCILE_KEY, RECONCILE_ATTEMPTS, 0);
+            Reconcile::Reinstalled { from }
         }
-        Ok(()) => Migration::Failed(DeployError::InstallUnverified),
-        Err(e) => Migration::Failed(e),
+        Ok(()) => Reconcile::Failed { from, error: DeployError::InstallUnverified },
+        Err(error) => Reconcile::Failed { from, error },
     }
 }
 
@@ -615,6 +655,24 @@ mod tests {
                 pkg.inf,
                 pkg.catalog
             );
+        }
+    }
+
+    #[test]
+    fn payload_driver_versions_are_readable() {
+        // installed_driver() treats an unreadable version as Indeterminate and
+        // never upgrades, so the shipped INFs must always parse. Pinned to the
+        // vendored release; update alongside the driver files.
+        assert_eq!(inf_driver_version(payload::HIDMAESTRO_INF).as_deref(), Some("1.4.7.48"));
+        assert_eq!(inf_driver_version(payload::HIDMAESTRO_XUSB_INF).as_deref(), Some("1.4.7.48"));
+    }
+
+    #[test]
+    fn only_version_or_signer_mismatches_reinstall() {
+        assert!(InstalledDriver::OtherVersion.needs_reinstall());
+        assert!(InstalledDriver::ForeignSigner.needs_reinstall());
+        for state in [InstalledDriver::NotInstalled, InstalledDriver::Current, InstalledDriver::Indeterminate] {
+            assert!(!state.needs_reinstall(), "{state:?}");
         }
     }
 

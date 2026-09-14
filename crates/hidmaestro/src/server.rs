@@ -241,30 +241,39 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     // anything else, so a user's controller can never stay dark across restarts.
     crate::orchestrator::recover_xinput_reorder();
 
-    // Per-machine driver signing: an install left by an earlier build still
-    // carries the catalogs it vendored, signed on a build machine. Re-sign it
-    // with this machine's own cert, once. This runs before the accept loop, so
-    // no device of this session exists yet — but persisted nodes from earlier
-    // runs are bound to the old packages and get recreated. Later starts find
-    // the install already signed and only confirm no legacy cert is trusted.
-    use crate::deploy::Migration;
-    match crate::deploy::migrate_legacy_install(crate::orchestrator::remove_all_hidmaestro_devices) {
-        Migration::NotNeeded { legacy_certs_removed: 0 } => {}
-        Migration::NotNeeded { legacy_certs_removed: n } => {
-            diag_log(&format!("[helper] signing: withdrew {n} legacy certificate trust entries"))
+    // Bring the installed driver in line with this build: the vendored
+    // HIDMaestro version, signed by this machine's own cert. That's how a driver
+    // update reaches existing installs (nothing else replaces an installed
+    // driver) and how installs signed by an earlier build's shared certs move
+    // off them. Runs before the accept loop, so no device of this session exists
+    // yet — but persisted nodes from earlier runs are bound to the old packages,
+    // so they're cleared (and recreated later) when a reinstall is needed. Later
+    // starts find the install current and only confirm no legacy cert is trusted.
+    use crate::deploy::Reconcile;
+    let clear_devices = || {
+        if !crate::orchestrator::clear_hidmaestro_devices_and_wait(std::time::Duration::from_secs(15)) {
+            diag_log("[helper] driver: device nodes still present after 15 s; reinstalling anyway");
         }
-        Migration::Migrated => diag_log(
-            "[helper] signing: driver re-signed with this machine's certificate; \
-             legacy certificates withdrawn, virtual devices will be recreated",
+    };
+    match crate::deploy::reconcile_installed_driver(clear_devices) {
+        Reconcile::NotNeeded { legacy_certs_removed: 0 } => {}
+        Reconcile::NotNeeded { legacy_certs_removed: n } => {
+            diag_log(&format!("[helper] driver: withdrew {n} legacy certificate trust entries"))
+        }
+        Reconcile::Reinstalled { from } => diag_log(&format!(
+            "[helper] driver: reinstalled (was {from:?}) with this build's HIDMaestro, signed by \
+             this machine's certificate; virtual devices will be recreated"
+        )),
+        Reconcile::Skipped => diag_log(
+            "[helper] driver: check skipped (driver half-installed, or its INFs or catalogs unreadable)",
         ),
-        Migration::Skipped => diag_log(
-            "[helper] signing: check skipped (driver half-installed or its catalogs not found)",
-        ),
-        Migration::GaveUp => diag_log(
-            "[helper] signing: driver still carries a legacy signature and automatic \
-             re-signing has given up; 'Reinstall drivers' will re-sign it",
-        ),
-        Migration::Failed(e) => diag_log(&format!("[helper] signing: automatic re-sign failed: {e}")),
+        Reconcile::GaveUp { from } => diag_log(&format!(
+            "[helper] driver: install needs replacing (was {from:?}) but automatic reinstall \
+             has given up; 'Reinstall drivers' will do it"
+        )),
+        Reconcile::Failed { from, error } => {
+            diag_log(&format!("[helper] driver: automatic reinstall (was {from:?}) failed: {error}"))
+        }
     }
 
     let state = Arc::new(HelperState::new());
@@ -579,8 +588,8 @@ fn handle_request(req: Request, state: &Arc<HelperState>) -> (Response, bool) {
                 Err(e) => (Response::err(format!("driver uninstall failed: {e}")), false),
             }
         }
-        Request::Create { device_id, profile_json, index_hint, poll_interval_ms } => {
-            (handle_create(&device_id, &profile_json, index_hint, poll_interval_ms, state), false)
+        Request::Create { device_id, profile_json, index_hint } => {
+            (handle_create(&device_id, &profile_json, index_hint, state), false)
         }
         Request::Destroy { instance_id } => (handle_destroy(&instance_id, state), false),
         Request::ListDevices => {
@@ -674,7 +683,6 @@ fn handle_create(
     device_id: &str,
     profile_json: &str,
     index_hint: u32,
-    poll_interval_ms: u32,
     state: &Arc<HelperState>,
 ) -> Response {
     let profile = match Profile::from_json(profile_json) {
@@ -794,16 +802,6 @@ fn handle_create(
     // ALLOCATE a globally-unique index: lowest free, considering both nodes
     // present in the system and indices we already hold this session.
     let index = allocate_index(&existing, state, index_hint);
-
-    // Stamp the XUSB companion's input-pump period (PollIntervalMs) into the
-    // device's config key BEFORE the node is created, so the companion driver
-    // reads it at CompanionDeviceAdd. Derived from the app's polling-rate
-    // setting; clamped 1..8 ms (1000..125 Hz). 0 (older app / non-XInput) =>
-    // leave unset so the driver keeps its 8ms (125Hz) default. Only meaningful
-    // for XInput profiles, but harmless to write otherwise.
-    if profile.requires_xusb_companion && poll_interval_ms > 0 {
-        crate::orchestrator::write_poll_interval(index, poll_interval_ms);
-    }
 
     let mut input = match InputSection::create(index) {
         Ok(s) => s,

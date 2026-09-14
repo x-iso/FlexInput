@@ -2,7 +2,11 @@
 //!
 //! Layout is a verbatim transcription of
 //! `sdk/HIDMaestro.Core/Internal/SharedMemoryIO.cs` (`@main`, 2026-06-11), which
-//! the file's own header notes must match `driver/driver.h`.
+//! the file's own header notes must match `driver/driver.h`. Rechecked against
+//! v1.7.3, the vendored driver: both section layouts are unchanged. That release
+//! added the companion input doorbell (see `InputSection::write_frame`), and its
+//! producers now reserve an output slot before publishing it, which the reader
+//! below already treats as "nothing new yet".
 //!
 //! ## Input section `Global\HIDMaestroInput{i}` — 362 bytes, seqlock writer
 //! ```text
@@ -379,6 +383,14 @@ impl Drop for EventHandle {
 unsafe impl Send for MappedSection {}
 unsafe impl Send for EventHandle {}
 
+/// Name of the XUSB companion's input doorbell for `controller_index`. The
+/// companion driver opens this exact name (HIDMaestro `companion.c`), and a
+/// mismatch fails silently — it just falls back to its 8 ms timer — so a test
+/// pins the spelling.
+fn companion_event_name(controller_index: u32) -> String {
+    format!(r"Global\HIDMaestroCompanionInputEvent{controller_index}")
+}
+
 /// Writer for one controller's input section (`Global\HIDMaestroInput{i}`).
 ///
 /// Single-writer seqlock: the driver and XUSB companion are many readers that
@@ -387,11 +399,16 @@ unsafe impl Send for EventHandle {}
 pub struct InputSection {
     section: MappedSection,
     event: EventHandle,
+    /// `Global\HIDMaestroCompanionInputEvent{i}`: the XUSB companion's input
+    /// doorbell. See [`write_frame`](Self::write_frame). Optional because the
+    /// companion works without it (on its 8 ms timer), so a failure to create or
+    /// open it must not take the device down with it.
+    companion_event: Option<EventHandle>,
     seq_no: u32,
 }
 
 impl InputSection {
-    /// Create the input section + signaling event for `controller_index`.
+    /// Create the input section + signaling events for `controller_index`.
     /// Requires the caller to hold `SeCreateGlobalPrivilege` (i.e. run elevated)
     /// — WUDFHost cannot create `Global\` objects itself. For the Phase-1 gate,
     /// prefer [`open`](Self::open) against a C#-created section instead.
@@ -401,10 +418,15 @@ impl InputSection {
             SHARED_INPUT_SIZE,
         )?;
         let event = EventHandle::create(&format!(r"Global\HIDMaestroInputEvent{controller_index}"))?;
-        Ok(InputSection { section, event, seq_no: 0 })
+        // A second event rather than sharing the one above: the HID driver's
+        // worker consumes that auto-reset event, and one auto-reset event can't
+        // wake two waiters. Created here, by the elevated helper, for the same
+        // reason as the section — the unelevated app can only open `Global\` names.
+        let companion_event = EventHandle::create(&companion_event_name(controller_index)).ok();
+        Ok(InputSection { section, event, companion_event, seq_no: 0 })
     }
 
-    /// Open an input section + event already created by another process
+    /// Open an input section + events already created by another process
     /// (HIDMaestro's C# app, or FlexInput's elevated helper in a later phase).
     pub fn open(controller_index: u32) -> Result<Self, ShmError> {
         let section = MappedSection::open(
@@ -412,10 +434,11 @@ impl InputSection {
             SHARED_INPUT_SIZE,
         )?;
         let event = EventHandle::open(&format!(r"Global\HIDMaestroInputEvent{controller_index}"))?;
+        let companion_event = EventHandle::open(&companion_event_name(controller_index)).ok();
         // Resume from whatever sequence the section currently holds so the driver
         // (which tracks last-seen SeqNo) sees our first write as a real change.
         let seq_no = unsafe { section.read_u32(0) };
-        Ok(InputSection { section, event, seq_no })
+        Ok(InputSection { section, event, companion_event, seq_no })
     }
 
     /// Publish one legacy input frame (Report-ID stripped `report`), optionally
@@ -424,6 +447,14 @@ impl InputSection {
     ///
     /// `report` is truncated to `DATA_CAPACITY` (256); `gip`, if present, must be
     /// `GIP_DATA_LENGTH` (14) bytes and is written only for Xbox companions.
+    ///
+    /// A frame carrying `gip` also rings the XUSB companion's doorbell. Windows.
+    /// Gaming.Input and GameInput read an Xbox 360 pad through a pended
+    /// `IOCTL_XUSB_WAIT_FOR_INPUT`, which the companion otherwise completes on
+    /// an 8 ms timer — capping those APIs at 125 Hz with up to 8 ms of phase
+    /// delay. Signalled per frame, it completes at frame arrival, so they get
+    /// every frame at the rate FlexInput writes. (Plain `XInputGetState` reads the
+    /// section on demand and never waited on either.)
     pub fn write_frame(&mut self, report: &[u8], gip: Option<&[u8; 14]>) {
         let data_len = report.len().min(DATA_CAPACITY);
         unsafe {
@@ -458,6 +489,13 @@ impl InputSection {
         }
         // 4. Wake the driver's per-device worker (auto-reset event).
         self.event.signal();
+        // 5. Ring the companion's doorbell. Only GIP frames feed the companion,
+        //    so plain-HID devices never pay for the extra syscall.
+        if gip.is_some() {
+            if let Some(ev) = &self.companion_event {
+                ev.signal();
+            }
+        }
     }
 
     /// Diagnostic snapshot of the current input section: `(SeqNo, DataSize,
@@ -628,6 +666,14 @@ impl OutputSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_doorbell_name_matches_the_driver() {
+        // Spelled as HIDMaestro v1.7.3 driver/companion.c builds it
+        // (`Global\\HIDMaestroCompanionInputEvent` + decimal index).
+        assert_eq!(companion_event_name(0), r"Global\HIDMaestroCompanionInputEvent0");
+        assert_eq!(companion_event_name(13), r"Global\HIDMaestroCompanionInputEvent13");
+    }
 
     #[test]
     fn layout_constants_match_driver() {

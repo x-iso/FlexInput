@@ -56,6 +56,29 @@ All notable changes to FlexInput are documented here. This project adheres to
   as a `.fxrws` file (with the derived counts-per-360 for reference), so a
   game's calibration can be recalled instead of redone.
 
+### Changed
+
+- **HIDMaestro updated from v1.3.17 to v1.7.3.** Both driver packages are now the
+  upstream release, unmodified: the XInput companion is no longer FlexInput's own
+  rebuild. That rebuild existed to add `PollIntervalMs`, a configurable timer for
+  how often the companion answers Windows.Gaming.Input / GameInput reads — the
+  stock companion answered on a fixed 8 ms timer, capping them at 125 Hz with up
+  to 8 ms of added delay. v1.7.3 replaces the timer with an input doorbell:
+  FlexInput signals it with every frame, and the pending read completes when the
+  frame arrives, at whatever rate the I/O loop writes and with no timer phase
+  delay. The polling-rate setting now reaches existing virtual Xbox 360 pads live
+  rather than only at creation. Plain `XInputGetState` reads were never timer-bound
+  and are unaffected. The release also fixes a driver race that could hand a
+  reader the previous frame.
+- **Driver updates now reach existing installs.** Nothing used to replace an
+  installed driver, so a newer vendored HIDMaestro would never have been used on a
+  machine that already had one. On startup the helper now compares each installed
+  package's `DriverVer` with the vendored INF's and reinstalls on a mismatch,
+  through the same once-only path as the per-machine re-signing below: device
+  nodes are cleared (waiting until they're gone), the packages replaced, and
+  virtual devices recreated. Existing 1.3.17 installs upgrade this way on first
+  launch.
+
 ### Removed
 
 - **RWS Aim auto-spin calibration and the Gyro/Stick input selector.** The old

@@ -92,11 +92,11 @@ impl FlexInputApp {
         match key {
             PollingHz => {
                 // Snap to a valid whole-ms step (same quantization as the
-                // Settings slider) and retune the virtual Xbox 360's pump.
+                // Settings slider). The virtual Xbox 360 follows on its own: it
+                // reports each frame the I/O thread writes.
                 let v = settings::snap_polling_hz(val.round() as u32);
                 self.settings.polling_hz = v;
                 self.polling_hz.store(v, Ordering::Relaxed);
-                flexinput_virtual::set_requested_poll_hz(v);
             }
             SampleRateHz => {
                 let v = (val.round() as u32)

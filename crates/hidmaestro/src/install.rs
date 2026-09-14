@@ -200,6 +200,51 @@ fn inf_is_hidmaestro_xusb(path: &Path) -> bool {
 
 /// Decode an INF's bytes to a String, handling the common UTF-16LE (BOM) and
 /// ANSI/UTF-8 cases well enough for a substring sniff.
+/// A HIDMaestro driver package Windows has published, as `%SystemRoot%\INF`
+/// records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPackage {
+    /// Published INF name, e.g. `oem17.inf`.
+    pub name: String,
+    /// True for the XUSB companion package.
+    pub is_xusb: bool,
+    /// The version half of the INF's `DriverVer` (e.g. `1.4.7.48`), if present.
+    pub version: Option<String>,
+}
+
+/// Every published HIDMaestro package with its driver version, in the same
+/// companion-first order as [`installed_inf_names`].
+pub fn published_packages() -> Vec<PublishedPackage> {
+    published_packages_in(&windir().join("INF"))
+}
+
+fn published_packages_in(inf_dir: &Path) -> Vec<PublishedPackage> {
+    inf_names_in(inf_dir)
+        .into_iter()
+        .map(|name| {
+            let path = inf_dir.join(&name);
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            PublishedPackage { is_xusb: inf_is_hidmaestro_xusb(&path), version: inf_driver_version(&bytes), name }
+        })
+        .collect()
+}
+
+/// The version half of an INF's `DriverVer = mm/dd/yyyy,w.x.y.z` directive —
+/// the value Windows ranks driver packages by. `None` if absent or malformed.
+pub fn inf_driver_version(inf: &[u8]) -> Option<String> {
+    let text = decode_inf(inf);
+    text.lines().find_map(|line| {
+        let line = line.split(';').next()?.trim();
+        let (key, value) = line.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("DriverVer") {
+            return None;
+        }
+        let (_, version) = value.split_once(',')?;
+        let version = version.trim();
+        (!version.is_empty()).then(|| version.to_string())
+    })
+}
+
 fn decode_inf(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
         // UTF-16LE with BOM.
@@ -279,6 +324,32 @@ mod tests {
             names,
             vec!["oem99.inf".to_string(), "oem10.inf".to_string()],
             "companion must be removed before the main package it depends on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn driver_version_parses_the_published_form() {
+        // Verbatim from a published oemNN.inf (UTF-8 with BOM, padded key).
+        let inf = "\u{FEFF};\n[Version]\nSignature   = \"$WINDOWS NT$\"\nDriverVer   = 06/19/2026,1.3.17.1\n";
+        assert_eq!(inf_driver_version(inf.as_bytes()).as_deref(), Some("1.3.17.1"));
+        assert_eq!(inf_driver_version(b"driverver=01/02/2026, 2.0.0.7 ; stamped\n").as_deref(), Some("2.0.0.7"));
+        assert_eq!(inf_driver_version(b"[Version]\nDriverVer = 01/02/2026\n"), None);
+        assert_eq!(inf_driver_version(b"; DriverVer = 01/02/2026,9.9.9.9\n"), None);
+    }
+
+    #[test]
+    fn published_packages_carry_role_and_version() {
+        let dir = fixture_dir("versions");
+        std::fs::write(dir.join("oem4.inf"), format!("{MAIN_INF}DriverVer = 06/11/2026,1.3.17.0\n")).unwrap();
+        std::fs::write(dir.join("oem17.inf"), format!("{XUSB_INF}DriverVer = 06/19/2026,1.3.17.1\n")).unwrap();
+        let pkgs = published_packages_in(&dir);
+        assert_eq!(
+            pkgs,
+            vec![
+                PublishedPackage { name: "oem17.inf".into(), is_xusb: true, version: Some("1.3.17.1".into()) },
+                PublishedPackage { name: "oem4.inf".into(), is_xusb: false, version: Some("1.3.17.0".into()) },
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

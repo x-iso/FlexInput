@@ -207,11 +207,7 @@ impl HidMaestroDevice {
         // (it allocates a globally-unique one, or reclaims the existing device).
         let mut dev = Self::open(id, display_name, profile_json, index_hint)?;
         let device_id = dev.id.clone();
-        // XUSB companion pump period from the app's polling-rate setting (0 =>
-        // unset => helper leaves the driver's 125Hz default). Only the XInput
-        // profile's companion uses it; harmless for plain-HID.
-        let poll_interval_ms = crate::requested_poll_interval_ms();
-        match helper::create(&device_id, &dev.profile_json, index_hint, poll_interval_ms) {
+        match helper::create(&device_id, &dev.profile_json, index_hint) {
             Ok((instance_id, allocated_index)) => {
                 // Open the sections at the index the helper actually used — NOT
                 // the hint. (Opening the wrong index was the no-input bug: two

@@ -53,7 +53,7 @@ pub const LICENSES: &[License] = &[
                in crates/hidmaestro is a port of its shared-memory protocol.",
         spdx: "MIT",
         url: "https://github.com/hifihedgehog/HIDMaestro",
-        note: Some("Driver binaries from release v1.3.17."),
+        note: Some("Driver binaries from release v1.7.3."),
         text: include_str!("../../../crates/hidmaestro/driver/LICENSE"),
     },
     License {

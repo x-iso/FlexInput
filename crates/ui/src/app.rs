@@ -729,10 +729,6 @@ impl FlexInputApp {
         let polling_hz     = Arc::new(AtomicU32::new(app_settings.polling_hz));
         let sdl_all_pads   = Arc::new(AtomicBool::new(app_settings.sdl_all_pads));
         let joycon2_pairing = Arc::new(AtomicBool::new(app_settings.joycon2_pairing));
-        // Mirror the polling rate to flexinput-virtual so HIDMaestro XInput pads
-        // set their XUSB companion's pump period to match (see
-        // requested_poll_interval_ms). Pushed again on every slider change.
-        flexinput_virtual::set_requested_poll_hz(app_settings.polling_hz);
         // Mirror the virtual-mouse physical-suppression settings to the
         // flexinput-virtual globals the keymouse thread reads. Pushed again on
         // every Settings change (see the Settings panel handlers).

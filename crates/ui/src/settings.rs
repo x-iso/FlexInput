@@ -15,10 +15,11 @@ pub const POLLING_HZ_MIN: u32 = 125;
 pub const POLLING_HZ_MAX: u32 = 1000;
 pub const POLLING_HZ_DEFAULT: u32 = 500;
 
-/// The only polling rates we expose: each is exactly 1000/N for N = 1..8 ms,
-/// because the HIDMaestro XUSB companion's input-pump period is whole-ms (so the
-/// virtual Xbox 360 delivers XInput at exactly these rates; anything in between
-/// would round to one of them on the driver side). Descending = ms ascending.
+/// The only polling rates we expose: each is exactly 1000/N for N = 1..8 ms.
+/// Whole-ms periods were chosen when FlexInput's rebuilt XUSB companion pumped
+/// XInput on a whole-ms timer. The stock companion instead reports each frame as
+/// it's written, so the virtual Xbox 360 follows the I/O rate directly; the steps
+/// stay so saved settings remain valid. Descending = ms ascending.
 pub const POLLING_HZ_STEPS: [u32; 8] = [1000, 500, 333, 250, 200, 167, 143, 125];
 
 /// Snap an arbitrary Hz to the nearest exposed step in [`POLLING_HZ_STEPS`].

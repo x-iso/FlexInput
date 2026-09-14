@@ -129,7 +129,7 @@ State is shared via `Arc<RwLock<T>>` and `Arc<Mutex<T>>` with careful lock hiera
 
 - The vendored virtual-controller driver in `crates/hidmaestro/driver` (and the
   protocol port that drives it) comes from
-  [hifihedgehog/HIDMaestro](https://github.com/hifihedgehog/HIDMaestro) v1.3.17
+  [hifihedgehog/HIDMaestro](https://github.com/hifihedgehog/HIDMaestro) v1.7.3
   (MIT). Its licence is reproduced at
   [`crates/hidmaestro/driver/LICENSE`](crates/hidmaestro/driver/LICENSE).
 - 3D controller models in `app/assets/models` are adapted from

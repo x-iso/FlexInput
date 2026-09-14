@@ -513,7 +513,7 @@ impl FlexInputApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Max polling rate")
-                        .on_hover_text("Upper bound for the I/O loop, and the rate the virtual Xbox 360 (HIDMaestro XInput) delivers to games. Steps are whole-millisecond periods (the driver's resolution): 1000=1ms … 125=8ms. Actual per-device input rate depends on the device — see the live Hz on each device header.");
+                        .on_hover_text("Upper bound for the I/O loop, and the rate the virtual Xbox 360 (HIDMaestro XInput) delivers to games. Steps are whole-millisecond periods: 1000=1ms … 125=8ms. Actual per-device input rate depends on the device — see the live Hz on each device header.");
                     // The slider drives the STEP INDEX (0..=7), not the raw Hz, so
                     // the handle is evenly spaced and snaps to a valid whole-ms
                     // period *while* dragging (an in-between rate would just round
@@ -537,7 +537,6 @@ impl FlexInputApp {
                         let i = last - (pos as usize).min(last);
                         self.settings.polling_hz = settings::polling_hz_from_index(i);
                         self.polling_hz.store(self.settings.polling_hz, Ordering::Relaxed);
-                        flexinput_virtual::set_requested_poll_hz(self.settings.polling_hz);
                         dirty = true;
                     }
                 });
