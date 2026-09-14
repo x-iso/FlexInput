@@ -400,63 +400,35 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     }
                 }
 
-                // RWS Aim: input-mode dropdown + Calibrate Start/Stop live in the
-                // header so the body stays clean for the knobs + ruler. Both are
-                // still registered as pinnable elements ("input"/"cal").
+                // RWS Aim: Save/Load preset buttons live in the header so the body
+                // stays clean for the knobs + ruler. The Rotation input is always
+                // read as a gyro rate.
                 if is_rws {
-                    let input_mode = snarl.get_node(node)
-                        .and_then(|n| n.params.get("input_mode").and_then(|v| v.as_str()))
-                        .unwrap_or("gyro").to_string();
-                    ui.label(egui::RichText::new("Input mode").small().weak())
-                        .on_hover_text("How the Rotation input is read:\n• Gyro — a true angular rate (±1 = ±2000 °/s), for 1:1 calibration.\n• Stick (rate) — a stick deflection driven as a turn rate up to Max °/s.");
-                    let combo = egui::ComboBox::from_id_salt((node, "rws_hdr_input"))
-                        .selected_text(if input_mode == "stick_rate" { "Stick" } else { "Gyro" })
-                        .width(72.0)
-                        .show_ui(ui, |ui| {
-                            for (val, lbl) in [("gyro", "Gyro"), ("stick_rate", "Stick (rate)")] {
-                                if ui.selectable_label(input_mode == val, lbl).clicked() {
-                                    if let Some(n) = snarl.get_node_mut(node) {
-                                        n.params.insert("input_mode".into(), Value::String(val.to_string()));
-                                    }
-                                }
-                            }
-                        });
-                    crate::canvas::viewer::register_exposable_element(ui, node, "input", combo.response.rect);
-                    // Turn rate at full stick deflection — only meaningful in stick mode.
-                    if input_mode == "stick_rate" {
-                        let mut mr = snarl.get_node(node)
-                            .and_then(|n| n.params.get("max_rate_dps").and_then(|v| v.as_f64()))
-                            .unwrap_or(360.0) as f32;
-                        if ui.add(egui::DragValue::new(&mut mr).speed(5.0).range(1.0..=100_000.0).suffix(" °/s"))
-                            .on_hover_text("Turn rate at full stick deflection.")
-                            .changed()
-                        {
-                            if let (Some(n), Some(num)) = (snarl.get_node_mut(node), Number::from_f64(mr as f64)) {
-                                n.params.insert("max_rate_dps".into(), Value::Number(num));
-                            }
+                    // Save / load the RWS feel set (calibration + sensitivity +
+                    // flick/aim) as a portable .fxrws preset — e.g. one per game.
+                    if ui.small_button("Save…")
+                        .on_hover_text("Save this RWS calibration + feel set to a .fxrws preset")
+                        .clicked()
+                    {
+                        if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+                            rfd::FileDialog::new()
+                                .add_filter("FlexInput RWS preset", &["fxrws"])
+                                .set_file_name("aim.fxrws")
+                                .save_file()
+                        }) {
+                            let _ = rws_save_preset(snarl, node, &path);
                         }
                     }
-                    // Calibrate is DISABLED on the module for safety: it drives
-                    // your real mouse, so it must be pinned to the Config Overlay
-                    // and run from there (where a gamepad, not the busy mouse,
-                    // controls it). A ⚠ explains why.
-                    ui.label(egui::RichText::new("⚠").color(Color32::from_rgb(230, 180, 60)))
-                        .on_hover_text("Calibration takes over your real mouse.\nPin this button (or the ruler) to the Config Overlay and run it from there with a gamepad.");
-                    let cal_btn = ui.add_enabled(
-                        false,
-                        egui::Button::new(egui::RichText::new("▶ Calibrate").color(Color32::from_gray(140))),
-                    ).on_disabled_hover_text("Pin to the Config Overlay to calibrate — it takes over your mouse.");
-                    crate::canvas::viewer::register_exposable_element(ui, node, "cal", cal_btn.rect);
-                    // Spin speed is a plain number — safe to set here.
-                    let mut cs = snarl.get_node(node)
-                        .and_then(|n| n.params.get("cal_speed").and_then(|v| v.as_f64()))
-                        .unwrap_or(0.5) as f32;
-                    if ui.add(egui::DragValue::new(&mut cs).speed(0.01).range(0.05..=10.0).suffix(" rev/s"))
-                        .on_hover_text("Calibration spin speed (revolutions per second).")
-                        .changed()
+                    if ui.small_button("Load…")
+                        .on_hover_text("Load RWS settings from a .fxrws preset")
+                        .clicked()
                     {
-                        if let (Some(n), Some(num)) = (snarl.get_node_mut(node), Number::from_f64(cs as f64)) {
-                            n.params.insert("cal_speed".into(), Value::Number(num));
+                        if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
+                            rfd::FileDialog::new()
+                                .add_filter("FlexInput RWS preset", &["fxrws"])
+                                .pick_file()
+                        }) {
+                            let _ = rws_load_preset(snarl, node, &path);
                         }
                     }
                 }

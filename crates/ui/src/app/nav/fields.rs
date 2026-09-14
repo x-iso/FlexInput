@@ -432,7 +432,7 @@ impl FlexInputApp {
             | ("module.audio_stream_haptics", "asth_rumble_mix")
             | ("module.menu", "options")
             | ("processing.rws", "scale") | ("processing.rws", "rws")
-            | ("processing.rws", "input") | ("processing.rws", "cal")
+            | ("processing.rws", "stick_dps") | ("processing.rws", "vh")
             | ("processing.rws", "measure")
             | ("processing.rws", "field") | ("processing.rws", "style")
             | ("processing.rws", "flick") | ("processing.rws", "suppress")
@@ -643,17 +643,11 @@ impl FlexInputApp {
             // 0.1 (or 1) grid. `scale` fine (0.1) matters for calibration; the
             // °/s fields step by 10 coarse / 1 fine (whole degrees per second).
             ("processing.rws", "scale") => vec![f!("Scale", v("scale",0.0,100_000.0,100.0,Fixed(1.0)))],
-            ("processing.rws", "rws")   => vec![
-                f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0))),
-                f!("Stick °/s", v("stick_out_dps",1.0,100_000.0,360.0,Fixed(10.0))),
-            ],
-            ("processing.rws", "input") => vec![
-                f!("Input", Enum{key:"input_mode",opts:&["gyro","stick_rate"]}),
-                f!("Max °/s", v("max_rate_dps",1.0,100_000.0,360.0,Fixed(10.0))),
-            ],
-            ("processing.rws", "cal") => vec![
-                f!("Calibrate", Toggle{key:"calibrating"}),
-                f!("Speed", v("cal_speed",0.05,10.0,0.5,Linear)),
+            ("processing.rws", "rws")   => vec![f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0)))],
+            ("processing.rws", "stick_dps") => vec![f!("Stick °/s", v("stick_out_dps",1.0,100_000.0,360.0,Fixed(10.0)))],
+            ("processing.rws", "vh") => vec![
+                f!("Gyro V/H", v("gyro_vh_ratio",0.0,8.0,1.0,Fixed(0.1))),
+                f!("Stick V/H", v("stick_vh_ratio",0.0,8.0,1.0,Fixed(0.1))),
             ],
             // Measure auto-cal. One nominal field so it classifies as MultiField
             // (South at the pin ENTERS it); the actual in-widget controls are
@@ -665,8 +659,6 @@ impl FlexInputApp {
             ],
             ("processing.rws", "field") => vec![
                 f!("Scale", v("scale",0.0,100_000.0,100.0,Fixed(1.0))),
-                f!("Calibrate", Toggle{key:"calibrating"}),
-                f!("Speed", v("cal_speed",0.05,10.0,0.5,Linear)),
                 f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0))),
             ],
             // FOV strictly whole degrees (Fixed(10) → 10 coarse / 1 fine).

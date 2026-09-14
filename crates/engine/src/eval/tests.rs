@@ -3237,49 +3237,67 @@ mod rws_tests {
         }
     }
 
-    // Stick-rate mode: a bounded deflection is treated as a rate up to max_rate_dps.
-    #[test]
-    fn stick_rate_mode_uses_max_rate() {
-        let mut st = NodeState::default();
-        let p = params(&[
-            ("input_mode", serde_json::json!("stick_rate")),
-            ("max_rate_dps", serde_json::json!(360.0)),
-            ("scale", serde_json::json!(1.0)),
-            ("rws", serde_json::json!(1.0)),
-        ]);
-        let inputs = vec![Some(Signal::Vec2(glam::Vec2::new(1.0, 0.5)))];
-        let out = compute_rws(&inputs, &mut st, &p, 0.01);
-        match out[0] {
-            Some(Signal::Vec2(v)) => {
-                assert!((v.x - 3.6).abs() < 1e-4, "x {}", v.x);
-                assert!((v.y - 1.8).abs() < 1e-4, "y {}", v.y);
-            }
-            _ => panic!("expected Vec2 output"),
+    fn float_at(out: &[Option<Signal>], i: usize) -> f32 {
+        match out.get(i).copied().flatten() {
+            Some(Signal::Float(f)) => f,
+            other => panic!("expected Float at out[{i}], got {other:?}"),
         }
     }
 
-    // Calibration: ignore inputs and spin yaw at cal_speed revolutions/sec so the
-    // game turns at a known rate. cal_speed 1.0 => 360 deg/s.
+    // Measure calibration integrates the rotation in the ENGINE (exact tick dt)
+    // and publishes it as the display-only out[2]. Signed: turning back subtracts.
     #[test]
-    fn calibration_outputs_constant_regardless_of_input() {
+    fn measure_accumulates_signed_degrees_in_engine() {
+        let mut st = NodeState::default();
+        let p = params(&[("cal_measure", serde_json::json!("yaw"))]);
+        // 0.1 gyro = 200 °/s; 100 ticks × 10 ms = 1 s → +200°.
+        let fwd = vec![Some(Signal::Vec2(glam::Vec2::new(0.1, 0.0)))];
+        let mut out = Vec::new();
+        for _ in 0..100 { out = compute_rws(&fwd, &mut st, &p, 0.01); }
+        assert!((float_at(&out, 2) - 200.0).abs() < 1e-2, "fwd {}", float_at(&out, 2));
+        // Overshoot correction: 25 ticks back → −50° → 150° net.
+        let back = vec![Some(Signal::Vec2(glam::Vec2::new(-0.1, 0.0)))];
+        for _ in 0..25 { out = compute_rws(&back, &mut st, &p, 0.01); }
+        assert!((float_at(&out, 2) - 150.0).abs() < 1e-2, "after backtrack {}", float_at(&out, 2));
+    }
+
+    // The count restarts when the sweep switches axis, and is HELD while off so a
+    // Finish that reads a tick late still sees the full sweep.
+    #[test]
+    fn measure_restarts_on_axis_switch_and_holds_when_off() {
+        let mut st = NodeState::default();
+        let rot = vec![Some(Signal::Vec2(glam::Vec2::new(0.1, 0.1)))];
+        let yaw = params(&[("cal_measure", serde_json::json!("yaw"))]);
+        for _ in 0..50 { compute_rws(&rot, &mut st, &yaw, 0.01); }
+        let off = params(&[("cal_measure", serde_json::json!("off"))]);
+        let held = compute_rws(&rot, &mut st, &off, 0.01);
+        assert!((float_at(&held, 2) - 100.0).abs() < 1e-2, "held {}", float_at(&held, 2));
+        let pitch = params(&[("cal_measure", serde_json::json!("pitch"))]);
+        let restarted = compute_rws(&rot, &mut st, &pitch, 0.01);
+        // One tick of pitch after the switch: 200 °/s × 10 ms = 2°.
+        assert!((float_at(&restarted, 2) - 2.0).abs() < 1e-3, "restart {}", float_at(&restarted, 2));
+    }
+
+    // Stick calibration: out[3] reports the peak UNclamped deflection so the UI can
+    // reject a sweep turned faster than full stick (the game rate caps there).
+    #[test]
+    fn measure_reports_stick_saturation_peak() {
         let mut st = NodeState::default();
         let p = params(&[
-            ("calibrating", serde_json::json!(true)),
-            ("cal_speed", serde_json::json!(1.0)),
-            ("scale", serde_json::json!(2.0)),
-            ("rws", serde_json::json!(1.0)),
+            ("cal_measure", serde_json::json!("yaw")),
+            ("cal_output", serde_json::json!("stick")),
+            ("stick_out_dps", serde_json::json!(100.0)),
         ]);
-        // Non-zero input must be ignored while calibrating.
-        let inputs = vec![Some(Signal::Vec2(glam::Vec2::new(0.9, 0.9)))];
-        let out = compute_rws(&inputs, &mut st, &p, 0.01);
-        match out[0] {
-            Some(Signal::Vec2(v)) => {
-                assert!((v.x - (360.0 * 0.01 * 2.0)).abs() < 1e-3, "x {}", v.x);
-                assert!(v.y.abs() < 1e-6, "pitch stays 0 while calibrating: {}", v.y);
-            }
-            _ => panic!("expected Vec2 output"),
+        // 200 °/s against a 100 °/s full-stick rate → 2× full deflection.
+        let fast = vec![Some(Signal::Vec2(glam::Vec2::new(0.1, 0.0)))];
+        let out = compute_rws(&fast, &mut st, &p, 0.01);
+        assert!((float_at(&out, 3) - 2.0).abs() < 1e-3, "peak {}", float_at(&out, 3));
+        match out[1] {
+            Some(Signal::Vec2(v)) => assert!((v.x - 1.0).abs() < 1e-6, "stick clamps, got {}", v.x),
+            _ => panic!("expected Stick Vec2"),
         }
     }
+
 
     fn flick_params(smooth_ms: f32, scale: f32, rws: f32) -> HashMap<String, serde_json::Value> {
         params(&[

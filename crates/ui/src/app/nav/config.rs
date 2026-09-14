@@ -339,33 +339,55 @@ impl FlexInputApp {
         let east = nav.is_rising("btn_east");
         let cur = self.get_subpatch_param_str(outer, inner, "cal_measure").unwrap_or_default();
         let measuring = cur == "pitch" || cur == "yaw";
+        let mut wrote = false;
         if measuring {
             if south {
-                // The widget renderer sees this and back-solves Scale + stops.
+                // The widget renderer sees this and back-solves the constant + stops.
                 self.set_subpatch_param_bool(outer, inner, "cal_finish", true);
+                wrote = true;
             } else if east {
                 self.set_subpatch_param_str(outer, inner, "cal_measure", "off");
+                wrote = true;
             }
         } else {
             if nav.is_rising("dpad_left") {
                 self.set_subpatch_param_str(outer, inner, "cal_pending", "pitch");
+                wrote = true;
             }
             if nav.is_rising("dpad_right") {
                 self.set_subpatch_param_str(outer, inner, "cal_pending", "yaw");
+                wrote = true;
+            }
+            // Up/Down flips which OUTPUT gets calibrated (Mouse ↔ Stick).
+            if nav.is_rising("dpad_up") || nav.is_rising("dpad_down") {
+                let cur = self.get_subpatch_param_str(outer, inner, "cal_output");
+                let next = if cur.as_deref() == Some("stick") { "mouse" } else { "stick" };
+                self.set_subpatch_param_str(outer, inner, "cal_output", next);
+                wrote = true;
             }
             // Y toggles the snapshot-comparison reference (only used by 360° yaw).
             if nav.is_rising("btn_north") {
                 let s = self.get_subpatch_param_bool(outer, inner, "cal_ref_shot").unwrap_or(false);
                 self.set_subpatch_param_bool(outer, inner, "cal_ref_shot", !s);
+                wrote = true;
             }
             if south {
                 let pending = self.get_subpatch_param_str(outer, inner, "cal_pending")
                     .filter(|p| p == "pitch" || p == "yaw")
                     .unwrap_or_else(|| "yaw".into());
                 self.set_subpatch_param_str(outer, inner, "cal_measure", &pending);
+                wrote = true;
             } else if east {
                 self.gamepad_nav.edit_level = crate::gamepad_nav::EditLevel::Widget;
             }
+        }
+        // These are direct writes into the tab's embedded sub-patch copy. Bump the
+        // canvas generation (no undo entry — calibration state is transient) so an
+        // open sub-patch editor re-pulls it instead of keeping, and possibly writing
+        // back, its stale copy.
+        if wrote {
+            let canvas = &mut self.tabs[self.active_tab].canvas;
+            canvas.mutation_gen = canvas.mutation_gen.wrapping_add(1);
         }
         ctx.request_repaint();
     }

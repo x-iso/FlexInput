@@ -136,9 +136,20 @@ const FLK_DISENGAGE_HOLD_S: f32 = 0.06;
 /// can consume (and steady rolling reaches a steady output rate after it primes).
 const FLK_TRACK_SMOOTH_S: f32 = 0.025;
 
+// Measure-calibration state, after the flick slots in `NodeState::aux_f32`:
+//   [6] measured rotation on the active axis (deg, signed — backtracking subtracts)
+//   [7] active axis code (0 off, 1 pitch, 2 yaw) — a change restarts the count
+//   [8] peak unclamped Stick deflection seen this sweep (>1 = stick saturated)
+const MEAS_DEG: usize = 6;
+const MEAS_AXIS: usize = 7;
+const MEAS_PEAK_DEFL: usize = 8;
+
 /// Compute one tick of the RWS module.
 /// Outputs: [Mouse Vec2 (per-tick displacement), Stick Vec2 (right-stick
-/// deflection, unit range)].
+/// deflection, unit range), then two DISPLAY-ONLY trailing entries no wire reads
+/// (wiring indexes by pin): measured calibration degrees (Float), and the sweep's
+/// peak unclamped stick deflection (Float). The UI reads them from `last_out`
+/// (same pattern as the Virtual Menu's open/hover entries).
 pub(crate) fn compute_rws(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
@@ -155,9 +166,8 @@ pub(crate) fn compute_rws(
 
     let scale = pf("scale", 100.0);
     let mut rws = pf("rws", 1.0);
-    let calibrating = pb("calibrating", false);
-    let cal_speed = pf("cal_speed", 0.5);
-    let input_mode = ps("input_mode", "gyro");
+    // Full-deflection turn rate for the stick-aim (input 1). The Rotation input
+    // (input 0) is always a gyro rate now.
     let max_rate = pf("max_rate_dps", 360.0);
     let flick_enabled = pb("flick_enabled", false);
     let flick_deadzone = pf("flick_deadzone", 0.85);
@@ -169,46 +179,62 @@ pub(crate) fn compute_rws(
     let stick_vh_ratio = pf("stick_vh_ratio", 1.0).max(0.0);
     // User-driven MEASURE calibration ("pitch"|"yaw"|"off"): the user turns the
     // camera a known amount (180° down→up, or 360°) while we drive the game at the
-    // BASE scale (rws = 1, no V/H bias, off-axis blocked, no flick/stick-aim); the
-    // UI integrates the physical rotation and back-solves `scale`. Distinct from
-    // the spin-`calibrating` reference method.
+    // BASE scale (rws = 1, no V/H bias, off-axis blocked, no flick/stick-aim). The
+    // physical rotation is integrated HERE at tick rate (exact dt, the one copy of
+    // the node the engine evaluates) and published for the UI to back-solve.
     let cal_measure = ps("cal_measure", "off");
     let measuring = cal_measure == "pitch" || cal_measure == "yaw";
 
-    // Rotation rate in deg/s (yaw = x, pitch = y). While spin-calibrating we ignore
-    // the inputs and spin at a KNOWN rate (cal_speed revolutions/second) so the
-    // user can match the game to the on-screen reference; cal_speed 1.0 = 1 rev/s.
-    let (yaw_dps, pitch_dps) = if calibrating {
-        (cal_speed * 360.0, 0.0)
-    } else {
+    // Rotation rate in deg/s (yaw = x, pitch = y). The Rotation input is a gyro
+    // rate: ±1 == ±GYRO_REF_DPS deg/s.
+    let (yaw_dps, pitch_dps) = {
         let rot = match inputs.first().and_then(|s| *s) {
             Some(Signal::Vec2(v)) => v,
             Some(Signal::Float(f)) => glam::Vec2::new(f, 0.0),
             _ => glam::Vec2::ZERO,
         };
-        // Gyro axes are already ±1 == ±GYRO_REF_DPS deg/s; a stick is bounded
-        // deflection, so treat it as a rate up to `max_rate_dps` at full tilt.
-        let is_stick = input_mode == "stick_rate";
-        let k = if is_stick { max_rate } else { GYRO_REF_DPS };
+        let k = GYRO_REF_DPS;
         if measuring {
             // Drive only the axis being measured at the BASE scale (no V/H bias),
-            // so the UI's integral back-solves the ground-truth `scale`.
+            // so the UI's integral back-solves the ground-truth constant.
             rws = 1.0;
             match cal_measure.as_str() {
                 "pitch" => (0.0, rot.y * k),
                 _ => (rot.x * k, 0.0), // "yaw"
             }
         } else {
-            // Apply the V/H bias to the vertical (pitch) axis for this source.
-            let vh = if is_stick { stick_vh_ratio } else { gyro_vh_ratio };
-            (rot.x * k, rot.y * k * vh)
+            // Apply the gyro V/H bias to the vertical (pitch) axis.
+            (rot.x * k, rot.y * k * gyro_vh_ratio)
         }
     };
+
+    // Integrate the measured axis. Signed, so turning back (repositioning, or
+    // correcting an overshoot) subtracts. Restart whenever the sweep (re)starts or
+    // switches axis; hold the value while off so a Finish read lands intact.
+    while state.aux_f32.len() <= MEAS_PEAK_DEFL {
+        state.aux_f32.push(0.0);
+    }
+    let axis_code = match cal_measure.as_str() {
+        "pitch" => 1.0,
+        "yaw" => 2.0,
+        _ => 0.0,
+    };
+    if measuring {
+        if state.aux_f32[MEAS_AXIS] != axis_code {
+            state.aux_f32[MEAS_DEG] = 0.0;
+            state.aux_f32[MEAS_PEAK_DEFL] = 0.0;
+            state.aux_f32[MEAS_AXIS] = axis_code;
+        }
+        let axis_dps = if axis_code == 1.0 { pitch_dps } else { yaw_dps };
+        state.aux_f32[MEAS_DEG] += axis_dps * dt;
+    } else {
+        state.aux_f32[MEAS_AXIS] = 0.0;
+    }
 
     // Flick-stick yaw contribution (degrees). It is a REAL rotation, so it maps
     // 1:1 through `scale` only — `rws` (a feel multiplier) deliberately does NOT
     // apply, so a flick lands on the direction you point regardless of RWS.
-    let flick_deg = if flick_enabled && !calibrating && !measuring {
+    let flick_deg = if flick_enabled && !measuring {
         compute_flick(inputs, state, flick_deadzone, flick_smooth_ms, dt)
     } else {
         reset_flick(state);
@@ -231,7 +257,7 @@ pub(crate) fn compute_rws(
     // flick deadzone (past → the flick takes over); with flick off it uses the full
     // stick range. Its vertical axis honours the stick V/H bias, and eval_rws_node
     // suppresses the stick from its default mapping so it doesn't double-drive.
-    if pb("stick_aim_enabled", false) && !calibrating && !measuring {
+    if pb("stick_aim_enabled", false) && !measuring {
         let v = match inputs.get(1).and_then(|s| *s) {
             Some(Signal::Vec2(v)) => v,
             _ => glam::Vec2::ZERO,
@@ -257,12 +283,38 @@ pub(crate) fn compute_rws(
         }
     }
 
-    let sx = sx.clamp(-1.0, 1.0);
-    let sy = sy.clamp(-1.0, 1.0);
+    // Peak UNclamped stick deflection during a sweep: past 1.0 the stick is pinned
+    // at full tilt, so the game turns slower than the gyro and a Stick back-solve
+    // would come out wrong — the UI refuses it and asks for a slower turn.
+    if measuring {
+        let defl = sx.abs().max(sy.abs());
+        if defl > state.aux_f32[MEAS_PEAK_DEFL] {
+            state.aux_f32[MEAS_PEAK_DEFL] = defl;
+        }
+    }
+
+    let mut sx = sx.clamp(-1.0, 1.0);
+    let mut sy = sy.clamp(-1.0, 1.0);
+
+    // While MEASURING, drive ONLY the output being calibrated (`cal_output`) so a
+    // patch that wires BOTH outputs (with selectors deciding which is live) can't
+    // move the game via the wrong one and skew the back-solve.
+    if measuring {
+        if ps("cal_output", "mouse") == "stick" {
+            dx = 0.0;
+            dy = 0.0;
+        } else {
+            sx = 0.0;
+            sy = 0.0;
+        }
+    }
 
     vec![
         Some(Signal::Vec2(glam::Vec2::new(dx, dy))),
         Some(Signal::Vec2(glam::Vec2::new(sx, sy))),
+        // Display-only (not a pin): see the doc comment above.
+        Some(Signal::Float(state.aux_f32[MEAS_DEG])),
+        Some(Signal::Float(state.aux_f32[MEAS_PEAK_DEFL])),
     ]
 }
 

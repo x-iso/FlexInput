@@ -327,14 +327,13 @@ pub(crate) fn render_pinned_element_impl(
                 "RWS", "rws", 1.0, 0.01, 0.01..=50.0, Some(3));
             return;
         }
-        // Input-mode combo (+ max °/s when stick-rate).
-        ("processing.rws", "input") => {
-            render_rws_input(inner_id, ui, inner_snarl, container_size);
+        ("processing.rws", "stick_dps") => {
+            render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
+                "Stick °/s", "stick_out_dps", 360.0, 5.0, 1.0..=100_000.0, Some(0));
             return;
         }
-        // Calibration Start/Stop + spin speed.
-        ("processing.rws", "cal") => {
-            render_rws_cal(inner_id, ui, inner_snarl, container_size);
+        ("processing.rws", "vh") => {
+            render_rws_vh(inner_id, ui, inner_snarl, container_size);
             return;
         }
         // Measure-based auto-calibration (turn 180°/360° → back-solve Scale).

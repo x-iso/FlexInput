@@ -645,6 +645,14 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     if let Some(v) = set_passthrough_default {
         app.set_config_passthrough_default(v);
     }
+    // A pinned RWS calibration widget wrote node params from this viewport, which
+    // the canvas's own edit tracking can't see. Bump the tab canvas generation so
+    // an open sub-patch editor re-pulls those values rather than displaying — or
+    // writing back over them — its stale copy.
+    if crate::canvas::viewer::take_rws_overlay_write(ctx) {
+        let (tab, _, _) = app.overlay_parts();
+        tab.canvas.mutation_gen = tab.canvas.mutation_gen.wrapping_add(1);
+    }
     // Pace the parent context (immediate viewports render with the parent).
     ctx.request_repaint_after(frame_interval);
 }

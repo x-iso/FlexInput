@@ -68,17 +68,20 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
         if ui.add(egui::DragValue::new(&mut v).speed(0.01).range(0.01..=50.0)).changed() {
             if let Some(n) = Number::from_f64(v as f64) { set.push(("rws", Value::Number(n))); }
         }
-        // Right-stick output scaling: the game's camera turn rate at full stick.
-        ui.label(egui::RichText::new("Stick").small().weak());
+    });
+    register_exposable_element(ui, node_id, "rws", r_rws.response.rect);
+
+    // Stick output scaling — its OWN row so it pins independently (the game's
+    // camera turn rate at full stick; the Stick-output equivalent of Scale).
+    let r_sdps = ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Stick °/s").small())
+            .on_hover_text("Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.");
         let mut sm = stick_max;
-        if ui.add(egui::DragValue::new(&mut sm).speed(5.0).range(1.0..=100_000.0).suffix(" °/s"))
-            .on_hover_text("Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.")
-            .changed()
-        {
+        if ui.add(egui::DragValue::new(&mut sm).speed(5.0).range(1.0..=100_000.0).suffix(" °/s")).changed() {
             if let Some(n) = Number::from_f64(sm as f64) { set.push(("stick_out_dps", Value::Number(n))); }
         }
     });
-    register_exposable_element(ui, node_id, "rws", r_rws.response.rect);
+    register_exposable_element(ui, node_id, "stick_dps", r_sdps.response.rect);
 
     // V/H bias — vertical sensitivity relative to horizontal (the calibrated
     // reference), separately for the gyro source and stick sources. 1.0 = equal.
@@ -109,7 +112,9 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     register_exposable_element(ui, node_id, "field", frect);
 
     // Measure-based auto-calibration (turn a known 180°/360° → back-solve Scale).
-    let r_meas = ui.horizontal(|ui| rws_measure_controls(node_id, ui, snarl));
+    // (Body edits are real input in this window, so the canvas's own edit
+    // tracking syncs them — the returned write flag is only needed for overlays.)
+    let r_meas = ui.horizontal(|ui| { let _ = rws_measure_controls(node_id, ui, snarl); });
     register_exposable_element(ui, node_id, "measure", r_meas.response.rect);
 
     // View + style row.
@@ -252,51 +257,6 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     }
 }
 
-/// Input-mode combo (+ max °/s when in stick-rate mode), as a standalone
-/// pinnable element. Mirrors the header control sized to the pinned container.
-pub(crate) fn render_rws_input(
-    node_id: NodeId,
-    ui: &mut egui::Ui,
-    snarl: &mut Snarl<NodeData>,
-    container: egui::Vec2,
-) {
-    let input_mode = snarl
-        .get_node(node_id)
-        .and_then(|n| n.params.get("input_mode").and_then(|v| v.as_str()))
-        .unwrap_or("gyro")
-        .to_string();
-    let mut set: Vec<(&str, Value)> = Vec::new();
-    ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(170.0, 22.0));
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Input mode").small().weak());
-        egui::ComboBox::from_id_salt((node_id, "rws_pin_input"))
-            .selected_text(if input_mode == "stick_rate" { "Stick" } else { "Gyro" })
-            .width(72.0)
-            .show_ui(ui, |ui| {
-                for (val, lbl) in [("gyro", "Gyro"), ("stick_rate", "Stick (rate)")] {
-                    if ui.selectable_label(input_mode == val, lbl).clicked() {
-                        set.push(("input_mode", Value::String(val.to_string())));
-                    }
-                }
-            });
-        if input_mode == "stick_rate" {
-            let mut mr = snarl
-                .get_node(node_id)
-                .and_then(|n| n.params.get("max_rate_dps").and_then(|v| v.as_f64()))
-                .unwrap_or(360.0) as f32;
-            if ui.add(egui::DragValue::new(&mut mr).speed(5.0).range(1.0..=100_000.0).suffix(" °/s")).changed() {
-                if let Some(n) = Number::from_f64(mr as f64) { set.push(("max_rate_dps", Value::Number(n))); }
-            }
-        }
-    });
-    if !set.is_empty() {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            for (k, v) in set { node.params.insert(k.to_string(), v); }
-        }
-    }
-}
-
 /// Flick-stick row (enable + deadzone + smoothing), as a standalone pinnable
 /// element.
 pub(crate) fn render_rws_flick(
@@ -388,156 +348,205 @@ pub(crate) fn render_rws_suppress(
     }
 }
 
-/// Calibration Start/Stop + spin-speed row, as a standalone pinnable element.
-pub(crate) fn render_rws_cal(
+/// The portable RWS "feel set" saved to / loaded from a `.fxrws` preset: the
+/// calibrated constants plus the sensitivity/flick/aim knobs. Excludes transient
+/// calibration state and the ruler/room view style (which is cosmetic).
+pub(crate) const RWS_PRESET_KEYS: &[&str] = &[
+    "scale", "rws", "stick_out_dps", "max_rate_dps",
+    "gyro_vh_ratio", "stick_vh_ratio",
+    "flick_enabled", "flick_deadzone", "flick_smooth_ms",
+    "stick_aim_enabled", "stick_aim_rws", "suppress_source",
+];
+
+/// Write the node's RWS feel set to a `.fxrws` JSON preset. Includes a derived
+/// `counts_per_360` (= `scale` × 360) for cross-reference with community per-game
+/// values — there is no standard interchange format, so this is FlexInput-native.
+pub(crate) fn rws_save_preset(
+    snarl: &Snarl<NodeData>,
     node_id: NodeId,
-    ui: &mut egui::Ui,
-    snarl: &mut Snarl<NodeData>,
-    container: egui::Vec2,
-) {
-    let (calibrating, cal_speed) = snarl
-        .get_node(node_id)
-        .map(|n| {
-            (
-                n.params.get("calibrating").and_then(|v| v.as_bool()).unwrap_or(false),
-                n.params.get("cal_speed").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32,
-            )
-        })
-        .unwrap_or((false, 0.5));
-
-    let mut set: Vec<(&str, Value)> = Vec::new();
-    ui.set_max_width(container.x);
-    apply_widget_scale(ui, container, egui::vec2(170.0, 24.0));
-    ui.horizontal(|ui| {
-        let (txt, col) = if calibrating {
-            ("■ Stop", egui::Color32::from_rgb(230, 120, 110))
-        } else {
-            ("▶ Calibrate", egui::Color32::from_rgb(120, 200, 140))
-        };
-        if ui.add(egui::Button::new(egui::RichText::new(txt).color(col).strong())).clicked() {
-            set.push(("calibrating", Value::Bool(!calibrating)));
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    let node = snarl.get_node(node_id);
+    let mut params = serde_json::Map::new();
+    if let Some(node) = node {
+        for k in RWS_PRESET_KEYS {
+            if let Some(v) = node.params.get(*k) {
+                params.insert((*k).to_string(), v.clone());
+            }
         }
-        let mut v = cal_speed;
-        let w = pin_flex_width(ui, container, 72.0);
-        let h = ui.spacing().interact_size.y;
-        if ui
-            .add_sized([w, h], egui::DragValue::new(&mut v).speed(0.01).range(0.05..=10.0).suffix(" rev/s"))
-            .changed()
-        {
-            if let Some(n) = Number::from_f64(v as f64) { set.push(("cal_speed", Value::Number(n))); }
-        }
+    }
+    let scale = node
+        .and_then(|n| n.params.get("scale").and_then(|v| v.as_f64()))
+        .unwrap_or(100.0);
+    let doc = serde_json::json!({
+        "format": "flexinput-rws",
+        "version": 1,
+        "game": "",
+        "notes": "",
+        "counts_per_360": scale * 360.0,
+        "params": params,
     });
-    if !set.is_empty() {
-        if let Some(node) = snarl.get_node_mut(node_id) {
-            for (k, v) in set { node.params.insert(k.to_string(), v); }
+    let json = serde_json::to_vec_pretty(&doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, json)
+}
+
+/// Apply a `.fxrws` preset's feel set onto the node. Only recognised keys are
+/// copied, so a preset from a newer version never injects unknown params.
+pub(crate) fn rws_load_preset(
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if doc.get("format").and_then(|v| v.as_str()) != Some("flexinput-rws") {
+        return Err("Not a FlexInput RWS preset".into());
+    }
+    let params = doc.get("params").and_then(|v| v.as_object())
+        .ok_or_else(|| "preset has no params".to_string())?;
+    if let Some(node) = snarl.get_node_mut(node_id) {
+        for k in RWS_PRESET_KEYS {
+            if let Some(v) = params.get(*k) {
+                node.params.insert((*k).to_string(), v.clone());
+            }
         }
     }
+    Ok(())
 }
 
-// ── Measure calibration (user turns a known amount; we back-solve `scale`) ────
+// ── Measure calibration (user turns a known amount; we back-solve a constant) ──
 //
-// `cal_measure` param drives the engine to emit only the measured axis at the
-// BASE scale (rws 1, no V/H); meanwhile the UI integrates the physical rotation
-// entering the RWS node (the same rate readback the field preview uses) into a
-// running angle. On Finish: `scale_new = scale_old * |angle| / target` (target
-// 180° for pitch, 360° for yaw). Integrating a RATE by the UI dt is
-// cadence-independent, so a ~60 Hz UI still measures a smooth sweep accurately.
+// `cal_measure` drives the engine to emit only the measured axis at the BASE scale
+// (rws 1, no V/H) through only the chosen `cal_output`, and to integrate the
+// physical rotation at tick rate. The engine publishes that angle (and the peak
+// unclamped stick deflection) as display-only trailing outputs, read here from
+// `extra.last_out` — so every rendered copy of this widget (the config-overlay pin,
+// an open sub-patch editor's body) sees the SAME measurement, however often each
+// window repaints. On Finish:
+//   Mouse → scale         = old · |angle| / target
+//   Stick → stick_out_dps = old · target / |angle|
+// with target 180° (pitch) or 360° (yaw).
 
-fn rws_meas_theta_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_meas_theta", node_id.0)) }
-fn rws_meas_stamp_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_meas_stamp", node_id.0)) }
-fn rws_meas_prev_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_meas_prev", node_id.0)) }
-
-fn rws_meas_reset(ui: &egui::Ui, node_id: NodeId) {
-    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_theta_key(node_id), 0.0_f32));
-}
-
-/// Integrate the measured-axis rotation once per frame (guarded), returning the
-/// active axis ("off"/"pitch"/"yaw") and the accumulated degrees. The angle
-/// auto-resets whenever measuring (re)starts or switches axis, so starting via
-/// the gamepad (which just sets `cal_measure`) is equivalent to the buttons.
-fn rws_measure_state(node_id: NodeId, ui: &egui::Ui, snarl: &Snarl<NodeData>) -> (String, f32) {
-    let (cal_measure, input_mode, max_rate) = snarl.get_node(node_id).map(|n| (
-        n.params.get("cal_measure").and_then(|v| v.as_str()).unwrap_or("off").to_string(),
-        n.params.get("input_mode").and_then(|v| v.as_str()).unwrap_or("gyro").to_string(),
-        n.params.get("max_rate_dps").and_then(|v| v.as_f64()).unwrap_or(360.0) as f32,
-    )).unwrap_or(("off".into(), "gyro".into(), 360.0));
-
-    let theta = ui.ctx().data(|d| d.get_temp::<f32>(rws_meas_theta_key(node_id))).unwrap_or(0.0);
-    if cal_measure != "pitch" && cal_measure != "yaw" {
-        ui.ctx().data_mut(|d| d.insert_temp(rws_meas_prev_key(node_id), "off".to_string()));
-        return ("off".into(), theta);
-    }
-    // Once per pass: integrate the on-axis input RATE by the UI dt.
-    let frame = ui.ctx().cumulative_pass_nr();
-    let last = ui.ctx().data(|d| d.get_temp::<u64>(rws_meas_stamp_key(node_id))).unwrap_or(u64::MAX);
-    if last == frame {
-        return (cal_measure, theta);
-    }
-    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_stamp_key(node_id), frame));
-
-    // Reset the angle when (re)entering a measuring axis (start or axis switch).
-    let prev = ui.ctx().data(|d| d.get_temp::<String>(rws_meas_prev_key(node_id))).unwrap_or_default();
-    let mut theta = if prev != cal_measure { 0.0 } else { theta };
-    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_prev_key(node_id), cal_measure.clone()));
-
-    let src = snarl
-        .in_pin(InPinId { node: node_id, input: 0 })
-        .remotes
-        .first()
-        .copied()
-        .and_then(|src| snarl.get_node(src.node).and_then(|n| n.extra.last_out.get(src.output).copied().flatten()));
-    let is_pitch = cal_measure == "pitch";
-    let rate = src.map(|s| match s {
-        Signal::Vec2(v) => if is_pitch { v.y } else { v.x },
-        Signal::Float(f) => if is_pitch { 0.0 } else { f },
-        _ => 0.0,
-    }).unwrap_or(0.0);
-    let k = if input_mode == "stick_rate" { max_rate } else { GYRO_REF_DPS };
-    let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
-    theta += rate * k * dt;
-    ui.ctx().data_mut(|d| d.insert_temp(rws_meas_theta_key(node_id), theta));
-    (cal_measure, theta)
-}
+/// Past this peak deflection the stick was pinned at full tilt for part of the
+/// sweep, so the game turned slower than the gyro and a Stick back-solve would be
+/// wrong. Small headroom for noise.
+const RWS_STICK_SAT_LIMIT: f32 = 1.02;
 
 fn rws_meas_msg_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_cal_msg", node_id.0)) }
 
-/// Complete the active measure: back-solve `scale = old * |angle| / target`,
-/// then clear the calibration state and stash a short result message the widget
-/// shows for a few seconds (so the user KNOWS whether it took). Shared by the
-/// mouse Finish button and the gamepad South finish.
-fn rws_finish_measure(node_id: NodeId, ui: &egui::Ui, snarl: &mut Snarl<NodeData>, axis: &str, theta: f32) {
+/// Ctx flag: a pinned calibration widget wrote node params outside the canvas's
+/// own edit tracking (the config overlay renders in its own viewport). The config
+/// overlay consumes it and bumps the tab canvas `mutation_gen`, so an open
+/// sub-patch editor re-pulls the real values instead of showing — or writing back
+/// — its stale copy.
+fn rws_overlay_write_id() -> egui::Id { egui::Id::new("fxi_rws_overlay_param_write") }
+
+pub(crate) fn mark_rws_overlay_write(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(rws_overlay_write_id(), true));
+}
+
+/// Read-and-clear the overlay write flag (see [`mark_rws_overlay_write`]).
+pub(crate) fn take_rws_overlay_write(ctx: &egui::Context) -> bool {
+    let set = ctx.data(|d| d.get_temp::<bool>(rws_overlay_write_id())).unwrap_or(false);
+    if set {
+        ctx.data_mut(|d| d.insert_temp(rws_overlay_write_id(), false));
+    }
+    set
+}
+
+/// The active sweep ("off"/"pitch"/"yaw"), the engine-measured angle (signed
+/// degrees), and the sweep's peak unclamped stick deflection.
+fn rws_measure_state(node_id: NodeId, snarl: &Snarl<NodeData>) -> (String, f32, f32) {
+    let Some(node) = snarl.get_node(node_id) else { return ("off".into(), 0.0, 0.0) };
+    let axis = node.params.get("cal_measure").and_then(|v| v.as_str())
+        .filter(|a| *a == "pitch" || *a == "yaw")
+        .unwrap_or("off")
+        .to_string();
+    let float_out = |i: usize| match node.extra.last_out.get(i).copied().flatten() {
+        Some(Signal::Float(f)) if f.is_finite() => f,
+        _ => 0.0,
+    };
+    (axis, float_out(2), float_out(3))
+}
+
+/// Which output the measure calibrates — chosen EXPLICITLY by the user via the
+/// `cal_output` param ("mouse" | "stick"), not guessed from wiring (a patch can
+/// wire both and switch between them with selectors). Mouse → `scale`
+/// (counts/degree); Stick → `stick_out_dps` (turn rate at full deflection).
+pub(crate) fn rws_cal_output_is_stick(snarl: &Snarl<NodeData>, node_id: NodeId) -> bool {
+    snarl.get_node(node_id)
+        .and_then(|n| n.params.get("cal_output").and_then(|v| v.as_str()))
+        == Some("stick")
+}
+
+/// Complete the active sweep: back-solve the constant for the chosen output from
+/// the engine's measured angle, stop measuring, and stash a result message
+/// (old → new, or why nothing changed) the widget shows for a few seconds.
+fn rws_finish_measure(
+    node_id: NodeId,
+    ui: &egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    axis: &str,
+    theta: f32,
+    peak_defl: f32,
+) {
     let target = if axis == "yaw" { 360.0_f32 } else { 180.0 };
-    let mut msg = "⚠ No rotation measured — re-run".to_string();
+    let is_stick = rws_cal_output_is_stick(snarl, node_id);
+    let mut msg = String::new();
     if let Some(node) = snarl.get_node_mut(node_id) {
-        let scale = node.params.get("scale").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32;
-        if theta.abs() >= 5.0 && scale > 0.0 {
-            let new = scale * theta.abs() / target;
-            if let Some(n) = Number::from_f64(new as f64) { node.params.insert("scale".into(), Value::Number(n)); }
-            msg = format!("✓ Scale set to {new:.1}");
+        let param = |node: &NodeData, k: &str, d: f32| {
+            node.params.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
+        };
+        if theta.abs() < 5.0 {
+            msg = "⚠ No rotation measured — nothing changed".into();
+        } else if is_stick && peak_defl > RWS_STICK_SAT_LIMIT {
+            msg = format!("⚠ Turned faster than full stick ({peak_defl:.1}×) — nothing changed; turn slower and re-run");
+        } else if is_stick {
+            let old = param(node, "stick_out_dps", 360.0).max(1.0);
+            let new = (old * target / theta.abs()).max(1.0);
+            if let Some(n) = Number::from_f64(new as f64) {
+                node.params.insert("stick_out_dps".into(), Value::Number(n));
+            }
+            msg = format!("✓ Stick °/s {old:.0} → {new:.0}");
+        } else {
+            let old = param(node, "scale", 100.0);
+            if old > 0.0 {
+                let new = old * theta.abs() / target;
+                if let Some(n) = Number::from_f64(new as f64) {
+                    node.params.insert("scale".into(), Value::Number(n));
+                }
+                msg = format!("✓ Scale {old:.2} → {new:.2}");
+            } else {
+                msg = "⚠ Scale is 0 — set a nonzero Scale first".into();
+            }
         }
         node.params.insert("cal_measure".into(), Value::String("off".into()));
         node.params.insert("cal_finish".into(), Value::Bool(false));
     }
     let now = ui.input(|i| i.time);
     ui.ctx().data_mut(|d| d.insert_temp(rws_meas_msg_key(node_id), (msg, now)));
-    rws_meas_reset(ui, node_id);
 }
 
 /// The measure-calibration controls. Gamepad flow (see `nav_drive_rws_measure`):
-/// enter the widget with South, then ◄► pick the method, Ⓐ start, Ⓐ finish, Ⓑ
-/// cancel/back, Ⓨ toggles the 360°-only snapshot reference. Mouse users click the
-/// method / Finish / Cancel buttons directly. A guide line under the row spells
-/// out where to point the camera; a short result message reports the outcome.
-/// Shared by the module body and the pinnable element.
-pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    let (axis, theta) = rws_measure_state(node_id, ui, snarl);
-    let (ref_on, pending, finish_flag) = snarl.get_node(node_id).map(|n| (
+/// enter the widget with South, then ◄► pick the method, ▲▼ the output, Ⓐ start,
+/// Ⓐ finish, Ⓑ cancel/back, Ⓨ toggles the 360°-only snapshot reference. Mouse
+/// users click the buttons directly. A guide line spells out where to point the
+/// camera; a short result message reports the outcome. Shared by the module body
+/// and the pinnable element. Returns whether it wrote node params this frame.
+pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+    let (axis, theta, peak_defl) = rws_measure_state(node_id, snarl);
+    let (ref_on, pending, finish_flag, cal_output, scale, stick_dps) = snarl.get_node(node_id).map(|n| (
         n.params.get("cal_ref_shot").and_then(|v| v.as_bool()).unwrap_or(false),
         n.params.get("cal_pending").and_then(|v| v.as_str()).filter(|p| *p == "pitch" || *p == "yaw").unwrap_or("yaw").to_string(),
         n.params.get("cal_finish").and_then(|v| v.as_bool()).unwrap_or(false),
-    )).unwrap_or((false, "yaw".into(), false));
+        n.params.get("cal_output").and_then(|v| v.as_str()).filter(|o| *o == "mouse" || *o == "stick").unwrap_or("mouse").to_string(),
+        n.params.get("scale").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
+        n.params.get("stick_out_dps").and_then(|v| v.as_f64()).unwrap_or(360.0) as f32,
+    )).unwrap_or((false, "yaw".into(), false, "mouse".into(), 100.0, 360.0));
 
     let measuring = axis == "pitch" || axis == "yaw";
+    let is_stick = cal_output == "stick";
     let mut set: Vec<(&str, Value)> = Vec::new();
     let mut do_finish = false;
     let mut cancel = false;
@@ -546,17 +555,23 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
 
     if measuring {
         let target = if axis == "yaw" { 360.0_f32 } else { 180.0 };
+        let out_lbl = if is_stick { "Stick °/s" } else { "Scale" };
         let r = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(format!("Measuring {axis}: {:.0}° / {:.0}°", theta.abs(), target))
+            ui.label(egui::RichText::new(format!("Measuring {axis} → {out_lbl}: {:.0}° / {:.0}°", theta.abs(), target))
                 .strong().color(egui::Color32::from_rgb(255, 200, 80)));
             if ui.button(egui::RichText::new("✓ Finish").small()).clicked() { do_finish = true; }
             if ui.button(egui::RichText::new("✗ Cancel").small()).clicked() { cancel = true; }
         });
         method_rect = r.response.rect;
-        let guide = if axis == "pitch" {
-            "Turn the camera fully UP, then Finish  ·  A = Finish · B = Cancel"
-        } else {
-            "Turn one full 360°, then Finish  ·  A = Finish · B = Cancel"
+        if is_stick && peak_defl > RWS_STICK_SAT_LIMIT {
+            ui.label(egui::RichText::new(format!("⚠ Too fast — the stick maxed out ({peak_defl:.1}×). Cancel and turn slower."))
+                .small().color(egui::Color32::from_rgb(230, 150, 110)));
+        }
+        let guide = match (axis.as_str(), is_stick) {
+            ("pitch", false) => "Turn the camera fully UP, then Finish  ·  A = Finish · B = Cancel",
+            ("pitch", true) => "Turn the camera fully UP (steadily, not too fast), then Finish  ·  A = Finish · B = Cancel",
+            (_, false) => "Turn one full 360°, then Finish  ·  A = Finish · B = Cancel",
+            (_, true) => "Turn one full 360° (steadily, not too fast), then Finish  ·  A = Finish · B = Cancel",
         };
         ui.label(egui::RichText::new(guide).small().weak());
     } else {
@@ -570,10 +585,29 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
             if r_p.clicked() { set.push(("cal_measure", Value::String("pitch".into()))); }
             if r_y.clicked() { set.push(("cal_measure", Value::String("yaw".into()))); }
             method_rect = r_p.rect.union(r_y.rect);
+            ui.separator();
+            // Which OUTPUT to calibrate — explicit, because a patch may wire both
+            // and switch between them with selectors (auto-detect can't know).
+            ui.label(egui::RichText::new("out").small().weak());
+            if ui.selectable_label(!is_stick, egui::RichText::new("Mouse").small())
+                .on_hover_text("Calibrate the Mouse output (Scale, counts/degree).")
+                .clicked()
+            {
+                set.push(("cal_output", Value::String("mouse".into())));
+            }
+            if ui.selectable_label(is_stick, egui::RichText::new("Stick").small())
+                .on_hover_text("Calibrate the Stick output (°/s at full deflection).")
+                .clicked()
+            {
+                set.push(("cal_output", Value::String("stick".into())));
+            }
+            // The constant this output uses right now, so a Finish visibly moves it.
+            let cur = if is_stick { format!("= {stick_dps:.0} °/s") } else { format!("= {scale:.2}") };
+            ui.label(egui::RichText::new(cur).small().weak());
             // Snapshot comparison — only meaningful for the 360° horizontal method.
             if pending == "yaw" {
                 let mut shot = ref_on;
-                if ui.checkbox(&mut shot, egui::RichText::new("snapshot comparison").small())
+                if ui.checkbox(&mut shot, egui::RichText::new("snapshot").small())
                     .on_hover_text("Freeze the game frame behind the overlay at sweep start and show its\nleft half at 70% as an alignment reference for the full 360° turn.")
                     .changed()
                 {
@@ -585,15 +619,15 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
         // Recent result message (a few seconds after a Finish).
         let msg = ui.ctx().data(|d| d.get_temp::<(String, f64)>(rws_meas_msg_key(node_id)));
         if let Some((m, t)) = msg {
-            if ui.input(|i| i.time) - t < 3.5 {
+            if ui.input(|i| i.time) - t < 5.0 {
                 let col = if m.starts_with('✓') { egui::Color32::from_rgb(150, 220, 150) } else { egui::Color32::from_rgb(230, 180, 120) };
                 ui.label(egui::RichText::new(m).small().color(col));
             }
         }
         let guide = if pending == "pitch" {
-            "Aim the camera straight DOWN first  ·  A = Start · ◄► method"
+            "Aim the camera straight DOWN first  ·  A = Start · ◄► method · ▲▼ output"
         } else {
-            "Aim straight ahead first  ·  A = Start · ◄► method · Y = snapshot"
+            "Aim straight ahead first  ·  A = Start · ◄► method · ▲▼ output · Y = snapshot"
         };
         ui.label(egui::RichText::new(guide).small().weak());
     }
@@ -602,22 +636,28 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
 
     if finish_flag || do_finish {
         if measuring {
-            rws_finish_measure(node_id, ui, snarl, &axis, theta);
+            rws_finish_measure(node_id, ui, snarl, &axis, theta, peak_defl);
         } else if let Some(node) = snarl.get_node_mut(node_id) {
             node.params.insert("cal_finish".into(), Value::Bool(false));
         }
+        true
     } else if cancel {
         if let Some(node) = snarl.get_node_mut(node_id) {
             node.params.insert("cal_measure".into(), Value::String("off".into()));
         }
+        true
     } else if !set.is_empty() {
         if let Some(node) = snarl.get_node_mut(node_id) {
             for (k, v) in set { node.params.insert(k.to_string(), v); }
         }
+        true
+    } else {
+        false
     }
 }
 
-/// Measure-calibration controls as a standalone pinnable element.
+/// Measure-calibration controls as a standalone pinnable element. Writes made
+/// here (config overlay) are flagged so open sub-patch editors re-sync.
 pub(crate) fn render_rws_measure(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -626,7 +666,46 @@ pub(crate) fn render_rws_measure(
 ) {
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(210.0, 24.0));
-    rws_measure_controls(node_id, ui, snarl);
+    if rws_measure_controls(node_id, ui, snarl) {
+        mark_rws_overlay_write(ui.ctx());
+    }
+}
+
+/// V/H bias (gyro + stick ratios) as a standalone pinnable element. Publishes
+/// both field rects so the config-overlay gamepad glow lands on each control.
+pub(crate) fn render_rws_vh(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let (gyro_vh, stick_vh) = snarl.get_node(node_id).map(|n| (
+        n.params.get("gyro_vh_ratio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        n.params.get("stick_vh_ratio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+    )).unwrap_or((1.0, 1.0));
+    let mut set: Vec<(&str, Value)> = Vec::new();
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(200.0, 22.0));
+    let mut fr = [egui::Rect::NOTHING; 2];
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("V/H").small().weak());
+        ui.label(egui::RichText::new("gyro").small().weak());
+        let mut g = gyro_vh;
+        let r0 = ui.add(egui::DragValue::new(&mut g).speed(0.01).range(0.0..=8.0));
+        if r0.changed() { if let Some(n) = Number::from_f64(g as f64) { set.push(("gyro_vh_ratio", Value::Number(n))); } }
+        fr[0] = r0.rect;
+        ui.label(egui::RichText::new("stick").small().weak());
+        let mut s = stick_vh;
+        let r1 = ui.add(egui::DragValue::new(&mut s).speed(0.01).range(0.0..=8.0));
+        if r1.changed() { if let Some(n) = Number::from_f64(s as f64) { set.push(("stick_vh_ratio", Value::Number(n))); } }
+        fr[1] = r1.rect;
+    });
+    publish_nav_field_rects(ui, node_id, &fr);
+    if !set.is_empty() {
+        if let Some(node) = snarl.get_node_mut(node_id) {
+            for (k, v) in set { node.params.insert(k.to_string(), v); }
+        }
+    }
 }
 
 /// Ruler style row (BG opacity / tick spacing / labels), as a standalone
@@ -681,13 +760,12 @@ pub(crate) fn render_rws_style(
     }
 }
 
-/// Draw the calibration viewport: a scrolling degree ruler with a fixed centre
-/// reference marker plus an editable Scale box. While `calibrating`, the ruler
-/// scrolls at the known `cal_speed` (rev/s) — the reference the user matches the
-/// game to; otherwise it follows the module's live yaw output (recovered from the
-/// per-tick displacement) so the user can re-check that the lock still holds.
-/// Background is transparent by default (`field_bg_alpha` = 0).
-/// Returns the allocated rect so the body can register it as pinnable.
+/// Draw the ruler/room reference viewport: a degree ruler with a fixed centre
+/// marker (and/or the 3D room) that follows the module's live yaw output
+/// (recovered from the input rotation rate) so the user can eyeball that the
+/// in-game turn tracks 1:1. Background is transparent by default
+/// (`field_bg_alpha` = 0). Returns the allocated rect so the body can register it
+/// as pinnable.
 pub(crate) fn render_rws_field(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -695,29 +773,25 @@ pub(crate) fn render_rws_field(
     container: egui::Vec2,
     is_pinned: bool,
 ) -> egui::Rect {
-    let (calibrating, cal_speed, scale, rws) = snarl
+    let (scale, rws) = snarl
         .get_node(node_id)
         .map(|n| {
             (
-                n.params.get("calibrating").and_then(|v| v.as_bool()).unwrap_or(false),
-                n.params.get("cal_speed").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32,
                 n.params.get("scale").and_then(|v| v.as_f64()).unwrap_or(100.0) as f32,
                 n.params.get("rws").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
             )
         })
-        .unwrap_or((false, 0.5, 100.0, 1.0));
+        .unwrap_or((100.0, 1.0));
     let (bg_alpha, tick_deg, labels) = rws_field_style(snarl, node_id);
-    let (mode, fov, input_mode, max_rate) = snarl
+    let (mode, fov) = snarl
         .get_node(node_id)
         .map(|n| {
             (
                 n.params.get("field_mode").and_then(|v| v.as_str()).unwrap_or("ruler").to_string(),
                 n.params.get("field_fov").and_then(|v| v.as_f64()).unwrap_or(90.0) as f32,
-                n.params.get("input_mode").and_then(|v| v.as_str()).unwrap_or("gyro").to_string(),
-                n.params.get("max_rate_dps").and_then(|v| v.as_f64()).unwrap_or(360.0) as f32,
             )
         })
-        .unwrap_or(("ruler".to_string(), 90.0, "gyro".to_string(), 360.0));
+        .unwrap_or(("ruler".to_string(), 90.0));
 
     let size = egui::vec2(container.x.max(80.0), container.y.max(48.0));
     let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -733,50 +807,28 @@ pub(crate) fn render_rws_field(
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(16, 18, 24, a));
     }
 
-    // Phase accumulation (degrees), persisted per layer + node. Calibrating →
-    // integrate the known spin; live → recover physical degrees from the yaw
-    // displacement the module last emitted (out 1 = X counts).
+    // Live phase (degrees), persisted per layer + node: rotate the reference at
+    // the SAME rate the aim OUTPUT produces (RWS applied) so you can eyeball that
+    // the room/ruler tracks the in-game turn. Read the input rotation RATE from
+    // the wire source (a rate, so integrating by the UI dt is cadence-independent,
+    // unlike the per-tick output displacement) and interpret it as compute_rws does.
     let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
     let key = egui::Id::new(("rws_field_phase", ui.layer_id().id, node_id.0));
-    let prevcal_key = egui::Id::new(("rws_field_prevcal", ui.layer_id().id, node_id.0));
     let mut phase = ui.ctx().data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
-    // Reset to the home heading (0°) the moment calibration STOPS.
-    let prev_cal: bool = ui.ctx().data(|d| d.get_temp::<bool>(prevcal_key)).unwrap_or(false);
-    if prev_cal && !calibrating {
-        phase = 0.0;
-    }
-    ui.ctx().data_mut(|d| d.insert_temp(prevcal_key, calibrating));
-
-    if calibrating {
-        // Calibration is observed on the PINNED overlay reference. The canvas
-        // module body (and any other non-pinned copy) stays parked at home so it
-        // doesn't spin distractingly while you calibrate elsewhere.
-        if is_pinned {
-            phase += cal_speed * 360.0 * dt;
-        } else {
-            phase = 0.0;
-        }
-    } else {
-        // Live: rotate the reference at the SAME rate the aim OUTPUT produces —
-        // RWS applied — so you can check the room still tracks the game. Read the
-        // input rotation RATE from the wire source (a rate, so integrating by the
-        // UI dt is cadence-independent, unlike the per-tick output displacement)
-        // and interpret it exactly as compute_rws does.
-        let rate = snarl
-            .in_pin(InPinId { node: node_id, input: 0 })
-            .remotes
-            .first()
-            .copied()
-            .and_then(|src| snarl.get_node(src.node).and_then(|n| n.extra.last_out.get(src.output).copied().flatten()))
-            .map(|s| match s {
-                Signal::Vec2(v) => v.x,
-                Signal::Float(f) => f,
-                _ => 0.0,
-            })
-            .unwrap_or(0.0);
-        let k = if input_mode == "stick_rate" { max_rate } else { GYRO_REF_DPS };
-        phase += rate * k * rws * dt;
-    }
+    let rate = snarl
+        .in_pin(InPinId { node: node_id, input: 0 })
+        .remotes
+        .first()
+        .copied()
+        .and_then(|src| snarl.get_node(src.node).and_then(|n| n.extra.last_out.get(src.output).copied().flatten()))
+        .map(|s| match s {
+            Signal::Vec2(v) => v.x,
+            Signal::Float(f) => f,
+            _ => 0.0,
+        })
+        .unwrap_or(0.0);
+    let k = GYRO_REF_DPS;
+    phase += rate * k * rws * dt;
     if !phase.is_finite() {
         phase = 0.0;
     }
@@ -811,17 +863,12 @@ pub(crate) fn render_rws_field(
     );
 
     // Status label (bottom-left).
-    let (status, scol) = if calibrating {
-        (format!("● CAL {cal_speed:.2} rev/s"), egui::Color32::from_rgb(120, 220, 140))
-    } else {
-        ("live".to_string(), egui::Color32::from_gray(120))
-    };
     painter.text(
         egui::pos2(rect.left() + 4.0, rect.bottom() - 3.0),
         egui::Align2::LEFT_BOTTOM,
-        status,
+        "live",
         egui::FontId::proportional(9.0),
-        scol,
+        egui::Color32::from_gray(120),
     );
 
     // Editable Scale box, overlaid top-centre (the "value box in the middle").

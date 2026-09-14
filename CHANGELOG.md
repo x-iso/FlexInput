@@ -33,15 +33,33 @@ All notable changes to FlexInput are documented here. This project adheres to
   rate aim with its own RWS multiplier (inside the flick deadzone when Flick is
   on, full range when off). A per-source **V/H sensitivity bias** scales the
   vertical axis relative to the calibrated horizontal, separately for the gyro
-  and stick sources. And a new **measure-based auto-calibration** sets Scale by
+  and stick sources. And a new **measure-based auto-calibration** calibrates by
   turning the camera a known amount instead of eyeballing the ruler: **↕180°**
   (aim down → up, horizontal blocked) or **↔360°** (one full turn, vertical
-  blocked); it drives the game at the base scale and back-solves Scale from the
-  rotation it emitted (curve-immune). Fully gamepad-operable from the config
-  overlay (◄► method, A start/finish, B cancel), since the mouse is busy driving
-  the game — with an optional **snapshot comparison** that freezes the game frame
-  behind the overlay (captured so our own overlay is excluded) and shows its left
-  half at 70% as an alignment reference for the 360° turn.
+  blocked). You pick which output to calibrate — **Mouse** sets Scale, **Stick**
+  sets Stick °/s — and only that output drives the game during the sweep, so
+  patches that wire both behind selectors calibrate correctly. The rotation is
+  measured in the engine with its sign, so turning back after an overshoot
+  subtracts; the result shows old → new (or why nothing changed), and a Stick
+  sweep that maxed out the stick is refused. Fully gamepad-operable from the
+  config overlay (◄► method, ▲▼ output, A start/finish, B cancel), since the
+  mouse is busy driving the game — with an optional **snapshot comparison** that
+  freezes the game frame behind the overlay (captured so our own overlay is
+  excluded) and shows its left half at 70% as an alignment reference for the
+  360° turn.
+
+- **RWS Aim presets.** Save/Load in the module header stores the full aim feel —
+  Scale, RWS, Stick °/s, V/H bias, flick and stick-aim settings, suppression —
+  as a `.fxrws` file (with the derived counts-per-360 for reference), so a
+  game's calibration can be recalled instead of redone.
+
+### Removed
+
+- **RWS Aim auto-spin calibration and the Gyro/Stick input selector.** The old
+  method that spun the camera at a fixed rate is gone in favour of the measure
+  calibration above, along with the header input-mode selector it needed; the
+  module's rotation input is always a gyro rate. Stick °/s now has its own
+  pinnable row, and the pinned V/H bias row is interactive.
 
 ### Fixed
 
