@@ -56,6 +56,22 @@ All notable changes to FlexInput are documented here. This project adheres to
   as a `.fxrws` file (with the derived counts-per-360 for reference), so a
   game's calibration can be recalled instead of redone.
 
+- **The Bluetooth panel names an adapter that can never work.** Some chips only
+  answer HCI after their vendor driver uploads firmware — Broadcom and Cypress
+  patchram parts, Intel `ibt-*` parts — and binding the adapter to WinUSB is
+  exactly what stops that driver loading. Such an adapter used to appear idle and
+  healthy while nothing could talk to it, sending the user looking for a
+  configuration mistake that didn't exist; it now shows in red with the reason,
+  ahead of every other state. The reason is recorded when a transport actually
+  fails (probing for it would reset a radio mid-conversation) and cleared on success.
+
+- **Joy-Con 2 experiment switches, for testing on other hardware.** Environment
+  variables select alternative init paths and extra capture — among them
+  `FLEXINPUT_JC2_MODE`, `…_FEATURES`, `…_DISCOVER`, `…_MOUSE` and
+  `FLEXINPUT_JC2_CAPTURE`, documented in `docs/BLUETOOTH_TRANSPORTS.md`. An experiment run never falls back
+  to the Windows Bluetooth stack, because that produces a log indistinguishable
+  from a healthy session. Defaults are unchanged.
+
 ### Changed
 
 - **HIDMaestro updated from v1.3.17 to v1.7.3.** Both driver packages are now the
@@ -78,6 +94,30 @@ All notable changes to FlexInput are documented here. This project adheres to
   nodes are cleared (waiting until they're gone), the packages replaced, and
   virtual devices recreated. Existing 1.3.17 installs upgrade this way on first
   launch.
+
+- **More room for two controllers on one Bluetooth dongle.** Each LE link now
+  requests a 3.75 ms connection event instead of the shortest possible one. A
+  single link already held 200 Hz, but a second controller cost one of the two
+  about a fifth of its reports. The stack also requests the LE 2M PHY.
+
+- **Joy-Con 2 gyro is steadier at rest.** Its rate is still derived from the
+  controller's fused heading, and differencing that report to report got noisier
+  as the link got faster: about 3 °/s of jitter with the pad lying on a table. The
+  rate is now averaged over 25 ms of wall time, which adds about 12 ms of delay. A
+  real angular-rate stream would make this unnecessary, but on the Mobapad M12-S
+  the channel that enables it accepts commands and never answers them, across every
+  variation tried. Retail Joy-Con 2 hardware is untested there and may differ.
+
+- **Joy-Con 2 diagnostic logs are opt-in in release builds, and moved to
+  `%APPDATA%\FlexInput\logs`.** `jc2-dongle.log`, `jc2-drift.log` and the rest were
+  written beside the executable, where an installed app can't write, and grew for
+  the whole session. They were also written on the controller's transport thread
+  with a flush per line, which could freeze input for seconds when the file sat
+  in a synced folder. They now go through a background writer, rotate at 5 MB
+  keeping one previous generation, and in a release build open only when their
+  environment variable is set (`FLEXINPUT_JC2_LOG=on`, or a path). Debug builds
+  log as before. The helper's `flexinput-hidmaestro.log` moved to the same folder
+  and is still always written.
 
 ### Removed
 
@@ -126,6 +166,49 @@ All notable changes to FlexInput are documented here. This project adheres to
   package under `crates/hidmaestro/driver` was vendored and redistributed without
   the licence text MIT requires travel with it; the notice is now reproduced at
   `crates/hidmaestro/driver/LICENSE` and shown in the in-app viewer.
+
+- **Any WinUSB-bound Bluetooth adapter works, not only the one FlexInput was
+  developed on.** The Joy-Con 2 transport opened a hard-coded Realtek `0bda:a728`
+  without consulting discovery, and the Classic transport fell back to it, so on
+  any other machine FlexInput reported "no usable dongle" while a perfectly good
+  adapter sat beside it. Adapters are now found by USB class; with two plugged in,
+  both transports share whichever one is already open.
+
+- **A switched-off Switch Pro froze connected Joy-Cons for two seconds in every
+  twenty.** Paging a paired pad that wasn't there held the shared radio
+  exclusively, so every other link on it went unserviced. The Classic transport
+  now stands aside whenever the radio has carried traffic in the last half second.
+
+- **Switch Pro sticks over Bluetooth Classic use the controller's own
+  calibration.** They were normalised against a nominal range, so a stick
+  saturated before reaching the diagonals (a square circularity plot), and a
+  stick recalibrated on a Switch reached further one way than the other. The pad's
+  factory and user calibration are now read over the link, with the user
+  calibration taking precedence.
+
+- **Retail Joy-Con 2 calibration was impossible, and every Joy-Con 2 inherited one
+  grip's gyro offset.** Retail controllers interleave a 40-byte block that isn't
+  motion data, and it was decoded as motion: on a pad lying still the
+  accelerometer read 6–11 g every other frame, so stillness never registered and
+  calibration, baseline capture and gyro-bias learning could never start. Only
+  blocks of the expected length are decoded now, and an unreadable frame no longer
+  counts as movement. Separately, the resting gyro offset measured on one Mobapad
+  M12-S grip was applied to every Joy-Con 2 — up to 0.41 °/s of injected bias on
+  any other unit. An uncalibrated controller now starts from zero.
+
+- **3D orientation was scrambled on every pad except Joy-Con 2.** DualSense, DS4,
+  Switch Pro and XInput pads take their orientation from the Gyro 3DOF module,
+  which published it in the renderer's frame while the viewer converted as if it
+  were canonical — so yaw drew as pitch, pitch as roll, and roll as yaw. Every
+  orientation signal on a pin is now canonical, converted once by the renderer. A
+  pinned 3D view, which applied no conversion at all, now agrees with its node.
+
+- **Gamepad navigation no longer leaks through mapping Learn captures.** While
+  Learn was armed on a Remapper, Map Action or 3DOF-to-2D Lean card, the chord
+  being demonstrated still switched tabs, opened Alt+Tab or the preset list, ran
+  undo/redo and moved the cursor. An armed capture now holds navigation off (the
+  hold expires on its own if the capture goes stale), Touch Zones' gamepad learn
+  uses the same hold, and Remapper's Stop disarms the capture.
 
 ### Security
 
