@@ -241,6 +241,32 @@ pub fn run_helper_server(parent_pid: Option<u32>, initial_persist: bool) {
     // anything else, so a user's controller can never stay dark across restarts.
     crate::orchestrator::recover_xinput_reorder();
 
+    // Per-machine driver signing: an install left by an earlier build still
+    // carries the catalogs it vendored, signed on a build machine. Re-sign it
+    // with this machine's own cert, once. This runs before the accept loop, so
+    // no device of this session exists yet — but persisted nodes from earlier
+    // runs are bound to the old packages and get recreated. Later starts find
+    // the install already signed and only confirm no legacy cert is trusted.
+    use crate::deploy::Migration;
+    match crate::deploy::migrate_legacy_install(crate::orchestrator::remove_all_hidmaestro_devices) {
+        Migration::NotNeeded { legacy_certs_removed: 0 } => {}
+        Migration::NotNeeded { legacy_certs_removed: n } => {
+            diag_log(&format!("[helper] signing: withdrew {n} legacy certificate trust entries"))
+        }
+        Migration::Migrated => diag_log(
+            "[helper] signing: driver re-signed with this machine's certificate; \
+             legacy certificates withdrawn, virtual devices will be recreated",
+        ),
+        Migration::Skipped => diag_log(
+            "[helper] signing: check skipped (driver half-installed or its catalogs not found)",
+        ),
+        Migration::GaveUp => diag_log(
+            "[helper] signing: driver still carries a legacy signature and automatic \
+             re-signing has given up; 'Reinstall drivers' will re-sign it",
+        ),
+        Migration::Failed(e) => diag_log(&format!("[helper] signing: automatic re-sign failed: {e}")),
+    }
+
     let state = Arc::new(HelperState::new());
     state.persist.store(initial_persist, Ordering::SeqCst);
     if let Some(pid) = parent_pid {

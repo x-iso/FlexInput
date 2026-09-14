@@ -8,6 +8,19 @@ license.workspace = true
 flexinput-core = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+# Per-machine driver package signing (signing.rs): self-signed cert on a CNG
+# key, Authenticode via mssign32, catalogs via wintrust's CDF engine — all
+# in-box Windows DLLs, no SDK tooling. 0.61 to match the other crates.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }
 
 # Standalone protocol-proof binary (Phase 1 verification gate). Opens a
 # section created by HIDMaestro's C# test app and drives a known pattern.
@@ -15,6 +28,11 @@ serde_json = { workspace = true }
 name = "hm_shm_probe"
 path = "src/bin/hm_shm_probe.rs"
 required-features = ["probe-bin"]
+
+[[bin]]
+name = "hm_sign_probe"
+path = "src/bin/hm_sign_probe.rs"
+required-features = ["sign-probe-bin"]
 
 [[bin]]
 name = "hidmaestro_helper"
@@ -28,3 +46,6 @@ probe-bin = []
 # The elevated helper binary (named-pipe server). Built for distribution and
 # the Phase-4 gate; gated so a plain workspace build doesn't require it.
 helper-bin = []
+# Verification probe for per-machine driver signing (signing.rs): catalog build,
+# CurrentUser self-test, and the elevated pnputil acceptance test.
+sign-probe-bin = []

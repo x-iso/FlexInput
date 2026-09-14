@@ -34,6 +34,8 @@ pub mod orchestrator;
 pub mod profile;
 pub mod server;
 pub mod shm;
+#[cfg(windows)]
+pub mod signing;
 
 pub use descriptor::{parse_descriptor, InputField, InputReport};
 pub use encode::{encode_report, encode_report_into, gip_from_state, GamepadState, Hat, PinState};

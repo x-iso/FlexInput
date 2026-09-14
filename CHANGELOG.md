@@ -96,6 +96,40 @@ All notable changes to FlexInput are documented here. This project adheres to
   the licence text MIT requires travel with it; the notice is now reproduced at
   `crates/hidmaestro/driver/LICENSE` and shown in the in-app viewer.
 
+### Security
+
+- **The HIDMaestro driver is now signed on each machine, instead of trusting a
+  certificate shared by every install.** FlexInput used to ship the driver's
+  catalogs pre-signed by two self-signed build-machine certificates
+  (`CN=HIDMaestroTestCert`, `CN=FlexInput HIDMaestro Driver`) and add both to
+  `Root` and `TrustedPublisher` everywhere it installed — a single trust anchor
+  common to all users, whose private key sat on whichever machine built the
+  package. The elevated helper now creates a self-signed code-signing
+  certificate per machine (`CN=FlexInput Local Driver Signing`) on a
+  non-exportable RSA-3072 key, signs the driver binaries, builds the catalogs,
+  and signs those before installing. A machine only ever trusts a key that was
+  generated on it and can't leave it. Everything uses in-box Windows components;
+  no SDK tooling ships (SignTool isn't redistributable, and Inf2Cat is WDK-only).
+  The vendored `.cat` and `.cer` files are gone from the repository.
+- **Existing installs are re-signed automatically, once.** On the first helper
+  start after updating, an install still carrying the old signature is removed
+  and reinstalled per-machine-signed — so virtual devices, including persisted
+  ones, are recreated that one time — and the two legacy certificates are
+  withdrawn from `Root` and `TrustedPublisher` by exact thumbprint. A legacy
+  certificate whose private key is present on the machine is left in place. If
+  re-signing keeps failing it stops after three attempts rather than recreating
+  devices on every launch; **Reinstall drivers** re-signs on demand.
+- **Driver staging moved out of the user's temp folder.** The package is now
+  staged in a randomly named directory under `%windir%\Temp` that only
+  Administrators and SYSTEM can write to, created with that ACL in place. Signing
+  on the machine made the old location a local privilege escalation risk: an
+  unelevated process could have swapped a driver binary before it was
+  catalogued. `pnputil` and the staging path are also resolved through the OS
+  rather than the `%SystemRoot%` environment variable.
+- **Uninstall drivers now withdraws FlexInput's certificate trust too**, deleting
+  the per-machine certificate and its key, where it previously left the signer
+  certificates trusted.
+
 ## [0.13.5] - 2026-08-23
 
 **Joy-Con 2 support — by way of an entire Bluetooth host stack of FlexInput's

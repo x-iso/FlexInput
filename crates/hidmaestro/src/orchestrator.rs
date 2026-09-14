@@ -2004,8 +2004,9 @@ impl Drop for DisGuard {
 }
 
 /// Minimal registry helpers (advapi32) — only what the orchestrator needs:
-/// enumerate subkeys, read/write a DWORD, read a REG_MULTI_SZ.
-mod registry {
+/// enumerate subkeys, read/write a DWORD, read a REG_MULTI_SZ. Also used by
+/// `deploy` to count automatic driver re-sign attempts.
+pub(crate) mod registry {
     use std::ffi::c_void;
 
     pub const HKLM: *mut c_void = 0x8000_0002u32 as usize as *mut c_void;

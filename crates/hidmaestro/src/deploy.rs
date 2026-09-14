@@ -1,52 +1,102 @@
-//! Driver deployment — trust the signing cert + install the INFs (elevated).
+//! Driver deployment: sign the driver packages on this machine, trust the
+//! signer, install the INFs. Everything here needs elevation and runs in the
+//! helper process.
 //!
-//! Lighter-weight alternative to HIDMaestro's `DriverBuilder.FullDeploy`: rather
-//! than embed signtool/inf2cat and sign on the user's machine, FlexInput vendors
-//! the **already-signed** driver package (DLLs + INFs + `.cat` catalogs, MIT,
-//! ~247 KB; see `crates/hidmaestro/driver/`) plus the signer's public cert. At
-//! runtime the elevated helper:
-//!   1. adds the cert to `Root` + `TrustedPublisher` (so Windows trusts the
-//!      catalog-signed package), then
-//!   2. runs the OS-builtin `pnputil /add-driver <inf> /install` for each INF.
+//! FlexInput vendors HIDMaestro's driver binaries and INFs (MIT; see
+//! `crates/hidmaestro/driver/`) but no catalogs and no certificates. To install,
+//! the helper:
+//!   1. stages the payload in a fresh directory only Administrators and SYSTEM
+//!      can write to ([`StagingDir`]),
+//!   2. signs both packages with this machine's own cert ([`crate::signing`]),
+//!   3. trusts that cert in `Root` + `TrustedPublisher`, and
+//!   4. runs the OS-builtin `pnputil /add-driver <inf> /install` for each INF.
 //!
-//! No external signing toolchain is redistributed. Everything here requires
-//! elevation and is intended to run inside the helper process.
-//!
-//! **Distribution note:** the vendored binaries are HIDMaestro's, signed with
-//! `CN=HIDMaestroTestCert`. For a shipping product you would re-sign the driver
-//! package with your own cert at *build* time and swap the vendored cert; the
-//! runtime logic here is unchanged.
+//! Each machine trusts only a key it generated itself, and that key never leaves
+//! it. Earlier builds instead shipped catalogs pre-signed on one build machine
+//! and trusted those certs on every install. [`installed_signing`] recognises
+//! such an install, and the helper re-signs it once at startup via
+//! [`migrate_legacy_install`], after which the legacy certs are removed.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-use crate::install::{driver_state, DriverState};
+use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_ALREADY_EXISTS};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
-/// The vendored, pre-signed driver payload, embedded at compile time so the
-/// helper can stage it to a temp dir regardless of cwd.
+use crate::install::{driver_state, installed_inf_names, DriverState};
+use crate::orchestrator::registry;
+use crate::signing::{self, DriverPackage, Scope, SignError, Thumbprint};
+
+/// The vendored driver payload, embedded at compile time so the helper can stage
+/// it regardless of cwd. The binaries' own signatures are replaced and the
+/// catalogs are built on the target machine.
 pub mod payload {
     pub const HIDMAESTRO_DLL: &[u8] = include_bytes!("../driver/HIDMaestro.dll");
     pub const HIDMAESTRO_INF: &[u8] = include_bytes!("../driver/hidmaestro.inf");
-    pub const HIDMAESTRO_CAT: &[u8] = include_bytes!("../driver/hidmaestro.cat");
+    /// The XUSB companion, which FlexInput rebuilds from HIDMaestro's source to
+    /// make the input-pump period configurable via `PollIntervalMs`.
     pub const HMXINPUT_DLL: &[u8] = include_bytes!("../driver/HMXInput.dll");
     pub const HIDMAESTRO_XUSB_INF: &[u8] = include_bytes!("../driver/hidmaestro_xusb.inf");
-    pub const HIDMAESTRO_XUSB_CAT: &[u8] = include_bytes!("../driver/hidmaestro_xusb.cat");
-    /// Signs the MAIN HID driver package (`hidmaestro.cat` / `HIDMaestro.dll`),
-    /// vendored as-is from upstream (`CN=HIDMaestroTestCert`).
-    pub const SIGNER_CERT: &[u8] = include_bytes!("../driver/HIDMaestroTestCert.cer");
-    /// Signs the XUSB COMPANION package (`hidmaestro_xusb.cat` / `HMXInput.dll`),
-    /// which FlexInput rebuilds from source (to make the input-pump period
-    /// configurable via `PollIntervalMs`) and re-signs with its own self-signed
-    /// cert. Trusted alongside [`SIGNER_CERT`] at install. `CN=FlexInput
-    /// HIDMaestro Driver`.
-    pub const COMPANION_SIGNER_CERT: &[u8] = include_bytes!("../driver/FlexInputHIDMaestroDriver.cer");
 }
+
+/// The main HID driver package. `hardware_ids` must track the INF's models
+/// section; a test checks it.
+pub const MAIN_PACKAGE: DriverPackage<'static> = DriverPackage {
+    inf: "hidmaestro.inf",
+    binaries: &["HIDMaestro.dll"],
+    catalog: "hidmaestro.cat",
+    hardware_ids: &[r"root\HIDMaestro"],
+};
+
+/// The XUSB companion package.
+pub const XUSB_PACKAGE: DriverPackage<'static> = DriverPackage {
+    inf: "hidmaestro_xusb.inf",
+    binaries: &["HMXInput.dll"],
+    catalog: "hidmaestro_xusb.cat",
+    hardware_ids: &[
+        r"root\VID_045E&PID_028E&XI_00",
+        r"root\VID_045E&PID_0291&XI_00",
+        r"root\VID_045E&PID_0719&XI_00",
+        r"root\HIDMaestroXUSB",
+    ],
+};
+
+/// The certs that signed the catalogs earlier builds vendored, and that those
+/// builds trusted in `Root` + `TrustedPublisher` on every install:
+/// `CN=HIDMaestroTestCert` and `CN=FlexInput HIDMaestro Driver`. Matched by exact
+/// thumbprint, never by name: HIDMaestro's own SDK generates a per-machine
+/// `CN=HIDMaestroTestCert` that isn't ours to remove.
+const LEGACY_SIGNERS: [Thumbprint; 2] = [
+    thumbprint("4353B1700E42A8484DCD16671EC00A320FD53908"),
+    thumbprint("2499E17BDE28C969B426BA81BB3E963CD9532D68"),
+];
+
+/// Catalog-database folder for driver catalogs. Installing `oemNN.inf` places
+/// its signed catalog here as `oemNN.cat`, and that copy is what Windows checks
+/// when it binds the driver to a device.
+const DRIVER_CATROOT: &str = r"System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}";
+
+/// Where the helper records automatic re-sign attempts: see [`migrate_legacy_install`].
+const MIGRATION_KEY: &str = r"SOFTWARE\FlexInput\Driver";
+const MIGRATION_ATTEMPTS: &str = "ResignAttempts";
+/// Automatic re-signing gives up after this many failed attempts, so a machine
+/// where it can't succeed doesn't lose its virtual devices on every launch.
+/// "Reinstall drivers" still works, and a success resets the count.
+const MAX_MIGRATION_ATTEMPTS: u32 = 3;
 
 #[derive(Debug)]
 pub enum DeployError {
     Io(std::io::Error),
-    /// Adding the cert to a system store failed (store name + GetLastError).
-    CertStore(&'static str, u32),
+    /// Creating the protected staging directory failed (GetLastError).
+    Staging(u32),
+    /// Creating the signing cert, or signing or trusting a package, failed.
+    Sign(SignError),
     /// `pnputil /add-driver` ran but the package isn't in the DriverStore.
     InstallUnverified,
     /// Exactly one of the two packages is present in the DriverStore. A
@@ -62,7 +112,8 @@ impl std::fmt::Display for DeployError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DeployError::Io(e) => write!(f, "io error: {e}"),
-            DeployError::CertStore(s, e) => write!(f, "cert store '{s}' failed (err {e})"),
+            DeployError::Staging(e) => write!(f, "could not create driver staging directory (err {e})"),
+            DeployError::Sign(e) => write!(f, "driver signing failed: {e}"),
             DeployError::InstallUnverified => {
                 write!(f, "pnputil ran but HIDMaestro not present in DriverStore")
             }
@@ -89,10 +140,19 @@ impl From<std::io::Error> for DeployError {
     }
 }
 
+impl From<SignError> for DeployError {
+    fn from(e: SignError) -> Self {
+        DeployError::Sign(e)
+    }
+}
+
 /// Idempotent full deploy: if the driver is already in the store, no-op;
-/// otherwise trust the cert, stage the payload, and install both INFs. Returns
-/// `Ok(true)` if a fresh install happened, `Ok(false)` if already present.
-/// **Requires elevation.**
+/// otherwise sign, trust and install both packages. Returns `Ok(true)` if a
+/// fresh install happened, `Ok(false)` if already present. **Requires elevation.**
+///
+/// Deliberately doesn't re-sign an install made by an earlier build: this runs on
+/// every device create, where tearing devices down isn't acceptable. The helper
+/// handles that once at startup instead ([`migrate_legacy_install`]).
 pub fn ensure_driver_installed() -> Result<bool, DeployError> {
     match driver_state() {
         DriverState::Complete => return Ok(false),
@@ -104,67 +164,238 @@ pub fn ensure_driver_installed() -> Result<bool, DeployError> {
         }
         DriverState::Missing => {}
     }
-    trust_signer_cert()?;
-    let dir = stage_payload()?;
-    install_inf(&dir.join("hidmaestro.inf"))?;
-    install_inf(&dir.join("hidmaestro_xusb.inf"))?;
-    match driver_state() {
-        DriverState::Complete => Ok(true),
-        DriverState::Partial { has_main, has_xusb } => {
-            Err(DeployError::PartialInstall { has_main, has_xusb })
-        }
-        DriverState::Missing => Err(DeployError::InstallUnverified),
-    }
+    install_signed_packages()?;
+    Ok(true)
 }
 
 /// Force a clean reinstall: remove every installed HIDMaestro driver package
 /// from the DriverStore, then run a fresh install. Unlike
 /// [`ensure_driver_installed`] this does NOT short-circuit when the driver is
 /// present — it's the "Reinstall drivers" path for recovering from a corrupt or
-/// mismatched package. **Requires elevation.** Callers must tear down any live
-/// virtual device nodes first (a bound driver can refuse removal).
+/// mismatched package, and how an install is re-signed. **Requires elevation.**
+/// Callers must tear down any live virtual device nodes first (a bound driver can
+/// refuse removal).
+///
+/// Removal has to come first even when only the signature changes: the
+/// DriverStore identifies a package by its INF, so re-adding the same INF with a
+/// newly signed catalog would be taken as the package already present.
 ///
 /// Returns `Ok(())` on a verified fresh install. The uninstall step is
 /// best-effort (a package that's already gone, or pinned by a node we missed, is
 /// logged-but-not-fatal); the post-install DriverStore check is authoritative.
 pub fn reinstall_driver_force() -> Result<(), DeployError> {
     uninstall_all_hidmaestro_packages();
-    // Re-add the cert + INFs unconditionally (the cert add is idempotent).
-    trust_signer_cert()?;
-    let dir = stage_payload()?;
-    install_inf(&dir.join("hidmaestro.inf"))?;
-    install_inf(&dir.join("hidmaestro_xusb.inf"))?;
-    match driver_state() {
-        DriverState::Complete => Ok(()),
-        DriverState::Partial { has_main, has_xusb } => {
-            Err(DeployError::PartialInstall { has_main, has_xusb })
-        }
-        DriverState::Missing => Err(DeployError::InstallUnverified),
-    }
+    install_signed_packages()
 }
 
 /// Remove the HIDMaestro driver entirely: delete every installed package from the
-/// DriverStore. Unlike [`reinstall_driver_force`] nothing is reinstalled. The
-/// trusted signer certs are intentionally LEFT in place — they're harmless and a
-/// later reinstall reuses them. **Requires elevation.** Callers must tear down any
-/// live virtual device nodes first (a bound driver can refuse removal).
+/// DriverStore, then withdraw the trust FlexInput added — this machine's signing
+/// cert (and its private key) and any legacy certs. Nothing is reinstalled; a
+/// later install creates a new cert. **Requires elevation.** Callers must tear
+/// down any live virtual device nodes first (a bound driver can refuse removal).
 ///
 /// Returns `Ok(())` once no HIDMaestro package remains in the DriverStore;
 /// `Err(InstallUnverified)` if a package is still present (e.g. pinned by a node we
-/// missed). Per-`pnputil` errors are best-effort/logged; the DriverStore check is
-/// authoritative.
+/// missed). Trust is only withdrawn after that check passes: a package still in
+/// the store would otherwise stop validating. Per-`pnputil` errors are
+/// best-effort/logged; the DriverStore check is authoritative.
 pub fn uninstall_driver() -> Result<(), DeployError> {
     uninstall_all_hidmaestro_packages();
     // `Missing` is the only success here. Checking `!hidmaestro_available()`
     // instead would report a half-removed state as a clean uninstall — the
     // exact failure that strands the companion INF and crashes WUDFHost.
     match driver_state() {
-        DriverState::Missing => Ok(()),
+        DriverState::Missing => {
+            retire_signing_certs(None);
+            remove_legacy_trust();
+            Ok(())
+        }
         DriverState::Partial { has_main, has_xusb } => {
             Err(DeployError::PartialInstall { has_main, has_xusb })
         }
         DriverState::Complete => Err(DeployError::InstallUnverified),
     }
+}
+
+/// Who signed the HIDMaestro packages Windows has installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledSigning {
+    /// No HIDMaestro package is installed.
+    NotInstalled,
+    /// Every installed package's catalog is signed by this machine's current cert.
+    ThisMachine,
+    /// A catalog is signed by something else — an earlier build's vendored cert,
+    /// or a machine cert that has since been replaced — so the install needs
+    /// re-signing.
+    Other,
+    /// Half-installed, or the installed catalogs couldn't be found. Left alone
+    /// rather than guessed at: "Reinstall drivers" resolves both.
+    Indeterminate,
+}
+
+/// Classify the installed packages by who signed the catalogs Windows validates
+/// against (see [`DRIVER_CATROOT`]). Read-only; never creates a cert.
+pub fn installed_signing() -> InstalledSigning {
+    match driver_state() {
+        DriverState::Missing => return InstalledSigning::NotInstalled,
+        DriverState::Partial { .. } => return InstalledSigning::Indeterminate,
+        DriverState::Complete => {}
+    }
+    let published = installed_inf_names();
+    if published.is_empty() {
+        return InstalledSigning::Indeterminate;
+    }
+    let ours = signing::find_signing_cert(Scope::LocalMachine).and_then(|c| c.thumbprint().ok());
+    let catroot = windows_dir().join(DRIVER_CATROOT);
+    for inf in published {
+        let catalog = catroot.join(Path::new(&inf).with_extension("cat"));
+        if !catalog.exists() {
+            return InstalledSigning::Indeterminate;
+        }
+        match signing::signer_thumbprint(&catalog) {
+            Ok(Some(signer)) if Some(signer) == ours => {}
+            _ => return InstalledSigning::Other,
+        }
+    }
+    InstalledSigning::ThisMachine
+}
+
+/// What [`migrate_legacy_install`] did.
+#[derive(Debug)]
+pub enum Migration {
+    /// Already signed by this machine, or nothing installed. Any leftover legacy
+    /// certs were removed; the count says how many store entries went.
+    NotNeeded { legacy_certs_removed: usize },
+    /// The install was signed by another cert and has been re-signed.
+    Migrated,
+    /// Re-signing was needed but automatic attempts are exhausted.
+    GaveUp,
+    /// Half-installed or unreadable; left for "Reinstall drivers".
+    Skipped,
+    Failed(DeployError),
+}
+
+/// Move an install onto this machine's own signing cert, once. The helper calls
+/// this at startup, before it accepts any request, so no device of this session
+/// exists yet. **Requires elevation.**
+///
+/// When re-signing is needed, `remove_devices` runs first: installed packages
+/// can't be replaced while device nodes are bound to them, so virtual devices —
+/// including persisted ones — are recreated afterwards. That happens once per
+/// machine; later starts find the install already signed and only confirm that
+/// no legacy cert is still trusted.
+///
+/// Failed attempts are counted in the registry, and after
+/// [`MAX_MIGRATION_ATTEMPTS`] the helper stops trying, so a machine where
+/// re-signing can't succeed doesn't lose its devices on every launch.
+pub fn migrate_legacy_install(remove_devices: impl FnOnce() -> usize) -> Migration {
+    match installed_signing() {
+        InstalledSigning::NotInstalled | InstalledSigning::ThisMachine => {
+            // A manual reinstall may have succeeded after automatic attempts ran
+            // out; clear the count so a future re-sign (e.g. a replaced cert)
+            // starts fresh instead of giving up at once.
+            if registry::read_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS).unwrap_or(0) != 0 {
+                let _ = registry::write_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS, 0);
+            }
+            return Migration::NotNeeded { legacy_certs_removed: remove_legacy_trust() };
+        }
+        InstalledSigning::Indeterminate => return Migration::Skipped,
+        InstalledSigning::Other => {}
+    }
+    let attempts = registry::read_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS).unwrap_or(0);
+    if attempts >= MAX_MIGRATION_ATTEMPTS {
+        return Migration::GaveUp;
+    }
+    let _ = registry::write_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS, attempts + 1);
+    remove_devices();
+    match reinstall_driver_force() {
+        Ok(()) if installed_signing() == InstalledSigning::ThisMachine => {
+            let _ = registry::write_dword(registry::HKLM, MIGRATION_KEY, MIGRATION_ATTEMPTS, 0);
+            Migration::Migrated
+        }
+        Ok(()) => Migration::Failed(DeployError::InstallUnverified),
+        Err(e) => Migration::Failed(e),
+    }
+}
+
+/// Stage, sign, trust and install both packages, then verify. On success, retire
+/// every other FlexInput signing cert and any legacy cert: nothing installed
+/// depends on them any more.
+fn install_signed_packages() -> Result<(), DeployError> {
+    let staging = StagingDir::create()?;
+    let dir = staging.path();
+    for (name, bytes) in [
+        (MAIN_PACKAGE.binaries[0], payload::HIDMAESTRO_DLL),
+        (MAIN_PACKAGE.inf, payload::HIDMAESTRO_INF),
+        (XUSB_PACKAGE.binaries[0], payload::HMXINPUT_DLL),
+        (XUSB_PACKAGE.inf, payload::HIDMAESTRO_XUSB_INF),
+    ] {
+        std::fs::write(dir.join(name), bytes)?;
+    }
+
+    let cert = signing::ensure_signing_cert(Scope::LocalMachine)?;
+    // Read before anything is signed: retiring the other certs later must know
+    // for certain which one to keep, or it could remove the signer just used.
+    let thumb = cert.thumbprint()?;
+    signing::sign_driver_package(dir, &MAIN_PACKAGE, &cert)?;
+    signing::sign_driver_package(dir, &XUSB_PACKAGE, &cert)?;
+    for store in ["ROOT", "TrustedPublisher"] {
+        signing::add_to_store(Scope::LocalMachine, store, cert.der())?;
+    }
+
+    install_inf(&dir.join(MAIN_PACKAGE.inf))?;
+    install_inf(&dir.join(XUSB_PACKAGE.inf))?;
+    match driver_state() {
+        DriverState::Complete => {}
+        DriverState::Partial { has_main, has_xusb } => {
+            return Err(DeployError::PartialInstall { has_main, has_xusb })
+        }
+        DriverState::Missing => return Err(DeployError::InstallUnverified),
+    }
+
+    retire_signing_certs(Some(thumb));
+    remove_legacy_trust();
+    Ok(())
+}
+
+/// Remove FlexInput signing certs from `Root`, `TrustedPublisher` and `My`, and
+/// destroy their keys — all of them, or all but `keep`. Best-effort.
+fn retire_signing_certs(keep: Option<Thumbprint>) {
+    for thumb in signing::signing_cert_thumbprints(Scope::LocalMachine) {
+        if Some(thumb) == keep {
+            continue;
+        }
+        for store in ["ROOT", "TrustedPublisher"] {
+            let _ = signing::remove_from_store(Scope::LocalMachine, store, &thumb);
+        }
+        let _ = signing::delete_cert_and_key(Scope::LocalMachine, &thumb);
+    }
+}
+
+/// Remove the [`LEGACY_SIGNERS`] from `LocalMachine\Root` and `TrustedPublisher`,
+/// returning how many store entries were removed. Best-effort.
+///
+/// A legacy cert whose private key is on this machine is left alone: this is the
+/// machine it was generated on (a FlexInput or HIDMaestro build box), where it may
+/// still sign things that matter. Everywhere else FlexInput only ever added the
+/// public cert, so nothing but FlexInput's old packages relied on it.
+///
+/// Only call once no installed package is signed by a legacy cert.
+pub fn remove_legacy_trust() -> usize {
+    let mut removed = 0;
+    for thumb in &LEGACY_SIGNERS {
+        if signing::has_private_key(Scope::LocalMachine, thumb)
+            || signing::has_private_key(Scope::CurrentUser, thumb)
+        {
+            continue;
+        }
+        for store in ["ROOT", "TrustedPublisher"] {
+            if matches!(signing::remove_from_store(Scope::LocalMachine, store, thumb), Ok(true)) {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 /// `pnputil /delete-driver <oemNN.inf> /uninstall /force` for every published
@@ -174,7 +405,7 @@ pub fn uninstall_driver() -> Result<(), DeployError> {
 /// the reinstall (the post-install verify catches a real failure).
 fn uninstall_all_hidmaestro_packages() {
     let pnputil = system32().join("pnputil.exe");
-    for inf in crate::install::installed_inf_names() {
+    for inf in installed_inf_names() {
         let _ = std::process::Command::new(&pnputil)
             .arg("/delete-driver")
             .arg(&inf)
@@ -182,23 +413,6 @@ fn uninstall_all_hidmaestro_packages() {
             .arg("/force")
             .status();
     }
-}
-
-/// Stage the embedded driver payload into a temp dir and return it. pnputil
-/// needs the INF, its referenced DLL, and the `.cat` to sit together.
-fn stage_payload() -> Result<PathBuf, DeployError> {
-    let dir = std::env::temp_dir().join("flexinput_hidmaestro_driver");
-    std::fs::create_dir_all(&dir)?;
-    let write = |name: &str, bytes: &[u8]| -> Result<(), DeployError> {
-        std::fs::write(dir.join(name), bytes).map_err(DeployError::Io)
-    };
-    write("HIDMaestro.dll", payload::HIDMAESTRO_DLL)?;
-    write("hidmaestro.inf", payload::HIDMAESTRO_INF)?;
-    write("hidmaestro.cat", payload::HIDMAESTRO_CAT)?;
-    write("HMXInput.dll", payload::HMXINPUT_DLL)?;
-    write("hidmaestro_xusb.inf", payload::HIDMAESTRO_XUSB_INF)?;
-    write("hidmaestro_xusb.cat", payload::HIDMAESTRO_XUSB_CAT)?;
-    Ok(dir)
 }
 
 /// `pnputil /add-driver <inf> /install`. Success is verified by the caller via
@@ -218,90 +432,125 @@ fn install_inf(inf: &Path) -> Result<(), DeployError> {
     Ok(())
 }
 
-/// Add the vendored signer cert(s) to LocalMachine `Root` + `TrustedPublisher`
-/// so Windows accepts the catalog-signed driver packages. Idempotent (adding an
-/// existing cert is a no-op / benign).
+/// A fresh, randomly named directory under `%windir%\Temp` that only
+/// Administrators and SYSTEM can open, removed again on drop.
 ///
-/// Two certs because the package is signed by two: the upstream
-/// `HIDMaestroTestCert` over the main HID driver, and FlexInput's own cert over
-/// the rebuilt XUSB companion (see [`payload::COMPANION_SIGNER_CERT`]). Both must
-/// be trusted or one of the two `pnputil /add-driver` calls would fail catalog
-/// validation.
-fn trust_signer_cert() -> Result<(), DeployError> {
-    add_cert_to_store("ROOT", payload::SIGNER_CERT)?;
-    add_cert_to_store("TrustedPublisher", payload::SIGNER_CERT)?;
-    add_cert_to_store("ROOT", payload::COMPANION_SIGNER_CERT)?;
-    add_cert_to_store("TrustedPublisher", payload::COMPANION_SIGNER_CERT)?;
-    Ok(())
-}
+/// The protection is load-bearing now that packages are signed here. Anyone able
+/// to write to the staging directory could swap a driver binary between staging
+/// and cataloguing, and the helper would sign the replacement into a trusted
+/// catalog — code that then loads as a driver. The old staging spot, the user's
+/// `%TEMP%`, is writable by the unelevated user; it was only safe while the
+/// catalogs arrived pre-signed, when a swapped file just failed validation.
+///
+/// The DACL is set as the directory is created, so there's no window where it's
+/// open; the random name means no one can create it first; and creation fails
+/// rather than reusing a directory that already exists. It also keeps the path
+/// plain ASCII, which the catalog builder needs — a user profile path may not be.
+struct StagingDir(PathBuf);
 
-// ── Win32 cert-store FFI (crypt32) ──────────────────────────────────────────
-const CERT_STORE_PROV_SYSTEM_W: usize = 10;
-const CERT_SYSTEM_STORE_LOCAL_MACHINE: u32 = 2 << 16;
-const X509_ASN_ENCODING: u32 = 0x0000_0001;
-const PKCS_7_ASN_ENCODING: u32 = 0x0001_0000;
-const CERT_STORE_ADD_REPLACE_EXISTING: u32 = 3;
+impl StagingDir {
+    /// Protected DACL: full control for SYSTEM and Administrators, inherited by
+    /// everything created inside; no other principal gets any access.
+    const SDDL: &'static str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
-#[link(name = "crypt32")]
-extern "system" {
-    fn CertOpenStore(
-        store_provider: usize,
-        encoding: u32,
-        crypt_prov: *mut c_void,
-        flags: u32,
-        para: *const u16,
-    ) -> *mut c_void;
-    fn CertAddEncodedCertificateToStore(
-        cert_store: *mut c_void,
-        encoding: u32,
-        cert_encoded: *const u8,
-        cert_encoded_len: u32,
-        add_disposition: u32,
-        cert_context: *mut *const c_void,
-    ) -> i32;
-    fn CertCloseStore(cert_store: *mut c_void, flags: u32) -> i32;
-}
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetLastError() -> u32;
-}
-
-fn add_cert_to_store(store_name: &'static str, cert_der: &[u8]) -> Result<(), DeployError> {
-    let wname: Vec<u16> = store_name.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let store = CertOpenStore(
-            CERT_STORE_PROV_SYSTEM_W,
-            0,
-            std::ptr::null_mut(),
-            CERT_SYSTEM_STORE_LOCAL_MACHINE,
-            wname.as_ptr(),
-        );
-        if store.is_null() {
-            return Err(DeployError::CertStore(store_name, GetLastError()));
+    fn create() -> Result<StagingDir, DeployError> {
+        let parent = windows_dir().join("Temp");
+        let sddl: Vec<u16> = Self::SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut())
+        };
+        if converted == 0 {
+            return Err(DeployError::Staging(unsafe { GetLastError() }));
         }
-        let ok = CertAddEncodedCertificateToStore(
-            store,
-            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-            cert_der.as_ptr(),
-            cert_der.len() as u32,
-            CERT_STORE_ADD_REPLACE_EXISTING,
-            std::ptr::null_mut(),
-        );
-        let err = if ok == 0 { GetLastError() } else { 0 };
-        CertCloseStore(store, 0);
-        if ok == 0 {
-            return Err(DeployError::CertStore(store_name, err));
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let result = (|| {
+            // A collision is astronomically unlikely, but retrying costs nothing.
+            for _ in 0..4 {
+                let path = parent.join(format!("FlexInputDriver-{}", random_hex(16)?));
+                let wide = wide_nul(&path);
+                if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } != 0 {
+                    return Ok(StagingDir(path));
+                }
+                let err = unsafe { GetLastError() };
+                if err != ERROR_ALREADY_EXISTS {
+                    return Err(DeployError::Staging(err));
+                }
+            }
+            Err(DeployError::Staging(ERROR_ALREADY_EXISTS))
+        })();
+        unsafe {
+            LocalFree(descriptor);
         }
+        result
     }
-    Ok(())
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        // pnputil has copied what it needs into the DriverStore by now.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn wide_nul(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn random_hex(bytes: usize) -> Result<String, DeployError> {
+    let mut buf = vec![0u8; bytes];
+    let status = unsafe {
+        BCryptGenRandom(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+    };
+    if status < 0 {
+        return Err(DeployError::Staging(status as u32));
+    }
+    Ok(signing::hex(&buf))
+}
+
+/// The Windows directory, from the OS rather than `%SystemRoot%`. The helper runs
+/// elevated but inherits its environment from the launching user, who can shadow
+/// that variable; it decides which `pnputil.exe` runs and where packages are staged.
+fn windows_dir() -> PathBuf {
+    let mut buf = [0u16; 260];
+    let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n > buf.len() {
+        return PathBuf::from(r"C:\Windows");
+    }
+    PathBuf::from(String::from_utf16_lossy(&buf[..n]))
 }
 
 fn system32() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("System32")
+    windows_dir().join("System32")
+}
+
+const fn thumbprint(hex: &str) -> Thumbprint {
+    const fn nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'A'..=b'F' => c - b'A' + 10,
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("thumbprint: not a hex digit"),
+        }
+    }
+    let b = hex.as_bytes();
+    assert!(b.len() == 40, "thumbprint: expected 40 hex digits");
+    let mut out = [0u8; 20];
+    let mut i = 0;
+    while i < 20 {
+        out[i] = (nibble(b[2 * i]) << 4) | nibble(b[2 * i + 1]);
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -312,10 +561,66 @@ mod tests {
     fn payload_embedded_and_nonempty() {
         // The driver files must be present at compile time.
         assert!(payload::HIDMAESTRO_DLL.len() > 10_000);
-        assert!(payload::HIDMAESTRO_INF.windows(4).any(|w| w == b".dll" || w == b".DLL")
-            || !payload::HIDMAESTRO_INF.is_empty());
-        assert!(payload::SIGNER_CERT.len() > 100);
-        assert!(payload::COMPANION_SIGNER_CERT.len() > 100);
         assert!(payload::HMXINPUT_DLL.len() > 10_000);
+        assert!(!payload::HIDMAESTRO_INF.is_empty());
+        assert!(!payload::HIDMAESTRO_XUSB_INF.is_empty());
+    }
+
+    /// INF text, whether the file is UTF-16LE or UTF-8.
+    fn inf_text(inf: &[u8]) -> String {
+        if inf.starts_with(&[0xFF, 0xFE]) {
+            let units: Vec<u16> = inf[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(inf).into_owned()
+        }
+    }
+
+    /// Hardware IDs declared in an INF's `[Standard.*]` models sections, in order.
+    fn inf_hardware_ids(inf: &[u8]) -> Vec<String> {
+        let text = inf_text(inf);
+        let mut ids = Vec::new();
+        let mut in_models = false;
+        for line in text.lines() {
+            let line = line.split(';').next().unwrap_or("").trim();
+            if line.starts_with('[') {
+                in_models = line.to_ascii_lowercase().starts_with("[standard.");
+                continue;
+            }
+            if in_models {
+                if let Some((_, rhs)) = line.split_once('=') {
+                    ids.extend(rhs.split(',').skip(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn package_hardware_ids_match_their_infs() {
+        for (pkg, inf) in [(&MAIN_PACKAGE, payload::HIDMAESTRO_INF), (&XUSB_PACKAGE, payload::HIDMAESTRO_XUSB_INF)] {
+            let declared: Vec<String> = inf_hardware_ids(inf).iter().map(|s| s.to_ascii_lowercase()).collect();
+            let listed: Vec<String> = pkg.hardware_ids.iter().map(|s| s.to_ascii_lowercase()).collect();
+            assert_eq!(listed, declared, "{} hardware ids drifted from the INF", pkg.inf);
+        }
+    }
+
+    #[test]
+    fn package_inf_names_its_catalog() {
+        for (pkg, inf) in [(&MAIN_PACKAGE, payload::HIDMAESTRO_INF), (&XUSB_PACKAGE, payload::HIDMAESTRO_XUSB_INF)] {
+            let text: String = inf_text(inf).to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                text.contains(&format!("catalogfile={}", pkg.catalog)),
+                "{} doesn't name {}",
+                pkg.inf,
+                pkg.catalog
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_thumbprints_parse() {
+        assert_eq!(LEGACY_SIGNERS[0][0], 0x43);
+        assert_eq!(LEGACY_SIGNERS[1][19], 0x68);
     }
 }
