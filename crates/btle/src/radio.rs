@@ -69,6 +69,16 @@ const QUEUE_LIMIT: usize = 512;
 
 struct Sub {
     id: usize,
+    /// Whether this subscriber is sent LE advertising reports at all.
+    ///
+    /// ⛔ **A transport that never reads adverts must not be sent them.** The
+    /// queue is bounded and drops its OLDEST entry when full, and a continuous
+    /// LE scan produces hundreds of reports a second in an ordinary room. The
+    /// Bluetooth Classic transport has no use for a single one — but it was
+    /// queueing all of them, so the thing sitting oldest in its queue when the
+    /// flood arrived, a bonded controller's Connection Request, was the thing
+    /// evicted to make room.
+    adverts: bool,
     queue: Mutex<VecDeque<Inbound>>,
     signal: Condvar,
     dropped: AtomicUsize,
@@ -92,7 +102,11 @@ struct Bus {
 impl Bus {
     fn broadcast(&self, item: Inbound) {
         let subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
+        let is_advert = matches!(item, Inbound::Event(Event::LeAdvertisingReport(_)));
         for s in subs.iter() {
+            if is_advert && !s.adverts {
+                continue;
+            }
             let mut q = s.queue.lock().unwrap_or_else(|e| e.into_inner());
             if q.len() >= QUEUE_LIMIT {
                 q.pop_front();
@@ -104,8 +118,13 @@ impl Bus {
     }
 
     fn add(&self) -> Arc<Sub> {
+        self.add_with(true)
+    }
+
+    fn add_with(&self, adverts: bool) -> Arc<Sub> {
         let sub = Arc::new(Sub {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            adverts,
             queue: Mutex::new(VecDeque::new()),
             signal: Condvar::new(),
             dropped: AtomicUsize::new(0),
@@ -554,6 +573,20 @@ pub fn subscribe(radio: &Arc<Radio>) -> Subscriber {
     }
 }
 
+/// Subscribe a transport that has no use for LE advertising reports.
+///
+/// See `Sub::adverts`: a Bluetooth Classic transport sharing a radio with an LE
+/// scan would otherwise have its bounded queue flooded with reports it throws
+/// away, and lose the events it does need to the eviction.
+pub fn subscribe_without_adverts(radio: &Arc<Radio>) -> Subscriber {
+    let sub = radio.bus.add_with(false);
+    Subscriber {
+        radio: Arc::clone(radio),
+        sub,
+        stash: Mutex::new(VecDeque::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +621,43 @@ mod tests {
     /// growth or back-pressure here would turn one wedged transport into two.
     /// Dropping the oldest is the right failure: input is disposable, a stalled
     /// radio is not.
+    /// A minimal advertising report, for flooding a queue with.
+    fn advert() -> Inbound {
+        Inbound::Event(Event::LeAdvertisingReport(crate::hci::AdvReport {
+            event_type: 0,
+            address_type: 0,
+            address: [0; 6],
+            data: Vec::new(),
+            rssi: 0,
+        }))
+    }
+
+    /// ⛔ The reconnection bug, as a test. A subscriber that opted out of
+    /// adverts must still hold a Connection Request after an LE scan's worth of
+    /// reports has gone past — which, sharing the queue with them, it did not.
+    #[test]
+    fn an_advert_flood_cannot_evict_a_connection_request() {
+        let bus = Bus::default();
+        let classic = bus.add_with(false);
+        let le = bus.add_with(true);
+        bus.broadcast(Inbound::Event(Event::ConnectionRequest {
+            address: [1, 2, 3, 4, 5, 6],
+            class_of_device: [0; 3],
+            link_type: 1,
+        }));
+        for _ in 0..(QUEUE_LIMIT * 4) {
+            bus.broadcast(advert());
+        }
+        assert_eq!(classic.dropped.load(Ordering::Relaxed), 0, "classic dropped something");
+        assert!(
+            matches!(take(&classic), Some(Inbound::Event(Event::ConnectionRequest { .. }))),
+            "the Connection Request was evicted by adverts it never wanted"
+        );
+        assert!(take(&classic).is_none(), "classic was sent adverts it opted out of");
+        // The LE transport still gets its adverts — opting out is per subscriber.
+        assert!(le.queue.lock().unwrap().len() == QUEUE_LIMIT);
+    }
+
     #[test]
     fn a_subscriber_that_falls_behind_drops_rather_than_blocks() {
         let bus = Bus::default();

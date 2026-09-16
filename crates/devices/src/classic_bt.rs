@@ -524,6 +524,15 @@ fn run_inner(shared: &Arc<Shared>) {
                     // this the pad blinks, pages a deaf radio, and gives up.
                     // Page scan only: our own controllers can find us, a
                     // general inquiry cannot.
+                    // ⛔ Listen OFTEN, not at the controller's default. After a
+                    // reset it listens 11.25 ms every 1.28 s, and a switched-on
+                    // pad pages for only a few seconds — so whether it got
+                    // through was luck. See `Dongle::set_fast_connectable`.
+                    if let Err(e) = r.with_dongle(|d| d.set_fast_connectable()) {
+                        eprintln!(
+                            "[bt-classic] fast page scan refused ({e}) — paired                              controllers may take several attempts to reconnect"
+                        );
+                    }
                     match r.with_dongle(|d| {
                         d.set_scan_enable(0x02).and_then(|()| d.read_scan_enable())
                     }) {
@@ -541,7 +550,10 @@ fn run_inner(shared: &Arc<Shared>) {
                         Err(e) => eprintln!("[bt-classic] could not enable page scan: {e}"),
                     }
                     warn_about_foreign_keys(&r, &known);
-                    sub = Some(flexinput_btle::radio::subscribe(&r));
+                    // Without adverts: this transport reads none, and a
+                    // Joy-Con scan's flood of them evicted the Connection
+                    // Requests it does need. See `radio::subscribe_without_adverts`.
+                    sub = Some(flexinput_btle::radio::subscribe_without_adverts(&r));
                     shared.yielded.store(false, Ordering::Relaxed);
                     radio = Some(r);
                 }

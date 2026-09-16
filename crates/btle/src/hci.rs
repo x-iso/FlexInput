@@ -142,6 +142,20 @@ impl Opcode {
     /// picking up.
     pub const READ_SCAN_ENABLE: Opcode = Opcode::new(0x03, 0x0019);
     pub const WRITE_SCAN_ENABLE: Opcode = Opcode::new(0x03, 0x001A);
+    /// How often, and for how long, the radio listens for pages.
+    ///
+    /// ⛔ **Never left at the default.** After `HCI_Reset` a controller listens
+    /// for 11.25 ms every 1.28 s — under 1% of the time — which is tuned for a
+    /// phone saving battery, not a USB dongle whose whole job is to be found.
+    /// A bonded pad pages its host for a few seconds when switched on, and at
+    /// the default rate whether it lands inside one of those windows is luck.
+    pub const WRITE_PAGE_SCAN_ACTIVITY: Opcode = Opcode::new(0x03, 0x001C);
+    /// Standard or INTERLACED page scan.
+    ///
+    /// Interlaced listens on both halves of the page train in consecutive
+    /// windows, so a pager that does not yet know our clock is heard within one
+    /// interval instead of up to two.
+    pub const WRITE_PAGE_SCAN_TYPE: Opcode = Opcode::new(0x03, 0x0047);
     /// How long a page attempt keeps trying, in 0.625 ms slots.
     ///
     /// ❗ Worth setting rather than inheriting. The default varies by
@@ -959,6 +973,8 @@ mod inquiry_tests {
         assert_eq!(Opcode::CREATE_CONNECTION.0, 0x0405);
         assert_eq!(Opcode::CREATE_CONNECTION_CANCEL.0, 0x0408);
         assert_eq!(Opcode::READ_SCAN_ENABLE.0, 0x0C19);
+        assert_eq!(Opcode::WRITE_PAGE_SCAN_ACTIVITY.0, 0x0C1C);
+        assert_eq!(Opcode::WRITE_PAGE_SCAN_TYPE.0, 0x0C47);
         assert_eq!(Opcode::LINK_KEY_REQUEST_REPLY.0, 0x040B);
         assert_eq!(Opcode::LINK_KEY_REQUEST_NEGATIVE_REPLY.0, 0x040C);
         assert_eq!(Opcode::AUTHENTICATION_REQUESTED.0, 0x0411);

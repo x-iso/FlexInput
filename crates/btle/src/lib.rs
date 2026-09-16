@@ -723,20 +723,63 @@ impl Dongle {
         // succeeded; we simply stopped listening too early and reported
         // "no Command Complete within timeout".
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            match self.read_event_timeout(Duration::from_millis(100))? {
-                Some(Event::CommandComplete(cc)) if cc.opcode == opcode => return Ok(cc),
-                // Unrelated events are skipped rather than treated as failures —
-                // a dongle emits plenty unprompted, and the earlier Joy-Con work
-                // was repeatedly misled by validators that locked onto the first
-                // thing they saw.
-                _ => continue,
+        // ⛔ **Passed over, NOT thrown away.**
+        //
+        // This used to `continue` past every event that was not its Command
+        // Complete, and that silently destroyed them. A command runs inside a
+        // radio lease, and while a lease is held the shared reader is stopped —
+        // so an event read here is invisible to every other transport unless it
+        // is put back. The one that mattered most was a bonded controller's
+        // `Connection Request`: arriving while anyone's command awaited its
+        // reply, it was eaten, the controller heard nothing, gave up and retried
+        // from scratch. That is reconnection by luck, with nothing in any log.
+        //
+        // ❗ Put back AFTER the wait, never during it. Re-queueing inside the
+        // loop would hand the same events straight back to the next read, which
+        // takes queued events before the wire — so this would spin on them and
+        // never see its own reply.
+        //
+        // Advertising reports are the exception, and are dropped. They repeat
+        // constantly, a continuous LE scan produces hundreds a second, and
+        // keeping them would only bury the events that cannot be repeated.
+        let mut passed_over: Vec<Event> = Vec::new();
+        let outcome = loop {
+            if std::time::Instant::now() >= deadline {
+                break Err(Error::Protocol(format!(
+                    "no Command Complete for {opcode:?} within 2 s"
+                )));
             }
-        }
-        Err(Error::Protocol(format!(
-            "no Command Complete for {opcode:?} within 2 s"
-        )))
+            match self.read_event_timeout(Duration::from_millis(100)) {
+                Ok(Some(Event::CommandComplete(cc))) if cc.opcode == opcode => break Ok(cc),
+                Ok(Some(other)) => hold_back(&mut passed_over, other),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.push_events_front(passed_over);
+        outcome
     }
+}
+
+/// Most events a single command wait holds back for others.
+///
+/// Generous — outside advertising, a controller emits a handful of events a
+/// second — and bounded only so a wedged controller cannot grow it without
+/// limit.
+const PASSED_OVER_LIMIT: usize = 256;
+
+/// Hold an event back for the other transports, unless nobody could want it.
+///
+/// ⭐ The one rule every wait loop under a lease follows, so it exists once.
+/// Advertising reports are dropped: they repeat constantly and a continuous LE
+/// scan produces hundreds a second. Everything else — a calling controller's
+/// Connection Request above all — is kept, up to a bound a wedged controller
+/// cannot exceed.
+fn hold_back(passed_over: &mut Vec<Event>, e: Event) {
+    if matches!(e, Event::LeAdvertisingReport(_)) || passed_over.len() >= PASSED_OVER_LIMIT {
+        return;
+    }
+    passed_over.push(e);
 }
 
 impl Dongle {
@@ -1030,9 +1073,33 @@ impl Dongle {
         // one's result, handing the caller a handle that is already in use —
         // and two "links" reading the same stream look exactly like two working
         // controllers until you notice their frames are byte-identical.
-        while let Ok(Some(_)) = self.read_event_timeout(Duration::from_millis(2)) {}
+        //
+        // ⛔ Only LE connection results are stale here. This used to discard
+        // EVERY queued event, and the radio is shared: a Bluetooth Classic
+        // controller calling us at that moment had its Connection Request
+        // thrown away along with the advertising reports.
+        let mut kept: Vec<Event> = Vec::new();
+        while let Ok(Some(e)) = self.read_event_timeout(Duration::from_millis(2)) {
+            match e {
+                Event::LeConnectionComplete { .. } => {}
+                other => hold_back(&mut kept, other),
+            }
+        }
+        let result = self
+            .send_command(hci::Opcode::LE_CREATE_CONNECTION, &p)
+            .and_then(|()| self.await_le_connection(&mut kept));
+        // ❗ Put back only now, on every outcome. Re-queued earlier, they would
+        // sit in front of the connection result and be read first.
+        self.push_events_front(kept);
+        result
+    }
 
-        self.send_command(hci::Opcode::LE_CREATE_CONNECTION, &p)?;
+    /// Wait for the outcome of an `LE_Create_Connection` already sent.
+    ///
+    /// Anything else that arrives meanwhile goes into `passed_over` for the
+    /// caller to hand back — this wait can last ten seconds, and an event
+    /// swallowed for ten seconds on a shared radio is an event lost.
+    fn await_le_connection(&self, passed_over: &mut Vec<Event>) -> Result<LinkParams> {
 
         // Short reads, not the default 2 s. A refused parameter set answers
         // with Command Status and then nothing, so 40 iterations of a 2 s
@@ -1069,7 +1136,7 @@ impl Dongle {
                     );
                     return Ok(LinkParams { conn_handle, interval, supervision_timeout });
                 }
-                Some(_) => continue,
+                Some(other) => hold_back(passed_over, other),
                 None => continue,
             }
         }
@@ -2026,6 +2093,47 @@ impl Dongle {
         }
     }
 
+    /// Listen for pages often enough that a bonded controller connects at once.
+    ///
+    /// ⭐ **The difference between reconnecting instantly and reconnecting by
+    /// luck.** A switched-on controller pages its host for a few seconds and
+    /// then gives up. After `HCI_Reset` this radio listened for 11.25 ms every
+    /// 1.28 s, standard scan — so the page had to land inside a window open
+    /// under 1% of the time, while the same radio was also serving an LE scan.
+    ///
+    /// These are BlueZ's "fast connectable" values: INTERLACED scan, a window
+    /// every 160 ms. Interlaced covers both halves of the page train in
+    /// back-to-back windows, so a pager that does not know our clock is still
+    /// heard within one interval. BlueZ pays for this in battery on a laptop;
+    /// a USB dongle pays nothing.
+    ///
+    /// ❗ Checked, not assumed. A controller that refuses either command is
+    /// reported, because a silent refusal here is indistinguishable from the
+    /// original bug.
+    pub fn set_fast_connectable(&self) -> Result<()> {
+        const INTERVAL: u16 = 0x0100; // 256 x 0.625 ms = 160 ms
+        const WINDOW: u16 = 0x0012; //    18 x 0.625 ms = 11.25 ms
+        const INTERLACED: u8 = 0x01;
+        let mut p = Vec::with_capacity(4);
+        p.extend_from_slice(&INTERVAL.to_le_bytes());
+        p.extend_from_slice(&WINDOW.to_le_bytes());
+        let cc = self.command_sync(Opcode::WRITE_PAGE_SCAN_ACTIVITY, &p)?;
+        if !cc.succeeded() {
+            return Err(Error::Protocol(format!(
+                "page scan activity refused: status {:#04x}",
+                cc.status().unwrap_or(0xFF)
+            )));
+        }
+        let cc = self.command_sync(Opcode::WRITE_PAGE_SCAN_TYPE, &[INTERLACED])?;
+        if !cc.succeeded() {
+            return Err(Error::Protocol(format!(
+                "interlaced page scan refused: status {:#04x}",
+                cc.status().unwrap_or(0xFF)
+            )));
+        }
+        Ok(())
+    }
+
     /// What the controller's scan state ACTUALLY is: bit 0 inquiry, bit 1 page.
     ///
     /// ⭐ Ground truth rather than "we sent the command". Worth having because
@@ -2685,5 +2793,72 @@ mod adapter_tests {
             ),
             None => assert!(discover().iter().all(|d| !d.available && !d.ours)),
         }
+    }
+}
+
+#[cfg(test)]
+mod hold_back_tests {
+    use super::{hold_back, Event, PASSED_OVER_LIMIT};
+
+    fn advert() -> Event {
+        Event::LeAdvertisingReport(crate::hci::AdvReport {
+            event_type: 0,
+            address_type: 0,
+            address: [0; 6],
+            data: Vec::new(),
+            rssi: 0,
+        })
+    }
+
+    fn request(last: u8) -> Event {
+        Event::ConnectionRequest {
+            address: [0, 0, 0, 0, 0, last],
+            class_of_device: [0; 3],
+            link_type: 1,
+        }
+    }
+
+    #[test]
+    fn a_connection_request_is_kept_for_the_other_transports() {
+        // ⛔ The reconnection bug. A command waiting for its reply used to drop
+        // this on the floor, inside a lease, where no other transport could
+        // ever see it again.
+        let mut held = Vec::new();
+        hold_back(&mut held, request(1));
+        assert!(matches!(held.as_slice(), [Event::ConnectionRequest { .. }]));
+    }
+
+    #[test]
+    fn advertising_reports_are_dropped() {
+        let mut held = Vec::new();
+        for _ in 0..1000 {
+            hold_back(&mut held, advert());
+        }
+        assert!(held.is_empty(), "a scan's worth of adverts would bury what matters");
+    }
+
+    #[test]
+    fn order_is_preserved_among_the_kept() {
+        let mut held = Vec::new();
+        hold_back(&mut held, request(1));
+        hold_back(&mut held, advert());
+        hold_back(&mut held, request(2));
+        let lasts: Vec<u8> = held
+            .iter()
+            .map(|e| match e {
+                Event::ConnectionRequest { address, .. } => address[5],
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(lasts, vec![1, 2]);
+    }
+
+    #[test]
+    fn the_hold_is_bounded() {
+        let mut held = Vec::new();
+        for i in 0..(PASSED_OVER_LIMIT + 50) {
+            hold_back(&mut held, request(i as u8));
+        }
+        assert_eq!(held.len(), PASSED_OVER_LIMIT);
     }
 }
