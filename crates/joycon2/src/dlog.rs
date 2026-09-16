@@ -297,46 +297,6 @@ pub(crate) fn drift(args: std::fmt::Arguments) {
 /// be found, read and mailed by someone who is not going to be walked through
 /// AppData. Delete this function and its call site when the question is
 /// answered. `FLEXINPUT_JC2_IMU_LOG` overrides the path, `off` disables it.
-/// Whether the raw per-report capture is switched on.
-pub(crate) fn capturing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("FLEXINPUT_JC2_CAPTURE").is_ok_and(|v| v.eq_ignore_ascii_case("on"))
-    })
-}
-
-/// One CSV row of RAW report data, at full report rate.
-///
-/// ⭐ **Every attempt to fix this gyro has worked on the derived signal.** The
-/// angle fields have been modelled as wrapping twice per turn, spike-limited,
-/// smoothed and drift-corrected — and the reported symptoms are still mirrored
-/// bounces and teleports, which are signatures of the ENCODING, not of noise.
-///
-/// ❗ Two-second diagnostic samples cannot settle it. A wrap and a fold produce
-/// the identical value RANGE and are told apart only by what happens across the
-/// boundary: a wrap is a discontinuity in the value with a continuous
-/// derivative, a fold is a continuous value whose derivative flips sign. Seeing
-/// that needs consecutive reports, so it needs this.
-///
-/// Written raw and unprocessed on purpose — no permutation, no mount
-/// correction, no scaling. Every one of those is a hypothesis, and a capture
-/// that bakes in the hypotheses cannot test them.
-pub(crate) fn capture(args: std::fmt::Arguments) {
-    static SINK: std::sync::OnceLock<Option<Sink>> = std::sync::OnceLock::new();
-    let sink = SINK.get_or_init(|| {
-        let s = Sink::open("jc2-raw-capture.csv", "FLEXINPUT_JC2_CAPTURE_FILE", true);
-        if let Some(s) = &s {
-            eprintln!("[jc2] raw capture: {}", s.path().display());
-            s.write("host_us,side,dev_ticks,f0,f1,f2,ax,ay,az,motion_len");
-        }
-        s
-    });
-    let Some(sink) = sink else { return };
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    let t = START.get_or_init(Instant::now).elapsed().as_micros();
-    sink.write(&format!("{t},{args}"));
-}
-
 pub(crate) fn imu(args: std::fmt::Arguments) {
     static SINK: std::sync::OnceLock<Option<Sink>> = std::sync::OnceLock::new();
     let sink = SINK.get_or_init(|| {

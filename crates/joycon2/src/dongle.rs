@@ -39,7 +39,6 @@ use crate::reports::{self, OrientationTracker, PadSnapshot, StickCalib};
 /// Most halves to hold at once. Two is a full pair.
 const MAX_LINKS: usize = 2;
 
-
 /// Spacing between the fire-and-forget init writes.
 ///
 /// Waiting on each reply is what once turned a millisecond handshake into ~40 s
@@ -47,24 +46,12 @@ const MAX_LINKS: usize = 2;
 /// having never seen a completed init.
 const INIT_GAP: Duration = Duration::from_millis(30);
 
-/// How long to wait for a Write Response during init.
-///
-/// ⛔ **Init is a race against [`INPUT_TIMEOUT`], and I lost it.**
-///
-/// Acknowledged writes were introduced so a refused command would say so
-/// instead of vanishing, which was right — but at 400-600 ms each, four of
-/// them plus a 600 ms discovery walk put more than two seconds of blocking
-/// waits in front of a three-second watchdog. Observed as controllers
-/// reconnecting in a loop, and on one attempt as every single write returning
-/// NO REPLY: a link too busy being set up to answer anything.
-///
-/// A controller that is going to acknowledge does it in milliseconds. Waiting
-/// longer does not make a refusal more likely to arrive; it only makes the
-/// link less likely to survive long enough to hear it.
-const ATT_ACK_WAIT: Duration = Duration::from_millis(120);
-
 /// Longest gap between input notifications before a link is written off.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// First and longest gap between attempts to start a scan that was refused.
+const SCAN_RETRY_MIN: Duration = Duration::from_millis(200);
+const SCAN_RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Shared {
@@ -102,107 +89,12 @@ struct Shared {
 }
 
 /// A live connection to one half.
-/// Watches the mouse delta fields for signs of being a gyroscope in disguise.
-///
-/// ⭐ **The question is where this controller's angular rate actually lives.**
-/// A retail Joy-Con 2 has a real optical sensor: slide it on a desk and it
-/// reports surface motion. A third-party unit that lacks that sensor but must
-/// still satisfy a Switch 2 has an obvious shortcut — synthesise the deltas
-/// from the gyro. Projecting 3DOF onto two axes would pass unnoticed in
-/// ordinary use, and it would mean the rate we have been reconstructing by
-/// differentiating a quantised heading has been sitting in the report all
-/// along, already differentiated by the firmware.
-///
-/// ❗ The discriminator is motion IN THE AIR. An optical sensor with nothing in
-/// front of it produces nothing; a gyro-derived one tracks rotation regardless.
-/// So the numbers here are only meaningful against a stated gesture, which is
-/// why the log line says what it is measuring rather than just printing deltas.
-#[derive(Debug, Default)]
-struct MouseProbe {
-    window_began: Option<Instant>,
-    reports: u32,
-    moved: u32,
-    sum_abs: [u64; 2],
-    peak: [i16; 2],
-    /// Every distinct liftoff byte seen, OR-ed. A sensor that never leaves a
-    /// surface it does not have should hold this constant.
-    liftoff_bits: u8,
-}
-
-impl MouseProbe {
-    /// Fold in one report; returns a summary every `window`.
-    fn tick(&mut self, m: &reports::Mouse, now: Instant, window: Duration) -> Option<String> {
-        let began = *self.window_began.get_or_insert(now);
-        self.reports += 1;
-        if m.delta_x != 0 || m.delta_y != 0 {
-            self.moved += 1;
-        }
-        self.sum_abs[0] += m.delta_x.unsigned_abs() as u64;
-        self.sum_abs[1] += m.delta_y.unsigned_abs() as u64;
-        if m.delta_x.abs() > self.peak[0].abs() {
-            self.peak[0] = m.delta_x;
-        }
-        if m.delta_y.abs() > self.peak[1].abs() {
-            self.peak[1] = m.delta_y;
-        }
-        self.liftoff_bits |= m.liftoff;
-        if now.duration_since(began) < window || self.reports == 0 {
-            return None;
-        }
-        let out = format!(
-            "mouse over {} reports: {} moved, sum |dx| {} |dy| {}, peak {:+} {:+}, \
-             liftoff bits {:#04x} — {}",
-            self.reports,
-            self.moved,
-            self.sum_abs[0],
-            self.sum_abs[1],
-            self.peak[0],
-            self.peak[1],
-            self.liftoff_bits,
-            if self.moved == 0 {
-                "DEAD (no optical sensor, or the feature bit did not take)"
-            } else {
-                "LIVE - compare against whether it was on a surface"
-            },
-        );
-        *self = MouseProbe { window_began: Some(now), ..Default::default() };
-        Some(out)
-    }
-}
-
 struct Link {
     key: PadKey,
     conn: u16,
-    /// Resolved from THIS controller's table — see `resolve_handles`. Matching
-    /// notifications against the captured constants instead would drop a
-    /// stream that discovery had just found at a different number.
-    handles: Handles,
     calib: StickCalib,
     orientation: OrientationTracker,
-    /// ⏳ TEMPORARY — slow timer for the 0x000a presence line.
-    common_probe: Instant,
-    /// ⏳ TEMPORARY — slow timer for the whole-frame dump.
-    frame_dump: Instant,
-    /// Latest real gyro (and its accel) from the common input, if it streams.
-    common_motion: Option<([i16; 3], Option<[i16; 3]>)>,
-    /// True when the per-side stream was never subscribed, so the common
-    /// characteristic is the only source of input for this link.
-    common_only: bool,
     last_input: Instant,
-    /// Inter-report timing, for the gyro-jitter diagnostic.
-    cadence: flexinput_btle::cadence::Cadence,
-    /// Mouse-delta watch, live only when the feature bit is set.
-    mouse_probe: MouseProbe,
-    /// Reports parsed on this link, for the backoff in the motion diagnostic.
-    reports: u32,
-    /// Notifications on the previously unsubscribed streams — see
-    /// `jc::HANDLE_INPUT_EXTRA`.
-    extra_reports: u32,
-    /// Command replies seen. Logged during init and then left alone.
-    replies: u32,
-    /// Notifications seen on the COMMON input characteristic, which has never
-    /// produced one. Counted separately so the first is unmistakable.
-    common_reports: u32,
     /// Reports that failed to parse. Silent failure here reads as a dead
     /// controller everywhere downstream, so it is counted and reported.
     unparsed: u32,
@@ -303,256 +195,6 @@ impl Drop for Joycon2DongleHub {
             eprintln!("[jc2-dongle] worker did not finish in time — leaving it detached");
         }
     }
-}
-
-/// Feature mask to send during init, or `None` to skip the command entirely.
-///
-/// Defaults to sending [`protocol::feature::JOYCON2_DEFAULT`]. Skipping it was
-/// tried, on the grounds that no working reference sends one to enable motion,
-/// and this controller then withholds motion completely — see the body.
-///
-/// `FLEXINPUT_JC2_FEATURES` takes a hex byte (`2f`, `37`, `10`, `04`, …) to try
-/// a different mask, or `off` to skip the command, without a rebuild.
-/// Parse `FLEXINPUT_JC2_FEATURES` into the masks to sweep.
-///
-/// Split out from [`feature_override`] purely so it can be tested: the rest of
-/// that function reads the environment and advances a global counter, and a
-/// parse slip there costs a hardware run on someone else's hands rather than a
-/// red test.
-fn parse_feature_masks(raw: &str) -> Vec<u8> {
-    raw.split(',')
-        .filter_map(|t| {
-            let t = t.trim();
-            let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
-            u8::from_str_radix(t, 16).ok()
-        })
-        .collect()
-}
-
-/// Whether this run asked for the mouse feature.
-///
-/// Separate from the mask so the probe can be turned on without hand-building a
-/// mask byte and getting the bit wrong — the sweep already showed how easily a
-/// run gets spent testing a condition nobody meant to set.
-fn mouse_enabled() -> bool {
-    std::env::var("FLEXINPUT_JC2_MOUSE").is_ok_and(|v| v.eq_ignore_ascii_case("on"))
-}
-
-fn feature_override() -> Option<u8> {
-    let Ok(raw) = std::env::var("FLEXINPUT_JC2_FEATURES") else {
-        // ⭐ Default is to SEND it. Skipping was tried and the controller then
-        // reports `motion_len = 0` forever: input notifications keep arriving
-        // with the counter climbing, but the motion block is absent entirely.
-        // So on this hardware the feature command is what enables motion at
-        // all — it is not merely selecting a format.
-        // ❗ The mouse switch has to survive this early return too, or
-        // `FLEXINPUT_JC2_MOUSE=on` alone silently probes a feature that was
-        // never enabled — a dead reading that looks like an answer.
-        return Some(if mouse_enabled() {
-            protocol::feature::JOYCON2_DEFAULT | protocol::feature::MOUSE
-        } else {
-            protocol::feature::JOYCON2_DEFAULT
-        });
-    };
-    let raw = raw.trim();
-    if raw.eq_ignore_ascii_case("off") || raw.is_empty() {
-        return None;
-    }
-    // ⭐ **A comma-separated list sweeps one mask per connection.**
-    //
-    // A mask is only testable across a whole connect-init-observe cycle, so a
-    // single value per run meant one data point per launch, and the masks worth
-    // trying are more numerous than anyone wants to relaunch for. These
-    // controllers already reconnect every few seconds while the stream under
-    // test is silent, which turns the reconnect loop from a nuisance into the
-    // sweep mechanism: `FLEXINPUT_JC2_FEATURES=07,0f,2f,3f,ff` walks the list,
-    // one entry per initialisation, and the log records which was in force for
-    // each. A bare single value behaves exactly as before.
-    let masks = parse_feature_masks(raw);
-    if masks.is_empty() {
-        eprintln!("[jc2-dongle] FLEXINPUT_JC2_FEATURES={raw:?} has no hex bytes — skipping");
-        return None;
-    }
-    // ❗ Advances per CALL, which is per controller initialisation. Both halves
-    // reconnecting therefore see different masks, and the log line naming the
-    // mask is what ties a result to its condition — never assume the nth
-    // connection used the nth entry.
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let i = NEXT.fetch_add(1, Ordering::Relaxed) % masks.len();
-    if masks.len() > 1 {
-        eprintln!(
-            "[jc2-dongle] feature mask sweep: entry {}/{} = {:#04x}",
-            i + 1,
-            masks.len(),
-            masks[i]
-        );
-    }
-    // ⭐ The switch ORs its bit in rather than replacing the mask, so it
-    // composes with a sweep instead of overriding one.
-    Some(if mouse_enabled() { masks[i] | protocol::feature::MOUSE } else { masks[i] })
-}
-
-/// Walk the controller's whole attribute table and print it.
-///
-/// ⭐ **Looking for a service nobody knew to look for.** Decompiling the vendor's
-/// own configuration app shows it does not use the Nintendo service at all. It
-/// talks to its controllers over a private GATT service:
-///
-/// * service `0000FF00-0000-1000-8000-00805F9B34FB`
-/// * write   `0000FF01-…`
-/// * notify  `0000FF02-…`
-///
-/// with frames `[len][cmd][content…][SN]`, `len = content.len() + 3`. Its
-/// command `0x6A` carries a family of motion sub-commands — mapping type,
-/// axis ratio, dead zone, XY reversal — and separate gyroscope alignment
-/// commands at `0x41`/`0x42`/`0x43`.
-///
-/// Whether this controller exposes that service while it is running the Switch 2
-/// BLE profile is unknown and is exactly what this prints. If it does, there is
-/// a whole command channel available that this project has never spoken to, and
-/// "motion mapping type" is the most promising switch left.
-///
-/// Off by default because a full walk costs a second of init and normal use does
-/// not need it. `FLEXINPUT_JC2_GATT_SCAN=1` turns it on.
-fn scan_gatt(dongle: &Dongle, conn: u16) {
-    if std::env::var("FLEXINPUT_JC2_GATT_SCAN").is_err() {
-        return;
-    }
-    eprintln!("[jc2-dongle] GATT scan: walking the attribute table");
-    // Let the MTU exchange settle and clear anything already queued, so the
-    // first response we match is genuinely ours. Reading a stale packet is what
-    // made the previous version stop after a single attribute and then report
-    // "not found" from a walk that had enumerated one handle.
-    std::thread::sleep(Duration::from_millis(200));
-    let _ = dongle.drain_acl(256);
-
-    let mut start = 0x0001u16;
-    let mut found_vendor = false;
-    let mut seen = 0usize;
-    // Characteristic-declaration handles (UUID 0x2803), read for properties
-    // after the walk finishes — reading mid-walk would interleave responses.
-    let mut decls: Vec<u16> = Vec::new();
-    // Ask one handle at a time rather than open-ended. It costs more round
-    // trips but every reply is unambiguous, and an unsupported or empty range
-    // cannot be mistaken for the end of the table.
-    while start < 0x0100 {
-        if dongle
-            .send_att(conn, &acl::find_information_request(start, 0x00FF))
-            .is_err()
-        {
-            break;
-        }
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let mut infos: Option<Vec<acl::AttrInfo>> = None;
-        let mut att_error = false;
-        while Instant::now() < deadline && infos.is_none() && !att_error {
-            for pkt in dongle.drain_acl(64) {
-                if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
-                    continue;
-                }
-                // An "Attribute Not Found" error IS the end of the table, and
-                // is the only reliable terminator — distinguishing it from
-                // silence matters, because silence means the scan is broken.
-                if pkt.payload[0] == acl::ATT_ERROR_RESPONSE {
-                    eprintln!("[jc2-dongle] GATT scan: end of table at {start:#06x}");
-                    att_error = true;
-                    break;
-                }
-                if let Some(v) = acl::parse_find_information_response(&pkt.payload) {
-                    if !v.is_empty() {
-                        infos = Some(v);
-                        break;
-                    }
-                }
-            }
-        }
-        if att_error {
-            break;
-        }
-        let Some(infos) = infos else {
-            eprintln!("[jc2-dongle] GATT scan: NO REPLY past {start:#06x} — scan incomplete");
-            break;
-        };
-        for info in &infos {
-            let mark = match info.uuid {
-                acl::AttUuid::Short(u) if (0xFF00..=0xFF1F).contains(&u) => "   <== VENDOR SERVICE",
-                acl::AttUuid::Long(_) => "   (128-bit)",
-                _ => "",
-            };
-            if mark.starts_with("   <==") {
-                found_vendor = true;
-            }
-            if matches!(info.uuid, acl::AttUuid::Short(0x2803)) {
-                decls.push(info.handle);
-            }
-            eprintln!("[jc2-dongle]   {:#06x}  {:?}{mark}", info.handle, info.uuid);
-            seen += 1;
-        }
-        let last = infos.last().map(|i| i.handle).unwrap_or(start);
-        if last < start {
-            break;
-        }
-        start = last.saturating_add(1);
-    }
-    // ⭐ Now READ every characteristic declaration and print its properties.
-    //
-    // Enumerating handles says what exists; it does not say what any of it can
-    // DO. Subscribing `0x0026` and `0x0022` produced no notifications, and with
-    // fire-and-forget CCCD writes there is no way to tell "the stream is idle"
-    // from "this characteristic does not support notify and the write was
-    // rejected". The declaration answers it directly: one byte of property bits
-    // per characteristic, from the controller itself.
-    //
-    // Declaration value is `[properties][value handle LE][uuid]`.
-    for decl in decls {
-        if dongle.send_att(conn, &acl::read_request(decl)).is_err() {
-            continue;
-        }
-        let deadline = Instant::now() + Duration::from_millis(300);
-        let mut value: Option<Vec<u8>> = None;
-        while Instant::now() < deadline && value.is_none() {
-            for pkt in dongle.drain_acl(64) {
-                if pkt.cid == acl::CID_ATT {
-                    if let Some(v) = acl::parse_read_response(&pkt.payload) {
-                        value = Some(v);
-                        break;
-                    }
-                }
-            }
-        }
-        let Some(v) = value else { continue };
-        if v.len() < 3 {
-            continue;
-        }
-        let props = v[0];
-        let vh = u16::from_le_bytes([v[1], v[2]]);
-        let mut names = Vec::new();
-        for (bit, name) in [
-            (acl::PROP_READ, "READ"),
-            (acl::PROP_WRITE_NO_RESPONSE, "WRITE_NR"),
-            (acl::PROP_WRITE, "WRITE"),
-            (acl::PROP_NOTIFY, "NOTIFY"),
-        ] {
-            if props & bit != 0 {
-                names.push(name);
-            }
-        }
-        eprintln!(
-            "[jc2-dongle]   decl {decl:#06x} -> value {vh:#06x}  props {props:#04x} [{}]",
-            names.join("|"),
-        );
-    }
-
-    eprintln!(
-        "[jc2-dongle] GATT scan done — {seen} attributes, Mobapad vendor service {}",
-        if found_vendor {
-            "PRESENT"
-        } else if seen < 8 {
-            "UNKNOWN (scan enumerated too little to say)"
-        } else {
-            "not found"
-        },
-    );
 }
 
 /// Send one command on the working per-side handle and wait for its reply.
@@ -742,319 +384,6 @@ fn run_pairing(dongle: &Dongle, conn: u16, side: Side) -> Option<[u8; 16]> {
     Some(ltk)
 }
 
-/// Read the readable vendor characteristics and dump them.
-///
-/// ⭐ **`0x0026` does not have to notify for us to see what is in it.** The
-/// declaration read says `props 0x12 [READ|NOTIFY]` — the same properties as
-/// the two known input streams — so a plain Read Request returns its current
-/// value whether or not it is streaming. That sidesteps the whole question of
-/// what starts it.
-///
-/// The vendor service's readable attributes, from the attribute-table walk:
-///
-/// ```text
-///   0x000a  ab7de9be-…-7fd2   READ|NOTIFY   common input, never notifies here
-///   0x0026  ab7de9be-…-7fde   READ|NOTIFY   third stream, never notifies
-///   0x0002  00c5af5d-…-d281   READ          first service
-///   0x0006  00c5af5d-…-d283   READ          first service
-/// ```
-///
-/// Run AFTER init, because a stream that only fills once motion is enabled
-/// would read as zeros beforehand and look empty for the wrong reason.
-///
-/// What to look for: this controller's accelerometer is 4096 LSB/g, so any
-/// buffer holding motion shows a value near ±4096 on one axis with the pad at
-/// rest. That signature is unmistakable and needs no decode.
-fn probe_readable(dongle: &Dongle, conn: u16) {
-    if std::env::var("FLEXINPUT_JC2_GATT_SCAN").is_err() {
-        return;
-    }
-    let _ = dongle.drain_acl(256);
-    for handle in [jc::HANDLE_INPUT_EXTRA, jc::HANDLE_INPUT_COMMON, 0x0002, 0x0006] {
-        // Twice, a moment apart: a live sensor buffer changes between reads and
-        // a static one does not, which distinguishes "stream that needs
-        // starting" from "constant descriptor" without decoding anything.
-        for pass in 0..2 {
-            if dongle.send_att(conn, &acl::read_request(handle)).is_err() {
-                continue;
-            }
-            let deadline = Instant::now() + Duration::from_millis(400);
-            let mut got = None;
-            while Instant::now() < deadline && got.is_none() {
-                for pkt in dongle.drain_acl(64) {
-                    if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
-                        continue;
-                    }
-                    if pkt.payload[0] == acl::ATT_ERROR_RESPONSE {
-                        eprintln!("[jc2-dongle] read {handle:#06x} -> ATT error {:02x?}", pkt.payload);
-                        got = Some(Vec::new());
-                        break;
-                    }
-                    if let Some(v) = acl::parse_read_response(&pkt.payload) {
-                        got = Some(v);
-                        break;
-                    }
-                }
-            }
-            match got {
-                Some(v) if !v.is_empty() => eprintln!(
-                    "[jc2-dongle] ⭐ READ {handle:#06x} pass {pass} ({} bytes): {:02x?}",
-                    v.len(),
-                    &v[..v.len().min(64)],
-                ),
-                Some(_) => {}
-                None => eprintln!("[jc2-dongle] read {handle:#06x} -> no reply"),
-            }
-            std::thread::sleep(Duration::from_millis(150));
-        }
-    }
-}
-
-/// The handles this controller actually uses, resolved from its own table.
-///
-/// ⛔ **Handle numbers are not part of a protocol. They are one device's
-/// GATT layout, and we had them hardcoded.**
-///
-/// `0x000a`, `0x000e`, `0x0016` and the rest were captured by walking the
-/// attribute table of ONE controller — a third-party M12-S grip — and then
-/// written into `joycon.rs` as constants. A GATT server is free to lay its
-/// table out however it likes; the numbers are assigned in the order attributes
-/// are declared, and nothing requires two devices to agree. Subscribing by
-/// number on a device with a different layout writes `CCCD_NOTIFY` to whatever
-/// attribute happens to occupy that slot.
-///
-/// That failure is completely silent. Every write here is fire-and-forget, so
-/// an `Attribute Not Found` or `Write Not Permitted` in reply goes unread, and
-/// the symptom is a characteristic that was "subscribed and never notified" —
-/// which is exactly what was recorded against `0x000a` on both the reference
-/// grip and, in a field log, on retail Joy-Con 2s. Reported working in another
-/// project on the same hardware, which is what makes it ours rather than the
-/// controller's.
-///
-/// So the table is walked and the characteristics are found by UUID, which IS
-/// part of the protocol. The constants remain as a fallback for a controller
-/// that will not answer discovery at all.
-#[derive(Debug, Clone, Copy)]
-struct Handles {
-    /// Per-side input, report 0x07/0x08 — the stream we already decode.
-    input: u16,
-    /// Common input, report 0x05 — where a real gyro would be.
-    common: Option<u16>,
-    /// Whether the common input declares NOTIFY at all.
-    common_notifiable: bool,
-    /// Command channel, shared with rumble.
-    cmd: u16,
-}
-
-impl Default for Handles {
-    fn default() -> Self {
-        Self {
-            input: jc::HANDLE_INPUT_VALUE,
-            common: Some(jc::HANDLE_INPUT_COMMON),
-            common_notifiable: true,
-            cmd: jc::HANDLE_CMD_WRITE,
-        }
-    }
-}
-
-/// Find the characteristics by UUID, falling back to the captured numbers.
-///
-/// ❗ Failure is not fatal. A controller that refuses discovery still works on
-/// the old constants — they were right for at least one device — so this
-/// upgrades where it can and never blocks a connection.
-fn resolve_handles(dongle: &Dongle, conn: u16, side: Side) -> Handles {
-    let mut h = Handles::default();
-    // ⭐ An escape hatch that needs no rebuild. Discovery runs during setup,
-    // before the input subscription, so if it ever costs a link again this is
-    // how to prove it in one run rather than one round trip.
-    // ⛔ **Opt-IN, because it costs connect time and has never once
-    // disagreed with the constants.**
-    //
-    // Across every log so far it has resolved input, cmd and common to exactly
-    // the assumed handles, on two different controllers — while spending its
-    // whole budget doing so. Connect time is not free: it is measured against a
-    // three-second input watchdog, and everything spent here is spent before
-    // the stream starts. The question it was added to answer has been answered.
-    //
-    // `FLEXINPUT_JC2_DISCOVER=on` brings it back for the next controller that
-    // might genuinely differ.
-    if !std::env::var("FLEXINPUT_JC2_DISCOVER")
-        .is_ok_and(|v| v.eq_ignore_ascii_case("on"))
-    {
-        return h;
-    }
-    // ❗ Budgeted, and TIMED. This happens before the input subscription, so
-    // whatever it spends is time the controller is connected and silent — and
-    // the link watchdog is three seconds. See `discover_characteristics`.
-    let began = Instant::now();
-    // ⛔ Find Information, NOT Read By Type. A Joy-Con 2 grip does not answer
-    // Read By Type at all — "no reply within 2 s", every connect — which both
-    // wasted the budget and, before it was bounded, cost the link. The GATT
-    // scan has always walked the table this way and always worked.
-    let attrs = match dongle.discover_attributes(conn, Duration::from_millis(600)) {
-        Ok(a) if !a.is_empty() => a,
-        other => {
-            let why = match other {
-                Ok(_) => "the table was empty".to_string(),
-                Err(e) => e.to_string(),
-            };
-            eprintln!("[jc2-dongle] {} handle discovery failed ({why}) — using captured numbers",
-                side.display_name());
-            crate::dlog::imu(format_args!(
-                "{} handle discovery FAILED ({why}) — falling back to hardcoded \
-                 handles, which may belong to a different controller's layout",
-                side.display_name(),
-            ));
-            return h;
-        }
-    };
-
-    // ⛔ **The whole table, into the log.**
-    //
-    // Subscribing the common input means writing CCCD_NOTIFY to
-    // `HANDLE_INPUT_COMMON + 1`, on the GATT convention that a CCCD follows the
-    // value it configures. That write is acknowledged every time — but a write
-    // to ANY writable attribute is acknowledged, so the acknowledgement has
-    // never been evidence that 0x000b is a CCCD at all. If a vendor descriptor
-    // sits there instead, we have been enabling notifications on nothing and
-    // being told it worked, which fits every observation so far.
-    //
-    // The walk already has the answer in hand; it was throwing it away and
-    // keeping three handles. Printing it costs nothing and settles what 0x000b
-    // and 0x000c actually are — 0x2902 is a CCCD, anything else is not.
-    for a in &attrs {
-        crate::dlog::imu(format_args!(
-            "{} attr {:#06x} = {}",
-            side.display_name(),
-            a.handle,
-            a.uuid,
-        ));
-    }
-
-    // ⛔ **Can 0x000a notify AT ALL?**
-    //
-    // Everything checks out and nothing arrives: the handle is right, 0x000b
-    // really is a `0x2902` CCCD, the write is acknowledged, the layout matches
-    // the per-side pair that works. The one property never measured is whether
-    // the characteristic declares NOTIFY in the first place — and this
-    // project's own notes contradict each other on it, one calling 0x000a
-    // `READ|NOTIFY` and another `Read Not Permitted`.
-    //
-    // A characteristic declaration (`0x2803`) sits immediately before its
-    // value and holds `properties | value_handle | uuid`. Reading the two
-    // declarations and comparing them answers it outright: if the common input
-    // lacks bit 0x10 while the per-side one has it, it cannot notify however it
-    // is configured, and every attempt to make it has been addressed to a
-    // characteristic that was never going to.
-    let read_decl = |value_handle: u16, what: &str| {
-        let decl = value_handle.saturating_sub(1);
-        if dongle.send_att(conn, &acl::read_request(decl)).is_err() {
-            return;
-        }
-        let deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < deadline {
-            for pkt in dongle.drain_acl(32) {
-                if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
-                    continue;
-                }
-                let Some(v) = acl::parse_read_response(&pkt.payload) else { continue };
-                let props = v.first().copied().unwrap_or(0);
-                crate::dlog::imu(format_args!(
-                    "{} {what} declaration {decl:#06x}: properties {props:#04x}                      (read {} write-no-rsp {} write {} NOTIFY {} indicate {}) raw {:02x?}",
-                    side.display_name(),
-                    props & 0x02 != 0,
-                    props & 0x04 != 0,
-                    props & 0x08 != 0,
-                    props & 0x10 != 0,
-                    props & 0x20 != 0,
-                    &v[..v.len().min(24)],
-                ));
-                return;
-            }
-        }
-        crate::dlog::imu(format_args!(
-            "{} {what} declaration {decl:#06x}: NO REPLY to the read",
-            side.display_name()
-        ));
-    };
-    let _ = dongle.drain_acl(64);
-    read_decl(jc::HANDLE_INPUT_COMMON, "common input");
-    read_decl(jc::HANDLE_INPUT_VALUE, "per-side input (known good)");
-
-    // ⭐ The TYPE of a characteristic value attribute IS the characteristic's
-    // UUID, so a Find Information walk resolves handles on its own.
-    let find = |want: uuid::Uuid| -> Option<u16> {
-        attrs
-            .iter()
-            .find(|a| match a.uuid {
-                // ATT carries 128-bit UUIDs little-endian; `uuid::Uuid` bytes
-                // are big-endian, so one side has to be reversed to compare.
-                acl::AttUuid::Long(raw) => {
-                    let mut be = raw;
-                    be.reverse();
-                    uuid::Uuid::from_bytes(be) == want
-                }
-                acl::AttUuid::Short(_) => false,
-            })
-            .map(|a| a.handle)
-    };
-
-    let per_side = match side {
-        Side::Left => protocol::CHR_INPUT_L,
-        Side::Right => protocol::CHR_INPUT_R,
-    };
-    if let Some(v) = find(per_side) {
-        h.input = v;
-    }
-    let cmd = match side {
-        Side::Left => protocol::CHR_RUMBLE_CMD_L,
-        Side::Right => protocol::CHR_RUMBLE_CMD_R,
-    };
-    if let Some(v) = find(cmd) {
-        h.cmd = v;
-    }
-    // ❗ The walk is capped at 600 ms and was spending all of it. Stopping as
-    // soon as the three characteristics are in hand takes a fixed cost off
-    // every connect, and connect time is what the link watchdog measures.
-    match find(protocol::CHR_INPUT_COMMON) {
-        Some(v) => {
-            h.common = Some(v);
-            // Find Information does not carry properties; the declaration walk
-            // did. Not knowing is not a reason to refuse to subscribe.
-            h.common_notifiable = true;
-        }
-        None => {
-            // ⭐ Absent from the table is a different fact from present and
-            // silent, and only one of them is our bug.
-            h.common = None;
-        }
-    }
-
-    // ⭐ Logged with the ASSUMED values beside them. A mismatch here is the
-    // whole hypothesis, and it is invisible unless both numbers are shown.
-    crate::dlog::imu(format_args!(
-        "{} handles resolved in {} ms — input {:#06x} (assumed {:#06x}) · cmd {:#06x} \
-         (assumed {:#06x}) · common {} (assumed {:#06x}){}",
-        side.display_name(),
-        began.elapsed().as_millis(),
-        h.input,
-        jc::HANDLE_INPUT_VALUE,
-        h.cmd,
-        jc::HANDLE_CMD_WRITE,
-        match h.common {
-            Some(v) => format!("{v:#06x}"),
-            None => "ABSENT FROM THIS CONTROLLER'S TABLE".to_string(),
-        },
-        jc::HANDLE_INPUT_COMMON,
-        if h.common.is_some() && !h.common_notifiable {
-            " — common input declares NO NOTIFY property"
-        } else {
-            ""
-        },
-    ));
-    h
-}
-
 /// `FLEXINPUT_JC2_DONGLE=vid:pid` if set, otherwise whatever is actually here.
 ///
 /// ⛔ **This used to fall back to a literal `0bda:a728` without ever asking
@@ -1086,29 +415,6 @@ pub const DONGLE_PROBING: u8 = 0;
 pub const DONGLE_ACTIVE: u8 = 1;
 pub const DONGLE_ABSENT: u8 = 2;
 
-/// The diagnostic switches that ONLY this transport implements.
-///
-/// ⛔ **A run with one of these set must never fall back to the Windows
-/// stack.** The WinRT hub knows nothing about them: it connects, subscribes
-/// the per-side characteristic and streams, and writes a log that reads
-/// exactly like a healthy ordinary session. So a test whose transport
-/// silently changed underneath it does not look like "the experiment did not
-/// run" — it looks like "the experiment ran and changed nothing", which is
-/// the most expensive wrong answer available, and it has already cost
-/// hardware runs on someone else's hands.
-fn experiment_switches() -> Vec<String> {
-    [
-        "FLEXINPUT_JC2_MODE",
-        "FLEXINPUT_JC2_COMMON",
-        "FLEXINPUT_JC2_CMD",
-        "FLEXINPUT_JC2_PAIR",
-        "FLEXINPUT_JC2_DISCOVER",
-    ]
-    .into_iter()
-    .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
-    .collect()
-}
-
 fn run(shared: Arc<Shared>) {
     // Open the log FIRST, before anything can fail.
     //
@@ -1122,30 +428,15 @@ fn run(shared: Arc<Shared>) {
     // Whatever happens below, the hub must eventually be released; without this
     // an early return would leave it standing down forever and Joy-Cons would
     // stop working entirely on machines with no dongle.
-    let experiments = experiment_switches();
-    struct ReleaseUnlessActive {
-        state: Arc<AtomicU8>,
-        /// A diagnostic switch is set, so the hub must NOT take over.
-        pinned: bool,
-    }
+    struct ReleaseUnlessActive(Arc<AtomicU8>);
     impl Drop for ReleaseUnlessActive {
         fn drop(&mut self) {
-            if self.pinned {
-                // Left at DONGLE_PROBING, the value the hub stands down on.
-                // No input at all is the correct outcome: a run that produces
-                // nothing says so, while a run on the other transport says
-                // nothing true about the thing under test.
-                eprintln!(
-                    "[jc2-dongle] a diagnostic switch is set and this transport is                      unavailable — NOT handing the Joy-Cons to the Windows stack,                      because that would quietly run a different experiment."
-                );
-                return;
-            }
             // ❗ Publishing ABSENT is not housekeeping — it is the signal that
             // lets the WinRT hub start scanning, after which Windows
             // auto-connects any remembered controller and the dongle can no
             // longer even SEE it. Announce it, because from the outside it
             // looks like "the dongle stopped working for no reason".
-            if self.state.swap(DONGLE_ABSENT, Ordering::Relaxed) == DONGLE_ACTIVE {
+            if self.0.swap(DONGLE_ABSENT, Ordering::Relaxed) == DONGLE_ACTIVE {
                 eprintln!(
                     "[jc2-dongle] dongle thread exiting — Joy-Cons handed back to the \
                      Windows stack, which will grab them within seconds"
@@ -1153,26 +444,15 @@ fn run(shared: Arc<Shared>) {
             }
         }
     }
-    let _release = ReleaseUnlessActive {
-        state: Arc::clone(&shared.state),
-        pinned: !experiments.is_empty(),
-    };
+    let _release = ReleaseUnlessActive(Arc::clone(&shared.state));
 
     let Some((vid, pid)) = configured_dongle() else {
         eprintln!(
-            "[jc2-dongle] no WinUSB-bound Bluetooth adapter found — bind one              with Zadig, or set FLEXINPUT_JC2_DONGLE=vid:pid.
-             [jc2-dongle] Joy-Cons will fall back to the Windows stack."
+            "[jc2-dongle] no WinUSB-bound Bluetooth adapter found — bind one with \
+             Zadig, or set FLEXINPUT_JC2_DONGLE=vid:pid. Joy-Cons will fall back \
+             to the Windows stack."
         );
         dlog!("no WinUSB-bound adapter present");
-        // ⭐ Into the IMU log too, because that is the file these experiments
-        // are read from, and its silence there is otherwise indistinguishable
-        // from a result.
-        if !experiments.is_empty() {
-            crate::dlog::imu(format_args!(
-                "NO RUN — {} set, but no WinUSB-bound Bluetooth adapter is present.                  Only the dongle transport implements these switches, so NOTHING was                  tested. Bind an adapter with Zadig (or set FLEXINPUT_JC2_DONGLE=vid:pid)                  and run again.",
-                experiments.join(" ")
-            ));
-        }
         return;
     };
     // ⭐ SHARED, not owned. This hub and the Bluetooth Classic transport run on
@@ -1209,6 +489,7 @@ fn run(shared: Arc<Shared>) {
     // stopped. ACL now drains continuously while the scan runs.
     let mut scanning = false;
     let mut scan_retry_at = Instant::now();
+    let mut scan_backoff = SCAN_RETRY_MIN;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         // ⭐ SCAN CONTINUOUSLY until every half is connected. No windowing.
@@ -1234,6 +515,7 @@ fn run(shared: Arc<Shared>) {
             match radio.with_dongle(|d| d.start_le_scan_duty(true)) {
                 Ok(()) => {
                     scanning = true;
+                    scan_backoff = SCAN_RETRY_MIN;
                     dlog!("scan START ({} link(s) held)", links.len());
                 }
                 Err(e) => {
@@ -1242,7 +524,15 @@ fn run(shared: Arc<Shared>) {
                     // Back off briefly rather than spinning on a controller
                     // that is busy — usually a half-finished initiator, which
                     // `start_le_scan` cancels on the next attempt.
-                    scan_retry_at = Instant::now() + Duration::from_millis(200);
+                    //
+                    // ⛔ And back off FURTHER each time it keeps failing. Each
+                    // attempt is a radio lease, and a lease stops the shared
+                    // reader for every transport — so a scan that refuses to
+                    // start, retried five times a second forever, would black
+                    // out a Bluetooth Classic controller's reconnection for as
+                    // long as it went on.
+                    scan_retry_at = Instant::now() + scan_backoff;
+                    scan_backoff = (scan_backoff * 2).min(SCAN_RETRY_MAX);
                 }
             }
         } else if !want_scan && scanning {
@@ -1360,7 +650,6 @@ fn run(shared: Arc<Shared>) {
     shared.finished.store(true, Ordering::Relaxed);
 }
 
-
 /// Decide whether an advertising report is a Joy-Con 2 worth connecting to.
 fn advert_match(
     shared: &Arc<Shared>,
@@ -1370,68 +659,51 @@ fn advert_match(
     // A controller we have already identified needs no manufacturer data.
     // Copied out to a local before branching — the guard would otherwise live
     // for the whole block, and this function locks `known` again further down.
-    // See the deadlock note in `connect_and_init`.
     let known_side = shared.known.lock().unwrap().get(&r.address).copied();
     if let Some(side) = known_side {
         if links.iter().any(|l| l.key.address == r.address) {
             return None;
         }
-        dlog!("adv {:02x?} {} KNOWN — matching without scan response",
-              r.address, side.display_name());
         return Some((r.address, r.address_type, side));
     }
-    // Every rejection below is logged with its reason. They were all bare
-    // `return None`, so a controller that advertised and was turned away looked
-    // exactly like one that never advertised at all.
-    let Some(md) = r.manufacturer_data() else {
-        // `event_type` 0x00 is ADV_IND, 0x04 is SCAN_RSP. Logged because which
-        // one carries the identifying payload is the whole question here.
-        dlog!(
-            "adv {:02x?} rssi {} type {} — no manufacturer data, {} data bytes",
-            r.address, r.rssi, r.event_type, r.data.len(),
-        );
-        return None;
-    };
+    // ⛔ No log line per rejection. A passive scan in an ordinary room reports
+    // hundreds of advertisements a second from devices that are not Joy-Cons,
+    // and logging each one was a firehose on a thread that shares its radio.
+    let md = r.manufacturer_data()?;
     // The company id is INCLUDED in this stack's manufacturer data (unlike
     // btleplug, which strips it into a map key), so VID sits at 5 and PID at 7
     // rather than 3 and 5.
     if md.len() < 9 {
-        dlog!("adv {:02x?} — manufacturer data only {} bytes: {md:02x?}", r.address, md.len());
         return None;
     }
-    let company = u16::from_le_bytes([md[0], md[1]]);
-    if company != protocol::NINTENDO_MANUFACTURER_ID {
-        dlog!("adv {:02x?} — company {company:#06x}, not Nintendo", r.address);
+    if u16::from_le_bytes([md[0], md[1]]) != protocol::NINTENDO_MANUFACTURER_ID {
         return None;
     }
-    let vid = u16::from_le_bytes([md[5], md[6]]);
-    if vid != protocol::NINTENDO_VID {
-        dlog!("adv {:02x?} — VID {vid:#06x}, not Nintendo", r.address);
+    if u16::from_le_bytes([md[5], md[6]]) != protocol::NINTENDO_VID {
         return None;
     }
     let pid = u16::from_le_bytes([md[7], md[8]]);
-    let Some(side) = Side::from_pid(pid) else {
-        dlog!("adv {:02x?} — PID {pid:#06x} is not a known half", r.address);
-        return None;
-    };
+    let side = Side::from_pid(pid)?;
     if Side::is_safe_mode(pid) {
-        dlog!("adv {:02x?} {} — SAFE MODE (PID {pid:#06x}), refusing",
-              r.address, side.display_name());
         return None;
     }
     if links.iter().any(|l| l.key.address == r.address) {
-        dlog!("adv {:02x?} {} — already connected", r.address, side.display_name());
         return None;
     }
-    dlog!(
-        "adv {:02x?} {} MATCH — pid {pid:#06x} rssi {} addr_type {} data {md:02x?}",
-        r.address, side.display_name(), r.rssi, r.address_type,
-    );
+    dlog!("adv {:02x?} {} MATCH — pid {pid:#06x}", r.address, side.display_name());
     shared.known.lock().unwrap().insert(r.address, side);
     Some((r.address, r.address_type, side))
 }
 
 /// Connect, subscribe and initialise one controller.
+///
+/// ⭐ **The working recipe and nothing more.** Everything here runs inside a
+/// radio lease, and a lease stops the shared reader for every transport on the
+/// dongle — so each extra write is time a Bluetooth Classic controller cannot
+/// be heard. The protocol investigation that used to live here (probe reads,
+/// attribute walks, the common and extra input streams, mirrored commands)
+/// added the better part of a second per connect and found nothing usable;
+/// its conclusions are recorded in `docs/BLUETOOTH_TRANSPORTS.md`.
 fn connect_and_init(
     shared: &Arc<Shared>,
     dongle: &Dongle,
@@ -1442,392 +714,57 @@ fn connect_and_init(
     // The advertisement's address type is carried through rather than assumed
     // public: a controller using a random address is unreachable if we get it
     // wrong, and the failure looks like "connect times out" with no clue why.
-    // Fixed 7.5 ms, the BLE spec minimum, rather than `le_connect`'s attempt at
-    // 5 ms followed by a fallback.
     //
-    // 5 ms is BELOW the spec minimum; the reference ESP32 firmware pins 6 with
-    // the note that lower values are rejected. Asking for 6 directly measured
-    // ~140-200 Hz of input reports against the ~67 Hz this link has always run
-    // at — two to three times the motion samples, for free, and the same change
-    // removed the intermittent failure to find the second half.
+    // Fixed 7.5 ms, the BLE spec minimum. Lower is rejected; asking for it
+    // directly measured ~140-200 Hz of input against the ~67 Hz this link used
+    // to run at.
     let link = dongle.le_connect_params(address, address_type, 6, 6)?;
     let conn = link.conn_handle;
     eprintln!(
-        "[jc2-dongle] {} link: interval {:.2} ms, supervision timeout {} ms",
+        "[jc2-dongle] {} connected, handle {conn:#06x}, interval {:.2} ms",
         side.display_name(),
         link.interval_ms(),
-        link.timeout_ms(),
     );
-    eprintln!(
-        "[jc2-dongle] {} connected, handle {conn:#06x}",
-        side.display_name()
-    );
-    // ⭐ **Ask for the 2M PHY, because the interval cannot go any lower.**
-    //
-    // 7.5 ms is the spec floor for a connection interval, so the only remaining
-    // way to move more reports per second is to move them faster on the air.
-    // Doubling the symbol rate roughly doubles what one connection event can
-    // carry, and events are exactly what the two halves are competing for: a
-    // lone controller holds 200 Hz, and the second one arriving costs the loser
-    // a fifth of its reports.
-    //
-    // ❗ Best-effort and deliberately unchecked here. The command is
-    // status-only and the outcome arrives later as an LE PHY Update Complete,
-    // so this logs the REQUEST. Reading it as confirmation would repeat the
-    // write-response mistake — claiming a result from an answer that has not
-    // come back yet.
-    match dongle.request_2m_phy(conn) {
-        Ok(()) => crate::dlog::imu(format_args!(
-            "{} requested LE 2M PHY (adapter advertises 2M: {})",
-            side.display_name(),
-            dongle.supports_2m_phy(),
-        )),
-        Err(e) => crate::dlog::imu(format_args!(
-            "{} LE 2M PHY request refused: {e} — staying on 1M, which streams fine",
-            side.display_name(),
-        )),
-    }
+    // The interval cannot go lower, so more reports per second can only come
+    // from moving them faster on the air. Best effort: status-only, and a link
+    // that stays on 1M streams fine.
+    let _ = dongle.request_2m_phy(conn);
 
     // Raise the ATT MTU before anything else. At the 23-byte default a 63-byte
     // input report arrives fragmented and every parser offset is wrong.
     dongle.send_att(conn, &acl::exchange_mtu_request(jc::DESIRED_MTU))?;
 
-    // Before any of the Nintendo init, ask what this controller actually
-    // exposes — see `scan_gatt`. No-op unless FLEXINPUT_JC2_GATT_SCAN is set.
-    scan_gatt(dongle, conn);
-
-    // ⛔ Resolve the handles from THIS controller's table before writing to any
-    // of them — see `resolve_handles`. Subscribing by a number captured from a
-    // different device configures whatever attribute happens to sit there.
-    let handles = resolve_handles(dongle, conn, side);
-
-    // ⭐ **Whether the per-side stream is subscribed at all is now a choice.**
-    //
-    // ⛔ The reference subscribes its input characteristic LAST, after the
-    // motion enable, and subscribes only ONE. FlexInput subscribes the per-side
-    // input FIRST and then asks for the common one too — and the common one has
-    // never sent a byte, on any controller, even with every write accepted.
-    //
-    // ❗ "Accepted" there means an ATT Write Response came back: the write
-    // reached the attribute. It says nothing about the controller acting on it.
-    // A plausible reading of the silence is that the controller emits ONE input
-    // stream and picks it from what is already subscribed when the enable
-    // lands — in which case subscribing the per-side report first settles the
-    // question before the enable is even sent.
-    //
-    // FLEXINPUT_JC2_COMMON=only tests exactly that: skip the per-side
-    // subscription entirely and take the common stream or nothing. Off by
-    // default, because the per-side path is the one that currently works and a
-    // hypothesis should not cost anyone their controllers.
-    // ⛔ **The two settings are a MATCHED PAIR and were only ever tested
-    // apart.**
-    //
-    // Reading the reference in full rather than in fragments: it writes
-    // commands to `649d4ac9-…` (0x0014) and reads input from
-    // `ab7de9be-…-7fd2` (0x000a), and it never touches the per-side
-    // characteristics at all — `cc1bbbb5`/`d5a9e01e` appear nowhere in it.
-    //
-    // Routing commands to 0x0014 ALONE was tried, and the per-side stream's
-    // motion_len dropped from 0x1e to 0x00. That was read as "0x0014 is inert".
-    // It is the opposite: the controller switched to serving the OTHER stream,
-    // and we were still listening to the one it had stopped filling.
-    //
-    // FLEXINPUT_JC2_MODE=reference sets both at once, because setting one
-    // without the other is what made a working change look like a broken one.
-    let reference_mode = std::env::var("FLEXINPUT_JC2_MODE")
-        .is_ok_and(|v| v.eq_ignore_ascii_case("reference"));
-    let common_only = reference_mode
-        || std::env::var("FLEXINPUT_JC2_COMMON")
-            .is_ok_and(|v| v.eq_ignore_ascii_case("only"));
-    if common_only {
-        crate::dlog::imu(format_args!(
-            "{} FLEXINPUT_JC2_COMMON=only — per-side input NOT subscribed;              the common stream is the only source this run",
-            side.display_name()
-        ));
-    } else {
-        dongle.send_att(
-            conn,
-            &acl::write_request(handles.input + 1, &acl::CCCD_NOTIFY),
-        )?;
-    }
+    // Input notifications, and command responses on both response channels —
+    // pairing waits on `0x001a`.
+    dongle.send_att(conn, &acl::write_request(jc::HANDLE_INPUT_CCCD, &acl::CCCD_NOTIFY))?;
     dongle.send_att(
         conn,
         &acl::write_request(jc::HANDLE_CMD_RESPONSE_CCCD, &acl::CCCD_NOTIFY),
     )?;
-
-    // ⭐ Also subscribe the COMMON input, and give it the report-rate descriptor
-    // the per-side one gets.
-    //
-    // This is the one combination never tried. The common input was written off
-    // as "unreachable by notify" after it stayed silent through every ordering,
-    // mask and mode — but that testing only ever wrote the CCCD. It never wrote
-    // the report-rate descriptor, and this file's own comment thirty lines below
-    // records what happens when that step is skipped: "WITHOUT THIS the
-    // controller streams stub reports forever". Each input characteristic has
-    // its own descriptor, and the common one has never been written in the life
-    // of this project.
-    //
-    // It matters because the two working PC implementations both read motion
-    // from THIS characteristic, at offsets that are all zero in the per-side
-    // report we do receive — accel at 0x30, gyro at 0x36, six contiguous i16.
-    // The per-side stream has now been shown to contain no angular rate at all:
-    // its accel padding bytes stay exactly zero through a full 360 deg sweep, so
-    // they are padding rather than a gyro at rest, and nothing past the accel
-    // block is ever non-zero.
-    //
-    // Failing is free — an unsupported handle returns an ATT error, which the
-    // send path already tolerates, and the per-side stream is untouched either
-    // way.
-    // ⭐ And the PER-SIDE response channel, which answers the handle we send
-    // commands to and has never been subscribed — see the constant's docs.
     dongle.send_att(
         conn,
         &acl::write_request(jc::HANDLE_CMD_RESPONSE_PERSIDE_CCCD, &acl::CCCD_NOTIFY),
     )?;
-    dlog!("init: feature-select done, writing report-rate descriptor");
-    // The vendor report-rate descriptor. WITHOUT THIS the controller streams
+    // ⛔ The vendor report-rate descriptor. WITHOUT THIS the controller streams
     // stub reports forever — counter incrementing, every field zero — which is
-    // indistinguishable from a parser bug. It is the single most expensive
-    // omission in this sequence.
+    // indistinguishable from a parser bug.
     dongle.send_att(
         conn,
         &acl::write_request(jc::HANDLE_INPUT_REPORT_RATE, &protocol::REPORT_RATE_PAYLOAD),
     )?;
 
-    dlog!("init: report-rate written, stream should start now");
-    probe_readable(dongle, conn);
-    // ⛔ **Moved to the END of init, which is where the reference puts it.**
-    //
-    // This ran FIRST — before pairing, the memory reads, the LED, and before
-    // the report-rate descriptor that actually starts a stream. Acknowledged
-    // every time, and the common characteristic never sent a byte. The
-    // reference sends its enable after the info and calibration reads and
-    // subscribes its input LAST, and that ordering was described plainly in the
-    // source I took the command from; I implemented the command and ignored
-    // where it sat.
-    //
-    // ❗ Not proof that order is the missing piece — subscribing only the
-    // common stream did not start it either, so exclusivity is already ruled
-    // out. But sending a setup command before setup has happened is not a test
-    // of anything, and this is the cheap half of the remaining difference.
-    // ⭐ **Turn the common stream ON before subscribing to it.**
-    //
-    // ⛔ This is the step that was missing, and the reason `0x000a` was
-    // recorded as "subscribed and silent" for the whole gyro search. FlexInput
-    // enables features with `0x0C` on the per-side rumble+command channel,
-    // which visibly works — it starts the per-side report. It simply enables a
-    // DIFFERENT stream. Every working PC implementation sends `0x03` on the
-    // BASIC command channel instead, twice: subcommand `0x00` to initialise
-    // and `0x01` to enable, each carrying the feature flags.
-    //
-    // The report that follows carries a real angular rate at 0x30/0x36, which
-    // is what every workaround downstream exists to substitute for.
-    //
-    // ❗ Order matters and is taken from the reference: enable FIRST, subscribe
-    // second. Both writes are acknowledged so a refusal is visible rather than
-    // inferred from silence, and neither is fatal — a controller that refuses
-    // still streams the per-side report exactly as before.
-    // ❗ Written to the DISCOVERY log as well, so its position in the real
-    // sequence is observable rather than inferred. Two attempts to place this
-    // step by reading timestamps were wrong: the diagnostic log and the
-    // discovery log have different clock origins, and the `dlog!` calls around
-    // it live in different functions, so neither file nor the source order
-    // answers "when does this actually run".
-
-    // ⭐ The third input stream and the spare notify characteristic, both found
-    // by walking the attribute table — see `jc::HANDLE_INPUT_EXTRA`. Same
-    // subscribe-then-set-a-rate pattern the two known inputs need.
-    dongle.send_att(
-        conn,
-        &acl::write_request(jc::HANDLE_INPUT_EXTRA_CCCD, &acl::CCCD_NOTIFY),
-    )?;
-    dongle.send_att(
-        conn,
-        &acl::write_request(jc::HANDLE_INPUT_EXTRA_RATE, &protocol::REPORT_RATE_PAYLOAD),
-    )?;
-    dongle.send_att(
-        conn,
-        &acl::write_request(jc::HANDLE_NOTIFY_EXTRA2_CCCD, &acl::CCCD_NOTIFY),
-    )?;
-
-    // ❗ [`jc::HANDLE_CMD_WRITE`] must be the handle the controller EXECUTES
-    // from (`0x0016`), not the one the reference's UUID table points at
-    // (`0x0014`). Repointing this at `0x0014` sent the entire sequence below —
-    // handshake, memory reads, feature-select — into a handle that accepts
-    // writes and discards them. The link came up, reports streamed, and every
-    // one of them was a stub: `motion_len = 0`, all fields zero. Downstream
-    // that reads as a dead accelerometer, several layers from the cause.
+    // ❗ Commands go to the handle the controller EXECUTES from (`0x0016`).
+    // `0x0014` accepts writes and acts on none of them.
     debug_assert!(jc::executes_commands(jc::HANDLE_CMD_WRITE));
-    // ⛔ **The last structural difference from the working reference.**
+    // Fire-and-forget with a short gap. Waiting on each reply once turned a
+    // millisecond handshake into ~40 s and the controller powered off mid-way.
     //
-    // Everything else about the common input now checks out and it is still
-    // silent: the handle is right, 0x000b is a real CCCD, the rate descriptor
-    // matches the per-side one, the write is acknowledged, and its declaration
-    // reads properties 0x12 — READ|NOTIFY, byte for byte identical to the
-    // per-side input that streams perfectly.
-    //
-    // So the characteristic can notify and nothing we send makes it. The one
-    // thing left that differs: the reference drives its WHOLE session through
-    // `649d4ac9-…` (0x0014) with bare frames, while this drives
-    // `65a724b3-…` (0x0016) with a 17-byte rumble prefix and only mirrors the
-    // feature-select onto 0x0014.
-    //
-    // ❗ 0x0014 was once written off as inert — commands there "moved nothing"
-    // while the same command on 0x0016 visibly worked. But that was judged on
-    // LEDs and buzzes, which are per-side effects, and a stream-selection bit
-    // need not have any visible effect at all. Inert for rumble does not mean
-    // inert for everything.
-    //
-    // FLEXINPUT_JC2_CMD=common routes the entire init there, unprefixed, the
-    // way the reference does. If the LEDs stop responding it is inert and this
-    // is settled; if the common input starts streaming, it never was.
-    let cmd_common = reference_mode
-        || std::env::var("FLEXINPUT_JC2_CMD")
-            .is_ok_and(|v| v.eq_ignore_ascii_case("common"));
-    // ⭐ **The control this investigation has never had.**
-    //
-    // Reference mode reports that no command on `0x0014` is ever answered. That
-    // is only meaningful against a channel known to answer — and nothing has
-    // ever waited for a reply on the WORKING `0x0016` path, so "the controller
-    // does not answer commands on 0x0014" and "this controller does not answer
-    // commands at all" have never been told apart. One is a wrong channel; the
-    // other means the reference protocol does not exist on this hardware and
-    // the search should stop.
-    //
-    // `FLEXINPUT_JC2_REPLIES=on` waits on the default path too. Off by default
-    // because it adds up to 400 ms per command to an init measured against a
-    // three-second watchdog — a diagnostic, not a mode to ship.
-    let reply_probe = std::env::var("FLEXINPUT_JC2_REPLIES")
-        .is_ok_and(|v| v.eq_ignore_ascii_case("on"));
-    if reply_probe {
-        crate::dlog::imu(format_args!(
-            "{} FLEXINPUT_JC2_REPLIES=on — waiting for a reply to every command, \
-             on whichever channel this run uses",
-            side.display_name()
-        ));
-    }
-    crate::dlog::imu(format_args!(
-        "{} command channel: {} ({})",
-        side.display_name(),
-        if cmd_common { "0x0014 BARE (reference)" } else { "0x0016 prefixed (default)" },
-        if cmd_common { "FLEXINPUT_JC2_CMD=common" } else { "set FLEXINPUT_JC2_CMD=common to try the reference path" },
-    ));
+    // ⭐ The gap DRAINS rather than sleeps: while this half initialises, the
+    // other one is still streaming into the dongle, and a controller whose
+    // buffers fill stops being able to send.
     let cmd = |c: u8, s: u8, data: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
-        let (handle, frame) = if cmd_common {
-            (jc::HANDLE_CMD_WRITE_COMMON, protocol::command(c, s, data))
-        } else {
-            (jc::HANDLE_CMD_WRITE, protocol::rumble_cmd_frame(c, s, data))
-        };
-        dongle.send_att(conn, &acl::write_command(handle, &frame))?;
-        // ⭐ Keep draining while we wait, rather than sleeping blind.
-        //
-        // Initialising the SECOND controller takes about three seconds, and for
-        // all of it the first one was going unserviced — its notifications
-        // piling up in the dongle's ACL buffer with nobody reading them. A
-        // controller whose buffers fill stops being able to send, which looks
-        // from the outside like the first Joy-Con dying the moment the second
-        // one connects.
-        //
-        // The data drained here belongs to a link this function knows nothing
-        // about, so it is discarded; a few dropped reports during init is
-        // nothing next to stalling the transport.
-        // ⛔ **In reference mode, WAIT for the controller's reply.**
-        //
-        // The reference's write_command blocks on the response and validates it
-        // — `resp[0] == command_id` and `resp[1] == 0x01` — with a two-second
-        // timeout, before sending the next command. This has always fired and
-        // forgotten with a fixed 30 ms sleep, on the reasoning that waiting
-        // once turned a millisecond handshake into forty seconds.
-        //
-        // ❗ That reasoning is about TIMING and says nothing about ordering. If
-        // the controller processes commands strictly in sequence and drops
-        // whatever arrives while it is busy, a fire-and-forget init is applied
-        // in part, and which parts survive depends on how fast the link is that
-        // day. Feature-select landing often enough for the per-side stream
-        // while never landing for the common one is exactly what a partially
-        // applied init looks like.
-        //
-        // Reference mode only: the default path keeps its 30 ms and its
-        // measured behaviour.
-        if cmd_common || reply_probe {
-            // ⛔ **Record every ATT PDU seen while waiting, not only the one
-            // that matched.**
-            //
-            // The previous version dropped non-matching packets on the floor and
-            // could therefore only ever report absence. A whole run came back
-            // reading "no reply in 400 ms" nineteen times, which is equally
-            // consistent with a silent controller, a reply on a handle nothing
-            // here watches, and a matcher that is simply wrong — three
-            // different problems, and a log that says nothing cannot tell them
-            // apart. Absence is evidence only when you can also show what would
-            // have been accepted.
-            // ❗ **The budget is the input watchdog, not patience.**
-            //
-            // Nineteen commands at 400 ms each is 7.6 s of init when nothing
-            // answers, against a 3 s watchdog — the diagnostic would kill the
-            // link it is measuring and report the wrong cause. Reference mode
-            // can afford the long wait because its stream never starts anyway;
-            // the working path cannot, so it gets 120 ms, which is far longer
-            // than a reply that is coming at all will take.
-            let budget = if cmd_common { 400 } else { 120 };
-            let deadline = Instant::now() + Duration::from_millis(budget);
-            let mut answered = false;
-            let mut seen: Vec<String> = Vec::new();
-            while Instant::now() < deadline && !answered {
-                for pkt in dongle.drain_acl(64) {
-                    if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
-                        continue;
-                    }
-                    if seen.len() < 8 {
-                        seen.push(format!(
-                            "op {:#04x} {:02x?}",
-                            pkt.payload[0],
-                            &pkt.payload[..pkt.payload.len().min(10)],
-                        ));
-                    }
-                    let Some(note) = acl::parse_notification(&pkt.payload) else { continue };
-                    // ⛔ **Both response channels, and the project's own parser.**
-                    //
-                    // The hand-rolled `value[0] == cmd` test used here before
-                    // only ever matched a bare header at offset 0. Replies on
-                    // `0x001e` carry fifteen bytes of prefix, so a reply
-                    // arriving there was read as no reply at all — the failure
-                    // mode this whole block exists to rule out. `parse_response`
-                    // validates at the expected offset and falls back to
-                    // scanning, and it is what the working pairing path uses.
-                    let offset = if note.handle == jc::HANDLE_CMD_RESPONSE_PERSIDE {
-                        protocol::CMD_RESP_HEADER_OFFSET
-                    } else {
-                        0
-                    };
-                    if note.handle != jc::HANDLE_CMD_RESPONSE
-                        && note.handle != jc::HANDLE_CMD_RESPONSE_PERSIDE
-                    {
-                        continue;
-                    }
-                    if let Some((hdr, _)) = protocol::parse_response(&note.value, offset, c) {
-                        crate::dlog::imu(format_args!(
-                            "{} command {c:#04x}/{s:#04x} REPLY on {:#06x}: sub {:#04x} ack {:#04x}",
-                            side.display_name(),
-                            note.handle,
-                            hdr.subcmd,
-                            hdr.ack,
-                        ));
-                        answered = true;
-                        break;
-                    }
-                }
-            }
-            if !answered {
-                crate::dlog::imu(format_args!(
-                    "{} command {c:#04x}/{s:#04x} — NO REPLY on 0x001a or 0x001e \
-                     within {budget} ms; ATT traffic meanwhile: {}",
-                    side.display_name(),
-                    if seen.is_empty() { "NOTHING AT ALL".to_string() } else { seen.join(" | ") },
-                ));
-            }
-            return Ok(());
-        }
+        let frame = protocol::rumble_cmd_frame(c, s, data);
+        dongle.send_att(conn, &acl::write_command(jc::HANDLE_CMD_WRITE, &frame))?;
         let until = Instant::now() + INIT_GAP;
         while Instant::now() < until {
             let _ = dongle.drain_acl(64);
@@ -1836,161 +773,25 @@ fn connect_and_init(
         Ok(())
     };
 
-    // ⭐ **Probe the command handle with a write that MUST be answered.**
-    //
-    // Every command below is an ATT Write Command (`0x52`), unacknowledged by
-    // definition — the reference uses the same opcode. So a write to a handle
-    // that refuses writes, does not exist, or is gated behind authentication is
-    // indistinguishable from one that was accepted and acted upon. That
-    // ambiguity has sat underneath this entire investigation.
-    //
-    // An ATT Write Request (`0x12`) to the same handle cannot be ignored: the
-    // peer owes either a Write Response or an Error Response. It settles
-    // whether `0x0014` is reachable at all, which no fire-and-forget sequence
-    // can. One extra PDU per connection, in reference mode only.
-    if cmd_common || reply_probe {
-        // ⛔ **Drain first.** An ATT Write Response carries no handle, so the
-        // bare `0x13` this loop matches could belong to any earlier write — and
-        // on the first run it did: three CCCD writes were still in flight, the
-        // probe credited one of their responses to itself and reported "the
-        // handle accepts writes", while the genuine answer for `0x0014` —
-        // `01 12 14 00 03`, Write Not Permitted — arrived in the NEXT drain and
-        // was read as unrelated traffic. A correlation-free matcher on a
-        // shared queue will always find the answer it hoped for.
-        let flushed = dongle.drain_acl(64).len();
-        let probe = protocol::command(protocol::CMD_UNKNOWN_07, 0x01, &[]);
-        let target = if cmd_common { jc::HANDLE_CMD_WRITE_COMMON } else { jc::HANDLE_CMD_WRITE };
-        let _ = dongle.send_att(conn, &acl::write_request(target, &probe));
-        let deadline = Instant::now() + Duration::from_millis(400);
-        let mut answer: Option<String> = None;
-        while Instant::now() < deadline && answer.is_none() {
-            for pkt in dongle.drain_acl(64) {
-                if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
-                    continue;
-                }
-                match pkt.payload[0] {
-                    0x13 => {
-                        answer = Some("WRITE RESPONSE - the handle accepts writes".to_string());
-                    }
-                    // Error responses DO name the handle, so this one is
-                    // attributable: only claim it if it is ours.
-                    0x01 if pkt.payload.len() >= 5
-                        && u16::from_le_bytes([pkt.payload[2], pkt.payload[3]]) == target =>
-                    {
-                        answer = Some(format!(
-                            "ERROR RESPONSE {:02x?} - the handle REFUSED the write \
-                             (0x03 = Write Not Permitted, which is NORMAL for a \
-                             write-without-response-only characteristic)",
-                            &pkt.payload[..pkt.payload.len().min(6)],
-                        ));
-                    }
-                    _ => continue,
-                }
-                break;
-            }
-        }
-        let _ = flushed;
-        crate::dlog::imu(format_args!(
-            "{} write-request probe of command handle {:#06x} (flushed {flushed} stale PDUs): {}",
-            side.display_name(),
-            target,
-            answer.unwrap_or_else(|| {
-                "NO ANSWER in 400 ms - an ATT violation, so the PDU never reached the peer"
-                    .to_string()
-            }),
-        ));
-    }
-
     // Undocumented handshake steps official software always sends first.
-    //
-    // ⛔ Not in reference mode. The reference's initialize() sends NONE of
-    // these — it goes straight from subscribing the response channel to
-    // reading controller info. Three unknown commands ahead of everything else,
-    // taken from a different research source, could put the controller into a
-    // mode the reference never sees. "We send a superset of what works" is safe
-    // only if every extra is inert, and that was never established for these.
-    if !reference_mode {
-        cmd(protocol::CMD_UNKNOWN_07, 0x01, &[])?;
-        cmd(protocol::CMD_UNKNOWN_10, 0x01, &[])?;
-        cmd(protocol::CMD_UNKNOWN_16, 0x01, &[])?;
-    }
+    cmd(protocol::CMD_UNKNOWN_07, 0x01, &[])?;
+    cmd(protocol::CMD_UNKNOWN_10, 0x01, &[])?;
+    cmd(protocol::CMD_UNKNOWN_16, 0x01, &[])?;
 
-    // Controller-memory reads. These carry factory calibration; other
-    // implementations report that skipping them leaves the controller emitting
-    // stub reports indefinitely.
-    // ⭐ Pair BEFORE the rest of init, not after.
+    // ⭐ Pair BEFORE the rest of init, so the flash writes never land in the
+    // middle of a live stream.
     //
-    // It used to run last, after the report-rate descriptor had already started
-    // the input stream — so two controller-flash writes landed in the middle of
-    // a live stream. The controller then showed its player LED (connected) while
-    // FlexInput listed nothing at all: reports had stopped and never resumed,
-    // and the log simply ended.
-    //
-    // The Bluetooth hub has always paired before finishing init, and its logs
-    // read `paired …` then `init complete` then `steady state`. Matching that
-    // order keeps the stream-start as the last thing that happens, which is
-    // also what makes it recoverable — nothing after it can disturb it.
-    // ❗ The lookup is a STATEMENT, not an `if let` scrutinee, and that is not
-    // style. A `MutexGuard` created in an `if let` condition lives until the end
-    // of the whole if/else-if chain, so
-    //
-    //     if let Some(prev) = shared.paired.lock().unwrap().get(..).copied() {
-    //     } else if let Some(ltk) = run_pairing(..) {
-    //         shared.paired.lock().unwrap().insert(..);   // deadlock
-    //     }
-    //
-    // takes the same non-reentrant lock twice and blocks the thread forever.
-    // It hung exactly here: the console printed `PAIRED`, the very next log
-    // line never arrived, the controller kept its link, and closing the app
-    // stranded it because the teardown is at the end of a thread that could no
-    // longer reach it.
-    // ⛔ **The reference NEVER PAIRS, and that is now the only thing we do
-    // that it does not.**
-    //
-    // `trevlars/switch2-controllers-linux` connects L2CAP with
-    // `BT_SECURITY_LOW`, and its own comment says why: "which is required by
-    // Switch 2 controllers (they drop any link that attempts SMP pairing)". It
-    // sends no 0x15 at all. It then reads the common input on a plaintext,
-    // unbonded link — the exact thing FlexInput cannot get.
-    //
-    // This runs a full Nintendo pairing on every first connect: exchange
-    // addresses, exchange keys, confirm the LTK, FINALISE — which writes the
-    // controller's flash and replaces its bond with a Switch — and register the
-    // link key. None of that is in the reference's path.
-    //
-    // ❗ Two reasons to be able to turn it off, and only one is the gyro. The
-    // other is that if a plaintext link works without it, then writing a user's
-    // controller flash to talk to it was never necessary, and doing something
-    // irreversible that the working reference does not do needs better
-    // justification than "it is what we have always done".
-    //
-    // FLEXINPUT_JC2_PAIR=off skips it. Off by default until it is shown safe:
-    // the per-side stream may or may not depend on it, and finding out is what
-    // the switch is for.
-    if reference_mode
-        || std::env::var("FLEXINPUT_JC2_PAIR").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
-    {
-        eprintln!("[jc2-dongle] {} pairing SKIPPED (FLEXINPUT_JC2_PAIR=off)", side.display_name());
-        crate::dlog::imu(format_args!(
-            "{} pairing SKIPPED — no 0x15 sent, no flash written, as the reference does",
-            side.display_name()
-        ));
-    } else {
+    // ❗ The lookup is a STATEMENT, not an `if let` scrutinee. A `MutexGuard`
+    // created in an `if let` condition lives until the end of the whole
+    // if/else chain, so locking `paired` again inside it deadlocks the thread.
     let already_paired = shared.paired.lock().unwrap().get(&address).copied();
-    match already_paired {
-        Some(prev) => eprintln!(
-            "[jc2-dongle] {} already paired this run, skipping the flash writes (LTK {prev:02x?})",
-            side.display_name(),
-        ),
-        None => {
-            if let Some(ltk) = run_pairing(dongle, conn, side) {
-                shared.paired.lock().unwrap().insert(address, ltk);
-            }
+    if already_paired.is_none() {
+        if let Some(ltk) = run_pairing(dongle, conn, side) {
+            shared.paired.lock().unwrap().insert(address, ltk);
         }
     }
-    }
 
-    dlog!("init: pairing done, starting memory reads");
+    // Controller-memory reads, which carry factory calibration.
     for (size, addr) in protocol::JC2_INIT_MEMORY_READS {
         cmd(
             protocol::CMD_READ_MEMORY,
@@ -1999,317 +800,34 @@ fn connect_and_init(
         )?;
     }
 
-    dlog!("init: memory reads done");
+    // Connection feedback: the buzz, then the player LED.
+    cmd(protocol::CMD_VIBRATION, 0x02, &[0x03, 0, 0, 0])?;
+    cmd(protocol::CMD_PLAYER_LEDS, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0])?;
 
-    // ⭐ CONNECTION FEEDBACK — this is the buzz, and it is a COMMAND.
-    //
-    // The Bluetooth hub sends `0x0a/0x02` (play a canned vibration preset) as
-    // the first step after the memory reads, and the dongle path never has. A
-    // Joy-Con paired over the Windows stack buzzes; over the dongle it does
-    // not — and that difference was reasonably, but wrongly, read as evidence
-    // that dongle pairing was being refused.
-    //
-    // It is not evidence of anything about pairing. Pairing reports a genuine
-    // cryptographic agreement at every step: the controller returns its device
-    // key, and the AES confirmation it sends back matches the one derived from
-    // the LTK. That cannot be faked by a controller that ignored the exchange.
-    // The buzz was simply a command nobody was sending.
-    // Reference order is player LEDs, then the vibration preset. This path had
-    // them the other way round for no recorded reason, so reference mode uses
-    // theirs.
-    if reference_mode {
-        cmd(protocol::CMD_PLAYER_LEDS, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0])?;
-        cmd(protocol::CMD_VIBRATION, 0x02, &[0x03, 0, 0, 0])?;
-    } else {
-        cmd(protocol::CMD_VIBRATION, 0x02, &[0x03, 0, 0, 0])?;
-        cmd(protocol::CMD_PLAYER_LEDS, 0x07, &[0x01, 0, 0, 0, 0, 0, 0, 0])?;
-    }
-    dlog!("init: player LED and connection feedback sent");
-
-    // ⭐ The feature-select command is now OPTIONAL, and off by default.
-    //
-    // Three independent reference implementations decode the gyroscope at
-    // offset 0x36 of a 63-byte report, and NONE of them sends a feature command
-    // to enable motion. The upstream one calls it in exactly one place:
-    //
-    //     if CONFIG.mouse_config.enabled:
-    //         await self.enableFeatures(FEATURE_MOUSE)
-    //
-    // So on a standard controller the IMU is present by default, and this
-    // command's job is to turn the MOUSE on — not the motion.
-    //
-    // Every init this project has ever run sent it, always with the mouse bit
-    // set. And the report we receive carries mouse deltas at 0x09, a motion
-    // block at 0x10 that matches no published layout, and zeroes across
-    // 0x30..0x3C where the standard accelerometer and gyroscope live. That is
-    // consistent with the command switching the controller into an alternate
-    // report format in which the raw IMU is simply not carried.
-    //
-    // It would also explain why sweeping the mask changed nothing: if the
-    // layout latches on the first feature-select regardless of payload, then
-    // every mask ever tested was applied AFTER the format was already chosen.
-    //
-    // `FLEXINPUT_JC2_FEATURES=2f` (any hex byte) restores the old behaviour with
-    // that mask, so both paths are one restart apart rather than a rebuild.
-    // ⭐ Reference mode defaults to the mask the reference actually sends.
-    //
-    // `enable_features(0x03 | FEATURE_MOTION)` — buttons, sticks, motion, and
-    // nothing else. This path's default is `0x2f`, which adds IMU_RAW and
-    // RUMBLE. Running "the reference sequence" with a mask the reference never
-    // sends is not running the reference sequence, and the mask is the one
-    // parameter this command exists to carry. An explicit
-    // FLEXINPUT_JC2_FEATURES still wins, so the sweep stays available.
-    let selected = if reference_mode && std::env::var_os("FLEXINPUT_JC2_FEATURES").is_none() {
-        Some(protocol::feature::BUTTONS | protocol::feature::STICKS | protocol::feature::IMU)
-    } else {
-        feature_override()
-    };
-    match selected {
-        Some(mask) => {
-            eprintln!("[jc2-dongle] feature-select ENABLED, mask {mask:#04x} (mouse needs 0x10)");
-            // ⛔ **Into the diagnostic log, not just stderr.**
-            //
-            // The mask is the variable under test and it was only ever printed
-            // to a console nobody keeps, so a run could not say which
-            // experiment it was. A log that records the result but not the
-            // condition answers nothing.
-            crate::dlog::imu(format_args!(
-                "{} feature-select mask {mask:#04x} \
-                 (buttons {} sticks {} imu {} imu_raw {} mouse {} rumble {} mag {}) \
-                 -> per-side {:#06x}, bare -> common {:#06x}",
-                side.display_name(),
-                mask & protocol::feature::BUTTONS != 0,
-                mask & protocol::feature::STICKS != 0,
-                mask & protocol::feature::IMU != 0,
-                mask & protocol::feature::IMU_RAW != 0,
-                mask & protocol::feature::MOUSE != 0,
-                mask & protocol::feature::RUMBLE != 0,
-                mask & protocol::feature::MAGNETOMETER != 0,
-                jc::HANDLE_CMD_WRITE,
-                jc::HANDLE_CMD_WRITE_COMMON,
-            ));
-            // ❗ The full captured sequence, in order, not just the two
-            // feature-select frames.
-            //
-            // The hub sends INIT, then `0x11/0x03`, then the 20-byte vibration
-            // payload `0x0a/0x08`, then `0x11/0x01`, and only THEN the confirm.
-            // Its own comment records that official software always sends the
-            // vibration data before the final confirm, and that omitting it was
-            // a real regression once already. The dongle path was sending the
-            // two feature frames back to back with all four intervening steps
-            // missing — a shorter sequence than the one this controller was
-            // captured responding to.
-            // ⛔ **In reference mode the two feature frames go back to back.**
-            //
-            // enable_features() in the reference is exactly two writes:
-            //
-            //     self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_INIT, payload)
-            //     self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, payload)
-            //
-            // with nothing at all between them. This path injects three
-            // unrelated commands into that gap. If the pair is one transaction
-            // — which is what an INIT/ENABLE pair usually is — interleaving
-            // voids it, and it would fail in exactly the way seen here: the
-            // per-side stream, already running, unaffected; the stream the
-            // ENABLE was meant to select never arriving.
-            cmd(protocol::CMD_FEATURE_SELECT, protocol::SUB_FEATURE_INIT, &[mask, 0, 0, 0])?;
-            if reference_mode {
-                cmd(
-                    protocol::CMD_FEATURE_SELECT,
-                    protocol::SUB_FEATURE_CONFIRM,
-                    &[mask, 0, 0, 0],
-                )?;
-            } else {
-            cmd(protocol::CMD_UNKNOWN_11, 0x03, &[])?;
-            cmd(
-                protocol::CMD_VIBRATION,
-                0x08,
-                &[
-                    0x01, 0x59, 0x09, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x35,
-                    0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ],
-            )?;
-            cmd(protocol::CMD_UNKNOWN_11, 0x01, &[])?;
-            cmd(protocol::CMD_FEATURE_SELECT, protocol::SUB_FEATURE_CONFIRM, &[mask, 0, 0, 0])?;
-            }
-
-            // ⭐ Mirror it onto the COMMON command characteristic, bare.
-            //
-            // Never tried in this combination. The reference implementations
-            // write commands here (UUID 649d4ac9-…) with NO 17-byte prefix, and
-            // read motion from the common input, where the standard accel/gyro
-            // block lives. This project drives the per-side channel instead,
-            // because that is the one that visibly executes — but "0x0014 is
-            // inert" was concluded from init commands whose only evidence of
-            // success was a reply, and a feature bit can take effect without
-            // one.
-            //
-            // Costs two ATT writes. If the handle ignores them, nothing changes;
-            // if it does not, the common input may start carrying the standard
-            // report, which the notification handler already dumps.
-            for sub in [0x02u8, 0x04] {
-                let bare = protocol::command(protocol::CMD_FEATURE_SELECT, sub, &[mask, 0, 0, 0]);
-                dongle.send_att(conn, &acl::write_command(jc::HANDLE_CMD_WRITE_COMMON, &bare))?;
-                std::thread::sleep(INIT_GAP);
-            }
-        }
-        None => {
-            eprintln!("[jc2-dongle] feature-select SKIPPED by FLEXINPUT_JC2_FEATURES=off");
-            crate::dlog::imu(format_args!(
-                "{} feature-select SKIPPED (FLEXINPUT_JC2_FEATURES=off)",
-                side.display_name()
-            ));
-        }
-    }
-
-    // ⛔ **Subscribed LAST, after the features are on — and with NO rate
-    // descriptor.**
-    //
-    // From the reference's initialise(), verbatim, which ends:
-    //
-    //     self._retry("enable features", lambda: self.enable_features(...))
-    //     self._retry("input notifications",
-    //                 lambda: self.att.subscribe(self.h_input_cccd, True))
-    //
-    // Two differences, both mine. The common input was subscribed near the
-    // START of init, before the feature-select that enables motion had been
-    // sent — asking a controller to stream something it had not yet been told
-    // to produce. And a vendor rate descriptor was written to 0x000c because
-    // the per-side input needs one at 0x0010; the reference writes no such
-    // thing here, and an unasked-for write to a vendor descriptor is as likely
-    // to suppress a stream as to start one.
-    //
-    // ❗ The per-side input keeps its rate descriptor. That path works, and
-    // this is not the place to find out whether it needs it.
-    // ⭐ The common input, subscribed at its RESOLVED handle and with the reply
-    // actually read.
-    //
-    // ⛔ Both of these were fire-and-forget at a hardcoded number. If the
-    // number was wrong the write landed on an unrelated attribute; if it was
-    // refused the error response was never read. Either way the outcome was a
-    // characteristic recorded as "subscribed and silent" — the exact note that
-    // sat against `0x000a` for the whole gyro search, on two different
-    // controllers, while another project read motion from it on the same
-    // hardware.
-    //
-    // A CCCD sits immediately after the value handle it configures, and the
-    // vendor rate descriptor after that; those offsets are GATT convention and
-    // hold wherever the base handle lands.
-    if let Some(common) = handles.common {
-        for (what, handle, payload) in [
-            ("CCCD", common + 1, &acl::CCCD_NOTIFY[..]),
-        ] {
-            match dongle.att_request(
-                conn,
-                &acl::write_request(handle, payload),
-                acl::ATT_WRITE_RESPONSE,
-                ATT_ACK_WAIT,
-            ) {
-                Ok(Some(_)) => crate::dlog::imu(format_args!(
-                    "{} common input {what} write {handle:#06x} acknowledged",
-                    side.display_name()
-                )),
-                Ok(None) => crate::dlog::imu(format_args!(
-                    "{} common input {what} write {handle:#06x} — NO REPLY                      (the attribute may not exist here)",
-                    side.display_name()
-                )),
-                Err(e) => crate::dlog::imu(format_args!(
-                    "{} common input {what} write {handle:#06x} REFUSED: {e}",
-                    side.display_name()
-                )),
-            }
-        }
-    } else {
-        crate::dlog::imu(format_args!(
-            "{} common input NOT PRESENT in this controller's table — nothing              to subscribe to, so report 0x05 cannot be a gyro source here",
-            side.display_name()
-        ));
-    }
-
-    // ⛔ **READ it, rather than waiting to be told.**
-    //
-    // Five hypotheses have died against this characteristic: exclusivity, the
-    // feature mask, the CCCD, the command channel, and the subscribe ordering.
-    // Every one was a guess at why it will not NOTIFY. Its declaration says
-    // properties 0x12 — and 0x02 is READ, which has never once been used.
-    //
-    // ⭐ A read separates two very different worlds. If 0x000a returns a report
-    // with accel and gyro at 0x30/0x36, the data exists and only the
-    // notification path is broken — and polling a readable characteristic is an
-    // ugly but entirely workable fallback that would deliver a real angular
-    // rate today. If it returns zeros or refuses, the stream genuinely is not
-    // there to be had on this firmware, and no amount of subscribing was ever
-    // going to produce it.
-    //
-    // ❗ Cheap, and it needs nothing from the user beyond one run. It should
-    // have been the second thing tried, not the seventh.
-    if let Some(common) = handles.common {
-        let _ = dongle.drain_acl(64);
-        if dongle.send_att(conn, &acl::read_request(common)).is_ok() {
-            let deadline = Instant::now() + Duration::from_millis(400);
-            let mut got = false;
-            while Instant::now() < deadline && !got {
-                for pkt in dongle.drain_acl(32) {
-                    if pkt.cid != acl::CID_ATT || pkt.payload.is_empty() {
-                        continue;
-                    }
-                    if pkt.payload[0] == acl::ATT_ERROR_RESPONSE {
-                        crate::dlog::imu(format_args!(
-                            "{} READ of common input {common:#06x} REFUSED: {:02x?}",
-                            side.display_name(),
-                            pkt.payload,
-                        ));
-                        got = true;
-                        break;
-                    }
-                    let Some(v) = acl::parse_read_response(&pkt.payload) else { continue };
-                    let block = v
-                        .get(0x30..0x3c)
-                        .map(|b| b.iter().any(|x| *x != 0))
-                        .unwrap_or(false);
-                    crate::dlog::imu(format_args!(
-                        "{} READ of common input {common:#06x}: {} bytes, standard block                          0x30..0x3c {} - {:02x?}",
-                        side.display_name(),
-                        v.len(),
-                        if block { "POPULATED" } else { "zero/absent" },
-                        &v[..],
-                    ));
-                    got = true;
-                    break;
-                }
-            }
-            if !got {
-                crate::dlog::imu(format_args!(
-                    "{} READ of common input {common:#06x}: no reply in 400 ms",
-                    side.display_name()
-                ));
-            }
-        }
-    }
+    // Feature select, in the captured order: INIT, then `0x11/0x03`, the
+    // vibration payload `0x0a/0x08`, `0x11/0x01`, and only then the confirm.
+    // Skipping it leaves `motion_len = 0` forever.
+    let mask = protocol::feature::JOYCON2_DEFAULT;
+    cmd(protocol::CMD_FEATURE_SELECT, protocol::SUB_FEATURE_INIT, &[mask, 0, 0, 0])?;
+    cmd(protocol::CMD_UNKNOWN_11, 0x03, &[])?;
+    cmd(
+        protocol::CMD_VIBRATION,
+        0x08,
+        &[
+            0x01, 0x59, 0x09, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x35,
+            0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+    )?;
+    cmd(protocol::CMD_UNKNOWN_11, 0x01, &[])?;
+    cmd(protocol::CMD_FEATURE_SELECT, protocol::SUB_FEATURE_CONFIRM, &[mask, 0, 0, 0])?;
 
     dlog!("init: COMPLETE");
-
     Ok(Link {
         key: PadKey { side, address },
         conn,
-        handles,
         calib: StickCalib::default(),
         orientation: OrientationTracker::default(),
-        common_probe: Instant::now(),
-        // ❗ Dated in the PAST so the first frame dumps immediately. Set to
-        // "now", the first dump was ten seconds away and two short test runs
-        // produced no frame at all — a diagnostic that cannot answer a
-        // five-second run is not a diagnostic.
-        frame_dump: Instant::now() - Duration::from_secs(10),
-        common_motion: None,
-        common_only,
         last_input: Instant::now(),
-        cadence: flexinput_btle::cadence::Cadence::new(),
-        mouse_probe: MouseProbe::default(),
-        reports: 0,
-        extra_reports: 0,
-        replies: 0,
-        common_reports: 0,
         unparsed: 0,
     })
 }
@@ -2344,10 +862,6 @@ fn pump(
     scanning: bool,
 ) -> Option<([u8; 6], u8, Side)> {
     let mut found = None;
-    // ❗ Taken before the per-report loop borrows `links` mutably. It is the
-    // condition the cadence measurement is being compared ACROSS, so a
-    // measurement that could not name it would answer nothing.
-    let streaming_links = links.len();
     // ⭐ From the shared radio's fan-out, not from the dongle directly. One
     // reader feeds every transport; reading the transport here would consume
     // the other one's traffic as well as ours.
@@ -2356,7 +870,6 @@ fn pump(
     while let Some(evt) = sub.recv_event(Duration::from_millis(1)) {
         match evt {
             Event::DisconnectionComplete { conn_handle, reason } => {
-                dlog!("DISCONNECT handle {conn_handle:#06x} reason {reason:#04x}");
                 if let Some(pos) = links.iter().position(|l| l.conn == conn_handle) {
                     let link = links.remove(pos);
                     eprintln!(
@@ -2369,32 +882,12 @@ fn pump(
             Event::LeAdvertisingReport(r) if scanning && found.is_none() => {
                 found = advert_match(shared, &r, links);
             }
-            // ⭐ Reports that arrive when we are NOT looking, logged too.
-            //
-            // `found.is_none()` means only the first match per pass is taken,
-            // and `scanning` gates the rest — so a controller whose whole
-            // advertising burst lands in a window where either was false is
-            // discarded without a trace. That is precisely the "woke it and
-            // nothing happened" case, and it is invisible from the console.
-            Event::LeAdvertisingReport(r) => {
-                dlog!(
-                    "adv {:02x?} rssi {} IGNORED — scanning={scanning} already_found={}",
-                    r.address, r.rssi, found.is_some(),
-                );
-            }
-            other => dlog!("event {other:?}"),
+            _ => {}
         }
     }
 
-    // Drain EVERYTHING waiting, not one packet per pass.
-    //
-    // Reading a single packet per iteration with a blocking timeout capped the
-    // whole process at roughly 90 packets a second shared between both links,
-    // and whichever half was serviced first took nearly all of it — the right
-    // half was observed at 6 Hz against the left's 60 Hz. Two halves at a 5 ms
-    // connection interval need 400 packets a second, so this has to be greedy.
-    // Same fan-out. Bounded so one very chatty link cannot keep this loop from
-    // returning to its callers' scan and connect handling.
+    // Bounded, so a flood of input cannot keep this from returning to the scan
+    // and connect logic in the caller.
     let mut drained = 0;
     while let Some(pkt) = sub.recv_acl(Duration::from_millis(1)) {
         drained += 1;
@@ -2405,342 +898,33 @@ fn pump(
             continue;
         }
         let Some(n) = acl::parse_notification(&pkt.payload) else { continue };
-        // ⭐ Announce ANY traffic on the common input, loudly and once.
-        //
-        // This characteristic has been assumed dead for the whole project, on
-        // evidence that never included writing its report-rate descriptor. If a
-        // single notification arrives here it changes what this controller is
-        // believed to be capable of, and the raw bytes are printed because that
-        // is the report both working PC implementations parse motion from —
-        // accel at 0x30, gyro at 0x36. A hex dump is enough to confirm or kill
-        // it on sight: byte 0x34 should read about 4096 with the pad face-up.
-        // ⭐ Anything on the previously unsubscribed streams, dumped raw. If the
-        // gyro is anywhere outside the per-side report, this is where it shows.
-        if n.handle == jc::HANDLE_INPUT_EXTRA || n.handle == jc::HANDLE_NOTIFY_EXTRA2 {
-            if let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) {
-                link.extra_reports = link.extra_reports.saturating_add(1);
-                if link.extra_reports.is_power_of_two() {
-                    eprintln!(
-                        "[jc2-dongle] {} ⭐ EXTRA STREAM {:#06x} #{} ({} bytes): {:02x?}",
-                        link.key.side.display_name(),
-                        n.handle,
-                        link.extra_reports,
-                        n.value.len(),
-                        &n.value[..n.value.len().min(64)],
-                    );
-                }
-            }
-            continue;
-        }
-        if links
-            .iter()
-            .any(|l| l.conn == pkt.conn_handle && l.handles.common == Some(n.handle))
-        {
-            if let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) {
-                link.common_reports = link.common_reports.saturating_add(1);
-                // ⭐ **The real angular rate, kept for the next per-side
-                // report.**
-                //
-                // Merged rather than used wholesale: the per-side report is
-                // what buttons, sticks, mouse and battery already come from and
-                // it works, so this changes only the one field that was
-                // missing. `OrientationTracker::update` ALREADY prefers
-                // `motion.gyro` over the constructed axes when it is present —
-                // so supplying it here retires the differentiated heading, the
-                // x4 yaw gain and the smoothing window in one step, with no
-                // change to the pipeline below.
-                if let Some(common) = reports::parse_common_input(link.key.side, &n.value) {
-                    link.common_motion = common.motion.gyro.map(|g| (g, common.motion.std_accel));
-                }
-                if link.common_reports.is_power_of_two() {
-                    eprintln!(
-                        "[jc2-dongle] {} ⭐ COMMON INPUT #{} ({} bytes): {:02x?}",
-                        link.key.side.display_name(),
-                        link.common_reports,
-                        n.value.len(),
-                        &n.value[..n.value.len().min(64)],
-                    );
-                    // ⏳ TEMPORARY, and the single most valuable line this log
-                    // can carry.
-                    //
-                    // ⭐ **This characteristic is where a real gyro would be.**
-                    // The per-side stream has been shown to contain no angular
-                    // rate at all, so every rate FlexInput reports is
-                    // differentiated from a fused heading — which is why yaw
-                    // needs a x4 fudge for its frequency response. Both working
-                    // PC implementations read motion from HERE instead, as six
-                    // contiguous i16 at 0x30 (accel) and 0x36 (gyro).
-                    //
-                    // ❗ It has never notified on the reference M12-S grip, so
-                    // nobody knows whether retail hardware gates it differently.
-                    // If these lines appear on a genuine Joy-Con 2, the whole
-                    // constructed-axis approach can be replaced by the real
-                    // thing. Decoded inline because "did it notify" and "is
-                    // there sensible motion in it" are one question in practice.
-                    let i16_at = |off: usize| -> Option<i16> {
-                        let b = n.value.get(off..off + 2)?;
-                        Some(i16::from_le_bytes([b[0], b[1]]))
-                    };
-                    let six = (0..6)
-                        .map(|i| i16_at(0x30 + i * 2))
-                        .collect::<Option<Vec<_>>>();
-                    match six {
-                        Some(v) => crate::dlog::imu(format_args!(
-                            "{} COMMON INPUT (0x000a) #{} len {} | accel {:>7} {:>7} {:>7}                              | gyro {:>7} {:>7} {:>7} | raw {:02x?}",
-                            link.key.side.display_name(),
-                            link.common_reports,
-                            n.value.len(),
-                            v[0], v[1], v[2], v[3], v[4], v[5],
-                            &n.value[..n.value.len().min(64)],
-                        )),
-                        None => crate::dlog::imu(format_args!(
-                            "{} COMMON INPUT (0x000a) #{} len {} — TOO SHORT for the                              0x30/0x36 motion block | raw {:02x?}",
-                            link.key.side.display_name(),
-                            link.common_reports,
-                            n.value.len(),
-                            &n.value[..n.value.len().min(64)],
-                        )),
-                    }
-                }
-            }
-            // ⛔ **When the common stream is the only source it must drive
-            // EVERYTHING, not just donate a gyro.**
-            //
-            // In reference mode the per-side characteristic is never
-            // subscribed, so continuing here would leave no buttons, no sticks
-            // and no device at all — and the run would prove nothing about
-            // whether 0x000a works, which is the only reason for the mode.
-            // Falling through sends this report down the same path the
-            // per-side one takes; the decoder is chosen by handle below.
-            // ❗ Looked up again rather than reusing the borrow above: this
-            // sits outside that `if let`, and the mutable borrow has ended.
-            let only = links
-                .iter()
-                .find(|l| l.conn == pkt.conn_handle)
-                .map(|l| l.common_only)
-                .unwrap_or(false);
-            if !only {
-                continue;
-            }
-        }
-        // ⭐ Print the controller's command REPLIES. We have never read them.
-        //
-        // Every init command here is fire-and-forget, on the reasoning that
-        // waiting on replies once turned a millisecond handshake into 40
-        // seconds. That is still the right call for TIMING — but it means the
-        // controller has been answering into a void this whole time. A reply to
-        // the feature-select is the one place a refused or clamped mask would
-        // announce itself, and "the mask had no effect" versus "the mask was
-        // rejected" are very different problems.
-        //
-        // Cheap: replies only arrive during init, so this is a handful of lines
-        // per connection and then silence.
-        if n.handle == jc::HANDLE_CMD_RESPONSE || n.handle == jc::HANDLE_CMD_RESPONSE_PERSIDE {
-            if let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) {
-                link.replies = link.replies.saturating_add(1);
-                if link.replies <= 24 {
-                    eprintln!(
-                        "[jc2-dongle] {} <- reply #{} on {:#06x} ({} bytes): {:02x?}",
-                        link.key.side.display_name(),
-                        link.replies,
-                        n.handle,
-                        n.value.len(),
-                        &n.value[..n.value.len().min(32)],
-                    );
-                }
-            }
-            continue;
-        }
         if n.handle != jc::HANDLE_INPUT_VALUE {
             continue;
         }
         let Some(link) = links.iter_mut().find(|l| l.conn == pkt.conn_handle) else {
             continue;
         };
-        // ⏳ TEMPORARY. The WHOLE frame, periodically.
-        //
-        // ⛔ The previous version of this logged a "frame shape" from byte
-        // 0x0f and reported two alternating shapes. There is only one: byte
-        // 0x0f is the motion TIMESTAMP, which steps by four every report, and
-        // the motion-length byte for the left half sits one earlier at 0x0e
-        // where it reads a constant 30. A discriminator invented from a
-        // counter will always look like two formats.
-        //
-        // ❗ So this prints the entire 63 bytes instead of a summary of them.
-        // Every offset question so far — accel stride, the per-side one-byte
-        // shift, whether retail lays the block out the same way — is answerable
-        // from the raw frame and from nothing less. Once every ten seconds
-        // costs a few hundred bytes and no judgement about what matters.
-        if link.frame_dump.elapsed() >= Duration::from_secs(10) {
-            link.frame_dump = Instant::now();
-            // ⭐ The verdict alongside the bytes. Whether 0x30..0x3c is zero
-            // is the entire question, and counting zeros by eye across
-            // sixty-three bytes of hex is how a run gets misread.
-            let block_empty = n
-                .value
-                .get(0x30..0x3c)
-                .map(|b| b.iter().all(|v| *v == 0))
-                .unwrap_or(true);
-            crate::dlog::imu(format_args!(
-                "{} FRAME len {} - standard block 0x30..0x3c {} - {:02x?}",
-                link.key.side.display_name(),
-                n.value.len(),
-                if block_empty { "STILL ZERO" } else { "POPULATED" },
-                &n.value[..],
-            ));
-        }
-        // ⭐ The decoder follows the CHARACTERISTIC, not an assumption. The
-        // two reports share nothing but their length: the per-side block is
-        // strided with padding and a one-byte side shift, the common one is
-        // contiguous with neither.
-        let parsed = if link.common_only && Some(n.handle) == link.handles.common {
-            reports::parse_common_input(link.key.side, &n.value)
-        } else {
-            reports::parse_input(link.key.side, &n.value)
-        };
-        let Some(snap) = parsed else {
+        let Some(snap) = reports::parse_input(link.key.side, &n.value) else {
             link.unparsed = link.unparsed.saturating_add(1);
             if link.unparsed.is_power_of_two() {
                 eprintln!(
-                    "[jc2-dongle] {} {} report(s) FAILED TO PARSE, {} bytes: {:02x?}",
+                    "[jc2-dongle] {} {} report(s) FAILED TO PARSE, {} bytes",
                     link.key.side.display_name(),
                     link.unparsed,
                     n.value.len(),
-                    &n.value[..n.value.len().min(24)],
                 );
             }
             continue;
         };
-        // ⭐ Inject the real rate, if the common stream is running.
-        //
-        // ❗ `mut` from here on purely for this. Everything downstream is
-        // unchanged: the tracker already prefers `motion.gyro` when it exists,
-        // so this is the single line that switches the whole orientation path
-        // from a differentiated heading to a rate sensor.
-        let mut snap = snap;
-        if let Some((gyro, accel)) = link.common_motion {
-            snap.motion.gyro = Some(gyro);
-            if let Some(a) = accel {
-                snap.motion.std_accel = Some(a);
-            }
-        }
         let stick = link.calib.normalize(snap.stick_raw);
-        // Orientation from gravity (roll, pitch) and the heading field (yaw),
-        // differenced into a rate. No zero-rate correction step any more:
-        // both sources are absolute, so there is no bias to accumulate.
-        // Pick up a calibration measured on THIS controller, if the user has
-        // captured one. Pushed every report rather than at connect: a capture
-        // that finishes while the pad is streaming must take effect at once,
-        // and an unchanged value costs one read lock.
-        // ⏳ TEMPORARY. ⛔ Silence in a log is ambiguous — "0x000a never
-        // notified" and "this build does not log it" look identical, and the
-        // first is the finding. So absence is stated, on a slow timer.
-        if link.common_probe.elapsed() >= Duration::from_secs(30) {
-            link.common_probe = Instant::now();
-            crate::dlog::imu(format_args!(
-                "{} common input (0x000a): {} report(s) so far{}",
-                link.key.side.display_name(),
-                link.common_reports,
-                if link.common_reports == 0 {
-                    " — SUBSCRIBED AND SILENT, so rates stay differentiated from                      the fused heading"
-                } else {
-                    ""
-                },
-            ));
-        }
         link.orientation.set_resting_drift(crate::cal::field_drift(&link.key));
         let o = link.orientation.update(&snap.motion, link.key.side);
-        let gyro = o.rate_dps;
-
-        // ⭐ MOTION DIAGNOSTIC. The dongle path had no report dump at all,
-        // which is why "the accel pins are dead" could not be told apart from
-        // "the controller is not sending motion" without guessing.
-        //
-        // Prints the PARSED values, not raw bytes: raw bytes still need a human
-        // to apply the offsets, and getting those offsets wrong is one of the
-        // failure modes this is meant to catch. `motion_len` is included
-        // because a short block silently skips the whole motion parse — that
-        // guard failing is invisible everywhere else.
-        //
-        // Doubling backoff: the first reports appear immediately, then it goes
-        // quiet on its own rather than flooding a 67 Hz stream forever.
-        link.reports = link.reports.saturating_add(1);
-        if link.reports.is_power_of_two() {
-            let a = snap.motion.accel;
-            let mag = ((a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) as f32).sqrt();
-            // ⭐ Whether the RAW gyro block is live is the single most useful
-            // fact this line can carry. It is present only when the feature
-            // mask enables it, and its absence is otherwise invisible: the
-            // fallback path still produces plausible-looking numbers from
-            // integrated angles, so "motion works" and "motion is real" look
-            // the same downstream.
-            let imu = match (snap.motion.gyro, snap.motion.std_accel) {
-                (Some(g), Some(sa)) => format!("RAW gyro={g:?} accel={sa:?}"),
-                _ => "raw IMU block ABSENT (feature bit refused?)".to_string(),
-            };
-            eprintln!(
-                "[jc2-dongle] {} #{} len={} accel={a:?} |a|={mag:.0} ({:.2} g) \
-                 heading={} rate={:.1?} | {imu}",
-                link.key.side.display_name(),
-                link.reports,
-                snap.motion_len,
-                mag / reports::ACCEL_LSB_PER_G,
-                snap.motion.angle[reports::HEADING_AXIS],
-                gyro,
-            );
-        }
-        let arrived = Instant::now();
-        // ⭐ The raw fields, before anything interprets them.
-        if crate::dlog::capturing() {
-            let m = &snap.motion;
-            crate::dlog::capture(format_args!(
-                "{},{},{},{},{},{},{},{},{}",
-                match link.key.side {
-                    protocol::Side::Left => "L",
-                    protocol::Side::Right => "R",
-                },
-                m.timestamp,
-                m.angle[0],
-                m.angle[1],
-                m.angle[2],
-                m.accel[0],
-                m.accel[1],
-                m.accel[2],
-                snap.motion_len,
-            ));
-        }
-        if let Some(c) = link.cadence.tick(arrived, Duration::from_secs(2)) {
-            crate::dlog::imu(format_args!(
-                "{} cadence over {} reports: {:.1} Hz, mean {:.2} ms \
-                 (min {:.2}, max {:.2}), jitter {:.2} ms/step — {} link(s) streaming",
-                link.key.side.display_name(),
-                c.samples,
-                c.hz,
-                c.mean_ms,
-                c.min_ms,
-                c.max_ms,
-                c.jitter_ms,
-                streaming_links,
-            ));
-        }
-        if mouse_enabled() {
-            if let Some(line) = link.mouse_probe.tick(
-                &snap.mouse,
-                arrived,
-                Duration::from_secs(2),
-            ) {
-                crate::dlog::imu(format_args!(
-                    "{} {line}",
-                    link.key.side.display_name()
-                ));
-            }
-        }
-        link.last_input = arrived;
+        link.last_input = Instant::now();
         if let Some(pad) = shared.pads.lock().unwrap().get_mut(&link.key) {
             pad.streaming = true;
             pad.snapshot = snap;
             pad.stick = stick;
-            pad.gyro = gyro;
+            pad.gyro = o.rate_dps;
             pad.field_rate = o.field_rate_dps;
             pad.yaw_rate = o.yaw_rate_dps;
             pad.pin_rate = o.pin_rate_dps;
@@ -2797,34 +981,3 @@ mod tests {
         assert_eq!(MAX_LINKS, 2, "two halves make one controller");
     }
 }
-
-#[cfg(test)]
-mod feature_mask_tests {
-    use super::parse_feature_masks;
-
-    #[test]
-    fn a_single_value_is_a_one_entry_sweep() {
-        assert_eq!(parse_feature_masks("2f"), vec![0x2f]);
-        assert_eq!(parse_feature_masks("0x2F"), vec![0x2f]);
-    }
-
-    #[test]
-    fn a_list_keeps_its_order_and_tolerates_spacing() {
-        assert_eq!(parse_feature_masks("07, 0f ,0x2f"), vec![0x07, 0x0f, 0x2f]);
-    }
-
-    #[test]
-    fn unparsable_entries_are_dropped_rather_than_shifting_the_sweep() {
-        // ❗ A silently mis-parsed entry would attribute one mask's result to
-        // another, which is worse than testing one fewer mask.
-        assert_eq!(parse_feature_masks("07,zz,2f"), vec![0x07, 0x2f]);
-        assert!(parse_feature_masks("zz").is_empty());
-        assert!(parse_feature_masks("").is_empty());
-    }
-
-    #[test]
-    fn a_value_wider_than_a_byte_is_refused_not_truncated() {
-        assert!(parse_feature_masks("1ff").is_empty());
-    }
-}
-

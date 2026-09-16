@@ -944,65 +944,6 @@ async fn run_session(
         chars.iter().find(|c| c.uuid == uuid).cloned()
     };
 
-    // ⭐ The same GATT probe the dongle runs, on the Windows stack.
-    //
-    // The two transports reach the same controller and get different results:
-    // over the dongle, `ab7de9be-…-7fd2` and `…-7fde` declare READ|NOTIFY and
-    // refuse both — Read Not Permitted, never a notification — and no
-    // confirmation buzz ever arrives even though every pairing step reports
-    // success and the AES confirmation matches.
-    //
-    // Windows reaches the controller through a relationship this project cannot
-    // reproduce, so if those attributes are gated on something about the LINK
-    // rather than on the commands sent over it, this is where the difference
-    // shows. Reading the same characteristics from here answers it directly,
-    // and Windows holds the pad long enough (~31 s) to find out.
-    //
-    // Same log file as the dongle, deliberately: one timeline, one clock, so
-    // the two paths can be compared line for line.
-    if std::env::var("FLEXINPUT_JC2_GATT_SCAN").is_ok() {
-        dlog!("=== WinRT path: GATT probe for {} ===", side.display_name());
-        for c in &chars {
-            dlog!(
-                "winrt char {} props {:?} service {}",
-                c.uuid, c.properties, c.service_uuid,
-            );
-        }
-        // The two that refuse everything over the dongle.
-        for uuid_str in [
-            "ab7de9be-89fe-49ad-828f-118f09df7fd2",
-            "ab7de9be-89fe-49ad-828f-118f09df7fde",
-            "ab7de9be-89fe-49ad-828f-118f09df7fdf",
-        ] {
-            let Ok(uuid) = Uuid::parse_str(uuid_str) else { continue };
-            match find(uuid) {
-                None => dlog!("winrt read {uuid_str}: characteristic ABSENT"),
-                Some(c) => match p.read(&c).await {
-                    Ok(v) => dlog!(
-                        "winrt read {uuid_str}: ⭐ OK {} bytes {:02x?}",
-                        v.len(),
-                        &v[..v.len().min(48)],
-                    ),
-                    Err(e) => dlog!("winrt read {uuid_str}: FAILED {e}"),
-                },
-            }
-        }
-        // And whether the silent streams notify here.
-        for uuid_str in [
-            "ab7de9be-89fe-49ad-828f-118f09df7fd2",
-            "ab7de9be-89fe-49ad-828f-118f09df7fde",
-        ] {
-            let Ok(uuid) = Uuid::parse_str(uuid_str) else { continue };
-            if let Some(c) = find(uuid) {
-                match p.subscribe(&c).await {
-                    Ok(()) => dlog!("winrt subscribe {uuid_str}: ⭐ accepted"),
-                    Err(e) => dlog!("winrt subscribe {uuid_str}: refused {e}"),
-                }
-            }
-        }
-        dlog!("=== WinRT GATT probe done ===");
-    }
-
     {
         let mut pads = shared.pads.lock().unwrap();
         pads.insert(

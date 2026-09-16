@@ -259,12 +259,11 @@ pub mod feature {
     ///   `0x03 | FEATURE_MOTION` — `0x07` — with neither `IMU_RAW` nor
     ///   [`RUMBLE`] set.
     ///
-    /// ❗ Both may be right for different firmware, and the difference is the
-    /// last unexplained thing between a controller that streams a real angular
-    /// rate and one that streams fused headings over a block of zeros. But a
-    /// default is not the place to settle it: `FLEXINPUT_JC2_FEATURES=07` runs
-    /// the experiment in one command, and until it reports back the recorded
-    /// capture outranks a summary of somebody else's source.
+    /// ❗ Settled on the M12-S, and not by the mask: `0x07`, `0x0f`, `0x2f`,
+    /// `0x3f` and `0xff` were all swept on hardware, every one acknowledged,
+    /// and every one left `0x30..0x3c` zero. On that controller the block lives
+    /// behind a command channel that ignores everything sent to it — see
+    /// `docs/BLUETOOTH_TRANSPORTS.md`. Retail Joy-Con 2 firmware is untested.
     pub const JOYCON2_DEFAULT: u8 = BUTTONS | STICKS | IMU | IMU_RAW | RUMBLE; // 0x2f
 
     /// `JOYCON2_DEFAULT` plus the magnetometer (0xB7).
