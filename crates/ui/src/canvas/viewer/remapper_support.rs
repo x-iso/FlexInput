@@ -614,6 +614,7 @@ pub(crate) fn remapper_press_mode_glyph(mode: &str) -> &'static str {
         "double"     => "↡",
         "on_press"   => "↧",
         "on_release" => "↥",
+        "sequence"   => "⇉",
         "analog"     => "∿",
         _            => "↓",
     }
@@ -626,6 +627,7 @@ pub(crate) fn remapper_press_mode_label(mode: &str) -> &'static str {
         "double"     => "Double tap",
         "on_press"   => "On press",
         "on_release" => "On release",
+        "sequence"   => "Sequence",
         "analog"     => "Analog",
         _            => "Normal (gate)",
     }

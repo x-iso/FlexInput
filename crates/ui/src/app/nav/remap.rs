@@ -207,11 +207,13 @@ impl FlexInputApp {
     pub(crate) fn nav_remap_reset_card(&mut self, outer_id: egui_snarl::NodeId, idx: usize) -> bool {
         self.nav_remap_card_obj_mut(outer_id, idx, |m| {
             let had = m.contains_key("mode") || m.contains_key("window_ms")
-                || m.contains_key("sustain") || m.contains_key("turbo");
+                || m.contains_key("sustain") || m.contains_key("turbo")
+                || m.contains_key("in_order");
             m.remove("mode");
             m.remove("window_ms");
             m.remove("sustain");
             m.remove("turbo");
+            m.remove("in_order");
             had
         })
     }
@@ -221,6 +223,43 @@ impl FlexInputApp {
     /// inline cycle and the press-mode picker modal.
     pub(crate) const PRESS_MODES: &'static [&'static str] =
         &["down","short","long","double","on_press","on_release","analog"];
+
+    /// The Remapper's press modes: `PRESS_MODES` plus Sequence (Remapper only —
+    /// it matches multi-input chords), listed before Analog as in the card popup.
+    pub(crate) const REMAP_PRESS_MODES: &'static [&'static str] =
+        &["down","short","long","double","on_press","on_release","sequence","analog"];
+
+    /// Whether the selected widget is a Remapper (not Map Action / Lean / Touch
+    /// Zones, which share the card machinery).
+    pub(crate) fn nav_selected_is_remapper(&self, outer_id: egui_snarl::NodeId) -> bool {
+        self.nav_selected_element(outer_id).is_some_and(|(m, _)| m == "module.remapper")
+    }
+
+    /// Press modes offered for card `idx` of the selected widget. Sequence only
+    /// on a Remapper card with two or more inputs or a single analog input (the
+    /// card popup grays it out otherwise; nav just skips it).
+    pub(crate) fn nav_press_modes(&self, outer_id: egui_snarl::NodeId, idx: usize) -> &'static [&'static str] {
+        let sequence_ok = self.nav_remap_card_json(outer_id, idx)
+            .and_then(|m| m.get("in").and_then(|v| v.as_array()).map(|a| match a.as_slice() {
+                [only] => only.as_str().is_some_and(flexinput_engine::pin_is_analog_input),
+                pins => pins.len() >= 2,
+            }))
+            .unwrap_or(false);
+        if sequence_ok && self.nav_selected_is_remapper(outer_id) {
+            Self::REMAP_PRESS_MODES
+        } else {
+            Self::PRESS_MODES
+        }
+    }
+
+    /// A copy of card `idx` as JSON.
+    pub(crate) fn nav_remap_card_json(&self, outer_id: egui_snarl::NodeId, idx: usize) -> Option<serde_json::Value> {
+        let key = self.nav_remap_mappings_key(outer_id);
+        let inner = self.nav_selected_inner_node(outer_id)?;
+        let canvas = &self.tabs[self.active_tab].canvas;
+        canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?
+            .snarl.get_node(inner)?.params.get(key)?.as_array()?.get(idx).cloned()
+    }
 
     /// Set card `idx`'s press mode to `mode` directly, applying the same
     /// default-param fixups the renderer's popup does.
@@ -245,7 +284,7 @@ impl FlexInputApp {
     /// fixups the card renderer's popup does (down clears window_ms/sustain;
     /// other modes seed window_ms). Mirrors the analog availability rule.
     pub(crate) fn nav_remap_cycle_mode(&mut self, outer_id: egui_snarl::NodeId, idx: usize, dir: i32) {
-        let modes = Self::PRESS_MODES;
+        let modes = self.nav_press_modes(outer_id, idx);
         self.nav_remap_card_obj_mut(outer_id, idx, |m| {
             let cur = m.get("mode").and_then(|v| v.as_str()).unwrap_or("down");
             let ci = modes.iter().position(|x| *x == cur).unwrap_or(0) as i32;
@@ -1022,9 +1061,10 @@ impl FlexInputApp {
     /// left/right move between the fields that APPLY for the current mode
     /// (press-mode / time-gap / hold / turbo — grayed-out ones skipped), up/down
     /// or South edit the focused field, North resets the card, East exits.
-    /// Analog cards extend past the header onto the response-curve section:
-    /// field 4 = show/hide graph, 5 = enter dot editing (when open), 6 = threshold
-    /// toggle (when open + applicable).
+    /// A Remapper card whose "in order" toggle applies reaches it next, as field
+    /// 8 (the in pill). Analog cards extend past the header onto the response-
+    /// curve section: field 4 = show/hide graph, 5 = enter dot editing (when
+    /// open), 6 = threshold toggle (when open + applicable).
     pub(crate) fn nav_drive_remap_card(
         &mut self,
         ctx: &egui::Context,
@@ -1075,8 +1115,13 @@ impl FlexInputApp {
             return;
         };
         let turbo_on = self.nav_remap_card_bool(outer_id, idx, "turbo");
+        let order_applies = self.nav_selected_is_remapper(outer_id)
+            && self.nav_remap_card_json(outer_id, idx)
+                .is_some_and(|m| flexinput_engine::in_order_applies(&m));
+        let in_order_on = order_applies && self.nav_remap_card_bool(outer_id, idx, "in_order");
         let gap_applies = matches!(mode.as_str(),
-            "short"|"long"|"double"|"analog"|"on_press"|"on_release") || turbo_on;
+            "short"|"long"|"double"|"analog"|"on_press"|"on_release"|"sequence")
+            || turbo_on || in_order_on;
         let hold_applies = mode == "long" || mode == "analog";
         let turbo_applies = !matches!(mode.as_str(), "short"|"double"|"on_press"|"on_release");
         // Field 0 (press-mode) always applies.
@@ -1094,6 +1139,11 @@ impl FlexInputApp {
             && self.nav_card_curve_open(ctx, inner, scope, idx);
         // Ordered list of reachable field ids for this card.
         let mut nav_fields: Vec<usize> = (0..4).filter(|&f| applies[f]).collect();
+        // Field 8 (Remapper): the "in order" toggle on the in pill — the next stop
+        // right of the header, ahead of the response-curve section below it.
+        if order_applies {
+            nav_fields.push(8);
+        }
         if let Some(show_threshold) = curve_shape {
             nav_fields.push(4);
             if curve_open {
@@ -1148,7 +1198,7 @@ impl FlexInputApp {
                     self.gamepad_nav.press_mode_card = idx;
                     self.gamepad_nav.press_mode_outer = Some(outer_id);
                     self.gamepad_nav.press_mode_idx =
-                        Self::PRESS_MODES.iter().position(|m| *m == cur).unwrap_or(0);
+                        self.nav_press_modes(outer_id, idx).iter().position(|m| *m == cur).unwrap_or(0);
                 } else if edit_press != 0 {
                     self.nav_remap_cycle_mode(outer_id, idx, edit_press);
                 }
@@ -1236,6 +1286,23 @@ impl FlexInputApp {
                     }
                     if delta != 0.0 {
                         self.nav_nudge_card_threshold(outer_id, idx, delta);
+                    }
+                }
+            }
+            8 => {
+                // "In order" toggle: South flips it, up/down set it on/off.
+                if south || edit_press != 0 {
+                    let cur = self.nav_remap_card_bool(outer_id, idx, "in_order");
+                    let next = if south { !cur } else { edit_press > 0 };
+                    if next != cur {
+                        self.nav_remap_card_obj_mut(outer_id, idx, |m| {
+                            if next {
+                                m.insert("in_order".into(), serde_json::Value::Bool(true));
+                            } else {
+                                m.remove("in_order");
+                            }
+                            true
+                        });
                     }
                 }
             }

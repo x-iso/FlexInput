@@ -760,6 +760,412 @@ mod trigger_tests {
             "both moving: RS must carry LS input, got {:?}", stick(&out, "right_stick"));
     }
 
+    // ── Order-aware cards: "in order" chords + Sequence mode ─────────────────
+
+    /// One Remapper node driven directly, 10 ms per tick. Every face/shoulder
+    /// button and stick axis reads released/centered unless a tick sets it.
+    struct RemapRig {
+        snap: NodeSnap,
+        state: HashMap<usize, NodeState>,
+    }
+
+    const RIG_DEV: &str = "gilrs:switch_pro:0";
+    const RIG_DT: f32 = 0.01;
+
+    impl RemapRig {
+        fn new(mappings: Value) -> Self {
+            let mut snap = empty_node(1, "module.remapper");
+            snap.params.insert("_automap_device_id".into(), Value::String(RIG_DEV.into()));
+            snap.params.insert("mappings".into(), mappings);
+            let mut rig = RemapRig { snap, state: HashMap::new() };
+            rig.tick(&[]); // cards start clean on their first tick
+            rig
+        }
+
+        fn tick_sigs(&mut self, sigs: &[(&str, Signal)]) -> HashMap<(String, String), Signal> {
+            let mut dev = HashMap::new();
+            for b in ["btn_south", "btn_east", "btn_west", "btn_north", "btn_lb", "btn_rb"] {
+                dev.insert((RIG_DEV.to_string(), b.to_string()), Signal::Bool(false));
+            }
+            for a in ["left_stick_x", "left_stick_y"] {
+                dev.insert((RIG_DEV.to_string(), a.to_string()), Signal::Float(0.0));
+            }
+            for (pin, sig) in sigs {
+                dev.insert((RIG_DEV.to_string(), pin.to_string()), *sig);
+            }
+            let mut c = HashMap::new();
+            eval_remapper_node(&self.snap, 1, &dev, &mut c, &mut self.state, RIG_DT);
+            c
+        }
+
+        fn tick(&mut self, down: &[&str]) -> HashMap<(String, String), Signal> {
+            let sigs: Vec<(&str, Signal)> = down.iter().map(|p| (*p, Signal::Bool(true))).collect();
+            self.tick_sigs(&sigs)
+        }
+    }
+
+    fn on(c: &HashMap<(String, String), Signal>, pin: &str) -> bool {
+        c.get(&("remap:1".to_string(), pin.to_string())).map(|s| s.as_bool()).unwrap_or(false)
+    }
+
+    // A then B and B then A are different cards.
+    #[test]
+    fn in_order_chord_distinguishes_order() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "in_order": true },
+            { "in": ["btn_east", "btn_south"], "out": ["btn_rb"], "in_order": true }
+        ]));
+        rig.tick(&["btn_south"]);
+        let c = rig.tick(&["btn_south", "btn_east"]);
+        assert!(on(&c, "btn_lb") && !on(&c, "btn_rb"), "A then B must fire only the A-then-B card");
+        rig.tick(&[]);
+        rig.tick(&["btn_east"]);
+        let c = rig.tick(&["btn_east", "btn_south"]);
+        assert!(on(&c, "btn_rb") && !on(&c, "btn_lb"), "B then A must fire only the B-then-A card");
+    }
+
+    // The chord's start is hidden while it waits, then consumed with the rest;
+    // an input still held after the chord stays hidden until released.
+    #[test]
+    fn in_order_holds_back_start_then_consumes() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "in_order": true }
+        ]));
+        let c = rig.tick(&["btn_south"]);
+        assert!(!on(&c, "btn_south"), "the first input must be held back while the chord waits");
+        assert!(c.contains_key(&("remap:1".to_string(), format!("{CONSUMED_PREFIX}btn_south"))),
+            "a held-back input is marked consumed, so a Combiner won't take it from a raw port");
+        let c = rig.tick(&["btn_south", "btn_east"]);
+        assert!(on(&c, "btn_lb"));
+        assert!(!on(&c, "btn_south") && !on(&c, "btn_east"), "matched inputs are consumed");
+        let c = rig.tick(&["btn_south"]);
+        assert!(!on(&c, "btn_lb"));
+        assert!(!on(&c, "btn_south"), "a consumed input stays hidden until it's released");
+        // Pressing B again with A still held fires the chord again.
+        let c = rig.tick(&["btn_south", "btn_east"]);
+        assert!(on(&c, "btn_lb"), "re-pressing the last input with the start held must re-fire");
+    }
+
+    // Held past the time gap without the rest: the input goes live, late.
+    #[test]
+    fn in_order_timeout_releases_held_input_live() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "in_order": true }
+        ]));
+        let seen: Vec<bool> = (0..30).map(|_| on(&rig.tick(&["btn_south"]), "btn_south")).collect();
+        assert!(!seen[..15].contains(&true), "hidden inside the 200 ms gap: {seen:?}");
+        assert!(seen[25..].iter().all(|v| *v), "live once the gap runs out: {seen:?}");
+    }
+
+    // A tap that breaks the chord (released before the rest) plays back late at
+    // its original length instead of being lost.
+    #[test]
+    fn in_order_released_tap_is_replayed() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "in_order": true }
+        ]));
+        for _ in 0..5 {
+            assert!(!on(&rig.tick(&["btn_south"]), "btn_south"));
+        }
+        let replay: Vec<bool> = (0..12).map(|_| on(&rig.tick(&[]), "btn_south")).collect();
+        let len = replay.iter().filter(|v| **v).count();
+        assert!(replay[0], "replay starts when the tap breaks the chord: {replay:?}");
+        assert!((4..=7).contains(&len), "replay keeps the ~50 ms tap length, got {len} ticks: {replay:?}");
+        assert!(!replay[11], "replay ends: {replay:?}");
+    }
+
+    // Holding B then pressing A is B-then-A: an A-then-B card must not hide A,
+    // so an order-agnostic A+B card matches at once. And a matched ordered card
+    // outranks an order-agnostic one over the same inputs.
+    #[test]
+    fn in_order_outranks_plain_chord_over_same_inputs() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_west"] },
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "in_order": true }
+        ]));
+        rig.tick(&["btn_south"]);
+        let c = rig.tick(&["btn_south", "btn_east"]);
+        assert!(on(&c, "btn_lb") && !on(&c, "btn_west"), "in-order match must suppress the plain chord");
+        rig.tick(&[]);
+        rig.tick(&["btn_east"]);
+        let c = rig.tick(&["btn_east", "btn_south"]);
+        assert!(on(&c, "btn_west") && !on(&c, "btn_lb"), "wrong order falls back to the plain chord at once");
+    }
+
+    // Sequence: steps in order within the gap, earlier ones already released;
+    // on while the last step is held. Wrong order or an overrun gap: nothing.
+    #[test]
+    fn sequence_fires_in_order_within_gap() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "mode": "sequence" }
+        ]));
+        let c = rig.tick(&["btn_south"]);
+        assert!(on(&c, "btn_south"), "without hold-back the first step passes through");
+        rig.tick(&[]);
+        let c = rig.tick(&["btn_east"]);
+        assert!(on(&c, "btn_lb"), "second step within the gap must fire");
+        assert!(!on(&c, "btn_east"), "the final step is consumed");
+        assert!(on(&rig.tick(&["btn_east"]), "btn_lb"), "stays on while the last step is held");
+        assert!(!on(&rig.tick(&[]), "btn_lb"));
+
+        rig.tick(&["btn_east"]);
+        rig.tick(&[]);
+        assert!(!on(&rig.tick(&["btn_south"]), "btn_lb"), "wrong order must not fire");
+        rig.tick(&[]);
+
+        rig.tick(&["btn_south"]);
+        for _ in 0..25 { rig.tick(&[]); }
+        assert!(!on(&rig.tick(&["btn_east"]), "btn_lb"), "a step after the gap must not fire");
+    }
+
+    // A repeated step restarts from the right place: A, A, A, B matches A, A, B.
+    #[test]
+    fn sequence_repeated_step_restarts_correctly() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_south", "btn_east"], "out": ["btn_lb"], "mode": "sequence" }
+        ]));
+        for _ in 0..3 {
+            rig.tick(&["btn_south"]);
+            rig.tick(&[]);
+        }
+        assert!(on(&rig.tick(&["btn_east"]), "btn_lb"));
+    }
+
+    // Stick directions work as steps: flick left, then right.
+    #[test]
+    fn sequence_of_stick_directions() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["left_stick_left", "left_stick_right"], "out": ["btn_lb"], "mode": "sequence" }
+        ]));
+        rig.tick_sigs(&[("left_stick_x", Signal::Float(-0.9))]);
+        rig.tick_sigs(&[("left_stick_x", Signal::Float(0.0))]);
+        let c = rig.tick_sigs(&[("left_stick_x", Signal::Float(0.9))]);
+        assert!(on(&c, "btn_lb"), "left then right must fire");
+    }
+
+    // Sequence + hold-back: earlier steps stay hidden while it waits. Completed,
+    // they're consumed for good; overrun, the tap replays late.
+    #[test]
+    fn sequence_hold_back_consumes_or_replays() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "mode": "sequence", "in_order": true }
+        ]));
+        let mut seen = Vec::new();
+        for _ in 0..3 { seen.push(on(&rig.tick(&["btn_south"]), "btn_south")); }
+        for _ in 0..5 { seen.push(on(&rig.tick(&[]), "btn_south")); }
+        let c = rig.tick(&["btn_east"]);
+        assert!(on(&c, "btn_lb"));
+        for _ in 0..30 { seen.push(on(&rig.tick(&[]), "btn_south")); }
+        assert!(!seen.contains(&true), "a completed sequence's start never reaches the output: {seen:?}");
+
+        let mut seen = Vec::new();
+        for _ in 0..3 { seen.push(on(&rig.tick(&["btn_south"]), "btn_south")); }
+        for _ in 0..40 { seen.push(on(&rig.tick(&[]), "btn_south")); }
+        let first = seen.iter().position(|v| *v);
+        assert!(matches!(first, Some(i) if i >= 18), "hidden until the gap runs out: {seen:?}");
+        assert!(!seen[42], "the replayed tap ends: {seen:?}");
+    }
+
+    // ── Timed press modes hold back instead of swallowing ────────────────────
+
+    /// Tick `n` times with `down` held; returns `watch`'s state each tick and
+    /// whether `out` was ever on.
+    fn rig_run(rig: &mut RemapRig, n: usize, down: &[&str], watch: &str, out: &str) -> (Vec<bool>, bool) {
+        let mut seen = Vec::new();
+        let mut fired = false;
+        for _ in 0..n {
+            let c = rig.tick(down);
+            seen.push(on(&c, watch));
+            fired |= on(&c, out);
+        }
+        (seen, fired)
+    }
+
+    // Short press: a tap fires the card and never reaches the output; a press
+    // held past the gap isn't swallowed — it comes through, late by the gap.
+    #[test]
+    fn short_press_held_past_gap_goes_live() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south"], "out": ["btn_lb"], "mode": "short", "window_ms": 50.0 }
+        ]));
+        let (mut seen, mut fired) = rig_run(&mut rig, 3, &["btn_south"], "btn_south", "btn_lb");
+        let (after, fired_after) = rig_run(&mut rig, 10, &[], "btn_south", "btn_lb");
+        seen.extend(after);
+        fired |= fired_after;
+        assert!(fired, "a tap inside the gap fires the card");
+        assert!(!seen.contains(&true), "a tap that fired never reaches the output: {seen:?}");
+
+        let (seen, fired) = rig_run(&mut rig, 15, &["btn_south"], "btn_south", "btn_lb");
+        assert!(!fired, "a press past the gap doesn't fire");
+        assert!(!seen[..4].contains(&true), "hidden while the card decides: {seen:?}");
+        assert!(seen[8..].iter().all(|v| *v), "live once the gap runs out: {seen:?}");
+    }
+
+    fn rig_stick_y(c: &HashMap<(String, String), Signal>) -> f32 {
+        c.get(&("remap:1".to_string(), "left_stick_y".to_string())).map(|s| s.as_float()).unwrap_or(f32::NAN)
+    }
+
+    fn push_y(rig: &mut RemapRig, v: f32) -> HashMap<(String, String), Signal> {
+        rig.tick_sigs(&[("left_stick_y", Signal::Float(v))])
+    }
+
+    // A stick direction on a Short card with a threshold, timed from where the
+    // stick leaves zero: reaching the threshold fast caps the stick where it
+    // crossed while the card decides (no drop to zero), then lets the full
+    // deflection through once the gap since the move began runs out; a quick
+    // flick fires.
+    #[test]
+    fn short_press_stick_direction_is_capped_not_blocked() {
+        let card = serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["btn_lb"], "mode": "short", "window_ms": 55.0, "threshold": 0.9 }
+        ]);
+        let mut rig = RemapRig::new(card.clone());
+        assert!((rig_stick_y(&push_y(&mut rig, 0.5)) - 0.5).abs() < 1e-4, "below the threshold: untouched");
+        assert!((rig_stick_y(&push_y(&mut rig, 0.92)) - 0.92).abs() < 1e-4, "crossing: capped where it is");
+        for _ in 0..3 {
+            let v = rig_stick_y(&push_y(&mut rig, 1.0));
+            assert!((v - 0.92).abs() < 1e-4, "while deciding: held at the crossing, not zeroed (got {v})");
+        }
+        let late: Vec<f32> = (0..3).map(|_| rig_stick_y(&push_y(&mut rig, 1.0))).collect();
+        assert!(late.iter().all(|v| (v - 1.0).abs() < 1e-4),
+            "the gap counts from the move's start, so it runs out soon after: {late:?}");
+
+        let mut rig = RemapRig::new(card);
+        push_y(&mut rig, 0.5);
+        let mut fired = false;
+        for v in [0.95, 0.95, 0.3, 0.0, 0.0] {
+            fired |= on(&push_y(&mut rig, v), "btn_lb");
+        }
+        assert!(fired, "a quick flick past the threshold fires the card");
+    }
+
+    // A slow push that only reaches the threshold after the time gap (counted
+    // from where the stick left zero) is just stick movement: never capped,
+    // never fires.
+    #[test]
+    fn short_press_slow_stick_push_passes_straight_through() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["btn_lb"], "mode": "short", "window_ms": 50.0, "threshold": 0.9 }
+        ]));
+        let mut fired = false;
+        for step in 1..=12 {
+            let v = (step as f32 * 0.08).min(1.0);
+            let c = push_y(&mut rig, v);
+            assert!((rig_stick_y(&c) - v).abs() < 1e-4, "slow push must pass untouched at {v} (got {})", rig_stick_y(&c));
+            fired |= on(&c, "btn_lb");
+        }
+        for _ in 0..3 { fired |= on(&push_y(&mut rig, 0.0), "btn_lb"); }
+        assert!(!fired, "a slow push doesn't fire a Short card");
+    }
+
+    // Sequence over one analog input: reach the threshold within the gap from
+    // the move's start, and the output stays on as long as the input stays past
+    // it. A dip under the threshold ends it until the stick returns to zero; a
+    // slow push never fires.
+    #[test]
+    fn sequence_single_stick_direction_fast_move_then_hold() {
+        let card = |in_order: bool| serde_json::json!([
+            { "in": ["left_stick_up"], "out": ["btn_lb"], "mode": "sequence", "window_ms": 50.0,
+              "threshold": 0.9, "in_order": in_order }
+        ]);
+        let mut rig = RemapRig::new(card(false));
+        assert!(!on(&push_y(&mut rig, 0.5), "btn_lb"));
+        assert!(on(&push_y(&mut rig, 0.95), "btn_lb"), "reached the threshold in time: on");
+        for _ in 0..20 {
+            assert!(on(&push_y(&mut rig, 1.0), "btn_lb"), "held past the threshold: stays on");
+        }
+        assert!(!on(&push_y(&mut rig, 0.5), "btn_lb"), "dropping under the threshold: off");
+        assert!(!on(&push_y(&mut rig, 0.95), "btn_lb"), "back past it without returning to zero: still spent");
+        push_y(&mut rig, 0.0);
+        push_y(&mut rig, 0.6);
+        assert!(on(&push_y(&mut rig, 1.0), "btn_lb"), "a fresh fast move fires again");
+
+        let mut rig = RemapRig::new(card(false));
+        let mut fired = false;
+        for step in 1..=12 {
+            fired |= on(&push_y(&mut rig, (step as f32 * 0.08).min(1.0)), "btn_lb");
+        }
+        assert!(!fired, "a slow push never fires");
+
+        // With "in order": the move toward the threshold is held back fully.
+        let mut rig = RemapRig::new(card(true));
+        let c = push_y(&mut rig, 0.5);
+        assert!(rig_stick_y(&c).abs() < 1e-4, "on its way to the threshold: hidden (got {})", rig_stick_y(&c));
+        let c = push_y(&mut rig, 0.95);
+        assert!(on(&c, "btn_lb") && rig_stick_y(&c).abs() < 1e-4, "fired: consumed");
+        let mut rig = RemapRig::new(card(true));
+        let ys: Vec<f32> = (0..10).map(|_| rig_stick_y(&push_y(&mut rig, 0.4))).collect();
+        assert!(ys[0].abs() < 1e-4 && (ys[9] - 0.4).abs() < 1e-4, "too slow: comes back once the gap runs out: {ys:?}");
+    }
+
+    // Long press: a hold fires and consumes; a tap isn't swallowed — it plays
+    // back late at its own length.
+    #[test]
+    fn long_press_tap_is_replayed() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south"], "out": ["btn_lb"], "mode": "long", "window_ms": 100.0, "sustain": true }
+        ]));
+        let (held, _) = rig_run(&mut rig, 3, &["btn_south"], "btn_south", "btn_lb");
+        let (after, fired) = rig_run(&mut rig, 10, &[], "btn_south", "btn_lb");
+        assert!(!held.contains(&true), "hidden while the card decides: {held:?}");
+        assert!(!fired, "a tap doesn't fire a Long card");
+        let len = after.iter().filter(|v| **v).count();
+        assert!(after[0] && (3..=5).contains(&len), "the ~30 ms tap replays on release: {after:?}");
+
+        let (seen, fired) = rig_run(&mut rig, 20, &["btn_south"], "btn_south", "btn_lb");
+        let (after, _) = rig_run(&mut rig, 5, &[], "btn_south", "btn_lb");
+        assert!(fired, "a hold past the gap fires");
+        assert!(!seen.contains(&true) && !after.contains(&true), "a press that fired never shows: {seen:?} {after:?}");
+    }
+
+    // Double tap: a double fires and consumes both taps; a single tap plays back
+    // once the gap for the second one runs out.
+    #[test]
+    fn double_tap_single_tap_is_replayed() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south"], "out": ["btn_lb"], "mode": "double", "window_ms": 100.0 }
+        ]));
+        let (mut seen, _) = rig_run(&mut rig, 2, &["btn_south"], "btn_south", "btn_lb");
+        let (after, fired) = rig_run(&mut rig, 20, &[], "btn_south", "btn_lb");
+        seen.extend(after);
+        assert!(!fired, "a single tap doesn't fire a Double card");
+        let first = seen.iter().position(|v| *v);
+        assert!(matches!(first, Some(i) if i >= 9), "the tap waits out the gap, then replays: {seen:?}");
+
+        let mut seen = Vec::new();
+        let mut fired = false;
+        for down in [true, true, false, false, true, true, false, false] {
+            let c = rig.tick(if down { &["btn_south"] } else { &[] });
+            seen.push(on(&c, "btn_south"));
+            fired |= on(&c, "btn_lb");
+        }
+        let (after, _) = rig_run(&mut rig, 15, &[], "btn_south", "btn_lb");
+        assert!(fired, "a double tap fires");
+        assert!(!seen.contains(&true) && !after.contains(&true), "both taps are consumed: {seen:?} {after:?}");
+    }
+
+    // Tap-or-hold on one button: the tap card and the hold card each take their
+    // own press, and the button itself never leaks through either.
+    #[test]
+    fn short_and_long_share_a_button() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south"], "out": ["btn_lb"], "mode": "short", "window_ms": 100.0 },
+            { "in": ["btn_south"], "out": ["btn_rb"], "mode": "long", "window_ms": 100.0, "sustain": true }
+        ]));
+        let run = |rig: &mut RemapRig, ticks: usize| {
+            let (mut seen, mut lb, mut rb) = (false, false, false);
+            for t in 0..ticks + 15 {
+                let c = rig.tick(if t < ticks { &["btn_south"] } else { &[] });
+                seen |= on(&c, "btn_south");
+                lb |= on(&c, "btn_lb");
+                rb |= on(&c, "btn_rb");
+            }
+            (seen, lb, rb)
+        };
+        assert_eq!(run(&mut rig, 3), (false, true, false), "tap: (button leaked, tap card, hold card)");
+        assert_eq!(run(&mut rig, 20), (false, false, true), "hold: (button leaked, tap card, hold card)");
+    }
+
     // A Remapper's mapped OUTPUT pin must survive a downstream Combiner whose
     // higher-priority port carries the raw device bus. Regression for the
     // "General purpose preset" button→button bug: a real controller reports

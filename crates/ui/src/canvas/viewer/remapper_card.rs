@@ -39,6 +39,8 @@ pub(crate) fn remapper_mapping_card_pixel(
     out_pins: Option<&[String]>,    // None → Map Action variant (single row)
     skin: crate::canvas::remapper_icons::Skin,
     allow_analog_mode: bool,        // true for Lean cards and Remapper/Map Action (since analog support added)
+    allow_order: bool,              // Remapper only: Sequence press mode + the "in order" toggle
+                                    // on the in pill
     reorder_enabled: bool,          // sense a drag on the body for reorder
     drag_offset_y: f32,             // visual lift (paint offset) while dragging this card
     nav_scope: &str,                // nav-temp key scope: "mappings" / "lean_left" / "lean_right"
@@ -56,6 +58,7 @@ pub(crate) fn remapper_mapping_card_pixel(
     const C_PILL_MID:  Color32 = Color32::from_rgb(0x4A, 0x4A, 0x4A);  // value box / toggle pill
     const C_CHECK_BG:  Color32 = Color32::from_rgb(0xD9, 0xD9, 0xD9);  // checkbox
     const C_INOUT_BG:  Color32 = Color32::from_rgb(0x76, 0x76, 0x76);  // in/out chip
+    const C_ORDER_BG:  Color32 = Color32::from_rgb(0x2C, 0x5A, 0x8C);  // in chip, "in order" on
     const C_TEXT:      Color32 = Color32::WHITE;
 
     // Card width is parameterized to fill the parent body. The mockup card
@@ -179,7 +182,9 @@ pub(crate) fn remapper_mapping_card_pixel(
     // The nav driver publishes (pass, selected_idx, entered) keyed by node id,
     // and (pass, field) for the focused header field. We glow the selected card
     // and (when entered) the focused field; field rects are captured below as
-    // each header control is laid out: [press-mode, time-gap, hold, turbo].
+    // each control is laid out, indexed by nav field id: 0-3 = [press-mode,
+    // time-gap, hold, turbo], 8 = the in pill's "in order" toggle. (4-7 are the
+    // response-curve section's, which publishes its own rects.)
     // Viewport-agnostic nav pass so the card highlight shows in the config
     // overlay's own viewport (see `crate::widgets::nav_pass`). Distinct from the
     // local `pass` used below to publish the card RECTS (a same-viewport channel).
@@ -194,7 +199,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         .filter(|(p, _)| cur_pass.saturating_sub(*p) <= 1)
         .map(|(_, f)| f);
     let nav_this = nav_card_sel == Some(mapping_idx);
-    let mut nav_field_rects = [egui::Rect::NOTHING; 4];
+    let mut nav_field_rects = [egui::Rect::NOTHING; 9];
 
     // Helper to paint a button background with idle + hover states. Matches
     // the visual weight of the header pills so × and mode read as buttons.
@@ -256,12 +261,23 @@ pub(crate) fn remapper_mapping_card_pixel(
                     ("on_press",   "↧", "On press"),
                     ("on_release", "↥", "On release"),
                 ];
+                if allow_order {
+                    options.push(("sequence", "⇉", "Sequence"));
+                }
                 if allow_analog_mode {
                     options.push(("analog", "∿", "Analog"));
                 }
+                // A sequence needs steps: two or more inputs, or one analog
+                // input (move off zero, then reach the threshold in time).
+                let sequence_ok = in_pins.len() >= 2 || (in_pins.len() == 1
+                    && flexinput_engine::pin_is_analog_input(&in_pins[0]));
                 for (val, g, label) in options {
-                    if ui.selectable_label(mode_now == val,
-                        format!("{g}  {label}")).clicked() { picked = Some(val); }
+                    let enabled = val != "sequence" || sequence_ok;
+                    let resp = ui.add_enabled(enabled,
+                        egui::Button::selectable(mode_now == val, format!("{g}  {label}")))
+                        .on_disabled_hover_text(
+                            "Sequence needs two or more inputs, or a single stick direction or trigger.");
+                    if resp.clicked() { picked = Some(val); }
                 }
             },
         );
@@ -281,14 +297,24 @@ pub(crate) fn remapper_mapping_card_pixel(
         }
     }
 
+    // "In order" (Remapper only): whether the toggle does anything for this card
+    // (engine rule — not analog, not a touchpad output, 2+ inputs) and its state.
+    let order_applies = allow_order
+        && flexinput_engine::in_order_applies(&Value::Object(mapping.clone()));
+    let in_order_on = order_applies
+        && mapping.get("in_order").and_then(|v| v.as_bool()).unwrap_or(false);
+
     // ── time gap pill: outer (61,5,137×20), valuebox (135,5,63×20) ────────
     let turbo_on = mapping.get("turbo").and_then(|v| v.as_bool()).unwrap_or(false);
     // Modes that read the time-gap value:
     //   short/long/double — window timing; analog — per-tap duration;
     //   on_press/on_release — emitted trigger duration (see apply_press_mode);
-    //   any mode with turbo on — turbo period.
+    //   sequence — max gap between steps;
+    //   any mode with turbo on — turbo period;
+    //   "in order" on — how long the chord's start is held back.
     let gap_applies = matches!(mode_now.as_str(),
-        "short" | "long" | "double" | "analog" | "on_press" | "on_release") || turbo_on;
+        "short" | "long" | "double" | "analog" | "on_press" | "on_release" | "sequence")
+        || turbo_on || in_order_on;
     // Turbo is only meaningful for sustained/continuous gates. It's grayed for
     // short, double, and the edge-trigger modes (on_press/on_release) — turbo
     // on a one-shot edge pulse has no sensible meaning.
@@ -417,7 +443,27 @@ pub(crate) fn remapper_mapping_card_pixel(
             C_TEXT,
         );
     };
-    draw_io_pill("in", 5.0, 40.0);
+    // The in pill doubles as the Remapper's "in order" toggle (the header has no
+    // room left). On, it reads "in order" — accented, without the arrow, which
+    // doesn't fit — and the in chips join with › instead of +. Its click is
+    // registered after the body drag handle below so it sits on top of it.
+    let in_pill_rect = egui::Rect::from_min_size(at(5.0, 40.0), sz(48.0, 20.0));
+    if in_order_on {
+        painter.rect_filled(in_pill_rect, RADIUS, C_ORDER_BG);
+        painter.text(
+            in_pill_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "in order",
+            egui::FontId::proportional(TEXT_SIZE_INOUT * s),
+            C_TEXT,
+        );
+    } else {
+        draw_io_pill("in", 5.0, 40.0);
+    }
+    if order_applies {
+        nav_field_rects[8] = in_pill_rect;
+    }
+    let in_sep = if in_order_on || mode_now == "sequence" { "›" } else { "+" };
 
     // ── chord chip row (painter-driven, wrap on overflow) ─────────────────
     // Each chip is `chip_size` square. Label pill center is at y=50 (in row)
@@ -428,7 +474,7 @@ pub(crate) fn remapper_mapping_card_pixel(
     let chord_y_out_first = 69.0 * s; // = label_y(72) - 3, center at y=82
 
     let chord_painter = painter.clone();
-    let render_chord_row_painter = |row_y_start: f32, pins: &[String]| {
+    let render_chord_row_painter = |row_y_start: f32, pins: &[String], sep: &str| {
         let mut cur_x = chord_x_start;
         let mut row_y = row_y_start;
         let mut first = true;
@@ -454,7 +500,7 @@ pub(crate) fn remapper_mapping_card_pixel(
                 chord_painter.text(
                     card_origin + egui::vec2(cur_x + plus_w * 0.5, row_y + chip_size * 0.5),
                     egui::Align2::CENTER_CENTER,
-                    "+",
+                    sep,
                     egui::FontId::proportional(chip_size * 0.5),
                     Color32::WHITE,
                 );
@@ -469,7 +515,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         }
     };
 
-    render_chord_row_painter(chord_y_in, in_pins);
+    render_chord_row_painter(chord_y_in, in_pins, in_sep);
     if let Some(out_pins) = out_pins {
         // Out row starts after the in row's actual wrapped height — keep
         // label pill paired with the first chip on the row.
@@ -481,7 +527,7 @@ pub(crate) fn remapper_mapping_card_pixel(
         // the out row down by exactly one row pitch per extra in-row.
         let extra = (in_rows as f32 - 1.0) * row_pitch_y;
         draw_io_pill("out", 5.0, 72.0 + extra / s);
-        render_chord_row_painter(chord_y_out_first + extra, out_pins);
+        render_chord_row_painter(chord_y_out_first + extra, out_pins, "+");
     }
 
     // ── Body drag handle (reorder) ─────────────────────────────────────────
@@ -505,6 +551,49 @@ pub(crate) fn remapper_mapping_card_pixel(
     } else {
         None
     };
+
+    // ── "in order" toggle click (on top of the drag handle) ──────────────────
+    if order_applies {
+        let one_input_move = in_pins.len() == 1;
+        let tip = match (mode_now == "sequence", in_order_on) {
+            (true, false) if one_input_move =>
+                "The move toward the threshold passes through to the game.\n\
+                 Click to hold it back until it reaches the threshold in time.",
+            (true, true) if one_input_move =>
+                "The move toward the threshold is held back from the game until it \
+                 reaches the threshold. If the time gap runs out first, it comes \
+                 back late.\nClick to let it pass through.",
+            (false, false) =>
+                "In order: off. These inputs match in any order.\n\
+                 Click to require this order. The first inputs are then held back \
+                 from the game until the rest arrive, for up to the time gap.",
+            (false, true) =>
+                "In order: on. These inputs must go down in this order, and the \
+                 first ones are held back from the game until the rest arrive, for \
+                 up to the time gap.\nClick to match in any order.",
+            (true, false) =>
+                "Sequence steps pass through to the game as they're pressed.\n\
+                 Click to hold earlier steps back until the sequence completes.",
+            (true, true) =>
+                "Earlier steps are held back from the game until the sequence \
+                 completes. If the time gap runs out, they come back late.\n\
+                 Click to let them pass through.",
+        };
+        let resp = ui.interact(in_pill_rect, ui.id().with(("in_order", mapping_idx)),
+            egui::Sense::click()).on_hover_text(tip);
+        if resp.hovered() {
+            painter.rect_filled(in_pill_rect, RADIUS, Color32::from_white_alpha(28));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            if in_order_on {
+                mapping.remove("in_order");
+            } else {
+                mapping.insert("in_order".to_string(), Value::Bool(true));
+            }
+            changed = true;
+        }
+    }
 
     // ── Gamepad-nav selection: PUBLISH global rects (do NOT paint here) ──────
     // The remapper body renders inside a child TSTransform layer; painting onto

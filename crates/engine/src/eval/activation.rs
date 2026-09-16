@@ -41,6 +41,8 @@ pub(crate) enum PressMode {
     Double,      // double-tap within window → ON during 2nd press
     OnPress,     // 10ms trigger on rising edge
     OnRelease,   // 10ms trigger on falling edge
+    Sequence,    // inputs pressed in order within the gap (Remapper only) —
+                 // matched upstream by `order_tick`, then gates like Down
 }
 
 impl PressMode {
@@ -51,6 +53,7 @@ impl PressMode {
             "double"     => Self::Double,
             "on_press"   => Self::OnPress,
             "on_release" => Self::OnRelease,
+            "sequence"   => Self::Sequence,
             _            => Self::Down,
         }
     }
@@ -270,7 +273,7 @@ pub(crate) fn apply_press_mode(
     let mut trigger_remaining = (slots[2] - dt).max(0.0);
 
     let out = match mode {
-        PressMode::Down => raw_held,
+        PressMode::Down | PressMode::Sequence => raw_held,
         PressMode::OnPress => {
             // `window_ms` sets the emitted trigger duration (floored at the
             // 10 ms minimum pulse so a 0/tiny value still registers).

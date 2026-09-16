@@ -16,7 +16,7 @@ pub use eval::{
     analog_axis_for_cardinal,
     apply_curve, biases_from_params, curve_points_from_params, curve_points_from_params_keyed,
     curve_insert_point, curve_remove_point, curve_scale, curve_scale_inv, envelope_flags, eval_graph_tick, eval_pure, get_b, get_f,
-    crossover_hz_to_pos, multiband_collapse_band, multiband_collapse_carrier, namespaced_uid,
+    crossover_hz_to_pos, in_order_applies, multiband_collapse_band, multiband_collapse_carrier, namespaced_uid,
     osc_sample, pin_is_analog_input, read_scale_t, sample_curve, sig_to_f32,
     vec_reshape_apply, VEC_RESHAPE_BOUNDARY_DEFAULT, VEC_RESHAPE_GAIN_DEFAULT,
 };

@@ -635,7 +635,7 @@ pub(crate) fn show_remapper_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, Some(&out_pins), skin,
-                                    true, reorder_enabled, drag_off, "mappings", card_analog,
+                                    true, true, reorder_enabled, drag_off, "mappings", card_analog,
                                     card_conf.as_ref(),
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }
@@ -1112,7 +1112,7 @@ pub(crate) fn show_map_action_body(
                                 let result = remapper_mapping_card_pixel(
                                     ui, node_id, i, &mut working,
                                     &in_pins, None, skin,
-                                    true, reorder_enabled, drag_off, "mappings", false,
+                                    true, false, reorder_enabled, drag_off, "mappings", false,
                                     None, // Map Action rows aren't bus writers (out_pins None)
                                 );
                                 if result.delete_clicked { to_remove = Some(i); }

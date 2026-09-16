@@ -718,7 +718,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
                 |ui| {
                     let result = remapper_mapping_card_pixel(
                         ui, node_id, i, &mut working,
-                        &out_pins, None, skin, true,
+                        &out_pins, None, skin, true, false,
                         reorder_enabled, drag_off, key, true,
                         card_conf.as_ref(),
                     );

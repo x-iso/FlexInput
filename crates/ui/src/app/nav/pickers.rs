@@ -78,7 +78,9 @@ impl FlexInputApp {
             self.gamepad_nav.press_mode_open = false;
             return;
         }
-        let n = Self::PRESS_MODES.len();
+        let modes = self.gamepad_nav.press_mode_outer
+            .map_or(Self::PRESS_MODES, |o| self.nav_press_modes(o, self.gamepad_nav.press_mode_card));
+        let n = modes.len();
         let mut i = self.gamepad_nav.press_mode_idx.min(n - 1);
         match step_dir {
             Some(NavDir::Up)   => i = i.saturating_sub(1),
@@ -90,7 +92,7 @@ impl FlexInputApp {
         if nav.is_rising("btn_south") {
             if let Some(outer) = self.gamepad_nav.press_mode_outer {
                 let card = self.gamepad_nav.press_mode_card;
-                let mode = Self::PRESS_MODES[i];
+                let mode = modes[i];
                 self.nav_remap_set_mode(outer, card, mode);
             }
             self.gamepad_nav.press_mode_open = false;
@@ -370,7 +372,9 @@ impl FlexInputApp {
     /// `drive_press_mode_picker`.
     pub(crate) fn draw_press_mode_picker(&mut self, ctx: &egui::Context) {
         if !self.gamepad_nav.press_mode_open { return; }
-        let sel = self.gamepad_nav.press_mode_idx.min(Self::PRESS_MODES.len() - 1);
+        let modes = self.gamepad_nav.press_mode_outer
+            .map_or(Self::PRESS_MODES, |o| self.nav_press_modes(o, self.gamepad_nav.press_mode_card));
+        let sel = self.gamepad_nav.press_mode_idx.min(modes.len() - 1);
         // Current mode on the target card (to mark the active row).
         let cur_mode = self.gamepad_nav.press_mode_outer.map(|o|
             self.nav_remap_card_mode(o, self.gamepad_nav.press_mode_card)
@@ -388,7 +392,7 @@ impl FlexInputApp {
                     "LS/D-pad: move   South: apply   East: cancel")
                     .small().color(egui::Color32::from_gray(150)));
                 ui.add_space(6.0);
-                for (i, mode) in Self::PRESS_MODES.iter().enumerate() {
+                for (i, mode) in modes.iter().enumerate() {
                     let glyph = crate::canvas::viewer::remapper_press_mode_glyph(mode);
                     let label = crate::canvas::viewer::remapper_press_mode_label(mode);
                     let focused = i == sel;

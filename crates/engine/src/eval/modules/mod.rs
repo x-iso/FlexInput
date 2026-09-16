@@ -12,6 +12,7 @@ mod lean;
 mod map_action;
 mod menu;
 mod remapper;
+mod remapper_hold_back;
 mod rws;
 mod shared;
 mod touch_zones;
@@ -21,6 +22,9 @@ pub(crate) use lean::*;
 pub(crate) use map_action::*;
 pub(crate) use menu::*;
 pub(crate) use remapper::*;
+pub(crate) use remapper_hold_back::*;
+// Read by the UI to decide when a card offers its "in order" toggle.
+pub use remapper_hold_back::in_order_applies;
 pub(crate) use rws::*;
 pub(crate) use touch_zones::*;
 // `shared` carries `pin_is_analog_input`, which the UI reads through

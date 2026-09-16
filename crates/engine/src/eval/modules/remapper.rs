@@ -114,6 +114,14 @@ pub(crate) fn eval_remapper_node(
             upstream.insert("touch_center".to_string(),    Signal::Bool(touch_only[1]));
             upstream.insert("touch_right".to_string(),     Signal::Bool(touch_only[2]));
 
+            // Cards that decide after the press ("in order", Sequence, Short /
+            // Long / Double) run first, against the RAW inputs. Their hold-back
+            // then decides what the rest of the node sees, so every read below
+            // goes through that view instead.
+            let ns = state.entry(uid).or_insert_with(NodeState::default);
+            let HoldBackPass { verdicts, view: upstream, hidden: held_back } =
+                remapper_hold_back_pass(&mappings, upstream, ns, dt);
+
             let read_upstream = |pin_id: &str| -> Option<Signal> { upstream.get(pin_id).copied() };
 
             // Per-mapping press mode is stored under `mode` + `window_ms` +
@@ -137,6 +145,8 @@ pub(crate) fn eval_remapper_node(
                 let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
+                // Deciding cards were gated by `remapper_hold_back_pass`.
+                if let Some(v) = verdicts[i] { return v.effective; }
                 if in_pins.is_empty() { return false; }
                 let press = PressParams::from_card(m);
                 if press.is_analog() {
@@ -151,37 +161,7 @@ pub(crate) fn eval_remapper_node(
                         }
                     });
                 }
-                // Stick-gesture path: when every `in` pin is a stick cardinal,
-                // the chord can never be "simultaneously held" (a single stick
-                // can't be Left AND Right at the same instant). Instead we
-                // track which cardinals have been visited during the active
-                // gesture and fire when all required cardinals across both
-                // sticks have been visited at least once.
-                // Manual activation threshold: an explicit "fire at this
-                // magnitude" instruction. It BYPASSES the stick-gesture
-                // accumulator (visit-all-cardinals semantics conflict with a
-                // hold-above-the-line gate) and replaces the built-in
-                // cardinal derivation / 0.5 trigger coercion: each analog in
-                // pin gates on the card's curve-shaped magnitude crossing the
-                // line, releasing the moment it dips back below.
-                let shape = MappingShape::from_card(m);
-                let raw_held = if let (Some(required), None) =
-                    (gesture_required_bits(&in_pins), shape.threshold)
-                {
-                    let buttons_held = in_pins.iter().all(|p| {
-                        if gesture_pin_to_bit(p).is_some() { return true; }
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    });
-                    let visited = gesture_state_get(ns, i);
-                    buttons_held && gesture_tick(required, visited, &upstream)
-                } else {
-                    in_pins.iter().all(|p| {
-                        if let Some(passed) = shape.analog_gate(&upstream, p) {
-                            return passed;
-                        }
-                        read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
-                    })
-                };
+                let raw_held = chord_raw_held(m, i, &in_pins, &upstream, ns);
                 press.gate(raw_held, press_state_get(ns, i), dt)
             }).collect();
 
@@ -191,11 +171,15 @@ pub(crate) fn eval_remapper_node(
             // for as long as it is held, even when the press-mode gate (on-press
             // pulse, double-tap window, etc.) is momentarily closed. Otherwise
             // the raw input would leak through while the user keeps holding it.
-            let held_now: Vec<bool> = mappings.iter().map(|m| {
+            let held_now: Vec<bool> = mappings.iter().enumerate().map(|(i, m)| {
                 let in_pins: Vec<&str> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
                 if in_pins.is_empty() { return false; }
+                // A deciding card owns its inputs only once it has fired: B then
+                // A must not consume an A-then-B card's inputs, nor a long press
+                // a Short card's. (Its hold-back hides them while it decides.)
+                if let Some(v) = verdicts[i] { return v.held_now; }
                 // Touch-output combos can mix opposite cardinals of one axis
                 // (left+right), which can never be "simultaneously held"; use the
                 // touch-combo activation rule so their gate buttons + sticks get
@@ -232,14 +216,16 @@ pub(crate) fn eval_remapper_node(
             }).collect();
 
             // Determine which mappings are currently triggered. Sort indices
-            // by descending input-set size so longer combos win conflicts;
+            // by descending input-set size so longer combos win conflicts, and
+            // order-aware cards ahead of order-agnostic ones of the same size;
             // original indices are preserved so we can look up `effective`
             // and mapping fields afterwards.
+            let ordered = |i: usize| verdicts[i].is_some_and(|v| v.ordered);
             let mut sorted_idx: Vec<usize> = (0..mappings.len()).collect();
             sorted_idx.sort_by(|&a, &b| {
                 let la = mappings[a].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
                 let lb = mappings[b].get("in").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                lb.cmp(&la)
+                lb.cmp(&la).then(ordered(b).cmp(&ordered(a)))
             });
 
             // Trigger pass 1: identify triggered mappings and the pins they consume.
@@ -251,12 +237,15 @@ pub(crate) fn eval_remapper_node(
             //   - Mappings with the SAME input set are allowed to coexist
             //     so users can fan one button out to multiple outputs:
             //     `Y → X` and `Y → Y` both fire when Y is pressed.
+            //   - EXCEPT that a triggered order-aware card (in order / Sequence)
+            //     suppresses an order-agnostic card over the same inputs: the
+            //     plain chord is the fallback for when no order matched.
             //
             // Analog mappings with IDENTICAL input chords have an extra
             // last-wins override applied during the publish pass below
             // (user-error guard for conflicting analog writes).
             let mut triggered: Vec<(Vec<String>, Vec<String>, bool, usize)> = Vec::new(); // (in, out, is_analog, orig_idx)
-            let mut triggered_claims: Vec<(usize, Vec<String>)> = Vec::new();
+            let mut triggered_claims: Vec<(usize, bool, Vec<String>)> = Vec::new(); // (len, ordered, sorted in)
             for &i in &sorted_idx {
                 let m = &mappings[i];
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
@@ -268,14 +257,17 @@ pub(crate) fn eval_remapper_node(
                 if in_pins.is_empty() { continue; }
                 if !effective[i] { continue; }
                 let my_len = in_pins.len();
-                let suppressed = triggered_claims.iter().any(|(claim_len, claim_pins)| {
-                    *claim_len > my_len && in_pins.iter().all(|p| claim_pins.contains(p))
+                let my_ordered = ordered(i);
+                let suppressed = triggered_claims.iter().any(|(claim_len, claim_ordered, claim_pins)| {
+                    let outranks = *claim_len > my_len
+                        || (*claim_len == my_len && *claim_ordered && !my_ordered);
+                    outranks && in_pins.iter().all(|p| claim_pins.contains(p))
                 });
                 if suppressed { continue; }
                 let is_analog = m.get("mode").and_then(|v| v.as_str()) == Some("analog");
                 let mut sorted_in = in_pins.clone();
                 sorted_in.sort();
-                triggered_claims.push((my_len, sorted_in));
+                triggered_claims.push((my_len, my_ordered, sorted_in));
                 triggered.push((in_pins, out_pins, is_analog, i));
             }
 
@@ -320,6 +312,11 @@ pub(crate) fn eval_remapper_node(
                 &claimed_inputs_digital, &claimed_inputs_analog,
                 collector_sigs,
             );
+            // Held-back inputs are already hidden (or capped) in the view the
+            // pass-through read; mark them consumed too, so a downstream Combiner
+            // doesn't take them from a raw-device port. Not claimed above: that
+            // would zero a stick direction a timed card only caps.
+            publish_consumed_markers(&key, &held_back, &HashSet::new(), collector_sigs);
 
             // ── Analog publish pass ──────────────────────────────────────
             //
@@ -686,6 +683,38 @@ pub(crate) fn eval_remapper_node(
                 }
                 publish_touch_points(&key, &fingers, collector_sigs);
             }
+}
+
+/// Whether an order-agnostic digital card's input counts as held this tick.
+/// Advances the stick-gesture state, so call it once per card per tick.
+///
+/// Stick-gesture path: when the chord has stick cardinals, it can never be
+/// "simultaneously held" (a single stick can't be Left AND Right at the same
+/// instant). Instead we track which cardinals have been visited during the
+/// active gesture and count the chord held once every required cardinal
+/// across both sticks has been visited, with its buttons held.
+///
+/// Manual activation threshold: an explicit "fire at this magnitude"
+/// instruction. It BYPASSES the stick-gesture accumulator (visit-all-cardinals
+/// semantics conflict with a hold-above-the-line gate) and replaces the
+/// built-in cardinal derivation / 0.5 trigger coercion: each analog in pin
+/// gates on the card's curve-shaped magnitude crossing the line, releasing the
+/// moment it dips back below.
+pub(crate) fn chord_raw_held(
+    m: &Value,
+    i: usize,
+    in_pins: &[&str],
+    upstream: &HashMap<String, Signal>,
+    ns: &mut NodeState,
+) -> bool {
+    let shape = MappingShape::from_card(m);
+    let pin_on = |p: &str| upstream.get(p).map(|s| s.as_bool()).unwrap_or(false);
+    if let (Some(required), None) = (gesture_required_bits(in_pins), shape.threshold) {
+        let buttons_held = in_pins.iter().all(|p| gesture_pin_to_bit(p).is_some() || pin_on(p));
+        buttons_held && gesture_tick(required, gesture_state_get(ns, i), upstream)
+    } else {
+        in_pins.iter().all(|p| shape.analog_gate(upstream, p).unwrap_or_else(|| pin_on(p)))
+    }
 }
 
 /// The analog-mode chord rule: every non-cardinal pin (gate button) must pass,

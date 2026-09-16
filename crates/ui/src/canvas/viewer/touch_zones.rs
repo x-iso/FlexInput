@@ -2869,7 +2869,7 @@ pub(crate) fn render_touch_zone_cards(
                 let result = remapper_mapping_card_pixel(
                     ui, node_id, i, &mut working,
                     &in_pins, Some(&out_pins), skin,
-                    true, reorder_enabled, drag_off, "zone_maps", card_analog,
+                    true, false, reorder_enabled, drag_off, "zone_maps", card_analog,
                     card_conf.as_ref(),
                 );
                 if result.delete_clicked { remove = Some(i); }
