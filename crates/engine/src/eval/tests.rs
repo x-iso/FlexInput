@@ -692,6 +692,74 @@ mod trigger_tests {
         assert!((y - 1.0).abs() < 0.05, "stick output should be preserved, got left_stick_y={y}");
     }
 
+    // Swapping the sticks with two analog cards (all four LS cardinals → RS, and
+    // the reverse) must hold with only ONE stick moving. A card over opposite
+    // cardinals can never have them all deflected at once, so suppression used
+    // to require all-held and never consumed the source stick: pushing LS alone
+    // drove the virtual RS AND leaked raw onto the virtual LS. With both sticks
+    // moving the other card's axis writes overwrote the leak, hiding it.
+    #[test]
+    fn analog_stick_swap_holds_with_one_stick() {
+        let remap_uid = 1usize;
+        let dev = "gilrs:switch_pro:0";
+        let mut remap = empty_node(remap_uid, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in":  ["right_stick_up", "right_stick_right", "right_stick_down", "right_stick_left"],
+              "out": ["left_stick_up", "left_stick_right", "left_stick_down", "left_stick_left"],
+              "mode": "analog" },
+            { "in":  ["left_stick_up", "left_stick_right", "left_stick_down", "left_stick_left"],
+              "out": ["right_stick_up", "right_stick_right", "right_stick_down", "right_stick_left"],
+              "mode": "analog" }
+        ]));
+        let src = source_node(3, dev, 0.0);
+        let sink = sink_node(2, "virtual.xinput:0", &format!("remap:{remap_uid}"), true);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink] };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+
+        let tick = |ls: Vec2, rs: Vec2, state: &mut HashMap<usize, NodeState>, out: &mut TickOutput| {
+            let mut d = HashMap::new();
+            for (vec2, x, y, v) in [
+                ("left_stick", "left_stick_x", "left_stick_y", ls),
+                ("right_stick", "right_stick_x", "right_stick_y", rs),
+            ] {
+                d.insert((dev.to_string(), vec2.to_string()), Signal::Vec2(v));
+                d.insert((dev.to_string(), x.to_string()), Signal::Float(v.x));
+                d.insert((dev.to_string(), y.to_string()), Signal::Float(v.y));
+            }
+            eval_graph_tick(&graph, state, &d, 0.016, out);
+        };
+        let stick = |out: &TickOutput, pin: &str| -> Vec2 {
+            match out.sink_outputs.get(&("virtual.xinput:0".to_string(), pin.to_string())) {
+                Some(Signal::Vec2(v)) => *v,
+                other => panic!("{pin} missing at sink: {other:?}"),
+            }
+        };
+        let near = |a: Vec2, b: Vec2| (a - b).length() < 0.05;
+
+        // LS alone → drives RS only; virtual LS stays centered.
+        tick(Vec2::new(0.8, 0.0), Vec2::ZERO, &mut state, &mut out);
+        assert!(near(stick(&out, "right_stick"), Vec2::new(0.8, 0.0)),
+            "LS input must drive RS, got {:?}", stick(&out, "right_stick"));
+        assert!(near(stick(&out, "left_stick"), Vec2::ZERO),
+            "LS input must not leak onto LS, got {:?}", stick(&out, "left_stick"));
+
+        // RS alone → drives LS only.
+        tick(Vec2::ZERO, Vec2::new(0.0, -0.6), &mut state, &mut out);
+        assert!(near(stick(&out, "left_stick"), Vec2::new(0.0, -0.6)),
+            "RS input must drive LS, got {:?}", stick(&out, "left_stick"));
+        assert!(near(stick(&out, "right_stick"), Vec2::ZERO),
+            "RS input must not leak onto RS, got {:?}", stick(&out, "right_stick"));
+
+        // Both → fully swapped.
+        tick(Vec2::new(-0.5, 0.5), Vec2::new(0.7, 0.0), &mut state, &mut out);
+        assert!(near(stick(&out, "left_stick"), Vec2::new(0.7, 0.0)),
+            "both moving: LS must carry RS input, got {:?}", stick(&out, "left_stick"));
+        assert!(near(stick(&out, "right_stick"), Vec2::new(-0.5, 0.5)),
+            "both moving: RS must carry LS input, got {:?}", stick(&out, "right_stick"));
+    }
+
     // A Remapper's mapped OUTPUT pin must survive a downstream Combiner whose
     // higher-priority port carries the raw device bus. Regression for the
     // "General purpose preset" button→button bug: a real controller reports

@@ -143,22 +143,13 @@ pub(crate) fn eval_remapper_node(
                     // Buttons (non-cardinal) all held? Cardinals: any
                     // non-zero magnitude is enough — analog mode passes the
                     // live magnitude through, no activation threshold.
-                    let mut has_cardinal = false;
-                    let mut any_cardinal_active = false;
-                    let mut all_buttons_held = true;
-                    for p in &in_pins {
+                    return analog_chord_active(&in_pins, |p| {
                         if analog_axis_for_cardinal(p).is_some() {
-                            has_cardinal = true;
-                            if analog_cardinal_input_value(&upstream, p) > 0.0 {
-                                any_cardinal_active = true;
-                            }
-                        } else if !read_upstream(p).map(|s| s.as_bool()).unwrap_or(false) {
-                            all_buttons_held = false;
+                            analog_cardinal_input_value(&upstream, p) > 0.0
+                        } else {
+                            read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
                         }
-                    }
-                    // Pure-button analog mappings (no cardinal in) reduce to
-                    // "all held" — same as Down mode. Reasonable fallback.
-                    return all_buttons_held && (!has_cardinal || any_cardinal_active);
+                    });
                 }
                 // Stick-gesture path: when every `in` pin is a stick cardinal,
                 // the chord can never be "simultaneously held" (a single stick
@@ -218,7 +209,7 @@ pub(crate) fn eval_remapper_node(
                 // shaped-magnitude gate as activation so a below-threshold
                 // deflection doesn't consume the input it isn't firing on.
                 let shape = MappingShape::from_card(m);
-                in_pins.iter().all(|p| {
+                let pin_held = |p: &str| {
                     if let Some(passed) = shape.analog_gate(&upstream, p) {
                         return passed;
                     }
@@ -227,7 +218,17 @@ pub(crate) fn eval_remapper_node(
                     } else {
                         read_upstream(p).map(|s| s.as_bool()).unwrap_or(false)
                     }
-                })
+                };
+                // Analog cards consume their inputs by the same chord rule that
+                // activates them (ANY cardinal deflected), not all-held: a card
+                // over opposite cardinals (a full-stick swap) can never have
+                // them all deflected at once, so it would never suppress its
+                // source stick, which then leaks through raw alongside the
+                // mapped output whenever no other card overwrites that axis.
+                if PressParams::from_card(m).is_analog() {
+                    return analog_chord_active(&in_pins, pin_held);
+                }
+                in_pins.iter().all(|p| pin_held(p))
             }).collect();
 
             // Determine which mappings are currently triggered. Sort indices
@@ -687,6 +688,28 @@ pub(crate) fn eval_remapper_node(
             }
 }
 
+/// The analog-mode chord rule: every non-cardinal pin (gate button) must pass,
+/// and when the chord has stick cardinals, ANY one of them passing is enough —
+/// analog mode drives each output from its cardinal's live magnitude, so an
+/// undeflected cardinal just contributes zero. `pin_passes` supplies the
+/// per-pin verdict. Shared by activation (`effective`) and suppression
+/// (`held_now`) so the two can't disagree about when an analog card is live.
+fn analog_chord_active(in_pins: &[&str], mut pin_passes: impl FnMut(&str) -> bool) -> bool {
+    let mut has_cardinal = false;
+    let mut any_cardinal = false;
+    for p in in_pins {
+        let passes = pin_passes(p);
+        if analog_axis_for_cardinal(p).is_some() {
+            has_cardinal = true;
+            any_cardinal |= passes;
+        } else if !passes {
+            return false;
+        }
+    }
+    // Pure-button analog chords (no cardinal in) reduce to "all held" — same
+    // as Down mode.
+    !has_cardinal || any_cardinal
+}
 
 /// Shared Remapper pass-through + suppression pass, called identically by the
 /// top-level and sub-patch Remapper arms (so the two never diverge). For every
