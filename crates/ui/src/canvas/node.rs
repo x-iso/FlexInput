@@ -931,20 +931,114 @@ impl UiSubPatch {
     }
 }
 
-// ── Overlay-pin ↔ sub-patch attribution ─────────────────────────────────────
+// ── Overlay-layout ↔ sub-patch attribution ──────────────────────────────────
 //
-// Info/config overlay pins live on the tab (`OverlayLayout`) during a session,
-// but pins whose `source_path == [sp]` reference a first-level sub-patch node.
-// So overlays travel with a `.fxsp` preset, these two inverse transforms move
-// such pins into the sub-patch on SAVE and restore them on LOAD. Tab-canvas pins
-// (`source_path == []`) and decorations always stay on the tab.
+// Info/config overlay layouts live on the tab (`OverlayLayout`) during a
+// session. So overlays travel with a `.fxsp` preset, these transforms move the
+// items that BELONG to a first-level sub-patch into it on SAVE and restore them
+// on LOAD. Ownership (see `layout_item_owners`):
+// - a module pin belongs to the sub-patch its `source_path == [sp]` names;
+// - a decoration belongs to a sub-patch when its anchor-link group (items joined
+//   by anchor-to links, either direction) holds pins of that sub-patch only;
+// - a pin-less group (e.g. an unlinked decoration) belongs to the tab's ONLY
+//   sub-patch when no pin in the layout lives elsewhere — the Easy-mode case;
+// - everything else (tab-canvas pins, groups mixing owners) stays on the tab.
 
-/// SAVE side: move every overlay/config pin that references a first-level
-/// sub-patch node into that node's `overlay_items` / `config_items` (clearing
-/// `source_path`). Tab-canvas pins stay. Orphan pins (source_path points at a
-/// node that is missing or not a sub-patch) are dropped — they can't render.
-/// Operate on a CLONE of the snarl + layouts at serialize time; never the live
-/// state.
+/// Where a layout item goes when the tab's overlays are split per sub-patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemOwner {
+    Tab,
+    /// First-level sub-patch node id.
+    SubPatch(usize),
+    /// A pin whose sub-patch node is missing (or not a sub-patch): it can't
+    /// render, so it is dropped rather than kept or attributed.
+    Orphan,
+}
+
+fn layout_item_owners(snarl: &Snarl<NodeData>, items: &[LayoutItem]) -> Vec<ItemOwner> {
+    let is_subpatch = |sp: usize| {
+        snarl.get_node(egui_snarl::NodeId(sp)).is_some_and(|n| n.subpatch.is_some())
+    };
+    let pin_owner: Vec<Option<ItemOwner>> = items
+        .iter()
+        .map(|it| match it {
+            LayoutItem::Module(m) => Some(match m.source_path.as_slice() {
+                [sp] if is_subpatch(*sp) => ItemOwner::SubPatch(*sp),
+                [_] => ItemOwner::Orphan,
+                _ => ItemOwner::Tab,
+            }),
+            LayoutItem::Deco(_) => None,
+        })
+        .collect();
+
+    // Anchor-link groups: union-find over follower → target edges.
+    let mut parent: Vec<usize> = (0..items.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for (i, it) in items.iter().enumerate() {
+        let Some(to) = it.anchor().to.filter(|&t| t != 0) else { continue };
+        if let Some(j) = items.iter().position(|t| t.anchor().id == to) {
+            let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+            parent[a] = b;
+        }
+    }
+    // Each group's owner, from its pins: one sub-patch, or Tab when mixed.
+    let mut group_owner: HashMap<usize, ItemOwner> = HashMap::new();
+    for (i, o) in pin_owner.iter().enumerate() {
+        let Some(o @ (ItemOwner::Tab | ItemOwner::SubPatch(_))) = *o else { continue };
+        let r = root(&mut parent, i);
+        group_owner
+            .entry(r)
+            .and_modify(|g| if *g != o { *g = ItemOwner::Tab })
+            .or_insert(o);
+    }
+    // Pin-less groups go with the tab's only sub-patch, unless some pin in the
+    // layout lives elsewhere (then the decoration may frame that one instead).
+    let mut sps = snarl
+        .nodes_ids_data()
+        .filter(|(_, n)| n.value.subpatch.is_some())
+        .map(|(id, _)| id.0);
+    let pinless_owner = match (sps.next(), sps.next()) {
+        (Some(sp), None)
+            if pin_owner.iter().all(|o| {
+                matches!(o, None | Some(ItemOwner::Orphan)) || *o == Some(ItemOwner::SubPatch(sp))
+            }) =>
+        {
+            ItemOwner::SubPatch(sp)
+        }
+        _ => ItemOwner::Tab,
+    };
+
+    (0..items.len())
+        .map(|i| match pin_owner[i] {
+            Some(o) => o,
+            None => {
+                let r = root(&mut parent, i);
+                group_owner.get(&r).copied().unwrap_or(pinless_owner)
+            }
+        })
+        .collect()
+}
+
+fn with_source_path(mut item: LayoutItem, path: Vec<usize>) -> LayoutItem {
+    if let LayoutItem::Module(m) = &mut item {
+        m.source_path = path;
+    }
+    item
+}
+
+/// SAVE side: move every overlay/config item that belongs to a first-level
+/// sub-patch (pins, and the decorations that go with them) into that node's
+/// `overlay_items` / `config_items`, clearing pins' `source_path`. Link ids are
+/// kept, so links to items that stayed on the tab survive a workspace round
+/// trip. Orphan pins (source_path points at a node that is missing or not a
+/// sub-patch) are dropped — they can't render. Operate on a CLONE of the snarl +
+/// layouts at serialize time; never the live state.
 pub fn attribute_overlays_into_subpatches(
     snarl: &mut Snarl<NodeData>,
     overlay: &mut OverlayLayout,
@@ -952,7 +1046,7 @@ pub fn attribute_overlays_into_subpatches(
 ) {
     // The tab overlays are the live source of truth. A sub-patch node may still
     // carry stale `overlay_items` from when it was loaded; clear them so the
-    // rebuild below can't duplicate, and so a pin the user deleted on the tab
+    // rebuild below can't duplicate, and so an item the user deleted on the tab
     // actually disappears from the preset.
     let ids: Vec<egui_snarl::NodeId> = snarl.nodes_ids_data().map(|(id, _)| id).collect();
     for id in ids {
@@ -970,33 +1064,32 @@ fn attribute_layout_into_subpatches(
     items: &mut Vec<LayoutItem>,
     into_config: bool,
 ) {
-    for item in std::mem::take(items) {
-        // Only single-level module pins are attributable; decorations and
-        // tab-canvas pins (empty source_path) stay on the tab.
-        let sp = match &item {
-            LayoutItem::Module(m) if m.source_path.len() == 1 => Some(m.source_path[0]),
-            _ => None,
-        };
-        let Some(sp) = sp else { items.push(item); continue; };
-        let subp = snarl.get_node_mut(egui_snarl::NodeId(sp))
-            .and_then(|n| n.subpatch.as_mut());
-        match (subp, item) {
-            (Some(subp), LayoutItem::Module(mut m)) => {
-                m.source_path.clear();
-                if into_config { subp.config_items.push(LayoutItem::Module(m)); }
-                else { subp.overlay_items.push(LayoutItem::Module(m)); }
+    let owners = layout_item_owners(snarl, items);
+    for (item, owner) in std::mem::take(items).into_iter().zip(owners) {
+        match owner {
+            ItemOwner::Tab => items.push(item),
+            ItemOwner::Orphan => {}
+            ItemOwner::SubPatch(sp) => {
+                let Some(subp) = snarl
+                    .get_node_mut(egui_snarl::NodeId(sp))
+                    .and_then(|n| n.subpatch.as_mut())
+                else {
+                    continue;
+                };
+                let dst = if into_config { &mut subp.config_items } else { &mut subp.overlay_items };
+                dst.push(with_source_path(item, Vec::new()));
             }
-            // Node missing or not a sub-patch → orphan, drop.
-            _ => {}
         }
     }
 }
 
 /// LOAD side: for each first-level sub-patch node, append its stored
-/// `overlay_items` / `config_items` onto the tab's `overlay` / `config` with
-/// `source_path` set to that node's id. Deduped by
-/// `(source_path, inner_node_id, element_id)` so re-materializing (or loading a
-/// preset already present) never doubles pins.
+/// `overlay_items` / `config_items` onto the tab's `overlay` / `config` (pins get
+/// `source_path` = that node's id), in their stored paint order. Items already
+/// on the tab are not doubled (pins by `(source_path, inner_node_id,
+/// element_id)`, decorations by value), so re-materializing — or loading a
+/// preset already present — is idempotent. Link ids that collide with ids
+/// already on the tab are renumbered, followers included.
 pub fn materialize_subpatch_overlays(
     snarl: &Snarl<NodeData>,
     overlay: &mut OverlayLayout,
@@ -1009,43 +1102,131 @@ pub fn materialize_subpatch_overlays(
     }
 }
 
-/// COPY (not move) a tab's overlay/config pins that reference sub-patch node
-/// `sp_id` into `target`'s stored item lists (source_path cleared), for baking a
-/// `.fxsp` preset without disturbing the live tab overlays. Clear `target`'s
-/// lists first if you want the tab overlays to be the sole source of truth.
-pub fn collect_overlays_for_subpatch(
+/// Remove the tab's overlay/config items that belong to sub-patch node `sp_id`
+/// (its pins and their decorations) — before materializing a freshly loaded
+/// preset into that node, so the new layout replaces the old one.
+pub fn remove_subpatch_overlays(
+    snarl: &Snarl<NodeData>,
+    sp_id: usize,
+    overlay: &mut OverlayLayout,
+    config: &mut OverlayLayout,
+) {
+    for items in [&mut overlay.items, &mut config.items] {
+        let mut owners = layout_item_owners(snarl, items).into_iter();
+        items.retain(|_| owners.next() != Some(ItemOwner::SubPatch(sp_id)));
+    }
+}
+
+/// Sub-patch node `sp_id` as it should be written to a `.fxsp`: a clone whose
+/// `overlay_items` / `config_items` are this tab's LIVE overlay/config items
+/// that belong to it (what the node stores is only a snapshot from its last load
+/// or workspace save). The live tab overlays are untouched. A link to an item
+/// that stays on the tab is dropped, since the preset can't carry its target.
+pub fn subpatch_with_overlays(
+    snarl: &Snarl<NodeData>,
     sp_id: usize,
     overlay: &OverlayLayout,
     config: &OverlayLayout,
-    target: &mut UiSubPatch,
-) {
-    collect_layout_for(sp_id, &overlay.items, &mut target.overlay_items);
-    collect_layout_for(sp_id, &config.items, &mut target.config_items);
+) -> Option<UiSubPatch> {
+    let mut sp = (**snarl.get_node(egui_snarl::NodeId(sp_id))?.subpatch.as_ref()?).clone();
+    sp.overlay_items = collect_layout_for(snarl, sp_id, &overlay.items);
+    sp.config_items = collect_layout_for(snarl, sp_id, &config.items);
+    Some(sp)
 }
 
-fn collect_layout_for(sp_id: usize, src: &[LayoutItem], dst: &mut Vec<LayoutItem>) {
-    for item in src {
-        if let LayoutItem::Module(m) = item {
-            if m.source_path == [sp_id] {
-                let mut m = m.clone();
-                m.source_path.clear();
-                dst.push(LayoutItem::Module(m));
-            }
+fn collect_layout_for(snarl: &Snarl<NodeData>, sp_id: usize, src: &[LayoutItem]) -> Vec<LayoutItem> {
+    let owners = layout_item_owners(snarl, src);
+    let mut out: Vec<LayoutItem> = src
+        .iter()
+        .zip(owners)
+        .filter(|(_, o)| *o == ItemOwner::SubPatch(sp_id))
+        .map(|(it, _)| with_source_path(it.clone(), Vec::new()))
+        .collect();
+    let ids: std::collections::HashSet<u64> =
+        out.iter().map(|it| it.anchor().id).filter(|&id| id != 0).collect();
+    for it in &mut out {
+        let mut a = it.anchor();
+        if a.to.is_some_and(|t| !ids.contains(&t)) {
+            a.to = None;
+            it.set_anchor(a);
         }
+    }
+    out
+}
+
+/// Same element for materialize dedup: a pin by its source identity, a
+/// decoration by value (ignoring its link id/target, which renumbering changes).
+fn same_layout_item(a: &LayoutItem, b: &LayoutItem) -> bool {
+    match (a, b) {
+        (LayoutItem::Module(x), LayoutItem::Module(y)) => {
+            x.source_path == y.source_path
+                && x.inner_node_id == y.inner_node_id
+                && x.element_id == y.element_id
+        }
+        (LayoutItem::Deco(x), LayoutItem::Deco(y)) => {
+            let unlinked = |d: &LayoutDecoration| {
+                let mut d = d.clone();
+                let mut an = d.anchor();
+                an.id = 0;
+                an.to = None;
+                d.set_anchor(an);
+                serde_json::to_value(d).ok()
+            };
+            unlinked(x) == unlinked(y)
+        }
+        _ => false,
     }
 }
 
 fn materialize_layout(src: &[LayoutItem], dst: &mut Vec<LayoutItem>, sp: usize) {
+    let existing = dst.len();
+    let taken: std::collections::HashSet<u64> =
+        dst.iter().map(|it| it.anchor().id).filter(|&id| id != 0).collect();
+    let mut next = taken
+        .iter()
+        .copied()
+        .chain(src.iter().map(|it| it.anchor().id))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    // Batch link id → the id it ends up with on the tab (changed ones only).
+    let mut remap: HashMap<u64, u64> = HashMap::new();
     for item in src {
-        let LayoutItem::Module(m) = item else { continue };
-        let dup = dst.iter().any(|it| matches!(it, LayoutItem::Module(e)
-            if e.source_path == [sp]
-            && e.inner_node_id == m.inner_node_id
-            && e.element_id == m.element_id));
-        if dup { continue; }
-        let mut m = m.clone();
-        m.source_path = vec![sp];
-        dst.push(LayoutItem::Module(m));
+        let item = with_source_path(item.clone(), vec![sp]);
+        let id = item.anchor().id;
+        if let Some(j) = dst[..existing].iter().position(|e| same_layout_item(e, &item)) {
+            // Already on the tab: point this batch's followers at that copy.
+            if id != 0 {
+                let mut ea = dst[j].anchor();
+                if ea.id == 0 {
+                    ea.id = next;
+                    next += 1;
+                    dst[j].set_anchor(ea);
+                }
+                if ea.id != id {
+                    remap.insert(id, ea.id);
+                }
+            }
+            continue;
+        }
+        if id != 0 && taken.contains(&id) {
+            remap.insert(id, next);
+            next += 1;
+        }
+        dst.push(item);
+    }
+    if remap.is_empty() {
+        return;
+    }
+    for it in &mut dst[existing..] {
+        let mut a = it.anchor();
+        if let Some(&n) = remap.get(&a.id) {
+            a.id = n;
+        }
+        if let Some(n) = a.to.and_then(|t| remap.get(&t).copied()) {
+            a.to = Some(n);
+        }
+        it.set_anchor(a);
     }
 }
 
@@ -1437,5 +1618,137 @@ mod tests {
         assert_eq!(overlay.items.len(), 1);
         assert!(matches!(&overlay.items[0],
             LayoutItem::Module(m) if m.inner_node_id == 2));
+    }
+
+    fn deco(x: f32) -> LayoutItem {
+        LayoutItem::Deco(LayoutDecoration::Rect {
+            pos: [x, 10.0], size: [40.0, 20.0], fill: [1, 2, 3, 255],
+            stroke: [0, 0, 0, 0], stroke_px: 0.0, corner_radius: 0.0,
+            anchor: Anchor::default(),
+        })
+    }
+
+    /// `item` with link id `id` (0 = none) following `to`.
+    fn linked(mut item: LayoutItem, id: u64, to: Option<u64>) -> LayoutItem {
+        let mut a = item.anchor();
+        a.id = id;
+        a.to = to;
+        item.set_anchor(a);
+        item
+    }
+
+    fn deco_x(item: &LayoutItem) -> Option<f32> {
+        match item { LayoutItem::Deco(d) => Some(d.bbox().0[0]), _ => None }
+    }
+
+    #[test]
+    fn decorations_travel_with_their_subpatch_and_keep_links() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let sp = snarl.insert_node(eframe::egui::pos2(0.0, 0.0), subpatch_node()).0;
+
+        // Paint order: frame deco (link target 1), pin following it, a label
+        // deco following the pin (target 2), and an unlinked deco.
+        let mut config = OverlayLayout::default();
+        config.items.push(linked(deco(1.0), 1, None));
+        config.items.push(linked(overlay_pin(9, vec![sp]), 2, Some(1)));
+        config.items.push(linked(deco(2.0), 0, Some(2)));
+        config.items.push(deco(3.0));
+        let mut overlay = OverlayLayout::default();
+
+        // The .fxsp bake carries all four, in order, links intact.
+        let baked = subpatch_with_overlays(&snarl, sp, &overlay, &config).unwrap();
+        assert_eq!(baked.config_items.len(), 4);
+        assert_eq!(deco_x(&baked.config_items[0]), Some(1.0));
+        assert!(matches!(&baked.config_items[1],
+            LayoutItem::Module(m) if m.source_path.is_empty() && m.anchor.to == Some(1)));
+        assert_eq!(baked.config_items[2].anchor().to, Some(2));
+        assert_eq!(deco_x(&baked.config_items[3]), Some(3.0));
+
+        // Workspace attribution moves them all; loading brings them back as-is.
+        attribute_overlays_into_subpatches(&mut snarl, &mut overlay, &mut config);
+        assert!(config.items.is_empty());
+        let mut o2 = OverlayLayout::default();
+        let mut c2 = OverlayLayout::default();
+        materialize_subpatch_overlays(&snarl, &mut o2, &mut c2);
+        assert_eq!(c2.items.len(), 4);
+        assert_eq!(c2.items[0].anchor().id, 1);
+        assert!(matches!(&c2.items[1],
+            LayoutItem::Module(m) if m.source_path == [sp] && m.anchor.id == 2 && m.anchor.to == Some(1)));
+        assert_eq!(c2.items[2].anchor().to, Some(2));
+
+        // Idempotent: decorations aren't doubled either.
+        materialize_subpatch_overlays(&snarl, &mut o2, &mut c2);
+        assert_eq!(c2.items.len(), 4);
+    }
+
+    #[test]
+    fn decoration_ownership_with_two_subpatches() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let a = snarl.insert_node(eframe::egui::pos2(0.0, 0.0), subpatch_node()).0;
+        let b = snarl.insert_node(eframe::egui::pos2(0.0, 0.0), subpatch_node()).0;
+
+        let mut config = OverlayLayout::default();
+        config.items.push(linked(deco(1.0), 1, None));                      // framed by A's pin
+        config.items.push(linked(overlay_pin(5, vec![a]), 0, Some(1)));
+        config.items.push(linked(deco(2.0), 2, None));                      // shared by A and B
+        config.items.push(linked(overlay_pin(6, vec![a]), 0, Some(2)));
+        config.items.push(linked(overlay_pin(7, vec![b]), 0, Some(2)));
+        config.items.push(deco(3.0));                                       // unlinked: ambiguous
+        let overlay = OverlayLayout::default();
+
+        let baked = subpatch_with_overlays(&snarl, a, &overlay, &config).unwrap();
+        // A gets its framed deco + both pins; the shared deco and the unlinked
+        // one stay on the tab, and the pin following the shared deco loses that
+        // link (its target isn't in the preset).
+        assert_eq!(baked.config_items.len(), 3);
+        assert_eq!(deco_x(&baked.config_items[0]), Some(1.0));
+        assert_eq!(baked.config_items[1].anchor().to, Some(1));
+        assert_eq!(baked.config_items[2].anchor().to, None);
+    }
+
+    #[test]
+    fn materialize_renumbers_colliding_link_ids() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let mut node = subpatch_node();
+        {
+            let subp = node.subpatch.as_mut().unwrap();
+            subp.config_items.push(linked(deco(1.0), 1, None));
+            subp.config_items.push(linked(overlay_pin(9, vec![]), 0, Some(1)));
+        }
+        let sp = snarl.insert_node(eframe::egui::pos2(0.0, 0.0), node).0;
+
+        // The tab already has an unrelated link pair using id 1.
+        let mut overlay = OverlayLayout::default();
+        let mut config = OverlayLayout::default();
+        config.items.push(linked(overlay_pin(3, vec![]), 1, None));
+        config.items.push(linked(deco(50.0), 0, Some(1)));
+
+        materialize_subpatch_overlays(&snarl, &mut overlay, &mut config);
+        assert_eq!(config.items.len(), 4);
+        // Existing pair untouched.
+        assert_eq!(config.items[0].anchor().id, 1);
+        assert_eq!(config.items[1].anchor().to, Some(1));
+        // Loaded pair renumbered consistently, away from 1.
+        let new_id = config.items[2].anchor().id;
+        assert!(new_id != 0 && new_id != 1);
+        assert!(matches!(&config.items[3],
+            LayoutItem::Module(m) if m.source_path == [sp] && m.anchor.to == Some(new_id)));
+    }
+
+    #[test]
+    fn remove_subpatch_overlays_drops_its_decorations_only() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let sp = snarl.insert_node(eframe::egui::pos2(0.0, 0.0), subpatch_node()).0;
+        let mut overlay = OverlayLayout::default();
+        overlay.items.push(overlay_pin(3, vec![]));                         // tab-canvas pin
+        overlay.items.push(deco(1.0));                                      // tab pin exists → stays
+        let mut config = OverlayLayout::default();
+        config.items.push(linked(deco(2.0), 1, None));
+        config.items.push(linked(overlay_pin(9, vec![sp]), 0, Some(1)));
+        config.items.push(deco(3.0));                                       // only sp's pins here → sp's
+
+        remove_subpatch_overlays(&snarl, sp, &mut overlay, &mut config);
+        assert_eq!(overlay.items.len(), 2);
+        assert!(config.items.is_empty());
     }
 }

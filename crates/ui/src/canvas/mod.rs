@@ -550,6 +550,9 @@ pub struct Canvas {
     pub(crate) mutation_gen: u64,
     /// Set this frame when the user requests to open a subpatch editor window.
     pub pending_edit_subpatch: Option<egui_snarl::NodeId>,
+    /// Set this frame when the user clicks a subpatch node's "Save…" (tab canvas
+    /// only; see `FlexViewer::save_subpatch_request`).
+    pub pending_save_subpatch: Option<egui_snarl::NodeId>,
     /// Set this frame when the user picks "Pin element …" on an inner canvas
     /// node. (NodeId, element_id, source_size). `source_size = [0,0]` means
     /// "no measured size" — the receiver should fall back to a default.
@@ -637,6 +640,7 @@ impl Canvas {
             clipboard_gen: 0,
             mutation_gen: 0,
             pending_edit_subpatch: None,
+            pending_save_subpatch: None,
             pending_expose_module: None,
             is_inner: false,
             pinned_inner_ids: std::collections::HashSet::new(),
@@ -1169,6 +1173,7 @@ impl Canvas {
             rename_request: None,
             replace_request: None,
             edit_subpatch_request: None,
+            save_subpatch_request: None,
             is_inner_canvas: self.is_inner,
             expose_module_request: None,
             pinned_inner_ids: self.pinned_inner_ids.clone(),
@@ -1363,6 +1368,7 @@ impl Canvas {
         }
 
         self.pending_edit_subpatch  = viewer.edit_subpatch_request;
+        self.pending_save_subpatch  = viewer.save_subpatch_request;
         self.pending_expose_module  = viewer.expose_module_request;
         // Stash group_request flag; acted on after `selected` is fetched below.
         let group_from_menu = viewer.group_request;

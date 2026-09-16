@@ -5,6 +5,22 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Sub-patch presets now keep their overlay decorations.** Saving a sub-patch
+  to `.fxsp` carried only its pinned widgets, so boxes, labels and other
+  decorations laid out on the info and config overlays were stripped from the
+  preset, and pins anchored to one of them landed in the wrong place once
+  loaded. A decoration now travels with the sub-patch it is anchor-linked to,
+  and on a tab with a single sub-patch every unlinked decoration goes with it
+  too (the Easy-mode case); paint order and anchor links are kept, and link ids
+  that clash with ones already on the tab are renumbered on load. Loading a
+  different preset replaces the previous preset's decorations along with its
+  pins. The Advanced-mode **Save…** buttons (node header and sub-patch editor)
+  now bake the tab's live overlays too, instead of writing whatever the node
+  stored at its last load. A preset saved before this fix can't recover its
+  decorations; re-save it from a tab that still shows them.
+
 ## [0.14.0] - 2026-09-16
 
 ### Added

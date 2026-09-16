@@ -70,16 +70,12 @@ pub fn show(
     show_pending_modal(ui, canvas, easy_state, &presets);
 
     // A preset / sub-patch load just replaced a sub-patch node — swap that
-    // node's overlay/config pins for the freshly-loaded ones (the preset ships
-    // its own). Replace (not merge): drop the previous preset's pins for the
-    // node, then materialize the new set.
+    // node's overlay/config items for the freshly-loaded ones (the preset ships
+    // its own). Replace (not merge): drop the previous preset's pins and
+    // decorations for the node, then materialize the new set.
     if let Some(sp) = easy_state.overlay_reload_node.take() {
-        let drop_old = |items: &mut Vec<crate::canvas::node::LayoutItem>| {
-            items.retain(|it| !matches!(it,
-                crate::canvas::node::LayoutItem::Module(m) if m.source_path == [sp]));
-        };
-        drop_old(&mut tab_overlay.items);
-        drop_old(&mut tab_config.items);
+        crate::canvas::node::remove_subpatch_overlays(
+            &canvas.snarl, sp, tab_overlay, tab_config);
         crate::canvas::node::materialize_subpatch_overlays(
             &canvas.snarl, tab_overlay, tab_config);
     }
@@ -359,16 +355,13 @@ fn show_preset_picker(
             .clicked()
         {
             if let Some(oid) = outer_id {
-                if let Some(sp) = canvas.snarl.get_node(oid).and_then(|n| n.subpatch.as_ref()) {
-                    // Bake THIS tab's overlay/config pins for this sub-patch into
-                    // the saved copy (the tab overlays are the live source of
-                    // truth), so the preset ships its overlays. The live tab
-                    // overlays are untouched.
-                    let mut sp = sp.clone();
-                    sp.overlay_items.clear();
-                    sp.config_items.clear();
-                    crate::canvas::node::collect_overlays_for_subpatch(
-                        oid.0, tab_overlay, tab_config, &mut sp);
+                // Bake THIS tab's overlay/config items for this sub-patch (pins
+                // and their decorations) into the saved copy — the tab overlays
+                // are the live source of truth — so the preset ships its
+                // overlays. The live tab overlays are untouched.
+                if let Some(sp) = crate::canvas::node::subpatch_with_overlays(
+                    &canvas.snarl, oid.0, tab_overlay, tab_config)
+                {
                     if let Some(path) = crate::app::save_subpatch_file(&sp) {
                         let hash = hash_subpatch(&sp);
                         easy_state.loaded_preset = Some((path, hash));

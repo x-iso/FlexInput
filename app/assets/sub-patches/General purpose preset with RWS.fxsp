@@ -40,13 +40,10 @@
               }
             ],
             "params": {
-              "biases": [
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0
-              ],
+              "in_max": 1.0,
+              "scale_t": -0.7604460716247559,
+              "trail_ms": 300,
+              "snap": false,
               "points": [
                 [
                   0.0,
@@ -73,15 +70,18 @@
                   1.0
                 ]
               ],
-              "grid_y": 4,
-              "trail_ms": 300,
-              "show_grid_labels": true,
               "grid_x": 4,
-              "in_max": 1.0,
-              "scale_t": -0.7604460716247559,
               "show_scaled_grid": true,
-              "out_max": 1.0,
-              "snap": false
+              "show_grid_labels": true,
+              "biases": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "grid_y": 4,
+              "out_max": 1.0
             }
           },
           "pos": {
@@ -147,9 +147,9 @@
               }
             ],
             "params": {
-              "ui_phase": "capturing",
               "mappings": [],
               "_pressed_prev": [],
+              "ui_phase": "capturing",
               "draft_input": []
             }
           },
@@ -237,8 +237,17 @@
               }
             ],
             "params": {
-              "trail_ms": 300,
+              "biases": [
+                0.0
+              ],
+              "snap": false,
+              "show_scaled_grid": true,
+              "grid_y": 4,
               "in_max": 1.0,
+              "out_max": 1.0,
+              "trail_ms": 300,
+              "show_grid_labels": true,
+              "grid_x": 4,
               "points": [
                 [
                   0.0,
@@ -249,16 +258,7 @@
                   1.0
                 ]
               ],
-              "grid_y": 4,
-              "show_scaled_grid": true,
-              "out_max": 1.0,
-              "scale_t": 0.0,
-              "biases": [
-                0.0
-              ],
-              "grid_x": 4,
-              "snap": false,
-              "show_grid_labels": true
+              "scale_t": 0.0
             }
           },
           "pos": {
@@ -287,12 +287,18 @@
               }
             ],
             "params": {
+              "out_max": 1.0,
               "grid_x": 4,
+              "grid_y": 4,
+              "show_scaled_grid": true,
               "snap": false,
               "biases": [
                 -0.03879748284816742,
                 0.0
               ],
+              "trail_ms": 300,
+              "in_max": 1.0,
+              "scale_t": -0.5137927532196045,
               "points": [
                 [
                   0.0,
@@ -307,13 +313,7 @@
                   1.0
                 ]
               ],
-              "show_grid_labels": true,
-              "show_scaled_grid": true,
-              "in_max": 1.0,
-              "trail_ms": 300,
-              "scale_t": -0.5137927532196045,
-              "out_max": 1.0,
-              "grid_y": 4
+              "show_grid_labels": true
             }
           },
           "pos": {
@@ -439,28 +439,22 @@
               }
             ],
             "params": {
-              "reset_ease_in": 0.25,
-              "inv_yaw": false,
-              "orient_auto_recenter": true,
-              "inv_pitch": false,
-              "inv_accel_y": false,
+              "orient_scale": 1.0,
+              "inv_accel_z": false,
               "lean_threshold": 0.30000001192092896,
+              "inv_roll": false,
+              "reset_ease_in": 0.25,
+              "family": "pointer",
+              "inv_accel_y": false,
               "orient_recenter_thresh": 0.004999999888241291,
+              "inv_yaw": false,
               "axis": "player",
               "orient_drift": 0.0,
-              "_lean_left_pressed_prev": [],
-              "recenter_strength": 0.0,
-              "inv_accel_x": false,
-              "_lean_right_pressed_prev": [],
-              "_lean_right_draft": [],
-              "family": "pointer",
-              "_lean_left_phase": "idle",
-              "_lean_right_phase": "idle",
-              "inv_accel_z": false,
-              "_lean_left_draft": [],
-              "inv_roll": false,
               "steering_exclude_y": false,
-              "orient_scale": 1.0
+              "inv_pitch": false,
+              "orient_auto_recenter": true,
+              "inv_accel_x": false,
+              "recenter_strength": 0.0
             }
           },
           "pos": {
@@ -572,28 +566,28 @@
               }
             ],
             "params": {
-              "lean_right": [],
-              "family": "pointer",
+              "inv_accel_z": false,
               "reset_ease_in": 0.10000000149011612,
-              "recenter_strength": 0.0,
-              "lean_left": [],
-              "axis": "player",
-              "inv_accel_y": false,
-              "_lean_left_phase": "idle",
-              "_lean_right_draft": [],
-              "spike_sensitivity": 100.0,
-              "inv_accel_x": false,
-              "inv_roll": false,
               "_lean_left_pressed_prev": [],
-              "lean_threshold": 0.20000000298023224,
-              "inv_yaw": false,
-              "inv_pitch": false,
               "_lean_right_phase": "idle",
-              "_lean_left_draft": [],
-              "steering_exclude_y": false,
-              "_lean_right_pressed_prev": [],
+              "lean_threshold": 0.20000000298023224,
+              "family": "pointer",
               "spike_suppress": true,
-              "inv_accel_z": false
+              "inv_yaw": false,
+              "_lean_left_draft": [],
+              "axis": "player",
+              "steering_exclude_y": false,
+              "inv_accel_y": false,
+              "inv_pitch": false,
+              "spike_sensitivity": 100.0,
+              "inv_roll": false,
+              "inv_accel_x": false,
+              "_lean_right_pressed_prev": [],
+              "_lean_left_phase": "idle",
+              "lean_right": [],
+              "lean_left": [],
+              "_lean_right_draft": [],
+              "recenter_strength": 0.0
             }
           },
           "pos": {
@@ -803,8 +797,8 @@
             ],
             "outputs": [],
             "params": {
-              "signal_type": "AutoMap",
-              "pin_index": 0
+              "pin_index": 0,
+              "signal_type": "AutoMap"
             }
           },
           "pos": {
@@ -874,13 +868,13 @@
               }
             ],
             "params": {
-              "box_width": 161.375,
               "selected_index": 1,
               "options": [
                 "Hold to Activate",
                 "Hold to Suppress",
                 "Toggle"
-              ]
+              ],
+              "box_width": 161.375
             }
           },
           "pos": {
@@ -1045,10 +1039,10 @@
               }
             ],
             "params": {
-              "caption_off": "off",
+              "caption_on": "on",
               "ui_toggle_seq": 12,
-              "active": true,
-              "caption_on": "on"
+              "caption_off": "off",
+              "active": true
             }
           },
           "pos": {
@@ -1136,11 +1130,11 @@
               }
             ],
             "params": {
-              "_pressed_prev": [],
               "draft_output": [],
+              "_pressed_prev": [],
               "mappings": [],
-              "ui_phase": "capturing",
-              "draft_input": []
+              "draft_input": [],
+              "ui_phase": "capturing"
             }
           },
           "pos": {
@@ -1175,9 +1169,9 @@
             ],
             "params": {
               "active": false,
-              "caption_on": "",
+              "caption_pos_on": "right",
               "svg_on_rev": 2,
-              "caption_pos_on": "right"
+              "caption_on": ""
             }
           },
           "pos": {
@@ -1216,13 +1210,13 @@
               }
             ],
             "params": {
-              "rws": 3.0,
-              "field_bg_alpha": 0.09000000357627869,
-              "stick_aim_enabled": true,
               "scale_unit": "deg",
-              "field_mode": "both",
               "flick_enabled": false,
-              "suppress_source": "deadzone"
+              "field_mode": "both",
+              "suppress_source": "deadzone",
+              "stick_aim_enabled": true,
+              "rws": 3.0,
+              "field_bg_alpha": 0.09000000357627869
             }
           },
           "pos": {
@@ -1245,8 +1239,8 @@
               }
             ],
             "params": {
-              "signal_type": "AutoMap",
-              "pin_index": 1
+              "pin_index": 1,
+              "signal_type": "AutoMap"
             }
           },
           "pos": {
@@ -1281,9 +1275,9 @@
             ],
             "params": {
               "mappings": [],
-              "draft_input": [],
+              "ui_phase": "capturing",
               "_pressed_prev": [],
-              "ui_phase": "capturing"
+              "draft_input": []
             }
           },
           "pos": {
@@ -1478,6 +1472,16 @@
       "wires": [
         {
           "out_pin": {
+            "node": 37,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
             "node": 22,
             "output": 0
           },
@@ -1488,242 +1492,12 @@
         },
         {
           "out_pin": {
-            "node": 8,
+            "node": 11,
             "output": 5
           },
           "in_pin": {
-            "node": 3,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 18,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 29,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 13,
-            "output": 0
-          },
-          "in_pin": {
             "node": 36,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 41,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 12,
             "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 30,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 5,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 41,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 1,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 24,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 15,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 22,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 34,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 3,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 2,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 32,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 34,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 22,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 33,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 41,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 7,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 11,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 39,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 1,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 14,
-            "output": 2
-          },
-          "in_pin": {
-            "node": 5,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 30,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 36,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 6,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 12,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 14,
-            "output": 4
-          },
-          "in_pin": {
-            "node": 40,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 6,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 33,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 25,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 26,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 40,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 4
-          }
-        },
-        {
-          "out_pin": {
-            "node": 27,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 40,
-            "input": 0
           }
         },
         {
@@ -1738,91 +1512,11 @@
         },
         {
           "out_pin": {
-            "node": 24,
+            "node": 22,
             "output": 0
           },
           "in_pin": {
-            "node": 13,
-            "input": 7
-          }
-        },
-        {
-          "out_pin": {
-            "node": 23,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 1,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 33,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 24,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 26,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 7,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
             "node": 11,
-            "output": 5
-          },
-          "in_pin": {
-            "node": 36,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 2,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 28,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 28,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 18,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 2,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 18,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 27,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 37,
             "input": 0
           }
         },
@@ -1838,12 +1532,22 @@
         },
         {
           "out_pin": {
-            "node": 36,
+            "node": 22,
             "output": 0
           },
           "in_pin": {
-            "node": 16,
+            "node": 13,
             "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 7,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 2
           }
         },
         {
@@ -1853,6 +1557,126 @@
           },
           "in_pin": {
             "node": 7,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 40,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 4
+          }
+        },
+        {
+          "out_pin": {
+            "node": 9,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 33,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 41,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 2
+          },
+          "in_pin": {
+            "node": 5,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 33,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 24,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 24,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 7
+          }
+        },
+        {
+          "out_pin": {
+            "node": 18,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 29,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 0,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 33,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 5,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 41,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 7,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 2,
             "input": 0
           }
         },
@@ -1868,11 +1692,141 @@
         },
         {
           "out_pin": {
-            "node": 22,
+            "node": 27,
             "output": 0
           },
           "in_pin": {
-            "node": 2,
+            "node": 40,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 41,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 25,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 26,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 26,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 4,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 41,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 8,
+            "output": 5
+          },
+          "in_pin": {
+            "node": 3,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 39,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 26,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 40,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 5
+          }
+        },
+        {
+          "out_pin": {
+            "node": 34,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 22,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 27,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 37,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 22,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 41,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 0,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 36,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 16,
             "input": 0
           }
         },
@@ -1888,52 +1842,22 @@
         },
         {
           "out_pin": {
-            "node": 14,
-            "output": 3
-          },
-          "in_pin": {
-            "node": 37,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 37,
+            "node": 39,
             "output": 1
           },
           "in_pin": {
-            "node": 13,
-            "input": 3
-          }
-        },
-        {
-          "out_pin": {
-            "node": 0,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 33,
+            "node": 1,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 11,
+            "node": 28,
             "output": 0
           },
           "in_pin": {
-            "node": 29,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 41,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 1
+            "node": 18,
+            "input": 2
           }
         },
         {
@@ -1948,61 +1872,131 @@
         },
         {
           "out_pin": {
-            "node": 39,
-            "output": 1
+            "node": 34,
+            "output": 0
           },
           "in_pin": {
-            "node": 4,
+            "node": 3,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 0,
+            "node": 23,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 1,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 11,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 29,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 3
+          },
+          "in_pin": {
+            "node": 37,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 4
+          },
+          "in_pin": {
+            "node": 40,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 30,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 30,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 36,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 35,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 6,
             "output": 0
           },
           "in_pin": {
             "node": 12,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 9,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 4,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 40,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 5
-          }
-        },
-        {
-          "out_pin": {
-            "node": 4,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 41,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 39,
-            "output": 1
+            "node": 13,
+            "output": 0
           },
           "in_pin": {
-            "node": 26,
+            "node": 36,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 35,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 11,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 6,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 33,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 28,
             "input": 0
           }
         },
@@ -2018,31 +2012,31 @@
         },
         {
           "out_pin": {
-            "node": 22,
+            "node": 2,
             "output": 0
           },
           "in_pin": {
-            "node": 35,
+            "node": 32,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 39,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 4,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 7,
+            "node": 1,
             "output": 0
           },
           "in_pin": {
-            "node": 12,
-            "input": 3
-          }
-        },
-        {
-          "out_pin": {
-            "node": 35,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 11,
+            "node": 24,
             "input": 1
           }
         }
@@ -3290,6 +3284,353 @@
     ],
     "config_items": [
       {
+        "Deco": {
+          "Rect": {
+            "pos": [
+              428.50977,
+              73.88131
+            ],
+            "size": [
+              384.18118,
+              147.76262
+            ],
+            "fill": [
+              0,
+              0,
+              0,
+              132
+            ],
+            "stroke": [
+              255,
+              255,
+              255,
+              220
+            ],
+            "stroke_px": 0.0,
+            "corner_radius": 6.0,
+            "anchor": {
+              "x": "Start",
+              "y": "Start",
+              "id": 7,
+              "to": 1
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Rect": {
+            "pos": [
+              1078.6626,
+              461.75818
+            ],
+            "size": [
+              354.62878,
+              424.81754
+            ],
+            "fill": [
+              0,
+              0,
+              0,
+              132
+            ],
+            "stroke": [
+              255,
+              255,
+              255,
+              220
+            ],
+            "stroke_px": 0.0,
+            "corner_radius": 6.0,
+            "anchor": {
+              "x": "Auto",
+              "y": "Auto",
+              "id": 3
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Rect": {
+            "pos": [
+              29.552399,
+              655.6966
+            ],
+            "size": [
+              398.9574,
+              230.87909
+            ],
+            "fill": [
+              0,
+              0,
+              0,
+              132
+            ],
+            "stroke": [
+              255,
+              255,
+              255,
+              220
+            ],
+            "stroke_px": 0.0,
+            "corner_radius": 6.0,
+            "anchor": {
+              "x": "Auto",
+              "y": "Auto",
+              "id": 2
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Rect": {
+            "pos": [
+              29.552399,
+              73.88131
+            ],
+            "size": [
+              398.9574,
+              554.1098
+            ],
+            "fill": [
+              0,
+              0,
+              0,
+              132
+            ],
+            "stroke": [
+              255,
+              255,
+              255,
+              220
+            ],
+            "stroke_px": 0.0,
+            "corner_radius": 6.0,
+            "anchor": {
+              "x": "Start",
+              "y": "Start",
+              "id": 1
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Text": {
+            "pos": [
+              1093.4387,
+              470.99335
+            ],
+            "size": [
+              325.0764,
+              27.70549
+            ],
+            "text": "Quick mapping tool",
+            "font_size": 20.0,
+            "fill": [
+              200,
+              200,
+              200,
+              220
+            ],
+            "outline": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "outline_px": 0.0,
+            "align": "Left",
+            "valign": "Top",
+            "anchor": {
+              "x": "Center",
+              "y": "Start",
+              "to": 3
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Svg": {
+            "pos": [
+              59.104797,
+              92.35164
+            ],
+            "size": [
+              44.328598,
+              46.17582
+            ],
+            "svg_data": "",
+            "rev": 2,
+            "tint": [
+              255,
+              255,
+              255,
+              143
+            ],
+            "tint_mode": "override",
+            "stroke": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "stroke_px": 0.0,
+            "icon_key": "shared_gyro",
+            "anchor": {
+              "x": "Auto",
+              "y": "Auto",
+              "to": 4
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Svg": {
+            "pos": [
+              59.104797,
+              378.64172
+            ],
+            "size": [
+              44.328598,
+              46.17582
+            ],
+            "svg_data": "",
+            "rev": 4,
+            "tint": [
+              255,
+              255,
+              255,
+              143
+            ],
+            "tint_mode": "override",
+            "stroke": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "stroke_px": 0.0,
+            "icon_key": "gp:right_stick",
+            "anchor": {
+              "x": "Auto",
+              "y": "Auto",
+              "to": 5
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Svg": {
+            "pos": [
+              59.104797,
+              674.16693
+            ],
+            "size": [
+              44.328598,
+              46.17582
+            ],
+            "svg_data": "",
+            "rev": 4,
+            "tint": [
+              255,
+              255,
+              255,
+              143
+            ],
+            "tint_mode": "override",
+            "stroke": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "stroke_px": 0.0,
+            "icon_key": "gp:left_stick",
+            "anchor": {
+              "x": "Auto",
+              "y": "Auto",
+              "to": 6
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Rect": {
+            "pos": [
+              1093.4387,
+              507.934
+            ],
+            "size": [
+              325.0764,
+              369.40656
+            ],
+            "fill": [
+              55,
+              55,
+              55,
+              177
+            ],
+            "stroke": [
+              255,
+              255,
+              255,
+              220
+            ],
+            "stroke_px": 0.0,
+            "corner_radius": 6.0,
+            "anchor": {
+              "x": "Center",
+              "y": "End",
+              "stretch_y": true,
+              "to": 3
+            }
+          }
+        }
+      },
+      {
+        "Deco": {
+          "Text": {
+            "pos": [
+              443.28598,
+              138.52745
+            ],
+            "size": [
+              160.0,
+              28.0
+            ],
+            "text": "Calibrate RWS here:",
+            "font_size": 16.0,
+            "fill": [
+              200,
+              200,
+              200,
+              220
+            ],
+            "outline": [
+              0,
+              0,
+              0,
+              0
+            ],
+            "outline_px": 0.0,
+            "align": "Left",
+            "valign": "Center",
+            "anchor": {
+              "x": "Start",
+              "y": "Start",
+              "to": 7
+            }
+          }
+        }
+      },
+      {
         "Module": {
           "inner_node_id": 30,
           "element_id": "whole_module",
@@ -3353,7 +3694,8 @@
           "size": [
             177.31439,
             175.46811
-          ]
+          ],
+          "keep_aspect": true
         }
       },
       {
@@ -3509,8 +3851,8 @@
             18.470327
           ],
           "anchor": {
-            "x": "Auto",
-            "y": "Auto",
+            "x": "Start",
+            "y": "Start",
             "to": 7
           }
         }
@@ -3528,8 +3870,8 @@
             18.06573
           ],
           "anchor": {
-            "x": "Auto",
-            "y": "Auto",
+            "x": "Start",
+            "y": "Start",
             "to": 7
           }
         }
@@ -3547,8 +3889,8 @@
             18.0
           ],
           "anchor": {
-            "x": "Auto",
-            "y": "Auto",
+            "x": "Start",
+            "y": "Start",
             "to": 7
           }
         }
@@ -3566,8 +3908,8 @@
             22.837135
           ],
           "anchor": {
-            "x": "Auto",
-            "y": "Auto",
+            "x": "Start",
+            "y": "Start",
             "to": 7
           }
         }
@@ -3585,8 +3927,8 @@
             45.913147
           ],
           "anchor": {
-            "x": "Auto",
-            "y": "Auto",
+            "x": "Start",
+            "y": "Start",
             "to": 7
           }
         }

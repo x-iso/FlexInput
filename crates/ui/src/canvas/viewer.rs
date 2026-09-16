@@ -105,6 +105,10 @@ pub struct FlexViewer<'a> {
     pub replace_request: Option<(NodeId, usize)>,
     /// Set when the user clicks "Edit…" on a subpatch node.
     pub edit_subpatch_request: Option<NodeId>,
+    /// Set when the user clicks "Save…" on a subpatch node on a TAB canvas: the
+    /// app writes the `.fxsp` so it can bake in the tab's overlay/config items,
+    /// which this viewer can't reach.
+    pub save_subpatch_request: Option<NodeId>,
     /// True when rendering the inner canvas of a sub-patch editor.
     /// When false, the "SubPatch" module category (Inlet/Outlet) is hidden.
     pub is_inner_canvas: bool,
@@ -355,7 +359,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         .on_hover_text("Save sub-patch to a .fxsp file")
                         .clicked()
                     {
-                        if let Some(sp) = snarl.get_node(node).and_then(|n| n.subpatch.as_ref()) {
+                        if !self.is_inner_canvas {
+                            self.save_subpatch_request = Some(node);
+                        } else if let Some(sp) = snarl.get_node(node).and_then(|n| n.subpatch.as_ref()) {
+                            // Nested sub-patches carry no overlay items to bake.
                             let _ = crate::app::save_subpatch_file(sp);
                         }
                     }

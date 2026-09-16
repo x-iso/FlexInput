@@ -187,6 +187,16 @@ pub(crate) fn show_subpatch_editors(
     live_device_ids: &std::collections::HashSet<String>,
 ) {
     let active = app.active_tab;
+    // A tab-canvas sub-patch node's "Save…": write it with the tab's live
+    // overlay/config items that belong to it baked in.
+    if let Some(node_id) = app.tabs[active].canvas.pending_save_subpatch.take() {
+        let tab = &app.tabs[active];
+        if let Some(sp) = crate::canvas::node::subpatch_with_overlays(
+            &tab.canvas.snarl, node_id.0, &tab.overlay, &tab.config)
+        {
+            let _ = save_subpatch_file(&sp);
+        }
+    }
     // Fast path: no editors and no pending open request → nothing to do.
     // Called every frame from update(), so skip all per-frame work in the
     // common case (empty workspace / no editor open).
@@ -547,11 +557,25 @@ pub(crate) fn show_subpatch_editors(
         }
 
         if save_clicked {
-            let sp_opt = match parent_editor_idx {
-                None    => app.tabs[active].canvas.snarl.get_node(node_id),
-                Some(p) => app.sub_patch_editors[p].canvas.snarl.get_node(node_id),
-            }.and_then(|n| n.subpatch.as_ref());
-            if let Some(sp) = sp_opt { let _ = save_subpatch_file(sp); }
+            match parent_editor_idx {
+                // First-level: bake the tab's live overlay/config items for it.
+                None => {
+                    let tab = &app.tabs[active];
+                    if let Some(sp) = crate::canvas::node::subpatch_with_overlays(
+                        &tab.canvas.snarl, node_id.0, &tab.overlay, &tab.config)
+                    {
+                        let _ = save_subpatch_file(&sp);
+                    }
+                }
+                // Nested sub-patches carry no overlay items.
+                Some(p) => {
+                    if let Some(sp) = app.sub_patch_editors[p].canvas.snarl.get_node(node_id)
+                        .and_then(|n| n.subpatch.as_ref())
+                    {
+                        let _ = save_subpatch_file(sp);
+                    }
+                }
+            }
         }
         if load_clicked {
             if let Some(loaded) = load_subpatch_file() {
