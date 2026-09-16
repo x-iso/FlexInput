@@ -7,6 +7,11 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **A factory preset with calibrated gyro aim.** Easy mode gains
+  **General purpose preset with RWS**, a general-purpose layout whose gyro
+  aiming runs through RWS Aim, so the camera turn can be calibrated to match a
+  physical rotation 1:1 instead of tuned by feel.
+
 - **RWS Aim: Mouse Scale in dots per 360°.** A header toggle switches the Mouse
   Scale readings between dots per degree and dots per 360° turn — the unit Steam
   Input and sensitivity databases use — everywhere the value appears: the body,
