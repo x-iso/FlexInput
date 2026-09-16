@@ -382,7 +382,12 @@ fn answer_signalling(
     link: &Link,
     pkt: &flexinput_btle::AclPacket,
 ) {
-    let Some(sig) = l2cap::parse_signal(&pkt.payload) else { return };
+    let send = |reply: &[u8]| {
+        let _ = radio.with_dongle(|d| d.send_att_raw(link.conn, l2cap::CID_SIGNALLING, reply));
+    };
+    // ⛔ Every command in the packet, not just the first — see
+    // `l2cap::parse_signals`.
+    for sig in l2cap::parse_signals(&pkt.payload) {
     match sig.code {
         l2cap::SIG_CONFIGURE_REQUEST => {
             if let Some((dest, opts)) = l2cap::parse_configure_request(&sig.data) {
@@ -391,14 +396,11 @@ fn answer_signalling(
                 } else {
                     link.control.remote_cid
                 };
-                let reply = l2cap::encode_signal(
+                send(&l2cap::encode_signal(
                     l2cap::SIG_CONFIGURE_RESPONSE,
                     sig.identifier,
                     &l2cap::configure_response(remote, &opts),
-                );
-                let _ = radio.with_dongle(|d| {
-                    d.send_att_raw(link.conn, l2cap::CID_SIGNALLING, &reply)
-                });
+                ));
             }
         }
         l2cap::SIG_DISCONNECTION_REQUEST => {
@@ -407,11 +409,34 @@ fn answer_signalling(
                 sig.identifier,
                 &sig.data,
             );
-            let _ = radio.with_dongle(|d| {
-                d.send_att_raw(link.conn, l2cap::CID_SIGNALLING, &reply)
-            });
+            send(&reply);
         }
-        _ => {}
+        // A channel requested once the HID pair is already up — an SDP query,
+        // typically. Refused out loud, because silence leaves the controller
+        // waiting on it.
+        l2cap::SIG_CONNECTION_REQUEST => {
+            if let Some((psm, their_cid)) = l2cap::parse_connection_request(&sig.data) {
+                if trace() {
+                    eprintln!(
+                        "[bt-classic] {} asked for PSM {psm:#06x} on a live link — refusing",
+                        keystore::format_addr(link.addr)
+                    );
+                }
+                send(&l2cap::encode_signal(
+                    l2cap::SIG_CONNECTION_RESPONSE,
+                    sig.identifier,
+                    &l2cap::connection_response(0, their_cid, 0x0002),
+                ));
+            }
+        }
+        // ⭐ Information and Echo Requests, and anything unimplemented — see
+        // `l2cap::housekeeping_reply`. These were ignored here too.
+        _ => {
+            if let Some(reply) = l2cap::housekeeping_reply(&sig) {
+                send(&reply);
+            }
+        }
+    }
     }
 }
 
@@ -776,7 +801,15 @@ fn run_inner(shared: &Arc<Shared>) {
                     last_note = None;
                     links.push(link);
                 }
-                Err(e) => eprintln!("[bt-classic] {text} incoming link failed: {e}"),
+                Err(e) => {
+                    eprintln!("[bt-classic] {text} incoming link failed: {e}");
+                    // ⛔ **Listen, do not page.** A controller whose incoming
+                    // link just failed goes straight back to calling us, and a
+                    // radio that is paging cannot hear it — the page times out
+                    // (`0x04`) while the pad's own call goes unanswered. Traced:
+                    // exactly that, immediately after a failed setup.
+                    next_try = Instant::now() + PAGE_EAGER;
+                }
             }
         }
 
@@ -1244,9 +1277,28 @@ fn bring_up(
     // start and asks for anything it does not offer, so this no longer has to
     // guess which end of the link intends to open the channels — a guess that
     // was wrong in one direction or the other on every reconnection.
-    let (control, interrupt) = dongle
-        .l2cap_hid(link.conn_handle, cid_base, Duration::from_secs(6), &mut quiet)
-        .map_err(|e| e.to_string())?;
+    let (control, interrupt) =
+        match dongle.l2cap_hid(link.conn_handle, cid_base, Duration::from_secs(6), &mut quiet) {
+            Ok(channels) => channels,
+            Err(e) => {
+                // ⛔ **Take the link down, or the controller is stranded.**
+                //
+                // By this point the link is up, authenticated and encrypted —
+                // only the HID channels failed. Returning the error used to
+                // leave that link standing: the controller was still connected
+                // to us at the radio level, so it could not call again, and
+                // this side no longer tracked it, so nothing would ever use or
+                // close it. The pad sat "searching for its host" until it
+                // switched itself off, and only restarting it gave a second
+                // attempt. A clean disconnect lets it call straight back.
+                let closed = dongle.disconnect_and_wait(link.conn_handle, Duration::from_millis(800));
+                quiet(&format!(
+                    "HID setup failed — link {}",
+                    if closed { "closed so the controller can call again" } else { "close not confirmed" }
+                ));
+                return Err(e.to_string());
+            }
+        };
     Ok(Link {
         addr,
         conn: link.conn_handle,

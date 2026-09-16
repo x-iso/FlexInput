@@ -45,6 +45,19 @@ pub const SIG_CONFIGURE_REQUEST: u8 = 0x04;
 pub const SIG_CONFIGURE_RESPONSE: u8 = 0x05;
 pub const SIG_DISCONNECTION_REQUEST: u8 = 0x06;
 pub const SIG_DISCONNECTION_RESPONSE: u8 = 0x07;
+/// Sent in reply to a command the receiver does not understand.
+pub const SIG_COMMAND_REJECT: u8 = 0x01;
+pub const SIG_ECHO_REQUEST: u8 = 0x08;
+pub const SIG_ECHO_RESPONSE: u8 = 0x09;
+/// "What do you support?" — and the one that stalls a link when ignored. See
+/// [`housekeeping_reply`].
+pub const SIG_INFORMATION_REQUEST: u8 = 0x0A;
+pub const SIG_INFORMATION_RESPONSE: u8 = 0x0B;
+
+/// Information types a peer may ask about.
+pub const INFO_CONNECTIONLESS_MTU: u16 = 0x0001;
+pub const INFO_EXTENDED_FEATURES: u16 = 0x0002;
+pub const INFO_FIXED_CHANNELS: u16 = 0x0003;
 
 /// First dynamically allocated channel id. Everything below `0x0040` is
 /// reserved for the fixed channels.
@@ -86,6 +99,82 @@ pub fn parse_signal(payload: &[u8]) -> Option<Signal> {
         identifier: payload[1],
         data: payload[4..4 + len].to_vec(),
     })
+}
+
+/// Decode EVERY signalling command in an L2CAP payload.
+///
+/// ⛔ **One signalling packet may carry several commands**, and [`parse_signal`]
+/// reads only the first. A peer that bundles, say, an Information Request with
+/// its Connection Request for the HID control channel had the channel request
+/// silently discarded — which from the host side is indistinguishable from a
+/// peer that never offered the channel at all.
+///
+/// Stops at the first command that does not fit, rather than guessing at the
+/// rest.
+pub fn parse_signals(payload: &[u8]) -> Vec<Signal> {
+    let mut out = Vec::new();
+    let mut rest = payload;
+    while let Some(sig) = parse_signal(rest) {
+        let used = 4 + sig.data.len();
+        out.push(sig);
+        rest = &rest[used..];
+    }
+    out
+}
+
+/// The reply owed to a signalling command that carries no channel state.
+///
+/// ⭐ **An unanswered Information Request can stall a link completely.** Many
+/// L2CAP stacks ask what the other side supports before they open a channel,
+/// and wait for the answer — neither offering their own channels nor answering
+/// requests for ours until it arrives. This stack used to ignore the command,
+/// so a controller that asked sat silent for the whole setup window and then
+/// dropped the link. From the host that reads exactly as "the remote did not
+/// offer, and granted nothing", with no clue that a question went unanswered.
+/// A controller that had our answer cached does not ask, which is why the same
+/// pad connected on some attempts and not others.
+///
+/// Returns `None` for anything that must not be answered — above all a
+/// RESPONSE, which answering would turn into an endless exchange — and for the
+/// commands that change channel state, which their callers handle.
+///
+/// What this claims to support is deliberately minimal and TRUE: basic mode
+/// only (no extended features), and the signalling channel as the only fixed
+/// channel. Advertising more than is implemented invites the peer to use it.
+pub fn housekeeping_reply(sig: &Signal) -> Option<Vec<u8>> {
+    match sig.code {
+        SIG_ECHO_REQUEST => Some(encode_signal(SIG_ECHO_RESPONSE, sig.identifier, &sig.data)),
+        SIG_INFORMATION_REQUEST => {
+            let Some(kind) = sig.data.get(0..2).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+                return Some(command_reject(sig.identifier));
+            };
+            let mut body = kind.to_le_bytes().to_vec();
+            match kind {
+                INFO_EXTENDED_FEATURES => {
+                    body.extend_from_slice(&0x0000u16.to_le_bytes()); // success
+                    body.extend_from_slice(&0u32.to_le_bytes()); // basic mode only
+                }
+                INFO_FIXED_CHANNELS => {
+                    body.extend_from_slice(&0x0000u16.to_le_bytes()); // success
+                    // Bit 1: the L2CAP signalling channel, which is always there.
+                    body.extend_from_slice(&0x0000_0000_0000_0002u64.to_le_bytes());
+                }
+                _ => body.extend_from_slice(&0x0001u16.to_le_bytes()), // not supported
+            }
+            Some(encode_signal(SIG_INFORMATION_RESPONSE, sig.identifier, &body))
+        }
+        // Requests this host implements nowhere (AMP channel creation and
+        // moves), and any code the spec had not assigned. Silence would leave
+        // the peer waiting; a reject tells it to carry on without.
+        0x0C | 0x0E | 0x10 => Some(command_reject(sig.identifier)),
+        code if code > 0x1A => Some(command_reject(sig.identifier)),
+        _ => None,
+    }
+}
+
+/// `Command Reject`, reason `0x0000` — command not understood.
+fn command_reject(identifier: u8) -> Vec<u8> {
+    encode_signal(SIG_COMMAND_REJECT, identifier, &0x0000u16.to_le_bytes())
 }
 
 /// `Connection Request`: which service, and the channel id we will listen on.
@@ -299,5 +388,101 @@ mod tests {
         let resp = configure_response(0x0045, &got);
         assert_eq!(&resp[6..], &opts, "options were not echoed");
         assert_eq!(u16::from_le_bytes([resp[4], resp[5]]), 0, "must say success");
+    }
+}
+
+#[cfg(test)]
+mod housekeeping_tests {
+    use super::*;
+
+    fn sig(code: u8, id: u8, data: &[u8]) -> Signal {
+        Signal { code, identifier: id, data: data.to_vec() }
+    }
+
+    #[test]
+    fn several_commands_in_one_packet_are_all_decoded() {
+        // ⛔ The channel request second in the packet is the one that used to
+        // be lost.
+        let mut payload = encode_signal(SIG_INFORMATION_REQUEST, 1, &INFO_EXTENDED_FEATURES.to_le_bytes());
+        payload.extend(encode_signal(SIG_CONNECTION_REQUEST, 2, &connection_request(PSM_HID_CONTROL, 0x0041)));
+        let all = parse_signals(&payload);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].code, SIG_INFORMATION_REQUEST);
+        assert_eq!(all[1].code, SIG_CONNECTION_REQUEST);
+        assert_eq!(parse_connection_request(&all[1].data), Some((PSM_HID_CONTROL, 0x0041)));
+    }
+
+    #[test]
+    fn a_truncated_trailing_command_is_not_guessed_at() {
+        let mut payload = encode_signal(SIG_ECHO_REQUEST, 1, &[]);
+        payload.extend_from_slice(&[SIG_CONNECTION_REQUEST, 2, 8, 0, 0x11]); // claims 8, has 1
+        assert_eq!(parse_signals(&payload).len(), 1);
+    }
+
+    #[test]
+    fn an_information_request_for_features_is_answered_basic_mode_only() {
+        let reply = housekeeping_reply(&sig(SIG_INFORMATION_REQUEST, 7, &INFO_EXTENDED_FEATURES.to_le_bytes()))
+            .expect("must be answered — silence stalls the link");
+        let r = parse_signal(&reply).unwrap();
+        assert_eq!(r.code, SIG_INFORMATION_RESPONSE);
+        assert_eq!(r.identifier, 7, "a reply carries the request's identifier");
+        assert_eq!(&r.data[0..2], &INFO_EXTENDED_FEATURES.to_le_bytes());
+        assert_eq!(&r.data[2..4], &[0, 0], "success");
+        assert_eq!(&r.data[4..8], &[0, 0, 0, 0], "no extended features claimed");
+    }
+
+    #[test]
+    fn an_information_request_for_fixed_channels_names_the_signalling_channel() {
+        let reply = housekeeping_reply(&sig(SIG_INFORMATION_REQUEST, 3, &INFO_FIXED_CHANNELS.to_le_bytes())).unwrap();
+        let r = parse_signal(&reply).unwrap();
+        assert_eq!(&r.data[2..4], &[0, 0], "success");
+        assert_eq!(u64::from_le_bytes(r.data[4..12].try_into().unwrap()), 0x02);
+    }
+
+    #[test]
+    fn an_unknown_information_type_is_answered_not_supported() {
+        let reply = housekeeping_reply(&sig(SIG_INFORMATION_REQUEST, 4, &0x0077u16.to_le_bytes())).unwrap();
+        let r = parse_signal(&reply).unwrap();
+        assert_eq!(r.code, SIG_INFORMATION_RESPONSE);
+        assert_eq!(&r.data[2..4], &[1, 0], "not supported");
+        assert_eq!(r.data.len(), 4, "no data follows a refusal");
+    }
+
+    #[test]
+    fn an_echo_is_returned_verbatim() {
+        let reply = housekeeping_reply(&sig(SIG_ECHO_REQUEST, 9, &[1, 2, 3])).unwrap();
+        assert_eq!(parse_signal(&reply).unwrap(), sig(SIG_ECHO_RESPONSE, 9, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn responses_are_never_answered() {
+        // ❗ Answering a response invites a reply to the reply.
+        for code in [
+            SIG_COMMAND_REJECT,
+            SIG_CONNECTION_RESPONSE,
+            SIG_CONFIGURE_RESPONSE,
+            SIG_DISCONNECTION_RESPONSE,
+            SIG_ECHO_RESPONSE,
+            SIG_INFORMATION_RESPONSE,
+        ] {
+            assert_eq!(housekeeping_reply(&sig(code, 1, &[0, 0])), None, "code {code:#04x}");
+        }
+    }
+
+    #[test]
+    fn channel_commands_are_left_to_their_callers() {
+        for code in [SIG_CONNECTION_REQUEST, SIG_CONFIGURE_REQUEST, SIG_DISCONNECTION_REQUEST] {
+            assert_eq!(housekeeping_reply(&sig(code, 1, &[0; 4])), None, "code {code:#04x}");
+        }
+    }
+
+    #[test]
+    fn an_unimplemented_request_is_rejected_rather_than_ignored() {
+        for code in [0x0Cu8, 0x0E, 0x10, 0x40] {
+            let r = parse_signal(&housekeeping_reply(&sig(code, 5, &[])).unwrap()).unwrap();
+            assert_eq!(r.code, SIG_COMMAND_REJECT, "code {code:#04x}");
+            assert_eq!(r.identifier, 5);
+            assert_eq!(r.data, vec![0, 0], "reason: not understood");
+        }
     }
 }

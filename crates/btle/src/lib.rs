@@ -1148,6 +1148,34 @@ impl Dongle {
     }
 
     /// Tear down a connection.
+    /// Disconnect a link and wait for the controller to confirm it.
+    ///
+    /// Returns whether the confirmation arrived. Everything else read while
+    /// waiting is handed back, as in every wait under a lease.
+    pub fn disconnect_and_wait(&self, conn_handle: u16, timeout: Duration) -> bool {
+        if self.disconnect(conn_handle).is_err() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut passed_over: Vec<Event> = Vec::new();
+        let mut closed = false;
+        while std::time::Instant::now() < deadline {
+            match self.read_event_timeout(Duration::from_millis(50)) {
+                Ok(Some(Event::DisconnectionComplete { conn_handle: h, .. }))
+                    if h == conn_handle =>
+                {
+                    closed = true;
+                    break;
+                }
+                Ok(Some(other)) => hold_back(&mut passed_over, other),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        self.push_events_front(passed_over);
+        closed
+    }
+
     pub fn disconnect(&self, conn_handle: u16) -> Result<()> {
         let mut p = conn_handle.to_le_bytes().to_vec();
         p.push(0x13); // reason: remote user terminated connection
@@ -1287,6 +1315,23 @@ impl Dongle {
         patience: Duration,
         on_event: &mut dyn FnMut(&str),
     ) -> Result<(l2cap::Channel, l2cap::Channel)> {
+        // Events are read during setup now, to notice the link dropping — and
+        // like every wait under a lease, what it passes over goes back after.
+        let mut passed_over: Vec<Event> = Vec::new();
+        let result =
+            self.l2cap_hid_inner(conn_handle, cid_base, patience, on_event, &mut passed_over);
+        self.push_events_front(passed_over);
+        result
+    }
+
+    fn l2cap_hid_inner(
+        &self,
+        conn_handle: u16,
+        cid_base: u16,
+        patience: Duration,
+        on_event: &mut dyn FnMut(&str),
+        passed_over: &mut Vec<Event>,
+    ) -> Result<(l2cap::Channel, l2cap::Channel)> {
         use l2cap::*;
 
         /// How long the remote gets to start before we do.
@@ -1297,6 +1342,16 @@ impl Dongle {
         /// anywhere near the link supervision timeout.
         const GRACE: Duration = Duration::from_millis(700);
 
+        /// How long an unanswered channel request waits before it is sent again.
+        ///
+        /// ❗ L2CAP expects this — a request is retransmitted when its timer
+        /// runs out, with the SAME identifier so the peer can recognise a
+        /// duplicate. Sending once and waiting out the whole setup meant one
+        /// request arriving before the peer was ready to hear it failed the
+        /// entire connection.
+        const RTX: Duration = Duration::from_secs(2);
+        const RESENDS: u8 = 2;
+
         struct Half {
             psm: u16,
             local_cid: u16,
@@ -1304,6 +1359,13 @@ impl Dongle {
             ours_configured: bool,
             theirs_configured: bool,
             asked: bool,
+            /// Identifier of our request, reused when it is sent again.
+            ident: u8,
+            asked_at: Option<std::time::Instant>,
+            resends: u8,
+            /// The peer answered "pending": it is deciding, not deaf, so it is
+            /// not asked again.
+            pending: bool,
         }
         impl Half {
             fn done(&self) -> bool {
@@ -1319,6 +1381,10 @@ impl Dongle {
                 ours_configured: false,
                 theirs_configured: false,
                 asked: false,
+                ident: 0,
+                asked_at: None,
+                resends: 0,
+                pending: false,
             },
             Half {
                 psm: PSM_HID_INTERRUPT,
@@ -1327,6 +1393,10 @@ impl Dongle {
                 ours_configured: false,
                 theirs_configured: false,
                 asked: false,
+                ident: 0,
+                asked_at: None,
+                resends: 0,
+                pending: false,
             },
         ];
         let mut ident: u8 = 1;
@@ -1334,21 +1404,58 @@ impl Dongle {
         let deadline = start + patience;
 
         while std::time::Instant::now() < deadline {
-            // Ask for whatever the remote has not offered by now.
+            // ⛔ **Notice the link going away.** This used to read only data
+            // packets, so a link that dropped straight after encryption was
+            // waited on for the full setup window and then reported as "HID
+            // channels timed out" — a false cause, hiding the real reason code.
+            // Bounded per pass so a busy event stream cannot starve the reads
+            // below.
+            for _ in 0..32 {
+                let Some(e) = self.read_event_timeout(Duration::from_millis(1))? else {
+                    break;
+                };
+                match e {
+                    Event::DisconnectionComplete { conn_handle: h, reason }
+                        if h == conn_handle =>
+                    {
+                        return Err(Error::Protocol(format!(
+                            "link dropped during HID channel setup (reason {reason:#04x})"
+                        )));
+                    }
+                    other => hold_back(passed_over, other),
+                }
+            }
+
+            // Ask for whatever the remote has not offered by now, and ask again
+            // when a request goes unanswered.
             if start.elapsed() >= GRACE {
                 for h in halves.iter_mut() {
-                    if h.asked || h.remote_cid != 0 {
+                    if h.remote_cid != 0 {
                         continue;
                     }
-                    h.asked = true;
-                    ident = ident.wrapping_add(1);
-                    on_event(&format!("PSM {:#06x}: remote did not offer — asking", h.psm));
+                    let again = h.asked
+                        && !h.pending
+                        && h.resends < RESENDS
+                        && h.asked_at.is_some_and(|t| t.elapsed() >= RTX);
+                    if h.asked && !again {
+                        continue;
+                    }
+                    if again {
+                        h.resends += 1;
+                        on_event(&format!("PSM {:#06x}: no answer — asking again", h.psm));
+                    } else {
+                        h.asked = true;
+                        ident = ident.wrapping_add(1);
+                        h.ident = ident;
+                        on_event(&format!("PSM {:#06x}: remote did not offer — asking", h.psm));
+                    }
+                    h.asked_at = Some(std::time::Instant::now());
                     self.send_l2cap(
                         conn_handle,
                         CID_SIGNALLING,
                         &encode_signal(
                             SIG_CONNECTION_REQUEST,
-                            ident,
+                            h.ident,
                             &connection_request(h.psm, h.local_cid),
                         ),
                     )?;
@@ -1361,142 +1468,162 @@ impl Dongle {
             if pkt.conn_handle != conn_handle || pkt.cid != CID_SIGNALLING {
                 continue;
             }
-            let Some(sig) = parse_signal(&pkt.payload) else { continue };
-            match sig.code {
-                SIG_CONNECTION_REQUEST => {
-                    let Some((psm, their_cid)) = parse_connection_request(&sig.data) else {
-                        continue;
-                    };
-                    let Some(idx) = halves.iter().position(|h| h.psm == psm) else {
-                        // ❗ Refused, not ignored: silence makes the remote
-                        // retry until it gives up on the whole link.
-                        let refuse = encode_signal(
-                            SIG_CONNECTION_RESPONSE,
-                            sig.identifier,
-                            // 0x0002 = PSM not supported.
-                            &connection_response(0, their_cid, 0x0002),
-                        );
-                        let _ = self.send_l2cap(conn_handle, CID_SIGNALLING, &refuse);
-                        continue;
-                    };
-                    // ⭐ A remote offer WINS even if we had already asked. It is
-                    // the side that will be sending the reports, and letting its
-                    // channel be the live one avoids two half-open pairs.
-                    let (local_cid, remote_cid) = {
-                        let h = &mut halves[idx];
-                        h.local_cid = cid_base + 4 + idx as u16;
-                        h.remote_cid = their_cid;
-                        h.ours_configured = false;
-                        h.theirs_configured = false;
-                        (h.local_cid, h.remote_cid)
-                    };
-                    on_event(&format!(
-                        "PSM {psm:#06x}: remote opened it — granting as cid {local_cid:#06x}"
-                    ));
-                    self.send_l2cap(
-                        conn_handle,
-                        CID_SIGNALLING,
-                        &encode_signal(
-                            SIG_CONNECTION_RESPONSE,
-                            sig.identifier,
-                            &connection_response(local_cid, their_cid, 0),
-                        ),
-                    )?;
-                    ident = ident.wrapping_add(1);
-                    self.send_l2cap(
-                        conn_handle,
-                        CID_SIGNALLING,
-                        &encode_signal(
-                            SIG_CONFIGURE_REQUEST,
-                            ident,
-                            &configure_request(remote_cid, 672),
-                        ),
-                    )?;
-                }
-                SIG_CONNECTION_RESPONSE => {
-                    let Some(r) = parse_connection_response(&sig.data) else { continue };
-                    let Some(idx) = halves.iter().position(|h| h.local_cid == r.source_cid)
-                    else {
-                        continue;
-                    };
-                    match r.result {
-                        0x0000 => {
-                            halves[idx].remote_cid = r.dest_cid;
+            // ⛔ EVERY command in the packet — see `l2cap::parse_signals`.
+            for sig in parse_signals(&pkt.payload) {
+                match sig.code {
+                    SIG_CONNECTION_REQUEST => {
+                        let Some((psm, their_cid)) = parse_connection_request(&sig.data) else {
+                            continue;
+                        };
+                        let Some(idx) = halves.iter().position(|h| h.psm == psm) else {
                             on_event(&format!(
-                                "PSM {:#06x}: granted, remote cid {:#06x}",
-                                halves[idx].psm, r.dest_cid
+                                "PSM {psm:#06x}: remote asked for it — not supported, refusing"
                             ));
-                            ident = ident.wrapping_add(1);
-                            self.send_l2cap(
-                                conn_handle,
-                                CID_SIGNALLING,
-                                &encode_signal(
-                                    SIG_CONFIGURE_REQUEST,
-                                    ident,
-                                    &configure_request(r.dest_cid, 672),
-                                ),
-                            )?;
+                            // ❗ Refused, not ignored: silence makes the remote
+                            // retry until it gives up on the whole link.
+                            let refuse = encode_signal(
+                                SIG_CONNECTION_RESPONSE,
+                                sig.identifier,
+                                // 0x0002 = PSM not supported.
+                                &connection_response(0, their_cid, 0x0002),
+                            );
+                            let _ = self.send_l2cap(conn_handle, CID_SIGNALLING, &refuse);
+                            continue;
+                        };
+                        // ⭐ A remote offer WINS even if we had already asked. It is
+                        // the side that will be sending the reports, and letting its
+                        // channel be the live one avoids two half-open pairs.
+                        let (local_cid, remote_cid) = {
+                            let h = &mut halves[idx];
+                            h.local_cid = cid_base + 4 + idx as u16;
+                            h.remote_cid = their_cid;
+                            h.ours_configured = false;
+                            h.theirs_configured = false;
+                            (h.local_cid, h.remote_cid)
+                        };
+                        on_event(&format!(
+                            "PSM {psm:#06x}: remote opened it — granting as cid {local_cid:#06x}"
+                        ));
+                        self.send_l2cap(
+                            conn_handle,
+                            CID_SIGNALLING,
+                            &encode_signal(
+                                SIG_CONNECTION_RESPONSE,
+                                sig.identifier,
+                                &connection_response(local_cid, their_cid, 0),
+                            ),
+                        )?;
+                        ident = ident.wrapping_add(1);
+                        self.send_l2cap(
+                            conn_handle,
+                            CID_SIGNALLING,
+                            &encode_signal(
+                                SIG_CONFIGURE_REQUEST,
+                                ident,
+                                &configure_request(remote_cid, 672),
+                            ),
+                        )?;
+                    }
+                    SIG_CONNECTION_RESPONSE => {
+                        let Some(r) = parse_connection_response(&sig.data) else { continue };
+                        let Some(idx) = halves.iter().position(|h| h.local_cid == r.source_cid)
+                        else {
+                            continue;
+                        };
+                        match r.result {
+                            0x0000 => {
+                                halves[idx].remote_cid = r.dest_cid;
+                                on_event(&format!(
+                                    "PSM {:#06x}: granted, remote cid {:#06x}",
+                                    halves[idx].psm, r.dest_cid
+                                ));
+                                ident = ident.wrapping_add(1);
+                                self.send_l2cap(
+                                    conn_handle,
+                                    CID_SIGNALLING,
+                                    &encode_signal(
+                                        SIG_CONFIGURE_REQUEST,
+                                        ident,
+                                        &configure_request(r.dest_cid, 672),
+                                    ),
+                                )?;
+                            }
+                            // Still deciding — normal while it authenticates.
+                            0x0001 => {
+                                halves[idx].pending = true;
+                                on_event(&format!("PSM {:#06x}: pending…", halves[idx].psm));
+                            }
+                            other => {
+                                return Err(Error::Protocol(format!(
+                                    "PSM {:#06x} refused: result {other:#06x}",
+                                    halves[idx].psm
+                                )))
+                            }
                         }
-                        // Still deciding — normal while it authenticates.
-                        0x0001 => on_event(&format!("PSM {:#06x}: pending…", halves[idx].psm)),
-                        other => {
+                    }
+                    SIG_CONFIGURE_REQUEST => {
+                        let Some((dest, opts)) = parse_configure_request(&sig.data) else {
+                            continue;
+                        };
+                        // `dest` is OUR cid as the remote sees it. Answer even when
+                        // it names a channel we do not know, or that one never
+                        // opens; the reply is addressed with the remote's own id.
+                        let reply_to = halves
+                            .iter()
+                            .find(|h| h.local_cid == dest)
+                            .map(|h| h.remote_cid)
+                            .filter(|c| *c != 0)
+                            .unwrap_or(dest);
+                        self.send_l2cap(
+                            conn_handle,
+                            CID_SIGNALLING,
+                            &encode_signal(
+                                SIG_CONFIGURE_RESPONSE,
+                                sig.identifier,
+                                &configure_response(reply_to, &opts),
+                            ),
+                        )?;
+                        if let Some(h) = halves.iter_mut().find(|h| h.local_cid == dest) {
+                            h.theirs_configured = true;
+                            on_event(&format!("PSM {:#06x}: their side configured", h.psm));
+                        }
+                    }
+                    SIG_CONFIGURE_RESPONSE => {
+                        let Some((scid, result)) = parse_configure_response_full(&sig.data) else {
+                            continue;
+                        };
+                        let Some(h) = halves.iter_mut().find(|h| h.local_cid == scid) else {
+                            continue;
+                        };
+                        if result != 0 {
                             return Err(Error::Protocol(format!(
-                                "PSM {:#06x} refused: result {other:#06x}",
-                                halves[idx].psm
-                            )))
+                                "PSM {:#06x} configuration refused: {result:#06x}",
+                                h.psm
+                            )));
                         }
+                        h.ours_configured = true;
+                        on_event(&format!("PSM {:#06x}: our side configured", h.psm));
                     }
-                }
-                SIG_CONFIGURE_REQUEST => {
-                    let Some((dest, opts)) = parse_configure_request(&sig.data) else {
-                        continue;
-                    };
-                    // `dest` is OUR cid as the remote sees it. Answer even when
-                    // it names a channel we do not know, or that one never
-                    // opens; the reply is addressed with the remote's own id.
-                    let reply_to = halves
-                        .iter()
-                        .find(|h| h.local_cid == dest)
-                        .map(|h| h.remote_cid)
-                        .filter(|c| *c != 0)
-                        .unwrap_or(dest);
-                    self.send_l2cap(
-                        conn_handle,
-                        CID_SIGNALLING,
-                        &encode_signal(
-                            SIG_CONFIGURE_RESPONSE,
-                            sig.identifier,
-                            &configure_response(reply_to, &opts),
-                        ),
-                    )?;
-                    if let Some(h) = halves.iter_mut().find(|h| h.local_cid == dest) {
-                        h.theirs_configured = true;
-                        on_event(&format!("PSM {:#06x}: their side configured", h.psm));
+                    SIG_DISCONNECTION_REQUEST => {
+                        let reply =
+                            encode_signal(SIG_DISCONNECTION_RESPONSE, sig.identifier, &sig.data);
+                        let _ = self.send_l2cap(conn_handle, CID_SIGNALLING, &reply);
+                        return Err(Error::Protocol("remote closed a channel".into()));
                     }
+                    // ⭐ Housekeeping: Information and Echo Requests, and
+                    // anything unimplemented. Ignoring an Information Request
+                    // is enough on its own to stall the whole setup — see
+                    // `l2cap::housekeeping_reply`.
+                    _ => match housekeeping_reply(&sig) {
+                        Some(reply) => {
+                            on_event(&format!("answered signalling command {:#04x}", sig.code));
+                            self.send_l2cap(conn_handle, CID_SIGNALLING, &reply)?;
+                        }
+                        None => {
+                            on_event(&format!("ignored signalling command {:#04x}", sig.code))
+                        }
+                    },
                 }
-                SIG_CONFIGURE_RESPONSE => {
-                    let Some((scid, result)) = parse_configure_response_full(&sig.data) else {
-                        continue;
-                    };
-                    let Some(h) = halves.iter_mut().find(|h| h.local_cid == scid) else {
-                        continue;
-                    };
-                    if result != 0 {
-                        return Err(Error::Protocol(format!(
-                            "PSM {:#06x} configuration refused: {result:#06x}",
-                            h.psm
-                        )));
-                    }
-                    h.ours_configured = true;
-                    on_event(&format!("PSM {:#06x}: our side configured", h.psm));
-                }
-                SIG_DISCONNECTION_REQUEST => {
-                    let reply =
-                        encode_signal(SIG_DISCONNECTION_RESPONSE, sig.identifier, &sig.data);
-                    let _ = self.send_l2cap(conn_handle, CID_SIGNALLING, &reply);
-                    return Err(Error::Protocol("remote closed a channel".into()));
-                }
-                _ => {}
             }
 
             if halves.iter().all(Half::done) {
