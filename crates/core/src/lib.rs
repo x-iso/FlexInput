@@ -2,6 +2,7 @@ pub mod frames;
 pub mod automap;
 pub mod macros;
 pub mod menu;
+pub mod midi;
 pub mod module;
 pub mod patch;
 pub mod signal;

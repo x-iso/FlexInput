@@ -227,6 +227,7 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
                 }
             }
         }
+        migrate_midi_automap_port(&mut node.value);
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
         }
@@ -269,6 +270,30 @@ pub fn renumber_subpatch_ports(snarl: &mut Snarl<NodeData>) {
                 node.params.insert("pin_index".into(), Value::from(position as u64));
             }
         }
+    }
+}
+
+/// MIDI In/Out nodes gained an AutoMap port. Nodes saved before that have only
+/// their CC pins: APPEND the port (never insert), so every existing wire keeps
+/// its pin index, and keep the id array aligned with the pin list first — the
+/// node body and engine both address pins by index. Idempotent.
+fn migrate_midi_automap_port(node: &mut NodeData) {
+    let dev = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+    let (outputs, key, pin_id) = match node.module_id.as_str() {
+        "device.source" if dev.starts_with("midi_in:") => (true, "output_pin_ids", flexinput_devices::midi::AUTOMAP_OUT_PIN),
+        "device.sink" if dev.starts_with("midi_out:") => (false, "input_pin_ids", flexinput_devices::midi::AUTOMAP_IN_PIN),
+        _ => return,
+    };
+    let pins = if outputs { &mut node.outputs } else { &mut node.inputs };
+    if pins.iter().any(|p| p.signal_type == SignalType::AutoMap) {
+        return;
+    }
+    pins.push(PinDescriptor::new("Auto-Map", SignalType::AutoMap));
+    let n = pins.len();
+    let ids = node.params.entry(key.to_string()).or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(ids) = ids {
+        ids.resize(n - 1, Value::String(String::new()));
+        ids.push(Value::String(pin_id.to_string()));
     }
 }
 
@@ -421,6 +446,47 @@ mod migration_tests {
         assert_eq!(names(&snarl), [RWS_MOUSE_OUT_NAME, "Stick"]);
         migrate_loaded_snarl(&mut snarl);
         assert_eq!(names(&snarl), [RWS_MOUSE_OUT_NAME, "Stick"]);
+    }
+
+    /// A MIDI node saved before AutoMap ports gets its port APPENDED: existing
+    /// CC pins keep their indices (so wires stay put), ids stay aligned, and a
+    /// second pass changes nothing. Gamepad sources are left alone.
+    #[test]
+    fn migrate_appends_an_automap_port_to_legacy_midi_nodes() {
+        fn midi_node(module_id: &str, device_id: &str, pins: &[&str]) -> NodeData {
+            let mut params = HashMap::new();
+            params.insert("device_id".to_string(), Value::from(device_id));
+            let ids = Value::Array(pins.iter().map(|p| Value::from(*p)).collect());
+            let descs: Vec<PinDescriptor> = pins.iter().map(|p| PinDescriptor::new(*p, SignalType::Float)).collect();
+            let is_source = module_id == "device.source";
+            params.insert(if is_source { "output_pin_ids" } else { "input_pin_ids" }.to_string(), ids);
+            NodeData {
+                module_id: module_id.to_string(),
+                display_name: "MIDI".to_string(),
+                category: "Device".to_string(),
+                inputs: if is_source { vec![] } else { descs.clone() },
+                outputs: if is_source { descs } else { vec![] },
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            }
+        }
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let src = snarl.insert_node(egui::Pos2::ZERO, midi_node("device.source", "midi_in:0", &["cc_7", "cc_1"]));
+        let sink = snarl.insert_node(egui::pos2(10.0, 0.0), midi_node("device.sink", "midi_out:2", &["cc_74"]));
+        let pad = snarl.insert_node(egui::pos2(20.0, 0.0), midi_node("device.source", "gilrs:xinput:0", &["btn_south"]));
+
+        for _ in 0..2 {
+            migrate_loaded_snarl(&mut snarl);
+            let s = snarl.get_node(src).unwrap();
+            assert_eq!(s.outputs.len(), 3);
+            assert_eq!(s.outputs[2].signal_type, SignalType::AutoMap);
+            assert_eq!(s.params["output_pin_ids"], serde_json::json!(["cc_7", "cc_1", "automap_out"]));
+            let k = snarl.get_node(sink).unwrap();
+            assert_eq!(k.inputs.len(), 2);
+            assert_eq!(k.params["input_pin_ids"], serde_json::json!(["cc_74", "automap_in"]));
+            assert_eq!(snarl.get_node(pad).unwrap().outputs.len(), 1, "gamepads untouched");
+        }
     }
 
     /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,

@@ -102,7 +102,6 @@ pub(crate) fn spawn_io_thread(
             // precise without raising the global timer resolution (see hr_timer).
             let waiter = flexinput_engine::HrWaiter::new();
             let mut last_enum = Instant::now() - Duration::from_secs(10);
-            let mut last_midi_out: HashMap<(String, String), Signal> = HashMap::new();
             // Physical-pad haptic outputs we drove last tick (rumble, HD amp,
             // lightbar…). Used to actively send a single 0 when a pin's feedback
             // producer vanishes (network link dropped, wire disconnected, a game
@@ -549,20 +548,23 @@ pub(crate) fn spawn_io_thread(
                         last_phys_haptics.insert((device_id.clone(), pin_id.clone()), signal);
                     }
                 }
-                if !bypass {
-                    // MIDI output — only send on change to avoid flooding the bus.
-                    if let Ok(mut mg) = midi.try_lock() {
-                        if let Some(m) = mg.as_mut() {
+                // MIDI output. Each port's encoder turns this tick's pin levels
+                // into messages (edges, quantised changes). Bypass hands every
+                // port an empty frame, which releases sounding notes and
+                // returns values to rest instead of leaving them stuck. A tick
+                // that can't take the lock is simply skipped: the encoders keep
+                // their state and catch up next tick.
+                if let Ok(mut mg) = midi.try_lock() {
+                    if let Some(m) = mg.as_mut() {
+                        let mut frames: HashMap<String, Vec<(String, Signal)>> = HashMap::new();
+                        if !bypass {
                             for ((device_id, pin_id), &signal) in &sink_outputs {
                                 if device_id.starts_with("midi_out:") {
-                                    let key = (device_id.clone(), pin_id.clone());
-                                    if last_midi_out.get(&key) != Some(&signal) {
-                                        m.send(device_id, pin_id, signal);
-                                        last_midi_out.insert(key, signal);
-                                    }
+                                    frames.entry(device_id.clone()).or_default().push((pin_id.clone(), signal));
                                 }
                             }
                         }
+                        m.send_frames(&frames);
                     }
                 }
 
@@ -723,18 +725,16 @@ pub(crate) fn spawn_io_thread(
 
 // ── MIDI watch thread ────────────────────────────────────────────────────────
 //
-// Runs the (slow, Windows-blocking) MIDI port enumeration off the I/O
-// loop so it never stalls device polling. Cycle every 2 s:
+// Runs the (slow, Windows-blocking) MIDI port enumeration and port opening
+// off the I/O loop so they never stall device polling:
 //
-//  1. Read pinned_midi_ids (set of midi_in:N / midi_out:N the canvas uses).
-//  2. Lock MidiBackend briefly to drop any open OS handles that aren't
-//     pinned — this lets the Windows MIDI subsystem report removed ports as
-//     gone (otherwise an open handle keeps loopMIDI ports alive even after
-//     the user deletes them in loopMIDI's UI).
-//  3. Without the lock, call list_live_ports() — the slow Win32 call.
-//  4. Lock MidiBackend again briefly to apply the diff (open connections for
-//     pinned ports that came back, drop entries for vanished ports) and
-//     rebuild the shared MIDI device list for the UI panel.
+//  1. Enumerate at startup and on manual refresh: list_live_ports() without
+//     the lock, then apply_port_list() + publish the device list briefly
+//     under it.
+//  2. Every 250 ms read pinned_midi_ids (midi_in:N / midi_out:N the canvas
+//     uses). When it changed: close unpinned connections under the lock (an
+//     open handle also keeps a deleted loopMIDI port alive), open newly
+//     pinned ports WITHOUT the lock, then adopt them under it.
 pub(crate) fn spawn_midi_watch_thread(
     midi: Arc<Mutex<Option<MidiBackend>>>,
     pinned_midi_ids: Arc<RwLock<HashSet<String>>>,
@@ -757,16 +757,8 @@ pub(crate) fn spawn_midi_watch_thread(
             // button sets `refresh_requested`). The thread otherwise just sleeps,
             // never touching wdmaud, so it can't disturb audio.
             let do_enumerate = |label: &str| {
-                // Release non-canvas-pinned handles so the OS can free them, then the
-                // slow enum without the lock, then apply the diff + publish.
-                {
-                    let pinned = pinned_midi_ids.read().unwrap().clone();
-                    if let Ok(mut mg) = midi.lock() {
-                        if let Some(m) = mg.as_mut() {
-                            m.release_unpinned(&pinned);
-                        }
-                    }
-                }
+                // The slow enum runs without the lock; applying the list and
+                // publishing the device panel's view takes it only briefly.
                 let t0 = std::time::Instant::now();
                 let (live_in, live_out) = MidiBackend::list_live_ports();
                 let took = t0.elapsed();
@@ -775,9 +767,43 @@ pub(crate) fn spawn_midi_watch_thread(
                 }
                 if let Ok(mut mg) = midi.lock() {
                     if let Some(m) = mg.as_mut() {
-                        m.apply_port_diff(&live_in, &live_out);
+                        m.apply_port_list(&live_in, &live_out);
                         let devs = m.enumerate();
                         *shared_midi_devices.write().unwrap() = devs;
+                    }
+                }
+            };
+
+            // Ports are OPENED only while a patch references them (legacy
+            // WinMM inputs are single-client, so holding every port would lock
+            // a DAW out of hardware we aren't using). Closing is instant;
+            // opening needs port handles, which re-lists the OS ports once —
+            // only when a node for an unopened port appears, never on a timer.
+            let sync_open = || {
+                let pinned = pinned_midi_ids.read().unwrap().clone();
+                let (ins, outs, guard) = match midi.lock() {
+                    Ok(mut mg) => match mg.as_mut() {
+                        Some(m) => {
+                            m.close_unpinned(&pinned);
+                            let (ins, outs) = m.ports_to_open(&pinned);
+                            (ins, outs, m.guard_handle())
+                        }
+                        None => return,
+                    },
+                    Err(_) => return,
+                };
+                if ins.is_empty() && outs.is_empty() {
+                    return;
+                }
+                let t0 = std::time::Instant::now();
+                let (in_entries, out_entries) = MidiBackend::open_ports(&ins, &outs, guard);
+                let took = t0.elapsed();
+                if took > Duration::from_millis(200) {
+                    eprintln!("[midi] opening {} port(s) took {took:?} (wdmaud)", ins.len() + outs.len());
+                }
+                if let Ok(mut mg) = midi.lock() {
+                    if let Some(m) = mg.as_mut() {
+                        m.adopt(in_entries, out_entries, &pinned);
                     }
                 }
             };
@@ -786,11 +812,19 @@ pub(crate) fn spawn_midi_watch_thread(
             do_enumerate("startup");
 
             // Then wait for explicit refresh requests. Cheap idle wakeups (250ms) just
-            // to poll the flag — these do NOT touch wdmaud/audio.
+            // to poll the flag and the pinned set — these do NOT touch wdmaud/audio
+            // unless a newly referenced port has to be opened.
+            let mut last_pinned: Option<HashSet<String>> = None;
             loop {
                 std::thread::sleep(Duration::from_millis(250));
-                if refresh_requested.swap(false, Ordering::AcqRel) {
+                let refreshed = refresh_requested.swap(false, Ordering::AcqRel);
+                if refreshed {
                     do_enumerate("manual-refresh");
+                }
+                let pinned = pinned_midi_ids.read().unwrap().clone();
+                if refreshed || last_pinned.as_ref() != Some(&pinned) {
+                    sync_open();
+                    last_pinned = Some(pinned);
                 }
             }
         })

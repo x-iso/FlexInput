@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use eframe::egui;
 use egui_snarl::{InPinId, NodeId, OutPinId, Snarl};
 use flexinput_core::{ModuleDescriptor, PinDescriptor, Signal, SignalType, SubPatchPin};
-use flexinput_devices::{init_backends, midi::cc_display_name, DeviceBackend, HidHideClient, MidiBackend, PhysicalDevice};
+use flexinput_devices::{init_backends, DeviceBackend, HidHideClient, MidiBackend, PhysicalDevice};
 use flexinput_engine::{Engine, NodeSnap, ProcessingGraph, ProcessingOutput, SinkBus, current_sample_rate, spawn_processing_thread};
 use flexinput_modules::all_modules;
 use flexinput_virtual::VirtualDevice;
@@ -1596,7 +1596,7 @@ impl eframe::App for FlexInputApp {
             *self.pinned_midi_ids.write().unwrap() = pinned;
         }
 
-        // Feed learned CCs into the active tab's canvas nodes.
+        // Feed learned MIDI pins into the active tab's MIDI In nodes.
         {
             let snarl = &mut self.tabs[self.active_tab].canvas.snarl;
             if let Ok(mut midi_g) = self.midi_backend.try_lock() {
@@ -1617,19 +1617,9 @@ impl eframe::App for FlexInputApp {
                     .collect();
 
                 for (node_id, device_id) in learning {
-                    if let Some(cc) = midi.take_learned_cc(&device_id) {
-                        let already_has = snarl
-                            .get_node(node_id)
-                            .and_then(|n| n.params.get("output_pin_ids").and_then(|v| v.as_array()))
-                            .map(|ids| ids.iter().any(|v| v.as_str() == Some(&format!("cc_{}", cc))))
-                            .unwrap_or(false);
-                        if !already_has {
-                            if let Some(node) = snarl.get_node_mut(node_id) {
-                                node.outputs.push(PinDescriptor::new(&cc_display_name(cc), flexinput_core::SignalType::Float));
-                                if let Some(serde_json::Value::Array(ids)) = node.params.get_mut("output_pin_ids") {
-                                    ids.push(serde_json::Value::String(format!("cc_{}", cc)));
-                                }
-                            }
+                    if let Some(pin) = midi.take_learned_pin(&device_id) {
+                        if let Some(node) = snarl.get_node_mut(node_id) {
+                            crate::canvas::viewer::add_midi_output_pin(node, &pin);
                         }
                     }
                 }

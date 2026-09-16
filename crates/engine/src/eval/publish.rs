@@ -195,6 +195,7 @@ pub(crate) fn republish_bus_as_collector(
             }
         }
     }
+    fill_raw_midi(dev_sigs, &upstream_dev, &uid_key, collector_sigs);
 }
 
 pub(crate) fn audio_stream_haptics_publish(
@@ -679,6 +680,7 @@ pub(crate) fn automap_fork_publish(
                 collector_sigs.insert((key.clone(), pin), sig);
             }
         }
+        fill_raw_midi(dev_sigs, dev_id, &key, collector_sigs);
     }
 }
 
@@ -981,8 +983,18 @@ pub(crate) fn automap_combiner_publish(
     // Off-spec pass-through (Remapper's keyboard/mouse pins etc.).
     {
         let mut extras: HashMap<String, Signal> = HashMap::new();
-        for collector_id in input_collectors.iter().rev() {
-            if collector_id.is_empty() { continue; }
+        // Highest port first, so the lowest port's value is inserted last and
+        // wins (SORT). Within a port, its collector beats its raw MIDI device.
+        let n_ports = input_collectors.len().max(input_devs.len());
+        for i in (0..n_ports).rev() {
+            if let Some(dev) = input_devs.get(i).filter(|d| is_midi_device(d)) {
+                for ((d, pin), &sig) in dev_sigs.iter() {
+                    if d == dev && flexinput_core::midi::is_midi_pin(pin) {
+                        extras.insert(pin.clone(), sig);
+                    }
+                }
+            }
+            let Some(collector_id) = input_collectors.get(i).filter(|c| !c.is_empty()) else { continue };
             for ((dev, pin), &sig) in collector_sigs.iter() {
                 if dev != collector_id { continue; }
                 if automap::ALL_PINS.iter().any(|p| p.id == pin.as_str()) { continue; }
@@ -1065,6 +1077,7 @@ pub(crate) fn automap_selector_publish(
             collector_sigs.insert((key.clone(), pin), sig);
         }
     }
+    fill_raw_midi(dev_sigs, &selected_dev, &key, collector_sigs);
 }
 
 // ── Sub-patch inner evaluation ────────────────────────────────────────────────

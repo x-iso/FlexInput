@@ -250,6 +250,36 @@ pub(crate) fn splitter_pin_label(pin_id: &str, neutral: &str, family: Option<&st
     }
 }
 
+/// Collapsible "MIDI…" section holding the MIDI pin picker. Returns the pin
+/// when one was added. Collapsed by default so gamepad-only patches don't
+/// carry the extra row.
+pub(crate) fn automap_midi_section(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    salt: &str,
+    for_output: bool,
+) -> Option<flexinput_core::midi::MidiPin> {
+    let mut picked = None;
+    egui::CollapsingHeader::new(egui::RichText::new("MIDI…").small().weak())
+        .id_salt((node_id, salt, "midi_section"))
+        .default_open(false)
+        .show(ui, |ui| {
+            picked = midi_pin_picker(ui, (node_id, salt), for_output);
+        });
+    picked
+}
+
+/// Row label for a bus pin: canonical name, MIDI name, or the raw id.
+fn bus_pin_neutral_label(pin_id: &str) -> String {
+    if let Some(p) = am_canon::ALL_PINS.iter().find(|p| p.id == pin_id) {
+        return p.display_name.to_string();
+    }
+    if flexinput_core::midi::is_midi_pin(pin_id) {
+        return midi_pin_label(pin_id);
+    }
+    pin_id.to_string()
+}
+
 pub(crate) fn show_automap_split_body(
     node_id: NodeId,
     outputs: &[OutPin],
@@ -270,11 +300,8 @@ pub(crate) fn show_automap_split_body(
         // Existing individual outputs with remove buttons.
         let mut to_remove: Option<usize> = None;
         for (i, pin_id) in current_ids.iter().enumerate() {
-            let neutral = am_canon::ALL_PINS.iter()
-                .find(|p| p.id == pin_id.as_str())
-                .map(|p| p.display_name)
-                .unwrap_or(pin_id.as_str());
-            let display = splitter_pin_label(pin_id, neutral, family_ref);
+            let neutral = bus_pin_neutral_label(pin_id);
+            let display = splitter_pin_label(pin_id, &neutral, family_ref);
             ui.horizontal(|ui| {
                 if ui.small_button("×").clicked() { to_remove = Some(i + 1); }
                 ui.label(egui::RichText::new(&display).small());
@@ -309,6 +336,26 @@ pub(crate) fn show_automap_split_body(
                     }
                 }
             });
+
+        if let Some(pin) = automap_midi_section(ui, node_id, "am_split", false) {
+            let id = pin.to_id();
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                let has = node.params.get("output_pin_ids").and_then(|v| v.as_array())
+                    .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(id.as_str())));
+                if !has {
+                    node.outputs.push(PinDescriptor::new(&pin.display_name(), pin.signal_type()));
+                    match node.params.get_mut("output_pin_ids") {
+                        Some(Value::Array(ids)) => ids.push(Value::String(id)),
+                        _ => {
+                            node.params.insert("output_pin_ids".to_string(), Value::Array(vec![
+                                Value::String("automap_pass".to_string()),
+                                Value::String(id),
+                            ]));
+                        }
+                    }
+                }
+            }
+        }
 
         let has_unused = outputs.iter().skip(1).any(|o| o.remotes.is_empty());
         if has_unused && ui.small_button("Clear unused").clicked() {
@@ -359,13 +406,11 @@ pub(crate) fn show_automap_collect_body(
         // Existing individual inputs with remove buttons.
         let mut to_remove: Option<usize> = None;
         for (i, pin_id) in current_ids.iter().enumerate() {
-            // Resolve display name: canonical list first, otherwise show the raw key name
-            // (learned keys use their egui Key Debug name as both id and display).
-            let neutral = am_canon::ALL_PINS.iter()
-                .find(|p| p.id == pin_id.as_str())
-                .map(|p| p.display_name)
-                .unwrap_or(pin_id.as_str());
-            let display = splitter_pin_label(pin_id, neutral, family_ref);
+            // Resolve display name: canonical list, then MIDI, otherwise the raw
+            // key name (learned keys use their egui Key Debug name as both id
+            // and display).
+            let neutral = bus_pin_neutral_label(pin_id);
+            let display = splitter_pin_label(pin_id, &neutral, family_ref);
             ui.horizontal(|ui| {
                 if ui.small_button("×").clicked() { to_remove = Some(i + 1); }
                 ui.label(egui::RichText::new(&display).small());
@@ -400,6 +445,24 @@ pub(crate) fn show_automap_collect_body(
                     }
                 }
             });
+
+        // A MIDI pin collected here is PRODUCED: a MIDI Out sink downstream
+        // sends it even with Thru off.
+        if let Some(pin) = automap_midi_section(ui, node_id, "am_collect", true) {
+            let id = pin.to_id();
+            if !current_ids.iter().any(|c| c == &id) {
+                if let Some(node) = snarl.get_node_mut(node_id) {
+                    node.inputs.push(PinDescriptor::new(&pin.display_name(), pin.signal_type()));
+                    match node.params.get_mut("collect_input_pin_ids") {
+                        Some(Value::Array(ids)) => ids.push(Value::String(id)),
+                        _ => {
+                            node.params.insert("collect_input_pin_ids".to_string(),
+                                Value::Array(vec![Value::String(id)]));
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Learn-key (capture next keypress; works for any key egui knows) ──
         if is_learning {

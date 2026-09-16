@@ -4626,3 +4626,143 @@ mod curve_edit_tests {
         assert_eq!(b, vec![0.0, 0.5, 0.0]);
     }
 }
+
+#[cfg(test)]
+mod midi_source_tests {
+    use super::*;
+
+    fn midi_source(pins: &[&str]) -> NodeSnap {
+        NodeSnap {
+            node_uid: 1,
+            module_id: "device.source".to_string(),
+            params: HashMap::new(),
+            n_outputs: pins.len(),
+            input_sources: Vec::new(),
+            device_id: Some("midi_in:0".to_string()),
+            output_pin_ids: pins.iter().map(|p| p.to_string()).collect(),
+            aux_f32_override: None,
+            sink_target: None,
+            inline_subgraph: None,
+        }
+    }
+
+    /// MIDI ports only publish pins away from rest. A MIDI In node must still
+    /// read an untouched pin as its rest value — every legacy CC pin read 0.0
+    /// back when the backend emitted all 128 of them each tick.
+    #[test]
+    fn untouched_midi_pins_read_as_rest_on_a_midi_source() {
+        let snap = midi_source(&["cc_7", "pitch_bend", "midi:note:1:60", "midi:cc:2:1", "btn_south"]);
+        let mut dev_sigs = HashMap::new();
+        dev_sigs.insert(("midi_in:0".to_string(), "midi:cc:2:1".to_string()), Signal::Float(0.5));
+        let out = compute_node(&snap, &[], &mut NodeState::default(), &dev_sigs, &HashMap::new(), 0.016);
+        assert_eq!(out, vec![
+            Some(Signal::Float(0.0)),
+            Some(Signal::Float(0.0)),
+            Some(Signal::Bool(false)),
+            Some(Signal::Float(0.5)),
+            None, // not a MIDI pin: no substitute
+        ]);
+    }
+
+    fn node(uid: usize, module_id: &str) -> NodeSnap {
+        let mut n = midi_source(&[]);
+        n.node_uid = uid;
+        n.module_id = module_id.to_string();
+        n.device_id = None;
+        n
+    }
+
+    fn midi_out_sink(uid: usize, src_key: &str, fallback: Option<&str>, thru: bool) -> NodeSnap {
+        let mut n = node(uid, "device.sink");
+        n.params.insert("midi_thru".into(), Value::Bool(thru));
+        n.sink_target = Some(crate::graph::SinkTarget {
+            device_id: "midi_out:0".to_string(),
+            pin_ids: vec!["automap_in".to_string()],
+            multi_sources: vec![Vec::new()],
+            automap_source: Some((src_key.to_string(), vec!["automap_out".to_string()])),
+            automap_fallback_dev: fallback.map(str::to_string),
+            feedback_sources: Vec::new(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+        });
+        n
+    }
+
+    fn played() -> HashMap<(String, String), Signal> {
+        let mut m = HashMap::new();
+        m.insert(("midi_in:0".to_string(), "midi:note:1:60".to_string()), Signal::Bool(true));
+        m.insert(("midi_in:0".to_string(), "midi:cc:1:7".to_string()), Signal::Float(0.5));
+        m.insert(("midi_in:0".to_string(), "cc_7".to_string()), Signal::Float(0.5));
+        m
+    }
+
+    fn midi_sent(out: &TickOutput) -> Vec<String> {
+        let mut v: Vec<String> = out.sink_outputs.keys()
+            .filter(|(d, _)| d == "midi_out:0")
+            .map(|(_, p)| p.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// MIDI In wired straight to MIDI Out: with Thru off nothing is sent (on a
+    /// shared port that would be an instant loop); with Thru on the bus's MIDI
+    /// pins go out, but never the legacy aliases.
+    #[test]
+    fn raw_midi_reaches_a_midi_out_only_with_thru() {
+        for (thru, want) in [(false, vec![]), (true, vec!["midi:cc:1:7", "midi:note:1:60"])] {
+            let graph = ProcessingGraph {
+                nodes: vec![midi_source(&["automap_out"]), midi_out_sink(2, "midi_in:0", None, thru)],
+            };
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut HashMap::new(), &played(), 0.016, &mut out);
+            assert_eq!(midi_sent(&out), want, "thru={thru}");
+        }
+    }
+
+    /// A MIDI pin wired into a Collector is PRODUCED and goes out with Thru
+    /// off; the raw MIDI the Collector passes through alongside it does not.
+    #[test]
+    fn a_collected_midi_pin_is_sent_but_its_raw_pass_through_is_not() {
+        let src = midi_source(&["automap_out"]);
+        let mut split = node(2, "module.automap_split");
+        split.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
+        split.n_outputs = 2;
+        split.output_pin_ids = vec!["automap_pass".into(), "midi:cc:1:7".into()];
+        split.input_sources = vec![Some((0, 0))];
+        let mut collect = node(3, "module.automap_collect");
+        collect.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
+        collect.params.insert("_collect_pin_ids".into(), serde_json::json!(["midi:cc:2:8"]));
+        collect.input_sources = vec![Some((1, 0)), Some((1, 1))];
+        collect.n_outputs = 1;
+        let sink = midi_out_sink(4, "collector:3", Some("midi_in:0"), false);
+        let graph = ProcessingGraph { nodes: vec![src, split, collect, sink] };
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut HashMap::new(), &played(), 0.016, &mut out);
+        assert_eq!(midi_sent(&out), vec!["midi:cc:2:8"]);
+        assert_eq!(
+            out.sink_outputs.get(&("midi_out:0".to_string(), "midi:cc:2:8".to_string())),
+            Some(&Signal::Float(0.5)),
+        );
+    }
+
+    /// A Splitter reading a MIDI pin that isn't playing gets its rest value,
+    /// not "no signal".
+    #[test]
+    fn a_splitter_reads_an_idle_midi_pin_as_rest() {
+        let mut split = node(2, "module.automap_split");
+        split.params.insert("_automap_device_id".into(), Value::String("midi_in:0".into()));
+        split.n_outputs = 3;
+        split.output_pin_ids = vec!["automap_pass".into(), "midi:note:1:61".into(), "midi:pb:1".into()];
+        let out = compute_node(&split, &[], &mut NodeState::default(), &played(), &HashMap::new(), 0.016);
+        assert_eq!(out, vec![None, Some(Signal::Bool(false)), Some(Signal::Float(0.0))]);
+    }
+
+    #[test]
+    fn non_midi_sources_are_not_rest_filled() {
+        let mut snap = midi_source(&["cc_7"]);
+        snap.device_id = Some("gilrs:xinput:0".to_string());
+        let out = compute_node(&snap, &[], &mut NodeState::default(), &HashMap::new(), &HashMap::new(), 0.016);
+        assert_eq!(out, vec![None]);
+    }
+}

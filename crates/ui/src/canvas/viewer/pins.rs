@@ -99,16 +99,22 @@ pub(crate) fn remove_dynamic_pin<S: PinSide>(
     }
 }
 
-/// Keep only pins that have at least one wire, compacting the rest away.
+/// Keep only pins that have at least one wire, compacting the rest away. An
+/// AutoMap port is never "unused" — it is the node's bus port, not a
+/// user-added pin — so it is always kept.
 pub(crate) fn clear_unused_dynamic_pins<S: PinSide>(
     node_id: NodeId,
     pins: &[S::Pin],
     snarl: &mut Snarl<NodeData>,
     ids_key: &str,
 ) {
+    let is_automap: Vec<bool> = match snarl.get_node_mut(node_id) {
+        Some(node) => S::pins_mut(node).iter().map(|d| d.signal_type == SignalType::AutoMap).collect(),
+        None => return,
+    };
     let connected: Vec<(usize, Vec<S::Remote>)> = pins
         .iter()
-        .filter(|p| !S::remotes(p).is_empty())
+        .filter(|p| !S::remotes(p).is_empty() || is_automap.get(S::index(p)).copied().unwrap_or(false))
         .map(|p| (S::index(p), S::remotes(p).to_vec()))
         .collect();
 

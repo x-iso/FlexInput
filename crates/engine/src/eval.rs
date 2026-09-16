@@ -23,6 +23,7 @@ mod config;
 mod curves;
 mod device_cal;
 mod feedback;
+mod midi_bus;
 mod modules;
 mod registry;
 #[cfg(test)]
@@ -40,6 +41,7 @@ pub(crate) use registry::*;
 // into the bus — so this one glob is narrowed rather than `pub`.
 pub(crate) use publish::*;
 pub(crate) use feedback::*;
+pub(crate) use midi_bus::*;
 
 /// Namespaces inner node UIDs under their containing subpatch's UID to avoid
 /// collisions in the shared `state` map (and the `remap:`/`collector:` keys the
@@ -174,12 +176,15 @@ fn eval_subgraph(
                     }
                 }
             }
+            // A MIDI device's pins are dynamic (not in ALL_PINS).
+            fill_raw_midi(dev_sigs, &upstream_dev, &uid_key, collector_sigs);
 
             // Phase 2: explicit collected-pin overrides.
             for (i, pin_id) in collect_ids.iter().enumerate() {
                 if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
                     if !pin_id.is_empty() {
                         collector_sigs.insert((uid_key.clone(), pin_id.clone()), sig);
+                        mark_produced(&uid_key, pin_id, collector_sigs);
                     }
                 }
             }
@@ -592,12 +597,18 @@ pub fn eval_graph_tick(
                     }
                 }
             }
+            // A MIDI device's pins are dynamic (not in ALL_PINS): copy its live
+            // ones too, under whatever the upstream collector already carried.
+            fill_raw_midi(dev_sigs, &upstream_dev, &uid_key, &mut collector_sigs);
 
             // Phase 2: explicit collected-pin overrides (win over pass-through).
+            // A MIDI pin wired in here counts as PRODUCED, so a MIDI Out sink
+            // sends it even with Thru off.
             for (i, pin_id) in collect_ids.iter().enumerate() {
                 if let Some(sig) = inputs.get(i + 1).and_then(|s| *s) {
                     if !pin_id.is_empty() {
                         collector_sigs.insert((uid_key.clone(), pin_id.clone()), sig);
+                        mark_produced(&uid_key, pin_id, &mut collector_sigs);
                     }
                 }
             }
@@ -810,6 +821,19 @@ pub fn eval_graph_tick(
                         sink_outputs
                             .entry((st.device_id.clone(), pin.clone()))
                             .or_insert(scale_for_sink(pin, sig));
+                    }
+                }
+                // MIDI Out: forward the bus's MIDI pins — only PRODUCED ones
+                // unless the sink's Thru toggle is on, so raw MIDI never loops
+                // straight back out by default (see `midi_bus`).
+                if st.device_id.starts_with("midi_out:") {
+                    let thru = snap.params.get("midi_thru").and_then(|v| v.as_bool()).unwrap_or(false);
+                    for (pin, sig) in midi_out_pins(
+                        src_dev, is_collector, st.automap_fallback_dev.as_deref(), thru,
+                        dev_sigs, &collector_sigs,
+                    ) {
+                        if directly_wired.contains(pin.as_str()) { continue; }
+                        sink_outputs.entry((st.device_id.clone(), pin)).or_insert(sig);
                     }
                 }
             }

@@ -21,10 +21,14 @@ pub(crate) fn compute_node(
             // at the top of `eval_graph_tick` so AutoMap/splitter/collector see
             // the same processed values via raw dev_sigs reads.
             let dev_id = snap.device_id.as_deref().unwrap_or("");
+            // MIDI ports only publish pins away from rest; a pin they omit reads
+            // as its rest value, as every CC did when all 128 were emitted.
+            let is_midi = dev_id.starts_with("midi_in:");
             (0..snap.n_outputs).map(|i| {
                 let pin_id = snap.output_pin_ids.get(i).map(|s| s.as_str()).unwrap_or("");
                 if pin_id.is_empty() { return None; }
                 dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+                    .or_else(|| if is_midi { flexinput_core::midi::rest_value_for_id(pin_id) } else { None })
             }).collect()
         }
         "module.automap_split" => {
@@ -43,7 +47,10 @@ pub(crate) fn compute_node(
                         return Some(sig);
                     }
                 }
+                // MIDI pins are only published away from rest; a missing one
+                // reads as its rest value.
                 dev_sigs.get(&(dev_id.to_string(), pin_id.to_string())).copied()
+                    .or_else(|| flexinput_core::midi::parse_pin(pin_id).map(|p| p.rest_value()))
             }).collect()
         }
         "module.input_viewer" => {
