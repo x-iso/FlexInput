@@ -5,6 +5,8 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-16
+
 ### Added
 
 - **A factory preset with calibrated gyro aim.** Easy mode gains
