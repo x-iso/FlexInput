@@ -32,6 +32,13 @@ impl BluetoothState {
     /// Whether any Bluetooth adapter is visible at all — drives the title-bar
     /// button. Cached on the same timer as the window's own list.
     pub fn present(&mut self) -> bool {
+        // ⛔ Holding a dongle already answers the question. This is called from
+        // the title bar every frame and used to enumerate the whole USB bus
+        // every two seconds regardless — on the UI thread, forever, while the
+        // adapter it was enumerating streamed a controller.
+        if flexinput_btle::holding_any() {
+            return true;
+        }
         self.refresh_if_stale();
         !self.adapters.is_empty()
     }

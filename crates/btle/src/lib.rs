@@ -249,6 +249,24 @@ pub fn last_open_failure(vid: u16, pid: u16) -> Option<String> {
         .map(|(_, _, why)| why.clone())
 }
 
+/// Whether this process holds ANY adapter open right now.
+///
+/// Cheap — no USB traffic — which is the point: see `discover`.
+pub fn holding_any() -> bool {
+    open_dongles().lock().map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Manufacturer and product strings last read from each adapter.
+///
+/// Remembered so an adapter this process is streaming from can still be named
+/// without being opened a second time to ask.
+fn adapter_names() -> &'static std::sync::Mutex<Vec<((u16, u16), (Option<String>, Option<String>))>> {
+    static NAMES: std::sync::OnceLock<
+        std::sync::Mutex<Vec<((u16, u16), (Option<String>, Option<String>))>>,
+    > = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
 /// Whether this process holds `vid:pid` open right now.
 pub fn is_ours(vid: u16, pid: u16) -> bool {
     open_dongles()
@@ -447,26 +465,51 @@ pub fn discover() -> Vec<DongleInfo> {
         // returns for "no driver" got it wrong: the list showed adapters the
         // app could never touch, and the Bluetooth button appeared on machines
         // with no usable dongle at all.
-        let opened = match device.open() {
-            Ok(h) => Some(h),
-            Err(rusb::Error::Access) | Err(rusb::Error::Busy) => None,
-            Err(_) => continue,
+        let (vid, pid) = (desc.vendor_id(), desc.product_id());
+        // ⛔ **Never open the adapter we are streaming from.**
+        //
+        // This runs every two seconds for the title-bar Bluetooth button, and
+        // it used to open every adapter — including the one a transport was
+        // actively streaming a controller from — and read its string
+        // descriptors over USB. Those are control transfers on the same
+        // endpoint the HCI commands use, issued from the UI thread into a live
+        // link, on a timer. Nothing it learned was new: whether we hold an
+        // adapter is known without asking the hardware.
+        let ours = is_ours(vid, pid);
+        let opened = if ours {
+            None
+        } else {
+            match device.open() {
+                Ok(h) => Some(h),
+                Err(rusb::Error::Access) | Err(rusb::Error::Busy) => None,
+                Err(_) => continue,
+            }
         };
         let (manufacturer, product) = match &opened {
-            Some(h) => (
-                h.read_manufacturer_string_ascii(&desc).ok().map(|s| s.trim().to_string()),
-                h.read_product_string_ascii(&desc).ok().map(|s| s.trim().to_string()),
-            ),
-            None => (None, None),
+            Some(h) => {
+                let names = (
+                    h.read_manufacturer_string_ascii(&desc).ok().map(|s| s.trim().to_string()),
+                    h.read_product_string_ascii(&desc).ok().map(|s| s.trim().to_string()),
+                );
+                if let Ok(mut cache) = adapter_names().lock() {
+                    cache.retain(|(k, _)| *k != (vid, pid));
+                    cache.push(((vid, pid), names.clone()));
+                }
+                names
+            }
+            None => adapter_names()
+                .lock()
+                .ok()
+                .and_then(|c| c.iter().find(|(k, _)| *k == (vid, pid)).map(|(_, n)| n.clone()))
+                .unwrap_or((None, None)),
         };
-        let (vid, pid) = (desc.vendor_id(), desc.product_id());
         out.push(DongleInfo {
             vid,
             pid,
             bus: device.bus_number(),
             address: device.address(),
             available: opened.is_some(),
-            ours: is_ours(vid, pid),
+            ours,
             manufacturer: manufacturer.filter(|s| !s.is_empty()),
             product: product.filter(|s| !s.is_empty()),
             problem: last_open_failure(vid, pid),
