@@ -20,6 +20,18 @@ All notable changes to FlexInput are documented here. This project adheres to
   unchanged. Auto-cal also tips that, without a known value, calibrating at a low
   in-game sensitivity usually gives finer aim steps.
 
+- **Remapper: chords that care about order, and a Sequence mode.** Clicking a
+  card's `in →` pill switches it to **in order**, so A then B is a different card
+  from B then A (the inputs join with › instead of +). While such a card waits
+  for the rest of its chord, the inputs it has matched are held back from the
+  rest of the node for up to the time gap, and a matched ordered card outranks a
+  plain card over the same inputs, which becomes the fallback for the wrong
+  order. The new **Sequence** mode fires on inputs pressed one after another,
+  each within the time gap of the previous; earlier steps may already be
+  released, and the card stays on while the last step is held. On a card with a
+  single stick direction or trigger it times the move instead: leave zero and
+  reach the threshold inside the gap.
+
 ### Changed
 
 - **RWS Aim: a more compact body.** The calibrated constants share a row
@@ -27,6 +39,48 @@ All notable changes to FlexInput are documented here. This project adheres to
   Auto-cal now sits above the ruler, with its guide and gamepad hints on rows of
   their own instead of stretching the module wide. The Mouse output is now
   labelled **Mouse Move (XY)**; saved patches are renamed on load, wires intact.
+
+### Removed
+
+- **The Joy-Con 2 experiment switches.** The investigation they served has
+  concluded, so the protocol probing is gone along with its `FLEXINPUT_JC2_*`
+  environment variables (added in 0.13.8), raw capture and frame dumps. Joy-Con 2
+  now initialises with exactly the working recipe. This wasn't free to keep: a
+  connect held the shared radio for over half a second of probes, during which a
+  Bluetooth Classic controller on the same dongle couldn't be heard. The log also
+  stops recording every advertisement the scan hears, and a refused scan start
+  backs off for 5 s instead of retrying five times a second.
+
+### Fixed
+
+- **A paired Switch Pro reconnects over the Bluetooth dongle straight away.**
+  Reconnecting took several tries and succeeded by chance: the dongle listened
+  for incoming calls under 1% of the time, and a controller's call could be
+  thrown away while the radio was busy or pushed out of the queue by Joy-Con 2
+  scan traffic. When the call did get through, the controller still failed to
+  connect about one time in three, because a question many Bluetooth stacks ask
+  before opening a channel went unanswered. After such a failure the controller
+  was left half-connected and had to be switched off and on to try again; a
+  failed setup now closes the link so it can call straight back.
+
+- **Bluetooth Classic input no longer stalls every two seconds.** The title-bar
+  Bluetooth button checked for adapters by opening each one every two seconds —
+  including the adapter streaming a controller, which interrupted the link. Input
+  went stale in short bursts: flat lines in the gyro calibration trace, stick
+  movement staggering at the same rhythm. The button now knows an adapter is in
+  use without touching it.
+
+- **Remapper: Short, Long and Double cards no longer swallow the presses they
+  don't fire on.** A Short card ate long presses, a Long card ate taps and a
+  Double card ate single taps. They now hold the input back only while deciding:
+  if the card fires, the input is consumed; otherwise it comes back — live if
+  still held, or a finished tap replayed at its original length. A held-back
+  stick direction is capped where it crossed the threshold rather than zeroed.
+
+- **Remapper: swapping the sticks with analog cards works when only one stick
+  moves.** With one card mapping the left stick to the right and another the
+  reverse, moving a single stick drove both, because a card only suppressed its
+  source stick when every one of its directions was deflected at once.
 
 ## [0.13.8] - 2026-09-14
 
