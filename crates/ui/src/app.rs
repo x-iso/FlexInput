@@ -3185,6 +3185,11 @@ pub(crate) enum NavStep {
     /// curve's in/out min-max are ±100 to allow extremes but are tuned near ±1),
     /// where `Linear`'s span-proportional step is uselessly huge.
     Fixed(f32),
+    /// `Fixed` in a DISPLAY unit, for a param shown scaled (display = param ×
+    /// `factor`): stepping, grid snap and the HUD readout all work in display
+    /// units, and the result is written back in param units. E.g. RWS Mouse
+    /// Scale, stored per degree but shown per 360°.
+    FixedScaled { coarse: f32, factor: f32 },
 }
 
 /// Numeric-edit descriptor for a generic nav-editable widget element.

@@ -533,7 +533,7 @@ impl Module for Gyro3DOFModule {
 // the `scale` (counts-per-degree) is calibrated; `rws` is the user multiplier on
 // that ground truth. A second Vec2 input drives flick-stick (stick angle → yaw).
 //
-// The "Mouse" output is meant to be wired to the KB/M `mouse_move` sink pin: that
+// The "Mouse Move (XY)" output is meant to be wired to the KB/M `mouse_move` sink pin: that
 // pin is applied once per tick (displacement, not integrated) and is NOT scaled
 // by the device card's mouse_sensitivity — so a preset carrying this module feels
 // identical regardless of the user's KB/M sensitivity setting. The "Stick" output
@@ -548,6 +548,10 @@ impl Module for Gyro3DOFModule {
 #[derive(Default)]
 pub struct RwsModule;
 
+/// Name of RWS Aim's output 0. Pin names persist with each node, so patches saved
+/// before the rename (as "Mouse") are migrated to this on load.
+pub const RWS_MOUSE_OUT_NAME: &str = "Mouse Move (XY)";
+
 impl Module for RwsModule {
     fn descriptor() -> ModuleDescriptor {
         ModuleDescriptor {
@@ -559,7 +563,7 @@ impl Module for RwsModule {
                 PinDescriptor::new("Flick", SignalType::Vec2).optional(),
             ],
             outputs: vec![
-                PinDescriptor::new("Mouse", SignalType::Vec2),
+                PinDescriptor::new(RWS_MOUSE_OUT_NAME, SignalType::Vec2),
                 PinDescriptor::new("Stick", SignalType::Vec2),
             ],
         }

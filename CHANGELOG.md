@@ -5,6 +5,24 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **RWS Aim: Mouse Scale in dots per 360°.** A header toggle switches the Mouse
+  Scale readings between dots per degree and dots per 360° turn — the unit Steam
+  Input and sensitivity databases use — everywhere the value appears: the body,
+  pinned widgets, the ruler's value box, auto-cal results and gamepad stepping
+  (100 dots, fine 10). Display only: the stored value and `.fxrws` presets are
+  unchanged. Auto-cal also tips that, without a known value, calibrating at a low
+  in-game sensitivity usually gives finer aim steps.
+
+### Changed
+
+- **RWS Aim: a more compact body.** The calibrated constants share a row
+  (**Mouse Scale** | Stick °/s), as do RWS | V/H — each still pins on its own.
+  Auto-cal now sits above the ruler, with its guide and gamepad hints on rows of
+  their own instead of stretching the module wide. The Mouse output is now
+  labelled **Mouse Move (XY)**; saved patches are renamed on load, wires intact.
+
 ## [0.13.8] - 2026-09-14
 
 ### Added

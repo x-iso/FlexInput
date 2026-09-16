@@ -318,8 +318,7 @@ pub(crate) fn render_pinned_element_impl(
         // RWS Aim: the calibrated scale + the RWS multiplier as editable boxes
         // (pinnable to the config overlay for live calibration).
         ("processing.rws", "scale") => {
-            render_dragvalue_param(inner_id, ui, inner_snarl, container_size,
-                "Scale", "scale", 100.0, 0.05, 0.0..=100_000.0, Some(3));
+            render_rws_scale(inner_id, ui, inner_snarl, container_size);
             return;
         }
         ("processing.rws", "rws") => {

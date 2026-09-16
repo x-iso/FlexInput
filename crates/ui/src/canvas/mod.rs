@@ -193,6 +193,13 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         if node.value.module_id == "math.negate" && node.value.display_name == "Negate" {
             node.value.display_name = "Inverse".to_string();
         }
+        // RWS Aim's output 0 was renamed "Mouse" → "Mouse Move (XY)". Pin names
+        // persist with the node; same position, so wires stay. Idempotent.
+        if node.value.module_id == "processing.rws" {
+            if let Some(pin) = node.value.outputs.first_mut().filter(|p| p.name == "Mouse") {
+                pin.name = flexinput_modules::processing::RWS_MOUSE_OUT_NAME.to_string();
+            }
+        }
         // Generic-pad stick-click / menu pins → positional names. Applies to
         // ANY device.source (the old ids only ever existed on Generic pads, so
         // a native pad simply has nothing to rewrite). Idempotent.
@@ -329,6 +336,36 @@ mod migration_tests {
         assert_eq!(snarl.get_node(custom).unwrap().display_name, "Flip Trigger");
         let inner_sp = snarl.get_node(host_id).unwrap().subpatch.as_ref().unwrap();
         assert_eq!(inner_sp.snarl.get_node(nested).unwrap().display_name, "Inverse");
+    }
+
+    /// RWS Aim nodes saved with the old "Mouse" output name are renamed in place
+    /// (Stick untouched); a second pass is a no-op.
+    #[test]
+    fn migrate_renames_rws_mouse_output() {
+        use flexinput_modules::processing::RWS_MOUSE_OUT_NAME;
+        let rws = NodeData {
+            module_id: "processing.rws".to_string(),
+            display_name: "RWS Aim".to_string(),
+            category: "Processing".to_string(),
+            inputs: vec![],
+            outputs: vec![
+                PinDescriptor::new("Mouse", SignalType::Vec2),
+                PinDescriptor::new("Stick", SignalType::Vec2),
+            ],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        };
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let id = snarl.insert_node(egui::Pos2::ZERO, rws);
+        let names = |s: &Snarl<NodeData>| -> Vec<String> {
+            s.get_node(id).unwrap().outputs.iter().map(|p| p.name.clone()).collect()
+        };
+
+        migrate_loaded_snarl(&mut snarl);
+        assert_eq!(names(&snarl), [RWS_MOUSE_OUT_NAME, "Stick"]);
+        migrate_loaded_snarl(&mut snarl);
+        assert_eq!(names(&snarl), [RWS_MOUSE_OUT_NAME, "Stick"]);
     }
 
     /// A `device.sink`/`device.source` node with a ViGEm id is rewritten in place,

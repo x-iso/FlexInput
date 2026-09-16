@@ -428,7 +428,8 @@ pub struct ModuleDescriptor {
     deflection treated as a rate up to `max_rate_dps` at full tilt.
   - Input 1: `Flick` (Vec2, optional) — stick position for flick-stick.
 - **Outputs:**
-  - Output 0: `Mouse` (Vec2) — per-tick mouse **displacement**; wire to the KB/M
+  - Output 0: `Mouse Move (XY)` (Vec2; formerly `Mouse`, renamed on load) —
+    per-tick mouse **displacement**; wire to the KB/M
     `mouse_move` sink (which is NOT scaled by the card's `mouse_sensitivity`, so
     the calibration is portable).
   - Output 1: `Stick` (Vec2) — right-stick **deflection** (unit range) for
@@ -436,6 +437,9 @@ pub struct ModuleDescriptor {
     a virtual Right Stick.
 - **Key parameters:**
   - `scale: f32` (default 100) — mouse counts per degree (THE calibrated value).
+  - `scale_unit: "deg" | "360"` (default `"deg"`) — header toggle for how `scale`
+    is shown and edited (per degree, or ×360 as dots per 360° like Steam Input).
+    Display only; not part of `.fxrws` presets.
   - `rws: f32` (default 1) — sensitivity multiplier over the calibrated ground truth.
   - `input_mode: "gyro" | "stick_rate"`, `max_rate_dps: f32` (stick_rate turn rate).
   - `stick_out_dps: f32` (default 360) — game camera turn rate at full stick, for

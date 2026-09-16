@@ -431,6 +431,21 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             let _ = rws_load_preset(snarl, node, &path);
                         }
                     }
+                    // Mouse Scale unit — display only: `scale` stays stored per
+                    // degree, so patches and presets are unaffected.
+                    ui.separator();
+                    let per_360 = RwsScaleUnit::of(snarl, node).per_360();
+                    let tip = "Mouse Scale unit: mouse dots per degree of turn, or per full 360° turn\n(as Steam Input and sensitivity databases list it). Display only — the\nstored value and .fxrws presets don't change.";
+                    for (val, lbl, on) in [("deg", "dots/°", !per_360), ("360", "dots/360°", per_360)] {
+                        if ui.selectable_label(on, egui::RichText::new(lbl).small())
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            if let Some(n) = snarl.get_node_mut(node) {
+                                n.params.insert("scale_unit".into(), Value::String(val.into()));
+                            }
+                        }
+                    }
                 }
 
                 // SVG module: Load… / Clear / tint picker live in the header.

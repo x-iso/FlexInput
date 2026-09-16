@@ -123,7 +123,14 @@ impl FlexInputApp {
         key: &str, lo: f32, hi: f32, default: f32, step: NavStep,
         press: f32, cont: f32, fine: bool, dt: f32)
     {
-        let cur = self.get_subpatch_param_f32(outer_id, inner, key).unwrap_or(default);
+        // A display-scaled field is nudged entirely in display units (steps +
+        // grid snap), then written back in param units.
+        let (factor, step) = match step {
+            NavStep::FixedScaled { coarse, factor } => (factor.max(f32::EPSILON), NavStep::Fixed(coarse)),
+            s => (1.0, s),
+        };
+        let cur = self.get_subpatch_param_f32(outer_id, inner, key).unwrap_or(default) * factor;
+        let (lo, hi) = (lo * factor, hi * factor);
         let press_step = match step {
             NavStep::Decade => {
                 let v = (cur - lo).abs().max(1e-6);
@@ -135,7 +142,7 @@ impl FlexInputApp {
                 let span = (hi - lo).abs().max(f32::EPSILON);
                 span * if fine { 0.005 } else { 0.02 }
             }
-            NavStep::Fixed(coarse) => {
+            NavStep::Fixed(coarse) | NavStep::FixedScaled { coarse, .. } => {
                 if fine { coarse * 0.1 } else { coarse }
             }
         };
@@ -185,7 +192,7 @@ impl FlexInputApp {
             self.set_subpatch_param_i64(outer_id, inner, key, next as i64);
             return;
         }
-        self.set_subpatch_param_f32(outer_id, inner, key, next);
+        self.set_subpatch_param_f32(outer_id, inner, key, next / factor);
     }
 
     /// Outward-bloom ring on a focused sub-control's rect, drawn on the given
@@ -214,9 +221,14 @@ impl FlexInputApp {
         let def = &fields[idx];
         // Read the focused field's current value as a string for the HUD.
         let val_str = match &def.field {
-            NavField::Value { key, .. } =>
+            NavField::Value { key, step, .. } =>
                 self.get_subpatch_param_f32(outer_id, inner, key)
-                    .map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                    .map(|v| match step {
+                        // Display-scaled fields are large whole-unit readings.
+                        NavStep::FixedScaled { factor, .. } => format!("{:.0}", v * factor),
+                        _ => format!("{:.3}", v),
+                    })
+                    .unwrap_or_default(),
             NavField::Enum { key, .. } | NavField::EnumPair { key_a: key, .. } =>
                 self.get_subpatch_param_str(outer_id, inner, key).unwrap_or_default(),
             NavField::Toggle { key } =>
@@ -605,7 +617,7 @@ impl FlexInputApp {
     /// functions' param keys.
     pub(crate) fn nav_element_fields(&self, outer_id: egui_snarl::NodeId) -> Vec<NavFieldDef> {
         use NavField::*;
-        use NavStep::{Decade, Fixed, Linear};
+        use NavStep::{Decade, Fixed, FixedScaled, Linear};
         let Some((mid, elem)) = self.nav_selected_element(outer_id) else { return vec![]; };
         // Gyro axis options (family, axis) for the pointer/steering mode rows.
         const GYRO_PTR: &[(&str, &str, &str)] = &[
@@ -622,6 +634,14 @@ impl FlexInputApp {
         ];
         let v = |key, lo, hi, default, step| NavField::Value { key, lo, hi, default, step };
         macro_rules! f { ($l:expr, $field:expr) => { NavFieldDef { label: $l, field: $field } }; }
+        // RWS Mouse Scale steps in the unit the header shows it in: 1 dot/°
+        // (fine 0.1), or 100 dots/360° (fine 10).
+        let rws_scale_step = || {
+            let per_360 = self.nav_selected_inner_node(outer_id)
+                .and_then(|inner| self.get_subpatch_param_str(outer_id, inner, "scale_unit"))
+                .as_deref() == Some("360");
+            if per_360 { FixedScaled { coarse: 100.0, factor: 360.0 } } else { Fixed(1.0) }
+        };
         match (mid.as_str(), elem.as_str()) {
             // ── single-field elements (also driven by the unified editor) ──
             ("module.delay", "ms")            => vec![f!("ms", v("delay_ms",0.0,60_000.0,100.0,Decade))],
@@ -642,7 +662,7 @@ impl FlexInputApp {
             // Fixed steps → clean stepping: coarse lands on integers, fine on the
             // 0.1 (or 1) grid. `scale` fine (0.1) matters for calibration; the
             // °/s fields step by 10 coarse / 1 fine (whole degrees per second).
-            ("processing.rws", "scale") => vec![f!("Scale", v("scale",0.0,100_000.0,100.0,Fixed(1.0)))],
+            ("processing.rws", "scale") => vec![f!("Mouse Scale", v("scale",0.0,100_000.0,100.0,rws_scale_step()))],
             ("processing.rws", "rws")   => vec![f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0)))],
             ("processing.rws", "stick_dps") => vec![f!("Stick °/s", v("stick_out_dps",1.0,100_000.0,360.0,Fixed(10.0)))],
             ("processing.rws", "vh") => vec![
@@ -658,7 +678,7 @@ impl FlexInputApp {
                 f!("Auto-cal", Enum{key:"cal_measure",opts:&["off","pitch","yaw"]}),
             ],
             ("processing.rws", "field") => vec![
-                f!("Scale", v("scale",0.0,100_000.0,100.0,Fixed(1.0))),
+                f!("Mouse Scale", v("scale",0.0,100_000.0,100.0,rws_scale_step())),
                 f!("RWS", v("rws",0.01,50.0,1.0,Fixed(1.0))),
             ],
             // FOV strictly whole degrees (Fixed(10) → 10 coarse / 1 fine).
@@ -1009,7 +1029,7 @@ impl FlexInputApp {
                 let span = (hi - lo).abs().max(f32::EPSILON);
                 span * if fine { 0.005 } else { 0.02 }
             }
-            NavStep::Fixed(coarse) => {
+            NavStep::Fixed(coarse) | NavStep::FixedScaled { coarse, .. } => {
                 if fine { coarse * 0.1 } else { coarse }
             }
         };

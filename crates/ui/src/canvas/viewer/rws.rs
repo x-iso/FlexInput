@@ -1,8 +1,9 @@
 //! RWS Aim module body (Real-World Sensitivity).
 //!
 //! Layout: the input-mode dropdown and the Calibrate Start/Stop button live in
-//! the node HEADER (see `show_header`); the body holds the numeric knobs (Scale
-//! / RWS), the calibration ruler viewport (`field`), and its style row. Every
+//! the node HEADER (see `show_header`); the body holds the numeric knobs (two to
+//! a row: Mouse Scale | Stick °/s, RWS | V/H), the measure auto-cal, the
+//! calibration ruler viewport (`field`), and its style row. Every
 //! element is registered as a pinnable + gamepad-editable element so it can be
 //! dropped onto the config overlay for live calibration — the ruler `field`
 //! itself carries the full calibration control set (Scale / Calibrate / Speed /
@@ -30,6 +31,53 @@ fn rws_field_style(snarl: &Snarl<NodeData>, node_id: NodeId) -> (f32, f32, bool)
         .unwrap_or((0.0, 15.0, true))
 }
 
+/// How Mouse Scale is shown and edited. `scale` is always STORED as mouse dots
+/// (counts) per degree; the `scale_unit` param ("deg" | "360", toggled in the
+/// header) is a view preference only — not in presets — that can show it per
+/// full 360° turn instead, as Steam Input and sensitivity databases list it.
+#[derive(Clone, Copy)]
+pub(crate) struct RwsScaleUnit {
+    per_360: bool,
+}
+
+impl RwsScaleUnit {
+    pub(crate) fn of(snarl: &Snarl<NodeData>, node_id: NodeId) -> Self {
+        let per_360 = snarl.get_node(node_id)
+            .and_then(|n| n.params.get("scale_unit").and_then(|v| v.as_str()))
+            == Some("360");
+        Self { per_360 }
+    }
+
+    pub(crate) fn per_360(self) -> bool { self.per_360 }
+
+    fn factor(self) -> f32 { if self.per_360 { 360.0 } else { 1.0 } }
+
+    /// A DragValue over the displayed value (`shown`, from [`Self::shown`]).
+    fn drag_value(self, shown: &mut f32) -> egui::DragValue<'_> {
+        let dv = egui::DragValue::new(shown).range(0.0..=100_000.0 * self.factor());
+        if self.per_360 { dv.speed(10.0).max_decimals(0) } else { dv.speed(0.05).max_decimals(3) }
+    }
+
+    fn shown(self, scale: f32) -> f32 { scale * self.factor() }
+
+    /// The displayed value converted back to the stored per-degree `scale`.
+    fn to_param(self, shown: f32) -> Option<Value> {
+        Number::from_f64(shown as f64 / self.factor() as f64).map(Value::Number)
+    }
+
+    fn suffix(self) -> &'static str { if self.per_360 { " /360°" } else { " /°" } }
+
+    /// Readout text with the unit, e.g. "151.51 /°" or "54545 /360°".
+    fn text(self, scale: f32) -> String {
+        if self.per_360 { format!("{:.0} /360°", self.shown(scale)) } else { format!("{scale:.2} /°") }
+    }
+
+    fn per_text(self) -> &'static str { if self.per_360 { "per 360° turn" } else { "per degree" } }
+}
+
+/// Mouse-sensitivity hint for calibrating without a known value.
+const RWS_LOW_SENS_TIP: &str = "No known value? Calibrate at a low in-game sensitivity — usually finer aim steps";
+
 pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
     let (scale, rws, stick_max) = snarl
         .get_node(node_id)
@@ -41,6 +89,7 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
         })
         .unwrap_or((100.0, 1.0, 360.0));
     let (bg_alpha, tick_deg, labels) = rws_field_style(snarl, node_id);
+    let unit = RwsScaleUnit::of(snarl, node_id);
 
     let mut set: Vec<(&str, Value)> = Vec::new();
 
@@ -48,74 +97,83 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
 
-    // Scale — mouse counts per degree; the calibrated ground truth (the value box
-    // the calibration viewport edits in the config overlay).
-    let r_scale = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Scale").small())
-            .on_hover_text("Mouse counts per degree — the calibrated 1:1 ground truth.\nCalibrate this (RWS 1 then feels like a 1:1 physical rotation).");
-        let mut v = scale;
-        if ui.add(egui::DragValue::new(&mut v).speed(0.05).range(0.0..=100_000.0)).changed() {
-            if let Some(n) = Number::from_f64(v as f64) { set.push(("scale", Value::Number(n))); }
-        }
+    // Each output's calibrated constant, side by side. Still two elements, so
+    // each pins independently.
+    ui.horizontal(|ui| {
+        // Mouse Scale — mouse dots per degree (or per 360°); the calibrated ground
+        // truth (the value box the calibration viewport edits in the config overlay).
+        let r_scale = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Mouse Scale").small())
+                .on_hover_text("Mouse Move (XY) output: mouse dots per degree of turn, or per 360°\n(unit switch in the header) — the calibrated 1:1 ground truth.\nCalibrate this (RWS 1 then feels like a 1:1 physical rotation).");
+            let mut v = unit.shown(scale);
+            if ui.add(unit.drag_value(&mut v).suffix(unit.suffix())).changed() {
+                if let Some(p) = unit.to_param(v) { set.push(("scale", p)); }
+            }
+        });
+        register_exposable_element(ui, node_id, "scale", r_scale.response.rect);
+        ui.separator();
+        // Stick output scaling (the game's camera turn rate at full stick; the
+        // Stick-output equivalent of Mouse Scale).
+        let r_sdps = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Stick °/s").small())
+                .on_hover_text("Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.");
+            let mut sm = stick_max;
+            if ui.add(egui::DragValue::new(&mut sm).speed(5.0).range(1.0..=100_000.0).suffix(" °/s")).changed() {
+                if let Some(n) = Number::from_f64(sm as f64) { set.push(("stick_out_dps", Value::Number(n))); }
+            }
+        });
+        register_exposable_element(ui, node_id, "stick_dps", r_sdps.response.rect);
     });
-    register_exposable_element(ui, node_id, "scale", r_scale.response.rect);
 
-    // RWS multiplier relative to the calibrated ground truth.
-    let r_rws = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("RWS").small())
-            .on_hover_text("Sensitivity as a multiple of the calibrated 1:1 ground truth.\n1.0 = matches your physical rotation; 2.0 = twice as fast.");
-        let mut v = rws;
-        if ui.add(egui::DragValue::new(&mut v).speed(0.01).range(0.01..=50.0)).changed() {
-            if let Some(n) = Number::from_f64(v as f64) { set.push(("rws", Value::Number(n))); }
-        }
-    });
-    register_exposable_element(ui, node_id, "rws", r_rws.response.rect);
-
-    // Stick output scaling — its OWN row so it pins independently (the game's
-    // camera turn rate at full stick; the Stick-output equivalent of Scale).
-    let r_sdps = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Stick °/s").small())
-            .on_hover_text("Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.");
-        let mut sm = stick_max;
-        if ui.add(egui::DragValue::new(&mut sm).speed(5.0).range(1.0..=100_000.0).suffix(" °/s")).changed() {
-            if let Some(n) = Number::from_f64(sm as f64) { set.push(("stick_out_dps", Value::Number(n))); }
-        }
-    });
-    register_exposable_element(ui, node_id, "stick_dps", r_sdps.response.rect);
-
-    // V/H bias — vertical sensitivity relative to horizontal (the calibrated
-    // reference), separately for the gyro source and stick sources. 1.0 = equal.
+    // RWS multiplier + V/H bias on one row, again as separate elements.
     let (gyro_vh, stick_vh) = snarl.get_node(node_id).map(|n| (
         n.params.get("gyro_vh_ratio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
         n.params.get("stick_vh_ratio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
     )).unwrap_or((1.0, 1.0));
-    let r_vh = ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("V/H").small().weak())
-            .on_hover_text("Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated reference,\nset per source: gyro vs stick.");
-        ui.label(egui::RichText::new("gyro").small().weak());
-        let mut g = gyro_vh;
-        if ui.add(egui::DragValue::new(&mut g).speed(0.01).range(0.0..=8.0)).changed() {
-            if let Some(n) = Number::from_f64(g as f64) { set.push(("gyro_vh_ratio", Value::Number(n))); }
-        }
-        ui.label(egui::RichText::new("stick").small().weak());
-        let mut s = stick_vh;
-        if ui.add(egui::DragValue::new(&mut s).speed(0.01).range(0.0..=8.0)).changed() {
-            if let Some(n) = Number::from_f64(s as f64) { set.push(("stick_vh_ratio", Value::Number(n))); }
-        }
+    ui.horizontal(|ui| {
+        // RWS multiplier relative to the calibrated ground truth.
+        let r_rws = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("RWS").small())
+                .on_hover_text("Sensitivity as a multiple of the calibrated 1:1 ground truth.\n1.0 = matches your physical rotation; 2.0 = twice as fast.");
+            let mut v = rws;
+            if ui.add(egui::DragValue::new(&mut v).speed(0.01).range(0.01..=50.0)).changed() {
+                if let Some(n) = Number::from_f64(v as f64) { set.push(("rws", Value::Number(n))); }
+            }
+        });
+        register_exposable_element(ui, node_id, "rws", r_rws.response.rect);
+        ui.separator();
+        // V/H bias — vertical sensitivity relative to horizontal (the calibrated
+        // reference), separately for the gyro source and stick sources. 1.0 = equal.
+        let r_vh = ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("V/H").small().weak())
+                .on_hover_text("Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated reference,\nset per source: gyro vs stick.");
+            ui.label(egui::RichText::new("gyro").small().weak());
+            let mut g = gyro_vh;
+            if ui.add(egui::DragValue::new(&mut g).speed(0.01).range(0.0..=8.0)).changed() {
+                if let Some(n) = Number::from_f64(g as f64) { set.push(("gyro_vh_ratio", Value::Number(n))); }
+            }
+            ui.label(egui::RichText::new("stick").small().weak());
+            let mut s = stick_vh;
+            if ui.add(egui::DragValue::new(&mut s).speed(0.01).range(0.0..=8.0)).changed() {
+                if let Some(n) = Number::from_f64(s as f64) { set.push(("stick_vh_ratio", Value::Number(n))); }
+            }
+        });
+        register_exposable_element(ui, node_id, "vh", r_vh.response.rect);
     });
-    register_exposable_element(ui, node_id, "vh", r_vh.response.rect);
+
+    // Measure-based auto-calibration (turn a known 180°/360° → back-solve the
+    // constant), above the ruler. Stacked vertically so its guide and result
+    // lines sit on rows of their own instead of widening the controls row.
+    // (Body edits are real input in this window, so the canvas's own edit
+    // tracking syncs them — the returned write flag is only needed for overlays.)
+    let r_meas = ui.vertical(|ui| { let _ = rws_measure_controls(node_id, ui, snarl, true); });
+    register_exposable_element(ui, node_id, "measure", r_meas.response.rect);
 
     // Calibration viewport (own row). Writes `scale` directly via its centre box,
     // so it must run before the `set` flush below (disjoint params — no conflict).
     let fw = ui.available_width().clamp(120.0, 260.0);
     let frect = render_rws_field(node_id, ui, snarl, egui::vec2(fw, 100.0), false);
     register_exposable_element(ui, node_id, "field", frect);
-
-    // Measure-based auto-calibration (turn a known 180°/360° → back-solve Scale).
-    // (Body edits are real input in this window, so the canvas's own edit
-    // tracking syncs them — the returned write flag is only needed for overlays.)
-    let r_meas = ui.horizontal(|ui| { let _ = rws_measure_controls(node_id, ui, snarl); });
-    register_exposable_element(ui, node_id, "measure", r_meas.response.rect);
 
     // View + style row.
     let mode = snarl.get_node(node_id)
@@ -244,7 +302,7 @@ pub(crate) fn show_rws_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snar
     });
     register_exposable_element(ui, node_id, "suppress", r_sup.response.rect);
 
-    ui.label(egui::RichText::new("→ wire Mouse to KB/M “Mouse XY (move)”").small().weak())
+    ui.label(egui::RichText::new("→ wire Mouse Move (XY) to KB/M “Mouse XY (move)”").small().weak())
         .on_hover_text("RWS drives the mouse via the displacement pin, which ignores the\nKB/M card's mouse sensitivity — so the calibration is portable.");
     }); // ui.vertical
 
@@ -345,6 +403,37 @@ pub(crate) fn render_rws_suppress(
         if let Some(node) = snarl.get_node_mut(node_id) {
             for (k, v) in set { node.params.insert(k.to_string(), v); }
         }
+    }
+}
+
+/// Mouse Scale value box as a standalone pinnable element, in the header's
+/// display unit (see [`RwsScaleUnit`]).
+pub(crate) fn render_rws_scale(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    container: egui::Vec2,
+) {
+    let scale = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("scale").and_then(|v| v.as_f64()))
+        .unwrap_or(100.0) as f32;
+    let unit = RwsScaleUnit::of(snarl, node_id);
+    let mut new_scale = None;
+    ui.set_max_width(container.x);
+    apply_widget_scale(ui, container, egui::vec2(150.0, 22.0));
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Mouse Scale").weak());
+        let mut v = unit.shown(scale);
+        // The value box is the row's flexible element (see `render_dragvalue_param`);
+        // its minimum leaves room for the longer per-360 number + suffix.
+        let w = pin_flex_width(ui, container, if unit.per_360() { 96.0 } else { 72.0 });
+        let h = ui.spacing().interact_size.y;
+        if ui.add_sized([w, h], unit.drag_value(&mut v).suffix(unit.suffix())).changed() {
+            new_scale = unit.to_param(v);
+        }
+    });
+    if let (Some(p), Some(node)) = (new_scale, snarl.get_node_mut(node_id)) {
+        node.params.insert("scale".into(), p);
     }
 }
 
@@ -493,6 +582,7 @@ fn rws_finish_measure(
 ) {
     let target = if axis == "yaw" { 360.0_f32 } else { 180.0 };
     let is_stick = rws_cal_output_is_stick(snarl, node_id);
+    let unit = RwsScaleUnit::of(snarl, node_id);
     let mut msg = String::new();
     if let Some(node) = snarl.get_node_mut(node_id) {
         let param = |node: &NodeData, k: &str, d: f32| {
@@ -516,9 +606,9 @@ fn rws_finish_measure(
                 if let Some(n) = Number::from_f64(new as f64) {
                     node.params.insert("scale".into(), Value::Number(n));
                 }
-                msg = format!("✓ Scale {old:.2} → {new:.2}");
+                msg = format!("✓ Mouse Scale {} → {}", unit.text(old), unit.text(new));
             } else {
-                msg = "⚠ Scale is 0 — set a nonzero Scale first".into();
+                msg = "⚠ Mouse Scale is 0 — set a nonzero Mouse Scale first".into();
             }
         }
         node.params.insert("cal_measure".into(), Value::String("off".into()));
@@ -533,8 +623,24 @@ fn rws_finish_measure(
 /// Ⓐ finish, Ⓑ cancel/back, Ⓨ toggles the 360°-only snapshot reference. Mouse
 /// users click the buttons directly. A guide line spells out where to point the
 /// camera; a short result message reports the outcome. Shared by the module body
-/// and the pinnable element. Returns whether it wrote node params this frame.
-pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> bool {
+/// and the pinnable element. `split_hints` puts the guide's gamepad hint on a
+/// line of its own (the body, which should stay narrow) instead of appending it
+/// to the instruction (the pin, whose sized frames expect one line). Returns
+/// whether it wrote node params this frame.
+pub(crate) fn rws_measure_controls(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    split_hints: bool,
+) -> bool {
+    let guide = |ui: &mut egui::Ui, instruction: &str, pad_hint: &str| {
+        if split_hints {
+            ui.label(egui::RichText::new(instruction).small().weak());
+            ui.label(egui::RichText::new(pad_hint).small().weak());
+        } else {
+            ui.label(egui::RichText::new(format!("{instruction}  ·  {pad_hint}")).small().weak());
+        }
+    };
     let (axis, theta, peak_defl) = rws_measure_state(node_id, snarl);
     let (ref_on, pending, finish_flag, cal_output, scale, stick_dps) = snarl.get_node(node_id).map(|n| (
         n.params.get("cal_ref_shot").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -547,6 +653,7 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
 
     let measuring = axis == "pitch" || axis == "yaw";
     let is_stick = cal_output == "stick";
+    let unit = RwsScaleUnit::of(snarl, node_id);
     let mut set: Vec<(&str, Value)> = Vec::new();
     let mut do_finish = false;
     let mut cancel = false;
@@ -555,7 +662,7 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
 
     if measuring {
         let target = if axis == "yaw" { 360.0_f32 } else { 180.0 };
-        let out_lbl = if is_stick { "Stick °/s" } else { "Scale" };
+        let out_lbl = if is_stick { "Stick °/s" } else { "Mouse Scale" };
         let r = ui.horizontal(|ui| {
             ui.label(egui::RichText::new(format!("Measuring {axis} → {out_lbl}: {:.0}° / {:.0}°", theta.abs(), target))
                 .strong().color(egui::Color32::from_rgb(255, 200, 80)));
@@ -567,16 +674,17 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
             ui.label(egui::RichText::new(format!("⚠ Too fast — the stick maxed out ({peak_defl:.1}×). Cancel and turn slower."))
                 .small().color(egui::Color32::from_rgb(230, 150, 110)));
         }
-        let guide = match (axis.as_str(), is_stick) {
-            ("pitch", false) => "Turn the camera fully UP, then Finish  ·  A = Finish · B = Cancel",
-            ("pitch", true) => "Turn the camera fully UP (steadily, not too fast), then Finish  ·  A = Finish · B = Cancel",
-            (_, false) => "Turn one full 360°, then Finish  ·  A = Finish · B = Cancel",
-            (_, true) => "Turn one full 360° (steadily, not too fast), then Finish  ·  A = Finish · B = Cancel",
+        let instruction = match (axis.as_str(), is_stick) {
+            ("pitch", false) => "Turn the camera fully UP, then Finish",
+            ("pitch", true) => "Turn the camera fully UP (steadily, not too fast), then Finish",
+            (_, false) => "Turn one full 360°, then Finish",
+            (_, true) => "Turn one full 360° (steadily, not too fast), then Finish",
         };
-        ui.label(egui::RichText::new(guide).small().weak());
+        guide(ui, instruction, "A = Finish · B = Cancel");
     } else {
         let r = ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Auto-cal").small().weak());
+            ui.label(egui::RichText::new("Auto-cal").small().weak())
+                .on_hover_text("Turn the camera a known amount; the constant for the chosen output\nis solved from the measured rotation.\n\nNo reference value for this game? Set a LOW in-game mouse sensitivity\nfirst: in most games it sets the turn per mouse dot, so lower means\nfiner angular resolution (more dots per 360°).");
             // Method buttons; the gamepad-highlighted (pending) one is marked.
             let r_p = ui.selectable_label(pending == "pitch", egui::RichText::new("↕180°").small())
                 .on_hover_text("Vertical: aim straight DOWN, then turn straight UP (horizontal blocked).");
@@ -590,7 +698,7 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
             // and switch between them with selectors (auto-detect can't know).
             ui.label(egui::RichText::new("out").small().weak());
             if ui.selectable_label(!is_stick, egui::RichText::new("Mouse").small())
-                .on_hover_text("Calibrate the Mouse output (Scale, counts/degree).")
+                .on_hover_text("Calibrate the Mouse Move (XY) output (Mouse Scale, counts/degree).")
                 .clicked()
             {
                 set.push(("cal_output", Value::String("mouse".into())));
@@ -602,7 +710,7 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
                 set.push(("cal_output", Value::String("stick".into())));
             }
             // The constant this output uses right now, so a Finish visibly moves it.
-            let cur = if is_stick { format!("= {stick_dps:.0} °/s") } else { format!("= {scale:.2}") };
+            let cur = if is_stick { format!("= {stick_dps:.0} °/s") } else { format!("= {}", unit.text(scale)) };
             ui.label(egui::RichText::new(cur).small().weak());
             // Snapshot comparison — only meaningful for the 360° horizontal method.
             if pending == "yaw" {
@@ -624,12 +732,15 @@ pub(crate) fn rws_measure_controls(node_id: NodeId, ui: &mut egui::Ui, snarl: &m
                 ui.label(egui::RichText::new(m).small().color(col));
             }
         }
-        let guide = if pending == "pitch" {
-            "Aim the camera straight DOWN first  ·  A = Start · ◄► method · ▲▼ output"
+        if pending == "pitch" {
+            guide(ui, "Aim the camera straight DOWN first", "A = Start · ◄► method · ▲▼ output");
         } else {
-            "Aim straight ahead first  ·  A = Start · ◄► method · ▲▼ output · Y = snapshot"
-        };
-        ui.label(egui::RichText::new(guide).small().weak());
+            guide(ui, "Aim straight ahead first", "A = Start · ◄► method · ▲▼ output · Y = snapshot");
+        }
+        // Mouse only: the in-game mouse sensitivity sets the angular resolution.
+        if !is_stick {
+            ui.label(egui::RichText::new(RWS_LOW_SENS_TIP).small().weak());
+        }
     }
 
     publish_nav_field_rects(ui, node_id, &[method_rect]);
@@ -666,7 +777,7 @@ pub(crate) fn render_rws_measure(
 ) {
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(210.0, 24.0));
-    if rws_measure_controls(node_id, ui, snarl) {
+    if rws_measure_controls(node_id, ui, snarl, false) {
         mark_rws_overlay_write(ui.ctx());
     }
 }
@@ -882,18 +993,17 @@ pub(crate) fn render_rws_field(
             egui::pos2(cx, rect.top() + box_h * 0.5 + 3.0),
             egui::vec2(box_w, box_h),
         );
-        let mut sv = scale;
-        let dv = egui::DragValue::new(&mut sv)
-            .speed(0.05)
-            .max_decimals(3)
-            .range(0.0..=100_000.0);
+        let unit = RwsScaleUnit::of(snarl, node_id);
+        let mut sv = unit.shown(scale);
         if ui
-            .put(box_rect, dv)
-            .on_hover_text("Calibrated Scale (mouse counts / degree).\nDrag until the game matches this reference's spin.")
+            .put(box_rect, unit.drag_value(&mut sv))
+            .on_hover_text(format!(
+                "Calibrated Mouse Scale (mouse dots {}).\nDrag until the game matches this reference's spin.",
+                unit.per_text()))
             .changed()
         {
-            if let (Some(n), Some(num)) = (snarl.get_node_mut(node_id), Number::from_f64(sv as f64)) {
-                n.params.insert("scale".into(), Value::Number(num));
+            if let (Some(n), Some(p)) = (snarl.get_node_mut(node_id), unit.to_param(sv)) {
+                n.params.insert("scale".into(), p);
             }
         }
     }
@@ -1120,5 +1230,25 @@ fn paint_rws_room(painter: &egui::Painter, rect: egui::Rect, yaw_deg: f32, fov_d
             line(Vec3::new(xf, -r, t), Vec3::new(xf, r, t), s(c));
             line(Vec3::new(xf, t, -r), Vec3::new(xf, t, r), s(c));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dots-per-360 entry is stored per degree and reads back as the same
+    /// whole number; per-degree mode stores the entry unchanged.
+    #[test]
+    fn scale_unit_round_trips_through_stored_per_degree_value() {
+        let per_360 = RwsScaleUnit { per_360: true };
+        let stored = per_360.to_param(54_545.0).and_then(|v| v.as_f64()).unwrap();
+        assert!((stored - 54_545.0 / 360.0).abs() < 1e-3);
+        assert_eq!(per_360.text(stored as f32), "54545 /360°");
+
+        let per_deg = RwsScaleUnit { per_360: false };
+        let stored = per_deg.to_param(151.5).and_then(|v| v.as_f64()).unwrap();
+        assert_eq!(stored, 151.5);
+        assert_eq!(per_deg.text(stored as f32), "151.50 /°");
     }
 }
