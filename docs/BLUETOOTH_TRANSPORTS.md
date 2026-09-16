@@ -43,10 +43,10 @@ and polling rate come from.
 | File | Purpose | Lines |
 |------|---------|-------|
 | `reports.rs` | Report parsing, orientation tracking, calibration, drift | ~4500 |
-| `dongle.rs` | The dongle transport: scan, connect, init, stream | ~2830 |
+| `dongle.rs` | The dongle transport: scan, connect, init, stream | ~990 |
 | `hub.rs` | Fallback transport over the Windows stack (btleplug/WinRT) | ~1850 |
 | `protocol.rs` | Command framing, feature bits, UUIDs | ~640 |
-| `dlog.rs` | The four diagnostic logs and their release gating | ~400 |
+| `dlog.rs` | The diagnostic logs and their release gating | ~370 |
 | `pairing.rs` | The `0x15` LTK handshake | ~390 |
 | `usb.rs` | WinUSB device enumeration and claiming | ~380 |
 
@@ -95,14 +95,22 @@ requests the **LE 2M PHY** — best effort, since the interval cannot go lower a
 on-air rate is the only remaining headroom.
 
 Observed report rates: **~200 Hz** for a single half; adding the second costs one
-of them roughly a fifth of its reports. See *Diagnostics* below for how to
-measure this rather than guess.
+of them roughly a fifth of its reports.
+
+### Initialisation is the recipe and nothing else
+
+Everything in `connect_and_init` runs inside a radio lease, and a lease stops the
+shared reader for **both** transports. Every extra write is time a Bluetooth
+Classic controller cannot be heard. The init therefore sends exactly the working
+sequence — MTU, the input and command-response CCCDs, the report-rate descriptor,
+the handshake, pairing, memory reads, feedback and feature select — and nothing
+the protocol investigation added on top of it.
 
 ### Handles
 
-Taken from `crates/btle/src/joycon.rs`. Discovery by UUID exists behind
-`FLEXINPUT_JC2_DISCOVER=on` and has never disagreed with these constants on any
-controller tested.
+Taken from `crates/btle/src/joycon.rs`. Discovery by UUID was run against every
+controller tested and never disagreed with these constants, so it is not done at
+connect time.
 
 | Handle | Role |
 |--------|------|
@@ -135,7 +143,8 @@ be enabled. **Retail Joy-Con 2 hardware is untested against this** and may well
 differ. Consequences of the derived path: drift, and boundary artefacts
 (mirroring and jumps) whose exact encoding is still unresolved — a wrap and a
 fold produce the same value range and are distinguishable only across a boundary,
-which needs the per-report capture described below.
+which needs consecutive raw reports — work for the standalone probes under
+`crates/btle/src/bin/`, not the app.
 
 ---
 
@@ -149,9 +158,11 @@ be a bad thing to ship. Pairing is an explicit act performed with the
 `bt_classic` tool; the backend connects **only** to addresses that already have a
 stored link key.
 
-### The six traps in bonded reconnection
+### The traps in bonded reconnection
 
-Each of these silently breaks reconnection on its own:
+Each of these silently breaks reconnection on its own. The first six stop it
+working at all; the last three make it work **by luck**, which is harder to spot
+because it sometimes succeeds.
 
 1. `Accept_Connection_Request` must use role byte **`0x01`** (remain slave). Role
    `0x00` never completes the switch on a Switch Pro and surfaces as LMP
@@ -164,6 +175,23 @@ Each of these silently breaks reconnection on its own:
 5. L2CAP channel setup is symmetric — either side may initiate, so both
    directions must be handled.
 6. Control channel before interrupt; the HID profile expects that order.
+7. **Page scan must be configured, not left at the default.** After `HCI_Reset`
+   a controller listens for 11.25 ms every 1.28 s — under 1% of the time. A
+   switched-on pad pages its host for only a few seconds, so whether it landed
+   in a window was chance. `set_fast_connectable` applies BlueZ's
+   fast-connectable values: interlaced scan, a window every 160 ms.
+8. **No wait loop may discard events it passes over.** A command waiting for its
+   Command Complete runs inside a lease, with the shared reader stopped, so
+   anything it reads and drops is gone for every transport. `command_sync` and the
+   LE connect path used to do exactly that, eating a calling controller's
+   `Connection Request`. They now put back everything except advertising
+   reports once their wait ends.
+9. **A transport must not be sent traffic it never reads.** Subscriber queues are
+   bounded and evict their oldest entry. An LE scan produces hundreds of
+   advertising reports a second, and the Classic transport — which uses none —
+   was queueing them all, so the oldest entry evicted was the `Connection
+   Request` it was waiting for. It subscribes with
+   `radio::subscribe_without_adverts`.
 
 ### Stick calibration
 
@@ -201,35 +229,36 @@ link settles for the fallback numbers and streams normally.
 
 ### Logs are opt-in for release builds
 
-All four diagnostic logs are gated at the single point they are opened
+All diagnostic logs are gated at the single point they are opened
 (`dlog::Sink::open`). In a **debug** build they behave as before; in a **release**
 build a log is written only if its variable is set. Each takes a path, or `on`
 for the default location, or `off` to disable.
 
 | Variable | File | Contents |
 |----------|------|----------|
-| `FLEXINPUT_JC2_LOG` | `jc2-dongle.log` | Discovery and connection lifecycle |
+| `FLEXINPUT_JC2_LOG` | `jc2-dongle.log` | Connection lifecycle |
 | `FLEXINPUT_JC2_DRIFT_LOG` | `jc2-drift.log` | One drift reading every 30 s |
 | `FLEXINPUT_JC2_IMU_LOG` | `jc2-imu-diag.log` | IMU/orientation diagnostics |
-| `FLEXINPUT_JC2_CAPTURE_FILE` | `jc2-raw-capture.csv` | Raw per-report capture |
 
-Long-lived logs go to `%APPDATA%\FlexInput\logs`; the IMU log and the capture go
-beside the executable, because they are meant to be found and mailed by someone
-who will not be walked through AppData. Each rotates at 5 MB keeping one
-generation, and each is written by its own thread — writing inline with a flush
-per line stalls the transport thread and manufactures the symptom being
-investigated.
+Long-lived logs go to `%APPDATA%\FlexInput\logs`; the IMU log goes beside the
+executable, because it is meant to be found and mailed by someone who will not be
+walked through AppData. Each rotates at 5 MB keeping one generation, and each is
+written by its own thread — writing inline with a flush per line stalls the
+transport thread and manufactures the symptom being investigated.
 
-`FLEXINPUT_BTC_CADENCE=on` enables the Classic report-cadence line in release
-builds (on by default in debug).
+The connection log records lifecycle only — scan start and stop, connect
+attempts and outcomes, disconnects. It used to log every advertisement the scan
+heard, which in an ordinary room is hundreds of lines a second.
 
 ### Measuring report cadence
 
-`flexinput_btle::cadence::Cadence` is used by both transports:
+`flexinput_btle::cadence::Cadence` measures how evenly reports arrive. The
+Classic transport prints it every 5 s in debug builds, or in release with
+`FLEXINPUT_BTC_CADENCE=on`:
 
 ```
-Switch 2 Controller (L) cadence over 264 reports: 132.0 Hz, mean 7.58 ms
-  (min 7.41, max 7.63), jitter 0.08 ms/step — 2 link(s) streaming
+[bt-classic] da:2d:16:0f:01:69 cadence: 170.2 Hz over 851 reports, mean 5.87 ms
+  (min 0.02, max 31.4), jitter 3.1 ms/step
 ```
 
 Per-step jitter is tracked separately from the mean because they answer different
@@ -237,32 +266,14 @@ questions: a stream alternating 5 ms and 25 ms has the same mean as a steady
 15 ms one and behaves nothing like it. It distinguishes "this is the device's
 chosen rate" from "this is our loss".
 
-### Raw capture
+### No protocol experiments in the app
 
-`FLEXINPUT_JC2_CAPTURE=on` writes one CSV row per report:
-
-```
-host_us,side,dev_ticks,f0,f1,f2,ax,ay,az,motion_len
-```
-
-Deliberately unprocessed — no permutation, no mount correction, no scaling, no
-wrap handling. Every one of those is a hypothesis, and a capture that bakes in
-the hypotheses cannot test them.
-
-### Experiment switches (Joy-Con 2 dongle only)
-
-`FLEXINPUT_JC2_MODE`, `_COMMON`, `_CMD`, `_PAIR`, `_DISCOVER` change the
-initialisation sequence for protocol investigation. When any is set and no
-WinUSB adapter is present, the dongle transport **refuses to hand the pads to the
-Windows stack** and logs `NO RUN`. That fallback produces a log which looks like
-a healthy ordinary session, so a test whose transport silently changed reads as
-"the experiment ran and changed nothing" — the most expensive wrong answer
-available, and one that has already cost hardware runs.
-
-Other switches: `FLEXINPUT_JC2_FEATURES` takes a comma list (`07,0f,2f`) and
-sweeps one mask per initialisation; `FLEXINPUT_JC2_REPLIES=on` waits for a reply
-to every command on whichever channel the run uses; `FLEXINPUT_JC2_MOUSE=on`
-enables the mouse feature bit and watches the delta fields.
+The investigation into the Joy-Con 2 common input stream used a set of
+environment switches that rewrote the initialisation sequence, probed attributes
+and captured raw reports. It concluded (see *Known limitation* above) and the
+switches were removed: each one put extra traffic on a radio the Classic transport
+shares. Protocol probing belongs in the standalone binaries under
+`crates/btle/src/bin/`, which own the dongle outright and affect nothing else.
 
 ---
 
@@ -302,3 +313,12 @@ to, since a key issued by one adapter is useless to another.
 `parse_switch_pro_report` (no calibration) sat next to the real parser and the
 Classic path used it for as long as it existed, shipping the square-stick
 response. It is now `#[cfg(test)]` so no transport can reach for it by accident.
+
+### 7. A wait loop under a lease must put back what it passes over
+
+Reading an event inside `with_dongle` consumes it for everyone: the router is
+stopped, so no other subscriber will ever see it. Matching one reply and
+`continue`-ing past the rest is therefore not "skipping" — it is deleting. Collect
+the others and hand them back with `push_events_front` **after** the wait, never
+during it: re-queued mid-wait they are read straight back ahead of the wire, and
+the loop spins on them instead of reaching its own reply.
