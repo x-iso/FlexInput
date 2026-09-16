@@ -161,7 +161,7 @@ stored link key.
 ### The traps in bonded reconnection
 
 Each of these silently breaks reconnection on its own. The first six stop it
-working at all; the last three make it work **by luck**, which is harder to spot
+working at all; the rest make it work **by luck**, which is harder to spot
 because it sometimes succeeds.
 
 1. `Accept_Connection_Request` must use role byte **`0x01`** (remain slave). Role
@@ -192,6 +192,28 @@ because it sometimes succeeds.
    was queueing them all, so the oldest entry evicted was the `Connection
    Request` it was waiting for. It subscribes with
    `radio::subscribe_without_adverts`.
+10. **Every L2CAP signalling command must be answered or refused.** Channel setup
+    handled five commands and ignored the rest, including the **Information
+    Request** many stacks send before opening a channel. A peer that asks waits
+    for the answer — neither offering its channels nor answering requests for
+    ours — and then drops the link. The trace reads "remote did not offer",
+    `granted=false`, and a timeout. A peer with our answer cached does not ask,
+    which is why it fails only sometimes. `l2cap::housekeeping_reply` answers
+    Information and Echo Requests and rejects anything unimplemented.
+11. **One signalling packet can carry several commands.** Only the first was
+    decoded, so a channel request bundled behind another command was lost.
+    Use `l2cap::parse_signals`.
+12. **An unanswered channel request is sent again** (every 2 s, same identifier),
+    and channel setup reads events so a link that drops is reported with its
+    real reason instead of as a timeout.
+13. **Do not page a controller whose incoming link just failed.** It goes
+    straight back to calling us, and a paging radio cannot hear it — the page
+    times out with `0x04` while the pad's call goes unanswered.
+14. **A failed channel setup must take the link down.** By then the link is up
+    and encrypted; leaving it standing strands the controller — connected to us
+    at the radio level so it cannot call again, untracked by us so nothing uses
+    or closes it — until it switches itself off. `disconnect_and_wait` closes it
+    so the pad can call straight back.
 
 ### Stick calibration
 
@@ -313,6 +335,15 @@ to, since a key issued by one adapter is useless to another.
 `parse_switch_pro_report` (no calibration) sat next to the real parser and the
 Classic path used it for as long as it existed, shipping the square-stick
 response. It is now `#[cfg(test)]` so no transport can reach for it by accident.
+
+### 8. Never touch the hardware to answer a question the process already knows
+
+`discover()` enumerates the USB bus and opens adapters to read their names. The
+title-bar Bluetooth button called it every two seconds, on the UI thread, and it
+opened the very adapter a transport was streaming from — control transfers into
+a live link, on a timer. Whether this process holds an adapter is `is_ours` /
+`holding_any`, which cost nothing; names are cached from the last time an adapter
+was opened while idle.
 
 ### 7. A wait loop under a lease must put back what it passes over
 
