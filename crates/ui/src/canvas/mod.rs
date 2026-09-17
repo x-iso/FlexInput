@@ -2774,6 +2774,8 @@ pub fn group_into_subpatch(
         items: vec![],
         overlay_items: vec![],
         config_items: vec![],
+        overlay_authored_size: None,
+        config_authored_size: None,
         exposed_modules: vec![],
         decorations: vec![],
         snap_enabled: false,

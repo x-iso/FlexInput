@@ -61,11 +61,13 @@ pub enum AnchorAxis {
     /// Derive point + stretch from the element's span in the 3×3 zone grid.
     #[default]
     Auto,
-    /// Fixed margin from the start edge (left / top).
+    /// The start edge (left / top) keeps its offset from the start of the axis
+    /// as a percentage of the axis.
     Start,
-    /// Held at the same fraction of the axis (centre).
+    /// The centre is held at the same fraction of the axis.
     Center,
-    /// Fixed margin from the end edge (right / bottom).
+    /// The end edge (right / bottom) keeps its offset from the end of the axis
+    /// as a percentage of the axis.
     End,
 }
 
@@ -78,7 +80,9 @@ pub enum AnchorAxis {
 /// element can be anchored to a specific zone (e.g. bottom-centre) AND stretch
 /// on either/both axes so a element spanning zones keeps the same RELATIVE
 /// width/height across aspect ratios. Stretch scales the size proportionally to
-/// the viewport; the anchor point decides which edge/centre stays put.
+/// the viewport; the anchor point decides which edge/centre keeps its
+/// percentage offset (from its own side of the axis) while the size is placed
+/// around it.
 ///
 /// `id`/`to` implement anchor-to-OBJECT: an element with `to == Some(id)` is
 /// laid out relative to the RESOLVED rect of the element whose `id` matches
@@ -619,10 +623,12 @@ pub(crate) fn zone_axis(pos: f32, size: f32, authored: f32) -> (AnchorAxis, bool
 }
 
 /// Re-anchor an overlay element from the size it was authored at to the current
-/// overlay viewport. Per axis, the anchor `point` (`Start`/`Center`/`End`) fixes
-/// which edge/centre stays put, and `stretch` decides whether the size scales
-/// proportionally with the viewport (keeping the same RELATIVE width/height) or
-/// stays a fixed physical size. `Auto` derives both from the element's span in
+/// overlay viewport. Per axis, the anchor `point` picks which of the element's
+/// start edge / centre / end edge keeps its position as a PERCENTAGE of the axis,
+/// measured from its own side (5% in from the right stays 5% in from the right
+/// on any width), and `stretch` decides whether the size scales proportionally
+/// with the viewport (keeping the same RELATIVE width/height) or stays the same
+/// size, placed around that point. `Auto` derives both from the element's span in
 /// the 3×3 zone grid (single zone → that zone, no stretch; spanning ≥2 zones →
 /// stretch). With `keep_aspect`, both axes scale by the smaller factor so a
 /// stretched element keeps its shape and re-centres.
@@ -648,17 +654,16 @@ pub(crate) fn resolve_anchored_rect(
             AnchorAxis::Auto => zone_axis(pos, size, authored),
             pt => (pt, stretch),
         };
+        let k = current / authored;
         // Stretch keeps the same relative size ⇒ scale the dimension by the
-        // viewport ratio. Otherwise the physical size is preserved (DPI).
-        let size_new = if st { size * (current / authored) } else { size };
+        // viewport ratio. Otherwise the size is preserved.
+        let size_new = if st { size * k } else { size };
+        // The anchor point keeps its offset from its own side as a fraction of
+        // the axis; the element is placed around it.
         let new_pos = match p {
-            AnchorAxis::Start => pos, // fixed near margin (physical px)
-            AnchorAxis::End => current - (authored - hi) - size_new, // fixed far margin
-            AnchorAxis::Center => {
-                // hold the centre at the same fraction of the axis.
-                let center_frac = (pos + size * 0.5) / authored;
-                center_frac * current - size_new * 0.5
-            }
+            AnchorAxis::Start => pos * k,
+            AnchorAxis::End => current - (authored - hi) * k - size_new,
+            AnchorAxis::Center => (pos + size * 0.5) * k - size_new * 0.5,
             AnchorAxis::Auto => unreachable!("resolved above"),
         };
         (new_pos, size_new.max(1.0), st)
@@ -829,6 +834,16 @@ pub struct UiSubPatch {
     /// Config-overlay counterpart to `overlay_items` (the M3 tweak-pins).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_items: Vec<LayoutItem>,
+    /// The overlay viewport size (`OverlayLayout::authored_size`) the positions
+    /// in `overlay_items` are expressed in. Without it a preset loaded on a tab
+    /// with no (or another) authored size can't re-anchor to the screen — its
+    /// right/bottom anchors silently act like top-left. `None` on legacy presets
+    /// ⇒ assumed to match the tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_authored_size: Option<[f32; 2]>,
+    /// `overlay_authored_size` for `config_items`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_authored_size: Option<[f32; 2]>,
     /// Legacy fields, read only — drained into `items` on first frame, then
     /// never written back (skip_serializing_if).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1053,21 +1068,23 @@ pub fn attribute_overlays_into_subpatches(
         if let Some(subp) = snarl.get_node_mut(id).and_then(|n| n.subpatch.as_mut()) {
             subp.overlay_items.clear();
             subp.config_items.clear();
+            subp.overlay_authored_size = None;
+            subp.config_authored_size = None;
         }
     }
-    attribute_layout_into_subpatches(snarl, &mut overlay.items, false);
-    attribute_layout_into_subpatches(snarl, &mut config.items, true);
+    attribute_layout_into_subpatches(snarl, overlay, false);
+    attribute_layout_into_subpatches(snarl, config, true);
 }
 
 fn attribute_layout_into_subpatches(
     snarl: &mut Snarl<NodeData>,
-    items: &mut Vec<LayoutItem>,
+    layout: &mut OverlayLayout,
     into_config: bool,
 ) {
-    let owners = layout_item_owners(snarl, items);
-    for (item, owner) in std::mem::take(items).into_iter().zip(owners) {
+    let owners = layout_item_owners(snarl, &layout.items);
+    for (item, owner) in std::mem::take(&mut layout.items).into_iter().zip(owners) {
         match owner {
-            ItemOwner::Tab => items.push(item),
+            ItemOwner::Tab => layout.items.push(item),
             ItemOwner::Orphan => {}
             ItemOwner::SubPatch(sp) => {
                 let Some(subp) = snarl
@@ -1076,8 +1093,13 @@ fn attribute_layout_into_subpatches(
                 else {
                     continue;
                 };
-                let dst = if into_config { &mut subp.config_items } else { &mut subp.overlay_items };
+                let (dst, size) = if into_config {
+                    (&mut subp.config_items, &mut subp.config_authored_size)
+                } else {
+                    (&mut subp.overlay_items, &mut subp.overlay_authored_size)
+                };
                 dst.push(with_source_path(item, Vec::new()));
+                *size = layout.authored_size;
             }
         }
     }
@@ -1085,11 +1107,13 @@ fn attribute_layout_into_subpatches(
 
 /// LOAD side: for each first-level sub-patch node, append its stored
 /// `overlay_items` / `config_items` onto the tab's `overlay` / `config` (pins get
-/// `source_path` = that node's id), in their stored paint order. Items already
-/// on the tab are not doubled (pins by `(source_path, inner_node_id,
-/// element_id)`, decorations by value), so re-materializing — or loading a
-/// preset already present — is idempotent. Link ids that collide with ids
-/// already on the tab are renumbered, followers included.
+/// `source_path` = that node's id), in their stored paint order. Items authored
+/// at a different overlay size than the tab's are re-anchored into the tab's
+/// size first (a tab with none adopts theirs). Items already on the tab are not
+/// doubled (pins by `(source_path, inner_node_id, element_id)`, decorations by
+/// value), so re-materializing — or loading a preset already present — is
+/// idempotent. Link ids that collide with ids already on the tab are
+/// renumbered, followers included.
 pub fn materialize_subpatch_overlays(
     snarl: &Snarl<NodeData>,
     overlay: &mut OverlayLayout,
@@ -1097,8 +1121,25 @@ pub fn materialize_subpatch_overlays(
 ) {
     for (node_id, n) in snarl.nodes_ids_data() {
         let Some(subp) = n.value.subpatch.as_ref() else { continue };
-        materialize_layout(&subp.overlay_items, &mut overlay.items, node_id.0);
-        materialize_layout(&subp.config_items, &mut config.items, node_id.0);
+        materialize_layout(&subp.overlay_items, subp.overlay_authored_size, overlay, node_id.0);
+        materialize_layout(&subp.config_items, subp.config_authored_size, config, node_id.0);
+    }
+}
+
+/// Re-anchor every item from the overlay size `from` to `to`, baking the
+/// resolved rects/decorations back into the items. All items resolve against
+/// the same pre-bake snapshot, so anchor-to followers see un-baked targets.
+pub(crate) fn reanchor_layout_items(items: &mut [LayoutItem], from: [f32; 2], to: [f32; 2]) {
+    let snap = items.to_vec();
+    for (i, item) in items.iter_mut().enumerate() {
+        match item {
+            LayoutItem::Module(m) => {
+                let (p, s) = resolve_layout_rect(&snap, i, from, to);
+                m.pos = p;
+                m.size = s;
+            }
+            LayoutItem::Deco(d) => *d = resolve_layout_deco(&snap, i, from, to),
+        }
     }
 }
 
@@ -1131,6 +1172,8 @@ pub fn subpatch_with_overlays(
     let mut sp = (**snarl.get_node(egui_snarl::NodeId(sp_id))?.subpatch.as_ref()?).clone();
     sp.overlay_items = collect_layout_for(snarl, sp_id, &overlay.items);
     sp.config_items = collect_layout_for(snarl, sp_id, &config.items);
+    sp.overlay_authored_size = overlay.authored_size.filter(|_| !sp.overlay_items.is_empty());
+    sp.config_authored_size = config.authored_size.filter(|_| !sp.config_items.is_empty());
     Some(sp)
 }
 
@@ -1178,21 +1221,40 @@ fn same_layout_item(a: &LayoutItem, b: &LayoutItem) -> bool {
     }
 }
 
-fn materialize_layout(src: &[LayoutItem], dst: &mut Vec<LayoutItem>, sp: usize) {
+fn materialize_layout(
+    src: &[LayoutItem],
+    src_size: Option<[f32; 2]>,
+    layout: &mut OverlayLayout,
+    sp: usize,
+) {
+    if src.is_empty() {
+        return;
+    }
+    let mut batch: Vec<LayoutItem> =
+        src.iter().map(|it| with_source_path(it.clone(), vec![sp])).collect();
+    // Bring the batch into the tab layout's authored space. A legacy preset with
+    // no recorded size is taken to match the tab.
+    match (src_size, layout.authored_size) {
+        (Some(from), Some(to)) if (from[0] - to[0]).abs() > 0.5 || (from[1] - to[1]).abs() > 0.5 => {
+            reanchor_layout_items(&mut batch, from, to);
+        }
+        (Some(from), None) => layout.authored_size = Some(from),
+        _ => {}
+    }
+    let dst = &mut layout.items;
     let existing = dst.len();
     let taken: std::collections::HashSet<u64> =
         dst.iter().map(|it| it.anchor().id).filter(|&id| id != 0).collect();
     let mut next = taken
         .iter()
         .copied()
-        .chain(src.iter().map(|it| it.anchor().id))
+        .chain(batch.iter().map(|it| it.anchor().id))
         .max()
         .unwrap_or(0)
         + 1;
     // Batch link id → the id it ends up with on the tab (changed ones only).
     let mut remap: HashMap<u64, u64> = HashMap::new();
-    for item in src {
-        let item = with_source_path(item.clone(), vec![sp]);
+    for item in batch {
         let id = item.anchor().id;
         if let Some(j) = dst[..existing].iter().position(|e| same_layout_item(e, &item)) {
             // Already on the tab: point this batch's followers at that copy.
@@ -1250,6 +1312,8 @@ impl Default for UiSubPatch {
             items: vec![],
             overlay_items: vec![],
             config_items: vec![],
+            overlay_authored_size: None,
+            config_authored_size: None,
             exposed_modules: vec![],
             decorations: vec![],
             snap_enabled: false,
@@ -1308,19 +1372,32 @@ mod tests {
     }
 
     #[test]
-    fn anchor_left_keeps_margin() {
-        // Left third (authored width 900 → thirds at 300): stays put, same size.
+    fn anchor_left_keeps_margin_percent() {
+        // Left third (authored width 900 → thirds at 300): the left offset stays
+        // 20/900 of the width (→ 40 at 1800), same size.
         let (p, s) = anchor([20.0, 20.0], [80.0, 40.0], [900.0, 300.0], [1800.0, 600.0]);
-        assert!((p[0] - 20.0).abs() < 0.5, "x {}", p[0]);
+        assert!((p[0] - 40.0).abs() < 0.5, "x {}", p[0]);
         assert!((s[0] - 80.0).abs() < 0.5, "w {}", s[0]);
     }
 
     #[test]
-    fn anchor_right_keeps_margin() {
-        // Right third: right margin (900-(800+80)=20) preserved on a wider screen.
+    fn anchor_right_keeps_margin_percent() {
+        // Right third: the right margin (900-(800+80)=20, i.e. 2.2%) stays 2.2%
+        // of a wider screen (→ 40), same size.
         let (p, s) = anchor([800.0, 20.0], [80.0, 40.0], [900.0, 300.0], [1800.0, 300.0]);
-        assert!((p[0] - (1800.0 - 20.0 - 80.0)).abs() < 0.5, "x {}", p[0]);
+        assert!((p[0] - (1800.0 - 40.0 - 80.0)).abs() < 0.5, "x {}", p[0]);
         assert!((s[0] - 80.0).abs() < 0.5, "w {}", s[0]);
+    }
+
+    #[test]
+    fn anchor_right_margin_percent_across_aspect_ratios() {
+        // 5% in from the right of a 16:9 width stays 5% on 21:9 and 4:3.
+        for current_w in [2560.0f32, 1440.0] {
+            let (p, s) = anchor([1728.0, 20.0], [96.0, 40.0], [1920.0, 1080.0], [current_w, 1080.0]);
+            let right_margin = current_w - (p[0] + s[0]);
+            assert!((right_margin / current_w - 0.05).abs() < 1e-3, "margin {right_margin} at {current_w}");
+            assert!((s[0] - 96.0).abs() < 0.5, "w {}", s[0]);
+        }
     }
 
     #[test]
@@ -1431,31 +1508,32 @@ mod tests {
     #[test]
     fn anchor_explicit_end_overrides_left_placement() {
         // An element sitting in the LEFT third but anchored End tracks the right
-        // edge (fixed right margin), not the left — proving explicit beats zone.
+        // edge (its right margin as a % of the width), not the left — proving
+        // explicit beats zone.
         let (p, _) = resolve_anchored_rect(
             [20.0, 20.0], [80.0, 40.0], [900.0, 300.0], [1800.0, 300.0], false,
             Anchor { x: AnchorAxis::End, y: AnchorAxis::Auto, ..Default::default() },
         );
-        let right_margin = 900.0 - (20.0 + 80.0); // 800
+        let right_margin = (900.0 - (20.0 + 80.0)) * 2.0; // 800 of 900 → 1600 of 1800
         assert!((p[0] - (1800.0 - right_margin - 80.0)).abs() < 0.5, "x {}", p[0]);
     }
 
     #[test]
     fn anchor_point_and_stretch_are_independent() {
-        // Left-anchored (fixed near margin) AND stretched: the left margin stays
-        // put while the width scales proportionally — the two are orthogonal.
+        // Left-anchored AND stretched: the left edge keeps its % offset while the
+        // width scales proportionally — the two are orthogonal.
         let (p, s) = resolve_anchored_rect(
             [20.0, 20.0], [80.0, 40.0], [900.0, 300.0], [1800.0, 300.0], false,
             Anchor { x: AnchorAxis::Start, stretch_x: true, y: AnchorAxis::Auto, ..Default::default() },
         );
-        assert!((p[0] - 20.0).abs() < 0.5, "x {}", p[0]);      // near margin fixed
+        assert!((p[0] - 40.0).abs() < 0.5, "x {}", p[0]);      // 20/900 → 40/1800
         assert!((s[0] - 160.0).abs() < 0.5, "w {}", s[0]);      // 80 * (1800/900) = 160
     }
 
     #[test]
     fn anchor_bottom_center_stretch_x() {
         // The case the picker must express: anchored bottom-centre, stretched
-        // horizontally — centred X with proportional width, bottom margin fixed.
+        // horizontally — centred X with proportional width, bottom margin kept.
         let (p, s) = resolve_anchored_rect(
             [450.0, 250.0], [300.0, 40.0], [1200.0, 300.0], [2400.0, 300.0], false,
             Anchor { x: AnchorAxis::Center, stretch_x: true, y: AnchorAxis::End, ..Default::default() },
@@ -1485,10 +1563,10 @@ mod tests {
             Anchor { x: AnchorAxis::End, to: Some(1), ..Default::default() },
         );
         let items = vec![target, follower];
-        // Screen doubles in width: target right edge 1000→2000, so the follower's
-        // 50px right margin inside the frame is preserved → x = 1900.
+        // Screen doubles in width: the target frame goes 1000→2000 wide, so the
+        // follower's right margin inside it stays 5% (50 → 100) → x = 1850.
         let (p, s) = resolve_layout_rect(&items, 1, [1000.0, 1000.0], [2000.0, 1000.0]);
-        assert!((p[0] - 1900.0).abs() < 0.5, "x {}", p[0]);
+        assert!((p[0] - 1850.0).abs() < 0.5, "x {}", p[0]);
         assert!((p[1] - 10.0).abs() < 0.5, "y {}", p[1]);
         assert!((s[0] - 50.0).abs() < 0.5 && (s[1] - 50.0).abs() < 0.5, "size {:?}", s);
     }
@@ -1502,7 +1580,7 @@ mod tests {
         );
         let items = vec![follower];
         let (p, _) = resolve_layout_rect(&items, 0, [900.0, 300.0], [1800.0, 300.0]);
-        assert!((p[0] - 20.0).abs() < 0.5, "x {}", p[0]); // Start keeps left margin
+        assert!((p[0] - 40.0).abs() < 0.5, "x {}", p[0]); // Start keeps left margin in %
     }
 
     #[test]
@@ -1750,5 +1828,62 @@ mod tests {
         remove_subpatch_overlays(&snarl, sp, &mut overlay, &mut config);
         assert_eq!(overlay.items.len(), 2);
         assert!(config.items.is_empty());
+    }
+    #[test]
+    fn preset_overlays_carry_authored_size_and_reanchor_on_load() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let sp = snarl.insert_node(eframe::egui::pos2(0.0, 0.0), subpatch_node()).0;
+
+        // Authored at 1000×500: a top-RIGHT deco (explicit End/Start) and a
+        // top-left pin.
+        let mut right = deco(900.0);
+        let mut a = right.anchor();
+        a.x = AnchorAxis::End;
+        a.y = AnchorAxis::Start;
+        right.set_anchor(a);
+        let mut config = OverlayLayout::default();
+        config.authored_size = Some([1000.0, 500.0]);
+        config.items.push(right);
+        config.items.push(overlay_pin(9, vec![sp]));
+        let overlay = OverlayLayout::default();
+
+        let baked = subpatch_with_overlays(&snarl, sp, &overlay, &config).unwrap();
+        assert_eq!(baked.config_authored_size, Some([1000.0, 500.0]));
+        assert_eq!(baked.overlay_authored_size, None); // no overlay items
+        snarl.get_node_mut(egui_snarl::NodeId(sp)).unwrap().subpatch = Some(Box::new(baked));
+
+        // Loaded on a tab authored at 2000×1000: the right deco keeps its right
+        // margin at 6% (60 → 120) instead of staying at x=900; the pin its left.
+        let mut o2 = OverlayLayout::default();
+        let mut c2 = OverlayLayout { authored_size: Some([2000.0, 1000.0]), ..Default::default() };
+        materialize_subpatch_overlays(&snarl, &mut o2, &mut c2);
+        assert_eq!(deco_x(&c2.items[0]), Some(1840.0));
+        assert!(matches!(&c2.items[1], LayoutItem::Module(m) if m.pos[0] == 0.0));
+        assert_eq!(c2.authored_size, Some([2000.0, 1000.0]));
+
+        // A tab with no authored size adopts the preset's, positions as stored.
+        let mut o3 = OverlayLayout::default();
+        let mut c3 = OverlayLayout::default();
+        materialize_subpatch_overlays(&snarl, &mut o3, &mut c3);
+        assert_eq!(c3.authored_size, Some([1000.0, 500.0]));
+        assert_eq!(deco_x(&c3.items[0]), Some(900.0));
+        assert!(o3.authored_size.is_none());
+    }
+
+    #[test]
+    fn workspace_attribution_records_the_tab_authored_size() {
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let sp = snarl.insert_node(eframe::egui::pos2(0.0, 0.0), subpatch_node()).0;
+        let mut overlay = OverlayLayout::default();
+        let mut config = OverlayLayout { authored_size: Some([1600.0, 900.0]), ..Default::default() };
+        config.items.push(overlay_pin(9, vec![sp]));
+        attribute_overlays_into_subpatches(&mut snarl, &mut overlay, &mut config);
+        let subp = snarl.get_node(egui_snarl::NodeId(sp)).unwrap().subpatch.as_ref().unwrap();
+        assert_eq!(subp.config_authored_size, Some([1600.0, 900.0]));
+        assert_eq!(subp.overlay_authored_size, None);
+
+        // Same size on reload ⇒ no re-anchoring.
+        materialize_subpatch_overlays(&snarl, &mut overlay, &mut config);
+        assert!(matches!(&config.items[0], LayoutItem::Module(m) if m.pos == [0.0, 0.0]));
     }
 }

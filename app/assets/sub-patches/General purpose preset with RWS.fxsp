@@ -40,10 +40,19 @@
               }
             ],
             "params": {
+              "grid_y": 4,
+              "show_scaled_grid": true,
               "in_max": 1.0,
+              "biases": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
               "scale_t": -0.7604460716247559,
-              "trail_ms": 300,
-              "snap": false,
+              "grid_x": 4,
+              "out_max": 1.0,
               "points": [
                 [
                   0.0,
@@ -70,18 +79,9 @@
                   1.0
                 ]
               ],
-              "grid_x": 4,
-              "show_scaled_grid": true,
+              "trail_ms": 300,
               "show_grid_labels": true,
-              "biases": [
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0
-              ],
-              "grid_y": 4,
-              "out_max": 1.0
+              "snap": false
             }
           },
           "pos": {
@@ -148,9 +148,9 @@
             ],
             "params": {
               "mappings": [],
+              "draft_input": [],
               "_pressed_prev": [],
-              "ui_phase": "capturing",
-              "draft_input": []
+              "ui_phase": "capturing"
             }
           },
           "pos": {
@@ -237,17 +237,11 @@
               }
             ],
             "params": {
-              "biases": [
-                0.0
-              ],
-              "snap": false,
+              "out_max": 1.0,
+              "in_max": 1.0,
+              "show_grid_labels": true,
               "show_scaled_grid": true,
               "grid_y": 4,
-              "in_max": 1.0,
-              "out_max": 1.0,
-              "trail_ms": 300,
-              "show_grid_labels": true,
-              "grid_x": 4,
               "points": [
                 [
                   0.0,
@@ -258,7 +252,13 @@
                   1.0
                 ]
               ],
-              "scale_t": 0.0
+              "scale_t": 0.0,
+              "trail_ms": 300,
+              "snap": false,
+              "biases": [
+                0.0
+              ],
+              "grid_x": 4
             }
           },
           "pos": {
@@ -287,18 +287,7 @@
               }
             ],
             "params": {
-              "out_max": 1.0,
-              "grid_x": 4,
-              "grid_y": 4,
-              "show_scaled_grid": true,
               "snap": false,
-              "biases": [
-                -0.03879748284816742,
-                0.0
-              ],
-              "trail_ms": 300,
-              "in_max": 1.0,
-              "scale_t": -0.5137927532196045,
               "points": [
                 [
                   0.0,
@@ -313,7 +302,18 @@
                   1.0
                 ]
               ],
-              "show_grid_labels": true
+              "grid_x": 4,
+              "show_scaled_grid": true,
+              "grid_y": 4,
+              "out_max": 1.0,
+              "show_grid_labels": true,
+              "trail_ms": 300,
+              "in_max": 1.0,
+              "scale_t": -0.5137927532196045,
+              "biases": [
+                -0.03879748284816742,
+                0.0
+              ]
             }
           },
           "pos": {
@@ -439,22 +439,22 @@
               }
             ],
             "params": {
-              "orient_scale": 1.0,
-              "inv_accel_z": false,
+              "orient_auto_recenter": true,
+              "inv_pitch": false,
+              "axis": "player",
+              "orient_recenter_thresh": 0.004999999888241291,
               "lean_threshold": 0.30000001192092896,
+              "inv_accel_y": false,
+              "inv_yaw": false,
+              "recenter_strength": 0.0,
+              "orient_scale": 1.0,
+              "steering_exclude_y": false,
               "inv_roll": false,
               "reset_ease_in": 0.25,
-              "family": "pointer",
-              "inv_accel_y": false,
-              "orient_recenter_thresh": 0.004999999888241291,
-              "inv_yaw": false,
-              "axis": "player",
+              "inv_accel_z": false,
               "orient_drift": 0.0,
-              "steering_exclude_y": false,
-              "inv_pitch": false,
-              "orient_auto_recenter": true,
               "inv_accel_x": false,
-              "recenter_strength": 0.0
+              "family": "pointer"
             }
           },
           "pos": {
@@ -566,28 +566,28 @@
               }
             ],
             "params": {
-              "inv_accel_z": false,
-              "reset_ease_in": 0.10000000149011612,
-              "_lean_left_pressed_prev": [],
-              "_lean_right_phase": "idle",
-              "lean_threshold": 0.20000000298023224,
-              "family": "pointer",
-              "spike_suppress": true,
-              "inv_yaw": false,
-              "_lean_left_draft": [],
-              "axis": "player",
-              "steering_exclude_y": false,
-              "inv_accel_y": false,
               "inv_pitch": false,
-              "spike_sensitivity": 100.0,
-              "inv_roll": false,
-              "inv_accel_x": false,
-              "_lean_right_pressed_prev": [],
-              "_lean_left_phase": "idle",
-              "lean_right": [],
               "lean_left": [],
+              "lean_threshold": 0.20000000298023224,
+              "steering_exclude_y": false,
               "_lean_right_draft": [],
-              "recenter_strength": 0.0
+              "_lean_right_phase": "idle",
+              "recenter_strength": 0.0,
+              "reset_ease_in": 0.10000000149011612,
+              "spike_suppress": true,
+              "spike_sensitivity": 100.0,
+              "inv_yaw": false,
+              "inv_accel_z": false,
+              "inv_roll": false,
+              "axis": "player",
+              "_lean_left_pressed_prev": [],
+              "_lean_left_draft": [],
+              "lean_right": [],
+              "_lean_left_phase": "idle",
+              "inv_accel_x": false,
+              "inv_accel_y": false,
+              "family": "pointer",
+              "_lean_right_pressed_prev": []
             }
           },
           "pos": {
@@ -773,8 +773,8 @@
               }
             ],
             "params": {
-              "signal_type": "AutoMap",
-              "pin_index": 0
+              "pin_index": 0,
+              "signal_type": "AutoMap"
             }
           },
           "pos": {
@@ -797,8 +797,8 @@
             ],
             "outputs": [],
             "params": {
-              "pin_index": 0,
-              "signal_type": "AutoMap"
+              "signal_type": "AutoMap",
+              "pin_index": 0
             }
           },
           "pos": {
@@ -868,13 +868,13 @@
               }
             ],
             "params": {
-              "selected_index": 1,
               "options": [
                 "Hold to Activate",
                 "Hold to Suppress",
                 "Toggle"
               ],
-              "box_width": 161.375
+              "box_width": 161.375,
+              "selected_index": 1
             }
           },
           "pos": {
@@ -1039,10 +1039,10 @@
               }
             ],
             "params": {
-              "caption_on": "on",
               "ui_toggle_seq": 12,
+              "active": true,
               "caption_off": "off",
-              "active": true
+              "caption_on": "on"
             }
           },
           "pos": {
@@ -1131,10 +1131,10 @@
             ],
             "params": {
               "draft_output": [],
-              "_pressed_prev": [],
               "mappings": [],
-              "draft_input": [],
-              "ui_phase": "capturing"
+              "ui_phase": "capturing",
+              "_pressed_prev": [],
+              "draft_input": []
             }
           },
           "pos": {
@@ -1168,9 +1168,9 @@
               }
             ],
             "params": {
-              "active": false,
-              "caption_pos_on": "right",
               "svg_on_rev": 2,
+              "caption_pos_on": "right",
+              "active": false,
               "caption_on": ""
             }
           },
@@ -1210,12 +1210,12 @@
               }
             ],
             "params": {
+              "rws": 3.0,
               "scale_unit": "deg",
               "flick_enabled": false,
               "field_mode": "both",
-              "suppress_source": "deadzone",
               "stick_aim_enabled": true,
-              "rws": 3.0,
+              "suppress_source": "deadzone",
               "field_bg_alpha": 0.09000000357627869
             }
           },
@@ -1239,8 +1239,8 @@
               }
             ],
             "params": {
-              "pin_index": 1,
-              "signal_type": "AutoMap"
+              "signal_type": "AutoMap",
+              "pin_index": 1
             }
           },
           "pos": {
@@ -1274,10 +1274,10 @@
               }
             ],
             "params": {
-              "mappings": [],
-              "ui_phase": "capturing",
               "_pressed_prev": [],
-              "draft_input": []
+              "mappings": [],
+              "draft_input": [],
+              "ui_phase": "capturing"
             }
           },
           "pos": {
@@ -1379,13 +1379,13 @@
               }
             ],
             "params": {
+              "selected_index": 1,
               "options": [
                 "Gyro disabled",
                 "Gyro to Mouse",
                 "Gyro to R Stick",
                 "Gyro to L Stick"
-              ],
-              "selected_index": 1
+              ]
             }
           },
           "pos": {
@@ -1472,131 +1472,31 @@
       "wires": [
         {
           "out_pin": {
-            "node": 37,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 3
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
+            "node": 6,
             "output": 0
           },
           "in_pin": {
-            "node": 8,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 11,
-            "output": 5
-          },
-          "in_pin": {
-            "node": 36,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 32,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 18,
-            "input": 3
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 11,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 29,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 0,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 7,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
             "node": 33,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 7,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 40,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 4
-          }
-        },
-        {
-          "out_pin": {
-            "node": 9,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 4,
             "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 33,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 41,
-            "input": 2
           }
         },
         {
           "out_pin": {
             "node": 14,
-            "output": 2
+            "output": 1
           },
           "in_pin": {
-            "node": 5,
+            "node": 6,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 28,
             "input": 0
           }
         },
@@ -1612,71 +1512,21 @@
         },
         {
           "out_pin": {
-            "node": 24,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 7
-          }
-        },
-        {
-          "out_pin": {
-            "node": 18,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 29,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 2,
+            "node": 28,
             "output": 0
           },
           "in_pin": {
             "node": 18,
-            "input": 1
+            "input": 2
           }
         },
         {
           "out_pin": {
-            "node": 0,
+            "node": 27,
             "output": 0
           },
           "in_pin": {
-            "node": 33,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 5,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 41,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 7,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 12,
-            "input": 3
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 2,
+            "node": 40,
             "input": 0
           }
         },
@@ -1692,42 +1542,22 @@
         },
         {
           "out_pin": {
-            "node": 27,
+            "node": 1,
             "output": 0
           },
           "in_pin": {
-            "node": 40,
-            "input": 0
+            "node": 24,
+            "input": 1
           }
         },
         {
           "out_pin": {
-            "node": 41,
+            "node": 24,
             "output": 0
           },
           "in_pin": {
             "node": 13,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 25,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 26,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 26,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 7,
-            "input": 1
+            "input": 7
           }
         },
         {
@@ -1742,6 +1572,46 @@
         },
         {
           "out_pin": {
+            "node": 11,
+            "output": 5
+          },
+          "in_pin": {
+            "node": 36,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 33,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 41,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 39,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 4,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 32,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
             "node": 8,
             "output": 5
           },
@@ -1752,12 +1622,72 @@
         },
         {
           "out_pin": {
-            "node": 39,
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 7,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 27,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 37,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 33,
             "output": 1
           },
           "in_pin": {
-            "node": 26,
+            "node": 7,
             "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 4
+          },
+          "in_pin": {
+            "node": 40,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 32,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 2,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 18,
+            "input": 1
           }
         },
         {
@@ -1776,38 +1706,28 @@
             "output": 0
           },
           "in_pin": {
-            "node": 22,
+            "node": 3,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 27,
+            "node": 22,
             "output": 0
           },
           "in_pin": {
-            "node": 37,
+            "node": 2,
             "input": 0
           }
         },
         {
           "out_pin": {
-            "node": 15,
+            "node": 34,
             "output": 0
           },
           "in_pin": {
             "node": 22,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 41,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 12,
-            "input": 2
+            "input": 0
           }
         },
         {
@@ -1822,71 +1742,31 @@
         },
         {
           "out_pin": {
-            "node": 36,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 16,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 14,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 6,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 39,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 1,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 28,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 18,
-            "input": 2
-          }
-        },
-        {
-          "out_pin": {
-            "node": 37,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 13,
-            "input": 6
-          }
-        },
-        {
-          "out_pin": {
-            "node": 34,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 3,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
             "node": 23,
             "output": 0
           },
           "in_pin": {
             "node": 1,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 30,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 9,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 4,
             "input": 1
           }
         },
@@ -1902,46 +1782,6 @@
         },
         {
           "out_pin": {
-            "node": 14,
-            "output": 3
-          },
-          "in_pin": {
-            "node": 37,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 14,
-            "output": 4
-          },
-          "in_pin": {
-            "node": 40,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 22,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 30,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 30,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 36,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
             "node": 22,
             "output": 0
           },
@@ -1952,11 +1792,171 @@
         },
         {
           "out_pin": {
+            "node": 0,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 33,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 39,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 26,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 26,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 7,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 25,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 26,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 18,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 29,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 39,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 1,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 7,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 37,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 6
+          }
+        },
+        {
+          "out_pin": {
             "node": 6,
             "output": 0
           },
           "in_pin": {
             "node": 12,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 8,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 37,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 3
+          }
+        },
+        {
+          "out_pin": {
+            "node": 35,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 11,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 2
+          },
+          "in_pin": {
+            "node": 5,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 5,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 41,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 15,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 22,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 14,
+            "output": 3
+          },
+          "in_pin": {
+            "node": 37,
+            "input": 1
+          }
+        },
+        {
+          "out_pin": {
+            "node": 22,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 11,
             "input": 0
           }
         },
@@ -1972,31 +1972,61 @@
         },
         {
           "out_pin": {
-            "node": 35,
+            "node": 41,
             "output": 0
           },
           "in_pin": {
-            "node": 11,
+            "node": 13,
             "input": 1
           }
         },
         {
           "out_pin": {
-            "node": 6,
+            "node": 36,
             "output": 0
           },
           "in_pin": {
-            "node": 33,
+            "node": 16,
+            "input": 0
+          }
+        },
+        {
+          "out_pin": {
+            "node": 40,
+            "output": 1
+          },
+          "in_pin": {
+            "node": 13,
+            "input": 4
+          }
+        },
+        {
+          "out_pin": {
+            "node": 41,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 12,
+            "input": 2
+          }
+        },
+        {
+          "out_pin": {
+            "node": 30,
+            "output": 0
+          },
+          "in_pin": {
+            "node": 36,
             "input": 1
           }
         },
         {
           "out_pin": {
-            "node": 2,
+            "node": 29,
             "output": 0
           },
           "in_pin": {
-            "node": 28,
+            "node": 0,
             "input": 0
           }
         },
@@ -2008,36 +2038,6 @@
           "in_pin": {
             "node": 14,
             "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 2,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 32,
-            "input": 1
-          }
-        },
-        {
-          "out_pin": {
-            "node": 39,
-            "output": 1
-          },
-          "in_pin": {
-            "node": 4,
-            "input": 0
-          }
-        },
-        {
-          "out_pin": {
-            "node": 1,
-            "output": 0
-          },
-          "in_pin": {
-            "node": 24,
-            "input": 1
           }
         }
       ]
@@ -3933,6 +3933,14 @@
           }
         }
       }
+    ],
+    "overlay_authored_size": [
+      1462.8438,
+      914.28125
+    ],
+    "config_authored_size": [
+      1462.8438,
+      914.28125
     ],
     "snap_enabled": true,
     "snap_grid_px": 4

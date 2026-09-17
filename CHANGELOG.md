@@ -21,6 +21,24 @@ All notable changes to FlexInput are documented here. This project adheres to
   stored at its last load. A preset saved before this fix can't recover its
   decorations; re-save it from a tab that still shows them.
 
+- **Sub-patch presets re-anchor their overlays on another screen size.** Overlay
+  positions are stored at the size the layout was edited at, but a `.fxsp` never
+  recorded that size, so a preset loaded into a tab without one (or with a
+  different one) couldn't re-anchor: right- and bottom-anchored pins and
+  decorations stayed where they were authored relative to the top-left, as if the
+  whole layout had just shrunk or grown. Presets now record the size alongside
+  their overlay items; on load they're re-anchored into the tab's layout size,
+  and a tab without one adopts the preset's. Presets saved before this fix still
+  load as before — re-save them to include the size.
+
+- **Overlay anchors keep their offset as a percentage.** An element anchored to
+  a side kept a fixed distance from that edge in UI points, so on a wider or
+  narrower screen it drifted relative to the layout around it. The anchored
+  edge (or centre) now keeps its offset as a percentage of the screen — or of
+  the target element, when anchored to one — measured from its own side: a
+  widget 5% in from the right edge stays 5% in on any resolution or aspect
+  ratio. Size is unchanged unless Stretch is on.
+
 ## [0.14.0] - 2026-09-16
 
 ### Added

@@ -113,27 +113,7 @@ pub(crate) fn show_overlay_body(
     if edit {
         if let Some(a) = overlay.authored_size {
             if (a[0] - cur[0]).abs() > 0.5 || (a[1] - cur[1]).abs() > 0.5 {
-                // Resolve every item against the SAME pre-bake snapshot (so
-                // anchor-to followers see un-baked target rects), then write the
-                // results back — order-independent.
-                let snap = overlay.items.clone();
-                for i in 0..snap.len() {
-                    match &snap[i] {
-                        LayoutItem::Module(_) => {
-                            let (p, s) = resolve_layout_rect(&snap, i, a, cur);
-                            if let Some(LayoutItem::Module(m)) = overlay.items.get_mut(i) {
-                                m.pos = p;
-                                m.size = s;
-                            }
-                        }
-                        LayoutItem::Deco(_) => {
-                            let nd = resolve_layout_deco(&snap, i, a, cur);
-                            if let Some(LayoutItem::Deco(d)) = overlay.items.get_mut(i) {
-                                *d = nd;
-                            }
-                        }
-                    }
-                }
+                crate::canvas::node::reanchor_layout_items(&mut overlay.items, a, cur);
             }
         }
         overlay.authored_size = Some(cur);
