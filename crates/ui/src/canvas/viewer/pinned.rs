@@ -26,10 +26,9 @@ pub(crate) fn render_pinned_element(
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
     menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
 ) {
-    // Stable identity for this pin's natural-size cache: (outer node, inner
-    // node, element). Two pins of the same element share one entry, which is
-    // fine — they render identical content.
-    let ws_key = egui::Id::new(("pin_ws_nat", outer_id.0, inner_id.0, element_id));
+    // Stable identity for this pin's natural-size cache: (viewport, outer node,
+    // inner node, element) — see `pin_ws_nat_key` for why the viewport.
+    let ws_key = pin_ws_nat_key(ui.ctx(), outer_id.0, inner_id.0, element_id);
     ui.ctx().data_mut(|d| d.insert_temp(pin_ws_key_scratch(), ws_key));
 
     render_pinned_element_impl(
@@ -56,12 +55,7 @@ pub(crate) fn render_pinned_element(
             // Normalize back to scale 1.0, with any flexible-element stretch
             // removed so the cache holds the row's MINIMUM width.
             let nat = egui::vec2((measured.x - stretch).max(1.0), measured.y) / scale;
-            let prev: Option<egui::Vec2> = ui.ctx().data(|d| d.get_temp(ws_key));
-            // ~1px dead-band: font rasterization rounds a little differently
-            // at each scale; without it the fit oscillates while resizing.
-            if prev.map_or(true, |p| (p - nat).abs().max_elem() > 1.0) {
-                ui.ctx().data_mut(|d| d.insert_temp(ws_key, nat));
-            }
+            store_pin_natural(ui.ctx(), ws_key, container_size, nat);
         }
     }
 }

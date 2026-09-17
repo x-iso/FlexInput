@@ -39,6 +39,17 @@ All notable changes to FlexInput are documented here. This project adheres to
   widget 5% in from the right edge stays 5% in on any resolution or aspect
   ratio. Size is unchanged unless Stretch is on.
 
+- **Pinned widgets no longer flicker between two sizes.** A pinned row measures
+  its content to pick a text scale, and two things could keep that from ever
+  settling. The same element pinned both in a sub-patch body and on an overlay
+  shared one measurement, so the main window and the overlay — different frame
+  sizes, and on another monitor a different DPI — overwrote each other every
+  frame. And rows whose content reflows with the scale (the RWS calibration
+  widget's wrapping guide text, for one) measured differently at each scale,
+  flipping back and forth; snapping or re-anchoring a frame onto such a size made
+  it permanent. Measurements are now kept per window, and a measurement that
+  keeps alternating settles on the size where every layout fits.
+
 ## [0.14.0] - 2026-09-16
 
 ### Added

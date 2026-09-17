@@ -88,6 +88,66 @@ pub(crate) fn publish_nav_action_rects_scoped(ui: &egui::Ui, node_id: NodeId, sc
     }
 }
 
+/// Natural-size cache key for one pinned element in the CURRENT viewport. Scoped
+/// per viewport because ctx temp data is shared by all of them: the same element
+/// pinned in a sub-patch body (main window) and on an overlay renders into
+/// different frames — and, on another monitor, at a different DPI — so a shared
+/// entry gets overwritten by the other host every frame and both pins flicker
+/// between two scales.
+pub(crate) fn pin_ws_nat_key(ctx: &egui::Context, outer: usize, inner: usize, element: &str) -> egui::Id {
+    egui::Id::new(("pin_ws_nat", ctx.viewport_id(), outer, inner, element))
+}
+
+/// Recent post-render measurements of one pin: `(pass, container, natural)`.
+#[derive(Clone, Default)]
+struct PinNaturalHistory(Vec<(u64, egui::Vec2, egui::Vec2)>);
+
+/// Cache a pin's freshly measured natural size (`nat`, normalized to scale 1.0)
+/// for the next frame's `apply_widget_scale`, damping limit cycles.
+///
+/// Content that reflows with its scale — wrapping text, fixed-size parts that
+/// don't scale — can measure differently at each scale it is rendered at, so
+/// A implies a scale whose measurement is B and B implies A: the pin flickers
+/// between two sizes forever. When a measurement returns to one taken a few
+/// frames ago in the same frame size, it is such a cycle; settle on the
+/// cycle's natural with the SMALLEST scale, which every layout in the cycle
+/// fits. A genuinely new measurement (content changed) still replaces it.
+pub(crate) fn store_pin_natural(ctx: &egui::Context, key: egui::Id, container: egui::Vec2, nat: egui::Vec2) {
+    // ~1px dead-band: font rasterization rounds a little differently at each
+    // scale; without it the fit oscillates while resizing.
+    const DEAD_BAND: f32 = 1.0;
+    // How many passes back a repeat still counts as a cycle (a real content
+    // change back and forth is far slower than this).
+    const CYCLE_WINDOW: u64 = 8;
+    let near = |a: egui::Vec2, b: egui::Vec2, tol: f32| (a - b).abs().max_elem() <= tol;
+    let scale_for = |n: egui::Vec2| (container.y / n.y.max(1.0)).min(container.x / n.x.max(1.0));
+
+    let pass = ctx.cumulative_pass_nr();
+    let hist_key = key.with("hist");
+    let prev: Option<egui::Vec2> = ctx.data(|d| d.get_temp(key));
+    let mut hist: PinNaturalHistory = ctx.data(|d| d.get_temp(hist_key)).unwrap_or_default();
+    hist.0.retain(|(p, c, _)| pass.saturating_sub(*p) <= CYCLE_WINDOW && near(*c, container, 0.5));
+
+    if prev.map_or(true, |p| !near(p, nat, DEAD_BAND)) {
+        let cycling = hist.0.iter().any(|(_, _, n)| near(*n, nat, DEAD_BAND));
+        let chosen = if cycling {
+            hist.0.iter().map(|e| e.2).chain([nat]).chain(prev)
+                .min_by(|a, b| scale_for(*a).total_cmp(&scale_for(*b)))
+                .unwrap_or(nat)
+        } else {
+            nat
+        };
+        if prev.map_or(true, |p| !near(p, chosen, DEAD_BAND)) {
+            ctx.data_mut(|d| d.insert_temp(key, chosen));
+        }
+    }
+    hist.0.push((pass, container, nat));
+    if hist.0.len() > 8 {
+        hist.0.remove(0);
+    }
+    ctx.data_mut(|d| d.insert_temp(hist_key, hist));
+}
+
 /// Ctx-data scratch: the natural-size cache key of the pin currently being
 /// rendered. Set by `render_pinned_element` before dispatch, read here so the
 /// measured content size (cached under that key) replaces the caller's guess.
@@ -162,4 +222,43 @@ pub(crate) fn apply_widget_scale(ui: &mut egui::Ui, container: egui::Vec2, natur
     sp.slider_width    *= scale;
     sp.combo_width     *= scale;
     scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row that wraps when rendered above 1.2× — so its measured natural
+    /// depends on the scale it was rendered at — must settle, not flicker.
+    #[test]
+    fn pin_natural_settles_a_reflow_cycle_and_still_follows_content() {
+        let ctx = egui::Context::default();
+        let key = egui::Id::new("test_pin");
+        let container = egui::vec2(200.0, 40.0);
+        let wrapped = egui::vec2(180.0, 40.0); // scale 1.0
+        let one_line = egui::vec2(150.0, 25.0); // scale 1.33
+        let scale_of = |n: egui::Vec2| (container.y / n.y).min(container.x / n.x);
+        let cached = |ctx: &egui::Context| ctx.data(|d| d.get_temp::<egui::Vec2>(key));
+
+        let content = |s: f32| if s > 1.2 { wrapped } else { one_line };
+        let mut seen = Vec::new();
+        for _ in 0..30 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let s = cached(ctx).map_or(1.0, scale_of);
+                store_pin_natural(ctx, key, container, content(s));
+                seen.push(cached(ctx).unwrap());
+            });
+        }
+        // Settled on the smaller-scale layout, and stayed there.
+        assert!(seen[10..].iter().all(|n| *n == wrapped), "{seen:?}");
+
+        // A real content change (e.g. an extra row appears) still takes over.
+        let taller = egui::vec2(180.0, 60.0);
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                store_pin_natural(ctx, key, container, taller);
+            });
+        }
+        assert_eq!(cached(&ctx), Some(taller));
+    }
 }

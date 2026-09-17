@@ -551,7 +551,7 @@ pub(crate) fn clamp_pin_frame_to_content(
     h: f32,
 ) -> (f32, f32) {
     let LayoutItem::Module(m) = it else { return (w, h) };
-    let ws_key = egui::Id::new(("pin_ws_nat", outer_id.0, m.inner_node_id, m.element_id.as_str()));
+    let ws_key = pin_ws_nat_key(ui.ctx(), outer_id.0, m.inner_node_id, &m.element_id);
     let Some(nat) = ui.ctx().data(|d| d.get_temp::<egui::Vec2>(ws_key)) else { return (w, h) };
     if nat.x < 1.0 || nat.y < 1.0 { return (w, h); }
     // 0.5 is the scale floor in `apply_widget_scale`: any narrower and the
