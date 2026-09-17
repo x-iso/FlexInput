@@ -262,6 +262,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         }).unwrap_or(false);
         let curve_is_float    = snarl.get_node(node).map(|n| n.module_id == "module.response_curve").unwrap_or(false);
         let is_rws            = snarl.get_node(node).map(|n| n.module_id == "processing.rws").unwrap_or(false);
+        let is_feedback_control = snarl.get_node(node).map(|n| n.module_id == "module.feedback_control").unwrap_or(false);
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
@@ -833,6 +834,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             // toggle because both are per-device input-conditioning opt-ins.
             if is_device_source && has_touch_misc_suppression(dev_id_str) {
                 touch_misc_header_toggle(ui, snarl, node);
+            }
+
+            // Feedback Control: add to the game's feedback, or override it.
+            if is_feedback_control {
+                feedback_override_header_toggle(ui, snarl, node);
             }
 
             // Second header row — only visible while in Layout mode for this

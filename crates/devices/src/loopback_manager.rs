@@ -187,6 +187,13 @@ fn set_params(uid: usize, params: LoopbackParams) {
     guard.get_or_insert_with(HashMap::new).insert(uid, params);
 }
 
+/// Publish captured params for a node as if its capture had produced them, so
+/// engine tests can drive Audio Stream Haptics without a WASAPI capture.
+#[doc(hidden)]
+pub fn set_params_for_test(uid: usize, params: LoopbackParams) {
+    set_params(uid, params);
+}
+
 fn retain_params(live: &std::collections::HashSet<usize>) {
     let mut guard = PARAMS.write().unwrap();
     if let Some(map) = guard.as_mut() {

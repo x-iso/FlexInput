@@ -71,8 +71,11 @@ pub(crate) fn combine_signals(a: Signal, b: Signal) -> Signal {
 /// pad's haptic channel and read outlet taps from the virtual destination's
 /// feedback. Shared by the top-level loop and `eval_subgraph`.
 ///
-/// Injection key: `("feedback_inject:{_fb_source_dev}", inlet_pin_id)`. The
-/// physical `device.source` sink drains this in its feedback pass, keyed by its
+/// Injection key: `("feedback_inject:{_fb_source_dev}", inlet_pin_id)` — added
+/// on top of the game's feedback — or, with the header's Override toggle
+/// (`fb_override`), `("feedback_override:{_fb_source_dev}", …)`, where each wired
+/// kind of feedback takes over from the game (see eval/feedback.rs). The
+/// physical `device.source` sink drains these in its feedback pass, keyed by its
 /// own device id — so the bridge needs no per-uid plumbing and works at any
 /// sub-patch depth. Multiple injectors targeting one pad combine additively.
 ///
@@ -97,7 +100,9 @@ pub(crate) fn feedback_control_publish(
     if !source_dev.is_empty() {
         let inlet_ids = snap.params.get("_fb_inlet_ids").and_then(|v| v.as_array());
         if let Some(inlet_ids) = inlet_ids {
-            let key = format!("feedback_inject:{source_dev}");
+            let overrides = snap.params.get("fb_override").and_then(|v| v.as_bool()).unwrap_or(false);
+            let channel = if overrides { FEEDBACK_OVERRIDE } else { FEEDBACK_INJECT };
+            let key = format!("{channel}{source_dev}");
             for (i, pin_v) in inlet_ids.iter().enumerate() {
                 let Some(pin_id) = pin_v.as_str() else { continue; };
                 if pin_id.is_empty() { continue; }
@@ -137,15 +142,17 @@ pub(crate) fn feedback_control_publish(
 
 /// Audio Stream Haptics: pass the AutoMap bus through (so the gamepad's forward
 /// signals continue downstream), then derive HD rumble from the node's WASAPI
-/// loopback capture, blend it with any standard rumble already on the bus per the
-/// `asth_modulator` slider, and inject the result into the target pad's feedback
-/// channel (`feedback_inject:{_asth_dest_dev}`), drained by the feedback post-pass.
+/// loopback capture, blend it with the game's own rumble per the
+/// `asth_modulator` slider, and write the result as the target pad's rumble
+/// (`feedback_override:{_asth_dest_dev}`), drained by the feedback post-pass.
+/// The node OWNS the pad's rumble: the game's rumble never reaches the pad
+/// alongside it — it only shapes the audio through the modulator.
 ///
 /// Modulator (`asth_modulator`, 0..1):
-///   1.0  → audio amplitude REPLACES standard rumble (pure audio haptics).
-///   0.0  → audio is GATED by standard-rumble amplitude (rumble decides *when*,
+///   1.0  → audio amplitude REPLACES the game's rumble (pure audio haptics).
+///   0.0  → audio is GATED by the game's rumble amplitude (rumble decides *when*,
 ///          audio decides the *texture*): out = audio_amp * std_rumble.
-///   0.5  → lighter audio, BOOSTED by standard-rumble events:
+///   0.5  → lighter audio, BOOSTED by game rumble events:
 ///          out = audio_amp * (base + (1-base) * std_rumble).
 /// Linearly interpolated between those anchors.
 /// Mirror the upstream AutoMap bus into this node's own `collector:{uid}` key,
@@ -250,16 +257,22 @@ pub(crate) fn audio_stream_haptics_publish(
     }
     let _ = &mut audio_l_freq; let _ = &mut audio_r_freq; // superseded by lf/hf_carrier
 
-    // ── 3. Standard rumble already on the bus (for the modulator). ────────────
-    let bus_f = |pin: &str| -> f32 {
-        sig_to_f32(collector_sigs.get(&(uid_key.clone(), pin.to_string())).copied()).unwrap_or(0.0)
-    };
-    // A tiny floor so residual/quantization noise on the rumble bus doesn't keep
-    // the gate open when the game isn't actually rumbling.
+    // ── 3. The game's own rumble (for the modulator). ─────────────────────────
+    // Gathered before the main loop (`gather_game_feedback`): what the game asks
+    // of the pad this node drives, and of the virtual pads fed from this node's
+    // own bus (the latter covers a receiver-side node whose target is a Network
+    // Receive rather than a pad). Rumble never travels forward on the bus, so it
+    // can't be read from there.
+    let dest_dev = snap.params.get("_asth_dest_dev").and_then(|v| v.as_str()).unwrap_or("");
+    let targets = [dest_dev, uid_key.as_str()];
+    // A tiny floor so residual/quantization noise on the game's rumble doesn't
+    // keep the gate open when the game isn't actually rumbling.
     const STD_GATE_FLOOR: f32 = 0.02;
     let gate_std = |v: f32| if v <= STD_GATE_FLOOR { 0.0 } else { v };
-    let std_l = gate_std(bus_f("rumble_strong").max(bus_f("hd_l_amp")));
-    let std_r = gate_std(bus_f("rumble_weak").max(bus_f("hd_r_amp")));
+    let std_l = gate_std(game_feedback(collector_sigs, &targets,
+        &["rumble_strong", "hd_l_amp", "hd_rumble_l", "ds_l_amp"]));
+    let std_r = gate_std(game_feedback(collector_sigs, &targets,
+        &["rumble_weak", "hd_r_amp", "hd_rumble_r", "ds_r_amp"]));
 
     // ── 4. Amplitude calibration + frequency-bias, then the modulator blend. ──
     // (Volume is applied as INPUT GAIN in the capture thread, before detection, so
@@ -402,10 +415,9 @@ pub(crate) fn audio_stream_haptics_publish(
         set(6, raw_hf_hz);
     }
 
-    // ── 5. Inject into the target pad's feedback channel. ──
-    let dest_dev = snap.params.get("_asth_dest_dev").and_then(|v| v.as_str()).unwrap_or("");
+    // ── 5. Take over the target pad's rumble. ──
     if dest_dev.is_empty() { return out; }
-    let key = format!("feedback_inject:{dest_dev}");
+    let key = format!("{FEEDBACK_OVERRIDE}{dest_dev}");
     // `force` distinguishes the amplitude pins (always written, even at 0.0, so the
     // feedback post-pass actively drives the pad's rumble back to zero on silence —
     // otherwise a skipped injection leaves the pad holding its last value and it
@@ -434,8 +446,12 @@ pub(crate) fn audio_stream_haptics_publish(
     out
 }
 
-/// Network Send: transmit the upstream AutoMap bus to a peer and inject any
-/// feedback received from that peer back into the upstream physical pad.
+/// Network Send: transmit the upstream AutoMap bus to a peer.
+///
+/// The feedback the peer sends back is NOT handled here: it's gathered before
+/// the main loop (`gather_game_feedback`) and lands on the upstream pad as game
+/// feedback, so a feedback module on this side can read it this tick and take
+/// over from it (see eval/feedback.rs).
 ///
 /// `uid` is the node's effective publishing id (raw at top level, namespaced in
 /// a sub-patch) — it keys BOTH the collector pass-through AND the network
@@ -462,25 +478,6 @@ pub(crate) fn net_send_publish(
     }
     let _ = &uid_key; // (kept for symmetry with ASTH; prefix is the same string)
     flexinput_net::publish_send_frame(uid, frame);
-
-    // ── 3. Feedback intake: values the peer's game requested, injected into the
-    //    upstream physical pad's feedback channel (drained by the post-pass). ──
-    let physical_dev = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
-    if !physical_dev.is_empty() {
-        if let Some((fb, age)) = flexinput_net::latest_feedback(uid) {
-            // Match the send worker's status window: ignore feedback older than
-            // ~1 s so a dead peer can't leave the pad buzzing forever.
-            if age.as_millis() < 1000 {
-                let key = format!("feedback_inject:{physical_dev}");
-                for (pin, v) in fb.iter_present() {
-                    collector_sigs
-                        .entry((key.clone(), pin.to_string()))
-                        .and_modify(|e| *e = combine_signals(*e, Signal::Float(v)))
-                        .or_insert(Signal::Float(v));
-                }
-            }
-        }
-    }
 
     vec![None; snap.n_outputs.max(1)]
 }
@@ -559,14 +556,17 @@ pub(crate) fn collect_sink_sources(nodes: &[NodeSnap], out: &mut HashMap<String,
 /// node's forward publish, and any `feedback_inject:collector:{uid}` an ASTH /
 /// Feedback Control node on the receiver wrote while targeting this node.
 ///
-/// Two feedback sources are max-combined per haptic pin:
-///   (a) game-driven output the downstream virtual sinks report (classic rumble,
-///       lightbar) — from `dev_sigs`, via `sink_sources` (the global source→sinks
-///       index, so cross-level wiring is covered).
-///   (b) HD/LED/trigger effects injected on the receiver — from `collector_sigs`
-///       under `feedback_inject:collector:{uid}`.
+/// The same layers as a physical pad (eval/feedback.rs), max-combined per pin:
+///   (a) the GAME — what the downstream virtual sinks report (classic rumble,
+///       lightbar) from `dev_sigs` via `sink_sources` (the global source→sinks
+///       index, so cross-level wiring is covered), plus feedback a Network Send
+///       relayed back to this node (`feedback_net:collector:{uid}`);
+///   (b) OVERRIDES written on the receiver (`feedback_override:collector:{uid}`)
+///       — for every group they take over, the game's values are dropped (sent
+///       as 0 so the far pad lets go) and the override's replace them;
+///   (c) ADDITIVE effects injected on the receiver (`feedback_inject:collector:{uid}`).
 ///
-/// Runs after the feedback_inject post-pass, so (b) is fully populated.
+/// Runs after the main loop, so (b) and (c) are fully populated.
 pub(crate) fn publish_recv_feedback_frames(
     nodes: &[NodeSnap],
     outer_uid: usize,
@@ -580,7 +580,11 @@ pub(crate) fn publish_recv_feedback_frames(
         if node.module_id == NET_RECV_ID {
             let empty = Vec::new();
             let fb_devs = sink_sources.get(&format!("collector:{}", uid)).unwrap_or(&empty);
-            let inject_key = format!("feedback_inject:collector:{}", uid);
+            let target = format!("collector:{}", uid);
+            let net_key = format!("{FEEDBACK_NET}{target}");
+            let override_key = format!("{FEEDBACK_OVERRIDE}{target}");
+            let inject_key = format!("{FEEDBACK_INJECT}{target}");
+            let groups = overridden_groups(collector_sigs, &target);
             let mut fb = flexinput_net::FeedbackFrame::empty();
             let mut any = false;
             for pin in flexinput_core::automap::FEEDBACK_INLET_PINS {
@@ -590,6 +594,15 @@ pub(crate) fn publish_recv_feedback_frames(
                         let v = sig.as_float();
                         best = Some(best.map_or(v, |b| b.max(v)));
                     }
+                }
+                if let Some(&sig) = collector_sigs.get(&(net_key.clone(), pin.id.to_string())) {
+                    let v = sig.as_float();
+                    best = Some(best.map_or(v, |b| b.max(v)));
+                }
+                if flexinput_core::automap::feedback_group(pin.id).is_some_and(|g| groups.contains(&g)) {
+                    best = collector_sigs.get(&(override_key.clone(), pin.id.to_string()))
+                        .map(|s| s.as_float())
+                        .or(best.map(|_| 0.0));
                 }
                 if let Some(&sig) = collector_sigs.get(&(inject_key.clone(), pin.id.to_string())) {
                     let v = sig.as_float();
@@ -1021,6 +1034,7 @@ pub(crate) fn automap_selector_publish(
     let route_to = if !selected_collector.is_empty() { &selected_collector } else { &selected_dev };
     if !route_to.is_empty() {
         fb_routes.insert(key.clone(), route_to.clone());
+        forward_game_feedback(collector_sigs, route_to, &key);
     }
     for pin in flexinput_core::automap::ALL_PINS {
         let sig = if !selected_collector.is_empty() {

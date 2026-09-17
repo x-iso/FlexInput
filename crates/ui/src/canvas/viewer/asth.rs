@@ -277,7 +277,9 @@ pub(crate) fn asth_draw_row(
         }).response.rect,
         AsthRow::RumbleMix => asth_slider_row(ui, "Rumble mix", label_w, body_w, scale, &mut changed, |ui, _w| {
             ui.add(egui::Slider::new(&mut a.modulator, 0.0..=1.0).show_value(false))
-                .on_hover_text("◄ gate (audio only when the game rumbles) · replace (pure audio) ►")
+                .on_hover_text("◄ gate (audio only when the game rumbles) · replace (pure audio) ►\n\
+                                The game's own rumble never plays alongside the audio: \
+                                it only decides how much of the audio you feel.")
         }),
     };
     (changed, rect)

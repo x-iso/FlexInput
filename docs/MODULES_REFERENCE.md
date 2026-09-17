@@ -702,13 +702,21 @@ pub struct ModuleDescriptor {
 
 #### Feedback Control
 - **ID:** `module.feedback_control`
-- **Purpose:** Routes virtual device feedback signals to physical haptic inputs
+- **Purpose:** Drives the upstream physical pad's feedback (rumble, light bar,
+  LEDs, adaptive triggers) from wired signals, and taps what the game asks of
+  the downstream virtual pad
 - **Inputs:** 
   - Input 0: Source AutoMap bus (AutoMap type)
-- **Outputs:** N haptic channel outputs (Float)
+  - Inputs 1..N: one per feedback pin (`FEEDBACK_INLET_PINS`), optional
+- **Outputs:** AutoMap pass-through + the game's basic feedback taps (`FEEDBACK_OUTLET_PINS`)
 - **Parameters:**
-  - `target_device_id: String` - Physical device to inject into
-  - `inlet_mappings: Array<InletMapping>` - Virtual pin → physical inlet mappings
+  - `fb_override: bool` (header toggle "Override game feedback", default off) —
+    off: wired values ADD to the game's feedback; on: each wired kind of
+    feedback (`FeedbackGroup`: rumble, light bar, player LED, mic LED, left /
+    right trigger) REPLACES the game's. Unwired kinds stay the game's.
+  - `_fb_source_dev`, `_fb_dest_dev`, `_fb_inlet_ids`, `_fb_outlet_ids` — stamped
+    by the graph builder
+- **Engine:** see *Feedback layers* in AUTOMAP_SYSTEM.md (`eval/feedback.rs`)
 
 #### Audio Stream Haptics (ASTH)
 - **ID:** `module.audio_stream_haptics`
@@ -719,8 +727,14 @@ pub struct ModuleDescriptor {
   - Output 0: Passthrough AutoMap bus
   - Outputs 1..7: Band energy + carrier frequency signals
 - **Parameters:**
-  - `target_device_id: String` - Physical device for haptic injection
-  - `audio_device: String` - WASAPI loopback device name
+  - `_asth_dest_dev` — the pad (or Network Receive) it drives, stamped by the graph builder
+  - `asth_modulator` ("Rumble mix", 0..1) — how the game's rumble shapes the
+    audio: 0 gate (audio only while the game rumbles), 0.5 boost, 1 replace
+    (pure audio)
+- **Feedback:** always OVERRIDES the target's rumble — the game's rumble never
+  plays alongside; it reaches the node through `feedback_game:` (the pad it
+  drives, and the virtual pads fed from its own bus) and only acts through the
+  modulator
 
 ---
 

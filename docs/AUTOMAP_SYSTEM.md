@@ -315,6 +315,39 @@ pub const FEEDBACK_OUTLET_PINS: &[AutoMapPin] = &[
 
 These are exposed as outlets by the Feedback Control module for user wiring.
 
+### Feedback Layers (`crates/engine/src/eval/feedback.rs`)
+
+When the game, modules and wires all want a pad's feedback at once, each
+haptic pin resolves by precedence, highest first:
+
+1. **Direct wire** into the pad's haptic input.
+2. **Override** (`feedback_override:{target}`) — a module taking over a kind of
+   feedback (`FeedbackGroup` in `core/automap.rs`: rumble, light bar, player LED,
+   mic LED, left trigger, right trigger). The game's values for the whole group
+   are zeroed on that pad, then the module's values replace them. Whole group,
+   not just the pins the module writes: a game's classic rumble lands on a
+   DualSense's `rumble_strong` while a module drives `hd_l_amp`.
+   Writers: Audio Stream Haptics (always, rumble), Feedback Control with
+   `fb_override`.
+3. **Game** — local virtual pads (main-loop auto-feedback via `feedback_sources`)
+   and network peers (`feedback_net:{target}`).
+
+**Additive** injections (`feedback_inject:{target}`, Feedback Control default)
+combine on top of whatever 2 and 3 left.
+
+`feedback_game:{id}` is the READ side, gathered before the main loop so a module
+reads this tick's request — per physical pad (its feedback sources + network
+peers) and per bus id that feeds virtual pads (`collector:{uid}`, `remap:{uid}`,
+a raw device…). Rumble never travels forward on the bus, so a module can't read
+it from there. An AutoMap Selector forwards its selected input's `feedback_game:`
+to its output id, and the reverse-route post-pass carries `feedback_net:` /
+`feedback_override:` / `feedback_inject:` from a Selector output back to the pad.
+
+A Network Receive's return frame applies the same layers (overridden game values
+are sent as 0 so the far pad lets go). A Network Send's received peer feedback is
+gathered in the pre-pass as `feedback_net:` — game feedback on the sender's pad,
+which a module there can override.
+
 ---
 
 ## AutoMap Node Types

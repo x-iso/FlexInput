@@ -77,6 +77,38 @@ pub fn resolve_feedback_pin<'a>(
     None
 }
 
+/// A kind of feedback a module takes over from the game as a whole.
+///
+/// Overriding any pin of a group drops the game's feedback for the WHOLE group
+/// on that device. Rumble is one sensation whether a pad plays it on classic
+/// motors or HD pins: a game's `rumble_strong` can land on a DualSense's
+/// `rumble_strong` while a module drives its `hd_l_amp`, and overriding only the
+/// pin the module writes would leave the game's rumble playing alongside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FeedbackGroup {
+    Rumble,
+    LightBar,
+    PlayerLed,
+    MicLed,
+    TriggerLeft,
+    TriggerRight,
+}
+
+/// The feedback group a haptic / feedback pin belongs to (see [`FeedbackGroup`]).
+pub fn feedback_group(pin: &str) -> Option<FeedbackGroup> {
+    use FeedbackGroup::*;
+    Some(match pin {
+        "lightbar_r" | "lightbar_g" | "lightbar_b" => LightBar,
+        "player_led" => PlayerLed,
+        "mic_led" => MicLed,
+        "rumble_strong" | "rumble_weak" => Rumble,
+        p if p.starts_with("trigger_l_") => TriggerLeft,
+        p if p.starts_with("trigger_r_") => TriggerRight,
+        p if p.starts_with("hd_") || p.starts_with("hd2_") || p.starts_with("ds_") => Rumble,
+        _ => return None,
+    })
+}
+
 /// A single auto-mappable signal in the canonical gamepad bus.
 pub struct AutoMapPin {
     pub id: &'static str,
@@ -394,6 +426,18 @@ pub fn resolve_mapping<'a>(src_pins: &[&'a str], dst_pins: &[&'a str]) -> Vec<(&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An override can only take over a kind of feedback it can name: every
+    // feedback pin a device exposes must belong to a group.
+    #[test]
+    fn every_feedback_pin_has_a_group() {
+        for pin in FEEDBACK_INLET_PINS {
+            assert!(feedback_group(pin.id).is_some(), "feedback pin `{}` has no group", pin.id);
+        }
+        assert_eq!(feedback_group("rumble_strong"), feedback_group("hd2_r_freq"));
+        assert_ne!(feedback_group("trigger_l_mode"), feedback_group("trigger_r_mode"));
+        assert_eq!(feedback_group("left_stick"), None);
+    }
 
     // Every gamepad source node exposes both the analog trigger pin and the digital
     // trigger button pin (see gamepad::standard_outputs). A virtual gamepad sink exposes

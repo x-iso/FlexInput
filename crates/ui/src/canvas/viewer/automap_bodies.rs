@@ -61,6 +61,35 @@ pub(crate) fn digital_trigger_header_toggle(
     });
 }
 
+/// Feedback Control header toggle: whether wired feedback ADDS to what the game
+/// asks of the pad (default) or OVERRIDES it. Stored on `fb_override`; the
+/// engine's feedback layers (eval/feedback.rs) read it.
+pub(crate) fn feedback_override_header_toggle(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node: NodeId,
+) {
+    let mut checked = snarl.get_node(node)
+        .and_then(|n| n.params.get("fb_override"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let resp = ui.checkbox(&mut checked, egui::RichText::new("Override game feedback").small());
+    if resp.changed() {
+        if let Some(n) = snarl.get_node_mut(node) {
+            n.params.insert("fb_override".into(), Value::Bool(checked));
+        }
+    }
+    resp.on_hover_text(
+        "Off: what you wire in is added on top of what the game sends to the pad.\n\
+         On: each kind of feedback you wire in replaces the game's — rumble (classic \
+         and HD alike), light bar, player LEDs, mic LED, left or right adaptive \
+         trigger. Kinds you don't wire stay the game's, so wiring only a light bar \
+         colour keeps the game's rumble.\n\
+         A wire sitting at 0 still counts: it silences that kind of feedback.",
+    );
+}
+
 /// Whether the "Suppress touch + misc" toggle is worth showing for this device.
 ///
 /// SDL-backed pads only. SDL is the backend that surfaces a pad's touchpad

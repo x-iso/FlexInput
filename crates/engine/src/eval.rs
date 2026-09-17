@@ -22,6 +22,7 @@ mod compute;
 mod config;
 mod curves;
 mod device_cal;
+mod feedback;
 mod modules;
 mod registry;
 #[cfg(test)]
@@ -38,6 +39,7 @@ pub(crate) use registry::*;
 // Every publisher is crate-internal — nothing outside the engine publishes
 // into the bus — so this one glob is narrowed rather than `pub`.
 pub(crate) use publish::*;
+pub(crate) use feedback::*;
 
 /// Namespaces inner node UIDs under their containing subpatch's UID to avoid
 /// collisions in the shared `state` map (and the `remap:`/`collector:` keys the
@@ -448,6 +450,10 @@ pub fn eval_graph_tick(
     } = *out;
     // Signals injected by AutoMap Collector nodes, keyed by ("collector:{uid}", pin_id).
     let mut collector_sigs: HashMap<(String, String), Signal> = HashMap::new();
+    // What the game asks of each pad / bus this tick (and network peers'
+    // feedback), gathered before any node runs so feedback modules read it
+    // this tick. See eval/feedback.rs.
+    gather_game_feedback(&graph.nodes, dev_sigs, &mut collector_sigs);
     // Reverse feedback routes: a synthetic AutoMap node's OUTPUT id (e.g.
     // "forksel:5:0" from a Selector) → the SOURCE id it currently gates from
     // (e.g. "collector:3" for a network recv, or "gilrs:…" for a pad). Populated
@@ -1031,13 +1037,14 @@ pub fn eval_graph_tick(
     }
 
     // Post-pass: reverse-feedback routing through AutoMap Selectors. An ASTH /
-    // Feedback Control node placed AFTER a Selector injects into the selector's
-    // OUTPUT id (`feedback_inject:forksel:{uid}:{out}`). Copy those injections to
-    // the source the selector is currently gating from — following the route
-    // chain — so they land under the physical pad id (drained by the injection
-    // post-pass below) or the network recv's `collector:{uid}` (drained by the
-    // recv feedback post-pass). Runs BEFORE the injection drain so a pad terminal
-    // is delivered this tick. Only fires when a Selector recorded a route.
+    // Feedback Control / Network Send node placed AFTER a Selector writes its
+    // feedback layers under the selector's OUTPUT id (e.g.
+    // `feedback_override:forksel:{uid}:{out}`). Copy them to the source the
+    // selector is currently gating from — following the route chain — so they
+    // land under the physical pad id (drained by the feedback-layers post-pass
+    // below) or the network recv's `collector:{uid}` (drained by the recv
+    // feedback post-pass). Runs BEFORE those drains so a terminal is delivered
+    // this tick. Only fires when a Selector recorded a route.
     if !fb_routes.is_empty() {
         for from_id in fb_routes.keys().cloned().collect::<Vec<_>>() {
             // Resolve the terminal source through the (short) route chain.
@@ -1049,91 +1056,39 @@ pub fn eval_graph_tick(
                 }
             }
             if terminal == from_id { continue; }
-            let from_key = format!("feedback_inject:{from_id}");
-            let to_key = format!("feedback_inject:{terminal}");
-            let entries: Vec<(String, Signal)> = collector_sigs.iter()
-                .filter(|((d, _), _)| d == &from_key)
-                .map(|((_, p), s)| (p.clone(), *s))
-                .collect();
-            for (pin, sig) in entries {
-                use std::collections::hash_map::Entry;
-                match collector_sigs.entry((to_key.clone(), pin)) {
-                    Entry::Occupied(mut o) => { *o.get_mut() = combine_signals(*o.get(), sig); }
-                    Entry::Vacant(v) => { v.insert(sig); }
+            for channel in FEEDBACK_WRITE_CHANNELS {
+                let from_key = format!("{channel}{from_id}");
+                let to_key = format!("{channel}{terminal}");
+                let entries: Vec<(String, Signal)> = collector_sigs.iter()
+                    .filter(|((d, _), _)| d == &from_key)
+                    .map(|((_, p), s)| (p.clone(), *s))
+                    .collect();
+                for (pin, sig) in entries {
+                    use std::collections::hash_map::Entry;
+                    match collector_sigs.entry((to_key.clone(), pin)) {
+                        Entry::Occupied(mut o) => { *o.get_mut() = combine_signals(*o.get(), sig); }
+                        Entry::Vacant(v) => { v.insert(sig); }
+                    }
                 }
             }
         }
     }
 
-    // Post-pass: Feedback Control injection drain. Runs AFTER the main loop so
-    // every `module.feedback_control` node — at the top level or nested in any
-    // sub-patch — has already written its inlet values into `collector_sigs`
-    // under `feedback_inject:{physical_dev_id}`. For each physical sink, route
-    // those values to the device's haptic inputs (direct pin-id match first,
-    // then `resolve_feedback_pin` rumble/lightbar aliasing). Direct wires and
-    // the auto-feedback in the main loop both win via `or_insert`.
+    // Post-pass: feedback layers on each physical pad. Runs AFTER the main loop
+    // so every feedback module — at the top level or nested in any sub-patch —
+    // has written its values: network game feedback, then overrides (which take
+    // over a kind of feedback from the game), then additive injections, on top
+    // of the main loop's local game feedback. Direct wires always win. See
+    // eval/feedback.rs.
     //
-    // Cheap early-out: skip entirely unless at least one injector wrote this
-    // tick (the common case is no Feedback Control nodes at all).
-    let has_injection = collector_sigs.keys()
-        .any(|(dev, _)| dev.starts_with("feedback_inject:"));
-    if has_injection {
-        puffin::profile_scope!("feedback_inject_post_pass");
+    // Cheap early-out: skip entirely unless a module or peer wrote a layer this
+    // tick (the common case is no feedback modules at all).
+    if any_feedback_layer(&collector_sigs) {
+        puffin::profile_scope!("feedback_layers_post_pass");
         for snap in graph.nodes.iter() {
             let Some(ref st) = snap.sink_target else { continue; };
             if st.device_id.starts_with("virtual.") { continue; }
-            let inject_key = format!("feedback_inject:{}", st.device_id);
-            let dst_pins: Vec<&str> = st.pin_ids.iter()
-                .filter(|p| !p.is_empty())
-                .map(|p| p.as_str())
-                .collect();
-            // Pins with at least one real direct wire keep priority.
-            let directly_wired: std::collections::HashSet<&str> = st.pin_ids.iter().enumerate()
-                .filter(|(i, pid)| !pid.is_empty() && st.multi_sources.get(*i).map_or(false, |s| !s.is_empty()))
-                .map(|(_, pid)| pid.as_str())
-                .collect();
-            for pin in flexinput_core::automap::FEEDBACK_INLET_PINS {
-                let Some(&sig) = collector_sigs.get(&(inject_key.clone(), pin.id.to_string()))
-                else { continue; };
-                let dst_pin = if dst_pins.iter().any(|&p| p == pin.id) {
-                    Some(pin.id)
-                } else {
-                    flexinput_core::automap::resolve_feedback_pin(pin.id, &dst_pins)
-                };
-                let Some(dst_pin) = dst_pin else { continue; };
-                if directly_wired.contains(dst_pin) { continue; }
-                // Perceptual HD shaping for a CLASSIC rumble that remapped onto an
-                // HD voice-coil amp pin (e.g. a networked Switch Pro: rumble_strong
-                // → hd_l_amp, since the pad exposes no rumble_strong inlet). Mirror
-                // the main-loop auto-feedback pass (`shape_hd_feedback`) so a weak
-                // game rumble (0.1–0.3) run through the encoder's power-law curve is
-                // still perceptible. Only when the pin actually REMAPPED (pin.id !=
-                // dst_pin): a direct hd_l_amp injection (ASTH / Feedback Control)
-                // already carries an intended amplitude and must NOT be reshaped.
-                // Uses the standard default floor/max/exp — the networked source's
-                // per-device shaping isn't available on this end.
-                let sig = if pin.id != dst_pin && matches!(dst_pin, "hd_l_amp" | "hd_r_amp") {
-                    shape_hd_feedback(sig, 0.35, 1.0, 0.6)
-                } else {
-                    sig
-                };
-                // Precedence: direct wire > injection > auto-feedback. The
-                // main-loop auto-feedback pass may have already `or_insert`-ed a
-                // value for this pin — typically `0.0` (the virtual sink's idle
-                // rumble when no game is driving it). A plain `or_insert` here
-                // would let that idle `0.0` mask the user's explicit injection,
-                // producing only a brief buzz on the rising edge. Instead COMBINE
-                // additively (clamped) so injection adds on top of any real game
-                // rumble and overrides idle silence.
-                use std::collections::hash_map::Entry;
-                match sink_outputs.entry((st.device_id.clone(), dst_pin.to_string())) {
-                    Entry::Occupied(mut o) => {
-                        let merged = combine_signals(*o.get(), sig);
-                        *o.get_mut() = clamp_feedback_signal(dst_pin, merged);
-                    }
-                    Entry::Vacant(v) => { v.insert(sig); }
-                }
-            }
+            apply_pad_feedback(st, &collector_sigs, sink_outputs);
         }
     }
 
@@ -1179,17 +1134,6 @@ fn graph_has_net_recv(nodes: &[NodeSnap]) -> bool {
         n.module_id == NET_RECV_ID
             || n.inline_subgraph.as_ref().is_some_and(|sg| graph_has_net_recv(&sg.graph.nodes))
     })
-}
-
-/// Clamp a combined feedback value to the valid range for its haptic pin so
-/// additive merging (game rumble + injected effect) can't overflow. Amplitudes
-/// and most haptic pins are 0–1; everything falls back to 0–1 which is correct
-/// for the rumble/lightbar/amp pins the Feedback Control node injects.
-fn clamp_feedback_signal(_pin: &str, sig: Signal) -> Signal {
-    match sig {
-        Signal::Float(f) => Signal::Float(f.clamp(0.0, 1.0)),
-        other => other,
-    }
 }
 
 /// Typed OFF value for a canonical pin the sink forces to zero because an open

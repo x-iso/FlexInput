@@ -2842,6 +2842,265 @@ mod trigger_tests {
             .map(|s| s.as_bool()).unwrap_or(false);
         assert!(dl, "self-mapped dpad_left must pass through (not be suppressed)");
     }
+
+    // ── Feedback layers: game vs Audio Stream Haptics / Feedback Control ─────
+
+    const FB_PAD: &str = "gilrs:switch_pro:0";
+    const FB_DS: &str = "gilrs:dualsense:0";
+    const FB_VIRT: &str = "virtual.xinput:0";
+    /// A Switch Pro renders all rumble on its HD pins.
+    const FB_HD_PINS: &[&str] = &[
+        "hd_l_amp", "hd_l_freq", "hd_r_amp", "hd_r_freq",
+        "hd2_l_amp", "hd2_l_freq", "hd2_r_amp", "hd2_r_freq",
+    ];
+    /// A DualSense has classic motors AND HD pins, plus a light bar: a game's
+    /// classic rumble lands on `rumble_strong` while a module drives `hd_l_amp`.
+    const FB_DS_PINS: &[&str] = &[
+        "rumble_strong", "rumble_weak",
+        "hd_l_amp", "hd_l_freq", "hd_r_amp", "hd_r_freq",
+        "hd2_l_amp", "hd2_l_freq", "hd2_r_amp", "hd2_r_freq",
+        "lightbar_r", "lightbar_g", "lightbar_b",
+    ];
+
+    /// A physical pad node whose haptic inputs are a sink target, the way the
+    /// graph builder wires it. `game_from`: the virtual pad fed from it, whose
+    /// feedback the main loop forwards (None = the pad shows only what modules
+    /// and network peers write).
+    fn fb_pad(uid: usize, dev: &str, pins: &[&str], game_from: Option<&str>) -> NodeSnap {
+        let mut pad = source_node(uid, dev, 0.0);
+        let pins: Vec<String> = pins.iter().map(|p| p.to_string()).collect();
+        pad.sink_target = Some(SinkTarget {
+            device_id: dev.to_string(),
+            multi_sources: vec![Vec::new(); pins.len()],
+            pin_ids: pins,
+            automap_source: None,
+            automap_fallback_dev: None,
+            feedback_sources: game_from.into_iter().map(|v| crate::graph::FeedbackSource {
+                device_id: v.to_string(),
+                rumble_floor: 0.0, rumble_max: 1.0, rumble_exp: 1.0,
+            }).collect(),
+            is_self_sink: false,
+            digital_trigger_bridge: false,
+        });
+        pad
+    }
+
+    /// Audio Stream Haptics node reading graph node 0's bus, with captured audio
+    /// `audio` on both sides.
+    fn asth_node(uid: usize, upstream_dev: &str, dest: &str, modulator: f32, audio: f32) -> NodeSnap {
+        flexinput_devices::loopback_manager::set_params_for_test(uid,
+            flexinput_devices::loopback_haptic::LoopbackParams {
+                l_amp: audio, l_freq: 0.3, r_amp: audio, r_freq: 0.3,
+            });
+        let mut asth = empty_node(uid, "module.audio_stream_haptics");
+        asth.params.insert("_automap_device_id".into(), Value::String(upstream_dev.into()));
+        asth.params.insert("_asth_dest_dev".into(), Value::String(dest.into()));
+        asth.params.insert("asth_modulator".into(), Value::from(modulator as f64));
+        asth.input_sources = vec![Some((0, 0))];
+        asth.n_outputs = 7;
+        asth
+    }
+
+    fn game_rumble(level: f32) -> HashMap<(String, String), Signal> {
+        let mut sigs = HashMap::new();
+        sigs.insert((FB_VIRT.to_string(), "rumble_strong".to_string()), Signal::Float(level));
+        sigs.insert((FB_VIRT.to_string(), "rumble_weak".to_string()), Signal::Float(level));
+        sigs
+    }
+
+    fn fb_tick(nodes: Vec<NodeSnap>, sigs: &HashMap<(String, String), Signal>) -> TickOutput {
+        let graph = ProcessingGraph { nodes };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        eval_graph_tick(&graph, &mut state, sigs, 0.016, &mut out);
+        out
+    }
+
+    fn pad_value(out: &TickOutput, dev: &str, pin: &str) -> f32 {
+        out.sink_outputs.get(&(dev.to_string(), pin.to_string())).map(|s| s.as_float()).unwrap_or(0.0)
+    }
+
+    /// Switch Pro → Audio Stream Haptics → virtual pad. `game_to_pad: false`
+    /// drops the pad's feedback sources, so the pad shows ONLY what the module
+    /// writes (isolates the module's reading of the game from the game reaching
+    /// the pad directly).
+    fn asth_pad_amp(uid: usize, modulator: f32, audio: f32, game: f32, game_to_pad: bool) -> f32 {
+        let pad = fb_pad(1, FB_PAD, FB_HD_PINS, game_to_pad.then_some(FB_VIRT));
+        let asth = asth_node(uid, FB_PAD, FB_PAD, modulator, audio);
+        let sink = sink_node(3, FB_VIRT, &format!("collector:{uid}"), false);
+        let out = fb_tick(vec![pad, asth, sink], &game_rumble(game));
+        pad_value(&out, FB_PAD, "hd_l_amp")
+    }
+
+    // The module itself must see the game's rumble: at the gate end its OWN
+    // output is audio × game rumble (pad shows only the module here).
+    #[test]
+    fn asth_module_reads_game_rumble() {
+        let written = asth_pad_amp(9101, 0.0, 1.0, 0.8, false);
+        assert!((written - 0.8).abs() < 0.01, "gate must write audio 1.0 × game 0.8, got {written}");
+    }
+
+    // Modulator at the gate end: game rumble decides WHEN, audio the texture.
+    // Loud audio with no game rumble must stay silent; with game rumble the pad
+    // feels audio 0.5 × game 0.8 — not the game's own rumble on top.
+    #[test]
+    fn asth_gate_follows_game_rumble() {
+        let silent = asth_pad_amp(9102, 0.0, 1.0, 0.0, true);
+        assert!(silent < 0.01, "no game rumble must gate the audio shut, got {silent}");
+        let gated = asth_pad_amp(9103, 0.0, 0.5, 0.8, true);
+        assert!((gated - 0.4).abs() < 0.01, "gate must give audio 0.5 × game 0.8 = 0.4, got {gated}");
+    }
+
+    // Modulator at the replace end: the pad feels the audio only, never the
+    // game's rumble on top of it.
+    #[test]
+    fn asth_replace_ignores_game_rumble() {
+        let quiet = asth_pad_amp(9104, 1.0, 0.2, 0.9, true);
+        assert!((quiet - 0.2).abs() < 0.01, "replace must play audio 0.2 alone, got {quiet}");
+    }
+
+    // On a pad with classic motors AND HD pins, the game's rumble lands on the
+    // motors while the module drives the HD pins: taking over rumble must
+    // silence the motors too, and leave the light bar to the game.
+    #[test]
+    fn asth_silences_game_rumble_on_other_rumble_pins() {
+        let pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        let asth = asth_node(9105, FB_DS, FB_DS, 1.0, 0.3);
+        let sink = sink_node(3, FB_VIRT, "collector:9105", false);
+        let mut sigs = game_rumble(0.9);
+        sigs.insert((FB_VIRT.to_string(), "lightbar_g".to_string()), Signal::Float(0.6));
+        let out = fb_tick(vec![pad, asth, sink], &sigs);
+        assert_eq!(pad_value(&out, FB_DS, "rumble_strong"), 0.0, "game rumble on the motors must be silenced");
+        assert_eq!(pad_value(&out, FB_DS, "rumble_weak"), 0.0);
+        assert!((pad_value(&out, FB_DS, "hd_l_amp") - 0.3).abs() < 0.01);
+        assert!((pad_value(&out, FB_DS, "lightbar_g") - 0.6).abs() < 0.01, "light bar stays the game's");
+    }
+
+    /// DualSense → Feedback Control (a constant wired into `inlet`) → virtual pad.
+    fn feedback_control_pad(
+        inlet: &str,
+        value: f32,
+        override_game: bool,
+        sigs: &HashMap<(String, String), Signal>,
+    ) -> TickOutput {
+        let pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        let mut konst = empty_node(2, "module.constant");
+        konst.n_outputs = 1;
+        konst.params.insert("value".into(), Value::from(value as f64));
+        let mut fc = empty_node(3, "module.feedback_control");
+        let inlets: Vec<&str> = flexinput_core::automap::FEEDBACK_INLET_PINS.iter().map(|p| p.id).collect();
+        fc.params.insert("_fb_source_dev".into(), Value::String(FB_DS.into()));
+        fc.params.insert("_fb_inlet_ids".into(), serde_json::json!(inlets));
+        fc.params.insert("fb_override".into(), Value::Bool(override_game));
+        fc.input_sources = std::iter::once(Some((0, 0)))
+            .chain(inlets.iter().map(|p| (*p == inlet).then_some((1, 0))))
+            .collect();
+        fc.n_outputs = 1;
+        let sink = sink_node(4, FB_VIRT, FB_DS, false);
+        fb_tick(vec![pad, konst, fc, sink], sigs)
+    }
+
+    // Add (default) sums a wired rumble with the game's; Override replaces it.
+    #[test]
+    fn feedback_control_add_or_override_game_rumble() {
+        let add = feedback_control_pad("rumble_strong", 0.3, false, &game_rumble(0.5));
+        let v = pad_value(&add, FB_DS, "rumble_strong");
+        assert!((v - 0.8).abs() < 0.01, "add: game 0.5 + 0.3, got {v}");
+        let over = feedback_control_pad("rumble_strong", 0.3, true, &game_rumble(0.5));
+        let v = pad_value(&over, FB_DS, "rumble_strong");
+        assert!((v - 0.3).abs() < 0.01, "override: 0.3 alone, got {v}");
+        assert_eq!(pad_value(&over, FB_DS, "rumble_weak"), 0.0, "override takes over all rumble");
+    }
+
+    // An override takes over only its own kind of feedback: a wired light bar
+    // colour replaces the game's colour but leaves the game's rumble alone.
+    #[test]
+    fn feedback_control_override_is_per_kind() {
+        let mut sigs = game_rumble(0.5);
+        sigs.insert((FB_VIRT.to_string(), "lightbar_g".to_string()), Signal::Float(0.7));
+        let out = feedback_control_pad("lightbar_r", 1.0, true, &sigs);
+        assert!((pad_value(&out, FB_DS, "lightbar_r") - 1.0).abs() < 0.01);
+        assert_eq!(pad_value(&out, FB_DS, "lightbar_g"), 0.0, "the game's light bar colour is replaced");
+        assert!((pad_value(&out, FB_DS, "rumble_strong") - 0.5).abs() < 0.01, "game rumble untouched");
+    }
+
+    fn peer_rumble(send_uid: usize, level: f32) {
+        let mut fb = flexinput_net::FeedbackFrame::empty();
+        fb.set("rumble_strong", level);
+        flexinput_net::set_latest_feedback(send_uid, fb);
+    }
+
+    fn net_send_node(uid: usize, upstream: usize, upstream_dev: &str) -> NodeSnap {
+        let mut send = empty_node(uid, crate::eval::NET_SEND_ID);
+        send.params.insert("_automap_device_id".into(), Value::String(upstream_dev.into()));
+        send.input_sources = vec![Some((upstream, 0))];
+        send.n_outputs = 1;
+        send
+    }
+
+    // A network peer's game rumble still reaches the sender's pad…
+    #[test]
+    fn network_peer_rumble_reaches_pad() {
+        peer_rumble(9201, 0.6);
+        let pad = fb_pad(1, FB_DS, FB_DS_PINS, None);
+        let out = fb_tick(vec![pad, net_send_node(9201, 0, FB_DS)], &HashMap::new());
+        let v = pad_value(&out, FB_DS, "rumble_strong");
+        assert!((v - 0.6).abs() < 0.01, "peer rumble 0.6 must reach the pad, got {v}");
+    }
+
+    // …and counts as the game for Audio Stream Haptics on the sender: it shapes
+    // the audio and never plays on its own.
+    #[test]
+    fn asth_takes_over_network_peer_rumble() {
+        peer_rumble(9202, 0.6);
+        let pad = fb_pad(1, FB_DS, FB_DS_PINS, None);
+        let asth = asth_node(9203, FB_DS, FB_DS, 0.0, 0.5);
+        let send = net_send_node(9202, 1, FB_DS);
+        let out = fb_tick(vec![pad, asth, send], &HashMap::new());
+        assert_eq!(pad_value(&out, FB_DS, "rumble_strong"), 0.0, "peer rumble must not play alongside");
+        let v = pad_value(&out, FB_DS, "hd_l_amp");
+        assert!((v - 0.3).abs() < 0.01, "gate: audio 0.5 × peer 0.6, got {v}");
+    }
+
+    // Receiver side: Audio Stream Haptics on a Network Receive's bus reads the
+    // game that bus feeds, and its rumble — not the game's — goes back to the
+    // sender (the game's is sent as 0 so the far pad lets go).
+    #[test]
+    fn asth_on_receiver_reads_game_and_sends_its_rumble_back() {
+        let recv_uid = 9301;
+        let mut recv = empty_node(recv_uid, crate::eval::NET_RECV_ID);
+        recv.n_outputs = 2;
+        let asth = asth_node(9302, "", &format!("collector:{recv_uid}"), 0.0, 1.0);
+        let sink = sink_node(3, FB_VIRT, &format!("collector:{recv_uid}"), false);
+        fb_tick(vec![recv, asth, sink], &game_rumble(0.7));
+        let (frame, _) = flexinput_net::latest_feedback_frame(recv_uid).expect("receiver publishes feedback");
+        let get = |pin: &str| frame.iter_present().find(|(p, _)| *p == pin).map(|(_, v)| v);
+        assert!(get("hd_l_amp").is_some_and(|v| (v - 0.7).abs() < 0.01),
+            "gate: audio 1.0 × game 0.7, got {:?}", get("hd_l_amp"));
+        assert_eq!(get("rumble_strong"), Some(0.0), "the game's rumble must go back as 0");
+    }
+
+    // Behind an AutoMap Selector the module still reads the game, and takes over
+    // the pad the Selector gates from.
+    #[test]
+    fn asth_after_selector_takes_over_the_selected_pad() {
+        let pad = fb_pad(1, FB_DS, FB_DS_PINS, Some(FB_VIRT));
+        let mut sel = empty_node(2, "module.automap_selector");
+        sel.params.insert("_automap_input_devs".into(), serde_json::json!([FB_DS]));
+        sel.params.insert("_automap_input_collectors".into(), serde_json::json!([""]));
+        sel.input_sources = vec![None, Some((0, 0))];
+        sel.n_outputs = 1;
+        let mut asth = asth_node(9401, "", "forksel:2:0", 0.0, 0.5);
+        asth.params.insert("_automap_collector_id".into(), Value::String("forksel:2:0".into()));
+        asth.input_sources = vec![Some((1, 0))];
+        // The virtual pad sits behind a later module, not right behind this one,
+        // so only the Selector's forwarding can tell it what the game wants.
+        let sink = sink_node(4, FB_VIRT, "remap:77", false);
+        let out = fb_tick(vec![pad, sel, asth, sink], &game_rumble(0.8));
+        assert_eq!(pad_value(&out, FB_DS, "rumble_strong"), 0.0, "game rumble must be taken over");
+        let v = pad_value(&out, FB_DS, "hd_l_amp");
+        assert!((v - 0.4).abs() < 0.01, "gate: audio 0.5 × game 0.8, got {v}");
+    }
 }
 
 #[cfg(test)]
