@@ -49,8 +49,10 @@ pub struct NodeState {
     /// order" chords and Sequence mode). Indexed like `gesture_state`; unused
     /// entries for order-agnostic cards stay default.
     pub order_state: Vec<OrderTrack>,
-    /// Per-mapping move timing for one-input analog Remapper cards in Short or
-    /// Sequence mode, which time a move from where the input leaves zero.
+    /// Per-mapping gesture timing for Remapper cards timed from where their
+    /// input starts: one-input analog cards in Short or Sequence mode (from
+    /// where the input leaves zero), and "in order" chords in Short or Double
+    /// mode (from where the chord's first input goes down).
     pub move_state: Vec<MoveTrack>,
     /// Per-pin hold-back state for a Remapper: inputs kept from the rest of the
     /// node while a card is still deciding on them ("in order", Sequence, or a
@@ -100,34 +102,41 @@ pub struct OrderTrack {
     pub progress: usize,
     /// Seconds since the last step matched.
     pub since_step: f32,
+    /// "In order" chord with Hold (normal / Long): it fired and its last input
+    /// is still held, so the output stays on after the earlier inputs are let
+    /// go.
+    pub latched: bool,
 }
 
-/// Where a one-input analog card's current move stands (see
-/// `NodeState::move_state`).
+/// Where a timed gesture stands (see `NodeState::move_state`). For an analog
+/// input "past" means past the card's threshold; for an "in order" chord it
+/// means the chord is completed.
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
 pub enum MovePhase {
-    /// At rest (zero).
+    /// At rest (zero / the chord's first input up).
     #[default]
     Idle,
-    /// Moving, not yet past the threshold, still inside the time gap.
+    /// Started, not past, still inside the time gap.
     Moving,
-    /// Reached the threshold inside the time gap and is still past it.
+    /// Got past inside the time gap and is still past.
     Fast,
-    /// Too slow, or dropped back under the threshold: nothing more from this
-    /// move until the input returns to zero.
+    /// Too slow, or done: nothing more from this gesture until it returns to
+    /// rest.
     Spent,
 }
 
-/// Timing of a one-input analog card's current move.
+/// Timing of a card's current gesture (see `NodeState::move_state`).
 #[derive(Default, Clone, Copy, Debug)]
 pub struct MoveTrack {
     pub phase: MovePhase,
-    /// Seconds since the input left zero.
+    /// Seconds since the gesture started.
     pub since_start: f32,
-    /// Seconds spent past the threshold during this fast move.
+    /// Seconds spent past during the current fast stretch.
     pub above_s: f32,
-    /// Short mode: seconds of output left to play back after a qualifying flick.
+    /// Short mode: seconds of output left to play back after a qualifying tap.
     pub replay_s: f32,
+    /// Double on a chord: how many times it's been completed in this gesture.
+    pub taps: u8,
 }
 
 /// Hold-back state of one input pin (see `NodeState::hold_back`).
@@ -142,8 +151,11 @@ pub enum HoldBackPin {
     /// press's length so far; `released` means that press already ended (so
     /// it's replayed if the card gives up).
     Withheld { held_s: f32, released: bool, cap: f32 },
-    /// Used by a card that fired; stays hidden until the pin is released.
-    Consumed { cap: f32 },
+    /// Used by a card that fired; stays hidden until the pin is released —
+    /// unless `restore`: an earlier input of an "in order" chord, which comes
+    /// back live as soon as the chord lets go while it's still held (the chord
+    /// works as a mode shift).
+    Consumed { cap: f32, restore: bool },
     /// The card gave up after the press ended: the press plays back late.
     Replaying { remaining_s: f32 },
 }

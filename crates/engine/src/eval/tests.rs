@@ -824,54 +824,249 @@ mod trigger_tests {
         assert!(on(&c, "btn_rb") && !on(&c, "btn_lb"), "B then A must fire only the B-then-A card");
     }
 
-    // The chord's start is hidden while it waits, then consumed with the rest;
-    // an input still held after the chord stays hidden until released.
+    // Normal press mode doesn't wait on the time gap: the chord's first input is
+    // live at once, consumed when the chord completes, and back as soon as the
+    // chord lets go of it while it's still held. Pressing the last input again
+    // re-fires.
     #[test]
-    fn in_order_holds_back_start_then_consumes() {
+    fn in_order_chord_start_is_live_then_consumed() {
         let mut rig = RemapRig::new(serde_json::json!([
             { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "in_order": true }
         ]));
-        let c = rig.tick(&["btn_south"]);
-        assert!(!on(&c, "btn_south"), "the first input must be held back while the chord waits");
-        assert!(c.contains_key(&("remap:1".to_string(), format!("{CONSUMED_PREFIX}btn_south"))),
-            "a held-back input is marked consumed, so a Combiner won't take it from a raw port");
+        assert!(on(&rig.tick(&["btn_south"]), "btn_south"), "the first input isn't delayed");
         let c = rig.tick(&["btn_south", "btn_east"]);
         assert!(on(&c, "btn_lb"));
         assert!(!on(&c, "btn_south") && !on(&c, "btn_east"), "matched inputs are consumed");
+        assert!(c.contains_key(&("remap:1".to_string(), format!("{CONSUMED_PREFIX}btn_south"))),
+            "a consumed input is marked, so a Combiner won't take it from a raw port");
         let c = rig.tick(&["btn_south"]);
-        assert!(!on(&c, "btn_lb"));
-        assert!(!on(&c, "btn_south"), "a consumed input stays hidden until it's released");
-        // Pressing B again with A still held fires the chord again.
+        assert!(!on(&c, "btn_lb") && on(&c, "btn_south"), "backing out brings the still-held start back at once");
         let c = rig.tick(&["btn_south", "btn_east"]);
-        assert!(on(&c, "btn_lb"), "re-pressing the last input with the start held must re-fire");
+        assert!(on(&c, "btn_lb") && !on(&c, "btn_south"), "re-pressing the last input re-fires and consumes the start");
     }
 
-    // Held past the time gap without the rest: the input goes live, late.
+    // Hold in normal press mode: once the chord fires, its output stays on while
+    // the last input is held, even after the earlier inputs are let go — and an
+    // output that is one of those inputs follows it. LB > X → LB + Y: lift LB
+    // and X keeps holding Y. LB > RB > X → LB + RB + Y works the same way.
     #[test]
-    fn in_order_timeout_releases_held_input_live() {
-        let mut rig = RemapRig::new(serde_json::json!([
-            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "in_order": true }
-        ]));
-        let seen: Vec<bool> = (0..30).map(|_| on(&rig.tick(&["btn_south"]), "btn_south")).collect();
-        assert!(!seen[..15].contains(&true), "hidden inside the 200 ms gap: {seen:?}");
-        assert!(seen[25..].iter().all(|v| *v), "live once the gap runs out: {seen:?}");
-    }
-
-    // A tap that breaks the chord (released before the rest) plays back late at
-    // its original length instead of being lost.
-    #[test]
-    fn in_order_released_tap_is_replayed() {
-        let mut rig = RemapRig::new(serde_json::json!([
-            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "in_order": true }
-        ]));
-        for _ in 0..5 {
-            assert!(!on(&rig.tick(&["btn_south"]), "btn_south"));
+    fn in_order_chord_hold_latches_output_on_trigger() {
+        let card = |hold: bool| serde_json::json!([
+            { "in": ["btn_lb", "btn_west"], "out": ["btn_lb", "btn_north"], "in_order": true, "sustain": hold }
+        ]);
+        let mut rig = RemapRig::new(card(true));
+        rig.tick(&["btn_lb"]);
+        let c = rig.tick(&["btn_lb", "btn_west"]);
+        assert!(on(&c, "btn_lb") && on(&c, "btn_north") && !on(&c, "btn_west"), "LB > X gives LB + Y");
+        for _ in 0..3 {
+            let c = rig.tick(&["btn_west"]);
+            assert!(on(&c, "btn_north") && !on(&c, "btn_lb") && !on(&c, "btn_west"),
+                "LB lifted: X keeps holding Y, LB drops");
         }
-        let replay: Vec<bool> = (0..12).map(|_| on(&rig.tick(&[]), "btn_south")).collect();
-        let len = replay.iter().filter(|v| **v).count();
-        assert!(replay[0], "replay starts when the tap breaks the chord: {replay:?}");
-        assert!((4..=7).contains(&len), "replay keeps the ~50 ms tap length, got {len} ticks: {replay:?}");
-        assert!(!replay[11], "replay ends: {replay:?}");
+        let c = rig.tick(&[]);
+        assert!(!on(&c, "btn_north") && !on(&c, "btn_west"), "X released: Y released");
+
+        let mut rig = RemapRig::new(card(false));
+        rig.tick(&["btn_lb"]);
+        rig.tick(&["btn_lb", "btn_west"]);
+        let c = rig.tick(&["btn_west"]);
+        assert!(!on(&c, "btn_north") && !on(&c, "btn_west"), "without Hold, lifting LB ends it; X stays consumed");
+
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_lb", "btn_rb", "btn_west"], "out": ["btn_lb", "btn_rb", "btn_north"],
+              "in_order": true, "sustain": true }
+        ]));
+        rig.tick(&["btn_lb"]);
+        rig.tick(&["btn_lb", "btn_rb"]);
+        let c = rig.tick(&["btn_lb", "btn_rb", "btn_west"]);
+        assert!(on(&c, "btn_lb") && on(&c, "btn_rb") && on(&c, "btn_north"), "LB > RB > X gives LB + RB + Y");
+        let c = rig.tick(&["btn_rb", "btn_west"]);
+        assert!(!on(&c, "btn_lb") && on(&c, "btn_rb") && on(&c, "btn_north"), "LB lifted: RB + Y");
+        let c = rig.tick(&["btn_west"]);
+        assert!(!on(&c, "btn_lb") && !on(&c, "btn_rb") && on(&c, "btn_north"), "RB lifted too: X holds Y");
+        assert!(!on(&rig.tick(&[]), "btn_north"), "X released: Y released");
+    }
+
+    // An "in order" chord as a mode shift, e.g. [LB > Y] → [LB + X]: LB + Y
+    // gives LB + X; letting go of Y leaves LB held; Y then LB is just Y + LB;
+    // and letting go of LB first doesn't send a stray Y.
+    #[test]
+    fn in_order_chord_works_as_mode_shift() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_lb", "btn_north"], "out": ["btn_lb", "btn_west"], "in_order": true }
+        ]));
+        rig.tick(&["btn_lb"]);
+        let c = rig.tick(&["btn_lb", "btn_north"]);
+        assert!(on(&c, "btn_lb") && on(&c, "btn_west") && !on(&c, "btn_north"), "LB > Y gives LB + X");
+        let c = rig.tick(&["btn_lb"]);
+        assert!(on(&c, "btn_lb") && !on(&c, "btn_west"), "releasing Y keeps LB held, drops X");
+        let c = rig.tick(&["btn_lb", "btn_north"]);
+        assert!(on(&c, "btn_lb") && on(&c, "btn_west"), "Y again: LB + X again");
+        rig.tick(&[]);
+
+        rig.tick(&["btn_north"]);
+        let c = rig.tick(&["btn_north", "btn_lb"]);
+        assert!(on(&c, "btn_north") && on(&c, "btn_lb") && !on(&c, "btn_west"), "Y then LB is Y + LB");
+        rig.tick(&[]);
+
+        rig.tick(&["btn_lb"]);
+        rig.tick(&["btn_lb", "btn_north"]);
+        for _ in 0..3 {
+            let c = rig.tick(&["btn_north"]);
+            assert!(!on(&c, "btn_north") && !on(&c, "btn_west") && !on(&c, "btn_lb"),
+                "releasing LB first: Y stays consumed until released");
+        }
+        rig.tick(&[]);
+        assert!(on(&rig.tick(&["btn_north"]), "btn_north"), "a fresh Y press is plain Y");
+    }
+
+    // A longer chord backs out the same way: every earlier input still held
+    // comes back, the input that completed the chord doesn't.
+    #[test]
+    fn in_order_three_input_chord_backing_out() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east", "btn_west"], "out": ["btn_rb"], "in_order": true }
+        ]));
+        rig.tick(&["btn_south"]);
+        rig.tick(&["btn_south", "btn_east"]);
+        assert!(on(&rig.tick(&["btn_south", "btn_east", "btn_west"]), "btn_rb"));
+        let c = rig.tick(&["btn_south", "btn_west"]);
+        assert!(!on(&c, "btn_rb"));
+        assert!(on(&c, "btn_south"), "the chord's first input comes back");
+        assert!(!on(&c, "btn_west"), "the input that completed it stays consumed");
+    }
+
+    /// Run `steps` of held inputs; returns each tick's published map.
+    fn rig_steps(rig: &mut RemapRig, steps: &[&[&str]]) -> Vec<HashMap<(String, String), Signal>> {
+        steps.iter().map(|down| rig.tick(down)).collect()
+    }
+
+    // Short + Turbo on an "in order" chord times the whole chord from its first input:
+    // completed and let go inside the gap fires. Its inputs are held back while
+    // it decides and the still-held modifier comes back once it's done; with
+    // Hold the modifier stays held throughout. Too slow: the inputs just come
+    // through, and a lone tap of the modifier plays back late.
+    #[test]
+    fn in_order_short_chord_times_the_whole_chord() {
+        let card = |hold: bool| serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "mode": "short", "window_ms": 100.0,
+              "in_order": true, "sustain": hold, "turbo": true }
+        ]);
+        let quick: [&[&str]; 5] = [
+            &["btn_south"], &["btn_south", "btn_east"], &["btn_south", "btn_east"], &["btn_south"], &["btn_south"],
+        ];
+        for hold in [false, true] {
+            let mut rig = RemapRig::new(card(hold));
+            let c = rig_steps(&mut rig, &quick);
+            let south: Vec<bool> = c.iter().map(|c| on(c, "btn_south")).collect();
+            assert!(c.iter().any(|c| on(c, "btn_lb")), "completed and let go inside the gap fires (hold {hold})");
+            assert!(!c.iter().any(|c| on(c, "btn_east")), "the trigger never reaches the game (hold {hold})");
+            if hold {
+                assert!(south.iter().all(|v| *v), "with Hold the modifier stays held throughout: {south:?}");
+            } else {
+                assert!(!south[..4].contains(&true), "held back while it decides: {south:?}");
+                let later: Vec<bool> = (0..3).map(|_| on(&rig.tick(&["btn_south"]), "btn_south")).collect();
+                assert!(later.iter().all(|v| *v), "the still-held modifier comes back after: {later:?}");
+            }
+        }
+
+        let mut rig = RemapRig::new(card(false));
+        let seen: Vec<bool> = (0..15).map(|_| on(&rig.tick(&["btn_south"]), "btn_south")).collect();
+        assert!(!seen[..9].contains(&true) && seen[12..].iter().all(|v| *v), "hidden up to the gap, then live: {seen:?}");
+        let c = rig.tick(&["btn_south", "btn_east"]);
+        assert!(!on(&c, "btn_lb") && on(&c, "btn_east"), "completing it after the gap is just the inputs");
+
+        let mut rig = RemapRig::new(card(false));
+        for _ in 0..4 { rig.tick(&["btn_south"]); }
+        let replay: Vec<bool> = (0..8).map(|_| on(&rig.tick(&[]), "btn_south")).collect();
+        assert!(replay[0] && !replay[7], "a lone tap of the modifier plays back late: {replay:?}");
+    }
+
+    // Double + Turbo on an "in order" chord: complete it twice inside the gap,
+    // counted from its first input; on during the second completion.
+    #[test]
+    fn in_order_double_chord_within_gap() {
+        for hold in [false, true] {
+            let mut rig = RemapRig::new(serde_json::json!([
+                { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "mode": "double", "window_ms": 150.0,
+                  "in_order": true, "sustain": hold, "turbo": true }
+            ]));
+            let c = rig_steps(&mut rig, &[
+                &["btn_south"], &["btn_south", "btn_east"], &["btn_south"],
+                &["btn_south", "btn_east"], &["btn_south", "btn_east"], &["btn_south"],
+            ]);
+            let lb: Vec<bool> = c.iter().map(|c| on(c, "btn_lb")).collect();
+            let south: Vec<bool> = c.iter().map(|c| on(c, "btn_south")).collect();
+            assert!(lb[3] && lb[4] && !lb[5] && !lb[..3].contains(&true), "on during the second completion: {lb:?} (hold {hold})");
+            assert!(!c.iter().any(|c| on(c, "btn_east")), "the trigger never reaches the game (hold {hold})");
+            if hold {
+                assert!(south.iter().all(|v| *v), "with Hold the modifier stays held throughout: {south:?}");
+            } else {
+                assert!(!south[..5].contains(&true) && south[5], "held back, then back once it's done: {south:?}");
+            }
+        }
+    }
+
+    // Short / Double on an "in order" chord without Turbo: the time gap times the
+    // last input only, so the modifier can be held as long as you like (a mode
+    // shift). The modifier stays live while the trigger decides.
+    #[test]
+    fn in_order_tap_chord_gap_times_last_input() {
+        let both: &[&str] = &["btn_south", "btn_east"];
+        let modifier: &[&str] = &["btn_south"];
+
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "mode": "short", "window_ms": 50.0, "in_order": true }
+        ]));
+        let long_hold: Vec<bool> = (0..20).map(|_| on(&rig.tick(modifier), "btn_south")).collect();
+        assert!(long_hold.iter().all(|v| *v), "the modifier isn't delayed: {long_hold:?}");
+        let c = rig_steps(&mut rig, &[both, both, modifier, modifier]);
+        assert!(c.iter().any(|c| on(c, "btn_lb")), "a quick tap of the last input fires, however long the modifier was held");
+        assert!(!c.iter().any(|c| on(c, "btn_east")), "the tapped trigger is consumed");
+        assert!(on(&c[0], "btn_south") && on(&c[1], "btn_south"), "the modifier stays live while the trigger decides");
+        rig_steps(&mut rig, &[modifier; 3]);
+        let c = rig_steps(&mut rig, &[both; 10]);
+        assert!(!c.iter().any(|c| on(c, "btn_lb")) && on(c.last().unwrap(), "btn_east"),
+            "the last input held past the gap comes through instead");
+
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "mode": "double", "window_ms": 100.0, "in_order": true }
+        ]));
+        rig_steps(&mut rig, &[modifier; 20]);
+        let c = rig_steps(&mut rig, &[both, modifier, both, both, modifier]);
+        let lb: Vec<bool> = c.iter().map(|c| on(c, "btn_lb")).collect();
+        assert!(!lb[0] && !lb[1] && lb[2] && lb[3] && !lb[4], "a double tap of the last input fires: {lb:?}");
+        assert!(!c.iter().any(|c| on(c, "btn_east")), "the tapped trigger is consumed");
+        assert!(on(&c[0], "btn_south") && on(&c[1], "btn_south") && on(&c[4], "btn_south"),
+            "the modifier is live while the trigger decides, and back after");
+    }
+
+    // Long on an "in order" chord: the modifier stays live while Long decides
+    // (only the trigger waits); once it fires both are consumed, and letting go
+    // of the trigger gives the modifier back. With Hold, lifting the modifier
+    // once it's fired keeps the output on while the trigger is held.
+    #[test]
+    fn in_order_long_chord_only_trigger_waits() {
+        let mut rig = RemapRig::new(serde_json::json!([
+            { "in": ["btn_south", "btn_east"], "out": ["btn_lb"], "mode": "long", "window_ms": 50.0,
+              "sustain": true, "in_order": true }
+        ]));
+        assert!(on(&rig.tick(&["btn_south"]), "btn_south"));
+        let c = rig.tick(&["btn_south", "btn_east"]);
+        assert!(on(&c, "btn_south") && !on(&c, "btn_east") && !on(&c, "btn_lb"), "deciding: modifier live, trigger waits");
+        let both: &[&str] = &["btn_south", "btn_east"];
+        let c = rig_steps(&mut rig, &[both; 8]);
+        let last = c.last().unwrap();
+        assert!(on(last, "btn_lb") && !on(last, "btn_south") && !on(last, "btn_east"), "fired: both consumed");
+        let c = rig.tick(&["btn_south"]);
+        assert!(on(&c, "btn_south") && !on(&c, "btn_lb"), "letting go of the trigger gives the modifier back");
+
+        rig_steps(&mut rig, &[&[], &["btn_south"]]);
+        rig_steps(&mut rig, &[both; 8]);
+        let trigger: &[&str] = &["btn_east"];
+        let c = rig_steps(&mut rig, &[trigger; 3]);
+        assert!(c.iter().all(|c| on(c, "btn_lb")), "Hold: modifier lifted after firing, the trigger keeps it on");
+        assert!(!on(&rig.tick(&[]), "btn_lb"));
     }
 
     // Holding B then pressing A is B-then-A: an A-then-B card must not hide A,

@@ -251,11 +251,19 @@ pub(crate) fn eval_remapper_node(
                 let in_pins: Vec<String> = m.get("in").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
-                let out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
+                let mut out_pins: Vec<String> = m.get("out").and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
                 if in_pins.is_empty() { continue; }
                 if !effective[i] { continue; }
+                // An "in order" chord kept on by Hold after its modifiers were let
+                // go: an output that is one of those modifiers follows it and drops
+                // (LB > X → LB + Y: lift LB and X keeps holding just Y).
+                let lifted = verdicts[i].map_or(0, |v| v.lifted_modifiers);
+                if lifted != 0 {
+                    out_pins.retain(|o| !in_pins.iter().enumerate()
+                        .any(|(k, p)| k < 32 && lifted & (1 << k) != 0 && p == o));
+                }
                 let my_len = in_pins.len();
                 let my_ordered = ordered(i);
                 let suppressed = triggered_claims.iter().any(|(claim_len, claim_ordered, claim_pins)| {
@@ -300,6 +308,13 @@ pub(crate) fn eval_remapper_node(
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
                 let target = if is_analog { &mut claimed_inputs_analog } else { &mut claimed_inputs_digital };
+                // An "in order" chord with Hold leaves its modifiers held in the
+                // game and owns only the last input.
+                let in_pins: Vec<String> = if verdicts[i].is_some_and(|v| v.owns_trigger_only) {
+                    in_pins.into_iter().last().into_iter().collect()
+                } else {
+                    in_pins
+                };
                 for p in in_pins {
                     if self_mapped.contains(&p) { continue; }
                     target.insert(p);

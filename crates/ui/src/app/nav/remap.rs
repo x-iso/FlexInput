@@ -1121,9 +1121,12 @@ impl FlexInputApp {
         let in_order_on = order_applies && self.nav_remap_card_bool(outer_id, idx, "in_order");
         let gap_applies = matches!(mode.as_str(),
             "short"|"long"|"double"|"analog"|"on_press"|"on_release"|"sequence")
-            || turbo_on || in_order_on;
-        let hold_applies = mode == "long" || mode == "analog";
-        let turbo_applies = !matches!(mode.as_str(), "short"|"double"|"on_press"|"on_release");
+            || turbo_on;
+        let hold_applies = mode == "long" || mode == "analog"
+            || (in_order_on && matches!(mode.as_str(), "down"|"short"|"double"));
+        // On an "in order" Short / Double chord, Turbo means "the whole chord in time".
+        let turbo_applies = (in_order_on && matches!(mode.as_str(), "short"|"double"))
+            || !matches!(mode.as_str(), "short"|"double"|"on_press"|"on_release");
         // Field 0 (press-mode) always applies.
         let applies = [true, gap_applies, hold_applies, turbo_applies];
 

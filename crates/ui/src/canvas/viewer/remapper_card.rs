@@ -310,15 +310,16 @@ pub(crate) fn remapper_mapping_card_pixel(
     //   short/long/double — window timing; analog — per-tap duration;
     //   on_press/on_release — emitted trigger duration (see apply_press_mode);
     //   sequence — max gap between steps;
-    //   any mode with turbo on — turbo period;
-    //   "in order" on — how long the chord's start is held back.
+    //   any mode with turbo on — turbo period.
     let gap_applies = matches!(mode_now.as_str(),
         "short" | "long" | "double" | "analog" | "on_press" | "on_release" | "sequence")
-        || turbo_on || in_order_on;
+        || turbo_on;
     // Turbo is only meaningful for sustained/continuous gates. It's grayed for
     // short, double, and the edge-trigger modes (on_press/on_release) — turbo
-    // on a one-shot edge pulse has no sensible meaning.
-    let turbo_applies = !matches!(mode_now.as_str(),
+    // on a one-shot edge pulse has no sensible meaning. Exception: on an "in
+    // order" chord in short / double mode it means "the whole chord in time".
+    let order_tap = in_order_on && matches!(mode_now.as_str(), "short" | "double");
+    let turbo_applies = order_tap || !matches!(mode_now.as_str(),
         "short" | "double" | "on_press" | "on_release");
     {
         let outer = egui::Rect::from_min_size(at(61.0, 5.0), sz(137.0, 20.0));
@@ -359,8 +360,30 @@ pub(crate) fn remapper_mapping_card_pixel(
     }
 
     // ── hold pill: (206,5,62×20), checkbox at +(45,3,14×14) ──────────────
-    // In `analog` mode, `hold` toggles short-tap vs long-tap pulse trains.
-    let hold_applies = mode_now == "long" || mode_now == "analog";
+    // In `analog` mode, `hold` toggles short-tap vs long-tap pulse trains. On an
+    // "in order" chord: normal / long — the output stays on while the last input
+    // is held, after the earlier ones are let go; short / double — the earlier
+    // inputs stay held in the game throughout (only the last one is taken).
+    let hold_applies = mode_now == "long" || mode_now == "analog"
+        || (in_order_on && matches!(mode_now.as_str(), "down" | "short" | "double"));
+    let hold_tip = if in_order_on {
+        match mode_now.as_str() {
+            "down" => Some(
+                "Hold: once the chord fires, its output stays on while the last input \
+                 is held, even after you let go of the earlier ones. An output that's \
+                 one of those earlier inputs lets go with it."),
+            "long" => Some(
+                "Hold: the output stays on while held instead of a short pulse, and \
+                 keeps going while the last input is held, even after you let go of \
+                 the earlier ones."),
+            "short" | "double" => Some(
+                "Hold: the earlier inputs stay held in the game the whole time; only \
+                 the last one is taken."),
+            _ => None,
+        }
+    } else {
+        None
+    };
     {
         let outer = egui::Rect::from_min_size(at(206.0, 5.0), sz(62.0, 20.0));
         let cb_rect = egui::Rect::from_min_size(at(206.0 + 45.0, 5.0 + 3.0), sz(14.0, 14.0));
@@ -380,8 +403,11 @@ pub(crate) fn remapper_mapping_card_pixel(
         if hold {
             painter.rect_filled(cb_rect.shrink(3.0 * s), 1.0, mul(C_PILL_DARK));
         }
-        let resp = ui.interact(outer, ui.id().with(("hold", mapping_idx)),
+        let mut resp = ui.interact(outer, ui.id().with(("hold", mapping_idx)),
             if hold_applies { egui::Sense::click() } else { egui::Sense::hover() });
+        if let Some(tip) = hold_tip {
+            resp = resp.on_hover_text(tip);
+        }
         if hold_applies && resp.clicked() {
             hold = !hold;
             mapping.insert("sustain".to_string(), Value::Bool(hold));
@@ -415,8 +441,19 @@ pub(crate) fn remapper_mapping_card_pixel(
         if turbo {
             painter.rect_filled(cb_rect.shrink(3.0 * s), 1.0, mul(C_PILL_DARK));
         }
-        let resp = ui.interact(outer, ui.id().with(("turbo", mapping_idx)),
+        let mut resp = ui.interact(outer, ui.id().with(("turbo", mapping_idx)),
             if turbo_applies { egui::Sense::click() } else { egui::Sense::hover() });
+        if order_tap {
+            resp = resp.on_hover_text(if mode_now == "short" {
+                "Turbo (whole chord): the entire chord, from its first input, has to be \
+                 completed and let go within the time gap.\nOff: the time gap only times \
+                 the last input, so the earlier ones can be held as long as you like."
+            } else {
+                "Turbo (whole chord): the entire chord, from its first input, has to be \
+                 completed twice within the time gap.\nOff: the time gap only times the \
+                 last input's double tap, so the earlier ones can be held as long as you like."
+            });
+        }
         if turbo_applies && resp.clicked() {
             turbo = !turbo;
             mapping.insert("turbo".to_string(), Value::Bool(turbo));
@@ -565,12 +602,13 @@ pub(crate) fn remapper_mapping_card_pixel(
                  back late.\nClick to let it pass through.",
             (false, false) =>
                 "In order: off. These inputs match in any order.\n\
-                 Click to require this order. The first inputs are then held back \
-                 from the game until the rest arrive, for up to the time gap.",
+                 Click to require this order, like a mode shift.",
             (false, true) =>
-                "In order: on. These inputs must go down in this order, and the \
-                 first ones are held back from the game until the rest arrive, for \
-                 up to the time gap.\nClick to match in any order.",
+                "In order: on. These inputs must go down in this order, like a mode \
+                 shift: the earlier ones reach the game as usual until the last one \
+                 completes the chord, and come back when it's let go. Hold and Turbo \
+                 change this per press mode — hover them for details.\n\
+                 Click to match in any order.",
             (true, false) =>
                 "Sequence steps pass through to the game as they're pressed.\n\
                  Click to hold earlier steps back until the sequence completes.",

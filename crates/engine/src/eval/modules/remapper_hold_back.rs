@@ -10,12 +10,25 @@
 //!     press counts once it's released, held long enough, or tapped again.
 //!
 //! While such a card is still deciding, it HOLDS BACK the input it has so far
-//! (always for "in order" and the timed modes; Sequence only with its toggle
-//! on): the rest of the node doesn't see it. If the card fires, the input is
-//! consumed. If it gives up, the input comes back late — still held → live, a
-//! press that already ended → replayed at its original length. That's what
-//! lets a Short card leave long presses working, a Long card leave taps
-//! working, and a Double card leave single taps working.
+//! (the timed modes always; Sequence only with its toggle on): the rest of the
+//! node doesn't see it. If the card fires, the input is consumed. If it gives
+//! up, the input comes back late — still held → live, a press that already
+//! ended → replayed at its original length. That's what lets a Short card
+//! leave long presses working, a Long card leave taps working, and a Double
+//! card leave single taps working.
+//!
+//! An "in order" chord is a MODE SHIFT: its earlier inputs (modifiers) reach
+//! the game as usual until the last input (the trigger) completes the chord;
+//! the chord then consumes them, and gives the modifiers back the moment it
+//! lets go while they're still held. The trigger stays consumed until
+//! released. Per press mode:
+//!   - normal / Long with Hold: once fired, the output stays on while the
+//!     trigger is held, even after the modifiers are let go; an output that is
+//!     itself one of the modifiers follows that modifier instead;
+//!   - Short / Double: the time gap times the trigger (Turbo: the whole chord,
+//!     from its first input, holding its inputs back while it decides); with
+//!     Hold the modifiers stay held in the game throughout and only the trigger
+//!     is taken.
 //!
 //! A card with a single analog input (stick direction / trigger) in Short or
 //! Sequence mode times the whole MOVE, from where the input leaves zero: Short
@@ -87,6 +100,7 @@ pub(crate) fn move_tick(track: &mut MoveTrack, engaged: bool, past: bool, window
         track.phase = MovePhase::Moving;
         track.since_start = 0.0;
         track.above_s = 0.0;
+        track.taps = 0;
     }
     track.since_start += dt;
     let in_time = track.since_start <= window_s;
@@ -117,8 +131,9 @@ pub(crate) fn move_tick(track: &mut MoveTrack, engaged: bool, past: bool, window
 
 /// How a card treats input order, or `None` for an order-agnostic card.
 ///
-/// The card's `in_order` flag makes a chord ordered and holds back its start;
-/// Sequence mode is always ordered, so there the flag only adds the hold-back.
+/// The card's `in_order` flag makes a chord ordered (a mode shift, see the
+/// module docs); Sequence mode is always ordered, so there the flag instead
+/// holds back the earlier steps.
 pub(crate) fn order_spec(m: &Value) -> Option<OrderSpec> {
     let press = PressParams::from_card(m);
     if press.is_analog() || mapping_targets_touch(m) {
@@ -129,10 +144,73 @@ pub(crate) fn order_spec(m: &Value) -> Option<OrderSpec> {
     if matches!(press.mode(), PressMode::Sequence) {
         Some(OrderSpec { kind: OrderKind::Sequence, hold_back: in_order })
     } else if in_order {
-        Some(OrderSpec { kind: OrderKind::Chord, hold_back: true })
+        Some(OrderSpec { kind: OrderKind::Chord, hold_back: false })
     } else {
         None
     }
+}
+
+/// Short / Double on an "in order" chord time the whole chord from where its
+/// first input goes down (`engaged`; `matched`: completed in order). Short
+/// fires when the chord is completed and let go inside the time gap — the
+/// return is how long it stayed completed, played back as a tap. Double fires
+/// on completing it a second time inside the gap, and stays on while that
+/// second one is held. A chord too slow for either waits for its first input
+/// to be released before it can start again.
+pub(crate) fn chord_tap_tick(
+    track: &mut MoveTrack,
+    double: bool,
+    engaged: bool,
+    matched: bool,
+    window_s: f32,
+    dt: f32,
+) -> Option<f32> {
+    track.replay_s = (track.replay_s - dt).max(0.0);
+    if track.phase == MovePhase::Idle {
+        if !engaged {
+            return None;
+        }
+        *track = MoveTrack { phase: MovePhase::Moving, replay_s: track.replay_s, ..MoveTrack::default() };
+    }
+    track.since_start += dt;
+    let in_time = track.since_start <= window_s;
+    let mut tap = None;
+    match track.phase {
+        MovePhase::Moving => {
+            if !in_time {
+                track.phase = MovePhase::Spent;
+            } else if matched {
+                track.phase = MovePhase::Fast;
+                track.taps += 1;
+                track.above_s = 0.0;
+            }
+        }
+        MovePhase::Fast => {
+            let second = double && track.taps >= 2;
+            if matched {
+                track.above_s += dt;
+                // Still completed past the gap: too long for a Short or for a
+                // Double's first press (a Double's second press may run on).
+                if !in_time && !second {
+                    track.phase = MovePhase::Spent;
+                }
+            } else if !double {
+                if in_time {
+                    tap = Some(track.above_s);
+                }
+                track.phase = MovePhase::Spent;
+            } else if !second && in_time {
+                track.phase = MovePhase::Moving;
+            } else {
+                track.phase = MovePhase::Spent;
+            }
+        }
+        _ => {}
+    }
+    if !engaged {
+        track.phase = MovePhase::Idle;
+    }
+    tap
 }
 
 /// A card that decides after the press: order-aware, timed, or both.
@@ -187,7 +265,7 @@ pub(crate) fn order_tick(
     if track.prev_held.len() != n {
         // First tick or the card was edited: start clean, treating inputs that
         // are already down as old presses so they can't count as steps.
-        *track = OrderTrack { prev_held: held.to_vec(), progress: 0, since_step: 0.0 };
+        *track = OrderTrack { prev_held: held.to_vec(), ..OrderTrack::default() };
         return false;
     }
     let rising: Vec<bool> = (0..n).map(|i| held[i] && !track.prev_held[i]).collect();
@@ -253,21 +331,10 @@ fn sequence_restart(pins: &[&str], progress: usize, x: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Whether a hold-back card is still waiting on the rest of its input: partway
-/// through and, for a chord, inside the time gap with none of the remaining
-/// inputs already down. An input that went down early can't count until it's
-/// pressed again, so holding B then pressing A is B-then-A — an A-then-B card
-/// must not hide A from whatever does match. (A sequence that overruns the gap
-/// has already started over.)
-pub(crate) fn order_pending(spec: OrderSpec, track: &OrderTrack, held: &[bool], window_s: f32) -> bool {
-    let n = held.len();
-    if !spec.hold_back || track.progress == 0 || track.progress >= n {
-        return false;
-    }
-    match spec.kind {
-        OrderKind::Sequence => true,
-        OrderKind::Chord => track.since_step <= window_s && !held[track.progress..].contains(&true),
-    }
+/// Whether a Sequence with hold-back is partway through, so its earlier steps
+/// stay hidden. (A sequence that overruns the gap has already started over.)
+pub(crate) fn order_pending(spec: OrderSpec, track: &OrderTrack, n: usize) -> bool {
+    spec.kind == OrderKind::Sequence && spec.hold_back && track.progress > 0 && track.progress < n
 }
 
 /// Where a press mode stands on the current press, read from its slots after
@@ -302,6 +369,13 @@ pub(crate) struct CardVerdict {
     pub(crate) held_now: bool,
     /// Order-aware: outranks an order-agnostic card over the same inputs.
     pub(crate) ordered: bool,
+    /// An "in order" Short / Double chord with Hold: it owns only its last
+    /// input (the trigger); the modifiers stay held in the game.
+    pub(crate) owns_trigger_only: bool,
+    /// An "in order" chord's modifiers (bit k = `in[k]`) that aren't held right
+    /// now. While the chord's output is on anyway (Hold), an output pin that is
+    /// one of these follows its modifier: it drops.
+    pub(crate) lifted_modifiers: u32,
 }
 
 /// Inputs the hold-back hides (with each one's stick cap) or replays this tick.
@@ -316,10 +390,12 @@ pub(crate) struct HoldBackView {
 /// `pending`: inputs a deciding hold-back card holds so far, each flagged true
 ///   when an order-aware card holds it (hide fully) rather than only timed ones
 ///   (cap a stick direction where it is).
-/// `fired_hold`: every input of a hold-back card that's fired — consumed, and
-///   kept hidden until released even once the card lets go.
+/// `fired_hold`: every input of a hold-back card that's fired — consumed.
 /// `fired_any`: every input of any fired deciding card; a withheld press one of
 ///   them used is consumed instead of replayed.
+/// `fired_sticky`: the inputs among those that stay consumed until released
+///   even once the card lets go — all of them, except an "in order" chord's
+///   earlier inputs, which come back live when the chord lets go (mode shift).
 /// `down`: inputs a deciding card counts as held (e.g. past its threshold), on
 ///   top of each input's own on/off state.
 pub(crate) fn hold_back_tick(
@@ -327,6 +403,7 @@ pub(crate) fn hold_back_tick(
     pending: &HashMap<&str, bool>,
     fired_hold: &HashSet<&str>,
     fired_any: &HashSet<&str>,
+    fired_sticky: &HashSet<&str>,
     down: &HashSet<&str>,
     upstream: &HashMap<String, Signal>,
     dt: f32,
@@ -342,10 +419,11 @@ pub(crate) fn hold_back_tick(
         // How far a stick direction still shows once hidden: not at all for an
         // order-aware card, else as far as it's pushed right now.
         let cap_now = |full: bool| if full { 0.0 } else { analog_cardinal_input_value(upstream, &p) };
+        let sticky = fired_sticky.contains(p.as_str());
         let next = match states.get(&p).copied().unwrap_or_default() {
             HoldBackPin::Idle => {
                 if held && fired_hold.contains(p.as_str()) {
-                    HoldBackPin::Consumed { cap: 0.0 }
+                    HoldBackPin::Consumed { cap: 0.0, restore: !sticky }
                 } else if let (true, Some(full)) = (held, waiting) {
                     HoldBackPin::Withheld { held_s: dt, released: false, cap: cap_now(full) }
                 } else {
@@ -354,7 +432,7 @@ pub(crate) fn hold_back_tick(
             }
             HoldBackPin::Withheld { held_s, released, cap } => {
                 if fired_any.contains(p.as_str()) {
-                    if held { HoldBackPin::Consumed { cap } } else { HoldBackPin::Idle }
+                    if held { HoldBackPin::Consumed { cap, restore: !sticky } } else { HoldBackPin::Idle }
                 } else if let Some(full) = waiting {
                     let cap = if full { 0.0 } else { cap };
                     match (held, released) {
@@ -372,8 +450,14 @@ pub(crate) fn hold_back_tick(
                     HoldBackPin::Idle
                 }
             }
-            HoldBackPin::Consumed { cap } => {
-                if held { HoldBackPin::Consumed { cap } } else { HoldBackPin::Idle }
+            HoldBackPin::Consumed { cap, restore } => {
+                if !held || (restore && !fired_any.contains(p.as_str())) {
+                    // Released — or a chord's earlier input the chord just let
+                    // go of: live again while it's still held.
+                    HoldBackPin::Idle
+                } else {
+                    HoldBackPin::Consumed { cap, restore: restore && !sticky }
+                }
             }
             HoldBackPin::Replaying { remaining_s } => {
                 if held {
@@ -390,7 +474,7 @@ pub(crate) fn hold_back_tick(
             }
         };
         match next {
-            HoldBackPin::Withheld { cap, .. } | HoldBackPin::Consumed { cap } => {
+            HoldBackPin::Withheld { cap, .. } | HoldBackPin::Consumed { cap, .. } => {
                 view.hidden.insert(p.clone(), cap);
             }
             HoldBackPin::Replaying { .. } => {
@@ -412,6 +496,23 @@ pub(crate) fn hold_back_tick(
 /// hidden until the card gives up, then goes live if still pushed.
 fn replayable(upstream: &HashMap<String, Signal>, pin: &str) -> bool {
     analog_axis_for_cardinal(pin).is_none() && matches!(upstream.get(pin), Some(Signal::Bool(_)))
+}
+
+/// Each input's held state for an order-aware card (past the card's threshold
+/// for an analog input); the held ones count as down for the hold-back.
+fn order_held<'a>(
+    m: &Value,
+    pins: &[&'a str],
+    upstream: &HashMap<String, Signal>,
+    down: &mut HashSet<&'a str>,
+) -> Vec<bool> {
+    let shape = MappingShape::from_card(m);
+    let held: Vec<bool> = pins.iter().map(|p| {
+        shape.analog_gate(upstream, p)
+            .unwrap_or_else(|| upstream.get(*p).map(|s| s.as_bool()).unwrap_or(false))
+    }).collect();
+    down.extend(pins.iter().zip(&held).filter(|(_, h)| **h).map(|(p, _)| *p));
+    held
 }
 
 /// Mark `pin` as held back by a deciding card; `full` (an order-aware card)
@@ -457,6 +558,7 @@ pub(crate) fn remapper_hold_back_pass(
     let mut pending: HashMap<&str, bool> = HashMap::new();
     let mut fired_hold: HashSet<&str> = HashSet::new();
     let mut fired_any: HashSet<&str> = HashSet::new();
+    let mut fired_sticky: HashSet<&str> = HashSet::new();
     let mut down: HashSet<&str> = HashSet::new();
     for (i, m) in mappings.iter().enumerate() {
         let Some(spec) = specs[i] else { continue; };
@@ -510,27 +612,107 @@ pub(crate) fn remapper_hold_back_pass(
             }
             if fired {
                 fired_any.insert(pin);
+                fired_sticky.insert(pin);
                 if spec.hold_back() {
                     fired_hold.insert(pin);
                 }
             }
-            verdicts[i] = Some(CardVerdict { effective, held_now, ordered });
+            verdicts[i] = Some(CardVerdict { effective, held_now, ordered, ..Default::default() });
             continue;
         }
 
-        // Is the input there: the order match for an order-aware card, the
-        // chord (or stick gesture) for any other.
+        // "In order" chord: a mode shift (see the module docs).
+        if let Some(order @ OrderSpec { kind: OrderKind::Chord, .. }) = spec.order {
+            let held = order_held(m, &pins, &upstream, &mut down);
+            let n = pins.len();
+            let trigger = pins[n - 1];
+            let trigger_held = held[n - 1];
+            let track = &mut ns.order_state[i];
+            let matched = order_tick(order.kind, track, &pins, &held, window_s, dt);
+            let progress = track.progress;
+            let was_latched = track.latched;
+            let tap_mode = matches!(press.mode(), PressMode::Short | PressMode::Double);
+            let double = matches!(press.mode(), PressMode::Double);
+            // Turbo on Short / Double: the whole chord, from its first input, has
+            // to be done inside the time gap. Without it the gap times the trigger.
+            let whole_chord = tap_mode && press.turbo;
+            // Hold on Short / Double: the modifiers stay held in the game, only
+            // the trigger is taken.
+            let keep_modifiers = tap_mode && press.sustain;
+            // Hold on normal / Long: once fired, the output stays on while the
+            // trigger is held, even after the modifiers are let go.
+            let latch = press.sustain && matches!(press.mode(), PressMode::Down | PressMode::Long);
+
+            // (output, still deciding, fired, trigger part of the decision, input there)
+            let (effective, deciding, fired, trigger_waiting, raw) = if whole_chord {
+                let tap = &mut ns.move_state[i];
+                if let Some(held_s) = chord_tap_tick(tap, double, progress > 0 || matched, matched, window_s, dt) {
+                    tap.replay_s = held_s.max(PRESS_TRIGGER_PULSE_S);
+                }
+                let fired = if double {
+                    matched && tap.phase == MovePhase::Fast && tap.taps >= 2
+                } else {
+                    tap.replay_s > 0.0
+                };
+                let deciding = !fired && matches!(tap.phase, MovePhase::Moving | MovePhase::Fast);
+                (fired, deciding, fired, matched || (double && tap.taps >= 1), matched)
+            } else {
+                let raw = matched || (latch && was_latched && trigger_held);
+                let slots = press_state_get(ns, i);
+                let effective = press.gate(raw, slots, dt);
+                let (deciding, fired) = press_decision(press.mode(), raw, slots, window_s);
+                // A Double between its taps still has the trigger in play.
+                let waiting = raw || (double && slots[3] as i32 == 2);
+                (effective, deciding, fired, waiting, raw)
+            };
+            ns.order_state[i].latched = latch && fired && trigger_held;
+
+            if deciding {
+                // Only the trigger waits — the modifiers were already live —
+                // unless the whole chord is being timed, which holds them back
+                // too (short of Hold keeping them).
+                if trigger_waiting {
+                    hold_pin(&mut pending, trigger, true);
+                }
+                if whole_chord && !keep_modifiers {
+                    for p in &pins[..progress.min(n - 1)] {
+                        hold_pin(&mut pending, p, true);
+                    }
+                }
+            }
+            if fired {
+                fired_any.extend(pins.iter().copied());
+                if keep_modifiers {
+                    fired_hold.insert(trigger);
+                } else {
+                    fired_hold.extend(pins.iter().copied());
+                }
+                // The trigger stays consumed until released, so letting go of a
+                // modifier first sends no stray press of it. The modifiers come
+                // back when the chord lets go.
+                fired_sticky.insert(trigger);
+            }
+            let lifted_modifiers = held[..n - 1].iter().take(32).enumerate()
+                .filter(|(_, h)| !**h)
+                .fold(0u32, |bits, (k, _)| bits | (1 << k));
+            verdicts[i] = Some(CardVerdict {
+                effective,
+                held_now: fired && raw,
+                ordered,
+                owns_trigger_only: keep_modifiers,
+                lifted_modifiers,
+            });
+            continue;
+        }
+
+        // Is the input there: the order match for a Sequence, the chord (or
+        // stick gesture) for any other card.
         let raw = match spec.order {
             Some(order) => {
-                let shape = MappingShape::from_card(m);
-                let held: Vec<bool> = pins.iter().map(|p| {
-                    shape.analog_gate(&upstream, p)
-                        .unwrap_or_else(|| upstream.get(*p).map(|s| s.as_bool()).unwrap_or(false))
-                }).collect();
-                down.extend(pins.iter().zip(&held).filter(|(_, h)| **h).map(|(p, _)| *p));
+                let held = order_held(m, &pins, &upstream, &mut down);
                 let track = &mut ns.order_state[i];
                 let matched = order_tick(order.kind, track, &pins, &held, window_s, dt);
-                if !matched && order_pending(order, track, &held, window_s) {
+                if !matched && order_pending(order, track, pins.len()) {
                     for p in &pins[..track.progress] {
                         hold_pin(&mut pending, p, true);
                     }
@@ -557,14 +739,17 @@ pub(crate) fn remapper_hold_back_pass(
         }
         if fired {
             fired_any.extend(pins.iter().copied());
+            fired_sticky.extend(pins.iter().copied());
             if spec.hold_back() {
                 fired_hold.extend(pins.iter().copied());
             }
         }
-        verdicts[i] = Some(CardVerdict { effective, held_now: fired && raw, ordered });
+        verdicts[i] = Some(CardVerdict { effective, held_now: fired && raw, ordered, ..Default::default() });
     }
 
-    let hb = hold_back_tick(&mut ns.hold_back, &pending, &fired_hold, &fired_any, &down, &upstream, dt);
+    let hb = hold_back_tick(
+        &mut ns.hold_back, &pending, &fired_hold, &fired_any, &fired_sticky, &down, &upstream, dt,
+    );
     let hidden: HashSet<String> = hb.hidden.keys().cloned().collect();
     if hb.hidden.is_empty() && hb.replayed.is_empty() {
         return HoldBackPass { verdicts, view: upstream, hidden };
