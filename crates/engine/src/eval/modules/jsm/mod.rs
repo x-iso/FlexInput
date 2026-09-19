@@ -1,0 +1,30 @@
+//! JSM Config module (`module.jsm`): a JoyShockMapper config, applied to the
+//! AutoMap bus with JSM's own rules.
+//!
+//! The config text is the only source of truth. It is compiled ([`parse`]) into
+//! bindings plus a status for every line, and run by the button state machines
+//! ([`bind`]); [`names`] holds JSM's vocabulary and what it is on our bus.
+//!
+//! Deliberately NOT a front-end for the Remapper: JSM's press rules, timings and
+//! chord layering are its own, and this module implements them directly. See
+//! `docs/JSM_MODULE_PLAN.md` for the scope and the phase order.
+
+mod aim;
+mod analog;
+mod bind;
+mod eval;
+mod names;
+mod parse;
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) use eval::{jsm_publish, JsmState};
+
+// The UI pauses the config's typing while its editor has focus.
+pub use eval::{jsm_editor_focus, set_jsm_editor_focus};
+
+// The editor compiles the text it is showing to put a status on every line, so
+// the parser's surface is public — the run-time side stays crate-internal.
+pub use parse::{compile as jsm_compile, Compiled as JsmConfig, LineInfo as JsmLineInfo,
+    LineStatus as JsmLineStatus};
