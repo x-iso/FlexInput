@@ -164,6 +164,10 @@ struct Flick {
     delta: f32,
     /// How far through the flick's easing we are, 0..1.
     done: f32,
+    /// A flick is still being paid out. JSM asks `flick_percent_done < 1`, which
+    /// is also true for a stick that has never flicked at all (it starts at
+    /// zero) — so the fact of a flick being underway is tracked outright.
+    paying_out: bool,
     since: f32,
     samples: Box<[f32; FLICK_SAMPLES]>,
     front: usize,
@@ -175,6 +179,7 @@ impl Default for Flick {
             flicking: false,
             delta: 0.0,
             done: 0.0,
+            paying_out: false,
             since: 0.0,
             samples: Box::new([0.0; FLICK_SAMPLES]),
             front: 0,
@@ -221,6 +226,13 @@ impl Default for Aim {
 }
 
 impl Aim {
+    /// Is this stick's flick still being paid out? A modeshift can't take the
+    /// stick out of flick mode mid-turn: JSM degrades it to `FLICK_ONLY` so the
+    /// turn finishes instead of stopping halfway round.
+    pub fn flick_unfinished(&self, side: usize) -> bool {
+        self.sticks[side].flick.paying_out
+    }
+
     /// One tick of aiming. Returns the mouse displacement for this tick in our
     /// bus's terms: pixels, y counting upward.
     pub fn tick(
@@ -474,6 +486,7 @@ impl Aim {
                     f.since = self.t;
                     f.delta = angle;
                     f.done = 0.0;
+                    f.paying_out = true;
                     f.samples.fill(0.0);
                     f.front = 0;
                 }
@@ -505,6 +518,9 @@ impl Aim {
             percent /= (f.delta.abs() / PI).powf(s.flick_time_exponent);
         }
         let percent = percent.min(1.0);
+        if percent >= 1.0 {
+            f.paying_out = false;
+        }
         let ease = |p: f32| 1.0 - (1.0 - p) * (1.0 - p);
         let was = ease(f.done);
         f.done = percent;

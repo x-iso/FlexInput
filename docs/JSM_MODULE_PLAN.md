@@ -293,6 +293,65 @@ Deferred, each with the reason on the line in the editor:
 module, which is how FlexInput measures real-world sensitivity; `CALIBRATE` as a
 binding runs but recalibrates nothing, because the device card owns that.
 
+**Phase 4 landed** (`parse::resolve`, and the runtime seams it needed): any
+setting this module runs can be chorded — `ZL,GYRO_SENS = 4` reads 4 while ZL is
+held and the config's own value the rest of the time. One code path parses a
+value whether it comes from a plain line or a modeshift, so a modeshift is
+checked when the config compiles: a bad value is an error on its line, and a
+setting a later phase owns waits with that setting rather than with modeshifts.
+Resolution is JSM's: walk the chords held, latest first, and take the first that
+has something to say about that setting — so two chords over one setting go to
+whichever went down last, while each still governs the settings the other doesn't
+touch. Both stick rules came with it:
+
+- **A stick waits for centre.** When a chord that was supplying a stick's mode is
+  released while the stick is still pushed, the stick does nothing at all until it
+  reads centred — otherwise the mode underneath is handed a stick already out at
+  full, and a flick stick would read that as a fresh flick.
+- **A flick can't be cut off mid-turn.** While a flick is still paying out, the
+  stick stays in flick mode whatever the mode underneath now says.
+
+One departure: JSM decides "a flick is unfinished" by `flick_percent_done < 1`,
+which is also true for a stick that has never flicked at all (it starts at zero),
+so in stock JSM the check appears to force `FLICK_ONLY` on a stick in any other
+mode. A flick being underway is tracked outright here instead.
+
+The settings in force are resolved from the chord stack as the press machinery
+left it at the end of the previous tick, so a modeshift takes hold one tick after
+its button. That keeps the order inside a tick simple — settings, then buttons,
+then aiming — and one tick is imperceptible at any rate the engine runs.
+
+## `X_` and `PS_` names stay aliases
+
+Raised after hands-on testing: since `PS_UP` and `X_UP` land on the same
+`dpad_up` pin, should a `PS_` name be routed only to a DualSense / DS4 sink when a
+patch has one of each family wired downstream?
+
+**No, and deliberately.** In JSM the two families ARE one set of names — a config
+picks its pad with `VIRTUAL_CONTROLLER`, and `PS_CROSS` is simply how a
+PlayStation player spells `X_A`. Routing by prefix would mean a config written
+with `PS_` names silently stops working the moment it is wired to an XInput pad,
+which is the exact class of silent failure the editor is supposed to abolish. It
+would also make one config behave differently in two patches, and the module
+cannot see the patch it sits in anyway.
+
+Two pads of different families wanting different mappings is a *patch* question,
+and the patch already answers it: give each pad its own JSM module (or its own
+tab), wired to its own sink. Every pad-output line says as much in the editor —
+that it needs a pad wired downstream, and that the prefix doesn't pick one.
+
+## Phase 9 — the custom-curve fork
+
+`evan1mclean/JSM_custom_curve` adds features on top of JSM 3.x that JSM users may
+be carrying configs for. **Not yet surveyed**: github was unreachable from the dev
+machine when this was written (`git clone` and a raw fetch both failed while an
+ordinary push had just worked), so the fork's own settings have not been read
+first-hand and nothing here is designed yet. Before implementing: clone it, diff
+its `SettingID` list and command registry against upstream 3.6.2 the way phases
+1-4 were done, and write the caveats down here first. Slot it after the phases
+that share its ground (aiming, phase 3) so its curve settings extend a pipeline
+that already exists rather than growing a second one.
+
 1. **Skeleton + parser + digital bindings.** Node, feature gate, bus republish,
    tabs with Load / Save, the editor with diagnostics, name tables, the button
    state machines (tap/hold, all modifiers, chord, simultaneous, diagonal,
@@ -304,6 +363,7 @@ binding runs but recalibrates nothing, because the device card owns that.
    cutoff, real-world calibration, `AIM`, `FLICK` and its variants, `MOUSE_RING`
    / `MOUSE_AREA`, `HYBRID_AIM`.
 4. **Modeshifts.** Chorded settings with the stack and the stick-recenter rule.
+   *(landed — see above)*
 5. **Virtual pad output.** Pad bindings, stick modes to virtual sticks,
    angle-to-axis and wind modes, gyro to a stick.
 6. **Touchpad and motion stick.** Grid, touch sticks, dual stage, motion stick

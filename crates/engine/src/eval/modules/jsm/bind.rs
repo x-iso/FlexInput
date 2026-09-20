@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::names::{Btn, GyroAction, Out};
-use super::parse::{ActionMod, Binding, Compiled, EventMod, Trigger};
+use super::parse::{ActionMod, Binding, Compiled, EventMod, Timings, Trigger};
 
 /// How long a tap's key stays down (JSM's `MAGIC_TAP_DURATION`), and how long an
 /// instant press stays down (`MAGIC_INSTANT_DURATION`). Gyro actions and
@@ -122,8 +122,18 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// The chords held right now, oldest first — what a modeshift resolves
+    /// against (`parse::resolve`).
+    pub fn chords(&self) -> &[Btn] { &self.chords }
+
     /// Advance one tick. `down` answers "is this JSM button pressed right now?".
-    pub fn tick(&mut self, cfg: &Compiled, dt: f32, down: &dyn Fn(Btn) -> bool) -> &Outputs {
+    pub fn tick(
+        &mut self,
+        cfg: &Compiled,
+        timings: &Timings,
+        dt: f32,
+        down: &dyn Fn(Btn) -> bool,
+    ) -> &Outputs {
         self.t += dt;
         self.out = Outputs::default();
         self.timed.retain(|t| t.until > self.t);
@@ -138,7 +148,7 @@ impl Runtime {
             let now = down(b);
             let was = self.buttons.entry(b).or_default().down;
             if was && !now {
-                self.release(b, cfg);
+                self.release(b, cfg, timings);
             }
         }
         // ── then presses
@@ -146,7 +156,7 @@ impl Runtime {
             let now = down(b);
             let was = self.buttons.entry(b).or_default().down;
             if !was && now {
-                self.press(b, cfg);
+                self.press(b, cfg, timings);
             }
             let run = self.buttons.entry(b).or_default();
             run.down = now;
@@ -155,7 +165,7 @@ impl Runtime {
         for &b in &watched {
             let expired = matches!(self.buttons[&b].role, Role::WaitSim { until } if until <= self.t);
             if expired {
-                self.resolve(b, cfg);
+                self.resolve(b, cfg, timings);
             }
         }
         // ── a tap held back for a double press that never came
@@ -170,14 +180,14 @@ impl Runtime {
             }
         }
 
-        self.advance_presses(cfg);
+        self.advance_presses(cfg, timings);
         self.compose();
         &self.out
     }
 
     // ── press lifecycle ──────────────────────────────────────────────────────
 
-    fn press(&mut self, b: Btn, cfg: &Compiled) {
+    fn press(&mut self, b: Btn, cfg: &Compiled, timings: &Timings) {
         {
             let run = self.buttons.entry(b).or_default();
             run.down = true;
@@ -188,12 +198,12 @@ impl Runtime {
 
         // A second press inside the window turns into the double-press binding.
         let last_down = self.buttons[&b].last_down;
-        let repeat = self.buttons[&b].last_down > 0.0 && self.t - last_down <= cfg.timings.double;
+        let repeat = self.buttons[&b].last_down > 0.0 && self.t - last_down <= timings.double;
         self.buttons.entry(b).or_default().last_down = self.t;
         if repeat {
             if let Some(i) = find(cfg, |t| matches!(t, Trigger::Double(x) if *x == b)) {
                 self.buttons.entry(b).or_default().pending_tap = None;
-                self.start(i, b, None, cfg);
+                self.start(i, b, None, cfg, timings);
                 return;
             }
         }
@@ -204,23 +214,23 @@ impl Runtime {
             let ready = matches!(self.buttons.get(&partner).map(|r| r.role), Some(Role::WaitSim { .. }));
             if ready {
                 self.take_over(partner);
-                self.start(i, b, Some(partner), cfg);
+                self.start(i, b, Some(partner), cfg, timings);
                 return;
             }
-            self.buttons.entry(b).or_default().role = Role::WaitSim { until: self.t + cfg.timings.sim };
+            self.buttons.entry(b).or_default().role = Role::WaitSim { until: self.t + timings.sim };
             return;
         }
-        self.resolve(b, cfg);
+        self.resolve(b, cfg, timings);
     }
 
     /// Pick the binding for a button that is down and not waiting on a partner.
-    fn resolve(&mut self, b: Btn, cfg: &Compiled) {
+    fn resolve(&mut self, b: Btn, cfg: &Compiled, timings: &Timings) {
         // A diagonal partner already pressing releases its own binding and the
         // pair takes over — no window, either order.
         if let Some((i, partner)) = diag_partner(cfg, b) {
             if self.buttons.get(&partner).is_some_and(|r| matches!(r.role, Role::Active(_))) {
                 self.take_over(partner);
-                self.start(i, b, Some(partner), cfg);
+                self.start(i, b, Some(partner), cfg, timings);
                 return;
             }
         }
@@ -230,18 +240,18 @@ impl Runtime {
             if let Some(i) = find(cfg, |t| matches!(t, Trigger::Chord { chord: c, btn }
                 if *c == chord && *btn == b))
             {
-                self.start(i, b, None, cfg);
+                self.start(i, b, None, cfg, timings);
                 return;
             }
         }
         if let Some(i) = find(cfg, |t| matches!(t, Trigger::Simple(x) if *x == b)) {
-            self.start(i, b, None, cfg);
+            self.start(i, b, None, cfg, timings);
             return;
         }
         self.buttons.entry(b).or_default().role = Role::Idle;
     }
 
-    fn start(&mut self, binding: usize, owner: Btn, partner: Option<Btn>, cfg: &Compiled) {
+    fn start(&mut self, binding: usize, owner: Btn, partner: Option<Btn>, cfg: &Compiled, timings: &Timings) {
         let idx = self.presses.len();
         self.presses.push(Press {
             binding,
@@ -249,7 +259,7 @@ impl Runtime {
             partner,
             start: self.t,
             hold_fired: false,
-            turbo_next: self.t + cfg.timings.hold,
+            turbo_next: self.t + timings.hold,
             held: Vec::new(),
             ended: false,
         });
@@ -269,7 +279,7 @@ impl Runtime {
         self.buttons.entry(b).or_default().pending_tap = None;
     }
 
-    fn release(&mut self, b: Btn, cfg: &Compiled) {
+    fn release(&mut self, b: Btn, cfg: &Compiled, timings: &Timings) {
         self.chords.retain(|&c| c != b);
         let role = self.buttons.entry(b).or_default().role;
         self.buttons.entry(b).or_default().role = Role::Idle;
@@ -281,15 +291,15 @@ impl Runtime {
             // binding never started, so resolve it now and let it end at once
             // (a quick tap of a button that has a simultaneous binding).
             Role::WaitSim { .. } => {
-                self.resolve(b, cfg);
+                self.resolve(b, cfg, timings);
                 let Some(Role::Active(i)) = self.buttons.get(&b).map(|r| r.role) else { return; };
                 self.buttons.entry(b).or_default().role = Role::Idle;
-                self.finish_press(i, b, cfg);
+                self.finish_press(i, b, cfg, timings);
                 return;
             }
             Role::Idle => return,
         };
-        self.finish_press(idx, b, cfg);
+        self.finish_press(idx, b, cfg, timings);
         // Releasing one half of a pair hands the other half its own binding,
         // the way JSM's diagonal presses do.
         if let Some(other) = pair_partner {
@@ -298,24 +308,24 @@ impl Runtime {
                 matches!(cfg.bindings.get(p.binding).map(|b| b.trigger), Some(Trigger::Diag(..))));
             self.buttons.entry(other).or_default().role = Role::Idle;
             if still_down && was_diag {
-                self.resolve(other, cfg);
+                self.resolve(other, cfg, timings);
             }
         }
     }
 
     /// Fire a press's release (and tap, when it was short) and drop its holds.
-    fn finish_press(&mut self, idx: usize, b: Btn, cfg: &Compiled) {
+    fn finish_press(&mut self, idx: usize, b: Btn, cfg: &Compiled, timings: &Timings) {
         let Some(press) = self.presses.get(idx) else { return; };
         if press.ended { return; }
         let (binding, held_long, start) = (press.binding, press.hold_fired, press.start);
         self.fire(binding, EventMod::Release, cfg, None);
-        if !held_long && self.t - start < cfg.timings.hold {
+        if !held_long && self.t - start < timings.hold {
             // A tap waits out the double-press window when the button has a
             // double-press binding, so the two don't both fire.
             let has_double = find(cfg, |t| matches!(t, Trigger::Double(x) if *x == b)).is_some();
             if has_double {
                 self.buttons.entry(b).or_default().pending_tap =
-                    Some((binding, self.t + cfg.timings.double));
+                    Some((binding, self.t + timings.double));
             } else {
                 self.fire(binding, EventMod::Tap, cfg, None);
             }
@@ -337,7 +347,7 @@ impl Runtime {
         }
     }
 
-    fn advance_presses(&mut self, cfg: &Compiled) {
+    fn advance_presses(&mut self, cfg: &Compiled, timings: &Timings) {
         let live: Vec<usize> = self.presses.iter().enumerate()
             .filter(|(_, p)| !p.ended)
             .map(|(i, _)| i)
@@ -347,14 +357,14 @@ impl Runtime {
                 let p = &self.presses[i];
                 (p.binding, p.start, p.hold_fired, p.turbo_next)
             };
-            if !hold_fired && self.t - start >= cfg.timings.hold {
+            if !hold_fired && self.t - start >= timings.hold {
                 self.presses[i].hold_fired = true;
                 self.fire(binding, EventMod::Hold, cfg, Some(i));
             }
             // Turbo pulses only once the button has been held: `turbo_next`
             // starts one hold time in, then moves on by a turbo period each time.
             if self.t >= turbo_next {
-                self.presses[i].turbo_next = self.t + cfg.timings.turbo;
+                self.presses[i].turbo_next = self.t + timings.turbo;
                 self.fire(binding, EventMod::Turbo, cfg, None);
             }
         }
@@ -435,8 +445,10 @@ fn find(cfg: &Compiled, pred: impl Fn(&Trigger) -> bool) -> Option<usize> {
     cfg.bindings.iter().position(|b| pred(&b.trigger))
 }
 
+/// A button that other bindings — or settings — hang off while it is held.
 fn is_chord_button(cfg: &Compiled, b: Btn) -> bool {
     cfg.bindings.iter().any(|x| matches!(x.trigger, Trigger::Chord { chord, .. } if chord == b))
+        || cfg.modeshifts.iter().any(|m| m.chord == b)
 }
 
 fn sim_partner(cfg: &Compiled, b: Btn) -> Option<(usize, Btn)> {

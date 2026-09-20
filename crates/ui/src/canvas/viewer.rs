@@ -1092,7 +1092,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
             "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals),
             "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, self.automap_parent.as_ref()),
-            "module.jsm" => show_jsm_body(node_id, ui, snarl),
+            "module.jsm" => show_jsm_body(node_id, ui, snarl, self.live_signals),
             "module.network_send" => show_net_send_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.network_recv" => show_net_recv_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),

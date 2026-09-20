@@ -328,6 +328,16 @@ fn punctuation_pin(c: char) -> Option<&'static str> {
     })
 }
 
+/// Is this pin one a virtual pad has to be wired up to receive? A config full of
+/// `X_*` bindings does nothing at all until one is, which is worth saying on the
+/// line rather than leaving the user to wonder.
+pub fn is_pad_pin(pin: &str) -> bool {
+    pin.starts_with("btn_")
+        || pin.starts_with("dpad")
+        || pin.ends_with("_trigger")
+        || pin.ends_with("_stick")
+}
+
 /// Virtual-pad output names. JSM's `PS_*` names are aliases of the `X_*` ones,
 /// and both land on our canonical pad pins — the user wires whichever virtual
 /// pad they want downstream.

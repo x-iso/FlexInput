@@ -36,8 +36,36 @@ fn status_color(ui: &egui::Ui, status: &flexinput_engine::eval::JsmLineStatus) -
     }
 }
 
-pub(crate) fn show_jsm_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
-    jsm_body(node_id, ui, snarl, None);
+pub(crate) fn show_jsm_body(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live: &std::collections::HashMap<(String, String), Signal>,
+) {
+    jsm_body(node_id, ui, snarl, None, live);
+}
+
+/// The pins the pad feeding this node actually reports, so the editor can say
+/// which buttons a config asks for that this pad hasn't got. Empty when there is
+/// no device yet — nothing is claimed on a guess.
+fn pins_this_pad_reports(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    live: &std::collections::HashMap<(String, String), Signal>,
+) -> std::collections::HashSet<String> {
+    let dev = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("_automap_device_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if dev.is_empty() {
+        return Default::default();
+    }
+    live.keys()
+        .filter(|(d, _)| *d == dev)
+        .map(|(_, pin)| pin.clone())
+        .collect()
 }
 
 /// The same body at an explicit size — the config overlay's pinned editor.
@@ -46,8 +74,9 @@ pub(crate) fn show_jsm_body_sized(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     size: egui::Vec2,
+    live: &std::collections::HashMap<(String, String), Signal>,
 ) {
-    jsm_body(node_id, ui, snarl, Some(size));
+    jsm_body(node_id, ui, snarl, Some(size), live);
 }
 
 /// The editor's size in a node body, from the node's own params. Pinned, the
@@ -66,6 +95,7 @@ fn jsm_body(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     pinned: Option<egui::Vec2>,
+    live: &std::collections::HashMap<(String, String), Signal>,
 ) {
     // A node body is laid out BETWEEN the pin columns, so its parent is a
     // horizontal layout with no width to inherit: the body picks its own size
@@ -74,7 +104,7 @@ fn jsm_body(
     let size = pinned.unwrap_or_else(|| editor_size(snarl, node_id));
     ui.vertical(|ui| {
         ui.set_max_width(size.x);
-        jsm_rows(node_id, ui, snarl, size, pinned.is_none());
+        jsm_rows(node_id, ui, snarl, size, pinned.is_none(), live);
     });
 }
 
@@ -84,6 +114,7 @@ fn jsm_rows(
     snarl: &mut Snarl<NodeData>,
     size: egui::Vec2,
     resizable: bool,
+    live: &std::collections::HashMap<(String, String), Signal>,
 ) {
     let mut tabs = read_tabs(snarl, node_id);
     let mut active = snarl.get_node(node_id)
@@ -168,7 +199,13 @@ fn jsm_rows(
     });
 
     // ── the editor, on its own row ───────────────────────────────────────────
-    let compiled = flexinput_engine::eval::jsm_compile(&tabs[active].text);
+    let mut compiled = flexinput_engine::eval::jsm_compile(&tabs[active].text);
+    // A button this pad hasn't got is the device's business, not the config's, so
+    // it lands as a note on the line rather than changing its status.
+    flexinput_engine::eval::jsm_note_missing_inputs(
+        &mut compiled,
+        &pins_this_pad_reports(snarl, node_id, live),
+    );
     let mut text = tabs[active].text.clone();
     let line_h = ui.text_style_height(&egui::TextStyle::Monospace).max(10.0);
     // Whatever height is left under the two rows above, in whole lines.

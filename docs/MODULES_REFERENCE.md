@@ -746,15 +746,17 @@ pub struct ModuleDescriptor {
   has keyboard focus the config's key and mouse output pauses, so a binding under
   test can't type into it. The wheel over the editor scrolls the config instead of
   panning the canvas (`canvas/wheel.rs`).
-- **Live so far (plan phases 1-3):** digital bindings (tap/hold, all modifiers,
+- **Live so far (plan phases 1-4):** digital bindings (tap/hold, all modifiers,
   chord, simultaneous, diagonal, double press, turbo) and JSM's timing settings;
   analog triggers (`TRIGGER_THRESHOLD` including the hair trigger, `ZL_MODE` /
   `ZR_MODE` full pull with every skip mode, `TRIGGER_SKIP_DELAY`); digital sticks
   (`NO_MOUSE` directions, `SCROLL_WHEEL`, ring modes, deadzones, axis inversion,
   `CONTROLLER_ORIENTATION`, `SCROLL_SENS`); and aiming — gyro mouse with the
   sensitivity ramp, smoothing, cutoff, trackball and `GYRO_ON`/`GYRO_OFF`, stick
-  `AIM`, flick stick and `MOUSE_AREA`, written to the bus's `mouse_move`.
-  Modeshifts, virtual pad output, the touchpad and feedback arrive in later
+  `AIM`, flick stick and `MOUSE_AREA`, written to the bus's `mouse_move`; and
+  modeshifts — any of those settings can be chorded (`ZL,GYRO_SENS = 4`), latest
+  chord winning per setting, with JSM's stick-recentre and unfinished-flick rules.
+  Virtual pad output, the touchpad and feedback arrive in later
   phases — their lines compile as "pending" and say which phase will run them,
   as do the gravity-referenced gyro spaces and `MOUSE_RING`.
 - **What it takes over:** only what it actually runs. A stick left in a mouse or

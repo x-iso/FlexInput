@@ -70,6 +70,11 @@ pub enum StickMode {
     MouseArea,
     /// A mode a later phase owns: nothing comes from the stick here.
     Elsewhere,
+    /// Doing nothing until the stick comes back to centre (JSM's `INVALID`).
+    /// A modeshift that has just ended leaves the stick here, so letting go of
+    /// the chord with the stick still pushed doesn't hand the base mode a stick
+    /// already out at full — a flick stick would read it as a fresh flick.
+    Inert,
 }
 
 impl StickMode {
@@ -215,6 +220,9 @@ struct StickRun {
     /// Doing something this tick, in whatever its mode is: what `GYRO_OFF =
     /// LEFT_STICK` watches for.
     active: bool,
+    /// A modeshift has been supplying this stick's mode, so when it stops the
+    /// stick waits at [`StickMode::Inert`] until it is back at centre.
+    recentre: bool,
     mode: StickMode,
     /// Degrees of turn not yet spent on a notch.
     leftovers: f32,
@@ -273,7 +281,15 @@ impl Analog {
             Some(_) => if side == 0 { s.zl } else { s.zr },
             None => TriggerMode::NoFull,
         };
-        let position = analog.unwrap_or(0.0).max(if digital { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+        // Where the trigger is, 0..1. When the pad has an analog axis that axis is
+        // the whole truth: a pad that reports BOTH an axis and a digital button
+        // trips the button a fraction of the way down (~15% on some), and folding
+        // that in as "position 1.0" made a full pull fire almost immediately.
+        // The digital button is only for a pad with no axis at all.
+        let position = match analog {
+            Some(v) => v.clamp(0.0, 1.0),
+            None => if digital { 1.0 } else { 0.0 },
+        };
         let full = position >= 1.0;
         let soft_pull = self.soft_pull(s, side, position);
 
@@ -474,6 +490,12 @@ impl Analog {
             StickMode::Flick | StickMode::FlickOnly | StickMode::RotateOnly =>
                 active = raw_len > outer,
             StickMode::Elsewhere => {}
+            // Waiting to be let go of: nothing until it reads centred.
+            StickMode::Inert => {
+                if raw_len == 0.0 {
+                    self.sticks[side].recentre = false;
+                }
+            }
         }
 
         let run = &mut self.sticks[side];
@@ -506,6 +528,14 @@ impl Analog {
     /// Is this stick doing something this tick? `GYRO_OFF = LEFT_STICK` turns the
     /// gyro off while it is.
     pub fn stick_active(&self, side: usize) -> bool { self.sticks[side].active }
+
+    /// Is this stick waiting to come back to centre before its mode applies
+    /// again? Set when a chord supplies the mode; cleared once it reads centred.
+    pub fn stick_recentring(&self, side: usize) -> bool { self.sticks[side].recentre }
+
+    pub fn set_stick_recentring(&mut self, side: usize, on: bool) {
+        self.sticks[side].recentre = on;
+    }
 
     /// Turning the stick spends degrees on scroll notches, each of which presses
     /// the stick's left or right button for a moment.

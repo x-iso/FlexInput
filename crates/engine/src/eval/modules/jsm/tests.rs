@@ -219,6 +219,107 @@ fn every_half_typed_line_compiles_instead_of_crashing() {
         "{info:?}");
 }
 
+// Every output name JoyShockMapper accepts, taken from its own `nameToKey`
+// (`src/win32/PlatformDefinitions.cpp`) plus its pattern-matched and pad names.
+// A config carrying any of them must get a truthful answer on the line: either it
+// runs, or it says why not. Never an error — an error means "we don't know this
+// name", which for a name JSM knows is a gap we've failed to describe — and never
+// a silent Ok that does nothing.
+const JSM_OUTPUT_NAMES: &[&str] = &[
+    // Named keys.
+    "ADD", "ALT", "BACKSPACE", "BMOUSE", "CAPS_LOCK", "CONTEXT", "CONTROL", "DECIMAL",
+    "DELETE", "DIVIDE", "DOWN", "END", "ENTER", "ESC", "FMOUSE", "HOME", "INSERT",
+    "LALT", "LCONTROL", "LEFT", "LMOUSE", "LSHIFT", "LWINDOWS", "MMOUSE", "MULTIPLY",
+    "MUTE", "NEXT_TRACK", "NUM_LOCK", "PAGEDOWN", "PAGEUP", "PLAY_PAUSE", "PREV_TRACK",
+    "RALT", "RCONTROL", "RIGHT", "RMOUSE", "RSHIFT", "RWINDOWS", "SCREENSHOT",
+    "SCROLLDOWN", "SCROLLUP", "SCROLL_LOCK", "SHIFT", "SPACE", "STOP_TRACK",
+    "SUBSTRACT", "SUBTRACT", "TAB", "UP", "VOLUME_DOWN", "VOLUME_UP",
+    // The pattern-matched ones: characters, function keys, numpad digits, rumble.
+    "A", "Z", "0", "9", "+", "-", ",", ".", ";", "/", "`", "[", "]", "'", "\\",
+    "F1", "F9", "F10", "F20", "N0", "N9", "R8080", "RFFFF",
+    // Actions.
+    "NONE", "DEFAULT", "CALIBRATE", "GYRO_ON", "GYRO_OFF", "GYRO_INVERT", "GYRO_INV_X",
+    "GYRO_INV_Y", "GYRO_TRACKBALL", "GYRO_TRACK_X", "GYRO_TRACK_Y",
+    "SMALL_RUMBLE", "BIG_RUMBLE",
+    // Virtual pad.
+    "X_A", "X_B", "X_X", "X_Y", "X_LB", "X_RB", "X_LS", "X_RS", "X_BACK", "X_START",
+    "X_GUIDE", "X_UP", "X_DOWN", "X_LEFT", "X_RIGHT", "X_LT", "X_RT",
+    "PS_CROSS", "PS_CIRCLE", "PS_SQUARE", "PS_TRIANGLE", "PS_L1", "PS_R1", "PS_L3",
+    "PS_R3", "PS_SHARE", "PS_OPTIONS", "PS_HOME", "PS_PAD_CLICK", "PS_UP", "PS_DOWN",
+    "PS_LEFT", "PS_RIGHT", "PS_L2", "PS_R2",
+];
+
+#[test]
+fn every_name_jsm_accepts_gets_a_truthful_status() {
+    for name in JSM_OUTPUT_NAMES {
+        let info = one(&format!("S = {name}"));
+        match &info.status {
+            LineStatus::Ok => {}
+            LineStatus::Pending(why) | LineStatus::Ignored(why) => assert!(
+                why.len() > 10,
+                "`{name}` isn't live, so the line has to say why: {why:?}"
+            ),
+            other => panic!("`{name}` is a name JSM accepts, so it can't read as {other:?}"),
+        }
+        // Anything not live has to name itself in the notes or the status, so the
+        // editor can point at what won't work.
+        if !matches!(info.status, LineStatus::Ok) {
+            let said = format!("{:?} {:?}", info.status, info.notes);
+            assert!(
+                said.contains(name) || said.len() > 20,
+                "`{name}` needs a reason a user can act on: {said}"
+            );
+        }
+    }
+}
+
+// A config written for another pad asks for buttons this one hasn't got. That is
+// the device's business, not the config's, so the line keeps its status and gains
+// a note naming the pin the pad is missing.
+#[test]
+fn a_button_this_pad_lacks_says_so_on_the_line() {
+    let pins: std::collections::HashSet<String> = ["btn_south", "btn_lb", "left_stick"]
+        .iter().map(|s| s.to_string()).collect();
+    let mut c = compile("S = SPACE\nMIC = M\nL = E\nLUP = W");
+    note_inputs_this_pad_lacks(&mut c, &pins);
+
+    assert!(c.lines[0].notes.is_empty(), "a button the pad has needs no note");
+    assert!(c.lines[1].notes.iter().any(|n| n.contains("btn_mute") && n.contains("MIC")),
+        "the missing one names both the pin and the button: {:?}", c.lines[1].notes);
+    assert!(c.lines[2].notes.is_empty(), "L is on this pad");
+    assert!(c.lines[3].notes.is_empty(), "and so is the left stick");
+    // The status is untouched: the config isn't wrong, this pad just can't do it.
+    assert_eq!(c.lines[1].status, LineStatus::Ok);
+
+    // Nothing known about the pad yet: claim nothing.
+    let mut c = compile("MIC = M");
+    note_inputs_this_pad_lacks(&mut c, &Default::default());
+    assert!(c.lines[0].notes.is_empty(), "with no device, nothing is claimed");
+
+    // Either trigger form will do — a pad with only the digital one still works.
+    let digital_only: std::collections::HashSet<String> =
+        ["btn_rt_dig"].iter().map(|s| s.to_string()).collect();
+    let mut c = compile("ZR = LMOUSE");
+    note_inputs_this_pad_lacks(&mut c, &digital_only);
+    assert!(c.lines[0].notes.is_empty(), "a digital-only trigger is still a trigger");
+}
+
+// And a pad binding says out loud that it needs a pad wired up, because nothing
+// in this module can tell whether one is.
+#[test]
+fn a_pad_binding_says_it_needs_a_pad() {
+    for line in ["S = X_A", "UP = X_UP", "ZL = X_LT"] {
+        let info = one(line);
+        assert_eq!(info.status, LineStatus::Ok, "{line}: {info:?}");
+        assert!(
+            info.notes.iter().any(|n| n.contains("virtual pad")),
+            "{line} should say it needs a pad: {:?}", info.notes
+        );
+    }
+    // A keyboard binding has nothing to warn about.
+    assert!(one("S = SPACE").notes.is_empty());
+}
+
 #[test]
 fn unknown_names_are_errors() {
     let info = one("S = FLOOMP");
@@ -322,8 +423,9 @@ fn recognised_but_not_live_settings_name_their_phase() {
             "{line} should be pending"
         );
     }
+    // A modeshift waits with whatever setting it changes.
     assert!(
-        matches!(one("ZLF,GYRO_SENS = 0.5").status, LineStatus::Pending(p) if p.contains("while a button is held"))
+        matches!(one("ZL,TOUCHPAD_MODE = MOUSE").status, LineStatus::Pending(p) if p.contains("touchpad"))
     );
 }
 
@@ -467,8 +569,11 @@ impl Rig {
     /// One tick; returns the pins driven this tick.
     fn tick(&mut self) -> std::collections::HashSet<String> {
         let down = self.down.clone();
+        // Resolved the same way the evaluator does — from the chord stack as the
+        // last tick left it — so a modeshift on a timing is felt here too.
+        let timings = resolve(&self.cfg, self.rt.chords()).timings;
         self.rt
-            .tick(&self.cfg, DT, &|b| down.contains(&b))
+            .tick(&self.cfg, &timings, DT, &|b| down.contains(&b))
             .pins
             .clone()
     }
@@ -948,6 +1053,28 @@ fn a_quick_tap_of_the_trigger_still_sends_the_soft_binding() {
         "the held-back soft press fires on release"
     );
     assert!(!t.pull(0.0).down(Btn::Zl), "and is over the next tick");
+}
+
+// A pad that reports both an analog trigger and a digital trigger button trips
+// the button a fraction of the way down. That button must not count as a full
+// pull, or every dual-stage mode fires its full binding almost at once (reported
+// as "15% counts as a full pull").
+#[test]
+fn a_digital_trigger_pin_is_not_a_full_pull() {
+    let mut t = Stage::new("ZR_MODE = NO_SKIP");
+    t.pad.trigger_digital[1] = true; // asserted early, as a real pad does
+    let mut ever_full = false;
+    for v in [0.15, 0.15, 0.3, 0.5, 0.8, 0.9] {
+        t.pad.triggers[1] = Some(v);
+        ever_full |= t.tick().down(Btn::Zrf);
+    }
+    assert!(t.a.down(Btn::Zr), "the soft pull is pressed all along");
+    assert!(!ever_full, "nothing short of the end of the travel is a full pull");
+
+    // Pulled all the way, it fires.
+    t.pad.triggers[1] = Some(1.0);
+    t.tick();
+    assert!(t.tick().down(Btn::Zrf), "at the end of the travel it does");
 }
 
 // A pad with no analog trigger can't tell a soft pull from a full one, so JSM
@@ -1523,6 +1650,136 @@ fn aiming_settings_are_read() {
     );
 }
 
+// ── modeshifts: settings that change while a button is held ──────────────────
+
+// `button,SETTING = value` reads that value while the button is held, and the
+// config's own value again when it isn't.
+#[test]
+fn a_chord_changes_a_setting_while_it_is_held() {
+    let cfg = compile("GYRO_SENS = 1\nZL,GYRO_SENS = 4");
+    assert!(cfg.lines.iter().all(|l| l.status == LineStatus::Ok), "{:?}", cfg.lines);
+    assert_eq!(cfg.modeshifts.len(), 1);
+
+    assert_eq!(resolve(&cfg, &[]).aim.min_sens, (1.0, 1.0), "nothing held: the config's own");
+    assert_eq!(resolve(&cfg, &[Btn::Zl]).aim.min_sens, (4.0, 4.0), "held: the chord's");
+    assert_eq!(resolve(&cfg, &[Btn::R]).aim.min_sens, (1.0, 1.0), "another button changes nothing");
+}
+
+// Two chords over the same setting: the one pressed last wins, and each chord
+// still gets its say over the settings the other doesn't touch.
+#[test]
+fn the_latest_chord_wins_setting_by_setting() {
+    let cfg = compile("GYRO_SENS = 1\nZL,GYRO_SENS = 4\nZR,GYRO_SENS = 9\nZR,IN_GAME_SENS = 2");
+    // The stack is oldest first, as the press machinery keeps it.
+    assert_eq!(resolve(&cfg, &[Btn::Zl, Btn::Zr]).aim.min_sens, (9.0, 9.0), "ZR pressed later");
+    assert_eq!(resolve(&cfg, &[Btn::Zr, Btn::Zl]).aim.min_sens, (4.0, 4.0), "ZL pressed later");
+
+    // IN_GAME_SENS is only ZR's, so it applies whichever went down last.
+    let both = resolve(&cfg, &[Btn::Zr, Btn::Zl]);
+    assert_eq!(both.aim.in_game_sens, 2.0, "a setting only one chord touches still applies");
+}
+
+// A modeshift is checked when the config is compiled, so a bad value is an error
+// on its own line rather than a surprise when the button is pressed.
+#[test]
+fn a_modeshift_with_a_bad_value_is_an_error() {
+    let info = one("ZL,GYRO_SENS = lots");
+    assert!(matches!(info.status, LineStatus::Error(ref e) if e.contains("number")), "{info:?}");
+    assert!(compile("ZL,GYRO_SENS = lots").modeshifts.is_empty(), "and it doesn't run");
+
+    // Only a chord can carry a setting; the other combo operators can't.
+    let info = one("ZL+GYRO_SENS = 2");
+    assert!(matches!(info.status, LineStatus::Error(ref e) if e.contains("chord")), "{info:?}");
+}
+
+// Timings shift too, and the press machinery feels it: a shorter hold time while
+// the chord is held means the hold binding fires sooner.
+#[test]
+fn a_chord_can_shorten_the_hold_time() {
+    let mut r = Rig::new("W = R E\nZL,HOLD_PRESS_TIME = 30");
+    r.set(Btn::W, true);
+    // The default 150 ms hold hasn't arrived yet at 50 ms.
+    assert!(!r.ticks(5).contains("key_e"), "the base hold time still applies");
+    r.set(Btn::W, false);
+    r.ticks(2);
+
+    r.set(Btn::Zl, true);
+    r.ticks(2); // the chord stack is read as the last tick left it
+    r.set(Btn::W, true);
+    assert!(r.ticks(5).contains("key_e"), "held, the chord's 30 ms hold fires sooner");
+}
+
+// The stick-recentre rule: when a chord that changed a stick's mode is released
+// while the stick is still pushed, the stick does nothing at all until it comes
+// back to centre — otherwise the mode underneath would be handed a stick already
+// out at full.
+#[test]
+fn a_stick_waits_for_centre_after_its_modeshift_ends() {
+    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let uid = 7101;
+    let cfg = "LUP = W\nZL,LEFT_STICK_MODE = AIM\nSTICK_SENS = 100";
+    let snap = jsm_snap(uid, cfg, false);
+    let key = format!("collector:{uid}");
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let up = Signal::Vec2(glam::Vec2::new(0.0, 1.0));
+
+    let mut run = |chord: bool, stick: bool| -> HashMap<String, Signal> {
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        if chord {
+            dev.insert((PAD.to_string(), "left_trigger".to_string()), Signal::Float(1.0));
+        }
+        dev.insert(
+            (PAD.to_string(), "left_stick".to_string()),
+            if stick { up } else { Signal::Vec2(glam::Vec2::ZERO) },
+        );
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, 0.010);
+        collector.into_iter()
+            .filter(|((d, _), _)| *d == key)
+            .map(|((_, p), s)| (p, s))
+            .collect()
+    };
+
+    // Base mode: the stick's directions drive their key.
+    let bus = run(false, true);
+    assert!(on(&bus, "key_w"), "the base mode reads directions");
+
+    // Hold ZL: the stick aims instead, so the direction stops.
+    run(true, true);
+    let bus = run(true, true);
+    assert!(!on(&bus, "key_w"), "while the chord is held the stick aims: {bus:?}");
+
+    // Let go of ZL with the stick still pushed: neither mode acts.
+    let bus = run(false, true);
+    assert!(!on(&bus, "key_w"), "still pushed, the stick waits for centre");
+    let bus = run(false, true);
+    assert!(!on(&bus, "key_w"), "and keeps waiting");
+
+    // Back to centre, then pushed again: the base mode is back.
+    run(false, false);
+    let bus = run(false, true);
+    assert!(on(&bus, "key_w"), "once recentred the base mode reads it again: {bus:?}");
+}
+
+// A flick that hasn't finished paying out isn't cut off by a modeshift: the stick
+// stays in flick mode (JSM drops it to FLICK_ONLY) until the turn is done.
+#[test]
+fn a_modeshift_cannot_cut_a_flick_off_mid_turn() {
+    let mut a = Aiming::new("RIGHT_STICK_MODE = FLICK\nREAL_WORLD_CALIBRATION = 1\nFLICK_TIME = 0.2");
+    a.stick(1, 0.0, 0.0);
+    a.stick(1, 0.0, -1.0);
+    assert!(a.a.flick_unfinished(1), "the flick is still paying out");
+    // Once it has run its course it lets go again.
+    a.ticks(40);
+    assert!(!a.a.flick_unfinished(1), "and stops holding the mode when it is done");
+
+    // A stick that never flicked never claims the mode — JSM's own check reads
+    // "percent done < 1", which is true before any flick at all.
+    let mut b = Aiming::new("RIGHT_STICK_MODE = AIM\nSTICK_SENS = 100");
+    b.stick(1, 0.0, 0.0);
+    assert!(!b.a.flick_unfinished(1), "an untouched stick isn't mid-flick");
+}
+
 // ── the node on the bus ──────────────────────────────────────────────────────
 
 use std::collections::HashMap;
@@ -1827,6 +2084,39 @@ REAL_WORLD_CALIBRATION = 1";
     match bus.get("mouse_move") {
         Some(Signal::Vec2(v)) => assert_eq!(*v, glam::Vec2::ZERO, "a still pad says so"),
         other => panic!("a config that aims must answer every tick: {other:?}"),
+    }
+}
+
+// A binding onto the virtual pad's D-pad has to drive all three forms the D-pad
+// reaches a sink in. Driving only the direction Bool left the zeroed `dpad` Vec2
+// to land after it and cancel it, so the binding did nothing at the pad.
+#[test]
+fn a_dpad_binding_drives_the_axis_and_vector_too() {
+    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let bus = run_node("S = X_UP", false, &["btn_south"], 2);
+    assert!(on(&bus, "dpad_up"), "the direction itself");
+    assert_eq!(bus.get("dpad_y").map(|s| s.as_float()), Some(1.0), "the axis form");
+    match bus.get("dpad") {
+        Some(Signal::Vec2(v)) => assert_eq!(*v, glam::Vec2::new(0.0, 1.0), "and the vector form"),
+        other => panic!("the D-pad vector should be published: {other:?}"),
+    }
+
+    // Let go and all three forms say so.
+    let bus = run_node("S = X_UP", false, &[], 2);
+    assert!(!on(&bus, "dpad_up"));
+    assert_eq!(bus.get("dpad_y").map(|s| s.as_float()), Some(0.0));
+
+    // A direction the config never touches keeps whatever the pad is doing.
+    let bus = run_node_with(
+        "S = X_UP",
+        false,
+        &[("btn_south", Signal::Bool(true)), ("dpad_left", Signal::Bool(true))],
+        2,
+    );
+    match bus.get("dpad") {
+        Some(Signal::Vec2(v)) => assert_eq!(*v, glam::Vec2::new(-1.0, 1.0),
+            "the pad's own direction survives alongside the config's"),
+        other => panic!("{other:?}"),
     }
 }
 

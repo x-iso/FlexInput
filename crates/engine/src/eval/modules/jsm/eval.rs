@@ -134,11 +134,35 @@ pub(crate) fn jsm_publish(
         st.aim = Aim::default();
     }
 
+    // What the settings are this tick, once the held chords have had their say.
+    // The chord stack is the one the press machinery left at the end of the last
+    // tick, so a modeshift takes hold a tick after its button — imperceptible at
+    // any tick rate we run, and it keeps the order here simple: settings, then
+    // buttons, then aiming.
+    let mut res = super::parse::resolve(&st.cfg, st.rt.chords());
+    for side in 0..2 {
+        let stick = if side == 0 { &mut res.settings.left } else { &mut res.settings.right };
+        if res.stick_mode_chorded[side] {
+            // A chord is supplying the mode: remember it, so letting go leaves
+            // the stick waiting for centre rather than acting on a full push.
+            st.analog.set_stick_recentring(side, true);
+        } else if st.analog.stick_recentring(side) {
+            stick.mode = super::analog::StickMode::Inert;
+        }
+        // A flick that hasn't finished paying out keeps the stick in flick mode
+        // until it has, whatever the mode underneath now says.
+        if st.aim.flick_unfinished(side)
+            && !matches!(stick.mode, super::analog::StickMode::Flick | super::analog::StickMode::FlickOnly)
+        {
+            stick.mode = super::analog::StickMode::FlickOnly;
+        }
+    }
+
     // Triggers and sticks first: they turn into buttons the bindings can use.
-    st.analog.tick(&st.cfg.settings, dt, &read_pad(&upstream));
+    st.analog.tick(&res.settings, dt, &read_pad(&upstream));
     let analog = &st.analog;
     let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog) };
-    let outputs = st.rt.tick(&st.cfg, dt, &held);
+    let outputs = st.rt.tick(&st.cfg, &res.timings, dt, &held);
     let driven: Vec<String> = outputs.pins.iter().cloned().collect();
     let gyro_actions = outputs.gyro.clone();
 
@@ -153,11 +177,11 @@ pub(crate) fn jsm_publish(
         let analog = &st.analog;
         let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog) };
         st.aim
-            .tick(&st.cfg.aim, dt, gyro, &st.analog, &gyro_actions, &held)
+            .tick(&res.aim, dt, gyro, &st.analog, &gyro_actions, &held)
     };
 
     // What the config takes over from the pad.
-    let (claimed_digital, claimed_analog) = claimed_pins(&st.cfg);
+    let (claimed_digital, claimed_analog) = claimed_pins(&st.cfg, &res);
 
     if strict {
         for ap in automap::ALL_PINS {
@@ -184,7 +208,9 @@ pub(crate) fn jsm_publish(
     // it once on the tick of release is not enough, because a tick where nobody
     // downstream looks leaves the key down for good. This is the rule the
     // Remapper follows for its own output pins.
-    for pin in claimed_outputs(&st.cfg) {
+    let drivable = claimed_outputs(&st.cfg);
+    for pin in &drivable {
+        let pin = pin.clone();
         // A pin the pad itself drives is the pass-through's to answer for: the
         // config saying "off" here would fight it every tick it isn't pressed.
         if upstream.contains_key(&pin) && !held.contains(&pin) {
@@ -197,12 +223,51 @@ pub(crate) fn jsm_publish(
         collector_sigs.insert((key.clone(), pin), sig);
     }
 
+    // ── the D-pad's other two forms ──────────────────────────────────────────
+    //
+    // A sink sees the D-pad three ways: four direction Bools, `dpad_x`/`dpad_y`,
+    // and the `dpad` Vec2 — and every sink derives all four hat bits from the
+    // Vec2 when it has one. Driving only the Bool left the zeroed Vec2 to land
+    // after it and cancel it, so `S = X_UP` lit up on the bus and never reached
+    // the pad. The Remapper hit this too (`remapper.rs`, "D-pad analog
+    // synthesis"): whenever the config drives any direction, recompute the axis
+    // and Vec2 forms from all four, reading each direction's published value so
+    // the ones this config doesn't touch keep their pass-through state.
+    const DPAD_DIRS: [(&str, usize, f32); 4] = [
+        ("dpad_right", 0, 1.0),
+        ("dpad_left", 0, -1.0),
+        ("dpad_up", 1, 1.0),
+        ("dpad_down", 1, -1.0),
+    ];
+    if DPAD_DIRS.iter().any(|(d, _, _)| drivable.iter().any(|p| p == d)) {
+        let mut xy = [0.0f32; 2];
+        for (dir, axis, sign) in DPAD_DIRS {
+            // Read back what was published, so a direction this config doesn't
+            // drive keeps whatever the pass-through gave it. Every D-pad pin is
+            // on the bus by now — passed through, or zeroed by strict mode — so
+            // there is nothing to fall back to.
+            let on = collector_sigs
+                .get(&(key.clone(), dir.to_string()))
+                .copied()
+                .map(|s| s.as_bool())
+                .unwrap_or(false);
+            if on {
+                xy[axis] += sign;
+            }
+        }
+        // Opposite directions cancel — one axis can't hold both.
+        let (x, y) = (xy[0].clamp(-1.0, 1.0), xy[1].clamp(-1.0, 1.0));
+        collector_sigs.insert((key.clone(), "dpad_x".to_string()), Signal::Float(x));
+        collector_sigs.insert((key.clone(), "dpad_y".to_string()), Signal::Float(y));
+        collector_sigs.insert((key.clone(), "dpad".to_string()), Signal::Vec2(Vec2::new(x, y)));
+    }
+
     // Aiming, as one displacement for this tick. `mouse_move` is applied as it
     // stands rather than integrated, which is what JSM computes; the axis pins
     // are left alone so a sink wired to both doesn't move twice. It is published
     // every tick the config aims, zero included — a latched displacement would
     // otherwise keep nudging the cursor for ever.
-    if aims_anything(&st.cfg) {
+    if aims_anything(&st.cfg, &res) {
         let m = if typing { Vec2::ZERO } else { mouse };
         collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m));
     }
@@ -278,7 +343,7 @@ fn button_down(btn: Btn, upstream: &HashMap<String, Signal>, analog: &Analog) ->
 
 /// The pins the config takes over, split the way the suppression pass wants
 /// them: buttons on one side, analog axes and triggers on the other.
-fn claimed_pins(cfg: &Compiled) -> (HashSet<String>, HashSet<String>) {
+fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String>, HashSet<String>) {
     let mut digital = HashSet::new();
     let mut analog = HashSet::new();
     let stick_pins = |stick: StickId| {
@@ -328,8 +393,8 @@ fn claimed_pins(cfg: &Compiled) -> (HashSet<String>, HashSet<String>) {
             // untouched rather than going quiet for nothing.
             BtnSource::Stick { stick, .. } => {
                 let cfg = match stick {
-                    StickId::Left => cfg.settings.left,
-                    StickId::Right => cfg.settings.right,
+                    StickId::Left => res.settings.left,
+                    StickId::Right => res.settings.right,
                 };
                 if cfg.mode.runs_here() {
                     analog.extend(stick_pins(stick));
@@ -345,7 +410,7 @@ fn claimed_pins(cfg: &Compiled) -> (HashSet<String>, HashSet<String>) {
     // A config that aims with the gyro owns it, so it can't also drive a Gyro
     // 3DOF node downstream. One left at JSM's default sensitivity of zero aims
     // with nothing, and passes the gyro on untouched.
-    if cfg.aim.min_sens != (0.0, 0.0) || cfg.aim.max_sens != (0.0, 0.0) {
+    if res.aim.min_sens != (0.0, 0.0) || res.aim.max_sens != (0.0, 0.0) {
         for pin in ["gyro_x", "gyro_y", "gyro_z"] {
             analog.insert(pin.to_string());
         }
@@ -369,11 +434,12 @@ fn claimed_outputs(cfg: &Compiled) -> Vec<String> {
 }
 
 /// Is any part of this config aiming the mouse?
-fn aims_anything(cfg: &Compiled) -> bool {
-    cfg.aim.min_sens != (0.0, 0.0)
-        || cfg.aim.max_sens != (0.0, 0.0)
-        || cfg.settings.left.mode.aims()
-        || cfg.settings.right.mode.aims()
+fn aims_anything(cfg: &Compiled, res: &super::parse::Resolved) -> bool {
+    let _ = cfg;
+    res.aim.min_sens != (0.0, 0.0)
+        || res.aim.max_sens != (0.0, 0.0)
+        || res.settings.left.mode.aims()
+        || res.settings.right.mode.aims()
 }
 
 /// A pin's released value, in the type it is declared with — a virtual pad's

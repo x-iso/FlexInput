@@ -104,6 +104,62 @@ pub struct Binding {
     pub line: usize,
 }
 
+/// `button,SETTING = value` — while `chord` is held, the setting reads `value`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Modeshift {
+    pub chord: Btn,
+    pub(crate) support: Support,
+    /// Kept as written so the value is parsed by exactly the same code that
+    /// parses the plain line.
+    pub name: String,
+    pub value: String,
+}
+
+/// The settings in force this tick, once the held chords have had their say.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Resolved {
+    pub timings: Timings,
+    pub settings: Settings,
+    pub aim: super::aim::Settings,
+    /// Per stick: a chord is supplying its mode right now. When that stops the
+    /// stick has to be let alone until it comes back to centre, or releasing the
+    /// chord mid-push would hand the base mode a stick already out at full.
+    pub stick_mode_chorded: [bool; 2],
+}
+
+/// Work out the settings in force, given the chords held — oldest first, as the
+/// press machinery stacks them. JSM resolves each setting against the stack from
+/// the newest chord down, taking the first that has something to say, so applying
+/// them oldest-first and letting later ones overwrite comes to the same thing.
+pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
+    let mut r = Resolved {
+        timings: cfg.timings,
+        settings: cfg.settings,
+        aim: cfg.aim,
+        stick_mode_chorded: [false; 2],
+    };
+    if cfg.modeshifts.is_empty() {
+        return r;
+    }
+    for &chord in chords {
+        for ms in cfg.modeshifts.iter().filter(|m| m.chord == chord) {
+            apply_setting(
+                &ms.name,
+                &ms.value,
+                ms.support,
+                &mut r.timings,
+                &mut r.settings,
+                &mut r.aim,
+            );
+            if let Support::Analog(AnalogId::StickMode(side)) = ms.support {
+                if side != Side::Right { r.stick_mode_chorded[0] = true; }
+                if side != Side::Left { r.stick_mode_chorded[1] = true; }
+            }
+        }
+    }
+    r
+}
+
 /// JSM's press timings, in seconds.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Timings {
@@ -136,6 +192,8 @@ pub struct Compiled {
     pub settings: Settings,
     /// Gyro, stick-aim and flick settings.
     pub aim: super::aim::Settings,
+    /// Settings that change while a button is held.
+    pub modeshifts: Vec<Modeshift>,
     /// Every button the config mentions, however it mentions it. Pass-through
     /// mode hands the rest of the bus straight on.
     pub mentioned: HashSet<Btn>,
@@ -167,6 +225,7 @@ pub fn compile(text: &str) -> Compiled {
         timings: Timings::default(),
         settings: Settings::default(),
         aim: super::aim::Settings::default(),
+        modeshifts: Vec::new(),
         mentioned: HashSet::new(),
     };
     for (n, line) in text.lines().enumerate() {
@@ -258,16 +317,17 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled) -> LineInfo {
 
     // `button,SETTING = value` — a modeshift.
     if let Some((op, second)) = &combo {
-        if setting_support(second).is_some() {
+        if let Some(support) = setting_support(second) {
             if *op != ',' {
                 return LineInfo::of(LineStatus::Error(
                     "only a chord (`button,SETTING`) can change a setting".into(),
                 ));
             }
-            if let Some(b) = Btn::from_name(&first) {
-                out.mentioned.insert(b);
-            }
-            return LineInfo::of(LineStatus::Pending(PHASE_MODESHIFT));
+            let Some(chord) = Btn::from_name(&first) else {
+                return LineInfo::of(LineStatus::Error(format!("`{first}` isn't a button")));
+            };
+            out.mentioned.insert(chord);
+            return modeshift_line(chord, second, rhs, support, out);
         }
     }
 
@@ -331,9 +391,47 @@ fn command_line(name: &str, out: &mut Compiled) -> LineInfo {
 }
 
 fn setting_line(name: &str, rhs: &str, support: Support, out: &mut Compiled) -> LineInfo {
+    apply_setting(name, rhs, support, &mut out.timings, &mut out.settings, &mut out.aim)
+}
+
+/// `button,SETTING = value`: the setting takes that value while the button is
+/// held. The value is checked here, against a throwaway copy of the settings, so
+/// the line can be called good or bad now rather than at run time.
+fn modeshift_line(
+    chord: Btn,
+    name: &str,
+    rhs: &str,
+    support: Support,
+    out: &mut Compiled,
+) -> LineInfo {
+    let (mut timings, mut settings, mut aim) = (out.timings, out.settings, out.aim);
+    let info = apply_setting(name, rhs, support, &mut timings, &mut settings, &mut aim);
+    // A setting a later phase owns says so, and the modeshift waits with it.
+    if matches!(info.status, LineStatus::Ok) {
+        out.modeshifts.push(Modeshift {
+            chord,
+            support,
+            name: name.to_string(),
+            value: rhs.to_string(),
+        });
+    }
+    info
+}
+
+/// Apply one `SETTING = value` line to a set of settings. The same code serves a
+/// plain line (writing the config's base settings) and a modeshift (writing a
+/// copy while its chord is held), so a value can only ever be read one way.
+pub(crate) fn apply_setting(
+    name: &str,
+    rhs: &str,
+    support: Support,
+    timings: &mut Timings,
+    settings: &mut Settings,
+    aim: &mut super::aim::Settings,
+) -> LineInfo {
     match support {
-        Support::Analog(which) => analog_setting(name, rhs, which, &mut out.settings),
-        Support::Aim(which) => aim_setting(name, rhs, which, &mut out.aim),
+        Support::Analog(which) => analog_setting(name, rhs, which, settings),
+        Support::Aim(which) => aim_setting(name, rhs, which, aim),
         Support::Timing(which) => {
             let Some(ms) = rhs
                 .split_whitespace()
@@ -349,10 +447,10 @@ fn setting_line(name: &str, rhs: &str, support: Support, out: &mut Compiled) -> 
             }
             let secs = ms / 1000.0;
             match which {
-                TimingId::Hold => out.timings.hold = secs,
-                TimingId::Turbo => out.timings.turbo = secs,
-                TimingId::Sim => out.timings.sim = secs,
-                TimingId::Double => out.timings.double = secs,
+                TimingId::Hold => timings.hold = secs,
+                TimingId::Turbo => timings.turbo = secs,
+                TimingId::Sim => timings.sim = secs,
+                TimingId::Double => timings.double = secs,
             }
             LineInfo::of(LineStatus::Ok)
         }
@@ -428,6 +526,19 @@ fn binding_line(
     if steps.iter().any(|s| s.out == Out::Calibrate) {
         notes.push("CALIBRATE does nothing here — the device card owns gyro calibration".into());
     }
+    // A pad output goes nowhere unless a virtual pad is wired downstream of this
+    // module, and it goes to EVERY pad wired there — `X_` and `PS_` are two names
+    // for one pin, as they are in JSM. The module can't see the patch, so the line
+    // says both.
+    if steps.iter().any(|s| matches!(&s.out, Out::Pin(p) | Out::Pulse(p)
+        if super::names::is_pad_pin(p)))
+    {
+        notes.push(
+            "needs a virtual pad wired downstream to reach anything; `X_` and `PS_` names are \
+             the same pin (as in JSM), so wiring decides which pad it reaches"
+                .into(),
+        );
+    }
 
     let status = if let Some(phase) = pending {
         LineStatus::Pending(phase)
@@ -450,6 +561,63 @@ fn binding_line(
     LineInfo {
         status,
         notes: notes.into_iter().chain(unsupported).collect(),
+    }
+}
+
+/// Note, on every line that reads a button this pad doesn't report, that it can't
+/// fire here. A config is written for whatever pad the author had, so this is the
+/// device's business rather than the config's — hence a note, not a status. Only
+/// the buttons this module already reads are checked: the rest say "pending",
+/// which is the truer thing to say about them.
+///
+/// `available` is the pins the device has published. Pass an empty set for "not
+/// known yet" and nothing is claimed.
+pub fn note_inputs_this_pad_lacks(cfg: &mut Compiled, available: &HashSet<String>) {
+    if available.is_empty() {
+        return;
+    }
+    let mut notes: Vec<(usize, String)> = Vec::new();
+    for b in &cfg.bindings {
+        let buttons = match b.trigger {
+            Trigger::Simple(x) | Trigger::Double(x) => vec![x],
+            Trigger::Chord { chord, btn } => vec![chord, btn],
+            Trigger::Sim(x, y) | Trigger::Diag(x, y) => vec![x, y],
+        };
+        for btn in buttons {
+            let needed: Vec<&str> = match btn.source() {
+                BtnSource::Pin(p) => vec![p],
+                // Either form will do — a pad with only one of them still works.
+                BtnSource::Trigger { analog, digital } => {
+                    if available.contains(analog) || available.contains(digital) {
+                        continue;
+                    }
+                    vec![analog, digital]
+                }
+                BtnSource::TriggerFull { analog } => vec![analog],
+                BtnSource::Stick { stick, .. } => match stick {
+                    StickId::Left => vec!["left_stick"],
+                    StickId::Right => vec!["right_stick"],
+                },
+                // Sources that aren't live yet already say so on the line.
+                _ => continue,
+            };
+            if needed.iter().any(|p| available.contains(*p)) {
+                continue;
+            }
+            let note = format!(
+                "this pad doesn't report `{}`, so `{}` never fires on it",
+                needed.join("` or `"),
+                btn.name()
+            );
+            notes.push((b.line, note));
+        }
+    }
+    for (line, note) in notes {
+        if let Some(info) = cfg.lines.get_mut(line) {
+            if !info.notes.contains(&note) {
+                info.notes.push(note);
+            }
+        }
     }
 }
 
@@ -671,8 +839,8 @@ pub(crate) fn parse_mapping(rhs: &str) -> Result<(Vec<Step>, Vec<String>), Strin
 // ── trigger and stick settings ───────────────────────────────────────────────
 
 /// Which analog setting a line sets, and for which side.
-#[derive(Clone, Copy)]
-enum AnalogId {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum AnalogId {
     Threshold,
     SkipDelay,
     TriggerMode(bool),
@@ -685,8 +853,8 @@ enum AnalogId {
     Orientation,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Side {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Side {
     Left,
     Right,
     Both,
@@ -906,8 +1074,8 @@ fn axis_sign(v: &str) -> Option<bool> {
 // ── gyro, stick aim and flick settings ───────────────────────────────────────
 
 /// Which aiming setting a line sets.
-#[derive(Clone, Copy)]
-enum AimId {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum AimId {
     /// `GYRO_SENS` sets both ends of the ramp at once.
     GyroSens,
     MinSens,
@@ -1122,16 +1290,16 @@ const PHASE_LAYERS: &str = "loading another config arrives in phase 8";
 
 const WHY_DEVICE_CARD: &str = "the device card owns calibration in FlexInput";
 
-#[derive(Clone, Copy)]
-enum TimingId {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum TimingId {
     Hold,
     Turbo,
     Sim,
     Double,
 }
 
-#[derive(Clone, Copy)]
-enum Support {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Support {
     Timing(TimingId),
     Analog(AnalogId),
     Aim(AimId),
