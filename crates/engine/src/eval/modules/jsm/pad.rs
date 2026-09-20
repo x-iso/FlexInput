@@ -125,6 +125,7 @@ impl Pad {
         stick_power: f32,
         gyro: Vec2,
         flick: Vec2,
+        steer: Option<(f32, f32)>,
     ) -> Out {
         // What camera rate each virtual stick is owed before any stick is read.
         let mut owed = [Vec2::ZERO; 2];
@@ -159,6 +160,11 @@ impl Pad {
                     angle_to_axis(s, side, is_x, now, st.len, stick_power)
                 }
                 StickMode::Wind(_) => self.wind(s, side, now, prev, st.len, dt),
+                // Steering comes from the lean angle, which `motion.rs` worked out
+                // — this stick only says which virtual stick it drives.
+                StickMode::Steer(_) => steer
+                    .and_then(|(sign, reach)| undeadzone(reach, &s.out[side]).map(|v| (sign, v)))
+                    .map(|(sign, v)| Vec2::new(sign * v, 0.0)),
                 // `VirtualStick`, and the only other thing `pad_side` answers for.
                 _ => {
                     carried[side] = true;

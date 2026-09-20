@@ -63,6 +63,10 @@ pub struct JsmState {
     aim: Aim,
     /// The sticks and rates pointed at a virtual pad instead.
     pad: PadOut,
+    /// Which way is down, and the motion stick built from it.
+    motion: super::motion::Motion,
+    /// The touchpad: its grid, its two relative sticks, its mouse mode.
+    touch: super::touch::Touch,
 }
 
 /// Evaluate one JSM Config node.
@@ -128,6 +132,8 @@ pub(crate) fn jsm_publish(
             analog: Analog::default(),
             aim: Aim::default(),
             pad: PadOut::default(),
+            motion: super::motion::Motion::default(),
+            touch: super::touch::Touch::default(),
         })
     });
     if st.gen != gen {
@@ -137,6 +143,8 @@ pub(crate) fn jsm_publish(
         st.analog = Analog::default();
         st.aim = Aim::default();
         st.pad = PadOut::default();
+        st.motion = super::motion::Motion::default();
+        st.touch = super::touch::Touch::default();
     }
 
     // What the settings are this tick, once the held chords have had their say.
@@ -163,10 +171,26 @@ pub(crate) fn jsm_publish(
         }
     }
 
-    // Triggers and sticks first: they turn into buttons the bindings can use.
-    st.analog.tick(&res.settings, dt, &read_pad(&upstream));
+    // Which way is down, and where the fingers are. Both come before the sticks,
+    // because each produces one: the motion stick from gravity, a touch stick per
+    // finger from how far it has been dragged.
+    let gravity = st.motion.tick(read_accel(&upstream), dt);
+    let touch_out = st.touch.tick(&res.touch, touch_fingers(&upstream), res.settings.touch);
+    let motion_stick = super::motion::motion_stick(gravity, res.settings.motion);
+
+    // Triggers and sticks: they turn into buttons the bindings can use.
+    st.analog
+        .tick(&res.settings, dt, &read_pad(&upstream, motion_stick, &touch_out));
+    // `SET_MOTION_STICK_NEUTRAL`: once as the config starts if it is on a line of
+    // its own, and whenever a binding fires it (below, once the bindings have run).
+    if st.cfg.neutral_at_load && !st.motion.has_neutral() && gravity.known {
+        st.motion.set_neutral(gravity);
+    }
+
+    let (lean_l, lean_r) = super::motion::lean(gravity, &res.motion, res.settings.orientation);
+    let ext = Extra { lean: (lean_l, lean_r), cells: touch_out.cells };
     let analog = &st.analog;
-    let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog) };
+    let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog, &ext) };
     // A trigger handed straight to the virtual pad can still chord, but its own
     // bindings stop running — JSM's rule, and what the editor says on the line.
     let (zl_pad, zr_pad) = (
@@ -181,6 +205,13 @@ pub(crate) fn jsm_publish(
     let outputs = st.rt.tick(&st.cfg, &res.timings, dt, &held, &chord_only);
     let driven: Vec<String> = outputs.pins.iter().cloned().collect();
     let gyro_actions = outputs.gyro.clone();
+    let recentre = outputs
+        .commands
+        .iter()
+        .any(|c| c.trim().eq_ignore_ascii_case("SET_MOTION_STICK_NEUTRAL"));
+    if recentre {
+        st.motion.set_neutral(gravity);
+    }
 
     // Then aiming: the gyro and whichever sticks are pointed at the mouse. What
     // is pointed at a virtual pad's stick instead comes back as a camera rate for
@@ -193,9 +224,9 @@ pub(crate) fn jsm_publish(
             yaw: f("gyro_z"),
         };
         let analog = &st.analog;
-        let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog) };
+        let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog, &ext) };
         st.aim
-            .tick(&res.aim, &res.pad, dt, gyro, &st.analog, &gyro_actions, &held)
+            .tick(&res.aim, &res.pad, &res.motion, gravity, dt, gyro, &st.analog, &gyro_actions, &held)
     };
     let mouse = aimed.mouse;
 
@@ -207,6 +238,13 @@ pub(crate) fn jsm_publish(
         res.aim.stick_power,
         aimed.gyro_dps,
         aimed.flick_dps,
+        super::motion::steer(
+            gravity,
+            res.settings.orientation,
+            res.settings.motion.inner_dz * 180.0,
+            (1.0 - res.settings.motion.outer_dz) * 180.0,
+            res.aim.stick_power,
+        ),
     );
 
     // What the config takes over from the pad.
@@ -316,8 +354,8 @@ pub(crate) fn jsm_publish(
     // are left alone so a sink wired to both doesn't move twice. It is published
     // every tick the config aims, zero included — a latched displacement would
     // otherwise keep nudging the cursor for ever.
-    if aims_anything(&st.cfg, &res) {
-        let m = if typing { Vec2::ZERO } else { mouse };
+    if aims_anything(&st.cfg, &res) || res.touch.mode == super::touch::Mode::Mouse {
+        let m = if typing { Vec2::ZERO } else { mouse + touch_out.mouse };
         collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m));
     }
 
@@ -347,7 +385,11 @@ fn text_gen(text: &str) -> u64 {
 }
 
 /// What the analog side needs off the bus this tick.
-fn read_pad(upstream: &HashMap<String, Signal>) -> Pad {
+fn read_pad(
+    upstream: &HashMap<String, Signal>,
+    motion: (f32, f32),
+    touch: &super::touch::Out,
+) -> Pad {
     let analog = |pin: &str| upstream.get(pin).map(|s| s.as_float());
     let b = |pin: &str| upstream.get(pin).map(|s| s.as_bool()).unwrap_or(false);
     let stick = |name: &str| -> (f32, f32) {
@@ -365,28 +407,90 @@ fn read_pad(upstream: &HashMap<String, Signal>) -> Pad {
                 .unwrap_or(0.0),
         )
     };
+    let fingers = touch_fingers(upstream);
     Pad {
         triggers: [analog("left_trigger"), analog("right_trigger")],
         trigger_digital: [b("btn_lt_dig"), b("btn_rt_dig")],
-        sticks: [stick("left_stick"), stick("right_stick")],
+        sticks: [
+            stick("left_stick"),
+            stick("right_stick"),
+            motion,
+            touch.sticks[0],
+            touch.sticks[1],
+        ],
+        touching: fingers[0].active || fingers[1].active,
+        touch_click: b("btn_touchpad"),
     }
 }
 
-/// Is this JSM button pressed right now? Triggers and sticks come from the
-/// analog side; the buttons whose source needs work still to come (the touchpad,
-/// the motion sensors) read as off — their lines compile as pending, so nothing
-/// claims to work that doesn't.
-fn button_down(btn: Btn, upstream: &HashMap<String, Signal>, analog: &Analog) -> bool {
+/// The touchpad's two fingers, as the touch side wants them.
+fn touch_fingers(upstream: &HashMap<String, Signal>) -> [super::touch::Finger; 2] {
+    let f = |n: usize| {
+        let g = |suffix: &str| {
+            upstream
+                .get(&format!("touch{n}_{suffix}"))
+                .map(|s| s.as_float())
+                .unwrap_or(0.0)
+        };
+        super::touch::Finger {
+            active: upstream
+                .get(&format!("touch{n}_active"))
+                .map(|s| s.as_bool())
+                .unwrap_or(false),
+            x: g("x"),
+            y: g("y"),
+        }
+    };
+    [f(1), f(2)]
+}
+
+/// The accelerometer, if the pad reports one. A pad that reports nothing here has
+/// no idea which way is down, which is not the same as being held flat.
+fn read_accel(upstream: &HashMap<String, Signal>) -> Option<glam::Vec3> {
+    let any = ["accel_x", "accel_y", "accel_z"]
+        .iter()
+        .any(|p| upstream.contains_key(*p));
+    any.then(|| {
+        let f = |pin: &str| upstream.get(pin).map(|s| s.as_float()).unwrap_or(0.0);
+        glam::Vec3::new(f("accel_x"), f("accel_y"), f("accel_z"))
+    })
+}
+
+/// The buttons that come from neither a pin nor the analog side.
+struct Extra {
+    /// `LEAN_LEFT`, `LEAN_RIGHT`.
+    lean: (bool, bool),
+    /// Which grid cell each finger is in, 1-based.
+    cells: [Option<u8>; 2],
+}
+
+/// Is this JSM button pressed right now? Buttons read straight off a pin; the
+/// trigger, stick, motion-stick and touch-stick ones come from the analog side,
+/// which runs all five of JSM's sticks; lean and the touchpad grid come from the
+/// gravity and touch passes.
+fn button_down(
+    btn: Btn,
+    upstream: &HashMap<String, Signal>,
+    analog: &Analog,
+    ext: &Extra,
+) -> bool {
     let b = |pin: &str| upstream.get(pin).map(|s| s.as_bool()).unwrap_or(false);
     match btn.source() {
         BtnSource::Pin(pin) => b(pin),
-        BtnSource::Trigger { .. } | BtnSource::TriggerFull { .. } | BtnSource::Stick { .. } => {
-            analog.down(btn)
-        }
-        BtnSource::Motion { .. }
-        | BtnSource::Lean { .. }
-        | BtnSource::Touch
-        | BtnSource::TouchZone { .. } => false,
+        BtnSource::Trigger { .. }
+        | BtnSource::TriggerFull { .. }
+        | BtnSource::Stick { .. }
+        | BtnSource::Motion { .. } => analog.down(btn),
+        BtnSource::Lean { right } => if right { ext.lean.1 } else { ext.lean.0 },
+        // `TOUCH` is the touchpad soft pull, which the analog side runs.
+        BtnSource::Touch => analog.down(btn),
+        BtnSource::TouchZone { cell, dir } => match (cell, dir) {
+            // A grid cell is down while either finger is in it.
+            (Some(c), _) => ext.cells.iter().any(|f| *f == Some(c)),
+            // A touch-stick direction, which the analog side runs for both fingers.
+            (None, Some(_)) => analog.down(btn),
+            (None, None) => false,
+        },
     }
 }
 
@@ -476,6 +580,32 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
             | BtnSource::TouchZone { .. } => {}
         }
     }
+    // A touchpad this config reads is the config's: its grid buttons, its sticks
+    // and its mouse mode all consume the finger positions, so a Touch Zones module
+    // downstream shouldn't see them as well. `PS_TOUCHPAD` is the exception —
+    // that mode exists precisely to pass them on.
+    if res.touch.mode != super::touch::Mode::PsTouchpad
+        && (cfg.mentioned.iter().any(|b| {
+            matches!(b.source(), BtnSource::Touch | BtnSource::TouchZone { .. })
+        }) || res.touch.mode == super::touch::Mode::Mouse
+            || res.settings.touch.mode.runs_here())
+    {
+        for pin in ["touch1_x", "touch1_y", "touch1_active", "touch2_x", "touch2_y", "touch2_active"] {
+            analog.insert(pin.to_string());
+        }
+    }
+    // Anything measured against gravity reads the accelerometer, and the motion
+    // stick and lean buttons read nothing else — so a config using them owns it.
+    let reads_gravity = res.motion.space.needs_gravity()
+        || res.settings.motion.mode.runs_here()
+        || cfg.mentioned.iter().any(|b| {
+            matches!(b.source(), BtnSource::Motion { .. } | BtnSource::Lean { .. })
+        });
+    if reads_gravity {
+        for pin in ["accel_x", "accel_y", "accel_z"] {
+            analog.insert(pin.to_string());
+        }
+    }
     // A config that aims with the gyro owns it, so it can't also drive a Gyro
     // 3DOF node downstream. One left at JSM's default sensitivity of zero aims
     // with nothing, and passes the gyro on untouched — and so does `GYRO_OUTPUT =
@@ -513,6 +643,9 @@ fn aims_anything(cfg: &Compiled, res: &super::parse::Resolved) -> bool {
         || res.aim.max_sens != (0.0, 0.0)
         || res.settings.left.mode.aims()
         || res.settings.right.mode.aims()
+        // The motion stick and the touch sticks can aim too.
+        || res.settings.motion.mode.aims()
+        || res.settings.touch.mode.aims()
 }
 
 /// A pin's released value, in the type it is declared with — a virtual pad's

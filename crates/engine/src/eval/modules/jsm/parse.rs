@@ -122,6 +122,8 @@ pub struct Resolved {
     pub settings: Settings,
     pub aim: super::aim::Settings,
     pub pad: super::pad::Settings,
+    pub motion: super::motion::Settings,
+    pub touch: super::touch::Settings,
     /// Per stick: a chord is supplying its mode right now. When that stops the
     /// stick has to be let alone until it comes back to centre, or releasing the
     /// chord mid-push would hand the base mode a stick already out at full.
@@ -138,6 +140,8 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
         settings: cfg.settings,
         aim: cfg.aim,
         pad: cfg.pad,
+        motion: cfg.motion,
+        touch: cfg.touch,
         stick_mode_chorded: [false; 2],
     };
     if cfg.modeshifts.is_empty() {
@@ -149,10 +153,14 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
                 &ms.name,
                 &ms.value,
                 ms.support,
-                &mut r.timings,
-                &mut r.settings,
-                &mut r.aim,
-                &mut r.pad,
+                Knobs {
+                    timings: &mut r.timings,
+                    settings: &mut r.settings,
+                    aim: &mut r.aim,
+                    pad: &mut r.pad,
+                    motion: &mut r.motion,
+                    touch: &mut r.touch,
+                },
             );
             if let Support::Analog(AnalogId::StickMode(side)) = ms.support {
                 if side != Side::Right { r.stick_mode_chorded[0] = true; }
@@ -197,6 +205,13 @@ pub struct Compiled {
     pub aim: super::aim::Settings,
     /// Virtual pad output settings.
     pub pad: super::pad::Settings,
+    /// Gravity: the lean buttons, the motion stick, the gravity gyro spaces.
+    pub motion: super::motion::Settings,
+    /// The touchpad.
+    pub touch: super::touch::Settings,
+    /// A bare `SET_MOTION_STICK_NEUTRAL` line: take the pad's resting orientation
+    /// as the motion stick's centre once the config is running.
+    pub neutral_at_load: bool,
     /// Settings that change while a button is held.
     pub modeshifts: Vec<Modeshift>,
     /// Every button the config mentions, however it mentions it. Pass-through
@@ -231,6 +246,9 @@ pub fn compile(text: &str) -> Compiled {
         settings: Settings::default(),
         aim: super::aim::Settings::default(),
         pad: super::pad::Settings::default(),
+        motion: super::motion::Settings::default(),
+        touch: super::touch::Settings::default(),
+        neutral_at_load: false,
         modeshifts: Vec::new(),
         mentioned: HashSet::new(),
     };
@@ -370,7 +388,19 @@ fn command_line(name: &str, out: &mut Compiled) -> LineInfo {
             "FlexInput measures real-world sensitivity in the RWS Aim module — \
              set REAL_WORLD_CALIBRATION here from what it tells you",
         )),
-        "SET_MOTION_STICK_NEUTRAL" => LineInfo::of(LineStatus::Pending(PHASE_TOUCH)),
+        // On its own line JSM runs this as the config loads, taking however the pad
+        // happens to be held right then as the motion stick's centre. Quoted as a
+        // binding it is far more useful — press a button to re-centre — and that
+        // path runs through `Out::Command`.
+        "SET_MOTION_STICK_NEUTRAL" => {
+            out.neutral_at_load = true;
+            let mut info = LineInfo::of(LineStatus::Ok);
+            info.notes.push(
+                "runs once, as the config loads, so it takes however the pad is being held                  then. Bind it to a button instead (`HOME = \"SET_MOTION_STICK_NEUTRAL\"`) to                  re-centre whenever you like."
+                    .to_string(),
+            );
+            info
+        }
         "RESTART_GYRO_CALIBRATION" | "FINISH_GYRO_CALIBRATION" | "CALIBRATE_TRIGGERS" => {
             LineInfo::of(LineStatus::Ignored(WHY_DEVICE_CARD))
         }
@@ -401,10 +431,14 @@ fn setting_line(name: &str, rhs: &str, support: Support, out: &mut Compiled) -> 
         name,
         rhs,
         support,
-        &mut out.timings,
-        &mut out.settings,
-        &mut out.aim,
-        &mut out.pad,
+        Knobs {
+            timings: &mut out.timings,
+            settings: &mut out.settings,
+            aim: &mut out.aim,
+            pad: &mut out.pad,
+            motion: &mut out.motion,
+            touch: &mut out.touch,
+        },
     )
 }
 
@@ -418,16 +452,24 @@ fn modeshift_line(
     support: Support,
     out: &mut Compiled,
 ) -> LineInfo {
-    let (mut timings, mut settings, mut aim, mut pad) =
-        (out.timings, out.settings, out.aim, out.pad);
+    let mut t = out.timings;
+    let mut a = out.settings;
+    let mut m = out.aim;
+    let mut p = out.pad;
+    let mut mo = out.motion;
+    let mut tp = out.touch;
     let info = apply_setting(
         name,
         rhs,
         support,
-        &mut timings,
-        &mut settings,
-        &mut aim,
-        &mut pad,
+        Knobs {
+            timings: &mut t,
+            settings: &mut a,
+            aim: &mut m,
+            pad: &mut p,
+            motion: &mut mo,
+            touch: &mut tp,
+        },
     );
     // A setting a later phase owns says so, and the modeshift waits with it.
     if matches!(info.status, LineStatus::Ok) {
@@ -444,19 +486,27 @@ fn modeshift_line(
 /// Apply one `SETTING = value` line to a set of settings. The same code serves a
 /// plain line (writing the config's base settings) and a modeshift (writing a
 /// copy while its chord is held), so a value can only ever be read one way.
-pub(crate) fn apply_setting(
-    name: &str,
-    rhs: &str,
-    support: Support,
-    timings: &mut Timings,
-    settings: &mut Settings,
-    aim: &mut super::aim::Settings,
-    pad: &mut super::pad::Settings,
-) -> LineInfo {
+/// Everything one setting line might change, borrowed together. A struct rather
+/// than a parameter list because each phase adds a group, and six positional
+/// `&mut`s at four call sites is how they get passed in the wrong order.
+pub(crate) struct Knobs<'a> {
+    pub timings: &'a mut Timings,
+    pub settings: &'a mut Settings,
+    pub aim: &'a mut super::aim::Settings,
+    pub pad: &'a mut super::pad::Settings,
+    pub motion: &'a mut super::motion::Settings,
+    pub touch: &'a mut super::touch::Settings,
+}
+
+pub(crate) fn apply_setting(name: &str, rhs: &str, support: Support, k: Knobs<'_>) -> LineInfo {
+    let Knobs { timings, settings, aim, pad, motion, touch } = k;
     match support {
         Support::Analog(which) => analog_setting(name, rhs, which, settings),
         Support::Aim(which) => aim_setting(name, rhs, which, aim),
         Support::Pad(which) => pad_setting(name, rhs, which, pad),
+        Support::Motion(which) => {
+            motion_setting(name, rhs, which, motion, settings, touch)
+        }
         Support::Timing(which) => {
             let Some(ms) = rhs
                 .split_whitespace()
@@ -527,12 +577,11 @@ fn binding_line(
         }
     }
 
-    // A button we can read is live now; the derived ones wait for their phase.
-    let pending = match trigger {
-        Trigger::Simple(b) | Trigger::Double(b) => pending_source(b),
-        Trigger::Chord { chord, btn } => pending_source(chord).or_else(|| pending_source(btn)),
-        Trigger::Sim(a, b) | Trigger::Diag(a, b) => pending_source(a).or_else(|| pending_source(b)),
-    };
+    // Every one of JSM's buttons is readable as of phase 6 — the triggers and
+    // sticks, the motion stick, lean, and the touchpad's grid and sticks — so no
+    // binding waits on its *source* any more. What a line can still be waiting for
+    // is its output, which `unsupported` below covers.
+    let pending: Option<&'static str> = None;
     let unsupported: Vec<String> = steps
         .iter()
         .filter_map(|s| match &s.out {
@@ -639,16 +688,6 @@ pub fn note_inputs_this_pad_lacks(cfg: &mut Compiled, available: &HashSet<String
                 info.notes.push(note);
             }
         }
-    }
-}
-
-/// The phase that will make a button readable, or `None` when it already is.
-fn pending_source(btn: Btn) -> Option<&'static str> {
-    use super::names::BtnSource as S;
-    match btn.source() {
-        S::Pin(_) | S::Trigger { .. } | S::TriggerFull { .. } | S::Stick { .. } => None,
-        S::Motion { .. } | S::Lean { .. } => Some(PHASE_TOUCH),
-        S::Touch | S::TouchZone { .. } => Some(PHASE_TOUCH),
     }
 }
 
@@ -1146,7 +1185,6 @@ pub(crate) enum AimId {
     InGameSens,
     /// `GYRO_ON` (true) / `GYRO_OFF` (false).
     GyroButton(bool),
-    Space,
     StickSens,
     StickPower,
     StickAccelRate,
@@ -1302,13 +1340,6 @@ fn aim_setting(name: &str, rhs: &str, which: AimId, s: &mut super::aim::Settings
             };
             ok
         }
-        AimId::Space => match value.as_str() {
-            "LOCAL" => ok,
-            "PLAYER_TURN" | "PLAYER_LEAN" | "WORLD_TURN" | "WORLD_LEAN" => {
-                LineInfo::of(LineStatus::Pending(PHASE_GRAVITY))
-            }
-            _ => wants("LOCAL, PLAYER_TURN, PLAYER_LEAN, WORLD_TURN or WORLD_LEAN"),
-        },
     }
 }
 
@@ -1467,6 +1498,238 @@ fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings
     }
 }
 
+
+// ── gravity and the touchpad ──────────────────────────────────────────────────
+
+/// Which of phase 6's settings a line sets. They land in three places — the gyro
+/// space and lean live in `motion`, the motion and touch *sticks* are ordinary
+/// stick configs in `settings`, and the touchpad's own knobs are in `touch` — so
+/// one handler writes to all three rather than splitting the table three ways.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum MotionId {
+    Space,
+    LeanThreshold,
+    /// The motion stick, in the same settings a thumbstick has.
+    MotionStick,
+    MotionRing,
+    MotionDeadzone(bool),
+    MotionAxis,
+    /// The touchpad itself.
+    TouchpadMode,
+    Grid,
+    TouchpadSens,
+    TouchpadDualStage,
+    /// The touch stick.
+    TouchStick,
+    TouchRing,
+    TouchRadius,
+    TouchDeadzone,
+    TouchAxis,
+}
+
+fn motion_setting(
+    name: &str,
+    rhs: &str,
+    which: MotionId,
+    m: &mut super::motion::Settings,
+    a: &mut Settings,
+    t: &mut super::touch::Settings,
+) -> LineInfo {
+    use super::motion::Space;
+    let wants = |what: &str| LineInfo::of(LineStatus::Error(format!("`{name}` wants {what}")));
+    let value = rhs.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    let num = || rhs.split_whitespace().next().and_then(|v| v.parse::<f32>().ok());
+    let ok = LineInfo::of(LineStatus::Ok);
+
+    match which {
+        MotionId::Space => {
+            m.space = match value.as_str() {
+                "LOCAL" => Space::Local,
+                "PLAYER_TURN" => Space::PlayerTurn,
+                "PLAYER_LEAN" => Space::PlayerLean,
+                "WORLD_TURN" => Space::WorldTurn,
+                "WORLD_LEAN" => Space::WorldLean,
+                _ => return wants("LOCAL, PLAYER_TURN, PLAYER_LEAN, WORLD_TURN or WORLD_LEAN"),
+            };
+            let mut info = ok;
+            if m.space.needs_gravity() {
+                info.notes.push(GRAVITY_NOTE.to_string());
+            }
+            info
+        }
+        MotionId::LeanThreshold => match num() {
+            Some(v) if (0.0..=90.0).contains(&v) => {
+                m.lean_threshold = v;
+                ok
+            }
+            _ => wants("an angle in degrees, 0 to 90"),
+        },
+        MotionId::MotionStick | MotionId::TouchStick => {
+            let touch = which == MotionId::TouchStick;
+            match stick_mode(&value) {
+                Parsed::Run((mode, ring)) => {
+                    let cfg = if touch { &mut a.touch } else { &mut a.motion };
+                    cfg.mode = mode;
+                    if let Some(r) = ring {
+                        cfg.ring = r;
+                    }
+                    let mut info = LineInfo::of(LineStatus::Ok);
+                    if mode.pads() {
+                        info.notes.push(PAD_NOTE.to_string());
+                    }
+                    if !touch {
+                        info.notes.push(GRAVITY_NOTE.to_string());
+                    }
+                    info
+                }
+                // `STEER_X` is the one mode that belongs to the motion stick and
+                // to nothing else, so here — and only here — it is not an error.
+                Parsed::Refused(_) if !touch => {
+                    a.motion.mode = match value.as_str() {
+                        "LEFT_STEER_X" => StickMode::Steer(0),
+                        _ => StickMode::Steer(1),
+                    };
+                    let mut info = LineInfo::of(LineStatus::Ok);
+                    info.notes.push(PAD_NOTE.to_string());
+                    info.notes.push(GRAVITY_NOTE.to_string());
+                    info
+                }
+                Parsed::Refused(why) => LineInfo::of(LineStatus::Error(why.to_string())),
+                Parsed::Later(phase) => {
+                    let cfg = if touch { &mut a.touch } else { &mut a.motion };
+                    cfg.mode = StickMode::Elsewhere;
+                    LineInfo::of(LineStatus::Pending(phase))
+                }
+                Parsed::Unknown => wants("a stick mode JSM knows"),
+            }
+        }
+        MotionId::MotionRing | MotionId::TouchRing => {
+            let cfg = if which == MotionId::TouchRing { &mut a.touch } else { &mut a.motion };
+            match value.as_str() {
+                "INNER" => {
+                    cfg.ring = RingMode::Inner;
+                    ok
+                }
+                "OUTER" => {
+                    cfg.ring = RingMode::Outer;
+                    ok
+                }
+                _ => wants("INNER or OUTER"),
+            }
+        }
+        // JSM states the motion stick's deadzones in DEGREES of tilt against a 180
+        // degree range; the stick it builds is a fraction of that half turn, so
+        // they are stored here already divided, in the units every other deadzone
+        // in this module uses.
+        MotionId::MotionDeadzone(inner) => match num() {
+            Some(v) if (0.0..=180.0).contains(&v) => {
+                if inner {
+                    a.motion.inner_dz = v / 180.0;
+                } else {
+                    a.motion.outer_dz = 1.0 - v / 180.0;
+                }
+                ok
+            }
+            _ => wants("an angle of tilt in degrees, 0 to 180"),
+        },
+        MotionId::TouchDeadzone => match num() {
+            Some(v) if (0.0..1.0).contains(&v) => {
+                a.touch.inner_dz = v;
+                ok
+            }
+            _ => wants("a fraction of the stick's reach, 0 to 1"),
+        },
+        MotionId::MotionAxis | MotionId::TouchAxis => {
+            let cfg = if which == MotionId::TouchAxis { &mut a.touch } else { &mut a.motion };
+            let mut it = rhs.split_whitespace();
+            let Some(x) = it.next().and_then(axis_sign) else {
+                return wants("STANDARD or INVERTED for each axis");
+            };
+            let y = match it.next() {
+                None => x,
+                Some(v) => match axis_sign(v) {
+                    Some(y) => y,
+                    None => return wants("STANDARD or INVERTED for each axis"),
+                },
+            };
+            cfg.invert_x = x;
+            cfg.invert_y = y;
+            ok
+        }
+        MotionId::TouchpadMode => {
+            use super::touch::Mode;
+            t.mode = match value.as_str() {
+                "GRID_AND_STICK" => Mode::GridAndStick,
+                "MOUSE" => Mode::Mouse,
+                "PS_TOUCHPAD" => Mode::PsTouchpad,
+                _ => return wants("GRID_AND_STICK, MOUSE or PS_TOUCHPAD"),
+            };
+            let mut info = LineInfo::of(LineStatus::Ok);
+            if t.mode == Mode::PsTouchpad {
+                info.notes.push(
+                    "the pad's own touchpad already passes through to whatever is wired \
+                     downstream, so a DualSense or DS4 sink receives it — as in JSM, nothing \
+                     here reads it"
+                        .to_string(),
+                );
+            }
+            info
+        }
+        MotionId::Grid => {
+            let Some((x, y)) = float_pair(rhs) else {
+                return wants("a number of columns and rows");
+            };
+            let (cols, rows) = (x.round(), y.round());
+            if cols < 1.0 || rows < 1.0 || cols * rows > 25.0 {
+                // The grid buttons are named `T1`…`T25`, so 25 cells is the
+                // ceiling — say so rather than clamping in silence.
+                return wants("a grid of 1 to 25 cells in all (the buttons are T1 to T25)");
+            }
+            t.grid = (cols as u8, rows as u8);
+            ok
+        }
+        MotionId::TouchpadSens => match float_pair(rhs) {
+            Some((x, y)) => {
+                t.sens = (x, y);
+                ok
+            }
+            None => wants("one or two numbers"),
+        },
+        MotionId::TouchRadius => match num() {
+            Some(v) if v > 0.0 => {
+                t.stick_radius = v;
+                ok
+            }
+            _ => wants("a distance in touchpad points, above zero"),
+        },
+        MotionId::TouchpadDualStage => match trigger_mode(&value) {
+            Parsed::Run(mode) => match mode.pad_side() {
+                // JSM refuses the pass-through modes here, and rightly: there is
+                // no analog travel on a touchpad to pass through.
+                Some(_) => wants(
+                    "a dual-stage mode — a touchpad has no analog travel, so X_LT and X_RT \
+                     have nothing to send",
+                ),
+                None => {
+                    a.touchpad_dual_stage = mode;
+                    ok
+                }
+            },
+            Parsed::Later(phase) => LineInfo::of(LineStatus::Pending(phase)),
+            Parsed::Refused(why) => LineInfo::of(LineStatus::Error(why.to_string())),
+            Parsed::Unknown => wants(
+                "NO_FULL, NO_SKIP, NO_SKIP_EXCLUSIVE, MUST_SKIP, MAY_SKIP, MUST_SKIP_R or \
+                 MAY_SKIP_R",
+            ),
+        },
+    }
+}
+
+/// Said on lines that only work once the pad reports its motion sensors.
+const GRAVITY_NOTE: &str = "needs the pad's accelerometer: which way is down is worked out by \
+                            watching where the pad is pulled, so it takes a moment to settle \
+                            after the pad connects";
+
 // ── the settings table ───────────────────────────────────────────────────────
 
 /// Said on every line whose output can only land on a virtual pad. A config full
@@ -1477,12 +1740,9 @@ const PAD_NOTE: &str = "needs a virtual pad wired downstream to reach anything; 
 const PHASE_GYRO: &str = "gyro, flick stick and real-world calibration arrive in phase 3";
 /// Gravity-referenced gyro spaces land with the motion stick, which needs the
 /// same work: our accelerometer frame matched to the one JSM reasons in.
-const PHASE_GRAVITY: &str =
-    "gyro spaces measured against gravity arrive with the motion stick in phase 6";
 const PHASE_ABSOLUTE: &str =
     "placing the pointer outright needs an absolute mouse pin, which the bus doesn't have yet";
 const PHASE_HYBRID: &str = "HYBRID_AIM arrives after the rest of aiming";
-const PHASE_TOUCH: &str = "the touchpad and motion stick arrive in phase 6";
 const PHASE_FEEDBACK: &str = "rumble, light bar and adaptive triggers arrive in phase 7";
 const PHASE_LAYERS: &str = "loading another config arrives in phase 8";
 
@@ -1502,6 +1762,7 @@ pub(crate) enum Support {
     Analog(AnalogId),
     Aim(AimId),
     Pad(PadId),
+    Motion(MotionId),
     Pending(&'static str),
     Ignored(&'static str),
 }
@@ -1547,7 +1808,7 @@ fn setting_support(name: &str) -> Option<Support> {
         "MAX_GYRO_SENS" => Aim(AimId::MaxSens),
         "MIN_GYRO_THRESHOLD" => Aim(AimId::MinThreshold),
         "MAX_GYRO_THRESHOLD" => Aim(AimId::MaxThreshold),
-        "GYRO_SPACE" => Aim(AimId::Space),
+        "GYRO_SPACE" => Motion(MotionId::Space),
         "GYRO_AXIS_X" => Aim(AimId::AxisSign(false)),
         "GYRO_AXIS_Y" => Aim(AimId::AxisSign(true)),
         "MOUSE_X_FROM_GYRO_AXIS" => Aim(AimId::FromAxis(false)),
@@ -1601,21 +1862,21 @@ fn setting_support(name: &str) -> Option<Support> {
         "ANGLE_TO_AXIS_DEADZONE_OUTER" => Pad(PadId::AngleDeadzone(false)),
 
         // Touchpad and motion stick.
-        "TOUCHPAD_MODE"
-        | "GRID_SIZE"
-        | "TOUCHPAD_SENS"
-        | "TOUCHPAD_DUAL_STAGE_MODE"
-        | "TOUCH_STICK_MODE"
-        | "TOUCH_STICK_RADIUS"
-        | "TOUCH_DEADZONE_INNER"
-        | "TOUCH_RING_MODE"
-        | "TOUCH_STICK_AXIS"
-        | "MOTION_STICK_MODE"
-        | "MOTION_RING_MODE"
-        | "MOTION_DEADZONE_INNER"
-        | "MOTION_DEADZONE_OUTER"
-        | "MOTION_STICK_AXIS"
-        | "LEAN_THRESHOLD" => Pending(PHASE_TOUCH),
+        "TOUCHPAD_MODE" => Motion(MotionId::TouchpadMode),
+        "GRID_SIZE" => Motion(MotionId::Grid),
+        "TOUCHPAD_SENS" => Motion(MotionId::TouchpadSens),
+        "TOUCHPAD_DUAL_STAGE_MODE" => Motion(MotionId::TouchpadDualStage),
+        "TOUCH_STICK_MODE" => Motion(MotionId::TouchStick),
+        "TOUCH_STICK_RADIUS" => Motion(MotionId::TouchRadius),
+        "TOUCH_DEADZONE_INNER" => Motion(MotionId::TouchDeadzone),
+        "TOUCH_RING_MODE" => Motion(MotionId::TouchRing),
+        "TOUCH_STICK_AXIS" => Motion(MotionId::TouchAxis),
+        "MOTION_STICK_MODE" => Motion(MotionId::MotionStick),
+        "MOTION_RING_MODE" => Motion(MotionId::MotionRing),
+        "MOTION_DEADZONE_INNER" => Motion(MotionId::MotionDeadzone(true)),
+        "MOTION_DEADZONE_OUTER" => Motion(MotionId::MotionDeadzone(false)),
+        "MOTION_STICK_AXIS" => Motion(MotionId::MotionAxis),
+        "LEAN_THRESHOLD" => Motion(MotionId::LeanThreshold),
 
         // Feedback.
         "RUMBLE"

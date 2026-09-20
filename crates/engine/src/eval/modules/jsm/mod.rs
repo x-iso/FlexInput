@@ -13,9 +13,11 @@ mod aim;
 mod analog;
 mod bind;
 mod eval;
+mod motion;
 mod names;
 mod pad;
 mod parse;
+mod touch;
 
 #[cfg(test)]
 mod tests;

@@ -252,6 +252,8 @@ impl Aim {
         &mut self,
         s: &Settings,
         p: &pad::Settings,
+        m: &super::motion::Settings,
+        gravity: super::motion::Gravity,
         dt: f32,
         gyro: Gyro,
         analog: &Analog,
@@ -272,8 +274,18 @@ impl Aim {
             if m.z { v += -x_sign * in_z; }
             v
         };
-        let mut gx = pick(s.mouse_x_from, 1.0);
-        let mut gy = pick(s.mouse_y_from, -1.0);
+        let (mut gx, mut gy) = if m.space.needs_gravity() {
+            // A space measured against gravity ignores the axis masks entirely —
+            // it works out which way "turning" and "leaning" point from where down
+            // is, and takes the gyro's component along that. See `motion.rs`.
+            super::motion::gravity_space(
+                m.space,
+                gravity,
+                super::motion::JsmGyro { x: in_x, y: in_y, z: in_z },
+            )
+        } else {
+            (pick(s.mouse_x_from, 1.0), pick(s.mouse_y_from, -1.0))
+        };
 
         // ── smoothing ────────────────────────────────────────────────────────
         let length = (gx * gx + gy * gy).sqrt();

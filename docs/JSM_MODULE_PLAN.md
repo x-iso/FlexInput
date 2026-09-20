@@ -386,6 +386,103 @@ the turn out over `FLICK_TIME`, while a stick can only be pushed so far — so t
 the turn becomes "hold it right over at `VIRTUAL_STICK_CALIBRATION` deg/s for
 however long the angle takes", and `FLICK_TIME` has nothing to say at all.
 
+**Phase 6 landed** (`jsm/motion.rs` and `jsm/touch.rs`): the touchpad, the motion
+stick, the lean buttons, and the gyro spaces measured against gravity. **There is
+now no button in JSM's vocabulary this module cannot read** — a test walks every
+one of them and asserts as much, so the day a new input source appears it will be
+a deliberate change rather than a silent regression.
+
+### Which way round the axes go, properly this time
+
+This phase is the first thing in the module to **combine accelerometer and gyro
+readings**, and on our bus the two are not in the same basis. Against the pad's
+body axes — F forward, R the player's right, U out of the face — our accel
+components are in `(F, -R, U)` and our gyro components are in `(F, R, -U)`. Both
+are right-handed, so nothing looks wrong until something combines them, which is
+exactly what a gravity-referenced gyro space does. See [[imu-canonical-frame]];
+the same mismatch is a known, deliberately unfixed bug in Gyro 3DOF's
+Player/World modes, and this module does **not** inherit it: both readings are
+converted into JSM's own frame up front and the maths is done there.
+
+| JSM | from our accel | from our gyro |
+| --- | --- | --- |
+| X (right / pitch) | `accel_y` | `gyro_y` |
+| Y (up / yaw) | `-accel_z` | `-gyro_z` |
+| Z (forward / roll) | `-accel_x` | `gyro_x` |
+
+The gyro column is the mapping phase 3 derived independently, from what JSM's
+*defaults* have to do. Two derivations from different evidence meeting is the
+closest thing to reassurance available without hardware, and the accel column is
+pinned pose by pose by `gravity_lands_in_jsms_frame` — flat, nose up, right grip
+down — so a sign error fails a test instead of shipping.
+
+### Gravity, and the four things measured against it
+
+JSM asks its motion library for a fused gravity estimate; our bus carries raw
+sensors, so gravity here is a low-passed accelerometer direction, the way Gyro
+3DOF already does it. Gravity is the only *sustained* acceleration a hand-held pad
+sees, so the filter settles onto "down" while a shake averages out — and the lag
+is the point, since the question is "how is this being held?", not "what is it
+doing this instant?". `GRAVITY_TAU` is 0.5 s. A pad reporting no accelerometer at
+all reads as *don't know*, not as *flat*: the difference between a motion stick
+that rests and one that runs to an edge.
+
+- **The motion stick** is how far gravity has swung from straight down, with a
+  half-turn reaching full deflection. `MOTION_DEADZONE_INNER` / `_OUTER` are in
+  **degrees of tilt** in JSM (15 and 135) against that 180° range, so they are
+  stored divided by 180, in the units every other deadzone here uses.
+- **The lean buttons** fire past `LEAN_THRESHOLD` degrees of side tilt, with
+  `CONTROLLER_ORIENTATION` picking which body axis counts as "to the side".
+- **`LEFT_STEER_X` / `RIGHT_STEER_X`** are the motion stick's alone, which is why
+  phase 5 made them an error on a thumbstick. Past vertical the lean angle folds
+  back, so leaning further keeps steering the same way rather than unwinding.
+- **The gravity gyro spaces** work out which way "turning" or "leaning" points
+  given where down is, and take the gyro's component along it. All four fade out
+  as the pad rolls onto its side, where a pitch axis derived from gravity means
+  almost nothing — and that fade needs testing at the *edge* of its band, where
+  the axis is still computable but worthless. A test that only checks a pad exactly
+  on its side passes with the fade removed, because the axis degenerates and reads
+  zero anyway; that was a real mutation survivor here.
+
+### The touchpad
+
+`TOUCHPAD_MODE` is a grid of buttons plus a relative stick per finger, a mouse, or
+a pass-through to a virtual pad.
+
+- **Units.** `TOUCH_STICK_RADIUS` (300) and `TOUCHPAD_SENS` are in touchpad
+  *points*, and JSM's defaults were chosen against a DS4 / DualSense pad reporting
+  1920 × 1080. Our bus normalises a finger to -1..1, so the two are bridged by that
+  same nominal size and a config carrying JSM's defaults feels as it did. A
+  differently sized touchpad is scaled to the same -1..1, so a sweep across it is a
+  sweep across this one — the honest choice, since nothing on the bus says how many
+  millimetres that was.
+- **A touch stick is relative**: it measures the drag from wherever the finger
+  landed, not where on the pad it is, and lifting re-centres it. The tick a finger
+  lands counts as no movement at all, or a new touch would jump by however far it
+  is from where the last one ended.
+- **A grid boundary belongs to the cell before it** (JSM rounds up and subtracts
+  one). The obvious `floor` gives the other answer and differs *only* exactly on
+  the line, so there is a test sitting on it.
+- **`GRID_SIZE` past 25 cells is an error, not a clamp**: the buttons stop at
+  `T25`, so a 6×6 grid would have cells nothing could ever be bound to.
+- **The touchpad is JSM's third trigger.** A finger down is the soft pull and a
+  click is the full one, run through the same dual-stage machine under
+  `TOUCHPAD_DUAL_STAGE_MODE`. JSM feeds it 0.99 for a finger and 1.0 for a click,
+  and that 0.99 is load-bearing: it is what lets a skip mode tell a tap from a
+  press, and what stops a resting finger from ever reading as a click.
+
+One shared consequence: lifting a finger and releasing the click in the same tick
+releases the full stage first and the soft one a tick later, because
+`DelayFullPress` holds the soft press while the full one goes. That is the
+dual-stage machine's own shape, shared with every real trigger, so it is left
+alone rather than special-cased for the touchpad.
+
+Both touch sticks drive one set of `TUP`…`TRING` names, as in JSM, so two fingers
+pushing the same way is the same as one. All five of JSM's sticks — left, right,
+motion, and one per finger — now run through the one `Analog::stick` routine, which
+is what makes `MUP` behave exactly as `LUP` does and what let the motion and touch
+sticks inherit every stick mode, virtual-pad output included, for free.
+
 ## `X_` and `PS_` names stay aliases
 
 Raised after hands-on testing: since `PS_UP` and `X_UP` land on the same
@@ -539,6 +636,7 @@ Plus one command, `ONE_EURO_FILTER`, and one new gyro space, `YAW_PLUS_ROLL`.
    *(landed — see above)*
 6. **Touchpad and motion stick.** Grid, touch sticks, dual stage, motion stick
    and lean.
+   *(landed — see above)*
 7. **Feedback.** Rumble on/off, light bar, adaptive triggers (plus the pin-model
    extension for bow / galloping / machine), rumble bindings.
 8. **Action layers.** Quoted commands, including loading another tab, and

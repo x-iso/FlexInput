@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 
-use super::names::{Btn, Dir, StickId};
+use super::names::{Btn, Dir};
 
 /// A stick counts as ringing past this much of its travel (JSM's constant).
 const RING_EDGE: f32 = 0.7;
@@ -95,6 +95,11 @@ pub enum StickMode {
     /// `LEFT_WIND_X` / `RIGHT_WIND_X`: turning the stick winds a value up, and
     /// letting go unwinds it. Which virtual stick.
     Wind(usize),
+    /// `LEFT_STEER_X` / `RIGHT_STEER_X`: leaning the pad steers a virtual stick's
+    /// X. The motion stick's alone — JSM refuses it on a thumbstick — and it is
+    /// measured from the lean angle rather than from the stick, so `motion.rs`
+    /// computes it and this mode only says where it goes.
+    Steer(usize),
     /// A mode a later phase owns: nothing comes from the stick here.
     Elsewhere,
     /// Doing nothing until the stick comes back to centre (JSM's `INVALID`).
@@ -119,7 +124,8 @@ impl StickMode {
         match self {
             StickMode::VirtualStick(side)
             | StickMode::AngleToAxis(side, _)
-            | StickMode::Wind(side) => Some(side),
+            | StickMode::Wind(side)
+            | StickMode::Steer(side) => Some(side),
             _ => None,
         }
     }
@@ -188,6 +194,14 @@ pub struct Settings {
     pub zr: TriggerMode,
     pub left: StickCfg,
     pub right: StickCfg,
+    /// The motion stick's own copy: `MOTION_STICK_MODE`, `MOTION_RING_MODE`,
+    /// `MOTION_DEADZONE_*`, `MOTION_STICK_AXIS`.
+    pub motion: StickCfg,
+    /// The touch sticks': `TOUCH_STICK_MODE`, `TOUCH_RING_MODE`,
+    /// `TOUCH_DEADZONE_INNER`, `TOUCH_STICK_AXIS`.
+    pub touch: StickCfg,
+    /// `TOUCHPAD_DUAL_STAGE_MODE`: how a finger down and a click relate.
+    pub touchpad_dual_stage: TriggerMode,
     pub orientation: Orientation,
 }
 
@@ -200,6 +214,13 @@ impl Default for Settings {
             zr: TriggerMode::default(),
             left: StickCfg::default(),
             right: StickCfg::default(),
+            // JSM's motion-stick deadzones are in DEGREES of tilt (15 and 135),
+            // and the stick it hands us is a fraction of a half-turn, so they
+            // land here already divided by 180.
+            motion: StickCfg { inner_dz: 15.0 / 180.0, outer_dz: 1.0 - 135.0 / 180.0, ..StickCfg::default() },
+            // A touch stick has one deadzone, 0.3, and no outer one.
+            touch: StickCfg { inner_dz: 0.3, outer_dz: 0.0, ..StickCfg::default() },
+            touchpad_dual_stage: TriggerMode::NoSkip,
             orientation: Orientation::default(),
         }
     }
@@ -212,9 +233,21 @@ pub struct Pad {
     pub triggers: [Option<f32>; 2],
     /// The digital trigger button some pads report instead.
     pub trigger_digital: [bool; 2],
-    /// Stick positions, -1..1, y up.
-    pub sticks: [(f32, f32); 2],
+    /// Stick positions, -1..1, y up. The first two are the thumbsticks; then the
+    /// motion stick and the touchpad's two fingers, each already worked out by
+    /// `motion.rs` / `touch.rs`, because each needs state of its own.
+    pub sticks: [(f32, f32); STICKS],
+    /// A finger is on the touchpad, and the touchpad is clicked. On a DS4 or
+    /// DualSense JSM treats the pair as one synthetic trigger: a finger is the
+    /// soft pull and a click is the full one.
+    pub touching: bool,
+    pub touch_click: bool,
 }
+
+/// JSM's five sticks: left, right, motion, and one per touchpad finger.
+pub const STICKS: usize = 5;
+/// Index of the motion stick in [`Pad::sticks`] and friends.
+pub const MOTION: usize = 2;
 
 /// Where a trigger is in JSM's dual-stage state machine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -290,8 +323,8 @@ pub struct StickOut {
 #[derive(Default)]
 pub struct Analog {
     t: f32,
-    triggers: [TriggerRun; 2],
-    sticks: [StickRun; 2],
+    triggers: [TriggerRun; 3],
+    sticks: [StickRun; STICKS],
     down: HashSet<Btn>,
     /// Where a virtual pad's triggers should sit, for the `X_LT` / `X_RT` modes.
     /// Indexed by the *virtual* trigger, not the physical one, since a config can
@@ -307,6 +340,14 @@ impl Analog {
         self.pad_triggers = [None; 2];
         for side in 0..2 {
             self.trigger(s, side, pad);
+        }
+        // The touchpad is a trigger too, on the pads that have one: a finger down
+        // is the soft pull and a click is the full one, run through the same
+        // dual-stage machine under `TOUCHPAD_DUAL_STAGE_MODE`. JSM feeds it
+        // position 0.99 for a finger and 1.0 for a click, which is what makes a
+        // "skip" mode able to tell a tap from a press.
+        self.touchpad_trigger(s, pad);
+        for side in 0..STICKS {
             self.stick(s, side, pad);
         }
     }
@@ -321,13 +362,28 @@ impl Analog {
     // ── triggers ─────────────────────────────────────────────────────────────
 
     fn trigger(&mut self, s: &Settings, side: usize, pad: &Pad) {
-        let (soft_btn, full_btn) = if side == 0 { (Btn::Zl, Btn::Zlf) } else { (Btn::Zr, Btn::Zrf) };
+        let names = if side == 0 { (Btn::Zl, Btn::Zlf) } else { (Btn::Zr, Btn::Zrf) };
+        self.trigger_channel(s, side, side, names, pad);
+    }
+
+    /// One trigger through JSM's dual-stage machine. `run` says which slot of
+    /// running state to use and `side` which of the pad's triggers to read, so the
+    /// touchpad can borrow the machine without borrowing a real trigger's state.
+    fn trigger_channel(
+        &mut self,
+        s: &Settings,
+        run_ix: usize,
+        side: usize,
+        names: (Btn, Btn),
+        pad: &Pad,
+    ) {
+        let (soft_btn, full_btn) = names;
         let analog = pad.triggers[side];
         let digital = pad.trigger_digital[side];
         // A pad with no analog trigger is all or nothing, and JSM forces NO_FULL
         // on those rather than firing the full pull off a button press.
         let mode = match analog {
-            Some(_) => if side == 0 { s.zl } else { s.zr },
+            Some(_) => if run_ix == 1 { s.zr } else { s.zl },
             None => TriggerMode::NoFull,
         };
         // Where the trigger is, 0..1. When the pad has an analog axis that axis is
@@ -356,13 +412,13 @@ impl Analog {
             if full {
                 self.down.insert(full_btn);
             }
-            self.triggers[side] = TriggerRun::default();
+            self.triggers[run_ix] = TriggerRun::default();
             return;
         }
 
-        let soft_pull = self.soft_pull(s, side, position);
+        let soft_pull = self.soft_pull(s, run_ix, position);
 
-        let run = &mut self.triggers[side];
+        let run = &mut self.triggers[run_ix];
         let (mut soft_on, mut full_on) = (false, false);
         match run.state {
             Dst::NoPress => {
@@ -479,6 +535,28 @@ impl Analog {
     /// Is the trigger past its soft-pull point? Either a plain threshold, or —
     /// when the threshold is negative — JSM's hair trigger, which presses while
     /// the trigger is still moving down and releases while it is coming back up.
+    /// The touchpad as JSM's third trigger: `TOUCH` is the soft pull and `CAPTURE`
+    /// (the click) the full one. JSM feeds it 0.99 for a finger and 1.0 for a
+    /// click, which is exactly what lets a skip mode tell a tap from a press —
+    /// the soft stage is never quite at the end of travel, so "full" means the
+    /// click and nothing else.
+    fn touchpad_trigger(&mut self, s: &Settings, pad: &Pad) {
+        let position = if pad.touch_click {
+            1.0
+        } else if pad.touching {
+            0.99
+        } else {
+            0.0
+        };
+        let mut settings = *s;
+        settings.zl = s.touchpad_dual_stage;
+        // A touchpad has no noise floor to clear and no threshold setting of its
+        // own: a finger is either there or it isn't.
+        settings.threshold = 0.0;
+        let pad = Pad { triggers: [Some(position), pad.triggers[1]], ..*pad };
+        self.trigger_channel(&settings, 2, 0, (Btn::Touch, Btn::Capture), &pad);
+    }
+
     fn soft_pull(&mut self, s: &Settings, side: usize, position: f32) -> bool {
         if s.threshold >= 0.0 {
             let run = &mut self.triggers[side];
@@ -509,10 +587,14 @@ impl Analog {
     // ── sticks ───────────────────────────────────────────────────────────────
 
     fn stick(&mut self, s: &Settings, side: usize, pad: &Pad) {
-        let (cfg, id) = if side == 0 {
-            (s.left, StickId::Left)
-        } else {
-            (s.right, StickId::Right)
+        let cfg = match side {
+            0 => s.left,
+            1 => s.right,
+            MOTION => s.motion,
+            // The touch sticks are the tail of the array — one per finger. Both
+            // share one set of `TUP`…`TRING` names, as in JSM, so two fingers
+            // pushing the same way is the same as one.
+            _ => s.touch,
         };
         let (mut x, mut y) = pad.sticks[side];
         if cfg.invert_x { x = -x; }
@@ -532,7 +614,7 @@ impl Analog {
             RingMode::Inner => len > 0.0 && len < RING_EDGE,
             RingMode::Outer => len > RING_EDGE,
         };
-        if ringing { self.down.insert(btn_for(id, Dir::Ring)); }
+        if ringing { self.down.insert(btn_for(side, Dir::Ring)); }
 
         let mut active = false;
         match cfg.mode {
@@ -546,13 +628,13 @@ impl Analog {
                     (y < -0.5 * ax, Dir::Down),
                 ] {
                     if on {
-                        self.down.insert(btn_for(id, dir));
+                        self.down.insert(btn_for(side, dir));
                         // The ring doesn't count as the stick being used.
                         active = true;
                     }
                 }
             }
-            StickMode::ScrollWheel => self.scroll(side, id, cfg, x, y),
+            StickMode::ScrollWheel => self.scroll(side, cfg, x, y),
             // What counts as "being used" depends on what the stick is for:
             // aiming starts inside the deadzone, a flick only at full push.
             StickMode::Aim | StickMode::MouseArea => active = raw_len > cfg.inner_dz,
@@ -566,6 +648,9 @@ impl Analog {
             // mode here uses.
             StickMode::VirtualStick(_) | StickMode::AngleToAxis(..) | StickMode::Wind(_) =>
                 active = raw_len > cfg.inner_dz,
+            // Steering is measured from the lean angle, not from this stick's
+            // deflection, so the stick itself has nothing to report here.
+            StickMode::Steer(_) => {}
             StickMode::Elsewhere => {}
             // Waiting to be let go of: nothing until it reads centred.
             StickMode::Inert => {
@@ -616,7 +701,7 @@ impl Analog {
 
     /// Turning the stick spends degrees on scroll notches, each of which presses
     /// the stick's left or right button for a moment.
-    fn scroll(&mut self, side: usize, id: StickId, cfg: StickCfg, x: f32, y: f32) {
+    fn scroll(&mut self, side: usize, cfg: StickCfg, x: f32, y: f32) {
         let t = self.t;
         let run = &mut self.sticks[side];
         if x == 0.0 && y == 0.0 {
@@ -649,7 +734,7 @@ impl Analog {
         if run.leftovers.abs() > sens {
             let dir = if run.leftovers > 0.0 { Dir::Left } else { Dir::Right };
             run.leftovers -= sens * run.leftovers.signum();
-            let btn = btn_for(id, dir);
+            let btn = btn_for(side, dir);
             run.notch = Some((btn, t + SCROLL_TAP));
             self.down.insert(btn);
         }
@@ -677,17 +762,30 @@ fn orient(o: Orientation, x: f32, y: f32) -> (f32, f32) {
     }
 }
 
-fn btn_for(stick: StickId, dir: Dir) -> Btn {
-    match (stick, dir) {
-        (StickId::Left, Dir::Up) => Btn::Lup,
-        (StickId::Left, Dir::Down) => Btn::Ldown,
-        (StickId::Left, Dir::Left) => Btn::Lleft,
-        (StickId::Left, Dir::Right) => Btn::Lright,
-        (StickId::Left, Dir::Ring) => Btn::Lring,
-        (StickId::Right, Dir::Up) => Btn::Rup,
-        (StickId::Right, Dir::Down) => Btn::Rdown,
-        (StickId::Right, Dir::Left) => Btn::Rleft,
-        (StickId::Right, Dir::Right) => Btn::Rright,
-        (StickId::Right, Dir::Ring) => Btn::Rring,
+/// The direction and ring buttons one stick drives. Keyed on the stick's index
+/// rather than [`StickId`], because the motion and touch sticks have names of
+/// their own (`MUP`, `TUP`) but no bus pins — `StickId` stays the two thumbsticks.
+fn btn_for(side: usize, dir: Dir) -> Btn {
+    match (side, dir) {
+        (0, Dir::Up) => Btn::Lup,
+        (0, Dir::Down) => Btn::Ldown,
+        (0, Dir::Left) => Btn::Lleft,
+        (0, Dir::Right) => Btn::Lright,
+        (0, Dir::Ring) => Btn::Lring,
+        (1, Dir::Up) => Btn::Rup,
+        (1, Dir::Down) => Btn::Rdown,
+        (1, Dir::Left) => Btn::Rleft,
+        (1, Dir::Right) => Btn::Rright,
+        (1, Dir::Ring) => Btn::Rring,
+        (MOTION, Dir::Up) => Btn::Mup,
+        (MOTION, Dir::Down) => Btn::Mdown,
+        (MOTION, Dir::Left) => Btn::Mleft,
+        (MOTION, Dir::Right) => Btn::Mright,
+        (MOTION, Dir::Ring) => Btn::Mring,
+        (_, Dir::Up) => Btn::Tup,
+        (_, Dir::Down) => Btn::Tdown,
+        (_, Dir::Left) => Btn::Tleft,
+        (_, Dir::Right) => Btn::Tright,
+        (_, Dir::Ring) => Btn::Tring,
     }
 }

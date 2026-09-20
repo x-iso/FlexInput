@@ -413,9 +413,8 @@ fn recognised_but_not_live_settings_name_their_phase() {
     for line in [
         "RIGHT_STICK_MODE = HYBRID_AIM",
         "RIGHT_STICK_MODE = MOUSE_RING",
-        "GYRO_SPACE = WORLD_TURN",
-        "TOUCHPAD_MODE = MOUSE",
         "RUMBLE = OFF",
+        "LIGHT_BAR = RED",
     ] {
         assert!(
             matches!(one(line).status, LineStatus::Pending(_)),
@@ -424,7 +423,7 @@ fn recognised_but_not_live_settings_name_their_phase() {
     }
     // A modeshift waits with whatever setting it changes.
     assert!(
-        matches!(one("ZL,TOUCHPAD_MODE = MOUSE").status, LineStatus::Pending(p) if p.contains("touchpad"))
+        matches!(one("ZL,RUMBLE = OFF").status, LineStatus::Pending(p) if p.contains("rumble"))
     );
 }
 
@@ -512,24 +511,44 @@ fn pad_output_names_map_to_our_pins() {
     assert_eq!(steps("ZL = X_LT")[0].out, pin("left_trigger"));
 }
 
-// A button we can't read yet compiles, but waits for its phase rather than
-// pretending to work.
+/// As of phase 6 there is no JSM button left that this module cannot read: the
+/// motion stick, the lean buttons and the touchpad were the last three. This is
+/// the test that used to assert they waited for a phase — kept, turned around, so
+/// the day a new input source appears it is a deliberate change rather than a
+/// silent regression.
 #[test]
-fn inputs_we_cannot_read_yet_wait_for_their_phase() {
-    let c = compile("MUP = W\nTOUCH = LMOUSE\nLEAN_LEFT = Q");
+fn every_button_jsm_has_can_be_read() {
+    let c = compile("MUP = W\nTOUCH = LMOUSE\nLEAN_LEFT = Q\nT7 = E\nTRING = R\nMRING = F");
     assert!(
-        c.lines
-            .iter()
-            .all(|l| matches!(l.status, LineStatus::Pending(_))),
-        "{:?}",
+        c.lines.iter().all(|l| l.status == LineStatus::Ok),
+        "every source is live: {:?}",
         c.lines
     );
-    assert!(c.bindings.is_empty());
+    assert_eq!(c.bindings.len(), 6, "and every line binds");
+
+    // Belt and braces: walk every name JSM accepts and check none of them comes
+    // back as a source we cannot read.
+    for name in [
+        "UP", "DOWN", "LEFT", "RIGHT", "L", "ZL", "ZLF", "R", "ZR", "ZRF", "N", "E", "S", "W",
+        "L3", "R3", "-", "+", "HOME", "CAPTURE", "MIC", "LSL", "LSR", "RSL", "RSR",
+        "LUP", "LDOWN", "LLEFT", "LRIGHT", "LRING", "RUP", "RDOWN", "RLEFT", "RRIGHT", "RRING",
+        "MUP", "MDOWN", "MLEFT", "MRIGHT", "MRING", "TUP", "TDOWN", "TLEFT", "TRIGHT", "TRING",
+        "LEAN_LEFT", "LEAN_RIGHT", "TOUCH", "T1", "T25",
+    ] {
+        let line = format!("{name} = E");
+        let info = one(&line);
+        assert_eq!(
+            info.status,
+            LineStatus::Ok,
+            "{name} should be readable, got {:?}",
+            info.status
+        );
+    }
 }
 
 #[test]
 fn the_summary_counts_what_the_editor_shows() {
-    let c = compile("S = SPACE\nTOUCHPAD_MODE = MOUSE\nAUTOLOAD = OFF\nFLOOMP = A");
+    let c = compile("S = SPACE\nRUMBLE = OFF\nAUTOLOAD = OFF\nFLOOMP = A");
     assert_eq!(c.summary(), (1, 1, 1));
 }
 
@@ -1285,6 +1304,10 @@ struct Aiming {
     pad: Pad,
     /// The virtual pad the config drives, when it drives one.
     pad_out: super::pad::Pad,
+    /// Gravity, and the accelerometer it is worked out from.
+    motion: super::motion::Motion,
+    accel: Option<glam::Vec3>,
+    gravity: super::motion::Gravity,
     gyro: Gyro,
     actions: std::collections::HashSet<GyroAction>,
     down: std::collections::HashSet<Btn>,
@@ -1305,6 +1328,9 @@ impl Aiming {
             analog: Analog::default(),
             pad: Pad::default(),
             pad_out: super::pad::Pad::default(),
+            motion: super::motion::Motion::default(),
+            accel: None,
+            gravity: super::motion::Gravity::default(),
             gyro: Gyro::default(),
             actions: std::collections::HashSet::new(),
             down: std::collections::HashSet::new(),
@@ -1328,11 +1354,19 @@ impl Aiming {
     }
     /// Everything one tick of aiming produced, not just the mouse half.
     fn aimed(&mut self) -> super::aim::Aimed {
+        // Gravity first, so a gravity-referenced space and the motion stick have
+        // something to measure against, then all five sticks.
+        let gravity = self.motion.tick(self.accel, DT);
+        self.gravity = gravity;
+        self.pad.sticks[super::analog::MOTION] =
+            super::motion::motion_stick(gravity, self.cfg.settings.motion);
         self.analog.tick(&self.cfg.settings, DT, &self.pad);
         let down = self.down.clone();
         self.a.tick(
             &self.cfg.aim,
             &self.cfg.pad,
+            &self.cfg.motion,
+            gravity,
             DT,
             self.gyro,
             &self.analog,
@@ -1350,6 +1384,13 @@ impl Aiming {
             self.cfg.aim.stick_power,
             aimed.gyro_dps,
             aimed.flick_dps,
+            super::motion::steer(
+                self.gravity,
+                self.cfg.settings.orientation,
+                self.cfg.settings.motion.inner_dz * 180.0,
+                (1.0 - self.cfg.settings.motion.outer_dz) * 180.0,
+                self.cfg.aim.stick_power,
+            ),
         )
     }
     fn pad_ticks(&mut self, n: usize) -> super::pad::Out {
@@ -1665,9 +1706,14 @@ fn aiming_settings_are_read() {
     assert_eq!(c.aim.stick_power, 1.5);
     assert_eq!(c.aim.trackball_decay, 3.0);
 
-    // A gyro space measured against gravity waits for the phase that has one.
-    assert!(matches!(one("GYRO_SPACE = PLAYER_TURN").status,
-        LineStatus::Pending(p) if p.contains("gravity")));
+    // A gyro space measured against gravity is live, and says what it leans on.
+    let space = one("GYRO_SPACE = PLAYER_TURN");
+    assert_eq!(space.status, LineStatus::Ok);
+    assert!(
+        space.notes.iter().any(|n| n.contains("accelerometer")),
+        "it says which sensor it needs: {:?}",
+        space.notes
+    );
     assert!(
         matches!(
             one("REAL_WORLD_CALIBRATION = 0").status,
@@ -2779,4 +2825,649 @@ fn a_flick_to_a_stick_holds_a_steady_turn() {
     assert!(mid.x.abs() > 0.9, "and holds it while the turn runs: {mid:?}");
     let end = a.pad_ticks(500).sticks[1].expect("driven");
     assert!(end.x.abs() < 0.1, "then stops when the angle is covered: {end:?}");
+}
+
+// ── phase 6: gravity, the motion stick and the touchpad ──────────────────────
+
+/// Our accelerometer, for a pad held in a named pose. The bus's accel basis is
+/// `(F, -R, U)` and an accelerometer at rest reads the direction that is *up*.
+fn accel_for(pose: &str) -> glam::Vec3 {
+    match pose {
+        // Up is out of the face.
+        "flat" => glam::Vec3::new(0.0, 0.0, 1.0),
+        // Nose points at the sky, so up is forward.
+        "nose up" => glam::Vec3::new(1.0, 0.0, 0.0),
+        "nose down" => glam::Vec3::new(-1.0, 0.0, 0.0),
+        // The right grip is down, so up is towards the pad's left, which is +y.
+        "right grip down" => glam::Vec3::new(0.0, 1.0, 0.0),
+        "left grip down" => glam::Vec3::new(0.0, -1.0, 0.0),
+        "upside down" => glam::Vec3::new(0.0, 0.0, -1.0),
+        other => panic!("no such pose: {other}"),
+    }
+}
+
+/// Gravity in JSM's frame, once the estimate has settled on a pose.
+fn gravity_for(pose: &str) -> super::motion::Gravity {
+    let mut m = super::motion::Motion::default();
+    let a = accel_for(pose);
+    let mut g = super::motion::Gravity::default();
+    // The filter starts on its first reading, so one tick settles it; a few more
+    // make sure nothing drifts.
+    for _ in 0..40 {
+        g = m.tick(Some(a), DT);
+    }
+    g
+}
+
+/// The frame conversion, pose by pose. Everything else in phase 6 is measured
+/// against this, so if it is wrong nothing above it can be right — and a sign
+/// error here is invisible without hardware unless it is pinned like this.
+#[test]
+fn gravity_lands_in_jsms_frame() {
+    // JSM's frame is (right, up, forward) and gravity points down, so a pad held
+    // flat has gravity straight down its Y.
+    let flat = gravity_for("flat");
+    assert!(flat.known, "a pad reporting an accelerometer knows which way is down");
+    assert!((flat.v - glam::Vec3::new(0.0, -1.0, 0.0)).length() < 0.01, "flat: {:?}", flat.v);
+
+    // Nose up: the forward axis points at the sky, so gravity is along -Z.
+    let nose_up = gravity_for("nose up");
+    assert!((nose_up.v - glam::Vec3::new(0.0, 0.0, -1.0)).length() < 0.01, "nose up: {:?}", nose_up.v);
+
+    // Right grip down: gravity is along the pad's right, +X.
+    let grip = gravity_for("right grip down");
+    assert!((grip.v - glam::Vec3::new(1.0, 0.0, 0.0)).length() < 0.01, "right grip down: {:?}", grip.v);
+
+    // And a pad with no accelerometer says so, rather than claiming to be flat —
+    // the difference between a motion stick that rests and one that runs away.
+    let mut m = super::motion::Motion::default();
+    let g = m.tick(None, DT);
+    assert!(!g.known, "no accelerometer means no idea which way is down");
+}
+
+/// The motion stick: tilt the pad and the stick pushes the way it was tilted.
+#[test]
+fn the_motion_stick_follows_how_the_pad_is_tilted() {
+    let cfg = super::analog::StickCfg::default();
+    let (x, y) = super::motion::motion_stick(gravity_for("flat"), cfg);
+    assert!(x.abs() < 0.01 && y.abs() < 0.01, "held flat it rests: {x}, {y}");
+
+    // Tipping the nose down pushes the stick down and tipping it up pushes it up,
+    // which is JSM's `calY = -grav.z` — the pad tips the way the stick goes, like
+    // steering a plane rather than pulling a lever.
+    let (x, y) = super::motion::motion_stick(gravity_for("nose down"), cfg);
+    assert!(y < -0.4, "nose down pushes the stick down: {x}, {y}");
+    assert!(x.abs() < 0.01, "and not sideways: {x}");
+    let (_, up) = super::motion::motion_stick(gravity_for("nose up"), cfg);
+    assert!(up > 0.4, "and nose up pushes it up: {up}");
+
+    // Right grip down pushes it right.
+    let (x, y) = super::motion::motion_stick(gravity_for("right grip down"), cfg);
+    assert!(x > 0.4, "right grip down pushes the stick right: {x}, {y}");
+    assert!(y.abs() < 0.01, "and not up or down: {y}");
+
+    // A quarter turn is half of the half-turn the stick's range covers.
+    let (x, _) = super::motion::motion_stick(gravity_for("right grip down"), cfg);
+    assert!((x - 0.5).abs() < 0.02, "a quarter turn is half deflection: {x}");
+
+    // And with no accelerometer it stays centred rather than picking a direction.
+    let (x, y) = super::motion::motion_stick(super::motion::Gravity::default(), cfg);
+    assert_eq!((x, y), (0.0, 0.0));
+}
+
+/// `SET_MOTION_STICK_NEUTRAL` makes whatever pose the pad is in read as centred.
+#[test]
+fn the_motion_stick_can_be_recentred() {
+    let mut m = super::motion::Motion::default();
+    let a = accel_for("nose up");
+    let mut g = super::motion::Gravity::default();
+    for _ in 0..40 {
+        g = m.tick(Some(a), DT);
+    }
+    let cfg = super::analog::StickCfg::default();
+    let (_, before) = super::motion::motion_stick(g, cfg);
+    assert!(before.abs() > 0.4, "nose up is a long way off centre: {before}");
+
+    m.set_neutral(g);
+    let g = m.tick(Some(a), DT);
+    let (x, y) = super::motion::motion_stick(g, cfg);
+    assert!(
+        x.abs() < 0.02 && y.abs() < 0.02,
+        "after re-centring the same pose reads as centred: {x}, {y}"
+    );
+}
+
+/// The lean buttons fire past `LEAN_THRESHOLD` degrees of side tilt, and not
+/// before — the threshold is what stops a pad resting at an angle from holding one
+/// down for ever.
+#[test]
+fn leaning_the_pad_presses_the_lean_buttons() {
+    let s = super::motion::Settings { lean_threshold: 15.0, ..Default::default() };
+    let o = super::analog::Orientation::default();
+
+    let (l, r) = super::motion::lean(gravity_for("flat"), &s, o);
+    assert!(!l && !r, "held flat, neither");
+    let (l, r) = super::motion::lean(gravity_for("right grip down"), &s, o);
+    assert!(r && !l, "right grip down leans right");
+    let (l, r) = super::motion::lean(gravity_for("left grip down"), &s, o);
+    assert!(l && !r, "left grip down leans left");
+
+    // Just under the threshold, nothing; just over it, something.
+    let tilt = |deg: f32| {
+        let rad = deg.to_radians();
+        let mut m = super::motion::Motion::default();
+        let a = glam::Vec3::new(0.0, rad.sin(), rad.cos());
+        let mut g = super::motion::Gravity::default();
+        for _ in 0..40 {
+            g = m.tick(Some(a), DT);
+        }
+        super::motion::lean(g, &s, o)
+    };
+    assert!(!tilt(10.0).1, "10 degrees is inside the threshold");
+    assert!(tilt(20.0).1, "20 degrees is past it");
+
+    // No accelerometer, no lean — rather than both, or a stuck one.
+    let (l, r) = super::motion::lean(super::motion::Gravity::default(), &s, o);
+    assert!(!l && !r);
+}
+
+/// `PLAYER_TURN`: turning the pad about *gravity* turns the camera, whichever way
+/// the pad happens to be tilted. That is the whole point of the space — and the
+/// one thing a `LOCAL` config cannot do.
+#[test]
+fn player_turn_reads_a_turn_about_gravity_whatever_the_tilt() {
+    use super::motion::{gravity_space, JsmGyro, Space};
+    // Held flat, gravity is down JSM's -Y, so a yaw about the pad's own up axis is
+    // a turn: JSM's Y component of the gyro.
+    let flat = gravity_for("flat");
+    let (x, _) = gravity_space(Space::PlayerTurn, flat, JsmGyro { x: 0.0, y: 10.0, z: 0.0 });
+    assert!(x.abs() > 1.0, "flat, a yaw turns the camera: {x}");
+
+    // Nose up, the pad's *roll* axis is the one pointing at the sky, so the same
+    // turn now arrives on Z — and the space must still see it as a turn.
+    let nose_up = gravity_for("nose up");
+    let (x, _) = gravity_space(Space::PlayerTurn, nose_up, JsmGyro { x: 0.0, y: 0.0, z: 10.0 });
+    assert!(x.abs() > 1.0, "nose up, a roll turns the camera: {x}");
+
+    // And a pure pitch is not a turn in either pose.
+    for (name, g) in [("flat", flat), ("nose up", nose_up)] {
+        let (x, y) = gravity_space(Space::PlayerTurn, g, JsmGyro { x: 10.0, y: 0.0, z: 0.0 });
+        assert!(x.abs() < 0.01, "{name}: a pitch is not a turn: {x}");
+        assert!(y.abs() > 1.0, "{name}: but it is a pitch: {y}");
+    }
+}
+
+/// The gravity spaces fade out when the pad is held on its side, where a pitch
+/// axis worked out from gravity means almost nothing. Without that they flail.
+#[test]
+fn a_world_space_gives_up_when_the_pad_is_on_its_side() {
+    use super::motion::{gravity_space, JsmGyro, Space};
+    let upright = gravity_for("flat");
+    let (_, y) = gravity_space(Space::WorldTurn, upright, JsmGyro { x: 10.0, y: 0.0, z: 0.0 });
+    assert!(y.abs() > 1.0, "held flat a pitch reads as pitch: {y}");
+
+    // Gravity along the pad's right: neither flat nor upright.
+    let sideways = gravity_for("right grip down");
+    let (_, y) = gravity_space(Space::WorldTurn, sideways, JsmGyro { x: 10.0, y: 0.0, z: 0.0 });
+    assert!(y.abs() < 0.01, "on its side it stops guessing: {y}");
+}
+
+/// The touchpad grid: which cell a finger is in, by name.
+#[test]
+fn the_touchpad_grid_names_the_cell_a_finger_is_in() {
+    let mut t = super::touch::Touch::default();
+    let s = super::touch::Settings { grid: (2, 2), ..Default::default() };
+    let cfg = super::analog::StickCfg::default();
+    let at = |x: f32, y: f32| super::touch::Finger { active: true, x, y };
+    let off = super::touch::Finger::default();
+
+    // Top-left quarter is cell 1, then across, then down: 1 2 / 3 4.
+    let out = t.tick(&s, [at(-0.5, -0.5), off], cfg);
+    assert_eq!(out.cells[0], Some(1), "top left is T1");
+    let out = t.tick(&s, [at(0.5, -0.5), off], cfg);
+    assert_eq!(out.cells[0], Some(2), "top right is T2");
+    let out = t.tick(&s, [at(-0.5, 0.5), off], cfg);
+    assert_eq!(out.cells[0], Some(3), "bottom left is T3");
+    let out = t.tick(&s, [at(0.5, 0.5), off], cfg);
+    assert_eq!(out.cells[0], Some(4), "bottom right is T4");
+
+    // A finger lifted is in no cell at all.
+    let out = t.tick(&s, [off, off], cfg);
+    assert_eq!(out.cells[0], None);
+
+    // The far corners stay in range rather than falling off the end of T1..T25.
+    let out = t.tick(&s, [at(1.0, 1.0), off], cfg);
+    assert_eq!(out.cells[0], Some(4), "the very corner is still the last cell");
+}
+
+/// A touch stick is *relative*: it measures how far the finger has been dragged
+/// from wherever it landed, not where on the pad it is.
+#[test]
+fn a_touch_stick_measures_the_drag_not_the_place() {
+    let mut t = super::touch::Touch::default();
+    // A radius of 192 points is a tenth of the nominal width, so a tenth of the
+    // touchpad is full deflection — easy numbers to check.
+    let s = super::touch::Settings { stick_radius: 192.0, ..Default::default() };
+    let cfg = super::analog::StickCfg::default();
+    let at = |x: f32, y: f32| super::touch::Finger { active: true, x, y };
+
+    // Landing far to the right is not a push: the stick starts where the finger
+    // lands.
+    let out = t.tick(&s, [at(0.8, 0.0), super::touch::Finger::default()], cfg);
+    assert_eq!(out.sticks[0], (0.0, 0.0), "the tick a finger lands is not a drag");
+
+    // Dragging a fifth of the way right is a full push at this radius.
+    let out = t.tick(&s, [at(1.0, 0.0), super::touch::Finger::default()], cfg);
+    assert!(out.sticks[0].0 > 0.9, "dragging right pushes right: {:?}", out.sticks[0]);
+
+    // Lifting re-centres it, so the next touch starts fresh.
+    let out = t.tick(&s, [super::touch::Finger::default(); 2], cfg);
+    let _ = out;
+    let out = t.tick(&s, [at(-0.9, 0.0), super::touch::Finger::default()], cfg);
+    assert_eq!(out.sticks[0], (0.0, 0.0), "a new touch starts from centre");
+}
+
+/// Dragging up the touchpad pushes the touch stick up, even though the touchpad's
+/// y counts down and a stick's counts up.
+#[test]
+fn a_touch_stick_agrees_with_a_stick_about_which_way_is_up() {
+    let mut t = super::touch::Touch::default();
+    let s = super::touch::Settings { stick_radius: 108.0, ..Default::default() };
+    let cfg = super::analog::StickCfg::default();
+    let at = |y: f32| super::touch::Finger { active: true, x: 0.0, y };
+    let off = super::touch::Finger::default();
+
+    t.tick(&s, [at(0.5), off], cfg);
+    // Towards the top of the touchpad is a smaller y.
+    let out = t.tick(&s, [at(0.0), off], cfg);
+    assert!(out.sticks[0].1 > 0.9, "dragging up pushes the stick up: {:?}", out.sticks[0]);
+}
+
+/// `TOUCHPAD_MODE = MOUSE` drags the pointer, and ignores a second finger rather
+/// than doubling the speed.
+#[test]
+fn the_touchpad_can_drag_the_mouse() {
+    let mut t = super::touch::Touch::default();
+    let s = super::touch::Settings {
+        mode: super::touch::Mode::Mouse,
+        sens: (1.0, 1.0),
+        ..Default::default()
+    };
+    let cfg = super::analog::StickCfg::default();
+    let at = |x: f32, y: f32| super::touch::Finger { active: true, x, y };
+    let off = super::touch::Finger::default();
+
+    t.tick(&s, [at(0.0, 0.0), off], cfg);
+    let out = t.tick(&s, [at(0.1, 0.0), off], cfg);
+    assert!(out.mouse.x > 1.0, "dragging right moves the pointer right: {:?}", out.mouse);
+    // Our bus counts mouse y up and the touchpad counts down.
+    t.tick(&s, [at(0.1, 0.0), off], cfg);
+    let out = t.tick(&s, [at(0.1, 0.2), off], cfg);
+    assert!(out.mouse.y < -1.0, "dragging down moves the pointer down: {:?}", out.mouse);
+
+    // In grid mode the pointer stays put.
+    let mut t = super::touch::Touch::default();
+    let grid = super::touch::Settings::default();
+    t.tick(&grid, [at(0.0, 0.0), off], cfg);
+    let out = t.tick(&grid, [at(0.5, 0.0), off], cfg);
+    assert_eq!(out.mouse, glam::Vec2::ZERO, "grid mode is not a mouse");
+}
+
+/// The touchpad is a dual-stage trigger: a finger is the soft pull, a click the
+/// full one. `NO_SKIP` (JSM's default here) fires the soft stage on touch and adds
+/// the full one on click.
+#[test]
+fn a_finger_and_a_click_are_the_touchpads_two_stages() {
+    let mut s = Stage::new("TOUCHPAD_DUAL_STAGE_MODE = NO_SKIP");
+    let step = |s: &mut Stage, touching: bool, click: bool| {
+        s.pad.touching = touching;
+        s.pad.touch_click = click;
+        s.a.tick(&s.s, DT, &s.pad);
+        (s.a.down(Btn::Touch), s.a.down(Btn::Capture))
+    };
+    assert_eq!(step(&mut s, false, false), (false, false), "nothing on the pad");
+    assert_eq!(step(&mut s, true, false), (true, false), "a finger is the soft pull");
+    assert_eq!(step(&mut s, true, true), (true, true), "a click adds the full one");
+    // Lifting the finger and releasing the click in one tick releases the full
+    // stage first and the soft one a tick later. That is the dual-stage machine's
+    // own shape — JSM's `DelayFullPress` keeps the soft press while the full one
+    // goes — and it is shared with every real trigger, so it is left alone here
+    // rather than special-cased for the touchpad.
+    assert_eq!(step(&mut s, false, false), (true, false), "the click goes first");
+    assert_eq!(step(&mut s, false, false), (false, false), "then the finger");
+}
+
+/// `MUST_SKIP` on the touchpad tells a tap from a press, which only works because
+/// a finger reads as 0.99 rather than as a full pull.
+#[test]
+fn the_touchpad_can_tell_a_tap_from_a_click() {
+    let mut s = Stage::new("TOUCHPAD_DUAL_STAGE_MODE = MUST_SKIP");
+    s.pad.touching = true;
+    s.a.tick(&s.s, DT, &s.pad);
+    assert!(!s.a.down(Btn::Touch), "MUST_SKIP waits to see if a click follows");
+    s.pad.touch_click = true;
+    s.a.tick(&s.s, DT, &s.pad);
+    assert!(s.a.down(Btn::Capture), "a quick click fires the full stage");
+    assert!(!s.a.down(Btn::Touch), "and skips the soft one");
+}
+
+/// Every one of phase 6's settings is read, and a bad value is called out.
+#[test]
+fn every_motion_and_touch_setting_is_read() {
+    let c = compile(
+        "GYRO_SPACE = WORLD_LEAN\n\
+         LEAN_THRESHOLD = 25\n\
+         MOTION_STICK_MODE = NO_MOUSE\n\
+         MOTION_RING_MODE = INNER\n\
+         MOTION_DEADZONE_INNER = 18\n\
+         MOTION_DEADZONE_OUTER = 90\n\
+         MOTION_STICK_AXIS = INVERTED STANDARD\n\
+         TOUCHPAD_MODE = MOUSE\n\
+         GRID_SIZE = 5 5\n\
+         TOUCHPAD_SENS = 2 3\n\
+         TOUCHPAD_DUAL_STAGE_MODE = MAY_SKIP\n\
+         TOUCH_STICK_MODE = AIM\n\
+         TOUCH_RING_MODE = INNER\n\
+         TOUCH_STICK_RADIUS = 200\n\
+         TOUCH_DEADZONE_INNER = 0.4\n\
+         TOUCH_STICK_AXIS = STANDARD INVERTED",
+    );
+    assert!(errors(&c).is_empty(), "all of these are live: {:?}", errors(&c));
+    assert_eq!(c.motion.space, super::motion::Space::WorldLean);
+    assert_eq!(c.motion.lean_threshold, 25.0);
+    assert_eq!(c.settings.motion.ring, RingMode::Inner);
+    assert!((c.settings.motion.inner_dz - 0.1).abs() < 1e-6, "18 of 180 degrees");
+    assert!((c.settings.motion.outer_dz - 0.5).abs() < 1e-6, "90 of 180 degrees");
+    assert!(c.settings.motion.invert_x && !c.settings.motion.invert_y);
+    assert_eq!(c.touch.mode, super::touch::Mode::Mouse);
+    assert_eq!(c.touch.grid, (5, 5));
+    assert_eq!(c.touch.sens, (2.0, 3.0));
+    assert_eq!(c.settings.touchpad_dual_stage, super::analog::TriggerMode::MaySkip);
+    assert_eq!(c.settings.touch.mode, super::analog::StickMode::Aim);
+    assert_eq!(c.touch.stick_radius, 200.0);
+    assert_eq!(c.settings.touch.inner_dz, 0.4);
+    assert!(!c.settings.touch.invert_x && c.settings.touch.invert_y);
+
+    for bad in [
+        "GYRO_SPACE = SIDEWAYS",
+        "LEAN_THRESHOLD = 200",
+        "MOTION_DEADZONE_INNER = 400",
+        "TOUCHPAD_MODE = WOBBLE",
+        "GRID_SIZE = 6 6",
+        "TOUCH_STICK_RADIUS = 0",
+        "TOUCH_DEADZONE_INNER = 3",
+    ] {
+        assert!(
+            matches!(one(bad).status, LineStatus::Error(_)),
+            "{bad} should be an error"
+        );
+    }
+}
+
+/// A grid too big to name is refused with the reason, not clamped in silence —
+/// the buttons stop at `T25`, so a 6x6 grid has cells nothing can be bound to.
+#[test]
+fn a_grid_bigger_than_the_buttons_says_so() {
+    match one("GRID_SIZE = 6 6").status {
+        LineStatus::Error(why) => {
+            assert!(why.contains("T25"), "it names the limit: {why}");
+        }
+        other => panic!("a 36-cell grid should be an error, got {other:?}"),
+    }
+}
+
+/// `LEFT_STEER_X` is refused on a thumbstick and accepted on the motion stick —
+/// the same name, two answers, which is exactly what JSM does.
+#[test]
+fn steering_belongs_to_the_motion_stick_alone() {
+    assert!(matches!(
+        one("LEFT_STICK_MODE = LEFT_STEER_X").status,
+        LineStatus::Error(_)
+    ));
+    let ok = one("MOTION_STICK_MODE = LEFT_STEER_X");
+    assert_eq!(ok.status, LineStatus::Ok, "the motion stick can steer");
+    assert!(
+        ok.notes.iter().any(|n| n.contains("virtual pad wired downstream")),
+        "and says it needs a pad: {:?}",
+        ok.notes
+    );
+}
+
+/// Leaning the pad steers a virtual stick, with `MOTION_DEADZONE_OUTER` deciding
+/// how far you have to lean for full lock.
+#[test]
+fn leaning_the_pad_steers_a_virtual_stick() {
+    let reach = |pose: &str| {
+        super::motion::steer(
+            gravity_for(pose),
+            super::analog::Orientation::default(),
+            15.0,
+            135.0,
+            1.0,
+        )
+    };
+    let (_, flat) = reach("flat").expect("gravity is known");
+    assert!(flat < 0.01, "held flat it steers straight: {flat}");
+
+    let (sign, tilted) = reach("right grip down").expect("gravity is known");
+    assert!(sign > 0.0, "leaning right steers right");
+    // 90 degrees of lean, 15 in and 135 out, is (90-15)/(180-135-15) = 2.5 → full.
+    assert!(tilted > 0.99, "a quarter turn is already full lock: {tilted}");
+
+    // No accelerometer, no steering.
+    assert!(super::motion::steer(
+        super::motion::Gravity::default(),
+        super::analog::Orientation::default(),
+        15.0,
+        135.0,
+        1.0
+    )
+    .is_none());
+}
+
+/// The motion stick's directions are ordinary stick directions, so `MUP` behaves
+/// the way `LUP` does — running all five of JSM's sticks through one routine is
+/// what buys that.
+#[test]
+fn the_motion_sticks_directions_are_buttons_like_any_other() {
+    let out = run_node_with(
+        "MOTION_STICK_MODE = NO_MOUSE\nMRIGHT = E",
+        false,
+        &[
+            // Right grip down: gravity along the pad's right, so the motion stick
+            // pushes right.
+            ("accel_x", Signal::Float(0.0)),
+            ("accel_y", Signal::Float(1.0)),
+            ("accel_z", Signal::Float(0.0)),
+        ],
+        4,
+    );
+    assert!(
+        out.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+        "tilting the pad right presses the binding on MRIGHT: {out:?}"
+    );
+}
+
+/// A touchpad grid cell is a button, and it only fires while a finger is in it.
+#[test]
+fn a_grid_cell_is_a_button() {
+    let held = run_node_with(
+        "GRID_SIZE = 2 1\nT1 = E\nT2 = F",
+        false,
+        &[
+            ("touch1_active", Signal::Bool(true)),
+            ("touch1_x", Signal::Float(-0.5)),
+            ("touch1_y", Signal::Float(0.0)),
+        ],
+        3,
+    );
+    assert!(
+        held.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+        "a finger on the left half presses T1: {held:?}"
+    );
+    assert!(
+        !held.get("key_f").map(|s| s.as_bool()).unwrap_or(false),
+        "and not T2"
+    );
+
+    let lifted = run_node_with("GRID_SIZE = 2 1\nT1 = E\nT2 = F", false, &[], 3);
+    assert!(
+        !lifted.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+        "no finger, no press: {lifted:?}"
+    );
+}
+
+/// A config that reads the touchpad takes it over, so a Touch Zones module
+/// downstream doesn't act on the same finger — except in `PS_TOUCHPAD` mode, which
+/// exists to pass it on.
+#[test]
+fn reading_the_touchpad_claims_it_unless_the_mode_is_to_pass_it_on() {
+    let claimed = run_node_with(
+        "GRID_SIZE = 2 1\nT1 = E",
+        false,
+        &[("touch1_active", Signal::Bool(true)), ("touch1_x", Signal::Float(-0.5))],
+        2,
+    );
+    assert_eq!(
+        claimed.get("touch1_active").map(|s| s.as_bool()),
+        Some(false),
+        "the finger is consumed: {claimed:?}"
+    );
+
+    let passed = run_node_with(
+        "TOUCHPAD_MODE = PS_TOUCHPAD",
+        false,
+        &[("touch1_active", Signal::Bool(true)), ("touch1_x", Signal::Float(-0.5))],
+        2,
+    );
+    assert_eq!(
+        passed.get("touch1_active").map(|s| s.as_bool()),
+        Some(true),
+        "PS_TOUCHPAD hands it on: {passed:?}"
+    );
+}
+
+/// Gravity from an arbitrary direction of "up", for poses that have no name.
+fn gravity_from(up: glam::Vec3) -> super::motion::Gravity {
+    let mut m = super::motion::Motion::default();
+    let a = up.normalize();
+    let mut g = super::motion::Gravity::default();
+    for _ in 0..40 {
+        g = m.tick(Some(a), DT);
+    }
+    g
+}
+
+/// The world spaces fade out *gradually* as the pad is rolled onto its side —
+/// partial trust, not just on or off. The cliff-edge version of this test passes
+/// even with the fade removed, because a pad exactly on its side has no usable
+/// pitch axis at all and reads zero either way.
+#[test]
+fn a_world_space_fades_out_as_the_pad_rolls_onto_its_side() {
+    use super::motion::{gravity_space, JsmGyro, Space};
+    let pitch = JsmGyro { x: 10.0, y: 0.0, z: 0.0 };
+
+    // Held flat: fully trusted, the pitch comes through whole.
+    let (_, square) = gravity_space(Space::WorldTurn, gravity_for("flat"), pitch);
+    assert!(square.abs() > 9.0, "held flat a pitch comes through whole: {square}");
+
+    // Now a pose just inside the give-up band. Gravity is almost exactly along the
+    // pad's own pitch axis, which is the case the fade exists for: the world pitch
+    // axis is still computable — so the projection alone would let a reduced
+    // signal through — but it is meaningless, and the fade must silence it
+    // outright rather than merely quieten it. This is the assertion that separates
+    // "damped by the projection" from "faded out on purpose".
+    let on_its_side = gravity_from(glam::Vec3::new(0.125, 0.992, 0.0));
+    let (_, faded) = gravity_space(Space::WorldTurn, on_its_side, pitch);
+    assert!(
+        faded.abs() < 0.001,
+        "at the edge of the band it goes quiet altogether, not just quieter: {faded}"
+    );
+}
+
+/// The player spaces keep pitch as the pad's own, and keep it the right way up.
+#[test]
+fn the_player_spaces_keep_pitch_the_right_way_up() {
+    use super::motion::{gravity_space, JsmGyro, Space};
+    // The same pitch, through `LOCAL` and through `PLAYER_TURN`, must agree about
+    // which way the camera goes — the player spaces re-reference the horizontal
+    // half and leave pitch alone, so a config swapping between them shouldn't
+    // suddenly aim upside down.
+    let (_, player) = gravity_space(
+        Space::PlayerTurn,
+        gravity_for("flat"),
+        JsmGyro { x: 10.0, y: 0.0, z: 0.0 },
+    );
+    // `LOCAL` with JSM's defaults does `gyroY += inGyroX` against a screen whose y
+    // counts down, which phase 3 pins by the same reasoning: tilting up aims up.
+    let mut a = Aiming::new(&format!("{AIM_CFG}\nGYRO_SMOOTH_TIME = 0"));
+    a.gyro = Gyro { roll: 0.0, pitch: 10.0, yaw: 0.0 };
+    let local = a.ticks(3);
+    assert!(
+        player.signum() == -local.y.signum(),
+        "player pitch and local pitch agree about up (bus y counts up, JSM's down): \
+         player {player}, local {}",
+        local.y
+    );
+}
+
+/// Leaning past vertical keeps steering the same way instead of unwinding, which
+/// is what the fold-back past 90 degrees is for.
+#[test]
+fn steering_keeps_going_past_vertical() {
+    let reach = |up: glam::Vec3| {
+        super::motion::steer(
+            gravity_from(up),
+            super::analog::Orientation::default(),
+            15.0,
+            60.0,
+            1.0,
+        )
+        .expect("gravity is known")
+    };
+    // Rolled 45 degrees right: partway.
+    let (sign_45, at_45) = reach(glam::Vec3::new(0.0, 0.7071, 0.7071));
+    // Rolled 135 degrees right — past vertical, still going the same way, and
+    // further over than at 45.
+    let (sign_135, at_135) = reach(glam::Vec3::new(0.0, 0.7071, -0.7071));
+    assert!(sign_45 > 0.0 && sign_135 > 0.0, "both lean right");
+    assert!(
+        at_135 > at_45,
+        "past vertical it keeps steering further, not back: {at_45} then {at_135}"
+    );
+}
+
+/// Which cell owns the line between two of them. JSM rounds up and subtracts one,
+/// so the boundary belongs to the cell before it — worth pinning, because the
+/// obvious `floor` gives the other answer and only differs exactly here.
+#[test]
+fn a_finger_on_a_grid_line_belongs_to_the_cell_before_it() {
+    let mut t = super::touch::Touch::default();
+    let s = super::touch::Settings { grid: (2, 1), ..Default::default() };
+    let cfg = super::analog::StickCfg::default();
+    let at = |x: f32| super::touch::Finger { active: true, x, y: 0.0 };
+
+    let out = t.tick(&s, [at(0.0), super::touch::Finger::default()], cfg);
+    assert_eq!(
+        out.cells[0],
+        Some(1),
+        "dead centre of a two-column grid is the left cell"
+    );
+}
+
+/// A finger alone is never a full pull, however the dual-stage mode is set. That
+/// is what the 0.99 is for: without it a resting finger would fire the click.
+#[test]
+fn a_finger_alone_never_counts_as_a_click() {
+    for mode in ["NO_SKIP", "NO_SKIP_EXCLUSIVE", "MAY_SKIP", "MUST_SKIP"] {
+        let mut s = Stage::new(&format!("TOUCHPAD_DUAL_STAGE_MODE = {mode}"));
+        s.pad.touching = true;
+        for tick in 0..40 {
+            s.a.tick(&s.s, DT, &s.pad);
+            assert!(
+                !s.a.down(Btn::Capture),
+                "{mode}: a finger with no click never presses CAPTURE (tick {tick})"
+            );
+        }
+    }
 }
