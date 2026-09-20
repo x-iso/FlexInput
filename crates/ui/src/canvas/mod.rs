@@ -6,6 +6,7 @@ pub mod node;
 pub(crate) mod overlay_body;
 pub mod remapper_icons;
 pub mod viewer;
+pub(crate) mod wheel;
 
 pub use node::NodeData;
 pub use node::OverlayLayout;
@@ -1192,6 +1193,10 @@ impl Canvas {
         let id_salt = ("flexinput_canvas", self.view_salt);
         let snarl_id = ui.make_persistent_id(id_salt);
         let snarl_rect = ui.available_rect_before_wrap();
+        // A node body that asked for the wheel (a text editor with a scroll
+        // area) gets it: the Scene inside `show` pans by the scroll delta it
+        // reads before any body draws, so the delta has to leave the input here.
+        wheel::take_wheel_from_canvas(ui.ctx());
         {
             puffin::profile_scope!("snarl_show");
             self.snarl.show(&mut viewer, &self.style, id_salt, ui);
