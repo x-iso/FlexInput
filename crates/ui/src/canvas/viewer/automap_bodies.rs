@@ -550,6 +550,30 @@ pub(crate) struct CombinerInputInfo {
     label: String,
 }
 
+/// A node that hands on a whole AutoMap bus of its own, and what to call it in
+/// the Combiner's list. Any canonical pin could come out of one of these, so each
+/// offers the full set — which is what makes a pin show up as overlapping.
+///
+/// Every module in `module_ui_info::republishes_automap_bus` has to be here, or
+/// the Combiner treats that input as offering nothing and quietly lists no
+/// conflicts to resolve (the JSM module's first outing did exactly that). The
+/// bus-shaped nodes that don't republish — Fork, Selector, Combiner, Remapper —
+/// belong here too.
+pub(crate) fn bus_label(module_id: &str) -> Option<&'static str> {
+    Some(match module_id {
+        "module.automap_collect" => "Collector",
+        "module.automap_fork" => "Fork",
+        "module.automap_selector" => "Selector",
+        "module.automap_combiner" => "Combiner",
+        "module.remapper" => "Remapper",
+        "module.jsm" => "JSM Config",
+        "module.audio_stream_haptics" => "Audio Haptics",
+        "module.network_send" => "Network Send",
+        "module.network_recv" => "Network Receive",
+        _ => return None,
+    })
+}
+
 pub(crate) fn combiner_inputs_info(
     snarl: &Snarl<NodeData>,
     node_id: NodeId,
@@ -574,12 +598,7 @@ pub(crate) fn combiner_inputs_info(
                 let upstream = *pin.remotes.first()?;
                 trace(snarl, upstream, depth + 1)
             }
-            "module.automap_collect"  => Some((None, "Collector")),
-            "module.automap_fork"     => Some((None, "Fork")),
-            "module.automap_selector" => Some((None, "Selector")),
-            "module.automap_combiner" => Some((None, "Combiner")),
-            "module.remapper"         => Some((None, "Remapper")),
-            _ => None,
+            id => bus_label(id).map(|label| (None, label)),
         }
     }
 

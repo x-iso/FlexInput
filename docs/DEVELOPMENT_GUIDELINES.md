@@ -643,6 +643,60 @@ transparent window (observed on Win11). The extended style is applied via the ve
 
 ---
 
+## Wiring a new module (the registrations that are easy to miss)
+
+A module works only once every registry knows about it. The descriptor alone
+gets you a node with pins and nothing else — the JSM module shipped once as a
+bare header because the body gate was missed. In rough order:
+
+- **`crates/modules/src/<module>.rs`** — descriptor + `registrations()`, behind a
+  cargo feature if optional, forwarded through `modules → ui → app`
+  (`default = [...]`), and added to `all_modules()` in `lib.rs`.
+- **Engine evaluation** — either a `compute_node` arm, or a registry hook in
+  `eval/registry.rs` (`publish` for a pure injector, `publish_stateful` when the
+  module keeps per-node state and needs `dt`), dispatched in BOTH `eval_graph_tick`
+  and `eval_subgraph`. Per-node state goes in `NodeState`, boxed when it is big.
+- **`viewer.rs` `module_has_body`** — the gate that decides whether a body draws
+  at all, separate from the `show_body` dispatch arm. Both are needed.
+- **`app/graph.rs`** — if the module reads the AutoMap bus, add it to the list
+  that stamps `_automap_device_id` / `_automap_collector_id`, or it reads nothing.
+- **`module_ui_info.rs`** — `republishes_automap_bus` when the module publishes a
+  bus of its own (so downstream nodes resolve its collector key rather than
+  walking past it to the pad), and `glows_from_automap_input` for the pin glow.
+- **Pinning** — `register_exposable_element` in the body for each pinnable
+  element, plus a render arm in `pinned.rs`. A pinned widget that writes params
+  must call `mark_overlay_param_write` so the config overlay bumps the canvas
+  generation (see the sub-patch stale-clone pitfall).
+- **Releasing what it drives** — a sink latches the last value it was told, and
+  most output pins (`key_e`, `mouse_left`, …) are NOT in `automap::ALL_PINS`, so
+  no pass-through ever carries their off value. Publish a definitive value for
+  EVERY pin the module can drive, EVERY tick — off unless it is held this tick —
+  the way `remapper.rs` does. Saying "off" only on the tick of release leaves the
+  key down for good if anything downstream misses that tick, which is exactly how
+  the JSM module first shipped (`L = E` typed `eeee…` for ever). The same trap
+  catches one-shot values like `mouse_move`: a latched displacement nudges the
+  cursor every tick until something says zero.
+- **`automap_bodies::bus_label`** — a module that republishes a bus of its own
+  (see `republishes_automap_bus`) needs a name here, or the AutoMap Combiner
+  traces that input to nothing, offers no pins, and silently lists no conflicts to
+  resolve.
+- **Gamepad nav** — `app/nav/fields.rs` if the module's controls should be
+  reachable without a mouse.
+- **A body that scrolls** — show the scroll area through
+  `canvas::wheel::scrolling_body` (`canvas/wheel.rs`). An ordinary `ScrollArea`
+  is broken in a node body in two ways, both because the canvas is an
+  `egui::Scene`: the Scene pans by the scroll delta it reads *before* any body
+  draws (so the area scrolled and dragged the canvas with it), and the area's own
+  wheel handling is gated on `rect_contains_pointer`, which resolves the pointer
+  through *registered areas* only — a Scene's layer is a sublayer of a panel, not
+  an `Area`, so the area decides the pointer isn't over it and ignores the wheel
+  entirely. `scrolling_body` takes the delta before the Scene sees it and applies
+  it to the offset by hand. (Ordinary widget hovering is unaffected: that goes
+  through the widget hit test.) Give the scroll bar its own always-visible lane
+  (`ScrollStyle::solid()` + `ScrollBarVisibility::AlwaysVisible`) as well: the
+  default bar floats in on hover, and in a node body that changes the geometry
+  the hover was measured against, which flickers.
+
 ## Design Decisions Worth Knowing (recent)
 
 ### Touch Zones / Virtual Menu geometry = one BSP tree, both modes

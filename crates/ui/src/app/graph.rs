@@ -1198,7 +1198,7 @@ pub(crate) fn build_processing_graph_rec(
             | "module.automap_fork" | "module.automap_selector"
             | "module.remapper" | "module.map_action"
             | "module.automap_collect" | "module.audio_stream_haptics"
-            | "module.touch_zones" | "module.menu"
+            | "module.touch_zones" | "module.menu" | "module.jsm"
             | "module.network_send")
         {
             let automap_idx = node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);

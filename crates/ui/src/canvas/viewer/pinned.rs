@@ -376,6 +376,12 @@ pub(crate) fn render_pinned_element_impl(
             );
             return;
         }
+        // JSM Config: the editor itself, so a config can be read and edited
+        // from the config overlay.
+        ("module.jsm", "editor") => {
+            show_jsm_body_sized(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         ("module.svg", "image") => {
             show_svg_body_sized(inner_id, ui, inner_snarl, container_size);
             return;

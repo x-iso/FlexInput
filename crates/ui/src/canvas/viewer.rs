@@ -27,6 +27,7 @@ mod controller3d;
 mod expose;
 mod glow;
 mod gyro_body;
+mod jsm;
 mod layout_edit;
 mod midi;
 mod net;
@@ -55,6 +56,7 @@ pub(crate) use controller3d::*;
 pub(crate) use expose::*;
 pub(crate) use glow::*;
 pub(crate) use gyro_body::*;
+pub(crate) use jsm::*;
 pub(crate) use layout_edit::*;
 pub(crate) use midi::*;
 pub(crate) use net::*;
@@ -263,6 +265,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let curve_is_float    = snarl.get_node(node).map(|n| n.module_id == "module.response_curve").unwrap_or(false);
         let is_rws            = snarl.get_node(node).map(|n| n.module_id == "processing.rws").unwrap_or(false);
         let is_feedback_control = snarl.get_node(node).map(|n| n.module_id == "module.feedback_control").unwrap_or(false);
+        let is_jsm            = snarl.get_node(node).map(|n| n.module_id == "module.jsm").unwrap_or(false);
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.horizontal(|ui| {
@@ -841,6 +844,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 feedback_override_header_toggle(ui, snarl, node);
             }
 
+            // JSM Config: pass the rest of the pad through, or only what the config says.
+            if is_jsm {
+                jsm_strict_header_toggle(ui, snarl, node);
+            }
+
             // Second header row — only visible while in Layout mode for this
             // sub-patch. Snap settings live on the sub-patch itself (they
             // belong to its body's drag/resize behavior, not to the editor).
@@ -993,26 +1001,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let dev_id = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
         let is_midi_source = node.module_id == "device.source" && dev_id.starts_with("midi_in:");
         let is_midi_sink   = node.module_id == "device.sink"   && dev_id.starts_with("midi_out:");
-        is_midi_source || is_midi_sink || matches!(
-            node.module_id.as_str(),
-            "device.sink" | "module.constant" | "module.switch" | "module.knob" | "module.label" | "module.svg"
-                | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
-                | "display.controller3d"
-                | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
-                | "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.negate"
-                | "math.min_max" | "math.quantize" | "module.vec_to_deflection"
-                | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
-                | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
-                | "generator.oscillator" | "generator.envelope" | "processing.gyro_3dof"
-                | "processing.rws"
-                | "module.automap_split" | "module.automap_collect"
-                | "module.automap_fork" | "module.automap_selector"
-                | "module.automap_combiner" | "module.audio_stream_haptics"
-                | "module.network_send" | "module.network_recv"
-                | "module.remapper" | "module.map_action"
-                | "module.touch_zones" | "module.input_viewer" | "module.menu"
-                | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
-        )
+        is_midi_source || is_midi_sink || module_has_body(&node.module_id)
     }
 
     fn show_body(
@@ -1103,6 +1092,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
             "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals),
             "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, self.automap_parent.as_ref()),
+            "module.jsm" => show_jsm_body(node_id, ui, snarl),
             "module.network_send" => show_net_send_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.network_recv" => show_net_recv_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),
@@ -1340,3 +1330,46 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
 
 
 //  interaction layer.)
+
+/// Which modules draw a body under their header. A module missing from this
+/// list renders as a bare header however complete its body renderer is — the
+/// gate is easy to forget when adding one, so it lives on its own and is tested.
+pub(crate) fn module_has_body(module_id: &str) -> bool {
+    matches!(
+        module_id,
+        "device.sink" | "module.constant" | "module.switch" | "module.knob" | "module.label" | "module.svg"
+        | "display.readout" | "display.oscilloscope" | "display.vectorscope" | "display.trigscope"
+        | "display.controller3d"
+        | "module.delay" | "module.average" | "module.dc_filter" | "module.response_curve" | "module.vec_response_curve" | "module.vec_reshape" | "module.twoway_response_curve"
+        | "math.add" | "math.subtract" | "math.multiply" | "math.divide" | "math.negate"
+        | "math.min_max" | "math.quantize" | "module.vec_to_deflection"
+        | "module.selector" | "module.split" | "module.dropdown" | "module.macro"
+        | "logic.greater_than" | "logic.less_than" | "logic.delay" | "logic.counter"
+        | "generator.oscillator" | "generator.envelope" | "processing.gyro_3dof"
+        | "processing.rws"
+        | "module.automap_split" | "module.automap_collect"
+        | "module.automap_fork" | "module.automap_selector"
+        | "module.automap_combiner" | "module.audio_stream_haptics" | "module.jsm"
+        | "module.network_send" | "module.network_recv"
+        | "module.remapper" | "module.map_action"
+        | "module.touch_zones" | "module.input_viewer" | "module.menu"
+        | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
+    )
+}
+
+#[cfg(test)]
+mod body_gate_tests {
+    use super::module_has_body;
+
+    // A module whose body renderer exists but which is missing from this gate
+    // draws a bare header — the JSM node shipped that way once.
+    #[test]
+    fn modules_with_a_body_are_gated_in() {
+        for m in ["module.jsm", "module.remapper", "module.audio_stream_haptics",
+                  "module.label", "module.touch_zones", "processing.rws"] {
+            assert!(module_has_body(m), "{m} draws a body");
+        }
+        assert!(!module_has_body("module.feedback_control"), "a pins-only module draws none");
+        assert!(!module_has_body("math.abs"));
+    }
+}

@@ -718,6 +718,49 @@ pub struct ModuleDescriptor {
     by the graph builder
 - **Engine:** see *Feedback layers* in AUTOMAP_SYSTEM.md (`eval/feedback.rs`)
 
+#### JSM Config
+- **ID:** `module.jsm` — display name "JSM Config" (optional module, cargo feature `jsm`)
+- **Purpose:** Applies a JoyShockMapper config text to the bus with JSM's own
+  rules, so an existing JSM config can be loaded and kept editable. NOT a
+  front-end for the Remapper — the press semantics, timings and chord layering
+  are JSM's. See `docs/JSM_MODULE_PLAN.md`.
+- **Inputs:** Input 0: Source AutoMap bus (AutoMap)
+- **Outputs:** Output 0: the bus with the config applied, republished as
+  `collector:{uid}`
+- **Parameters:**
+  - `jsm_tabs: Array<{name, text}>` — one config file per tab; a binding that
+    loads a config by name finds the tab of that name (paths and `.txt` ignored)
+  - `jsm_active_tab: u32` — the tab being applied
+  - `jsm_strict: bool` (header toggle "Only what the config says") — off: inputs
+    the config never mentions pass through and the mentioned ones are taken over
+    (and marked consumed); on: only the config's own output is published
+  - `jsm_editor_w`, `jsm_editor_h: f32` — the editor's size in the node body,
+    dragged by the grip in its bottom-right corner
+- **Engine:** `eval/modules/jsm/` — `parse` (grammar + a status per line),
+  `analog` (triggers and sticks as JSM's buttons), `aim` (gyro and sticks as
+  mouse movement), `bind` (the press machinery), `eval` (bus in, bus out).
+  Registered through the registry seam's stateful publisher hook; state lives in
+  `NodeState::jsm`
+- **Editor:** the body is the config text, each line tinted by what the parser
+  made of it, with the lines worth explaining listed underneath. While the editor
+  has keyboard focus the config's key and mouse output pauses, so a binding under
+  test can't type into it. The wheel over the editor scrolls the config instead of
+  panning the canvas (`canvas/wheel.rs`).
+- **Live so far (plan phases 1-3):** digital bindings (tap/hold, all modifiers,
+  chord, simultaneous, diagonal, double press, turbo) and JSM's timing settings;
+  analog triggers (`TRIGGER_THRESHOLD` including the hair trigger, `ZL_MODE` /
+  `ZR_MODE` full pull with every skip mode, `TRIGGER_SKIP_DELAY`); digital sticks
+  (`NO_MOUSE` directions, `SCROLL_WHEEL`, ring modes, deadzones, axis inversion,
+  `CONTROLLER_ORIENTATION`, `SCROLL_SENS`); and aiming — gyro mouse with the
+  sensitivity ramp, smoothing, cutoff, trackball and `GYRO_ON`/`GYRO_OFF`, stick
+  `AIM`, flick stick and `MOUSE_AREA`, written to the bus's `mouse_move`.
+  Modeshifts, virtual pad output, the touchpad and feedback arrive in later
+  phases — their lines compile as "pending" and say which phase will run them,
+  as do the gravity-referenced gyro spaces and `MOUSE_RING`.
+- **What it takes over:** only what it actually runs. A stick left in a mouse or
+  pad mode, and a full pull the trigger mode never fires, keep passing through
+  rather than going quiet for a binding that can't run; the line says why.
+
 #### Audio Stream Haptics (ASTH)
 - **ID:** `module.audio_stream_haptics`
 - **Purpose:** Routes audio loopback to haptic feedback without HIDMaestro driver

@@ -21,6 +21,7 @@ pub(crate) fn republishes_automap_bus(module_id: &str) -> bool {
         module_id,
         "module.automap_collect"
             | "module.audio_stream_haptics"
+            | "module.jsm"
             | "module.network_send"
             | "module.network_recv"
     )
@@ -37,6 +38,7 @@ pub(crate) fn glows_from_automap_input(module_id: &str) -> bool {
             | "module.automap_collect"
             | "module.remapper"
             | "module.audio_stream_haptics"
+            | "module.jsm"
             | "module.touch_zones"
     )
 }
@@ -73,6 +75,15 @@ mod tests {
         }
     }
 
+    // The JSM module publishes the bus it was handed, with the config applied:
+    // a downstream node must read its collector key, not walk past it to the pad.
+    #[test]
+    fn jsm_republishes_the_bus_it_was_given() {
+        assert!(republishes_automap_bus("module.jsm"));
+        assert!(glows_from_automap_input("module.jsm"));
+        assert!(!has_nav_response_curve("module.jsm"));
+    }
+
     #[test]
     fn republish_set_matches_the_engine_injectors() {
         // Mirrors the graph builder's automap-source stop set. feedback_control is
@@ -81,5 +92,22 @@ mod tests {
         assert!(republishes_automap_bus("module.network_send"));
         assert!(republishes_automap_bus("module.network_recv"));
         assert!(!republishes_automap_bus("module.feedback_control"));
+    }
+
+    // A module that hands on a bus of its own has to be one the Combiner can
+    // trace, or that input offers nothing and the Combiner lists no conflicts to
+    // resolve — which is what happened to the JSM module.
+    #[test]
+    fn every_bus_republisher_is_one_the_combiner_knows() {
+        for module in ["module.automap_collect", "module.audio_stream_haptics",
+                       "module.jsm", "module.network_send", "module.network_recv"] {
+            assert!(republishes_automap_bus(module), "{module} should republish");
+            assert!(
+                crate::canvas::viewer::bus_label(module).is_some(),
+                "{module} republishes a bus, so the Combiner must have a name for it",
+            );
+        }
+        assert!(crate::canvas::viewer::bus_label("module.curve").is_none(),
+            "a module that isn't bus-shaped has no business in that list");
     }
 }

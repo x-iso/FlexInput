@@ -529,17 +529,22 @@ fn rws_meas_msg_key(node_id: NodeId) -> egui::Id { egui::Id::new(("rws_cal_msg",
 /// overlay consumes it and bumps the tab canvas `mutation_gen`, so an open
 /// sub-patch editor re-pulls the real values instead of showing — or writing back
 /// — its stale copy.
-fn rws_overlay_write_id() -> egui::Id { egui::Id::new("fxi_rws_overlay_param_write") }
+fn overlay_write_id() -> egui::Id { egui::Id::new("fxi_rws_overlay_param_write") }
 
-pub(crate) fn mark_rws_overlay_write(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.insert_temp(rws_overlay_write_id(), true));
+/// A pinned widget wrote node params from the overlay's viewport, which the
+/// canvas's own edit tracking can't see. The overlay bumps the tab canvas
+/// generation on this, so an open sub-patch editor re-pulls rather than writing
+/// its stale copy back over the change. Set by the RWS calibration widget and by
+/// the JSM editor.
+pub(crate) fn mark_overlay_param_write(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(overlay_write_id(), true));
 }
 
-/// Read-and-clear the overlay write flag (see [`mark_rws_overlay_write`]).
-pub(crate) fn take_rws_overlay_write(ctx: &egui::Context) -> bool {
-    let set = ctx.data(|d| d.get_temp::<bool>(rws_overlay_write_id())).unwrap_or(false);
+/// Read-and-clear the overlay write flag (see [`mark_overlay_param_write`]).
+pub(crate) fn take_overlay_param_write(ctx: &egui::Context) -> bool {
+    let set = ctx.data(|d| d.get_temp::<bool>(overlay_write_id())).unwrap_or(false);
     if set {
-        ctx.data_mut(|d| d.insert_temp(rws_overlay_write_id(), false));
+        ctx.data_mut(|d| d.insert_temp(overlay_write_id(), false));
     }
     set
 }
@@ -778,7 +783,7 @@ pub(crate) fn render_rws_measure(
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(210.0, 24.0));
     if rws_measure_controls(node_id, ui, snarl, false) {
-        mark_rws_overlay_write(ui.ctx());
+        mark_overlay_param_write(ui.ctx());
     }
 }
 

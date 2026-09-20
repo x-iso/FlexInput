@@ -11,5 +11,8 @@ glam           = { workspace = true }
 [features]
 # Audio Stream Haptics (WASAPI loopback → HD rumble). Optional module — the
 # Phase C registry pilot. On by default; the app keeps it enabled via the engine.
-default = ["asth"]
+default = ["asth", "jsm"]
 asth = []
+# JSM Config (a JoyShockMapper config text applied to the bus). Optional module,
+# on by default; the app keeps it enabled through the same forwarding chain.
+jsm = []

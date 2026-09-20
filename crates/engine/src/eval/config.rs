@@ -33,6 +33,7 @@ pub fn is_namespaced_source(id: &str) -> bool {
 pub const AUDIO_STREAM_HAPTICS_ID: &str = "module.audio_stream_haptics";
 
 /// Stable module ids for the network transport nodes.
+pub const JSM_ID: &str = "module.jsm";
 pub const NET_SEND_ID: &str = "module.network_send";
 pub const NET_RECV_ID: &str = "module.network_recv";
 

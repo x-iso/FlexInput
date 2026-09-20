@@ -219,6 +219,80 @@ binding under test can't type into it.
 
 ## Phases
 
+**Phase 1 landed** (engine `eval/modules/jsm/`, UI `canvas/viewer/jsm.rs`): the
+node and its cargo feature, tabs with Load / Save, the editor with per-line
+statuses and a pinnable editor for the config overlay, the name tables, the
+press machinery, JSM's timings, and the pass-through / strict toggle. Accepted
+against JoyShockMapper's own `GyroConfigs/xbox.txt` and `Desktop.txt`, which load
+without errors and play. The registrations a module needs are listed under
+*Wiring a new module* in DEVELOPMENT_GUIDELINES.md — the body gate and the
+AutoMap stamping were both missed on the first pass here.
+
+**Phase 2 landed** (engine `eval/modules/jsm/analog.rs`): the trigger threshold
+and JSM's hair trigger, the dual-stage full pull with every skip mode and
+`TRIGGER_SKIP_DELAY`, and digital sticks — `NO_MOUSE` directions in JSM's eight
+sectors, `SCROLL_WHEEL` notches, ring modes, deadzones, axis inversion and
+`CONTROLLER_ORIENTATION`. Ported from JSM's own `processTriggerPress` /
+`processStick` state machines rather than from the README. Accepted end to end:
+`Desktop.txt`'s scroll wheel turns a stick on the bus into wheel notches.
+
+Three deliberate departures, all visible in the editor:
+
+- **A resting trigger has to clear a little noise.** JSM's default threshold is 0
+  — "the slightest press" — which on a pad whose trigger rests a hair above zero
+  would sit on permanently. A threshold of 0 means 0.02 here; anything the config
+  sets above that is used as written.
+- **Only what runs is taken over.** A stick left in a mouse or pad mode, and a
+  full pull the trigger mode never fires, keep passing through instead of going
+  quiet for a binding that can't run. JSM has no equivalent choice to make: its
+  pad is hidden from the game.
+- **The editor says why a binding is inert.** A stick direction bound while that
+  stick aims the mouse, or `ZLF` with `ZL_MODE` left at `NO_FULL`, gets a note on
+  the line. JSM is silent about both, and it is the first thing that confuses
+  someone whose config "doesn't work".
+
+`CONTROLLER_ORIENTATION` turns the sticks now and the gyro when phase 3 arrives;
+`JOYCON_SIDEWAYS` is ignored, since FlexInput treats each Joy-Con as its own
+device.
+
+**Phase 3 landed** (engine `eval/modules/jsm/aim.rs`): the gyro as a mouse —
+`GYRO_SENS` and the `MIN`/`MAX` ramp, `REAL_WORLD_CALIBRATION` / `IN_GAME_SENS`,
+the axis masks and signs, smoothing, the cutoff band, the trackball, and the
+`GYRO_ON` / `GYRO_OFF` buttons (button or stick) alongside the gyro action
+bindings — plus stick `AIM` with its power curve and acceleration, flick stick
+(`FLICK`, `FLICK_ONLY`, `ROTATE_ONLY`, snapping, the eased pay-out and the
+rotation smoother) and `MOUSE_AREA`. Ported from JSM's own IMU callback and
+`handleFlickStick`. Output goes to the bus's `mouse_move`, a per-tick pixel
+displacement — the same thing JSM computes and hands to `moveMouse`.
+
+**The axis convention is the one thing here that wants a pad to confirm it.** JSM
+names gyro axes in its own frame; ours are different, and two of the three are
+pinned by what JSM's *defaults* must do (turn right → aim right, tilt up → aim
+up), which gives JSM's Y = `-gyro_z` and JSM's X = `+gyro_y`. Nothing in JSM's
+defaults uses its Z (roll), so its sign can't be derived the same way: it is
+mapped to `+gyro_x`, and a config that puts `Z` in a mouse axis mask may want
+`GYRO_AXIS_X` / `GYRO_AXIS_Y` inverted. The reasoning is written out at the top
+of `aim.rs`.
+
+Deferred, each with the reason on the line in the editor:
+
+- **Gravity-referenced gyro spaces** (`PLAYER_TURN`, `PLAYER_LEAN`, `WORLD_TURN`,
+  `WORLD_LEAN`). They need a gravity vector in JSM's frame, and ours differs (see
+  [[imu-canonical-frame]]: accel and gyro sit in bases differing by
+  `diag(1,−1,−1)`). Getting that wrong is invisible to a test and wrong on
+  hardware, so it lands with the motion stick in phase 6, which needs the same
+  work.
+- **`MOUSE_RING`** and `SCREEN_RESOLUTION_*`: they place the pointer outright, and
+  the bus has no absolute mouse pin — only displacement.
+- **`HYBRID_AIM`** and its settings cluster (`STICKLIKE_FACTOR`,
+  `MOUSELIKE_FACTOR`, the return-deadzone and edge-push settings).
+- **`FLICK_STICK_OUTPUT` / `VIRTUAL_STICK_CALIBRATION`**: flick to a virtual stick
+  rather than the mouse belongs with pad output in phase 5.
+
+`CALCULATE_REAL_WORLD_CALIBRATION` is ignored with a pointer to the RWS Aim
+module, which is how FlexInput measures real-world sensitivity; `CALIBRATE` as a
+binding runs but recalibrates nothing, because the device card owns that.
+
 1. **Skeleton + parser + digital bindings.** Node, feature gate, bus republish,
    tabs with Load / Save, the editor with diagnostics, name tables, the button
    state machines (tap/hold, all modifiers, chord, simultaneous, diagonal,

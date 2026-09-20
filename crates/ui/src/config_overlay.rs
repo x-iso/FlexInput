@@ -570,6 +570,10 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             if edit { exit_edit = true; } else { close = true; }
         }
 
+        // A pinned widget that scrolls (the JSM editor) takes the wheel here the
+        // same way it does on the canvas — see `canvas/wheel.rs`.
+        crate::canvas::wheel::take_wheel_from_canvas(vctx);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(vctx, |ui| {
@@ -704,11 +708,11 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     if let Some(v) = set_passthrough_default {
         app.set_config_passthrough_default(v);
     }
-    // A pinned RWS calibration widget wrote node params from this viewport, which
-    // the canvas's own edit tracking can't see. Bump the tab canvas generation so
-    // an open sub-patch editor re-pulls those values rather than displaying — or
-    // writing back over them — its stale copy.
-    if crate::canvas::viewer::take_rws_overlay_write(ctx) {
+    // A pinned widget (RWS calibration, the JSM editor) wrote node params from
+    // this viewport, which the canvas's own edit tracking can't see. Bump the tab
+    // canvas generation so an open sub-patch editor re-pulls those values rather
+    // than displaying — or writing back over them — its stale copy.
+    if crate::canvas::viewer::take_overlay_param_write(ctx) {
         let (tab, _, _) = app.overlay_parts();
         tab.canvas.mutation_gen = tab.canvas.mutation_gen.wrapping_add(1);
     }

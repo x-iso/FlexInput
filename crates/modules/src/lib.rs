@@ -3,6 +3,7 @@ pub mod controls;
 pub mod display;
 pub mod generator;
 pub mod input_viewer;
+pub mod jsm;
 pub mod logic;
 pub mod math;
 pub mod menu;
@@ -28,6 +29,7 @@ pub fn all_modules() -> Vec<ModuleRegistration> {
     modules.extend(network::registrations());
     modules.extend(touch::registrations());
     modules.extend(input_viewer::registrations());
+    modules.extend(jsm::registrations());
     modules.extend(menu::registrations());
     modules.extend(macro_module::registrations());
     modules.extend(subpatch::registrations());

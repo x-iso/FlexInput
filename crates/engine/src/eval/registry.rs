@@ -14,7 +14,9 @@ use flexinput_core::Signal;
 
 use crate::graph::NodeSnap;
 
-use super::{audio_stream_haptics_publish, AUDIO_STREAM_HAPTICS_ID};
+use crate::state::NodeState;
+
+use super::{audio_stream_haptics_publish, jsm_publish, AUDIO_STREAM_HAPTICS_ID, JSM_ID};
 
 /// An "injector" publisher (the feedback / network / ASTH shape): it publishes
 /// the node's outputs into the collector + device signal maps under `uid` and
@@ -29,11 +31,24 @@ pub(crate) type PublishFn = fn(
     &mut HashMap<(String, String), Signal>,
 ) -> Vec<Option<Signal>>;
 
+/// The same shape as [`PublishFn`], for a module that also needs its own
+/// per-node state (and the tick's `dt`) — a state machine rather than a filter.
+pub(crate) type PublishStatefulFn = fn(
+    &NodeSnap,
+    usize,
+    &HashMap<(String, String), Signal>,
+    &mut HashMap<(String, String), Signal>,
+    &mut HashMap<usize, NodeState>,
+    f32,
+) -> Vec<Option<Signal>>;
+
 /// Engine-side hooks for one module id. Grows as more of a module's engine
 /// behaviour migrates off the hardcoded dispatch.
 pub(crate) struct EvalHooks {
     /// Replaces the default `compute_node` path with an injector publisher.
     pub(crate) publish: Option<PublishFn>,
+    /// As `publish`, but handed the graph's node state and the tick's `dt`.
+    pub(crate) publish_stateful: Option<PublishStatefulFn>,
 }
 
 /// Look up a module's engine hooks, or `None` to fall through to the hardcoded
@@ -41,10 +56,17 @@ pub(crate) struct EvalHooks {
 pub(crate) fn eval_hooks(module_id: &str) -> Option<&'static EvalHooks> {
     match module_id {
         AUDIO_STREAM_HAPTICS_ID => Some(&ASTH_HOOKS),
+        JSM_ID => Some(&JSM_HOOKS),
         _ => None,
     }
 }
 
 static ASTH_HOOKS: EvalHooks = EvalHooks {
     publish: Some(audio_stream_haptics_publish),
+    publish_stateful: None,
+};
+
+static JSM_HOOKS: EvalHooks = EvalHooks {
+    publish: None,
+    publish_stateful: Some(jsm_publish),
 };

@@ -24,7 +24,7 @@ use crate::state::NodeState;
 use super::aim::{Aim, Gyro};
 use super::analog::{Analog, Pad};
 use super::bind::Runtime;
-use super::names::{Btn, BtnSource, StickId};
+use super::names::{Btn, BtnSource, Out, StickId};
 use super::parse::{compile, Compiled};
 
 /// The bus carries a rotation rate as a fraction of this many degrees per second
@@ -72,34 +72,60 @@ pub(crate) fn jsm_publish(
     dt: f32,
 ) -> Vec<Option<Signal>> {
     let key = format!("collector:{uid}");
-    let strict = snap.params.get("jsm_strict").and_then(|v| v.as_bool()).unwrap_or(false);
+    let strict = snap
+        .params
+        .get("jsm_strict")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let text = active_tab_text(snap);
 
     // Snapshot the upstream bus once, so publishing can't alias the read side.
-    let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
-    let collector_id = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
+    let dev_id = snap
+        .params
+        .get("_automap_device_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let collector_id = snap
+        .params
+        .get("_automap_collector_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let mut upstream: HashMap<String, Signal> = HashMap::new();
     for ap in automap::ALL_PINS {
         let sig = (!collector_id.is_empty())
-            .then(|| collector_sigs.get(&(collector_id.to_string(), ap.id.to_string())).copied())
+            .then(|| {
+                collector_sigs
+                    .get(&(collector_id.to_string(), ap.id.to_string()))
+                    .copied()
+            })
             .flatten()
-            .or_else(|| (!dev_id.is_empty())
-                .then(|| dev_sigs.get(&(dev_id.to_string(), ap.id.to_string())).copied())
-                .flatten());
-        if let Some(s) = sig { upstream.insert(ap.id.to_string(), s); }
+            .or_else(|| {
+                (!dev_id.is_empty())
+                    .then(|| {
+                        dev_sigs
+                            .get(&(dev_id.to_string(), ap.id.to_string()))
+                            .copied()
+                    })
+                    .flatten()
+            });
+        if let Some(s) = sig {
+            upstream.insert(ap.id.to_string(), s);
+        }
     }
 
     // Compile on the first tick and after every edit; a fresh config starts from
     // a clean slate rather than inheriting half-finished presses.
     let ns = state.entry(uid).or_default();
     let gen = text_gen(&text);
-    let st = ns.jsm.get_or_insert_with(|| Box::new(JsmState {
-        gen,
-        cfg: compile(&text),
-        rt: Runtime::default(),
-        analog: Analog::default(),
-        aim: Aim::default(),
-    }));
+    let st = ns.jsm.get_or_insert_with(|| {
+        Box::new(JsmState {
+            gen,
+            cfg: compile(&text),
+            rt: Runtime::default(),
+            analog: Analog::default(),
+            aim: Aim::default(),
+        })
+    });
     if st.gen != gen {
         st.gen = gen;
         st.cfg = compile(&text);
@@ -119,10 +145,15 @@ pub(crate) fn jsm_publish(
     // Then aiming: the gyro and whichever sticks are pointed at the mouse.
     let mouse = {
         let f = |pin: &str| upstream.get(pin).map(|s| s.as_float()).unwrap_or(0.0) * GYRO_REF_DPS;
-        let gyro = Gyro { roll: f("gyro_x"), pitch: f("gyro_y"), yaw: f("gyro_z") };
+        let gyro = Gyro {
+            roll: f("gyro_x"),
+            pitch: f("gyro_y"),
+            yaw: f("gyro_z"),
+        };
         let analog = &st.analog;
         let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog) };
-        st.aim.tick(&st.cfg.aim, dt, gyro, &st.analog, &gyro_actions, &held)
+        st.aim
+            .tick(&st.cfg.aim, dt, gyro, &st.analog, &gyro_actions, &held)
     };
 
     // What the config takes over from the pad.
@@ -135,19 +166,45 @@ pub(crate) fn jsm_publish(
             }
         }
     } else {
-        remapper_pass_through_and_suppress(&key, &upstream, &claimed_digital, &claimed_analog, collector_sigs);
+        remapper_pass_through_and_suppress(
+            &key,
+            &upstream,
+            &claimed_digital,
+            &claimed_analog,
+            collector_sigs,
+        );
     }
     let typing = jsm_editor_focus();
-    for pin in driven {
-        if typing && types_into_the_editor(&pin) { continue; }
-        let on = on_value(&pin);
-        collector_sigs.insert((key.clone(), pin), on);
+    let held: HashSet<String> = driven.iter().cloned().collect();
+
+    // EVERY pin the config can ever drive gets a definitive value every tick —
+    // on while it is held, off the rest of the time. A sink latches what it was
+    // last told, and most of these pins (`key_e` and the like) are outside
+    // ALL_PINS, so nothing else on the bus ever carries their off value: saying
+    // it once on the tick of release is not enough, because a tick where nobody
+    // downstream looks leaves the key down for good. This is the rule the
+    // Remapper follows for its own output pins.
+    for pin in claimed_outputs(&st.cfg) {
+        // A pin the pad itself drives is the pass-through's to answer for: the
+        // config saying "off" here would fight it every tick it isn't pressed.
+        if upstream.contains_key(&pin) && !held.contains(&pin) {
+            continue;
+        }
+        // While an editor has focus the keys and mouse pause, and pause means
+        // released — a binding under test shouldn't freeze mid-press.
+        let on = held.contains(&pin) && !(typing && types_into_the_editor(&pin));
+        let sig = if on { on_value(&pin) } else { pin_off_value(&pin) };
+        collector_sigs.insert((key.clone(), pin), sig);
     }
+
     // Aiming, as one displacement for this tick. `mouse_move` is applied as it
     // stands rather than integrated, which is what JSM computes; the axis pins
-    // are left alone so a sink wired to both doesn't move twice.
-    if mouse != Vec2::ZERO && !typing {
-        collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(mouse));
+    // are left alone so a sink wired to both doesn't move twice. It is published
+    // every tick the config aims, zero included — a latched displacement would
+    // otherwise keep nudging the cursor for ever.
+    if aims_anything(&st.cfg) {
+        let m = if typing { Vec2::ZERO } else { mouse };
+        collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m));
     }
 
     // output[0] is the AutoMap pass-through, which carries no scalar.
@@ -157,7 +214,11 @@ pub(crate) fn jsm_publish(
 /// The text of the tab the module is applying.
 fn active_tab_text(snap: &NodeSnap) -> String {
     let tabs = snap.params.get("jsm_tabs").and_then(|v| v.as_array());
-    let active = snap.params.get("jsm_active_tab").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let active = snap
+        .params
+        .get("jsm_active_tab")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
     tabs.and_then(|t| t.get(active).or_else(|| t.first()))
         .and_then(|t| t.get("text"))
         .and_then(|v| v.as_str())
@@ -180,8 +241,14 @@ fn read_pad(upstream: &HashMap<String, Signal>) -> Pad {
             return (v.x, v.y);
         }
         (
-            upstream.get(&format!("{name}_x")).map(|s| s.as_float()).unwrap_or(0.0),
-            upstream.get(&format!("{name}_y")).map(|s| s.as_float()).unwrap_or(0.0),
+            upstream
+                .get(&format!("{name}_x"))
+                .map(|s| s.as_float())
+                .unwrap_or(0.0),
+            upstream
+                .get(&format!("{name}_y"))
+                .map(|s| s.as_float())
+                .unwrap_or(0.0),
         )
     };
     Pad {
@@ -199,9 +266,9 @@ fn button_down(btn: Btn, upstream: &HashMap<String, Signal>, analog: &Analog) ->
     let b = |pin: &str| upstream.get(pin).map(|s| s.as_bool()).unwrap_or(false);
     match btn.source() {
         BtnSource::Pin(pin) => b(pin),
-        BtnSource::Trigger { .. }
-        | BtnSource::TriggerFull { .. }
-        | BtnSource::Stick { .. } => analog.down(btn),
+        BtnSource::Trigger { .. } | BtnSource::TriggerFull { .. } | BtnSource::Stick { .. } => {
+            analog.down(btn)
+        }
         BtnSource::Motion { .. }
         | BtnSource::Lean { .. }
         | BtnSource::Touch
@@ -215,20 +282,31 @@ fn claimed_pins(cfg: &Compiled) -> (HashSet<String>, HashSet<String>) {
     let mut digital = HashSet::new();
     let mut analog = HashSet::new();
     let stick_pins = |stick: StickId| {
-        let name = match stick { StickId::Left => "left_stick", StickId::Right => "right_stick" };
+        let name = match stick {
+            StickId::Left => "left_stick",
+            StickId::Right => "right_stick",
+        };
         [name.to_string(), format!("{name}_x"), format!("{name}_y")]
     };
     // A stick pointed at the mouse is the config's whether or not a binding ever
     // names one of its directions.
-    for (stick, s) in [(StickId::Left, cfg.settings.left), (StickId::Right, cfg.settings.right)] {
+    for (stick, s) in [
+        (StickId::Left, cfg.settings.left),
+        (StickId::Right, cfg.settings.right),
+    ] {
         if s.mode.aims() {
             analog.extend(stick_pins(stick));
         }
     }
     for &btn in &cfg.mentioned {
         match btn.source() {
-            BtnSource::Pin(pin) => { digital.insert(pin.to_string()); }
-            BtnSource::Trigger { analog: a, digital: d } => {
+            BtnSource::Pin(pin) => {
+                digital.insert(pin.to_string());
+            }
+            BtnSource::Trigger {
+                analog: a,
+                digital: d,
+            } => {
                 analog.insert(a.to_string());
                 digital.insert(d.to_string());
             }
@@ -236,8 +314,14 @@ fn claimed_pins(cfg: &Compiled) -> (HashSet<String>, HashSet<String>) {
             // default NO_FULL) claims nothing, so the trigger isn't silenced for
             // a binding that can't run.
             BtnSource::TriggerFull { analog: a } => {
-                let mode = if btn == Btn::Zlf { cfg.settings.zl } else { cfg.settings.zr };
-                if mode.has_full() { analog.insert(a.to_string()); }
+                let mode = if btn == Btn::Zlf {
+                    cfg.settings.zl
+                } else {
+                    cfg.settings.zr
+                };
+                if mode.has_full() {
+                    analog.insert(a.to_string());
+                }
             }
             // A stick the config reads — as directions, or to aim with — is the
             // config's; one left in a mode we don't run yet passes through
@@ -269,6 +353,41 @@ fn claimed_pins(cfg: &Compiled) -> (HashSet<String>, HashSet<String>) {
     (digital, analog)
 }
 
+/// Every pin the compiled config could drive, whatever the event that would do
+/// it. These are the pins the module answers for each tick.
+fn claimed_outputs(cfg: &Compiled) -> Vec<String> {
+    let mut pins: HashSet<String> = HashSet::new();
+    for b in &cfg.bindings {
+        for step in &b.steps {
+            match &step.out {
+                Out::Pin(p) | Out::Pulse(p) => { pins.insert(p.clone()); }
+                _ => {}
+            }
+        }
+    }
+    pins.into_iter().collect()
+}
+
+/// Is any part of this config aiming the mouse?
+fn aims_anything(cfg: &Compiled) -> bool {
+    cfg.aim.min_sens != (0.0, 0.0)
+        || cfg.aim.max_sens != (0.0, 0.0)
+        || cfg.settings.left.mode.aims()
+        || cfg.settings.right.mode.aims()
+}
+
+/// A pin's released value, in the type it is declared with — a virtual pad's
+/// trigger goes to 0.0, not to `false`.
+fn pin_off_value(pin: &str) -> Signal {
+    match automap::ALL_PINS.iter().find(|ap| ap.id == pin).map(|ap| ap.signal_type) {
+        Some(SignalType::Float) => Signal::Float(0.0),
+        Some(SignalType::Int) => Signal::Int(0),
+        Some(SignalType::Vec2) => Signal::Vec2(Vec2::ZERO),
+        // Keys and mouse buttons aren't in ALL_PINS at all; they are booleans.
+        _ => Signal::Bool(false),
+    }
+}
+
 fn off_value(ty: SignalType) -> Option<Signal> {
     Some(match ty {
         SignalType::Bool => Signal::Bool(false),
@@ -282,7 +401,11 @@ fn off_value(ty: SignalType) -> Option<Signal> {
 /// A driven pin's "on" value: a button is true, an analog destination (a virtual
 /// pad's trigger, say) goes to full.
 fn on_value(pin: &str) -> Signal {
-    match automap::ALL_PINS.iter().find(|ap| ap.id == pin).map(|ap| ap.signal_type) {
+    match automap::ALL_PINS
+        .iter()
+        .find(|ap| ap.id == pin)
+        .map(|ap| ap.signal_type)
+    {
         Some(SignalType::Float) => Signal::Float(1.0),
         Some(SignalType::Int) => Signal::Int(1),
         _ => Signal::Bool(true),

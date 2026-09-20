@@ -294,6 +294,14 @@ fn eval_subgraph(
             last_outputs.insert(ns_uid, out);
             continue;
         }
+        // Same seam, for a module that runs a state machine over its own node
+        // state (and so needs `state` + `dt`). Migrated: module.jsm.
+        if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish_stateful) {
+            let out = publish(snap, ns_uid, dev_sigs, collector_sigs, state, dt);
+            computed[idx] = out.clone();
+            last_outputs.insert(ns_uid, out);
+            continue;
+        }
         // Network Send / Receive nested in a sub-patch. Publish under the
         // NAMESPACED uid so the socket, collector pass-through, and downstream
         // sink lookup all agree (mirrors ASTH's nested arm above).
@@ -639,6 +647,12 @@ pub fn eval_graph_tick(
         // target pad's feedback (output[0] = passthrough, output[1..] = band EFs +
         // carrier freqs; see audio_stream_haptics_publish). Publishes under the
         // node's top-level uid here.
+        if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish_stateful) {
+            let out = publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs, state, dt);
+            last_outputs.insert(snap.node_uid, out.clone());
+            computed[idx] = out;
+            continue;
+        }
         if let Some(publish) = eval_hooks(&snap.module_id).and_then(|h| h.publish) {
             let out = publish(snap, snap.node_uid, dev_sigs, &mut collector_sigs);
             last_outputs.insert(snap.node_uid, out.clone());
