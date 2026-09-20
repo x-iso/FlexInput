@@ -13,6 +13,7 @@ mod aim;
 mod analog;
 mod bind;
 mod eval;
+mod feedback;
 mod motion;
 mod names;
 mod pad;

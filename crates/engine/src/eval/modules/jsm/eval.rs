@@ -359,6 +359,29 @@ pub(crate) fn jsm_publish(
         collector_sigs.insert((key.clone(), "mouse_move".to_string()), Signal::Vec2(m));
     }
 
+    // ── what goes back to the pad ────────────────────────────────────────────
+    //
+    // Rumble, the light bar and the adaptive triggers are the only things this
+    // module sends BACKWARDS. They go on the override layer, which drops the game's
+    // own feedback for whichever group they touch — the same thing JSM does while
+    // it owns the pad. `RUMBLE = ON` (the default) leaves the rumble group alone so
+    // the game keeps it; a binding rumbling, or `RUMBLE = OFF`, takes it over.
+    //
+    // The destination is the physical pad upstream of this node, stamped by the
+    // graph builder the way Audio Stream Haptics' is. With nothing resolved there
+    // is nowhere to send it, and the editor says as much on the line.
+    let dest_dev = snap
+        .params
+        .get("_jsm_dest_dev")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !dest_dev.is_empty() {
+        let fb_key = format!("{}{dest_dev}", crate::eval::feedback::FEEDBACK_OVERRIDE);
+        for (pin, v) in super::feedback::pins(&res.fb, outputs.rumble) {
+            collector_sigs.insert((fb_key.clone(), pin.to_string()), Signal::Float(v));
+        }
+    }
+
     // output[0] is the AutoMap pass-through, which carries no scalar.
     vec![None; snap.n_outputs.max(1)]
 }

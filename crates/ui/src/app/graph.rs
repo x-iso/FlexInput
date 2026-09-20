@@ -1345,6 +1345,25 @@ pub(crate) fn build_processing_graph_rec(
         // injected into — the upstream physical source on AutoMap input 0 (same
         // resolution as Feedback Control's `_fb_source_dev`). The eval block keys
         // `feedback_inject:{_asth_dest_dev}`, drained by the feedback post-pass.
+        // JSM Config: the same resolution, for the same reason. A config's
+        // `RUMBLE`, `LIGHT_BAR` and trigger-effect settings take those kinds of
+        // feedback over from the game, which the eval block writes as
+        // `feedback_override:{_jsm_dest_dev}`.
+        if node.module_id == "module.jsm" {
+            let dest_dev = {
+                let pin = snarl.in_pin(InPinId { node: *node_id, input: 0 });
+                pin.remotes.first()
+                    .and_then(|&src| find_automap_device_rec(snarl, src, parents))
+                    .map(|(dev_id, _, fallback)| {
+                        if is_real_device_id(&dev_id) { dev_id } else { fallback.unwrap_or(dev_id) }
+                    })
+                    .filter(|d| !d.is_empty())
+            };
+            if let Some(d) = dest_dev {
+                params.insert("_jsm_dest_dev".to_string(), serde_json::Value::String(d));
+            }
+        }
+
         if node.module_id == "module.audio_stream_haptics" {
             let dest_dev = {
                 let pin = snarl.in_pin(InPinId { node: *node_id, input: 0 });

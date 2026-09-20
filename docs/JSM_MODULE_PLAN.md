@@ -483,6 +483,60 @@ motion, and one per finger — now run through the one `Analog::stick` routine, 
 is what makes `MUP` behave exactly as `LUP` does and what let the motion and touch
 sticks inherit every stick mode, virtual-pad output included, for free.
 
+**Phase 7 landed** (`jsm/feedback.rs`): rumble, the light bar and the adaptive
+triggers — the only things this module sends *backwards*. They go out as
+`feedback_override:{pad}`, the layer that takes a kind of feedback over from the
+game, which is what JSM does while it owns the pad. The destination is the physical
+pad upstream, stamped as `_jsm_dest_dev` by the graph builder exactly the way Audio
+Stream Haptics' is; with nothing resolved, nothing is published rather than a stray
+override nobody drains.
+
+**`RUMBLE` decides who owns the group, and that needed care.** With it on (JSM's
+default) the rumble group is left alone so the game keeps it — claiming it and
+writing zero would silence a game that was rumbling perfectly well. With it off, or
+while a binding is rumbling, the group *is* claimed and a definitive value written
+every tick, zero included. That is the same rule the output pins follow: a latched
+amplitude buzzes for ever.
+
+### The adaptive triggers do not line up, and the editor says so
+
+JSM carries the DualSense's full vocabulary — seven usable modes, up to six
+parameters. Our bus carries the four the DualSense encoder implements. Four of
+JSM's seven land exactly:
+
+| JSM | ours | JSM's parameters |
+| --- | --- | --- |
+| `ON` (default) | *nothing* — left as the game set it | — |
+| `OFF` | off | — |
+| `RESISTANCE` | feedback | start, force |
+| `SEMI_AUTOMATIC` | weapon | start, end, force |
+| `AUTOMATIC` | vibration | start, force, frequency |
+
+`BOW`, `GALLOPING` and `MACHINE` need two forces or a second frequency, and there
+is nowhere on the bus to put them. A config asking for one **is not an error** —
+JSM knows the name and so do we — but the line says what will actually happen and
+names the nearest thing that works, and the trigger is left as the game set it
+rather than quietly given something that feels wrong. Extending the bus to carry
+them touches the pin list, the DualSense encoder and every feedback-producing
+module's vocabulary; that belongs on its own, not smuggled in here.
+
+Units are JSM's own: zones 0-9, force 0-7, frequency 0-255. Our pins are all
+`Float` 0..1 with the device layer scaling each back, so every value is divided by
+its JSM maximum on the way out and a config's numbers mean what they meant.
+
+Two details worth keeping:
+
+- **`ADAPTIVE_TRIGGER = OFF` overrules whatever effect is set** — one switch to
+  stop the triggers fighting you, which is how JSM uses it.
+- **`#RRGGBB` can never be a light-bar colour**, because `#` starts a comment and
+  takes the value with it. The parser used to accept it, which was dead code; now
+  the error says why, so it reads as the config grammar rather than a parser bug.
+
+`LEFT_TRIGGER_OFFSET` / `_RANGE` are ignored with a reason: JSM writes them from
+its own trigger-calibration routine in the DualSense's raw travel, and our effect
+zones are fractions of the trigger already — so there is nothing to declare, and
+calibration is the device card's job here.
+
 ## `X_` and `PS_` names stay aliases
 
 Raised after hands-on testing: since `PS_UP` and `X_UP` land on the same
@@ -637,8 +691,10 @@ Plus one command, `ONE_EURO_FILTER`, and one new gyro space, `YAW_PLUS_ROLL`.
 6. **Touchpad and motion stick.** Grid, touch sticks, dual stage, motion stick
    and lean.
    *(landed — see above)*
-7. **Feedback.** Rumble on/off, light bar, adaptive triggers (plus the pin-model
-   extension for bow / galloping / machine), rumble bindings.
+7. **Feedback.** Rumble on/off, light bar, adaptive triggers, rumble bindings.
+   *(landed — see above. The pin-model extension for bow / galloping / machine is
+   deliberately NOT part of it: those three are reported honestly instead, and
+   extending the bus is its own change.)*
 8. **Action layers.** Quoted commands, including loading another tab, and
    `RESET_MAPPINGS`.
 9. **The custom-curve fork.** The five acceleration curves, decay smoothing, the

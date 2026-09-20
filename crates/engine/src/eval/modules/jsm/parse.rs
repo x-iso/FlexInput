@@ -124,6 +124,7 @@ pub struct Resolved {
     pub pad: super::pad::Settings,
     pub motion: super::motion::Settings,
     pub touch: super::touch::Settings,
+    pub fb: super::feedback::Settings,
     /// Per stick: a chord is supplying its mode right now. When that stops the
     /// stick has to be let alone until it comes back to centre, or releasing the
     /// chord mid-push would hand the base mode a stick already out at full.
@@ -142,6 +143,7 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
         pad: cfg.pad,
         motion: cfg.motion,
         touch: cfg.touch,
+        fb: cfg.fb,
         stick_mode_chorded: [false; 2],
     };
     if cfg.modeshifts.is_empty() {
@@ -160,6 +162,7 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
                     pad: &mut r.pad,
                     motion: &mut r.motion,
                     touch: &mut r.touch,
+                    fb: &mut r.fb,
                 },
             );
             if let Support::Analog(AnalogId::StickMode(side)) = ms.support {
@@ -209,6 +212,8 @@ pub struct Compiled {
     pub motion: super::motion::Settings,
     /// The touchpad.
     pub touch: super::touch::Settings,
+    /// Rumble, the light bar, the adaptive triggers.
+    pub fb: super::feedback::Settings,
     /// A bare `SET_MOTION_STICK_NEUTRAL` line: take the pad's resting orientation
     /// as the motion stick's centre once the config is running.
     pub neutral_at_load: bool,
@@ -248,6 +253,7 @@ pub fn compile(text: &str) -> Compiled {
         pad: super::pad::Settings::default(),
         motion: super::motion::Settings::default(),
         touch: super::touch::Settings::default(),
+        fb: super::feedback::Settings::default(),
         neutral_at_load: false,
         modeshifts: Vec::new(),
         mentioned: HashSet::new(),
@@ -438,6 +444,7 @@ fn setting_line(name: &str, rhs: &str, support: Support, out: &mut Compiled) -> 
             pad: &mut out.pad,
             motion: &mut out.motion,
             touch: &mut out.touch,
+            fb: &mut out.fb,
         },
     )
 }
@@ -458,6 +465,7 @@ fn modeshift_line(
     let mut p = out.pad;
     let mut mo = out.motion;
     let mut tp = out.touch;
+    let mut fbk = out.fb;
     let info = apply_setting(
         name,
         rhs,
@@ -469,6 +477,7 @@ fn modeshift_line(
             pad: &mut p,
             motion: &mut mo,
             touch: &mut tp,
+            fb: &mut fbk,
         },
     );
     // A setting a later phase owns says so, and the modeshift waits with it.
@@ -496,10 +505,11 @@ pub(crate) struct Knobs<'a> {
     pub pad: &'a mut super::pad::Settings,
     pub motion: &'a mut super::motion::Settings,
     pub touch: &'a mut super::touch::Settings,
+    pub fb: &'a mut super::feedback::Settings,
 }
 
 pub(crate) fn apply_setting(name: &str, rhs: &str, support: Support, k: Knobs<'_>) -> LineInfo {
-    let Knobs { timings, settings, aim, pad, motion, touch } = k;
+    let Knobs { timings, settings, aim, pad, motion, touch, fb } = k;
     match support {
         Support::Analog(which) => analog_setting(name, rhs, which, settings),
         Support::Aim(which) => aim_setting(name, rhs, which, aim),
@@ -507,6 +517,7 @@ pub(crate) fn apply_setting(name: &str, rhs: &str, support: Support, k: Knobs<'_
         Support::Motion(which) => {
             motion_setting(name, rhs, which, motion, settings, touch)
         }
+        Support::Fb(which) => fb_setting(name, rhs, which, fb),
         Support::Timing(which) => {
             let Some(ms) = rhs
                 .split_whitespace()
@@ -590,7 +601,6 @@ fn binding_line(
         })
         .collect();
     let pending_out = steps.iter().find_map(|s| match &s.out {
-        Out::Rumble { .. } => Some(PHASE_FEEDBACK),
         Out::Command(_) => Some(PHASE_LAYERS),
         _ => None,
     });
@@ -1730,6 +1740,176 @@ const GRAVITY_NOTE: &str = "needs the pad's accelerometer: which way is down is 
                             watching where the pad is pulled, so it takes a moment to settle \
                             after the pad connects";
 
+
+// ── feedback: rumble, the light bar, the adaptive triggers ────────────────────
+
+/// Which of phase 7's settings a line sets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum FbId {
+    Rumble,
+    LightBar,
+    Adaptive,
+    /// `LEFT_TRIGGER_EFFECT` / `RIGHT_TRIGGER_EFFECT`; `true` is the right one.
+    Effect(bool),
+}
+
+fn fb_setting(name: &str, rhs: &str, which: FbId, f: &mut super::feedback::Settings) -> LineInfo {
+    use super::feedback::Effect;
+    let wants = |what: &str| LineInfo::of(LineStatus::Error(format!("`{name}` wants {what}")));
+    let ok = LineInfo::of(LineStatus::Ok);
+    let mut words = rhs.split_whitespace();
+    let first = words.next().unwrap_or("").to_ascii_uppercase();
+
+    match which {
+        FbId::Rumble => match on_off(&first) {
+            Some(on) => {
+                f.rumble = on;
+                let mut info = ok;
+                if !on {
+                    info.notes.push(
+                        "the game's rumble stops reaching the pad while this config runs, as in \
+                         JSM — a binding can still rumble it (`SMALL_RUMBLE`, `Rhhhh`)"
+                            .to_string(),
+                    );
+                }
+                info
+            }
+            None => wants("ON or OFF"),
+        },
+        FbId::Adaptive => match on_off(&first) {
+            Some(on) => {
+                f.adaptive = on;
+                ok
+            }
+            None => wants("ON or OFF"),
+        },
+        FbId::LightBar => match colour(&first) {
+            Some(rgb) => {
+                f.light_bar = rgb;
+                ok
+            }
+            None => wants(
+                "a colour name (RED, GREEN, BLUE, WHITE, BLACK, YELLOW, CYAN, MAGENTA, ORANGE, \
+                 PURPLE, PINK, GREY) or a hex value like xFF8000 — not #FF8000, since `#` \
+                 starts a comment and takes the value with it",
+            ),
+        },
+        FbId::Effect(right) => {
+            // JSM reads the parameters positionally, in an order that differs per
+            // mode, so each arm takes exactly the numbers its mode uses.
+            let mut nums = words.map(|w| w.parse::<u32>().ok());
+            let mut next = |what: &str| -> Result<u8, LineInfo> {
+                match nums.next() {
+                    Some(Some(v)) => Ok(v.min(255) as u8),
+                    _ => Err(wants(&format!("{what} after `{first}`"))),
+                }
+            };
+            let effect = match first.as_str() {
+                "ON" => Effect::Auto,
+                "OFF" => Effect::Off,
+                "RESISTANCE" => {
+                    let (start, force) = match (next("a start zone"), next("a force")) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) | (_, Err(e)) => return e,
+                    };
+                    Effect::Resistance { start, force }
+                }
+                "SEMI_AUTOMATIC" => {
+                    let (start, end, force) =
+                        match (next("a start zone"), next("an end zone"), next("a force")) {
+                            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+                            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+                        };
+                    Effect::SemiAutomatic { start, end, force }
+                }
+                "AUTOMATIC" => {
+                    let (start, force, frequency) =
+                        match (next("a start zone"), next("a force"), next("a frequency")) {
+                            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+                            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+                        };
+                    Effect::Automatic { start, force, frequency }
+                }
+                // The three the bus has nowhere to put. Not an error — JSM knows
+                // them and so do we — but the line must say what it will actually
+                // do, and name the nearest thing that works.
+                "BOW" | "GALLOPING" | "MACHINE" => {
+                    let nearest = match first.as_str() {
+                        "BOW" => "SEMI_AUTOMATIC, which clicks between two zones",
+                        "GALLOPING" => "AUTOMATIC, which vibrates from one zone on",
+                        _ => "AUTOMATIC, which vibrates from one zone on",
+                    };
+                    let mut info = LineInfo::of(LineStatus::Ok);
+                    f.trigger[right as usize] = Effect::Auto;
+                    info.notes.push(format!(
+                        "`{first}` needs two forces or a second frequency, and the bus carries \
+                         four trigger effects — off, resistance, a click, and vibration. The \
+                         trigger is left as the game set it; try {nearest}."
+                    ));
+                    return info;
+                }
+                _ => {
+                    return wants(
+                        "ON, OFF, RESISTANCE, SEMI_AUTOMATIC, AUTOMATIC, BOW, GALLOPING or \
+                         MACHINE",
+                    )
+                }
+            };
+            f.trigger[right as usize] = effect;
+            let mut info = LineInfo::of(LineStatus::Ok);
+            if effect != Effect::Auto {
+                info.notes.push(TRIGGER_NOTE.to_string());
+            }
+            info
+        }
+    }
+}
+
+fn on_off(v: &str) -> Option<bool> {
+    match v {
+        "ON" | "TRUE" | "1" => Some(true),
+        "OFF" | "FALSE" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// JSM takes a colour name or a hex value, written `xRRGGBB`. A bare `RRGGBB` is
+/// taken too, since that is what people type — but `#RRGGBB` cannot be: `#` starts
+/// a comment in a JSM config, so the rest of the line is gone before this is
+/// reached.
+fn colour(v: &str) -> Option<(u8, u8, u8)> {
+    let named = match v {
+        "BLACK" => 0x000000,
+        "WHITE" => 0xFFFFFF,
+        "RED" => 0xFF0000,
+        "GREEN" => 0x00FF00,
+        "BLUE" => 0x0000FF,
+        "YELLOW" => 0xFFFF00,
+        "CYAN" => 0x00FFFF,
+        "MAGENTA" | "PINK" => 0xFF00FF,
+        "ORANGE" => 0xFF8000,
+        "PURPLE" => 0x8000FF,
+        "GREY" | "GRAY" => 0x808080,
+        _ => {
+            let hex = v.strip_prefix('X').unwrap_or(v);
+            if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            u32::from_str_radix(hex, 16).ok()?
+        }
+    };
+    Some((
+        ((named >> 16) & 0xFF) as u8,
+        ((named >> 8) & 0xFF) as u8,
+        (named & 0xFF) as u8,
+    ))
+}
+
+/// Said on a line that shapes an adaptive trigger.
+const TRIGGER_NOTE: &str = "only a DualSense has adaptive triggers; on any other pad this does \
+                            nothing, and the pad has to be wired to this module for it to reach \
+                            one";
+
 // ── the settings table ───────────────────────────────────────────────────────
 
 /// Said on every line whose output can only land on a virtual pad. A config full
@@ -1743,7 +1923,6 @@ const PHASE_GYRO: &str = "gyro, flick stick and real-world calibration arrive in
 const PHASE_ABSOLUTE: &str =
     "placing the pointer outright needs an absolute mouse pin, which the bus doesn't have yet";
 const PHASE_HYBRID: &str = "HYBRID_AIM arrives after the rest of aiming";
-const PHASE_FEEDBACK: &str = "rumble, light bar and adaptive triggers arrive in phase 7";
 const PHASE_LAYERS: &str = "loading another config arrives in phase 8";
 
 const WHY_DEVICE_CARD: &str = "the device card owns calibration in FlexInput";
@@ -1763,6 +1942,7 @@ pub(crate) enum Support {
     Aim(AimId),
     Pad(PadId),
     Motion(MotionId),
+    Fb(FbId),
     Pending(&'static str),
     Ignored(&'static str),
 }
@@ -1879,15 +2059,20 @@ fn setting_support(name: &str) -> Option<Support> {
         "LEAN_THRESHOLD" => Motion(MotionId::LeanThreshold),
 
         // Feedback.
-        "RUMBLE"
-        | "LIGHT_BAR"
-        | "ADAPTIVE_TRIGGER"
-        | "LEFT_TRIGGER_EFFECT"
-        | "RIGHT_TRIGGER_EFFECT"
-        | "LEFT_TRIGGER_OFFSET"
-        | "LEFT_TRIGGER_RANGE"
-        | "RIGHT_TRIGGER_OFFSET"
-        | "RIGHT_TRIGGER_RANGE" => Pending(PHASE_FEEDBACK),
+        "RUMBLE" => Fb(FbId::Rumble),
+        "LIGHT_BAR" => Fb(FbId::LightBar),
+        "ADAPTIVE_TRIGGER" => Fb(FbId::Adaptive),
+        "LEFT_TRIGGER_EFFECT" => Fb(FbId::Effect(false)),
+        "RIGHT_TRIGGER_EFFECT" => Fb(FbId::Effect(true)),
+        // JSM writes these from its own trigger-calibration routine, in the
+        // DualSense's raw 0-255 travel, and uses them to place an effect zone. Our
+        // pins are zones along the trigger already, so the physical travel never
+        // needs declaring — and calibration is the device card's job here.
+        "LEFT_TRIGGER_OFFSET" | "LEFT_TRIGGER_RANGE" | "RIGHT_TRIGGER_OFFSET"
+        | "RIGHT_TRIGGER_RANGE" => Ignored(
+            "trigger travel is measured by the device card; effect zones here are fractions of \
+             it, so there is nothing to declare",
+        ),
 
         // FlexInput's own business.
         "AUTOLOAD" => Ignored("FlexInput loads profiles its own way"),

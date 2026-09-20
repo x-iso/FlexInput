@@ -736,11 +736,15 @@ pub struct ModuleDescriptor {
     (and marked consumed); on: only the config's own output is published
   - `jsm_editor_w`, `jsm_editor_h: f32` — the editor's size in the node body,
     dragged by the grip in its bottom-right corner
+  - `_jsm_dest_dev` — the physical pad its rumble / light bar / trigger effects go
+    back to, stamped by the graph builder (same resolution as ASTH's
+    `_asth_dest_dev`)
 - **Engine:** `eval/modules/jsm/` — `parse` (grammar + a status per line),
   `analog` (triggers and all five of JSM's sticks as its buttons), `aim` (gyro and
   sticks as mouse movement), `pad` (whatever drives a virtual pad instead),
   `motion` (gravity: lean, the motion stick, the gravity gyro spaces), `touch`
-  (the touchpad), `bind` (the press machinery), `eval` (bus in, bus out).
+  (the touchpad), `feedback` (what goes back to the pad), `bind` (the press
+  machinery), `eval` (bus in, bus out).
   Registered through the registry seam's stateful publisher hook; state lives in
   `NodeState::jsm`
 - **Editor:** the body is the config text, each line tinted by what the parser
@@ -748,7 +752,7 @@ pub struct ModuleDescriptor {
   has keyboard focus the config's key and mouse output pauses, so a binding under
   test can't type into it. The wheel over the editor scrolls the config instead of
   panning the canvas (`canvas/wheel.rs`).
-- **Live so far (plan phases 1-6):** digital bindings (tap/hold, all modifiers,
+- **Live so far (plan phases 1-7):** digital bindings (tap/hold, all modifiers,
   chord, simultaneous, diagonal, double press, turbo) and JSM's timing settings;
   analog triggers (`TRIGGER_THRESHOLD` including the hair trigger, `ZL_MODE` /
   `ZR_MODE` full pull with every skip mode, `TRIGGER_SKIP_DELAY`); digital sticks
@@ -768,9 +772,12 @@ pub struct ModuleDescriptor {
   (`MOTION_STICK_MODE` including `LEFT_STEER_X`, plus `SET_MOTION_STICK_NEUTRAL`),
   the lean buttons, and the gravity-referenced gyro spaces (`PLAYER_TURN`,
   `PLAYER_LEAN`, `WORLD_TURN`, `WORLD_LEAN`). **Every button JSM has can now be
-  read**, with a test asserting it. Feedback and action layers arrive in later
-  phases — their lines compile as "pending" and say which phase will run them, as
-  does `MOUSE_RING`.
+  read**, with a test asserting it. And phase 7: feedback — `RUMBLE`, `LIGHT_BAR`,
+  `ADAPTIVE_TRIGGER`, the two `*_TRIGGER_EFFECT` settings, and rumble bindings
+  (`SMALL_RUMBLE`, `BIG_RUMBLE`, `Rhhhh`), published as
+  `feedback_override:{_jsm_dest_dev}` so they replace the game's rather than add to
+  it. Action layers arrive in phase 8 — those lines compile as "pending" and say
+  so, as do `MOUSE_RING` and `HYBRID_AIM`.
 - **What it takes over:** only what it actually runs. A stick left in a mode a
   later phase owns, and a full pull the trigger mode never fires, keep passing
   through rather than going quiet for a binding that can't run; the line says why.

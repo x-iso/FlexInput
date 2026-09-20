@@ -413,8 +413,8 @@ fn recognised_but_not_live_settings_name_their_phase() {
     for line in [
         "RIGHT_STICK_MODE = HYBRID_AIM",
         "RIGHT_STICK_MODE = MOUSE_RING",
-        "RUMBLE = OFF",
-        "LIGHT_BAR = RED",
+        "SCREEN_RESOLUTION_X = 1920",
+        "STICKLIKE_FACTOR = 1",
     ] {
         assert!(
             matches!(one(line).status, LineStatus::Pending(_)),
@@ -423,7 +423,7 @@ fn recognised_but_not_live_settings_name_their_phase() {
     }
     // A modeshift waits with whatever setting it changes.
     assert!(
-        matches!(one("ZL,RUMBLE = OFF").status, LineStatus::Pending(p) if p.contains("rumble"))
+        matches!(one("ZL,STICKLIKE_FACTOR = 1").status, LineStatus::Pending(p) if p.contains("HYBRID_AIM"))
     );
 }
 
@@ -548,7 +548,7 @@ fn every_button_jsm_has_can_be_read() {
 
 #[test]
 fn the_summary_counts_what_the_editor_shows() {
-    let c = compile("S = SPACE\nRUMBLE = OFF\nAUTOLOAD = OFF\nFLOOMP = A");
+    let c = compile("S = SPACE\nSTICKLIKE_FACTOR = 1\nAUTOLOAD = OFF\nFLOOMP = A");
     assert_eq!(c.summary(), (1, 1, 1));
 }
 
@@ -3470,4 +3470,370 @@ fn a_finger_alone_never_counts_as_a_click() {
             );
         }
     }
+}
+
+// ── phase 7: feedback ────────────────────────────────────────────────────────
+
+/// What the feedback side wants written, as a lookup.
+fn fb_pins(text: &str, rumble: Option<(f32, f32)>) -> HashMap<String, f32> {
+    let c = compile(text);
+    assert!(errors(&c).is_empty(), "config should compile: {:?}", errors(&c));
+    super::feedback::pins(&c.fb, rumble)
+        .into_iter()
+        .map(|(p, v)| (p.to_string(), v))
+        .collect()
+}
+
+/// The light bar is set from a name or from hex, and reaches the pad as three
+/// channels.
+#[test]
+fn the_light_bar_takes_a_name_or_a_hex_value() {
+    let red = fb_pins("LIGHT_BAR = RED", None);
+    assert_eq!(red.get("lightbar_r"), Some(&1.0));
+    assert_eq!(red.get("lightbar_g"), Some(&0.0));
+    assert_eq!(red.get("lightbar_b"), Some(&0.0));
+
+    // JSM writes hex as `xRRGGBB`, and a bare one is taken too.
+    for spelling in ["LIGHT_BAR = x0000FF", "LIGHT_BAR = 0000FF"] {
+        let blue = fb_pins(spelling, None);
+        assert_eq!(blue.get("lightbar_b"), Some(&1.0), "{spelling}");
+        assert_eq!(blue.get("lightbar_r"), Some(&0.0), "{spelling}");
+    }
+
+    // And JSM's own default is white.
+    let plain = fb_pins("", None);
+    assert_eq!(plain.get("lightbar_r"), Some(&1.0));
+    assert_eq!(plain.get("lightbar_g"), Some(&1.0));
+    assert_eq!(plain.get("lightbar_b"), Some(&1.0));
+
+    assert!(matches!(one("LIGHT_BAR = TARTAN").status, LineStatus::Error(_)));
+
+    // `#RRGGBB` can never work: `#` starts a comment, so the value is gone before
+    // the colour is read. The error has to point that out, or it reads as a parser
+    // bug rather than as the config grammar.
+    match one("LIGHT_BAR = #0000FF").status {
+        LineStatus::Error(why) => assert!(
+            why.contains("starts a comment"),
+            "it explains why a hash cannot work: {why}"
+        ),
+        other => panic!("a commented-out value should be an error, got {other:?}"),
+    }
+}
+
+/// `RUMBLE = ON` (the default) leaves the game's rumble alone; `OFF` takes the
+/// group over and holds it at zero, which is the only way to stop it.
+#[test]
+fn rumble_off_takes_the_rumble_over_and_on_leaves_it_be() {
+    let on = fb_pins("RUMBLE = ON", None);
+    assert!(
+        !on.contains_key("rumble_strong"),
+        "with rumble on the group is left for the game: {on:?}"
+    );
+
+    let off = fb_pins("RUMBLE = OFF", None);
+    assert_eq!(
+        off.get("rumble_strong"),
+        Some(&0.0),
+        "with it off the group is claimed and held at zero: {off:?}"
+    );
+    assert_eq!(off.get("rumble_weak"), Some(&0.0));
+
+    // And the line says what it costs.
+    let line = one("RUMBLE = OFF");
+    assert!(
+        line.notes.iter().any(|n| n.contains("game's rumble stops")),
+        "it says the game's rumble stops: {:?}",
+        line.notes
+    );
+}
+
+/// A binding that rumbles takes the group over for as long as it is rumbling, even
+/// with `RUMBLE = ON` — and hands it straight back, or the pad would buzz for ever.
+#[test]
+fn a_rumble_binding_claims_the_group_only_while_it_rumbles() {
+    let quiet = fb_pins("RUMBLE = ON", None);
+    assert!(!quiet.contains_key("rumble_strong"), "nothing asking, nothing claimed");
+
+    let buzzing = fb_pins("RUMBLE = ON", Some((1.0, 0.5)));
+    assert_eq!(buzzing.get("rumble_strong"), Some(&1.0));
+    assert_eq!(buzzing.get("rumble_weak"), Some(&0.5));
+}
+
+/// JSM's own rumble amplitudes, as its names and its hex form give them.
+#[test]
+fn a_rumble_binding_carries_jsms_own_amplitudes() {
+    // `BIG_RUMBLE` is RFFFF, `SMALL_RUMBLE` is R0080 — high byte strong, low weak.
+    let big = steps("S = BIG_RUMBLE");
+    assert_eq!(big[0].out, super::names::Out::Rumble { strong: 1.0, weak: 1.0 });
+    let small = steps("S = SMALL_RUMBLE");
+    assert_eq!(
+        small[0].out,
+        super::names::Out::Rumble { strong: 0.0, weak: 128.0 / 255.0 }
+    );
+    let hex = steps("S = R8040");
+    assert_eq!(
+        hex[0].out,
+        super::names::Out::Rumble { strong: 128.0 / 255.0, weak: 64.0 / 255.0 }
+    );
+}
+
+/// The four adaptive-trigger effects our bus can carry, with JSM's own numbers
+/// landing on the right pins at the right scale.
+#[test]
+fn the_trigger_effects_our_bus_carries_land_on_their_pins() {
+    // `RESISTANCE start force` — zones are 0-9, force 0-7.
+    let r = fb_pins("LEFT_TRIGGER_EFFECT = RESISTANCE 3 7", None);
+    assert!((r["trigger_l_mode"] - 1.0 / 3.0).abs() < 1e-6, "feedback mode");
+    assert!((r["trigger_l_start"] - 3.0 / 9.0).abs() < 1e-6, "zone 3 of 9");
+    assert_eq!(r["trigger_l_strength"], 1.0, "force 7 of 7 is full");
+
+    // `SEMI_AUTOMATIC start end force` — the one that uses both zones.
+    let s = fb_pins("RIGHT_TRIGGER_EFFECT = SEMI_AUTOMATIC 2 6 4", None);
+    assert!((s["trigger_r_mode"] - 2.0 / 3.0).abs() < 1e-6, "weapon mode");
+    assert!((s["trigger_r_start"] - 2.0 / 9.0).abs() < 1e-6);
+    assert!((s["trigger_r_end"] - 6.0 / 9.0).abs() < 1e-6);
+
+    // `AUTOMATIC start force frequency` — frequency is 0-255.
+    let a = fb_pins("LEFT_TRIGGER_EFFECT = AUTOMATIC 1 5 255", None);
+    assert_eq!(a["trigger_l_mode"], 1.0, "vibration mode");
+    assert_eq!(a["trigger_l_freq"], 1.0, "frequency 255 of 255");
+
+    // `OFF` writes every pin of the group, so a previous effect can't shape it.
+    let off = fb_pins("LEFT_TRIGGER_EFFECT = OFF", None);
+    for pin in ["trigger_l_mode", "trigger_l_start", "trigger_l_end", "trigger_l_strength", "trigger_l_freq"] {
+        assert_eq!(off.get(pin), Some(&0.0), "{pin} is zeroed");
+    }
+
+    // A missing parameter is an error naming what was wanted.
+    match one("LEFT_TRIGGER_EFFECT = RESISTANCE 3").status {
+        LineStatus::Error(why) => assert!(why.contains("force"), "{why}"),
+        other => panic!("a short RESISTANCE should be an error, got {other:?}"),
+    }
+}
+
+/// `ON` — JSM's default — means "no effect of my own", so the group is left
+/// entirely alone and the game keeps whatever it set.
+#[test]
+fn an_adaptive_trigger_left_on_is_not_touched() {
+    let auto = fb_pins("LEFT_TRIGGER_EFFECT = ON", None);
+    assert!(
+        !auto.keys().any(|k| k.starts_with("trigger_l_")),
+        "nothing of the left trigger is claimed: {auto:?}"
+    );
+    // And the default is the same.
+    let plain = fb_pins("", None);
+    assert!(!plain.keys().any(|k| k.starts_with("trigger_")));
+}
+
+/// `ADAPTIVE_TRIGGER = OFF` overrules whatever effects are set — one switch to
+/// stop the triggers fighting you, which is how JSM uses it.
+#[test]
+fn adaptive_trigger_off_overrules_the_effects() {
+    let out = fb_pins(
+        "LEFT_TRIGGER_EFFECT = RESISTANCE 3 7\nADAPTIVE_TRIGGER = OFF",
+        None,
+    );
+    assert_eq!(out["trigger_l_mode"], 0.0, "the effect is switched off: {out:?}");
+    assert_eq!(out["trigger_l_strength"], 0.0);
+}
+
+/// The three effects the bus has nowhere to put say so, name the nearest thing
+/// that works, and leave the trigger as the game set it — rather than quietly
+/// giving the player something that feels wrong.
+#[test]
+fn the_effects_our_bus_cannot_carry_say_so_and_suggest_one_that_works() {
+    for (mode, expect) in [
+        ("BOW 2 5 4 6", "SEMI_AUTOMATIC"),
+        ("GALLOPING 1 8 3 5 100", "AUTOMATIC"),
+        ("MACHINE 1 9 3 4 40 60", "AUTOMATIC"),
+    ] {
+        let line = one(&format!("LEFT_TRIGGER_EFFECT = {mode}"));
+        assert_eq!(line.status, LineStatus::Ok, "{mode} is understood, not an error");
+        let note = line.notes.join(" ");
+        assert!(note.contains("four trigger effects"), "{mode}: says why: {note}");
+        assert!(note.contains(expect), "{mode}: names the nearest: {note}");
+    }
+    // And the trigger is left alone rather than set to something arbitrary.
+    let out = fb_pins("LEFT_TRIGGER_EFFECT = BOW 2 5 4 6", None);
+    assert!(
+        !out.keys().any(|k| k.starts_with("trigger_l_")),
+        "the trigger is left as the game set it: {out:?}"
+    );
+}
+
+/// Trigger travel calibration is the device card's, not the config's.
+#[test]
+fn trigger_travel_calibration_is_the_device_cards() {
+    for line in [
+        "LEFT_TRIGGER_OFFSET = 20",
+        "LEFT_TRIGGER_RANGE = 150",
+        "RIGHT_TRIGGER_OFFSET = 20",
+        "RIGHT_TRIGGER_RANGE = 150",
+    ] {
+        match one(line).status {
+            LineStatus::Ignored(why) => {
+                assert!(why.contains("device card"), "{line}: {why}");
+            }
+            other => panic!("{line} should be ignored with a reason, got {other:?}"),
+        }
+    }
+}
+
+/// Feedback reaches the pad on the override layer, keyed to the pad upstream —
+/// which is what lets it replace the game's rather than add to it.
+#[test]
+fn feedback_reaches_the_pad_it_came_from() {
+    let uid = 4242;
+    let mut snap = jsm_snap(uid, "LIGHT_BAR = RED\nRUMBLE = OFF", false);
+    snap.params
+        .insert("_jsm_dest_dev".into(), serde_json::Value::String(PAD.into()));
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    for _ in 0..2 {
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    let key = format!("feedback_override:{PAD}");
+    assert_eq!(
+        collector.get(&(key.clone(), "lightbar_r".to_string())).map(|s| s.as_float()),
+        Some(1.0),
+        "the light bar reaches the pad it came from"
+    );
+    assert_eq!(
+        collector.get(&(key, "rumble_strong".to_string())).map(|s| s.as_float()),
+        Some(0.0),
+        "and rumble is held at zero rather than left to the game"
+    );
+    let _ = &mut dev;
+}
+
+/// With no pad resolved upstream there is nowhere for feedback to go, and nothing
+/// is published — rather than a stray `feedback_override:` nobody drains.
+#[test]
+fn feedback_with_no_pad_upstream_goes_nowhere() {
+    let uid = 4243;
+    let snap = jsm_snap(uid, "LIGHT_BAR = RED", false);
+    let dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    assert!(
+        !collector.keys().any(|(k, _)| k.starts_with("feedback_override:")),
+        "nothing published with nowhere to send it"
+    );
+}
+
+/// Every one of phase 7's settings is read.
+#[test]
+fn every_feedback_setting_is_read() {
+    let c = compile(
+        "RUMBLE = OFF\n\
+         LIGHT_BAR = x123456\n\
+         ADAPTIVE_TRIGGER = ON\n\
+         LEFT_TRIGGER_EFFECT = RESISTANCE 4 5\n\
+         RIGHT_TRIGGER_EFFECT = AUTOMATIC 2 3 120",
+    );
+    assert!(errors(&c).is_empty(), "all live: {:?}", errors(&c));
+    assert!(!c.fb.rumble);
+    assert_eq!(c.fb.light_bar, (0x12, 0x34, 0x56));
+    assert!(c.fb.adaptive);
+    assert_eq!(
+        c.fb.trigger[0],
+        super::feedback::Effect::Resistance { start: 4, force: 5 }
+    );
+    assert_eq!(
+        c.fb.trigger[1],
+        super::feedback::Effect::Automatic { start: 2, force: 3, frequency: 120 }
+    );
+
+    for bad in [
+        "RUMBLE = MAYBE",
+        "ADAPTIVE_TRIGGER = SOMETIMES",
+        "LIGHT_BAR = xZZZZZZ",
+        "LEFT_TRIGGER_EFFECT = SQUEEZE",
+    ] {
+        assert!(matches!(one(bad).status, LineStatus::Error(_)), "{bad}");
+    }
+}
+
+/// A feedback setting can be chorded like any other, which is what phase 4 bought.
+#[test]
+fn feedback_settings_can_be_chorded() {
+    let c = compile("ZL,LIGHT_BAR = RED");
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    let held = super::parse::resolve(&c, &[Btn::Zl]);
+    assert_eq!(held.fb.light_bar, (0xFF, 0x00, 0x00), "held, it is red");
+    let idle = super::parse::resolve(&c, &[]);
+    assert_eq!(idle.fb.light_bar, (0xFF, 0xFF, 0xFF), "let go, back to white");
+}
+
+/// Every colour name JSM accepts, and what it is. A config written against JSM's
+/// names has to light the same colour here, and "it compiled" is not that.
+#[test]
+fn every_colour_name_is_the_colour_it_says() {
+    for (name, want) in [
+        ("BLACK", (0.0, 0.0, 0.0)),
+        ("WHITE", (1.0, 1.0, 1.0)),
+        ("RED", (1.0, 0.0, 0.0)),
+        ("GREEN", (0.0, 1.0, 0.0)),
+        ("BLUE", (0.0, 0.0, 1.0)),
+        ("YELLOW", (1.0, 1.0, 0.0)),
+        ("CYAN", (0.0, 1.0, 1.0)),
+        ("MAGENTA", (1.0, 0.0, 1.0)),
+        ("PINK", (1.0, 0.0, 1.0)),
+        ("ORANGE", (1.0, 128.0 / 255.0, 0.0)),
+        ("PURPLE", (128.0 / 255.0, 0.0, 1.0)),
+        ("GREY", (128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0)),
+        ("GRAY", (128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0)),
+    ] {
+        let out = fb_pins(&format!("LIGHT_BAR = {name}"), None);
+        let got = (out["lightbar_r"], out["lightbar_g"], out["lightbar_b"]);
+        assert!(
+            (got.0 - want.0).abs() < 1e-6
+                && (got.1 - want.1).abs() < 1e-6
+                && (got.2 - want.2).abs() < 1e-6,
+            "{name} should be {want:?}, got {got:?}"
+        );
+    }
+}
+
+/// A binding that rumbles reaches the pad, end to end — the binding fires, the
+/// amplitude lands on the override layer keyed to the pad upstream.
+#[test]
+fn a_rumble_binding_reaches_the_pad() {
+    let uid = 4244;
+    let mut snap = jsm_snap(uid, "S = BIG_RUMBLE", false);
+    snap.params
+        .insert("_jsm_dest_dev".into(), serde_json::Value::String(PAD.into()));
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let key = format!("feedback_override:{PAD}");
+    let mut strongest = 0.0f32;
+    for _ in 0..4 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+        if let Some(v) = collector.get(&(key.clone(), "rumble_strong".to_string())) {
+            strongest = strongest.max(v.as_float());
+        }
+    }
+    assert!(
+        strongest > 0.9,
+        "pressing the button rumbles the pad it came from, got {strongest}"
+    );
+
+    // And with nothing pressed, the rumble group is left to the game — `RUMBLE` is
+    // on by default, so nothing is claimed.
+    let dev: HashMap<(String, String), Signal> = HashMap::new();
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    for _ in 0..4 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    assert!(
+        !collector.contains_key(&(key, "rumble_strong".to_string())),
+        "with nothing rumbling the game keeps the group"
+    );
 }
