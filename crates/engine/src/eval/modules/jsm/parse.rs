@@ -121,6 +121,7 @@ pub struct Resolved {
     pub timings: Timings,
     pub settings: Settings,
     pub aim: super::aim::Settings,
+    pub pad: super::pad::Settings,
     /// Per stick: a chord is supplying its mode right now. When that stops the
     /// stick has to be let alone until it comes back to centre, or releasing the
     /// chord mid-push would hand the base mode a stick already out at full.
@@ -136,6 +137,7 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
         timings: cfg.timings,
         settings: cfg.settings,
         aim: cfg.aim,
+        pad: cfg.pad,
         stick_mode_chorded: [false; 2],
     };
     if cfg.modeshifts.is_empty() {
@@ -150,6 +152,7 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
                 &mut r.timings,
                 &mut r.settings,
                 &mut r.aim,
+                &mut r.pad,
             );
             if let Support::Analog(AnalogId::StickMode(side)) = ms.support {
                 if side != Side::Right { r.stick_mode_chorded[0] = true; }
@@ -192,6 +195,8 @@ pub struct Compiled {
     pub settings: Settings,
     /// Gyro, stick-aim and flick settings.
     pub aim: super::aim::Settings,
+    /// Virtual pad output settings.
+    pub pad: super::pad::Settings,
     /// Settings that change while a button is held.
     pub modeshifts: Vec<Modeshift>,
     /// Every button the config mentions, however it mentions it. Pass-through
@@ -225,6 +230,7 @@ pub fn compile(text: &str) -> Compiled {
         timings: Timings::default(),
         settings: Settings::default(),
         aim: super::aim::Settings::default(),
+        pad: super::pad::Settings::default(),
         modeshifts: Vec::new(),
         mentioned: HashSet::new(),
     };
@@ -391,7 +397,15 @@ fn command_line(name: &str, out: &mut Compiled) -> LineInfo {
 }
 
 fn setting_line(name: &str, rhs: &str, support: Support, out: &mut Compiled) -> LineInfo {
-    apply_setting(name, rhs, support, &mut out.timings, &mut out.settings, &mut out.aim)
+    apply_setting(
+        name,
+        rhs,
+        support,
+        &mut out.timings,
+        &mut out.settings,
+        &mut out.aim,
+        &mut out.pad,
+    )
 }
 
 /// `button,SETTING = value`: the setting takes that value while the button is
@@ -404,8 +418,17 @@ fn modeshift_line(
     support: Support,
     out: &mut Compiled,
 ) -> LineInfo {
-    let (mut timings, mut settings, mut aim) = (out.timings, out.settings, out.aim);
-    let info = apply_setting(name, rhs, support, &mut timings, &mut settings, &mut aim);
+    let (mut timings, mut settings, mut aim, mut pad) =
+        (out.timings, out.settings, out.aim, out.pad);
+    let info = apply_setting(
+        name,
+        rhs,
+        support,
+        &mut timings,
+        &mut settings,
+        &mut aim,
+        &mut pad,
+    );
     // A setting a later phase owns says so, and the modeshift waits with it.
     if matches!(info.status, LineStatus::Ok) {
         out.modeshifts.push(Modeshift {
@@ -428,10 +451,12 @@ pub(crate) fn apply_setting(
     timings: &mut Timings,
     settings: &mut Settings,
     aim: &mut super::aim::Settings,
+    pad: &mut super::pad::Settings,
 ) -> LineInfo {
     match support {
         Support::Analog(which) => analog_setting(name, rhs, which, settings),
         Support::Aim(which) => aim_setting(name, rhs, which, aim),
+        Support::Pad(which) => pad_setting(name, rhs, which, pad),
         Support::Timing(which) => {
             let Some(ms) = rhs
                 .split_whitespace()
@@ -533,11 +558,7 @@ fn binding_line(
     if steps.iter().any(|s| matches!(&s.out, Out::Pin(p) | Out::Pulse(p)
         if super::names::is_pad_pin(p)))
     {
-        notes.push(
-            "needs a virtual pad wired downstream to reach anything; `X_` and `PS_` names are \
-             the same pin (as in JSM), so wiring decides which pad it reaches"
-                .into(),
-        );
+        notes.push(PAD_NOTE.into());
     }
 
     let status = if let Some(phase) = pending {
@@ -908,9 +929,18 @@ fn analog_setting(name: &str, rhs: &str, which: AnalogId, s: &mut Settings) -> L
                 } else {
                     s.zl = m;
                 }
-                LineInfo::of(LineStatus::Ok)
+                let mut info = LineInfo::of(LineStatus::Ok);
+                if m.pad_side().is_some() {
+                    info.notes.push(PAD_NOTE.to_string());
+                    info.notes.push(
+                        "this trigger's own bindings stop running, as in JSM — its pull goes                          straight to the pad. It still works as a chord for a modeshift."
+                            .to_string(),
+                    );
+                }
+                info
             }
             Parsed::Later(phase) => LineInfo::of(LineStatus::Pending(phase)),
+            Parsed::Refused(why) => LineInfo::of(LineStatus::Error(why.to_string())),
             Parsed::Unknown => wants(
                 "NO_FULL, NO_SKIP, NO_SKIP_EXCLUSIVE, MUST_SKIP, MAY_SKIP, MUST_SKIP_R, \
                  MAY_SKIP_R, X_LT, X_RT, PS_L2 or PS_R2",
@@ -925,7 +955,11 @@ fn analog_setting(name: &str, rhs: &str, which: AnalogId, s: &mut Settings) -> L
                         c.ring = r;
                     }
                 });
-                LineInfo::of(LineStatus::Ok)
+                let mut info = LineInfo::of(LineStatus::Ok);
+                if mode.pads() {
+                    info.notes.push(PAD_NOTE.to_string());
+                }
+                info
             }
             Parsed::Later(phase) => {
                 // The stick is a mouse or a virtual stick from here on: remember
@@ -933,6 +967,7 @@ fn analog_setting(name: &str, rhs: &str, which: AnalogId, s: &mut Settings) -> L
                 each(s, side, &|c| c.mode = StickMode::Elsewhere);
                 LineInfo::of(LineStatus::Pending(phase))
             }
+            Parsed::Refused(why) => LineInfo::of(LineStatus::Error(why.to_string())),
             Parsed::Unknown => wants("a stick mode JSM knows"),
         },
         AnalogId::Ring(side) => match value.as_str() {
@@ -1023,6 +1058,8 @@ fn analog_setting(name: &str, rhs: &str, which: AnalogId, s: &mut Settings) -> L
 enum Parsed<T> {
     Run(T),
     Later(&'static str),
+    /// Understood, and never going to work here — say why, in full.
+    Refused(&'static str),
     Unknown,
 }
 
@@ -1037,7 +1074,8 @@ fn trigger_mode(v: &str) -> Parsed<TriggerMode> {
         "MUST_SKIP_R" => MustSkipR,
         "MAY_SKIP_R" => MaySkipR,
         // These send the trigger's position to a virtual pad's trigger.
-        "X_LT" | "X_RT" | "PS_L2" | "PS_R2" => return Parsed::Later(PHASE_PAD),
+        "X_LT" | "PS_L2" => Pad(0),
+        "X_RT" | "PS_R2" => Pad(1),
         _ => return Parsed::Unknown,
     })
 }
@@ -1055,9 +1093,22 @@ fn stick_mode(v: &str) -> Parsed<(StickMode, Option<RingMode>)> {
         "MOUSE_AREA" => (StickMode::MouseArea, None),
         "MOUSE_RING" => return Parsed::Later(PHASE_ABSOLUTE),
         "HYBRID_AIM" => return Parsed::Later(PHASE_HYBRID),
-        "LEFT_STICK" | "RIGHT_STICK" | "LEFT_ANGLE_TO_X" | "LEFT_ANGLE_TO_Y"
-        | "RIGHT_ANGLE_TO_X" | "RIGHT_ANGLE_TO_Y" | "LEFT_STEER_X" | "RIGHT_STEER_X"
-        | "LEFT_WIND_X" | "RIGHT_WIND_X" => return Parsed::Later(PHASE_PAD),
+        // ── the virtual pad's own sticks ──────────────────────────────────────
+        "LEFT_STICK" => (StickMode::VirtualStick(0), None),
+        "RIGHT_STICK" => (StickMode::VirtualStick(1), None),
+        "LEFT_ANGLE_TO_X" => (StickMode::AngleToAxis(0, true), None),
+        "LEFT_ANGLE_TO_Y" => (StickMode::AngleToAxis(0, false), None),
+        "RIGHT_ANGLE_TO_X" => (StickMode::AngleToAxis(1, true), None),
+        "RIGHT_ANGLE_TO_Y" => (StickMode::AngleToAxis(1, false), None),
+        "LEFT_WIND_X" => (StickMode::Wind(0), None),
+        "RIGHT_WIND_X" => (StickMode::Wind(1), None),
+        // JSM refuses these on a thumbstick — they are the motion stick's alone,
+        // and it says so rather than accepting the line and doing nothing. Saying
+        // the same thing here is the honest answer: no later phase will make this
+        // work on a thumbstick, so it must not read as pending.
+        "LEFT_STEER_X" | "RIGHT_STEER_X" => return Parsed::Refused(
+            "only MOTION_STICK_MODE can steer; a thumbstick wants LEFT_WIND_X or ANGLE_TO_X",
+        ),
         _ => return Parsed::Unknown,
     })
 }
@@ -1272,7 +1323,156 @@ fn float_pair(rhs: &str) -> Option<(f32, f32)> {
     }
 }
 
+// ── virtual pad output settings ───────────────────────────────────────────────
+
+/// Which virtual-pad setting a line sets. Where a side appears it is the
+/// *virtual* stick's, not the physical one's — a config can cross them over.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum PadId {
+    /// `VIRTUAL_STICK_CALIBRATION`.
+    Calibration,
+    /// `LEFT_STICK_UNDEADZONE_INNER` and its three siblings; `true` is the right
+    /// stick, and the `bool` after it distinguishes inner from outer.
+    Undeadzone(bool, bool),
+    Unpower(bool),
+    VirtualScale(bool),
+    /// `GYRO_OUTPUT` and `FLICK_STICK_OUTPUT`; `true` for the flick stick.
+    Dest(bool),
+    /// `ANGLE_TO_AXIS_DEADZONE_INNER` / `_OUTER`.
+    AngleDeadzone(bool),
+    WindRange,
+    WindPower,
+    UnwindRate,
+}
+
+/// Apply one virtual-pad setting.
+fn pad_setting(name: &str, rhs: &str, which: PadId, p: &mut super::pad::Settings) -> LineInfo {
+    use super::pad::Dest;
+    let wants =
+        |what: &str| LineInfo::of(LineStatus::Error(format!("`{name}` wants {what}")));
+    let num = || {
+        rhs.split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f32>().ok())
+    };
+    // Almost every one of these is a number in a range, so say the range once.
+    let in_range = |lo: f32, hi: f32| num().filter(|v| (lo..=hi).contains(v));
+
+    match which {
+        PadId::Calibration => match num() {
+            Some(v) if v > 0.0 => {
+                p.calibration = v;
+                LineInfo::of(LineStatus::Ok)
+            }
+            _ => wants("a camera speed in degrees per second, above zero"),
+        },
+        PadId::Undeadzone(right, inner) => match in_range(0.0, 1.0) {
+            Some(v) => {
+                let out = &mut p.out[right as usize];
+                if inner {
+                    out.undeadzone_inner = v;
+                } else {
+                    out.undeadzone_outer = v;
+                }
+                LineInfo::of(LineStatus::Ok)
+            }
+            None => wants("a fraction of stick travel, 0 to 1"),
+        },
+        PadId::Unpower(right) => match num() {
+            Some(v) if v >= 0.0 => {
+                p.out[right as usize].unpower = v;
+                LineInfo::of(LineStatus::Ok)
+            }
+            _ => wants("an exponent of zero or more (zero means no curve)"),
+        },
+        PadId::VirtualScale(right) => match num() {
+            Some(v) if v >= 0.0 => {
+                p.out[right as usize].virtual_scale = v;
+                LineInfo::of(LineStatus::Ok)
+            }
+            _ => wants("a multiplier of zero or more"),
+        },
+        PadId::Dest(flick) => {
+            let (dest, note) = match rhs.split_whitespace().next().unwrap_or("").to_ascii_uppercase().as_str() {
+                "MOUSE" => (Dest::Mouse, None),
+                "LEFT_STICK" => (Dest::LeftStick, None),
+                "RIGHT_STICK" => (Dest::RightStick, None),
+                "PS_MOTION" => (
+                    Dest::PsMotion,
+                    Some(
+                        "the pad's own motion passes straight through to whatever is wired \
+                         downstream, so a DualSense or DS4 sink receives it — as in JSM, \
+                         nothing here aims with it"
+                            .to_string(),
+                    ),
+                ),
+                _ => return wants("MOUSE, LEFT_STICK, RIGHT_STICK or PS_MOTION"),
+            };
+            if flick {
+                p.flick_dest = dest;
+            } else {
+                p.gyro_dest = dest;
+            }
+            let mut info = LineInfo::of(LineStatus::Ok);
+            if let Some(n) = note {
+                info.notes.push(n);
+            }
+            // JSM gates its whole mouse move on `GYRO_OUTPUT` being MOUSE, so
+            // sending the gyro to a stick stops an `AIM` stick from moving the
+            // mouse as well. Reproduced, and said out loud here.
+            if !flick && dest != Dest::Mouse {
+                info.notes.push(
+                    "as in JSM, this also stops a stick in `AIM` or `MOUSE_AREA` from moving \
+                     the mouse — the whole mouse output goes quiet, not just the gyro's part"
+                        .to_string(),
+                );
+            }
+            if dest.side().is_some() {
+                info.notes.push(PAD_NOTE.to_string());
+            }
+            info
+        }
+        PadId::AngleDeadzone(inner) => match in_range(0.0, 90.0) {
+            Some(v) => {
+                if inner {
+                    p.angle_dz_inner = v;
+                } else {
+                    p.angle_dz_outer = v;
+                }
+                LineInfo::of(LineStatus::Ok)
+            }
+            None => wants("an angle in degrees, 0 to 90"),
+        },
+        PadId::WindRange => match num() {
+            Some(v) if v > 0.0 => {
+                p.wind_range = v;
+                LineInfo::of(LineStatus::Ok)
+            }
+            _ => wants("a number of degrees above zero"),
+        },
+        PadId::WindPower => match num() {
+            Some(v) if v >= 0.0 => {
+                p.wind_power = v;
+                LineInfo::of(LineStatus::Ok)
+            }
+            _ => wants("an exponent of zero or more (zero means no curve)"),
+        },
+        PadId::UnwindRate => match num() {
+            Some(v) if v >= 0.0 => {
+                p.unwind_rate = v;
+                LineInfo::of(LineStatus::Ok)
+            }
+            _ => wants("a number of degrees per second, zero or more"),
+        },
+    }
+}
+
 // ── the settings table ───────────────────────────────────────────────────────
+
+/// Said on every line whose output can only land on a virtual pad. A config full
+/// of `X_*` bindings does nothing at all until one is wired up, which is worth
+/// saying on the line rather than leaving someone to wonder.
+const PAD_NOTE: &str = "needs a virtual pad wired downstream to reach anything; `X_` and `PS_`                         names are the same pin (as in JSM), so wiring decides which pad it                         reaches";
 
 const PHASE_GYRO: &str = "gyro, flick stick and real-world calibration arrive in phase 3";
 /// Gravity-referenced gyro spaces land with the motion stick, which needs the
@@ -1282,8 +1482,6 @@ const PHASE_GRAVITY: &str =
 const PHASE_ABSOLUTE: &str =
     "placing the pointer outright needs an absolute mouse pin, which the bus doesn't have yet";
 const PHASE_HYBRID: &str = "HYBRID_AIM arrives after the rest of aiming";
-const PHASE_MODESHIFT: &str = "settings that change while a button is held arrive in phase 4";
-const PHASE_PAD: &str = "virtual pad output arrives in phase 5";
 const PHASE_TOUCH: &str = "the touchpad and motion stick arrive in phase 6";
 const PHASE_FEEDBACK: &str = "rumble, light bar and adaptive triggers arrive in phase 7";
 const PHASE_LAYERS: &str = "loading another config arrives in phase 8";
@@ -1303,6 +1501,7 @@ pub(crate) enum Support {
     Timing(TimingId),
     Analog(AnalogId),
     Aim(AimId),
+    Pad(PadId),
     Pending(&'static str),
     Ignored(&'static str),
 }
@@ -1382,23 +1581,24 @@ fn setting_support(name: &str) -> Option<Support> {
         | "RETURN_DEADZONE_ANGLE_CUTOFF"
         | "EDGE_PUSH_IS_ACTIVE" => Pending(PHASE_HYBRID),
         // Flick and gyro can drive a virtual stick instead of the mouse.
-        "FLICK_STICK_OUTPUT" | "VIRTUAL_STICK_CALIBRATION" => Pending(PHASE_PAD),
+        "FLICK_STICK_OUTPUT" => Pad(PadId::Dest(true)),
+        "GYRO_OUTPUT" => Pad(PadId::Dest(false)),
+        "VIRTUAL_STICK_CALIBRATION" => Pad(PadId::Calibration),
 
         // Virtual pad output.
-        "GYRO_OUTPUT"
-        | "LEFT_STICK_UNDEADZONE_INNER"
-        | "LEFT_STICK_UNDEADZONE_OUTER"
-        | "LEFT_STICK_UNPOWER"
-        | "RIGHT_STICK_UNDEADZONE_INNER"
-        | "RIGHT_STICK_UNDEADZONE_OUTER"
-        | "RIGHT_STICK_UNPOWER"
-        | "LEFT_STICK_VIRTUAL_SCALE"
-        | "RIGHT_STICK_VIRTUAL_SCALE"
-        | "WIND_STICK_RANGE"
-        | "WIND_STICK_POWER"
-        | "UNWIND_RATE"
-        | "ANGLE_TO_AXIS_DEADZONE_INNER"
-        | "ANGLE_TO_AXIS_DEADZONE_OUTER" => Pending(PHASE_PAD),
+        "LEFT_STICK_UNDEADZONE_INNER" => Pad(PadId::Undeadzone(false, true)),
+        "LEFT_STICK_UNDEADZONE_OUTER" => Pad(PadId::Undeadzone(false, false)),
+        "RIGHT_STICK_UNDEADZONE_INNER" => Pad(PadId::Undeadzone(true, true)),
+        "RIGHT_STICK_UNDEADZONE_OUTER" => Pad(PadId::Undeadzone(true, false)),
+        "LEFT_STICK_UNPOWER" => Pad(PadId::Unpower(false)),
+        "RIGHT_STICK_UNPOWER" => Pad(PadId::Unpower(true)),
+        "LEFT_STICK_VIRTUAL_SCALE" => Pad(PadId::VirtualScale(false)),
+        "RIGHT_STICK_VIRTUAL_SCALE" => Pad(PadId::VirtualScale(true)),
+        "WIND_STICK_RANGE" => Pad(PadId::WindRange),
+        "WIND_STICK_POWER" => Pad(PadId::WindPower),
+        "UNWIND_RATE" => Pad(PadId::UnwindRate),
+        "ANGLE_TO_AXIS_DEADZONE_INNER" => Pad(PadId::AngleDeadzone(true)),
+        "ANGLE_TO_AXIS_DEADZONE_OUTER" => Pad(PadId::AngleDeadzone(false)),
 
         // Touchpad and motion stick.
         "TOUCHPAD_MODE"

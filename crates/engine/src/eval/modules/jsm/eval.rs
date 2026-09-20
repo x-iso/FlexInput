@@ -24,6 +24,7 @@ use crate::state::NodeState;
 use super::aim::{Aim, Gyro};
 use super::analog::{Analog, Pad};
 use super::bind::Runtime;
+use super::pad::Pad as PadOut;
 use super::names::{Btn, BtnSource, Out, StickId};
 use super::parse::{compile, Compiled};
 
@@ -60,6 +61,8 @@ pub struct JsmState {
     analog: Analog,
     /// The gyro and the aiming sticks, turned into mouse movement.
     aim: Aim,
+    /// The sticks and rates pointed at a virtual pad instead.
+    pad: PadOut,
 }
 
 /// Evaluate one JSM Config node.
@@ -124,6 +127,7 @@ pub(crate) fn jsm_publish(
             rt: Runtime::default(),
             analog: Analog::default(),
             aim: Aim::default(),
+            pad: PadOut::default(),
         })
     });
     if st.gen != gen {
@@ -132,6 +136,7 @@ pub(crate) fn jsm_publish(
         st.rt = Runtime::default();
         st.analog = Analog::default();
         st.aim = Aim::default();
+        st.pad = PadOut::default();
     }
 
     // What the settings are this tick, once the held chords have had their say.
@@ -162,12 +167,25 @@ pub(crate) fn jsm_publish(
     st.analog.tick(&res.settings, dt, &read_pad(&upstream));
     let analog = &st.analog;
     let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog) };
-    let outputs = st.rt.tick(&st.cfg, &res.timings, dt, &held);
+    // A trigger handed straight to the virtual pad can still chord, but its own
+    // bindings stop running — JSM's rule, and what the editor says on the line.
+    let (zl_pad, zr_pad) = (
+        res.settings.zl.pad_side().is_some(),
+        res.settings.zr.pad_side().is_some(),
+    );
+    let chord_only = |b: Btn| match b {
+        Btn::Zl | Btn::Zlf => zl_pad,
+        Btn::Zr | Btn::Zrf => zr_pad,
+        _ => false,
+    };
+    let outputs = st.rt.tick(&st.cfg, &res.timings, dt, &held, &chord_only);
     let driven: Vec<String> = outputs.pins.iter().cloned().collect();
     let gyro_actions = outputs.gyro.clone();
 
-    // Then aiming: the gyro and whichever sticks are pointed at the mouse.
-    let mouse = {
+    // Then aiming: the gyro and whichever sticks are pointed at the mouse. What
+    // is pointed at a virtual pad's stick instead comes back as a camera rate for
+    // the pad side to convert.
+    let aimed = {
         let f = |pin: &str| upstream.get(pin).map(|s| s.as_float()).unwrap_or(0.0) * GYRO_REF_DPS;
         let gyro = Gyro {
             roll: f("gyro_x"),
@@ -177,8 +195,19 @@ pub(crate) fn jsm_publish(
         let analog = &st.analog;
         let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog) };
         st.aim
-            .tick(&res.aim, dt, gyro, &st.analog, &gyro_actions, &held)
+            .tick(&res.aim, &res.pad, dt, gyro, &st.analog, &gyro_actions, &held)
     };
+    let mouse = aimed.mouse;
+
+    // Then the virtual pad: sticks pointed at one, and the rates just computed.
+    let pad_out = st.pad.tick(
+        &res.pad,
+        dt,
+        &st.analog,
+        res.aim.stick_power,
+        aimed.gyro_dps,
+        aimed.flick_dps,
+    );
 
     // What the config takes over from the pad.
     let (claimed_digital, claimed_analog) = claimed_pins(&st.cfg, &res);
@@ -260,6 +289,26 @@ pub(crate) fn jsm_publish(
         collector_sigs.insert((key.clone(), "dpad_x".to_string()), Signal::Float(x));
         collector_sigs.insert((key.clone(), "dpad_y".to_string()), Signal::Float(y));
         collector_sigs.insert((key.clone(), "dpad".to_string()), Signal::Vec2(Vec2::new(x, y)));
+    }
+
+    // ── the virtual pad's sticks and triggers ────────────────────────────────
+    //
+    // Same three-forms rule as the D-pad above: a sink reads a stick as a Vec2
+    // and as two floats, and prefers the Vec2, so all three have to agree or the
+    // one that lands last wins. A stick nothing here drives isn't written at all,
+    // so the pad's own passes through.
+    for side in 0..2 {
+        let name = if side == 0 { "left_stick" } else { "right_stick" };
+        if let Some(v) = pad_out.sticks[side] {
+            collector_sigs.insert((key.clone(), name.to_string()), Signal::Vec2(v));
+            collector_sigs.insert((key.clone(), format!("{name}_x")), Signal::Float(v.x));
+            collector_sigs.insert((key.clone(), format!("{name}_y")), Signal::Float(v.y));
+        }
+        // `ZL_MODE = X_LT`: the trigger's pull goes straight out to the pad.
+        if let Some(v) = st.analog.pad_trigger(side) {
+            let name = if side == 0 { "left_trigger" } else { "right_trigger" };
+            collector_sigs.insert((key.clone(), name.to_string()), Signal::Float(v));
+        }
     }
 
     // Aiming, as one displacement for this tick. `mouse_move` is applied as it
@@ -353,14 +402,34 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
         };
         [name.to_string(), format!("{name}_x"), format!("{name}_y")]
     };
-    // A stick pointed at the mouse is the config's whether or not a binding ever
-    // names one of its directions.
+    // A stick pointed at the mouse — or at a virtual pad — is the config's
+    // whether or not a binding ever names one of its directions.
     for (stick, s) in [
-        (StickId::Left, cfg.settings.left),
-        (StickId::Right, cfg.settings.right),
+        (StickId::Left, res.settings.left),
+        (StickId::Right, res.settings.right),
     ] {
-        if s.mode.aims() {
+        if s.mode.aims() || s.mode.pads() {
             analog.extend(stick_pins(stick));
+        }
+        // And the virtual stick it drives is the config's to write, which may not
+        // be the one it reads: `RIGHT_STICK_MODE = LEFT_STICK` crosses them over.
+        if let Some(side) = s.mode.pad_side() {
+            analog.extend(stick_pins(if side == 0 { StickId::Left } else { StickId::Right }));
+        }
+    }
+    // A gyro or flick stick aimed at a virtual stick owns that stick too, even
+    // with no physical stick in a pad mode at all.
+    for dest in [res.pad.gyro_dest, res.pad.flick_dest] {
+        if let Some(side) = dest.side() {
+            analog.extend(stick_pins(if side == 0 { StickId::Left } else { StickId::Right }));
+        }
+    }
+    // `ZL_MODE = X_LT` takes over a virtual trigger, and the physical trigger it
+    // reads (which the `mentioned` sweep below only claims if a binding names it).
+    for (right, mode) in [(false, res.settings.zl), (true, res.settings.zr)] {
+        if let Some(side) = mode.pad_side() {
+            analog.insert(if side == 0 { "left_trigger" } else { "right_trigger" }.to_string());
+            analog.insert(if right { "right_trigger" } else { "left_trigger" }.to_string());
         }
     }
     for &btn in &cfg.mentioned {
@@ -409,8 +478,12 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
     }
     // A config that aims with the gyro owns it, so it can't also drive a Gyro
     // 3DOF node downstream. One left at JSM's default sensitivity of zero aims
-    // with nothing, and passes the gyro on untouched.
-    if res.aim.min_sens != (0.0, 0.0) || res.aim.max_sens != (0.0, 0.0) {
+    // with nothing, and passes the gyro on untouched — and so does `GYRO_OUTPUT =
+    // PS_MOTION`, which is the whole of what that setting means here: the pad's
+    // own motion goes downstream untouched, for a DualSense or DS4 sink to use.
+    if res.pad.gyro_dest != super::pad::Dest::PsMotion
+        && (res.aim.min_sens != (0.0, 0.0) || res.aim.max_sens != (0.0, 0.0))
+    {
         for pin in ["gyro_x", "gyro_y", "gyro_z"] {
             analog.insert(pin.to_string());
         }

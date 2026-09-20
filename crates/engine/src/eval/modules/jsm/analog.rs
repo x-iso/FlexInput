@@ -43,11 +43,27 @@ pub enum TriggerMode {
     MustSkipR,
     /// `MAY_SKIP`, responsive in the same way.
     MaySkipR,
+    /// `X_LT` / `X_RT` (and their `PS_L2` / `PS_R2` aliases): the trigger's
+    /// position goes straight to a virtual pad's trigger and no binding of its
+    /// own runs. The `usize` is which virtual trigger, 0 left and 1 right.
+    ///
+    /// JSM still lets the soft and full pull act as *chord* modifiers while this
+    /// is on, and on a looser rule than usual: soft counts as held at any
+    /// position above zero, full at the very end of travel.
+    Pad(usize),
 }
 
 impl TriggerMode {
     /// Does this mode ever fire the full pull?
-    pub fn has_full(self) -> bool { self != TriggerMode::NoFull }
+    pub fn has_full(self) -> bool { !matches!(self, TriggerMode::NoFull | TriggerMode::Pad(_)) }
+
+    /// Which virtual trigger this one feeds, if it feeds one.
+    pub fn pad_side(self) -> Option<usize> {
+        match self {
+            TriggerMode::Pad(side) => Some(side),
+            _ => None,
+        }
+    }
 }
 
 /// The stick modes this module runs, plus one standing for the rest.
@@ -68,6 +84,17 @@ pub enum StickMode {
     RotateOnly,
     /// The stick moves the pointer by how far it is pushed.
     MouseArea,
+    /// `LEFT_STICK` / `RIGHT_STICK`: the stick drives a virtual pad's stick,
+    /// sharing it with the gyro if the gyro is pointed at the same one. The
+    /// `usize` is which virtual stick, 0 left and 1 right.
+    VirtualStick(usize),
+    /// `LEFT_ANGLE_TO_X` and its three siblings: how far the stick is turned away
+    /// from one axis becomes a push along that axis, the way a wheel steers.
+    /// Which virtual stick, then true for the X axis and false for Y.
+    AngleToAxis(usize, bool),
+    /// `LEFT_WIND_X` / `RIGHT_WIND_X`: turning the stick winds a value up, and
+    /// letting go unwinds it. Which virtual stick.
+    Wind(usize),
     /// A mode a later phase owns: nothing comes from the stick here.
     Elsewhere,
     /// Doing nothing until the stick comes back to centre (JSM's `INVALID`).
@@ -87,8 +114,21 @@ impl StickMode {
             | StickMode::RotateOnly | StickMode::MouseArea)
     }
 
+    /// Does this mode drive a virtual pad's stick, and which one?
+    pub fn pad_side(self) -> Option<usize> {
+        match self {
+            StickMode::VirtualStick(side)
+            | StickMode::AngleToAxis(side, _)
+            | StickMode::Wind(side) => Some(side),
+            _ => None,
+        }
+    }
+
+    /// Does this mode drive a virtual pad's stick?
+    pub fn pads(self) -> bool { self.pad_side().is_some() }
+
     /// Is the stick this module's to read at all?
-    pub fn runs_here(self) -> bool { self.is_digital() || self.aims() }
+    pub fn runs_here(self) -> bool { self.is_digital() || self.aims() || self.pads() }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -253,6 +293,10 @@ pub struct Analog {
     triggers: [TriggerRun; 2],
     sticks: [StickRun; 2],
     down: HashSet<Btn>,
+    /// Where a virtual pad's triggers should sit, for the `X_LT` / `X_RT` modes.
+    /// Indexed by the *virtual* trigger, not the physical one, since a config can
+    /// cross them over. `None` for a virtual trigger no mode feeds.
+    pad_triggers: [Option<f32>; 2],
 }
 
 impl Analog {
@@ -260,6 +304,7 @@ impl Analog {
     pub fn tick(&mut self, s: &Settings, dt: f32, pad: &Pad) {
         self.t += dt;
         self.down.clear();
+        self.pad_triggers = [None; 2];
         for side in 0..2 {
             self.trigger(s, side, pad);
             self.stick(s, side, pad);
@@ -268,6 +313,10 @@ impl Analog {
 
     /// Is this analog-derived button down right now?
     pub fn down(&self, b: Btn) -> bool { self.down.contains(&b) }
+
+    /// Where a virtual pad's trigger should sit this tick, if a trigger in
+    /// `X_LT` / `X_RT` mode is feeding it.
+    pub fn pad_trigger(&self, side: usize) -> Option<f32> { self.pad_triggers[side] }
 
     // ── triggers ─────────────────────────────────────────────────────────────
 
@@ -291,6 +340,26 @@ impl Analog {
             None => if digital { 1.0 } else { 0.0 },
         };
         let full = position >= 1.0;
+
+        // `X_LT` / `X_RT`: the position goes straight out to a virtual pad's
+        // trigger and no binding of this trigger's own runs. JSM stops here too,
+        // but it still lets the soft and full pull stand as chord modifiers — on
+        // a looser rule than the state machine's, since there is no state machine
+        // left to consult: soft is any position off the rest, full is the end of
+        // travel. So `ZL,GYRO_SENS = 4` keeps working with the trigger passed
+        // through.
+        if let Some(virt) = mode.pad_side() {
+            self.pad_triggers[virt] = Some(position);
+            if position > NOISE_FLOOR {
+                self.down.insert(soft_btn);
+            }
+            if full {
+                self.down.insert(full_btn);
+            }
+            self.triggers[side] = TriggerRun::default();
+            return;
+        }
+
         let soft_pull = self.soft_pull(s, side, position);
 
         let run = &mut self.triggers[side];
@@ -489,6 +558,14 @@ impl Analog {
             StickMode::Aim | StickMode::MouseArea => active = raw_len > cfg.inner_dz,
             StickMode::Flick | StickMode::FlickOnly | StickMode::RotateOnly =>
                 active = raw_len > outer,
+            // Pushing a stick that drives a virtual pad counts as using it, so
+            // `GYRO_OFF = LEFT_STICK` still turns the gyro off. JSM measures this
+            // one against the *output* undeadzone rather than the input deadzone,
+            // which at its default of zero comes to the same thing; the input
+            // deadzone is the meaningful line to draw and is what every other
+            // mode here uses.
+            StickMode::VirtualStick(_) | StickMode::AngleToAxis(..) | StickMode::Wind(_) =>
+                active = raw_len > cfg.inner_dz,
             StickMode::Elsewhere => {}
             // Waiting to be let go of: nothing until it reads centred.
             StickMode::Inert => {

@@ -14,6 +14,7 @@ mod analog;
 mod bind;
 mod eval;
 mod names;
+mod pad;
 mod parse;
 
 #[cfg(test)]

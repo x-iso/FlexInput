@@ -321,6 +321,71 @@ left it at the end of the previous tick, so a modeshift takes hold one tick afte
 its button. That keeps the order inside a tick simple — settings, then buttons,
 then aiming — and one tick is imperceptible at any rate the engine runs.
 
+**Phase 5 landed** (`jsm/pad.rs`, and the seams in `aim.rs` it needed): a config
+can drive a virtual pad rather than the keyboard and mouse. With it, **JSM's own
+shipped `Xbox.txt` runs end to end** — both triggers passed through, both sticks
+driving the pad's own — and a test pins that, so a future phase cannot quietly
+regress it.
+
+Everything on this side works in the unit JSM works in: degrees per second of
+in-game camera turn. A stick push and a gyro rate are both converted into that
+rate, added, and only then converted back into a stick position, which is what
+lets a gyro and a stick share one virtual stick without either clipping the other.
+`VIRTUAL_STICK_CALIBRATION` is the rate a fully deflected stick produces in the
+game being played, so it scales the whole conversion.
+
+Four things worth knowing before touching this code again:
+
+- **A virtual stick goes on the bus in all three forms** — the `Vec2` and both
+  floats — for exactly the reason the D-pad did. A sink prefers the vector, so a
+  disagreeing pair of floats is at best ignored and at worst wins. There is a test
+  for a stick pushed *up*, separately from one pushed right: the conversion passes
+  through camera space where y counts down, and a broken round trip inverts every
+  virtual stick vertically while a sideways-only test stays green.
+- **`GYRO_OUTPUT` pointed at a stick silences the whole mouse**, not just the
+  gyro's share of it, so an `AIM` stick stops moving the pointer too. That is
+  JSM's own gating (`gyroOutput == MOUSE` guards the entire `moveMouse` call) and
+  it looks far more like an oversight than a design — but a config was tuned on
+  it, so it is reproduced, and the editor says so on the `GYRO_OUTPUT` line rather
+  than leaving it to be discovered.
+- **`X_LT` / `X_RT` split a trigger in two.** Its pull goes straight to the pad
+  and its own bindings stop running, but it still stacks a chord — JSM returns
+  early out of the trigger state machine and poked the chord stack by hand, so
+  `Runtime::tick` grew a `chord_only` predicate that does the same thing in the
+  same place. The chord rule is looser than the state machine's, too: any pull off
+  the rest is the soft press and only the end of travel is the full one, because
+  there is no state machine left to ask.
+- **`*_UNDEADZONE_*` is for the gyro, not for a stick.** It runs the *game's*
+  deadzone backwards so a small contribution starts above it instead of at zero.
+  For a stick alone it is arithmetically a no-op — the stick's own length is
+  divided out and multiplied straight back in — which is right, since a stick
+  already reaches the whole range and it is the gyro's nudges a game's deadzone
+  swallows.
+
+Two departures, both deliberate:
+
+- **`LEFT_STEER_X` / `RIGHT_STEER_X` are an error on a thumbstick**, not pending.
+  JSM refuses them there (they are `MOTION_STICK_MODE`'s alone) and warns; no
+  later phase will make them work on a thumbstick, so calling them pending would
+  be a promise we would never keep. The message names where they do work and what
+  to use instead. This is what `Parsed::Refused` exists for.
+- **`GYRO_OUTPUT = PS_MOTION` is implemented by doing nothing**, which is exactly
+  right here: it means "don't aim with the gyro, let the pad's own motion reach
+  the pad", and the pass-through already does that — so the gyro pins are simply
+  left unclaimed. The line says as much.
+
+One faithful port that reads like a bug and isn't: a stick driving a virtual stick
+uses the **previous** tick's direction with the **current** tick's length, because
+JSM deadzones `lastX`/`lastY` in place and hands those to `processGyroStick`. It is
+one tick of lag on direction only, imperceptible at any rate the engine runs, and
+there is a mutation-checked test so nobody "fixes" it by accident.
+
+A flick bound for a stick is a wholly different sum from a flick bound for the
+mouse, not a scaled one: a mouse can be moved any distance in a tick, so JSM eases
+the turn out over `FLICK_TIME`, while a stick can only be pushed so far — so there
+the turn becomes "hold it right over at `VIRTUAL_STICK_CALIBRATION` deg/s for
+however long the angle takes", and `FLICK_TIME` has nothing to say at all.
+
 ## `X_` and `PS_` names stay aliases
 
 Raised after hands-on testing: since `PS_UP` and `X_UP` land on the same
@@ -342,15 +407,120 @@ that it needs a pad wired downstream, and that the prefix doesn't pick one.
 
 ## Phase 9 — the custom-curve fork
 
-`evan1mclean/JSM_custom_curve` adds features on top of JSM 3.x that JSM users may
-be carrying configs for. **Not yet surveyed**: github was unreachable from the dev
-machine when this was written (`git clone` and a raw fetch both failed while an
-ordinary push had just worked), so the fork's own settings have not been read
-first-hand and nothing here is designed yet. Before implementing: clone it, diff
-its `SettingID` list and command registry against upstream 3.6.2 the way phases
-1-4 were done, and write the caveats down here first. Slot it after the phases
-that share its ground (aiming, phase 3) so its curve settings extend a pipeline
-that already exists rather than growing a second one.
+`evan1mclean/JSM_custom_curve` adds features on top of JSM that JSM users may be
+carrying configs for. **Surveyed** at fork commit `0ace2da` against upstream
+3.6.2: its `SettingID` enum, its command registry and its gyro pipeline were
+diffed line by line, and the whole delta is 18 settings, one command and ten
+button names. Everything it adds lives in the gyro path, which is why it belongs
+after phase 3 rather than beside it — each item below extends a pipeline that
+already exists.
+
+Nothing here is guesswork about behaviour: the numbers are the fork's own
+defaults and the maths below is its own, read from source.
+
+### The acceleration curves — the fork's headline feature
+
+`ACCEL_CURVE` replaces the straight line between `MIN_GYRO_SENS` and
+`MAX_GYRO_SENS` with one of five shapes, applied per axis exactly where the
+existing ramp is applied:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `ACCEL_CURVE` | `LINEAR` | `LINEAR` \| `NATURAL` \| `POWER` \| `QUADRATIC` \| `SIGMOID` \| `JUMP` |
+| `ACCEL_NATURAL_VHALF` | `200` | deg/s at which `NATURAL` sits halfway up |
+| `ACCEL_POWER_VREF` | `0.01` | deg/s where `POWER` starts climbing |
+| `ACCEL_POWER_EXPONENT` | `0.5` | `POWER`'s exponent |
+| `ACCEL_SIGMOID_MID` | `20` | deg/s at `SIGMOID`'s inflection |
+| `ACCEL_SIGMOID_WIDTH` | `8` | `SIGMOID` steepness; larger is gentler |
+| `ACCEL_JUMP_TAU` | `1.5` | how sharply `JUMP` approaches its step |
+
+Written with `s` for the sensitivity returned, `ω` for `max(0, speed - MIN_GYRO_THRESHOLD)`
+in deg/s, and `lo`/`hi` for the two sens settings:
+
+- `NATURAL`: `s = hi - (hi-lo)·exp(-ln2·ω/vHalf)` — approaches `hi` but never
+  reaches it.
+- `POWER`: `s = lo + (hi-lo)·(1 - exp(-(ω/vRef)^exponent))`.
+- `QUADRATIC`: `s = lo + (hi-lo)·(ω/cap)²`, flat at `hi` above the cap, where
+  `cap` is `MAX_GYRO_THRESHOLD`.
+- `SIGMOID`: logistic in `(ω - mid)/width`, then rescaled so ω=0 gives exactly
+  `lo`.
+- `JUMP`: `exp((ω-cap)/tau)` rising to a step at `cap` (`MAX_GYRO_THRESHOLD`
+  again), likewise rescaled so ω=0 gives `lo`; `tau <= 0` is an instant step.
+
+**The trap worth writing down before anyone implements this:** only `LINEAR`,
+`QUADRATIC` and `JUMP` use `MAX_GYRO_THRESHOLD` at all. `NATURAL`, `POWER` and
+`SIGMOID` ignore it completely and take their shape from their own parameters in
+absolute deg/s. A user who sets a threshold pair and then switches curve will see
+the top threshold silently stop mattering — so the editor should say so on the
+`MAX_GYRO_THRESHOLD` line when the chosen curve does not consult it. That is the
+kind of silent surprise the honesty guarantee exists for, and it is the fork's
+behaviour we would be reproducing, not a bug we would be introducing.
+
+### The rest of the delta
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `GYRO_SMOOTHING_DECAY` | `OFF` | swaps the rolling-average smoother for an exponential one whose time constant shrinks as the stick speeds up |
+| `ONE_EURO_MIN_CUTOFF` | `6.0` | the one-euro filter's resting cutoff, Hz |
+| `ONE_EURO_SPEED_COEFF` | `0.3` | how fast that cutoff opens up with speed (β) |
+| `GYRO_ANGLE_SNAP` | `0.0` | snap to the nearest axis within this many degrees |
+| `GYRO_ANGLE_SNAP_EASE` | `OFF` | ease into the snap instead of jumping |
+| `DECEL_BRAKE_STRENGTH` | `0.0` | 0..1, how hard to brake after a fast flick |
+| `DECEL_BRAKE_THRESHOLD` | `25.0` | deg/s of deceleration over 10 ms before braking starts |
+| `ROLL_CONTRIBUTION` | `0.0` | percent, -100..100, roll's share of horizontal turn |
+| `IGNORE_GYRO_DEVICES` | `""` | space-separated `VID:PID` list whose gyro is ignored |
+| `TELEMETRY_ENABLED` / `TELEMETRY_PORT` | off | socket the fork's GUI reads the live curve from |
+
+Plus one command, `ONE_EURO_FILTER`, and one new gyro space, `YAW_PLUS_ROLL`.
+
+- **`ONE_EURO_FILTER` is a command, not a setting.** It switches the filter on
+  globally for every pad and stays on until `RESET_MAPPINGS`, so unlike the two
+  numbers that tune it, *it cannot be chorded*. Reproduce that asymmetry rather
+  than quietly making it a setting — a config that relies on it being sticky
+  would otherwise behave differently here. The filter itself is small: a
+  first-order low-pass on the signal whose cutoff is `min_cutoff + β·|smoothed
+  derivative|`, with the derivative itself low-passed at 1 Hz, and both parts
+  reset whenever gyro is blocked.
+- **`YAW_PLUS_ROLL` is default `LOCAL` plus a roll term**, and it uses the same
+  signs: `x = -yaw - roll·(ROLL_CONTRIBUTION/100)`, `y = -pitch`. Confirmed
+  against upstream's `LOCAL` block, where X-from-Y and X-from-Z are both
+  negative — so this costs one arm in the gyro-space match and no new
+  convention.
+- **Order matters in the fork's pipeline** and is not the obvious one: decel
+  brake measures speed *before* angle snap (so a snap-induced slowdown does not
+  read as braking), the snap then runs, and only then is speed recomputed for the
+  curve. Implement it in that order or the two features fight.
+- **The decel brake keeps a 50 ms history** and compares now against 10 ms ago,
+  with engage and release integrators (10 ms / 6 ms) and a speed gate of 2..60
+  deg/s. The fork times this off the wall clock; ours should use the tick's own
+  `dt`, which is more honest at any tick rate and makes it testable.
+- **One fidelity question to settle at implementation time, not now.** In the
+  eased snap branch the surviving axis is set to the full vector magnitude as
+  soon as the direction enters the snap zone, while the other axis is only
+  faded — so at the very edge of the zone, where the ease blend is still zero,
+  the output already gains magnitude. That reads like an oversight in the fork
+  rather than an intent. Decide then whether to match it exactly or blend both
+  axes, and say which in a comment either way.
+
+### What is deliberately not coming across
+
+- **`IGNORE_GYRO_DEVICES` does not apply here.** It exists because JSM grabs
+  every pad it can see; this module is handed one device by the patch and cannot
+  see a VID or PID. The patch already answers it — don't wire that pad, or use
+  `GYRO_OFF`. Worth a status on the line so a config carrying it is not silently
+  ignored.
+- **`TELEMETRY_ENABLED` / `TELEMETRY_PORT` do not apply either.** They exist to
+  feed the fork's separate GUI over a socket. Our editor *is* the GUI, so the
+  live sensitivity graph is something to draw natively from values we already
+  hold — no socket, no port.
+- **The fork's GUI itself is out of scope** as a program; the parts of it worth
+  having (a live sens graph, a curve preview) are editor work, and a curve
+  preview has prior art in this repo already — the per-card response curve
+  editor.
+- **Its ten new button names** (`LTOUCH`, `RTOUCH`, `LMINI`, `RMINI`,
+  `MISC1`..`MISC6`) are SDL3 extended inputs. Take them as *input* names, mapped
+  to whichever bus pins exist, and let the phase-4 honesty machinery report the
+  rest: a name a wired pad does not report already says so on its line.
 
 1. **Skeleton + parser + digital bindings.** Node, feature gate, bus republish,
    tabs with Load / Save, the editor with diagnostics, name tables, the button
@@ -366,12 +536,16 @@ that already exists rather than growing a second one.
    *(landed — see above)*
 5. **Virtual pad output.** Pad bindings, stick modes to virtual sticks,
    angle-to-axis and wind modes, gyro to a stick.
+   *(landed — see above)*
 6. **Touchpad and motion stick.** Grid, touch sticks, dual stage, motion stick
    and lean.
 7. **Feedback.** Rumble on/off, light bar, adaptive triggers (plus the pin-model
    extension for bow / galloping / machine), rumble bindings.
 8. **Action layers.** Quoted commands, including loading another tab, and
    `RESET_MAPPINGS`.
+9. **The custom-curve fork.** The five acceleration curves, decay smoothing, the
+   one-euro filter, angle snap, the deceleration brake and `YAW_PLUS_ROLL` —
+   see *Phase 9 — the custom-curve fork* above for the survey and the traps.
 
 Each phase lands with engine tests in the style of the Remapper's
 (`rig_steps`-like tick stepping), and with mutation checks that the tests catch

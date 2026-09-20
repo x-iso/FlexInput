@@ -127,12 +127,18 @@ impl Runtime {
     pub fn chords(&self) -> &[Btn] { &self.chords }
 
     /// Advance one tick. `down` answers "is this JSM button pressed right now?".
+    ///
+    /// `chord_only` names buttons that may stack a chord but must not run a
+    /// binding of their own — a trigger in `X_LT` mode, whose pull goes straight
+    /// to the virtual pad. JSM keeps the same split: that trigger returns early
+    /// out of its state machine and pokes the chord stack by hand.
     pub fn tick(
         &mut self,
         cfg: &Compiled,
         timings: &Timings,
         dt: f32,
         down: &dyn Fn(Btn) -> bool,
+        chord_only: &dyn Fn(Btn) -> bool,
     ) -> &Outputs {
         self.t += dt;
         self.out = Outputs::default();
@@ -142,6 +148,26 @@ impl Runtime {
         // buttons pressed in the same tick resolves the same way every time.
         let mut watched: Vec<Btn> = cfg.mentioned.iter().copied().collect();
         watched.sort_by_key(|b| b.name());
+
+        // A chord-only button never reaches the press machinery, so it is stacked
+        // and unstacked here and left out of everything below. Any binding it has
+        // stays silent, which is what JSM does and what the editor promises on the
+        // line.
+        watched.retain(|&b| {
+            if !chord_only(b) {
+                return true;
+            }
+            let held = down(b);
+            if held && !self.chords.contains(&b) {
+                if is_chord_button(cfg, b) {
+                    self.chords.push(b);
+                }
+            } else if !held {
+                self.chords.retain(|&c| c != b);
+            }
+            self.buttons.entry(b).or_default().down = held;
+            false
+        });
 
         // ── releases first, so a button freed this tick can't also start a pair
         for &b in &watched {

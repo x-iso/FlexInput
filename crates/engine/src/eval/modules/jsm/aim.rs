@@ -32,6 +32,7 @@ use glam::Vec2;
 
 use super::analog::{Analog, StickMode};
 use super::names::{Btn, GyroAction};
+use super::pad::{self, Dest};
 
 /// JSM's own buffer sizes for the two smoothers and the trackball.
 const GYRO_SAMPLES: usize = 256;
@@ -149,6 +150,18 @@ impl Default for Settings {
     }
 }
 
+/// What one tick of aiming produced.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Aimed {
+    /// The mouse displacement for this tick, in the bus's pixels.
+    pub mouse: Vec2,
+    /// The gyro's camera rate in deg/s, for a virtual stick to carry. Zero unless
+    /// `GYRO_OUTPUT` names a stick — the mouse gets it in `mouse` instead.
+    pub gyro_dps: Vec2,
+    /// The flick stick's camera rate in deg/s, on the same terms.
+    pub flick_dps: Vec2,
+}
+
 /// The pad's rotation this tick, in degrees per second, on our bus's axes.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Gyro {
@@ -238,12 +251,13 @@ impl Aim {
     pub fn tick(
         &mut self,
         s: &Settings,
+        p: &pad::Settings,
         dt: f32,
         gyro: Gyro,
         analog: &Analog,
         actions: &HashSet<GyroAction>,
         down: &dyn Fn(Btn) -> bool,
-    ) -> Vec2 {
+    ) -> Aimed {
         self.t += dt;
         // JSM's frame, from the note at the top of this file.
         let (in_x, in_y, in_z) = (gyro.pitch, -gyro.yaw, gyro.roll);
@@ -334,16 +348,39 @@ impl Aim {
 
         // ── the sticks ───────────────────────────────────────────────────────
         let mut cam = Vec2::ZERO;
+        let mut flick_dps = Vec2::ZERO;
         for side in 0..2 {
-            cam += self.stick(s, dt, side, analog);
+            let (mouse, dps) = self.stick(s, p, dt, side, analog);
+            cam += mouse;
+            flick_dps.x += dps;
         }
 
+        // ── where the gyro's rate goes ───────────────────────────────────────
+        // A stick carries it in camera terms (deg/s, y down, which is what
+        // `pad::virtual_stick` adds it to); the mouse takes it in pixels below.
+        let gyro_dps = match p.gyro_dest.side() {
+            Some(_) => Vec2::new(vel_x, vel_y),
+            None => Vec2::ZERO,
+        };
+
         // ── one displacement, in our bus's terms ─────────────────────────────
-        let calibration = s.real_world_calibration / s.in_game_sens.max(1e-6);
-        let x = vel_x * calibration * dt + cam.x;
-        // JSM counts the screen's y downward and the bus counts it up.
-        let y = -(vel_y * calibration * dt) + cam.y;
-        Vec2::new(x, y)
+        //
+        // JSM gates the whole mouse move on `GYRO_OUTPUT` being `MOUSE`, so
+        // pointing the gyro at a virtual stick also stops an `AIM` stick from
+        // moving the mouse. That reads like an oversight rather than a design, but
+        // it is what a config written against JSM was tuned on, so it is
+        // reproduced — and the editor says as much on the `GYRO_OUTPUT` line so
+        // nobody has to discover it the hard way.
+        let mouse = if p.gyro_dest == Dest::Mouse {
+            let calibration = s.real_world_calibration / s.in_game_sens.max(1e-6);
+            let x = vel_x * calibration * dt + cam.x;
+            // JSM counts the screen's y downward and the bus counts it up.
+            let y = -(vel_y * calibration * dt) + cam.y;
+            Vec2::new(x, y)
+        } else {
+            Vec2::ZERO
+        };
+        Aimed { mouse, gyro_dps, flick_dps }
     }
 
     /// JSM's gyro smoother: what is over the threshold goes straight through,
@@ -412,16 +449,25 @@ impl Aim {
 
     /// What one stick contributes to the mouse this tick (JSM's `camSpeed`, with
     /// y counting up).
-    fn stick(&mut self, s: &Settings, dt: f32, side: usize, analog: &Analog) -> Vec2 {
+    /// One stick's contribution, as a mouse displacement and — for a flick bound
+    /// for a virtual stick — a camera rate in deg/s.
+    fn stick(
+        &mut self,
+        s: &Settings,
+        p: &pad::Settings,
+        dt: f32,
+        side: usize,
+        analog: &Analog,
+    ) -> (Vec2, f32) {
         let st = analog.stick_out(side);
-        match st.mode {
+        let mouse = match st.mode {
             StickMode::Aim => {
                 if !st.pegged {
                     self.sticks[side].acceleration = 1.0;
                 }
                 let len = (st.x * st.x + st.y * st.y).sqrt();
                 if len == 0.0 {
-                    return Vec2::ZERO;
+                    return (Vec2::ZERO, 0.0);
                 }
                 if self.sticks[side].acceleration == 0.0 {
                     self.sticks[side].acceleration = 1.0;
@@ -440,7 +486,13 @@ impl Aim {
                 out
             }
             StickMode::Flick | StickMode::FlickOnly | StickMode::RotateOnly => {
-                Vec2::new(self.flick(s, side, &st), 0.0)
+                // A flick bound for a virtual stick is a rate, not a displacement,
+                // and a wholly different calculation — see `flick`.
+                let turn = self.flick(s, p, dt, side, &st);
+                if p.flick_dest != Dest::Mouse {
+                    return (Vec2::ZERO, turn);
+                }
+                Vec2::new(turn, 0.0)
             }
             StickMode::MouseArea => {
                 // Pushing the stick moves the pointer by how far it moved, which
@@ -449,17 +501,34 @@ impl Aim {
                 Vec2::new((st.raw.0 - st.prev_raw.0) * r, (st.raw.1 - st.prev_raw.1) * r)
             }
             _ => Vec2::ZERO,
-        }
+        };
+        (mouse, 0.0)
     }
 
     /// Flick stick: pushing the stick out snaps the camera to face that way, and
     /// turning it while held traces the camera around.
-    fn flick(&mut self, s: &Settings, side: usize, st: &super::analog::StickOut) -> f32 {
+    /// Returns mouse pixels when `FLICK_STICK_OUTPUT` is `MOUSE`, and a camera rate
+    /// in deg/s when it names a virtual stick. The two are not the same sum: a
+    /// mouse can be moved any distance in one tick, so the turn is eased out over
+    /// `FLICK_TIME`, while a stick can only be pushed so far — so there the turn
+    /// becomes "hold it right over at `VIRTUAL_STICK_CALIBRATION` deg/s for however
+    /// long the angle takes", and `FLICK_TIME` has nothing to say.
+    fn flick(
+        &mut self,
+        s: &Settings,
+        p: &pad::Settings,
+        dt: f32,
+        side: usize,
+        st: &super::analog::StickOut,
+    ) -> f32 {
         use std::f32::consts::PI;
         let mode = st.mode;
+        let to_stick = p.flick_dest.side().is_some();
         let cal = s.real_world_calibration / s.in_game_sens.max(1e-6);
-        // JSM works in radians here and its mouse calibration is per degree.
-        let flick_speed_constant = cal * (180.0 / PI);
+        // JSM works in radians here and its mouse calibration is per degree. Bound
+        // for a stick there is no mouse to calibrate against, so the rotation stays
+        // in radians per tick and is converted to deg/s at the end.
+        let flick_speed_constant = if to_stick { 1.0 } else { cal * (180.0 / PI) };
         let mut cam = 0.0;
 
         // Full deflection starts a flick; it takes a little less to keep one.
@@ -506,13 +575,35 @@ impl Aim {
                 };
                 let samples = FLICK_SAMPLES.min(64);
                 cam = self.smooth_rotation(side, speed, smooth.0, smooth.1, samples);
+                if to_stick {
+                    // Radians this tick into degrees per second.
+                    cam *= 180.0 / (PI * dt.max(1e-6));
+                }
             }
         } else {
             self.sticks[side].flick.flicking = false;
         }
 
-        // The flick itself, eased over `FLICK_TIME` and paid out a tick at a time.
         let f = &mut self.sticks[side].flick;
+        if to_stick {
+            // A stick turns at one speed for as long as the angle needs. Its
+            // duration is the angle divided by that speed, in radians because
+            // `delta` is.
+            let speed = p.calibration;
+            let flick_time = if speed > 0.0 {
+                f.delta.abs() / (speed * PI / 180.0)
+            } else {
+                0.0
+            };
+            let paying_out = self.t - f.since <= flick_time && flick_time > 0.0;
+            f.paying_out = paying_out;
+            if paying_out {
+                cam -= if f.delta >= 0.0 { speed } else { -speed };
+            }
+            return cam;
+        }
+
+        // The flick itself, eased over `FLICK_TIME` and paid out a tick at a time.
         let mut percent = (self.t - f.since) / s.flick_time.max(1e-6);
         if f.delta.abs() > 0.0 {
             percent /= (f.delta.abs() / PI).powf(s.flick_time_exponent);

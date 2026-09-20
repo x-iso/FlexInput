@@ -412,11 +412,10 @@ fn timings_are_live_and_in_seconds() {
 fn recognised_but_not_live_settings_name_their_phase() {
     for line in [
         "RIGHT_STICK_MODE = HYBRID_AIM",
+        "RIGHT_STICK_MODE = MOUSE_RING",
         "GYRO_SPACE = WORLD_TURN",
-        "ZL_MODE = X_LT",
         "TOUCHPAD_MODE = MOUSE",
         "RUMBLE = OFF",
-        "GYRO_OUTPUT = RIGHT_STICK",
     ] {
         assert!(
             matches!(one(line).status, LineStatus::Pending(_)),
@@ -573,7 +572,7 @@ impl Rig {
         // last tick left it — so a modeshift on a timing is felt here too.
         let timings = resolve(&self.cfg, self.rt.chords()).timings;
         self.rt
-            .tick(&self.cfg, &timings, DT, &|b| down.contains(&b))
+            .tick(&self.cfg, &timings, DT, &|b| down.contains(&b), &|_| false)
             .pins
             .clone()
     }
@@ -1260,8 +1259,8 @@ fn trigger_and_stick_settings_are_read() {
 
     // A value JSM knows but we don't run yet names its phase; a typo is an error.
     assert!(
-        matches!(one("LEFT_STICK_MODE = LEFT_STICK").status, LineStatus::Pending(p)
-        if p.contains("virtual pad"))
+        matches!(one("LEFT_STICK_MODE = MOUSE_RING").status, LineStatus::Pending(p)
+        if p.contains("absolute mouse pin"))
     );
     assert!(matches!(
         one("ZL_MODE = SORT_OF").status,
@@ -1282,7 +1281,10 @@ struct Aiming {
     cfg: Compiled,
     a: Aim,
     analog: Analog,
+    /// What the physical pad is reporting.
     pad: Pad,
+    /// The virtual pad the config drives, when it drives one.
+    pad_out: super::pad::Pad,
     gyro: Gyro,
     actions: std::collections::HashSet<GyroAction>,
     down: std::collections::HashSet<Btn>,
@@ -1302,6 +1304,7 @@ impl Aiming {
             a: Aim::default(),
             analog: Analog::default(),
             pad: Pad::default(),
+            pad_out: super::pad::Pad::default(),
             gyro: Gyro::default(),
             actions: std::collections::HashSet::new(),
             down: std::collections::HashSet::new(),
@@ -1321,16 +1324,40 @@ impl Aiming {
         self.tick()
     }
     fn tick(&mut self) -> glam::Vec2 {
+        self.aimed().mouse
+    }
+    /// Everything one tick of aiming produced, not just the mouse half.
+    fn aimed(&mut self) -> super::aim::Aimed {
         self.analog.tick(&self.cfg.settings, DT, &self.pad);
         let down = self.down.clone();
         self.a.tick(
             &self.cfg.aim,
+            &self.cfg.pad,
             DT,
             self.gyro,
             &self.analog,
             &self.actions,
             &|b| down.contains(&b),
         )
+    }
+    /// One tick of aiming, then one of the pad side it feeds.
+    fn to_pad(&mut self) -> super::pad::Out {
+        let aimed = self.aimed();
+        self.pad_out.tick(
+            &self.cfg.pad,
+            DT,
+            &self.analog,
+            self.cfg.aim.stick_power,
+            aimed.gyro_dps,
+            aimed.flick_dps,
+        )
+    }
+    fn pad_ticks(&mut self, n: usize) -> super::pad::Out {
+        let mut last = super::pad::Out::default();
+        for _ in 0..n {
+            last = self.to_pad();
+        }
+        last
     }
     fn ticks(&mut self, n: usize) -> glam::Vec2 {
         let mut last = glam::Vec2::ZERO;
@@ -2287,22 +2314,23 @@ fn jsms_own_xbox_config_loads_and_maps_its_buttons() {
     );
     // Fifteen button lines, all live.
     assert_eq!(cfg.bindings.len(), 15, "every button line binds");
-    // The virtual controller is FlexInput's own wiring; the trigger and stick
-    // modes belong to later phases.
+    // The virtual controller is FlexInput's own wiring. Everything else in it —
+    // both triggers passed through to the pad, both sticks driving the pad's own
+    // — runs as of phase 5, so JSM's shipped Xbox config is now live end to end.
     let ignored = cfg
         .lines
         .iter()
         .filter(|l| matches!(l.status, LineStatus::Ignored(_)))
         .count();
-    let pending = cfg
+    let pending: Vec<_> = cfg
         .lines
         .iter()
         .filter(|l| matches!(l.status, LineStatus::Pending(_)))
-        .count();
+        .collect();
     assert_eq!(ignored, 1, "VIRTUAL_CONTROLLER is ours to wire");
-    assert_eq!(
-        pending, 4,
-        "two trigger modes and two stick modes wait their turn"
+    assert!(
+        pending.is_empty(),
+        "nothing in JSM's own Xbox config is still waiting: {pending:?}"
     );
 
     // And it plays: pressing a face button drives the pad pin it was mapped to.
@@ -2359,4 +2387,396 @@ fn jsms_own_desktop_config_plays_its_keys_and_mouse() {
         drove.contains("scroll_down"),
         "and the other way scrolls back: {drove:?}"
     );
+}
+
+// ── phase 5: virtual pad output ──────────────────────────────────────────────
+
+/// A stick told to be a virtual stick drives that stick, and a push out reads as
+/// a push out — the whole round trip through camera degrees per second and back.
+#[test]
+fn a_stick_can_be_the_virtual_pads_stick() {
+    let mut a = Aiming::new("LEFT_STICK_MODE = LEFT_STICK");
+    // Two ticks: JSM reads the previous tick's direction, so the first push has
+    // nothing to point at yet.
+    a.pad.sticks[0] = (1.0, 0.0);
+    let out = a.pad_ticks(2);
+    let v = out.sticks[0].expect("the left virtual stick is driven");
+    assert!(v.x > 0.9, "a stick pushed right pushes the virtual stick right: {v:?}");
+    assert!(v.y.abs() < 0.01, "and not up or down: {v:?}");
+    assert_eq!(out.sticks[1], None, "the right stick is left alone");
+
+    // And up is up. This one is worth its own assertion: the conversion runs
+    // through camera space, where y counts *down*, and it has to come back — get
+    // the round trip wrong and every virtual stick is inverted vertically, which
+    // is both very obvious to a player and invisible in a test that only pushes
+    // sideways.
+    let mut a = Aiming::new("LEFT_STICK_MODE = LEFT_STICK");
+    a.pad.sticks[0] = (0.0, 1.0);
+    let v = a.pad_ticks(2).sticks[0].expect("driven");
+    assert!(v.y > 0.9, "a stick pushed up pushes the virtual stick up: {v:?}");
+    assert!(v.x.abs() < 0.01, "and not left or right: {v:?}");
+}
+
+/// The gyro can drive a virtual stick instead of the mouse — and when it does,
+/// JSM stops moving the mouse entirely. Both halves are the point.
+#[test]
+fn the_gyro_can_drive_a_virtual_stick_instead_of_the_mouse() {
+    let cfg = format!("{AIM_CFG}\nGYRO_OUTPUT = RIGHT_STICK\nVIRTUAL_STICK_CALIBRATION = 100");
+    let mut a = Aiming::new(&cfg);
+    a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw: 50.0 };
+    let out = a.pad_ticks(3);
+    let v = out.sticks[1].expect("the right virtual stick is driven");
+    assert!(v.x > 0.1, "turning the pad pushes the virtual stick: {v:?}");
+    // Half the calibrated speed is half the stick, give or take the smoother.
+    assert!(v.x < 0.9, "and not all the way over at half speed: {v:?}");
+
+    let mut a = Aiming::new(&cfg);
+    a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw: 50.0 };
+    let aimed = a.aimed();
+    assert_eq!(
+        aimed.mouse,
+        glam::Vec2::ZERO,
+        "with the gyro pointed at a stick the mouse gets nothing"
+    );
+}
+
+/// A stick and the gyro pointed at the same virtual stick combine, rather than
+/// one overwriting the other — that is the whole reason JSM works in deg/s.
+#[test]
+fn a_stick_and_the_gyro_share_one_virtual_stick() {
+    let cfg = format!(
+        "{AIM_CFG}\nLEFT_STICK_MODE = LEFT_STICK\nGYRO_OUTPUT = LEFT_STICK\n\
+         VIRTUAL_STICK_CALIBRATION = 100"
+    );
+    let stick_only = {
+        let mut a = Aiming::new(&cfg);
+        a.pad.sticks[0] = (0.3, 0.0);
+        a.pad_ticks(3).sticks[0].expect("driven").x
+    };
+    let both = {
+        let mut a = Aiming::new(&cfg);
+        a.pad.sticks[0] = (0.3, 0.0);
+        a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw: 30.0 };
+        a.pad_ticks(3).sticks[0].expect("driven").x
+    };
+    assert!(
+        both > stick_only + 0.05,
+        "the gyro adds to the stick rather than replacing it: {stick_only} then {both}"
+    );
+}
+
+/// `ANGLE_TO_X`: how far the stick is turned off the Y axis becomes an X push,
+/// with no sideways travel needed — a stick that steers like a wheel.
+#[test]
+fn angle_to_axis_turns_a_lean_into_a_push() {
+    let cfg = "LEFT_STICK_MODE = LEFT_ANGLE_TO_X\nANGLE_TO_AXIS_DEADZONE_OUTER = 0";
+    // Straight up: no lean, no push.
+    let mut a = Aiming::new(cfg);
+    a.pad.sticks[0] = (0.0, 1.0);
+    let straight = a.pad_ticks(2).sticks[0].expect("driven");
+    assert!(straight.x.abs() < 0.01, "straight ahead is no steer: {straight:?}");
+    // Leaned 45 degrees to the right: half of the 90 degree span.
+    let mut a = Aiming::new(cfg);
+    a.pad.sticks[0] = (0.7071, 0.7071);
+    let leaned = a.pad_ticks(2).sticks[0].expect("driven");
+    assert!(
+        (leaned.x - 0.5).abs() < 0.05,
+        "45 degrees off the axis is half the range: {leaned:?}"
+    );
+    assert!(leaned.y.abs() < 0.001, "and the other axis stays put: {leaned:?}");
+}
+
+/// Winding: turning the stick round winds a value up, and it only comes back
+/// when the stick is let go.
+#[test]
+fn winding_builds_up_by_turning_and_unwinds_when_let_go() {
+    let cfg = "LEFT_STICK_MODE = LEFT_WIND_X\nWIND_STICK_RANGE = 360\nUNWIND_RATE = 100";
+    let mut a = Aiming::new(cfg);
+    // Turn the stick a quarter of the way round, held right out.
+    let mut wound = 0.0;
+    for step in 0..=8 {
+        let angle = std::f32::consts::FRAC_PI_2 * step as f32 / 8.0;
+        a.pad.sticks[0] = (angle.sin(), angle.cos());
+        wound = a.to_pad().sticks[0].expect("driven").x;
+    }
+    assert!(wound > 0.1, "turning one way winds one way: {wound}");
+
+    // Let the stick go: it unwinds back towards nothing.
+    a.pad.sticks[0] = (0.0, 0.0);
+    let after = a.pad_ticks(30).sticks[0].expect("driven").x;
+    assert!(
+        after.abs() < wound.abs() - 0.05,
+        "a released stick unwinds: {wound} then {after}"
+    );
+
+    // How hard the stick is pushed scales the winding: the same turn made with a
+    // half-pushed stick winds about half as far. Without that, a lazy nudge round
+    // the edge of the deadzone would wind as fast as a deliberate sweep.
+    let quarter_turn = |reach: f32| {
+        let mut a = Aiming::new(cfg);
+        let mut last = 0.0;
+        for step in 0..=8 {
+            let angle = std::f32::consts::FRAC_PI_2 * step as f32 / 8.0;
+            a.pad.sticks[0] = (reach * angle.sin(), reach * angle.cos());
+            last = a.to_pad().sticks[0].expect("driven").x;
+        }
+        last
+    };
+    let full = quarter_turn(1.0);
+    let half = quarter_turn(0.6);
+    assert!(
+        half < full * 0.8,
+        "a gentler push winds less for the same turn: {full} at full, {half} at 0.6"
+    );
+}
+
+/// `ZL_MODE = X_LT` hands the trigger straight to the virtual pad, and takes its
+/// own bindings out of the picture.
+#[test]
+fn a_trigger_can_pass_straight_through_to_the_pad() {
+    let out = run_node_with(
+        "ZL_MODE = X_LT\nZL = E",
+        false,
+        &[("left_trigger", Signal::Float(0.6))],
+        3,
+    );
+    assert_eq!(
+        out.get("left_trigger").map(|s| s.as_float()),
+        Some(0.6),
+        "the pull reaches the virtual trigger as it stands: {out:?}"
+    );
+    assert!(
+        !out.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+        "and the trigger's own binding no longer fires"
+    );
+}
+
+/// The same trigger still counts as pressed for chords, which is JSM's rule and
+/// the reason the pass-through doesn't simply skip the button machinery. Note the
+/// looser rule it uses: any pull at all is the soft press, and only the very end
+/// of travel is the full one — there is no state machine left to ask.
+#[test]
+fn a_passed_through_trigger_still_reads_as_pressed_for_chords() {
+    let mut s = Stage::new("ZL_MODE = X_LT");
+    assert!(!s.pull(0.0).down(Btn::Zl), "a resting trigger is not held");
+    assert!(
+        s.pull(0.5).down(Btn::Zl),
+        "half a pull is enough to chord with"
+    );
+    assert!(
+        !s.pull(0.5).down(Btn::Zlf),
+        "but half a pull is not the full pull"
+    );
+    assert!(s.pull(1.0).down(Btn::Zlf), "the end of travel is");
+}
+
+/// And the chord it supplies reaches all the way through to a chorded binding —
+/// the passed-through trigger has to stack a chord without ever entering the press
+/// machinery, so this is the end-to-end proof that the split works.
+#[test]
+fn a_passed_through_trigger_still_supplies_a_chord() {
+    let out = run_node_with(
+        "ZL_MODE = X_LT
+ZL,S = E",
+        false,
+        &[
+            ("left_trigger", Signal::Float(0.6)),
+            ("btn_south", Signal::Bool(true)),
+        ],
+        3,
+    );
+    assert!(
+        out.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+        "the chorded binding fires with the trigger pulled: {out:?}"
+    );
+
+    // Not pulled, no chord, no binding.
+    let out = run_node_with(
+        "ZL_MODE = X_LT
+ZL,S = E",
+        false,
+        &[("btn_south", Signal::Bool(true))],
+        3,
+    );
+    assert!(
+        !out.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+        "and not without it: {out:?}"
+    );
+}
+
+/// `STEER_X` is the motion stick's alone in JSM, which refuses it on a thumbstick.
+/// Saying "a later phase will do this" would be a lie, so it is an error with the
+/// alternative named.
+#[test]
+fn steer_on_a_thumbstick_says_it_will_never_work() {
+    let info = one("LEFT_STICK_MODE = LEFT_STEER_X");
+    match &info.status {
+        LineStatus::Error(why) => {
+            assert!(why.contains("MOTION_STICK_MODE"), "says where it does work: {why}");
+            assert!(why.contains("WIND_X"), "and what to use instead: {why}");
+        }
+        other => panic!("STEER_X on a thumbstick should be an error, got {other:?}"),
+    }
+}
+
+/// Every pad-output line says it needs a pad wired downstream, and the gyro one
+/// also warns that it silences the mouse — the surprise JSM has and never says.
+#[test]
+fn pad_output_lines_say_what_they_need_and_what_they_cost() {
+    let stick = one("LEFT_STICK_MODE = LEFT_STICK");
+    assert_eq!(stick.status, LineStatus::Ok);
+    assert!(
+        stick.notes.iter().any(|n| n.contains("virtual pad wired downstream")),
+        "a stick driving a pad says so: {:?}",
+        stick.notes
+    );
+
+    let gyro = one("GYRO_OUTPUT = LEFT_STICK");
+    assert!(
+        gyro.notes.iter().any(|n| n.contains("MOUSE_AREA")),
+        "and the gyro warns it silences the aiming sticks too: {:?}",
+        gyro.notes
+    );
+
+    // PS_MOTION claims nothing and explains what actually happens.
+    let motion = one("GYRO_OUTPUT = PS_MOTION");
+    assert_eq!(motion.status, LineStatus::Ok);
+    assert!(
+        motion.notes.iter().any(|n| n.contains("passes straight through")),
+        "PS_MOTION says the pad's own motion goes downstream: {:?}",
+        motion.notes
+    );
+}
+
+/// `GYRO_OUTPUT = PS_MOTION` must leave the gyro pins alone, or the DS4 sink it
+/// exists to feed would never see them.
+#[test]
+fn ps_motion_lets_the_pads_own_gyro_through() {
+    let cfg = format!("{AIM_CFG}\nGYRO_OUTPUT = PS_MOTION");
+    let out = run_node_with(&cfg, false, &[("gyro_z", Signal::Float(0.25))], 2);
+    assert_eq!(
+        out.get("gyro_z").map(|s| s.as_float()),
+        Some(0.25),
+        "the gyro passes through untouched: {out:?}"
+    );
+}
+
+/// A virtual stick lands on the bus in all three forms a sink might read, the
+/// same trap the D-pad hit: a sink prefers the Vec2, so a disagreeing pair of
+/// floats would be silently ignored — or worse, win.
+#[test]
+fn a_virtual_stick_drives_the_vector_and_both_axes() {
+    let out = run_node_with(
+        "RIGHT_STICK_MODE = RIGHT_STICK",
+        false,
+        &[("right_stick", Signal::Vec2(glam::Vec2::new(1.0, 0.0)))],
+        3,
+    );
+    let v = match out.get("right_stick") {
+        Some(Signal::Vec2(v)) => *v,
+        other => panic!("the vector form is published: {other:?}"),
+    };
+    assert!(v.x > 0.9, "and carries the push: {v:?}");
+    assert_eq!(out.get("right_stick_x").map(|s| s.as_float()), Some(v.x));
+    assert_eq!(out.get("right_stick_y").map(|s| s.as_float()), Some(v.y));
+}
+
+/// The undeadzone runs a game's own deadzone backwards: told the game ignores the
+/// first 30%, a gentle push should come out above 30% rather than under it.
+#[test]
+fn the_undeadzone_lifts_a_small_push_over_the_games_deadzone() {
+    // It bites on the gyro's contribution, not a stick's: a stick push has its
+    // own length divided out and multiplied straight back in, so for a stick
+    // alone the setting is a no-op. That is JSM's arithmetic, and it is the right
+    // answer — the stick already reaches the whole range, and it is the gyro's
+    // small nudges that the game's deadzone would swallow.
+    let nudge = |extra: &str| {
+        let cfg = format!(
+            "{AIM_CFG}\nGYRO_OUTPUT = LEFT_STICK\nVIRTUAL_STICK_CALIBRATION = 400\n{extra}"
+        );
+        let mut a = Aiming::new(&cfg);
+        a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw: 40.0 };
+        a.pad_ticks(3).sticks[0].expect("driven").x
+    };
+    let bare = nudge("");
+    let lifted = nudge("LEFT_STICK_UNDEADZONE_INNER = 0.3");
+    assert!(
+        bare < 0.3,
+        "without it a gentle turn stays inside the game's deadzone: {bare}"
+    );
+    assert!(lifted > 0.3, "with it the same turn clears it: {lifted}");
+}
+
+/// Every one of phase 5's settings is read, with a bad value called out rather
+/// than quietly ignored.
+#[test]
+fn every_pad_setting_is_read() {
+    let c = compile(
+        "VIRTUAL_STICK_CALIBRATION = 180\n\
+         LEFT_STICK_UNDEADZONE_INNER = 0.1\n\
+         LEFT_STICK_UNDEADZONE_OUTER = 0.2\n\
+         LEFT_STICK_UNPOWER = 2\n\
+         LEFT_STICK_VIRTUAL_SCALE = 1.5\n\
+         RIGHT_STICK_UNDEADZONE_INNER = 0.3\n\
+         RIGHT_STICK_UNPOWER = 3\n\
+         RIGHT_STICK_VIRTUAL_SCALE = 0.5\n\
+         ANGLE_TO_AXIS_DEADZONE_INNER = 5\n\
+         ANGLE_TO_AXIS_DEADZONE_OUTER = 15\n\
+         WIND_STICK_RANGE = 720\n\
+         WIND_STICK_POWER = 2\n\
+         UNWIND_RATE = 900\n\
+         FLICK_STICK_OUTPUT = LEFT_STICK",
+    );
+    assert!(errors(&c).is_empty(), "all of these are live: {:?}", errors(&c));
+    assert_eq!(c.pad.calibration, 180.0);
+    assert_eq!(c.pad.out[0].undeadzone_inner, 0.1);
+    assert_eq!(c.pad.out[0].undeadzone_outer, 0.2);
+    assert_eq!(c.pad.out[0].unpower, 2.0);
+    assert_eq!(c.pad.out[0].virtual_scale, 1.5);
+    assert_eq!(c.pad.out[1].undeadzone_inner, 0.3);
+    assert_eq!(c.pad.out[1].unpower, 3.0);
+    assert_eq!(c.pad.out[1].virtual_scale, 0.5);
+    assert_eq!(c.pad.angle_dz_inner, 5.0);
+    assert_eq!(c.pad.angle_dz_outer, 15.0);
+    assert_eq!(c.pad.wind_range, 720.0);
+    assert_eq!(c.pad.wind_power, 2.0);
+    assert_eq!(c.pad.unwind_rate, 900.0);
+    assert_eq!(c.pad.flick_dest, super::pad::Dest::LeftStick);
+
+    // And a value out of range is an error naming what it wanted.
+    for bad in [
+        "VIRTUAL_STICK_CALIBRATION = 0",
+        "LEFT_STICK_UNDEADZONE_INNER = 2",
+        "ANGLE_TO_AXIS_DEADZONE_INNER = 100",
+        "WIND_STICK_RANGE = 0",
+        "GYRO_OUTPUT = SIDEWAYS",
+    ] {
+        assert!(
+            matches!(one(bad).status, LineStatus::Error(_)),
+            "{bad} should be an error"
+        );
+    }
+}
+
+/// A flick bound for a stick turns at one speed for as long as the angle needs,
+/// rather than being eased out the way a mouse flick is.
+#[test]
+fn a_flick_to_a_stick_holds_a_steady_turn() {
+    let cfg = format!(
+        "{AIM_CFG}\nRIGHT_STICK_MODE = FLICK\nFLICK_STICK_OUTPUT = RIGHT_STICK\n\
+         VIRTUAL_STICK_CALIBRATION = 180"
+    );
+    let mut a = Aiming::new(&cfg);
+    // Push the stick straight left: a quarter turn to make.
+    a.pad.sticks[1] = (-1.0, 0.0);
+    let first = a.to_pad();
+    let v = first.sticks[1].expect("the flick drives the stick");
+    assert!(v.x.abs() > 0.9, "a flick pushes the stick right over: {v:?}");
+
+    // A quarter turn at 180 deg/s takes half a second — still going a tick later,
+    // and done well before a second is out.
+    let mid = a.pad_ticks(10).sticks[1].expect("driven");
+    assert!(mid.x.abs() > 0.9, "and holds it while the turn runs: {mid:?}");
+    let end = a.pad_ticks(500).sticks[1].expect("driven");
+    assert!(end.x.abs() < 0.1, "then stops when the angle is covered: {end:?}");
 }

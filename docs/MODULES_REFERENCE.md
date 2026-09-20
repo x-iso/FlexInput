@@ -738,7 +738,8 @@ pub struct ModuleDescriptor {
     dragged by the grip in its bottom-right corner
 - **Engine:** `eval/modules/jsm/` — `parse` (grammar + a status per line),
   `analog` (triggers and sticks as JSM's buttons), `aim` (gyro and sticks as
-  mouse movement), `bind` (the press machinery), `eval` (bus in, bus out).
+  mouse movement), `pad` (whatever drives a virtual pad instead), `bind` (the
+  press machinery), `eval` (bus in, bus out).
   Registered through the registry seam's stateful publisher hook; state lives in
   `NodeState::jsm`
 - **Editor:** the body is the config text, each line tinted by what the parser
@@ -746,7 +747,7 @@ pub struct ModuleDescriptor {
   has keyboard focus the config's key and mouse output pauses, so a binding under
   test can't type into it. The wheel over the editor scrolls the config instead of
   panning the canvas (`canvas/wheel.rs`).
-- **Live so far (plan phases 1-4):** digital bindings (tap/hold, all modifiers,
+- **Live so far (plan phases 1-5):** digital bindings (tap/hold, all modifiers,
   chord, simultaneous, diagonal, double press, turbo) and JSM's timing settings;
   analog triggers (`TRIGGER_THRESHOLD` including the hair trigger, `ZL_MODE` /
   `ZR_MODE` full pull with every skip mode, `TRIGGER_SKIP_DELAY`); digital sticks
@@ -755,13 +756,19 @@ pub struct ModuleDescriptor {
   sensitivity ramp, smoothing, cutoff, trackball and `GYRO_ON`/`GYRO_OFF`, stick
   `AIM`, flick stick and `MOUSE_AREA`, written to the bus's `mouse_move`; and
   modeshifts — any of those settings can be chorded (`ZL,GYRO_SENS = 4`), latest
-  chord winning per setting, with JSM's stick-recentre and unfinished-flick rules.
-  Virtual pad output, the touchpad and feedback arrive in later
-  phases — their lines compile as "pending" and say which phase will run them,
-  as do the gravity-referenced gyro spaces and `MOUSE_RING`.
-- **What it takes over:** only what it actually runs. A stick left in a mouse or
-  pad mode, and a full pull the trigger mode never fires, keep passing through
-  rather than going quiet for a binding that can't run; the line says why.
+  chord winning per setting, with JSM's stick-recentre and unfinished-flick rules;
+  and virtual pad output — `LEFT_STICK` / `RIGHT_STICK`, `*_ANGLE_TO_X/Y`,
+  `*_WIND_X`, `GYRO_OUTPUT` and `FLICK_STICK_OUTPUT` to a stick, `ZL_MODE = X_LT`
+  passing a trigger straight through, and the undeadzone / unpower / scale settings
+  that shape them. JSM's own shipped `Xbox.txt` runs end to end.
+  The touchpad, the motion stick and feedback arrive in later phases — their lines
+  compile as "pending" and say which phase will run them, as do the
+  gravity-referenced gyro spaces and `MOUSE_RING`.
+- **What it takes over:** only what it actually runs. A stick left in a mode a
+  later phase owns, and a full pull the trigger mode never fires, keep passing
+  through rather than going quiet for a binding that can't run; the line says why.
+  `GYRO_OUTPUT = PS_MOTION` is the clearest case: it means "let the pad's own
+  motion reach the pad", so the gyro pins are simply left unclaimed.
 
 #### Audio Stream Haptics (ASTH)
 - **ID:** `module.audio_stream_haptics`
