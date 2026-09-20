@@ -88,6 +88,10 @@ pub struct Outputs {
     pub commands: Vec<String>,
     /// Rumble asked for by a binding, as (strong, weak) — phase 7 sends it.
     pub rumble: Option<(f32, f32)>,
+    /// A binding asked to switch to this tab (JSM: load that config file).
+    pub layer: Option<String>,
+    /// A binding asked for `RESET_MAPPINGS`.
+    pub reset: bool,
 }
 
 /// The run-time state of one JSM Config node.
@@ -420,6 +424,10 @@ impl Runtime {
             Out::Gyro(g) => { self.out.gyro.insert(*g); }
             Out::Calibrate => {}
             Out::Command(c) => self.out.commands.push(c.clone()),
+            // Both are acted on by `eval.rs`, which owns the tab the module runs
+            // and the state a reset throws away.
+            Out::Layer(tab) => self.out.layer = Some(tab.clone()),
+            Out::Reset => self.out.reset = true,
             Out::Rumble { strong, weak } => self.out.rumble = Some((*strong, *weak)),
             Out::Pulse(pin) => self.timed.push(Timed { pin: pin.clone(), until: self.t + TAP_HOLD }),
             Out::Pin(pin) => match action {

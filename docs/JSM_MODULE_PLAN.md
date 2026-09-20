@@ -537,6 +537,57 @@ its own trigger-calibration routine in the DualSense's raw travel, and our effec
 zones are fractions of the trigger already — so there is nothing to declare, and
 calibration is the device card's job here.
 
+**Phase 8 landed**: action layers. A JSM config does layers by *loading another
+config file*, and this module holds each config as a tab, so a quoted file name
+resolves to the tab of that name — path and `.txt` dropped, matched
+case-insensitively. Both forms work:
+
+- **Bound to a button** (`HOME = "driving.txt"`) it switches which tab is running.
+  The tab the editor has open is where a config starts, and where `RESET_MAPPINGS`
+  or any edit sends it back to; a switch is not always visible on screen, which is
+  the one place this model departs in *feel* from JSM's (there, the console tells
+  you). The switch happens **after** everything else in the tick, so the layer being
+  left gets to finish — including releasing what it drove.
+- **On its own line** (`defaults.txt`) it applies everything in that tab right
+  there, as JSM loading the file mid-config would. One level only: a config named
+  *inside* an included tab is not followed, and the line says so. Two configs naming
+  each other therefore cannot loop, and there is a test that they don't.
+
+A tab that isn't there is an error naming the tabs that are — the most useful thing
+it can say, since the fix is always "load it into a tab" or "you meant one of
+these". Only a name with a `.txt` suffix or a path separator is taken for a config
+at all; a bare word is far likelier a mistyped command, and calling it a missing tab
+would bury the real mistake.
+
+`RESET_MAPPINGS` works both ways too: bound to a button it goes back to the open
+tab, and on its own line it discards everything above it, as JSM does. At the very
+top of a file — where a JSM config almost always puts it, to clear a *previous*
+config — there is nothing to discard, because each tab compiles on its own. The line
+says exactly that rather than sitting there looking effective.
+
+**Two real bugs came out of building this**, both found by reasoning about what a
+layer switch has to do:
+
+1. **A rebound button was using the FIRST binding, not the last.** A binding is an
+   assignment (`mappings[button] = value` in JSM), so `S = A` followed by `S = B`
+   means B. Bindings were appended and the runtime took the first match, so it meant
+   A. That was wrong on its own, and it is the whole basis of the "set defaults, then
+   override" shape a config with includes or a reset is written in. The line that
+   loses now says which line took over.
+2. **A layer switch left the old layer's keys latched on the bus.** The tab holding
+   `key_a` is gone and the new one has never heard of it, so nothing published `false`
+   and the sink kept holding `true` — the original stuck-key bug in a different coat.
+   The module now remembers every pin *any* layer has claimed and keeps telling all
+   of them where they stand. The test that nearly missed this asserted "the key is no
+   longer true", which absence satisfies; the honest assertion is that `false` is
+   actively published, with a fresh collector map every tick.
+
+Console commands are also finished here. A command this module runs
+(`SET_MOTION_STICK_NEUTRAL`, `RESET_MAPPINGS`) is live; one FlexInput owns itself is
+`Ignored` with the *same reason* the bare command line gives, so a command means the
+same thing whether written alone or bound to a button. A line whose every step is
+such a command reads as ignored; a real key beside one still runs.
+
 ## `X_` and `PS_` names stay aliases
 
 Raised after hands-on testing: since `PS_UP` and `X_UP` land on the same
@@ -697,6 +748,7 @@ Plus one command, `ONE_EURO_FILTER`, and one new gyro space, `YAW_PLUS_ROLL`.
    extending the bus is its own change.)*
 8. **Action layers.** Quoted commands, including loading another tab, and
    `RESET_MAPPINGS`.
+   *(landed — see above)*
 9. **The custom-curve fork.** The five acceleration curves, decay smoothing, the
    one-euro filter, angle snap, the deceleration brake and `YAW_PLUS_ROLL` —
    see *Phase 9 — the custom-curve fork* above for the survey and the traps.

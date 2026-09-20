@@ -242,8 +242,32 @@ impl Compiled {
     }
 }
 
-/// Compile a whole config.
+/// A config's sibling tabs, as (name, text) — what a layer switch can reach.
+///
+/// A tab is named by its file name alone, so a config that loads
+/// `GyroConfigs/vehicle.txt`, `Autoload/GTA5/vehicle.txt` or `vehicle.txt` all mean
+/// the tab `vehicle`. That is what lets a set of related JSM configs be imported
+/// from wherever they sit and then travel inside the patch.
+pub type Tabs<'a> = &'a [(String, String)];
+
+/// The tab a JSM file name refers to: the base name, without directory or `.txt`.
+pub fn tab_name(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    base.strip_suffix(".txt")
+        .or_else(|| base.strip_suffix(".TXT"))
+        .unwrap_or(base)
+        .trim()
+        .to_string()
+}
+
+/// Compile a whole config, with no sibling tabs known — every layer switch then
+/// says it cannot find its tab, which is the right answer when there are none.
 pub fn compile(text: &str) -> Compiled {
+    compile_with(text, &[])
+}
+
+/// Compile a whole config against the tabs it can reach.
+pub fn compile_with(text: &str, tabs: Tabs) -> Compiled {
     let mut out = Compiled {
         lines: Vec::new(),
         bindings: Vec::new(),
@@ -259,7 +283,7 @@ pub fn compile(text: &str) -> Compiled {
         mentioned: HashSet::new(),
     };
     for (n, line) in text.lines().enumerate() {
-        let info = compile_line(line, n, &mut out);
+        let info = compile_line(line, n, &mut out, tabs);
         out.lines.push(info);
     }
     annotate_analog(&mut out);
@@ -326,7 +350,7 @@ fn annotate_analog(out: &mut Compiled) {
     }
 }
 
-fn compile_line(raw: &str, n: usize, out: &mut Compiled) -> LineInfo {
+fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs) -> LineInfo {
     // '#' starts a comment to end of line (JSM cuts it before parsing, so a '#'
     // inside a quoted command ends the line there too).
     let line = raw.split('#').next().unwrap_or("").trim();
@@ -336,7 +360,7 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled) -> LineInfo {
 
     // A line with no value: RESET_MAPPINGS, a config file name, the console-only ones.
     let Some((lhs, rhs)) = line.split_once('=') else {
-        return command_line(line, out);
+        return command_line(line, out, tabs);
     };
     let (lhs, rhs) = (lhs.trim(), rhs.trim());
     let Some((first, combo)) = split_combo(lhs) else {
@@ -369,12 +393,126 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled) -> LineInfo {
     }
 
     // Everything else is a binding.
-    binding_line(&first, combo, rhs, n, out)
+    binding_line(&first, combo, rhs, n, out, tabs)
 }
 
 // ── line kinds ───────────────────────────────────────────────────────────────
 
-fn command_line(name: &str, out: &mut Compiled) -> LineInfo {
+/// Why a JSM console command does nothing here, or `None` when it does something.
+///
+/// These are the same reasons a bare command line gives, so a command means the same
+/// thing whether it is written on its own or bound to a button.
+fn command_does_nothing(name: &str) -> Option<&'static str> {
+    Some(match name.trim().to_ascii_uppercase().as_str() {
+        // The ones that DO something: re-centring the motion stick, resetting, and
+        // switching layers (the last two never arrive as `Out::Command` at all).
+        "SET_MOTION_STICK_NEUTRAL" | "RESET_MAPPINGS" => return None,
+        "CALCULATE_REAL_WORLD_CALIBRATION" => {
+            "the RWS Aim module measures real-world sensitivity; set \
+             REAL_WORLD_CALIBRATION here from what it tells you"
+        }
+        "RESTART_GYRO_CALIBRATION" | "FINISH_GYRO_CALIBRATION" | "CALIBRATE_TRIGGERS" => {
+            WHY_DEVICE_CARD
+        }
+        "RECONNECT_CONTROLLERS" | "MERGE" | "SPLIT" => {
+            "FlexInput tracks connected controllers itself"
+        }
+        "WHITELIST_SHOW" | "WHITELIST_ADD" | "WHITELIST_REMOVE" => {
+            "FlexInput hides pads through HidHide, in Settings"
+        }
+        "README" | "HELP" | "CLEAR" | "QUIT" | "SLEEP" => {
+            "it is a JSM console command with nothing to do here"
+        }
+        // Anything else is a name JSM would print or refuse; say so plainly.
+        _ => "it is not a command this module runs",
+    })
+}
+
+
+/// Does this name refer to another config? `Some(Ok(tab))` when it does and the tab
+/// exists, `Some(Err(why))` when it plainly means a config we haven't got, and
+/// `None` when it isn't a config name at all.
+///
+/// What counts as a config name is JSM's own giveaway: a `.txt` suffix or a path
+/// separator. Without either, a bare word is far more likely a typo'd command than
+/// a file, and calling it a missing tab would bury the real mistake.
+fn layer_target(name: &str, tabs: Tabs) -> Option<Result<String, String>> {
+    let looks_like_a_file =
+        name.to_ascii_uppercase().ends_with(".TXT") || name.contains('/') || name.contains('\\');
+    if !looks_like_a_file {
+        return None;
+    }
+    let want = tab_name(name);
+    if want.is_empty() {
+        return Some(Err(format!("`{name}` doesn't name a config")));
+    }
+    match tabs.iter().find(|(n, _)| n.eq_ignore_ascii_case(&want)) {
+        Some((n, _)) => Some(Ok(n.clone())),
+        None if tabs.is_empty() => Some(Err(format!(
+            "no tab called `{want}` — this module holds each config as a tab, so load \
+             `{name}` into one and it will be found"
+        ))),
+        None => {
+            let have: Vec<&str> = tabs.iter().map(|(n, _)| n.as_str()).collect();
+            Some(Err(format!(
+                "no tab called `{want}` — the tabs here are {}",
+                have.join(", ")
+            )))
+        }
+    }
+}
+
+/// Fold another tab's settings and bindings in at this point, the way JSM loading
+/// that file mid-config would.
+///
+/// Its own line statuses are NOT merged: they belong to that tab's text and are
+/// shown when that tab is open. What comes across is what it does.
+fn include_tab(tab: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
+    let Some((_, text)) = tabs.iter().find(|(n, _)| n == tab) else {
+        return LineInfo::of(LineStatus::Error(format!("no tab called `{tab}`")));
+    };
+    // Compiled WITHOUT the tab list, so a pair of configs naming each other cannot
+    // loop for ever. One level of include is what a JSM config actually uses (a
+    // base and a layer); deeper nesting would need a visited set, and saying plainly
+    // that it stops here beats a stack overflow.
+    let inner = compile(text);
+    out.timings = inner.timings;
+    out.settings = inner.settings;
+    out.aim = inner.aim;
+    out.pad = inner.pad;
+    out.motion = inner.motion;
+    out.touch = inner.touch;
+    out.fb = inner.fb;
+    out.neutral_at_load |= inner.neutral_at_load;
+    out.modeshifts.extend(inner.modeshifts);
+    out.mentioned.extend(inner.mentioned.iter().copied());
+    // A binding is an assignment, so the included tab's win — and they are folded in
+    // one at a time so the replacement rule applies to each.
+    for b in inner.bindings {
+        out.bindings.retain(|x| x.trigger != b.trigger);
+        out.bindings.push(b);
+    }
+    let mut info = LineInfo::of(LineStatus::Ok);
+    let errors = inner
+        .lines
+        .iter()
+        .filter(|l| matches!(l.status, LineStatus::Error(_)))
+        .count();
+    if errors > 0 {
+        info.notes.push(format!(
+            "tab `{tab}` has {errors} line{} with errors of its own — open that tab to see them",
+            if errors == 1 { "" } else { "s" }
+        ));
+    }
+    info.notes.push(format!(
+        "applies everything in tab `{tab}` here, as JSM would by loading that file. \
+         A config naming another one INSIDE `{tab}` is not followed, so the chain stops here."
+    ));
+    info
+}
+
+
+fn command_line(name: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
     let name = name.trim();
     let upper = name.to_ascii_uppercase();
     // Take the gyro's on/off button away again, so the gyro is simply always on.
@@ -389,7 +527,37 @@ fn command_line(name: &str, out: &mut Compiled) -> LineInfo {
         ));
     }
     match upper.as_str() {
-        "RESET_MAPPINGS" => LineInfo::of(LineStatus::Pending(PHASE_LAYERS)),
+        // Everything above this line is discarded, which is what JSM does: a config
+        // is a list of console commands and this one resets them all. At the very
+        // top of a file — where it usually sits — there is nothing to discard, and
+        // saying so is worth more than silence, because a JSM user puts it there to
+        // clear a PREVIOUS config and here there is no previous config to clear.
+        "RESET_MAPPINGS" => {
+            let had_anything = !out.bindings.is_empty()
+                || !out.modeshifts.is_empty()
+                || out.settings != Settings::default()
+                || out.aim != super::aim::Settings::default();
+            out.bindings.clear();
+            out.modeshifts.clear();
+            out.mentioned.clear();
+            out.timings = Timings::default();
+            out.settings = Settings::default();
+            out.aim = super::aim::Settings::default();
+            out.pad = super::pad::Settings::default();
+            out.motion = super::motion::Settings::default();
+            out.touch = super::touch::Settings::default();
+            out.fb = super::feedback::Settings::default();
+            let mut info = LineInfo::of(LineStatus::Ok);
+            if !had_anything {
+                info.notes.push(
+                    "nothing above it to reset — this module compiles each tab on its own, so \
+                     there is never a previous config left over. Harmless, and kept so the file \
+                     still matches what JSM would run."
+                        .to_string(),
+                );
+            }
+            info
+        }
         "CALCULATE_REAL_WORLD_CALIBRATION" => LineInfo::of(LineStatus::Ignored(
             "FlexInput measures real-world sensitivity in the RWS Aim module — \
              set REAL_WORLD_CALIBRATION here from what it tells you",
@@ -420,13 +588,15 @@ fn command_line(name: &str, out: &mut Compiled) -> LineInfo {
             LineStatus::Ignored("FlexInput hides pads through HidHide, in Settings"),
         ),
         _ => {
-            // JSM loads a config by naming its file; we resolve that to a tab.
-            if upper.ends_with(".TXT") || name.contains('/') || name.contains('\\') {
-                LineInfo::of(LineStatus::Pending(PHASE_LAYERS))
-            } else {
-                LineInfo::of(LineStatus::Error(format!(
+            // JSM loads a config by naming its file, and a bare name loads it right
+            // there — so everything in it applies as if pasted in. We resolve the
+            // name to a tab and fold that tab's compiled result in at this point.
+            match layer_target(name, tabs) {
+                Some(Ok(tab)) => include_tab(&tab, out, tabs),
+                Some(Err(missing)) => LineInfo::of(LineStatus::Error(missing)),
+                None => LineInfo::of(LineStatus::Error(format!(
                     "`{name}` isn't a button, setting or command"
-                )))
+                ))),
             }
         }
     }
@@ -551,6 +721,7 @@ fn binding_line(
     rhs: &str,
     line: usize,
     out: &mut Compiled,
+    tabs: Tabs,
 ) -> LineInfo {
     let Some(btn) = Btn::from_name(first) else {
         return LineInfo::of(LineStatus::Error(format!(
@@ -576,7 +747,7 @@ fn binding_line(
         }
     };
 
-    let (steps, notes) = match parse_mapping(rhs) {
+    let (steps, notes) = match parse_mapping(rhs, tabs) {
         Ok(v) => v,
         Err(e) => return LineInfo::of(LineStatus::Error(e)),
     };
@@ -600,15 +771,27 @@ fn binding_line(
             _ => None,
         })
         .collect();
-    let pending_out = steps.iter().find_map(|s| match &s.out {
-        Out::Command(_) => Some(PHASE_LAYERS),
-        _ => None,
-    });
+    let pending_out: Option<&'static str> = None;
     // Recalibrating mid-game is the device card's job here, so a binding that
     // asks for it still runs — it just doesn't recalibrate.
     let mut notes = notes;
     if steps.iter().any(|s| s.out == Out::Calibrate) {
         notes.push("CALIBRATE does nothing here — the device card owns gyro calibration".into());
+    }
+    // A console command JSM has and this module doesn't run is not an error — JSM
+    // knows the name and so do we — but the line has to say it will do nothing, and
+    // why. The reasons are the same ones a bare command line gives.
+    let mut inert = 0;
+    for step in &steps {
+        if let Out::Command(name) = &step.out {
+            match command_does_nothing(name) {
+                Some(why) => {
+                    inert += 1;
+                    notes.push(format!("`{name}` does nothing here — {why}"));
+                }
+                None => {}
+            }
+        }
     }
     // A pad output goes nowhere unless a virtual pad is wired downstream of this
     // module, and it goes to EVERY pad wired there — `X_` and `PS_` are two names
@@ -622,6 +805,8 @@ fn binding_line(
 
     let status = if let Some(phase) = pending {
         LineStatus::Pending(phase)
+    } else if inert > 0 && inert == steps.len() {
+        LineStatus::Ignored("every command on this line is one FlexInput owns itself")
     } else if !unsupported.is_empty()
         && steps
             .iter()
@@ -631,6 +816,23 @@ fn binding_line(
     } else if let Some(phase) = pending_out {
         LineStatus::Pending(phase)
     } else {
+        // A binding is an ASSIGNMENT, so a second one for the same trigger replaces
+        // the first — that is what JSM does (`mappings[button] = value`), and it is
+        // the whole basis of the "set a default, then override it" shape a config
+        // with includes or a `RESET_MAPPINGS` is written in. Appending and taking
+        // the first match would silently keep the line the author meant to replace.
+        if let Some(prev) = out.bindings.iter().position(|b| b.trigger == trigger) {
+            let old_line = out.bindings[prev].line;
+            out.bindings.remove(prev);
+            // Say so on the line that lost, so a config with two bindings for one
+            // button doesn't look like it has two.
+            if let Some(info) = out.lines.get_mut(old_line) {
+                info.notes.push(format!(
+                    "replaced by the binding on line {} — a second one for the same trigger                      wins, as in JSM",
+                    line + 1
+                ));
+            }
+        }
         out.bindings.push(Binding {
             trigger,
             steps: steps.clone(),
@@ -758,7 +960,7 @@ fn read_token(chars: &[char], i: &mut usize) -> Option<String> {
 /// Event modifiers default the way JSM's parser does: the only key of a binding
 /// follows the press, the first of several is the tap and the second the hold,
 /// and a third needs saying which event it wants.
-pub(crate) fn parse_mapping(rhs: &str) -> Result<(Vec<Step>, Vec<String>), String> {
+pub(crate) fn parse_mapping(rhs: &str, tabs: Tabs) -> Result<(Vec<Step>, Vec<String>), String> {
     let chars: Vec<char> = rhs.chars().collect();
     let mut i = 0;
     let mut steps: Vec<Step> = Vec::new();
@@ -863,7 +1065,15 @@ pub(crate) fn parse_mapping(rhs: &str) -> Result<(Vec<Step>, Vec<String>), Strin
             if action != ActionMod::Instant {
                 return Err("a command in quotes can only be instant".into());
             }
-            Out::Command(key.clone())
+            // A quoted config file name is a layer switch: JSM loads that file,
+            // we switch to the tab of that name. Anything else is a console
+            // command, run as JSM would run it.
+            match layer_target(&key, tabs) {
+                Some(Ok(tab)) => Out::Layer(tab),
+                Some(Err(missing)) => return Err(missing),
+                None if key.eq_ignore_ascii_case("RESET_MAPPINGS") => Out::Reset,
+                None => Out::Command(key.clone()),
+            }
         } else {
             let Some(found) = out_from_name(&key) else {
                 return Err(format!(
@@ -1923,7 +2133,6 @@ const PHASE_GYRO: &str = "gyro, flick stick and real-world calibration arrive in
 const PHASE_ABSOLUTE: &str =
     "placing the pointer outright needs an absolute mouse pin, which the bus doesn't have yet";
 const PHASE_HYBRID: &str = "HYBRID_AIM arrives after the rest of aiming";
-const PHASE_LAYERS: &str = "loading another config arrives in phase 8";
 
 const WHY_DEVICE_CARD: &str = "the device card owns calibration in FlexInput";
 
@@ -2088,7 +2297,6 @@ fn setting_support(name: &str) -> Option<Support> {
         "JOYCON_GYRO_MASK" | "JOYCON_MOTION_MASK" => {
             Ignored("FlexInput treats each Joy-Con as its own device")
         }
-        "RESET_MAPPINGS" => Pending(PHASE_LAYERS),
         _ => return None,
     })
 }

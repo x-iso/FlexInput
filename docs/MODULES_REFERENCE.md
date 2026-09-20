@@ -730,7 +730,8 @@ pub struct ModuleDescriptor {
 - **Parameters:**
   - `jsm_tabs: Array<{name, text}>` — one config file per tab; a binding that
     loads a config by name finds the tab of that name (paths and `.txt` ignored)
-  - `jsm_active_tab: u32` — the tab being applied
+  - `jsm_active_tab: u32` — the tab the editor has open, and where a config starts
+    running; a binding can switch the running tab away from it — the tab being applied
   - `jsm_strict: bool` (header toggle "Only what the config says") — off: inputs
     the config never mentions pass through and the mentioned ones are taken over
     (and marked consumed); on: only the config's own output is published
@@ -752,7 +753,7 @@ pub struct ModuleDescriptor {
   has keyboard focus the config's key and mouse output pauses, so a binding under
   test can't type into it. The wheel over the editor scrolls the config instead of
   panning the canvas (`canvas/wheel.rs`).
-- **Live so far (plan phases 1-7):** digital bindings (tap/hold, all modifiers,
+- **Live so far (plan phases 1-8):** digital bindings (tap/hold, all modifiers,
   chord, simultaneous, diagonal, double press, turbo) and JSM's timing settings;
   analog triggers (`TRIGGER_THRESHOLD` including the hair trigger, `ZL_MODE` /
   `ZR_MODE` full pull with every skip mode, `TRIGGER_SKIP_DELAY`); digital sticks
@@ -776,8 +777,10 @@ pub struct ModuleDescriptor {
   `ADAPTIVE_TRIGGER`, the two `*_TRIGGER_EFFECT` settings, and rumble bindings
   (`SMALL_RUMBLE`, `BIG_RUMBLE`, `Rhhhh`), published as
   `feedback_override:{_jsm_dest_dev}` so they replace the game's rather than add to
-  it. Action layers arrive in phase 8 — those lines compile as "pending" and say
-  so, as do `MOUSE_RING` and `HYBRID_AIM`.
+  it. And phase 8: action layers — a quoted config file name switches which tab is
+  running (`HOME = "driving.txt"`), a bare one applies that tab where it stands, and
+  `RESET_MAPPINGS` works both ways. Only `MOUSE_RING` and `HYBRID_AIM` are still
+  pending, and their lines say why.
 - **What it takes over:** only what it actually runs. A stick left in a mode a
   later phase owns, and a full pull the trigger mode never fires, keep passing
   through rather than going quiet for a binding that can't run; the line says why.

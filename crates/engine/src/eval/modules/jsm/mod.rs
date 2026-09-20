@@ -30,5 +30,5 @@ pub use eval::{jsm_editor_focus, set_jsm_editor_focus};
 
 // The editor compiles the text it is showing to put a status on every line, so
 // the parser's surface is public — the run-time side stays crate-internal.
-pub use parse::{compile as jsm_compile, note_inputs_this_pad_lacks as jsm_note_missing_inputs,
+pub use parse::{compile_with as jsm_compile, note_inputs_this_pad_lacks as jsm_note_missing_inputs,
     Compiled as JsmConfig, LineInfo as JsmLineInfo, LineStatus as JsmLineStatus};

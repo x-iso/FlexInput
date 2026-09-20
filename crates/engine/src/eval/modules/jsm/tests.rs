@@ -156,15 +156,18 @@ fn a_bare_action_modifier_is_an_error_not_a_crash() {
     assert_eq!(info.status, LineStatus::Ok, "{info:?}");
 }
 
-// A console command in quotes fires once, and can only be instant. The line
-// itself waits for the phase that runs commands.
+// A console command in quotes fires once, and can only be instant.
 #[test]
 fn a_quoted_command_is_instant() {
-    let (s, _) = parse_mapping("\"GyroConfigs/driving.txt\"").expect("parses");
+    // A name that isn't a config file stays a console command.
+    let (s, _) = parse_mapping("\"RECONNECT_CONTROLLERS\"", &[]).expect("parses");
     assert_eq!(s[0].action, ActionMod::Instant);
-    assert_eq!(s[0].out, Out::Command("GyroConfigs/driving.txt".into()));
-    assert!(matches!(one("HOME = \"GyroConfigs/driving.txt\"").status,
-        LineStatus::Pending(p) if p.contains("another config")));
+    assert_eq!(s[0].out, Out::Command("RECONNECT_CONTROLLERS".into()));
+
+    // A config file name is a layer switch, and resolves to the tab of that name.
+    let tabs = vec![("driving".to_string(), String::new())];
+    let (s, _) = parse_mapping("\"GyroConfigs/driving.txt\"", &tabs).expect("parses");
+    assert_eq!(s[0].out, Out::Layer("driving".into()));
 
     let info = one("HOME = ^\"RESET_MAPPINGS\"");
     assert!(
@@ -457,11 +460,32 @@ fn comments_and_blank_lines_are_blank_and_dont_hide_a_binding() {
     assert_eq!(c.bindings.len(), 1);
 }
 
+/// Naming a config with no tab of that name is an error that says which tabs there
+/// are — the most useful thing it can say, since the fix is always "load it into a
+/// tab" or "you meant one of these".
 #[test]
-fn naming_a_config_file_waits_for_the_layers_phase() {
-    assert!(
-        matches!(one("GyroConfigs/xbox.txt").status, LineStatus::Pending(p) if p.contains("another config"))
-    );
+fn naming_a_config_with_no_tab_says_which_tabs_there_are() {
+    match one("GyroConfigs/xbox.txt").status {
+        LineStatus::Error(why) => {
+            assert!(why.contains("xbox"), "it names what was asked for: {why}");
+            assert!(why.contains("load"), "and what to do about it: {why}");
+        }
+        other => panic!("a missing tab should be an error, got {other:?}"),
+    }
+
+    let tabs = vec![
+        ("driving".to_string(), String::new()),
+        ("onfoot".to_string(), String::new()),
+    ];
+    match compile_with("GyroConfigs/xbox.txt", &tabs).lines[0].status.clone() {
+        LineStatus::Error(why) => {
+            assert!(
+                why.contains("driving") && why.contains("onfoot"),
+                "with tabs present it lists them: {why}"
+            );
+        }
+        other => panic!("a missing tab should be an error, got {other:?}"),
+    }
 }
 
 // ── name mapping caveats ─────────────────────────────────────────────────────
@@ -3835,5 +3859,472 @@ fn a_rumble_binding_reaches_the_pad() {
     assert!(
         !collector.contains_key(&(key, "rumble_strong".to_string())),
         "with nothing rumbling the game keeps the group"
+    );
+}
+
+// ── phase 8: action layers ───────────────────────────────────────────────────
+
+/// A node holding several tabs, with the first one open.
+fn tabbed_snap(uid: usize, tabs: &[(&str, &str)]) -> NodeSnap {
+    let mut snap = jsm_snap(uid, tabs[0].1, false);
+    let list: Vec<serde_json::Value> = tabs
+        .iter()
+        .map(|(n, t)| {
+            serde_json::json!({ "name": n.to_string(), "text": t.to_string() })
+        })
+        .collect();
+    snap.params.insert("jsm_tabs".into(), serde_json::Value::Array(list));
+    snap.params.insert("jsm_active_tab".into(), serde_json::json!(0));
+    snap
+}
+
+/// Run a tabbed node, pressing whatever is named, and return what it drove.
+fn run_tabs(
+    tabs: &[(&str, &str)],
+    steps: &[(&[&str], usize)],
+) -> Vec<std::collections::HashSet<String>> {
+    let uid = 5150;
+    let snap = tabbed_snap(uid, tabs);
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut seen = Vec::new();
+    for (held, ticks) in steps {
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        for pin in *held {
+            dev.insert((PAD.to_string(), pin.to_string()), Signal::Bool(true));
+        }
+        for _ in 0..*ticks {
+            collector.clear();
+            super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+        }
+        seen.push(
+            collector
+                .iter()
+                .filter(|((_, p), v)| p.starts_with("key_") && v.as_bool())
+                .map(|((_, p), _)| p.clone())
+                .collect(),
+        );
+    }
+    seen
+}
+
+/// A tab is named by its file name alone, whatever path a JSM config used.
+#[test]
+fn a_tab_is_named_by_its_file_name_alone() {
+    for raw in [
+        "vehicle.txt",
+        "vehicle",
+        "GyroConfigs/vehicle.txt",
+        "Autoload/GTA5/vehicle.txt",
+        r"GyroConfigs\vehicle.txt",
+    ] {
+        assert_eq!(super::parse::tab_name(raw), "vehicle", "{raw}");
+    }
+}
+
+/// A button bound to a config file switches which tab is running — JSM's action
+/// layers, in a patch that keeps its configs as tabs.
+#[test]
+fn a_binding_can_switch_to_another_tab() {
+    let seen = run_tabs(
+        &[
+            ("base", "S = A\nHOME = \"driving.txt\""),
+            ("driving", "S = B\nHOME = \"base.txt\""),
+        ],
+        &[
+            // Press S on the base layer.
+            (&["btn_south"], 3),
+            // Switch, then press S again — the same button, a different key.
+            (&["btn_guide"], 3),
+            (&["btn_south"], 3),
+            // And back.
+            (&["btn_guide"], 3),
+            (&["btn_south"], 3),
+        ],
+    );
+    assert!(seen[0].contains("key_a"), "base layer: S is A — {:?}", seen[0]);
+    assert!(seen[2].contains("key_b"), "driving layer: S is B — {:?}", seen[2]);
+    assert!(!seen[2].contains("key_a"), "and not A any more — {:?}", seen[2]);
+    assert!(seen[4].contains("key_a"), "back on base: S is A again — {:?}", seen[4]);
+}
+
+/// Switching layers must release whatever the old one was driving. This is the
+/// stuck-key bug in a different coat: a key held when the layer changes has no
+/// binding left to release it.
+#[test]
+fn switching_layers_does_not_leave_a_key_held() {
+    let uid = 5151;
+    let snap = tabbed_snap(
+        uid,
+        &[("base", "S = A\nHOME = \"driving.txt\""), ("driving", "N = B")],
+    );
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+
+    // Hold S so A is down.
+    dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
+    for _ in 0..3 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    assert_eq!(
+        collector.get(&(format!("collector:{uid}"), "key_a".to_string())).map(|s| s.as_bool()),
+        Some(true),
+        "A is held to start with"
+    );
+
+    // Now switch layers with S still held. The new tab has no binding for S at all.
+    dev.insert((PAD.to_string(), "btn_guide".to_string()), Signal::Bool(true));
+    for _ in 0..5 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    let a = collector
+        .get(&(format!("collector:{uid}"), "key_a".to_string()))
+        .map(|s| s.as_bool());
+    assert!(
+        a != Some(true),
+        "the key the old layer was holding is not left down: {a:?}"
+    );
+}
+
+/// `RESET_MAPPINGS` bound to a button puts the module back on the tab the editor
+/// has open, whatever layer it had wandered to.
+#[test]
+fn reset_mappings_goes_back_to_the_open_tab() {
+    let seen = run_tabs(
+        &[
+            ("base", "S = A\nHOME = \"driving.txt\""),
+            ("driving", "S = B\nN = \"RESET_MAPPINGS\""),
+        ],
+        &[
+            (&["btn_guide"], 3),
+            (&["btn_south"], 3),
+            (&["btn_north"], 3),
+            (&["btn_south"], 3),
+        ],
+    );
+    assert!(seen[1].contains("key_b"), "on the driving layer — {:?}", seen[1]);
+    assert!(seen[3].contains("key_a"), "reset put it back on base — {:?}", seen[3]);
+}
+
+/// A bare `RESET_MAPPINGS` line discards everything above it, which is what JSM
+/// does — and at the top of a file, where it usually sits, it says plainly that
+/// there was nothing to discard.
+#[test]
+fn a_bare_reset_mappings_line_discards_what_came_before() {
+    // Mid-file: the binding and the setting above it are gone.
+    let c = compile("S = A\nGYRO_SENS = 4\nRESET_MAPPINGS\nN = B");
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    assert_eq!(c.bindings.len(), 1, "only the binding below it survives");
+    assert_eq!(c.bindings[0].trigger, Trigger::Simple(Btn::N));
+    assert_eq!(c.aim.min_sens, (0.0, 0.0), "and the setting is back to default");
+
+    // At the top: nothing to discard, and the line says so rather than looking
+    // like it did something.
+    let c = compile("RESET_MAPPINGS\nS = A");
+    assert_eq!(c.lines[0].status, LineStatus::Ok);
+    assert!(
+        c.lines[0].notes.iter().any(|n| n.contains("nothing above it")),
+        "it says there was nothing to reset: {:?}",
+        c.lines[0].notes
+    );
+    assert_eq!(c.bindings.len(), 1, "and the binding below it is untouched");
+}
+
+/// Naming a config on its own line applies everything in that tab right there —
+/// JSM loads the file at that point, so its settings and bindings take effect.
+#[test]
+fn a_bare_config_name_applies_that_tab() {
+    let tabs = vec![(
+        "defaults".to_string(),
+        "GYRO_SENS = 3\nS = A\nN = C".to_string(),
+    )];
+    // The included tab's binding for S is replaced by the later one here; its
+    // binding for N, which nothing else touches, comes across.
+    let c = compile_with("defaults.txt\nS = B", &tabs);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    assert_eq!(c.aim.min_sens, (3.0, 3.0), "its settings apply");
+    let for_btn = |b: Btn| {
+        c.bindings
+            .iter()
+            .find(|x| x.trigger == Trigger::Simple(b))
+            .map(|x| x.steps[0].out.clone())
+    };
+    assert_eq!(for_btn(Btn::N), Some(pin("key_c")), "its bindings apply");
+    assert_eq!(
+        for_btn(Btn::S),
+        Some(pin("key_b")),
+        "and a later line here overrides one of them"
+    );
+    assert!(
+        c.lines[0].notes.iter().any(|n| n.contains("chain stops here")),
+        "the line says it does not follow a chain: {:?}",
+        c.lines[0].notes
+    );
+}
+
+/// Two configs naming each other must not compile for ever.
+#[test]
+fn configs_that_name_each_other_do_not_loop() {
+    let tabs = vec![
+        ("a".to_string(), "b.txt\nS = A".to_string()),
+        ("b".to_string(), "a.txt\nN = B".to_string()),
+    ];
+    // Compiling either one terminates; that it returns at all is the assertion.
+    let c = compile_with("b.txt", &tabs);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    assert!(
+        c.bindings.iter().any(|x| x.trigger == Trigger::Simple(Btn::N)),
+        "one level came across"
+    );
+}
+
+/// A rebound button uses the LAST binding, not the first — a binding is an
+/// assignment, as in JSM. The earlier line says which one took over.
+#[test]
+fn a_rebound_button_uses_the_last_binding() {
+    let c = compile("S = A\nS = B");
+    assert_eq!(c.bindings.len(), 1, "one binding, not two");
+    assert_eq!(c.bindings[0].steps[0].out, pin("key_b"), "the later one wins");
+    assert!(
+        c.lines[0].notes.iter().any(|n| n.contains("replaced by the binding on line 2")),
+        "the line that lost says so: {:?}",
+        c.lines[0].notes
+    );
+
+    // End to end: pressing the button sends the second key, not the first.
+    let out = run_node("S = A\nS = B", false, &["btn_south"], 3);
+    assert!(out.get("key_b").map(|s| s.as_bool()).unwrap_or(false), "{out:?}");
+    assert!(!out.get("key_a").map(|s| s.as_bool()).unwrap_or(false), "{out:?}");
+}
+
+/// Editing any tab recompiles, including one a layer switch would reach — and puts
+/// the module back on the tab the editor has open, rather than running a
+/// half-edited chain.
+#[test]
+fn an_edit_puts_the_module_back_on_the_open_tab() {
+    let uid = 5152;
+    let mut snap = tabbed_snap(
+        uid,
+        &[("base", "S = A\nHOME = \"driving.txt\""), ("driving", "S = B")],
+    );
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    dev.insert((PAD.to_string(), "btn_guide".to_string()), Signal::Bool(true));
+    for _ in 0..3 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    // On the driving layer now: S is B.
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
+    for _ in 0..3 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    assert_eq!(
+        collector.get(&(format!("collector:{uid}"), "key_b".to_string())).map(|s| s.as_bool()),
+        Some(true),
+        "the layer switch took"
+    );
+
+    // Now edit the OTHER tab. It recompiles, and lands back on the open one.
+    snap = tabbed_snap(
+        uid,
+        &[("base", "S = A\nHOME = \"driving.txt\"\n# edited"), ("driving", "S = B")],
+    );
+    for _ in 0..3 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    assert_eq!(
+        collector.get(&(format!("collector:{uid}"), "key_a".to_string())).map(|s| s.as_bool()),
+        Some(true),
+        "an edit puts it back on the tab being edited"
+    );
+}
+
+/// A console command JSM has and we don't is not an error — it is deliberately
+/// ignored, with the same reason the bare command line gives. A command means the
+/// same thing whether it is written on its own or bound to a button.
+#[test]
+fn a_console_command_binding_says_it_does_nothing_and_why() {
+    for (line, expect) in [
+        ("HOME = \"RECONNECT_CONTROLLERS\"", "tracks connected controllers"),
+        ("HOME = \"CALIBRATE_TRIGGERS\"", "device card"),
+        ("HOME = \"WHITELIST_ADD\"", "HidHide"),
+        ("HOME = \"QUIT\"", "nothing to do here"),
+    ] {
+        let info = one(line);
+        assert!(
+            matches!(info.status, LineStatus::Ignored(_)),
+            "{line} is ignored, not an error or a claim: {:?}",
+            info.status
+        );
+        let notes = info.notes.join(" ");
+        assert!(notes.contains(expect), "{line} says why: {notes}");
+    }
+
+    // And a command the module DOES run is live: `SET_MOTION_STICK_NEUTRAL` bound to
+    // a button is the useful form of it.
+    let live = one("HOME = \"SET_MOTION_STICK_NEUTRAL\"");
+    assert_eq!(live.status, LineStatus::Ok, "{live:?}");
+
+    // A binding that mixes a real key with an inert command still runs the key.
+    let mixed = one("HOME = A \"QUIT\"");
+    assert_eq!(mixed.status, LineStatus::Ok, "the key still fires: {mixed:?}");
+}
+
+/// Switching layers must actively release what the old layer was driving, not just
+/// stop mentioning it. A sink latches the last value it was told, so a key that
+/// simply falls off the bus stays DOWN — the stuck-key bug in a different coat.
+/// This is the assertion the weaker "it isn't true any more" version missed.
+#[test]
+fn switching_layers_publishes_the_old_layers_keys_as_released() {
+    let uid = 5153;
+    let snap = tabbed_snap(
+        uid,
+        &[("base", "S = A\nHOME = \"driving.txt\""), ("driving", "N = B")],
+    );
+    let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+    let key = (format!("collector:{uid}"), "key_a".to_string());
+
+    dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
+    for _ in 0..3 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    assert_eq!(collector.get(&key).map(|s| s.as_bool()), Some(true), "A starts held");
+
+    // Switch with S still held, then run on for a while.
+    dev.insert((PAD.to_string(), "btn_guide".to_string()), Signal::Bool(true));
+    for _ in 0..6 {
+        collector.clear();
+        super::eval::jsm_publish(&snap, uid, &dev, &mut collector, &mut state, DT);
+    }
+    // A fresh map every tick, so this can only pass if the module actively says
+    // "off" — absence would leave the sink holding `true`.
+    assert_eq!(
+        collector.get(&key).map(|s| s.as_bool()),
+        Some(false),
+        "the new layer keeps telling the old layer's key it is released"
+    );
+}
+
+/// An included tab's bindings replace the host's for the same button, because the
+/// include happens at that point in the file and a binding is an assignment.
+#[test]
+fn an_included_tab_replaces_a_binding_made_above_it() {
+    let tabs = vec![("defaults".to_string(), "S = C".to_string())];
+    let c = compile_with("S = A\ndefaults.txt", &tabs);
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    let s_binding: Vec<_> = c
+        .bindings
+        .iter()
+        .filter(|x| x.trigger == Trigger::Simple(Btn::S))
+        .collect();
+    assert_eq!(s_binding.len(), 1, "one binding for S, not two: {:?}", c.bindings);
+    assert_eq!(
+        s_binding[0].steps[0].out,
+        pin("key_c"),
+        "the included tab's binding wins, being further down the file"
+    );
+}
+
+/// Editing a tab the editor does NOT have open still recompiles — a layer a binding
+/// can reach is as live as the one on screen.
+#[test]
+fn editing_a_tab_that_is_not_open_still_recompiles() {
+    let uid = 5154;
+    let run = |snap: &NodeSnap, state: &mut HashMap<usize, NodeState>| {
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        dev.insert((PAD.to_string(), "btn_guide".to_string()), Signal::Bool(true));
+        for _ in 0..3 {
+            collector.clear();
+            super::eval::jsm_publish(snap, uid, &dev, &mut collector, state, DT);
+        }
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        dev.insert((PAD.to_string(), "btn_south".to_string()), Signal::Bool(true));
+        for _ in 0..3 {
+            collector.clear();
+            super::eval::jsm_publish(snap, uid, &dev, &mut collector, state, DT);
+        }
+        collector
+            .iter()
+            .filter(|((_, p), v)| p.starts_with("key_") && v.as_bool())
+            .map(|((_, p), _)| p.clone())
+            .collect::<std::collections::HashSet<String>>()
+    };
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+
+    let first = tabbed_snap(
+        uid,
+        &[("base", "HOME = \"driving.txt\""), ("driving", "S = B")],
+    );
+    let got = run(&first, &mut state);
+    assert!(got.contains("key_b"), "the second tab's binding runs: {got:?}");
+
+    // Edit the SECOND tab — the one not open. It has to take effect.
+    let edited = tabbed_snap(
+        uid,
+        &[("base", "HOME = \"driving.txt\""), ("driving", "S = D")],
+    );
+    let got = run(&edited, &mut state);
+    assert!(
+        got.contains("key_d") && !got.contains("key_b"),
+        "editing a tab that isn't open still recompiles: {got:?}"
+    );
+}
+
+/// After an edit the module is back on the open tab *and knows it*, so a binding can
+/// switch away again. Forgetting the second half leaves the switch looking like a
+/// no-op, which is invisible until someone presses the button twice.
+#[test]
+fn a_layer_can_be_switched_to_again_after_an_edit() {
+    let uid = 5155;
+    let mut state: HashMap<usize, NodeState> = HashMap::new();
+    let press = |snap: &NodeSnap, state: &mut HashMap<usize, NodeState>, pins: &[&str]| {
+        let mut collector: HashMap<(String, String), Signal> = HashMap::new();
+        let mut dev: HashMap<(String, String), Signal> = HashMap::new();
+        for p in pins {
+            dev.insert((PAD.to_string(), p.to_string()), Signal::Bool(true));
+        }
+        for _ in 0..3 {
+            collector.clear();
+            super::eval::jsm_publish(snap, uid, &dev, &mut collector, state, DT);
+        }
+        collector
+            .iter()
+            .filter(|((_, p), v)| p.starts_with("key_") && v.as_bool())
+            .map(|((_, p), _)| p.clone())
+            .collect::<std::collections::HashSet<String>>()
+    };
+    let tabs: &[(&str, &str)] = &[("base", "S = A\nHOME = \"driving.txt\""), ("driving", "S = B")];
+    let snap = tabbed_snap(uid, tabs);
+
+    press(&snap, &mut state, &["btn_guide"]);
+    let on_layer = press(&snap, &mut state, &["btn_south"]);
+    assert!(on_layer.contains("key_b"), "switched once: {on_layer:?}");
+
+    // An edit sends it back to the open tab.
+    let edited = tabbed_snap(
+        uid,
+        &[("base", "S = A\nHOME = \"driving.txt\"\n# edited"), ("driving", "S = B")],
+    );
+    let back = press(&edited, &mut state, &["btn_south"]);
+    assert!(back.contains("key_a"), "an edit puts it back on base: {back:?}");
+
+    // And the switch works again — it is not remembered as already done.
+    press(&edited, &mut state, &["btn_guide"]);
+    let again = press(&edited, &mut state, &["btn_south"]);
+    assert!(
+        again.contains("key_b"),
+        "the same binding switches away again: {again:?}"
     );
 }

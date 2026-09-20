@@ -172,6 +172,12 @@ pub enum Out {
     Rumble { strong: f32, weak: f32 },
     /// A console command in quotes, run when the event fires.
     Command(String),
+    /// Switch to another config — JSM loads a file, we switch to the tab of that
+    /// name. This is how a JSM config does action layers.
+    Layer(String),
+    /// `RESET_MAPPINGS`: back to the config as written, dropping anything a layer
+    /// switch or a held chord had changed.
+    Reset,
     /// A deliberate no-op (`NONE`, `DEFAULT`) — takes the slot without acting.
     None,
     /// JSM knows this name; we can't drive it yet.

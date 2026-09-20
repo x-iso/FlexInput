@@ -199,7 +199,11 @@ fn jsm_rows(
     });
 
     // ── the editor, on its own row ───────────────────────────────────────────
-    let mut compiled = flexinput_engine::eval::jsm_compile(&tabs[active].text);
+    // Compiled against every tab, so a line that switches layers can be checked:
+    // one naming a tab that isn't there is an error saying which tabs there are.
+    let tab_list: Vec<(String, String)> =
+        tabs.iter().map(|t| (t.name.clone(), t.text.clone())).collect();
+    let mut compiled = flexinput_engine::eval::jsm_compile(&tabs[active].text, &tab_list);
     // A button this pad hasn't got is the device's business, not the config's, so
     // it lands as a note on the line rather than changing its status.
     flexinput_engine::eval::jsm_note_missing_inputs(

@@ -26,7 +26,7 @@ use super::analog::{Analog, Pad};
 use super::bind::Runtime;
 use super::pad::Pad as PadOut;
 use super::names::{Btn, BtnSource, Out, StickId};
-use super::parse::{compile, Compiled};
+use super::parse::Compiled;
 
 /// The bus carries a rotation rate as a fraction of this many degrees per second
 /// (`flexinput_devices::gyro::GYRO_REF_DPS`, as the RWS module also mirrors it).
@@ -67,6 +67,19 @@ pub struct JsmState {
     motion: super::motion::Motion,
     /// The touchpad: its grid, its two relative sticks, its mouse mode.
     touch: super::touch::Touch,
+    /// The tab actually running. A binding can switch it (JSM loads another config
+    /// file), so it is not always the tab the editor has open — `RESET_MAPPINGS`,
+    /// or an edit, brings it back to that one.
+    layer: String,
+    /// Every pin any layer of this node has ever claimed.
+    ///
+    /// A sink latches what it was last told, so a pin has to keep being told
+    /// "off" once nothing drives it any more. Switching layers is exactly that
+    /// situation: the tab that was holding `key_a` is gone, the new one has never
+    /// heard of it, and without this the key would stay down for good — the
+    /// original stuck-key bug in a different coat. Keeping the union costs a few
+    /// pin writes a tick and makes it impossible.
+    ever_claimed: HashSet<String>,
 }
 
 /// Evaluate one JSM Config node.
@@ -84,7 +97,8 @@ pub(crate) fn jsm_publish(
         .get("jsm_strict")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let text = active_tab_text(snap);
+    let tabs = all_tabs(snap);
+    let selected = selected_tab(snap, &tabs);
 
     // Snapshot the upstream bus once, so publishing can't alias the read side.
     let dev_id = snap
@@ -121,13 +135,24 @@ pub(crate) fn jsm_publish(
     }
 
     // Compile on the first tick and after every edit; a fresh config starts from
-    // a clean slate rather than inheriting half-finished presses.
+    // a clean slate rather than inheriting half-finished presses. The generation
+    // covers every tab's text, not just the live one, so editing a layer a binding
+    // switches to recompiles as readily as editing the one on screen.
     let ns = state.entry(uid).or_default();
-    let gen = text_gen(&text);
+    let gen = text_gen_of(&tabs, &selected);
+    let text_for = |layer: &str| -> String {
+        tabs.iter()
+            .find(|(n, _)| n == layer)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default()
+    };
+    let text = text_for(&selected);
     let st = ns.jsm.get_or_insert_with(|| {
         Box::new(JsmState {
             gen,
-            cfg: compile(&text),
+            layer: selected.clone(),
+            ever_claimed: HashSet::new(),
+            cfg: super::parse::compile_with(&text, &tabs),
             rt: Runtime::default(),
             analog: Analog::default(),
             aim: Aim::default(),
@@ -137,8 +162,11 @@ pub(crate) fn jsm_publish(
         })
     });
     if st.gen != gen {
+        // An edit anywhere puts the module back on the tab the editor has open: a
+        // half-edited layer chain is not something to keep running.
         st.gen = gen;
-        st.cfg = compile(&text);
+        st.layer = selected.clone();
+        st.cfg = super::parse::compile_with(&text, &tabs);
         st.rt = Runtime::default();
         st.analog = Analog::default();
         st.aim = Aim::default();
@@ -209,6 +237,8 @@ pub(crate) fn jsm_publish(
         .commands
         .iter()
         .any(|c| c.trim().eq_ignore_ascii_case("SET_MOTION_STICK_NEUTRAL"));
+    let switch_to = outputs.layer.clone();
+    let reset = outputs.reset;
     if recentre {
         st.motion.set_neutral(gravity);
     }
@@ -275,7 +305,11 @@ pub(crate) fn jsm_publish(
     // it once on the tick of release is not enough, because a tick where nobody
     // downstream looks leaves the key down for good. This is the rule the
     // Remapper follows for its own output pins.
+    // Everything the current config can drive, plus everything any layer before it
+    // could — see `ever_claimed`.
     let drivable = claimed_outputs(&st.cfg);
+    st.ever_claimed.extend(drivable.iter().cloned());
+    let drivable: Vec<String> = st.ever_claimed.iter().cloned().collect();
     for pin in &drivable {
         let pin = pin.clone();
         // A pin the pad itself drives is the pass-through's to answer for: the
@@ -382,30 +416,84 @@ pub(crate) fn jsm_publish(
         }
     }
 
+    // ── action layers ────────────────────────────────────────────────────────
+    //
+    // Last, after everything this tick has been published, so the layer that was
+    // running gets to finish its tick — including releasing what it drove. Switching
+    // first would leave whatever it was holding latched on the bus, which is the
+    // stuck-key bug in a different coat.
+    //
+    // A switch recompiles from the new tab and starts it clean: JSM loading a config
+    // replaces the mappings outright, so a press held across the switch does not
+    // carry over. `RESET_MAPPINGS` goes back to the tab the editor has open.
+    let want = if reset {
+        Some(selected.clone())
+    } else {
+        switch_to.filter(|t| *t != st.layer)
+    };
+    if let Some(layer) = want {
+        if reset || tabs.iter().any(|(n, _)| *n == layer) {
+            st.layer = layer.clone();
+            st.cfg = super::parse::compile_with(&text_for(&layer), &tabs);
+            st.rt = Runtime::default();
+            st.analog = Analog::default();
+            st.aim = Aim::default();
+            st.pad = PadOut::default();
+            st.touch = super::touch::Touch::default();
+            // The gravity estimate and its neutral are the PAD's state, not the
+            // config's — how the pad is being held doesn't change because a layer
+            // did, and re-settling the filter would blank the motion stick for half
+            // a second on every switch.
+        }
+    }
+
     // output[0] is the AutoMap pass-through, which carries no scalar.
     vec![None; snap.n_outputs.max(1)]
 }
 
-/// The text of the tab the module is applying.
-fn active_tab_text(snap: &NodeSnap) -> String {
-    let tabs = snap.params.get("jsm_tabs").and_then(|v| v.as_array());
+/// Every tab the node holds, as (name, text) — what a layer switch can reach.
+fn all_tabs(snap: &NodeSnap) -> Vec<(String, String)> {
+    snap.params
+        .get("jsm_tabs")
+        .and_then(|v| v.as_array())
+        .map(|tabs| {
+            tabs.iter()
+                .map(|t| {
+                    let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    (name, text)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tab the editor has open — the one a config runs from until a binding
+/// switches layers.
+fn selected_tab(snap: &NodeSnap, tabs: &[(String, String)]) -> String {
     let active = snap
         .params
         .get("jsm_active_tab")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
-    tabs.and_then(|t| t.get(active).or_else(|| t.first()))
-        .and_then(|t| t.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+    tabs.get(active)
+        .or_else(|| tabs.first())
+        .map(|(n, _)| n.clone())
+        .unwrap_or_default()
 }
 
-fn text_gen(text: &str) -> u64 {
+/// A generation for the whole tab set plus which tab is selected, so an edit to any
+/// of them — or a different tab being opened — recompiles.
+fn text_gen_of(tabs: &[(String, String)], selected: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
+    selected.hash(&mut h);
+    for (n, t) in tabs {
+        n.hash(&mut h);
+        t.hash(&mut h);
+    }
     h.finish()
 }
+
 
 /// What the analog side needs off the bus this tick.
 fn read_pad(
