@@ -18,6 +18,7 @@ use eframe::egui;
 use egui::{Color32, Pos2, Sense, Stroke};
 use egui_snarl::NodeId;
 use flexinput_core::Signal;
+use flexinput_devices::gyro::{ACCEL_REF_G, GYRO_REF_DPS};
 use serde_json::Value;
 
 use crate::canvas::Canvas;
@@ -382,6 +383,46 @@ impl Default for WindowState {
 }
 
 fn state_id(node: NodeId) -> egui::Id { egui::Id::new(("cal_state", node)) }
+
+// ── Physical-unit formatting for the scope ────────────────────────
+//
+// Trace values are normalized (±1.0 = ±GYRO_REF_DPS deg/s, ±ACCEL_REF_G G),
+// which is the right internal representation but an unreadable one to
+// calibrate against — "peak ±0.003" says nothing about whether a spike would
+// visibly throw your aim. These render the same numbers in the units the
+// sensor actually measures in.
+//
+// Decimals scale with magnitude rather than being fixed, because the scope
+// auto-zooms across more than three orders of magnitude: a fixed `{:.2}`
+// reads "0.00" on a resting pad, and a fixed `{:.4}` reads "1234.5600" during
+// a flick. Holding ~3-4 significant figures keeps the readout informative at
+// every zoom depth.
+fn fmt_unit(v: f32, unit: &str) -> String {
+    let a = v.abs();
+    let s = if a >= 100.0 {
+        format!("{v:.0}")
+    } else if a >= 10.0 {
+        format!("{v:.1}")
+    } else if a >= 1.0 {
+        format!("{v:.2}")
+    } else if a >= 0.1 {
+        format!("{v:.3}")
+    } else {
+        format!("{v:.4}")
+    };
+    format!("{s} {unit}")
+}
+
+/// Normalized gyro value → degrees per second.
+fn fmt_dps(norm: f32) -> String {
+    fmt_unit(norm * GYRO_REF_DPS, "°/s")
+}
+
+/// Normalized accel value → G.
+fn fmt_g(norm: f32) -> String {
+    fmt_unit(norm * ACCEL_REF_G, "G")
+}
+
 
 // ── Public entry: render all open windows ────────────────────────────────────
 
@@ -1622,7 +1663,7 @@ fn gyro_section(
                                             lower it if slow motions get eaten.")
                             .changed() { dz_changed = true; }
                         if g_floor > 0.0 {
-                            ui.label(egui::RichText::new(format!("±{:.4}", g_floor * dz_w))
+                            ui.label(egui::RichText::new(format!("±{}", fmt_dps(g_floor * dz_w)))
                                 .size(INSTRUCT_SIZE - 1.0).weak());
                         } else {
                             ui.label(egui::RichText::new("calibrate first")
@@ -1936,6 +1977,28 @@ fn gyro_scope(
     let display_peak = (peak * 1.5).max(0.005);
     let scale = half_w / display_peak;
 
+    // Calibrate the two side rails in °/s. Without these the rails mark a
+    // distance with no magnitude, so the trace reads as a shape rather than a
+    // measurement — and since the zoom is dynamic, the same visual excursion
+    // means something different from one moment to the next. Gyro units only:
+    // the accel rows are secondary here, and their peak is named in the
+    // readout below.
+    {
+        let rail_txt = fmt_dps(display_peak * 0.5);
+        let rail_font = egui::FontId::proportional(10.0);
+        let rail_col = Color32::from_gray(90);
+        for side in [-1.0_f32, 1.0] {
+            painter.text(
+                egui::pos2(center_x + side * half_w * 0.5 + side * 4.0,
+                           scope_rect.top() + 5.0),
+                if side < 0.0 { egui::Align2::RIGHT_TOP } else { egui::Align2::LEFT_TOP },
+                &rail_txt,
+                rail_font.clone(),
+                rail_col,
+            );
+        }
+    }
+
     let colors = [
         Color32::from_rgb(230, 70, 70),    // Roll  (gx)
         Color32::from_rgb(110, 220, 110),  // Pitch (gy)
@@ -2071,7 +2134,23 @@ fn gyro_scope(
     painter.text(
         egui::pos2(scope_rect.right() - 10.0, scope_rect.bottom() - 6.0),
         egui::Align2::RIGHT_BOTTOM,
-        format!("peak ±{:.3}  ·  {} pts", peak, total_pts),
+        {
+            // The axis is shared but the units are not: gyro traces read in
+            // °/s, accel traces in G. Report whichever channels are
+            // actually on screen, so the number always names its own unit.
+            let ch_peak = |chs: &[usize]| {
+                chs.iter()
+                    .filter(|c| active.contains(c))
+                    .flat_map(|&ch| samples_ch[ch].iter().map(|(_, v)| v.abs()))
+                    .fold(0.0_f32, f32::max)
+            };
+            let mut txt = format!("peak ±{}", fmt_dps(ch_peak(&[0, 1, 2])));
+            if active.contains(&3) || active.contains(&4) {
+                txt.push_str(&format!("  ·  ±{}", fmt_g(ch_peak(&[3, 4]))));
+            }
+            txt.push_str(&format!("  ·  {total_pts} pts"));
+            txt
+        },
         legend_font.clone(),
         Color32::from_gray(170),
     );
@@ -3131,3 +3210,38 @@ fn load_atrig_texture(ui: &egui::Ui, h_px: u32) -> Option<egui::TextureHandle> {
     Some(handle)
 }
 
+#[cfg(test)]
+mod unit_fmt_tests {
+    use super::*;
+
+    /// Significant figures, not decimal places. The scope auto-zooms across
+    /// several orders of magnitude, so a fixed precision is unreadable at one
+    /// end or the other; this pins that every zoom depth keeps a usable
+    /// number of digits.
+    #[test]
+    fn keeps_three_or_four_significant_figures_at_every_scale() {
+        for (norm, want) in [
+            (1.0_f32,     "2000 °/s"),   // full scale
+            (0.1,          "200 °/s"),
+            (0.01,         "20.0 °/s"),
+            (0.0028,       "5.60 °/s"),  // the spike from the bug report
+            (0.0003,       "0.600 °/s"), // a quiet pad's noise floor
+            (0.00002,      "0.0400 °/s"),
+        ] {
+            assert_eq!(fmt_dps(norm), want, "fmt_dps({norm})");
+        }
+    }
+
+    /// Accel shares the axis but not the unit, so it gets its own reference.
+    #[test]
+    fn accel_uses_its_own_reference() {
+        assert_eq!(fmt_g(1.0), "8.00 G");
+        assert_eq!(fmt_g(0.125), "1.00 G");
+    }
+
+    /// Negative values keep their sign and their precision bracket.
+    #[test]
+    fn negatives_format_like_their_magnitude() {
+        assert_eq!(fmt_dps(-0.0028), "-5.60 °/s");
+    }
+}
