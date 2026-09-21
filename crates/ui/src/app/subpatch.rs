@@ -177,7 +177,11 @@ pub(crate) fn load_subpatch_file() -> Option<UiSubPatch> {
             .pick_file()
     })?;
     let json = std::fs::read_to_string(&path).ok()?;
-    let file: SubPatchFile = serde_json::from_str(&json).ok()?;
+    let mut file: SubPatchFile = serde_json::from_str(&json).ok()?;
+    // Same repair a patch gets (it renumbers the ports first): a preset saved
+    // with a port gap has a dead output until this runs, and it is loaded
+    // without ever opening the editor.
+    crate::canvas::migrate_loaded_snarl(&mut file.sub_patch.snarl);
     Some(file.sub_patch)
 }
 
@@ -801,6 +805,13 @@ pub(crate) fn sync_inner_canvas_ports(
             }
         }
     }
+
+    // ── Keep pin_index equal to POSITION ─────────────────────────────────────
+    // The outer pins below are rebuilt as a dense list in pin_index order, so a
+    // port's number has to be its position or the two disagree. Deleting a port
+    // used to leave the survivors on their old numbers, and a sub-patch whose
+    // only outlet was still numbered 1 had a dead output with nothing to say so.
+    crate::canvas::renumber_subpatch_ports(&mut inner_canvas.snarl);
 
     // ── Sync inlet/outlet pin descriptors to match declared type and name ─────
 

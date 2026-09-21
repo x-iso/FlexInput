@@ -136,6 +136,9 @@ pub fn migrate_generic_button_pin(id: &str) -> Option<&'static str> {
 ///
 /// Recurses into sub-patches.
 pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
+    // A no-op on a tab canvas (no ports there); the work happens on the inner
+    // snarl of every sub-patch, reached by the recursion at the bottom.
+    renumber_subpatch_ports(snarl);
     for (_, node) in snarl.nodes_ids_data_mut() {
         if node.value.module_id == "module.map_action" && node.value.outputs.len() < 2 {
             node.value.outputs = vec![
@@ -214,6 +217,45 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
         }
         if let Some(sp) = node.value.subpatch.as_mut() {
             migrate_loaded_snarl(&mut sp.snarl);
+        }
+    }
+}
+
+/// Make each inlet's / outlet's `pin_index` equal its POSITION among its peers.
+///
+/// A sub-patch's outer pins are rebuilt as a dense list from the inlets and
+/// outlets in `pin_index` order, but nothing ever renumbered the ports
+/// themselves — so deleting a port left the survivors carrying their old
+/// numbers. With one outlet still numbered 1 and one declared output pin (index
+/// 0), every consumer that matched on the raw number found nothing: the
+/// sub-patch's output went dead, while everything INSIDE it kept working. No
+/// error anywhere, because each half was doing what it was told.
+///
+/// Renumbering by position is what the outer pins already assume, so this only
+/// closes the gap. Order is preserved, so wires stay on their pins, and it is
+/// idempotent — a healthy sub-patch is left exactly as it was.
+pub fn renumber_subpatch_ports(snarl: &mut Snarl<NodeData>) {
+    for role in ["subpatch.inlet", "subpatch.outlet"] {
+        let mut ports: Vec<(usize, NodeId)> = snarl
+            .nodes_ids_data()
+            .filter(|(_, n)| n.value.module_id == role)
+            .map(|(id, n)| {
+                let idx = n
+                    .value
+                    .params
+                    .get("pin_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(u64::MAX) as usize;
+                (idx, id)
+            })
+            .collect();
+        // By stored index, then by node id so two ports sharing a number (or
+        // both missing one) still land in a stable order.
+        ports.sort_by_key(|(idx, id)| (*idx, id.0));
+        for (position, (_, id)) in ports.into_iter().enumerate() {
+            if let Some(node) = snarl.get_node_mut(id) {
+                node.params.insert("pin_index".into(), Value::from(position as u64));
+            }
         }
     }
 }

@@ -1919,4 +1919,87 @@ mod subpatch_bus_tests {
         );
         assert_eq!(fallback, inner_fallback, "and the same pad behind it");
     }
+
+    /// The real fault behind "the JSM module's output doesn't leave the
+    /// sub-patch": one declared output pin, but the outlet inside still carrying
+    /// `pin_index = 1` from a second port that had been deleted.
+    ///
+    /// Every consumer matches an outer pin to an outlet by that number, so pin 0
+    /// found no outlet and the sub-patch's output was dead — while everything
+    /// INSIDE it kept working, which is exactly how it presented. Nothing
+    /// reported an error: the outer pins are rebuilt densely from the outlets, so
+    /// each half was doing what it was told.
+    #[test]
+    fn a_subpatch_whose_outlet_kept_a_deleted_ports_number_is_repaired_on_load() {
+        let p = egui::Pos2::ZERO;
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let inlet = inner.insert_node(p, {
+            let mut n = node("subpatch.inlet", &[], &[SignalType::AutoMap]);
+            n.params.insert("pin_index".into(), json!(0));
+            n
+        });
+        let jsm = inner.insert_node(
+            p,
+            node("module.jsm", &[SignalType::AutoMap], &[SignalType::AutoMap]),
+        );
+        let outlet = inner.insert_node(p, {
+            let mut n = node("subpatch.outlet", &[SignalType::AutoMap], &[]);
+            // The gap: one output pin exists, and it is index 0.
+            n.params.insert("pin_index".into(), json!(1));
+            n
+        });
+        wire(&mut inner, inlet, 0, jsm, 0);
+        wire(&mut inner, jsm, 0, outlet, 0);
+
+        let mut parent: Snarl<NodeData> = Snarl::new();
+        let dev = parent.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+            n
+        });
+        let sp = parent.insert_node(p, {
+            let mut n = node("subpatch", &[SignalType::AutoMap], &[SignalType::AutoMap]);
+            n.subpatch = Some(Box::new(crate::canvas::node::UiSubPatch {
+                snarl: Box::new(inner),
+                ..Default::default()
+            }));
+            n
+        });
+        wire(&mut parent, dev, 0, sp, 0);
+
+        let out0 = OutPinId { node: sp, output: 0 };
+        assert!(
+            find_automap_device_rec(&parent, out0, None).is_none(),
+            "this is the broken state: output 0 resolves to nothing at all"
+        );
+
+        crate::canvas::migrate_loaded_snarl(&mut parent);
+
+        let (id, _, _) = find_automap_device_rec(&parent, out0, None)
+            .expect("after the repair the sub-patch's output resolves");
+        assert!(id.starts_with("collector:"), "to the JSM module's bus, got `{id}`");
+        let fixed = &parent.get_node(sp).unwrap().subpatch.as_ref().unwrap().snarl;
+        assert_eq!(
+            fixed.get_node(outlet).unwrap().params["pin_index"],
+            json!(0),
+            "the outlet is renumbered to its position"
+        );
+
+        // The same resolution HidHide keys on: it collects the physical pads
+        // feeding a virtual sink, so while this returned nothing the pad was
+        // never blacklisted and Steam went on seeing it. One fault, three
+        // symptoms — dead mouse output, dead pad output, and no cloaking.
+        assert_eq!(
+            find_automap_device_id_for_viewer(&parent, out0, None).as_deref(),
+            Some("gilrs:pad:0"),
+            "the physical pad behind the sub-patch is findable again"
+        );
+
+        // Idempotent: a healthy sub-patch is left exactly as it was.
+        crate::canvas::migrate_loaded_snarl(&mut parent);
+        let fixed = &parent.get_node(sp).unwrap().subpatch.as_ref().unwrap().snarl;
+        assert_eq!(fixed.get_node(outlet).unwrap().params["pin_index"], json!(0));
+        assert_eq!(fixed.get_node(inlet).unwrap().params["pin_index"], json!(0));
+    }
 }
