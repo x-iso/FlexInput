@@ -306,6 +306,91 @@ pub(crate) fn pinned_fader(
     out
 }
 
+/// Height of the graph's Log/Exp row.
+pub(crate) const WARP_H: f32 = 15.0;
+/// How far the axis can be stretched either way: the exponent runs 1/5 .. 5.
+const WARP_RANGE: f32 = 5.0;
+
+/// The graph's speed axis is drawn with an exponent; this is the slider's
+/// position for it, -1 (Log) through 0 (linear) to +1 (Exp).
+pub(crate) fn warp_to_t(warp: f32) -> f32 {
+    (warp.max(1e-3).ln() / WARP_RANGE.ln()).clamp(-1.0, 1.0)
+}
+
+pub(crate) fn t_to_warp(t: f32) -> f32 {
+    WARP_RANGE.powf(t.clamp(-1.0, 1.0))
+}
+
+/// The Log ⟷ Exp control under the curve.
+///
+/// A gyro deadzone is a couple of degrees per second wide and the noise floor a
+/// resting pad sits at is smaller still; against a 500°/s axis both are inside
+/// the first pixel. Pulling this to Log stretches the slow end until they are
+/// something you can actually look at. Returns the new exponent while it moves.
+pub(crate) fn warp_slider(
+    ui: &mut egui::Ui,
+    width: f32,
+    warp: f32,
+    paint: JsmPaint<'_>,
+) -> Option<f32> {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(width, WARP_H), egui::Sense::click_and_drag());
+    let small = egui::FontId::proportional(9.0);
+    let vis = ui.visuals();
+    let painter = ui.painter_at(rect);
+    // End labels, with the track between them — one row, because this is a view
+    // control and must not cost the curve the height it needs to be read.
+    let ends = 22.0_f32.min(width * 0.2);
+    painter.text(
+        egui::pos2(rect.left(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Log",
+        small.clone(),
+        vis.weak_text_color(),
+    );
+    painter.text(
+        egui::pos2(rect.right(), rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        "Exp",
+        small,
+        vis.weak_text_color(),
+    );
+    let track = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + ends, rect.top()),
+        egui::pos2(rect.right() - ends, rect.bottom()),
+    );
+
+    let mut out = None;
+    let t = warp_to_t(warp);
+    if resp.double_clicked() {
+        // Back to a plain linear axis, which is where you want to end up after
+        // looking at the small end.
+        out = Some(1.0);
+    } else if resp.dragged() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let nt = ((p.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+            out = Some(t_to_warp(nt * 2.0 - 1.0));
+        }
+    }
+    let active = resp.hovered() || resp.dragged();
+    super::simple_bodies::draw_knob_h_fader_styled(
+        &painter,
+        track,
+        (t + 1.0) * 0.5,
+        true,
+        active,
+        knob_paint(paint),
+    );
+    if active {
+        resp.on_hover_text(
+            "Stretch the speed axis. Log opens up the slow end — where a gyro \
+             deadzone and a resting pad's noise floor live, both of them inside \
+             the first pixel of a linear 500°/s axis. Double-click for linear.",
+        );
+    }
+    out
+}
+
 /// A setting's name on the left and its value on the right, in one row of the
 /// given width — the value complete, the name truncated if it has to be.
 ///
@@ -383,6 +468,7 @@ pub(crate) fn curve_graph(
     points: &[flexinput_engine::eval::JsmCurvePoint],
     live_dps: Option<f32>,
     paint: JsmPaint<'_>,
+    warp: f32,
 ) -> egui::Rect {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -421,9 +507,15 @@ pub(crate) fn curve_graph(
     if plot.width() < 8.0 || plot.height() < 8.0 {
         return rect;
     }
+    // The speed axis can be stretched at either end: below 1 the slow end opens
+    // up, which is the only way to see a deadzone a couple of degrees wide or the
+    // noise floor a resting pad sits at, against a 500°/s axis.
+    let warp = warp.clamp(0.05, 20.0);
+    let at_speed = |dps: f32| (dps / axis_x).clamp(0.0, 1.0).powf(warp);
+    let speed_at = |p: f32| axis_x * p.clamp(0.0, 1.0).powf(1.0 / warp);
     let to_pos = |dps: f32, sens: f32| {
         egui::pos2(
-            plot.left() + (dps / axis_x).clamp(0.0, 1.0) * plot.width(),
+            plot.left() + at_speed(dps) * plot.width(),
             plot.bottom() - (sens / axis_y).clamp(0.0, 1.0) * plot.height(),
         )
     };
@@ -452,10 +544,13 @@ pub(crate) fn curve_graph(
         painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], grid);
         // Every other one: ten numbers along a node-width axis is a smear.
         if labelled && i % 2 == 0 {
+            // The gridlines are evenly spaced on SCREEN, so their values are
+            // whatever the warp puts there — read them off, don't assume.
+            let v = speed_at(i as f32 / 10.0);
             painter.text(
                 egui::pos2(x, plot.bottom() + 2.0),
                 egui::Align2::CENTER_TOP,
-                format!("{}", (axis_x * i as f32 / 10.0).round() as i64),
+                if v < 10.0 { format!("{v:.1}") } else { format!("{}", v.round() as i64) },
                 small.clone(),
                 vis.weak_text_color(),
             );
@@ -485,7 +580,9 @@ pub(crate) fn curve_graph(
             .min_by(|a, b| (a.dps - dps).abs().total_cmp(&(b.dps - dps).abs()))
             .copied()
     };
-    if let Some(dps) = live_dps.filter(|d| *d > 0.5) {
+    // No lower gate: a resting pad's noise floor is exactly what a stretched slow
+    // end is for, and hiding it under 0.5°/s would defeat the zoom.
+    if let Some(dps) = live_dps {
         if let Some(p) = sample_at(dps) {
             let x = dps.min(axis_x);
             painter.line_segment(
@@ -499,7 +596,7 @@ pub(crate) fn curve_graph(
 
     // ── read off any speed ───────────────────────────────────────────────────
     if let Some(pos) = resp.hover_pos().filter(|p| plot.contains(*p)) {
-        let dps = ((pos.x - plot.left()) / plot.width()).clamp(0.0, 1.0) * axis_x;
+        let dps = speed_at((pos.x - plot.left()) / plot.width());
         if let Some(p) = sample_at(dps) {
             painter.line_segment(
                 [egui::pos2(pos.x, plot.top()), egui::pos2(pos.x, plot.bottom())],
@@ -660,6 +757,23 @@ pub(crate) fn knob_name_of(element: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{knob_element_id, knob_name_of};
+
+    // The slider's position and the axis exponent have to round-trip, or the
+    // handle would drift a little every time the graph was redrawn.
+    #[test]
+    fn the_axis_slider_round_trips_its_exponent() {
+        use super::{t_to_warp, warp_to_t};
+        for t in [-1.0f32, -0.5, 0.0, 0.37, 1.0] {
+            let back = warp_to_t(t_to_warp(t));
+            assert!((back - t).abs() < 1e-4, "t {t} came back {back}");
+        }
+        assert!((t_to_warp(0.0) - 1.0).abs() < 1e-6, "the middle is a linear axis");
+        assert!(t_to_warp(-1.0) < 1.0, "Log stretches the slow end");
+        assert!(t_to_warp(1.0) > 1.0, "Exp stretches the fast end");
+        // Out-of-range stored values clamp rather than flinging the handle off.
+        assert_eq!(warp_to_t(1000.0), 1.0);
+        assert_eq!(warp_to_t(0.0), -1.0);
+    }
 
     #[test]
     fn a_sliders_pin_id_round_trips_its_setting_name() {

@@ -142,7 +142,21 @@ pub struct CurvePoint {
 ///
 /// The horizontal (yaw) sensitivities are used, since that is the axis JSM treats
 /// as the reference and the one a player calibrates against.
+/// `warp` is the exponent the speed axis is drawn with: 1 is linear, below 1
+/// stretches the slow end (where a deadzone and the noise floor live), above 1
+/// stretches the fast end. Samples are distributed the same way, or a stretched
+/// slow end would be drawn from two or three points and the very detail it was
+/// stretched to show would be a straight line between them.
+pub fn sens_curve_warped(cfg: &Compiled, samples: usize, warp: f32) -> Vec<CurvePoint> {
+    curve(cfg, samples, warp.clamp(0.05, 20.0))
+}
+
+/// The curve on a plain linear axis.
 pub fn sens_curve(cfg: &Compiled, samples: usize) -> Vec<CurvePoint> {
+    curve(cfg, samples, 1.0)
+}
+
+fn curve(cfg: &Compiled, samples: usize, warp: f32) -> Vec<CurvePoint> {
     let a = &cfg.aim;
     let c = &cfg.cc;
     let (lo, hi) = (a.min_sens.0, a.max_sens.0);
@@ -165,18 +179,27 @@ pub fn sens_curve(cfg: &Compiled, samples: usize) -> Vec<CurvePoint> {
     let n = samples.max(2);
     (0..n)
         .map(|i| {
-            let dps = span * i as f32 / (n - 1) as f32;
-            // Same reduction the pipeline applies before the curve.
-            let magnitude = (dps - a.min_threshold).max(0.0);
+            // Placed where the axis will draw them: evenly on screen, which is
+            // unevenly in degrees per second whenever the axis is warped.
+            let p = i as f32 / (n - 1) as f32;
+            let dps = span * p.powf(1.0 / warp);
+            // The cutoff scales the VELOCITY before the ramp reads it, exactly as
+            // the pipeline does — so a config's gyro deadzone shows here as the
+            // curve falling to nothing below it, instead of being invisible.
+            let eff = dps * super::aim::cutoff_factor(a, dps);
+            let magnitude = (eff - a.min_threshold).max(0.0);
             let denom = a.max_threshold - a.min_threshold;
             let t = if denom <= 0.0 {
                 if magnitude > 0.0 { 1.0 } else { 0.0 }
             } else {
                 (magnitude / denom).min(1.0)
             };
+            // Folding the cutoff into the sensitivity keeps `dps × sens` the true
+            // camera speed, so the output curve needs no separate knowledge of it.
+            let scale = if dps > 0.0 { eff / dps } else { 1.0 };
             CurvePoint {
                 dps,
-                sens: cc::sensitivity(c, magnitude, t, a.max_threshold, lo, hi),
+                sens: scale * cc::sensitivity(c, magnitude, t, a.max_threshold, lo, hi),
             }
         })
         .collect()

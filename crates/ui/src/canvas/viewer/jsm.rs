@@ -87,6 +87,24 @@ impl Side {
     }
 }
 
+/// The exponent the curve's speed axis is drawn with. A view setting, so it
+/// lives on the node and never in the config text — it changes nothing the
+/// engine runs.
+fn curve_warp(snarl: &Snarl<NodeData>, node_id: NodeId) -> f32 {
+    snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("jsm_curve_warp"))
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32)
+        .unwrap_or(1.0)
+}
+
+fn set_curve_warp(snarl: &mut Snarl<NodeData>, node_id: NodeId, warp: f32) {
+    if let Some(n) = snarl.get_node_mut(node_id) {
+        n.params.insert("jsm_curve_warp".into(), Value::from(warp as f64));
+    }
+}
+
 fn knob_side(snarl: &Snarl<NodeData>, node_id: NodeId) -> Side {
     Side::from_param(
         snarl
@@ -168,16 +186,28 @@ pub(crate) fn show_jsm_curve_sized(
     let compiled = flexinput_engine::eval::jsm_compile(&text, &[]);
     // Pinned, this can be a large panel — sample it finely enough that the line
     // reads as a curve rather than as the polygon it is.
-    let points = flexinput_engine::eval::jsm_sens_curve(&compiled, 160);
+    let warp = curve_warp(snarl, node_id);
+    let points = flexinput_engine::eval::jsm_sens_curve_warped(&compiled, 160, warp);
     let dev = upstream_device(snarl, node_id, parent).unwrap_or_default();
+    // The control only appears where taking a row off the graph still leaves a
+    // graph; on a short pin the axis keeps whatever the node was set to.
+    let room = size.y >= 90.0;
+    let graph_h = (size.y - if room { super::jsm_widgets::WARP_H } else { 0.0 }).max(40.0);
     super::jsm_widgets::curve_graph(
         ui,
         size.x,
-        size.y.max(40.0),
+        graph_h,
         &points,
         super::jsm_widgets::live_turn_speed(live, &dev),
         paint,
+        warp,
     );
+    if room {
+        if let Some(w) = super::jsm_widgets::warp_slider(ui, size.x, warp, paint) {
+            set_curve_warp(snarl, node_id, w);
+            mark_overlay_param_write(ui.ctx());
+        }
+    }
 }
 
 /// One setting's slider on its own, for the config overlay. The setting is found by
@@ -401,16 +431,25 @@ fn strip_column(
     // thing on a fader that must never be trimmed.
     let width = width.min(ui.available_width().max(60.0));
     let mut edited = None;
+    let mut warp = None;
     ui.vertical(|ui| {
         ui.set_max_width(width);
         // Beside the editor the strip owns its column's full height, whether the
         // body is a node (which grows) or a pin (which does not) — either way it
         // has a column to fill rather than a leftover to squeeze into.
-        edited = knob_rows(
+        let (text, w) = knob_rows(
             node_id, ui, snarl, width, &tabs[active].text, live, parent, paint,
             Some(height),
         );
+        edited = text;
+        warp = w;
     });
+    if let Some(w) = warp {
+        set_curve_warp(snarl, node_id, w);
+        if !resizable {
+            mark_overlay_param_write(ui.ctx());
+        }
+    }
     if let Some(text) = edited {
         tabs[active].text = text;
         write_tabs(snarl, node_id, &tabs, active);
@@ -440,6 +479,9 @@ fn jsm_rows(
         .unwrap_or(0) as usize;
     if active >= tabs.len() { active = 0; }
     let mut changed = false;
+    // `knob_rows` only borrows the snarl to read; an axis change is applied once
+    // the borrow is done.
+    let mut pending_warp: Option<f32> = None;
     let side = knob_side(snarl, node_id);
 
     // ── the strip, when it goes above the editor ─────────────────────────────
@@ -447,11 +489,15 @@ fn jsm_rows(
     // already in this column) accounts for it without being told.
     if owns_strip && side == Side::Top {
         let budget = (!resizable).then(|| (size.y * 0.5).max(56.0));
-        if let Some(text) = knob_rows(
+        let (text, warp) = knob_rows(
             node_id, ui, snarl, size.x, &tabs[active].text, live, parent, paint, budget,
-        ) {
+        );
+        if let Some(text) = text {
             tabs[active].text = text;
             changed = true;
+        }
+        if let Some(w) = warp {
+            pending_warp = Some(w);
         }
     }
 
@@ -586,7 +632,9 @@ fn jsm_rows(
     let knobs_on = owns_strip && side == Side::Bottom;
     let strip_want = if knobs_on {
         let n = flexinput_engine::eval::jsm_knobs(&tabs[active].text).len() as f32;
-        super::jsm_widgets::graph_height() + n * super::jsm_widgets::fader_height(ui)
+        super::jsm_widgets::graph_height()
+            + super::jsm_widgets::WARP_H
+            + n * super::jsm_widgets::fader_height(ui)
     } else {
         0.0
     };
@@ -694,11 +742,15 @@ fn jsm_rows(
 
     // ── a slider per numeric setting, and the curve they shape ───────────────
     if knobs_on {
-        if let Some(text) = knob_rows(
+        let (text, warp) = knob_rows(
             node_id, ui, snarl, size.x, &tabs[active].text, live, parent, paint, strip_budget,
-        ) {
+        );
+        if let Some(text) = text {
             tabs[active].text = text;
             changed = true;
+        }
+        if let Some(w) = warp {
+            pending_warp = Some(w);
         }
     }
 
@@ -712,6 +764,12 @@ fn jsm_rows(
         }
     }
 
+    if let Some(w) = pending_warp {
+        set_curve_warp(snarl, node_id, w);
+        if !resizable {
+            mark_overlay_param_write(ui.ctx());
+        }
+    }
     if changed {
         write_tabs(snarl, node_id, &tabs, active);
         // Pinned, this ran in the overlay's viewport: tell it to bump the canvas
@@ -767,17 +825,19 @@ fn knob_rows(
     parent: Option<&AutomapGlowParent<'_>>,
     paint: super::jsm_widgets::JsmPaint<'_>,
     budget: Option<f32>,
-) -> Option<String> {
+) -> (Option<String>, Option<f32>) {
     // The curve first, and it stays put while the faders scroll: it is the thing
     // you are watching as you drag one.
     let curve_h = match budget {
         // Enough of the budget to read, but never so much that no fader is left
         // visible under it.
-        Some(h) => (h * 0.45).clamp(44.0, super::jsm_widgets::graph_height()),
+        Some(h) => ((h - super::jsm_widgets::WARP_H) * 0.45)
+            .clamp(44.0, super::jsm_widgets::graph_height()),
         None => super::jsm_widgets::graph_height(),
     };
     let compiled = flexinput_engine::eval::jsm_compile(text, &[]);
-    let points = flexinput_engine::eval::jsm_sens_curve(&compiled, 96);
+    let warp = curve_warp(snarl, node_id);
+    let points = flexinput_engine::eval::jsm_sens_curve_warped(&compiled, 96, warp);
     let dev = upstream_device(snarl, node_id, parent).unwrap_or_default();
     let rect = super::jsm_widgets::curve_graph(
         ui,
@@ -786,8 +846,10 @@ fn knob_rows(
         &points,
         super::jsm_widgets::live_turn_speed(live, &dev),
         paint,
+        warp,
     );
     register_exposable_element(ui, node_id, "curve", rect);
+    let new_warp = super::jsm_widgets::warp_slider(ui, width, warp, paint);
 
     let knobs = flexinput_engine::eval::jsm_knobs(text);
     if knobs.is_empty() {
@@ -796,7 +858,7 @@ fn knob_rows(
                 .small()
                 .weak(),
         );
-        return None;
+        return (None, new_warp);
     }
 
     // Inside a scroll area the bar takes a lane off the right — without allowing
@@ -860,7 +922,8 @@ fn knob_rows(
             ui,
             node_id,
             width,
-            (h - curve_h - ui.spacing().item_spacing.y).max(super::jsm_widgets::fader_height(ui)),
+            (h - curve_h - super::jsm_widgets::WARP_H - ui.spacing().item_spacing.y)
+                .max(super::jsm_widgets::fader_height(ui)),
             |ui| faders(ui, &mut field_rects),
         ),
         None => faders(ui, &mut field_rects),
@@ -868,7 +931,7 @@ fn knob_rows(
     // Keyed by (inner node, current element) — the pinned renderer stamps the
     // element before dispatching, which is the same key the focus ring reads.
     publish_nav_field_rects(ui, node_id, &field_rects);
-    edited
+    (edited, new_warp)
 }
 
 /// Bottom-right grip that drags the editor's size, like the 3D viewer's.

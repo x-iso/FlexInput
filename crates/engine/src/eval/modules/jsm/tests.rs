@@ -5403,3 +5403,68 @@ fn a_setting_says_which_input_you_need_to_feel_it() {
     assert_eq!(feel_of(&plain, "HOLD_PRESS_TIME"), Feel::Nothing);
     assert_eq!(feel_of(&plain, "NOT_A_SETTING"), Feel::Nothing);
 }
+
+/// A gyro deadzone has to be visible on the curve, or the preview says a config
+/// aims at slow speeds when it throws them away. `GYRO_CUTOFF_SPEED` scales the
+/// VELOCITY before the sensitivity ramp reads it, so the curve folds it in.
+#[test]
+fn the_curve_shows_a_gyro_deadzone_that_the_config_actually_applies() {
+    use super::knobs::sens_curve_warped;
+    let at = |c: &[super::knobs::CurvePoint], dps: f32| {
+        c.iter()
+            .min_by(|a, b| (a.dps - dps).abs().total_cmp(&(b.dps - dps).abs()))
+            .unwrap()
+            .sens
+    };
+    // A hard cutoff: nothing below 5°/s reaches the game at all.
+    let cfg = compile("GYRO_SENS = 3\nGYRO_CUTOFF_SPEED = 5\n");
+    let hard = sens_curve_warped(&cfg, 400, 0.25);
+    assert_eq!(at(&hard, 1.0), 0.0, "inside the deadzone the curve is flat zero");
+    assert_eq!(at(&hard, 4.0), 0.0);
+    assert!((at(&hard, 50.0) - 3.0).abs() < 1e-3, "and full sensitivity past it");
+
+    // A recovery band fades back in across it rather than switching on.
+    let ramped = sens_curve_warped(
+        &compile("GYRO_SENS = 3\nGYRO_CUTOFF_SPEED = 5\nGYRO_CUTOFF_RECOVERY = 15\n"),
+        400,
+        0.25,
+    );
+    assert_eq!(at(&ramped, 1.0), 0.0, "still nothing below the cutoff");
+    let mid = at(&ramped, 10.0);
+    assert!(mid > 0.1 && mid < 2.9, "halfway up the band, part way in: {mid}");
+    assert!(at(&ramped, 20.0) > mid, "and further in higher up");
+
+    // No cutoff set: the curve is exactly what it was, so this can't quietly
+    // change the picture for every config that doesn't use one.
+    let plain = sens_curve_warped(&compile("GYRO_SENS = 3\n"), 400, 0.25);
+    assert!((at(&plain, 1.0) - 3.0).abs() < 1e-3);
+}
+
+/// Stretching the axis has to move the SAMPLES too. A deadzone a couple of
+/// degrees wide is a handful of pixels on a linear 500°/s axis; stretching the
+/// slow end without sampling it would draw that detail as one straight line
+/// between two far-apart points — the zoom would show nothing new.
+#[test]
+fn stretching_the_speed_axis_samples_where_it_stretched() {
+    use super::knobs::{sens_curve, sens_curve_warped};
+    let cfg = compile("GYRO_SENS = 3\nGYRO_CUTOFF_SPEED = 5\n");
+    let below = |c: &[super::knobs::CurvePoint]| c.iter().filter(|p| p.dps < 5.0).count();
+
+    let linear = sens_curve(&cfg, 200);
+    let logish = sens_curve_warped(&cfg, 200, 0.25);
+    assert!(
+        below(&logish) > below(&linear) * 5,
+        "the stretched end gets the samples: {} against {}",
+        below(&logish),
+        below(&linear)
+    );
+    // Both still span the same axis, so the two are the same curve drawn twice.
+    assert!((logish.last().unwrap().dps - linear.last().unwrap().dps).abs() < 1e-2);
+    assert_eq!(logish[0].dps, 0.0, "and both start at a standstill");
+
+    // An exponent of 1 is the plain axis, whichever way you ask for it.
+    let same = sens_curve_warped(&cfg, 64, 1.0);
+    for (a, b) in same.iter().zip(sens_curve(&cfg, 64).iter()) {
+        assert!((a.dps - b.dps).abs() < 1e-3 && (a.sens - b.sens).abs() < 1e-3);
+    }
+}

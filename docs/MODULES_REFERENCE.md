@@ -766,6 +766,19 @@ pub struct ModuleDescriptor {
   and on the canvas the wheel pans the Scene, so a fader that changed a
   sensitivity as you scrolled past it would be a nasty surprise. Pinned on its
   own (where nothing else wants the wheel) a fader keeps it.
+  A **Log ⟷ Exp** row under the curve stretches the speed axis (`jsm_curve_warp`
+  on the node — a view setting, never written to the config text). A gyro
+  deadzone is a couple of degrees per second wide and a resting pad's noise floor
+  smaller still; against a linear 500°/s axis both are inside the first pixel.
+  Pulling to Log opens that end up; double-click restores linear. The samples move
+  with the axis (`jsm_sens_curve_warped`), or the stretched end would be drawn as
+  one straight line between two far-apart points and the zoom would reveal
+  nothing. The gridline labels are read off the warp rather than assumed, and the
+  live dot has no lower cutoff — the noise floor is the thing you zoomed in for.
+  The curve folds in `GYRO_CUTOFF_SPEED`/`_RECOVERY` (`aim::cutoff_factor`, shared
+  with the pipeline so the two can't drift): the cutoff scales the VELOCITY before
+  the sensitivity ramp reads it, so a config's gyro deadzone shows as the curve
+  falling to nothing below it instead of being invisible.
   The **curve** is drawn the way the `JSM_custom_curve` fork's GUI draws it, so a
   curve read here and the same curve read there are the same picture: both axes
   anchored at zero over a labelled grid, the speed axis a fixed 500°/s unless a

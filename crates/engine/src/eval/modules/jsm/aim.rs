@@ -82,6 +82,26 @@ pub enum GyroSource {
     Never,
 }
 
+/// How much of a rotation at `length` deg/s survives the cutoff, 0..1.
+///
+/// This is the gyro's deadzone: below `GYRO_CUTOFF_SPEED` a slow drift is thrown
+/// away entirely, and a `GYRO_CUTOFF_RECOVERY` above it fades the rotation back
+/// in across that band instead of switching it on. It scales the VELOCITY, before
+/// the sensitivity ramp reads it — so a config with a cutoff aims at nothing
+/// below that speed however high its sensitivity is.
+///
+/// Shared with the editor's curve preview, which would otherwise draw a config's
+/// deadzone as if it weren't there.
+pub(crate) fn cutoff_factor(s: &Settings, length: f32) -> f32 {
+    if s.cutoff_recovery > s.cutoff_speed {
+        ((length - s.cutoff_speed) / (s.cutoff_recovery - s.cutoff_speed)).clamp(0.0, 1.0)
+    } else if s.cutoff_speed > 0.0 && length < s.cutoff_speed {
+        0.0
+    } else {
+        1.0
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
     pub min_sens: (f32, f32),
@@ -334,16 +354,10 @@ impl Aim {
 
         // ── cutoff: ignore a slow drift, fade back in over the recovery band ──
         let length = (gx * gx + gy * gy).sqrt();
-        if s.cutoff_recovery > s.cutoff_speed {
-            let factor = (length - s.cutoff_speed) / (s.cutoff_recovery - s.cutoff_speed);
-            if factor < 1.0 {
-                let factor = factor.max(0.0);
-                gx *= factor;
-                gy *= factor;
-            }
-        } else if s.cutoff_speed > 0.0 && length < s.cutoff_speed {
-            gx = 0.0;
-            gy = 0.0;
+        let factor = cutoff_factor(s, length);
+        if factor != 1.0 {
+            gx *= factor;
+            gy *= factor;
         }
 
         // ── is the gyro on at all? ───────────────────────────────────────────
