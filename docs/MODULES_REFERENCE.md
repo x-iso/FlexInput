@@ -743,6 +743,8 @@ pub struct ModuleDescriptor {
   - `jsm_show_knobs: bool` — the header's **Tune** toggle: the curve preview and the
     per-setting faders. Off by default, since a config with a dozen numeric settings
     would otherwise double the body's height unasked
+  - `jsm_knob_side: "bottom" | "top" | "left" | "right"` — where the tuning strip
+    sits relative to the editor. Anything unrecognised reads as `bottom`
 - **Engine:** `eval/modules/jsm/` — `parse` (grammar + a status per line),
   `analog` (triggers and all five of JSM's sticks as its buttons), `aim` (gyro and
   sticks as mouse movement), `pad` (whatever drives a virtual pad instead),
@@ -773,12 +775,24 @@ pub struct ModuleDescriptor {
   catches a fault: where it sags, turning the pad *faster* aims *slower*. Dots
   mark where the pad is right now, and hovering reads off any speed. The axis
   labels drop out when the graph is too small for them to fit.
+  A dropdown beside **Tune** puts the strip **Below** (default), **Above**,
+  **Left** or **Right** of the editor — beside it the two become columns, which
+  suits a wide node; above or below suits a tall one.
   The curve and each fader pin to the config overlay on their own, so a tuning
   session can live there with the editor left on the canvas. Pinned, a fader
   takes the Knob module's shape — wide is a horizontal fader, tall a vertical
   one, square a rotary — and pinned the editor budgets its height between the
   text and the tuning strip, which scrolls, so a config setting thirty numbers is
-  as reachable as one setting three. While the editor
+  as reachable as one setting three.
+  Every JSM pin is a **graph pin** for the layout inspector, so its colours come
+  from the same `PinGraphOverride` the Response Curve and the scopes use: on the
+  curve, `background` / `outline` / `gridline` plus channel 1 = the sensitivity
+  line and channel 2 = the camera-speed line; on a fader, `gridline` is the track
+  and channel 1 the fill; the editor takes background and outline.
+  Resolving the pad feeding the node goes through
+  `find_automap_device_id_for_viewer`, **never** the `_automap_device_id` param —
+  the graph builder injects that into a clone on its way to the engine and never
+  writes it back to the canvas, so in the UI it is always absent. While the editor
   has keyboard focus the config's key and mouse output pauses, so a binding under
   test can't type into it. The wheel over the editor scrolls the config instead of
   panning the canvas (`canvas/wheel.rs`).

@@ -1786,7 +1786,51 @@ pub(crate) fn knob_angle_rad(t: f32) -> f32 {
     (135.0_f32 + t * 270.0_f32).to_radians()
 }
 
+/// Colours a fader or knob is painted in. `None` on a field keeps the default,
+/// so a caller that doesn't care passes `KnobPaint::default()` and gets exactly
+/// what the Knob module has always drawn.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct KnobPaint {
+    /// The unfilled part of the track.
+    pub track: Option<Color32>,
+    /// The filled part, and the rotary's value arc.
+    pub accent: Option<Color32>,
+    /// The handle / indicator.
+    pub handle: Option<Color32>,
+}
+
+impl KnobPaint {
+    fn accent(&self, bipolar: bool) -> Color32 {
+        self.accent.unwrap_or(if bipolar {
+            Color32::from_rgb(100, 150, 255)
+        } else {
+            Color32::from_rgb(80, 200, 120)
+        })
+    }
+    fn handle(&self, active: bool) -> Color32 {
+        match self.handle {
+            // Still brighten on hover, so a recoloured handle keeps saying
+            // whether it has the pointer.
+            Some(c) if active => c,
+            Some(c) => c.gamma_multiply(0.8),
+            None if active => Color32::WHITE,
+            None => Color32::from_gray(200),
+        }
+    }
+}
+
 pub(crate) fn draw_knob_rotary(painter: &egui::Painter, rect: egui::Rect, t: f32, bipolar: bool, active: bool) {
+    draw_knob_rotary_styled(painter, rect, t, bipolar, active, KnobPaint::default());
+}
+
+pub(crate) fn draw_knob_rotary_styled(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    t: f32,
+    bipolar: bool,
+    active: bool,
+    paint: KnobPaint,
+) {
     let center = rect.center();
     let radius = (rect.width().min(rect.height()) * 0.5 - 4.0).max(10.0);
     let track_r = radius * 0.72;
@@ -1804,10 +1848,13 @@ pub(crate) fn draw_knob_rotary(painter: &egui::Painter, rect: egui::Rect, t: f32
     };
 
     // Background track
-    painter.add(egui::Shape::line(arc_pts(0.0, 1.0), egui::Stroke::new(3.0, Color32::from_gray(50))));
+    painter.add(egui::Shape::line(
+        arc_pts(0.0, 1.0),
+        egui::Stroke::new(3.0, paint.track.unwrap_or(Color32::from_gray(50))),
+    ));
 
     // Value arc
-    let accent = if bipolar { Color32::from_rgb(100, 150, 255) } else { Color32::from_rgb(80, 200, 120) };
+    let accent = paint.accent(bipolar);
     let (a0, a1) = if bipolar { if t >= 0.5 { (0.5, t) } else { (t, 0.5) } } else { (0.0, t) };
     if (a1 - a0).abs() > 0.001 {
         painter.add(egui::Shape::line(arc_pts(a0, a1), egui::Stroke::new(3.0, accent)));
@@ -1820,21 +1867,32 @@ pub(crate) fn draw_knob_rotary(painter: &egui::Painter, rect: egui::Rect, t: f32
             egui::pos2(center.x + radius * 0.18 * va.cos(), center.y + radius * 0.18 * va.sin()),
             egui::pos2(center.x + radius * 0.62 * va.cos(), center.y + radius * 0.62 * va.sin()),
         ],
-        egui::Stroke::new(2.0, if active { Color32::WHITE } else { Color32::from_gray(200) }),
+        egui::Stroke::new(2.0, paint.handle(active)),
     );
     painter.circle_filled(center, 2.5, Color32::from_gray(85));
 }
 
 pub(crate) fn draw_knob_h_fader(painter: &egui::Painter, rect: egui::Rect, t: f32, bipolar: bool, active: bool) {
+    draw_knob_h_fader_styled(painter, rect, t, bipolar, active, KnobPaint::default());
+}
+
+pub(crate) fn draw_knob_h_fader_styled(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    t: f32,
+    bipolar: bool,
+    active: bool,
+    paint: KnobPaint,
+) {
     let margin = 8.0f32;
     let track_rect = egui::Rect::from_center_size(
         rect.center(),
         egui::vec2(rect.width() - 2.0 * margin, 6.0),
     );
-    painter.rect_filled(track_rect, 3.0, Color32::from_gray(40));
+    painter.rect_filled(track_rect, 3.0, paint.track.unwrap_or(Color32::from_gray(40)));
 
     let handle_x = track_rect.left() + t * track_rect.width();
-    let accent = if bipolar { Color32::from_rgb(100, 150, 255) } else { Color32::from_rgb(80, 200, 120) };
+    let accent = paint.accent(bipolar);
 
     let fill = if bipolar {
         let cx = track_rect.center().x;
@@ -1857,23 +1915,31 @@ pub(crate) fn draw_knob_h_fader(painter: &egui::Painter, rect: egui::Rect, t: f3
     }
 
     let r = if active { 7.0 } else { 5.0 };
-    painter.circle_filled(
-        egui::pos2(handle_x, rect.center().y), r,
-        if active { Color32::WHITE } else { Color32::from_gray(200) },
-    );
+    painter.circle_filled(egui::pos2(handle_x, rect.center().y), r, paint.handle(active));
 }
 
 pub(crate) fn draw_knob_v_fader(painter: &egui::Painter, rect: egui::Rect, t: f32, bipolar: bool, active: bool) {
+    draw_knob_v_fader_styled(painter, rect, t, bipolar, active, KnobPaint::default());
+}
+
+pub(crate) fn draw_knob_v_fader_styled(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    t: f32,
+    bipolar: bool,
+    active: bool,
+    paint: KnobPaint,
+) {
     let margin = 8.0f32;
     let track_rect = egui::Rect::from_center_size(
         rect.center(),
         egui::vec2(6.0, rect.height() - 2.0 * margin),
     );
-    painter.rect_filled(track_rect, 3.0, Color32::from_gray(40));
+    painter.rect_filled(track_rect, 3.0, paint.track.unwrap_or(Color32::from_gray(40)));
 
     // t=1 → top of track, t=0 → bottom
     let handle_y = track_rect.bottom() - t * track_rect.height();
-    let accent = if bipolar { Color32::from_rgb(100, 150, 255) } else { Color32::from_rgb(80, 200, 120) };
+    let accent = paint.accent(bipolar);
 
     let fill = if bipolar {
         let cy = track_rect.center().y;
@@ -1896,10 +1962,7 @@ pub(crate) fn draw_knob_v_fader(painter: &egui::Painter, rect: egui::Rect, t: f3
     }
 
     let r = if active { 7.0 } else { 5.0 };
-    painter.circle_filled(
-        egui::pos2(rect.center().x, handle_y), r,
-        if active { Color32::WHITE } else { Color32::from_gray(200) },
-    );
+    painter.circle_filled(egui::pos2(rect.center().x, handle_y), r, paint.handle(active));
 }
 
 // ── clear_unused helper ───────────────────────────────────────────────────────

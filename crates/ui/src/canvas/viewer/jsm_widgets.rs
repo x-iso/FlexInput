@@ -11,7 +11,45 @@
 //! config overlay with the editor left behind on the canvas.
 
 use super::*;
+use crate::canvas::node::PinGraphOverride;
 use flexinput_engine::eval::JsmKnob;
+
+/// A pinned JSM widget's colours, or the module's own where a field is `None`.
+///
+/// This is the same `PinGraphOverride` the Response Curve and the scopes use, so
+/// the layout inspector's existing strip drives it with no new UI: `background`,
+/// `outline`, `gridline`, then channel 1 = the sensitivity line (and a fader's
+/// fill), channel 2 = the output line.
+pub(crate) type JsmPaint<'a> = Option<&'a PinGraphOverride>;
+
+fn col(v: Option<[u8; 4]>) -> Option<Color32> {
+    v.map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
+}
+
+/// Channel `n` (0-based) of the override, if set.
+fn channel(paint: JsmPaint<'_>, n: usize) -> Option<Color32> {
+    col(paint.and_then(|p| p.channel_colors.get(n).copied().flatten()))
+}
+
+/// Paint the pin's background and frame behind a widget, where they were set.
+fn backdrop(painter: &egui::Painter, rect: egui::Rect, paint: JsmPaint<'_>, fallback: Color32) {
+    painter.rect_filled(rect, 3.0, col(paint.and_then(|p| p.background)).unwrap_or(fallback));
+    let px = paint.and_then(|p| p.outline_px).unwrap_or(0.0);
+    if px > 0.0 {
+        if let Some(c) = col(paint.and_then(|p| p.outline)) {
+            painter.rect_stroke(rect, 3.0, egui::Stroke::new(px, c), egui::StrokeKind::Inside);
+        }
+    }
+}
+
+/// The fader's colours from the same override: channel 1 tints the fill.
+fn knob_paint(paint: JsmPaint<'_>) -> super::simple_bodies::KnobPaint {
+    super::simple_bodies::KnobPaint {
+        track: col(paint.and_then(|p| p.gridline)),
+        accent: channel(paint, 0),
+        handle: channel(paint, 1),
+    }
+}
 
 /// Height of one slider's track row, under its label.
 const FADER_H: f32 = 16.0;
@@ -23,7 +61,12 @@ const NOTES_MAX_H: f32 = 96.0;
 /// One setting's slider: its name and value above, the fader below, full width.
 ///
 /// Returns the new value while it is being dragged or scrolled.
-pub(crate) fn fader(ui: &mut egui::Ui, width: f32, knob: &JsmKnob) -> Option<f32> {
+pub(crate) fn fader(
+    ui: &mut egui::Ui,
+    width: f32,
+    knob: &JsmKnob,
+    paint: JsmPaint<'_>,
+) -> Option<f32> {
     let mut out = None;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(&knob.name).small().weak());
@@ -52,12 +95,13 @@ pub(crate) fn fader(ui: &mut egui::Ui, width: f32, knob: &JsmKnob) -> Option<f32
     let active = resp.hovered() || resp.dragged();
     // The same fader the Knob module draws, laid on its side. Bipolar when the
     // setting can go negative, so the centre line means something.
-    super::simple_bodies::draw_knob_h_fader(
+    super::simple_bodies::draw_knob_h_fader_styled(
         &ui.painter_at(rect),
         rect,
         t,
         knob.lo < 0.0,
         active,
+        knob_paint(paint),
     );
     if active {
         resp.on_hover_text(format!(
@@ -83,7 +127,12 @@ pub(crate) fn fader(ui: &mut egui::Ui, width: f32, knob: &JsmKnob) -> Option<f32
 /// stretched bar. Drags are relative, as the Knob's are.
 ///
 /// Returns the new value while it is being dragged or scrolled.
-pub(crate) fn pinned_fader(ui: &mut egui::Ui, size: egui::Vec2, knob: &JsmKnob) -> Option<f32> {
+pub(crate) fn pinned_fader(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    knob: &JsmKnob,
+    paint: JsmPaint<'_>,
+) -> Option<f32> {
     let avail = egui::vec2(size.x.max(24.0), size.y.max(18.0));
     let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
 
@@ -116,12 +165,18 @@ pub(crate) fn pinned_fader(ui: &mut egui::Ui, size: egui::Vec2, knob: &JsmKnob) 
     let painter = ui.painter_at(rect);
     let active = resp.hovered() || resp.dragged();
     let bipolar = knob.lo < 0.0;
+    // A pinned widget can be given a background and a frame of its own; on the
+    // canvas the node body already provides both, so there it stays transparent.
+    if paint.is_some_and(|p| p.background.is_some() || p.outline_px.unwrap_or(0.0) > 0.0) {
+        backdrop(&painter, rect, paint, Color32::TRANSPARENT);
+    }
+    let kp = knob_paint(paint);
     if aspect >= 2.0 {
-        super::simple_bodies::draw_knob_h_fader(&painter, track, t, bipolar, active);
+        super::simple_bodies::draw_knob_h_fader_styled(&painter, track, t, bipolar, active, kp);
     } else if aspect <= 0.5 {
-        super::simple_bodies::draw_knob_v_fader(&painter, track, t, bipolar, active);
+        super::simple_bodies::draw_knob_v_fader_styled(&painter, track, t, bipolar, active, kp);
     } else {
-        super::simple_bodies::draw_knob_rotary(&painter, track, t, bipolar, active);
+        super::simple_bodies::draw_knob_rotary_styled(&painter, track, t, bipolar, active, kp);
     }
 
     if label_h > 0.0 {
@@ -197,11 +252,14 @@ pub(crate) fn curve_graph(
     height: f32,
     points: &[flexinput_engine::eval::JsmCurvePoint],
     live_dps: Option<f32>,
+    paint: JsmPaint<'_>,
 ) -> egui::Rect {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     let vis = ui.visuals();
-    painter.rect_filled(rect, 3.0, vis.extreme_bg_color);
+    let sens_color = channel(paint, 0).unwrap_or(SENS_COLOR);
+    let output_color = channel(paint, 1).unwrap_or(OUTPUT_COLOR);
+    backdrop(&painter, rect, paint, vis.extreme_bg_color);
 
     let small = egui::FontId::proportional(9.0);
     if points.len() < 2 {
@@ -241,7 +299,11 @@ pub(crate) fn curve_graph(
     };
 
     // ── grid ─────────────────────────────────────────────────────────────────
-    let grid = egui::Stroke::new(1.0, vis.weak_text_color().gamma_multiply(0.28));
+    let grid = egui::Stroke::new(
+        1.0,
+        col(paint.and_then(|p| p.gridline))
+            .unwrap_or_else(|| vis.weak_text_color().gamma_multiply(0.28)),
+    );
     for i in 0..=6 {
         let y = plot.bottom() - plot.height() * i as f32 / 6.0;
         painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], grid);
@@ -276,12 +338,12 @@ pub(crate) fn curve_graph(
     let out_line: Vec<egui::Pos2> = points.iter().map(|p| to_pos(p.dps, output_at(p))).collect();
     painter.extend(egui::Shape::dashed_line(
         &out_line,
-        egui::Stroke::new(1.3, OUTPUT_COLOR),
+        egui::Stroke::new(1.3, output_color),
         5.0,
         5.0,
     ));
     let line: Vec<egui::Pos2> = points.iter().map(|p| to_pos(p.dps, p.sens)).collect();
-    painter.add(egui::Shape::line(line, egui::Stroke::new(1.8, SENS_COLOR)));
+    painter.add(egui::Shape::line(line, egui::Stroke::new(1.8, sens_color)));
 
     // ── where the pad is right now ───────────────────────────────────────────
     // The dots are the point of drawing this live rather than as a static
@@ -300,8 +362,8 @@ pub(crate) fn curve_graph(
                 [egui::pos2(to_pos(x, 0.0).x, plot.top()), egui::pos2(to_pos(x, 0.0).x, plot.bottom())],
                 egui::Stroke::new(1.0, Color32::from_white_alpha(36)),
             );
-            painter.circle_filled(to_pos(x, p.sens), 3.5, SENS_COLOR);
-            painter.circle_filled(to_pos(x, output_at(&p)), 3.0, OUTPUT_COLOR);
+            painter.circle_filled(to_pos(x, p.sens), 3.5, sens_color);
+            painter.circle_filled(to_pos(x, output_at(&p)), 3.0, output_color);
         }
     }
 
@@ -313,7 +375,7 @@ pub(crate) fn curve_graph(
                 [egui::pos2(pos.x, plot.top()), egui::pos2(pos.x, plot.bottom())],
                 egui::Stroke::new(1.0, vis.weak_text_color()),
             );
-            painter.circle_filled(to_pos(p.dps, p.sens), 2.5, SENS_COLOR);
+            painter.circle_filled(to_pos(p.dps, p.sens), 2.5, sens_color);
             let text = format!("{:.0}°/s → {}", p.dps, trim((p.sens * 100.0).round() / 100.0));
             // Flip the label to whichever side of the line has room for it.
             let (anchor, dx) = if pos.x > plot.center().x {

@@ -382,6 +382,8 @@ pub(crate) fn graph_channels_of_node(inner: &NodeData) -> usize {
             inner.inputs.len().min(inner.outputs.len()).max(1),
         "display.trigscope" => inner.inputs.len().saturating_sub(1).max(1),
         "generator.envelope" => 1,
+        // Sensitivity, and the camera speed it produces.
+        "module.jsm" => 2,
         _ => inner.inputs.len().max(1),
     }
 }
@@ -423,6 +425,11 @@ pub(crate) fn layout_inspector_strip_core(
             // EQ/spectrum draw their own contents, so gridline/channel controls
             // are inert on it — same "only some fields apply" rule as the pad pins).
             | Some("module.audio_stream_haptics")
+            // JSM Config: the curve pin uses every field (channel 1 = the
+            // sensitivity line, channel 2 = the camera-speed line); the editor
+            // and fader pins honour background / outline, and a fader also takes
+            // gridline as its track and channel 1 as its fill.
+            | Some("module.jsm")
     );
     let graph_channels = sel_module.as_ref().map(|(_, ch)| *ch).unwrap_or(1);
 

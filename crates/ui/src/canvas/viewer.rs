@@ -847,7 +847,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         ) {
                             crate::gamepad_nav::request_nav_toggle(dev_id_str, v);
                         }
-                        ui.label(egui::RichText::new("UI navigation").small().weak());
+                        // Say which of the three states this is in words. A
+                        // greyed icon button in a node header is easy to click at
+                        // and conclude nothing happened, when the answer is that
+                        // this pad is barred from nav entirely.
+                        let (text, color) = if nav_disabled {
+                            ("UI navigation — unavailable", Color32::from_rgb(214, 168, 74))
+                        } else if nav_on {
+                            ("UI navigation — on", ui.visuals().strong_text_color())
+                        } else {
+                            ("UI navigation — off", ui.visuals().weak_text_color())
+                        };
+                        ui.label(egui::RichText::new(text).small().color(color));
                     });
                 }
             }
@@ -1112,7 +1123,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.automap_selector"  => show_automap_selector_body(node_id, inputs, ui, snarl),
             "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals),
             "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, self.automap_parent.as_ref()),
-            "module.jsm" => show_jsm_body(node_id, ui, snarl, self.live_signals),
+            "module.jsm" => show_jsm_body(
+                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(),
+            ),
             "module.network_send" => show_net_send_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.network_recv" => show_net_recv_body(node_id, ui, snarl, self.automap_parent.as_ref()),
             "module.remapper" => show_remapper_body(node_id, inputs, ui, snarl, self.live_signals, self.panic_shortcut, self.automap_parent.as_ref()),

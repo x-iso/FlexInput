@@ -5227,6 +5227,28 @@ fn setting_a_slider_rewrites_only_the_number() {
     assert_eq!(compile(&out).aim.min_threshold, 12.5);
 }
 
+/// A slider's range is for the control to feel right in, not a limit on what the
+/// config may say. A value written outside it stays put until the slider is
+/// dragged, and then it lands inside — which is the only way one control can be
+/// both usable across the span people actually use and honest about the rest.
+#[test]
+fn a_value_outside_a_sliders_range_is_kept_until_the_slider_is_dragged() {
+    let text = "REAL_WORLD_CALIBRATION = 25.69\n";
+    let k = &super::knobs::knobs(text)[0];
+    assert_eq!(k.value, 25.69, "the config's value is read as written");
+    assert_eq!((k.lo, k.hi), (0.0, 10.0), "the range configs actually live in");
+    assert_eq!(k.t(), 1.0, "the handle sits at the end rather than off the track");
+    // The parser still takes it — a slider has no say in what is legal.
+    assert_eq!(compile(text).aim.real_world_calibration, 25.69);
+    // Dragging anywhere lands in range.
+    for t in [0.0, 0.5, 1.0] {
+        let v = k.at(t);
+        assert!((0.0..=10.0).contains(&v), "at({t}) = {v}");
+    }
+    assert_eq!(compile(&super::knobs::set_knob(text, 0, k.at(0.5), false))
+        .aim.real_world_calibration, 5.0);
+}
+
 /// The curve preview follows the curve the config chose, and its shape is the same
 /// one the gyro actually runs.
 #[test]

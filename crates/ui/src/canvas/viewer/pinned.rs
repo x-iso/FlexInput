@@ -379,18 +379,26 @@ pub(crate) fn render_pinned_element_impl(
         // JSM Config: the editor itself, so a config can be read and edited
         // from the config overlay.
         ("module.jsm", "editor") => {
-            show_jsm_body_sized(inner_id, ui, inner_snarl, container_size, live_signals);
+            show_jsm_body_sized(
+                inner_id, ui, inner_snarl, container_size, live_signals, bridged_parent,
+                graph_ov_ref,
+            );
             return;
         }
         // The sensitivity curve, and one slider per numeric setting — so a tuning
         // session can live in the overlay with the editor left on the canvas.
         ("module.jsm", "curve") => {
-            super::jsm::show_jsm_curve_sized(inner_id, ui, inner_snarl, container_size, live_signals);
+            super::jsm::show_jsm_curve_sized(
+                inner_id, ui, inner_snarl, container_size, live_signals, bridged_parent,
+                graph_ov_ref,
+            );
             return;
         }
         ("module.jsm", k) if super::jsm_widgets::knob_name_of(k).is_some() => {
             let name = super::jsm_widgets::knob_name_of(k).unwrap_or_default().to_string();
-            super::jsm::show_jsm_knob_sized(inner_id, ui, inner_snarl, container_size, &name);
+            super::jsm::show_jsm_knob_sized(
+                inner_id, ui, inner_snarl, container_size, &name, graph_ov_ref,
+            );
             return;
         }
         ("module.svg", "image") => {

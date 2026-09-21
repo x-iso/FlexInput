@@ -380,6 +380,13 @@ shows are never a frame apart. `nav_state_of` returns `None` where the switch wo
 mean nothing (a MIDI port), and `(false, greyed)` for FlexInput's own virtual
 output shown as physical, where nav would feed our own mappings back into the UI.
 
+The header's label spells the state out (`on` / `off` / `unavailable`) rather than
+relying on the icon's fill: a greyed icon button in a node header is easy to click
+at and conclude nothing happened, when the answer is that the pad is barred from
+nav — which is what `own_virtual_device_ids` decides, and its ViGEm tier claims by
+plug order, so a real pad of the same family as a deployed virtual one can be
+caught by it.
+
 ### GamepadNav state + the EditLevel machine
 
 All nav state lives in one runtime-only (never serialized) struct, `GamepadNav`, on

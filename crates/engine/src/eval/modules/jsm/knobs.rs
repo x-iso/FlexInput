@@ -209,7 +209,11 @@ fn range(upper: &str) -> Option<(f32, f32, bool)> {
         "GYRO_SMOOTH_TIME" => (0.0, 0.5, false),
         "GYRO_CUTOFF_SPEED" | "GYRO_CUTOFF_RECOVERY" => (0.0, 50.0, false),
         "TRACKBALL_DECAY" => (0.0, 10.0, false),
-        "REAL_WORLD_CALIBRATION" => (1.0, 400.0, false),
+        // A slider range, not a limit — the parser takes any positive number, and
+        // a config that writes one outside this keeps it until the slider is
+        // dragged. Real configs live at the low end, so a range up to 400 gave
+        // the whole usable span about two pixels of travel.
+        "REAL_WORLD_CALIBRATION" => (0.0, 10.0, false),
         "IN_GAME_SENS" => (0.1, 10.0, false),
         // Stick aiming and flick.
         "STICK_POWER" => (0.0, 4.0, false),
