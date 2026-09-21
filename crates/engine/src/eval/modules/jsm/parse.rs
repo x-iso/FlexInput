@@ -2394,7 +2394,7 @@ pub(crate) enum Support {
 
 /// Every setting JSM knows, and what this module does with it today. Keep the
 /// names in step with `SettingID` in JSM's `include/JoyShockMapper.h`.
-fn setting_support(name: &str) -> Option<Support> {
+pub(crate) fn setting_support(name: &str) -> Option<Support> {
     use Support::*;
     Some(match name.to_ascii_uppercase().as_str() {
         // Live now.

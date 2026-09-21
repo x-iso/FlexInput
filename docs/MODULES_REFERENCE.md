@@ -740,6 +740,9 @@ pub struct ModuleDescriptor {
   - `_jsm_dest_dev` — the physical pad its rumble / light bar / trigger effects go
     back to, stamped by the graph builder (same resolution as ASTH's
     `_asth_dest_dev`)
+  - `jsm_show_knobs: bool` — the header's **Tune** toggle: the curve preview and the
+    per-setting faders. Off by default, since a config with a dozen numeric settings
+    would otherwise double the body's height unasked
 - **Engine:** `eval/modules/jsm/` — `parse` (grammar + a status per line),
   `analog` (triggers and all five of JSM's sticks as its buttons), `aim` (gyro and
   sticks as mouse movement), `pad` (whatever drives a virtual pad instead),
@@ -750,7 +753,15 @@ pub struct ModuleDescriptor {
   Registered through the registry seam's stateful publisher hook; state lives in
   `NodeState::jsm`
 - **Editor:** the body is the config text, each line tinted by what the parser
-  made of it, with the lines worth explaining listed underneath. While the editor
+  made of it, with the lines worth explaining listed underneath (scrolling once
+  they outgrow their room). A **Tune** toggle in the header adds, below them, the
+  sensitivity curve drawn live — with a marker showing how fast the pad is turning
+  right now — and a horizontal fader for every numeric setting the config sets.
+  A fader rewrites the number on its own line, so the text stays the source of
+  truth and the parser sees a drag like any other edit; a setting that takes a
+  *pair* of numbers gets none, since one control cannot honestly stand for two.
+  The curve and each fader pin to the config overlay on their own, so a tuning
+  session can live there with the editor left on the canvas. While the editor
   has keyboard focus the config's key and mouse output pauses, so a binding under
   test can't type into it. The wheel over the editor scrolls the config instead of
   panning the canvas (`canvas/wheel.rs`).

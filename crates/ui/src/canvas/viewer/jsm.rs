@@ -79,6 +79,76 @@ pub(crate) fn show_jsm_body_sized(
     jsm_body(node_id, ui, snarl, Some(size), live);
 }
 
+/// The sensitivity curve on its own, for the config overlay.
+pub(crate) fn show_jsm_curve_sized(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    size: egui::Vec2,
+    live: &std::collections::HashMap<(String, String), Signal>,
+) {
+    let tabs = read_tabs(snarl, node_id);
+    let active = active_tab(snarl, node_id, tabs.len());
+    let text = tabs.get(active).map(|t| t.text.clone()).unwrap_or_default();
+    let compiled = flexinput_engine::eval::jsm_compile(&text, &[]);
+    let points = flexinput_engine::eval::jsm_sens_curve(&compiled, 64);
+    let dev = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("_automap_device_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    super::jsm_widgets::curve_graph(
+        ui,
+        size.x,
+        size.y.max(40.0),
+        &points,
+        super::jsm_widgets::live_turn_speed(live, &dev),
+    );
+}
+
+/// One setting's slider on its own, for the config overlay. The setting is found by
+/// name, so it follows the line if the config is edited around it — and says so
+/// plainly if the line is gone rather than silently showing nothing.
+pub(crate) fn show_jsm_knob_sized(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    size: egui::Vec2,
+    name: &str,
+) {
+    let mut tabs = read_tabs(snarl, node_id);
+    let active = active_tab(snarl, node_id, tabs.len());
+    let Some(tab) = tabs.get(active) else { return };
+    let knobs = flexinput_engine::eval::jsm_knobs(&tab.text);
+    let Some(knob) = knobs.iter().find(|k| k.name.eq_ignore_ascii_case(name)) else {
+        ui.label(
+            egui::RichText::new(format!("`{name}` isn't set in this tab any more"))
+                .small()
+                .weak(),
+        );
+        return;
+    };
+    if let Some(v) = super::jsm_widgets::fader(ui, size.x, knob) {
+        let text = flexinput_engine::eval::jsm_set_knob(&tab.text, knob.line, v, knob.integral);
+        tabs[active].text = text;
+        write_tabs(snarl, node_id, &tabs, active);
+        // Pinned, this ran in the overlay's viewport: bump the canvas generation so
+        // an open sub-patch editor re-reads rather than writing its stale copy back.
+        mark_overlay_param_write(ui.ctx());
+    }
+}
+
+/// Which tab the editor has open, clamped to what exists.
+fn active_tab(snarl: &Snarl<NodeData>, node_id: NodeId, count: usize) -> usize {
+    let active = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("jsm_active_tab"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    if active >= count { 0 } else { active }
+}
+
 /// The editor's size in a node body, from the node's own params. Pinned, the
 /// container decides instead.
 fn editor_size(snarl: &Snarl<NodeData>, node_id: NodeId) -> egui::Vec2 {
@@ -196,6 +266,21 @@ fn jsm_rows(
                 }
             }
         }
+        // The slider strip is opt-in: a config with a dozen numeric settings would
+        // otherwise double the body's height before anyone asked for it.
+        let mut knobs_on = show_knobs(snarl, node_id);
+        if ui
+            .selectable_label(knobs_on, egui::RichText::new("Tune").small())
+            .on_hover_text(
+                "Show the sensitivity curve, and a slider for every numeric setting this                  config sets. A slider rewrites the number on its own line — the text stays                  the config.",
+            )
+            .clicked()
+        {
+            knobs_on = !knobs_on;
+            if let Some(n) = snarl.get_node_mut(node_id) {
+                n.params.insert("jsm_show_knobs".into(), Value::Bool(knobs_on));
+            }
+        }
     });
 
     // ── the editor, on its own row ───────────────────────────────────────────
@@ -214,7 +299,15 @@ fn jsm_rows(
     let line_h = ui.text_style_height(&egui::TextStyle::Monospace).max(10.0);
     // Whatever height is left under the two rows above, in whole lines.
     let used = ui.min_rect().height();
-    let rows = (((size.y - used - SUMMARY_H) / line_h).floor() as i32).max(3) as usize;
+    // The sliders and the curve are laid out *after* the editor, so the editor has
+    // to leave room for them up front or the body simply overflows its own size.
+    let reserved = if show_knobs(snarl, node_id) {
+        let n = flexinput_engine::eval::jsm_knobs(&tabs[active].text).len() as f32;
+        super::jsm_widgets::graph_height() + n * super::jsm_widgets::fader_height(ui)
+    } else {
+        0.0
+    };
+    let rows = (((size.y - used - SUMMARY_H - reserved) / line_h).floor() as i32).max(3) as usize;
     let statuses: Vec<_> = compiled.lines.iter().map(|l| l.status.clone()).collect();
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let mut job = egui::text::LayoutJob::default();
@@ -293,9 +386,21 @@ fn jsm_rows(
             }
         });
         // Pinned, the container owns the height: the counts carry the summary and
-        // the node body keeps the line-by-line reasons.
+        // the node body keeps the line-by-line reasons. They scroll rather than
+        // growing the body without limit — a config with many notes would otherwise
+        // push the sliders off the bottom.
         if resizable {
-            show_line_notes(ui, &compiled);
+            super::jsm_widgets::scrolling_notes(ui, node_id, size.x, size.y * 0.4, |ui| {
+                show_line_notes(ui, &compiled);
+            });
+        }
+    }
+
+    // ── a slider per numeric setting, and the curve they shape ───────────────
+    if show_knobs(snarl, node_id) {
+        if let Some(text) = knob_rows(node_id, ui, snarl, size.x, &tabs[active].text, live) {
+            tabs[active].text = text;
+            changed = true;
         }
     }
 
@@ -318,6 +423,75 @@ fn jsm_rows(
             mark_overlay_param_write(ui.ctx());
         }
     }
+}
+
+/// Is the slider strip switched on for this node? Off by default: a config with a
+/// dozen numeric settings would otherwise double the body's height before anyone
+/// asked for it.
+fn show_knobs(snarl: &Snarl<NodeData>, node_id: NodeId) -> bool {
+    snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("jsm_show_knobs"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// The curve preview and a slider per numeric setting, under the diagnostics.
+///
+/// Returns the rewritten config text when a slider moved — the text is the source
+/// of truth, so a drag is an edit like any other and the parser sees it at once.
+fn knob_rows(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &Snarl<NodeData>,
+    width: f32,
+    text: &str,
+    live: &std::collections::HashMap<(String, String), Signal>,
+) -> Option<String> {
+    let mut edited = None;
+
+    // The curve first: it is what the sliders under it are shaping.
+    let compiled = flexinput_engine::eval::jsm_compile(text, &[]);
+    let points = flexinput_engine::eval::jsm_sens_curve(&compiled, 64);
+    let dev = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get("_automap_device_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let rect = super::jsm_widgets::curve_graph(
+        ui,
+        width,
+        super::jsm_widgets::graph_height(),
+        &points,
+        super::jsm_widgets::live_turn_speed(live, dev),
+    );
+    register_exposable_element(ui, node_id, "curve", rect);
+
+    let knobs = flexinput_engine::eval::jsm_knobs(text);
+    if knobs.is_empty() {
+        ui.label(
+            egui::RichText::new("no numeric settings to tune yet — add one (GYRO_SENS = 2) and a slider appears")
+                .small()
+                .weak(),
+        );
+        return edited;
+    }
+    for knob in &knobs {
+        let start = ui.cursor().min;
+        if let Some(v) = super::jsm_widgets::fader(ui, width, knob) {
+            edited = Some(flexinput_engine::eval::jsm_set_knob(
+                text,
+                knob.line,
+                v,
+                knob.integral,
+            ));
+        }
+        // Each slider pins on its own, so a tuning session can carry just the two
+        // or three that matter into the config overlay.
+        let row = egui::Rect::from_min_max(start, ui.cursor().min + egui::vec2(width, 0.0));
+        register_exposable_element(ui, node_id, &super::jsm_widgets::knob_element_id(&knob.name), row);
+    }
+    edited
 }
 
 /// Bottom-right grip that drags the editor's size, like the 3D viewer's.

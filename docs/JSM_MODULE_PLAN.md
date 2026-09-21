@@ -612,6 +612,51 @@ The old error text on that line claimed it was "how many mouse counts make a ful
 turn", which is wrong by 360 and could have sent someone the other way. It now says
 counts per degree.
 
+## Tuning in the editor: faders and the curve
+
+The custom-curve fork ships a separate GUI and opens a telemetry socket so that GUI
+can draw a live sensitivity graph. Here the editor and the engine are the same
+process, so the socket buys nothing that a function call doesn't — `TELEMETRY_*` is
+ignored, and the thing it existed to feed is drawn natively instead.
+
+A **Tune** toggle in the header adds two things under the diagnostics:
+
+- **The sensitivity curve**, from the compiled config, with a marker at the pad's
+  current turn speed. Drawing it live is the point: you turn the pad and watch where
+  on the curve you actually spend your time. The marker uses the two axes JSM's
+  defaults aim with, so a config that remaps them makes the marker indicative rather
+  than exact — the curve itself is unaffected.
+- **A fader per numeric setting**, in the order the config writes them, using the
+  Knob module's horizontal design.
+
+Both are **views of the text**, which stays the only source of truth: a fader
+rewrites the number on its own line and the parser sees the edit like any other. It
+replaces the number *token* and nothing else, so the author's spacing and any
+trailing comment survive — a control that quietly reformatted the file every time it
+moved would be its own small insult.
+
+Three deliberate limits:
+
+- **A setting taking a pair of numbers gets no fader.** `GRID_SIZE = 2 3` and
+  `MIN_GYRO_SENS = 2 3` are two values; one control cannot stand for both, and
+  silently dropping half the line is worse than leaving it to the keyboard.
+- **A chorded setting gets none either** — a modeshift's value belongs to a chord,
+  and a fader with no chord shown would not say which.
+- **Only settings this module runs.** A fader on a pending or ignored line would
+  imply it does something.
+
+Slider ranges are for a control to feel right in, not the parser's limits: typing a
+number outside one is still legal, and the handle simply pegs (the tooltip says so).
+
+The diagnostics scroll rather than growing without limit, which needs the same
+wheel-lifting `canvas/wheel.rs` does for the editor — inside an `egui::Scene` a
+`ScrollArea` never sees the wheel at all.
+
+The curve and every fader pin to the config overlay individually, so a tuning
+session can live there with the editor left on the canvas. A pinned fader finds its
+setting by *name*, so it follows the line as the config is edited around it, and says
+plainly when the setting is gone rather than showing an empty box.
+
 ## `X_` and `PS_` names stay aliases
 
 Raised after hands-on testing: since `PS_UP` and `X_UP` land on the same

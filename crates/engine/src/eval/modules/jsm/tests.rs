@@ -5143,3 +5143,124 @@ fn each_misc_button_is_its_own_pin() {
         );
     }
 }
+
+// ── sliders and the curve preview ────────────────────────────────────────────
+
+/// A numeric setting the module runs gets a slider; one it doesn't, doesn't.
+#[test]
+fn a_numeric_setting_gets_a_slider() {
+    let text = "GYRO_SENS = 4\nS = A\n# a comment\nRIGHT_STICK_MODE = AIM\nFLICK_TIME = 0.1";
+    let ks = super::knobs::knobs(text);
+    let names: Vec<&str> = ks.iter().map(|k| k.name.as_str()).collect();
+    assert_eq!(names, vec!["GYRO_SENS", "FLICK_TIME"], "only the numeric settings");
+    assert_eq!(ks[0].line, 0, "and it knows which line it is on");
+    assert_eq!(ks[0].value, 4.0);
+    assert_eq!(ks[1].line, 4);
+
+    // A setting this module doesn't run gets none — a slider on a dead line lies.
+    assert!(super::knobs::knobs("AUTOLOAD = ON").is_empty(), "an ignored setting");
+    assert!(
+        super::knobs::knobs("SCREEN_RESOLUTION_X = 1920").is_empty(),
+        "a pending setting"
+    );
+    // Nor does a binding, or a word that isn't a setting at all.
+    assert!(super::knobs::knobs("S = A\nFLOOMP = 3").is_empty());
+}
+
+/// A setting that takes two numbers gets no slider: one control cannot honestly
+/// stand for a pair, and silently dropping half the line would be worse than
+/// leaving it to the keyboard.
+#[test]
+fn a_paired_setting_gets_no_slider() {
+    assert!(super::knobs::knobs("MIN_GYRO_SENS = 2 3").is_empty(), "a pair");
+    assert_eq!(
+        super::knobs::knobs("MIN_GYRO_SENS = 2").len(),
+        1,
+        "but one number is fine"
+    );
+    // And a chorded setting is a modeshift — which chord would the slider be for?
+    assert!(super::knobs::knobs("ZL,GYRO_SENS = 4").is_empty());
+}
+
+/// A slider's range is the span it moves through, and its position follows the
+/// value.
+#[test]
+fn a_slider_maps_its_value_onto_its_range() {
+    let k = &super::knobs::knobs("DECEL_BRAKE_STRENGTH = 0.5")[0];
+    assert_eq!((k.lo, k.hi), (0.0, 1.0), "a fraction has its natural bounds");
+    assert!((k.t() - 0.5).abs() < 1e-6, "halfway along");
+    assert!((k.at(0.25) - 0.25).abs() < 1e-6, "and back again");
+
+    // Milliseconds are whole numbers, so the slider lands on whole numbers.
+    let k = &super::knobs::knobs("HOLD_PRESS_TIME = 150")[0];
+    assert!(k.integral);
+    assert_eq!(k.at(0.1234), 123.0, "rounded, not 123.4 milliseconds");
+
+    // A value outside the slider's range still reads; the handle just pegs.
+    let k = &super::knobs::knobs("GYRO_SENS = 99")[0];
+    assert_eq!(k.value, 99.0, "the value is what the config says");
+    assert_eq!(k.t(), 1.0, "the handle pegs rather than running off the end");
+}
+
+/// Dragging a slider rewrites only the number, leaving the line otherwise as the
+/// author wrote it — name, spacing and trailing comment.
+#[test]
+fn setting_a_slider_rewrites_only_the_number() {
+    let text = "GYRO_SENS = 4   # feel free to tune\nS = A";
+    let out = super::knobs::set_knob(text, 0, 7.5, false);
+    assert_eq!(
+        out,
+        "GYRO_SENS = 7.5   # feel free to tune\nS = A",
+        "the comment and the rest of the file survive"
+    );
+
+    // A whole number is written without a pointless decimal tail.
+    assert_eq!(super::knobs::set_knob("GYRO_SENS = 4", 0, 6.0, false), "GYRO_SENS = 6");
+    assert_eq!(super::knobs::set_knob("HOLD_PRESS_TIME = 150", 0, 200.4, true), "HOLD_PRESS_TIME = 200");
+    // And a trailing newline is not eaten, or editing the last line would reflow
+    // the file every time.
+    assert_eq!(super::knobs::set_knob("GYRO_SENS = 4\n", 0, 5.0, false), "GYRO_SENS = 5\n");
+
+    // The rewritten text parses back to the value that was set — the round trip is
+    // the point, since the text is the only source of truth.
+    let out = super::knobs::set_knob("MIN_GYRO_THRESHOLD = 0\n", 0, 12.5, false);
+    assert_eq!(compile(&out).aim.min_threshold, 12.5);
+}
+
+/// The curve preview follows the curve the config chose, and its shape is the same
+/// one the gyro actually runs.
+#[test]
+fn the_curve_preview_matches_the_curve_the_config_chose() {
+    let curve_of = |extra: &str| {
+        let cfg = compile(&format!(
+            "MIN_GYRO_SENS = 1\nMAX_GYRO_SENS = 5\nMIN_GYRO_THRESHOLD = 0\n\
+             MAX_GYRO_THRESHOLD = 100\n{extra}"
+        ));
+        super::knobs::sens_curve(&cfg, 41)
+    };
+    let linear = curve_of("ACCEL_CURVE = LINEAR");
+    assert_eq!(linear.len(), 41, "as many samples as asked for");
+    assert!(linear[0].dps == 0.0, "starts at a standstill");
+    assert!((linear[0].sens - 1.0).abs() < 1e-5, "at the low sensitivity");
+    assert!(linear.last().unwrap().dps > 100.0, "and runs past the top threshold");
+
+    // Quadratic is below the straight line partway up, as it is in the engine.
+    let quad = curve_of("ACCEL_CURVE = QUADRATIC");
+    let mid = linear.len() / 4;
+    assert!(
+        quad[mid].sens < linear[mid].sens,
+        "the preview shows the curve's shape: {} against {}",
+        quad[mid].sens,
+        linear[mid].sens
+    );
+
+    // A curve whose interesting range is well past the threshold is still drawn
+    // over a span that shows it — otherwise the three that ignore the threshold
+    // would be drawn over an arbitrary window.
+    let wide = curve_of("ACCEL_CURVE = NATURAL\nACCEL_NATURAL_VHALF = 600");
+    assert!(
+        wide.last().unwrap().dps > 600.0,
+        "the span follows the curve's own settings: {}",
+        wide.last().unwrap().dps
+    );
+}

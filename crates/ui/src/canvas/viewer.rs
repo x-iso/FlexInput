@@ -28,6 +28,7 @@ mod expose;
 mod glow;
 mod gyro_body;
 mod jsm;
+mod jsm_widgets;
 mod layout_edit;
 mod midi;
 mod net;
