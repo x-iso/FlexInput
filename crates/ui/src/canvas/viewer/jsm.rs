@@ -22,6 +22,11 @@ const EDITOR_W: f32 = 380.0;
 const EDITOR_H: f32 = 220.0;
 const MIN_W: f32 = 200.0;
 const MIN_H: f32 = 80.0;
+/// Beside the editor, the narrowest a tuning strip can be and still show a
+/// setting's name, its value, and a fader worth dragging.
+const MIN_STRIP_W: f32 = 150.0;
+/// ...and the narrowest the editor can be and still be one.
+const MIN_EDITOR_W: f32 = 190.0;
 /// Room the summary row needs under a pinned editor.
 const SUMMARY_H: f32 = 18.0;
 
@@ -208,6 +213,43 @@ pub(crate) fn show_jsm_knob_sized(
     }
 }
 
+/// Nudge one setting's fader from the gamepad, by a fraction of its range.
+///
+/// Unlike every other pinnable value in the app, a JSM setting does not live in a
+/// param — it is a number inside the config text, and the text stays the source
+/// of truth. So nav edits it the same way a drag does, through `jsm_set_knob`,
+/// and the parser sees it on the next frame like any other edit.
+///
+/// Returns whether anything moved (a setting already at its end does not).
+pub(crate) fn nav_nudge_knob(node: &mut NodeData, name: &str, delta: f32) -> bool {
+    let mut arr = match node.params.get("jsm_tabs").and_then(|v| v.as_array()) {
+        Some(a) => a.clone(),
+        None => return false,
+    };
+    let active = node
+        .params
+        .get("jsm_active_tab")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let active = if active >= arr.len() { 0 } else { active };
+    let Some(text) = arr.get(active).and_then(|t| t.get("text")).and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let knobs = flexinput_engine::eval::jsm_knobs(text);
+    let Some(k) = knobs.iter().find(|k| k.name.eq_ignore_ascii_case(name)) else {
+        return false;
+    };
+    let next = k.at(k.t() + delta);
+    if (next - k.value).abs() < f32::EPSILON {
+        return false;
+    }
+    let rewritten = flexinput_engine::eval::jsm_set_knob(text, k.line, next, k.integral);
+    let Some(tab) = arr.get_mut(active) else { return false };
+    tab["text"] = Value::String(rewritten);
+    node.params.insert("jsm_tabs".into(), Value::Array(arr));
+    true
+}
+
 /// Which tab the editor has open, clamped to what exists.
 fn active_tab(snarl: &Snarl<NodeData>, node_id: NodeId, count: usize) -> usize {
     let active = snarl
@@ -226,7 +268,16 @@ fn editor_size(snarl: &Snarl<NodeData>, node_id: NodeId) -> egui::Vec2 {
         .and_then(|v| v.as_f64())
         .map(|f| f as f32)
         .unwrap_or(d);
-    egui::vec2(p("jsm_editor_w", EDITOR_W).max(MIN_W), p("jsm_editor_h", EDITOR_H).max(MIN_H))
+    // With the strip beside it the body holds two columns, so the floor is what
+    // both of them need rather than the editor's own.
+    let min_w = if show_knobs(snarl, node_id)
+        && matches!(knob_side(snarl, node_id), Side::Left | Side::Right)
+    {
+        MIN_STRIP_W + MIN_EDITOR_W + 8.0
+    } else {
+        MIN_W
+    };
+    egui::vec2(p("jsm_editor_w", EDITOR_W).max(min_w), p("jsm_editor_h", EDITOR_H).max(MIN_H))
 }
 
 fn jsm_body(
@@ -250,13 +301,24 @@ fn jsm_body(
     // Beside the editor the strip is a column of its own, so the two are laid
     // out side by side rather than stacked. Above or below, one vertical column
     // does the whole job and `jsm_rows` places the strip itself.
-    if knobs_on && matches!(side, Side::Left | Side::Right) {
-        let gap = ui.spacing().item_spacing.x;
-        // The strip gets its share, but never so much that the editor stops
-        // being one — below that the strip would be a column of faders next to a
-        // sliver of text, which is not what "beside" is for.
-        let strip_w = (size.x * 0.42).clamp(140.0, 320.0).min((size.x - 160.0).max(1.0));
-        let col_w = (size.x - strip_w - gap).max(120.0);
+    let gap = ui.spacing().item_spacing.x;
+    // Beside the editor only while there is room for both to work. Below the
+    // two minimums the strip would be a column of clipped captions next to a
+    // sliver of text, so the layout falls back to stacking rather than showing
+    // something unusable — and `editor_size` raises the node's own minimum width
+    // to match, so dragging it narrow doesn't silently drop out of this layout.
+    let beside = knobs_on
+        && matches!(side, Side::Left | Side::Right)
+        && size.x >= MIN_STRIP_W + MIN_EDITOR_W + gap;
+
+    // The editor pin's own background and frame. The rect they cover isn't known
+    // until the body has been laid out, so two slots are reserved here — under
+    // everything the body draws — and filled in once it has.
+    let plate = super::jsm_widgets::reserve_backdrop(ui, paint);
+
+    if beside {
+        let strip_w = (size.x * 0.42).clamp(MIN_STRIP_W, 320.0).min(size.x - MIN_EDITOR_W - gap);
+        let col_w = (size.x - strip_w - gap).max(MIN_EDITOR_W);
         ui.horizontal_top(|ui| {
             if side == Side::Left {
                 strip_column(node_id, ui, snarl, strip_w, size.y, live, parent, paint, resizable);
@@ -272,6 +334,7 @@ fn jsm_body(
                 strip_column(node_id, ui, snarl, strip_w, size.y, live, parent, paint, resizable);
             }
         });
+        super::jsm_widgets::fill_backdrop(ui, plate, paint);
         return;
     }
 
@@ -279,6 +342,7 @@ fn jsm_body(
         ui.set_max_width(size.x);
         jsm_rows(node_id, ui, snarl, size, resizable, live, parent, paint, knobs_on);
     });
+    super::jsm_widgets::fill_backdrop(ui, plate, paint);
 }
 
 /// The tuning strip as a column of its own, for the beside-the-editor layouts.
@@ -846,6 +910,45 @@ mod tests {
     // The strip's placement is saved on the node, so it has to survive the trip
     // through a param string — and an unknown one has to mean the default rather
     // than a panic or a blank body.
+    // A pad driving a pinned setting has to move the NUMBER IN THE TEXT, since
+    // that is the only source of truth — not a param the engine would never read.
+    #[test]
+    fn a_gamepad_nudge_rewrites_the_setting_in_the_config_text() {
+        use crate::canvas::node::{NodeData, NodeExtra};
+        let mut node = NodeData {
+            module_id: "module.jsm".into(),
+            display_name: "JSM Config".into(),
+            category: String::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            params: Default::default(),
+            subpatch: None,
+            extra: NodeExtra::default(),
+        };
+        node.params.insert(
+            "jsm_tabs".into(),
+            serde_json::json!([{ "name": "main", "text": "GYRO_SENS = 4   # feel\n" }]),
+        );
+
+        assert!(super::nav_nudge_knob(&mut node, "GYRO_SENS", 0.1), "it moved");
+        let text = |n: &NodeData| {
+            n.params["jsm_tabs"][0]["text"].as_str().unwrap_or_default().to_string()
+        };
+        // GYRO_SENS runs 0..32, so a tenth of the range is +3.2 on top of 4.
+        assert_eq!(text(&node), "GYRO_SENS = 7.2   # feel\n", "spacing and comment survive");
+
+        // A setting already at the top of its range doesn't "move", and saying so
+        // lets the caller leave the text — and its undo history — alone.
+        super::nav_nudge_knob(&mut node, "GYRO_SENS", 10.0);
+        assert!(!super::nav_nudge_knob(&mut node, "GYRO_SENS", 1.0), "already at the end");
+        assert_eq!(text(&node), "GYRO_SENS = 32   # feel\n");
+
+        // A name that isn't in this tab is a no-op, not a panic or a stray write.
+        let before = text(&node);
+        assert!(!super::nav_nudge_knob(&mut node, "FLICK_TIME", 0.5));
+        assert_eq!(text(&node), before);
+    }
+
     #[test]
     fn where_the_tuning_strip_sits_round_trips_through_the_node() {
         for s in [Side::Bottom, Side::Top, Side::Left, Side::Right] {

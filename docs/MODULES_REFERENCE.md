@@ -788,7 +788,18 @@ pub struct ModuleDescriptor {
   from the same `PinGraphOverride` the Response Curve and the scopes use: on the
   curve, `background` / `outline` / `gridline` plus channel 1 = the sensitivity
   line and channel 2 = the camera-speed line; on a fader, `gridline` is the track
-  and channel 1 the fill; the editor takes background and outline.
+  and channel 1 the fill; the editor takes background and outline (reserved as
+  shape slots before the body is laid out, since its rect isn't known until
+  after and the plate has to sit under what it contains).
+  A pinned fader is also a **gamepad-nav target**, driven like a Knob — but its
+  value lives in the config text, so nav edits it through `jsm_set_knob` exactly
+  as a drag does. The editor and the curve are deliberately *not* targets: there
+  is nothing a pad can do on either, and a target you can't act on only makes the
+  overlay longer to get through.
+  Where text has to give way it is always the setting's **name** that truncates,
+  never its value — a trimmed number can read as a different number. Beside the
+  editor the layout falls back to stacking below the minimum width the two
+  columns need, rather than showing clipped captions next to a sliver of text.
   Resolving the pad feeding the node goes through
   `find_automap_device_id_for_viewer`, **never** the `_automap_device_id` param —
   the graph builder injects that into a clone on its way to the engine and never

@@ -293,7 +293,108 @@ pub fn compile_with(text: &str, tabs: Tabs) -> Compiled {
         out.lines.push(info);
     }
     annotate_analog(&mut out);
+    note_overridden_settings(&mut out, text);
     out
+}
+
+/// Which settings a line actually writes. Almost always just itself — but
+/// `GYRO_SENS` is shorthand for both ends of the sensitivity ramp, which JSM's
+/// own help spells out: "This sets both MIN_GYRO_SENS and MAX_GYRO_SENS to the
+/// same values."
+fn writes_of(upper: &str) -> Vec<&'static str> {
+    match upper {
+        "GYRO_SENS" => vec!["MIN_GYRO_SENS", "MAX_GYRO_SENS"],
+        "MIN_GYRO_SENS" => vec!["MIN_GYRO_SENS"],
+        "MAX_GYRO_SENS" => vec!["MAX_GYRO_SENS"],
+        _ => vec![],
+    }
+}
+
+/// Say where a later line throws away what an earlier one set.
+///
+/// A config is a list of console commands, so writing the same setting twice is
+/// legal and the last one wins — usually deliberately. The case worth catching is
+/// `GYRO_SENS` under a sensitivity ramp: it writes **both** ends, so a config
+/// that carefully sets MIN_ and MAX_GYRO_SENS and then says `GYRO_SENS` below has
+/// flattened the ramp, and whatever `ACCEL_CURVE` it chose has nothing left to
+/// ramp between. Nothing in the file is wrong — it just doesn't do what it reads
+/// like, and silence there costs an evening.
+fn note_overridden_settings(out: &mut Compiled, text: &str) {
+    // (setting, the line that last wrote it). A handful of entries at most, so a
+    // linear scan beats a map and keeps the order stable.
+    let mut set_at: Vec<(&'static str, usize)> = Vec::new();
+    let mut notes: Vec<(usize, String)> = Vec::new();
+
+    for (line, raw) in text.lines().enumerate() {
+        if !matches!(out.lines.get(line).map(|l| &l.status), Some(LineStatus::Ok)) {
+            continue;
+        }
+        let stripped = raw.split('#').next().unwrap_or("");
+        let Some((lhs, _)) = stripped.split_once('=') else {
+            // Everything above it is discarded, so nothing before it can be
+            // "replaced" by anything after.
+            if stripped.trim().eq_ignore_ascii_case("RESET_MAPPINGS") {
+                set_at.clear();
+            }
+            continue;
+        };
+        let name = lhs.trim();
+        // A chord applies only while it is held, so it replaces nothing.
+        if name.contains(',') || name.contains('+') {
+            continue;
+        }
+        let upper = name.to_ascii_uppercase();
+        let writes = writes_of(&upper);
+        if writes.is_empty() {
+            continue;
+        }
+        let mut lost = Vec::new();
+        for w in writes {
+            if let Some(pos) = set_at.iter().position(|(n, _)| *n == w) {
+                let (_, prev) = set_at.remove(pos);
+                if prev != line {
+                    lost.push((prev, w));
+                }
+            }
+            set_at.push((w, line));
+        }
+        if lost.is_empty() {
+            continue;
+        }
+        for (prev, w) in &lost {
+            notes.push((
+                *prev,
+                if upper == "GYRO_SENS" {
+                    format!(
+                        "thrown away by GYRO_SENS on line {} — that one line sets BOTH \
+                         MIN_GYRO_SENS and MAX_GYRO_SENS, so the ramp this line is part of \
+                         ends up flat and ACCEL_CURVE has nothing to ramp between",
+                        line + 1
+                    )
+                } else {
+                    format!("{w} is set again on line {}, which is the one that counts", line + 1)
+                },
+            ));
+        }
+        if upper == "GYRO_SENS" {
+            let lines: Vec<String> = lost.iter().map(|(p, _)| (p + 1).to_string()).collect();
+            notes.push((
+                line,
+                format!(
+                    "sets both MIN_GYRO_SENS and MAX_GYRO_SENS, replacing line{} {} above. \
+                     For a sensitivity that ramps with turn speed, drop this line and keep \
+                     those; for one flat sensitivity, drop those and keep this.",
+                    if lines.len() == 1 { "" } else { "s" },
+                    lines.join(" and ")
+                ),
+            ));
+        }
+    }
+    for (line, note) in notes {
+        if let Some(info) = out.lines.get_mut(line) {
+            info.notes.push(note);
+        }
+    }
 }
 
 /// Settings are read wherever they sit in the file, so what a binding will do

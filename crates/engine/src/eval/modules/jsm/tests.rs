@@ -5227,6 +5227,46 @@ fn setting_a_slider_rewrites_only_the_number() {
     assert_eq!(compile(&out).aim.min_threshold, 12.5);
 }
 
+/// `GYRO_SENS` writes BOTH ends of the ramp (JSM's own help: "sets both
+/// MIN_GYRO_SENS and MAX_GYRO_SENS to the same values"), so a config that sets a
+/// ramp and then writes it below has silently flattened that ramp. The file is
+/// legal and JSM would run it exactly this way — the editor's job is to say so.
+#[test]
+fn gyro_sens_under_a_ramp_flattens_it_and_the_editor_says_where() {
+    let text = "MIN_GYRO_SENS = 4.31\nMAX_GYRO_SENS = 8.45\nACCEL_CURVE = POWER\n\
+                GYRO_SENS = 2.3 2\nZR,GYRO_SENS = 1.9 1.9\n";
+    let cfg = compile(text);
+    // What actually runs: one flat sensitivity, the ramp gone.
+    assert_eq!(cfg.aim.min_sens, (2.3, 2.0));
+    assert_eq!(cfg.aim.max_sens, (2.3, 2.0));
+
+    let note_on = |i: usize| cfg.lines[i].notes.join(" ");
+    assert!(note_on(0).contains("line 4"), "MIN says who took it: {}", note_on(0));
+    assert!(note_on(1).contains("line 4"), "MAX says who took it: {}", note_on(1));
+    assert!(
+        note_on(3).contains("MIN_GYRO_SENS") && note_on(3).contains("MAX_GYRO_SENS"),
+        "and GYRO_SENS says what it did: {}",
+        note_on(3)
+    );
+    // The chorded one applies only while ZR is held, so it replaces nothing and
+    // must not be blamed for the flattening.
+    assert!(note_on(4).is_empty(), "a chord replaces nothing: {}", note_on(4));
+
+    // The ramp on its own is left alone — this must not cry wolf on a config
+    // that is doing exactly what it looks like.
+    // (Only the two sens lines: ACCEL_CURVE carries its own note saying the
+    // setting comes from the custom-curve fork, which is unrelated and correct.)
+    let fine = compile("MIN_GYRO_SENS = 4.31\nMAX_GYRO_SENS = 8.45\nACCEL_CURVE = POWER\n");
+    for i in 0..2 {
+        assert!(
+            fine.lines[i].notes.is_empty(),
+            "a ramp nothing overrides gets no note, but line {} says: {:?}",
+            i + 1,
+            fine.lines[i].notes
+        );
+    }
+}
+
 /// A slider's range is for the control to feel right in, not a limit on what the
 /// config may say. A value written outside it stays put until the slider is
 /// dragged, and then it lands inside — which is the only way one control can be

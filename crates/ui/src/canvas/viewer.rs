@@ -29,6 +29,10 @@ mod glow;
 mod gyro_body;
 mod jsm;
 mod jsm_widgets;
+// Gamepad nav reaches into the JSM faders: a pinned setting is driven like a
+// Knob, but its value lives in the config text rather than in a param.
+pub(crate) use jsm::nav_nudge_knob as jsm_nav_nudge_knob;
+pub(crate) use jsm_widgets::knob_name_of as jsm_knob_name_of;
 mod layout_edit;
 mod midi;
 mod net;

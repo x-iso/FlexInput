@@ -392,6 +392,11 @@ impl FlexInputApp {
             | ("module.menu", "field") | ("module.menu", "cards") => true,
             ("processing.gyro_3dof", "lean_left")
             | ("processing.gyro_3dof", "lean_right") => true,
+            // JSM Config: a pinned setting's fader is driven like a Knob. The
+            // editor and the curve are not targets — there is nothing on either
+            // a pad can usefully do, and a target you cannot act on just makes
+            // the overlay harder to get through.
+            ("module.jsm", e) => crate::canvas::viewer::jsm_knob_name_of(e).is_some(),
             // Everything else is a field row — targetable iff it has fields.
             _ => Self::elem_has_fields(mid, elem),
         }
@@ -905,23 +910,19 @@ impl FlexInputApp {
 
     /// Kind of gamepad interaction the selected widget supports.
     pub(crate) fn nav_selected_kind(&self, outer_id: egui_snarl::NodeId) -> NavWidgetKind {
-        // The selected item's element_id: a curve module can be pinned as the
-        // dot-graph ("curve") or as separate scale/range/grid rows — only the
-        // graph element supports dot editing.
-        let elem = if let Some((_, _, e)) = self.nav_config_override(outer_id) {
-            Some(e)
-        } else {
-            let canvas = &self.tabs[self.active_tab].canvas;
-            canvas.snarl.get_node(outer_id)
-                .and_then(|n| n.subpatch.as_ref())
-                .and_then(|sp| sp.selected_item.and_then(|i| sp.items.get(i)))
-                .and_then(|it| match it {
-                    crate::canvas::node::LayoutItem::Module(m) => Some(m.element_id.clone()),
-                    _ => None,
-                })
-        };
+        // Which element this module is pinned as decides what a pad can do with
+        // it: a curve module as its dot-graph or as an option row, a JSM config
+        // as its editor or as one setting's fader.
+        let elem = self.nav_selected_element(outer_id).map(|(_, e)| e);
         match self.nav_selected_module_id(outer_id).as_deref() {
             Some("module.knob") | Some("module.constant") => NavWidgetKind::Value,
+            // A JSM setting is a value widget whose value happens to live in the
+            // config text rather than in a param.
+            Some("module.jsm")
+                if elem
+                    .as_deref()
+                    .and_then(crate::canvas::viewer::jsm_knob_name_of)
+                    .is_some() => NavWidgetKind::Value,
             Some("module.dropdown") => NavWidgetKind::Dropdown,
             Some("module.switch") => NavWidgetKind::Toggle,
             Some("module.response_curve")
@@ -972,10 +973,18 @@ impl FlexInputApp {
             self.set_subpatch_param_f32(outer_id, inner, spec.key, next);
             return;
         }
+        let jsm_knob = self
+            .nav_selected_element(outer_id)
+            .and_then(|(_, e)| crate::canvas::viewer::jsm_knob_name_of(&e).map(str::to_string));
         let canvas = &mut self.tabs[self.active_tab].canvas;
         let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) else { return; };
         let Some(node) = sp.snarl.get_node_mut(inner) else { return; };
         match node.module_id.as_str() {
+            "module.jsm" => {
+                if let Some(name) = jsm_knob {
+                    crate::canvas::viewer::jsm_nav_nudge_knob(node, &name, delta);
+                }
+            }
             "module.knob" => {
                 let bipolar = node.params.get("bipolar").and_then(|v| v.as_bool()).unwrap_or(false);
                 let (lo, hi) = if bipolar { (-1.0f32, 1.0f32) } else { (0.0f32, 1.0f32) };

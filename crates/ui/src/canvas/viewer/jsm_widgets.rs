@@ -42,6 +42,48 @@ fn backdrop(painter: &egui::Painter, rect: egui::Rect, paint: JsmPaint<'_>, fall
     }
 }
 
+/// Reserve the shape slots a body's background and frame will fill.
+///
+/// A node body's rect isn't known until it has been laid out, and the plate has
+/// to sit *under* what it contains — so the slots are claimed first, in painting
+/// order, and set afterwards. `None` when there is nothing to paint, so an
+/// un-styled body adds no shapes at all.
+pub(crate) fn reserve_backdrop(
+    ui: &mut egui::Ui,
+    paint: JsmPaint<'_>,
+) -> Option<(egui::layers::ShapeIdx, egui::layers::ShapeIdx)> {
+    let wanted = paint.is_some_and(|p| {
+        p.background.is_some() || (p.outline_px.unwrap_or(0.0) > 0.0 && p.outline.is_some())
+    });
+    wanted.then(|| {
+        let p = ui.painter();
+        (p.add(egui::Shape::Noop), p.add(egui::Shape::Noop))
+    })
+}
+
+/// Fill in what [`reserve_backdrop`] claimed, now that the body has a size.
+pub(crate) fn fill_backdrop(
+    ui: &mut egui::Ui,
+    slots: Option<(egui::layers::ShapeIdx, egui::layers::ShapeIdx)>,
+    paint: JsmPaint<'_>,
+) {
+    let Some((bg_at, outline_at)) = slots else { return };
+    // A little air around the content, so the frame reads as a frame rather than
+    // as something touching the text.
+    let rect = ui.min_rect().expand(3.0);
+    let painter = ui.painter();
+    if let Some(bg) = col(paint.and_then(|p| p.background)) {
+        painter.set(bg_at, egui::Shape::rect_filled(rect, 4.0, bg));
+    }
+    let px = paint.and_then(|p| p.outline_px).unwrap_or(0.0);
+    if let (true, Some(c)) = (px > 0.0, col(paint.and_then(|p| p.outline))) {
+        painter.set(
+            outline_at,
+            egui::Shape::rect_stroke(rect, 4.0, egui::Stroke::new(px, c), egui::StrokeKind::Inside),
+        );
+    }
+}
+
 /// The fader's colours from the same override: channel 1 tints the fill.
 fn knob_paint(paint: JsmPaint<'_>) -> super::simple_bodies::KnobPaint {
     super::simple_bodies::KnobPaint {
@@ -68,12 +110,11 @@ pub(crate) fn fader(
     paint: JsmPaint<'_>,
 ) -> Option<f32> {
     let mut out = None;
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(&knob.name).small().weak());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(shown_value(knob)).small().monospace());
-        });
-    });
+    // The value is laid out first and keeps its full width; the NAME is what
+    // gives way, with an ellipsis. A trimmed number is useless — it can read as a
+    // different number — whereas a trimmed name is still recognisable, and the
+    // tooltip carries it in full either way.
+    caption_row(ui, width, &knob.name, &shown_value(knob));
 
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, FADER_H),
@@ -136,9 +177,14 @@ pub(crate) fn pinned_fader(
     let avail = egui::vec2(size.x.max(24.0), size.y.max(18.0));
     let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
 
-    // A label row only where there is room for one — cramped, the name and value
-    // would leave the control a sliver, so they go to the tooltip instead.
-    let label_h = if avail.y >= 40.0 { (avail.y * 0.22).clamp(12.0, 26.0) } else { 0.0 };
+    // Which shape this is decides where the text goes. A wide fader has a label
+    // row across its top, as it does in the strip. A vertical fader or a rotary
+    // has no width to spare for a side-by-side row, so the name sits above the
+    // control and the value below it — and both are allowed to spill past the
+    // widget's own bounds rather than be clipped, because a pin narrowed until
+    // its caption no longer fits should still tell you what it is.
+    let wide = avail.x / avail.y.max(1.0) >= 2.0;
+    let label_h = if wide && avail.y >= 40.0 { (avail.y * 0.22).clamp(12.0, 26.0) } else { 0.0 };
     let track = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, label_h), rect.max);
     let aspect = track.width() / track.height().max(1.0);
 
@@ -179,21 +225,40 @@ pub(crate) fn pinned_fader(
         super::simple_bodies::draw_knob_rotary_styled(&painter, track, t, bipolar, active, kp);
     }
 
+    // The text grows with the pin, so a widget scaled up on a config overlay is
+    // readable from wherever the overlay is being used. It is painted through
+    // `ui.painter()` rather than the widget-clipped one, so a caption wider than
+    // the pin runs past its edge instead of being cut in half.
+    let text = ui.painter();
+    let vis = ui.visuals();
     if label_h > 0.0 {
-        // The text grows with the pin, so a widget scaled up on a config overlay
-        // is readable from where the overlay is actually being used.
         let font = egui::FontId::proportional((label_h * 0.62).clamp(8.0, 20.0));
-        let vis = ui.visuals();
-        painter.text(
+        text.text(
             egui::pos2(rect.left() + 2.0, rect.top() + label_h * 0.5),
             egui::Align2::LEFT_CENTER,
             &knob.name,
             font.clone(),
             vis.weak_text_color(),
         );
-        painter.text(
+        text.text(
             egui::pos2(rect.right() - 2.0, rect.top() + label_h * 0.5),
             egui::Align2::RIGHT_CENTER,
+            shown_value(knob),
+            font,
+            vis.strong_text_color(),
+        );
+    } else if !wide {
+        let font = egui::FontId::proportional((avail.y * 0.13).clamp(8.0, 18.0));
+        text.text(
+            egui::pos2(rect.center().x, rect.top() - 1.0),
+            egui::Align2::CENTER_BOTTOM,
+            &knob.name,
+            font.clone(),
+            vis.weak_text_color(),
+        );
+        text.text(
+            egui::pos2(rect.center().x, rect.bottom() + 1.0),
+            egui::Align2::CENTER_TOP,
             shown_value(knob),
             font,
             vis.strong_text_color(),
@@ -209,6 +274,41 @@ pub(crate) fn pinned_fader(
         ));
     }
     out
+}
+
+/// A setting's name on the left and its value on the right, in one row of the
+/// given width — the value complete, the name truncated if it has to be.
+///
+/// The width a fader strip gets can be narrow (beside the editor, on a small
+/// node), and something has to give. A trimmed number can read as a *different*
+/// number, so it never gives; a trimmed name is still recognisable.
+fn caption_row(ui: &mut egui::Ui, width: f32, name: &str, value: &str) {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let (weak, strong) = (ui.visuals().weak_text_color(), ui.visuals().text_color());
+    let val = ui.ctx().fonts_mut(|f| {
+        f.layout_no_wrap(value.to_string(), egui::FontId::monospace(font.size), strong)
+    });
+    let gap = 6.0;
+    let name_w = (width - val.size().x - gap).max(8.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), font, weak);
+    job.wrap.max_width = name_w;
+    job.wrap.max_rows = 1;
+    job.wrap.overflow_character = Some('…');
+    let nm = ui.ctx().fonts_mut(|f| f.layout_job(job));
+
+    let h = nm.size().y.max(val.size().y);
+    let (row, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.galley(
+        egui::pos2(row.left(), row.center().y - nm.size().y * 0.5),
+        nm,
+        weak,
+    );
+    painter.galley(
+        egui::pos2(row.right() - val.size().x, row.center().y - val.size().y * 0.5),
+        val,
+        strong,
+    );
 }
 
 /// A setting's value as the config would spell it.
