@@ -16,6 +16,36 @@ use super::*;
 /// converted to global screen space. Keyed by inner node id; pass-stamped so the
 /// driver can ignore stale data. Cheap no-op cost when nav is inactive (just a
 /// temp insert), so renderers always publish.
+/// Which field gamepad nav has focused inside one element, published by the nav
+/// driver for the BODY to read — the opposite direction to the rects below.
+///
+/// A body whose controls scroll needs this to bring the focused one into view;
+/// nothing else can, because the scroll offset belongs to the body and the focus
+/// index belongs to the nav state.
+pub(crate) fn publish_nav_focus_field(
+    ctx: &egui::Context,
+    inner_id: NodeId,
+    element: &str,
+    idx: usize,
+) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        d.insert_temp(egui::Id::new(("gp_nav_focus_field", inner_id.0, element.to_string())), (pass, idx))
+    });
+}
+
+/// The focused field for this element, if nav published one recently.
+///
+/// "Recently" rather than "this pass": the nav driver runs early in the frame and
+/// the body draws later, so an exact match would never hold.
+pub(crate) fn nav_focus_field(ui: &egui::Ui, inner_id: NodeId) -> Option<usize> {
+    let element: String = ui.ctx().data(|d|
+        d.get_temp(egui::Id::new(("gp_nav_cur_element", inner_id.0)))).unwrap_or_default();
+    let (pass, idx): (u64, usize) = ui.ctx().data(|d|
+        d.get_temp(egui::Id::new(("gp_nav_focus_field", inner_id.0, element))))?;
+    (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(idx)
+}
+
 pub(crate) fn publish_nav_field_rects(ui: &egui::Ui, inner_id: NodeId, local_rects: &[egui::Rect]) {
     if local_rects.is_empty() { return; }
     let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())

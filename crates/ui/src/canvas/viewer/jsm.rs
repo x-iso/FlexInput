@@ -390,23 +390,21 @@ fn strip_column(
     if tabs.get(active).is_none() {
         return;
     }
-    let mut edited = None;
     // Only as wide as the column really is. Anything the editor column overran by
     // comes out of this one, and drawing past it would clip the values — the one
     // thing on a fader that must never be trimmed.
     let width = width.min(ui.available_width().max(60.0));
-    let mut edited_w = None;
+    let mut edited = None;
     ui.vertical(|ui| {
         ui.set_max_width(width);
         // Beside the editor the strip owns its column's full height, whether the
         // body is a node (which grows) or a pin (which does not) — either way it
         // has a column to fill rather than a leftover to squeeze into.
-        edited_w = knob_rows(
+        edited = knob_rows(
             node_id, ui, snarl, width, &tabs[active].text, live, parent, paint,
             Some(height),
         );
     });
-    edited = edited_w;
     if let Some(text) = edited {
         tabs[active].text = text;
         write_tabs(snarl, node_id, &tabs, active);
@@ -805,9 +803,19 @@ fn knob_rows(
     // One rect per fader, in the order nav walks them, so the focused-field ring
     // lands on the setting the pad is actually editing.
     let mut field_rects: Vec<egui::Rect> = Vec::with_capacity(knobs.len());
+    // The fader gamepad nav has focused, and the one this strip last scrolled to.
+    // Only a CHANGE scrolls: holding focus on a row while the wheel is used would
+    // otherwise drag the strip straight back, and the mouse would feel stuck.
+    let focus = nav_focus_field(ui, node_id);
+    let scrolled_to_id = egui::Id::new(("jsm_nav_scrolled", node_id.0));
+    let scrolled_to: Option<usize> = ui.ctx().data(|d| d.get_temp(scrolled_to_id));
+    let bring_into_view = focus.filter(|f| Some(*f) != scrolled_to);
+    if let Some(f) = bring_into_view {
+        ui.ctx().data_mut(|d| d.insert_temp(scrolled_to_id, f));
+    }
     let faders = |ui: &mut egui::Ui, field_rects: &mut Vec<egui::Rect>| {
         let mut edited = None;
-        for knob in &knobs {
+        for (i, knob) in knobs.iter().enumerate() {
             let start = ui.cursor().min;
             if let Some(v) = super::jsm_widgets::fader(ui, fader_w, knob, paint) {
                 edited = Some(flexinput_engine::eval::jsm_set_knob(
@@ -822,7 +830,13 @@ fn knob_rows(
             // of sight registers nothing: an overlay pick has to land on what the
             // pointer is actually over.
             let row = egui::Rect::from_min_max(start, ui.cursor().min + egui::vec2(fader_w, 0.0));
-            field_rects.push(row);
+            if bring_into_view == Some(i) {
+                ui.scroll_to_rect(row, None);
+            }
+            // Clipped to what is actually on screen, so a row scrolled out of the
+            // band publishes an empty rect and the focus ring skips it instead of
+            // drawing across the container's edge at a control nobody can see.
+            field_rects.push(row.intersect(ui.clip_rect()));
             if ui.clip_rect().intersects(row) {
                 register_exposable_element(
                     ui,

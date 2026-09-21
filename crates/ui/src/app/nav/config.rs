@@ -449,7 +449,10 @@ pub(crate) fn draw_config_field_glow(ctx: &egui::Context, target: Option<(usize,
     if pass != ctx.cumulative_pass_nr() {
         return;
     }
-    if let Some(fr) = frs.get(field_idx) {
+    if let Some(fr) = frs
+        .get(field_idx)
+        .filter(|r| FlexInputApp::nav_ring_is_worth_drawing(r))
+    {
         let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
         FlexInputApp::paint_field_glow_ring(ctx, *fr, accent);
     }

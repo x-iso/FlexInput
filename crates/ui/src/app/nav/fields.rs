@@ -70,6 +70,13 @@ impl FlexInputApp {
         let idx = self.gamepad_nav.field_index;
         let def = fields[idx].clone();
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return; };
+        // Tell the body which field has focus. The rects come the other way; this
+        // is what lets a strip that scrolls bring the focused row into view, so a
+        // selection can't sit below the fold with only a highlight ring — drawn
+        // over the container, not inside it — to say where it went.
+        if let Some((_, element)) = self.nav_selected_element(outer_id) {
+            crate::canvas::viewer::publish_nav_focus_field(ctx, inner, &element, idx);
+        }
 
         // North → reset focused field.
         if nav.is_rising("btn_north") {
@@ -308,7 +315,7 @@ impl FlexInputApp {
         let field_rects: Option<(u64, Vec<egui::Rect>)> =
             ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner.0, element))));
         if let Some((_, frs)) = field_rects {
-            if let Some(fr) = frs.get(idx) {
+            if let Some(fr) = frs.get(idx).filter(|r| Self::nav_ring_is_worth_drawing(r)) {
                 Self::paint_field_glow_ring(ctx, *fr, accent);
             }
         }
@@ -1176,6 +1183,15 @@ impl FlexInputApp {
         walk >= cross * MARGIN
     }
 
+    /// Is there enough of this field left on screen to ring?
+    ///
+    /// A scrolling strip publishes each row clipped to the band actually visible,
+    /// so a row scrolled out comes back empty. Ringing that drew a highlight
+    /// across the container's edge, pointing at a control nobody could see.
+    pub(crate) fn nav_ring_is_worth_drawing(r: &egui::Rect) -> bool {
+        r.width() > 2.0 && r.height() > 2.0
+    }
+
     #[cfg(test)]
     pub(crate) fn nav_axis_is_clear_for_test(stick: egui::Vec2, column: bool) -> bool {
         Self::nav_axis_is_clear(stick, column)
@@ -1375,5 +1391,24 @@ mod nav_axis_tests {
         // unambiguous — gating it there would make the dpad feel broken.
         assert!(clear(0.0, 0.0, true), "the dpad");
         assert!(clear(0.3, 0.3, true), "a barely-touched stick is the dpad's case");
+    }
+
+    // A strip that scrolls publishes each row clipped to the band on screen, so a
+    // row scrolled out comes back empty. Ringing that drew a highlight lying
+    // across the container's edge, pointing at a control nobody could see.
+    #[test]
+    fn a_field_scrolled_out_of_view_gets_no_highlight_ring() {
+        let band = egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(200.0, 80.0));
+        let row_at = |y: f32| {
+            egui::Rect::from_min_size(egui::pos2(0.0, y), egui::vec2(200.0, 24.0)).intersect(band)
+        };
+        let worth = FlexInputApp::nav_ring_is_worth_drawing;
+
+        assert!(worth(&row_at(120.0)), "a row inside the band rings");
+        assert!(worth(&row_at(96.0)), "and one straddling the edge still does");
+        assert!(!worth(&row_at(20.0)), "one scrolled off the top does not");
+        assert!(!worth(&row_at(400.0)), "nor one below the fold");
+        // Exactly flush with the edge is nothing to ring either.
+        assert!(!worth(&row_at(76.0)), "a row ending on the band's top edge");
     }
 }

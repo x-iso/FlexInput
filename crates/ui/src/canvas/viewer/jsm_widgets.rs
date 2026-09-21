@@ -254,9 +254,12 @@ pub(crate) fn pinned_fader(
     // pin — was clipped away ENTIRELY, leaving a knob with no label at all. Rather
     // than shrink the control to make room, let the text overhang: a caption you
     // can read next to a knob you can grab beats both of them being too small.
-    let text = ui
-        .painter()
-        .with_clip_rect(rect.expand2(egui::vec2(rect.width(), rect.height() * 0.6 + 14.0)));
+    //
+    // `set_clip_rect` REPLACES, where `with_clip_rect` intersects — and
+    // intersecting with the container is exactly what we are trying to escape, so
+    // the obvious-looking builder call here is silently a no-op.
+    let mut text = ui.painter().clone();
+    text.set_clip_rect(rect.expand2(egui::vec2(rect.width(), rect.height() * 0.6 + 14.0)));
     let vis = ui.visuals();
     if label_h > 0.0 {
         let font = egui::FontId::proportional((label_h * 0.62).clamp(8.0, 20.0));
