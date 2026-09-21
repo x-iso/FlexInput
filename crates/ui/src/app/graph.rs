@@ -1801,3 +1801,122 @@ mod jsm_passthrough_tests {
         assert!(!pins.is_empty(), "an empty list would pass the WHOLE pad");
     }
 }
+
+#[cfg(test)]
+mod subpatch_bus_tests {
+    use super::*;
+    use flexinput_core::{PinDescriptor, SignalType};
+    use serde_json::json;
+
+    fn node(module_id: &str, ins: &[SignalType], outs: &[SignalType]) -> NodeData {
+        NodeData {
+            module_id: module_id.to_string(),
+            display_name: module_id.to_string(),
+            category: "test".to_string(),
+            inputs: ins
+                .iter()
+                .enumerate()
+                .map(|(i, t)| PinDescriptor::new(format!("in{i}"), *t))
+                .collect(),
+            outputs: outs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| PinDescriptor::new(format!("out{i}"), *t))
+                .collect(),
+            params: std::collections::HashMap::new(),
+            subpatch: None,
+            extra: crate::canvas::node::NodeExtra::default(),
+        }
+    }
+
+    fn wire(s: &mut Snarl<NodeData>, from: NodeId, o: usize, to: NodeId, i: usize) {
+        s.connect(OutPinId { node: from, output: o }, InPinId { node: to, input: i });
+    }
+
+    /// A JSM module inside a sub-patch, its bus taken out through an outlet — the
+    /// shape anyone wraps a config in. What a consumer on the PARENT canvas
+    /// resolves the sub-patch's output to has to be the JSM node's own collector
+    /// key, or it reads the raw pad instead and every pin the config PRODUCES
+    /// (`mouse_move` above all) is simply absent.
+    #[test]
+    fn a_jsm_bus_keeps_its_collector_identity_out_through_a_subpatch() {
+        let p = egui::Pos2::ZERO;
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let inlet = inner.insert_node(p, {
+            let mut n = node("subpatch.inlet", &[], &[SignalType::AutoMap]);
+            n.params.insert("pin_index".into(), json!(0));
+            n
+        });
+        let jsm = inner.insert_node(
+            p,
+            node("module.jsm", &[SignalType::AutoMap], &[SignalType::AutoMap]),
+        );
+        let outlet = inner.insert_node(p, {
+            let mut n = node("subpatch.outlet", &[SignalType::AutoMap], &[]);
+            n.params.insert("pin_index".into(), json!(0));
+            n
+        });
+        wire(&mut inner, inlet, 0, jsm, 0);
+        wire(&mut inner, jsm, 0, outlet, 0);
+
+        let mut parent: Snarl<NodeData> = Snarl::new();
+        let dev = parent.insert_node(p, {
+            let mut n = node("device.source", &[], &[SignalType::AutoMap]);
+            n.params.insert("device_id".into(), json!("gilrs:pad:0"));
+            n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+            n
+        });
+        let sp = parent.insert_node(p, {
+            let mut n = node("subpatch", &[SignalType::AutoMap], &[SignalType::AutoMap]);
+            n.subpatch = Some(Box::new(crate::canvas::node::UiSubPatch {
+                snarl: Box::new(inner),
+                ..Default::default()
+            }));
+            n
+        });
+        wire(&mut parent, dev, 0, sp, 0);
+
+        let resolved = find_automap_device_rec(
+            &parent,
+            OutPinId { node: sp, output: 0 },
+            None,
+        );
+        let (id, pins, fallback) = resolved.expect("the sub-patch's bus resolves to something");
+        assert!(
+            id.starts_with("collector:"),
+            "a consumer outside the sub-patch must read the JSM node's collector, got `{id}`"
+        );
+        assert_eq!(
+            fallback.as_deref(),
+            Some("gilrs:pad:0"),
+            "with the real pad behind it for feedback routing"
+        );
+        assert!(
+            pins.iter().any(|p| p == "mouse_move"),
+            "and `mouse_move` among the pins it carries — the whole point of a gyro config"
+        );
+
+        // ...and it must be the SAME key a consumer INSIDE the sub-patch resolves,
+        // or the two sides of the boundary read different collectors and only the
+        // inner one finds anything. This is the comparison that matters: both
+        // sides starting with "collector:" proves nothing on its own.
+        let inner_snarl = &parent.get_node(sp).unwrap().subpatch.as_ref().unwrap().snarl;
+        let jsm_inner = inner_snarl
+            .nodes_ids_data()
+            .find(|(_, n)| n.value.module_id == "module.jsm")
+            .map(|(id, _)| id)
+            .unwrap();
+        let frame = AutomapParent { snarl: &parent, subpatch_id: sp, prev: None };
+        let (inner_id, _, inner_fallback) = find_automap_device_rec(
+            inner_snarl,
+            OutPinId { node: jsm_inner, output: 0 },
+            Some(&frame),
+        )
+        .expect("the same bus, seen from inside");
+        assert_eq!(
+            id, inner_id,
+            "both sides of the sub-patch boundary must name the same collector"
+        );
+        assert_eq!(fallback, inner_fallback, "and the same pad behind it");
+    }
+}
