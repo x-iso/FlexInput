@@ -219,6 +219,11 @@ pub struct Aim {
     last_abs_x: f32,
     last_abs_y: f32,
     sticks: [StickAim; 2],
+    /// The custom-curve fork's own running state.
+    decay: super::cc::Decay,
+    one_euro_x: super::cc::OneEuro,
+    one_euro_y: super::cc::OneEuro,
+    brake: super::cc::Brake,
 }
 
 impl Default for Aim {
@@ -234,6 +239,10 @@ impl Default for Aim {
             last_abs_x: 0.0,
             last_abs_y: 0.0,
             sticks: [StickAim::default(), StickAim::default()],
+            decay: super::cc::Decay::default(),
+            one_euro_x: super::cc::OneEuro::default(),
+            one_euro_y: super::cc::OneEuro::default(),
+            brake: super::cc::Brake::default(),
         }
     }
 }
@@ -253,6 +262,7 @@ impl Aim {
         s: &Settings,
         p: &pad::Settings,
         m: &super::motion::Settings,
+        c: &super::cc::Settings,
         gravity: super::motion::Gravity,
         dt: f32,
         gyro: Gyro,
@@ -274,7 +284,11 @@ impl Aim {
             if m.z { v += -x_sign * in_z; }
             v
         };
-        let (mut gx, mut gy) = if m.space.needs_gravity() {
+        let (mut gx, mut gy) = if m.space == super::motion::Space::YawPlusRoll {
+            // The custom-curve fork's space: pitch on the vertical, yaw with a share
+            // of roll mixed into the turn. See `cc.rs`.
+            super::cc::yaw_plus_roll(c, glam::Vec3::new(in_x, in_y, in_z))
+        } else if m.space.needs_gravity() {
             // A space measured against gravity ignores the axis masks entirely —
             // it works out which way "turning" and "leaning" point from where down
             // is, and takes the gyro's component along that. See `motion.rs`.
@@ -288,11 +302,35 @@ impl Aim {
         };
 
         // ── smoothing ────────────────────────────────────────────────────────
-        let length = (gx * gx + gy * gy).sqrt();
-        let samples = ((s.smooth_time / dt.max(1e-6)) as usize).clamp(1, GYRO_SAMPLES);
-        let (sx, sy) = self.smooth_gyro(gx, gy, length, s.smooth_threshold / 2.0, s.smooth_threshold, samples);
-        gx = sx;
-        gy = sy;
+        if c.decay_smoothing {
+            // The fork's alternative: one exponential smoother whose time constant
+            // shrinks as the pad speeds up, instead of a rolling average.
+            let (sx, sy) = self.decay.smooth(gx, gy, dt, s.smooth_time, s.smooth_threshold);
+            gx = sx;
+            gy = sy;
+        } else {
+            self.decay.reset();
+            let length = (gx * gx + gy * gy).sqrt();
+            let samples = ((s.smooth_time / dt.max(1e-6)) as usize).clamp(1, GYRO_SAMPLES);
+            let (sx, sy) = self.smooth_gyro(gx, gy, length, s.smooth_threshold / 2.0, s.smooth_threshold, samples);
+            gx = sx;
+            gy = sy;
+        }
+
+        // ── the one-euro filter, when the command has switched it on ──────────
+        if c.one_euro_enabled {
+            gx = self.one_euro_x.filter(gx, dt, c.one_euro_min_cutoff, c.one_euro_speed_coeff);
+            gy = self.one_euro_y.filter(gy, dt, c.one_euro_min_cutoff, c.one_euro_speed_coeff);
+        } else {
+            self.one_euro_x.reset();
+            self.one_euro_y.reset();
+        }
+
+        // The speed the deceleration brake measures against: post-smoothing, before
+        // the cutoff and before anything synthetic is added. The fork records it
+        // exactly here, and the order matters — a cutoff fading the tail of a flick
+        // out would read as braking all by itself.
+        let brake_speed = (gx * gx + gy * gy).sqrt();
 
         // ── cutoff: ignore a slow drift, fade back in over the recovery band ──
         let length = (gx * gx + gy * gy).sqrt();
@@ -335,6 +373,14 @@ impl Aim {
         if blocked {
             gx = 0.0;
             gy = 0.0;
+            // The fork resets the one-euro filter here, and rightly: coming back from
+            // a blocked gyro should not have to wash the filter's memory of zero out
+            // first. The brake goes with it — a blocked gyro reads as a dead stop,
+            // which is exactly the shape the brake watches for, so leaving it engaged
+            // would damp the first movement after the gyro comes back.
+            self.one_euro_x.reset();
+            self.one_euro_y.reset();
+            self.brake.reset();
         }
 
         // ── axis signs, and the inversions a binding can ask for ─────────────
@@ -344,8 +390,21 @@ impl Aim {
         let mut vel_x = gx * sign_x;
         let mut vel_y = gy * sign_y;
 
+        // ── the brake, then the snap, then the ramp ──────────────────────────
+        //
+        // This order is the fork's and is not the obvious one: the brake measures
+        // BEFORE the snap, so a snap-induced slowdown is not mistaken for the hands
+        // stopping, and the speed is recomputed afterwards for the curve. Implement
+        // it the other way round and the two features fight each other.
+        let speed_for_brake = (vel_x * vel_x + vel_y * vel_y).sqrt();
+        let brake = self.brake.tick(c, dt, brake_speed, speed_for_brake);
+
+        let (sx, sy) = super::cc::angle_snap(c, vel_x, vel_y);
+        vel_x = sx;
+        vel_y = sy;
+
         // ── the sensitivity ramp ─────────────────────────────────────────────
-        let magnitude = (gx * gx + gy * gy).sqrt() - s.min_threshold;
+        let magnitude = (vel_x * vel_x + vel_y * vel_y).sqrt() - s.min_threshold;
         let magnitude = magnitude.max(0.0);
         let denom = s.max_threshold - s.min_threshold;
         let ramp = if denom <= 0.0 {
@@ -355,8 +414,15 @@ impl Aim {
         } else {
             (magnitude / denom).min(1.0)
         };
-        vel_x *= s.min_sens.0 * (1.0 - ramp) + s.max_sens.0 * ramp;
-        vel_y *= s.min_sens.1 * (1.0 - ramp) + s.max_sens.1 * ramp;
+        // `LINEAR` is the straight line stock JSM draws; the fork's five curves take
+        // their shape from their own parameters instead. Note that three of the six
+        // never look at `MAX_GYRO_THRESHOLD` at all.
+        vel_x *= super::cc::sensitivity(c, magnitude, ramp, s.max_threshold, s.min_sens.0, s.max_sens.0);
+        vel_y *= super::cc::sensitivity(c, magnitude, ramp, s.max_threshold, s.min_sens.1, s.max_sens.1);
+        if brake < 1.0 {
+            vel_x *= brake;
+            vel_y *= brake;
+        }
 
         // ── the sticks ───────────────────────────────────────────────────────
         let mut cam = Vec2::ZERO;

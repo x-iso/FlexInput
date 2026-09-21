@@ -68,11 +68,16 @@ pub enum Space {
     /// As `PLAYER_TURN`, but pitch is measured against the world too.
     WorldTurn,
     WorldLean,
+    /// `YAW_PLUS_ROLL`, from the custom-curve fork: pitch on the vertical and yaw
+    /// with a share of roll mixed in. Needs no gravity — see `cc.rs`.
+    YawPlusRoll,
 }
 
 impl Space {
     /// Does this space need to know which way is down?
-    pub fn needs_gravity(self) -> bool { self != Space::Local }
+    pub fn needs_gravity(self) -> bool {
+        !matches!(self, Space::Local | Space::YawPlusRoll)
+    }
 }
 
 /// What the motion side of a config is configured with.
@@ -263,8 +268,8 @@ pub fn gravity_space(space: Space, g: Gravity, r: JsmGyro) -> (f32, f32) {
 
     let (mut mx, mut my) = (0.0, 0.0);
     match space {
-        // Already handled in `aim.rs`; nothing here.
-        Space::Local => {}
+        // Handled in `aim.rs`; nothing here.
+        Space::Local | Space::YawPlusRoll => {}
         Space::PlayerTurn | Space::PlayerLean => {
             // Player spaces keep pitch as the pad's own, which is what makes them
             // feel direct: only the horizontal half is re-referenced.

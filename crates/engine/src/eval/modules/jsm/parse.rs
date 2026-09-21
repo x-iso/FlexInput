@@ -125,6 +125,7 @@ pub struct Resolved {
     pub motion: super::motion::Settings,
     pub touch: super::touch::Settings,
     pub fb: super::feedback::Settings,
+    pub cc: super::cc::Settings,
     /// Per stick: a chord is supplying its mode right now. When that stops the
     /// stick has to be let alone until it comes back to centre, or releasing the
     /// chord mid-push would hand the base mode a stick already out at full.
@@ -144,6 +145,7 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
         motion: cfg.motion,
         touch: cfg.touch,
         fb: cfg.fb,
+        cc: cfg.cc,
         stick_mode_chorded: [false; 2],
     };
     if cfg.modeshifts.is_empty() {
@@ -163,6 +165,7 @@ pub fn resolve(cfg: &Compiled, chords: &[Btn]) -> Resolved {
                     motion: &mut r.motion,
                     touch: &mut r.touch,
                     fb: &mut r.fb,
+                    cc: &mut r.cc,
                 },
             );
             if let Support::Analog(AnalogId::StickMode(side)) = ms.support {
@@ -214,6 +217,8 @@ pub struct Compiled {
     pub touch: super::touch::Settings,
     /// Rumble, the light bar, the adaptive triggers.
     pub fb: super::feedback::Settings,
+    /// The custom-curve fork's additions to the gyro pipeline.
+    pub cc: super::cc::Settings,
     /// A bare `SET_MOTION_STICK_NEUTRAL` line: take the pad's resting orientation
     /// as the motion stick's centre once the config is running.
     pub neutral_at_load: bool,
@@ -278,6 +283,7 @@ pub fn compile_with(text: &str, tabs: Tabs) -> Compiled {
         motion: super::motion::Settings::default(),
         touch: super::touch::Settings::default(),
         fb: super::feedback::Settings::default(),
+        cc: super::cc::Settings::default(),
         neutral_at_load: false,
         modeshifts: Vec::new(),
         mentioned: HashSet::new(),
@@ -483,6 +489,7 @@ fn include_tab(tab: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
     out.motion = inner.motion;
     out.touch = inner.touch;
     out.fb = inner.fb;
+    out.cc = inner.cc;
     out.neutral_at_load |= inner.neutral_at_load;
     out.modeshifts.extend(inner.modeshifts);
     out.mentioned.extend(inner.mentioned.iter().copied());
@@ -527,6 +534,21 @@ fn command_line(name: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
         ));
     }
     match upper.as_str() {
+        // A command in the fork too, and that asymmetry is the point: it is global
+        // and sticky until `RESET_MAPPINGS`, so unlike the two numbers that tune it,
+        // it cannot be chorded. A config relying on that would behave differently if
+        // this were quietly made a setting.
+        "ONE_EURO_FILTER" => {
+            out.cc.one_euro_enabled = true;
+            let mut info = LineInfo::of(LineStatus::Ok);
+            info.notes.push(FORK_NOTE.to_string());
+            info.notes.push(
+                "a command, not a setting — it stays on for the whole config and cannot be \
+                 chorded. ONE_EURO_MIN_CUTOFF and ONE_EURO_SPEED_COEFF can."
+                    .to_string(),
+            );
+            info
+        }
         // Everything above this line is discarded, which is what JSM does: a config
         // is a list of console commands and this one resets them all. At the very
         // top of a file — where it usually sits — there is nothing to discard, and
@@ -536,7 +558,8 @@ fn command_line(name: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
             let had_anything = !out.bindings.is_empty()
                 || !out.modeshifts.is_empty()
                 || out.settings != Settings::default()
-                || out.aim != super::aim::Settings::default();
+                || out.aim != super::aim::Settings::default()
+                || out.cc != super::cc::Settings::default();
             out.bindings.clear();
             out.modeshifts.clear();
             out.mentioned.clear();
@@ -547,6 +570,7 @@ fn command_line(name: &str, out: &mut Compiled, tabs: Tabs) -> LineInfo {
             out.motion = super::motion::Settings::default();
             out.touch = super::touch::Settings::default();
             out.fb = super::feedback::Settings::default();
+            out.cc = super::cc::Settings::default();
             let mut info = LineInfo::of(LineStatus::Ok);
             if !had_anything {
                 info.notes.push(
@@ -615,6 +639,7 @@ fn setting_line(name: &str, rhs: &str, support: Support, out: &mut Compiled) -> 
             motion: &mut out.motion,
             touch: &mut out.touch,
             fb: &mut out.fb,
+            cc: &mut out.cc,
         },
     )
 }
@@ -636,6 +661,7 @@ fn modeshift_line(
     let mut mo = out.motion;
     let mut tp = out.touch;
     let mut fbk = out.fb;
+    let mut ccs = out.cc;
     let info = apply_setting(
         name,
         rhs,
@@ -648,6 +674,7 @@ fn modeshift_line(
             motion: &mut mo,
             touch: &mut tp,
             fb: &mut fbk,
+            cc: &mut ccs,
         },
     );
     // A setting a later phase owns says so, and the modeshift waits with it.
@@ -676,10 +703,11 @@ pub(crate) struct Knobs<'a> {
     pub motion: &'a mut super::motion::Settings,
     pub touch: &'a mut super::touch::Settings,
     pub fb: &'a mut super::feedback::Settings,
+    pub cc: &'a mut super::cc::Settings,
 }
 
 pub(crate) fn apply_setting(name: &str, rhs: &str, support: Support, k: Knobs<'_>) -> LineInfo {
-    let Knobs { timings, settings, aim, pad, motion, touch, fb } = k;
+    let Knobs { timings, settings, aim, pad, motion, touch, fb, cc } = k;
     match support {
         Support::Analog(which) => analog_setting(name, rhs, which, settings),
         Support::Aim(which) => aim_setting(name, rhs, which, aim),
@@ -688,6 +716,7 @@ pub(crate) fn apply_setting(name: &str, rhs: &str, support: Support, k: Knobs<'_
             motion_setting(name, rhs, which, motion, settings, touch)
         }
         Support::Fb(which) => fb_setting(name, rhs, which, fb),
+        Support::Cc(which) => cc_setting(name, rhs, which, cc, motion),
         Support::Timing(which) => {
             let Some(ms) = rhs
                 .split_whitespace()
@@ -775,6 +804,30 @@ fn binding_line(
     // Recalibrating mid-game is the device card's job here, so a binding that
     // asks for it still runs — it just doesn't recalibrate.
     let mut notes = notes;
+    // A button JSM (or its fork) names that nothing on our bus reports. The binding
+    // compiles — the name is real — but it can never fire, and the line says why.
+    for btn in [
+        match trigger {
+            Trigger::Simple(b) | Trigger::Double(b) => Some(b),
+            Trigger::Chord { chord, .. } => Some(chord),
+            Trigger::Sim(a, _) | Trigger::Diag(a, _) => Some(a),
+        },
+        match trigger {
+            Trigger::Chord { btn, .. } => Some(btn),
+            Trigger::Sim(_, b) | Trigger::Diag(_, b) => Some(b),
+            _ => None,
+        },
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let BtnSource::Absent(why) = btn.source() {
+            let note = format!("`{}` never fires here — {why}", btn.name());
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
+    }
     if steps.iter().any(|s| s.out == Out::Calibrate) {
         notes.push("CALIBRATE does nothing here — the device card owns gyro calibration".into());
     }
@@ -1479,8 +1532,11 @@ fn aim_setting(name: &str, rhs: &str, which: AimId, s: &mut super::aim::Settings
                 AimId::TrackballDecay => s.trackball_decay = v,
                 AimId::RealWorldCalibration => {
                     if v <= 0.0 {
+                        // It is counts per DEGREE, not per turn — worth getting right
+                        // in the message, since a reader who takes it for per-turn is
+                        // 360 times out.
                         return wants(
-                            "a number above zero — it is how many mouse counts make a full turn",
+                            "a number above zero — it is how many mouse counts the game turns                              the camera by for each degree the pad rotates",
                         );
                     }
                     s.real_world_calibration = v;
@@ -1495,6 +1551,20 @@ fn aim_setting(name: &str, rhs: &str, which: AimId, s: &mut super::aim::Settings
                 AimId::FlickDeadzoneAngle => s.flick_deadzone_angle = v,
                 AimId::RotateSmoothOverride => s.rotate_smooth_override = v,
                 _ => s.mouse_ring_radius = v,
+            }
+            // A calibration measured in-game — by FlexInput's own RWS Aim module, or
+            // by JSM's `CALCULATE_REAL_WORLD_CALIBRATION` — already has the in-game
+            // sensitivity baked into it, because that is what was on screen while it
+            // was measured. Setting `IN_GAME_SENS` as well divides it a second time,
+            // and the aim comes out exactly that many times too slow. It is the one
+            // place a plain constant factor can appear, so both lines say so.
+            if matches!(which, AimId::RealWorldCalibration | AimId::InGameSens) {
+                let mut info = LineInfo::of(LineStatus::Ok);
+                info.notes.push(
+                    "REAL_WORLD_CALIBRATION is mouse counts per DEGREE, and IN_GAME_SENS                      divides it. A calibration you measured in-game already includes your                      in-game sensitivity, so leave IN_GAME_SENS at 1 for it — setting both                      makes the aim exactly IN_GAME_SENS times too slow."
+                        .to_string(),
+                );
+                return info;
             }
             ok
         }
@@ -1769,7 +1839,10 @@ fn motion_setting(
                 "PLAYER_LEAN" => Space::PlayerLean,
                 "WORLD_TURN" => Space::WorldTurn,
                 "WORLD_LEAN" => Space::WorldLean,
-                _ => return wants("LOCAL, PLAYER_TURN, PLAYER_LEAN, WORLD_TURN or WORLD_LEAN"),
+                "YAW_PLUS_ROLL" => Space::YawPlusRoll,
+                _ => return wants(
+                    "LOCAL, PLAYER_TURN, PLAYER_LEAN, WORLD_TURN, WORLD_LEAN or YAW_PLUS_ROLL",
+                ),
             };
             let mut info = ok;
             if m.space.needs_gravity() {
@@ -2120,6 +2193,168 @@ const TRIGGER_NOTE: &str = "only a DualSense has adaptive triggers; on any other
                             nothing, and the pad has to be wired to this module for it to reach \
                             one";
 
+
+// ── the custom-curve fork ─────────────────────────────────────────────────────
+
+/// Which of the `JSM_custom_curve` fork's settings a line sets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum CcId {
+    Curve,
+    NaturalVhalf,
+    PowerVref,
+    PowerExponent,
+    SigmoidMid,
+    SigmoidWidth,
+    JumpTau,
+    DecaySmoothing,
+    OneEuroMinCutoff,
+    OneEuroSpeedCoeff,
+    AngleSnap,
+    AngleSnapEase,
+    BrakeStrength,
+    BrakeThreshold,
+    RollContribution,
+}
+
+fn cc_setting(
+    name: &str,
+    rhs: &str,
+    which: CcId,
+    c: &mut super::cc::Settings,
+    m: &super::motion::Settings,
+) -> LineInfo {
+    use super::cc::Curve;
+    let wants = |what: &str| LineInfo::of(LineStatus::Error(format!("`{name}` wants {what}")));
+    let value = rhs.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    let num = || rhs.split_whitespace().next().and_then(|v| v.parse::<f32>().ok());
+    let ok = LineInfo::of(LineStatus::Ok);
+    // Almost all of these are "a number, at least this big".
+    let at_least = |lo: f32, what: &str| match num() {
+        Some(v) if v >= lo => Ok(v),
+        _ => Err(wants(what)),
+    };
+
+    match which {
+        CcId::Curve => {
+            c.curve = match value.as_str() {
+                "LINEAR" => Curve::Linear,
+                "NATURAL" => Curve::Natural,
+                "POWER" => Curve::Power,
+                "QUADRATIC" => Curve::Quadratic,
+                "SIGMOID" => Curve::Sigmoid,
+                "JUMP" => Curve::Jump,
+                _ => return wants("LINEAR, NATURAL, POWER, QUADRATIC, SIGMOID or JUMP"),
+            };
+            let mut info = LineInfo::of(LineStatus::Ok);
+            info.notes.push(FORK_NOTE.to_string());
+            if !c.curve.uses_max_threshold() {
+                // The trap worth stating out loud: three of the six curves never
+                // look at the top threshold, so a config that sets one and then
+                // switches curve has a setting that silently stops mattering.
+                info.notes.push(format!(
+                    "`{value}` takes its shape from its own settings in degrees per second and \
+                     never looks at MAX_GYRO_THRESHOLD — only LINEAR, QUADRATIC and JUMP use that"
+                ));
+            }
+            info
+        }
+        CcId::NaturalVhalf => match at_least(0.0, "a speed in degrees per second") {
+            Ok(v) => { c.natural_vhalf = v; ok }
+            Err(e) => e,
+        },
+        CcId::PowerVref => match at_least(0.0, "a reference speed in degrees per second") {
+            Ok(v) => { c.power_vref = v; ok }
+            Err(e) => e,
+        },
+        CcId::PowerExponent => match at_least(0.0, "an exponent of zero or more") {
+            Ok(v) => { c.power_exponent = v; ok }
+            Err(e) => e,
+        },
+        CcId::SigmoidMid => match at_least(0.0, "a speed in degrees per second") {
+            Ok(v) => { c.sigmoid_mid = v; ok }
+            Err(e) => e,
+        },
+        CcId::SigmoidWidth => match at_least(0.0, "a width in degrees per second (larger is gentler)") {
+            Ok(v) => { c.sigmoid_width = v; ok }
+            Err(e) => e,
+        },
+        CcId::JumpTau => match at_least(0.0, "a time constant of zero or more (zero is an instant step)") {
+            Ok(v) => { c.jump_tau = v; ok }
+            Err(e) => e,
+        },
+        CcId::OneEuroMinCutoff => match at_least(0.0, "a cutoff frequency in Hz") {
+            Ok(v) => { c.one_euro_min_cutoff = v; ok }
+            Err(e) => e,
+        },
+        CcId::OneEuroSpeedCoeff => match at_least(0.0, "a coefficient of zero or more") {
+            Ok(v) => { c.one_euro_speed_coeff = v; ok }
+            Err(e) => e,
+        },
+        CcId::BrakeStrength => match num() {
+            Some(v) if (0.0..=1.0).contains(&v) => {
+                c.brake_strength = v;
+                let mut info = LineInfo::of(LineStatus::Ok);
+                info.notes.push(FORK_NOTE.to_string());
+                info
+            }
+            _ => wants("a strength from 0 to 1"),
+        },
+        CcId::BrakeThreshold => match at_least(0.0, "a deceleration in degrees per second") {
+            Ok(v) => { c.brake_threshold = v; ok }
+            Err(e) => e,
+        },
+        CcId::AngleSnap => match num() {
+            Some(v) if (0.0..=45.0).contains(&v) => {
+                c.angle_snap = v;
+                let mut info = LineInfo::of(LineStatus::Ok);
+                info.notes.push(FORK_NOTE.to_string());
+                info
+            }
+            _ => wants("an angle in degrees, 0 to 45"),
+        },
+        CcId::AngleSnapEase => match on_off(&value) {
+            Some(on) => { c.angle_snap_ease = on; ok }
+            None => wants("ON or OFF"),
+        },
+        CcId::DecaySmoothing => match on_off(&value) {
+            Some(on) => {
+                c.decay_smoothing = on;
+                let mut info = LineInfo::of(LineStatus::Ok);
+                info.notes.push(FORK_NOTE.to_string());
+                if on {
+                    info.notes.push(
+                        "GYRO_SMOOTH_TIME and GYRO_SMOOTH_THRESHOLD now shape a decaying \
+                         smoother instead of a rolling average, so the same numbers feel \
+                         different"
+                            .to_string(),
+                    );
+                }
+                info
+            }
+            None => wants("ON or OFF"),
+        },
+        CcId::RollContribution => match num() {
+            Some(v) if (-100.0..=100.0).contains(&v) => {
+                c.roll_contribution = v;
+                let mut info = LineInfo::of(LineStatus::Ok);
+                info.notes.push(FORK_NOTE.to_string());
+                if m.space != super::motion::Space::YawPlusRoll {
+                    info.notes.push(
+                        "only does anything with `GYRO_SPACE = YAW_PLUS_ROLL`".to_string(),
+                    );
+                }
+                info
+            }
+            _ => wants("a percentage from -100 to 100"),
+        },
+    }
+}
+
+/// Said on a line that comes from the custom-curve fork rather than from JSM itself,
+/// so nobody is surprised that a stock JSM build doesn't know it.
+const FORK_NOTE: &str = "from the JSM_custom_curve fork, not stock JoyShockMapper — a config using \
+                         it won't load in an unmodified JSM";
+
 // ── the settings table ───────────────────────────────────────────────────────
 
 /// Said on every line whose output can only land on a virtual pad. A config full
@@ -2152,6 +2387,7 @@ pub(crate) enum Support {
     Pad(PadId),
     Motion(MotionId),
     Fb(FbId),
+    Cc(CcId),
     Pending(&'static str),
     Ignored(&'static str),
 }
@@ -2266,6 +2502,32 @@ fn setting_support(name: &str) -> Option<Support> {
         "MOTION_DEADZONE_OUTER" => Motion(MotionId::MotionDeadzone(false)),
         "MOTION_STICK_AXIS" => Motion(MotionId::MotionAxis),
         "LEAN_THRESHOLD" => Motion(MotionId::LeanThreshold),
+
+        // The JSM_custom_curve fork's additions. See `cc.rs` and the plan's phase 9.
+        "ACCEL_CURVE" => Cc(CcId::Curve),
+        "ACCEL_NATURAL_VHALF" => Cc(CcId::NaturalVhalf),
+        "ACCEL_POWER_VREF" => Cc(CcId::PowerVref),
+        "ACCEL_POWER_EXPONENT" => Cc(CcId::PowerExponent),
+        "ACCEL_SIGMOID_MID" => Cc(CcId::SigmoidMid),
+        "ACCEL_SIGMOID_WIDTH" => Cc(CcId::SigmoidWidth),
+        "ACCEL_JUMP_TAU" => Cc(CcId::JumpTau),
+        "GYRO_SMOOTHING_DECAY" => Cc(CcId::DecaySmoothing),
+        "ONE_EURO_MIN_CUTOFF" => Cc(CcId::OneEuroMinCutoff),
+        "ONE_EURO_SPEED_COEFF" => Cc(CcId::OneEuroSpeedCoeff),
+        "GYRO_ANGLE_SNAP" => Cc(CcId::AngleSnap),
+        "GYRO_ANGLE_SNAP_EASE" => Cc(CcId::AngleSnapEase),
+        "DECEL_BRAKE_STRENGTH" => Cc(CcId::BrakeStrength),
+        "DECEL_BRAKE_THRESHOLD" => Cc(CcId::BrakeThreshold),
+        "ROLL_CONTRIBUTION" => Cc(CcId::RollContribution),
+        // Two the fork has that cannot mean anything here.
+        "IGNORE_GYRO_DEVICES" => Ignored(
+            "it exists because JSM grabs every pad it can see; this module is handed one device \
+             by the patch and cannot see a VID or PID. Don't wire that pad in, or use GYRO_OFF",
+        ),
+        "TELEMETRY_ENABLED" | "TELEMETRY_PORT" => Ignored(
+            "the fork opens a socket so its separate GUI can draw the live curve; the editor here \
+             is the GUI",
+        ),
 
         // Feedback.
         "RUMBLE" => Fb(FbId::Rumble),

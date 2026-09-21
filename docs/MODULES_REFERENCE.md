@@ -744,8 +744,9 @@ pub struct ModuleDescriptor {
   `analog` (triggers and all five of JSM's sticks as its buttons), `aim` (gyro and
   sticks as mouse movement), `pad` (whatever drives a virtual pad instead),
   `motion` (gravity: lean, the motion stick, the gravity gyro spaces), `touch`
-  (the touchpad), `feedback` (what goes back to the pad), `bind` (the press
-  machinery), `eval` (bus in, bus out).
+  (the touchpad), `feedback` (what goes back to the pad), `cc` (the
+  JSM_custom_curve fork's additions), `bind` (the press machinery), `eval` (bus in,
+  bus out).
   Registered through the registry seam's stateful publisher hook; state lives in
   `NodeState::jsm`
 - **Editor:** the body is the config text, each line tinted by what the parser
@@ -753,7 +754,7 @@ pub struct ModuleDescriptor {
   has keyboard focus the config's key and mouse output pauses, so a binding under
   test can't type into it. The wheel over the editor scrolls the config instead of
   panning the canvas (`canvas/wheel.rs`).
-- **Live so far (plan phases 1-8):** digital bindings (tap/hold, all modifiers,
+- **Live so far (plan phases 1-9):** digital bindings (tap/hold, all modifiers,
   chord, simultaneous, diagonal, double press, turbo) and JSM's timing settings;
   analog triggers (`TRIGGER_THRESHOLD` including the hair trigger, `ZL_MODE` /
   `ZR_MODE` full pull with every skip mode, `TRIGGER_SKIP_DELAY`); digital sticks
@@ -779,7 +780,11 @@ pub struct ModuleDescriptor {
   `feedback_override:{_jsm_dest_dev}` so they replace the game's rather than add to
   it. And phase 8: action layers — a quoted config file name switches which tab is
   running (`HOME = "driving.txt"`), a bare one applies that tab where it stands, and
-  `RESET_MAPPINGS` works both ways. Only `MOUSE_RING` and `HYBRID_AIM` are still
+  `RESET_MAPPINGS` works both ways. And phase 9: the `JSM_custom_curve` fork's
+  additions — five acceleration curves (`ACCEL_CURVE`), decay smoothing, the
+  one-euro filter, `GYRO_ANGLE_SNAP`, the deceleration brake, `YAW_PLUS_ROLL`, and
+  its `MISC1`-`MISC6` buttons. Every fork line says it is the fork's, since a config
+  using one won't load in a stock JSM. Only `MOUSE_RING` and `HYBRID_AIM` are still
   pending, and their lines say why.
 - **What it takes over:** only what it actually runs. A stick left in a mode a
   later phase owns, and a full pull the trigger mode never fires, keep passing

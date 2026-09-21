@@ -31,6 +31,16 @@ pub enum Btn {
     Tup, Tdown, Tleft, Tright, Tring,
     /// Touchpad grid cell, 1-based (`T1`…`T25`).
     T(u8),
+    // ── the custom-curve fork's extra buttons ────────────────────────────────
+    /// `MISC1`…`MISC6`, 1-based — SDL's generic extra buttons, which our bus has
+    /// one for one.
+    Misc(u8),
+    /// Capacitive touch on a stick, and the "mini" shoulder buttons. The fork reads
+    /// these from SDL3; our bus has no pin for any of them, so they say so.
+    LTouch,
+    RTouch,
+    LMini,
+    RMini,
 }
 
 /// Where a button reads from on the bus.
@@ -51,6 +61,11 @@ pub enum BtnSource {
     Touch,
     /// A touchpad grid cell (1-based) or touch-stick direction.
     TouchZone { cell: Option<u8>, dir: Option<Dir> },
+    /// A name JSM (or its fork) accepts that nothing on our bus reports, with the
+    /// reason. It reads as never pressed, and its line says why — which beats both
+    /// calling the name an error and guessing at a pin that might be something else
+    /// entirely.
+    Absent(&'static str),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -63,6 +78,14 @@ impl Btn {
     /// Parse a JSM button name. `None` when it isn't one.
     pub fn from_name(name: &str) -> Option<Btn> {
         use Btn::*;
+        // `MISC1`…`MISC6` — the fork's names for SDL's generic extra buttons.
+        if let Some(d) = name.to_ascii_uppercase().strip_prefix("MISC") {
+            if let Ok(n) = d.parse::<u8>() {
+                if (1..=6).contains(&n) {
+                    return Some(Btn::Misc(n));
+                }
+            }
+        }
         // Grid cells T1..T25 (T alone is not a button; TOUCH is).
         if let Some(rest) = name.strip_prefix('T').or_else(|| name.strip_prefix('t')) {
             if let Ok(n) = rest.parse::<u8>() {
@@ -80,6 +103,7 @@ impl Btn {
             "RUP" => Rup, "RDOWN" => Rdown, "RLEFT" => Rleft, "RRIGHT" => Rright, "RRING" => Rring,
             "MUP" => Mup, "MDOWN" => Mdown, "MLEFT" => Mleft, "MRIGHT" => Mright, "MRING" => Mring,
             "TOUCH" => Touch, "CAPTURE" => Capture,
+            "LTOUCH" => LTouch, "RTOUCH" => RTouch, "LMINI" => LMini, "RMINI" => RMini,
             "ZLF" => Zlf, "ZRF" => Zrf,
             "TUP" => Tup, "TDOWN" => Tdown, "TLEFT" => Tleft, "TRIGHT" => Tright, "TRING" => Tring,
             _ => return None,
@@ -103,6 +127,9 @@ impl Btn {
             Mup => "MUP".into(), Mdown => "MDOWN".into(), Mleft => "MLEFT".into(),
             Mright => "MRIGHT".into(), Mring => "MRING".into(),
             Touch => "TOUCH".into(), Capture => "CAPTURE".into(),
+            LTouch => "LTOUCH".into(), RTouch => "RTOUCH".into(),
+            LMini => "LMINI".into(), RMini => "RMINI".into(),
+            Misc(n) => format!("MISC{n}"),
             Zlf => "ZLF".into(), Zrf => "ZRF".into(),
             Tup => "TUP".into(), Tdown => "TDOWN".into(), Tleft => "TLEFT".into(),
             Tright => "TRIGHT".into(), Tring => "TRING".into(),
@@ -146,6 +173,26 @@ impl Btn {
             Mring => S::Motion { dir: Dir::Ring },
             LeanLeft => S::Lean { right: false }, LeanRight => S::Lean { right: true },
             Touch => S::Touch,
+            Misc(n) => S::Pin(match n {
+                1 => "btn_misc1",
+                2 => "btn_misc2",
+                3 => "btn_misc3",
+                4 => "btn_misc4",
+                5 => "btn_misc5",
+                _ => "btn_misc6",
+            }),
+            // The fork reads these off SDL3's extended button set. Nothing on our bus
+            // carries them, and guessing at a paddle or a misc slot would be worse
+            // than saying so: on one pad `LMINI` is a rail button, on another it is
+            // something else entirely.
+            LTouch | RTouch => S::Absent(
+                "nothing on the bus reports capacitive touch on a stick — a pad that senses it \
+                 usually surfaces it as one of the MISC buttons instead",
+            ),
+            LMini | RMini => S::Absent(
+                "the bus has no pin for a mini shoulder button; try LSL / LSR / RSL / RSR for a \
+                 rail button, or a MISC one for whatever your pad calls it",
+            ),
             Tup => S::TouchZone { cell: None, dir: Some(Dir::Up) },
             Tdown => S::TouchZone { cell: None, dir: Some(Dir::Down) },
             Tleft => S::TouchZone { cell: None, dir: Some(Dir::Left) },

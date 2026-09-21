@@ -588,6 +588,30 @@ Console commands are also finished here. A command this module runs
 same thing whether written alone or bound to a button. A line whose every step is
 such a command reads as ignored; a real key beside one still runs.
 
+## `REAL_WORLD_CALIBRATION` and a measured number
+
+Reported from hands-on testing: a calibration measured with the RWS Aim module
+seemed to need a multiplier of about four in this module.
+
+The arithmetic here is JSM's own and is now pinned by a test —
+`moveMouse(velocity * RWC / IN_GAME_SENS * dt)`, verified against
+`shapedSensitivityMoveMouse` in JSM's `InputHelpers.h`, with a 90° turn at `RWC = 1`
+moving exactly 90 counts. So a constant factor cannot come from the formula; it can
+only come from what a number *means*. There are exactly two places it can hide:
+
+1. **`IN_GAME_SENS` double-counts.** A calibration measured in-game — by RWS Aim, or
+   by JSM's own `CALCULATE_REAL_WORLD_CALIBRATION` — already has the in-game
+   sensitivity baked in, because that is what was on screen while it was measured.
+   Setting `IN_GAME_SENS` as well divides by it a second time, and the aim comes out
+   exactly that many times too slow. Both lines now say so in the editor.
+2. **`MIN_GYRO_SENS` and `MAX_GYRO_SENS` as a pair** make the sensitivity vary with
+   turn speed, so no single multiplier matches — which would also explain a factor
+   that "varies depending on the target".
+
+The old error text on that line claimed it was "how many mouse counts make a full
+turn", which is wrong by 360 and could have sent someone the other way. It now says
+counts per degree.
+
 ## `X_` and `PS_` names stay aliases
 
 Raised after hands-on testing: since `PS_UP` and `X_UP` land on the same
@@ -608,6 +632,45 @@ tab), wired to its own sink. Every pad-output line says as much in the editor �
 that it needs a pad wired downstream, and that the prefix doesn't pick one.
 
 ## Phase 9 — the custom-curve fork
+
+**Landed** (`jsm/cc.rs`). Kept in its own file because it is a *fork's* vocabulary:
+a config written for stock JSM never touches any of it, and someone comparing this
+against upstream should see at a glance what is and isn't Electronicks'. Every line
+that uses one says so, too — a config carrying these won't load in an unmodified
+JSM, and that is worth knowing before you save it.
+
+All three traps the survey called out are handled:
+
+- **`ACCEL_CURVE`'s five shapes** are implemented from the fork's own formulas, and
+  the editor warns on a curve that ignores `MAX_GYRO_THRESHOLD` — Natural, Power and
+  Sigmoid take their shape from their own parameters in absolute deg/s, so setting a
+  top threshold and then switching curve silently stops it mattering.
+- **`ONE_EURO_FILTER` stays a command**, global and sticky until `RESET_MAPPINGS`, so
+  it cannot be chorded while the two numbers that tune it can. The line says so.
+- **The pipeline order is the fork's**, not the obvious one: the brake measures
+  *before* the snap so a snap-induced slowdown is not mistaken for the hands
+  stopping, and the speed is recomputed afterwards for the curve.
+
+One deliberate departure, and it is the bug the survey spotted. The fork's *eased*
+angle snap sets the surviving axis to the full vector magnitude the moment the
+direction enters the snap zone, while only fading the other — so right at the edge,
+where the ease blend is still zero, the output already gains speed. Here the
+surviving axis is blended in over the same curve: identical at full snap, smooth in
+between. There is a test sitting exactly at the zone's edge.
+
+`GYRO_SMOOTHING_DECAY` needs a word of warning that is in the editor too: it reuses
+`GYRO_SMOOTH_TIME` and `GYRO_SMOOTH_THRESHOLD` for a different smoother, so the same
+two numbers feel different. Neither smoother is "less" smoothing than the other —
+which is why the test for it asserts that the two *differ*, not that one lags more.
+
+**The fork's ten extra button names**: `MISC1`…`MISC6` are our `btn_misc1`…`6`, one
+for one. `LTOUCH`, `RTOUCH`, `LMINI` and `RMINI` have no pin on our bus, and rather
+than guess at a paddle or a misc slot — on one pad `LMINI` is a rail button, on
+another something else — they compile, never fire, and say why on the line. That
+needed a new `BtnSource::Absent(reason)`, which is the honest shape for "a name we
+know and cannot read".
+
+## Phase 9 — the survey it was built from
 
 `evan1mclean/JSM_custom_curve` adds features on top of JSM that JSM users may be
 carrying configs for. **Surveyed** at fork commit `0ace2da` against upstream
@@ -750,8 +813,8 @@ Plus one command, `ONE_EURO_FILTER`, and one new gyro space, `YAW_PLUS_ROLL`.
    `RESET_MAPPINGS`.
    *(landed — see above)*
 9. **The custom-curve fork.** The five acceleration curves, decay smoothing, the
-   one-euro filter, angle snap, the deceleration brake and `YAW_PLUS_ROLL` —
-   see *Phase 9 — the custom-curve fork* above for the survey and the traps.
+   one-euro filter, angle snap, the deceleration brake and `YAW_PLUS_ROLL`.
+   *(landed — see above)*
 
 Each phase lands with engine tests in the style of the Remapper's
 (`rig_steps`-like tick stepping), and with mutation checks that the tests catch

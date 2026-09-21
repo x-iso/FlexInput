@@ -256,7 +256,7 @@ pub(crate) fn jsm_publish(
         let analog = &st.analog;
         let held = |btn: Btn| -> bool { button_down(btn, &upstream, analog, &ext) };
         st.aim
-            .tick(&res.aim, &res.pad, &res.motion, gravity, dt, gyro, &st.analog, &gyro_actions, &held)
+            .tick(&res.aim, &res.pad, &res.motion, &res.cc, gravity, dt, gyro, &st.analog, &gyro_actions, &held)
     };
     let mouse = aimed.mouse;
 
@@ -593,6 +593,8 @@ fn button_down(
         | BtnSource::Stick { .. }
         | BtnSource::Motion { .. } => analog.down(btn),
         BtnSource::Lean { right } => if right { ext.lean.1 } else { ext.lean.0 },
+        // Nothing reports it, so it is never pressed. Its line says as much.
+        BtnSource::Absent(_) => false,
         // `TOUCH` is the touchpad soft pull, which the analog side runs.
         BtnSource::Touch => analog.down(btn),
         BtnSource::TouchZone { cell, dir } => match (cell, dir) {
@@ -684,6 +686,9 @@ fn claimed_pins(cfg: &Compiled, res: &super::parse::Resolved) -> (HashSet<String
                     analog.extend(stick_pins(stick));
                 }
             }
+            // A name nothing on our bus reports claims nothing — there is no pin to
+            // claim, and the line already says it can never fire.
+            BtnSource::Absent(_) => {}
             // Sources later phases read: nothing to claim while they can't fire.
             BtnSource::Motion { .. }
             | BtnSource::Lean { .. }

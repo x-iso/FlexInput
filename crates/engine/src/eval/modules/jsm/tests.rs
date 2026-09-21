@@ -1390,6 +1390,7 @@ impl Aiming {
             &self.cfg.aim,
             &self.cfg.pad,
             &self.cfg.motion,
+            &self.cfg.cc,
             gravity,
             DT,
             self.gyro,
@@ -1812,7 +1813,7 @@ fn a_chord_can_shorten_the_hold_time() {
 // out at full.
 #[test]
 fn a_stick_waits_for_centre_after_its_modeshift_ends() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = alone();
     let uid = 7101;
     let cfg = "LUP = W\nZL,LEFT_STICK_MODE = AIM\nSTICK_SENS = 100";
     let snap = jsm_snap(uid, cfg, false);
@@ -1890,8 +1891,42 @@ use crate::state::NodeState;
 const PAD: &str = "gilrs:xinput:0";
 
 /// Editor focus is process-wide (the UI sets it for whichever editor has the
-/// keyboard), so these tests run one at a time.
+/// keyboard), and while it is on the config's key and mouse output pauses. So any
+/// test that runs a node has to hold this, or a focus test running beside it makes
+/// every key read as released — an intermittent failure that looks like a bug in
+/// whatever the test was actually about.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Take the lock *and* put editor focus back to off. Every helper that runs a node
+/// goes through this, so a new test cannot forget it: the lock is held for the call
+/// and dropped after, which is enough because nothing here nests.
+fn alone() -> Alone {
+    // Taking it twice on one thread would deadlock on a std mutex, and a deadlock is
+    // the worst failure to debug: no message, no backtrace, just a test that never
+    // ends. Say what went wrong instead. (This cost an hour once — the `*_unlocked`
+    // helpers exist for callers that already hold it.)
+    assert!(
+        !HELD.with(|h| h.get()),
+        "this thread already holds the test lock — use the `run_*_unlocked` form inside          a test that took `alone()` itself"
+    );
+    let guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    HELD.with(|h| h.set(true));
+    crate::eval::set_jsm_editor_focus(false);
+    Alone(guard)
+}
+
+thread_local! {
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The lock, plus the flag that makes a second take on the same thread say so.
+struct Alone(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for Alone {
+    fn drop(&mut self) {
+        HELD.with(|h| h.set(false));
+    }
+}
 
 fn jsm_snap(uid: usize, text: &str, strict: bool) -> NodeSnap {
     let mut params = HashMap::new();
@@ -1929,6 +1964,28 @@ fn run_node_with(
     sigs: &[(&str, Signal)],
     ticks: usize,
 ) -> HashMap<String, Signal> {
+    let _guard = alone();
+    run_node_unlocked_with(text, strict, sigs, ticks)
+}
+
+/// The same, for a caller that already holds [`alone`] — the one test that wants
+/// editor focus left ON has to, since `alone` clears it.
+fn run_node_unlocked(
+    text: &str,
+    strict: bool,
+    held: &[&str],
+    ticks: usize,
+) -> HashMap<String, Signal> {
+    let sigs: Vec<(&str, Signal)> = held.iter().map(|p| (*p, Signal::Bool(true))).collect();
+    run_node_unlocked_with(text, strict, &sigs, ticks)
+}
+
+fn run_node_unlocked_with(
+    text: &str,
+    strict: bool,
+    sigs: &[(&str, Signal)],
+    ticks: usize,
+) -> HashMap<String, Signal> {
     let uid = 4242;
     let snap = jsm_snap(uid, text, strict);
     let mut dev: HashMap<(String, String), Signal> = HashMap::new();
@@ -1959,6 +2016,7 @@ fn run_frames(
     strict: bool,
     frames: &[Vec<(&str, Signal)>],
 ) -> std::collections::HashSet<String> {
+    let _guard = alone();
     let uid = 4242;
     let snap = jsm_snap(uid, text, strict);
     let key = format!("collector:{uid}");
@@ -1984,7 +2042,6 @@ fn run_frames(
 // over, and a button it never mentions carries on to the game.
 #[test]
 fn a_bound_button_is_taken_over_and_the_rest_passes_through() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let bus = run_node("S = SPACE", false, &["btn_south", "btn_north"], 2);
     assert!(on(&bus, "key_space"), "the config drives its key");
     assert!(!on(&bus, "btn_south"), "the button it bound is taken over");
@@ -2005,7 +2062,6 @@ fn a_bound_button_is_taken_over_and_the_rest_passes_through() {
 // from belongs to the config from then on.
 #[test]
 fn a_stick_direction_drives_its_key_and_claims_the_stick() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let up = Signal::Vec2(glam::Vec2::new(0.0, 1.0));
     let stick = |bus: &HashMap<String, Signal>| match bus.get("left_stick") {
         Some(Signal::Vec2(v)) => *v,
@@ -2048,7 +2104,6 @@ fn a_stick_direction_drives_its_key_and_claims_the_stick() {
 // still drives the directions.
 #[test]
 fn stick_axes_work_without_the_vector() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let bus = run_node_with(
         "LRIGHT = D",
         false,
@@ -2062,7 +2117,6 @@ fn stick_axes_work_without_the_vector() {
 // analog trigger over rather than passing it on half-pressed.
 #[test]
 fn a_full_pull_binding_runs_on_the_bus() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let cfg = "ZR_MODE = NO_SKIP\nZR = LMOUSE\nZRF = RMOUSE";
     let bus = run_node_with(cfg, false, &[("right_trigger", Signal::Float(0.5))], 2);
     assert!(on(&bus, "mouse_left"), "the soft pull holds its key");
@@ -2099,7 +2153,6 @@ fn a_full_pull_binding_runs_on_the_bus() {
 // the gyro takes the gyro over so it can't also drive a node downstream.
 #[test]
 fn gyro_aiming_reaches_the_bus_as_mouse_movement() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Half of the bus's full scale is 1000 deg/s of yaw.
     let turn = [("gyro_z", Signal::Float(0.5))];
     let bus = run_node_with("GYRO_SENS = 1\nREAL_WORLD_CALIBRATION = 1", false, &turn, 2);
@@ -2144,7 +2197,7 @@ fn gyro_aiming_reaches_the_bus_as_mouse_movement() {
 // not only on the one where it happens to be released.
 #[test]
 fn a_released_key_stays_released() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = alone();
     let uid = 7001;
     let snap = jsm_snap(uid, "L = E", false);
     let key = format!("collector:{uid}");
@@ -2168,7 +2221,6 @@ fn a_released_key_stays_released() {
 // left holding the last one would nudge the cursor for ever.
 #[test]
 fn a_still_pad_publishes_no_more_movement() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let cfg = "GYRO_SENS = 1
 REAL_WORLD_CALIBRATION = 1";
     let turning = [("gyro_z", Signal::Float(0.5))];
@@ -2189,7 +2241,6 @@ REAL_WORLD_CALIBRATION = 1";
 // to land after it and cancel it, so the binding did nothing at the pad.
 #[test]
 fn a_dpad_binding_drives_the_axis_and_vector_too() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let bus = run_node("S = X_UP", false, &["btn_south"], 2);
     assert!(on(&bus, "dpad_up"), "the direction itself");
     assert_eq!(bus.get("dpad_y").map(|s| s.as_float()), Some(1.0), "the axis form");
@@ -2220,7 +2271,6 @@ fn a_dpad_binding_drives_the_axis_and_vector_too() {
 // Strict mode: nothing but the config's own output leaves the module.
 #[test]
 fn strict_mode_publishes_only_what_the_config_says() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let bus = run_node("S = SPACE", true, &["btn_south", "btn_north"], 2);
     assert!(on(&bus, "key_space"));
     assert!(
@@ -2233,7 +2283,6 @@ fn strict_mode_publishes_only_what_the_config_says() {
 // destination goes to full.
 #[test]
 fn a_pad_binding_drives_the_pad_pin() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let bus = run_node("S = X_LT", false, &["btn_south"], 2);
     assert_eq!(bus.get("left_trigger").map(|s| s.as_float()), Some(1.0));
 }
@@ -2242,9 +2291,12 @@ fn a_pad_binding_drives_the_pad_pin() {
 // otherwise a binding under test types into the config you are writing.
 #[test]
 fn keys_pause_while_an_editor_has_focus() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // The only test that wants focus ON, so it drives the node itself: `run_node`
+    // clears the flag on the way in, which is what stops every other test from
+    // inheriting it.
+    let _guard = alone();
     crate::eval::set_jsm_editor_focus(true);
-    let bus = run_node("S = SPACE\nE = X_A", false, &["btn_south", "btn_east"], 2);
+    let bus = run_node_unlocked("S = SPACE\nE = X_A", false, &["btn_south", "btn_east"], 2);
     crate::eval::set_jsm_editor_focus(false);
     assert!(
         !on(&bus, "key_space"),
@@ -2255,7 +2307,9 @@ fn keys_pause_while_an_editor_has_focus() {
         "pad output carries on, so the mapping is still felt"
     );
 
-    let bus = run_node("S = SPACE", false, &["btn_south"], 2);
+    // Still holding the lock, so the unlocked form again — `run_node` would try to
+    // take it a second time, and a std mutex is not reentrant.
+    let bus = run_node_unlocked("S = SPACE", false, &["btn_south"], 2);
     assert!(
         on(&bus, "key_space"),
         "and keys resume once the editor loses focus"
@@ -2267,7 +2321,7 @@ fn keys_pause_while_an_editor_has_focus() {
 // how JSM reads ZL/ZR by default.
 #[test]
 fn an_analog_trigger_presses_its_button() {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = alone();
     let uid = 4243;
     let snap = jsm_snap(uid, "ZR = LMOUSE", false);
     let mut dev: HashMap<(String, String), Signal> = HashMap::new();
@@ -2445,7 +2499,6 @@ fn jsms_own_desktop_config_plays_its_keys_and_mouse() {
 
     // And its scroll wheel turns, all the way from a stick on the bus to a
     // wheel notch: SCROLL_SENS = 60, so a quarter turn is more than one notch.
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let turn = |x: f32, y: f32| vec![("left_stick", Signal::Vec2(glam::Vec2::new(x, y)))];
     let drove = run_frames(DESKTOP_CONFIG, false, &[turn(1.0, 0.0), turn(0.0, 1.0)]);
     assert!(
@@ -3707,6 +3760,7 @@ fn trigger_travel_calibration_is_the_device_cards() {
 /// which is what lets it replace the game's rather than add to it.
 #[test]
 fn feedback_reaches_the_pad_it_came_from() {
+    let _guard = alone();
     let uid = 4242;
     let mut snap = jsm_snap(uid, "LIGHT_BAR = RED\nRUMBLE = OFF", false);
     snap.params
@@ -3735,6 +3789,7 @@ fn feedback_reaches_the_pad_it_came_from() {
 /// is published — rather than a stray `feedback_override:` nobody drains.
 #[test]
 fn feedback_with_no_pad_upstream_goes_nowhere() {
+    let _guard = alone();
     let uid = 4243;
     let snap = jsm_snap(uid, "LIGHT_BAR = RED", false);
     let dev: HashMap<(String, String), Signal> = HashMap::new();
@@ -3825,6 +3880,7 @@ fn every_colour_name_is_the_colour_it_says() {
 /// amplitude lands on the override layer keyed to the pad upstream.
 #[test]
 fn a_rumble_binding_reaches_the_pad() {
+    let _guard = alone();
     let uid = 4244;
     let mut snap = jsm_snap(uid, "S = BIG_RUMBLE", false);
     snap.params
@@ -3883,6 +3939,7 @@ fn run_tabs(
     tabs: &[(&str, &str)],
     steps: &[(&[&str], usize)],
 ) -> Vec<std::collections::HashSet<String>> {
+    let _guard = alone();
     let uid = 5150;
     let snap = tabbed_snap(uid, tabs);
     let mut collector: HashMap<(String, String), Signal> = HashMap::new();
@@ -3953,6 +4010,7 @@ fn a_binding_can_switch_to_another_tab() {
 /// binding left to release it.
 #[test]
 fn switching_layers_does_not_leave_a_key_held() {
+    let _guard = alone();
     let uid = 5151;
     let snap = tabbed_snap(
         uid,
@@ -4105,6 +4163,7 @@ fn a_rebound_button_uses_the_last_binding() {
 /// half-edited chain.
 #[test]
 fn an_edit_puts_the_module_back_on_the_open_tab() {
+    let _guard = alone();
     let uid = 5152;
     let mut snap = tabbed_snap(
         uid,
@@ -4184,6 +4243,7 @@ fn a_console_command_binding_says_it_does_nothing_and_why() {
 /// This is the assertion the weaker "it isn't true any more" version missed.
 #[test]
 fn switching_layers_publishes_the_old_layers_keys_as_released() {
+    let _guard = alone();
     let uid = 5153;
     let snap = tabbed_snap(
         uid,
@@ -4240,6 +4300,7 @@ fn an_included_tab_replaces_a_binding_made_above_it() {
 /// can reach is as live as the one on screen.
 #[test]
 fn editing_a_tab_that_is_not_open_still_recompiles() {
+    let _guard = alone();
     let uid = 5154;
     let run = |snap: &NodeSnap, state: &mut HashMap<usize, NodeState>| {
         let mut collector: HashMap<(String, String), Signal> = HashMap::new();
@@ -4287,6 +4348,7 @@ fn editing_a_tab_that_is_not_open_still_recompiles() {
 /// no-op, which is invisible until someone presses the button twice.
 #[test]
 fn a_layer_can_be_switched_to_again_after_an_edit() {
+    let _guard = alone();
     let uid = 5155;
     let mut state: HashMap<usize, NodeState> = HashMap::new();
     let press = |snap: &NodeSnap, state: &mut HashMap<usize, NodeState>, pins: &[&str]| {
@@ -4327,4 +4389,757 @@ fn a_layer_can_be_switched_to_again_after_an_edit() {
         again.contains("key_b"),
         "the same binding switches away again: {again:?}"
     );
+}
+
+// ── phase 9: the JSM_custom_curve fork ───────────────────────────────────────
+
+/// Each curve's shape, checked where its shape actually differs from a straight
+/// line. The three settings a curve does or doesn't consult matter more than the
+/// exact numbers, so each case picks a speed where the difference is unmistakable.
+#[test]
+fn every_acceleration_curve_has_the_shape_it_claims() {
+    use super::cc::{sensitivity, Curve, Settings as Cc};
+    let (lo, hi, cap) = (1.0f32, 5.0f32, 100.0f32);
+    // The linear position between the thresholds, for `LINEAR` only.
+    let t = |omega: f32| (omega / cap).min(1.0);
+    let at = |c: Cc, omega: f32| sensitivity(&c, omega, t(omega), cap, lo, hi);
+
+    // LINEAR is the straight line stock JSM draws.
+    let lin = Cc { curve: Curve::Linear, ..Default::default() };
+    assert!((at(lin, 0.0) - lo).abs() < 1e-5, "linear starts at the bottom");
+    assert!((at(lin, 50.0) - 3.0).abs() < 1e-5, "and is halfway at halfway");
+    assert!((at(lin, 100.0) - hi).abs() < 1e-5, "and reaches the top");
+
+    // NATURAL is halfway up at `vhalf`, and never quite reaches the top.
+    let nat = Cc { curve: Curve::Natural, natural_vhalf: 50.0, ..Default::default() };
+    assert!((at(nat, 0.0) - lo).abs() < 1e-5, "natural starts at the bottom");
+    assert!((at(nat, 50.0) - 3.0).abs() < 1e-4, "halfway at vhalf: {}", at(nat, 50.0));
+    // Three half-lives up it is at 7/8 of the way, still short of the top. (Far
+    // enough out the exponential underflows and it reaches `hi` exactly, which is a
+    // float limit rather than anything to assert about.)
+    let three_halves = at(nat, 150.0);
+    assert!(
+        three_halves < hi && three_halves > 4.0,
+        "approaches the top without reaching it: {three_halves}"
+    );
+
+    // QUADRATIC is flat early and steep late — under the line at halfway.
+    let quad = Cc { curve: Curve::Quadratic, ..Default::default() };
+    assert!(at(quad, 50.0) < at(lin, 50.0), "quadratic is gentler at halfway");
+    assert!((at(quad, 100.0) - hi).abs() < 1e-5, "and pegs at the cap");
+    assert!((at(quad, 200.0) - hi).abs() < 1e-5, "and stays there past it");
+
+    // SIGMOID starts exactly at the bottom, by construction.
+    let sig = Cc { curve: Curve::Sigmoid, sigmoid_mid: 50.0, sigmoid_width: 8.0, ..Default::default() };
+    assert!((at(sig, 0.0) - lo).abs() < 1e-5, "sigmoid is rescaled to start at lo");
+    assert!((at(sig, 50.0) - 3.0).abs() < 0.05, "and is halfway at its midpoint");
+    assert!(at(sig, 30.0) < at(lin, 30.0), "S-shaped: below the line early");
+    assert!(at(sig, 70.0) > at(lin, 70.0), "and above it late");
+
+    // JUMP hugs the bottom then steps up near the cap.
+    let jump = Cc { curve: Curve::Jump, jump_tau: 10.0, ..Default::default() };
+    assert!((at(jump, 0.0) - lo).abs() < 1e-5, "jump is rescaled to start at lo");
+    assert!(at(jump, 50.0) < 1.1, "and stays down until the cap is near: {}", at(jump, 50.0));
+    assert!((at(jump, 100.0) - hi).abs() < 1e-5, "then steps to the top");
+
+    // POWER with a tiny reference speed climbs almost at once.
+    let pow = Cc { curve: Curve::Power, power_vref: 0.01, power_exponent: 0.5, ..Default::default() };
+    assert!(at(pow, 0.0) <= lo + 1e-5, "power is at the bottom when standing still");
+    assert!(at(pow, 1.0) > at(lin, 1.0), "and climbs faster than the line: {}", at(pow, 1.0));
+}
+
+/// Only three of the six curves consult `MAX_GYRO_THRESHOLD` — the trap the plan
+/// calls out, and the one the editor has to warn about.
+#[test]
+fn three_curves_ignore_the_top_threshold_and_say_so() {
+    use super::cc::{sensitivity, Curve, Settings as Cc};
+    for curve in [Curve::Linear, Curve::Quadratic, Curve::Jump] {
+        assert!(curve.uses_max_threshold(), "{curve:?} uses the cap");
+    }
+    for curve in [Curve::Natural, Curve::Power, Curve::Sigmoid] {
+        assert!(!curve.uses_max_threshold(), "{curve:?} does not");
+        // And prove it: changing the cap changes nothing.
+        let c = Cc { curve, ..Default::default() };
+        let a = sensitivity(&c, 30.0, 0.3, 100.0, 1.0, 5.0);
+        let b = sensitivity(&c, 30.0, 0.3, 900.0, 1.0, 5.0);
+        assert!((a - b).abs() < 1e-6, "{curve:?} ignores the cap: {a} vs {b}");
+    }
+
+    // The editor says so on the line that picks the curve.
+    let warned = one("ACCEL_CURVE = SIGMOID");
+    assert_eq!(warned.status, LineStatus::Ok);
+    let notes = warned.notes.join(" ");
+    assert!(
+        notes.contains("MAX_GYRO_THRESHOLD"),
+        "it warns the top threshold stops mattering: {notes}"
+    );
+    // And it doesn't cry wolf for the three that do use it.
+    let quiet = one("ACCEL_CURVE = QUADRATIC");
+    assert!(
+        !quiet.notes.join(" ").contains("never looks at"),
+        "no warning for a curve that uses it: {:?}",
+        quiet.notes
+    );
+}
+
+/// Every fork setting says it is a fork setting, so nobody is surprised when a
+/// config using one won't load in a stock JSM build.
+#[test]
+fn fork_settings_say_they_are_the_forks() {
+    for line in [
+        "ACCEL_CURVE = NATURAL",
+        "GYRO_SMOOTHING_DECAY = ON",
+        "GYRO_ANGLE_SNAP = 10",
+        "DECEL_BRAKE_STRENGTH = 0.5",
+        "ROLL_CONTRIBUTION = 50",
+        "ONE_EURO_FILTER",
+    ] {
+        let info = one(line);
+        assert_eq!(info.status, LineStatus::Ok, "{line}: {:?}", info.status);
+        assert!(
+            info.notes.iter().any(|n| n.contains("JSM_custom_curve")),
+            "{line} names the fork: {:?}",
+            info.notes
+        );
+    }
+}
+
+/// `ONE_EURO_FILTER` is a command, not a setting — global and sticky, so it cannot
+/// be chorded. Reproducing that asymmetry is deliberate.
+#[test]
+fn the_one_euro_filter_is_a_command_and_cannot_be_chorded() {
+    let c = compile("ONE_EURO_FILTER");
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    assert!(c.cc.one_euro_enabled, "the command switches it on");
+    let notes = c.lines[0].notes.join(" ");
+    assert!(notes.contains("cannot be chorded"), "and says so: {notes}");
+
+    // As a chord it is not a setting at all, so the modeshift is refused.
+    assert!(
+        matches!(one("ZL,ONE_EURO_FILTER = ON").status, LineStatus::Error(_)),
+        "it is not a setting to chord"
+    );
+
+    // Its two tuning numbers, though, chord like anything else.
+    let c = compile("ZL,ONE_EURO_MIN_CUTOFF = 20");
+    assert!(errors(&c).is_empty(), "{:?}", errors(&c));
+    let held = super::parse::resolve(&c, &[Btn::Zl]);
+    assert_eq!(held.cc.one_euro_min_cutoff, 20.0, "held, it is 20");
+    assert_eq!(
+        super::parse::resolve(&c, &[]).cc.one_euro_min_cutoff,
+        6.0,
+        "let go, back to the default"
+    );
+}
+
+/// The one-euro filter smooths a jittery signal at rest and lets a fast move
+/// through — the whole reason for it over a plain low-pass.
+#[test]
+fn the_one_euro_filter_smooths_jitter_but_not_a_fast_move() {
+    let settle = |values: &[f32]| {
+        let mut f = super::cc::OneEuro::default();
+        let mut last = 0.0;
+        for v in values {
+            last = f.filter(*v, DT, 6.0, 0.3);
+        }
+        last
+    };
+    // Jitter about zero: the filter should land near zero, not near the last sample.
+    let jitter: Vec<f32> = (0..40).map(|i| if i % 2 == 0 { 3.0 } else { -3.0 }).collect();
+    let calm = settle(&jitter);
+    assert!(calm.abs() < 1.5, "jitter at rest is smoothed away: {calm}");
+
+    // A sustained fast move: the filter should follow it closely.
+    let fast: Vec<f32> = (0..40).map(|_| 300.0).collect();
+    let followed = settle(&fast);
+    assert!(followed > 250.0, "a fast move comes through: {followed}");
+}
+
+/// Angle snap straightens a nearly-level turn without slowing it — the magnitude is
+/// kept, which is the point.
+#[test]
+fn angle_snap_straightens_a_turn_without_slowing_it() {
+    use super::cc::{angle_snap, Settings as Cc};
+    let s = Cc { angle_snap: 10.0, ..Default::default() };
+    // 5 degrees off horizontal: inside the zone, so it snaps flat.
+    let (x, y) = (100.0f32, 100.0 * 5.0f32.to_radians().tan());
+    let mag = (x * x + y * y).sqrt();
+    let (sx, sy) = angle_snap(&s, x, y);
+    assert!(sy.abs() < 1e-3, "the off-axis part goes: {sy}");
+    assert!((sx - mag).abs() < 1e-3, "and the speed is kept, not lost: {sx} vs {mag}");
+
+    // 30 degrees off: well outside, untouched.
+    let (x, y) = (100.0f32, 100.0 * 30.0f32.to_radians().tan());
+    assert_eq!(angle_snap(&s, x, y), (x, y), "outside the zone nothing happens");
+
+    // Nearly vertical snaps to vertical, and keeps its sign.
+    let (x, y) = (100.0 * 5.0f32.to_radians().tan(), -100.0f32);
+    let (sx, sy) = angle_snap(&s, x, y);
+    assert!(sx.abs() < 1e-3 && sy < 0.0, "snaps down, still downward: {sx}, {sy}");
+
+    // Switched off, it never touches anything.
+    let off = Cc::default();
+    assert_eq!(angle_snap(&off, 100.0, 3.0), (100.0, 3.0));
+}
+
+/// The eased snap ramps in rather than jumping — including the magnitude, which is
+/// where this deliberately departs from the fork.
+#[test]
+fn the_eased_angle_snap_ramps_in_from_nothing() {
+    use super::cc::{angle_snap, Settings as Cc};
+    let eased = Cc { angle_snap: 20.0, angle_snap_ease: true, ..Default::default() };
+    let at = |deg: f32| {
+        let (x, y) = (100.0f32, 100.0 * deg.to_radians().tan());
+        (angle_snap(&eased, x, y), (x * x + y * y).sqrt())
+    };
+    // Right at the edge of the zone the blend is zero, so NOTHING changes — neither
+    // axis. The fork gains magnitude here, which is what this departs from.
+    let ((sx, sy), _) = at(19.99);
+    let (x, y) = (100.0f32, 100.0 * 19.99f32.to_radians().tan());
+    assert!(
+        (sx - x).abs() < 0.5 && (sy - y).abs() < 0.5,
+        "at the edge of the zone the snap has not started: {sx}, {sy} against {x}, {y}"
+    );
+    // Halfway in, part way snapped.
+    let ((_, mid_y), _) = at(10.0);
+    let straight = 100.0 * 10.0f32.to_radians().tan();
+    assert!(mid_y.abs() < straight && mid_y.abs() > 0.0, "partly snapped: {mid_y}");
+    // All the way in, flat.
+    let ((_, in_y), _) = at(0.5);
+    assert!(in_y.abs() < straight * 0.2, "nearly flat: {in_y}");
+}
+
+/// The deceleration brake damps the tail of a fast stop, and does nothing when it is
+/// switched off or when the pad is turning steadily.
+#[test]
+fn the_deceleration_brake_only_bites_when_the_pad_is_stopping() {
+    use super::cc::{Brake, Settings as Cc};
+    let on = Cc { brake_strength: 0.8, brake_threshold: 25.0, ..Default::default() };
+
+    // Steady speed inside the band: nothing to brake.
+    let mut b = Brake::default();
+    let mut mult = 1.0;
+    for _ in 0..40 {
+        mult = b.tick(&on, DT, 30.0, 30.0);
+    }
+    assert!((mult - 1.0).abs() < 1e-6, "a steady turn is not braked: {mult}");
+
+    // Now a real stop: turning at 60 deg/s and arrested in a single tick, ending
+    // slow but still moving — that last part matters, because the speed gate is
+    // 2..60 deg/s, so the brake damps a camera that is still coasting rather than
+    // one already stopped. It is a brief pulse, so take the strongest damping seen.
+    let mut b = Brake::default();
+    for _ in 0..10 {
+        b.tick(&on, DT, 60.0, 60.0);
+    }
+    let mut hardest = 1.0f32;
+    for _ in 0..5 {
+        hardest = hardest.min(b.tick(&on, DT, 8.0, 8.0));
+    }
+    assert!(hardest < 0.9, "a hard stop is damped: {hardest}");
+
+    // And it lets go again once the deceleration is over.
+    let mut released = 0.0;
+    for _ in 0..20 {
+        released = b.tick(&on, DT, 8.0, 8.0);
+    }
+    assert!((released - 1.0).abs() < 1e-6, "then releases: {released}");
+
+    // Switched off, never anything.
+    let off = Cc::default();
+    let mut b = Brake::default();
+    for _ in 0..10 {
+        b.tick(&off, DT, 60.0, 60.0);
+    }
+    let mut mult = 1.0f32;
+    for _ in 0..5 {
+        mult = mult.min(b.tick(&off, DT, 8.0, 8.0));
+    }
+    assert_eq!(mult, 1.0, "with strength 0 it is inert");
+}
+
+/// `YAW_PLUS_ROLL` mixes a share of roll into the turn, and is default `LOCAL` when
+/// that share is zero.
+#[test]
+fn yaw_plus_roll_mixes_roll_into_the_turn() {
+    let with = |roll_pct: f32, roll_rate: f32| {
+        let cfg = format!(
+            "{AIM_CFG}\nGYRO_SPACE = YAW_PLUS_ROLL\nROLL_CONTRIBUTION = {roll_pct}"
+        );
+        let mut a = Aiming::new(&cfg);
+        a.gyro = Gyro { roll: roll_rate, pitch: 0.0, yaw: 30.0 };
+        a.ticks(3).x
+    };
+    // With no roll contribution, rolling the pad does nothing to the turn.
+    let plain = with(0.0, 0.0);
+    let rolled_but_ignored = with(0.0, 40.0);
+    assert!(
+        (plain - rolled_but_ignored).abs() < 1e-3,
+        "at 0% roll is ignored: {plain} vs {rolled_but_ignored}"
+    );
+    // With a share of it, the same roll changes the turn.
+    let mixed = with(100.0, 40.0);
+    assert!(
+        (mixed - plain).abs() > 0.1,
+        "at 100% roll joins the turn: {plain} then {mixed}"
+    );
+
+    // And `ROLL_CONTRIBUTION` says when it is doing nothing.
+    let idle = one("ROLL_CONTRIBUTION = 50");
+    assert!(
+        idle.notes.iter().any(|n| n.contains("YAW_PLUS_ROLL")),
+        "it says which space it needs: {:?}",
+        idle.notes
+    );
+}
+
+/// Decay smoothing is an alternative to the rolling average, and says that the two
+/// smoothing settings now mean something different.
+#[test]
+fn decay_smoothing_replaces_the_rolling_average() {
+    use super::cc::Decay;
+    // A slow step, well under the threshold, is smoothed: settle at rest first, since
+    // the smoother (like the fork's) starts on whatever it first sees, and a steady
+    // input converges to itself however hard it is smoothed.
+    let mut d = Decay::default();
+    for _ in 0..20 {
+        d.smooth(0.0, 0.0, DT, 0.125, 100.0);
+    }
+    let stepped = d.smooth(10.0, 0.0, DT, 0.125, 100.0).0;
+    assert!(stepped < 5.0, "a slow step is smoothed: {stepped}");
+
+    // Fast, past the threshold: straight through even from rest.
+    let mut d = Decay::default();
+    for _ in 0..20 {
+        d.smooth(0.0, 0.0, DT, 0.125, 100.0);
+    }
+    let fast = d.smooth(500.0, 0.0, DT, 0.125, 100.0).0;
+    assert!(fast > 450.0, "a fast one is not: {fast}");
+
+    // With either setting at zero it is a pass-through, as in the fork.
+    let mut d = Decay::default();
+    assert_eq!(d.smooth(10.0, 2.0, DT, 0.0, 100.0), (10.0, 2.0));
+    assert_eq!(d.smooth(10.0, 2.0, DT, 0.125, 0.0), (10.0, 2.0));
+
+    let line = one("GYRO_SMOOTHING_DECAY = ON");
+    assert!(
+        line.notes.iter().any(|n| n.contains("feel different")),
+        "it says the same numbers now feel different: {:?}",
+        line.notes
+    );
+}
+
+/// The two fork settings that cannot mean anything here say why.
+#[test]
+fn the_fork_settings_that_do_not_apply_say_why() {
+    match one("IGNORE_GYRO_DEVICES = 0x054c:0x0ce6").status {
+        LineStatus::Ignored(why) => {
+            assert!(why.contains("handed one device"), "{why}");
+        }
+        other => panic!("IGNORE_GYRO_DEVICES should be ignored with a reason, got {other:?}"),
+    }
+    for line in ["TELEMETRY_ENABLED = ON", "TELEMETRY_PORT = 5000"] {
+        match one(line).status {
+            LineStatus::Ignored(why) => {
+                assert!(why.contains("the GUI"), "{line}: {why}");
+            }
+            other => panic!("{line} should be ignored with a reason, got {other:?}"),
+        }
+    }
+}
+
+/// The fork's `MISC1`…`MISC6` are our `btn_misc1`…`6`, one for one.
+#[test]
+fn the_forks_misc_buttons_are_our_misc_pins() {
+    for n in 1..=6 {
+        let line = format!("MISC{n} = E");
+        let info = one(&line);
+        assert_eq!(info.status, LineStatus::Ok, "{line}: {:?}", info.status);
+    }
+    let out = run_node("MISC3 = E", false, &["btn_misc3"], 3);
+    assert!(
+        out.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+        "pressing the pad's third misc button fires the binding: {out:?}"
+    );
+    // Past six is not a button.
+    assert!(matches!(one("MISC7 = E").status, LineStatus::Error(_)));
+}
+
+/// The four fork names our bus has no pin for compile, never fire, and say so —
+/// rather than being called errors or being guessed onto a pin that might be
+/// something else entirely.
+#[test]
+fn the_fork_names_we_have_no_pin_for_say_they_never_fire() {
+    for (name, expect) in [
+        ("LTOUCH", "capacitive touch"),
+        ("RTOUCH", "capacitive touch"),
+        ("LMINI", "mini shoulder"),
+        ("RMINI", "mini shoulder"),
+    ] {
+        let info = one(&format!("{name} = E"));
+        assert_eq!(
+            info.status,
+            LineStatus::Ok,
+            "{name} is a real name, not an error: {:?}",
+            info.status
+        );
+        let notes = info.notes.join(" ");
+        assert!(notes.contains("never fires here"), "{name}: {notes}");
+        assert!(notes.contains(expect), "{name} says what it would need: {notes}");
+    }
+}
+
+/// Every one of phase 9's settings is read, with a bad value called out.
+#[test]
+fn every_fork_setting_is_read() {
+    let c = compile(
+        "ACCEL_CURVE = JUMP\n\
+         ACCEL_NATURAL_VHALF = 150\n\
+         ACCEL_POWER_VREF = 0.5\n\
+         ACCEL_POWER_EXPONENT = 2\n\
+         ACCEL_SIGMOID_MID = 40\n\
+         ACCEL_SIGMOID_WIDTH = 12\n\
+         ACCEL_JUMP_TAU = 3\n\
+         GYRO_SMOOTHING_DECAY = ON\n\
+         ONE_EURO_MIN_CUTOFF = 8\n\
+         ONE_EURO_SPEED_COEFF = 0.6\n\
+         GYRO_ANGLE_SNAP = 12\n\
+         GYRO_ANGLE_SNAP_EASE = ON\n\
+         DECEL_BRAKE_STRENGTH = 0.7\n\
+         DECEL_BRAKE_THRESHOLD = 40\n\
+         ROLL_CONTRIBUTION = -25",
+    );
+    assert!(errors(&c).is_empty(), "all live: {:?}", errors(&c));
+    assert_eq!(c.cc.curve, super::cc::Curve::Jump);
+    assert_eq!(c.cc.natural_vhalf, 150.0);
+    assert_eq!(c.cc.power_vref, 0.5);
+    assert_eq!(c.cc.power_exponent, 2.0);
+    assert_eq!(c.cc.sigmoid_mid, 40.0);
+    assert_eq!(c.cc.sigmoid_width, 12.0);
+    assert_eq!(c.cc.jump_tau, 3.0);
+    assert!(c.cc.decay_smoothing);
+    assert_eq!(c.cc.one_euro_min_cutoff, 8.0);
+    assert_eq!(c.cc.one_euro_speed_coeff, 0.6);
+    assert_eq!(c.cc.angle_snap, 12.0);
+    assert!(c.cc.angle_snap_ease);
+    assert_eq!(c.cc.brake_strength, 0.7);
+    assert_eq!(c.cc.brake_threshold, 40.0);
+    assert_eq!(c.cc.roll_contribution, -25.0);
+
+    for bad in [
+        "ACCEL_CURVE = SQUIGGLE",
+        "ACCEL_JUMP_TAU = -1",
+        "GYRO_ANGLE_SNAP = 90",
+        "GYRO_ANGLE_SNAP_EASE = MAYBE",
+        "DECEL_BRAKE_STRENGTH = 2",
+        "ROLL_CONTRIBUTION = 200",
+        "GYRO_SMOOTHING_DECAY = SOMETIMES",
+    ] {
+        assert!(matches!(one(bad).status, LineStatus::Error(_)), "{bad}");
+    }
+}
+
+/// The curve reaches the actual gyro output — the pipeline is wired, not just the
+/// settings parsed.
+#[test]
+fn the_chosen_curve_changes_what_the_gyro_does() {
+    let aim_with = |extra: &str, yaw: f32| {
+        let cfg = format!(
+            "MIN_GYRO_SENS = 1\nMAX_GYRO_SENS = 8\nMIN_GYRO_THRESHOLD = 0\n\
+             MAX_GYRO_THRESHOLD = 100\nREAL_WORLD_CALIBRATION = 1\nGYRO_SMOOTH_TIME = 0\n{extra}"
+        );
+        let mut a = Aiming::new(&cfg);
+        a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw };
+        a.ticks(3).x
+    };
+    // At a quarter of the way up the threshold band, QUADRATIC is far gentler than
+    // the straight line — the curve is doing the work, not the sens settings.
+    let linear = aim_with("ACCEL_CURVE = LINEAR", 25.0);
+    let quad = aim_with("ACCEL_CURVE = QUADRATIC", 25.0);
+    assert!(linear > 0.0 && quad > 0.0, "both aim: {linear}, {quad}");
+    assert!(
+        quad < linear * 0.7,
+        "quadratic is much gentler at a quarter speed: {quad} against {linear}"
+    );
+}
+
+/// The deceleration brake reaches the gyro output too, and leaves a steady turn
+/// alone.
+#[test]
+fn the_brake_reaches_the_gyro_output() {
+    let cfg = format!(
+        "{AIM_CFG}\nMIN_GYRO_SENS = 1\nMAX_GYRO_SENS = 1\nDECEL_BRAKE_STRENGTH = 1\n\
+         DECEL_BRAKE_THRESHOLD = 10"
+    );
+    // The same turn, once with the brake and once without, arrested in a tick.
+    let run = |cfg: &str| {
+        let mut a = Aiming::new(cfg);
+        a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw: 50.0 };
+        let steady = a.ticks(20).x;
+        a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw: 8.0 };
+        let mut lowest = f32::MAX;
+        for _ in 0..5 {
+            lowest = lowest.min(a.tick().x.abs());
+        }
+        (steady.abs(), lowest)
+    };
+    let (steady, braked) = run(&cfg);
+    // 50 deg/s at calibration 1 over a 10 ms tick is half a pixel — small numbers,
+    // but the comparison is what matters.
+    assert!(steady > 0.4, "a steady turn aims: {steady}");
+    let plain = format!("{AIM_CFG}\nMIN_GYRO_SENS = 1\nMAX_GYRO_SENS = 1");
+    let (_, unbraked) = run(&plain);
+    assert!(
+        braked < unbraked * 0.95,
+        "the brake damps the tail: {braked} against {unbraked}"
+    );
+}
+
+
+/// What `REAL_WORLD_CALIBRATION` means, pinned to a number anyone can check by hand:
+/// it is **mouse counts per degree turned**, so turning the pad through 90 degrees at
+/// `RWC = 1` and `GYRO_SENS = 1` moves the pointer 90 counts, and `IN_GAME_SENS`
+/// divides that.
+///
+/// This exists because a report came in that a calibration measured elsewhere seemed
+/// to need a multiplier of about four in this module. The formula here is JSM's own —
+/// `moveMouse(velocity * RWC / IN_GAME_SENS * dt)`, verified against
+/// `shapedSensitivityMoveMouse` in JSM's `InputHelpers.h` — so a constant factor can
+/// only come from what a number MEANS, not from the arithmetic. Pinning the meaning
+/// is how that stays true.
+#[test]
+fn real_world_calibration_is_mouse_counts_per_degree() {
+    // Turn at 90 deg/s for exactly one second, in 100 ticks of 10 ms.
+    let sweep = |extra: &str| {
+        let cfg = format!(
+            "GYRO_SENS = 1\nGYRO_SMOOTH_TIME = 0\nREAL_WORLD_CALIBRATION = 1\n{extra}"
+        );
+        let mut a = Aiming::new(&cfg);
+        a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw: 90.0 };
+        let mut total = 0.0;
+        for _ in 0..100 {
+            total += a.tick().x;
+        }
+        total
+    };
+    let ninety = sweep("");
+    assert!(
+        (ninety - 90.0).abs() < 0.5,
+        "90 degrees at RWC 1 is 90 counts, got {ninety}"
+    );
+
+    // Ten times the calibration is ten times the counts — it is a plain scale, so no
+    // multiplier can be hiding in it.
+    let times_ten = sweep("REAL_WORLD_CALIBRATION = 10");
+    assert!(
+        (times_ten - 900.0).abs() < 5.0,
+        "RWC scales linearly: {times_ten}"
+    );
+
+    // And `IN_GAME_SENS` divides it, which is the one place a factor of about four
+    // can come from: a calibration measured in-game already has the in-game
+    // sensitivity baked in, so setting both double-counts it.
+    let with_sens = sweep("IN_GAME_SENS = 4");
+    assert!(
+        (with_sens - 22.5).abs() < 0.5,
+        "IN_GAME_SENS divides the calibration: {with_sens}"
+    );
+
+    // `GYRO_SENS` multiplies on top, as JSM's own feel multiplier.
+    let double = sweep("GYRO_SENS = 2");
+    assert!((double - 180.0).abs() < 1.0, "GYRO_SENS multiplies: {double}");
+}
+
+/// `POWER` climbs steeply past its reference speed — the reference is what sets
+/// where, so it has to be the divisor and not a plain multiplier.
+#[test]
+fn the_power_curve_climbs_from_its_reference_speed() {
+    use super::cc::{sensitivity, Curve, Settings as Cc};
+    let (lo, hi, cap) = (1.0f32, 5.0f32, 100.0f32);
+    let at = |c: Cc, omega: f32| sensitivity(&c, omega, (omega / cap).min(1.0), cap, lo, hi);
+
+    // A hundredth of a degree per second reference: by 1 deg/s it is already at the
+    // top, because that is a hundred times the reference.
+    let quick = Cc { curve: Curve::Power, power_vref: 0.01, power_exponent: 0.5, ..Default::default() };
+    assert!(at(quick, 1.0) > 4.9, "far past the reference it is at the top: {}", at(quick, 1.0));
+
+    // Move the reference out and the same speed is barely off the bottom — which is
+    // the whole point of having one.
+    let slow = Cc { curve: Curve::Power, power_vref: 100.0, power_exponent: 0.5, ..Default::default() };
+    assert!(at(slow, 1.0) < 2.0, "well short of it, still low: {}", at(slow, 1.0));
+    assert!(
+        at(quick, 1.0) > at(slow, 1.0) * 2.0,
+        "the reference speed decides, not the exponent alone"
+    );
+}
+
+/// The one-euro filter's whole trick is that its cutoff opens up with speed, so it
+/// tracks a fast ramp closely while still smoothing a slow one. A plain low-pass
+/// cannot do both.
+#[test]
+fn the_one_euro_cutoff_opens_up_with_speed() {
+    let ramp = |beta: f32| {
+        let mut f = super::cc::OneEuro::default();
+        let mut last = 0.0;
+        // A steady climb of 20 deg/s per tick.
+        for i in 0..30 {
+            last = f.filter(i as f32 * 20.0, DT, 6.0, beta);
+        }
+        (29.0 * 20.0) - last
+    };
+    // With no speed coefficient it lags badly; with one it keeps up.
+    let lag_without = ramp(0.0);
+    let lag_with = ramp(3.0);
+    assert!(lag_without > 0.0, "a plain low-pass lags a ramp: {lag_without}");
+    assert!(
+        lag_with < lag_without * 0.5,
+        "opening the cutoff with speed cuts the lag: {lag_with} against {lag_without}"
+    );
+}
+
+/// The brake only watches for *slowing*, only inside its speed band, and only past
+/// its threshold. Each of the three is what stops it firing when it shouldn't.
+#[test]
+fn the_brake_ignores_speeding_up_a_dead_stop_and_a_gentle_slowdown() {
+    use super::cc::{Brake, Settings as Cc};
+    let on = Cc { brake_strength: 1.0, brake_threshold: 25.0, ..Default::default() };
+    let lowest = |from: f32, to: f32, thr: f32| {
+        let s = Cc { brake_threshold: thr, ..on };
+        let mut b = Brake::default();
+        for _ in 0..10 {
+            b.tick(&s, DT, from, from);
+        }
+        let mut worst = 1.0f32;
+        for _ in 0..5 {
+            worst = worst.min(b.tick(&s, DT, to, to));
+        }
+        worst
+    };
+
+    // Speeding up just as hard: not braking. Braking an acceleration would fight the
+    // flick it is supposed to be cleaning up after.
+    assert_eq!(lowest(8.0, 60.0, 25.0), 1.0, "a hard acceleration is not braked");
+
+    // Stopping dead: outside the 2..60 deg/s band, so nothing to damp — the camera
+    // has already stopped, and damping zero achieves nothing but a surprise on the
+    // next movement.
+    assert_eq!(lowest(60.0, 0.0, 25.0), 1.0, "a dead stop is not braked");
+
+    // Slowing gently, under the threshold: left alone. Without the threshold every
+    // ordinary slowdown would be damped.
+    assert_eq!(lowest(30.0, 28.0, 25.0), 1.0, "a gentle slowdown is under the threshold");
+
+    // And the same slowdown with a low enough threshold IS braked, which proves the
+    // threshold is what made the difference rather than the shape of the test.
+    assert!(lowest(30.0, 28.0, 0.5) < 1.0, "with a low threshold it bites");
+}
+
+/// Decay smoothing reaches the gyro output, and is off unless asked for.
+#[test]
+fn decay_smoothing_reaches_the_gyro_output() {
+    let step = |extra: &str| {
+        let cfg = format!(
+            "GYRO_SENS = 1\nREAL_WORLD_CALIBRATION = 1\nGYRO_SMOOTH_TIME = 0.125\n\
+             GYRO_SMOOTH_THRESHOLD = 500\n{extra}"
+        );
+        let mut a = Aiming::new(&cfg);
+        // Settle at rest, then step to a slow turn.
+        a.gyro = Gyro::default();
+        a.ticks(20);
+        a.gyro = Gyro { roll: 0.0, pitch: 0.0, yaw: 30.0 };
+        a.tick().x
+    };
+    let with_decay = step("GYRO_SMOOTHING_DECAY = ON");
+    let without = step("GYRO_SMOOTHING_DECAY = OFF");
+    // The full, unsmoothed value: 30 deg/s at calibration 1 over a 10 ms tick.
+    let full = 0.3;
+    assert!(with_decay > 0.0 && with_decay < full * 0.5, "decay smooths the step: {with_decay}");
+    assert!(without > 0.0 && without < full * 0.5, "so does the rolling average: {without}");
+    // Both smooth, so "is it smoothed" proves nothing. What proves the decay smoother
+    // is the one running is that it gives a DIFFERENT answer to the same two
+    // settings — which is exactly what the editor warns about on that line.
+    assert!(
+        (with_decay - without).abs() > full * 0.05,
+        "the two smoothers differ on the same settings: {with_decay} against {without}"
+    );
+}
+
+/// The one-euro filter reaches the gyro output, and only when its command is given.
+#[test]
+fn the_one_euro_filter_reaches_the_gyro_output() {
+    let jitter = |extra: &str| {
+        let cfg = format!(
+            "GYRO_SENS = 1\nREAL_WORLD_CALIBRATION = 1\nGYRO_SMOOTH_TIME = 0\n\
+             ONE_EURO_MIN_CUTOFF = 2\nONE_EURO_SPEED_COEFF = 0\n{extra}"
+        );
+        let mut a = Aiming::new(&cfg);
+        let mut worst = 0.0f32;
+        for i in 0..40 {
+            a.gyro = Gyro {
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: if i % 2 == 0 { 60.0 } else { -60.0 },
+            };
+            if i > 10 {
+                worst = worst.max(a.tick().x.abs());
+            } else {
+                a.tick();
+            }
+        }
+        worst
+    };
+    let filtered = jitter("ONE_EURO_FILTER");
+    let raw = jitter("");
+    assert!(raw > 0.0, "the jitter comes through unfiltered: {raw}");
+    assert!(
+        filtered < raw * 0.5,
+        "the filter damps it: {filtered} against {raw}"
+    );
+}
+
+/// Angle snap reaches the gyro output: a turn a few degrees off level comes out
+/// level, and keeps its speed.
+#[test]
+fn angle_snap_reaches_the_gyro_output() {
+    let aim = |extra: &str| {
+        let cfg = format!(
+            "GYRO_SENS = 1\nREAL_WORLD_CALIBRATION = 1\nGYRO_SMOOTH_TIME = 0\n{extra}"
+        );
+        let mut a = Aiming::new(&cfg);
+        // Mostly yaw with a little pitch: about 6 degrees off level.
+        a.gyro = Gyro { roll: 0.0, pitch: 6.0, yaw: 60.0 };
+        a.ticks(3)
+    };
+    let plain = aim("");
+    assert!(plain.y.abs() > 0.01, "without snapping the tilt shows: {plain:?}");
+
+    let snapped = aim("GYRO_ANGLE_SNAP = 20");
+    assert!(
+        snapped.y.abs() < plain.y.abs() * 0.2,
+        "snapping levels it out: {snapped:?} against {plain:?}"
+    );
+    assert!(
+        snapped.x.abs() >= plain.x.abs() * 0.99,
+        "and the speed is kept, not lost: {snapped:?} against {plain:?}"
+    );
+}
+
+/// Each `MISC` button is its own pin, not all of them the first one.
+#[test]
+fn each_misc_button_is_its_own_pin() {
+    for n in 1..=6u8 {
+        let pin = format!("btn_misc{n}");
+        let out = run_node(&format!("MISC{n} = E"), false, &[&pin], 3);
+        assert!(
+            out.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+            "MISC{n} reads {pin}: {out:?}"
+        );
+        // And it is not some other pin: pressing the NEXT one must not fire it.
+        let other = format!("btn_misc{}", if n == 6 { 1 } else { n + 1 });
+        let wrong = run_node(&format!("MISC{n} = E"), false, &[&other], 3);
+        assert!(
+            !wrong.get("key_e").map(|s| s.as_bool()).unwrap_or(false),
+            "MISC{n} does not read {other}: {wrong:?}"
+        );
+    }
 }

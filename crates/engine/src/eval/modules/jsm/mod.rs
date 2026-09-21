@@ -12,6 +12,7 @@
 mod aim;
 mod analog;
 mod bind;
+mod cc;
 mod eval;
 mod feedback;
 mod motion;
